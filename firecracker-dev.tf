@@ -11,7 +11,7 @@ variable "enable_firecracker_instance" {
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "c6g.metal"  # ARM64 metal for nested virt
+  default     = "c7g.metal"  # ARM64 Graviton3 metal for nested virt
 }
 
 variable "firecracker_volume_size" {
