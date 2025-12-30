@@ -155,6 +155,33 @@ output "github_runner_ssh_command" {
 }
 
 # ============================================
+# Auto-stop after 8 hours idle
+# ============================================
+
+resource "aws_cloudwatch_metric_alarm" "github_runner_idle" {
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "github-runner-idle-8h"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 32 # 32 x 15min = 8 hours
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 900 # 15 minutes
+  statistic           = "Average"
+  threshold           = 5 # Less than 5% CPU = idle
+  alarm_description   = "Stop GitHub runner after 8 hours idle"
+
+  dimensions = {
+    InstanceId = aws_spot_instance_request.github_runner[0].spot_instance_id
+  }
+
+  alarm_actions = ["arn:aws:automate:us-west-1:ec2:stop"]
+
+  tags = {
+    Name = "github-runner-idle-8h"
+  }
+}
+
+# ============================================
 # IAM User for GitHub Actions to start runner
 # ============================================
 
