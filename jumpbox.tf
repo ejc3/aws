@@ -1,6 +1,6 @@
 # Jumpbox Instance
-# Tiny ARM64 instance with AWS admin access for remote management
-# Cost: ~$3/month for t4g.nano (can leave running)
+# ARM64 instance with AWS admin access for remote management
+# Cost: ~$48/month for t4g.large on-demand
 
 variable "enable_jumpbox" {
   description = "Enable jumpbox instance with admin AWS access"
@@ -52,11 +52,35 @@ resource "aws_iam_instance_profile" "jumpbox_admin" {
   role  = aws_iam_role.jumpbox_admin[0].name
 }
 
+# Persistent EBS volume for /home/ubuntu
+resource "aws_ebs_volume" "jumpbox_home" {
+  count             = var.enable_jumpbox ? 1 : 0
+  availability_zone = "us-west-1a"
+  size              = 20
+  type              = "gp3"
+
+  tags = {
+    Name = "jumpbox-home"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Attach home volume to jumpbox
+resource "aws_volume_attachment" "jumpbox_home" {
+  count       = var.enable_jumpbox ? 1 : 0
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.jumpbox_home[0].id
+  instance_id = aws_instance.jumpbox[0].id
+}
+
 # Jumpbox instance
 resource "aws_instance" "jumpbox" {
   count         = var.enable_jumpbox ? 1 : 0
   ami           = var.firecracker_ami  # Same Ubuntu ARM64 AMI
-  instance_type = "t4g.nano"
+  instance_type = "t4g.large"
   key_name      = var.firecracker_key_name
 
   # Network - same subnet as firecracker dev instance
@@ -84,8 +108,51 @@ resource "aws_instance" "jumpbox" {
       ami,
       user_data,
       user_data_base64,
+      instance_type,
     ]
   }
+}
+
+# Backup plan for jumpbox home volume
+resource "aws_backup_plan" "jumpbox" {
+  count = var.enable_jumpbox ? 1 : 0
+  name  = "jumpbox-backup-plan"
+
+  rule {
+    rule_name         = "daily"
+    target_vault_name = "fcvm-backups"
+    schedule          = "cron(0 5 * * ? *)"
+    start_window      = 60
+    completion_window = 120
+
+    lifecycle {
+      delete_after = 7
+    }
+  }
+
+  rule {
+    rule_name         = "weekly"
+    target_vault_name = "fcvm-backups"
+    schedule          = "cron(0 5 ? * SUN *)"
+    start_window      = 60
+    completion_window = 120
+
+    lifecycle {
+      delete_after = 30
+    }
+  }
+}
+
+# Backup selection for jumpbox home volume
+resource "aws_backup_selection" "jumpbox" {
+  count        = var.enable_jumpbox ? 1 : 0
+  name         = "jumpbox-home-volume"
+  plan_id      = aws_backup_plan.jumpbox[0].id
+  iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
+
+  resources = [
+    aws_ebs_volume.jumpbox_home[0].arn
+  ]
 }
 
 # Outputs
