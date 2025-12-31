@@ -9,3 +9,4 @@ variable "project_name" {
   type        = string
   default     = "aws-infrastructure"
 }
+
