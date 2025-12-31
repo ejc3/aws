@@ -1,4 +1,4 @@
-.PHONY: help shell init plan apply destroy output clean test connect connect-iam dev-start dev-stop dev-ssh dev-status .aws-login .check-aws-cli .check-podman
+.PHONY: help shell init plan apply destroy output clean test connect connect-iam dev-start dev-stop dev-ssh dev-status runners .aws-login .check-aws-cli .check-podman
 
 # Container runtime (podman or docker)
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null || echo /opt/homebrew/bin/podman)
@@ -33,6 +33,9 @@ help:
 	@echo "  make dev-stop    - Stop dev instance (persists disk)"
 	@echo "  make dev-ssh     - SSH into dev instance via SSM"
 	@echo "  make dev-status  - Show dev instance status"
+	@echo ""
+	@echo "GitHub Runners:"
+	@echo "  make runners     - List all GitHub runner instances"
 
 # Ensure AWS CLI is installed via Homebrew (required for SSO)
 .check-aws-cli:
@@ -245,3 +248,11 @@ dev-status: .check-aws-cli .container-built
 			--query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name,PublicIpAddress]' \
 			--output table; \
 	fi
+
+# GitHub runner management
+runners:
+	@echo "GitHub Runner Instances:"
+	@aws ec2 describe-instances \
+		--filters "Name=tag:Name,Values=github-runner,github-runner-autoscale" \
+		--query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value|[0],InstanceId,InstanceType,State.Name,PrivateIpAddress,LaunchTime]' \
+		--output table --region us-west-1
