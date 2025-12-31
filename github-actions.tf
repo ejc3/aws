@@ -24,7 +24,7 @@ resource "aws_iam_role" "github_actions_terraform" {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:ejc3/aws-setup:*"
+          "token.actions.githubusercontent.com:sub" = "repo:EJ-Campbell/aws-setup:*"
         }
       }
     }]
