@@ -125,7 +125,29 @@ resource "aws_instance" "firecracker_dev" {
       containernetworking-plugins \
       nftables \
       iproute2 \
-      dnsmasq
+      dnsmasq \
+      cmake \
+      ninja-build \
+      pkg-config \
+      autoconf \
+      libtool \
+      fuse3 \
+      libfuse3-dev \
+      protobuf-compiler \
+      libprotobuf-dev \
+      libsodium-dev \
+      libcurl4-openssl-dev \
+      libutempter-dev \
+      unzip \
+      zip
+
+    # ============================================
+    # GitHub CLI
+    # ============================================
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+    apt-get update
+    apt-get install -y gh
 
     # ============================================
     # Node.js 22.x
@@ -226,7 +248,8 @@ resource "aws_instance" "firecracker_dev" {
     [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 
     # Atuin (Ctrl-R history)
-    eval "$(atuin init zsh)"
+    command -v atuin >/dev/null && eval "$(atuin init zsh)"
+    . "$HOME/.atuin/bin/env"
 
     # zsh-autosuggestions
     [ -f ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
@@ -245,9 +268,18 @@ resource "aws_instance" "firecracker_dev" {
     chsh -s /usr/bin/zsh ubuntu
 
     # ============================================
+    # Shell history setup
+    # ============================================
+    sudo -u ubuntu bash << 'HISTORY_SETUP'
+    touch ~/.zsh_history
+    # Import bash history into atuin
+    ~/.atuin/bin/atuin import auto || true
+    HISTORY_SETUP
+
+    # ============================================
     # Claude Code
     # ============================================
-    sudo -u ubuntu bash -c 'npx @anthropic-ai/claude-code --version || true'
+    sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
 
     echo "Firecracker dev instance ready!" | tee /tmp/firecracker-status
   EOF
@@ -282,12 +314,12 @@ resource "aws_cloudwatch_metric_alarm" "firecracker_dev_idle" {
   count               = var.enable_firecracker_instance ? 1 : 0
   alarm_name          = "firecracker-dev-idle-3d"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 72   # 72 x 1hr = 72 hours = 3 days
+  evaluation_periods  = 72 # 72 x 1hr = 72 hours = 3 days
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
   period              = 3600 # 1 hour (required for multi-day spans)
   statistic           = "Average"
-  threshold           = 5    # Less than 5% CPU = idle
+  threshold           = 5 # Less than 5% CPU = idle
   alarm_description   = "Stop Firecracker dev instance after 3 days idle"
 
   dimensions = {
