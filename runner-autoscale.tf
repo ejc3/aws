@@ -135,7 +135,7 @@ resource "aws_lambda_function" "runner_webhook" {
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       USER_DATA         = base64encode(local.runner_user_data)
-      MAX_RUNNERS       = "3"
+      MAX_RUNNERS       = "6"
       WEBHOOK_SECRET    = var.github_webhook_secret
     }
   }
@@ -331,12 +331,61 @@ data "archive_file" "runner_cleanup" {
   source {
     content  = <<-EOF
       import boto3
+      import urllib.request
+      import json
+      import os
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
       cloudwatch = boto3.client('cloudwatch', region_name='us-west-1')
+      ssm = boto3.client('ssm', region_name='us-west-1')
+
+      REPO = 'ejc3/firepod'
+
+      def get_github_pat():
+          """Get GitHub PAT from SSM"""
+          try:
+              resp = ssm.get_parameter(Name='/github-runner/pat', WithDecryption=True)
+              pat = resp['Parameter']['Value']
+              if pat and pat != 'placeholder':
+                  return pat
+          except Exception:
+              pass
+          return None
+
+      def get_runners(pat):
+          """Get all runners from GitHub, returns dict of name -> {id, busy}"""
+          url = f'https://api.github.com/repos/{REPO}/actions/runners'
+          req = urllib.request.Request(url, headers={
+              'Authorization': f'token {pat}',
+              'Accept': 'application/vnd.github.v3+json'
+          })
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.loads(resp.read())
+                  return {r['name']: {'id': r['id'], 'busy': r['busy']} for r in data.get('runners', [])}
+          except Exception as e:
+              print(f'Failed to get runners: {e}')
+          return {}
+
+      def deregister_runner(runner_id, pat):
+          """Remove runner from GitHub by ID"""
+          try:
+              del_url = f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}'
+              del_req = urllib.request.Request(del_url, method='DELETE', headers={
+                  'Authorization': f'token {pat}',
+                  'Accept': 'application/vnd.github.v3+json'
+              })
+              urllib.request.urlopen(del_req)
+              return True
+          except Exception as e:
+              print(f'Failed to deregister runner {runner_id}: {e}')
+          return False
 
       def handler(event, context):
+          pat = get_github_pat()
+          runners = get_runners(pat) if pat else {}
+
           # Find auto-scaled runners
           response = ec2.describe_instances(
               Filters=[
@@ -346,14 +395,22 @@ data "archive_file" "runner_cleanup" {
               ]
           )
 
-          stopped = []
+          terminated = []
+          skipped_busy = []
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
                   instance_id = instance['InstanceId']
                   launch_time = instance['LaunchTime']
+                  runner_name = f'runner-{instance_id}'
 
                   # Skip if launched less than 30 minutes ago
                   if datetime.now(timezone.utc) - launch_time < timedelta(minutes=30):
+                      continue
+
+                  # Skip if runner is busy (has active job)
+                  runner_info = runners.get(runner_name, {})
+                  if runner_info.get('busy', False):
+                      skipped_busy.append(instance_id)
                       continue
 
                   # Check CPU utilization
@@ -368,14 +425,16 @@ data "archive_file" "runner_cleanup" {
                   )
 
                   # If avg CPU < 5% for last 30 mins, terminate it
-                  # Note: one-time spot instances can't be stopped, only terminated
                   if metrics['Datapoints']:
                       avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
                       if avg_cpu < 5:
+                          # Deregister from GitHub first
+                          if runner_info.get('id'):
+                              deregister_runner(runner_info['id'], pat)
                           ec2.terminate_instances(InstanceIds=[instance_id])
-                          stopped.append(instance_id)
+                          terminated.append(instance_id)
 
-          return {'terminated': stopped}
+          return {'terminated': terminated, 'skipped_busy': skipped_busy}
     EOF
     filename = "lambda_function.py"
   }
