@@ -292,16 +292,15 @@ locals {
     # Enable linger so user processes survive SSH logout
     loginctl enable-linger ubuntu
 
-    # Install SSM agent via deb (snap doesn't work - kernel lacks squashfs)
-    # Remove broken snap installation first
-    systemctl stop snapd 2>/dev/null || true
-    rm -rf /snap/amazon-ssm-agent /var/snap/amazon-ssm-agent 2>/dev/null || true
-    # Install from AWS deb package
-    cd /tmp
-    curl -sO https://s3.us-west-1.amazonaws.com/amazon-ssm-us-west-1/latest/debian_arm64/amazon-ssm-agent.deb
-    dpkg -i amazon-ssm-agent.deb
-    systemctl enable amazon-ssm-agent
-    systemctl start amazon-ssm-agent
+    # Add SSH key for direct access
+    mkdir -p /home/ubuntu/.ssh
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    # Start SSM agent (snap-based, kernel has squashfs)
+    snap start amazon-ssm-agent || true
 
     # Get instance ID
     TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
