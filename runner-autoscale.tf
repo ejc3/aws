@@ -19,6 +19,18 @@ data "archive_file" "runner_webhook" {
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
 
+      def get_latest_runner_ami():
+          """Get the latest AMI tagged with Purpose=github-runner"""
+          response = ec2.describe_images(
+              Owners=['self'],
+              Filters=[{'Name': 'tag:Purpose', 'Values': ['github-runner']}]
+          )
+          if not response['Images']:
+              return None
+          # Sort by creation date, newest first
+          images = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)
+          return images[0]['ImageId']
+
       def verify_signature(payload, signature, secret):
           if not secret:
               return True  # Skip verification if no secret configured
@@ -40,13 +52,14 @@ data "archive_file" "runner_webhook" {
 
       def launch_runner():
           """Launch a new spot runner instance with tags"""
-          import base64
+          ami_id = get_latest_runner_ami()
+          if not ami_id:
+              raise Exception("No runner AMI found with Purpose=github-runner tag")
           response = ec2.run_instances(
               MinCount=1,
               MaxCount=1,
-              ImageId=os.environ['AMI_ID'],
+              ImageId=ami_id,
               InstanceType=os.environ['INSTANCE_TYPE'],
-              KeyName=os.environ['KEY_NAME'],
               SubnetId=os.environ['SUBNET_ID'],
               SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
               IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
@@ -117,12 +130,10 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
-      AMI_ID            = var.firecracker_ami
       INSTANCE_TYPE     = var.github_runner_instance_type
-      KEY_NAME          = var.firecracker_key_name
-      SUBNET_ID         = aws_subnet.subnet_a.id
-      SECURITY_GROUP_ID = aws_security_group.firecracker_dev[0].id
-      INSTANCE_PROFILE  = aws_iam_instance_profile.jumpbox_admin[0].name
+      SUBNET_ID         = aws_subnet.runner[0].id
+      SECURITY_GROUP_ID = aws_security_group.runner[0].id
+      INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       USER_DATA         = base64encode(local.runner_user_data)
       MAX_RUNNERS       = "3"
       WEBHOOK_SECRET    = var.github_webhook_secret
@@ -168,6 +179,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
       {
         Effect = "Allow"
         Action = [
+          "ec2:DescribeImages",
           "ec2:DescribeInstances",
           "ec2:RunInstances",
           "ec2:StopInstances",
@@ -227,6 +239,18 @@ resource "aws_lambda_permission" "runner_webhook" {
 # Variables
 # ============================================
 
+variable "enable_github_runner" {
+  description = "Enable GitHub Actions runner infrastructure"
+  type        = bool
+  default     = true
+}
+
+variable "github_runner_instance_type" {
+  description = "Instance type for GitHub runner"
+  type        = string
+  default     = "c7g.metal"
+}
+
 variable "github_webhook_secret" {
   description = "GitHub webhook secret for signature verification"
   type        = string
@@ -248,11 +272,49 @@ output "runner_webhook_url" {
 # ============================================
 
 locals {
-  # Minimal user_data that fetches and runs the full setup script from GitHub
+  # User data for pre-baked AMI - just set permissions and register runner
   runner_user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
-    curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/scripts/setup-runner.sh | bash
+
+    # Runtime permissions
+    chmod 666 /dev/kvm
+    [ -e /dev/userfaultfd ] || mknod /dev/userfaultfd c 10 126
+    chmod 666 /dev/userfaultfd
+    sysctl -w vm.unprivileged_userfaultfd=1
+    sysctl -w kernel.unprivileged_userns_clone=1 || true
+    iptables -P FORWARD ACCEPT || true
+
+    # Fix podman rootless - deduplicate subuid/subgid (AMI has duplicates)
+    sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
+    sort -u /etc/subgid > /tmp/subgid && mv /tmp/subgid /etc/subgid
+
+    # Install SSM agent via deb (snap doesn't work - kernel lacks squashfs)
+    # Remove broken snap installation first
+    systemctl stop snapd 2>/dev/null || true
+    rm -rf /snap/amazon-ssm-agent /var/snap/amazon-ssm-agent 2>/dev/null || true
+    # Install from AWS deb package
+    cd /tmp
+    curl -sO https://s3.us-west-1.amazonaws.com/amazon-ssm-us-west-1/latest/debian_arm64/amazon-ssm-agent.deb
+    dpkg -i amazon-ssm-agent.deb
+    systemctl enable amazon-ssm-agent
+    systemctl start amazon-ssm-agent
+
+    # Get instance ID
+    TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+    # Register and start runner
+    cd /opt/actions-runner
+    PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
+    if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
+      TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
+        https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
+      sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" \
+        --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended --replace
+      ./svc.sh install ubuntu
+      ./svc.sh start
+    fi
   EOF
 }
 
@@ -303,14 +365,15 @@ data "archive_file" "runner_cleanup" {
                       Statistics=['Average']
                   )
 
-                  # If avg CPU < 5% for last 30 mins, stop it
+                  # If avg CPU < 5% for last 30 mins, terminate it
+                  # Note: one-time spot instances can't be stopped, only terminated
                   if metrics['Datapoints']:
                       avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
                       if avg_cpu < 5:
-                          ec2.stop_instances(InstanceIds=[instance_id])
+                          ec2.terminate_instances(InstanceIds=[instance_id])
                           stopped.append(instance_id)
 
-          return {'stopped': stopped}
+          return {'terminated': stopped}
     EOF
     filename = "lambda_function.py"
   }
