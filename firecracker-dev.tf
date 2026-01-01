@@ -30,7 +30,7 @@ variable "firecracker_key_name" {
 variable "firecracker_ami" {
   description = "AMI ID for Firecracker instance"
   type        = string
-  default     = "ami-002a311ff44607e17" # Ubuntu ARM64
+  default     = "ami-0094253710d975cfa" # Ubuntu 24.04 ARM64 (2025-12-12)
 }
 
 # Security group for Firecracker dev instance
