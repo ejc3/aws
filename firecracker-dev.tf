@@ -1,6 +1,9 @@
 # Firecracker Development Instance
 # ARM64 metal instance for Firecracker/KVM testing
 # Cost: ~$1.36/hour for c6g.metal (stop when not in use!)
+#
+# IMPORTANT: NV2 nested virtualization requires a custom kernel with DSB patches.
+# See CLAUDE.md for kernel rebuild instructions after adding new patches to fcvm.
 
 variable "enable_firecracker_instance" {
   description = "Enable standalone Firecracker development instance"
@@ -152,7 +155,13 @@ resource "aws_instance" "firecracker_dev" {
       libcurl4-openssl-dev \
       libutempter-dev \
       unzip \
-      zip
+      zip \
+      flex \
+      bison \
+      libssl-dev \
+      libelf-dev \
+      bc \
+      dwarves
 
     # ============================================
     # GitHub CLI

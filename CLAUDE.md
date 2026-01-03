@@ -2,6 +2,31 @@
 
 This file provides guidance to Claude Code when working with this repository.
 
+## Nested Virtualization (NV2) Kernel
+
+**CRITICAL**: The fcvm project requires a custom kernel with DSB patches for nested virtualization.
+
+The host kernel must have these patches from `fcvm/kernel/patches/`:
+- `nv2-vsock-cache-sync.patch` - DSB in KVM nested exit path
+- `nv2-vsock-rx-barrier.patch` - DSB in vsock RX path
+- `mmfr4-override.patch` - ID register override for recursive nesting
+
+**Rebuild host kernel after adding new patches:**
+```bash
+cd /home/ubuntu/fcvm
+./kernel/build.sh  # Builds guest kernel with patches
+
+# For HOST kernel (needs modules too):
+KERNEL_VERSION=6.18.3 BUILD_DIR=/tmp/kernel-build-host ./kernel/build.sh
+cd /tmp/kernel-build-host/linux-6.18.3
+sudo make ARCH=arm64 modules_install
+sudo cp arch/arm64/boot/Image /boot/vmlinuz-6.18.3-nested-dsb
+sudo update-grub
+sudo reboot
+```
+
+**Current kernel on instance:** Check with `uname -r` - should show `-nested-dsb` suffix if DSB patches are applied.
+
 ## Project Philosophy
 
 **KISS - Keep It Simple, Stupid**
