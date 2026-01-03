@@ -146,6 +146,73 @@ No manual build, no manual login, no manual infrastructure setup.
 
 **Manual setup steps**: Don't make users copy/paste values. Extract from Terraform state automatically.
 
+## Development Instances
+
+Three "snowflake" dev instances with static Elastic IPs:
+
+| Instance | Type | Purpose | Terraform |
+|----------|------|---------|-----------|
+| jumpbox | t4g.large | Remote management, admin AWS access | jumpbox.tf |
+| fcvm-metal-arm | c7g.metal | Firecracker/KVM on ARM64 | firecracker-dev.tf |
+| fcvm-metal-x86 | c5.metal | Firecracker/KVM on x86 | x86-dev.tf |
+
+### SSH Access
+
+```bash
+# Get current IPs from terraform output
+cd ~/src/aws && terraform output
+
+# Or use the SSH commands directly
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<jumpbox_public_ip>
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<firecracker_dev_public_ip>
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
+```
+
+### Shared Configuration
+
+Common user_data scripts are in `dev-instance-common.tf`:
+- `local.gh_auth_script` - GitHub CLI auth from Secrets Manager
+- `local.claude_sync_script` - Claude Code Sync installation
+- `local.gh_and_claude_sync_script` - Combined script
+
+### GitHub PAT in Secrets Manager
+
+GitHub authentication for private repos is stored in AWS Secrets Manager:
+- **Secret name**: `github-pat-ejc3`
+- **Region**: us-west-1
+- **Used by**: claude-code-sync to clone private history repo
+
+Instances fetch the token during user_data bootstrap:
+```bash
+GH_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id github-pat-ejc3 \
+  --region us-west-1 \
+  --query SecretString \
+  --output text)
+```
+
+### Claude Code Sync
+
+All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:
+- Syncs Claude Code conversation history to GitHub
+- Config: `~/.claude-code-sync-init.toml`
+- Repo: `~/claude-history-sync`
+- Remote: `https://github.com/ejc3/claude-code-history.git`
+
+To sync manually:
+```bash
+claude-code-sync push   # Push local history to GitHub
+claude-code-sync pull   # Pull history from GitHub
+claude-code-sync        # Bidirectional sync (default)
+```
+
+### Elastic IPs
+
+All dev instances have Elastic IPs for static addressing:
+- IPs persist across stop/start cycles
+- Defined in each instance's .tf file
+- Cost: ~$3.60/month per unused EIP (free when attached to running instance)
+
 ## Common Tasks
 
 **Add a new Terraform variable**:

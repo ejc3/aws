@@ -1,4 +1,4 @@
-.PHONY: help shell init plan apply destroy output clean test connect fmt dev-start dev-stop dev-ssh dev-status runners .aws-login .check-aws-cli .check-podman
+.PHONY: help shell init plan apply destroy output clean test connect fmt dev-start dev-stop dev-ssh dev-status runners .aws-login .check-aws-cli .check-podman ssh-jumpbox ssh-arm ssh-x86
 
 # Container runtime (podman or docker)
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null || echo /opt/homebrew/bin/podman)
@@ -29,7 +29,12 @@ help:
 	@echo "  make clean       - Clean everything"
 	@echo "  make test        - Test container tools"
 	@echo ""
-	@echo "Development Instance:"
+	@echo "SSH to Dev Instances (direct via Elastic IP):"
+	@echo "  make ssh-jumpbox - SSH to jumpbox"
+	@echo "  make ssh-arm     - SSH to fcvm-metal-arm"
+	@echo "  make ssh-x86     - SSH to fcvm-metal-x86"
+	@echo ""
+	@echo "Development Instance (legacy SSM):"
 	@echo "  make dev-start   - Start dev instance (creates if needed)"
 	@echo "  make dev-stop    - Stop dev instance (persists disk)"
 	@echo "  make dev-ssh     - SSH into dev instance via SSM"
@@ -257,3 +262,25 @@ runners:
 		--filters "Name=tag:Name,Values=github-runner,github-runner-autoscale" \
 		--query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value|[0],InstanceId,InstanceType,State.Name,PrivateIpAddress,LaunchTime]' \
 		--output table --region us-west-1
+
+# Direct SSH to dev instances (uses Elastic IPs from terraform output)
+ssh-jumpbox:
+	@IP=$$(terraform output -raw jumpbox_public_ip 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
+		echo "Jumpbox not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	fi && \
+	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
+
+ssh-arm:
+	@IP=$$(terraform output -raw firecracker_dev_public_ip 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
+		echo "ARM instance not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	fi && \
+	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
+
+ssh-x86:
+	@IP=$$(terraform output -raw x86_dev_public_ip 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
+		echo "x86 instance not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	fi && \
+	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
