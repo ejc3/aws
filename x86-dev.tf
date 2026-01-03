@@ -334,6 +334,25 @@ resource "aws_cloudwatch_metric_alarm" "x86_dev_idle" {
   }
 }
 
+# ============================================
+# Elastic IP for static address
+# ============================================
+
+resource "aws_eip" "x86_dev" {
+  count  = var.enable_x86_dev_instance ? 1 : 0
+  domain = "vpc"
+
+  tags = {
+    Name = "fcvm-metal-x86-eip"
+  }
+}
+
+resource "aws_eip_association" "x86_dev" {
+  count         = var.enable_x86_dev_instance ? 1 : 0
+  instance_id   = aws_instance.x86_dev[0].id
+  allocation_id = aws_eip.x86_dev[0].id
+}
+
 # Outputs
 output "x86_dev_instance_id" {
   description = "Instance ID of x86 dev instance"
@@ -341,11 +360,11 @@ output "x86_dev_instance_id" {
 }
 
 output "x86_dev_public_ip" {
-  description = "Public IP of x86 dev instance"
-  value       = var.enable_x86_dev_instance ? aws_instance.x86_dev[0].public_ip : null
+  description = "Public IP of x86 dev instance (Elastic IP)"
+  value       = var.enable_x86_dev_instance ? aws_eip.x86_dev[0].public_ip : null
 }
 
 output "x86_dev_ssh_command" {
   description = "Command to connect to x86 dev instance via SSH"
-  value       = var.enable_x86_dev_instance ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_instance.x86_dev[0].public_ip}" : null
+  value       = var.enable_x86_dev_instance ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_eip.x86_dev[0].public_ip}" : null
 }
