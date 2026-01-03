@@ -45,27 +45,6 @@ This project is opinionated and minimal:
 4. **No Extra Docs**: README.md is the only user-facing documentation
 5. **ALL AWS CHANGES VIA TERRAFORM**: Never use AWS CLI to create/modify/delete resources. Always update .tf files and run `make apply`
 
-## CRITICAL: Terraform Only
-
-**NEVER make AWS changes directly via CLI.** All infrastructure changes MUST go through Terraform:
-
-- ❌ `aws ec2 run-instances` - NO
-- ❌ `aws ec2 modify-instance-attribute` - NO
-- ❌ `aws ec2 create-volume` - NO
-- ❌ Any `aws` command that creates/modifies/deletes resources - NO
-
-- ✅ Edit `.tf` files, then `make apply` - YES
-- ✅ `aws` commands for READ-ONLY queries (describe, list, get) - OK
-
-**Why?** Direct CLI changes cause terraform state drift. The state becomes out of sync with reality, leading to confusing errors and potential data loss.
-
-**If you need to make a quick fix:**
-1. Update the terraform files first
-2. Run `make apply` (or `terraform apply`)
-3. Verify the change worked
-
-**Exception:** Disaster recovery only - if terraform is broken and you need to urgently restore service.
-
 ## Project Overview
 
 AWS infrastructure management with:
@@ -137,46 +116,6 @@ No manual build, no manual login, no manual infrastructure setup.
 ├── terraform.tfvars       # User values (auto-created, gitignored)
 └── README.md             # Simple guide
 ```
-
-## AWS SSO Authentication
-
-**Critical Lessons from Implementation:**
-
-1. **SSO Session Format is Required**
-   - Must use `[sso-session]` block in `~/.aws/config`
-   - Device code flow (`--no-browser`) doesn't work with all SSO setups
-   - PKCE flow (browser-based) is the reliable method
-
-2. **Region Must Match SSO Region**
-   - `sso_region` must match where your IAM Identity Center is deployed
-   - Using wrong region causes `InvalidRequestException` errors
-
-3. **SSO Configuration Structure**
-   ```
-   [sso-session default-sso]
-   sso_start_url = https://d-xxxxxxxxxx.awsapps.com/start
-   sso_region = us-west-1
-   sso_registration_scopes = sso:account:access
-
-   [profile default]
-   sso_session = default-sso
-   sso_account_id = 928413605543
-   sso_role_name = AdministratorAccess
-   region = us-west-1
-   ```
-
-4. **Container Authentication Flow**
-   - AWS CLI must run on HOST for browser-based auth (PKCE flow)
-   - Container accesses cached credentials in `~/.aws/`
-   - Install AWS CLI via Homebrew: `brew install awscli`
-   - Login on host: `aws sso login --profile default`
-   - Container reads from mounted `~/.aws:/root/.aws:ro`
-
-5. **Common Pitfalls**
-   - ❌ Device code flow with `#/device` URLs - often fails
-   - ❌ Running AWS CLI only in container - can't open browser
-   - ✅ Browser-based PKCE flow on host - reliable
-   - ✅ Mount ~/.aws as read-only in container
 
 ## When Working on This Project
 
