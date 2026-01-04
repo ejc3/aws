@@ -348,7 +348,7 @@ RSYSLOG
     # SSH keys: jumpbox (fcvm-ec2) + dev servers can access runners
     mkdir -p /home/ubuntu/.ssh
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
-    aws ssm get-parameter --name /dev-servers/runner-ssh-key-pub --region us-west-1 --query Parameter.Value --output text >> /home/ubuntu/.ssh/authorized_keys || true
+    echo "${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
