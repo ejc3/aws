@@ -136,6 +136,22 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:DescribeNetworkInterfaces"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "EC2ManageRunners"
+        Effect = "Allow"
+        Action = [
+          "ec2:StartInstances",
+          "ec2:StopInstances",
+          "ec2:TerminateInstances",
+          "ec2:RebootInstances"
+        ]
+        Resource = "arn:aws:ec2:us-west-1:928413605543:instance/*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Role" = "github-runner"
+          }
+        }
       }
     ]
   })
