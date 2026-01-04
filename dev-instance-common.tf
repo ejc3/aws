@@ -130,11 +130,20 @@ resource "aws_iam_role_policy" "dev_server" {
         Resource = "arn:aws:secretsmanager:us-west-1:928413605543:secret:github-pat-ejc3*"
       },
       {
-        Sid    = "EC2DescribeForSSH"
+        Sid    = "EC2ReadOnly"
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
-          "ec2:DescribeInstanceStatus"
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeImages",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeSnapshots",
+          "ec2:DescribeTags",
+          "ec2:DescribeKeyPairs",
+          "ec2:DescribeNetworkInterfaces"
         ]
         Resource = "*"
       }
