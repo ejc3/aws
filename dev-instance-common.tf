@@ -16,16 +16,6 @@ resource "aws_ssm_parameter" "dev_ssh_private_key" {
   }
 }
 
-# Store public key in SSM for runners to fetch
-resource "aws_ssm_parameter" "dev_ssh_public_key" {
-  name  = "/dev-servers/runner-ssh-key-pub"
-  type  = "String"
-  value = tls_private_key.dev_to_runner.public_key_openssh
-  tags = {
-    Name = "dev-to-runner-ssh-key-pub"
-  }
-}
-
 # ============================================
 # IAM Role for Dev Servers (restricted, not admin)
 # ============================================
