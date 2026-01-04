@@ -18,12 +18,22 @@ data "archive_file" "runner_webhook" {
       import hashlib
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
+      ssm = boto3.client('ssm', region_name='us-west-1')
+
+      def get_user_data():
+          """Fetch user_data from SSM Parameter Store"""
+          param_name = os.environ.get('USER_DATA_PARAM', '/github-runner/user-data')
+          resp = ssm.get_parameter(Name=param_name)
+          return resp['Parameter']['Value']
 
       def get_latest_runner_ami():
-          """Get the latest AMI tagged with Purpose=github-runner"""
+          """Get the latest available AMI tagged with Purpose=github-runner"""
           response = ec2.describe_images(
               Owners=['self'],
-              Filters=[{'Name': 'tag:Purpose', 'Values': ['github-runner']}]
+              Filters=[
+                  {'Name': 'tag:Purpose', 'Values': ['github-runner']},
+                  {'Name': 'state', 'Values': ['available']}
+              ]
           )
           if not response['Images']:
               return None
@@ -60,6 +70,7 @@ data "archive_file" "runner_webhook" {
               MaxCount=1,
               ImageId=ami_id,
               InstanceType=os.environ['INSTANCE_TYPE'],
+              KeyName='fcvm-ec2',
               SubnetId=os.environ['SUBNET_ID'],
               SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
               IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
@@ -67,7 +78,7 @@ data "archive_file" "runner_webhook" {
                   'DeviceName': '/dev/sda1',
                   'Ebs': {'VolumeSize': 100, 'VolumeType': 'gp3', 'DeleteOnTermination': True}
               }],
-              UserData=os.environ['USER_DATA'],
+              UserData=get_user_data(),
               InstanceMarketOptions={
                   'MarketType': 'spot',
                   'SpotOptions': {'SpotInstanceType': 'one-time'}
@@ -134,8 +145,8 @@ resource "aws_lambda_function" "runner_webhook" {
       SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
-      USER_DATA         = base64encode(local.runner_user_data)
-      MAX_RUNNERS       = "6"
+      USER_DATA_PARAM   = aws_ssm_parameter.runner_user_data[0].name
+      MAX_RUNNERS       = "5"
       WEBHOOK_SECRET    = var.github_webhook_secret
     }
   }
@@ -253,7 +264,7 @@ variable "enable_github_runner" {
 variable "github_runner_instance_type" {
   description = "Instance type for GitHub runner"
   type        = string
-  default     = "c7g.metal"
+  default     = "c7gd.metal"
 }
 
 variable "github_webhook_secret" {
@@ -282,6 +293,43 @@ locals {
     #!/bin/bash
     set -euxo pipefail
 
+    # Console logging (for debugging via EC2 get-console-output)
+    cat >> /etc/rsyslog.d/50-console.conf << 'RSYSLOG'
+*.emerg;*.alert;*.crit;*.err                    /dev/ttyS0
+kern.*                                           /dev/ttyS0
+RSYSLOG
+    systemctl restart rsyslog || true
+    echo "kernel.printk = 7 4 1 7" >> /etc/sysctl.conf
+    sysctl -w kernel.printk="7 4 1 7" || true
+
+    # Mount NVMe instance storage (find NVMe that isn't the root disk)
+    ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
+    NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
+    if [ -n "$NVME_DEV" ]; then
+      echo "Setting up NVMe: /dev/$NVME_DEV"
+      mkfs.ext4 -F /dev/$NVME_DEV
+      mkdir -p /mnt/nvme
+      mount /dev/$NVME_DEV /mnt/nvme
+      chmod 1777 /mnt/nvme
+
+      # Heavy dirs on NVMe: btrfs image, containers, cargo builds
+      mkdir -p /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
+      chown ubuntu:ubuntu /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
+
+      # Symlink so fcvm uses NVMe for btrfs image
+      ln -sf /mnt/nvme/fcvm /var/fcvm
+
+      # Podman containers on NVMe
+      mkdir -p /home/ubuntu/.local/share
+      ln -sf /mnt/nvme/containers /home/ubuntu/.local/share/containers
+      chown -R ubuntu:ubuntu /home/ubuntu/.local
+
+      # Cargo target dir on NVMe
+      echo 'export CARGO_TARGET_DIR=/mnt/nvme/cargo-target' >> /home/ubuntu/.bashrc
+    else
+      echo "WARNING: No NVMe found"
+    fi
+
     # Runtime permissions
     chmod 666 /dev/kvm
     [ -e /dev/userfaultfd ] || mknod /dev/userfaultfd c 10 126
@@ -297,10 +345,10 @@ locals {
     # Enable linger so user processes survive SSH logout
     loginctl enable-linger ubuntu
 
-    # Add SSH keys for direct access
+    # SSH keys: jumpbox (fcvm-ec2) + dev servers can access runners
     mkdir -p /home/ubuntu/.ssh
-    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm" >> /home/ubuntu/.ssh/authorized_keys
-    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEnsYFangbzY7I0yUxa1sr0MNWN9fMiAKIcUpV6KaLn runner_key" >> /home/ubuntu/.ssh/authorized_keys
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
+    aws ssm get-parameter --name /dev-servers/runner-ssh-key-pub --region us-west-1 --query Parameter.Value --output text >> /home/ubuntu/.ssh/authorized_keys || true
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
@@ -324,6 +372,18 @@ locals {
       ./svc.sh start
     fi
   EOF
+}
+
+# SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
+resource "aws_ssm_parameter" "runner_user_data" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "/github-runner/user-data"
+  type  = "String"
+  tier  = "Advanced"
+  value = base64encode(local.runner_user_data)
+  tags = {
+    Name = "github-runner-user-data"
+  }
 }
 
 # ============================================
@@ -470,7 +530,25 @@ data "archive_file" "runner_cleanup" {
                           ec2.terminate_instances(InstanceIds=[instance_id])
                           terminated.append(instance_id)
 
-          return {'terminated': terminated, 'skipped_busy': skipped_busy, 'orphans_cleaned': orphans_cleaned}
+          # Phase 3: Clean up stale AMI builder instances (> 2 hours old)
+          ami_builder_terminated = []
+          ami_response = ec2.describe_instances(
+              Filters=[
+                  {'Name': 'tag:Name', 'Values': ['ami-builder-temp']},
+                  {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+              ]
+          )
+          for reservation in ami_response['Reservations']:
+              for instance in reservation['Instances']:
+                  instance_id = instance['InstanceId']
+                  launch_time = instance['LaunchTime']
+                  age_hours = (datetime.now(timezone.utc) - launch_time).total_seconds() / 3600
+                  if age_hours > 2:
+                      print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
+                      ec2.terminate_instances(InstanceIds=[instance_id])
+                      ami_builder_terminated.append(instance_id)
+
+          return {'terminated': terminated, 'skipped_busy': skipped_busy, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated}
     EOF
     filename = "lambda_function.py"
   }

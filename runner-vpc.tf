@@ -112,7 +112,10 @@ resource "aws_iam_role_policy" "runner" {
     Statement = [{
       Effect   = "Allow"
       Action   = "ssm:GetParameter"
-      Resource = aws_ssm_parameter.github_runner_pat[0].arn
+      Resource = [
+        aws_ssm_parameter.github_runner_pat[0].arn,
+        aws_ssm_parameter.dev_ssh_public_key.arn
+      ]
     }]
   })
 }

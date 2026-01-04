@@ -90,8 +90,8 @@ resource "aws_instance" "firecracker_dev" {
   vpc_security_group_ids      = [aws_security_group.firecracker_dev[0].id]
   associate_public_ip_address = true
 
-  # IAM role for SSM access
-  iam_instance_profile = aws_iam_instance_profile.jumpbox_admin[0].name
+  # IAM role - restricted (SSM to runners only, not admin)
+  iam_instance_profile = aws_iam_instance_profile.dev_server.name
 
   # Spot instance - ~70% cheaper than on-demand
   instance_market_options {
@@ -115,229 +115,14 @@ resource "aws_instance" "firecracker_dev" {
     }
   }
 
-  # User data - captures current instance setup for reproducibility
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -euxo pipefail
-
-    # ============================================
-    # System packages
-    # ============================================
-    apt-get update
-    apt-get upgrade -y
-
-    apt-get install -y \
-      zsh \
-      curl \
-      wget \
-      git \
-      jq \
-      build-essential \
-      software-properties-common \
-      podman \
-      uidmap \
-      slirp4netns \
-      fuse-overlayfs \
-      containernetworking-plugins \
-      nftables \
-      iproute2 \
-      dnsmasq \
-      cmake \
-      ninja-build \
-      pkg-config \
-      autoconf \
-      libtool \
-      fuse3 \
-      libfuse3-dev \
-      protobuf-compiler \
-      libprotobuf-dev \
-      libsodium-dev \
-      libcurl4-openssl-dev \
-      libutempter-dev \
-      unzip \
-      zip \
-      flex \
-      bison \
-      libssl-dev \
-      libelf-dev \
-      bc \
-      dwarves
-
-    # ============================================
-    # Eternal Terminal (build from source for latest fixes)
-    # ============================================
-    git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/EternalTerminal
-    cd /tmp/EternalTerminal
-    mkdir build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd / && rm -rf /tmp/EternalTerminal
-
-    # Create systemd service for etserver
-    cat > /etc/systemd/system/et.service << 'ETSERVICE'
-[Unit]
-Description=Eternal Terminal Server
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/etserver
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-ETSERVICE
-
-    systemctl daemon-reload
-    systemctl enable et.service
-    systemctl start et.service
-
-    # ============================================
-    # GitHub CLI
-    # ============================================
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-    apt-get update
-    apt-get install -y gh
-
-    # ============================================
-    # Node.js 22.x
-    # ============================================
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
-
-    # ============================================
-    # Rust via rustup
-    # ============================================
-    sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-
-    # ============================================
-    # Firecracker (ARM64)
-    # ============================================
-    FIRECRACKER_VERSION="v1.13.1"
-    ARCH="aarch64"
-    wget -q -O /tmp/firecracker.tgz \
-      "https://github.com/firecracker-microvm/firecracker/releases/download/$${FIRECRACKER_VERSION}/firecracker-$${FIRECRACKER_VERSION}-$${ARCH}.tgz"
-    tar -xzf /tmp/firecracker.tgz -C /tmp/
-    mv /tmp/release-$${FIRECRACKER_VERSION}-$${ARCH}/firecracker-$${FIRECRACKER_VERSION}-$${ARCH} /usr/local/bin/firecracker
-    chmod +x /usr/local/bin/firecracker
-    rm -rf /tmp/firecracker.tgz /tmp/release-$${FIRECRACKER_VERSION}-$${ARCH}
-    firecracker --version
-
-    # ============================================
-    # Podman rootless config
-    # ============================================
-    echo "ubuntu:100000:65536" >> /etc/subuid
-    echo "ubuntu:100000:65536" >> /etc/subgid
-    sysctl -w kernel.unprivileged_userns_clone=1
-    echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
-
-    # ============================================
-    # Shell setup for ubuntu user
-    # ============================================
-    sudo -u ubuntu bash << 'SHELL_SETUP'
-    set -e
-    mkdir -p ~/.local/bin ~/.config ~/.zsh
-
-    # Starship prompt
-    curl -sS https://starship.rs/install.sh | sh -s -- -y -b ~/.local/bin
-
-    # Starship config
-    cat > ~/.config/starship.toml << 'STARSHIP'
-    # Minimal single-line prompt
-    format = "$directory$git_branch$git_status$character"
-    add_newline = false
-
-    [directory]
-    truncation_length = 3
-
-    [git_branch]
-    format = "[$branch]($style) "
-    ignore_branches = ["main", "master"]
-
-    [git_status]
-    format = '[$all_status$ahead_behind]($style) '
-
-    [character]
-    success_symbol = "[❯](green)"
-    error_symbol = "[❯](red)"
-    STARSHIP
-
-    # fzf
-    git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
-    ~/.fzf/install --all --no-bash --no-fish --key-bindings --completion --update-rc
-
-    # Atuin (shell history)
-    curl --proto '=https' --tlsv1.2 -sSf https://setup.atuin.sh | bash
-
-    # zsh plugins
-    git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
-    git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
-
-    # .zshrc
-    cat > ~/.zshrc << 'ZSHRC'
-    # Modern shell config
-
-    # PATH for local tools
-    export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/bin:$PATH"
-
-    # History settings
-    HISTFILE=~/.zsh_history
-    HISTSIZE=100000
-    SAVEHIST=100000
-    setopt SHARE_HISTORY
-    setopt HIST_IGNORE_DUPS
-    setopt HIST_IGNORE_SPACE
-
-    # Completion
-    autoload -Uz compinit && compinit
-
-    # Starship prompt
-    eval "$(starship init zsh)"
-
-    # fzf
-    [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
-
-    # Atuin (Ctrl-R history)
-    command -v atuin >/dev/null && eval "$(atuin init zsh)"
-    . "$HOME/.atuin/bin/env"
-
-    # zsh-autosuggestions
-    [ -f ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
-
-    # zsh-syntax-highlighting (must be last)
-    [ -f ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
-
-    # Useful aliases
-    alias ll="ls -la"
-    alias gs="git status"
-    alias gd="git diff"
-    ZSHRC
-    SHELL_SETUP
-
-    # Change default shell to zsh
-    chsh -s /usr/bin/zsh ubuntu
-
-    # ============================================
-    # Shell history setup
-    # ============================================
-    sudo -u ubuntu bash << 'HISTORY_SETUP'
-    touch ~/.zsh_history
-    # Import bash history into atuin
-    ~/.atuin/bin/atuin import auto || true
-    HISTORY_SETUP
-
-    # ============================================
-    # Claude Code
-    # ============================================
-    sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
-
-${local.gh_and_claude_sync_script}
-
-    echo "Firecracker dev instance ready!" | tee /tmp/firecracker-status
-  EOF
+  # User data - bootstrap fetches full script from S3 (bypasses 16KB limit)
+  # Full script defined in dev-user-data.tf -> aws_s3_object.arm_user_data
+  user_data = base64encode(<<-BOOTSTRAP
+#!/bin/bash
+set -euxo pipefail
+aws s3 cp s3://ejc3-dev-scripts/user-data/arm.sh /tmp/user_data.sh
+chmod +x /tmp/user_data.sh && /tmp/user_data.sh
+BOOTSTRAP
   )
 
   # Monitoring
@@ -354,7 +139,6 @@ ${local.gh_and_claude_sync_script}
       user_data,
       user_data_base64,
       metadata_options,
-      iam_instance_profile,
       root_block_device[0].encrypted,
       root_block_device[0].kms_key_id,
     ]
