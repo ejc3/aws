@@ -289,89 +289,90 @@ output "runner_webhook_url" {
 
 locals {
   # User data for pre-baked AMI - just set permissions and register runner
+  # NOTE: Heredoc content starts at column 0 because <<-EOF only strips tabs, not spaces
   runner_user_data = <<-EOF
-    #!/bin/bash
-    set -euxo pipefail
+#!/bin/bash
+set -euxo pipefail
 
-    # Console logging (for debugging via EC2 get-console-output)
-    cat >> /etc/rsyslog.d/50-console.conf << 'RSYSLOG'
+# Console logging (for debugging via EC2 get-console-output)
+cat >> /etc/rsyslog.d/50-console.conf << 'RSYSLOG'
 *.emerg;*.alert;*.crit;*.err                    /dev/ttyS0
 kern.*                                           /dev/ttyS0
 RSYSLOG
-    systemctl restart rsyslog || true
-    echo "kernel.printk = 7 4 1 7" >> /etc/sysctl.conf
-    sysctl -w kernel.printk="7 4 1 7" || true
+systemctl restart rsyslog || true
+echo "kernel.printk = 7 4 1 7" >> /etc/sysctl.conf
+sysctl -w kernel.printk="7 4 1 7" || true
 
-    # Mount NVMe instance storage (find NVMe that isn't the root disk)
-    ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
-    NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
-    if [ -n "$NVME_DEV" ]; then
-      echo "Setting up NVMe: /dev/$NVME_DEV"
-      mkfs.ext4 -F /dev/$NVME_DEV
-      mkdir -p /mnt/nvme
-      mount /dev/$NVME_DEV /mnt/nvme
-      chmod 1777 /mnt/nvme
+# Mount NVMe instance storage (find NVMe that isn't the root disk)
+ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
+NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
+if [ -n "$NVME_DEV" ]; then
+  echo "Setting up NVMe: /dev/$NVME_DEV"
+  mkfs.ext4 -F /dev/$NVME_DEV
+  mkdir -p /mnt/nvme
+  mount /dev/$NVME_DEV /mnt/nvme
+  chmod 1777 /mnt/nvme
 
-      # Heavy dirs on NVMe: btrfs image, containers, cargo builds
-      mkdir -p /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
-      chown ubuntu:ubuntu /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
+  # Heavy dirs on NVMe: btrfs image, containers, cargo builds
+  mkdir -p /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
+  chown ubuntu:ubuntu /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
 
-      # Symlink so fcvm uses NVMe for btrfs image
-      ln -sf /mnt/nvme/fcvm /var/fcvm
+  # Symlink so fcvm uses NVMe for btrfs image
+  ln -sf /mnt/nvme/fcvm /var/fcvm
 
-      # Podman containers on NVMe
-      mkdir -p /home/ubuntu/.local/share
-      ln -sf /mnt/nvme/containers /home/ubuntu/.local/share/containers
-      chown -R ubuntu:ubuntu /home/ubuntu/.local
+  # Podman containers on NVMe
+  mkdir -p /home/ubuntu/.local/share
+  ln -sf /mnt/nvme/containers /home/ubuntu/.local/share/containers
+  chown -R ubuntu:ubuntu /home/ubuntu/.local
 
-      # Cargo target dir on NVMe
-      echo 'export CARGO_TARGET_DIR=/mnt/nvme/cargo-target' >> /home/ubuntu/.bashrc
-    else
-      echo "WARNING: No NVMe found"
-    fi
+  # Cargo target dir on NVMe
+  echo 'export CARGO_TARGET_DIR=/mnt/nvme/cargo-target' >> /home/ubuntu/.bashrc
+else
+  echo "WARNING: No NVMe found"
+fi
 
-    # Runtime permissions
-    chmod 666 /dev/kvm
-    [ -e /dev/userfaultfd ] || mknod /dev/userfaultfd c 10 126
-    chmod 666 /dev/userfaultfd
-    sysctl -w vm.unprivileged_userfaultfd=1
-    sysctl -w kernel.unprivileged_userns_clone=1 || true
-    iptables -P FORWARD ACCEPT || true
+# Runtime permissions
+chmod 666 /dev/kvm
+[ -e /dev/userfaultfd ] || mknod /dev/userfaultfd c 10 126
+chmod 666 /dev/userfaultfd
+sysctl -w vm.unprivileged_userfaultfd=1
+sysctl -w kernel.unprivileged_userns_clone=1 || true
+iptables -P FORWARD ACCEPT || true
 
-    # Fix podman rootless - deduplicate subuid/subgid (AMI has duplicates)
-    sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
-    sort -u /etc/subgid > /tmp/subgid && mv /tmp/subgid /etc/subgid
+# Fix podman rootless - deduplicate subuid/subgid (AMI has duplicates)
+sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
+sort -u /etc/subgid > /tmp/subgid && mv /tmp/subgid /etc/subgid
 
-    # Enable linger so user processes survive SSH logout
-    loginctl enable-linger ubuntu
+# Enable linger so user processes survive SSH logout
+loginctl enable-linger ubuntu
 
-    # SSH keys: jumpbox (fcvm-ec2) + dev servers can access runners
-    mkdir -p /home/ubuntu/.ssh
-    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
-    echo "${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
-    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-    chmod 700 /home/ubuntu/.ssh
-    chmod 600 /home/ubuntu/.ssh/authorized_keys
+# SSH keys: jumpbox (fcvm-ec2) + dev servers can access runners
+mkdir -p /home/ubuntu/.ssh
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
+echo "${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+chmod 700 /home/ubuntu/.ssh
+chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    # Start SSM agent (snap-based, kernel has squashfs)
-    snap start amazon-ssm-agent || true
+# Start SSM agent (snap-based, kernel has squashfs)
+snap start amazon-ssm-agent || true
 
-    # Get instance ID
-    TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+# Get instance ID
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
-    # Register and start runner
-    cd /opt/actions-runner
-    PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
-    if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
-      TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-        https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
-      sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" \
-        --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended --replace
-      ./svc.sh install ubuntu
-      ./svc.sh start
-    fi
-  EOF
+# Register and start runner
+cd /opt/actions-runner
+PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
+if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
+  TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
+    https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
+  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" \
+    --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended --replace
+  ./svc.sh install ubuntu
+  ./svc.sh start
+fi
+EOF
 }
 
 # SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
