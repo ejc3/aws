@@ -65,7 +65,7 @@ resource "aws_iam_role_policy" "dev_server" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "SSMSendCommandToRunnersOnly"
+        Sid    = "SSMSendCommandToRunners"
         Effect = "Allow"
         Action = "ssm:SendCommand"
         Resource = [
@@ -75,6 +75,20 @@ resource "aws_iam_role_policy" "dev_server" {
         Condition = {
           StringEquals = {
             "ssm:resourceTag/Role" = "github-runner"
+          }
+        }
+      },
+      {
+        Sid    = "SSMSendCommandToAMIBuilders"
+        Effect = "Allow"
+        Action = "ssm:SendCommand"
+        Resource = [
+          "arn:aws:ssm:us-west-1::document/AWS-RunShellScript",
+          "arn:aws:ec2:us-west-1:928413605543:instance/*"
+        ]
+        Condition = {
+          StringEquals = {
+            "ssm:resourceTag/Name" = "ami-builder-temp"
           }
         }
       },
