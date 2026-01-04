@@ -297,9 +297,10 @@ locals {
     # Enable linger so user processes survive SSH logout
     loginctl enable-linger ubuntu
 
-    # Add SSH key for direct access
+    # Add SSH keys for direct access
     mkdir -p /home/ubuntu/.ssh
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm" >> /home/ubuntu/.ssh/authorized_keys
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEnsYFangbzY7I0yUxa1sr0MNWN9fMiAKIcUpV6KaLn runner_key" >> /home/ubuntu/.ssh/authorized_keys
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
