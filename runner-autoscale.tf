@@ -303,32 +303,36 @@ systemctl restart rsyslog || true
 echo "kernel.printk = 7 4 1 7" >> /etc/sysctl.conf
 sysctl -w kernel.printk="7 4 1 7" || true
 
-# Mount NVMe instance storage (find NVMe that isn't the root disk)
+# Mount NVMe instance storage as btrfs at /mnt/fcvm-btrfs
+# This is where fcvm expects its data (CoW reflinks require btrfs)
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
 if [ -n "$NVME_DEV" ]; then
-  echo "Setting up NVMe: /dev/$NVME_DEV"
-  mkfs.ext4 -F /dev/$NVME_DEV
-  mkdir -p /mnt/nvme
-  mount /dev/$NVME_DEV /mnt/nvme
-  chmod 1777 /mnt/nvme
+  echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
+  # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
+  which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
+  mkfs.btrfs -f /dev/$NVME_DEV
+  mkdir -p /mnt/fcvm-btrfs
+  mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+  chmod 1777 /mnt/fcvm-btrfs
 
-  # Heavy dirs on NVMe: btrfs image, containers, cargo builds
-  mkdir -p /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
-  chown ubuntu:ubuntu /mnt/nvme/fcvm /mnt/nvme/containers /mnt/nvme/cargo-target
+  # Create fcvm directory structure
+  mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache}
+  chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
 
-  # Symlink so fcvm uses NVMe for btrfs image
-  ln -sf /mnt/nvme/fcvm /var/fcvm
+  # Also set up containers and cargo on NVMe (separate ext4 partition would be better but single disk)
+  mkdir -p /mnt/fcvm-btrfs/containers /mnt/fcvm-btrfs/cargo-target
+  chown ubuntu:ubuntu /mnt/fcvm-btrfs/containers /mnt/fcvm-btrfs/cargo-target
 
   # Podman containers on NVMe
   mkdir -p /home/ubuntu/.local/share
-  ln -sf /mnt/nvme/containers /home/ubuntu/.local/share/containers
+  ln -sf /mnt/fcvm-btrfs/containers /home/ubuntu/.local/share/containers
   chown -R ubuntu:ubuntu /home/ubuntu/.local
 
   # Cargo target dir on NVMe
-  echo 'export CARGO_TARGET_DIR=/mnt/nvme/cargo-target' >> /home/ubuntu/.bashrc
+  echo 'export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target' >> /home/ubuntu/.bashrc
 else
-  echo "WARNING: No NVMe found"
+  echo "WARNING: No NVMe found - will use loopback btrfs (slower, limited space)"
 fi
 
 # Runtime permissions
