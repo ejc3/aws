@@ -68,12 +68,11 @@ $(AWS_DIR)/config:
 	@echo "output = json" >> $(AWS_DIR)/config
 
 # Check if AWS credentials work, login if needed
-.aws-login: .check-aws-cli $(AWS_DIR)/config .container-built
-	@$(CONTAINER_RUNTIME) run -it --rm \
-		-v $(AWS_DIR):/root/.aws \
-		$(CONTAINER_ENV_ARGS) \
-		--entrypoint /usr/local/bin/aws-login.sh \
-		aws-dev
+.aws-login: .check-aws-cli $(AWS_DIR)/config
+	@if ! /opt/homebrew/bin/aws sts get-caller-identity >/dev/null 2>&1; then \
+		echo "AWS session expired. Starting SSO login..."; \
+		/opt/homebrew/bin/aws sso login --use-device-code; \
+	fi
 
 # Ensure terraform.tfvars exists (create if missing)
 terraform.tfvars:
@@ -256,7 +255,7 @@ dev-status: .check-aws-cli .container-built
 	fi
 
 # GitHub runner management
-runners:
+runners: .aws-login
 	@echo "GitHub Runner Instances:"
 	@aws ec2 describe-instances \
 		--filters "Name=tag:Name,Values=github-runner,github-runner-autoscale" \
@@ -264,7 +263,7 @@ runners:
 		--output table --region us-west-1
 
 # Direct SSH to dev instances (uses AWS CLI to get Elastic IPs by instance tag)
-ssh-jumpbox:
+ssh-jumpbox: .aws-login
 	@IP=$$(aws ec2 describe-instances --region us-west-1 \
 		--filters "Name=tag:Name,Values=jumpbox" "Name=instance-state-name,Values=running" \
 		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
@@ -273,7 +272,7 @@ ssh-jumpbox:
 	fi && \
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
 
-ssh-arm:
+ssh-arm: .aws-login
 	@IP=$$(aws ec2 describe-instances --region us-west-1 \
 		--filters "Name=tag:Name,Values=fcvm-metal-arm" "Name=instance-state-name,Values=running" \
 		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
@@ -282,7 +281,7 @@ ssh-arm:
 	fi && \
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
 
-ssh-x86:
+ssh-x86: .aws-login
 	@IP=$$(aws ec2 describe-instances --region us-west-1 \
 		--filters "Name=tag:Name,Values=fcvm-metal-x86" "Name=instance-state-name,Values=running" \
 		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
