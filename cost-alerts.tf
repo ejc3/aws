@@ -211,3 +211,105 @@ resource "aws_budgets_budget" "daily_cost" {
     subscriber_sns_topic_arns = [aws_sns_topic.cost_alerts.arn]
   }
 }
+
+# ============================================
+# CloudWatch Alarms
+# ============================================
+
+# Alert if more than 4 runners are running for 30+ minutes
+resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
+  alarm_name          = "too-many-runners"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 6  # 30 minutes (6 x 5min periods)
+  threshold           = 4
+  alarm_description   = "More than 4 runners running for 30+ minutes - check for stuck jobs"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "runner_count"
+    expression  = "SELECT COUNT(InstanceId) FROM SCHEMA(\"AWS/EC2\", InstanceId) WHERE Role = 'github-runner'"
+    label       = "Running Runners"
+    period      = 300
+    return_data = true
+  }
+}
+
+# Alert if any runner is running for more than 2 hours
+resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
+  alarm_name          = "runner-long-running"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 24  # 2 hours (24 x 5min periods)
+  threshold           = 0
+  alarm_description   = "Runner(s) running for 2+ hours - possible stuck job"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "runner_count"
+    expression  = "SELECT COUNT(InstanceId) FROM SCHEMA(\"AWS/EC2\", InstanceId) WHERE Role = 'github-runner'"
+    label       = "Running Runners"
+    period      = 300
+    return_data = true
+  }
+}
+
+# Alert on high EC2 spend (estimated from running hours)
+resource "aws_cloudwatch_metric_alarm" "high_ec2_spend" {
+  alarm_name          = "high-ec2-daily-spend"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "EstimatedCharges"
+  namespace           = "AWS/Billing"
+  period              = 21600  # 6 hours
+  statistic           = "Maximum"
+  threshold           = 100
+  alarm_description   = "EC2 estimated charges exceed $100"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ServiceName = "AmazonEC2"
+    Currency    = "USD"
+  }
+}
+
+# Alert if jumpbox goes down
+resource "aws_cloudwatch_metric_alarm" "jumpbox_status" {
+  alarm_name          = "jumpbox-status-check"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Jumpbox instance status check failed"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    InstanceId = aws_instance.jumpbox[0].id
+  }
+}
+
+# Alert if dev server goes down while running
+resource "aws_cloudwatch_metric_alarm" "dev_server_status" {
+  count               = var.enable_firecracker_instance ? 1 : 0
+  alarm_name          = "dev-server-status-check"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Dev server instance status check failed"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    InstanceId = aws_instance.firecracker_dev[0].id
+  }
+}
