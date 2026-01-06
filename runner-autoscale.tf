@@ -370,8 +370,8 @@ cd /opt/actions-runner
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-    https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
-  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" \
+    https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
+  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$TOKEN" \
     --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended --replace
   ./svc.sh install ubuntu
   ./svc.sh start
@@ -411,7 +411,7 @@ data "archive_file" "runner_cleanup" {
       cloudwatch = boto3.client('cloudwatch', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
 
-      REPO = 'ejc3/firepod'
+      REPO = 'ejc3/fcvm'
 
       def get_github_pat():
           """Get GitHub PAT from SSM"""
