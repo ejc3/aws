@@ -213,6 +213,14 @@ All dev instances have Elastic IPs for static addressing:
 - Defined in each instance's .tf file
 - Cost: ~$3.60/month per unused EIP (free when attached to running instance)
 
+## GitHub Actions Runners
+
+- c7gd.metal spot instances, launched on-demand via webhook
+- NVMe mounted as **btrfs at /mnt/fcvm-btrfs** (fcvm needs CoW reflinks)
+- Check status: `make runners`
+
+**Merging PRs:** Don't click "Update branch" before merging—it triggers redundant PR CI. Just merge directly.
+
 ## Common Tasks
 
 **Add a new Terraform variable**:
