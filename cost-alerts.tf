@@ -29,14 +29,17 @@ data "archive_file" "cost_report" {
     content  = <<-PYTHON
 import boto3
 import json
+import os
 from datetime import datetime, timedelta
 
 def handler(event, context):
     ce = boto3.client('ce', region_name='us-east-1')
     ses = boto3.client('ses', region_name='us-west-1')
+    sns = boto3.client('sns', region_name='us-west-1')
     ssm = boto3.client('ssm', region_name='us-west-1')
 
     email = ssm.get_parameter(Name='/alerts/email')['Parameter']['Value']
+    sns_topic = os.environ.get('SNS_TOPIC_ARN', '')
 
     today = datetime.utcnow().date()
     yesterday = today - timedelta(days=1)
@@ -52,6 +55,7 @@ def handler(event, context):
     )
 
     total = 0.0
+    top_services = []
     lines = ["AWS Cost Report for " + yesterday.isoformat(), "=" * 40, ""]
 
     for group in response['ResultsByTime'][0]['Groups']:
@@ -60,6 +64,9 @@ def handler(event, context):
         if amount > 0.01:
             lines.append(service + ": $" + format(amount, '.2f'))
             total += amount
+            if amount > 1.0:
+                short_name = service.replace('Amazon ', '').replace('AWS ', '')[:12]
+                top_services.append(short_name + ":$" + format(amount, '.0f'))
 
     lines.extend(["", "-" * 40, "TOTAL: $" + format(total, '.2f')])
     body = "\n".join(lines)
@@ -72,6 +79,13 @@ def handler(event, context):
             'Body': {'Text': {'Data': body}}
         }
     )
+
+    # Send SMS via SNS (short message)
+    if sns_topic:
+        sms_msg = "AWS " + yesterday.isoformat() + ": $" + format(total, '.2f')
+        if top_services:
+            sms_msg += " (" + ", ".join(top_services[:3]) + ")"
+        sns.publish(TopicArn=sns_topic, Message=sms_msg)
 
     return {'statusCode': 200, 'body': json.dumps({'total': total})}
 PYTHON
@@ -87,6 +101,12 @@ resource "aws_lambda_function" "cost_report" {
   timeout          = 30
   filename         = data.archive_file.cost_report.output_path
   source_code_hash = data.archive_file.cost_report.output_base64sha256
+
+  environment {
+    variables = {
+      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
+    }
+  }
 }
 
 resource "aws_iam_role" "cost_report" {
@@ -118,6 +138,11 @@ resource "aws_iam_role_policy" "cost_report" {
         Effect   = "Allow"
         Action   = ["ses:SendEmail"]
         Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = [aws_sns_topic.cost_alerts.arn]
       },
       {
         Effect   = "Allow"
