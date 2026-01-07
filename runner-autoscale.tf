@@ -408,10 +408,10 @@ data "archive_file" "runner_cleanup" {
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
-      cloudwatch = boto3.client('cloudwatch', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
+      IDLE_TIMEOUT_MINUTES = 30
 
       def get_github_pat():
           """Get GitHub PAT from SSM"""
@@ -465,6 +465,33 @@ data "archive_file" "runner_cleanup" {
               pass
           return None
 
+      def get_tag(instance, key):
+          """Get tag value from instance"""
+          for tag in instance.get('Tags', []):
+              if tag['Key'] == key:
+                  return tag['Value']
+          return None
+
+      def set_idle_tag(instance_id, timestamp):
+          """Set IdleSince tag on instance"""
+          try:
+              ec2.create_tags(
+                  Resources=[instance_id],
+                  Tags=[{'Key': 'IdleSince', 'Value': timestamp}]
+              )
+          except Exception as e:
+              print(f'Failed to set IdleSince tag on {instance_id}: {e}')
+
+      def remove_idle_tag(instance_id):
+          """Remove IdleSince tag from instance"""
+          try:
+              ec2.delete_tags(
+                  Resources=[instance_id],
+                  Tags=[{'Key': 'IdleSince'}]
+              )
+          except Exception as e:
+              print(f'Failed to remove IdleSince tag from {instance_id}: {e}')
+
       def handler(event, context):
           pat = get_github_pat()
           print(f'PAT available: {bool(pat)}')
@@ -487,6 +514,7 @@ data "archive_file" "runner_cleanup" {
                       orphans_cleaned.append(runner_name)
 
           # Phase 2: Find idle running instances to terminate
+          # Use GitHub's busy status + IdleSince tag to track idle time
           response = ec2.describe_instances(
               Filters=[
                   {'Name': 'tag:Role', 'Values': ['github-runner']},
@@ -497,43 +525,59 @@ data "archive_file" "runner_cleanup" {
 
           terminated = []
           skipped_busy = []
+          now = datetime.now(timezone.utc)
+
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
                   instance_id = instance['InstanceId']
                   launch_time = instance['LaunchTime']
                   runner_name = f'runner-{instance_id}'
+                  idle_since_str = get_tag(instance, 'IdleSince')
 
-                  # Skip if launched less than 30 minutes ago
-                  if datetime.now(timezone.utc) - launch_time < timedelta(minutes=30):
+                  # Skip if launched less than 10 minutes ago (initial setup time)
+                  if now - launch_time < timedelta(minutes=10):
+                      print(f'{instance_id}: launched {(now - launch_time).seconds // 60}m ago, skipping (setup)')
                       continue
 
-                  # Skip if runner is busy (has active job)
+                  # Get runner status from GitHub
                   runner_info = runners.get(runner_name, {})
-                  if runner_info.get('busy', False):
+                  is_busy = runner_info.get('busy', False)
+
+                  if is_busy:
+                      # Runner is working - clear idle tag if set
                       skipped_busy.append(instance_id)
+                      if idle_since_str:
+                          print(f'{instance_id}: busy, clearing IdleSince tag')
+                          remove_idle_tag(instance_id)
+                      else:
+                          print(f'{instance_id}: busy')
                       continue
 
-                  # Check CPU utilization
-                  metrics = cloudwatch.get_metric_statistics(
-                      Namespace='AWS/EC2',
-                      MetricName='CPUUtilization',
-                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                      StartTime=datetime.now(timezone.utc) - timedelta(minutes=30),
-                      EndTime=datetime.now(timezone.utc),
-                      Period=300,
-                      Statistics=['Average']
-                  )
+                  # Runner is NOT busy
+                  if not idle_since_str:
+                      # First time seeing this runner idle - set the tag
+                      idle_since_str = now.isoformat()
+                      print(f'{instance_id}: idle, setting IdleSince={idle_since_str}')
+                      set_idle_tag(instance_id, idle_since_str)
+                      continue
 
-                  # If avg CPU < 5% for last 30 mins, terminate it
-                  if metrics['Datapoints']:
-                      avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
-                      if avg_cpu < 5:
-                          print(f'Terminating idle: {instance_id} (cpu={avg_cpu:.1f}%)')
-                          # Deregister from GitHub first
-                          if runner_info.get('id'):
-                              deregister_runner(runner_info['id'], pat)
-                          ec2.terminate_instances(InstanceIds=[instance_id])
-                          terminated.append(instance_id)
+                  # Runner has been idle - check how long
+                  try:
+                      idle_since = datetime.fromisoformat(idle_since_str.replace('Z', '+00:00'))
+                      idle_minutes = (now - idle_since).total_seconds() / 60
+                  except Exception as e:
+                      print(f'{instance_id}: failed to parse IdleSince={idle_since_str}: {e}')
+                      continue
+
+                  print(f'{instance_id}: idle for {idle_minutes:.1f} minutes')
+
+                  if idle_minutes >= IDLE_TIMEOUT_MINUTES:
+                      print(f'Terminating idle: {instance_id} (idle {idle_minutes:.1f}m)')
+                      # Deregister from GitHub first
+                      if runner_info.get('id'):
+                          deregister_runner(runner_info['id'], pat)
+                      ec2.terminate_instances(InstanceIds=[instance_id])
+                      terminated.append(instance_id)
 
           # Phase 3: Clean up stale AMI builder instances (> 2 hours old)
           ami_builder_terminated = []
@@ -547,7 +591,7 @@ data "archive_file" "runner_cleanup" {
               for instance in reservation['Instances']:
                   instance_id = instance['InstanceId']
                   launch_time = instance['LaunchTime']
-                  age_hours = (datetime.now(timezone.utc) - launch_time).total_seconds() / 3600
+                  age_hours = (now - launch_time).total_seconds() / 3600
                   if age_hours > 2:
                       print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
                       ec2.terminate_instances(InstanceIds=[instance_id])
