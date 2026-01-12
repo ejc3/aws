@@ -26,8 +26,8 @@ resource "aws_iam_role" "dev_server" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ec2.amazonaws.com" }
     }]
   })
@@ -99,9 +99,9 @@ resource "aws_iam_role_policy" "dev_server" {
         Resource = "*"
       },
       {
-        Sid    = "SSMDescribeInstances"
-        Effect = "Allow"
-        Action = "ssm:DescribeInstanceInformation"
+        Sid      = "SSMDescribeInstances"
+        Effect   = "Allow"
+        Action   = "ssm:DescribeInstanceInformation"
         Resource = "*"
       },
       {
@@ -114,9 +114,9 @@ resource "aws_iam_role_policy" "dev_server" {
         ]
       },
       {
-        Sid    = "SecretsManagerGitHubPAT"
-        Effect = "Allow"
-        Action = "secretsmanager:GetSecretValue"
+        Sid      = "SecretsManagerGitHubPAT"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
         Resource = "arn:aws:secretsmanager:us-west-1:928413605543:secret:github-pat-ejc3*"
       },
       {

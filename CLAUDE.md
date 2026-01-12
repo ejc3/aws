@@ -153,8 +153,8 @@ Three "snowflake" dev instances with static Elastic IPs:
 | Instance | Type | Purpose | Terraform |
 |----------|------|---------|-----------|
 | jumpbox | t4g.large | Remote management, admin AWS access | jumpbox.tf |
-| fcvm-metal-arm | c7g.metal | Firecracker/KVM on ARM64 | firecracker-dev.tf |
-| fcvm-metal-x86 | c5.metal | Firecracker/KVM on x86 | x86-dev.tf |
+| fcvm-metal-arm | c7gd.metal | Firecracker/KVM on ARM64 + NVMe | firecracker-dev.tf |
+| fcvm-metal-x86 | c5d.metal | Firecracker/KVM on x86 + NVMe | x86-dev.tf |
 
 ### SSH Access
 
@@ -206,12 +206,63 @@ claude-code-sync pull   # Pull history from GitHub
 claude-code-sync        # Bidirectional sync (default)
 ```
 
+### NVMe Instance Storage
+
+Dev instances use NVMe instance storage for scratch space:
+- **Mount point**: `/mnt/fcvm-btrfs` (btrfs formatted)
+- **Purpose**: Cargo builds, VM disks, containers - anything benefiting from CoW
+- **Ephemeral**: Data is lost on stop/terminate (use EBS root for persistent data)
+- **Setup**: Automatic via systemd service `nvme-btrfs.service`
+
+The setup script (`/usr/local/bin/nvme-btrfs-setup.sh`) runs on every boot to:
+1. Detect NVMe instance storage (excluding EBS volumes)
+2. Format as btrfs if not already formatted
+3. Mount at `/mnt/fcvm-btrfs` with compression
+
 ### Elastic IPs
 
 All dev instances have Elastic IPs for static addressing:
 - IPs persist across stop/start cycles
 - Defined in each instance's .tf file
 - Cost: ~$3.60/month per unused EIP (free when attached to running instance)
+
+### Migrating Instance Types (Preserving EBS Data)
+
+**IMPORTANT**: You cannot change instance types on spot instances. To migrate to a new instance type while preserving EBS data:
+
+1. **Create snapshot of EBS root volume**:
+   ```bash
+   # Get volume ID from instance
+   VOLUME_ID=$(aws ec2 describe-instances --instance-ids <instance-id> \
+     --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' --output text)
+
+   # Create snapshot
+   aws ec2 create-snapshot --volume-id $VOLUME_ID --description "Migration snapshot" --query 'SnapshotId' --output text
+   ```
+
+2. **Wait for snapshot to complete** (can take 30-60+ minutes for 300GB):
+   ```bash
+   aws ec2 describe-snapshots --snapshot-ids <snap-id> --query 'Snapshots[0].[State,Progress]' --output text
+   ```
+
+3. **Register AMI from snapshot**:
+   ```bash
+   aws ec2 register-image \
+     --name "migration-$(date +%Y%m%d)" \
+     --root-device-name /dev/sda1 \
+     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"SnapshotId\":\"<snap-id>\",\"VolumeSize\":300,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+     --architecture arm64 \  # or x86_64
+     --virtualization-type hvm \
+     --ena-support
+   ```
+
+4. **Launch new instance from AMI** with new instance type
+
+5. **Attach Elastic IP** to new instance
+
+6. **Terminate old instance** and clean up old snapshots/AMIs
+
+**Note**: EBS volumes cannot be detached from instances while serving as root volumes. The snapshot→AMI approach is the only way to migrate data to a new instance type.
 
 ## GitHub Actions Runners
 

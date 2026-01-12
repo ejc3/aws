@@ -2,7 +2,78 @@
 # These scripts configure ARM and x86 dev instances from scratch
 
 locals {
-  # ARM dev server (c7g.metal) full setup script
+  # NVMe btrfs setup - runs on every boot via systemd
+  # Formats NVMe as btrfs and mounts at /mnt/fcvm-btrfs (for CoW reflinks)
+  nvme_btrfs_setup = <<-NVME
+# Install btrfs-progs
+apt-get install -y btrfs-progs
+
+# Create systemd service for NVMe setup on every boot
+cat > /etc/systemd/system/nvme-btrfs.service << 'SVC'
+[Unit]
+Description=Format and mount NVMe as btrfs
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nvme-btrfs-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+# Create the setup script
+cat > /usr/local/bin/nvme-btrfs-setup.sh << 'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+# Find NVMe device that's NOT the root disk
+ROOT_DEV=$$(lsblk -no PKNAME $$(findmnt -no SOURCE /) 2>/dev/null | head -1)
+NVME_DEV=$$(lsblk -dn -o NAME,TYPE | awk '$$2=="disk" && /^nvme/ {print $$1}' | grep -v "^$${ROOT_DEV}$$" | head -1)
+
+if [ -z "$$NVME_DEV" ]; then
+    echo "No NVMe instance storage found, skipping"
+    exit 0
+fi
+
+echo "Setting up NVMe as btrfs: /dev/$$NVME_DEV"
+
+# Format as btrfs (always - NVMe is ephemeral)
+mkfs.btrfs -f /dev/$$NVME_DEV
+
+# Mount
+mkdir -p /mnt/fcvm-btrfs
+mount /dev/$$NVME_DEV /mnt/fcvm-btrfs
+chmod 1777 /mnt/fcvm-btrfs
+
+# Create directory structure for fcvm
+mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache}
+mkdir -p /mnt/fcvm-btrfs/{containers,cargo-target}
+chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
+
+# Symlink podman containers to NVMe
+CONTAINERS_DIR="/home/ubuntu/.local/share/containers"
+if [ ! -L "$$CONTAINERS_DIR" ]; then
+    rm -rf "$$CONTAINERS_DIR"
+    mkdir -p /home/ubuntu/.local/share
+    ln -sf /mnt/fcvm-btrfs/containers "$$CONTAINERS_DIR"
+    chown -R ubuntu:ubuntu /home/ubuntu/.local
+fi
+
+echo "NVMe btrfs setup complete: /mnt/fcvm-btrfs"
+SCRIPT
+
+chmod +x /usr/local/bin/nvme-btrfs-setup.sh
+systemctl daemon-reload
+systemctl enable nvme-btrfs.service
+
+# Run it now too (for first boot)
+/usr/local/bin/nvme-btrfs-setup.sh || true
+NVME
+
+  # ARM dev server (c7gd.metal) full setup script
   arm_user_data = <<-SCRIPT
 #!/bin/bash
 set -euxo pipefail
@@ -16,6 +87,9 @@ apt-get install -y \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev unzip zip flex bison libssl-dev \
   libelf-dev bc dwarves
+
+# NVMe btrfs setup (scratch space for builds, VMs, containers)
+${local.nvme_btrfs_setup}
 
 # Eternal Terminal
 git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/et
@@ -83,6 +157,8 @@ git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosugges
 git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$PATH"
+# Use NVMe for cargo builds if available
+[ -d /mnt/fcvm-btrfs/cargo-target ] && export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target
 HISTFILE=~/.zsh_history; HISTSIZE=100000; SAVEHIST=100000
 setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE
 autoload -Uz compinit && compinit
@@ -105,7 +181,7 @@ ${local.gh_and_claude_sync_script}
 echo "ARM dev instance ready!"
 SCRIPT
 
-  # x86 dev server (c5.metal) full setup script
+  # x86 dev server (c5d.metal) full setup script
   x86_user_data = <<-SCRIPT
 #!/bin/bash
 set -euxo pipefail
@@ -118,6 +194,9 @@ apt-get install -y \
   nftables iproute2 dnsmasq cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev libssl-dev unzip zip
+
+# NVMe btrfs setup (scratch space for builds, VMs, containers)
+${local.nvme_btrfs_setup}
 
 # Eternal Terminal
 git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/et
@@ -185,6 +264,8 @@ git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosugges
 git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$PATH"
+# Use NVMe for cargo builds if available
+[ -d /mnt/fcvm-btrfs/cargo-target ] && export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target
 HISTFILE=~/.zsh_history; HISTSIZE=100000; SAVEHIST=100000
 setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE
 autoload -Uz compinit && compinit

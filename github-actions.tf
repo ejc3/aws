@@ -72,9 +72,9 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Resource = "*"
       },
       {
-        Sid    = "TerraformState"
-        Effect = "Allow"
-        Action = "s3:GetObject"
+        Sid      = "TerraformState"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
         Resource = "arn:aws:s3:::aws-infrastructure-*-tf-state/*"
       },
       {

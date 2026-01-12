@@ -220,7 +220,7 @@ resource "aws_budgets_budget" "daily_cost" {
 resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
   alarm_name          = "too-many-runners"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 6  # 30 minutes (6 x 5min periods)
+  evaluation_periods  = 6 # 30 minutes (6 x 5min periods)
   threshold           = 4
   alarm_description   = "More than 4 runners running for 30+ minutes - check for stuck jobs"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
@@ -240,7 +240,7 @@ resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
 resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
   alarm_name          = "runner-long-running"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 24  # 2 hours (24 x 5min periods)
+  evaluation_periods  = 24 # 2 hours (24 x 5min periods)
   threshold           = 0
   alarm_description   = "Runner(s) running for 2+ hours - possible stuck job"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
@@ -262,7 +262,7 @@ resource "aws_cloudwatch_metric_alarm" "high_ec2_spend" {
   evaluation_periods  = 1
   metric_name         = "EstimatedCharges"
   namespace           = "AWS/Billing"
-  period              = 21600  # 6 hours
+  period              = 21600 # 6 hours
   statistic           = "Maximum"
   threshold           = 100
   alarm_description   = "EC2 estimated charges exceed $100"

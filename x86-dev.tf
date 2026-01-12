@@ -11,7 +11,7 @@ variable "enable_x86_dev_instance" {
 variable "x86_dev_instance_type" {
   description = "Instance type for x86 dev"
   type        = string
-  default     = "c5.metal" # 96 vCPU, 192GB RAM
+  default     = "c5d.metal" # 96 vCPU, 192GB RAM + 3.6TB NVMe
 }
 
 variable "x86_dev_volume_size" {

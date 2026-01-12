@@ -14,7 +14,7 @@ variable "enable_firecracker_instance" {
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "c7g.metal" # ARM64 Graviton3 metal for nested virt
+  default     = "c7gd.metal" # ARM64 Graviton3 metal + NVMe for nested virt
 }
 
 variable "firecracker_volume_size" {
@@ -106,7 +106,7 @@ resource "aws_instance" "firecracker_dev" {
   root_block_device {
     volume_size           = var.firecracker_volume_size
     volume_type           = "gp3"
-    delete_on_termination = false  # Keep EBS when instance terminates
+    delete_on_termination = false # Keep EBS when instance terminates
     iops                  = 3000
     throughput            = 125
     tags = {
