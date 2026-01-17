@@ -159,13 +159,10 @@ Three "snowflake" dev instances with static Elastic IPs:
 ### SSH Access
 
 ```bash
-# Get current IPs from terraform output
-cd ~/src/aws && terraform output
-
-# Or use the SSH commands directly
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@<jumpbox_public_ip>
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@<firecracker_dev_public_ip>
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
+# Static IPs (Elastic IPs don't change)
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@52.9.31.202     # jumpbox
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@184.72.40.255   # fcvm-metal-arm
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@50.18.109.164   # fcvm-metal-x86
 ```
 
 ### Shared Configuration
@@ -263,6 +260,20 @@ All dev instances have Elastic IPs for static addressing:
 6. **Terminate old instance** and clean up old snapshots/AMIs
 
 **Note**: EBS volumes cannot be detached from instances while serving as root volumes. The snapshot→AMI approach is the only way to migrate data to a new instance type.
+
+## Backups
+
+Both dev instances are backed up via AWS Backup to the `fcvm-backups` vault:
+
+| Schedule | Retention | Covers |
+|----------|-----------|--------|
+| Daily 5:00 UTC | 7 days | ARM + x86 EBS root volumes |
+| Weekly (Sunday) | 28 days | ARM + x86 EBS root volumes |
+| Monthly (1st) | 90 days | ARM + x86 EBS root volumes |
+
+**To restore**: AWS Console → Backup → Protected resources → Select snapshot → Restore
+
+**Important**: NVMe instance storage is NOT backed up (ephemeral). Only EBS root volumes are backed up.
 
 ## GitHub Actions Runners
 
