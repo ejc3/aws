@@ -261,6 +261,33 @@ All dev instances have Elastic IPs for static addressing:
 
 **Note**: EBS volumes cannot be detached from instances while serving as root volumes. The snapshot→AMI approach is the only way to migrate data to a new instance type.
 
+### Keeping Terraform State in Sync
+
+**CRITICAL**: After manually creating instances, you MUST import them into Terraform state. Otherwise:
+- CloudWatch alarms will point to old (stale) instance IDs
+- EIP associations may become orphaned
+- Backup selections may target wrong resources
+
+```bash
+# After manual instance creation, sync Terraform state:
+
+# 1. Remove old instance from state
+terraform state rm 'aws_instance.firecracker_dev[0]'
+terraform state rm 'aws_instance.x86_dev[0]'
+
+# 2. Import actual instances (get IDs from AWS Console or CLI)
+terraform import 'aws_instance.firecracker_dev[0]' i-XXXXXXXXXXXXX
+terraform import 'aws_instance.x86_dev[0]' i-XXXXXXXXXXXXX
+
+# 3. Apply to update all dependent resources (alarms, EIP associations, etc.)
+terraform apply
+```
+
+**Best practice**: Prefer `terraform apply` to change instance types:
+1. Update `firecracker_instance_type` or `x86_dev_instance_type` in `terraform.tfvars`
+2. Run `terraform apply` - it will recreate the spot instance
+3. All dependent resources (alarms, EIPs) automatically update
+
 ## Backups
 
 Both dev instances are backed up via AWS Backup to the `fcvm-backups` vault:
