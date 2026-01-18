@@ -153,16 +153,19 @@ Three "snowflake" dev instances with static Elastic IPs:
 | Instance | Type | Purpose | Terraform |
 |----------|------|---------|-----------|
 | jumpbox | t4g.large | Remote management, admin AWS access | jumpbox.tf |
-| fcvm-metal-arm | c7gd.metal | Firecracker/KVM on ARM64 + NVMe | firecracker-dev.tf |
-| fcvm-metal-x86 | c5d.metal | Firecracker/KVM on x86 + NVMe | x86-dev.tf |
+| fcvm-metal-arm | c7g.metal | Firecracker/KVM on ARM64 | firecracker-dev.tf |
+| fcvm-metal-x86 | c5.metal | Firecracker/KVM on x86 | x86-dev.tf |
 
 ### SSH Access
 
 ```bash
-# Static IPs (Elastic IPs don't change)
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@52.9.31.202     # jumpbox
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@184.72.40.255   # fcvm-metal-arm
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@50.18.109.164   # fcvm-metal-x86
+# Get current IPs from terraform output
+cd ~/aws && terraform output
+
+# Or use the SSH commands directly
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<jumpbox_public_ip>
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<firecracker_dev_public_ip>
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
 ```
 
 ### Shared Configuration
@@ -203,112 +206,12 @@ claude-code-sync pull   # Pull history from GitHub
 claude-code-sync        # Bidirectional sync (default)
 ```
 
-### NVMe Instance Storage
-
-Dev instances use NVMe instance storage for scratch space:
-- **Mount point**: `/mnt/fcvm-btrfs` (btrfs formatted)
-- **Purpose**: Cargo builds, VM disks, containers - anything benefiting from CoW
-- **Ephemeral**: Data is lost on stop/terminate (use EBS root for persistent data)
-- **Setup**: Automatic via systemd service `nvme-btrfs.service`
-
-The setup script (`/usr/local/bin/nvme-btrfs-setup.sh`) runs on every boot to:
-1. Detect NVMe instance storage (excluding EBS volumes)
-2. Format as btrfs if not already formatted
-3. Mount at `/mnt/fcvm-btrfs` with compression
-
 ### Elastic IPs
 
 All dev instances have Elastic IPs for static addressing:
 - IPs persist across stop/start cycles
 - Defined in each instance's .tf file
 - Cost: ~$3.60/month per unused EIP (free when attached to running instance)
-
-### Migrating Instance Types (Preserving EBS Data)
-
-**IMPORTANT**: You cannot change instance types on spot instances. To migrate to a new instance type while preserving EBS data:
-
-1. **Create snapshot of EBS root volume**:
-   ```bash
-   # Get volume ID from instance
-   VOLUME_ID=$(aws ec2 describe-instances --instance-ids <instance-id> \
-     --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' --output text)
-
-   # Create snapshot
-   aws ec2 create-snapshot --volume-id $VOLUME_ID --description "Migration snapshot" --query 'SnapshotId' --output text
-   ```
-
-2. **Wait for snapshot to complete** (can take 30-60+ minutes for 300GB):
-   ```bash
-   aws ec2 describe-snapshots --snapshot-ids <snap-id> --query 'Snapshots[0].[State,Progress]' --output text
-   ```
-
-3. **Register AMI from snapshot**:
-   ```bash
-   aws ec2 register-image \
-     --name "migration-$(date +%Y%m%d)" \
-     --root-device-name /dev/sda1 \
-     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"SnapshotId\":\"<snap-id>\",\"VolumeSize\":300,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-     --architecture arm64 \  # or x86_64
-     --virtualization-type hvm \
-     --ena-support
-   ```
-
-4. **Launch new instance from AMI** with new instance type
-
-5. **Attach Elastic IP** to new instance
-
-6. **Terminate old instance** and clean up old snapshots/AMIs
-
-**Note**: EBS volumes cannot be detached from instances while serving as root volumes. The snapshot→AMI approach is the only way to migrate data to a new instance type.
-
-### Keeping Terraform State in Sync
-
-**CRITICAL**: After manually creating instances, you MUST import them into Terraform state. Otherwise:
-- CloudWatch alarms will point to old (stale) instance IDs
-- EIP associations may become orphaned
-- Backup selections may target wrong resources
-
-```bash
-# After manual instance creation, sync Terraform state:
-
-# 1. Remove old instance from state
-terraform state rm 'aws_instance.firecracker_dev[0]'
-terraform state rm 'aws_instance.x86_dev[0]'
-
-# 2. Import actual instances (get IDs from AWS Console or CLI)
-terraform import 'aws_instance.firecracker_dev[0]' i-XXXXXXXXXXXXX
-terraform import 'aws_instance.x86_dev[0]' i-XXXXXXXXXXXXX
-
-# 3. Apply to update all dependent resources (alarms, EIP associations, etc.)
-terraform apply
-```
-
-**Best practice**: Prefer `terraform apply` to change instance types:
-1. Update `firecracker_instance_type` or `x86_dev_instance_type` in `terraform.tfvars`
-2. Run `terraform apply` - it will recreate the spot instance
-3. All dependent resources (alarms, EIPs) automatically update
-
-## Backups
-
-Both dev instances are backed up via AWS Backup to the `fcvm-backups` vault:
-
-| Schedule | Retention | Covers |
-|----------|-----------|--------|
-| Daily 5:00 UTC | 7 days | ARM + x86 EBS root volumes |
-| Weekly (Sunday) | 28 days | ARM + x86 EBS root volumes |
-| Monthly (1st) | 90 days | ARM + x86 EBS root volumes |
-
-**To restore**: AWS Console → Backup → Protected resources → Select snapshot → Restore
-
-**Important**: NVMe instance storage is NOT backed up (ephemeral). Only EBS root volumes are backed up.
-
-## GitHub Actions Runners
-
-- c7gd.metal spot instances, launched on-demand via webhook
-- NVMe mounted as **btrfs at /mnt/fcvm-btrfs** (fcvm needs CoW reflinks)
-- Check status: `make runners`
-
-**Merging PRs:** Don't click "Update branch" before merging—it triggers redundant PR CI. Just merge directly.
 
 ## Common Tasks
 
