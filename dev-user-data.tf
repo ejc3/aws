@@ -86,7 +86,14 @@ apt-get install -y \
   nftables iproute2 dnsmasq cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev unzip zip flex bison libssl-dev \
-  libelf-dev bc dwarves
+  libelf-dev bc dwarves nfs-kernel-server
+
+# AWS CLI v2 (apt package not available on Ubuntu 24.04)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+cd /tmp && unzip -o awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
+
+# Enable user_allow_other in fuse.conf (required for FUSE tests)
+sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 
 # NVMe btrfs setup (scratch space for builds, VMs, containers)
 ${local.nvme_btrfs_setup}
@@ -133,6 +140,9 @@ echo "ubuntu:100000:65536" >> /etc/subuid
 echo "ubuntu:100000:65536" >> /etc/subgid
 sysctl -w kernel.unprivileged_userns_clone=1
 echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
+# Disable AppArmor restriction on unprivileged user namespaces (required for rootless podman/fcvm)
+sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo "kernel.apparmor_restrict_unprivileged_userns=0" >> /etc/sysctl.conf
 
 # Shell setup
 sudo -u ubuntu bash << 'SHELL'
@@ -193,7 +203,14 @@ apt-get install -y \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
   nftables iproute2 dnsmasq cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
-  libcurl4-openssl-dev libutempter-dev libssl-dev unzip zip
+  libcurl4-openssl-dev libutempter-dev libssl-dev unzip zip nfs-kernel-server
+
+# AWS CLI v2 (apt package not available on Ubuntu 24.04)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+cd /tmp && unzip -o awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
+
+# Enable user_allow_other in fuse.conf (required for FUSE tests)
+sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 
 # NVMe btrfs setup (scratch space for builds, VMs, containers)
 ${local.nvme_btrfs_setup}
@@ -240,6 +257,9 @@ echo "ubuntu:100000:65536" >> /etc/subuid
 echo "ubuntu:100000:65536" >> /etc/subgid
 sysctl -w kernel.unprivileged_userns_clone=1
 echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
+# Disable AppArmor restriction on unprivileged user namespaces (required for rootless podman/fcvm)
+sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo "kernel.apparmor_restrict_unprivileged_userns=0" >> /etc/sysctl.conf
 
 # Shell setup
 sudo -u ubuntu bash << 'SHELL'
