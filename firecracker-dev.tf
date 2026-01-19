@@ -153,7 +153,7 @@ resource "aws_cloudwatch_metric_alarm" "firecracker_dev_idle" {
   count               = var.enable_firecracker_instance ? 1 : 0
   alarm_name          = "firecracker-dev-idle-3d"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 72 # 72 x 1hr = 72 hours = 3 days
+  evaluation_periods  = 8 # 8 x 1hr = 8 hours
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
   period              = 3600 # 1 hour (required for multi-day spans)

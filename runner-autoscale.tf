@@ -16,6 +16,7 @@ data "archive_file" "runner_webhook" {
       import os
       import hmac
       import hashlib
+      from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
@@ -26,13 +27,14 @@ data "archive_file" "runner_webhook" {
           resp = ssm.get_parameter(Name=param_name)
           return resp['Parameter']['Value']
 
-      def get_latest_runner_ami():
-          """Get the latest available AMI tagged with Purpose=github-runner"""
+      def get_latest_runner_ami(arch='arm64'):
+          """Get the latest available AMI for the specified architecture"""
           response = ec2.describe_images(
               Owners=['self'],
               Filters=[
                   {'Name': 'tag:Purpose', 'Values': ['github-runner']},
-                  {'Name': 'state', 'Values': ['available']}
+                  {'Name': 'state', 'Values': ['available']},
+                  {'Name': 'architecture', 'Values': [arch]}
               ]
           )
           if not response['Images']:
@@ -60,38 +62,80 @@ data "archive_file" "runner_webhook" {
           count = sum(len(r['Instances']) for r in response['Reservations'])
           return count
 
-      def launch_runner():
-          """Launch a new spot runner instance with tags"""
-          ami_id = get_latest_runner_ami()
+      def detect_architecture(labels):
+          """Detect architecture from job labels, default to arm64"""
+          labels_lower = [l.lower() for l in labels]
+          if 'x64' in labels_lower or 'x86_64' in labels_lower or 'amd64' in labels_lower:
+              return 'x86_64'
+          # Default to arm64 (cheaper, faster for most workloads)
+          return 'arm64'
+
+      def get_instance_types(arch):
+          """Get list of instance types to try for architecture (fallback order)"""
+          if arch == 'x86_64':
+              # Try multiple x86 metal types for better spot availability
+              return ['c5d.metal', 'c5.metal', 'c6i.metal', 'm5d.metal']
+          return ['c7gd.metal', 'c7g.metal']
+
+      # Lease duration in minutes - runners auto-terminate after this unless renewed
+      LEASE_DURATION_MINUTES = 60
+
+      def get_lease_expiry():
+          """Calculate lease expiry time (now + LEASE_DURATION_MINUTES)"""
+          return (datetime.now(timezone.utc) + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
+
+      def launch_runner(arch='arm64'):
+          """Launch a new spot runner instance, trying multiple instance types"""
+          ami_id = get_latest_runner_ami(arch)
           if not ami_id:
-              raise Exception("No runner AMI found with Purpose=github-runner tag")
-          response = ec2.run_instances(
-              MinCount=1,
-              MaxCount=1,
-              ImageId=ami_id,
-              InstanceType=os.environ['INSTANCE_TYPE'],
-              KeyName='fcvm-ec2',
-              SubnetId=os.environ['SUBNET_ID'],
-              SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
-              IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
-              BlockDeviceMappings=[{
-                  'DeviceName': '/dev/sda1',
-                  'Ebs': {'VolumeSize': 100, 'VolumeType': 'gp3', 'DeleteOnTermination': True}
-              }],
-              UserData=get_user_data(),
-              InstanceMarketOptions={
-                  'MarketType': 'spot',
-                  'SpotOptions': {'SpotInstanceType': 'one-time'}
-              },
-              TagSpecifications=[{
-                  'ResourceType': 'instance',
-                  'Tags': [
-                      {'Key': 'Name', 'Value': 'github-runner-autoscale'},
-                      {'Key': 'Role', 'Value': 'github-runner'}
-                  ]
-              }]
-          )
-          return response['Instances'][0]['InstanceId']
+              raise Exception(f"No runner AMI found for architecture: {arch}")
+
+          instance_types = get_instance_types(arch)
+          last_error = None
+
+          # x86 AMI is from 300GB dev instance, ARM is smaller
+          volume_size = 300 if arch == 'x86_64' else 100
+
+          # Set initial lease - runner will auto-terminate if not renewed
+          lease_expiry = get_lease_expiry()
+
+          for instance_type in instance_types:
+              try:
+                  response = ec2.run_instances(
+                      MinCount=1,
+                      MaxCount=1,
+                      ImageId=ami_id,
+                      InstanceType=instance_type,
+                      KeyName='fcvm-ec2',
+                      SubnetId=os.environ['SUBNET_ID'],
+                      SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
+                      IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
+                      BlockDeviceMappings=[{
+                          'DeviceName': '/dev/sda1',
+                          'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True}
+                      }],
+                      UserData=get_user_data(),
+                      InstanceMarketOptions={
+                          'MarketType': 'spot',
+                          'SpotOptions': {'SpotInstanceType': 'one-time'}
+                      },
+                      TagSpecifications=[{
+                          'ResourceType': 'instance',
+                          'Tags': [
+                              {'Key': 'Name', 'Value': f'github-runner-{arch}'},
+                              {'Key': 'Role', 'Value': 'github-runner'},
+                              {'Key': 'Architecture', 'Value': arch},
+                              {'Key': 'LeaseExpires', 'Value': lease_expiry}
+                          ]
+                      }]
+                  )
+                  return response['Instances'][0]['InstanceId'], instance_type
+              except Exception as e:
+                  last_error = e
+                  print(f"Failed to launch {instance_type}: {e}, trying next...")
+                  continue
+
+          raise last_error or Exception(f"All instance types failed for {arch}")
 
       def handler(event, context):
           # Parse webhook
@@ -111,6 +155,11 @@ data "archive_file" "runner_webhook" {
           if action != 'queued':
               return {'statusCode': 200, 'body': f'Ignoring action: {action}'}
 
+          # Get job labels to detect architecture
+          workflow_job = payload.get('workflow_job', {})
+          labels = workflow_job.get('labels', [])
+          arch = detect_architecture(labels)
+
           # Check current runner count
           max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
           running = get_running_runners()
@@ -118,11 +167,11 @@ data "archive_file" "runner_webhook" {
           if running >= max_runners:
               return {'statusCode': 200, 'body': f'Max runners ({max_runners}) reached'}
 
-          # Launch new runner
-          spot_id = launch_runner()
+          # Launch new runner for detected architecture
+          spot_id, instance_type = launch_runner(arch)
           return {
               'statusCode': 200,
-              'body': f'Launched runner: {spot_id}'
+              'body': f'Launched {arch} runner ({instance_type}): {spot_id}'
           }
     EOF
     filename = "lambda_function.py"
@@ -141,12 +190,11 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
-      INSTANCE_TYPE     = var.github_runner_instance_type
       SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       USER_DATA_PARAM   = aws_ssm_parameter.runner_user_data[0].name
-      MAX_RUNNERS       = "5"
+      MAX_RUNNERS       = "8"
       WEBHOOK_SECRET    = var.github_webhook_secret
     }
   }
@@ -261,12 +309,6 @@ variable "enable_github_runner" {
   default     = true
 }
 
-variable "github_runner_instance_type" {
-  description = "Instance type for GitHub runner"
-  type        = string
-  default     = "c7gd.metal"
-}
-
 variable "github_webhook_secret" {
   description = "GitHub webhook secret for signature verification"
   type        = string
@@ -308,13 +350,18 @@ sysctl -w kernel.printk="7 4 1 7" || true
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
 if [ -n "$NVME_DEV" ]; then
-  echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
-  # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
-  which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
-  mkfs.btrfs -f /dev/$NVME_DEV
-  mkdir -p /mnt/fcvm-btrfs
-  mount /dev/$NVME_DEV /mnt/fcvm-btrfs
-  chmod 1777 /mnt/fcvm-btrfs
+  # Skip if already mounted (from AMI)
+  if mountpoint -q /mnt/fcvm-btrfs; then
+    echo "NVMe already mounted at /mnt/fcvm-btrfs, skipping setup"
+  else
+    echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
+    # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
+    which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
+    mkfs.btrfs -f /dev/$NVME_DEV
+    mkdir -p /mnt/fcvm-btrfs
+    mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+    chmod 1777 /mnt/fcvm-btrfs
+  fi
 
   # Create fcvm directory structure
   mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache}
@@ -361,9 +408,15 @@ chmod 600 /home/ubuntu/.ssh/authorized_keys
 # Start SSM agent (snap-based, kernel has squashfs)
 snap start amazon-ssm-agent || true
 
-# Get instance ID
+# Get instance ID and architecture
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+  LABELS="self-hosted,Linux,X64"
+else
+  LABELS="self-hosted,Linux,ARM64"
+fi
 
 # Register and start runner
 cd /opt/actions-runner
@@ -372,7 +425,7 @@ if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
     https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
   sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$TOKEN" \
-    --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended --replace
+    --name "runner-$INSTANCE_ID" --labels $LABELS --unattended --replace
   ./svc.sh install ubuntu
   ./svc.sh start
 fi
@@ -411,7 +464,8 @@ data "archive_file" "runner_cleanup" {
       ssm = boto3.client('ssm', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
-      IDLE_TIMEOUT_MINUTES = 30
+      # Lease duration - busy runners get extended, idle runners expire
+      LEASE_DURATION_MINUTES = 60
 
       def get_github_pat():
           """Get GitHub PAT from SSM"""
@@ -472,31 +526,25 @@ data "archive_file" "runner_cleanup" {
                   return tag['Value']
           return None
 
-      def set_idle_tag(instance_id, timestamp):
-          """Set IdleSince tag on instance"""
+      def renew_lease(instance_id, now):
+          """Extend the lease by LEASE_DURATION_MINUTES"""
+          new_expiry = (now + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
           try:
               ec2.create_tags(
                   Resources=[instance_id],
-                  Tags=[{'Key': 'IdleSince', 'Value': timestamp}]
+                  Tags=[{'Key': 'LeaseExpires', 'Value': new_expiry}]
               )
+              return new_expiry
           except Exception as e:
-              print(f'Failed to set IdleSince tag on {instance_id}: {e}')
-
-      def remove_idle_tag(instance_id):
-          """Remove IdleSince tag from instance"""
-          try:
-              ec2.delete_tags(
-                  Resources=[instance_id],
-                  Tags=[{'Key': 'IdleSince'}]
-              )
-          except Exception as e:
-              print(f'Failed to remove IdleSince tag from {instance_id}: {e}')
+              print(f'Failed to renew lease on {instance_id}: {e}')
+          return None
 
       def handler(event, context):
           pat = get_github_pat()
           print(f'PAT available: {bool(pat)}')
           runners = get_runners(pat) if pat else {}
           print(f'Found {len(runners)} runners from GitHub')
+          now = datetime.now(timezone.utc)
 
           # Phase 1: Clean up orphaned GitHub runners (instances gone)
           orphans_cleaned = []
@@ -507,32 +555,32 @@ data "archive_file" "runner_cleanup" {
               instance_id = runner_name.replace('runner-', '')
               state = get_instance_state(instance_id)
               print(f'Runner {runner_name}: instance state={state}')
-              # If instance doesn't exist or is terminated, deregister runner
               if state is None or state in ('terminated', 'shutting-down'):
                   print(f'Cleaning orphan: {runner_name} (state={state})')
                   if deregister_runner(runner_info['id'], pat):
                       orphans_cleaned.append(runner_name)
 
-          # Phase 2: Find idle running instances to terminate
-          # Use GitHub's busy status + IdleSince tag to track idle time
+          # Phase 2: Lease-based runner management
+          # - Busy runners: renew lease (extend expiry)
+          # - Idle runners: don't renew (let lease expire)
+          # - Expired lease: terminate
           response = ec2.describe_instances(
               Filters=[
                   {'Name': 'tag:Role', 'Values': ['github-runner']},
-                  {'Name': 'tag:Name', 'Values': ['github-runner-autoscale']},
                   {'Name': 'instance-state-name', 'Values': ['running']}
               ]
           )
 
           terminated = []
-          skipped_busy = []
-          now = datetime.now(timezone.utc)
+          renewed = []
+          expired = []
 
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
                   instance_id = instance['InstanceId']
                   launch_time = instance['LaunchTime']
                   runner_name = f'runner-{instance_id}'
-                  idle_since_str = get_tag(instance, 'IdleSince')
+                  lease_expires_str = get_tag(instance, 'LeaseExpires')
 
                   # Skip if launched less than 10 minutes ago (initial setup time)
                   if now - launch_time < timedelta(minutes=10):
@@ -543,41 +591,39 @@ data "archive_file" "runner_cleanup" {
                   runner_info = runners.get(runner_name, {})
                   is_busy = runner_info.get('busy', False)
 
+                  # Parse lease expiry
+                  if lease_expires_str:
+                      try:
+                          lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
+                      except Exception as e:
+                          print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
+                          lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
+                  else:
+                      # No lease tag - set one (legacy instance)
+                      print(f'{instance_id}: no lease tag, setting initial lease')
+                      lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
+                      renew_lease(instance_id, now)
+                      continue
+
+                  minutes_until_expiry = (lease_expires - now).total_seconds() / 60
+
                   if is_busy:
-                      # Runner is working - clear idle tag if set
-                      skipped_busy.append(instance_id)
-                      if idle_since_str:
-                          print(f'{instance_id}: busy, clearing IdleSince tag')
-                          remove_idle_tag(instance_id)
-                      else:
-                          print(f'{instance_id}: busy')
+                      # Runner is working - RENEW the lease
+                      new_expiry = renew_lease(instance_id, now)
+                      print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                      renewed.append(instance_id)
                       continue
 
-                  # Runner is NOT busy
-                  if not idle_since_str:
-                      # First time seeing this runner idle - set the tag
-                      idle_since_str = now.isoformat()
-                      print(f'{instance_id}: idle, setting IdleSince={idle_since_str}')
-                      set_idle_tag(instance_id, idle_since_str)
-                      continue
-
-                  # Runner has been idle - check how long
-                  try:
-                      idle_since = datetime.fromisoformat(idle_since_str.replace('Z', '+00:00'))
-                      idle_minutes = (now - idle_since).total_seconds() / 60
-                  except Exception as e:
-                      print(f'{instance_id}: failed to parse IdleSince={idle_since_str}: {e}')
-                      continue
-
-                  print(f'{instance_id}: idle for {idle_minutes:.1f} minutes')
-
-                  if idle_minutes >= IDLE_TIMEOUT_MINUTES:
-                      print(f'Terminating idle: {instance_id} (idle {idle_minutes:.1f}m)')
-                      # Deregister from GitHub first
+                  # Runner is idle - check if lease expired
+                  if lease_expires <= now:
+                      print(f'Terminating expired: {instance_id} (lease expired {-minutes_until_expiry:.1f}m ago)')
                       if runner_info.get('id'):
                           deregister_runner(runner_info['id'], pat)
                       ec2.terminate_instances(InstanceIds=[instance_id])
                       terminated.append(instance_id)
+                      expired.append(instance_id)
+                  else:
+                      print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
 
           # Phase 3: Clean up stale AMI builder instances (> 2 hours old)
           ami_builder_terminated = []
@@ -597,7 +643,7 @@ data "archive_file" "runner_cleanup" {
                       ec2.terminate_instances(InstanceIds=[instance_id])
                       ami_builder_terminated.append(instance_id)
 
-          return {'terminated': terminated, 'skipped_busy': skipped_busy, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated}
     EOF
     filename = "lambda_function.py"
   }

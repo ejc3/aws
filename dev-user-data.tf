@@ -100,21 +100,22 @@ ${local.nvme_btrfs_setup}
 
 # Eternal Terminal
 git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/et
-cd /tmp/et && mkdir build && cd build && cmake .. && make -j$(nproc) && make install
+cd /tmp/et && mkdir build && cd build && cmake .. && make -j$(nproc)
+cp et etserver etterminal /usr/bin/
 rm -rf /tmp/et
-cat > /etc/systemd/system/et.service << 'EOF'
+cat > /etc/systemd/system/etserver.service << 'EOF'
 [Unit]
 Description=Eternal Terminal Server
 After=network.target
 [Service]
 Type=simple
-ExecStart=/usr/bin/etserver
+ExecStart=/usr/bin/etserver --port 2022
 Restart=on-failure
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload && systemctl enable et.service && systemctl start et.service
+systemctl daemon-reload && systemctl enable etserver.service && systemctl start etserver.service
 
 # GitHub CLI
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -217,21 +218,22 @@ ${local.nvme_btrfs_setup}
 
 # Eternal Terminal
 git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/et
-cd /tmp/et && mkdir build && cd build && cmake .. && make -j$(nproc) && make install
+cd /tmp/et && mkdir build && cd build && cmake .. && make -j$(nproc)
+cp et etserver etterminal /usr/bin/
 rm -rf /tmp/et
-cat > /etc/systemd/system/et.service << 'EOF'
+cat > /etc/systemd/system/etserver.service << 'EOF'
 [Unit]
 Description=Eternal Terminal Server
 After=network.target
 [Service]
 Type=simple
-ExecStart=/usr/bin/etserver
+ExecStart=/usr/bin/etserver --port 2022
 Restart=on-failure
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload && systemctl enable et.service && systemctl start et.service
+systemctl daemon-reload && systemctl enable etserver.service && systemctl start etserver.service
 
 # GitHub CLI
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
