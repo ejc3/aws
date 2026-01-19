@@ -120,6 +120,8 @@ resource "aws_instance" "x86_dev" {
   user_data = base64encode(<<-BOOTSTRAP
 #!/bin/bash
 set -euxo pipefail
+# Install AWS CLI via snap (awscli package not available on Ubuntu 24.04)
+snap install aws-cli --classic
 aws s3 cp s3://ejc3-dev-scripts/user-data/x86.sh /tmp/user_data.sh
 chmod +x /tmp/user_data.sh && /tmp/user_data.sh
 BOOTSTRAP
