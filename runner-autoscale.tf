@@ -412,20 +412,31 @@ snap start amazon-ssm-agent || true
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 ARCH=$(uname -m)
-if [ "$ARCH" = "x86_64" ]; then
-  LABELS="self-hosted,Linux,X64"
+
+# Determine runner architecture and label
+if [ "$ARCH" = "aarch64" ]; then
+  RUNNER_ARCH="arm64"
+  RUNNER_LABEL="ARM64"
 else
-  LABELS="self-hosted,Linux,ARM64"
+  RUNNER_ARCH="x64"
+  RUNNER_LABEL="X64"
 fi
 
-# Register and start runner
+# Download latest runner (v2.322.0+ required for node24/actions v6)
+RUNNER_VERSION="2.322.0"
+RUNNER_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-$${RUNNER_ARCH}-$${RUNNER_VERSION}.tar.gz"
+mkdir -p /opt/actions-runner
 cd /opt/actions-runner
+curl -sL "$RUNNER_URL" | tar xz
+chown -R ubuntu:ubuntu /opt/actions-runner
+
+# Register and start runner
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
-  TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
+  REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
     https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
-  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$TOKEN" \
-    --name "runner-$INSTANCE_ID" --labels $LABELS --unattended --replace
+  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
+    --name "runner-$INSTANCE_ID" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
   ./svc.sh install ubuntu
   ./svc.sh start
 fi
