@@ -422,8 +422,8 @@ else
   RUNNER_LABEL="X64"
 fi
 
-# Download latest runner (v2.322.0+ required for node24/actions v6)
-RUNNER_VERSION="2.331.0"
+# Download latest runner from GitHub releases
+RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
 RUNNER_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-$${RUNNER_ARCH}-$${RUNNER_VERSION}.tar.gz"
 mkdir -p /opt/actions-runner
 cd /opt/actions-runner
