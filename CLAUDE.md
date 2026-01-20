@@ -213,6 +213,50 @@ All dev instances have Elastic IPs for static addressing:
 - Defined in each instance's .tf file
 - Cost: ~$3.60/month per unused EIP (free when attached to running instance)
 
+### Persistent Root Volumes (Spot Instances)
+
+Dev instances use **spot instances** for ~70% cost savings, with persistent EBS root volumes to preserve data.
+
+**The Challenge**: Spot instances can be terminated by AWS at any time. When terraform recreates the instance, it creates a NEW root volume from the AMI, orphaning the old volume with user data.
+
+**Our Approach**:
+1. Use spot with `persistent` type + `stop` interruption behavior
+2. Set `delete_on_termination = false` on root volume
+3. **Manual one-time volume swap** when instance is recreated:
+   ```bash
+   # After terraform creates new instance with fresh volume:
+   INSTANCE_ID="i-xxx"
+   PERSISTENT_VOL="vol-09e5c3cee32bb67dc"  # ARM dev server
+
+   # Stop, swap, start
+   aws ec2 stop-instances --instance-ids $INSTANCE_ID
+   aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
+
+   CURRENT_VOL=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+     --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' \
+     --output text)
+
+   aws ec2 detach-volume --volume-id $CURRENT_VOL
+   sleep 5
+   aws ec2 attach-volume --volume-id $PERSISTENT_VOL --instance-id $INSTANCE_ID --device /dev/sda1
+   sleep 5
+   aws ec2 start-instances --instance-ids $INSTANCE_ID
+
+   # Delete the temp volume
+   aws ec2 delete-volume --volume-id $CURRENT_VOL
+   ```
+
+**Persistent Volume IDs** (don't delete these!):
+- ARM (fcvm-metal-arm): `vol-09e5c3cee32bb67dc`
+- x86 (fcvm-metal-x86): TBD
+
+**Why not automate in terraform?** Spot instances have complex state issues:
+- `persistent + stop`: Can stop manually, but sometimes gets stuck in "marked-for-stop" state
+- `one-time + terminate`: Can't stop at all
+- Automating the swap in terraform triggers on every instance recreation, causing cascading failures
+
+**When to run the manual swap**: After `terraform apply` creates a new instance (you'll see a new instance ID in the output). Check if data is missing, then run the swap.
+
 ## Common Tasks
 
 **Add a new Terraform variable**:

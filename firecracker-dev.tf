@@ -102,11 +102,11 @@ resource "aws_instance" "firecracker_dev" {
     }
   }
 
-  # Root volume - PERSISTENT (survives instance termination)
+  # Root volume
   root_block_device {
     volume_size           = var.firecracker_volume_size
     volume_type           = "gp3"
-    delete_on_termination = false # Keep EBS when instance terminates
+    delete_on_termination = false
     iops                  = 3000
     throughput            = 125
     tags = {
