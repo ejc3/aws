@@ -144,32 +144,8 @@ BOOTSTRAP
   }
 }
 
-# ============================================
-# Auto-stop after 3 days idle
-# ============================================
-
-resource "aws_cloudwatch_metric_alarm" "x86_dev_idle" {
-  count               = var.enable_x86_dev_instance ? 1 : 0
-  alarm_name          = "x86-dev-idle-3d"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 8 # 8 x 1hr = 8 hours
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 3600
-  statistic           = "Average"
-  threshold           = 5
-  alarm_description   = "Stop x86 dev instance after 3 days idle"
-
-  dimensions = {
-    InstanceId = aws_instance.x86_dev[0].id
-  }
-
-  alarm_actions = ["arn:aws:automate:us-west-1:ec2:stop"]
-
-  tags = {
-    Name = "x86-dev-idle-3d"
-  }
-}
+# Auto-stop handled by Lambda (dev-auto-stop-lambda.tf)
+# CloudWatch alarms removed - they caused drift when instances were recreated
 
 # ============================================
 # Elastic IP for static address

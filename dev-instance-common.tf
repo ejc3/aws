@@ -152,6 +152,18 @@ resource "aws_iam_role_policy" "dev_server" {
             "ec2:ResourceTag/Role" = "github-runner"
           }
         }
+      },
+      {
+        Sid    = "S3ReadDevScripts"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::ejc3-dev-scripts",
+          "arn:aws:s3:::ejc3-dev-scripts/*"
+        ]
       }
     ]
   })
