@@ -128,7 +128,7 @@ BOOTSTRAP
   )
 
 
-  monitoring = false
+  monitoring = true  # 1-minute detailed monitoring
 
   tags = {
     Name = "fcvm-metal-x86"
