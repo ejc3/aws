@@ -45,6 +45,19 @@ This project is opinionated and minimal:
 4. **No Extra Docs**: README.md is the only user-facing documentation
 5. **ALL AWS CHANGES VIA TERRAFORM**: Never use AWS CLI to create/modify/delete resources. Always update .tf files and run `make apply`
 
+## Preventing Terraform Drift
+
+**Fixed drift sources:**
+- Removed CloudWatch alarms that referenced instance IDs (caused drift on spot instance recreation)
+- Backup plans now terraform-managed (were manually created)
+- Auto-stop uses Lambda instead of CloudWatch EC2 actions (works with spot instances)
+
+**Rules to prevent drift:**
+- **Never use `aws` CLI to create/modify/delete resources** - always edit `.tf` files
+- Run `terraform plan` before `terraform apply` to catch issues
+- Keep all infrastructure changes in git
+- Avoid resources that reference instance IDs directly (they change on spot recreation)
+
 ## Project Overview
 
 AWS infrastructure management with:
