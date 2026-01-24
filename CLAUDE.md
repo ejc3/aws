@@ -152,9 +152,18 @@ Three "snowflake" dev instances with static Elastic IPs:
 
 | Instance | Type | Purpose | Terraform |
 |----------|------|---------|-----------|
-| jumpbox | t4g.large | Remote management, admin AWS access | jumpbox.tf |
+| jumpbox | t4g.large (8GB RAM) | Remote management, admin AWS access | jumpbox.tf |
 | fcvm-metal-arm | c7g.metal | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5.metal | Firecracker/KVM on x86 | x86-dev.tf |
+
+### Jumpbox Storage
+
+The jumpbox has separate root and home volumes:
+- **Root volume**: 8GB (`/dev/nvme0n1`) - OS, packages, boot
+- **Home volume**: 20GB (`/dev/nvme1n1`) mounted at `/home/ubuntu` - user data, projects
+- **Swap**: 4GB at `/home/ubuntu/.swapfile` (on home volume to save root space)
+
+The home volume is backed up daily/weekly via AWS Backup.
 
 ### SSH Access
 
@@ -213,6 +222,26 @@ All dev instances have Elastic IPs for static addressing:
 - Defined in each instance's .tf file
 - Cost: ~$3.60/month per unused EIP (free when attached to running instance)
 
+### Auto-Stop Lambda
+
+Dev servers are automatically stopped after **12 hours** of idle time to save costs. This is handled by a Lambda function (`dev-auto-stop-lambda.tf`) that runs hourly.
+
+**How it works:**
+- Checks CloudWatch CPU metrics (Maximum per hour, not average)
+- If **all** hours in the last 12 have peak CPU < 5%, stops the instance
+- Only counts metrics since instance `LaunchTime` (prevents false positives after restart)
+- Sends SNS notification on stop (or if stop fails)
+
+**Why Lambda instead of CloudWatch alarms:**
+- CloudWatch EC2 stop actions don't work reliably with spot instances
+- Lambda can check LaunchTime to avoid stale metric issues
+- More control over logic (peak CPU vs average)
+
+**Configuration:**
+- `IDLE_HOURS = 12` - Hours of idle before auto-stop
+- `INSTANCE_IDS` - Comma-separated list of instances to monitor
+- `SNS_TOPIC_ARN` - For notifications
+
 ### Persistent Root Volumes (Spot Instances)
 
 Dev instances use **spot instances** for ~70% cost savings, with persistent EBS root volumes to preserve data.
@@ -248,7 +277,7 @@ Dev instances use **spot instances** for ~70% cost savings, with persistent EBS 
 
 **Persistent Volume IDs** (don't delete these!):
 - ARM (fcvm-metal-arm): `vol-09e5c3cee32bb67dc`
-- x86 (fcvm-metal-x86): TBD
+- x86 (fcvm-metal-x86): `vol-071f114b67441e776`
 
 **Why not automate in terraform?** Spot instances have complex state issues:
 - `persistent + stop`: Can stop manually, but sometimes gets stuck in "marked-for-stop" state

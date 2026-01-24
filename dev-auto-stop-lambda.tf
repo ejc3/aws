@@ -101,7 +101,7 @@ def check_and_stop_instance(instance_id):
             ec2.stop_instances(InstanceIds=[instance_id])
             notify(f"Auto-stopped {name}",
                    f"Instance {instance_id} ({name}) was idle for {IDLE_HOURS}+ hours (peak CPU: {peak_cpu:.2f}%) and has been stopped.")
-            return {'instance': instance_id, 'name': name, 'status': 'stopped', 'avg_cpu': avg_cpu}
+            return {'instance': instance_id, 'name': name, 'status': 'stopped', 'peak_cpu': peak_cpu}
         except Exception as e:
             error_msg = str(e)
             print(f"Failed to stop {instance_id}: {error_msg}")
@@ -221,7 +221,7 @@ resource "aws_lambda_function" "dev_auto_stop" {
         var.enable_x86_dev_instance ? aws_instance.x86_dev[0].id : ""
       ]))
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
-      IDLE_HOURS    = "8"
+      IDLE_HOURS    = "12"
     }
   }
 
