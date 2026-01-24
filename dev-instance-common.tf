@@ -406,4 +406,54 @@ SSHCONFIG
     chmod +x /tmp/user_data.sh
     /tmp/user_data.sh
   SCRIPT
+
+  # Persistent volume IDs for dev servers (manually swapped, not terraform-managed)
+  # These are the root volumes we preserve across spot instance recreation
+  arm_persistent_volume_arn = "arn:aws:ec2:us-west-1:928413605543:volume/vol-09e5c3cee32bb67dc"
+  x86_persistent_volume_arn = "arn:aws:ec2:us-west-1:928413605543:volume/vol-071f114b67441e776"
+}
+
+# ============================================
+# Backup Plan for Dev Server Persistent Volumes
+# ============================================
+
+resource "aws_backup_plan" "dev_servers" {
+  name = "dev-servers-backup"
+
+  rule {
+    rule_name         = "daily"
+    target_vault_name = "fcvm-backups"
+    schedule          = "cron(0 6 * * ? *)"  # 6 AM UTC daily
+    start_window      = 60
+    completion_window = 120
+
+    lifecycle {
+      delete_after = 7  # Keep daily backups for 7 days
+    }
+  }
+
+  rule {
+    rule_name         = "weekly"
+    target_vault_name = "fcvm-backups"
+    schedule          = "cron(0 6 ? * SUN *)"  # 6 AM UTC Sundays
+    start_window      = 60
+    completion_window = 120
+
+    lifecycle {
+      delete_after = 30  # Keep weekly backups for 30 days
+    }
+  }
+
+  tags = { Name = "dev-servers-backup" }
+}
+
+resource "aws_backup_selection" "dev_servers" {
+  name         = "dev-server-persistent-volumes"
+  plan_id      = aws_backup_plan.dev_servers.id
+  iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
+
+  resources = [
+    local.arm_persistent_volume_arn,
+    local.x86_persistent_volume_arn
+  ]
 }
