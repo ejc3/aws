@@ -264,38 +264,82 @@ Dev instances use **spot instances** for ~70% cost savings, with persistent EBS 
 **Our Approach**:
 1. Use spot with `persistent` type + `stop` interruption behavior
 2. Set `delete_on_termination = false` on root volume
-3. **Manual one-time volume swap** when instance is recreated:
-   ```bash
-   # After terraform creates new instance with fresh volume:
-   INSTANCE_ID="i-xxx"
-   PERSISTENT_VOL="vol-09e5c3cee32bb67dc"  # ARM dev server
+3. **Manual one-time volume swap** when instance is recreated
 
-   # Stop, swap, start
-   aws ec2 stop-instances --instance-ids $INSTANCE_ID
-   aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
+**CRITICAL: Spot Instance Restart Timing**
 
-   CURRENT_VOL=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-     --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' \
-     --output text)
+When you stop a persistent spot instance, AWS transitions the spot request state:
+- `active` / `fulfilled` → `disabled` / `instance-stopped-by-user`
 
-   aws ec2 detach-volume --volume-id $CURRENT_VOL
-   sleep 5
-   aws ec2 attach-volume --volume-id $PERSISTENT_VOL --instance-id $INSTANCE_ID --device /dev/sda1
-   sleep 5
-   aws ec2 start-instances --instance-ids $INSTANCE_ID
+**There is a DELAY in this transition!** If you try to `start-instances` before the transition completes, you get:
+```
+IncorrectSpotRequestState: You can't start the Spot Instance because the associated Spot Instance request is not in an appropriate state
+```
 
-   # Delete the temp volume
-   aws ec2 delete-volume --volume-id $CURRENT_VOL
-   ```
+**Solution**: Wait for the spot request to show `disabled` state before starting:
+```bash
+# Check spot request state
+aws ec2 describe-spot-instance-requests --region us-west-1 \
+  --query "SpotInstanceRequests[?InstanceId=='$INSTANCE_ID'].{State:State,Status:Status.Code}" \
+  --output table
+
+# Wait until it shows: State=disabled, Status=instance-stopped-by-user
+# Then start-instances will work
+```
+
+**Volume Swap Procedure** (after terraform creates new instance):
+```bash
+INSTANCE_ID="i-xxx"  # New instance ID from terraform output
+PERSISTENT_VOL="vol-09e5c3cee32bb67dc"  # ARM dev server
+
+# 1. Stop the new instance
+aws ec2 stop-instances --instance-ids $INSTANCE_ID --region us-west-1
+aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID --region us-west-1
+
+# 2. WAIT for spot request state transition (critical!)
+echo "Waiting for spot request to transition to disabled state..."
+while true; do
+  STATE=$(aws ec2 describe-spot-instance-requests --region us-west-1 \
+    --query "SpotInstanceRequests[?InstanceId=='$INSTANCE_ID'].State" --output text)
+  echo "Spot request state: $STATE"
+  if [ "$STATE" = "disabled" ]; then break; fi
+  sleep 5
+done
+
+# 3. Swap volumes
+CURRENT_VOL=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region us-west-1 \
+  --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' \
+  --output text)
+echo "Swapping $CURRENT_VOL -> $PERSISTENT_VOL"
+
+aws ec2 detach-volume --volume-id $CURRENT_VOL --region us-west-1
+sleep 10
+aws ec2 attach-volume --volume-id $PERSISTENT_VOL --instance-id $INSTANCE_ID \
+  --device /dev/sda1 --region us-west-1
+sleep 5
+
+# 4. Start instance (now it will work!)
+aws ec2 start-instances --instance-ids $INSTANCE_ID --region us-west-1
+
+# 5. Cleanup temp volume
+aws ec2 delete-volume --volume-id $CURRENT_VOL --region us-west-1
+
+# 6. Re-associate EIP (terraform loses the association on recreate)
+# ARM: eipalloc-034a515771765d101, x86: eipalloc-0173c9b5e3d294cc5
+EIP_ALLOC="eipalloc-034a515771765d101"  # ARM
+aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $EIP_ALLOC --region us-west-1
+
+# 7. Wait for instance and clear old SSH host key
+aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region us-west-1
+IP="184.72.40.255"  # ARM EIP
+ssh-keygen -R $IP
+ssh -i ~/.ssh/fcvm-ec2 -o StrictHostKeyChecking=accept-new ubuntu@$IP "hostname; uptime"
+echo "Done!"
+```
 
 **Persistent Volume IDs** (don't delete these!):
-- ARM (fcvm-metal-arm): `vol-09e5c3cee32bb67dc`
-- x86 (fcvm-metal-x86): `vol-071f114b67441e776`
-
-**Why not automate in terraform?** Spot instances have complex state issues:
-- `persistent + stop`: Can stop manually, but sometimes gets stuck in "marked-for-stop" state
-- `one-time + terminate`: Can't stop at all
-- Automating the swap in terraform triggers on every instance recreation, causing cascading failures
+- ARM (fcvm-metal-arm): `vol-09e5c3cee32bb67dc`, EIP: `184.72.40.255` (`eipalloc-034a515771765d101`)
+- x86 (fcvm-metal-x86): `vol-071f114b67441e776`, EIP: `50.18.109.164` (`eipalloc-0173c9b5e3d294cc5`)
 
 **When to run the manual swap**: After `terraform apply` creates a new instance (you'll see a new instance ID in the output). Check if data is missing, then run the swap.
 
