@@ -178,6 +178,33 @@ The jumpbox has separate root and home volumes:
 
 The home volume is backed up daily/weekly via AWS Backup.
 
+### ARM Dev Server Storage (fcvm-metal-arm)
+
+The ARM dev server (c7gd.metal) has instance NVMe storage for fast I/O:
+- **Root volume**: 300GB EBS (`/dev/nvme2n1`) - OS, persistent data
+- **NVMe 1**: 1.7TB (`/dev/nvme0n1`) - instance storage (ephemeral)
+- **NVMe 2**: 1.7TB (`/dev/nvme1n1`) - instance storage, mounted at `/mnt/fcvm-btrfs`
+
+**IMPORTANT**: The NVMe drives are ephemeral - data is lost on stop/start. Use for:
+- VM images and caches (`/mnt/fcvm-btrfs/image-cache`)
+- Build artifacts and temp files
+- Firecracker VM storage
+
+**Setup after instance start** (if NVMe not mounted):
+```bash
+# Check if already mounted
+mount | grep nvme1n1
+
+# If not mounted, format and mount:
+sudo mkfs.btrfs -f /dev/nvme1n1
+sudo mount /dev/nvme1n1 /mnt/fcvm-btrfs
+
+# Add to fstab (use nofail since ephemeral)
+echo '/dev/nvme1n1 /mnt/fcvm-btrfs btrfs defaults,nofail 0 0' | sudo tee -a /etc/fstab
+```
+
+**DO NOT** use loop device images (`/var/fcvm-btrfs.img`) - use NVMe directly for performance.
+
 ### SSH Access
 
 ```bash
