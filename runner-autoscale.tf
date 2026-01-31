@@ -336,6 +336,12 @@ locals {
 #!/bin/bash
 set -euxo pipefail
 
+# Disable apt auto-updates - they cause systemd daemon-reexec which kills runner services
+# This is critical: apt-daily-upgrade.service triggers daemon-reexec, stopping all services
+systemctl stop apt-daily.timer apt-daily-upgrade.timer || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer || true
+systemctl mask apt-daily.service apt-daily-upgrade.service || true
+
 # Console logging (for debugging via EC2 get-console-output)
 cat >> /etc/rsyslog.d/50-console.conf << 'RSYSLOG'
 *.emerg;*.alert;*.crit;*.err                    /dev/ttyS0
