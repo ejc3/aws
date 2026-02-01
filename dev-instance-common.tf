@@ -164,6 +164,15 @@ resource "aws_iam_role_policy" "dev_server" {
           "arn:aws:s3:::ejc3-dev-scripts",
           "arn:aws:s3:::ejc3-dev-scripts/*"
         ]
+      },
+      {
+        Sid    = "SESSendEmail"
+        Effect = "Allow"
+        Action = [
+          "ses:SendEmail",
+          "ses:SendRawEmail"
+        ]
+        Resource = "*"
       }
     ]
   })
