@@ -30,22 +30,22 @@ cat > /usr/local/bin/nvme-btrfs-setup.sh << 'SCRIPT'
 set -euo pipefail
 
 # Find NVMe device that's NOT the root disk
-ROOT_DEV=$$(lsblk -no PKNAME $$(findmnt -no SOURCE /) 2>/dev/null | head -1)
-NVME_DEV=$$(lsblk -dn -o NAME,TYPE | awk '$$2=="disk" && /^nvme/ {print $$1}' | grep -v "^$${ROOT_DEV}$$" | head -1)
+ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) 2>/dev/null | head -1)
+NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$${ROOT_DEV}$" | head -1)
 
-if [ -z "$$NVME_DEV" ]; then
+if [ -z "$NVME_DEV" ]; then
     echo "No NVMe instance storage found, skipping"
     exit 0
 fi
 
-echo "Setting up NVMe as btrfs: /dev/$$NVME_DEV"
+echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
 
 # Format as btrfs (always - NVMe is ephemeral)
-mkfs.btrfs -f /dev/$$NVME_DEV
+mkfs.btrfs -f /dev/$NVME_DEV
 
 # Mount
 mkdir -p /mnt/fcvm-btrfs
-mount /dev/$$NVME_DEV /mnt/fcvm-btrfs
+mount /dev/$NVME_DEV /mnt/fcvm-btrfs
 chmod 1777 /mnt/fcvm-btrfs
 
 # Create directory structure for fcvm
@@ -55,10 +55,10 @@ chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
 
 # Symlink podman containers to NVMe
 CONTAINERS_DIR="/home/ubuntu/.local/share/containers"
-if [ ! -L "$$CONTAINERS_DIR" ]; then
-    rm -rf "$$CONTAINERS_DIR"
+if [ ! -L "$CONTAINERS_DIR" ]; then
+    rm -rf "$CONTAINERS_DIR"
     mkdir -p /home/ubuntu/.local/share
-    ln -sf /mnt/fcvm-btrfs/containers "$$CONTAINERS_DIR"
+    ln -sf /mnt/fcvm-btrfs/containers "$CONTAINERS_DIR"
     chown -R ubuntu:ubuntu /home/ubuntu/.local
 fi
 
