@@ -194,7 +194,7 @@ resource "aws_lambda_function" "runner_webhook" {
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       USER_DATA_PARAM   = aws_ssm_parameter.runner_user_data[0].name
-      MAX_RUNNERS       = "4"  # Per architecture (4 ARM + 4 x86 = 8 total max)
+      MAX_RUNNERS       = "4" # Per architecture (4 ARM + 4 x86 = 8 total max)
       WEBHOOK_SECRET    = var.github_webhook_secret
     }
   }

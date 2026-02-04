@@ -50,6 +50,12 @@ locals {
   vpc_id = data.aws_vpc.selected.id
 }
 
+# IPv6 CIDR block for VPC (works with existing or new VPC)
+resource "aws_vpc_ipv6_cidr_block_association" "main" {
+  vpc_id                           = local.vpc_id
+  assign_generated_ipv6_cidr_block = true
+}
+
 # Internet Gateway
 resource "aws_internet_gateway" "main" {
   vpc_id = local.vpc_id
@@ -68,6 +74,11 @@ resource "aws_route_table" "public" {
     gateway_id = aws_internet_gateway.main.id
   }
 
+  route {
+    ipv6_cidr_block = "::/0"
+    gateway_id      = aws_internet_gateway.main.id
+  }
+
   tags = {
     Name = "${var.project_name}-public-rt"
   }
@@ -84,6 +95,10 @@ resource "aws_subnet" "subnet_a" {
   vpc_id            = local.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = data.aws_availability_zones.available.names[0]
+
+  # IPv6 support
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block, 8, 1)
+  assign_ipv6_address_on_creation = true
 
   tags = {
     Name = "${var.project_name}-subnet-a"

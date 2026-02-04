@@ -432,24 +432,24 @@ resource "aws_backup_plan" "dev_servers" {
   rule {
     rule_name         = "daily"
     target_vault_name = "fcvm-backups"
-    schedule          = "cron(0 6 * * ? *)"  # 6 AM UTC daily
+    schedule          = "cron(0 6 * * ? *)" # 6 AM UTC daily
     start_window      = 60
     completion_window = 120
 
     lifecycle {
-      delete_after = 7  # Keep daily backups for 7 days
+      delete_after = 7 # Keep daily backups for 7 days
     }
   }
 
   rule {
     rule_name         = "weekly"
     target_vault_name = "fcvm-backups"
-    schedule          = "cron(0 6 ? * SUN *)"  # 6 AM UTC Sundays
+    schedule          = "cron(0 6 ? * SUN *)" # 6 AM UTC Sundays
     start_window      = 60
     completion_window = 120
 
     lifecycle {
-      delete_after = 30  # Keep weekly backups for 30 days
+      delete_after = 30 # Keep weekly backups for 30 days
     }
   }
 

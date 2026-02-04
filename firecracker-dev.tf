@@ -49,28 +49,31 @@ resource "aws_security_group" "firecracker_dev" {
 
   # SSH access
   ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "SSH access"
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "SSH access"
   }
 
   # Eternal Terminal (persistent SSH sessions)
   ingress {
-    from_port   = 2022
-    to_port     = 2022
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Eternal Terminal"
+    from_port        = 2022
+    to_port          = 2022
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "Eternal Terminal"
   }
 
   # All outbound traffic for package installs, etc.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
   }
 
   tags = {
@@ -128,7 +131,7 @@ BOOTSTRAP
   )
 
   # Monitoring
-  monitoring = true  # 1-minute detailed monitoring
+  monitoring = true # 1-minute detailed monitoring
 
   tags = {
     Name = "fcvm-metal-arm"

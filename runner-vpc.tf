@@ -2,10 +2,11 @@
 # No connectivity to main VPC - internet only
 
 resource "aws_vpc" "runner" {
-  count                = var.enable_github_runner ? 1 : 0
-  cidr_block           = "10.1.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+  count                            = var.enable_github_runner ? 1 : 0
+  cidr_block                       = "10.1.0.0/16"
+  enable_dns_hostnames             = true
+  enable_dns_support               = true
+  assign_generated_ipv6_cidr_block = true
 
   tags = {
     Name = "github-runner-vpc"
@@ -28,6 +29,10 @@ resource "aws_subnet" "runner" {
   availability_zone       = "us-west-1a"
   map_public_ip_on_launch = true
 
+  # IPv6 support
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc.runner[0].ipv6_cidr_block, 8, 1)
+  assign_ipv6_address_on_creation = true
+
   tags = {
     Name = "github-runner-subnet"
   }
@@ -40,6 +45,11 @@ resource "aws_route_table" "runner" {
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.runner[0].id
+  }
+
+  route {
+    ipv6_cidr_block = "::/0"
+    gateway_id      = aws_internet_gateway.runner[0].id
   }
 
   tags = {
@@ -61,19 +71,21 @@ resource "aws_security_group" "runner" {
   vpc_id      = aws_vpc.runner[0].id
 
   ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "SSH access for debugging"
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "SSH access for debugging"
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Internet access"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "Internet access"
   }
 
   tags = {

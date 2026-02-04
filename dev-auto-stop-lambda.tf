@@ -193,9 +193,9 @@ resource "aws_iam_role_policy" "dev_auto_stop" {
         Resource = "*"
       },
       {
-        Sid    = "SNSPublish"
-        Effect = "Allow"
-        Action = "sns:Publish"
+        Sid      = "SNSPublish"
+        Effect   = "Allow"
+        Action   = "sns:Publish"
         Resource = aws_sns_topic.cost_alerts.arn
       }
     ]
@@ -216,7 +216,7 @@ resource "aws_lambda_function" "dev_auto_stop" {
 
   environment {
     variables = {
-      INSTANCE_IDS  = join(",", compact([
+      INSTANCE_IDS = join(",", compact([
         var.enable_firecracker_instance ? aws_instance.firecracker_dev[0].id : "",
         var.enable_x86_dev_instance ? aws_instance.x86_dev[0].id : ""
       ]))
