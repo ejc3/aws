@@ -77,18 +77,20 @@ def check_and_stop_instance(instance_id):
             Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
             StartTime=start_time,
             EndTime=end_time,
-            Period=3600,  # 1 hour
+            Period=300,  # 5 minutes - catches short compile bursts on 64-core metal
             Statistics=['Maximum']  # Use max, not avg - a 5min compile burst should count
         )
 
         datapoints = metrics.get('Datapoints', [])
+        # With 5-min periods over IDLE_HOURS, expect IDLE_HOURS*12 datapoints
+        # Require at least IDLE_HOURS worth (one per hour minimum)
         if len(datapoints) < IDLE_HOURS:
             return {'instance': instance_id, 'name': name, 'status': 'insufficient_data',
                     'datapoints': len(datapoints)}
 
-        # Check if ANY hour had CPU >= 5% (using hourly max, not avg)
-        max_per_hour = [d['Maximum'] for d in datapoints]
-        peak_cpu = max(max_per_hour)
+        # Check if ANY 5-min window had CPU >= 5%
+        max_per_period = [d['Maximum'] for d in datapoints]
+        peak_cpu = max(max_per_period)
 
         if peak_cpu >= 5.0:
             return {'instance': instance_id, 'name': name, 'status': 'active',
