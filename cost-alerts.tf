@@ -190,6 +190,44 @@ resource "aws_sns_topic" "cost_alerts" {
   name = "cost-alerts"
 }
 
+resource "aws_sns_topic_policy" "cost_alerts" {
+  arn = aws_sns_topic.cost_alerts.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DefaultPolicy"
+        Effect    = "Allow"
+        Principal = { AWS = "*" }
+        Action = [
+          "SNS:GetTopicAttributes",
+          "SNS:SetTopicAttributes",
+          "SNS:AddPermission",
+          "SNS:RemovePermission",
+          "SNS:DeleteTopic",
+          "SNS:Subscribe",
+          "SNS:ListSubscriptionsByTopic",
+          "SNS:Publish"
+        ]
+        Resource  = aws_sns_topic.cost_alerts.arn
+        Condition = {
+          StringEquals = {
+            "AWS:SourceOwner" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      {
+        Sid       = "AllowBudgetsPublish"
+        Effect    = "Allow"
+        Principal = { Service = "budgets.amazonaws.com" }
+        Action    = "SNS:Publish"
+        Resource  = aws_sns_topic.cost_alerts.arn
+      }
+    ]
+  })
+}
+
 resource "aws_sns_topic_subscription" "cost_alerts_email" {
   topic_arn = aws_sns_topic.cost_alerts.arn
   protocol  = "email"
