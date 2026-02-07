@@ -356,10 +356,16 @@ sysctl -w kernel.printk="7 4 1 7" || true
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
 if [ -n "$NVME_DEV" ]; then
-  # Skip if already mounted (from AMI)
-  if mountpoint -q /mnt/fcvm-btrfs; then
+  # Check if already mounted with real NVMe (not loop device from AMI)
+  CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
+  if [[ "$CURRENT_MOUNT" == /dev/nvme* ]]; then
     echo "NVMe already mounted at /mnt/fcvm-btrfs, skipping setup"
   else
+    # Unmount loop device if present (AMI has baked-in loop mount)
+    if mountpoint -q /mnt/fcvm-btrfs; then
+      echo "Replacing loop mount with real NVMe"
+      umount /mnt/fcvm-btrfs || true
+    fi
     echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
     # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
     which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
