@@ -51,14 +51,16 @@ data "archive_file" "runner_webhook" {
           ).hexdigest()
           return hmac.compare_digest(expected, signature)
 
-      def get_running_runners():
-          """Count running runner instances"""
-          response = ec2.describe_instances(
-              Filters=[
-                  {'Name': 'tag:Role', 'Values': ['github-runner']},
-                  {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
-              ]
-          )
+      def get_running_runners(arch=None):
+          """Count running runner instances, optionally filtered by architecture"""
+          filters = [
+              {'Name': 'tag:Role', 'Values': ['github-runner']},
+              {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+          ]
+          if arch:
+              name_value = f'github-runner-{arch}'
+              filters.append({'Name': 'tag:Name', 'Values': [name_value]})
+          response = ec2.describe_instances(Filters=filters)
           count = sum(len(r['Instances']) for r in response['Reservations'])
           return count
 
@@ -142,11 +144,12 @@ data "archive_file" "runner_webhook" {
           body = event.get('body', '{}')
           headers = event.get('headers', {})
 
-          # Verify signature
-          signature = headers.get('x-hub-signature-256', '')
-          secret = os.environ.get('WEBHOOK_SECRET', '')
-          if not verify_signature(body, signature, secret):
-              return {'statusCode': 401, 'body': 'Invalid signature'}
+          # Verify signature (skip for internal invocations from cleanup Lambda)
+          if headers.get('x-internal-invoke') != 'cleanup-retry':
+              signature = headers.get('x-hub-signature-256', '')
+              secret = os.environ.get('WEBHOOK_SECRET', '')
+              if not verify_signature(body, signature, secret):
+                  return {'statusCode': 401, 'body': 'Invalid signature'}
 
           payload = json.loads(body)
           action = payload.get('action', '')
@@ -160,12 +163,12 @@ data "archive_file" "runner_webhook" {
           labels = workflow_job.get('labels', [])
           arch = detect_architecture(labels)
 
-          # Check current runner count
+          # Check per-architecture runner count
           max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
-          running = get_running_runners()
+          running = get_running_runners(arch)
 
           if running >= max_runners:
-              return {'statusCode': 200, 'body': f'Max runners ({max_runners}) reached'}
+              return {'statusCode': 200, 'body': f'Max {arch} runners ({max_runners}) reached'}
 
           # Launch new runner for detected architecture
           spot_id, instance_type = launch_runner(arch)
@@ -253,6 +256,11 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:us-west-1:928413605543:parameter/github-runner/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = "arn:aws:lambda:us-west-1:928413605543:function:github-runner-webhook"
       }
     ]
   })
@@ -485,6 +493,7 @@ data "archive_file" "runner_cleanup" {
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
+      lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
       # Lease duration - busy runners get extended, idle runners expire
@@ -666,7 +675,63 @@ data "archive_file" "runner_cleanup" {
                       ec2.terminate_instances(InstanceIds=[instance_id])
                       ami_builder_terminated.append(instance_id)
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated}
+          # Phase 4: Check for queued GitHub jobs and launch runners
+          # This retries runner launches that failed (e.g. spot quota exceeded)
+          # GitHub does NOT retry webhooks, so we poll every 5 minutes
+          launched = []
+          if pat:
+              try:
+                  url = f'https://api.github.com/repos/{REPO}/actions/runs?status=queued&per_page=10'
+                  req = urllib.request.Request(url, headers={
+                      'Authorization': f'token {pat}',
+                      'Accept': 'application/vnd.github.v3+json'
+                  })
+                  with urllib.request.urlopen(req) as resp:
+                      data = json.loads(resp.read())
+                      queued_runs = data.get('workflow_runs', [])
+
+                  if queued_runs:
+                      # Find which architectures have queued self-hosted jobs
+                      archs_needed = set()
+                      for run in queued_runs[:5]:  # Limit API calls
+                          jobs_url = f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/jobs'
+                          jobs_req = urllib.request.Request(jobs_url, headers={
+                              'Authorization': f'token {pat}',
+                              'Accept': 'application/vnd.github.v3+json'
+                          })
+                          with urllib.request.urlopen(jobs_req) as jobs_resp:
+                              jobs_data = json.loads(jobs_resp.read())
+                              for job in jobs_data.get('jobs', []):
+                                  if job['status'] == 'queued':
+                                      labels = [l.lower() for l in job.get('labels', [])]
+                                      if 'self-hosted' in labels:
+                                          if 'x64' in labels or 'x86_64' in labels or 'amd64' in labels:
+                                              archs_needed.add('x86_64')
+                                          else:
+                                              archs_needed.add('arm64')
+
+                      # Invoke webhook Lambda for each architecture needed
+                      webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
+                      for arch in archs_needed:
+                          labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
+                          payload = {
+                              'body': json.dumps({'action': 'queued', 'workflow_job': {'labels': labels}}),
+                              'headers': {'x-internal-invoke': 'cleanup-retry'}
+                          }
+                          print(f'Retrying runner launch for {arch} (queued jobs found)')
+                          try:
+                              lambda_client.invoke(
+                                  FunctionName=webhook_fn,
+                                  InvocationType='Event',
+                                  Payload=json.dumps(payload)
+                              )
+                              launched.append(arch)
+                          except Exception as e:
+                              print(f'Failed to invoke webhook for {arch}: {e}')
+              except Exception as e:
+                  print(f'Failed to check queued jobs: {e}')
+
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
     EOF
     filename = "lambda_function.py"
   }
@@ -681,6 +746,12 @@ resource "aws_lambda_function" "runner_cleanup" {
   handler          = "lambda_function.handler"
   runtime          = "python3.12"
   timeout          = 60
+
+  environment {
+    variables = {
+      WEBHOOK_FUNCTION = var.enable_github_runner ? aws_lambda_function.runner_webhook[0].function_name : ""
+    }
+  }
 
   tags = {
     Name = "github-runner-cleanup"
