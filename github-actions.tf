@@ -60,6 +60,7 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
           "apigateway:GET",
           "budgets:View*",
           "budgets:Describe*",
+          "budgets:List*",
           "ses:Get*",
           "ses:List*",
           "ssm:GetParameter*",
