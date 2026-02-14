@@ -64,9 +64,14 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
           "ses:List*",
           "ssm:GetParameter*",
           "ssm:DescribeParameters",
+          "ssm:ListTagsForResource",
           "backup:Describe*",
           "backup:Get*",
           "backup:List*",
+          "events:Describe*",
+          "events:List*",
+          "sns:Get*",
+          "sns:List*",
           "sms-voice:Describe*"
         ]
         Resource = "*"
