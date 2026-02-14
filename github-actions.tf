@@ -72,10 +72,23 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Resource = "*"
       },
       {
-        Sid      = "TerraformState"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
-        Resource = "arn:aws:s3:::aws-infrastructure-*-tf-state/*"
+        Sid    = "TerraformState"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::aws-infrastructure-*-tf-state",
+          "arn:aws:s3:::aws-infrastructure-*-tf-state/*"
+        ]
+      },
+      {
+        Sid    = "TerraformLock"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = "arn:aws:dynamodb:us-west-1:928413605543:table/ejc3-terraform-locks"
       },
       {
         Sid    = "AMIBuilder"
