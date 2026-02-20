@@ -29,23 +29,30 @@ cat > /usr/local/bin/nvme-btrfs-setup.sh << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
-# Find NVMe device that's NOT the root disk
+# Find NVMe devices that are NOT the root disk
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) 2>/dev/null | head -1)
-NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$${ROOT_DEV}$" | head -1)
+NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$${ROOT_DEV}$")
+NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
 
-if [ -z "$NVME_DEV" ]; then
+if [ "$NVME_COUNT" -eq 0 ]; then
     echo "No NVMe instance storage found, skipping"
     exit 0
 fi
 
-echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
-
-# Format as btrfs (always - NVMe is ephemeral)
-mkfs.btrfs -f /dev/$NVME_DEV
-
-# Mount
-mkdir -p /mnt/fcvm-btrfs
-mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+if [ "$NVME_COUNT" -ge 2 ]; then
+    # RAID0 multiple NVMe drives for maximum throughput
+    NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
+    echo "Setting up btrfs RAID0 across $NVME_COUNT NVMe drives: $NVME_PATHS"
+    mkfs.btrfs -f -d raid0 -m raid0 $NVME_PATHS
+    mkdir -p /mnt/fcvm-btrfs
+    mount $(echo "$NVME_PATHS" | awk '{print $1}') /mnt/fcvm-btrfs
+else
+    NVME_DEV=$(echo "$NVME_DEVS" | head -1)
+    echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
+    mkfs.btrfs -f /dev/$NVME_DEV
+    mkdir -p /mnt/fcvm-btrfs
+    mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+fi
 chmod 1777 /mnt/fcvm-btrfs
 
 # Create directory structure for fcvm
@@ -144,6 +151,15 @@ echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
 # Disable AppArmor restriction on unprivileged user namespaces (required for rootless podman/fcvm)
 sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 echo "kernel.apparmor_restrict_unprivileged_userns=0" >> /etc/sysctl.conf
+
+# Raise dirty_ratio to prevent writeback throttling during concurrent snapshot creation.
+# Default dirty_ratio=20% causes kernel to throttle all writers when dirty pages exceed
+# 20% of RAM. With many VMs snapshotting simultaneously (CI), this stalls snapshots for
+# 100+ seconds. At 80%, most snapshot workloads complete at memory speed.
+sysctl -w vm.dirty_ratio=80
+sysctl -w vm.dirty_background_ratio=50
+echo "vm.dirty_ratio=80" >> /etc/sysctl.conf
+echo "vm.dirty_background_ratio=50" >> /etc/sysctl.conf
 
 # Shell setup
 sudo -u ubuntu bash << 'SHELL'
@@ -262,6 +278,12 @@ echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
 # Disable AppArmor restriction on unprivileged user namespaces (required for rootless podman/fcvm)
 sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 echo "kernel.apparmor_restrict_unprivileged_userns=0" >> /etc/sysctl.conf
+
+# Raise dirty_ratio to prevent writeback throttling during concurrent snapshot creation.
+sysctl -w vm.dirty_ratio=80
+sysctl -w vm.dirty_background_ratio=50
+echo "vm.dirty_ratio=80" >> /etc/sysctl.conf
+echo "vm.dirty_background_ratio=50" >> /etc/sysctl.conf
 
 # Shell setup
 sudo -u ubuntu bash << 'SHELL'

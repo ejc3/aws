@@ -361,9 +361,11 @@ sysctl -w kernel.printk="7 4 1 7" || true
 
 # Mount NVMe instance storage as btrfs at /mnt/fcvm-btrfs
 # This is where fcvm expects its data (CoW reflinks require btrfs)
+# Uses RAID0 when multiple NVMe drives are available for 2x throughput
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
-NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
-if [ -n "$NVME_DEV" ]; then
+NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$")
+NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
+if [ "$NVME_COUNT" -gt 0 ]; then
   # Check if already mounted with real NVMe (not loop device from AMI)
   CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
   if [[ "$CURRENT_MOUNT" == /dev/nvme* ]]; then
@@ -374,12 +376,21 @@ if [ -n "$NVME_DEV" ]; then
       echo "Replacing loop mount with real NVMe"
       umount /mnt/fcvm-btrfs || true
     fi
-    echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
     # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
     which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
-    mkfs.btrfs -f /dev/$NVME_DEV
     mkdir -p /mnt/fcvm-btrfs
-    mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+    if [ "$NVME_COUNT" -ge 2 ]; then
+      # RAID0 multiple NVMe drives for maximum throughput
+      NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
+      echo "Setting up btrfs RAID0 across $NVME_COUNT NVMe drives: $NVME_PATHS"
+      mkfs.btrfs -f -d raid0 -m raid0 $NVME_PATHS
+      mount $(echo "$NVME_PATHS" | awk '{print $1}') /mnt/fcvm-btrfs
+    else
+      NVME_DEV=$(echo "$NVME_DEVS" | head -1)
+      echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
+      mkfs.btrfs -f /dev/$NVME_DEV
+      mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+    fi
     chmod 1777 /mnt/fcvm-btrfs
   fi
 
@@ -409,6 +420,11 @@ chmod 666 /dev/userfaultfd
 sysctl -w vm.unprivileged_userfaultfd=1
 sysctl -w kernel.unprivileged_userns_clone=1 || true
 iptables -P FORWARD ACCEPT || true
+
+# Raise dirty_ratio to prevent writeback throttling during concurrent snapshot creation.
+# Default 20% causes 100+ second stalls when many VMs snapshot simultaneously.
+sysctl -w vm.dirty_ratio=80
+sysctl -w vm.dirty_background_ratio=50
 
 # Fix podman rootless - deduplicate subuid/subgid (AMI has duplicates)
 sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
