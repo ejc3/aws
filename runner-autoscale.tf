@@ -344,45 +344,36 @@ locals {
 #!/bin/bash
 set -euxo pipefail
 
-# Disable apt auto-updates - they cause systemd daemon-reexec which kills runner services
-# This is critical: apt-daily-upgrade.service triggers daemon-reexec, stopping all services
+# Disable apt auto-updates (daemon-reexec kills runner services)
 systemctl stop apt-daily.timer apt-daily-upgrade.timer || true
 systemctl disable apt-daily.timer apt-daily-upgrade.timer || true
 systemctl mask apt-daily.service apt-daily-upgrade.service || true
 
-# Console logging (for debugging via EC2 get-console-output)
+# Console logging
 cat >> /etc/rsyslog.d/50-console.conf << 'RSYSLOG'
-*.emerg;*.alert;*.crit;*.err                    /dev/ttyS0
-kern.*                                           /dev/ttyS0
+*.emerg;*.alert;*.crit;*.err /dev/ttyS0
+kern.* /dev/ttyS0
 RSYSLOG
 systemctl restart rsyslog || true
-echo "kernel.printk = 7 4 1 7" >> /etc/sysctl.conf
 sysctl -w kernel.printk="7 4 1 7" || true
 
-# Mount NVMe instance storage as btrfs at /mnt/fcvm-btrfs
-# This is where fcvm expects its data (CoW reflinks require btrfs)
-# Uses RAID0 when multiple NVMe drives are available for 2x throughput
+# Mount NVMe as btrfs RAID0 at /mnt/fcvm-btrfs
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$")
 NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
 if [ "$NVME_COUNT" -gt 0 ]; then
-  # Check if already mounted with real NVMe (not loop device from AMI)
   CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
-  if [[ "$CURRENT_MOUNT" == /dev/nvme* ]]; then
-    echo "NVMe already mounted at /mnt/fcvm-btrfs, skipping setup"
+  BTRFS_DEVS=$(btrfs filesystem show /mnt/fcvm-btrfs 2>/dev/null | grep -c 'devid' || echo 0)
+  if [[ "$CURRENT_MOUNT" == /dev/nvme* ]] && [ "$BTRFS_DEVS" -ge "$NVME_COUNT" ]; then
+    echo "RAID0 already mounted ($BTRFS_DEVS devices), skipping"
   else
-    # Unmount loop device if present (AMI has baked-in loop mount)
-    if mountpoint -q /mnt/fcvm-btrfs; then
-      echo "Replacing loop mount with real NVMe"
-      umount /mnt/fcvm-btrfs || true
-    fi
-    # Install btrfs-progs if not present (gives flexibility without AMI rebuild)
-    which mkfs.btrfs || apt-get update && apt-get install -y btrfs-progs
+    # Unmount existing (loop from AMI or single-NVMe from old service)
+    mountpoint -q /mnt/fcvm-btrfs && umount /mnt/fcvm-btrfs || true
+    which mkfs.btrfs || apt-get install -y btrfs-progs
     mkdir -p /mnt/fcvm-btrfs
     if [ "$NVME_COUNT" -ge 2 ]; then
-      # RAID0 multiple NVMe drives for maximum throughput
       NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
-      echo "Setting up btrfs RAID0 across $NVME_COUNT NVMe drives: $NVME_PATHS"
+      echo "RAID0 across $NVME_COUNT NVMe: $NVME_PATHS"
       mkfs.btrfs -f -d raid0 -m raid0 $NVME_PATHS
       mount $(echo "$NVME_PATHS" | awk '{print $1}') /mnt/fcvm-btrfs
     else
@@ -394,23 +385,12 @@ if [ "$NVME_COUNT" -gt 0 ]; then
     chmod 1777 /mnt/fcvm-btrfs
   fi
 
-  # Create fcvm directory structure
-  mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache}
+  mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache,containers,cargo-target}
   chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
-
-  # Also set up containers and cargo on NVMe (separate ext4 partition would be better but single disk)
-  mkdir -p /mnt/fcvm-btrfs/containers /mnt/fcvm-btrfs/cargo-target
-  chown ubuntu:ubuntu /mnt/fcvm-btrfs/containers /mnt/fcvm-btrfs/cargo-target
-
-  # Podman containers on NVMe
   mkdir -p /home/ubuntu/.local/share
   ln -sf /mnt/fcvm-btrfs/containers /home/ubuntu/.local/share/containers
   chown -R ubuntu:ubuntu /home/ubuntu/.local
-
-  # Cargo target dir on NVMe
   echo 'export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target' >> /home/ubuntu/.bashrc
-else
-  echo "WARNING: No NVMe found - will use loopback btrfs (slower, limited space)"
 fi
 
 # Runtime permissions
@@ -421,19 +401,14 @@ sysctl -w vm.unprivileged_userfaultfd=1
 sysctl -w kernel.unprivileged_userns_clone=1 || true
 iptables -P FORWARD ACCEPT || true
 
-# Raise dirty_ratio to prevent writeback throttling during concurrent snapshot creation.
-# Default 20% causes 100+ second stalls when many VMs snapshot simultaneously.
+# Raise dirty_ratio to prevent writeback throttling during snapshot creation
 sysctl -w vm.dirty_ratio=80
 sysctl -w vm.dirty_background_ratio=50
 
-# Fix podman rootless - deduplicate subuid/subgid (AMI has duplicates)
+# Fix podman rootless, enable linger, SSH keys
 sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
 sort -u /etc/subgid > /tmp/subgid && mv /tmp/subgid /etc/subgid
-
-# Enable linger so user processes survive SSH logout
 loginctl enable-linger ubuntu
-
-# SSH keys: jumpbox (fcvm-ec2) + dev servers can access runners
 mkdir -p /home/ubuntu/.ssh
 echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
 echo "${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
@@ -441,15 +416,11 @@ chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-# Start SSM agent (snap-based, kernel has squashfs)
 snap start amazon-ssm-agent || true
-
-# Get instance ID and architecture
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 ARCH=$(uname -m)
 
-# Determine runner architecture and label
 if [ "$ARCH" = "aarch64" ]; then
   RUNNER_ARCH="arm64"
   RUNNER_LABEL="ARM64"
@@ -458,7 +429,6 @@ else
   RUNNER_LABEL="X64"
 fi
 
-# Download latest runner from GitHub releases
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
 RUNNER_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-$${RUNNER_ARCH}-$${RUNNER_VERSION}.tar.gz"
 mkdir -p /opt/actions-runner
@@ -466,7 +436,6 @@ cd /opt/actions-runner
 curl -sL "$RUNNER_URL" | tar xz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
-# Register and start runner
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
