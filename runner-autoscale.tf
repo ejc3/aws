@@ -109,8 +109,13 @@ data "archive_file" "runner_webhook" {
                       ImageId=ami_id,
                       InstanceType=instance_type,
                       KeyName='fcvm-ec2',
-                      SubnetId=os.environ['SUBNET_ID'],
-                      SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
+                      NetworkInterfaces=[{
+                          'DeviceIndex': 0,
+                          'SubnetId': os.environ['SUBNET_ID'],
+                          'Groups': [os.environ['SECURITY_GROUP_ID']],
+                          'AssociatePublicIpAddress': True,
+                          'Ipv6PrefixCount': 1,
+                      }],
                       IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
                       BlockDeviceMappings=[{
                           'DeviceName': '/dev/sda1',

@@ -138,6 +138,15 @@ resource "aws_iam_role_policy" "dev_server" {
         Resource = "*"
       },
       {
+        Sid    = "EC2AssignIpv6Prefix"
+        Effect = "Allow"
+        Action = [
+          "ec2:AssignIpv6Addresses",
+          "ec2:UnassignIpv6Addresses"
+        ]
+        Resource = "arn:aws:ec2:us-west-1:928413605543:network-interface/*"
+      },
+      {
         Sid    = "EC2ManageRunners"
         Effect = "Allow"
         Action = [

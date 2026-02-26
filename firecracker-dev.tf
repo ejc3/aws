@@ -81,6 +81,18 @@ resource "aws_security_group" "firecracker_dev" {
   }
 }
 
+# Network interface with IPv6 /64 prefix for routed mode VMs
+resource "aws_network_interface" "firecracker_dev" {
+  count             = var.enable_firecracker_instance ? 1 : 0
+  subnet_id         = aws_subnet.subnet_a.id
+  security_groups   = [aws_security_group.firecracker_dev[0].id]
+  ipv6_prefix_count = 1
+
+  tags = {
+    Name = "fcvm-metal-arm-eni"
+  }
+}
+
 # Firecracker dev instance
 resource "aws_instance" "firecracker_dev" {
   count         = var.enable_firecracker_instance ? 1 : 0
@@ -88,10 +100,11 @@ resource "aws_instance" "firecracker_dev" {
   instance_type = var.firecracker_instance_type
   key_name      = var.firecracker_key_name
 
-  # Network configuration
-  subnet_id                   = aws_subnet.subnet_a.id
-  vpc_security_group_ids      = [aws_security_group.firecracker_dev[0].id]
-  associate_public_ip_address = true
+  # Network configuration - uses explicit ENI for IPv6 /64 prefix delegation
+  network_interface {
+    network_interface_id = aws_network_interface.firecracker_dev[0].id
+    device_index         = 0
+  }
 
   # IAM role - restricted (SSM to runners only, not admin)
   iam_instance_profile = aws_iam_instance_profile.dev_server.name
