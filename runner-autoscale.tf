@@ -52,10 +52,10 @@ data "archive_file" "runner_webhook" {
           return hmac.compare_digest(expected, signature)
 
       def get_running_runners(arch=None):
-          """Count running runner instances, optionally filtered by architecture"""
+          """Count runner instances in any non-terminated state"""
           filters = [
               {'Name': 'tag:Role', 'Values': ['github-runner']},
-              {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+              {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
           ]
           if arch:
               name_value = f'github-runner-{arch}'
@@ -196,6 +196,10 @@ resource "aws_lambda_function" "runner_webhook" {
   handler          = "lambda_function.handler"
   runtime          = "python3.12"
   timeout          = 30
+
+  # Serialize webhook processing to prevent race condition where concurrent
+  # invocations all read the same runner count and over-launch instances
+  reserved_concurrent_executions = 1
 
   environment {
     variables = {
