@@ -55,7 +55,7 @@ data "archive_file" "runner_webhook" {
           """Count runner instances in any non-terminated state"""
           filters = [
               {'Name': 'tag:Role', 'Values': ['github-runner']},
-              {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
+              {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
           ]
           if arch:
               name_value = f'github-runner-{arch}'
