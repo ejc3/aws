@@ -410,6 +410,15 @@ sysctl -w vm.unprivileged_userfaultfd=1
 sysctl -w kernel.unprivileged_userns_clone=1 || true
 iptables -P FORWARD ACCEPT || true
 
+# Assign a global IPv6 address to the ENI
+# AWS run_instances can't set both Ipv6AddressCount and Ipv6PrefixCount in the same
+# NetworkInterfaces entry, so we assign the IPv6 address post-launch.
+TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
+ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
+aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION" && echo "IPv6 address assigned to $ENI_ID"
+
 # Raise dirty_ratio to prevent writeback throttling during snapshot creation
 sysctl -w vm.dirty_ratio=80
 sysctl -w vm.dirty_background_ratio=50

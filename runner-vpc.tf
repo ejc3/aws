@@ -121,11 +121,22 @@ resource "aws_iam_role_policy" "runner" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "ssm:GetParameter"
-      Resource = aws_ssm_parameter.github_runner_pat[0].arn
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = aws_ssm_parameter.github_runner_pat[0].arn
+      },
+      {
+        Sid      = "AssignIpv6"
+        Effect   = "Allow"
+        Action   = [
+          "ec2:AssignIpv6Addresses",
+          "ec2:DescribeNetworkInterfaces"
+        ]
+        Resource = "*"
+      }
+    ]
   })
 }
 
