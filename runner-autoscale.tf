@@ -114,7 +114,6 @@ data "archive_file" "runner_webhook" {
                           'SubnetId': os.environ['SUBNET_ID'],
                           'Groups': [os.environ['SECURITY_GROUP_ID']],
                           'AssociatePublicIpAddress': True,
-                          'Ipv6AddressCount': 1,
                           'Ipv6PrefixCount': 1,
                       }],
                       IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
