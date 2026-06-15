@@ -182,6 +182,32 @@ resource "aws_iam_role_policy" "dev_server" {
           "ses:SendRawEmail"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "CodeArtifact"
+        Effect = "Allow"
+        Action = [
+          "codeartifact:GetAuthorizationToken",
+          "codeartifact:GetRepositoryEndpoint",
+          "codeartifact:ReadFromRepository",
+          "codeartifact:PublishPackageVersion",
+          "codeartifact:PutPackageMetadata",
+          "codeartifact:DescribePackageVersion",
+          "codeartifact:ListPackageVersions",
+          "codeartifact:ListPackages"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "CodeArtifactToken"
+        Effect   = "Allow"
+        Action   = "sts:GetServiceBearerToken"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "sts:AWSServiceName" = "codeartifact.amazonaws.com"
+          }
+        }
       }
     ]
   })

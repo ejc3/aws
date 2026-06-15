@@ -115,6 +115,32 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Effect   = "Allow"
         Action   = "iam:PassRole"
         Resource = aws_iam_role.jumpbox_admin[0].arn
+      },
+      {
+        Sid    = "CodeArtifact"
+        Effect = "Allow"
+        Action = [
+          "codeartifact:GetAuthorizationToken",
+          "codeartifact:GetRepositoryEndpoint",
+          "codeartifact:ReadFromRepository",
+          "codeartifact:PublishPackageVersion",
+          "codeartifact:PutPackageMetadata",
+          "codeartifact:DescribePackageVersion",
+          "codeartifact:ListPackageVersions",
+          "codeartifact:ListPackages"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "CodeArtifactToken"
+        Effect   = "Allow"
+        Action   = "sts:GetServiceBearerToken"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "sts:AWSServiceName" = "codeartifact.amazonaws.com"
+          }
+        }
       }
     ]
   })
