@@ -77,7 +77,8 @@ resource "aws_codeartifact_repository_permissions_policy" "npm" {
           "codeartifact:GetPackageVersionReadme",
           "codeartifact:GetRepositoryEndpoint",
           "codeartifact:ListPackageVersions",
-          "codeartifact:ListPackages"
+          "codeartifact:ListPackages",
+          "codeartifact:DeletePackageVersions"
         ]
         Resource = "*"
       }

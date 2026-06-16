@@ -194,7 +194,8 @@ resource "aws_iam_role_policy" "dev_server" {
           "codeartifact:PutPackageMetadata",
           "codeartifact:DescribePackageVersion",
           "codeartifact:ListPackageVersions",
-          "codeartifact:ListPackages"
+          "codeartifact:ListPackages",
+          "codeartifact:DeletePackageVersions"
         ]
         Resource = "*"
       },

@@ -127,7 +127,8 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
           "codeartifact:PutPackageMetadata",
           "codeartifact:DescribePackageVersion",
           "codeartifact:ListPackageVersions",
-          "codeartifact:ListPackages"
+          "codeartifact:ListPackages",
+          "codeartifact:DeletePackageVersions"
         ]
         Resource = "*"
       },
