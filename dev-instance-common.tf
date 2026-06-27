@@ -244,6 +244,27 @@ resource "aws_iam_role_policy" "dev_server" {
             "aws:CalledViaLast" = "bedrock-mantle.amazonaws.com"
           }
         }
+      },
+      {
+        # Classic bedrock-runtime path (Invoke/Converse) used by opencode and
+        # plain claude/tmux, separate from the Mantle endpoint above. Claude is
+        # invoked via cross-region inference profiles (us.anthropic.*), which
+        # require BOTH the inference-profile ARN and the underlying
+        # foundation-model ARNs in every routed region — hence the region
+        # wildcard. Foundation models are scoped to anthropic.* for least
+        # privilege; inference profiles are account-pinned.
+        Sid    = "BedrockRuntimeInvoke"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:Converse",
+          "bedrock:ConverseStream"
+        ]
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/anthropic.*",
+          "arn:aws:bedrock:*:928413605543:inference-profile/*"
+        ]
       }
     ]
   })
