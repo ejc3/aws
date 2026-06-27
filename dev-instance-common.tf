@@ -209,6 +209,20 @@ resource "aws_iam_role_policy" "dev_server" {
             "sts:AWSServiceName" = "codeartifact.amazonaws.com"
           }
         }
+      },
+      {
+        # Amazon Bedrock "Mantle" inference endpoint (OpenAI/Anthropic-compatible
+        # API used by Claude Code). Region wildcard so it works in every Claude
+        # region; account-pinned for least privilege. Get*/List* cover model
+        # discovery (GET /v1/models) so Claude Code starts cleanly.
+        Sid    = "BedrockMantleInference"
+        Effect = "Allow"
+        Action = [
+          "bedrock-mantle:CreateInference",
+          "bedrock-mantle:Get*",
+          "bedrock-mantle:List*"
+        ]
+        Resource = "arn:aws:bedrock-mantle:*:928413605543:project/*"
       }
     ]
   })
