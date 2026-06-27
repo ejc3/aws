@@ -213,16 +213,37 @@ resource "aws_iam_role_policy" "dev_server" {
       {
         # Amazon Bedrock "Mantle" inference endpoint (OpenAI/Anthropic-compatible
         # API used by Claude Code). Region wildcard so it works in every Claude
-        # region; account-pinned for least privilege. Get*/List* cover model
-        # discovery (GET /v1/models) so Claude Code starts cleanly.
+        # region; account-pinned for least privilege. CreateInference runs the
+        # request, CountTokens backs Claude's token counting, Get*/List* cover
+        # model discovery (GET /v1/models) so Claude Code starts cleanly.
         Sid    = "BedrockMantleInference"
         Effect = "Allow"
         Action = [
           "bedrock-mantle:CreateInference",
+          "bedrock-mantle:CountTokens",
           "bedrock-mantle:Get*",
           "bedrock-mantle:List*"
         ]
         Resource = "arn:aws:bedrock-mantle:*:928413605543:project/*"
+      },
+      {
+        # First-use model subscription for the Bedrock Mantle flow. Mirrors AWS's
+        # AmazonBedrockMantleInferenceAccess managed policy: Subscribe +
+        # ViewSubscriptions only, and only when called via bedrock-mantle (the
+        # CalledViaLast condition prevents this role from subscribing to
+        # arbitrary Marketplace products directly).
+        Sid    = "BedrockMantleMarketplace"
+        Effect = "Allow"
+        Action = [
+          "aws-marketplace:Subscribe",
+          "aws-marketplace:ViewSubscriptions"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:CalledViaLast" = "bedrock-mantle.amazonaws.com"
+          }
+        }
       }
     ]
   })
