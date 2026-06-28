@@ -133,7 +133,10 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:DescribeSnapshots",
           "ec2:DescribeTags",
           "ec2:DescribeKeyPairs",
-          "ec2:DescribeNetworkInterfaces"
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeNatGateways",
+          "ec2:DescribeAddresses",
+          "ec2:DescribeRouteTables"
         ]
         Resource = "*"
       },
