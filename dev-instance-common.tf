@@ -227,23 +227,21 @@ resource "aws_iam_role_policy" "dev_server" {
         Resource = "arn:aws:bedrock-mantle:*:928413605543:project/*"
       },
       {
-        # First-use model subscription for the Bedrock Mantle flow. Mirrors AWS's
-        # AmazonBedrockMantleInferenceAccess managed policy: Subscribe +
-        # ViewSubscriptions only, and only when called via bedrock-mantle (the
-        # CalledViaLast condition prevents this role from subscribing to
-        # arbitrary Marketplace products directly).
-        Sid    = "BedrockMantleMarketplace"
+        # First-use model subscription for both Bedrock inference paths (Mantle
+        # for Claude Code, bedrock-runtime for opencode/tmux). Left unconditional
+        # on purpose: the Marketplace auto-subscribe that Bedrock triggers on
+        # first model use is not reliably tagged with a Bedrock aws:CalledVia, so
+        # any CalledVia condition makes the subscribe intermittently fail. This
+        # mirrors AWS's AmazonBedrockFullAccess managed policy, which grants these
+        # Marketplace actions on "*" with no condition. Subscribe +
+        # ViewSubscriptions only (no Unsubscribe).
+        Sid    = "BedrockMarketplace"
         Effect = "Allow"
         Action = [
           "aws-marketplace:Subscribe",
           "aws-marketplace:ViewSubscriptions"
         ]
         Resource = "*"
-        Condition = {
-          StringEquals = {
-            "aws:CalledViaLast" = "bedrock-mantle.amazonaws.com"
-          }
-        }
       },
       {
         # Classic bedrock-runtime path (Invoke/Converse) used by opencode and
