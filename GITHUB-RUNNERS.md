@@ -11,7 +11,7 @@ secret**, a PAT in SSM. Every resource below belongs to one of those two pattern
 
 |  | Pattern A — hosted → AWS | Pattern B — self-hosted in AWS |
 |--|--|--|
-| Repos | `ejc3/aws`, `ejc3/firepod` | `ejc3/fcvm` |
+| Repos | `ejc3/aws`, `ejc3/fcvm` | `ejc3/fcvm` (uses both) |
 | Runs on | GitHub's `ubuntu-latest` | spot `*.metal` in this account |
 | Secret across the boundary | none (federated token) | GitHub PAT + webhook HMAC |
 | What it does | Terraform drift, AMI builds, CodeArtifact | KVM/Firecracker CI that needs bare metal |
@@ -28,7 +28,7 @@ The trust chain:
   audience `sts.amazonaws.com`, thumbprint `6938fd4d98bab03faadb97b34396831e3780aea1` pinned.
 - **Role** `github-actions-terraform` — assumable only via `sts:AssumeRoleWithWebIdentity`
   when the token's `aud` is `sts.amazonaws.com` **and** its `sub` matches
-  `repo:ejc3/aws:*` or `repo:ejc3/firepod:*`. The `sub` is the only thing tying a given
+  `repo:ejc3/aws:*` or `repo:ejc3/fcvm:*`. The `sub` is the only thing tying a given
   GitHub repo to this role.
 - **Permissions** on that role: account-wide read-only (`Describe*`/`Get*`/`List*` across
   ec2, iam, s3, cloudwatch, logs, rds, lambda, apigateway, budgets, ses, ssm, backup,
@@ -117,11 +117,12 @@ single public `/24` (`10.1.1.0/24`) in **`us-west-1a` only**, internet gateway, 
 IPv6, public IP on launch. That one AZ is the ceiling on the spot fallback: the launcher
 walks several instance types but never another subnet/AZ, so a `us-west-1a` capacity gap
 fails the launch outright (the cleanup poll is the only retry). The security group allows
-**inbound SSH (22) only from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) and all
-egress; shell access from outside is via **SSM Session Manager** (the runner role carries
-`AmazonSSMManagedInstanceCore`). Nothing is reachable inbound from the public internet;
-everything else (webhook, registration, job dispatch) is runner-initiated outbound to GitHub
-and the AWS APIs.
+**inbound SSH (22) from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) **and the
+operator's three static EIPs** (jumpbox + the two dev servers, so the `dev_to_runner` debug
+path works) and all egress; shell access from anywhere else is via **SSM Session Manager**
+(the runner role carries `AmazonSSMManagedInstanceCore`). SSH is closed to the public internet
+at large; everything else (webhook, registration, job dispatch) is runner-initiated outbound
+to GitHub and the AWS APIs.
 
 ## Trade-offs and sharp edges
 
@@ -137,16 +138,18 @@ Closed (were sharp edges, now hardened):
   anonymous POST to `/webhook` no longer launches instances and no header skips verification
   (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
   by being direct `lambda:Invoke`, which carry no `requestContext`).
-- **SSH is VPC-only.** Port 22 is reachable only from `10.1.0.0/16` (and the VPC IPv6 block);
-  shell access from outside is via SSM Session Manager. The runners still run with `/dev/kvm`
-  exposed and `iptables -P FORWARD ACCEPT`, so keeping them off the public internet matters.
+- **SSH is restricted to known hosts.** Port 22 is reachable from `10.1.0.0/16` (intra-VPC)
+  and the operator's three static EIPs (jumpbox + the two dev servers) — not the public
+  internet; shell access from anywhere else is via SSM Session Manager. The runners still run
+  with `/dev/kvm` exposed and `iptables -P FORWARD ACCEPT`, so keeping them off the open
+  internet matters.
 
 Still open (accepted for now):
 
 - **The OIDC role is admin-capable by composition.** Its inline policy reads as scoped, but
   `ec2:RunInstances` (`Resource: *`) plus `iam:PassRole` on `jumpbox-admin-role` (which
   carries `AdministratorAccess`) lets a run launch an instance under the admin profile and
-  act as admin from there. The `sub` is `repo:ejc3/aws:*` / `repo:ejc3/firepod:*` — any ref,
+  act as admin from there. The `sub` is `repo:ejc3/aws:*` / `repo:ejc3/fcvm:*` — any ref,
   not pinned to a protected branch or a GitHub environment.
 - **PAT blast radius.** `/github-runner/pat` can register and remove runners on `ejc3/fcvm`;
   any process on a runner that reaches instance-role SSM can read it. Self-hosted runners and

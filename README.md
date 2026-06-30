@@ -1,6 +1,6 @@
-# AWS Infrastructure for firepod
+# AWS Infrastructure for fcvm
 
-Terraform infrastructure for [ejc3/firepod](https://github.com/ejc3/firepod) CI/CD and development.
+Terraform infrastructure for [ejc3/fcvm](https://github.com/ejc3/fcvm) CI/CD and development.
 
 ## Infrastructure
 
@@ -71,7 +71,7 @@ jumpbox.tf           # Admin host + backups
    make apply
    ```
 
-2. GitHub webhook (already configured for ejc3/firepod):
+2. GitHub webhook (already configured for ejc3/fcvm):
    - URL: `https://epteb3h8ia.execute-api.us-west-1.amazonaws.com/webhook`
    - Events: `workflow_job`
 

@@ -24,8 +24,8 @@ resource "aws_iam_role" "github_actions_terraform" {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
         StringLike = {
-          # Allow both aws and firepod repos
-          "token.actions.githubusercontent.com:sub" = ["repo:ejc3/aws:*", "repo:ejc3/firepod:*"]
+          # Allow both aws and fcvm repos (firepod was renamed to fcvm)
+          "token.actions.githubusercontent.com:sub" = ["repo:ejc3/aws:*", "repo:ejc3/fcvm:*"]
         }
       }
     }]
