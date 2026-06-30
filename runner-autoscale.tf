@@ -45,7 +45,7 @@ data "archive_file" "runner_webhook" {
 
       def verify_signature(payload, signature, secret):
           if not secret:
-              return True  # Skip verification if no secret configured
+              return False  # Fail closed: no secret configured means reject, never accept
           expected = 'sha256=' + hmac.new(
               secret.encode(), payload.encode(), hashlib.sha256
           ).hexdigest()
@@ -149,8 +149,11 @@ data "archive_file" "runner_webhook" {
           body = event.get('body', '{}')
           headers = event.get('headers', {})
 
-          # Verify signature (skip for internal invocations from cleanup Lambda)
-          if headers.get('x-internal-invoke') != 'cleanup-retry':
+          # Requests via API Gateway carry requestContext (set by AWS, not the
+          # caller) - that is the public, untrusted path, so it must pass HMAC
+          # verification. The cleanup Lambda reaches us by direct lambda:Invoke
+          # (IAM-authed, no requestContext) and is trusted without a forgeable header.
+          if 'requestContext' in event:
               signature = headers.get('x-hub-signature-256', '')
               secret = os.environ.get('WEBHOOK_SECRET', '')
               if not verify_signature(body, signature, secret):
@@ -717,9 +720,11 @@ data "archive_file" "runner_cleanup" {
                       webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
                       for arch in archs_needed:
                           labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
+                          # Direct invoke: no requestContext, so the handler trusts it
+                          # without a header. Skips HMAC, which API Gateway callers cannot.
                           payload = {
                               'body': json.dumps({'action': 'queued', 'workflow_job': {'labels': labels}}),
-                              'headers': {'x-internal-invoke': 'cleanup-retry'}
+                              'headers': {}
                           }
                           print(f'Retrying runner launch for {arch} (queued jobs found)')
                           try:

@@ -63,7 +63,7 @@ resource "aws_route_table_association" "runner" {
   route_table_id = aws_route_table.runner[0].id
 }
 
-# Security group - SSH for debugging, outbound for internet
+# Security group - SSH only from within the runner VPC (use SSM from outside), outbound for internet
 resource "aws_security_group" "runner" {
   count       = var.enable_github_runner ? 1 : 0
   name        = "github-runner-sg"
@@ -74,9 +74,9 @@ resource "aws_security_group" "runner" {
     from_port        = 22
     to_port          = 22
     protocol         = "tcp"
-    cidr_blocks      = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-    description      = "SSH access for debugging"
+    cidr_blocks      = [aws_vpc.runner[0].cidr_block]
+    ipv6_cidr_blocks = [aws_vpc.runner[0].ipv6_cidr_block]
+    description      = "SSH from within the runner VPC only; use SSM Session Manager from outside"
   }
 
   egress {

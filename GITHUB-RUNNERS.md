@@ -52,8 +52,11 @@ that registers itself back as a self-hosted runner, serves the job, and is reape
 **Launch path.** GitHub fires a `workflow_job` webhook → API Gateway HTTP API
 (`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook`
 (`reserved_concurrent_executions = 1`, so concurrent webhooks can't all read the same count
-and over-launch). The Lambda verifies the `x-hub-signature-256` HMAC against `WEBHOOK_SECRET`,
-acts only on `action == "queued"`, reads the job labels to pick an architecture
+and over-launch). The Lambda HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET` on
+every request that arrives through API Gateway, **failing closed** if the secret is unset (the
+cleanup Lambda's direct `lambda:Invoke` retries carry no `requestContext`, so they're trusted
+without a forgeable header); it acts only on `action == "queued"`, reads the job labels to pick
+an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
 per architecture**. ARM tries `c7gd.metal`→`c7g.metal`; x86 tries
@@ -114,29 +117,32 @@ single public `/24` (`10.1.1.0/24`) in **`us-west-1a` only**, internet gateway, 
 IPv6, public IP on launch. That one AZ is the ceiling on the spot fallback: the launcher
 walks several instance types but never another subnet/AZ, so a `us-west-1a` capacity gap
 fails the launch outright (the cleanup poll is the only retry). The security group allows
-**inbound SSH (22) from `0.0.0.0/0` and `::/0`** and all egress. There is no inbound path to
-the runners except SSH; everything else (webhook, registration, job dispatch) is
-runner-initiated outbound to GitHub and the AWS APIs.
+**inbound SSH (22) only from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) and all
+egress; shell access from outside is via **SSM Session Manager** (the runner role carries
+`AmazonSSMManagedInstanceCore`). Nothing is reachable inbound from the public internet;
+everything else (webhook, registration, job dispatch) is runner-initiated outbound to GitHub
+and the AWS APIs.
 
 ## Trade-offs and sharp edges
 
 These are deliberate simplifications for a single-owner CI account, not recommendations to
 copy blindly.
 
-- **Webhook auth fails open.** `verify_signature` returns `True` when `WEBHOOK_SECRET` is
-  empty, and the tfvar defaults to `""`. With the secret unset, anyone who finds the
-  `/webhook` URL and POSTs `{"action":"queued", ...}` can launch metal spot instances — a
-  denial-of-wallet path. Set `github_webhook_secret` and confirm it matches the GitHub
-  webhook.
-- **The "internal" retry bypass is reachable from the public endpoint.** The handler skips
-  HMAC verification whenever a request carries `x-internal-invoke: cleanup-retry`. The
-  cleanup Lambda uses that to re-enter the launch path, but API Gateway forwards arbitrary
-  client headers, so an external caller can set the same header and skip verification up to
-  the per-arch cap. Invoking the launch logic directly instead of re-posting through the
-  public handler would close it.
-- **SSH is open to the internet.** Port 22 from `0.0.0.0/0`/`::/0`, in front of boxes that
-  run with `/dev/kvm` exposed and `iptables -P FORWARD ACCEPT`. Key-only auth is the only
-  control. Convenient for debugging an ephemeral runner; broad as a standing default.
+Closed (were sharp edges, now hardened):
+
+- **The webhook fails closed and verifies every public request.** `verify_signature` rejects
+  when `WEBHOOK_SECRET` is unset, and HMAC verification runs on everything arriving through
+  API Gateway — identified by `requestContext`, which AWS sets and a caller can't forge. The
+  shared secret is set on the GitHub `workflow_job` webhook and in the Lambda env, so an
+  anonymous POST to `/webhook` no longer launches instances and no header skips verification
+  (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
+  by being direct `lambda:Invoke`, which carry no `requestContext`).
+- **SSH is VPC-only.** Port 22 is reachable only from `10.1.0.0/16` (and the VPC IPv6 block);
+  shell access from outside is via SSM Session Manager. The runners still run with `/dev/kvm`
+  exposed and `iptables -P FORWARD ACCEPT`, so keeping them off the public internet matters.
+
+Still open (accepted for now):
+
 - **The OIDC role is admin-capable by composition.** Its inline policy reads as scoped, but
   `ec2:RunInstances` (`Resource: *`) plus `iam:PassRole` on `jumpbox-admin-role` (which
   carries `AdministratorAccess`) lets a run launch an instance under the admin profile and
