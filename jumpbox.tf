@@ -120,11 +120,10 @@ resource "aws_backup_plan" "jumpbox" {
 
   rule {
     rule_name         = "daily"
-    target_vault_name = "fcvm-backups"
+    target_vault_name = aws_backup_vault.ejc3_backup.name
     schedule          = "cron(0 5 * * ? *)"
     start_window      = 60
     completion_window = 120
-
     lifecycle {
       delete_after = 7
     }
@@ -132,13 +131,37 @@ resource "aws_backup_plan" "jumpbox" {
 
   rule {
     rule_name         = "weekly"
-    target_vault_name = "fcvm-backups"
+    target_vault_name = aws_backup_vault.ejc3_backup.name
     schedule          = "cron(0 5 ? * SUN *)"
     start_window      = 60
     completion_window = 120
-
     lifecycle {
       delete_after = 30
+    }
+    copy_action {
+      destination_vault_arn = aws_backup_vault.ejc3_backup_dr.arn
+      lifecycle {
+        delete_after = 30
+      }
+    }
+  }
+
+  rule {
+    rule_name         = "monthly"
+    target_vault_name = aws_backup_vault.ejc3_backup.name
+    schedule          = "cron(0 5 1 * ? *)"
+    start_window      = 60
+    completion_window = 300
+    lifecycle {
+      cold_storage_after = 30
+      delete_after       = 365
+    }
+    copy_action {
+      destination_vault_arn = aws_backup_vault.ejc3_backup_dr.arn
+      lifecycle {
+        cold_storage_after = 30
+        delete_after       = 365
+      }
     }
   }
 }

@@ -524,25 +524,48 @@ resource "aws_backup_plan" "dev_servers" {
 
   rule {
     rule_name         = "daily"
-    target_vault_name = "fcvm-backups"
-    schedule          = "cron(0 6 * * ? *)" # 6 AM UTC daily
+    target_vault_name = aws_backup_vault.ejc3_backup.name
+    schedule          = "cron(0 6 * * ? *)"
     start_window      = 60
     completion_window = 120
-
     lifecycle {
-      delete_after = 7 # Keep daily backups for 7 days
+      delete_after = 7
     }
   }
 
   rule {
     rule_name         = "weekly"
-    target_vault_name = "fcvm-backups"
-    schedule          = "cron(0 6 ? * SUN *)" # 6 AM UTC Sundays
+    target_vault_name = aws_backup_vault.ejc3_backup.name
+    schedule          = "cron(0 6 ? * SUN *)"
     start_window      = 60
     completion_window = 120
-
     lifecycle {
-      delete_after = 30 # Keep weekly backups for 30 days
+      delete_after = 30
+    }
+    copy_action {
+      destination_vault_arn = aws_backup_vault.ejc3_backup_dr.arn
+      lifecycle {
+        delete_after = 30
+      }
+    }
+  }
+
+  rule {
+    rule_name         = "monthly"
+    target_vault_name = aws_backup_vault.ejc3_backup.name
+    schedule          = "cron(0 6 1 * ? *)"
+    start_window      = 60
+    completion_window = 300
+    lifecycle {
+      cold_storage_after = 30
+      delete_after       = 365
+    }
+    copy_action {
+      destination_vault_arn = aws_backup_vault.ejc3_backup_dr.arn
+      lifecycle {
+        cold_storage_after = 30
+        delete_after       = 365
+      }
     }
   }
 
