@@ -20,10 +20,20 @@ variable "enable_mac_dev" {
   default     = false
 }
 
+# IMPORTANT: this account only has Dedicated-Host QUOTA (5 each) for these three types
+# in us-west-2 -- there is NO quota entry for mac-m4/mac-m4pro/mac-m4max/mac-m3ultra, so
+# allocating those always fails (AWS reports it as Client.InsufficientHostCapacity, which
+# is misleading). Check with:
+#   aws service-quotas list-service-quotas --service-code ec2 --region us-west-2 \
+#     --query "Quotas[?contains(QuotaName,'mac')]"
+#   mac2-m2pro.metal    12 vCPU / 32 GB  (~$1.56/hr)   AZs: us-west-2a,2b,2c
+#   mac2-m1ultra.metal  20 vCPU / 128 GB (~$5.00/hr)   AZs: us-west-2b,2c,2d
+#   mac2.metal           8 vCPU / 16 GB  (~$0.65/hr)   AZs: us-west-2a,2b,2c,2d
+# Raise a quota request if you want the M4/M3 generations.
 variable "mac_instance_type" {
-  description = "EC2 Mac instance type (mac-m4pro.metal = 14 vCPU / 48 GB)"
+  description = "EC2 Mac instance type (must be one we hold dedicated-host quota for)"
   type        = string
-  default     = "mac-m4pro.metal"
+  default     = "mac2-m2pro.metal"
 }
 
 variable "mac_ssh_public_key" {
@@ -37,8 +47,17 @@ provider "aws" {
   region = "us-west-2"
 }
 
+# Mac dedicated-host capacity is genuinely scarce and varies by AZ — us-west-2b returned
+# Client.InsufficientHostCapacity for mac-m4pro.metal. Override to hunt for capacity:
+#   terraform apply -var enable_mac_dev=true -var mac_az=us-west-2c
+variable "mac_az" {
+  description = "AZ to allocate the Mac dedicated host in (capacity varies by AZ)"
+  type        = string
+  default     = "us-west-2b"
+}
+
 locals {
-  mac_az = "us-west-2b" # mac-m4pro.metal is offered here
+  mac_az = var.mac_az
 }
 
 data "aws_vpc" "mac_default" {
