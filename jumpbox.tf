@@ -163,6 +163,13 @@ resource "aws_backup_plan" "jumpbox" {
         delete_after       = 365
       }
     }
+    copy_action {
+      destination_vault_arn = aws_backup_vault.staging.arn
+      lifecycle {
+        cold_storage_after = 30
+        delete_after       = 365
+      }
+    }
   }
 }
 
