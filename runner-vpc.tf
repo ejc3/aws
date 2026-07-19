@@ -71,14 +71,14 @@ resource "aws_security_group" "runner" {
   vpc_id      = aws_vpc.runner[0].id
 
   ingress {
-    from_port        = 22
-    to_port          = 22
-    protocol         = "tcp"
+    from_port = 22
+    to_port   = 22
+    protocol  = "tcp"
     cidr_blocks = [
-      aws_vpc.runner[0].cidr_block,                  # intra-VPC runner-to-runner
-      "${aws_eip.jumpbox[0].public_ip}/32",          # jumpbox (management host)
-      "${aws_eip.firecracker_dev[0].public_ip}/32",  # fcvm-metal-arm dev server
-      "${aws_eip.x86_dev[0].public_ip}/32",          # fcvm-metal-x86 dev server
+      aws_vpc.runner[0].cidr_block,                 # intra-VPC runner-to-runner
+      "${aws_eip.jumpbox[0].public_ip}/32",         # jumpbox (management host)
+      "${aws_eip.firecracker_dev[0].public_ip}/32", # fcvm-metal-arm dev server
+      "${aws_eip.x86_dev[0].public_ip}/32",         # fcvm-metal-x86 dev server
     ]
     ipv6_cidr_blocks = [aws_vpc.runner[0].ipv6_cidr_block]
     description      = "SSH from the runner VPC + operator EIPs (jumpbox, dev servers); SSM elsewhere"
@@ -133,9 +133,9 @@ resource "aws_iam_role_policy" "runner" {
         Resource = aws_ssm_parameter.github_runner_pat[0].arn
       },
       {
-        Sid      = "AssignIpv6"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "AssignIpv6"
+        Effect = "Allow"
+        Action = [
           "ec2:AssignIpv6Addresses",
           "ec2:DescribeNetworkInterfaces"
         ]

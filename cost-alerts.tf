@@ -210,7 +210,7 @@ resource "aws_sns_topic_policy" "cost_alerts" {
           "SNS:ListSubscriptionsByTopic",
           "SNS:Publish"
         ]
-        Resource  = aws_sns_topic.cost_alerts.arn
+        Resource = aws_sns_topic.cost_alerts.arn
         Condition = {
           StringEquals = {
             "AWS:SourceOwner" = data.aws_caller_identity.current.account_id
