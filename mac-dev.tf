@@ -36,6 +36,12 @@ variable "mac_instance_type" {
   default     = "mac2-m2pro.metal"
 }
 
+variable "mac_extra_ssh_key" {
+  description = "Second public key added via user_data (fcvm dev-box key, for hopping from fcvm)"
+  type        = string
+  default     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-test"
+}
+
 variable "mac_ssh_public_key" {
   description = "Public key permitted to SSH into the Mac"
   type        = string
@@ -154,6 +160,22 @@ resource "aws_instance" "mac" {
   subnet_id                   = data.aws_subnets.mac.ids[0]
   vpc_security_group_ids      = [aws_security_group.mac[0].id]
   associate_public_ip_address = true
+
+  # An EC2 key pair holds only ONE key, so the second (fcvm) key goes in via user_data
+  # to allow SSH from the fcvm dev boxes. ignore_changes keeps a running box from being
+  # replaced when this text changes -- a replacement would cost a ~20min macOS reboot.
+  user_data = <<-MACINIT
+#!/bin/bash
+install -d -m 700 -o ec2-user -g staff /Users/ec2-user/.ssh
+grep -qxF '${var.mac_extra_ssh_key}' /Users/ec2-user/.ssh/authorized_keys 2>/dev/null || \
+  echo '${var.mac_extra_ssh_key}' >> /Users/ec2-user/.ssh/authorized_keys
+chown ec2-user:staff /Users/ec2-user/.ssh/authorized_keys
+chmod 600 /Users/ec2-user/.ssh/authorized_keys
+MACINIT
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   root_block_device {
     volume_size = 200 # room for Xcode + cmux build artifacts
