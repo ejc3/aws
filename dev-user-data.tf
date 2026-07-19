@@ -157,7 +157,13 @@ kernel.apparmor_restrict_unprivileged_userns=0
 vm.dirty_ratio=80
 vm.dirty_background_ratio=50
 SYSCTL
-sysctl -p /etc/sysctl.d/99-fcvm.conf
+# Non-fatal: `sysctl -p` exits non-zero if ANY key is missing, and these boxes boot a
+# custom -nested-dsb kernel that lacks kernel.unprivileged_userns_clone and
+# kernel.apparmor_restrict_unprivileged_userns (both Ubuntu-stock-kernel keys). Under
+# set -e that aborted the whole setup script before the shell/gh/self-update sections.
+# The keys that DO exist are still applied; the rest are reported and skipped.
+sysctl -p /etc/sysctl.d/99-fcvm.conf \
+  || echo "WARNING: some sysctl keys are unavailable on this kernel; applied the rest and continuing"
 PODMANSYS
 
   # Interactive shell setup: starship, fzf, atuin, zsh plugins, .zshrc (identical on both arches)
@@ -273,7 +279,9 @@ ${local.podman_sysctl_setup}
 ${local.shell_setup}
 
 # Claude Code
-sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
+# Global npm installs write to /usr/lib/node_modules, which is root-owned -- running
+# this as the ubuntu user fails with EACCES. Install as root; ubuntu only needs to RUN it.
+npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
 
@@ -330,7 +338,9 @@ ${local.podman_sysctl_setup}
 ${local.shell_setup}
 
 # Claude Code
-sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
+# Global npm installs write to /usr/lib/node_modules, which is root-owned -- running
+# this as the ubuntu user fails with EACCES. Install as root; ubuntu only needs to RUN it.
+npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
 
