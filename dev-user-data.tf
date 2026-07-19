@@ -29,9 +29,22 @@ cat > /usr/local/bin/nvme-btrfs-setup.sh << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
-# Find NVMe devices that are NOT the root disk
+# Pick the ephemeral instance-store NVMe disks to format.
+#
+# SAFETY: this script runs mkfs on whatever it selects, on EVERY boot. Selecting by
+# "every nvme except the root device" was unsafe: if ROOT_DEV ever resolved empty, the
+# exclusion became `grep -v "^$"` (which excludes nothing) and mkfs would have wiped the
+# root EBS volume -- the persistent, delete_on_termination=false disk. So:
+#   1. select POSITIVELY on the instance-store model, so an EBS disk can never match, and
+#   2. fail closed if the root disk cannot be identified.
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) 2>/dev/null | head -1)
-NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$${ROOT_DEV}$")
+if [ -z "$${ROOT_DEV}" ]; then
+    echo "FATAL: cannot determine the root disk; refusing to format anything" >&2
+    exit 1
+fi
+NVME_DEVS=$(lsblk -dn -o NAME,TYPE,MODEL \
+    | awk '$2=="disk" && /Instance Storage/ {print $1}' \
+    | grep -v "^$${ROOT_DEV}$")
 NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
 
 if [ "$NVME_COUNT" -eq 0 ]; then
