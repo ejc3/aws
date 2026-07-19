@@ -278,7 +278,9 @@ locals {
     # GitHub CLI authentication (from Secrets Manager)
     # ============================================
     sudo -u ubuntu bash << 'GH_AUTH_SETUP'
-    set -euxo pipefail
+    # NOTE: deliberately NO -x here. This block expands a GitHub PAT, and xtrace would
+    # echo `GH_TOKEN=github_pat_...` verbatim into the setup log.
+    set -euo pipefail
 
     # Fetch GitHub PAT from Secrets Manager
     GH_TOKEN=$(aws secretsmanager get-secret-value \
@@ -317,8 +319,17 @@ GH_AUTH_SETUP
     set -euxo pipefail
 
     # Clone and build from feature branch
-    git clone -b feature/non-interactive-init https://github.com/ejc3/claude-code-sync.git ~/src/claude-code-sync
-    cd ~/src/claude-code-sync
+    # Idempotent: this script now re-runs on every boot, and `git clone` into an
+    # existing directory is a fatal error. Fetch into the existing checkout instead.
+    if [ -d ~/src/claude-code-sync/.git ]; then
+      cd ~/src/claude-code-sync
+      git fetch origin feature/non-interactive-init
+      git checkout -f feature/non-interactive-init
+      git reset --hard origin/feature/non-interactive-init
+    else
+      git clone -b feature/non-interactive-init https://github.com/ejc3/claude-code-sync.git ~/src/claude-code-sync
+      cd ~/src/claude-code-sync
+    fi
     ~/.cargo/bin/cargo install --path .
 
     # Create init config for non-interactive setup
