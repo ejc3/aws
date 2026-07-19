@@ -72,9 +72,13 @@ resource "aws_backup_vault_policy" "staging" {
 }
 
 # Enable cross-account backup at the org level (management account = main).
+# Declare EVERY key AWS returns, not just the one we care about — otherwise the
+# undeclared keys show as a diff on every plan (perpetual drift).
 resource "aws_backup_global_settings" "main" {
   global_settings = {
-    "isCrossAccountBackupEnabled" = "true"
+    "isCrossAccountBackupEnabled"     = "true"
+    "isDelegatedAdministratorEnabled" = "false"
+    "isMpaEnabled"                    = "false"
   }
 }
 

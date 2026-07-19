@@ -25,7 +25,10 @@ resource "aws_iam_role" "github_actions_terraform" {
         }
         StringLike = {
           # Allow both aws and fcvm repos (firepod was renamed to fcvm)
-          "token.actions.githubusercontent.com:sub" = ["repo:ejc3/aws:*", "repo:ejc3/fcvm:*"]
+          # Pinned to main for ejc3/aws: its only workflow is the scheduled drift run, so a
+          # branch has no reason to assume this role. ejc3/fcvm keeps the wildcard because
+          # its AMI build uses workflow_dispatch, which may legitimately run from a branch.
+          "token.actions.githubusercontent.com:sub" = ["repo:ejc3/aws:ref:refs/heads/main", "repo:ejc3/fcvm:*"]
         }
       }
     }]
