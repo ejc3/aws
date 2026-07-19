@@ -1,6 +1,6 @@
 # mac-dev.tf
 #
-# TEMPORARY EC2 Mac dev box (mac-m4pro.metal: 14 vCPU / 48 GB) for cmux builds.
+# TEMPORARY EC2 Mac dev box (mac2-m2pro.metal: 12 vCPU / 32 GB) for cmux builds.
 #
 # ⚠️  TWO THINGS TO KNOW:
 #   1. us-west-1 offers NO Mac instance types, so this lives in us-west-2 (its own
@@ -11,11 +11,11 @@
 #      running or stopped. TEARDOWN: set enable_mac_dev = false and apply (only after
 #      the 24h window has elapsed).
 
-# OFF BY DEFAULT on purpose: this box costs ~$1.97/hr with a 24h minimum that cannot
+# OFF BY DEFAULT on purpose: this box costs ~$1.56/hr with a 24h minimum that cannot
 # be released early, so a plain `terraform apply` must never spin it up by accident.
 # Enable it deliberately for a run:  terraform apply -var enable_mac_dev=true
 variable "enable_mac_dev" {
-  description = "Spin up the temporary EC2 Mac dev host. NOTE: ~$1.97/hr, 24h minimum billing."
+  description = "Spin up the temporary EC2 Mac dev host. NOTE: ~$1.56/hr, 24h minimum billing."
   type        = bool
   default     = false
 }
@@ -48,7 +48,8 @@ provider "aws" {
 }
 
 # Mac dedicated-host capacity is genuinely scarce and varies by AZ — us-west-2b returned
-# Client.InsufficientHostCapacity for mac-m4pro.metal. Override to hunt for capacity:
+# Client.InsufficientHostCapacity for mac-m4pro.metal (2a did too for mac2-m2pro). The
+# error message names the AZs that DO have capacity -- read it. Override with:
 #   terraform apply -var enable_mac_dev=true -var mac_az=us-west-2c
 variable "mac_az" {
   description = "AZ to allocate the Mac dedicated host in (capacity varies by AZ)"
