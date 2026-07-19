@@ -300,7 +300,12 @@ EOF
 
     # Set up git credential helper
     gh auth setup-git
-    GH_AUTH_SETUP
+# NOTE: this terminator MUST stay at column 0. The heredoc above is `<< 'GH_AUTH_SETUP'`
+# (no dash), so bash only accepts an unindented terminator -- and terraform's `<<-SCRIPT`
+# strips the COMMON indentation of this block, which is 0 because the inner EOF body
+# below is unindented. An indented terminator here silently swallows the entire rest of
+# the setup script into `sudo -u ubuntu bash`, running it as ubuntu instead of root.
+GH_AUTH_SETUP
   SCRIPT
 
   # Claude Code Sync installation and initialization
@@ -327,7 +332,8 @@ INITCFG
 
     # Initialize (will clone the history repo)
     ~/.cargo/bin/claude-code-sync init || true
-    CLAUDE_SYNC_SETUP
+# Terminator must stay at column 0 -- see the note on GH_AUTH_SETUP above.
+CLAUDE_SYNC_SETUP
   SCRIPT
 
   # Ghostty terminal terminfo installation
@@ -483,7 +489,7 @@ Host runner-*
     UserKnownHostsFile /dev/null
 SSHCONFIG
     chmod 600 ~/.ssh/config
-    RUNNER_SSH_SETUP
+RUNNER_SSH_SETUP
   SCRIPT
 
   # Combined script for GitHub auth + Claude Sync + Ghostty terminfo + Cron + Unattended Upgrades + Runner SSH + Console logging

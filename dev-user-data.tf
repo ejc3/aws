@@ -103,6 +103,9 @@ apt-get remove -y et || true
 add-apt-repository -r -y ppa:jgmath2000/et || true
 systemctl disable --now et.service || true
 rm -f /etc/systemd/system/et.service /usr/lib/systemd/system/et.service
+if /usr/bin/etserver --version 2>/dev/null | grep -q "7.0.0"; then
+  echo "Eternal Terminal already at 7.0.0, skipping rebuild"
+else
 git clone --recurse-submodules --depth 1 --branch et-v7.0.0 https://github.com/MisterTea/EternalTerminal.git /tmp/et
 cd /tmp/et && mkdir build && cd build && cmake .. && make -j$(nproc)
 cp et etserver etterminal /usr/bin/
@@ -120,6 +123,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload && systemctl enable etserver.service && systemctl start etserver.service
+fi
 ET
 
   # gh CLI + Node.js 22 + Rust (identical on both arches)
@@ -177,11 +181,11 @@ format = "[$branch]($style) "
 success_symbol = "[❯](green)"
 error_symbol = "[❯](red)"
 TOML
-git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
-~/.fzf/install --all --no-bash --no-fish
+[ -d ~/.fzf ] || git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
+[ -f ~/.fzf.zsh ] || ~/.fzf/install --all --no-bash --no-fish
 curl --proto '=https' --tlsv1.2 -sSf https://setup.atuin.sh | bash
-git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
-git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
+[ -d ~/.zsh/zsh-autosuggestions ] || git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
+[ -d ~/.zsh/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$PATH"
 # Use NVMe for cargo builds if available
@@ -246,7 +250,13 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 ${local.nvme_btrfs_setup}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
+${local.et_binary_update}
+# Try the prebuilt binary from ejc3/EternalTerminal CI first; compile from source only
+# if no release asset is available for this arch.
+/usr/local/bin/et-update.sh || true
+if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
 ( ${local.et_setup} ) || echo "WARNING: Eternal Terminal setup failed; continuing (SSH :22 unaffected)"
+fi
 
 ${local.dev_langs}
 
@@ -266,6 +276,8 @@ ${local.shell_setup}
 sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
 
 ${local.gh_and_claude_sync_script}
+
+${local.selfupdate_setup}
 
 echo "ARM dev instance ready!"
 SCRIPT
@@ -295,7 +307,13 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 ${local.nvme_btrfs_setup}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
+${local.et_binary_update}
+# Try the prebuilt binary from ejc3/EternalTerminal CI first; compile from source only
+# if no release asset is available for this arch.
+/usr/local/bin/et-update.sh || true
+if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
 ( ${local.et_setup} ) || echo "WARNING: Eternal Terminal setup failed; continuing (SSH :22 unaffected)"
+fi
 
 ${local.dev_langs}
 
@@ -315,6 +333,8 @@ ${local.shell_setup}
 sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
 
 ${local.gh_and_claude_sync_script}
+
+${local.selfupdate_setup}
 
 echo "x86 dev instance ready!"
 SCRIPT
