@@ -157,6 +157,7 @@ resource "aws_instance" "mac" {
   host_id                     = aws_ec2_host.mac[0].id
   tenancy                     = "host"
   key_name                    = aws_key_pair.mac[0].key_name
+  iam_instance_profile        = aws_iam_instance_profile.mac_instance[0].name
   subnet_id                   = data.aws_subnets.mac.ids[0]
   vpc_security_group_ids      = [aws_security_group.mac[0].id]
   associate_public_ip_address = true
@@ -166,11 +167,35 @@ resource "aws_instance" "mac" {
   # replaced when this text changes -- a replacement would cost a ~20min macOS reboot.
   user_data = <<-MACINIT
 #!/bin/bash
+# 1. Second SSH key (an EC2 key pair holds only one), so we can hop in from the fcvm boxes.
 install -d -m 700 -o ec2-user -g staff /Users/ec2-user/.ssh
 grep -qxF '${var.mac_extra_ssh_key}' /Users/ec2-user/.ssh/authorized_keys 2>/dev/null || \
   echo '${var.mac_extra_ssh_key}' >> /Users/ec2-user/.ssh/authorized_keys
 chown ec2-user:staff /Users/ec2-user/.ssh/authorized_keys
 chmod 600 /Users/ec2-user/.ssh/authorized_keys
+
+# 2. macOS Screen Sharing (VNC) + Apple Remote Desktop, for GUI access from an iOS
+#    client such as Screens or Jump Desktop.
+#    NOTE: port 5900 is deliberately NOT opened in the security group -- reach the GUI by
+#    tunnelling over SSH:  ssh -L 5900:localhost:5900 ec2-user@<ip>   then vnc://localhost:5900
+#    NOTE: the account password is deliberately NOT set here. user_data is readable by
+#    anyone holding ec2:DescribeInstanceAttribute, so it must never carry a secret. Set it
+#    out of band once the box is up:  sudo dscl . -passwd /Users/ec2-user '<password>'
+launchctl enable system/com.apple.screensharing
+launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null
+/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+  -activate -configure -access -on -restart -agent -privs -all 2>/dev/null
+
+# 3. Set the ec2-user password (VNC requires a real account password) by reading it from
+#    SSM SecureString using this instance's own profile -- so the credential is never in
+#    user_data, which is readable via ec2:DescribeInstanceAttribute.
+PW=$(aws ssm get-parameter --name /mac-dev/vnc-password --with-decryption \
+     --region us-west-2 --query Parameter.Value --output text 2>/dev/null)
+if [ -n "$PW" ]; then
+  dscl . -passwd /Users/ec2-user "$PW" && echo "ec2-user password set from SSM"
+else
+  echo "WARNING: could not read /mac-dev/vnc-password from SSM; set the password manually"
+fi
 MACINIT
 
   lifecycle {
