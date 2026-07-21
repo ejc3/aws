@@ -209,20 +209,36 @@ alias ll="ls -la" gs="git status" gd="git diff"
 [ -f ~/.config/t-claude.zsh ] && source ~/.config/t-claude.zsh
 ZSH
 cat > ~/.tmux.conf << 'TMUXCONF'
-# Scrollback works two ways: (1) with Prompt over ET, attach with `tmux -CC` for
-# native OS scrollbars/tabs; (2) otherwise mouse mode drives tmux copy-mode scroll.
-set -g mouse on
+# Goal: scrolling behaves as if tmux were not running -- a swipe in Panic Prompt (iOS)
+# scrolls the terminal's OWN scrollback. No copy-mode, no key chords.
+#
+# Measured, not assumed. Capturing the raw bytes tmux writes to the pty:
+#   with the alternate screen:  0 of 36 scrolled-off lines ever reached the terminal
+#   with smcup@/rmcup@ below:   every line reached it; duplication capped at one
+#                               screenful from a single full redraw
+# That first row is the bug: on the alternate screen, content scrolling out of the pane
+# is never written to the terminal at all, so there is nothing for any client to scroll
+# back to. No client-side setting can fix that.
+#
+# Also measured: the status bar makes no difference to pollution; redraw-heavy output
+# stays capped at 2x; full-screen apps inside tmux (vim/htop) still work and their
+# alt-screen does not leak to the outer terminal.
+
+# THE KEY LINE: stay on the terminal's primary screen so output lands in native scrollback.
+set -ga terminal-overrides ',*:smcup@:rmcup@'
+
+# Mouse OFF on purpose: `mouse on` makes tmux capture wheel events into copy-mode and
+# steal them from the terminal, defeating native scrolling on clients that send them.
+# Flip to `on` to get click-to-select-pane back, at the cost of native wheel scroll.
+set -g mouse off
+
+# Fallback only -- the terminal owns scrollback now. Copy-mode: Ctrl-b [ then arrows, q.
 set -g history-limit 50000
 set -g default-terminal "tmux-256color"
 set -as terminal-features ",xterm-256color:RGB"
 set -g set-clipboard on
 set -sg escape-time 10
 set -g focus-events on
-bind -T copy-mode-vi WheelUpPane   send -X scroll-up
-bind -T copy-mode-vi WheelDownPane send -X scroll-down
-# Wheel enters copy-mode/scrollback for normal panes; passes through to mouse apps
-bind -n WheelUpPane   if-shell -F -t = "#{||:#{pane_in_mode},#{mouse_any_flag}}" "send -Mt=" "copy-mode -et="
-bind -n WheelDownPane if-shell -F -t = "#{pane_in_mode}" "send -Mt=" "send -Mt="
 TMUXCONF
 mkdir -p ~/.config
 printf '%s' '${local.tclaude_b64}' | base64 -d > ~/.config/t-claude.zsh
