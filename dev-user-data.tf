@@ -243,8 +243,18 @@ cat > ~/.tmux.conf << 'TMUXCONF'
 # to ~3x for some rows) is re-emitted into scrollback per attach. Inherent to primary-screen
 # operation; the tradeoff for having any scrollback at all.
 
-# THE KEY LINE: stay on the terminal's primary screen.
+# THE KEY LINES. Native scrollback needs BOTH:
+#  1. smcup@/rmcup@ -- stay on the primary screen (the alt screen has no scrollback).
+#  2. status off -- keep the pane the FULL terminal height. With a status line the pane
+#     is one row short, so tmux scrolls inside a DECSTBM region (ESC[1;H-1r), and lines
+#     scrolled out of a restricted region are DISCARDED by the terminal, not saved.
+#     Byte-capture verified: status on emits ESC[1;23r on every scroll; status off emits
+#     only a full-screen region at startup and scrolls with bare linefeeds, identical to
+#     a bare shell. Splits break this too -- single pane only. Never set status-position
+#     top: a top status shifts the region top off row 0, which kills scrollback in every
+#     emulator (xterm/VTE feed scrollback only when the region top is row 0, full width).
 set -ga terminal-overrides ',*:smcup@:rmcup@'
+set -g status off
 
 # Mouse OFF, and PINNED deliberately: `mouse on` makes tmux capture wheel events into
 # copy-mode and steal them from the terminal. tmux 3.8 changes the DEFAULT to on, so
