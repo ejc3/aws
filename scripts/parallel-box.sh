@@ -20,20 +20,19 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEY="${HOME}/.ssh/fcvm-ec2"
-REGION="us-west-1"
+REGION="us-west-2"
 JUMPBOX="10.0.1.72"
 
-# Candidate pools, all offered in us-west-1a and all Graviton4. The floor is "better
+# Candidate pools, all offered in us-west-2d and all Graviton (incl. gen-5 c9g/m9g). The floor is "better
 # than the dev box" (c7gd.metal, 64 cores / 128GB Graviton3), so nothing here is under
 # 96 cores.
 #
 # Order matters:
 #   1. 192-core virtualized, cheapest family first (c8g < c8gn < m8g < r8g < r8gd)
 #   2. 96-core virtualized -- half the cores but a much likelier pool
-#   3. .metal LAST: metal is a genuinely separate capacity pool so it adds real odds,
-#      but bare metal takes many minutes to boot, which defeats fast startup. Only
-#      reached when nothing virtualized is available.
-TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gn.48xlarge m8g.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gn.24xlarge m8g.24xlarge r8g.24xlarge r8gd.24xlarge c8g.metal-48xl m8g.metal-48xl r8g.metal-48xl}"
+# Metal is excluded entirely: it boots in many minutes, which defeats fast startup, and
+# us-west-2d has enough virtualized pools that we should never need it.
+TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xlarge c9g.48xlarge c9gd.48xlarge m8g.48xlarge m8gd.48xlarge m9g.48xlarge m9gd.48xlarge i8g.48xlarge i8ge.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gb.24xlarge c8gd.24xlarge c8gn.24xlarge c9g.24xlarge c9gd.24xlarge m8g.24xlarge m8gd.24xlarge m9g.24xlarge m9gd.24xlarge i8g.24xlarge i8ge.24xlarge r8g.24xlarge r8gd.24xlarge}"
 
 # The dev servers hold a restricted IAM role with no ec2:RunInstances, and terraform
 # state lives on the jumpbox, so delegate the terraform half rather than widening

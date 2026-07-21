@@ -2,6 +2,10 @@
 #
 # Aggressive idle watchdog for the on-demand parallel box.
 #
+# Runs in us-west-2, alongside the box it watches (the dev auto-stop lambda is in
+# us-west-1 with the dev boxes). CloudWatch metrics and ec2:TerminateInstances are both
+# region-scoped, so a us-west-1 lambda simply would not see this instance.
+#
 # WHY A SEPARATE LAMBDA FROM dev-auto-stop-lambda.tf: the semantics genuinely differ on
 # three axes, and folding them together would mean parameterising the function that
 # protects the dev boxes -- risk to working code for little gain.
@@ -38,6 +42,8 @@ IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
 TAG_NAME     = os.environ.get("TAG_NAME", "parallel-box")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
+# The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
+SNS_REGION   = os.environ.get("SNS_REGION", "us-west-1")
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -47,7 +53,7 @@ def notify(subject, body):
     if not SNS_TOPIC:
         return
     try:
-        boto3.client("sns").publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=body)
+        boto3.client("sns", region_name=SNS_REGION).publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=body)
     except Exception as e:
         print("sns publish failed: %s" % e)
 
@@ -127,7 +133,8 @@ data "archive_file" "parallel_watchdog" {
 }
 
 resource "aws_iam_role" "parallel_watchdog" {
-  name = "parallel-box-watchdog"
+  provider = aws.west2
+  name     = "parallel-box-watchdog"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -139,13 +146,15 @@ resource "aws_iam_role" "parallel_watchdog" {
 }
 
 resource "aws_iam_role_policy_attachment" "parallel_watchdog_basic" {
+  provider   = aws.west2
   role       = aws_iam_role.parallel_watchdog.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "parallel_watchdog" {
-  name = "parallel-box-watchdog-policy"
-  role = aws_iam_role.parallel_watchdog.id
+  provider = aws.west2
+  name     = "parallel-box-watchdog-policy"
+  role     = aws_iam_role.parallel_watchdog.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -174,6 +183,7 @@ resource "aws_iam_role_policy" "parallel_watchdog" {
 }
 
 resource "aws_lambda_function" "parallel_watchdog" {
+  provider         = aws.west2
   function_name    = "parallel-box-watchdog"
   role             = aws_iam_role.parallel_watchdog.arn
   handler          = "index.lambda_handler"
@@ -187,6 +197,7 @@ resource "aws_lambda_function" "parallel_watchdog" {
       IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
       TAG_NAME      = "parallel-box"
+      SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
   }
@@ -196,18 +207,21 @@ resource "aws_lambda_function" "parallel_watchdog" {
 
 # Every 5 minutes: at ~$3.14/hr, a missed reap costs real money, and the check is free.
 resource "aws_cloudwatch_event_rule" "parallel_watchdog" {
+  provider            = aws.west2
   name                = "parallel-box-watchdog"
   description         = "Terminate the parallel box when idle"
   schedule_expression = "rate(5 minutes)"
 }
 
 resource "aws_cloudwatch_event_target" "parallel_watchdog" {
+  provider  = aws.west2
   rule      = aws_cloudwatch_event_rule.parallel_watchdog.name
   target_id = "parallel-box-watchdog"
   arn       = aws_lambda_function.parallel_watchdog.arn
 }
 
 resource "aws_lambda_permission" "parallel_watchdog" {
+  provider      = aws.west2
   statement_id  = "AllowExecutionFromCloudWatch"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.parallel_watchdog.function_name

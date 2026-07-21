@@ -9,9 +9,13 @@
 # c8i.96xlarge costs per PHYSICAL core. Graviton runs one thread per core, so 192 vCPU
 # really is 192 cores -- unlike Intel, where 384 vCPU is 192 cores with SMT.
 #
-# WHY us-west-1a: EBS volumes are AZ-locked, so the persistent disk pins the instance's
-# AZ. 1a is where the existing dev boxes and subnet already live, and c8g.48xlarge is
-# offered there, so this reuses the VPC/subnet/key/SG instead of duplicating them.
+# WHY us-west-2d, NOT us-west-1 (where the rest of the infra lives): us-west-1 has only
+# two AZs and is capacity-starved for 192-core instances. A real launch there failed
+# across all 13 Graviton pools with Server.InsufficientInstanceCapacity, and its
+# on-demand quota (155 vCPU) is below the 192 this needs, so even paying full price
+# would fail. us-west-2d scores 9/10 on spot placement and the region already has
+# 512 vCPU of both spot and on-demand quota. EBS is AZ-locked, so the volume pins the
+# AZ -- deliberately, since AZ-roaming would require a slow snapshot restore on boot.
 #
 # LIFECYCLE: the VOLUME always exists (cheap: 100GB gp3 ~= $8/month). The INSTANCE only
 # exists while enable_parallel_box = true. Bring it up and down with:
@@ -34,7 +38,28 @@ variable "parallel_box_type" {
 variable "parallel_box_az" {
   description = "AZ for the box AND its persistent volume. Changing this strands the volume."
   type        = string
-  default     = "us-west-1a"
+  default     = "us-west-2d" # spot placement score 9/10 for 192-core Graviton
+}
+
+# Second alias for us-west-2. mac-dev.tf already declares one ("mac"), but that name is
+# meaningless here and the Mac config is disabled; a distinct alias keeps the two
+# unrelated us-west-2 workloads from sharing a name.
+provider "aws" {
+  alias  = "west2"
+  region = "us-west-2"
+}
+
+variable "parallel_box_ami" {
+  description = "Ubuntu 24.04 arm64 in us-west-2"
+  type        = string
+  default     = "ami-0d81b5e3fc6de11fe"
+}
+
+resource "aws_key_pair" "parallel_box" {
+  provider   = aws.west2
+  key_name   = "fcvm-ec2-west2"
+  public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2"
+  tags       = { Name = "fcvm-ec2-west2" }
 }
 
 # ---------------------------------------------------------------------------------
@@ -46,6 +71,7 @@ variable "parallel_box_az" {
 # we want.
 # ---------------------------------------------------------------------------------
 resource "aws_ebs_volume" "parallel_work" {
+  provider          = aws.west2
   availability_zone = var.parallel_box_az
   size              = 100
   type              = "gp3"
@@ -65,9 +91,10 @@ resource "aws_ebs_volume" "parallel_work" {
 # disappears whenever enable_firecracker_instance is false, which would break this box
 # for an unrelated reason.
 resource "aws_security_group" "parallel_box" {
+  provider    = aws.west2
   name_prefix = "parallel-box-"
   description = "On-demand parallel compute box: SSH only"
-  vpc_id      = data.aws_vpc.selected.id
+  vpc_id      = "vpc-0376811912470fdbe" # default VPC in us-west-2
 
   ingress {
     description = "SSH"
@@ -92,14 +119,15 @@ resource "aws_security_group" "parallel_box" {
 }
 
 resource "aws_instance" "parallel_box" {
-  count = var.enable_parallel_box ? 1 : 0
+  provider = aws.west2
+  count    = var.enable_parallel_box ? 1 : 0
 
-  ami           = var.firecracker_ami # Ubuntu 24.04 ARM64, shared with the dev boxes
+  ami           = var.parallel_box_ami # Ubuntu 24.04 arm64, us-west-2
   instance_type = var.parallel_box_type
-  key_name      = var.firecracker_key_name
+  key_name      = aws_key_pair.parallel_box.key_name
 
   availability_zone      = var.parallel_box_az
-  subnet_id              = "subnet-05c215519b2150ecd" # same subnet as the dev boxes
+  subnet_id              = "subnet-095349c0fcef8c47f" # default VPC, us-west-2d
   vpc_security_group_ids = [aws_security_group.parallel_box.id]
 
   instance_market_options {
@@ -179,6 +207,7 @@ resource "aws_instance" "parallel_box" {
 }
 
 resource "aws_volume_attachment" "parallel_work" {
+  provider    = aws.west2
   count       = var.enable_parallel_box ? 1 : 0
   device_name = "/dev/sdf"
   volume_id   = aws_ebs_volume.parallel_work.id
