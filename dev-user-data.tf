@@ -52,6 +52,14 @@ if [ "$NVME_COUNT" -eq 0 ]; then
     exit 0
 fi
 
+# Already set up (this script also runs at boot, and self-update re-runs it later):
+# mkfs on a mounted device fails, and reformatting would throw away the cache for no
+# reason. The instance store is ephemeral, so a mount that already exists is correct.
+if mountpoint -q /mnt/fcvm-btrfs; then
+    echo "/mnt/fcvm-btrfs already mounted; leaving it alone"
+    exit 0
+fi
+
 if [ "$NVME_COUNT" -ge 2 ]; then
     # RAID0 multiple NVMe drives for maximum throughput
     NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
@@ -131,7 +139,8 @@ ET
 # GitHub CLI
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-apt-get update && apt-get install -y gh
+apt-get update || true
+apt-get install -y gh || echo "WARNING: gh install failed; continuing"
 
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -266,7 +275,12 @@ SHELLSETUP
 set -euxo pipefail
 
 # System packages
-apt-get update && apt-get upgrade -y
+# Non-fatal on purpose: a stale mirror index 404s on unrelated packages (snapd has done
+# this) and, under set -e, that aborted the entire setup before the config sections ran.
+# Retry once with a refreshed index, then continue regardless -- an OS upgrade is not a
+# prerequisite for converging dotfiles and services.
+apt-get update || true
+apt-get upgrade -y || { echo "WARNING: apt upgrade failed (likely a stale mirror); retrying once"; apt-get update || true; apt-get upgrade -y || echo "WARNING: apt upgrade still failing; continuing"; }
 apt-get install -y \
   zsh curl wget git jq build-essential software-properties-common \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
@@ -328,7 +342,12 @@ SCRIPT
 set -euxo pipefail
 
 # System packages
-apt-get update && apt-get upgrade -y
+# Non-fatal on purpose: a stale mirror index 404s on unrelated packages (snapd has done
+# this) and, under set -e, that aborted the entire setup before the config sections ran.
+# Retry once with a refreshed index, then continue regardless -- an OS upgrade is not a
+# prerequisite for converging dotfiles and services.
+apt-get update || true
+apt-get upgrade -y || { echo "WARNING: apt upgrade failed (likely a stale mirror); retrying once"; apt-get update || true; apt-get upgrade -y || echo "WARNING: apt upgrade still failing; continuing"; }
 apt-get install -y \
   zsh curl wget git jq build-essential software-properties-common \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
