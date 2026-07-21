@@ -255,6 +255,12 @@ cat > ~/.tmux.conf << 'TMUXCONF'
 #     emulator (xterm/VTE feed scrollback only when the region top is row 0, full width).
 set -ga terminal-overrides ',*:smcup@:rmcup@'
 set -g status off
+# 3. indn@ -- scroll with bare linefeeds ONLY, never CSI S. tmux batches multi-line
+#    scrolls into the indn capability (ESC[nS) when the terminal advertises it, and
+#    Prompt on iOS saves LF-scrolled lines to its scrollback but discards CSI-S-scrolled
+#    ones (side-by-side verified: seq output scrolled by LF survives a swipe; Claude's
+#    Ink commits scrolled by CSI S vanish). Disabling indn forces a plain LF loop.
+set -as terminal-overrides ',*:indn@'
 
 # Mouse OFF, and PINNED deliberately: `mouse on` makes tmux capture wheel events into
 # copy-mode and steal them from the terminal. tmux 3.8 changes the DEFAULT to on, so
