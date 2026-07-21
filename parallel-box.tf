@@ -26,7 +26,7 @@ variable "enable_parallel_box" {
 }
 
 variable "parallel_box_type" {
-  description = "Instance type. Must be arm64 and offered in the volume's AZ."
+  description = "Instance type. Must be arm64 and offered in the volume's AZ. scripts/parallel-box.sh overrides this per attempt, walking a list of pools until one has spot capacity."
   type        = string
   default     = "c8g.48xlarge" # 192 cores / 384GB
 }

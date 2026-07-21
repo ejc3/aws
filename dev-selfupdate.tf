@@ -51,7 +51,10 @@ ARCH=$(uname -m)
 TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
 ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V'
 
-echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
+# Read the table on fd 3, NOT stdin. A command inside the loop (etserver -V, which
+# aborts on this build) consumed the remaining stdin and silently ate every entry after
+# the first -- tmux was never processed at all. Everything inside also gets </dev/null.
+while IFS='|' read -r repo tag prefix bins dir svc vercmd <&3; do
   [ -n "$repo" ] || continue
   url="https://github.com/$repo/releases/download/$tag/$prefix-$ARCH.tar.gz"
   state="/var/lib/dev-bin-update/$prefix"
@@ -63,7 +66,7 @@ echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
   fi
 
   sum=$(sha256sum "$tmp/a.tar.gz" | awk '{print $1}')
-  if [ "$sum" = "$(cat "$state/sha256" 2>/dev/null)" ] && $vercmd >/dev/null 2>&1; then
+  if [ "$sum" = "$(cat "$state/sha256" 2>/dev/null)" ] && $vercmd >/dev/null 2>&1 </dev/null; then
     echo "bin-update[$prefix]: already current"; rm -rf "$tmp"; continue
   fi
 
@@ -72,17 +75,17 @@ echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
   fi
 
   # Prove the downloaded binary executes on THIS box before touching the live one.
-  ok=1
-  for b in $bins; do
-    chmod +x "$tmp/$b" 2>/dev/null
-    "$tmp/$b" -V >/dev/null 2>&1 || "$tmp/$b" --version >/dev/null 2>&1 || ok=0
-  done
-  if [ "$ok" -ne 1 ]; then
-    echo "bin-update[$prefix]: downloaded binary will not execute; keeping current"
+  for b in $bins; do chmod +x "$tmp/$b" 2>/dev/null; done
+
+  # Verify exactly the binary the version-check names, using its known-good flag.
+  probe_bin=$(basename "$(echo "$vercmd" | awk '{print $1}')")
+  probe_flag=$(echo "$vercmd" | awk '{print $2}')
+  if ! "$tmp/$probe_bin" $probe_flag >/dev/null 2>&1 </dev/null; then
+    echo "bin-update[$prefix]: downloaded $probe_bin will not execute; keeping current"
     rm -rf "$tmp"; continue
   fi
 
-  [ -n "$svc" ] && systemctl stop "$svc" 2>/dev/null
+  [ -n "$svc" ] && systemctl stop "$svc" 2>/dev/null </dev/null
   mkdir -p "$dir"
   for b in $bins; do
     # rename-then-install: overwriting a RUNNING binary in place fails "Text file busy"
@@ -90,7 +93,7 @@ echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
     install -m 755 "$tmp/$b" "$dir/$b"
   done
 
-  if [ -z "$svc" ] || systemctl start "$svc"; then
+  if [ -z "$svc" ] || systemctl start "$svc" </dev/null; then
     echo "$sum" > "$state/sha256"
     echo "bin-update[$prefix]: installed $($vercmd 2>&1 | head -1)"
   else
@@ -99,7 +102,9 @@ echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
     systemctl start "$svc" 2>/dev/null
   fi
   rm -rf "$tmp"
-done
+done 3<<TABLE_EOF
+$TABLE
+TABLE_EOF
 BINUPD
 chmod +x /usr/local/bin/dev-bin-update.sh
 
