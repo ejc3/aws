@@ -212,6 +212,51 @@ cat > ~/.tmux.conf << 'TMUXCONF'
 # Goal: scrolling behaves as if tmux were not running -- a swipe in Panic Prompt (iOS)
 # scrolls the terminal's OWN scrollback. No copy-mode, no key chords.
 #
+# THE MECHANISM (deterministic, 4/4 across burst and paced output):
+#   default config    -> tmux emits ESC[?1049h, terminal enters the ALTERNATE screen
+#   with smcup@ below -> no ESC[?1049h, tmux stays on the PRIMARY screen
+#
+# The alternate screen has no scrollback by definition, so anything scrolling out of the
+# pane is discarded by the terminal and there is nothing for a swipe to reach. Staying on
+# the primary screen means output lands in the terminal's own scrollback, as with no tmux.
+#
+# CORRECTION: an earlier version of this file claimed "0 of 36 scrolled-off lines ever
+# reached the terminal". That was a capture-flush artifact of a single test run. Re-measured
+# it is 36/36 in BOTH configs -- the bytes always arrive; what differs is whether the
+# terminal RETAINS them, which is decided solely by the alternate screen. Same conclusion,
+# but do not trust the old byte-count reasoning.
+#
+# Verified separately: Prompt on iOS implements xterm mouse "click-only" (Panic's own docs),
+# so it sends no wheel events and `mouse on` can never scroll here. Full-screen apps inside
+# tmux (vim/htop) still work and their alt-screen does not leak outward.
+#
+# KNOWN WART: reattaching redraws the visible screen, so roughly one screenful (measured up
+# to ~3x for some rows) is re-emitted into scrollback per attach. Inherent to primary-screen
+# operation; the tradeoff for having any scrollback at all.
+
+# THE KEY LINE: stay on the terminal's primary screen.
+set -ga terminal-overrides ',*:smcup@:rmcup@'
+
+# Mouse OFF, and PINNED deliberately: `mouse on` makes tmux capture wheel events into
+# copy-mode and steal them from the terminal. tmux 3.8 changes the DEFAULT to on, so
+# leaving it unset would silently break native scrolling on a future upgrade.
+set -g mouse off
+
+# Lowered from 50000: tmux history costs ~310 bytes/line plus ~27 bytes per used cell and
+# has no byte cap (tmux#4859), so 50k dense lines is ~120MB per pane. The terminal owns
+# scrollback now, so this is only a copy-mode fallback (Ctrl-b [ , arrows, q).
+# To extract a full pane regardless: tmux capture-pane -J -S - -p > file.txt
+set -g history-limit 10000
+
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm-256color:RGB"
+set -g set-clipboard on
+set -sg escape-time 10
+set -g focus-events on
+TMUXCONF'
+# Goal: scrolling behaves as if tmux were not running -- a swipe in Panic Prompt (iOS)
+# scrolls the terminal's OWN scrollback. No copy-mode, no key chords.
+#
 # Measured, not assumed. Capturing the raw bytes tmux writes to the pty:
 #   with the alternate screen:  0 of 36 scrolled-off lines ever reached the terminal
 #   with smcup@/rmcup@ below:   every line reached it; duplication capped at one
