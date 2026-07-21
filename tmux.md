@@ -11,10 +11,28 @@ survives instance recreation.
   `<box>:2022` with the `fcvm-ec2` key. ET auto-reconnects and survives sleep, IP
   changes, and flaky networks — over one TCP connection on port 2022 (already open in
   the security group). Plain **SSH on :22 is always the fallback** — you can't be locked out.
-- **Scrolling:** attach tmux in **control mode** — `tmux -CC` (or `tmux -CC attach`) — and
-  Prompt renders tmux windows as native tabs with **native OS scrollbars**. Without `-CC`,
-  `~/.tmux.conf` sets `mouse on`, so the wheel drives tmux copy-mode scrollback. Keyboard
-  fallback that always works: `Ctrl-b [`, then PageUp / arrows, `q` to exit.
+- **Scrolling — native swipe, no copy-mode.** `~/.tmux.conf` is tuned so a two-finger
+  swipe scrolls **Prompt's own scrollback**, as if tmux weren't there. Three settings
+  make this work, and all three are load-bearing:
+  1. `smcup@/rmcup@` — tmux never enters the alternate screen (which has no scrollback)
+  2. `status off` — the single pane is exactly full-screen, so tmux never scrolls
+     inside a DECSTBM region (region-scrolled lines are discarded by the terminal)
+  3. `indn@` — tmux scrolls with plain linefeeds, never `CSI S` (Prompt drops
+     CSI-S-scrolled lines from its scrollback)
+  **The invariant: ONE pane, filling the whole terminal.** Splitting panes silently
+  stops output from reaching Prompt's scrollback (it comes back when you return to a
+  single full-screen pane). Switching windows/sessions interleaves redraws of a
+  different buffer into the scrollback — usable, but expect visual seams. `mouse off`
+  is deliberate and pinned: with `mouse on`, tmux steals wheel events into copy-mode,
+  and tmux 3.8 flips the default to on.
+  Do **not** attach with `tmux -CC`: no iOS client implements control mode (verified —
+  Prompt included); a plain `tmux attach` is correct here.
+  Keyboard fallback that always works: `Ctrl-b [`, then PageUp / arrows, `q` to exit.
+- **Rotation / second clients:** every resize (phone rotation, attaching from a
+  laptop at a different size) triggers a full redraw and can leave duplicated rows in
+  the scrollback, hard-wrapped at the old width. Cosmetic, not data loss. When it gets
+  noisy, `clear` starts a clean stretch. Prefer detaching other clients while driving
+  from the phone.
 
 ## The tmux model (quick reference)
 
@@ -35,7 +53,7 @@ t-claude [SESSION] [--resume <id>]
 |---|---|
 | **session** | the name you pass (`Apps`, `Backend`, `AWS`); omit it → `<folder>-<hash>` (unique per directory) |
 | **window** | the **folder** you launch from. Identity is the folder *path* (a hidden `@tclaude_key` window option), so two same-named folders never collide, and the same folder in two sessions is two windows |
-| **pane** | **you** split your own terminal in with `Ctrl-b %` / `Ctrl-b "` — t-claude never creates or touches panes |
+| **pane** | t-claude never creates panes. You *can* split (`Ctrl-b %` / `Ctrl-b "`), but **splits break native swipe scrollback** (see above) — prefer separate windows |
 
 Each window runs `claude --resume --dangerously-skip-permissions` (or
 `claude --resume <id> --dangerously-skip-permissions` when you pass `--resume`).

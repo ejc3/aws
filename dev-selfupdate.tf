@@ -85,21 +85,58 @@ while IFS='|' read -r repo tag prefix bins dir svc vercmd <&3; do
     rm -rf "$tmp"; continue
   fi
 
+  # tmux keeps LONG-LIVED detached servers holding the user's Claude sessions. Swapping
+  # the binary under a running server bumps the client-server protocol, so a later
+  # `tmux attach` fails with "protocol version mismatch" and the phone user loses access
+  # to their sessions. Defer while any server is up. NOTE: this updater runs as ROOT,
+  # but the sessions belong to the ubuntu user, whose server socket lives in
+  # /tmp/tmux-1000/ -- `tmux list-sessions` as root looks in /tmp/tmux-0/ and sees
+  # nothing. Probe each real user's socket dir explicitly, as that user.
+  if [ "$prefix" = "tmux" ]; then
+    deferred=0
+    for sockdir in /tmp/tmux-*; do
+      [ -d "$sockdir" ] || continue
+      uid=$(basename "$sockdir" | sed "s/^tmux-//")
+      case "$uid" in ""|*[!0-9]*) continue ;; esac
+      owner=$(stat -c %U "$sockdir" 2>/dev/null) || continue
+      if sudo -u "$owner" "$dir/tmux" list-sessions >/dev/null 2>&1 </dev/null; then
+        echo "bin-update[tmux]: user $owner has live sessions; deferring to avoid a"
+        echo "                  protocol-mismatch lockout (retries next run)"
+        deferred=1; break
+      fi
+    done
+    if [ "$deferred" -eq 1 ]; then rm -rf "$tmp"; continue; fi
+  fi
+
   [ -n "$svc" ] && systemctl stop "$svc" 2>/dev/null </dev/null
   mkdir -p "$dir"
+
+  # Keep a rollback copy that PERSISTS across runs (never overwrite a good .prev with a
+  # bad one): only refresh .prev from a binary we have already blessed via sha256.
+  installed_ok=1
   for b in $bins; do
+    if [ -f "$state/blessed" ] && [ -f "$dir/$b" ]; then
+      cp -f "$dir/$b" "$dir/$b.prev" 2>/dev/null || true
+    fi
     # rename-then-install: overwriting a RUNNING binary in place fails "Text file busy"
-    mv "$dir/$b" "$dir/$b.prev" 2>/dev/null || true
-    install -m 755 "$tmp/$b" "$dir/$b"
+    mv "$dir/$b" "$dir/$b.prev.tmp" 2>/dev/null || true
+    if ! install -m 755 "$tmp/$b" "$dir/$b"; then
+      # install failed (e.g. ENOSPC): restore so PATH does not fall back to a
+      # protocol-mismatched distro tmux.
+      mv "$dir/$b.prev.tmp" "$dir/$b" 2>/dev/null || true
+      installed_ok=0; break
+    fi
+    rm -f "$dir/$b.prev.tmp"
   done
 
-  if [ -z "$svc" ] || systemctl start "$svc" </dev/null; then
+  if [ "$installed_ok" -eq 1 ] && { [ -z "$svc" ] || systemctl start "$svc" </dev/null; }; then
     echo "$sum" > "$state/sha256"
+    touch "$state/blessed"
     echo "bin-update[$prefix]: installed $($vercmd 2>&1 | head -1)"
   else
-    echo "bin-update[$prefix]: service failed to start -- rolling back"
+    echo "bin-update[$prefix]: install/start failed -- rolling back"
     for b in $bins; do mv "$dir/$b.prev" "$dir/$b" 2>/dev/null || true; done
-    systemctl start "$svc" 2>/dev/null
+    [ -n "$svc" ] && systemctl start "$svc" 2>/dev/null
   fi
   rm -rf "$tmp"
 done 3<<TABLE_EOF
