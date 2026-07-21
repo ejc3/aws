@@ -346,6 +346,8 @@ npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
 
+${local.pbox_setup}
+
 ${local.selfupdate_setup}
 
 echo "ARM dev instance ready!"
@@ -404,6 +406,8 @@ ${local.shell_setup}
 npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
+
+${local.pbox_setup}
 
 ${local.selfupdate_setup}
 

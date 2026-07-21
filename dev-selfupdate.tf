@@ -136,6 +136,58 @@ systemctl start et-update.timer >/dev/null 2>&1 || true
   EOT
 
   # ---------------------------------------------------------------------------
+  # `pbox` -- "I want it" / "I don't" for the on-demand 192-core Graviton box.
+  #
+  # Dev boxes deliberately hold a restricted IAM role with NO ec2:RunInstances, and
+  # terraform state lives on the jumpbox. So this does not launch anything itself: it
+  # delegates the terraform half to the jumpbox over SSH, then drops you onto the new
+  # machine. Keeps dev-box permissions unchanged.
+  # ---------------------------------------------------------------------------
+  pbox_setup = <<-EOT
+cat > /usr/local/bin/pbox <<'PBOX'
+#!/bin/bash
+# On-demand 192-core Graviton box (c8g.48xlarge, ~$3.14/hr spot).
+#
+#   pbox up      launch it and ssh over        ("I want it")
+#   pbox down    terminate it                  ("I don't")
+#   pbox ssh     reconnect to a running box
+#   pbox status  running? cost? disk?
+#
+# Work lives on /mnt/work -- a persistent 100GB volume that survives every up/down and
+# every spot interruption. The root disk does not; treat it as scratch.
+#
+# An idle watchdog terminates the box automatically after 30 min below 5% CPU, because
+# it costs roughly 50x a dev box per hour. Losing it costs nothing: /mnt/work persists.
+set -euo pipefail
+JUMPBOX=10.0.1.72
+KEY="$HOME/.ssh/fcvm-ec2"
+JB() { ssh -i "$KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" "cd ~/aws && ./scripts/parallel-box.sh $*"; }
+
+case "$${1:-status}" in
+  up|want)
+    JB up
+    IP="$(JB ip)"
+    [ -n "$IP" ] || { echo "box did not come up; try: pbox status" >&2; exit 1; }
+    echo "Connecting to $IP (work disk at /mnt/work)..."
+    exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
+    ;;
+  down|dont|stop)
+    JB down
+    ;;
+  ssh)
+    IP="$(JB ip)"
+    [ -n "$IP" ] || { echo "Box is down. Run: pbox up" >&2; exit 1; }
+    exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
+    ;;
+  status|*)
+    JB status
+    ;;
+esac
+PBOX
+chmod +x /usr/local/bin/pbox
+  EOT
+
+  # ---------------------------------------------------------------------------
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------
   selfupdate_setup = <<-EOT
