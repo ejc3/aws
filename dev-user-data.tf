@@ -317,10 +317,10 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 ${local.nvme_btrfs_setup}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
-${local.et_binary_update}
+${local.bin_update}
 # Try the prebuilt binary from ejc3/EternalTerminal CI first; compile from source only
 # if no release asset is available for this arch.
-/usr/local/bin/et-update.sh || true
+/usr/local/bin/dev-bin-update.sh || true
 if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
 ( ${local.et_setup} ) || echo "WARNING: Eternal Terminal setup failed; continuing (SSH :22 unaffected)"
 fi
@@ -376,10 +376,10 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 ${local.nvme_btrfs_setup}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
-${local.et_binary_update}
+${local.bin_update}
 # Try the prebuilt binary from ejc3/EternalTerminal CI first; compile from source only
 # if no release asset is available for this arch.
-/usr/local/bin/et-update.sh || true
+/usr/local/bin/dev-bin-update.sh || true
 if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
 ( ${local.et_setup} ) || echo "WARNING: Eternal Terminal setup failed; continuing (SSH :22 unaffected)"
 fi

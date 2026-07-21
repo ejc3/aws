@@ -10,8 +10,10 @@
 # THE FIX: two units.
 #   dev-selfupdate  - on every boot, fetch the published script from S3 and re-apply it
 #                     if its checksum changed. The login banner reports what happened.
-#   et-update       - weekly, install prebuilt Eternal Terminal binaries built by
-#                     ejc3/EternalTerminal CI instead of compiling from source on the box.
+#   et-update       - weekly, install prebuilt binaries built by ejc3 CI instead of
+#                     compiling on the box. Driven by a table: Eternal Terminal from
+#                     ejc3/EternalTerminal, and tmux from ejc3/tmux (Ubuntu 24.04 ships
+#                     3.4, which predates pane-scrollbars).
 #
 # JUMPBOX IS DELIBERATELY EXCLUDED: it is the machine we manage everything else from, so
 # it does not get a service that re-runs a downloaded script as root. Dev boxes only.
@@ -29,73 +31,95 @@
 
 locals {
   # ---------------------------------------------------------------------------
-  # Weekly Eternal Terminal binary refresh.
+  # Prebuilt-binary refresh, driven by a table so ET and tmux share one code path
+  # rather than duplicating an updater per tool.
   #
-  # ET is how we log in, so every failure path here must leave a WORKING etserver:
-  # the download is verified by running it before install, and a failed start rolls
-  # back to the previous binary. SSH on :22 is unaffected regardless.
+  # Every failure path must leave a WORKING binary in place: the download is executed
+  # once to prove it runs BEFORE the current one is replaced, and a service that fails
+  # to restart is rolled back. ET is how we log in, so this matters; SSH on :22 is
+  # unaffected regardless.
   # ---------------------------------------------------------------------------
-  et_binary_update = <<-EOT
-cat > /usr/local/bin/et-update.sh <<'ETUPD'
+  bin_update = <<-EOT
+cat > /usr/local/bin/dev-bin-update.sh <<'BINUPD'
 #!/bin/bash
 set -uo pipefail
-REPO=ejc3/EternalTerminal
-TAG=binaries-7.x
 ARCH=$(uname -m)
-URL="https://github.com/$REPO/releases/download/$TAG/et-$ARCH.tar.gz"
-STATE=/var/lib/et-update
-mkdir -p "$STATE"
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
-curl -fsSL --retry 3 -o "$TMP/et.tar.gz" "$URL" || {
-  echo "et-update: no release asset at $URL (keeping current build)"; exit 0; }
+# repo|release-tag|asset-prefix|binaries|install-dir|service-to-restart|version-cmd
+# tmux installs to /usr/local/bin so it shadows the distro package in PATH without
+# fighting dpkg -- removing the tarball reverts cleanly to Ubuntu's 3.4.
+TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
+ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V'
 
-NEW_SUM=$(sha256sum "$TMP/et.tar.gz" | awk '{print $1}')
-if [ "$NEW_SUM" = "$(cat "$STATE/sha256" 2>/dev/null)" ] && /usr/bin/etserver --version >/dev/null 2>&1; then
-  echo "et-update: already current"; exit 0
-fi
+echo "$TABLE" | while IFS='|' read -r repo tag prefix bins dir svc vercmd; do
+  [ -n "$repo" ] || continue
+  url="https://github.com/$repo/releases/download/$tag/$prefix-$ARCH.tar.gz"
+  state="/var/lib/dev-bin-update/$prefix"
+  mkdir -p "$state"
+  tmp=$(mktemp -d)
 
-tar xzf "$TMP/et.tar.gz" -C "$TMP" || { echo "et-update: bad tarball"; exit 0; }
-chmod +x "$TMP"/et "$TMP"/etserver "$TMP"/etterminal
-# Prove the downloaded binary runs on THIS box before touching the working one.
-"$TMP/etserver" --version >/dev/null 2>&1 || {
-  echo "et-update: downloaded etserver will not execute; keeping current"; exit 0; }
+  if ! curl -fsSL --retry 3 -o "$tmp/a.tar.gz" "$url"; then
+    echo "bin-update[$prefix]: no asset at $url (keeping current)"; rm -rf "$tmp"; continue
+  fi
 
-systemctl stop etserver.service
-for b in et etserver etterminal; do
-  # rename-then-copy: overwriting a running binary in place fails with "Text file busy"
-  mv "/usr/bin/$b" "/usr/bin/$b.prev" 2>/dev/null || true
-  install -m 755 "$TMP/$b" "/usr/bin/$b"
-done
+  sum=$(sha256sum "$tmp/a.tar.gz" | awk '{print $1}')
+  if [ "$sum" = "$(cat "$state/sha256" 2>/dev/null)" ] && $vercmd >/dev/null 2>&1; then
+    echo "bin-update[$prefix]: already current"; rm -rf "$tmp"; continue
+  fi
 
-if systemctl start etserver.service; then
-  echo "$NEW_SUM" > "$STATE/sha256"
-  /usr/bin/etserver --version > "$STATE/version" 2>&1
-  echo "et-update: installed $(cat "$STATE/version")"
-else
-  echo "et-update: new etserver failed to start -- rolling back"
-  for b in et etserver etterminal; do
-    mv "/usr/bin/$b.prev" "/usr/bin/$b" 2>/dev/null || true
+  if ! tar xzf "$tmp/a.tar.gz" -C "$tmp"; then
+    echo "bin-update[$prefix]: bad tarball"; rm -rf "$tmp"; continue
+  fi
+
+  # Prove the downloaded binary executes on THIS box before touching the live one.
+  ok=1
+  for b in $bins; do
+    chmod +x "$tmp/$b" 2>/dev/null
+    "$tmp/$b" -V >/dev/null 2>&1 || "$tmp/$b" --version >/dev/null 2>&1 || ok=0
   done
-  systemctl start etserver.service
-fi
-ETUPD
-chmod +x /usr/local/bin/et-update.sh
+  if [ "$ok" -ne 1 ]; then
+    echo "bin-update[$prefix]: downloaded binary will not execute; keeping current"
+    rm -rf "$tmp"; continue
+  fi
+
+  [ -n "$svc" ] && systemctl stop "$svc" 2>/dev/null
+  mkdir -p "$dir"
+  for b in $bins; do
+    # rename-then-install: overwriting a RUNNING binary in place fails "Text file busy"
+    mv "$dir/$b" "$dir/$b.prev" 2>/dev/null || true
+    install -m 755 "$tmp/$b" "$dir/$b"
+  done
+
+  if [ -z "$svc" ] || systemctl start "$svc"; then
+    echo "$sum" > "$state/sha256"
+    echo "bin-update[$prefix]: installed $($vercmd 2>&1 | head -1)"
+  else
+    echo "bin-update[$prefix]: service failed to start -- rolling back"
+    for b in $bins; do mv "$dir/$b.prev" "$dir/$b" 2>/dev/null || true; done
+    systemctl start "$svc" 2>/dev/null
+  fi
+  rm -rf "$tmp"
+done
+BINUPD
+chmod +x /usr/local/bin/dev-bin-update.sh
+
+# Keep the old path working; it is referenced by existing units and muscle memory.
+ln -sf /usr/local/bin/dev-bin-update.sh /usr/local/bin/et-update.sh
 
 cat > /etc/systemd/system/et-update.service <<'SVC'
 [Unit]
-Description=Install prebuilt Eternal Terminal binaries from ejc3/EternalTerminal
+Description=Install prebuilt dev binaries (Eternal Terminal, tmux) from ejc3 releases
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/et-update.sh
+ExecStart=/usr/local/bin/dev-bin-update.sh
 SVC
 
 cat > /etc/systemd/system/et-update.timer <<'TMR'
 [Unit]
-Description=Weekly Eternal Terminal binary refresh
+Description=Weekly prebuilt dev-binary refresh
 
 [Timer]
 OnCalendar=Mon 07:00
