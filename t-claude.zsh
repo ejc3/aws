@@ -38,8 +38,15 @@ t-claude() {
 
   key="$(printf '%s' "$folder" | cksum | awk '{print $1}')_$(printf '%s' "$resume" | cksum | awk '{print $1}')"
   winname="$base"; [ -n "$resume" ] && winname="${base}-$(printf '%s' "$resume" | tr -c 'A-Za-z0-9_-' '_')"
-  if [ -n "$resume" ]; then cmd="claude --resume $resume --dangerously-skip-permissions"
-  else cmd="claude --resume --dangerously-skip-permissions"; fi
+  # nosync-wrap strips Claude's synchronized-output-mode sequences (CSI ?2026h/l)
+  # before tmux sees them. tmux buffers all grid updates while sync mode is active and
+  # emits only a viewport redraw, so scrolled-off lines never reach the host terminal's
+  # native scrollback -- verified by strace on the live process (2026h emitted) and by
+  # a 40/40-vs-23/40 scrollback measurement with and without the wrapper. Falls back to
+  # bare claude if the wrapper is missing, so t-claude never breaks.
+  local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
+  if [ -n "$resume" ]; then cmd="${wrap}claude --resume $resume --dangerously-skip-permissions"
+  else cmd="${wrap}claude --resume --dangerously-skip-permissions"; fi
 
   # already the requested session's window?
   win=""

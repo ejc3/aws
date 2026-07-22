@@ -179,6 +179,7 @@ PODMANSYS
   # t-claude(): kept as a repo file and base64-encoded so terraform never touches
   # its ${...}; decoded to ~/.config/t-claude.zsh at boot, sourced from ~/.zshrc.
   tclaude_b64 = base64encode(file("${path.module}/t-claude.zsh"))
+  nosync_b64  = base64encode(file("${path.module}/nosync-wrap.py"))
 
   shell_setup = <<-SHELLSETUP
 sudo -u ubuntu bash << 'SHELL'
@@ -255,6 +256,11 @@ cat > ~/.tmux.conf << 'TMUXCONF'
 #     emulator (xterm/VTE feed scrollback only when the region top is row 0, full width).
 set -ga terminal-overrides ',*:smcup@:rmcup@'
 set -g status off
+# NOTE: these three settings are necessary but NOT sufficient for Claude Code. Claude
+# wraps its repaints in synchronized-output mode (CSI ?2026h/l); tmux buffers grid
+# updates during sync and emits only a viewport redraw, so scrolled lines never reach
+# native scrollback. t-claude launches claude under `nosync-wrap`, which strips those
+# sequences. Plain shell output needs only the three settings above.
 # 3. indn@ -- scroll with bare linefeeds ONLY, never CSI S. tmux batches multi-line
 #    scrolls into the indn capability (ESC[nS) when the terminal advertises it, and
 #    Prompt on iOS saves LF-scrolled lines to its scrollback but discards CSI-S-scrolled
@@ -281,6 +287,7 @@ set -g focus-events on
 TMUXCONF
 mkdir -p ~/.config
 printf '%s' '${local.tclaude_b64}' | base64 -d > ~/.config/t-claude.zsh
+printf '%s' '${local.nosync_b64}' | base64 -d | sudo tee /usr/local/bin/nosync-wrap >/dev/null && sudo chmod 755 /usr/local/bin/nosync-wrap
 SHELL
 chsh -s /usr/bin/zsh ubuntu
 SHELLSETUP
