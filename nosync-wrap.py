@@ -19,7 +19,7 @@ shell regains control. SIGCONT reverses it. SIGSTOP is used for the child rather
 than SIGTSTP because the child is a session leader in its own (orphaned) session,
 and POSIX discards stop signals sent to an orphaned process group.
 """
-import os, pty, re, sys, select, fcntl, termios, struct, signal, tty as ttymod
+import os, pty, re, sys, select, fcntl, termios, struct, signal, time, tty as ttymod
 
 SUSP = b"\x1a"          # Ctrl-Z (VSUSP); raw mode means we must handle it ourselves
 
@@ -74,6 +74,25 @@ def main():
             sz = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0"*8)
             fcntl.ioctl(fd, termios.TIOCSWINSZ, sz)
         except Exception: pass
+
+    def force_redraw():
+        """Make the child repaint now: shrink the pty by one column, pause, restore.
+
+        Without this claude stays blank after `fg` until the next keystroke -- measured
+        0 lines of its UI on screen, then a full repaint the moment any key arrives.
+        A SIGWINCH carrying the size it already has does nothing, and shrink-then-restore
+        back to back does nothing either: claude coalesces the two and sees no net change.
+        The pause is what makes them two events. Measured on a devserver: 150ms repaints,
+        no pause does not, and neither a focus-in event nor Ctrl-L does. It runs on resume
+        only, so the cost is invisible."""
+        try:
+            sz = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0"*8)
+            rows, cols, xpix, ypix = struct.unpack("HHHH", sz)
+            if cols > 1:
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols - 1, xpix, ypix))
+                time.sleep(0.15)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, sz)
+        except Exception: pass
     signal.signal(signal.SIGWINCH, winch); winch()
     try: old = termios.tcgetattr(0); set_raw(0); restore = True
     except Exception: old = None; restore = False
@@ -113,7 +132,7 @@ def main():
             if g: os.killpg(g, signal.SIGCONT)
             else: os.kill(pid, signal.SIGCONT)
         except Exception: pass
-        winch()                       # nudge the child to redraw its UI
+        force_redraw()                # same-size SIGWINCH is ignored; see force_redraw
         signal.signal(signal.SIGTSTP, tstp)
 
     def tstp(*_):
