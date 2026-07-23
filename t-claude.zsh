@@ -44,10 +44,15 @@ t-claude() {
   # native scrollback -- verified by strace on the live process (2026h emitted) and by
   # a 40/40-vs-23/40 scrollback measurement with and without the wrapper. Falls back to
   # bare claude if the wrapper is missing, so t-claude never breaks.
+  # Pass --effort here rather than relying on a claude() wrapper in ~/.zshrc: the command
+  # runs as `nosync-wrap claude ...`, so the shell runs nosync-wrap and any such function is
+  # skipped, leaving the window on the default effort. Exported variables still arrive on
+  # their own; a flag cannot, so it belongs in this command.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
+  local flags="--dangerously-skip-permissions --effort ultracode"
   local inner
-  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume --dangerously-skip-permissions"
-  else inner="${wrap}claude --resume --dangerously-skip-permissions"; fi
+  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags"
+  else inner="${wrap}claude --resume $flags"; fi
 
   # Ctrl-Z NOTE: the window is created running your normal interactive shell, and
   # claude is then sent to it as a JOB. Running claude as the pane command directly
