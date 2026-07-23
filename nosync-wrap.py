@@ -93,9 +93,17 @@ def main():
             if g: os.killpg(g, signal.SIGSTOP)
             else: os.kill(pid, signal.SIGSTOP)
         except Exception: pass
-        # Suspend self with the default handler so the shell actually sees us stop.
+        # Stop our whole process group with SIGSTOP, so the shell actually sees the job
+        # stop and takes the terminal back. Stopping only this pid is not enough when the
+        # interpreter is reached through a launcher: `#!/usr/bin/env python3` on a Meta
+        # devserver resolves to fbpython, which runs the real interpreter as a CHILD and
+        # keeps running, so the shell -- which waits on the job leader -- never gets a
+        # prompt back and later keystrokes land in the stopped child's pty. SIGSTOP rather
+        # than SIGTSTP because that launcher ignores SIGTSTP, and SIGSTOP cannot be caught
+        # or ignored. claude is unaffected: it leads its own session, in a different group,
+        # and was stopped explicitly above. Cost: zsh prints "suspended (signal)".
         signal.signal(signal.SIGTSTP, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGTSTP)
+        os.killpg(os.getpgrp(), signal.SIGSTOP)
 
     def resumed(*_):
         """SIGCONT: re-arm raw mode, wake the child, force a repaint."""
