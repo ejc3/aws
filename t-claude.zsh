@@ -98,15 +98,27 @@ t-claude() {
 
   # Reusing a window whose claude has exited: since the window now runs the shell rather
   # than claude itself, it survives that exit still carrying @tclaude_key, so t-claude
-  # would hand you an empty prompt and never start claude again. Relaunch -- but only when
-  # the window's shell has no children at all. A claude suspended with Ctrl-Z is still a
-  # child, and stacking a second one on top of it is worse than doing nothing.
+  # would hand you an empty prompt and never start claude again.
+  #
+  # Look for claude among the window shell's children, not merely for "any child". Running
+  # t-claude from inside the very window it is about to reuse -- which is exactly what you
+  # do after claude prints "Resume this session with" -- means our own command
+  # substitutions are children of that shell, so an any-child test always says claude is
+  # alive and silently does nothing. A claude suspended with Ctrl-Z still matches here, so
+  # a stopped session never gets a second claude stacked on it.
   if [ "$created" = 0 ]; then
-    local pane_pid
+    local pane_pid kid alive=0
     pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
-    if [ -n "$pane_pid" ] && [ -z "$(pgrep -P "$pane_pid" 2>/dev/null)" ]; then
-      tmux send-keys -t "$win" "$cmd" Enter
-      printf "relaunched claude in this folder's window -- it had exited\n" >&2
+    if [ -n "$pane_pid" ]; then
+      for kid in $(pgrep -P "$pane_pid" 2>/dev/null); do
+        case "$(ps -o command= -p "$kid" 2>/dev/null)" in
+          *claude*|*nosync-wrap*) alive=1; break ;;
+        esac
+      done
+      if [ "$alive" = 0 ]; then
+        tmux send-keys -t "$win" "$cmd" Enter
+        printf "relaunched claude in this folder's window -- it had exited\n" >&2
+      fi
     fi
   fi
 
