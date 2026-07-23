@@ -45,8 +45,16 @@ t-claude() {
   # a 40/40-vs-23/40 scrollback measurement with and without the wrapper. Falls back to
   # bare claude if the wrapper is missing, so t-claude never breaks.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
-  if [ -n "$resume" ]; then cmd="${wrap}claude --resume $resume --dangerously-skip-permissions"
-  else cmd="${wrap}claude --resume --dangerously-skip-permissions"; fi
+  local inner
+  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume --dangerously-skip-permissions"
+  else inner="${wrap}claude --resume --dangerously-skip-permissions"; fi
+
+  # Ctrl-Z NOTE: the window is created running your normal interactive shell, and
+  # claude is then sent to it as a JOB. Running claude as the pane command directly
+  # cannot support Ctrl-Z at all: a pane command is a session leader, so its process
+  # group is ORPHANED and POSIX silently discards stop signals. As a shell job it lives
+  # in the shell's session, so Ctrl-Z suspends it and `fg` resumes it -- verified.
+  cmd="$inner"
 
   # already the requested session's window?
   win=""
@@ -74,13 +82,16 @@ t-claude() {
 
   # nothing to reuse/move: add a new window (creating the session if needed)
   if [ -z "$win" ]; then
+    # Create the window running the plain interactive shell (no command), then send
+    # claude to it as a job -- see the Ctrl-Z note above.
     if tmux has-session -t "=$session" 2>/dev/null; then
-      win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session" -n "$winname" -c "$folder" "$cmd")"
+      win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session" -n "$winname" -c "$folder")"
     else
-      tmux new-session -d -s "$session" -n "$winname" -c "$folder" "$cmd"
+      tmux new-session -d -s "$session" -n "$winname" -c "$folder"
       win="$(tmux list-windows -t "=$session" -F '#{window_id}' | head -1)"
     fi
     tmux set-option -w -t "$win" @tclaude_key "$key"
+    tmux send-keys -t "$win" "$cmd" Enter
   fi
 
   tmux select-window -t "$win"
