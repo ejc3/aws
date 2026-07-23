@@ -81,6 +81,7 @@ t-claude() {
   fi
 
   # nothing to reuse/move: add a new window (creating the session if needed)
+  local created=0
   if [ -z "$win" ]; then
     # Create the window running the plain interactive shell (no command), then send
     # claude to it as a job -- see the Ctrl-Z note above.
@@ -92,6 +93,21 @@ t-claude() {
     fi
     tmux set-option -w -t "$win" @tclaude_key "$key"
     tmux send-keys -t "$win" "$cmd" Enter
+    created=1
+  fi
+
+  # Reusing a window whose claude has exited: since the window now runs the shell rather
+  # than claude itself, it survives that exit still carrying @tclaude_key, so t-claude
+  # would hand you an empty prompt and never start claude again. Relaunch -- but only when
+  # the window's shell has no children at all. A claude suspended with Ctrl-Z is still a
+  # child, and stacking a second one on top of it is worse than doing nothing.
+  if [ "$created" = 0 ]; then
+    local pane_pid
+    pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
+    if [ -n "$pane_pid" ] && [ -z "$(pgrep -P "$pane_pid" 2>/dev/null)" ]; then
+      tmux send-keys -t "$win" "$cmd" Enter
+      printf "relaunched claude in this folder's window -- it had exited\n" >&2
+    fi
   fi
 
   tmux select-window -t "$win"
