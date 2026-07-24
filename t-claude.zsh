@@ -59,7 +59,11 @@ t-claude() {
   # cannot support Ctrl-Z at all: a pane command is a session leader, so its process
   # group is ORPHANED and POSIX silently discards stop signals. As a shell job it lives
   # in the shell's session, so Ctrl-Z suspends it and `fg` resumes it -- verified.
-  cmd="$inner"
+  # Leading space keeps this out of shell history: ~/.zshrc sets HIST_IGNORE_SPACE, so
+  # zsh skips space-prefixed commands. Without it every launch types the full
+  # "nosync-wrap claude --resume ..." line into the window's shell and it lands in
+  # history, cluttering it and polluting up-arrow / Ctrl-R for the folder you work in.
+  cmd=" $inner"
 
   # already the requested session's window?
   win=""
