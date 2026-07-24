@@ -176,11 +176,6 @@ sysctl -p /etc/sysctl.d/99-fcvm.conf \
 PODMANSYS
 
   # Interactive shell setup: starship, fzf, atuin, zsh plugins, .zshrc (identical on both arches)
-  # t-claude(): kept as a repo file and base64-encoded so terraform never touches
-  # its ${...}; decoded to ~/.config/t-claude.zsh at boot, sourced from ~/.zshrc.
-  tclaude_b64 = base64encode(file("${path.module}/t-claude.zsh"))
-  nosync_b64  = base64encode(file("${path.module}/nosync-wrap.py"))
-
   shell_setup = <<-SHELLSETUP
 sudo -u ubuntu bash << 'SHELL'
 set -e
@@ -286,8 +281,21 @@ set -sg escape-time 10
 set -g focus-events on
 TMUXCONF
 mkdir -p ~/.config
-printf '%s' '${local.tclaude_b64}' | base64 -d > ~/.config/t-claude.zsh
-printf '%s' '${local.nosync_b64}' | base64 -d | sudo tee /usr/local/bin/nosync-wrap >/dev/null && sudo chmod 755 /usr/local/bin/nosync-wrap
+# t-claude and nosync-wrap now live in their own repo: github.com/ejc3/t-claude
+# Fetch them here instead of vendoring. Non-fatal (guarded, and set -e is on): a failed
+# fetch leaves the ~/.zshrc source line a no-op and t-claude falls back to bare claude.
+# Verify non-empty before installing so a truncated download never replaces a good file.
+TCRAW="https://raw.githubusercontent.com/ejc3/t-claude/main"
+if curl -fsSL --retry 3 "$TCRAW/t-claude.zsh" -o /tmp/t-claude.zsh && [ -s /tmp/t-claude.zsh ]; then
+  mv /tmp/t-claude.zsh ~/.config/t-claude.zsh
+else
+  echo "WARNING: could not fetch t-claude.zsh from $TCRAW (keeping any existing copy)"
+fi
+if curl -fsSL --retry 3 "$TCRAW/nosync-wrap" -o /tmp/nosync-wrap && [ -s /tmp/nosync-wrap ]; then
+  sudo install -m 755 /tmp/nosync-wrap /usr/local/bin/nosync-wrap && rm -f /tmp/nosync-wrap
+else
+  echo "WARNING: could not fetch nosync-wrap from $TCRAW (native scrollback may be off)"
+fi
 SHELL
 chsh -s /usr/bin/zsh ubuntu
 SHELLSETUP
