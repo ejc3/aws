@@ -26,8 +26,12 @@ way around it -- verified, not assumed:
   gdoc.py read   <docId>            print the document as plain text
   gdoc.py write  <docId> <file>     REPLACE the whole body with the file's contents
   gdoc.py append <docId> <file>     append the file's contents to the end
+  gdoc.py create <title> [file]     create a document, optionally filled
 """
+import base64
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -38,7 +42,15 @@ import urllib.request
 REGION = "us-west-1"
 CLIENT_SECRET = "google-docs-oauth-client"  # {client_id, client_secret}
 TOKEN_SECRET = "google-docs-oauth-token"    # {refresh_token}
-SCOPE = "https://www.googleapis.com/auth/documents"
+# Device flow will NOT accept `documents` or `drive` -- both return
+# "Invalid device flow scope". drive.file is accepted and IS a valid Docs API scope, but it
+# only reaches files this OAuth client created, so an existing user-authored document may
+# be invisible to it. Verified by testing each scope against the device endpoint.
+SCOPE = "https://www.googleapis.com/auth/drive.file"
+DESKTOP_SECRET = "google-docs-oauth-desktop"  # {client_id, client_secret}
+DESKTOP_SCOPE = "https://www.googleapis.com/auth/documents"
+LOOPBACK = "http://localhost"
+PKCE_PATH = "/home/ubuntu/.gdoc-pkce"
 
 
 def sm_get(name):
@@ -95,10 +107,11 @@ def api(method, url, token, payload=None):
 
 def access_token():
     """Exchange the stored refresh token for a short-lived access token."""
-    client = sm_get(CLIENT_SECRET)
-    if not client:
-        sys.exit(f"missing secret {CLIENT_SECRET}; see the header of this file")
     tok = sm_get(TOKEN_SECRET)
+    # Refresh with the SAME client that minted the token, or Google answers invalid_grant.
+    client = sm_get(DESKTOP_SECRET if (tok or {}).get("kind") == "desktop" else CLIENT_SECRET)
+    if not client:
+        sys.exit("missing OAuth client secret; see the header of this file")
     if not tok:
         sys.exit(f"missing secret {TOKEN_SECRET}; run: gdoc.py auth")
     r = post("https://oauth2.googleapis.com/token", {
@@ -154,6 +167,91 @@ def cmd_auth():
         print(f"  stored refresh token in {TOKEN_SECRET}")
         return
     sys.exit("timed out waiting for approval")
+
+
+def cmd_auth_url():
+    """Print the consent URL for a DESKTOP client (loopback redirect).
+
+    Device flow cannot be used for real document access: Google refuses both `documents`
+    and `drive` as device-flow scopes, and the one Drive scope it does accept,
+    drive.file, only reaches files this client itself created -- an existing user-authored
+    document answers 404, because Google hides the existence of files outside the grant.
+
+    The desktop client accepts the full `documents` scope. Its redirect goes to
+    http://localhost, which will not load for a browser on another machine -- that is
+    fine and expected. The authorization code is in the address bar, and the caller
+    pastes it back via `auth-code`. PKCE is included because Google requires it for
+    newer installed-app clients and it costs nothing when it is merely recommended.
+    """
+    client = sm_get(DESKTOP_SECRET)
+    if not client:
+        sys.exit(
+            f"Create a DESKTOP client, then store it:\n"
+            f"  GCP console -> Credentials -> Create credentials -> OAuth client ID\n"
+            f"  -> Application type: 'Desktop app'\n"
+            f"  aws secretsmanager create-secret --name {DESKTOP_SECRET} --region {REGION} \\\n"
+            f"    --secret-string '{{\"client_id\":\"...\",\"client_secret\":\"...\"}}'")
+    verifier = base64.urlsafe_b64encode(os.urandom(64)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    with open(PKCE_PATH, "w") as fh:
+        fh.write(verifier)
+    os.chmod(PKCE_PATH, 0o600)
+    q = urllib.parse.urlencode({
+        "client_id": client["client_id"],
+        "redirect_uri": LOOPBACK,
+        "response_type": "code",
+        "scope": DESKTOP_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",           # force a refresh_token even on re-authorization
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+    print(f"\n  Open:\n  https://accounts.google.com/o/oauth2/v2/auth?{q}\n")
+    print("  Approve, then copy the `code=` value from the address bar of the page")
+    print("  that fails to load, and run:  gdoc.py auth-code <code>\n")
+
+
+def cmd_auth_code(code):
+    client = sm_get(DESKTOP_SECRET)
+    if not client:
+        sys.exit(f"missing secret {DESKTOP_SECRET}")
+    try:
+        with open(PKCE_PATH) as fh:
+            verifier = fh.read().strip()
+    except OSError:
+        sys.exit("no pending PKCE verifier; run: gdoc.py auth-url")
+    # The browser percent-encodes the code; undo that or the exchange fails as invalid_grant.
+    t = post("https://oauth2.googleapis.com/token", {
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "code": urllib.parse.unquote(code),
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": LOOPBACK,
+    })
+    if "refresh_token" not in t:
+        sys.exit(f"exchange failed: {json.dumps(t)[:300]}\n"
+                 "codes are single-use and short-lived; re-run auth-url for a fresh one")
+    sm_put(TOKEN_SECRET, {"refresh_token": t["refresh_token"], "kind": "desktop"},
+           "Google Docs API refresh token (desktop loopback flow, scope: documents)")
+    os.unlink(PKCE_PATH)
+    print(f"  stored refresh token in {TOKEN_SECRET}")
+
+
+def cmd_create(title, path=None):
+    """Create a document and optionally fill it. Needs the `documents` scope.
+
+    documents.create takes only a title -- there is no way to supply a body in the same
+    call -- so content always arrives via a second batchUpdate.
+    """
+    token = access_token()
+    doc = api("POST", "https://docs.googleapis.com/v1/documents", token, {"title": title})
+    doc_id = doc["documentId"]
+    print(f"  created {doc_id}")
+    print(f"  https://docs.google.com/document/d/{doc_id}/edit")
+    if path:
+        cmd_write(doc_id, path)
 
 
 def doc_text(doc):
@@ -212,6 +310,12 @@ def main():
     cmd = sys.argv[1]
     if cmd == "auth":
         cmd_auth()
+    elif cmd == "create" and len(sys.argv) in (3, 4):
+        cmd_create(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
+    elif cmd == "auth-url":
+        cmd_auth_url()
+    elif cmd == "auth-code" and len(sys.argv) == 3:
+        cmd_auth_code(sys.argv[2])
     elif cmd == "read" and len(sys.argv) == 3:
         cmd_read(sys.argv[2])
     elif cmd in ("write", "append") and len(sys.argv) == 4:
