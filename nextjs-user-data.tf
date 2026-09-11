@@ -81,9 +81,22 @@ locals {
   # here rather than pasted into the box so a rebuild does not lose someone's access --
   # the fcvm key is for US getting in to help, this is for THEM getting in at all.
   # Public keys only; nothing secret lives in this file.
+  # A LIST per user, not a single string. ejc3 legitimately carries several keys (a personal
+  # one plus service keys like the instinct bot), and the old map(string) could hold exactly
+  # one -- so every additional key had to be installed by hand, which meant terraform did not
+  # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
-    skevh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"
+    skevh = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"]
+    ejc3  = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11"]
   }
+
+  # Flattened to "user|key" lines so the script can be fed ONE interpolation instead of a
+  # nested terraform for-directive. The ~ trim markers on those directives strip the newline
+  # on both sides and weld generated statements onto the previous line; that has already
+  # broken this file once.
+  nextjs_user_key_lines = flatten([
+    for ku, keys in local.nextjs_user_keys : [for kk in keys : "${ku}|${kk}"]
+  ])
 
   # Keys that were here and are NOT any more. The block below only ever APPENDS to
   # authorized_keys (grep -qxF || echo >>), which is right -- it must never clobber a key
@@ -1094,18 +1107,18 @@ for u in ${join(" ", local.nextjs_users)}; do
   chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
   chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
 
-  # The account owner's own key, if one is declared for them. Appended, never replacing
-  # the file: a user may have added keys by hand and this must not take their access away.
-  case "$u" in
-%{~for ku, kk in local.nextjs_user_keys~}
-    ${ku})
-      grep -qxF "${kk}" "/home/$u/.ssh/authorized_keys" 2>/dev/null || \
-        echo "${kk}" >> "/home/$u/.ssh/authorized_keys"
-      chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
-      chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
-      ;;
-%{~endfor~}
-  esac
+  # The account owner's declared keys. Appended, never replacing the file: a user may have
+  # added keys by hand and this must not take their access away.
+  while IFS='|' read -r ku kk; do
+    [ -n "$ku" ] || continue
+    [ "$ku" = "$u" ] || continue
+    grep -qxF "$kk" "/home/$u/.ssh/authorized_keys" 2>/dev/null || \
+      echo "$kk" >> "/home/$u/.ssh/authorized_keys"
+    chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+    chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+  done <<'USERKEYS'
+${join("\n", local.nextjs_user_key_lines)}
+USERKEYS
 
   # Retire superseded keys. Without this a rotated key stays authorized forever, because
   # the append above has no way to know a line is obsolete. Matched with grep -vxF on the
