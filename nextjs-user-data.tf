@@ -56,12 +56,11 @@ locals {
   # rather than merely ugly, because statements need a separator and case arms do not.
   nextjs_zone_rebuild = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
-    "CHANGED=0\n/usr/local/bin/ndev-rebuild ${z} || CHANGED=$?\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\"\n[ \"$CHANGED\" = \"10\" ] && systemctl reload \"cloudflared@${z}\" 2>/dev/null\ntrue"
+    "CHANGED=0\n/usr/local/bin/ndev-rebuild ${z} || CHANGED=$?\nif [ \"$CHANGED\" = \"10\" ]; then\n  systemctl restart \"cloudflared@${z}\"\nelse\n  systemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\"\nfi\ntrue"
   ])
-  # Enable for boot, and START only if it is down. Deliberately NOT reload-or-restart: the
-  # unit had no ExecReload, so that degraded to a full restart and took both zones offline
-  # for ~40s (cloudflared drains for 30) on every setup run -- users saw Cloudflare
-  # "Error 1033". Config changes are picked up by the reload in nextjs_zone_rebuild.
+  # Enable for boot, and START only if it is down. An unchanged setup must not restart
+  # either tunnel. cloudflared cannot reload local ingress on SIGHUP; only a changed
+  # zone is restarted by nextjs_zone_rebuild, briefly interrupting that zone's connections.
   nextjs_zone_enable = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
     "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
@@ -613,9 +612,16 @@ TMP=$(mktemp)
   echo "tunnel: $TUNNEL_ID"
   echo "credentials-file: /etc/cloudflared/creds-$ZONE.json"
   echo "ingress:"
+  # Reserved infrastructure route, before project routes so a stale registry row
+  # cannot turn SSH into an HTTP application. Other zones remain HTTP-only.
+  if [ "$ZONE" = "${local.dolphin_domain}" ]; then
+    echo "  - hostname: ssh.${local.dolphin_domain}"
+    echo "    service: ssh://127.0.0.1:22"
+  fi
   if [ -f "$REGISTRY" ]; then
     while IFS=$'\t' read -r h p rest; do
       [ -n "$h" ] || continue
+      [ "$h" != "ssh.${local.dolphin_domain}" ] || continue
       echo "  - hostname: $h"
       echo "    service: http://127.0.0.1:$p"
     done < "$REGISTRY"
@@ -628,7 +634,7 @@ if cmp -s "$TMP" "/etc/cloudflared/config-$ZONE.yml" 2>/dev/null; then
   exit 0            # unchanged: caller has nothing to reload
 fi
 mv "$TMP" "/etc/cloudflared/config-$ZONE.yml"
-exit 10             # changed: caller should reload
+exit 10             # changed: caller should restart this zone's connector
 REBUILD
 chmod 755 /usr/local/bin/ndev-rebuild
 
@@ -643,6 +649,9 @@ cat > /usr/local/bin/ndev-register <<'REG'
 # is the single door through it.
 set -euo pipefail
 HOST="$1"; PORT="$2"; WHO="$3"; DIR="$4"
+if [ "$HOST" = "ssh.${local.dolphin_domain}" ]; then
+  echo "refusing: $HOST is reserved for SSH" >&2; exit 1
+fi
 
 # The caller's zone decides what they may publish. Previously this hardcoded one domain,
 # which is the check that has to change for a second project -- and it must stay a check:
@@ -677,12 +686,15 @@ sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
 printf 'HOST=%s\nPORT=%s\nDIR=%s\n' "$HOST" "$PORT" "$DIR" > "/var/lib/ndev/$WHO.env"
 
 # ndev-rebuild exits 10 when it changed the config, 0 when it did not. Capture it rather
-# than letting set -e abort, and reload ONLY on a real change -- a publish that changes
+# than letting set -e abort, and restart ONLY on a real change -- a publish that changes
 # nothing must not disturb anyone else's hostname on this tunnel.
 CHANGED=0
 /usr/local/bin/ndev-rebuild "$ZONE" || CHANGED=$?
-systemctl is-active --quiet "cloudflared@$ZONE" || systemctl start "cloudflared@$ZONE"
-[ "$CHANGED" = "10" ] && systemctl reload "cloudflared@$ZONE" 2>/dev/null
+if [ "$CHANGED" = "10" ]; then
+  systemctl restart "cloudflared@$ZONE"
+else
+  systemctl is-active --quiet "cloudflared@$ZONE" || systemctl start "cloudflared@$ZONE"
+fi
 true
 systemctl enable --now "ndev@$WHO.service" >/dev/null 2>&1 || systemctl restart "ndev@$WHO.service"
 echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$WHO, enabled at boot)"
@@ -1004,11 +1016,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config-%i.yml --no-autoupdate tunnel run
-# cloudflared re-reads its config on SIGHUP. Without an ExecReload, systemd's
-# reload-or-restart degrades to a full restart -- and cloudflared's graceful shutdown drains
-# for ~30s, so every setup run took BOTH zones down for ~40 seconds and users got
-# "Error 1033 Cloudflare Tunnel error". A reload keeps the connections up.
-ExecReload=/bin/kill -HUP $MAINPID
+# Local ingress is read on startup. No ExecReload: cloudflared does not handle SIGHUP.
+# ndev restarts only the changed zone; existing connections briefly disconnect.
 Restart=always
 RestartSec=5
 User=root
