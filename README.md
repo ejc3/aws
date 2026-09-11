@@ -493,6 +493,34 @@ Once credentials exist and their units have been enabled, services and remote-co
 agents start at boot. A reboot restores the published URLs without another interactive
 login.
 
+### Dolphin SSH through Cloudflare
+
+`ssh.dolphin-labs.dev` reaches this host's existing SSH daemon on `127.0.0.1:22`
+through the Dolphin tunnel. The existing wildcard DNS and GitHub Access application
+protect it: first sign in as a member of `dolphin-labs-hq`, then authenticate to SSH
+with your existing key. This does not grant any new Unix accounts or change direct
+public SSH/ET access. For the owner's Dolphin checkout, use the `ejc3` account.
+
+On a Mac or Linux client with `cloudflared` installed:
+
+```bash
+ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' \
+  ejc3@ssh.dolphin-labs.dev
+```
+
+Add `-i /path/to/your/private-key` if the key is not already in your SSH agent/config.
+Cloudflare opens a browser for GitHub sign-in when your Access session needs renewal.
+The server's connector credential is never needed on the client. Plain SSH to this
+hostname without the proxy command will not work. Phone SSH apps that cannot run
+`cloudflared` need a separately configured supported network/client path; this route
+does not configure WARP or an iOS VPN. See the [Cloudflare SSH client guide](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/).
+
+`ndev-rebuild` always retains this static Dolphin-only SSH route, and `ndev-register`
+reserves its hostname so a project cannot replace it. Other project routes and the
+kids' tunnel are unchanged. Local cloudflared ingress requires a connector restart,
+not SIGHUP; only a zone whose config changes is restarted, briefly disconnecting its
+existing tunnel sessions. An unchanged rebuild does not restart either connector.
+
 ### Colton Games Cloudflare staging and previews
 
 The `colton-games-stage` Worker is deployed from `CoderColton/colton-games` with Wrangler
