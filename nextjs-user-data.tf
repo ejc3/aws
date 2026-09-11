@@ -87,7 +87,16 @@ locals {
   # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
     skevh = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"]
-    ejc3  = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11"]
+    # All of ejc3's keys, including two that were installed by hand and existed only on
+    # the running instance -- invisible to terraform and silently lost on any rebuild.
+    # Adopted 2026-09-11 by reading them off the box; declaring them is what makes them
+    # survive. If a key here is no longer wanted, move it to nextjs_retired_user_keys
+    # rather than deleting the line, or the append-only installer leaves it authorized.
+    ejc3 = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11",
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZTP2GqL7R1kFzSqoI6QLo3j/VacE9MK+tuXmHLCAFn hatch",
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILzudSh+XRY5YsnNnAWDTjKXNeZUueYq/etoVXsTrpx4 grok-bot-box-ejc3",
+    ]
   }
 
   # Flattened to "user|key" lines so the script can be fed ONE interpolation instead of a
