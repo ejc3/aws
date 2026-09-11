@@ -274,9 +274,138 @@ def body_end(doc):
     return content[-1].get("endIndex", 1) if content else 1
 
 
+def style_requests(text):
+    """Turn lightweight markup into Docs styling requests.
+
+    insertText inserts PLAIN TEXT and, worse, INHERITS the paragraph formatting at the
+    insertion point. Writing into a document whose first paragraph was a list item turns
+    the entire inserted body into one giant bulleted list -- title, blank lines and all.
+    So the first thing emitted is an unconditional deleteParagraphBullets and a
+    NORMAL_TEXT reset across the whole body; styling is then applied deliberately.
+
+    Index math: after insertText at 1, character i of the clean text sits at document
+    index 1+i, so clean[a:b] is the document range [1+a, 1+b).
+    """
+    lines, paras, bullets, mono = [], [], [], []
+    offset = 0
+    in_code = False
+    for raw in text.split("\n"):
+        line, kind, bullet = raw, None, False
+        if raw.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            kind = "code"
+        elif raw.startswith("### "):
+            line, kind = raw[4:], "HEADING_3"
+        elif raw.startswith("## "):
+            line, kind = raw[3:], "HEADING_2"
+        elif raw.startswith("# "):
+            line, kind = raw[2:], "HEADING_1"
+        elif raw.startswith("• ") or raw.startswith("- "):
+            line, bullet = raw[2:], True
+        elif raw.startswith("    ") and raw.strip():
+            kind = "code"
+        start = offset
+        end = start + len(line)
+        if kind in ("HEADING_1", "HEADING_2", "HEADING_3"):
+            paras.append((start, end, kind))
+        elif kind == "code":
+            mono.append((start, end))
+        if bullet:
+            bullets.append((start, end))
+        lines.append(line)
+        offset = end + 1
+    clean = "\n".join(lines)
+    total = len(clean)
+
+    reqs = []
+    if total:
+        whole = {"startIndex": 1, "endIndex": 1 + total}
+        # Clear inherited list formatting, then flatten to NORMAL_TEXT, before styling.
+        reqs.append({"deleteParagraphBullets": {"range": whole}})
+        reqs.append({"updateParagraphStyle": {
+            "range": whole,
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType"}})
+    for start, end, kind in paras:
+        if end > start:
+            reqs.append({"updateParagraphStyle": {
+                "range": {"startIndex": 1 + start, "endIndex": 1 + end},
+                "paragraphStyle": {"namedStyleType": kind},
+                "fields": "namedStyleType"}})
+    for start, end in mono:
+        if end > start:
+            reqs.append({"updateTextStyle": {
+                "range": {"startIndex": 1 + start, "endIndex": 1 + end},
+                "textStyle": {"weightedFontFamily": {"fontFamily": "Consolas"}},
+                "fields": "weightedFontFamily"}})
+    # Bullets last: createParagraphBullets on a range already reset above.
+    for start, end in bullets:
+        if end > start:
+            reqs.append({"createParagraphBullets": {
+                "range": {"startIndex": 1 + start, "endIndex": 1 + end},
+                "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE"}})
+    return clean, reqs
+
+
+def insert_table(doc_id, token, marker, rows):
+    """Replace a marker paragraph with a real Docs table.
+
+    ASCII-art tables are unreadable on a phone: fixed-width columns wrap at whatever the
+    screen allows and the alignment becomes noise. A native table reflows.
+
+    Cells must be filled in REVERSE index order. Every insertion shifts the indices of
+    everything after it, so filling top-down invalidates each subsequent cell index that
+    was read from the same snapshot.
+    """
+    url = f"https://docs.googleapis.com/v1/documents/{doc_id}"
+    doc = api("GET", url, token)
+
+    # Locate the marker paragraph and delete it, leaving an insertion point.
+    idx = None
+    for el in doc["body"]["content"]:
+        para = el.get("paragraph")
+        if not para:
+            continue
+        text = "".join(r.get("textRun", {}).get("content", "") for r in para.get("elements", []))
+        if marker in text:
+            idx = el["startIndex"]
+            api("POST", f"{url}:batchUpdate", token, {"requests": [
+                {"deleteContentRange": {"range": {"startIndex": el["startIndex"],
+                                                  "endIndex": el["endIndex"] - 1}}}]})
+            break
+    if idx is None:
+        return False
+
+    api("POST", f"{url}:batchUpdate", token, {"requests": [
+        {"insertTable": {"rows": len(rows), "columns": len(rows[0]),
+                         "location": {"index": idx}}}]})
+
+    # Re-read: cell indices only exist after the table does.
+    doc = api("GET", url, token)
+    cells = []
+    for el in doc["body"]["content"]:
+        if "table" not in el or el["startIndex"] < idx:
+            continue
+        for r, row in enumerate(el["table"]["tableRows"]):
+            for c, cell in enumerate(row["tableCells"]):
+                cells.append((r, c, cell["content"][0]["startIndex"]))
+        break
+
+    reqs = []
+    for r, c, at in sorted(cells, key=lambda x: -x[2]):   # reverse: keep indices valid
+        if r < len(rows) and c < len(rows[r]) and rows[r][c]:
+            reqs.append({"insertText": {"location": {"index": at}, "text": rows[r][c]}})
+    if reqs:
+        api("POST", f"{url}:batchUpdate", token, {"requests": reqs})
+    return True
+
+
 def cmd_write(doc_id, path, append=False):
     with open(path) as fh:
         text = fh.read()
+    text, style = style_requests(text)
     token = access_token()
     url = f"https://docs.googleapis.com/v1/documents/{doc_id}"
     doc = api("GET", url, token)
@@ -296,6 +425,10 @@ def cmd_write(doc_id, path, append=False):
         requests.append({"insertText": {"location": {"index": 1}, "text": text}})
 
     api("POST", f"{url}:batchUpdate", token, {"requests": requests})
+    # Styling is a SECOND pass: ranges are only valid once the text exists, and issuing
+    # them in the same batch as the insert would address indices that do not yet exist.
+    if style and not append:
+        api("POST", f"{url}:batchUpdate", token, {"requests": style})
 
     # Verify rather than trust the 200: read it back and compare length.
     after = doc_text(api("GET", url, token))
