@@ -32,21 +32,28 @@ class SecurityDefaults(unittest.TestCase):
         self.providers = source("security-regions.tf")
         self.module = source("modules/security-defaults/main.tf")
 
-    def test_exact_three_resource_types_and_count(self):
+    def test_exact_four_resource_types_and_count(self):
         self.assertEqual({name for name, _ in blocks(self.module, "resource")}, {
             '"aws_ebs_encryption_by_default" "security"',
             '"aws_ebs_snapshot_block_public_access" "security"',
             '"aws_ec2_instance_metadata_defaults" "security"',
+            '"aws_ssm_service_setting" "block_public_document_sharing"',
         })
-        self.assertEqual(len(blocks(self.module, "resource")), 3)
-        self.assertEqual(len(blocks(self.defaults, "module")) * 3, 102)
+        self.assertEqual(len(blocks(self.module, "resource")), 4)
+        self.assertEqual(len(blocks(self.defaults, "module")) * 4, 136)
 
     def test_only_reviewed_default_values(self):
-        self.assertEqual(dict(blocks(self.module, "resource")), {
+        resources = dict(blocks(self.module, "resource"))
+        sharing = resources.pop('"aws_ssm_service_setting" "block_public_document_sharing"')
+        self.assertEqual(resources, {
             '"aws_ebs_encryption_by_default" "security"': '  enabled = true\n',
             '"aws_ebs_snapshot_block_public_access" "security"': '  state = "block-all-sharing"\n',
             '"aws_ec2_instance_metadata_defaults" "security"': '  http_tokens = "required"\n',
         })
+        code = "\n".join(line for line in sharing.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(re.sub(r"\s+", "", code),
+            'setting_id="arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:servicesetting/ssm/documents/console/public-sharing-permission"'
+            'setting_value="Disable"lifecycle{prevent_destroy=true}')
 
     def test_exact_both_account_region_sets(self):
         names = [name.strip('"') for name, _ in blocks(self.defaults, "module")]
@@ -105,7 +112,7 @@ class SecurityDefaults(unittest.TestCase):
         code = "\n".join(line for line in (self.defaults + self.providers + self.module).splitlines()
                          if not line.lstrip().startswith("#"))
         self.assertNotRegex(code, r'\b(provisioner|local-exec|remote-exec|external|command|import|removed|moved)\b')
-        self.assertNotRegex(code, r'aws_(instance|ebs_volume|kms_key|backup_|guardduty|cloudcontrolapi|cloudwatch|s3_|sns_|ssm_|security_group)')
+        self.assertNotRegex(code, r'aws_(instance|ebs_volume|kms_key|backup_|guardduty|cloudcontrolapi|cloudwatch|s3_|sns_|ssm_(?!service_setting)|security_group)')
 
     def test_ci_is_sdk_and_credential_free(self):
         workflow = source(".github/workflows/lambda-tests.yml")
@@ -116,9 +123,10 @@ class SecurityDefaults(unittest.TestCase):
 
     def test_readme_preserves_scope_and_exception_warnings(self):
         readme = source("README.md")
-        for phrase in ["102 account settings", "34 account/region combinations", "Private sharing",
+        for phrase in ["136 account settings", "34 account/region combinations", "Private sharing",
                        "explicit launch options can override", "not re-encrypted", "no recurring service subscription"]:
             self.assertIn(phrase, readme)
+        self.assertIn("does not revoke existing public shares", readme)
 
 
 if __name__ == "__main__":
