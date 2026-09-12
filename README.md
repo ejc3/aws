@@ -238,8 +238,8 @@ ssh io
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
 address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, not the
 `fcvm-ec2` admin key, so ordinary dev-to-dev access does not grant an admin shell on a
-jumpbox. Nothing on a dev server can reach a jumpbox at all -- there is no key, and no
-delegation of any kind. `pbox` launches the parallel boxes itself with a tag-scoped IAM
+jumpbox. Dev hosts have no authorized dev-to-jumpbox login or privileged delegation path;
+the public SSH endpoint is still network-reachable. `pbox` launches the parallel boxes itself with a tag-scoped IAM
 grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gone.
 
 The metal, Next.js, and temporary-compute roles use a shared SSM connectivity policy
@@ -269,6 +269,19 @@ Both policies were applied and independently read back on September 12 at 19:07 
 all strength settings matched, with `ExpirePasswords=false`. The main root had MFA and
 no access keys; recovery root had no password or keys. Centralized root management is
 not enabled, and this audit did not verify the owner's Identity Center MFA settings.
+
+`security-account-contacts.tf` manages only the SECURITY alternate contact in each
+account, with title `Owner`, the existing `/alerts/email` address, and that account's
+primary name/phone read directly from AWS. The owner approved these details on September
+12, 2026. Primary, billing and operations contacts remain unchanged. Names and phone
+numbers are not committed to Git; target contact fields are marked sensitive. The native
+primary-contact data source still stores all returned contact/address fields in the
+existing encrypted, access-restricted Terraform state, so raw plans/state remain private.
+Before first creation, check `get-alternate-contact --alternate-contact-type SECURITY`
+under each account's own credentials; an existing contact must be reviewed and imported
+instead of silently overwritten. With this own-account provider routing, the import ID
+is `SECURITY` for each resource. After apply, compare each contact to its own primary
+name/phone and the approved alert address without printing personal values.
 
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
@@ -1245,14 +1258,43 @@ EC2 inventory and initial control evaluation can lag; freshly enabled services m
 temporarily retain stale failed controls. Recheck the actual service and resource
 before treating every failed control as a new outage or authorizing extra paid services.
 
-Remaining remediation is separate from monitoring acceptance. Ubuntu ESM enrollment
-and targeted package upgrades need an operator entitlement choice; avoid removing
-development dependencies simply to silence findings. Vendor fixes for every reported
-kernel/dependency issue are not yet available. Dolphin has an installed kernel update
-awaiting a separately scheduled reboot, which interrupts shared sessions; preserve
-fcvm's custom NV2 kernel. Both AWS accounts also lack a designated security alternate
-contact. The account API can reuse existing primary contact metadata after the owner
-confirms the security email/title and which name/phone to use; no dashboard is required.
+### Threat model and package-remediation priority
+
+These are trusted-admin development hosts: owner/root access is intentional, not an
+isolation failure. Application origins remain private behind Cloudflare Access, while
+public SSH on 22 and Eternal Terminal on 2022 remain explicit requirements. This is
+restricted application ingress, not zero public attack surface.
+
+The intended impact boundary is explicit: a development-host compromise is bad;
+a jumpbox compromise is catastrophic because it exposes AWS administrator authority,
+Terraform state and control-plane credentials. Assume an attacker who compromises a
+dev host can become root and take its instance-role credentials. Even then, that host
+must have no path to jumpbox authority: no admin SSH key, forced-command key, SSM
+command permission, or queue/other privileged delegation through a jumpbox. Dev-side
+automation must use narrow, resource/tag-scoped IAM directly, never an admin-host hop.
+This is an authorization boundary, not a claim that public jumpbox SSH is unreachable.
+Jumpbox-facing vulnerabilities, agent/tool inputs and credential protection merit
+stricter treatment than routine development-host package hygiene.
+
+Prioritize exploitable public-facing vulnerabilities, authentication bypass, exposed
+credentials, unauthorized AWS privileges, and unexpected public routes. Also prioritize
+malicious webpages, repositories or build inputs gaining host execution, and escapes
+across intended VM/sandbox boundaries. Outbound access and Cloudflare authentication
+do not eliminate these risks.
+
+Local-only privilege escalation affecting users already trusted with root is routine
+maintenance unless it crosses another meaningful boundary. Scanner severity alone does
+not justify purchasing Ubuntu Pro, rebooting shared hosts, removing development tools
+or replacing fcvm's custom kernel. Review exploitability and actual exposure, then
+schedule targeted maintenance. Under the owner's September 12 direction, ordinary
+development-package findings are lower priority than these access and credential boundaries;
+Ubuntu ESM enrollment is deferred, not an outstanding deployment gate. Dolphin's
+installed kernel update still awaits a separately scheduled reboot; this policy does
+not authorize interrupting shared sessions. Vendor fixes for every reported issue
+are not yet available, and this risk acceptance does not mean the packages are fixed.
+
+Keep scanners, alerts and the remediation backlog enabled. Preserve the dev-to-admin
+credential boundary, credential-free ordinary CI, protected backups and Access policies.
 
 ### Incremental monitoring cost
 

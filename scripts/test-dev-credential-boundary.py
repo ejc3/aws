@@ -132,6 +132,56 @@ class DevCredentialBoundaryTests(unittest.TestCase):
         self.assertNotIn('secret_version', metadata)
         self.assertNotIn('secret_string', metadata)
 
+    def test_security_contacts_use_only_the_two_existing_account_identities(self):
+        config = source('security-account-contacts.tf')
+        self.assertEqual(re.findall(r'^resource "([^\"]+)" "([^\"]+)"', config, re.M), [
+            ('aws_account_alternate_contact', 'security_main'),
+            ('aws_account_alternate_contact', 'security_staging'),
+        ])
+        self.assertEqual(re.findall(r'^data "([^\"]+)" "([^\"]+)"', config, re.M), [
+            ('aws_account_primary_contact', 'main'), ('aws_account_primary_contact', 'staging'),
+        ])
+        self.assertNotRegex(config, r'(?m)^\s*account_id\s*=')
+        for name, identity, account in [('main', 'current', '928413605543'),
+                                         ('staging', 'staging', '249042068453')]:
+            contact = block('security-account-contacts.tf', 'resource', 'security_' + name,
+                            'aws_account_alternate_contact')
+            self.assertIn(f'data.aws_caller_identity.{identity}.account_id == "{account}"', contact)
+            self.assertRegex(contact, r'prevent_destroy\s*=\s*true')
+            if name == 'staging':
+                self.assertRegex(contact, r'provider\s*=\s*aws\.staging')
+                self.assertRegex(config, r'data "aws_account_primary_contact" "staging"\s*\{\s*provider\s*=\s*aws\.staging')
+            else:
+                self.assertNotRegex(contact, r'(?m)^\s*provider\s*=')
+                self.assertIn('data "aws_account_primary_contact" "main" {}', config)
+
+    def test_security_contacts_derive_and_redact_personal_fields(self):
+        for name in ['main', 'staging']:
+            contact = block('security-account-contacts.tf', 'resource', 'security_' + name,
+                            'aws_account_alternate_contact')
+            for field, expression in [
+                ('name', f'data.aws_account_primary_contact.{name}.full_name'),
+                ('phone_number', f'data.aws_account_primary_contact.{name}.phone_number'),
+                ('email_address', 'data.aws_ssm_parameter.alert_email.value'),
+            ]:
+                self.assertRegex(contact, field + r'\s*=\s*sensitive\(' + re.escape(expression) + r'\)')
+            self.assertRegex(contact, r'alternate_contact_type\s*=\s*"SECURITY"')
+            self.assertRegex(contact, r'title\s*=\s*"Owner"')
+        config = source('security-account-contacts.tf')
+        self.assertNotRegex(config, r'local-exec|remote-exec|external|ignore_changes|^output\s|^variable\s')
+
+    def test_threat_model_prioritizes_real_boundaries_not_trusted_root_access(self):
+        readme = source('README.md')
+        for phrase in ['trusted-admin development hosts', 'not zero public attack surface',
+                       'users already trusted with root', 'Scanner severity alone',
+                       'Keep scanners, alerts and the remediation backlog enabled',
+                       'no authorized dev-to-jumpbox login or privileged delegation path',
+                       'a jumpbox compromise is catastrophic',
+                       'dev host can become root and take its instance-role credentials',
+                       'forced-command key, SSM',
+                       'narrow, resource/tag-scoped IAM directly, never an admin-host hop']:
+            self.assertIn(phrase, readme)
+
     def test_nextjs_policy_uses_only_connector_arns_and_existing_hop_key(self):
         policy = block('nextjs-dev.tf', 'resource', 'nextjs_dev', 'aws_iam_role_policy')
         self.assertEqual(policy.count('data.aws_secretsmanager_secret.nextjs_connector['), 2)
