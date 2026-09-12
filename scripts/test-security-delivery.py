@@ -849,9 +849,10 @@ class TerraformSafetyTests(unittest.TestCase):
     def test_defaults_have_a_single_separate_owner(self):
         defaults = (ROOT / "modules/security-defaults/main.tf").read_text()
         for kind in ("aws_ebs_encryption_by_default", "aws_ebs_snapshot_block_public_access",
-                     "aws_ec2_instance_metadata_defaults"):
+                     "aws_ec2_instance_metadata_defaults", "aws_ssm_service_setting"):
             self.assertNotIn(kind, REGIONAL)
-            self.assertNotIn("posture_enabled", block(defaults, kind, "security"))
+            name = "block_public_document_sharing" if kind == "aws_ssm_service_setting" else "security"
+            self.assertNotIn("posture_enabled", block(defaults, kind, name))
 
     def test_monitoring_reuses_shared_provider_aliases(self):
         self.assertNotRegex(TERRAFORM, re.compile(r'^provider "aws"', re.M))
