@@ -799,10 +799,22 @@ class TerraformSafetyTests(unittest.TestCase):
                 enabled.add(name)
         self.assertEqual(enabled, expected)
 
-    def test_posture_staged_off_without_disabling_foundation(self):
-        self.assertRegex(TERRAFORM, r'\bsecurity_posture_enabled\s*=\s*false\b')
+    def test_approved_posture_uses_single_gate_without_disabling_foundation(self):
+        self.assertRegex(TERRAFORM, r'\bsecurity_posture_enabled\s*=\s*true\b')
         self.assertNotRegex(TERRAFORM, r'\bposture_enabled\s*=\s*true\b')
         self.assertNotIn("posture_enabled", block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty"))
+
+    def test_posture_keeps_reviewed_scanning_and_recording_scope(self):
+        inspector = block(REGIONAL, "aws_inspector2_enabler", "security")
+        self.assertRegex(inspector, r'resource_types\s*=\s*\["EC2",\s*"LAMBDA"\]')
+        recorder = block(REGIONAL, "aws_config_configuration_recorder", "security")
+        self.assertRegex(recorder, r'include_global_resource_types\s*=\s*var\.record_global_iam')
+        self.assertRegex(recorder, r'recording_frequency\s*=\s*"DAILY"')
+        self.assertRegex(recorder, r'resource_types\s*=\s*\["AWS::EC2::Instance",\s*"AWS::EC2::NetworkInterface",\s*"AWS::EC2::Volume"\]')
+        hub = block(REGIONAL, "aws_securityhub_account", "security")
+        self.assertRegex(hub, r'enable_default_standards\s*=\s*false')
+        standard = block(REGIONAL, "aws_securityhub_standards_subscription", "foundational")
+        self.assertIn("standards/aws-foundational-security-best-practices/v/1.0.0", standard)
 
     def test_external_analyzers_have_a_single_separate_owner(self):
         external = (ROOT / "security-external-access.tf").read_text()
