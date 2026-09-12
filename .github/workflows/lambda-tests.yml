@@ -34,6 +34,9 @@ jobs:
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 
+      - name: Jumpbox native Claude installation boundaries
+        run: python3 -S -B scripts/test-jumpbox-native-claude.py
+
       - name: Dolphin SSH tunnel routing
         run: python3 -S -B scripts/test-dolphin-ssh.py
 
