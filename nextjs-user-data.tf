@@ -8,9 +8,10 @@
 #      `gh auth login`, and their own projects. Nobody shares a GitHub identity.
 #   2. cloudflared, running as a system service, holding the tunnel to Cloudflare.
 #   3. `ndev` -- run it in a Next.js project and it starts `next dev` on a deterministic
-#      port, registers <name>.<their zone> -> that port with the tunnel, and prints the
-#      URL. Cloudflare Access gates every hostname; which zone and which identity provider
-#      follows from the account (cc-games/Google, dolphin-labs/GitHub).
+#      port, registers <$USER> or <$USER>-<slug>.<their zone> -> that port with the tunnel,
+#      and prints the URL. Multiple worktree publishes stay up concurrently. Cloudflare
+#      Access gates every hostname; which zone and which identity provider follows from the
+#      account (cc-games/Google, dolphin-labs/GitHub).
 
 locals {
   nextjs_tunnel_id = "60234535-279b-4b20-bbc3-7fd353abb7f6"
@@ -56,12 +57,11 @@ locals {
   # rather than merely ugly, because statements need a separator and case arms do not.
   nextjs_zone_rebuild = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
-    "CHANGED=0\n/usr/local/bin/ndev-rebuild ${z} || CHANGED=$?\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\"\n[ \"$CHANGED\" = \"10\" ] && systemctl reload \"cloudflared@${z}\" 2>/dev/null\ntrue"
+    "CHANGED=0\n/usr/local/bin/ndev-rebuild ${z} || CHANGED=$?\nif [ \"$CHANGED\" = \"10\" ]; then\n  systemctl restart \"cloudflared@${z}\"\nelse\n  systemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\"\nfi\ntrue"
   ])
-  # Enable for boot, and START only if it is down. Deliberately NOT reload-or-restart: the
-  # unit had no ExecReload, so that degraded to a full restart and took both zones offline
-  # for ~40s (cloudflared drains for 30) on every setup run -- users saw Cloudflare
-  # "Error 1033". Config changes are picked up by the reload in nextjs_zone_rebuild.
+  # Enable for boot, and START only if it is down. An unchanged setup must not restart
+  # either tunnel. cloudflared cannot reload local ingress on SIGHUP; only a changed
+  # zone is restarted by nextjs_zone_rebuild, briefly interrupting that zone's connections.
   nextjs_zone_enable = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
     "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
@@ -82,9 +82,31 @@ locals {
   # here rather than pasted into the box so a rebuild does not lose someone's access --
   # the fcvm key is for US getting in to help, this is for THEM getting in at all.
   # Public keys only; nothing secret lives in this file.
+  # A LIST per user, not a single string. ejc3 legitimately carries several keys (a personal
+  # one plus service keys like the instinct bot), and the old map(string) could hold exactly
+  # one -- so every additional key had to be installed by hand, which meant terraform did not
+  # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
-    skevh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"
+    skevh = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"]
+    # All of ejc3's keys, including two that were installed by hand and existed only on
+    # the running instance -- invisible to terraform and silently lost on any rebuild.
+    # Adopted 2026-09-11 by reading them off the box; declaring them is what makes them
+    # survive. If a key here is no longer wanted, move it to nextjs_retired_user_keys
+    # rather than deleting the line, or the append-only installer leaves it authorized.
+    ejc3 = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11",
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZTP2GqL7R1kFzSqoI6QLo3j/VacE9MK+tuXmHLCAFn hatch",
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILzudSh+XRY5YsnNnAWDTjKXNeZUueYq/etoVXsTrpx4 grok-bot-box-ejc3",
+    ]
   }
+
+  # Flattened to "user|key" lines so the script can be fed ONE interpolation instead of a
+  # nested terraform for-directive. The ~ trim markers on those directives strip the newline
+  # on both sides and weld generated statements onto the previous line; that has already
+  # broken this file once.
+  nextjs_user_key_lines = flatten([
+    for ku, keys in local.nextjs_user_keys : [for kk in keys : "${ku}|${kk}"]
+  ])
 
   # Keys that were here and are NOT any more. The block below only ever APPENDS to
   # authorized_keys (grep -qxF || echo >>), which is right -- it must never clobber a key
@@ -280,9 +302,23 @@ FAILED=""
 for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
   systemctl is-active --quiet "$unit" || FAILED="$FAILED $unit"
 done
-for u in ${join(" ", local.nextjs_users)}; do
-  systemctl is-enabled --quiet "ndev@$u" 2>/dev/null || continue
-  systemctl is-active --quiet "ndev@$u" || FAILED="$FAILED ndev@$u"
+# Primary labels plus any user-<slug> preview instances that are enabled.
+for envf in /var/lib/ndev/instances/*.env /var/lib/ndev/*.env; do
+  [ -f "$envf" ] || continue
+  case "$envf" in
+    */instances/*) label=$(basename "$envf" .env) ;;
+    */registry*|*/registry.*) continue ;;
+    *)
+      base=$(basename "$envf" .env)
+      # Skip non-user legacy files; only bare $user.env
+      case " ${join(" ", local.nextjs_users)} " in
+        *" $base "*) label=$base ;;
+        *) continue ;;
+      esac
+      ;;
+  esac
+  systemctl is-enabled --quiet "ndev@$label" 2>/dev/null || continue
+  systemctl is-active --quiet "ndev@$label" || FAILED="$FAILED ndev@$label"
 done
 
 if [ -n "$FAILED" ]; then
@@ -541,8 +577,8 @@ fi
 # so the sudo was never a barrier -- just friction on the most common command on the box,
 # and friction that teaches people to reach for root by reflex.
 #
-# This grants each user start/stop/restart/reload on THEIR OWN instance of these templates
-# and nothing else: ndev@bob is bob's, and bob still cannot touch ndev@alice.
+# This grants each user start/stop/restart/reload on THEIR OWN instances of these templates
+# and nothing else: ndev@bob and ndev@bob-* are bob's; bob still cannot touch ndev@alice.
 mkdir -p /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/50-ndev-own-units.rules <<'POLKIT'
 polkit.addRule(function(action, subject) {
@@ -555,9 +591,18 @@ polkit.addRule(function(action, subject) {
     return polkit.Result.NOT_HANDLED;
   }
   var unit = action.lookup("unit");
-  var templates = ["ndev@", "claude-rc@", "codex-rc@"];
-  for (var i = 0; i < templates.length; i++) {
-    if (unit === templates[i] + subject.user + ".service") {
+  // Claude/Codex stay one-per-user. ndev allows the bare user instance plus any
+  // user-<slug> preview (multi-worktree publishes).
+  var exact = ["claude-rc@", "codex-rc@"];
+  for (var i = 0; i < exact.length; i++) {
+    if (unit === exact[i] + subject.user + ".service") {
+      return polkit.Result.YES;
+    }
+  }
+  var prefix = "ndev@";
+  if (unit.indexOf(prefix) === 0 && unit.slice(-8) === ".service") {
+    var inst = unit.substring(prefix.length, unit.length - 8);
+    if (inst === subject.user || inst.indexOf(subject.user + "-") === 0) {
       return polkit.Result.YES;
     }
   }
@@ -570,7 +615,7 @@ systemctl restart polkit 2>/dev/null || true
 # ---------------------------------------------------------------- ndev registry
 # hostname<TAB>port, one per line. ndev-register rewrites the cloudflared ingress from
 # this file, so adding a project never means hand-editing YAML.
-mkdir -p /var/lib/ndev
+mkdir -p /var/lib/ndev /var/lib/ndev/instances
 touch /var/lib/ndev/registry
 chmod 666 /var/lib/ndev/registry
 
@@ -613,9 +658,16 @@ TMP=$(mktemp)
   echo "tunnel: $TUNNEL_ID"
   echo "credentials-file: /etc/cloudflared/creds-$ZONE.json"
   echo "ingress:"
+  # Reserved infrastructure route, before project routes so a stale registry row
+  # cannot turn SSH into an HTTP application. Other zones remain HTTP-only.
+  if [ "$ZONE" = "${local.dolphin_domain}" ]; then
+    echo "  - hostname: ssh.${local.dolphin_domain}"
+    echo "    service: ssh://127.0.0.1:22"
+  fi
   if [ -f "$REGISTRY" ]; then
     while IFS=$'\t' read -r h p rest; do
       [ -n "$h" ] || continue
+      [ "$h" != "ssh.${local.dolphin_domain}" ] || continue
       echo "  - hostname: $h"
       echo "    service: http://127.0.0.1:$p"
     done < "$REGISTRY"
@@ -628,7 +680,7 @@ if cmp -s "$TMP" "/etc/cloudflared/config-$ZONE.yml" 2>/dev/null; then
   exit 0            # unchanged: caller has nothing to reload
 fi
 mv "$TMP" "/etc/cloudflared/config-$ZONE.yml"
-exit 10             # changed: caller should reload
+exit 10             # changed: caller should restart this zone's connector
 REBUILD
 chmod 755 /usr/local/bin/ndev-rebuild
 
@@ -641,8 +693,14 @@ cat > /usr/local/bin/ndev-register <<'REG'
 # unit that actually runs it. Runs as root via sudoers, so it validates every argument
 # rather than trusting the caller -- the kids' accounts hold no other privilege and this
 # is the single door through it.
+#
+# Instance label is the hostname left-label (ejc3, ejc3-dolphin-nav-jargon). Multiple
+# labels per user stay up concurrently; each has its own env file and ndev@<label> unit.
 set -euo pipefail
 HOST="$1"; PORT="$2"; WHO="$3"; DIR="$4"
+if [ "$HOST" = "ssh.${local.dolphin_domain}" ]; then
+  echo "refusing: $HOST is reserved for SSH" >&2; exit 1
+fi
 
 # The caller's zone decides what they may publish. Previously this hardcoded one domain,
 # which is the check that has to change for a second project -- and it must stay a check:
@@ -652,6 +710,15 @@ case "$ZONE" in "") echo "refusing: $WHO has no publishing zone" >&2; exit 1 ;; 
 case "$HOST" in
   *".$ZONE") ;;
   *) echo "refusing: $HOST is not under $ZONE (the zone for $WHO)" >&2; exit 1 ;;
+esac
+LABEL="$${HOST%.$ZONE}"
+# Hostnames must be $USER or $USER-<slug> under their zone -- no bare unrelated names.
+case "$LABEL" in
+  "$WHO"|"$WHO"-*) ;;
+  *) echo "refusing: $HOST must be $WHO.$ZONE or $WHO-<slug>.$ZONE" >&2; exit 1 ;;
+esac
+case "$LABEL" in
+  *[!a-z0-9-]*|"") echo "refusing: bad instance label $LABEL" >&2; exit 1 ;;
 esac
 case "$PORT" in ''|*[!0-9]*) echo "refusing: bad port $PORT" >&2; exit 1 ;; esac
 id "$WHO" >/dev/null 2>&1 || { echo "refusing: no such user $WHO" >&2; exit 1; }
@@ -672,20 +739,42 @@ grep -v -P "^\Q$HOST\E\t" "$REGISTRY" > "$REGISTRY.new" 2>/dev/null || true
 printf '%s\t%s\t%s\t%s\n' "$HOST" "$PORT" "$WHO" "$DIR" >> "$REGISTRY.new"
 sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
 
-# What ndev@<user>.service reads on boot. This is why a reboot restores the site with
-# nobody logged in: the unit needs no argument beyond the username.
-printf 'HOST=%s\nPORT=%s\nDIR=%s\n' "$HOST" "$PORT" "$DIR" > "/var/lib/ndev/$WHO.env"
+# Per-instance env: ndev@<label> reads this. Concurrent publishes for one user each keep
+# their own file; writing here no longer clobbers another label's DIR/PORT.
+mkdir -p /var/lib/ndev/instances
+printf 'HOST=%s\nPORT=%s\nDIR=%s\nWHO=%s\n' "$HOST" "$PORT" "$DIR" "$WHO" > "/var/lib/ndev/instances/$LABEL.env"
+# Legacy path kept in sync for the primary ($WHO) label so older helpers that still read
+# /var/lib/ndev/$WHO.env (agent-dir, kid-agents) keep working until they are updated.
+if [ "$LABEL" = "$WHO" ]; then
+  printf 'HOST=%s\nPORT=%s\nDIR=%s\nWHO=%s\n' "$HOST" "$PORT" "$DIR" "$WHO" > "/var/lib/ndev/$WHO.env"
+fi
+
+# %i is the label, not always a unix user. Drop-in forces the real account so
+# ndev@ejc3-foo runs as ejc3 with HOME under /home/ejc3.
+DROP_DIR="/etc/systemd/system/ndev@$LABEL.service.d"
+mkdir -p "$DROP_DIR"
+cat > "$DROP_DIR/user.conf" <<EOF
+[Service]
+User=$WHO
+Group=$WHO
+WorkingDirectory=/home/$WHO
+Environment=HOME=/home/$WHO
+EOF
 
 # ndev-rebuild exits 10 when it changed the config, 0 when it did not. Capture it rather
-# than letting set -e abort, and reload ONLY on a real change -- a publish that changes
+# than letting set -e abort, and restart ONLY on a real change -- a publish that changes
 # nothing must not disturb anyone else's hostname on this tunnel.
 CHANGED=0
 /usr/local/bin/ndev-rebuild "$ZONE" || CHANGED=$?
-systemctl is-active --quiet "cloudflared@$ZONE" || systemctl start "cloudflared@$ZONE"
-[ "$CHANGED" = "10" ] && systemctl reload "cloudflared@$ZONE" 2>/dev/null
+if [ "$CHANGED" = "10" ]; then
+  systemctl restart "cloudflared@$ZONE"
+else
+  systemctl is-active --quiet "cloudflared@$ZONE" || systemctl start "cloudflared@$ZONE"
+fi
 true
-systemctl enable --now "ndev@$WHO.service" >/dev/null 2>&1 || systemctl restart "ndev@$WHO.service"
-echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$WHO, enabled at boot)"
+systemctl daemon-reload
+systemctl enable --now "ndev@$LABEL.service" >/dev/null 2>&1 || systemctl restart "ndev@$LABEL.service"
+echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$LABEL, enabled at boot)"
 REG
 chmod 755 /usr/local/bin/ndev-register
 
@@ -702,11 +791,16 @@ chmod 755 /usr/local/bin/ndev-register
 
 cat > /usr/local/bin/ndev-run <<'RUN'
 #!/bin/bash
-# Started by ndev@<user>.service. Reads what ndev-register recorded and serves it.
+# Started by ndev@<label>.service. Reads what ndev-register recorded and serves it.
+# %i is the hostname left-label (ejc3 or ejc3-<slug>), not necessarily a unix user.
 set -euo pipefail
-WHO="$1"
-ENVF="/var/lib/ndev/$WHO.env"
-[ -f "$ENVF" ] || { echo "$WHO has not published a project yet" >&2; exit 0; }
+LABEL="$1"
+ENVF="/var/lib/ndev/instances/$LABEL.env"
+# Legacy single-file layout (pre multi-instance): /var/lib/ndev/$USER.env
+if [ ! -f "$ENVF" ] && [ -f "/var/lib/ndev/$LABEL.env" ]; then
+  ENVF="/var/lib/ndev/$LABEL.env"
+fi
+[ -f "$ENVF" ] || { echo "$LABEL has not published a project yet" >&2; exit 0; }
 . "$ENVF"
 cd "$DIR"
 # node_modules lives on the root volume and survives reboots, but a fresh volume (or a
@@ -730,6 +824,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Default assumes %i is a unix user (ejc3, colton). Prefixed labels (ejc3-foo) get a
+# drop-in from ndev-register that sets User=/Group=/HOME to the real account.
 User=%i
 WorkingDirectory=/home/%i
 Environment=HOME=/home/%i
@@ -753,9 +849,11 @@ UNIT
 cat > /usr/local/bin/agent-dir <<'ADIR'
 #!/bin/bash
 WHO="$1"
-ENVF="/var/lib/ndev/$WHO.env"
+ENVF=""
+[ -f "/var/lib/ndev/instances/$WHO.env" ] && ENVF="/var/lib/ndev/instances/$WHO.env"
+[ -z "$ENVF" ] && [ -f "/var/lib/ndev/$WHO.env" ] && ENVF="/var/lib/ndev/$WHO.env"
 DIR=""
-[ -f "$ENVF" ] && . "$ENVF"
+[ -n "$ENVF" ] && . "$ENVF"
 [ -n "$DIR" ] && [ -d "$DIR" ] || DIR="/home/$WHO"
 
 # Anchor on the REPO ROOT, not the directory ndev happens to publish.
@@ -784,7 +882,11 @@ OUT="$HOMEDIR/Documents/Codex/AGENTS.md"
 install -d -o "$WHO" -g "$WHO" -m 755 "$HOMEDIR/Documents/Codex"
 
 HOST=""; PORT=""
-[ -f "/var/lib/ndev/$WHO.env" ] && . "/var/lib/ndev/$WHO.env"
+if [ -f "/var/lib/ndev/instances/$WHO.env" ]; then
+  . "/var/lib/ndev/instances/$WHO.env"
+elif [ -f "/var/lib/ndev/$WHO.env" ]; then
+  . "/var/lib/ndev/$WHO.env"
+fi
 
 # git must run AS the user: root gets "dubious ownership" on a user-owned repo and every
 # command returns empty, which silently produces a project list with no projects in it.
@@ -988,6 +1090,32 @@ if [ -f /var/lib/ndev/registry ]; then
   echo "migrated shared ndev registry into per-zone registries"
 fi
 
+# Migrate legacy /var/lib/ndev/$USER.env into instances/$USER.env (multi-instance layout).
+# Idempotent: skips when the per-instance file already exists.
+mkdir -p /var/lib/ndev/instances
+for u in ${join(" ", local.nextjs_users)}; do
+  legacy="/var/lib/ndev/$u.env"
+  dest="/var/lib/ndev/instances/$u.env"
+  [ -s "$legacy" ] || continue
+  if [ ! -s "$dest" ]; then
+    # Subshell so HOST/PORT/DIR from the legacy file do not leak into this script
+    # (set -u would then trip on a later user whose legacy file is missing a key).
+    bash -c 'set -euo pipefail; . "$1"; printf "HOST=%s\\nPORT=%s\\nDIR=%s\\nWHO=%s\\n" "$HOST" "$PORT" "$DIR" "$2" > "$3"' \
+      bash "$legacy" "$u" "$dest"
+    echo "migrated $legacy -> $dest"
+  fi
+  # Ensure User= drop-in exists for the primary label (harmless if User=%i already matches).
+  DROP_DIR="/etc/systemd/system/ndev@$u.service.d"
+  mkdir -p "$DROP_DIR"
+  cat > "$DROP_DIR/user.conf" <<EOF
+[Service]
+User=$u
+Group=$u
+WorkingDirectory=/home/$u
+Environment=HOME=/home/$u
+EOF
+done
+
 # Build each zone's ingress from its registry. Also the reason a fresh box has a working
 # tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
 ${local.nextjs_zone_rebuild}
@@ -1004,11 +1132,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config-%i.yml --no-autoupdate tunnel run
-# cloudflared re-reads its config on SIGHUP. Without an ExecReload, systemd's
-# reload-or-restart degrades to a full restart -- and cloudflared's graceful shutdown drains
-# for ~30s, so every setup run took BOTH zones down for ~40 seconds and users got
-# "Error 1033 Cloudflare Tunnel error". A reload keeps the connections up.
-ExecReload=/bin/kill -HUP $MAINPID
+# Local ingress is read on startup. No ExecReload: cloudflared does not handle SIGHUP.
+# ndev restarts only the changed zone; existing connections briefly disconnect.
 Restart=always
 RestartSec=5
 User=root
@@ -1032,11 +1157,16 @@ fi
 # ---------------------------------------------------------------- ndev
 cat > /usr/local/bin/ndev <<'NDEV'
 #!/bin/bash
-# ndev [name] -- start `next dev` in this project and expose it at <name>.<your zone>
+# ndev [name] -- start `next dev` in this project and expose it under your zone.
 #
-# Defaults to your username, so `ndev` as colton publishes colton.cc-games.dev and as
-# ejc3 publishes ejc3.dolphin-labs.dev. Pass a name for a second project:
-# `ndev tetris` -> tetris.<your zone>. The zone comes from your account, not a flag.
+# Defaults:
+#   - primary checkout (e.g. ~/dolphin-labs/web) -> https://$USER.<zone>
+#   - worktree under ~/worktrees/<slug>/... or ~/<repo>/.claude/worktrees/<slug>/...
+#     -> https://$USER-<slug>.<zone>
+# Explicit arg becomes $USER-<arg> unless it is already $USER or $USER-*.
+# Hostnames must stay $USER or $USER-* under the account's zone (no bare unrelated names).
+#
+# Multiple labels for one user stay up concurrently (ndev@ejc3 and ndev@ejc3-foo).
 #
 # The port is derived from the hostname, so restarting gives you the same port and the
 # tunnel mapping stays valid. Binds 127.0.0.1 only -- the box has no inbound web ports;
@@ -1045,10 +1175,44 @@ cat > /usr/local/bin/ndev <<'NDEV'
 set -euo pipefail
 DOMAIN=$(/usr/local/bin/ndev-zone "$USER")
 [ -n "$DOMAIN" ] || { echo "no publishing zone for $USER -- add them to nextjs_user_zone" >&2; exit 1; }
-NAME="$${1:-$USER}"
-NAME=$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z' | sed 's/^-*//;s/-*$//')
-[ -n "$NAME" ] || { echo "usage: ndev [name]" >&2; exit 1; }
-HOST="$NAME.$DOMAIN"
+
+sanitize() {
+  printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z' | sed 's/^-*//;s/-*$//'
+}
+
+HERE=$(pwd -P 2>/dev/null || pwd)
+if [ -n "$${1:-}" ]; then
+  ARG=$(sanitize "$1")
+  [ -n "$ARG" ] || { echo "usage: ndev [name]" >&2; exit 1; }
+  case "$ARG" in
+    "$USER"|"$USER"-*) LABEL="$ARG" ;;
+    *) LABEL="$USER-$ARG" ;;
+  esac
+else
+  LABEL=""
+  case "$HERE" in
+    "/home/$USER/worktrees/"*)
+      SLUG="$${HERE#/home/$USER/worktrees/}"
+      SLUG="$${SLUG%%/*}"
+      LABEL="$USER-$(sanitize "$SLUG")"
+      ;;
+    *)
+      # e.g. /home/ejc3/dolphin-labs/.claude/worktrees/<slug>/web
+      SLUG=$(printf '%s' "$HERE" | sed -n "s|^/home/$USER/[^/]*/\\.claude/worktrees/\\([^/]*\\).*|\\1|p")
+      if [ -n "$SLUG" ]; then
+        LABEL="$USER-$(sanitize "$SLUG")"
+      fi
+      ;;
+  esac
+  [ -n "$LABEL" ] || LABEL="$USER"
+fi
+
+HOST="$LABEL.$DOMAIN"
+# Belt-and-suspenders with ndev-register's check.
+case "$LABEL" in
+  "$USER"|"$USER"-*) ;;
+  *) echo "refusing: hostname must be $USER.$DOMAIN or $USER-<slug>.$DOMAIN" >&2; exit 1 ;;
+esac
 PORT=$(( 3100 + ( $(printf '%s' "$HOST" | cksum | awk '{print $1}') % 800 ) ))
 
 [ -f package.json ] || { echo "no package.json here -- run ndev inside a Next.js project" >&2; exit 1; }
@@ -1063,9 +1227,9 @@ echo "  https://$HOST   (port $PORT)"
 echo "  sign in when prompted -- Cloudflare Access gates every hostname"
 echo ""
 echo "  it keeps running after you log out, and comes back by itself if the box reboots."
-echo "    logs:    journalctl -u ndev@$USER -f"
-echo "    restart: sudo systemctl restart ndev@$USER"
-echo "    stop:    sudo systemctl stop ndev@$USER"
+echo "    logs:    journalctl -u ndev@$LABEL -f"
+echo "    restart: systemctl restart ndev@$LABEL"
+echo "    stop:    systemctl stop ndev@$LABEL"
 echo ""
 NDEV
 chmod 755 /usr/local/bin/ndev
@@ -1085,18 +1249,18 @@ for u in ${join(" ", local.nextjs_users)}; do
   chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
   chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
 
-  # The account owner's own key, if one is declared for them. Appended, never replacing
-  # the file: a user may have added keys by hand and this must not take their access away.
-  case "$u" in
-%{~for ku, kk in local.nextjs_user_keys~}
-    ${ku})
-      grep -qxF "${kk}" "/home/$u/.ssh/authorized_keys" 2>/dev/null || \
-        echo "${kk}" >> "/home/$u/.ssh/authorized_keys"
-      chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
-      chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
-      ;;
-%{~endfor~}
-  esac
+  # The account owner's declared keys. Appended, never replacing the file: a user may have
+  # added keys by hand and this must not take their access away.
+  while IFS='|' read -r ku kk; do
+    [ -n "$ku" ] || continue
+    [ "$ku" = "$u" ] || continue
+    grep -qxF "$kk" "/home/$u/.ssh/authorized_keys" 2>/dev/null || \
+      echo "$kk" >> "/home/$u/.ssh/authorized_keys"
+    chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+    chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+  done <<'USERKEYS'
+${join("\n", local.nextjs_user_key_lines)}
+USERKEYS
 
   # Retire superseded keys. Without this a rotated key stays authorized forever, because
   # the append above has no way to know a line is obsolete. Matched with grep -vxF on the
@@ -1253,8 +1417,28 @@ AGENTSMD
   fi
   chown "$u:$u" "$CFG" 2>/dev/null || true
   { [ -s "/home/$u/.codex/auth.json" ] && [ -x "$CODEX_STANDALONE" ]; } && systemctl enable --now "codex-rc@$u.service" 2>/dev/null || true
-  # Re-enable a previously published project (ndev-register wrote the env file).
-  [ -s "/var/lib/ndev/$u.env" ] && systemctl enable --now "ndev@$u.service" 2>/dev/null || true
+  # Re-enable previously published projects (per-instance env files).
+  for envf in /var/lib/ndev/instances/*.env; do
+    [ -s "$envf" ] || continue
+    # shellcheck disable=SC1090
+    WHO_LINE=$(grep -E '^WHO=' "$envf" | head -1 | cut -d= -f2- || true)
+    [ "$WHO_LINE" = "$u" ] || continue
+    label=$(basename "$envf" .env)
+    DROP_DIR="/etc/systemd/system/ndev@$label.service.d"
+    mkdir -p "$DROP_DIR"
+    cat > "$DROP_DIR/user.conf" <<EOF
+[Service]
+User=$u
+Group=$u
+WorkingDirectory=/home/$u
+Environment=HOME=/home/$u
+EOF
+    systemctl enable --now "ndev@$label.service" 2>/dev/null || true
+  done
+  # Legacy single-file layout until migrated below.
+  if [ -s "/var/lib/ndev/$u.env" ] && [ ! -s "/var/lib/ndev/instances/$u.env" ]; then
+    systemctl enable --now "ndev@$u.service" 2>/dev/null || true
+  fi
 done
 
 # ---------------------------------------------------------------- nightly agent update

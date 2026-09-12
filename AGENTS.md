@@ -134,8 +134,10 @@ permissions, which is exactly why it was useless for this.
 
 Account id: `12ea67fb7ced068de03f35c22688e436`.
 
-**Outstanding:** that `.env` still holds the bootstrap token in plaintext. It is effectively
-account-level authority (it can mint any token), so it belongs in Secrets Manager only.
+**September 8, 2026 check:** `/home/ubuntu/aws/.env` was absent, and Secrets Manager
+`cloudflare-account-token` had an `AWSCURRENT` version. Keep this account-level token-minting
+credential in Secrets Manager only; do not recreate a plaintext `.env` copy. This checked
+only that file path and secret metadata, not token usability or historical/other copies.
 
 ## Preventing Terraform Drift
 
