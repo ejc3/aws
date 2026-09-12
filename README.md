@@ -1034,8 +1034,11 @@ do not prove existing hosts or disks have been remediated.
 
 The owner approved the monitoring foundation on September 8, 2026, at approximately
 $9/month fixed plus metered usage. Deployment requires the reviewed-plan, regional
-compatibility and delivery gates below; approval is not evidence of live delivery. Config,
-Security Hub and Inspector remain disabled and require separate approval.
+compatibility and delivery gates below; approval is not evidence of live delivery. The
+owner separately approved paid scanning on September 12, 2026. The source now enables
+the five-region/account Config, Security Hub CSPM and Inspector stage described below;
+the known alert's actual mailbox receipt was independently verified before rollout.
+A merge alone is not evidence that recording or scanning has started.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
@@ -1047,8 +1050,9 @@ modules do not recreate them. Monitoring does **not**
 migrate existing disks, restrict the required public SSH/ET access, remove Cloudflare
 service-token access, or change the verified backup pipeline.
 
-Roll out the foundation first with `local.security_posture_enabled = false`.
-After delivery acceptance, a usage/cost review and separate owner approval, enable that single bootstrap gate
+For a new deployment, roll out the foundation first with
+`local.security_posture_enabled = false`. After delivery acceptance, a usage/cost review
+and separate owner approval, enable that single bootstrap gate
 for Config, Security Hub CSPM foundational checks and Inspector EC2/Lambda scanning:
 main account `us-west-1`, `us-west-2`, `us-east-1`, and recovery account `us-west-1`,
 `us-east-1`. The final recovery vault is in `us-east-1` and must not be omitted.
@@ -1094,7 +1098,10 @@ be replaced by this rollout.
 
 Security findings, root-account activity (including read-only management calls),
 and high-risk IAM, network, KMS and backup changes forward to the
-existing confirmed `cost-alerts` SNS topic. Normal processing/checkpoint cleanup does
+existing confirmed `cost-alerts` SNS topic. Inspector and GuardDuty use their native
+finding events only; their Security Hub imports are excluded from forwarding to avoid
+duplicate notifications. Foundational checks and other Security Hub products retain
+their existing notification path. Normal processing/checkpoint cleanup does
 not page the owner; deletion attempts against legacy/final backup history do. Every
 region has two disjoint forwarding rules sharing one encrypted 14-day dead-letter
 queue; each event pattern stays within AWS's default 2,048-character limit. A
@@ -1144,6 +1151,27 @@ was verified; it referenced zero log files, and no event-log bodies were read. E
 hashes/full-chain integrity, actual email receipt, an SSM session transcript and a
 flow-log object from the quiet `us-west-2` VPC remain unproven; this is not yet complete
 end-to-end delivery acceptance.
+
+September 12, 2026 acceptance: the owner-authorized GuardDuty high-severity sample
+`570453a9836e4b60be3faecb4ec18612` (`Backdoor:EC2/C&CActivity.B!DNS`, severity 8,
+`sample=true`, fictitious instance `i-99999999`) was created at 18:06 UTC. The regional
+forwarder and central SNS target each recorded one successful invocation, and SNS
+recorded one publication, two deliveries to its existing email/Lambda subscriptions,
+and zero failures. A preceding severity-2 SSH sample was below the intended notification
+threshold. Read-only access to the owner's configured mailbox verified the exact positive
+sample message received at 18:06:30 UTC; this closes the delivery gate without inferring
+mailbox receipt from SNS metrics or claiming the owner had read the message.
+Four clean 34-region watchdog
+executions and all five healthy alarms were read back. A bounded standard SSM shell
+session on fcvm produced a 426-byte encrypted, versioned transcript whose unique test
+marker was verified after the session terminated. Retained September 9 S3 flow-log
+objects match the exact active west2 flow-log ID; west2 compute was stopped during
+this check and no extra instance was launched. All three flow logs report successful
+delivery and have matching objects. CloudTrail digest signatures, chain links and
+referenced log hashes were verified with the official CLI for a bounded 15:00–17:00 UTC
+window across all 34 account/region pairs (102/102 digests and 1,074/1,074 logs valid).
+This window is not a claim of integrity for all historical log objects; audit log
+bodies were not printed or sent to development hosts.
 
 ### Incremental monitoring cost
 
@@ -1495,6 +1523,24 @@ and `journalctl --user -u browser-manager -u browser-manager-tunnel`. If the she
 bus address, prefix these with `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`.
 Cloudflare errors before sign-in usually mean the apply/connector is not ready; a stopped
 desktop can be started from the dashboard. A profile remains on disk even if startup fails.
+
+The AWS browser connector secret is Terraform-managed. For an intentional rotation, bump
+`random_bytes.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
+apply the in-place tunnel update and new Secrets Manager version. Never replace the tunnel,
+DNS, Access application, or Mac connector. Read the replacement secret directly on ARM
+using its instance role into a private temporary file, verify it, and atomically install it
+as `~/.config/browser-manager/tunnel-token` (owner `ubuntu`, mode `0600`). Restart only
+`browser-manager-tunnel.service`; the browser manager and its desktops stay running.
+After a suspected exposure, also invalidate existing connections for this exact tunnel
+through Cloudflare's connections API, then verify the new connector is ready. Rotation
+alone prevents new connections with the old credential but does not disconnect old ones.
+Never print either token or place it in command arguments, Git, or a dev-host AWS admin session.
+Installed connector units read a local file; they do not automatically refresh from Secrets
+Manager. A stopped AWS browser host (including x86) is not verified by an ARM rotation:
+leave it stopped, and refresh its token through its own instance role before restarting
+its connector on the next authorized boot. Do not start an extra replica against a different
+browser manager, because Cloudflare would distribute traffic between unrelated desktops.
+See [Cloudflare token rotation and connection invalidation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/#rotate-a-compromised-token).
 
 ### Development and acceptance
 
