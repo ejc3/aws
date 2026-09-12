@@ -340,6 +340,8 @@ resource "aws_securityhub_standards_subscription" "foundational" {
   count         = var.posture_enabled ? 1 : 0
   standards_arn = "arn:aws:securityhub:${data.aws_region.current.name}::standards/aws-foundational-security-best-practices/v/1.0.0"
   depends_on    = [aws_securityhub_account.security]
+  # Initial regional enrollment can outlast the provider's three-minute default.
+  timeouts { create = "20m" }
 }
 
 # Standard OS/package and Lambda dependency scans, without the separately priced
@@ -348,4 +350,6 @@ resource "aws_inspector2_enabler" "security" {
   count          = var.posture_enabled ? 1 : 0
   account_ids    = [data.aws_caller_identity.current.account_id]
   resource_types = ["EC2", "LAMBDA"]
+  # First-time EC2 onboarding exceeded the provider's five-minute default.
+  timeouts { create = "20m" }
 }
