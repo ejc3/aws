@@ -832,6 +832,12 @@ class TerraformSafetyTests(unittest.TestCase):
         standard = block(REGIONAL, "aws_securityhub_standards_subscription", "foundational")
         self.assertIn("standards/aws-foundational-security-best-practices/v/1.0.0", standard)
 
+    def test_initial_posture_enrollment_has_bounded_create_timeouts(self):
+        for kind, name in [("aws_securityhub_standards_subscription", "foundational"),
+                           ("aws_inspector2_enabler", "security")]:
+            body = block(REGIONAL, kind, name)
+            self.assertRegex(body, r'timeouts\s*\{\s*create\s*=\s*"20m"\s*\}')
+
     def test_external_analyzers_have_a_single_separate_owner(self):
         external = (ROOT / "security-external-access.tf").read_text()
         self.assertNotIn('resource "aws_accessanalyzer_analyzer"', REGIONAL)
