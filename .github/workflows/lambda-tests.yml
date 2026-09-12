@@ -55,5 +55,8 @@ jobs:
       - name: Runner IAM canary acceptance guards
         run: python3 -S -B scripts/test-runner-iam-canary.py
 
+      - name: Runner IAM least-privilege boundaries
+        run: python3 -S -B scripts/test-runner-iam-boundary.py
+
       - name: Runner release freshness guards (offline)
         run: python3 -S -B scripts/test-runner-release-freshness.py

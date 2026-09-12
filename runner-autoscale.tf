@@ -842,22 +842,122 @@ resource "aws_iam_role_policy" "runner_lambda" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:*:*:*"
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = flatten([for name in ["github-runner-webhook", "github-runner-cleanup"] : [
+          "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}",
+          "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}:*",
+        ]])
       },
       {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeImages",
-          "ec2:DescribeInstances",
-          "ec2:RunInstances",
-          "ec2:StopInstances",
-          "ec2:TerminateInstances",
-          "ec2:CreateTags",
-          "cloudwatch:GetMetricStatistics"
-        ]
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeImages", "ec2:DescribeInstances"]
         Resource = "*"
+      },
+      {
+        Sid      = "LaunchApprovedRunnerImages"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1::image/*"
+        Condition = {
+          StringEquals = {
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
+            "aws:ResourceTag/Purpose" = "github-runner"
+          }
+        }
+      },
+      {
+        Sid    = "LaunchExactRunnerNetwork"
+        Effect = "Allow"
+        Action = "ec2:RunInstances"
+        Resource = [
+          aws_subnet.runner[0].arn,
+          aws_security_group.runner[0].arn,
+          "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:key-pair/fcvm-ec2",
+        ]
+      },
+      {
+        Sid      = "LaunchTaggedRunnerInstance"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/Role" = "github-runner", "ec2:MetadataHttpTokens" = "required" }
+          ArnEquals    = { "ec2:InstanceProfile" = aws_iam_instance_profile.runner[0].arn }
+        }
+      },
+      {
+        Sid      = "LaunchTaggedRunnerENI"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/Role" = "github-runner" }
+          ArnEquals    = { "ec2:Subnet" = aws_subnet.runner[0].arn }
+        }
+      },
+      {
+        Sid      = "LaunchEncryptedRunnerVolume"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:volume/*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/Role" = "github-runner" }
+          Bool         = { "ec2:Encrypted" = "true" }
+        }
+      },
+      {
+        Sid      = "TagOnlyDuringRunnerLaunch"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
+        Condition = {
+          StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "RunnerRegistrationProtocol"] }
+        }
+      },
+      {
+        Sid      = "UpdateRunnerLeaseOnly"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = {
+          StringEquals                = { "aws:ResourceTag/Role" = "github-runner" }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["LeaseExpires", "RunnerSeenAt", "CapacityFailedAt"] }
+        }
+      },
+      {
+        # Even an additive broad tag Allow cannot make the controller adopt a
+        # dev/admin host or AMI builder. Deny every non-lease key, including
+        # case variants of Name/Role (resource-tag condition keys ignore case).
+        Sid      = "DenyNonLeaseTagChangesOutsideLaunch"
+        Effect   = "Deny"
+        Action   = "ec2:CreateTags"
+        Resource = "*"
+        Condition = {
+          StringNotEqualsIfExists       = { "ec2:CreateAction" = "RunInstances" }
+          "ForAnyValue:StringNotEquals" = { "aws:TagKeys" = ["LeaseExpires", "RunnerSeenAt", "CapacityFailedAt"] }
+        }
+      },
+      {
+        Sid      = "TerminateRunnerOnly"
+        Effect   = "Allow"
+        Action   = "ec2:TerminateInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
+        }
+      },
+      {
+        # The existing cleanup function also reaps failed AMI builders. It never
+        # tags this Name, so retaining that narrow reaper is not an adoption path.
+        Sid      = "ReapExistingTemporaryAMIBuilder"
+        Effect   = "Allow"
+        Action   = "ec2:TerminateInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Name" = "ami-builder-temp" }
+        }
       },
       {
         # Every controller launch uses github-runner-profile. This restriction
@@ -889,7 +989,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
       {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:us-west-1:928413605543:parameter/github-runner/*"
+        Resource = [for name in ["pat", "user-data"] : "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/${name}"]
       },
       {
         Effect   = "Allow"
