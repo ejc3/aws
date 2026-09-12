@@ -1000,7 +1000,7 @@ box.
 
 ## Regional security defaults
 
-`security-defaults.tf` manages 102 account settings: three defaults across 17 enabled
+`security-defaults.tf` manages 136 account settings: four defaults across 17 enabled
 regions in both the main and recovery accounts (34 account/region combinations).
 Coverage is `ap-south-1`, `ap-northeast-{1,2,3}`, `ap-southeast-{1,2}`, `ca-central-1`,
 `eu-central-1`, `eu-north-1`, `eu-west-{1,2,3}`, `sa-east-1`, `us-east-{1,2}` and
@@ -1022,6 +1022,14 @@ adds only the missing regional aliases, with the existing recovery-account admin
   pinned provider also writes `no-preference` for the regional endpoint/tag defaults
   and `-1` for the hop limit, matching the September 8 inventory's unset values.
   Review any non-default regional metadata setting before applying. See [regional IMDS defaults](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-IMDS-new-instances.html).
+- SSM document public sharing is blocked by the regional service setting
+  `/ssm/documents/console/public-sharing-permission = Disable`. This prevents new public
+  shares; it does not revoke existing public shares or affect private account sharing,
+  use of AWS-owned documents, SSH, or Session Manager. September 12 preflight found
+  public sharing permitted in all 34 pairs, with two owned documents and no public
+  shares. Require `get-service-setting` to report `Disable` everywhere after apply.
+  The Terraform resource has `prevent_destroy` because removing it would reset the
+  service default and permit public sharing again. See [SSM document sharing](https://docs.aws.amazon.com/systems-manager/latest/userguide/documents-ssm-sharing.html#block-public-access).
 
 These settings have no recurring service subscription and create no detectors, log
 pipelines, keys or compute. Ordinary future storage, copy and KMS usage still costs
@@ -1098,7 +1106,7 @@ second detector. A failed live-property postcondition requires an administrator 
 diagnose and review a repair or future typed-resource migration; it does not perform
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
-After the separate 102 regional defaults, 36 external-analysis resources and two
+After the separate 136 regional defaults, 36 external-analysis resources and two
 global S3 controls, the monitoring foundation adds 293 managed Terraform resource
 instances plus one existing SNS topic-policy update; the posture gate adds 45 more.
 These are source counts, not

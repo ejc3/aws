@@ -1,4 +1,4 @@
-# No recurring service subscription: three regional account defaults, not hosts.
+# No recurring service subscription: four regional account defaults, not hosts.
 # Existing disk migration, public SSH/ET, Cloudflare and backup resources are unchanged.
 # Account defaults are not a substitute for instance-scoped IAM/metadata controls.
 
