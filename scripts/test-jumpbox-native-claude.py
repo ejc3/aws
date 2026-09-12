@@ -35,6 +35,30 @@ class JumpboxNativeClaudeTests(unittest.TestCase):
     def test_source_is_shell_syntax_valid(self):
         subprocess.run(["bash", "-n"], input=CLAUDE, text=True, check=True)
 
+    def run_with_fake_installer(self, native_status):
+        # Intercept every sudo/npm call: never invoke an installer, read a login,
+        # or write a real user's shell configuration during these offline tests.
+        harness = """
+sudo() {
+  if [ "$4" = /home/ubuntu/.local/bin/claude ]; then
+    return NATIVE_STATUS
+  fi
+  return 0
+}
+npm() { printf 'NPM:%s\\n' "$*"; }
+""".replace("NATIVE_STATUS", str(native_status))
+        return subprocess.run(["bash"], input=harness + CLAUDE, text=True,
+                              capture_output=True, check=True).stdout
+
+    def test_working_native_permits_only_the_legacy_package_removal(self):
+        output = self.run_with_fake_installer(0)
+        self.assertEqual(output.strip(), "NPM:uninstall -g --ignore-scripts @anthropic-ai/claude-code")
+
+    def test_failed_native_check_preserves_legacy_package(self):
+        output = self.run_with_fake_installer(1)
+        self.assertNotIn("NPM:", output)
+        self.assertIn("keeping the npm copy", output)
+
     def test_s3_publish_does_not_add_bootstrap_replay(self):
         instance = (ROOT / "jumpbox2.tf").read_text()
         self.assertRegex(instance, r"(?s)ignore_changes\s*=\s*\[.*?user_data,")
