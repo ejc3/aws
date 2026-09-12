@@ -1496,6 +1496,24 @@ bus address, prefix these with `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(i
 Cloudflare errors before sign-in usually mean the apply/connector is not ready; a stopped
 desktop can be started from the dashboard. A profile remains on disk even if startup fails.
 
+The AWS browser connector secret is Terraform-managed. For an intentional rotation, bump
+`random_bytes.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
+apply the in-place tunnel update and new Secrets Manager version. Never replace the tunnel,
+DNS, Access application, or Mac connector. Read the replacement secret directly on ARM
+using its instance role into a private temporary file, verify it, and atomically install it
+as `~/.config/browser-manager/tunnel-token` (owner `ubuntu`, mode `0600`). Restart only
+`browser-manager-tunnel.service`; the browser manager and its desktops stay running.
+After a suspected exposure, also invalidate existing connections for this exact tunnel
+through Cloudflare's connections API, then verify the new connector is ready. Rotation
+alone prevents new connections with the old credential but does not disconnect old ones.
+Never print either token or place it in command arguments, Git, or a dev-host AWS admin session.
+Installed connector units read a local file; they do not automatically refresh from Secrets
+Manager. A stopped AWS browser host (including x86) is not verified by an ARM rotation:
+leave it stopped, and refresh its token through its own instance role before restarting
+its connector on the next authorized boot. Do not start an extra replica against a different
+browser manager, because Cloudflare would distribute traffic between unrelated desktops.
+See [Cloudflare token rotation and connection invalidation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/#rotate-a-compromised-token).
+
 ### Development and acceptance
 
 `npm test`, `npm run typecheck`, and `npm run build` are the focused CI gate. Install `x11vnc`
