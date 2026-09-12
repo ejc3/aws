@@ -1030,7 +1030,8 @@ $9/month fixed plus metered usage. Deployment requires the reviewed-plan, region
 compatibility and delivery gates below; approval is not evidence of live delivery. The
 owner separately approved paid scanning on September 12, 2026. The source now enables
 the five-region/account Config, Security Hub CSPM and Inspector stage described below;
-a merge alone is not evidence that recording or scanning has started.
+the rollout must not merge or apply until the owner confirms the known alert's email
+receipt. A merge alone is not evidence that recording or scanning has started.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
@@ -1090,7 +1091,10 @@ be replaced by this rollout.
 
 Security findings, root-account activity (including read-only management calls),
 and high-risk IAM, network, KMS and backup changes forward to the
-existing confirmed `cost-alerts` SNS topic. Normal processing/checkpoint cleanup does
+existing confirmed `cost-alerts` SNS topic. Inspector and GuardDuty use their native
+finding events only; their Security Hub imports are excluded from forwarding to avoid
+duplicate notifications. Foundational checks and other Security Hub products retain
+their existing notification path. Normal processing/checkpoint cleanup does
 not page the owner; deletion attempts against legacy/final backup history do. Every
 region has two disjoint forwarding rules sharing one encrypted 14-day dead-letter
 queue; each event pattern stays within AWS's default 2,048-character limit. A

@@ -66,6 +66,7 @@ FINDING_BRANCHES = [
      "detail": {"status": ["ACTIVE"]}},
     {"source": ["aws.securityhub"], "detail-type": ["Security Hub Findings - Imported"],
      "detail": {"findings": {"Severity": {"Label": ["HIGH", "CRITICAL"]},
+                             "ProductArn": [{"anything-but": {"suffix": [":product/aws/inspector", ":product/aws/guardduty"]}}],
                              "RecordState": ["ACTIVE"], "Workflow": {"Status": ["NEW"]}}}},
     {"source": ["aws.inspector2"], "detail-type": ["Inspector2 Finding"],
      "detail": {"severity": ["HIGH", "CRITICAL"], "status": ["ACTIVE"]}},
@@ -97,6 +98,11 @@ def matches(pattern, event):
     if isinstance(event, list):
         return any(matches(pattern, member) for member in event)
     if isinstance(pattern, dict):
+        if set(pattern) == {"anything-but"}:
+            excluded = pattern["anything-but"]
+            if not isinstance(excluded, dict) or set(excluded) != {"suffix"} or not isinstance(excluded["suffix"], list):
+                raise AssertionError("Unreviewed anything-but operator")
+            return isinstance(event, str) and not event.endswith(tuple(excluded["suffix"]))
         if set(pattern) == {"numeric"}:
             operator, threshold = pattern["numeric"]
             if operator != ">=":
@@ -664,12 +670,22 @@ class TerraformSafetyTests(unittest.TestCase):
                 for workflow in ("NEW", "NOTIFIED", "RESOLVED"):
                     fixtures.append(({"source": "aws.securityhub", "detail-type": "Security Hub Findings - Imported",
                         "detail": {"findings": [{"Severity": {"Label": severity}, "RecordState": state,
+                                                "ProductArn": "arn:aws:securityhub:us-west-1::product/aws/securityhub",
                                                 "Workflow": {"Status": workflow}}]}},
                         REGIONAL_RULES[0] if severity in ("HIGH", "CRITICAL") and state == "ACTIVE" and workflow == "NEW" else None))
             for status in ("ACTIVE", "SUPPRESSED", "CLOSED"):
                 fixtures.append(({"source": "aws.inspector2", "detail-type": "Inspector2 Finding",
                                   "detail": {"severity": severity, "status": status}},
                                   REGIONAL_RULES[0] if severity in ("HIGH", "CRITICAL") and status == "ACTIVE" else None))
+        # Inspector and GuardDuty keep one native notification path, including when
+        # Security Hub imports the same finding. Other product paths still notify.
+        for region in REGIONS:
+            for product in ("aws/inspector", "aws/guardduty", "aws/securityhub", "partner/inspector"):
+                fixtures.append(({"source": "aws.securityhub", "detail-type": "Security Hub Findings - Imported",
+                    "detail": {"findings": [{"Severity": {"Label": "HIGH"}, "RecordState": "ACTIVE",
+                        "ProductArn": f"arn:aws:securityhub:{region}::product/{product}",
+                        "Workflow": {"Status": "NEW"}}]}},
+                    None if product in ("aws/inspector", "aws/guardduty") else REGIONAL_RULES[0]))
         # A finding with the right detail body but a different source must not page.
         for event, expected in list(fixtures):
             if expected:
