@@ -50,6 +50,15 @@ resource "aws_iam_role_policy_attachment" "dev_server_ssm" {
   }
 }
 
+locals {
+  # These explicit ENIs survive stop/start. Derive the allowlist from Terraform so
+  # replacements and disabled-host gates cannot leave authority over stale ENIs.
+  dev_server_ipv6_network_interface_arns = concat(
+    aws_network_interface.firecracker_dev[*].arn,
+    aws_network_interface.x86_dev[*].arn,
+  )
+}
+
 # Dev server permissions
 resource "aws_iam_role_policy" "dev_server" {
   name = "dev-server-policy"
@@ -57,7 +66,7 @@ resource "aws_iam_role_policy" "dev_server" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid    = "SSMSendCommandToRunners"
         Effect = "Allow"
@@ -79,8 +88,11 @@ resource "aws_iam_role_policy" "dev_server" {
         Resource = "arn:aws:ssm:us-west-1::document/AWS-RunShellScript"
       },
       {
-        Sid    = "SSMGetCommandResults"
-        Effect = "Allow"
+        # Run Command result/list APIs have no resource-level authorization. They
+        # can expose admin-host command inputs/output even when SendCommand is
+        # runner-scoped. Use the existing dev-to-runner SSH key for debug output.
+        Sid    = "NeverReadAccountWideCommandOutput"
+        Effect = "Deny"
         Action = [
           "ssm:GetCommandInvocation",
           "ssm:ListCommandInvocations",
@@ -144,15 +156,6 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:DescribeAvailabilityZones"
         ]
         Resource = "*"
-      },
-      {
-        Sid    = "EC2AssignIpv6Prefix"
-        Effect = "Allow"
-        Action = [
-          "ec2:AssignIpv6Addresses",
-          "ec2:UnassignIpv6Addresses"
-        ]
-        Resource = "arn:aws:ec2:us-west-1:928413605543:network-interface/*"
       },
       {
         Sid    = "EC2ManageRunners"
@@ -272,8 +275,44 @@ resource "aws_iam_role_policy" "dev_server" {
           "arn:aws:bedrock:*:928413605543:inference-profile/*"
         ]
       }
-    ]
+      ], length(local.dev_server_ipv6_network_interface_arns) > 0 ? [{
+        Sid    = "EC2AssignIpv6Prefix"
+        Effect = "Allow"
+        Action = [
+          "ec2:AssignIpv6Addresses",
+          "ec2:UnassignIpv6Addresses"
+        ]
+        Resource = local.dev_server_ipv6_network_interface_arns
+    }] : [])
   })
+}
+
+# Retire the unmanaged predecessor without deleting its role/profile or history.
+# September 12, 2026: no instance, launch configuration, or launch-template version
+# references its profile in any of the 17 enabled regions. IAM last used it on
+# December 31, 2025. Keep the existing broad grants inert, including any later
+# accidental attachment; the active metal role above is deliberately not this role.
+resource "aws_iam_role_policy" "retired_legacy_dev_server" {
+  name = "RetiredIdentityDenyAll"
+  role = "aws-infrastructure-dev-instance-role"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "RetiredIdentityDenyAll"
+      Effect   = "Deny"
+      Action   = "*"
+      Resource = "*"
+    }]
+  })
+
+  lifecycle {
+    prevent_destroy = true
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == "928413605543"
+      error_message = "The legacy dev identity retirement belongs only to the main fleet account."
+    }
+  }
 }
 
 locals {

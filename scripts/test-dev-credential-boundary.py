@@ -51,6 +51,42 @@ class DevCredentialBoundaryTests(unittest.TestCase):
         self.assertRegex(policy, r'"ssm:resourceTag/Role"\s*=\s*"github-runner"')
         self.assertIn('aws_ssm_parameter.dev_ssh_private_key.arn', policy)
 
+    def test_dev_denies_unscopable_command_input_and_output_reads(self):
+        policy = block('dev-instance-common.tf', 'resource', 'dev_server', 'aws_iam_role_policy')
+        statement = re.search(r'\{\s*(?:#[^\n]*\n\s*)*'
+                              r'Sid\s*=\s*"NeverReadAccountWideCommandOutput".*?\n\s*\}',
+                              policy, re.S).group()
+        self.assertRegex(statement, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(statement, r'Resource\s*=\s*"\*"')
+        for action in ['ssm:GetCommandInvocation', 'ssm:ListCommandInvocations',
+                       'ssm:ListCommands']:
+            self.assertEqual(policy.count('"' + action + '"'), 1)
+            self.assertIn('"' + action + '"', statement)
+        self.assertNotIn('SSMGetCommandResults', policy)
+        self.assertIn('SSMSendCommandToRunners', policy)
+
+    def test_dev_ipv6_assignment_uses_exact_managed_enis_and_optional_gates(self):
+        config = source('dev-instance-common.tf')
+        policy = block('dev-instance-common.tf', 'resource', 'dev_server', 'aws_iam_role_policy')
+        self.assertRegex(config, r'dev_server_ipv6_network_interface_arns\s*=\s*concat\(\s*'
+                         r'aws_network_interface\.firecracker_dev\[\*\]\.arn,\s*'
+                         r'aws_network_interface\.x86_dev\[\*\]\.arn,\s*\)')
+        self.assertIn('length(local.dev_server_ipv6_network_interface_arns) > 0 ? [{', policy)
+        self.assertRegex(policy, r'Resource\s*=\s*local.dev_server_ipv6_network_interface_arns')
+        self.assertNotIn('network-interface/*', policy)
+        self.assertIn('"ec2:AssignIpv6Addresses"', policy)
+        self.assertIn('"ec2:UnassignIpv6Addresses"', policy)
+
+    def test_retirement_is_bound_to_only_the_unused_legacy_role_and_main_account(self):
+        policy = block('dev-instance-common.tf', 'resource', 'retired_legacy_dev_server',
+                       'aws_iam_role_policy')
+        self.assertRegex(policy, r'role\s*=\s*"aws-infrastructure-dev-instance-role"')
+        self.assertIn('data.aws_caller_identity.current.account_id == "928413605543"', policy)
+        self.assertNotIn('aws_iam_role.dev_server', policy)
+        self.assertRegex(policy, r'prevent_destroy\s*=\s*true')
+        for field, value in [('Effect', 'Deny'), ('Action', '*'), ('Resource', '*')]:
+            self.assertRegex(policy, field + r'\s*=\s*"' + re.escape(value) + '"')
+
     def test_nextjs_connector_metadata_is_exact_and_contains_no_payload(self):
         metadata = block('nextjs-dev.tf', 'data', 'nextjs_connector')
         self.assertIn('data "aws_secretsmanager_secret"', metadata)
