@@ -1490,7 +1490,7 @@ Cloudflare errors before sign-in usually mean the apply/connector is not ready; 
 desktop can be started from the dashboard. A profile remains on disk even if startup fails.
 
 The AWS browser connector secret is Terraform-managed. For an intentional rotation, bump
-`random_id.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
+`random_bytes.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
 apply the in-place tunnel update and new Secrets Manager version. Never replace the tunnel,
 DNS, Access application, or Mac connector. Read the replacement secret directly on ARM
 using its instance role into a private temporary file, verify it, and atomically install it

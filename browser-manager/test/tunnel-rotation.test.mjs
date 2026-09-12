@@ -12,15 +12,16 @@ function block(kind, type, name) {
 }
 
 test('AWS connector rotation preserves the remotely managed tunnel identity', () => {
-  const secret = block('resource', 'random_id', 'browser_manager_tunnel_secret');
-  assert.match(secret, /byte_length\s*=\s*32\b/);
+  const secret = block('resource', 'random_bytes', 'browser_manager_tunnel_secret');
+  assert.match(secret, /length\s*=\s*32\b/);
   assert.match(secret, /keepers\s*=\s*\{\s*rotation\s*=\s*"\d{4}-\d{2}-\d{2}"\s*\}/);
   const tunnel = block('resource', 'cloudflare_zero_trust_tunnel_cloudflared', 'browser_manager');
   assert.match(tunnel, /config_src\s*=\s*"cloudflare"/);
-  assert.match(tunnel, /tunnel_secret\s*=\s*random_id\.browser_manager_tunnel_secret\.b64_std/);
+  assert.match(tunnel, /tunnel_secret\s*=\s*random_bytes\.browser_manager_tunnel_secret\.base64/);
   assert.match(tunnel, /prevent_destroy\s*=\s*true/);
   assert.doesNotMatch(tunnel, /replace_triggered_by|ignore_changes|local-exec|remote-exec/);
-  assert.doesNotMatch(macSource, /random_id\.browser_manager_tunnel_secret\./);
+  assert.doesNotMatch(source, /resource "random_id" "browser_manager_tunnel_secret"/);
+  assert.doesNotMatch(macSource, /random_bytes\.browser_manager_tunnel_secret\./);
 });
 
 test('replacement token is read after the PATCH and published only to its existing secret', () => {

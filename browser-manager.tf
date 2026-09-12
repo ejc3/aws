@@ -65,8 +65,10 @@ resource "cloudflare_zero_trust_access_application" "browser_manager" {
   ]
 }
 
-resource "random_id" "browser_manager_tunnel_secret" {
-  byte_length = 32
+resource "random_bytes" "browser_manager_tunnel_secret" {
+  # Unlike random_id, these outputs are sensitive and no secret-derived ID is
+  # printed in Terraform's apply/refresh progress messages.
+  length = 32
   # Bump only for an intentional, coordinated connector-token rotation.
   keepers = { rotation = "2026-09-12" }
 }
@@ -77,7 +79,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "browser_manager" {
   config_src = "cloudflare"
   # Cloudflare PATCH rotates the remote-managed connector token in place.
   # The secret and token stay in protected Terraform state / Secrets Manager.
-  tunnel_secret = random_id.browser_manager_tunnel_secret.b64_std
+  tunnel_secret = random_bytes.browser_manager_tunnel_secret.base64
 
   lifecycle { prevent_destroy = true }
 }
