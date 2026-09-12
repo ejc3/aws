@@ -45,9 +45,11 @@ sudo() {
   fi
   return 0
 }
-npm() { printf 'NPM:%s\\n' "$*"; }
+claude_test_npm_calls=
+npm() { claude_test_npm_calls="$*"; }
 """.replace("NATIVE_STATUS", str(native_status))
-        return subprocess.run(["bash"], input=harness + CLAUDE, text=True,
+        report = '\nif [ -n "$claude_test_npm_calls" ]; then printf "NPM:%s\\n" "$claude_test_npm_calls"; fi\n'
+        return subprocess.run(["bash"], input=harness + CLAUDE + report, text=True,
                               capture_output=True, check=True).stdout
 
     def test_working_native_permits_only_the_legacy_package_removal(self):
