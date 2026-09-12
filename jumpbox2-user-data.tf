@@ -130,21 +130,31 @@ if [ ! -d /home/ubuntu/aws ]; then
     || echo "WARNING: could not clone ejc3/aws"
 fi
 
-# ---------------------------------------------------------------- node.js (claude needs npm)
-# Missed on the first version of this file: `npm install -g @anthropic-ai/claude-code`
-# failed silently into its own `|| echo WARNING` guard because there was no npm at all to
-# run it against -- verified on the deployed box (`command -v node npm` returned nothing,
-# and the boot log showed the claude install line immediately followed by its own failure
-# warning). Same install nextjs-user-data.tf already uses.
+# ---------------------------------------------------------------- node.js (general CLI tooling)
+# Keep the existing tooling runtime; native Claude below does not depend on npm.
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   apt-get install -y nodejs
 fi
 
 # ---------------------------------------------------------------- claude code
-# Skeleton install only -- logging in is an interactive device-code flow that cannot be
-# scripted, same as on every other box. `claude login` is the one manual step left.
-command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude install failed"
+# Match the dev hosts: one user-owned native install that can update without sudo.
+# Never use `command -v claude` as the native guard: a stale /usr/bin npm copy satisfies
+# it. This only installs the program; personal login and history remain untouched.
+sudo -u ubuntu -H bash -c 'set -o pipefail; [ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
+  || echo "WARNING: claude native install failed"
+
+# Ensure interactive shells prefer the same native binary as remote-control sessions.
+sudo -u ubuntu -H bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+
+# Remove the obsolete global copy only after the native binary actually runs as ubuntu.
+# Do not run npm lifecycle scripts, alter personal credentials, or restart any sessions.
+if sudo -u ubuntu -H /home/ubuntu/.local/bin/claude --version >/dev/null 2>&1; then
+  npm uninstall -g --ignore-scripts @anthropic-ai/claude-code >/dev/null 2>&1 \
+    || echo "WARNING: legacy npm claude removal failed"
+else
+  echo "WARNING: native claude unavailable -- keeping the npm copy"
+fi
 
 # ---------------------------------------------------------------- codex, with remote control
 # Same setup as the metal boxes and nextjs-dev: standalone install, config.toml, and the
