@@ -37,7 +37,8 @@ class DolphinSSHTests(unittest.TestCase):
         self.registry = self.root / "registry"
         self.config = self.root / "config"
         self.homes = self.root / "home"
-        for directory in (self.bin, self.registry, self.config, self.homes):
+        self.systemd = self.root / "systemd"
+        for directory in (self.bin, self.registry, self.config, self.homes, self.systemd):
             directory.mkdir()
         self.calls = self.root / "systemctl-calls"
         self.env = os.environ.copy()
@@ -74,6 +75,7 @@ exit 0
                 ("/usr/local/bin/", str(self.bin) + "/"),
                 ("/var/lib/ndev", str(self.registry)),
                 ("/etc/cloudflared", str(self.config)),
+                ("/etc/systemd/system", str(self.systemd)),
                 ("/home/", str(self.homes) + "/"),
             ):
                 rendered = rendered.replace(original, replacement)
