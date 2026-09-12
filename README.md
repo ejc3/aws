@@ -764,8 +764,9 @@ has separate deployment gates; merging source is not evidence that a gate is liv
    a real trusted CI registration/job and drain instances booted with the old script.
    Non-secret IAM fixtures test authorization, not registration or job execution.
    New hosts register for one job, delete their bootstrap credential before service
-   startup, and power off when the service ends; EC2 then terminates them. The old
-   PAT grant and broad SSM attachment intentionally still exist in this source.
+   startup, and power off when the service ends; EC2 then terminates them. At this
+   intermediate stage the old PAT grant and broad SSM attachment remained; the
+   separately verified cutoff below removes them.
    The runner release and asset checksums are pinned and automatic updates disabled;
    review each release bump before GitHub's 30-day update deadline (immediately for
    required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
@@ -811,9 +812,20 @@ credential-bearing state and configures privileged Cloudflare/GitHub providers; 
 that permission set read-only would not prevent administrator access through those secrets.
 A green validation check is not evidence of zero live drift.
 
-This CI identity retirement does not change runner bootstrap, controller behavior, or the
-existing runner PAT grant. Those require a separate controller-first deployment, harmless
-own-versus-other bootstrap canaries, and an in-flight runner check before the PAT cutoff.
+CI identity retirement was separate from runner bootstrap and controller hardening.
+The September 12, 2026 IAM deployment (`2968911`, PRs #104 and #105) removed the
+runner's reusable PAT access and broad SSM attachment, narrowed controller launch and
+runner IPv6 permissions, closed metal-host account-wide command-output reads, and
+retired the unused predecessor dev role with an explicit Deny-all. The exact rendered
+policies passed AWS allow/deny simulations; real before/after EC2-role canaries proved
+own-versus-other SSM and DynamoDB access, and the post-cutoff PAT simulation changed
+from allowed to explicit Deny. Dev SSH/SSM remained healthy. The real post-cutoff
+[trusted ARM64 job](https://github.com/ejc3/fcvm/actions/runs/34672446556/job/103600236701)
+then passed at 18:43:15 UTC: the controller launched it under the narrowed policy,
+its own role assigned IPv6 and deleted the one-use credential at 18:28:49 before
+job startup at 18:28:52. The guest powered itself off; EC2 reported
+`Client.InstanceInitiatedShutdown` and terminated it by 18:49:37, with its exact root
+volume and ENI absent. This is actual post-cutoff acceptance, not only simulation.
 
 ## Bootstrap, authentication, and convergence
 
@@ -1513,6 +1525,14 @@ leave it stopped, and refresh its token through its own instance role before res
 its connector on the next authorized boot. Do not start an extra replica against a different
 browser manager, because Cloudflare would distribute traffic between unrelated desktops.
 See [Cloudflare token rotation and connection invalidation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/#rotate-a-compromised-token).
+
+September 12, 2026 receipt: revision `cc87713` rotated the AWS tunnel in place and
+published a new Secrets Manager version. ARM fetched it using its own instance role;
+the installed file was verified `ubuntu:ubuntu`, mode `0600`. Existing connections were
+invalidated and a new connector became healthy. The browser-manager process stayed
+running; unauthenticated access returned the Access login redirect and the dedicated
+service-token request reached the application with HTTP 200. The Mac tunnel was not
+changed, and x86 remained stopped with the next-boot refresh requirement above.
 
 ### Development and acceptance
 
