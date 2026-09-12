@@ -98,7 +98,8 @@ resource "aws_security_group" "runner" {
   }
 }
 
-# IAM role for runners - SSM Session Manager + PAT access
+# Job-host credentials: SSM agent connectivity and an own-instance bootstrap
+# credential, never the reusable runner PAT. Publish only after live job/drain gates.
 resource "aws_iam_role" "runner" {
   count = var.enable_github_runner ? 1 : 0
   name  = "github-runner-instance-role"
@@ -116,7 +117,13 @@ resource "aws_iam_role" "runner" {
 resource "aws_iam_role_policy_attachment" "runner_ssm" {
   count      = var.enable_github_runner ? 1 : 0
   role       = aws_iam_role.runner[0].name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = aws_iam_policy.ssm_managed_instance.arn
+  lifecycle {
+    create_before_destroy = true
+  }
+  # Establish the explicit payload denies before the old broad Core attachment
+  # is replaced; the overlapping attachments must not reopen PAT access.
+  depends_on = [aws_iam_role_policy.runner]
 }
 
 resource "aws_iam_role_policy" "runner" {
@@ -128,35 +135,41 @@ resource "aws_iam_role_policy" "runner" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = "ssm:GetParameter"
-        Resource = aws_ssm_parameter.github_runner_pat[0].arn
+        Sid         = "DenyReusableParameterPayloads"
+        Effect      = "Deny"
+        Action      = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath"]
+        NotResource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
       },
       {
-        Sid    = "AssignIpv6"
-        Effect = "Allow"
-        Action = [
-          "ec2:AssignIpv6Addresses",
-          "ec2:DescribeNetworkInterfaces"
-        ]
+        # An ancestor-path request can expose a denied child parameter. Bootstrap
+        # needs only a single current value, so deny all batch/history/path reads,
+        # including /, /github-runner and the bootstrap parent path, everywhere.
+        Sid      = "DenyBulkAndHistoricalParameterPayloads"
+        Effect   = "Deny"
+        Action   = ["ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath"]
         Resource = "*"
       },
       {
-        Sid    = "ClaimOwnRunnerRegistration"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem"
-        ]
-        Resource = aws_dynamodb_table.runner_registration[0].arn
+        Sid      = "DescribeIpv6Interfaces"
+        Effect   = "Allow"
+        Action   = "ec2:DescribeNetworkInterfaces"
+        Resource = "*"
+      },
+      {
+        Sid      = "AssignRunnerIpv6"
+        Effect   = "Allow"
+        Action   = "ec2:AssignIpv6Addresses"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
         Condition = {
-          "ForAllValues:StringEquals" = {
-            "dynamodb:LeadingKeys" = ["$${ec2:SourceInstanceARN}"]
-          }
+          StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
+          ArnEquals    = { "ec2:Subnet" = aws_subnet.runner[0].arn }
         }
       }
     ]
   })
+  # Own-bootstrap read/delete and the null-guarded own-ARN DynamoDB claim remain
+  # in the unchanged additive runner_bootstrap policy. Do not depend on user data
+  # here: that document already depends on this grant; runtime gates are separate.
 }
 
 resource "aws_iam_instance_profile" "runner" {

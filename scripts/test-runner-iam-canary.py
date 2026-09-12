@@ -48,6 +48,39 @@ class CanaryResultTests(unittest.TestCase):
         self.assertFalse(canary.accepted_parameter_result(result, self.name, False, "GetParameter"))
 
 
+    def test_registration_allow_requires_success_and_no_item(self):
+        self.assertTrue(canary.accepted_registration_result(self.result(0, "null\n"), True))
+        for result in (self.result(1, "null"), self.result(0, "{}"),
+                       self.result(0, '{"InstanceArn":{"S":"existing"}}'),
+                       self.result(0, ""), self.result(0, "None")):
+            self.assertFalse(canary.accepted_registration_result(result, True))
+
+    def test_registration_deny_requires_actual_get_item_access_denial(self):
+        denial = "An error occurred (AccessDeniedException) when calling the GetItem operation"
+        self.assertTrue(canary.accepted_registration_result(self.result(254, stderr=denial), False))
+        for result in (self.result(0, "null"), self.result(255, stderr=denial),
+                       self.result(254, stderr="An error occurred (ResourceNotFoundException) when calling the GetItem operation"),
+                       self.result(254, stderr=denial.replace("GetItem", "PutItem")),
+                       self.result(254, stderr="AccessDeniedException")):
+            self.assertFalse(canary.accepted_registration_result(result, False))
+
+    def test_registration_key_is_one_exact_current_instance_arn(self):
+        self.assertEqual(canary.registration_key("i-0123456789abcdef0"), {
+            "InstanceArn": {"S": "arn:aws:ec2:us-west-1:928413605543:instance/i-0123456789abcdef0"}
+        })
+        for value in ("i-*", "runner-iam-canary-first", "i-01234567", "../other"):
+            with self.assertRaises(RuntimeError):
+                canary.registration_key(value)
+
+    def test_registration_probe_never_writes_or_scans(self):
+        text = path.read_text()
+        for operation in ('"put-item"', '"delete-item"', '"scan"', '"query"',
+                          'dynamodb.put_item(', 'dynamodb.delete_item(', 'dynamodb.scan(', 'dynamodb.query('):
+            self.assertNotIn(operation, text)
+        self.assertIn('ProjectionExpression="InstanceArn", ConsistentRead=True', text)
+        self.assertIn('"--projection-expression", "InstanceArn", "--consistent-read"', text)
+
+
 class CanaryFixtureTests(unittest.TestCase):
     def setUp(self):
         self.source = path.parent.parent.joinpath("runner-bootstrap-canary.tf").read_text()

@@ -4,10 +4,14 @@
 The two fixtures contain only the literal security-canary-not-a-credential.
 Real EC2-role GetParameter calls return only Parameter.Name. The runner PAT is
 tested solely with IAM simulation, not GetParameter, GetParameters or history.
+GetItem checks touch only the two positively identified canary instance-ARN keys;
+both must be absent. No DynamoDB writes or real runner-record reads are performed.
 """
 
 import argparse
 import ipaddress
+import json
+import re
 import shlex
 import subprocess
 
@@ -16,6 +20,7 @@ REGION = "us-west-1"
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/github-runner-instance-role"
 PURPOSE = "runner-bootstrap-iam-canary"
 PREFIX = "/github-runner/bootstrap/security-canary-20260912-"
+REGISTRATION_TABLE = "github-runner-registration"
 
 
 def require(condition, message):
@@ -30,6 +35,22 @@ def accepted_parameter_result(result, name, allowed, operation="GetParameter"):
     # successful deny test. Never print the raw response as acceptance evidence.
     return (result.returncode not in (0, 255)
             and f"An error occurred (AccessDeniedException) when calling the {operation} operation"
+            in result.stderr)
+
+
+def registration_key(instance_id):
+    require(re.fullmatch(r"i-[0-9a-f]{17}", instance_id) is not None,
+            "Canary instance ID is not a current EC2 identifier")
+    return {"InstanceArn": {"S": f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/{instance_id}"}}
+
+
+def accepted_registration_result(result, allowed):
+    if allowed:
+        # --query Item returns JSON null only when GetItem succeeded without a
+        # record. An existing registration row is not a valid canary fixture.
+        return result.returncode == 0 and result.stdout.strip() == "null"
+    return (result.returncode not in (0, 255)
+            and "An error occurred (AccessDeniedException) when calling the GetItem operation"
             in result.stderr)
 
 
@@ -57,6 +78,7 @@ def check(phase, key):
     ec2 = boto3.client("ec2", region_name=REGION)
     ssm = boto3.client("ssm", region_name=REGION)
     iam = boto3.client("iam")
+    dynamodb = boto3.client("dynamodb", region_name=REGION)
     response = ec2.describe_instances(Filters=[
         {"Name": "tag:Purpose", "Values": [PURPOSE]},
         {"Name": "tag:Role", "Values": ["runner-iam-canary"]},
@@ -86,6 +108,15 @@ def check(phase, key):
             ResourceType="Parameter", ResourceId=name)["TagList"]}
         require(tags.get("InstanceArn") == source_arn and tags.get("Purpose") == PURPOSE,
                 "Fixture is not bound to its exact current canary instance")
+        # Preflight only these freshly described canary keys, projecting just
+        # their primary key. Never scan/query the registration table or inspect
+        # real runner records. A surprising existing row makes this fail closed.
+        record = dynamodb.get_item(
+            TableName=REGISTRATION_TABLE, Key=registration_key(instance_id),
+            ProjectionExpression="InstanceArn", ConsistentRead=True,
+        )
+        require("Item" not in record,
+                f"{label}: canary registration key unexpectedly exists; refusing to use it")
 
     for label in ("first", "second"):
         instance = by_name[f"runner-iam-canary-{label}"]
@@ -117,6 +148,19 @@ def check(phase, key):
                 f"{label}: batch peer request did not return AccessDenied")
         print(f"PASS real EC2 role: {label}: batch peer access = deny")
 
+        for target in ("first", "second"):
+            target_id = by_name[f"runner-iam-canary-{target}"]["InstanceId"]
+            registration = instance_aws(ip, key, [
+                "dynamodb", "get-item", "--table-name", REGISTRATION_TABLE,
+                "--key", json.dumps(registration_key(target_id)),
+                "--projection-expression", "InstanceArn", "--consistent-read",
+                "--query", "Item", "--output", "json",
+            ])
+            allowed = label == target
+            require(accepted_registration_result(registration, allowed),
+                    f"{label} -> {target}: expected GetItem {'allow with no item' if allowed else 'AccessDenied'}")
+            print(f"PASS real EC2 role: DDB {label} -> {target}: {'allow, absent key' if allowed else 'deny'}")
+
         # Deliberately never make a real request for /github-runner/pat.
         simulation = iam.simulate_principal_policy(
             PolicySourceArn=ROLE,
@@ -132,7 +176,7 @@ def check(phase, key):
         require(len(simulation) == 2 and all(r["EvalDecision"] == expected for r in simulation),
                 f"{label}: reusable PAT policy did not return the expected {phase}-cutoff decision")
         print(f"PASS simulation only: {label}: reusable PAT access = {expected}")
-    print("IAM canary passed. This does not prove controller brokering or a real CI job.")
+    print("IAM canary passed. Read-only DDB checks do not prove PutItem, controller brokering or a real CI job.")
 
 
 if __name__ == "__main__":
