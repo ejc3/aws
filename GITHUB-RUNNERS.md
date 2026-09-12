@@ -698,13 +698,14 @@ Still open (accepted for now):
 
 ### Temporary runner credential-boundary acceptance
 
-This source removes the temporary `runner-bootstrap-canary.tf` fixtures for cost cleanup.
-This cleanup can proceed while real broker-job acceptance is capacity-blocked. Removal
-does not mean the runner IAM cutoff passed: its job/deletion/drain/after-canary gates still apply.
-The acceptance checker and offline tests remain in `scripts/` for the next reviewed test.
+This source prepares a new September 12 acceptance window using the reviewed
+`runner-bootstrap-canary.tf` template. The prior pair was removed for cost cleanup;
+new instances must receive new ARN-bound, literal non-credential parameters. Preparation
+does not mean deployment or IAM-cutoff acceptance. First require a real broker job's
+success, own-token deletion before job startup, and automatic host termination.
 
-Before applying this cleanup, inspect a fresh full plan and require **only these four
-managed-resource destroys**, with no creates, updates, or other destroys:
+Only after that gate, inspect a fresh full plan and require **only these four
+managed-resource creates**, with no updates, replacements, or destroys:
 
 ```text
 aws_instance.runner_iam_canary["first"]
@@ -716,20 +717,27 @@ aws_ssm_parameter.runner_iam_canary["second"]
 These are two small Amazon Linux IAM-test hosts (`Role=runner-iam-canary`, no jobs,
 repositories, registrations, or personal logins) and two literal non-credential
 SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
-runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is removed.
-Until the cleanup is applied and checked, the fixtures may still be live. After applying,
-verify the exact two instances terminated, their root volumes deleted, and their two
-`/github-runner/bootstrap/security-canary-20260908-*` parameters absent. Do not describe
-them as cleaned up based on a git merge alone. `RemoveAfter=2026-09-08` was only a reminder,
+runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is changed.
+The original pinned Amazon ARM64 AL2023 AMI was revalidated available in us-west-1 on
+September 12; its 8 GiB root is encrypted explicitly for these hosts. The fixture prefix
+still matches the existing checker, but `InstanceArn` derives from each new instance.
+Apply and verify those four test resources first; the checker intentionally fails when
+the required pair is absent. Never read a real PAT or registration token as a substitute.
+
+After the before/after checks and required real post-cutoff job pass, remove this fixture
+file and its fixture-only source guards (retain the live checker/result tests). Review a
+fresh full plan with **only the four addresses above destroyed** and no other changes.
+Then verify both exact instances terminated, their root volumes deleted, and their two
+`/github-runner/bootstrap/security-canary-20260912-*` parameters absent. A source merge
+alone does not stop billing. `RemoveAfter=2026-09-13` is a removal reminder,
 not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
 instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
 
-For a later acceptance window, restore the [reviewed fixture template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
-in a new Terraform PR. Revalidate its AMI availability and removal date, keep fixture
-names aligned with the checker, and bind each fixture to the **new** instance ARN.
-Apply and verify those four test resources first; the checker intentionally fails when
-the required pair is absent. Never bypass an acceptance gate because the prior fixtures
-were removed, and never read a real PAT or registration token as a substitute.
+If this window slips, revalidate the AMI and removal date before any apply. The
+[original reviewed template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
+is retained in Git history. Keep fixture names aligned with the checker and bind every
+replacement parameter to its new instance ARN; do not bypass gates because old fixtures
+were removed.
 
 Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
 
