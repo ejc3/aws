@@ -123,6 +123,9 @@ locals {
           source        = ["aws.securityhub"]
           "detail-type" = ["Security Hub Findings - Imported"]
           detail = { findings = {
+            # These products already notify through their native branches below/above.
+            # Match ARN suffixes so the shared pattern remains identical in every region.
+            ProductArn  = [{ "anything-but" = { suffix = [":product/aws/inspector", ":product/aws/guardduty"] } }]
             Severity    = { Label = ["HIGH", "CRITICAL"] }
             RecordState = ["ACTIVE"]
             Workflow    = { Status = ["NEW"] }
