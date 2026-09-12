@@ -15,7 +15,7 @@ ACCOUNT = "928413605543"
 REGION = "us-west-1"
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/github-runner-instance-role"
 PURPOSE = "runner-bootstrap-iam-canary"
-PREFIX = "/github-runner/bootstrap/security-canary-20260908-"
+PREFIX = "/github-runner/bootstrap/security-canary-20260912-"
 
 
 def require(condition, message):

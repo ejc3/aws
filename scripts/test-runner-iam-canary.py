@@ -81,7 +81,7 @@ class CanaryFixtureTests(unittest.TestCase):
     def test_reviewed_ami_and_explicit_removal_reminder(self):
         self.assertIn('owners = ["amazon"]', self.source)
         self.assertIn('al2023-ami-2023.12.20260831.0-kernel-6.18-arm64', self.source)
-        self.assertEqual(self.source.count('RemoveAfter = "2026-09-08"'), 2)
+        self.assertEqual(self.source.count('RemoveAfter = "2026-09-13"'), 2)
         self.assertIn('NOT an automatic expiry policy', self.source)
 
 

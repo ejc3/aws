@@ -1,7 +1,7 @@
 # Temporary, non-credential acceptance fixtures restored from reviewed PR #69.
 # Source preparation is not a deployment gate: first prove a real broker job's
 # success, credential deletion before job startup, and automatic host termination.
-# Revalidated 2026-09-08: the pinned Amazon ARM64 image remains available in west1.
+# Revalidated 2026-09-12: the pinned Amazon ARM64 image remains available in west1.
 # These deliberately do not use Role=github-runner: the autoscaler ignores them.
 # Remove through a reviewed Terraform apply after the before/after IAM checks.
 # RemoveAfter is an operator reminder, NOT an automatic expiry policy.
@@ -51,7 +51,7 @@ resource "aws_instance" "runner_iam_canary" {
     Name        = "runner-iam-canary-${each.key}"
     Role        = "runner-iam-canary"
     Purpose     = "runner-bootstrap-iam-canary"
-    RemoveAfter = "2026-09-08"
+    RemoveAfter = "2026-09-13"
   }
 
   depends_on = [aws_iam_role_policy.runner_bootstrap]
@@ -60,13 +60,13 @@ resource "aws_instance" "runner_iam_canary" {
 resource "aws_ssm_parameter" "runner_iam_canary" {
   for_each = aws_instance.runner_iam_canary
 
-  name  = "/github-runner/bootstrap/security-canary-20260908-${each.key}"
+  name  = "/github-runner/bootstrap/security-canary-20260912-${each.key}"
   type  = "SecureString"
   tier  = "Standard"
   value = "security-canary-not-a-credential"
   tags = {
     InstanceArn = each.value.arn
     Purpose     = "runner-bootstrap-iam-canary"
-    RemoveAfter = "2026-09-08"
+    RemoveAfter = "2026-09-13"
   }
 }

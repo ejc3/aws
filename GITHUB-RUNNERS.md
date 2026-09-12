@@ -698,7 +698,7 @@ Still open (accepted for now):
 
 ### Temporary runner credential-boundary acceptance
 
-This source prepares a new September 8 acceptance window using the reviewed
+This source prepares a new September 12 acceptance window using the reviewed
 `runner-bootstrap-canary.tf` template. The prior pair was removed for cost cleanup;
 new instances must receive new ARN-bound, literal non-credential parameters. Preparation
 does not mean deployment or IAM-cutoff acceptance. First require a real broker job's
@@ -719,7 +719,7 @@ repositories, registrations, or personal logins) and two literal non-credential
 SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
 runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is changed.
 The original pinned Amazon ARM64 AL2023 AMI was revalidated available in us-west-1 on
-September 8; its 8 GiB root is encrypted explicitly for these hosts. The fixture prefix
+September 12; its 8 GiB root is encrypted explicitly for these hosts. The fixture prefix
 still matches the existing checker, but `InstanceArn` derives from each new instance.
 Apply and verify those four test resources first; the checker intentionally fails when
 the required pair is absent. Never read a real PAT or registration token as a substitute.
@@ -728,8 +728,8 @@ After the before/after checks and required real post-cutoff job pass, remove thi
 file and its fixture-only source guards (retain the live checker/result tests). Review a
 fresh full plan with **only the four addresses above destroyed** and no other changes.
 Then verify both exact instances terminated, their root volumes deleted, and their two
-`/github-runner/bootstrap/security-canary-20260908-*` parameters absent. A source merge
-alone does not stop billing. `RemoveAfter=2026-09-08` is a same-day removal reminder,
+`/github-runner/bootstrap/security-canary-20260912-*` parameters absent. A source merge
+alone does not stop billing. `RemoveAfter=2026-09-13` is a removal reminder,
 not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
 instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
 
