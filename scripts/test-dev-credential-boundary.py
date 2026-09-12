@@ -87,6 +87,42 @@ class DevCredentialBoundaryTests(unittest.TestCase):
         for field, value in [('Effect', 'Deny'), ('Action', '*'), ('Resource', '*')]:
             self.assertRegex(policy, field + r'\s*=\s*"' + re.escape(value) + '"')
 
+    def test_iam_password_policies_share_explicit_strength_without_forced_expiry(self):
+        for name in ['main', 'staging']:
+            with self.subTest(account=name):
+                policy = block('security-iam-passwords.tf', 'resource', name,
+                               'aws_iam_account_password_policy')
+                for field, value in [
+                    ('minimum_password_length', '14'),
+                    ('password_reuse_prevention', '24'),
+                    ('require_uppercase_characters', 'true'),
+                    ('require_lowercase_characters', 'true'),
+                    ('require_numbers', 'true'), ('require_symbols', 'true'),
+                    ('max_password_age', '0'), ('hard_expiry', 'false'),
+                    ('allow_users_to_change_password', 'false'),
+                    ('prevent_destroy', 'true'),
+                ]:
+                    self.assertRegex(policy, r'(?m)^\s*' + field + r'\s*=\s*' + value + r'\s*$')
+
+    def test_password_policy_account_routing_and_existing_singleton_adoption(self):
+        config = source('security-iam-passwords.tf')
+        policies = re.findall(r'^resource "([^\"]+)" "([^\"]+)"', config, re.M)
+        self.assertEqual(policies, [('aws_iam_account_password_policy', 'main'),
+                                    ('aws_iam_account_password_policy', 'staging')])
+        main = block('security-iam-passwords.tf', 'resource', 'main',
+                     'aws_iam_account_password_policy')
+        staging = block('security-iam-passwords.tf', 'resource', 'staging',
+                        'aws_iam_account_password_policy')
+        self.assertNotRegex(main, r'(?m)^\s*provider\s*=')
+        self.assertRegex(staging, r'provider\s*=\s*aws\.staging')
+        self.assertIn('data.aws_caller_identity.current.account_id == "928413605543"', main)
+        self.assertIn('data.aws_caller_identity.staging.account_id == "249042068453"', staging)
+        imports = re.findall(r'^import \{\n.*?^\}', config, re.M | re.S)
+        self.assertEqual(len(imports), 1)
+        self.assertRegex(imports[0], r'to\s*=\s*aws_iam_account_password_policy\.main')
+        self.assertRegex(imports[0], r'id\s*=\s*"iam-account-password-policy"')
+        self.assertNotRegex(config, r'local-exec|remote-exec|ignore_changes|count\s*=')
+
     def test_nextjs_connector_metadata_is_exact_and_contains_no_payload(self):
         metadata = block('nextjs-dev.tf', 'data', 'nextjs_connector')
         self.assertIn('data "aws_secretsmanager_secret"', metadata)

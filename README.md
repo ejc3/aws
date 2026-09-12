@@ -255,6 +255,16 @@ dev-only hop key through its setup policy, not the Cloudflare control-plane API 
 The separate Cloudflare Access service-token workflow is unchanged. Runner credential
 retirement is a separate, canary-gated rollout; this dev-host change does not complete it.
 
+`security-iam-passwords.tf` sets both accounts' IAM-user console-password minimum to
+14 characters, requires uppercase/lowercase/number/symbol, and prevents reuse of the last
+24 passwords. It adds no periodic expiry or account-wide password-change permission.
+The checked-in import adopts main's existing singleton policy; recovery receives its
+first custom policy. At the September 12 inventory, neither account had an enabled IAM
+user console password, so this is a future-login guardrail. It does not create passwords,
+change root/SSO credentials or MFA, or enable centralized root management. Those controls
+are independent; [IAM password policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_passwords_account-policy.html)
+do not govern root or [Identity Center authentication](https://docs.aws.amazon.com/singlesignon/latest/userguide/password-requirements.html).
+
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
 daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
