@@ -245,7 +245,12 @@ grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gon
 The metal, Next.js, and temporary-compute roles use a shared SSM connectivity policy
 without account-wide Parameter Store reads. Application parameter access is explicit;
 the metal role retains its intended runner SSH key access, but cannot send commands to
-AMI builders. Next.js can read only its two Cloudflare connector credentials and the
+AMI builders. Runner debug output uses that SSH path: the metal role explicitly denies
+account-wide Run Command input/output listing and reads, which AWS cannot scope to a
+runner. Its IPv6 assignment permissions cover only the two Terraform-managed metal ENIs.
+The unused predecessor `aws-infrastructure-dev-instance-role` retains its role/profile
+for history but has a protected Terraform-managed denial of all AWS actions.
+Next.js can read only its two Cloudflare connector credentials and the
 dev-only hop key through its setup policy, not the Cloudflare control-plane API token.
 The separate Cloudflare Access service-token workflow is unchanged. Runner credential
 retirement is a separate, canary-gated rollout; this dev-host change does not complete it.
@@ -780,13 +785,15 @@ orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.m
 for the protocol and failure behavior. An additive apply alone does not close the old
 PAT or CI escalation paths.
 
-The temporary runner IAM fixture source is removed for cost cleanup, independently of
-those still-required acceptance gates. Apply only a fresh plan deleting its two canary
-hosts and two non-credential parameters, then verify their absence; a merge alone does
-not stop billing. Before any later cutoff, recreate fresh Terraform-managed fixtures
-and repeat the required checks. The checker/tests and [exact cleanup/recreation scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance)
-are retained; this cleanup does not retire runner PAT permissions or authorize skipping
-real broker-job acceptance.
+This source prepares fresh temporary runner IAM fixtures for the September 12 acceptance
+window; it does not mean they are deployed or that the cutoff passed. Before creating
+them, require a real broker job's success, own-token deletion before job startup, and
+automatic host termination. Then review a fresh full plan with only two small canary
+hosts and two non-credential parameters, bound to their new instance ARNs. Repeat the
+before/after checks around the separately reviewed IAM cutoff, and remove the fixtures
+through Terraform afterward. `RemoveAfter=2026-09-13` is a reminder, not automatic expiry.
+See the [exact fixture gates and cleanup scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance).
+Neither fixture preparation nor IAM-only checks replace real broker-job acceptance.
 
 The repository also manages:
 
@@ -1514,6 +1521,24 @@ and `journalctl --user -u browser-manager -u browser-manager-tunnel`. If the she
 bus address, prefix these with `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`.
 Cloudflare errors before sign-in usually mean the apply/connector is not ready; a stopped
 desktop can be started from the dashboard. A profile remains on disk even if startup fails.
+
+The AWS browser connector secret is Terraform-managed. For an intentional rotation, bump
+`random_bytes.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
+apply the in-place tunnel update and new Secrets Manager version. Never replace the tunnel,
+DNS, Access application, or Mac connector. Read the replacement secret directly on ARM
+using its instance role into a private temporary file, verify it, and atomically install it
+as `~/.config/browser-manager/tunnel-token` (owner `ubuntu`, mode `0600`). Restart only
+`browser-manager-tunnel.service`; the browser manager and its desktops stay running.
+After a suspected exposure, also invalidate existing connections for this exact tunnel
+through Cloudflare's connections API, then verify the new connector is ready. Rotation
+alone prevents new connections with the old credential but does not disconnect old ones.
+Never print either token or place it in command arguments, Git, or a dev-host AWS admin session.
+Installed connector units read a local file; they do not automatically refresh from Secrets
+Manager. A stopped AWS browser host (including x86) is not verified by an ARM rotation:
+leave it stopped, and refresh its token through its own instance role before restarting
+its connector on the next authorized boot. Do not start an extra replica against a different
+browser manager, because Cloudflare would distribute traffic between unrelated desktops.
+See [Cloudflare token rotation and connection invalidation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/#rotate-a-compromised-token).
 
 ### Development and acceptance
 

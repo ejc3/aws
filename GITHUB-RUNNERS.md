@@ -4,15 +4,16 @@ How `ejc3` repos get CI into AWS account `928413605543` (us-west-1), and what cr
 the GitHub↔AWS boundary to make it work. Defined in `github-actions.tf`,
 `github-ami-builder.tf`, `runner-autoscale.tf`, and `runner-vpc.tf`.
 
-This stage retires the shared main/staging CI identities and switches GitHub to
-credential-free Terraform validation. It does not remove the runner PAT grant or
-change controller/runner bootstrap. That separate cutoff requires controller-first
-rollout, own/other bootstrap canaries, and a fresh in-flight runner preflight.
+Shared main/staging CI identities are retired and GitHub performs credential-free
+Terraform validation. This source additionally retires job-host PAT reads and narrows
+the runner controller's launch permissions. Deployment still requires the separate
+before/after canaries, fresh old-boot drain check, and real post-cutoff trusted job below.
 
 **The model:** two integrations, opposite directions of trust. GitHub-hosted runners
 reach *into* AWS with **no stored credential** — short-lived OIDC federation. Self-hosted
-runners run *inside* AWS on spot metal and reach *back* to GitHub with **one long-lived
-secret**, a PAT in SSM. Every resource below belongs to one of those two patterns.
+runners run *inside* AWS on spot metal and reach *back* to GitHub using a short-lived
+instance-bound registration credential. The controller alone reads the long-lived PAT
+in SSM after the gated cutoff. Every resource below belongs to one of those two patterns.
 
 |  | Pattern A — hosted → AWS | Pattern B — self-hosted in AWS |
 |--|--|--|
@@ -20,7 +21,7 @@ secret**, a PAT in SSM. Every resource below belongs to one of those two pattern
 | Runs on | GitHub's `ubuntu-latest` | spot `*.metal` in this account |
 | Secret across the boundary | none (federated token) | GitHub PAT + webhook HMAC |
 | What it does | isolated, non-admin AMI builds | KVM/Firecracker CI that needs bare metal |
-| Credential lifetime | ~1h STS session | PAT until manually rotated |
+| Credential lifetime | ~1h STS session | controller PAT until rotated; host credential deleted before its single job |
 
 ## Pattern A — hosted runners reach into AWS with OIDC (keyless)
 
@@ -483,12 +484,12 @@ and the webhook Lambda stays the single authority on the cap.
 
 ## Controller-first credential migration
 
-The controller can consume both legacy PAT-reading user data and the instance-bound
-bootstrap now published by this source. Publication follows verified controller
-deployment; it is not bundled with runner PAT-grant retirement. The runner PAT grant,
-broad runner SSM attachment, and controller EC2 resource permissions deliberately remain
-until real CI acceptance and old-boot drain. This is **not completion of credential
-retirement**. The independent `iam:PassRole` escalation is closed: both controller
+The controller can classify both legacy PAT-reading user data and the instance-bound
+bootstrap now published by this source. During the original migration, controller
+deployment preceded bootstrap publication; the PAT grant and broad runner SSM attachment
+remained until real CI acceptance and old-boot drain. This source contains the later
+[gated IAM cutoff](#runner-iam-cutoff), so do not republish a legacy PAT-reading document.
+The independent `iam:PassRole` escalation is closed: both controller
 Lambdas may pass only `github-runner-instance-role`, only to EC2. Explicit denies
 protect against another policy allowing any other role or service. The existing
 launcher already uses exactly `github-runner-profile`, so this does not change jobs.
@@ -587,16 +588,63 @@ Check that the scheduled run stays enabled and recent. The check only reads git/
 releases, not deployed SSM, so a committed but unapplied pin still needs the deployment
 and trusted-job acceptance above.
 
-This publication does not remove the old PAT permission: a job host can still read that
-PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
+The bootstrap-only stage does not remove the old PAT permission: a job host can still
+read that PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
 own-credential deletion, single-job exit, and EC2 termination, then verify old boots are
 drained before removing the legacy grants. Retest the non-secret IAM canaries afterward.
+
+### Runner IAM cutoff
+
+The September 8 trusted broker acceptance succeeded: run `34266873459`, job
+`102198382569`, instance `i-006e107132a388a2e`; its own credential was deleted before
+job startup, the job succeeded, and instance-initiated shutdown terminated the host.
+This historical result is not a fresh drain check or post-cutoff acceptance. The
+September 12 fixture stage must be deployed and pass its before check separately.
+This cutoff source preserves those temporary fixtures, the retired CI identities,
+and current account controls; merging it is not proof of live deployment.
+
+Do not deploy this stage before the broker bootstrap has passed a real trusted job,
+its own credential deletion, service exit/EC2 termination, and the old-boot drain.
+The unchanged instance-bound producer still grants only its source-instance SSM
+credential and DynamoDB claim. The replacement runner policy explicitly denies every
+non-bootstrap parameter read, plus all batch, history, and recursive-path reads.
+These denies remain effective under an accidentally restored broad SSM Allow. Denying
+only the PAT ARN is insufficient: [an ancestor recursive path can expose a denied child](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-setting-up.html).
+Bootstrap needs only the current value of its own parameter, never those bulk APIs.
+SSM agent/session actions remain through `dev-ssm-managed-instance`; Terraform establishes
+the denies first, creates this attachment before destroying the broad Core attachment,
+and does not change the role/profile or the bootstrap/DynamoDB producer.
+
+The controller's EC2 grants now require the own-account `Purpose=github-runner` images
+already selected by its code, exact runner subnet/security group/keypair/profile, IMDSv2,
+encrypted volumes, and `Role=github-runner` tags on every new instance, volume and ENI.
+Tag-on-create is constrained by [EC2's service-supplied creation context](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html).
+Outside launch, only the existing runner lease/health keys can change. An explicit deny
+rejects every other tag key, including case variants of ownership tags, even under an
+additive broad tag Allow. This prevents adopting an arbitrary dev/admin host or AMI.
+Termination is limited to `Role=github-runner` instances and the existing cleanup
+exception `Name=ami-builder-temp`; the controller cannot assign that Name to an existing
+host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnet.
+
+Offline guards and rendered-policy IAM simulations are review evidence, not a real EC2
+launch/SSM-agent test. Require the after-cutoff canaries (own read succeeds; peer single
+and batch reads fail; simulated PAT access is explicitly denied), then another trusted
+broker job to exercise the narrowed launch, IPv6, registration and teardown permissions.
+The same before/after checker also makes strongly consistent DynamoDB `GetItem` calls
+for only the two verified canary instance-ARN keys. It first requires both keys to be
+absent, then requires each own-key read to succeed without an item and each peer-key
+read to return `AccessDenied`. No `PutItem`, `DeleteItem`, scan, or real runner-record
+read is performed; successful reads do not replace the real broker's write/claim gate.
+Keep controller EC2 narrowing separate from PAT retirement if live launch acceptance
+cannot establish that every boot uses the atomic tag protocol; never widen permissions
+to work around an unverified launch failure. Remove the temporary fixtures through their
+reviewed Terraform removal plan after both acceptance stages pass.
 
 ## What crosses the boundary (secrets inventory)
 
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
 |--|--|--|--|--|
-| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` until the separate runner cutoff | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
+| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-lambda-role` after the gated IAM cutoff; legacy job-host access is removed in that stage | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
 | **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |
@@ -609,29 +657,30 @@ either federated (Pattern A) or stored AWS-side and read through IAM.
 
 **Three GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
 clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners, and
-`github-webhook-admin-pat` owns the webhook. The first two are read by machines that run
-other people's code — `dev-server-role` on the metal boxes and the runner instance role on
-CI hosts — so neither may hold webhook-write: that would let a dev box or a CI job repoint
-the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by
+`github-webhook-admin-pat` owns the webhook. The dev PAT is read by machines that run
+other people's code; before the cutoff, the runner PAT was too. Neither may hold
+webhook-write: that would let a compromised dev host or a leaked legacy runner token
+repoint the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by
 personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct answer.
 
 ## IAM boundaries — who can read what
 
-- **`github-runner-instance-role`** (on the runner): `AmazonSSMManagedInstanceCore` for
-  Session Manager, an explicit `ssm:GetParameter` grant for the PAT, and
-  `ec2:AssignIpv6Addresses` + `ec2:DescribeNetworkInterfaces` (`Resource: *`, for the
-  boot-time IPv6 self-assign); and `dynamodb:GetItem` + `dynamodb:PutItem` on
+- **`github-runner-instance-role`** (after cutoff): `dev-ssm-managed-instance` for
+  SSM connectivity without account-wide parameter reads. Only the exact source-instance
+  bootstrap credential can be read/deleted; reusable, peer, batch, path and history
+  reads are explicitly denied. IPv6 assignment requires a tagged runner ENI in the
+  runner subnet; interface metadata reads remain account-wide. `dynamodb:GetItem` + `dynamodb:PutItem` on
   `github-runner-registration`, restricted by `dynamodb:LeadingKeys` to
   `${ec2:SourceInstanceARN}`, so a runner can claim and read its own row and no other
-  (no `Scan`, `Query`, `UpdateItem` or `DeleteItem`). The managed SSM core policy
-  additionally allows `GetParameter`/`GetParameters` account-wide, including the
-  `dev_to_runner` key. This remains a risk until the separately canaried runner
-  policy cutoff; the additive bootstrap grant does not remove it.
-- **`github-runner-lambda-role`** (both Lambdas): logs; EC2
-  `Describe`/`Run`/`Stop`/`Terminate`/`CreateTags`; `iam:PassRole` only on
+  (no `Scan`, `Query`, `UpdateItem` or `DeleteItem`). Missing source-instance context
+  cannot authorize an own-key claim.
+- **`github-runner-lambda-role`** (after cutoff): own Lambda logs; EC2 metadata reads;
+  launches restricted to approved tagged images, exact network/profile and tagged,
+  encrypted IMDSv2 hosts; lease/health tags only after launch; termination of runners
+  and the existing named temporary AMI builders only. `iam:PassRole` only on
   `github-runner-instance-role` and only to EC2, with explicit denies for other
   roles and services;
-  `cloudwatch:GetMetricStatistics`; `ssm:GetParameter` on `/github-runner/*`;
+  `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;
   `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
   `dynamodb:GetItem` + `dynamodb:PutItem` on the registration table, for the cleanup claim.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
@@ -650,7 +699,7 @@ fails the launch outright (the cleanup poll is the only retry). The security gro
 **inbound SSH (22) from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) **and the
 operator's three static EIPs** (jumpbox + the two dev servers, so the `dev_to_runner` debug
 path works) and all egress; shell access from anywhere else is via **SSM Session Manager**
-(the runner role carries `AmazonSSMManagedInstanceCore`). SSH is closed to the public internet
+(the runner role retains the parameter-free SSM connectivity policy). SSH is closed to the public internet
 at large; everything else (webhook, registration, job dispatch) is runner-initiated outbound
 to GitHub and the AWS APIs.
 
@@ -690,21 +739,23 @@ Closed (were sharp edges, now hardened):
 
 Still open (accepted for now):
 
-- **PAT blast radius.** `/github-runner/pat` can register and remove runners on `ejc3/fcvm`;
-  any process on a runner that reaches instance-role SSM can read it. Self-hosted runners and
-  untrusted PRs don't mix.
+- **Controller PAT blast radius.** `/github-runner/pat` can register and remove runners
+  on `ejc3/fcvm`; after cutoff only the controller reads it. The one-job host still
+  executes privileged code and has an instance-bound AWS identity, so untrusted PRs
+  must not be automatically approved for self-hosted CI.
 
 ## Operating it
 
 ### Temporary runner credential-boundary acceptance
 
-This source removes the temporary `runner-bootstrap-canary.tf` fixtures for cost cleanup.
-This cleanup can proceed while real broker-job acceptance is capacity-blocked. Removal
-does not mean the runner IAM cutoff passed: its job/deletion/drain/after-canary gates still apply.
-The acceptance checker and offline tests remain in `scripts/` for the next reviewed test.
+This source prepares a new September 12 acceptance window using the reviewed
+`runner-bootstrap-canary.tf` template. The prior pair was removed for cost cleanup;
+new instances must receive new ARN-bound, literal non-credential parameters. Preparation
+does not mean deployment or IAM-cutoff acceptance. First require a real broker job's
+success, own-token deletion before job startup, and automatic host termination.
 
-Before applying this cleanup, inspect a fresh full plan and require **only these four
-managed-resource destroys**, with no creates, updates, or other destroys:
+Only after that gate, inspect a fresh full plan and require **only these four
+managed-resource creates**, with no updates, replacements, or destroys:
 
 ```text
 aws_instance.runner_iam_canary["first"]
@@ -716,20 +767,27 @@ aws_ssm_parameter.runner_iam_canary["second"]
 These are two small Amazon Linux IAM-test hosts (`Role=runner-iam-canary`, no jobs,
 repositories, registrations, or personal logins) and two literal non-credential
 SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
-runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is removed.
-Until the cleanup is applied and checked, the fixtures may still be live. After applying,
-verify the exact two instances terminated, their root volumes deleted, and their two
-`/github-runner/bootstrap/security-canary-20260908-*` parameters absent. Do not describe
-them as cleaned up based on a git merge alone. `RemoveAfter=2026-09-08` was only a reminder,
+runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is changed.
+The original pinned Amazon ARM64 AL2023 AMI was revalidated available in us-west-1 on
+September 12; its 8 GiB root is encrypted explicitly for these hosts. The fixture prefix
+still matches the existing checker, but `InstanceArn` derives from each new instance.
+Apply and verify those four test resources first; the checker intentionally fails when
+the required pair is absent. Never read a real PAT or registration token as a substitute.
+
+After the before/after checks and required real post-cutoff job pass, remove this fixture
+file and its fixture-only source guards (retain the live checker/result tests). Review a
+fresh full plan with **only the four addresses above destroyed** and no other changes.
+Then verify both exact instances terminated, their root volumes deleted, and their two
+`/github-runner/bootstrap/security-canary-20260912-*` parameters absent. A source merge
+alone does not stop billing. `RemoveAfter=2026-09-13` is a removal reminder,
 not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
 instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
 
-For a later acceptance window, restore the [reviewed fixture template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
-in a new Terraform PR. Revalidate its AMI availability and removal date, keep fixture
-names aligned with the checker, and bind each fixture to the **new** instance ARN.
-Apply and verify those four test resources first; the checker intentionally fails when
-the required pair is absent. Never bypass an acceptance gate because the prior fixtures
-were removed, and never read a real PAT or registration token as a substitute.
+If this window slips, revalidate the AMI and removal date before any apply. The
+[original reviewed template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
+is retained in Git history. Keep fixture names aligned with the checker and bind every
+replacement parameter to its new instance ARN; do not bypass gates because old fixtures
+were removed.
 
 Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
 

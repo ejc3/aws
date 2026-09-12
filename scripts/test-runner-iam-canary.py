@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+import re
 from subprocess import CompletedProcess
 import unittest
 
@@ -45,6 +46,76 @@ class CanaryResultTests(unittest.TestCase):
         result = self.result(254, stderr="An error occurred (AccessDeniedException) when calling the GetParameters operation: denied")
         self.assertTrue(canary.accepted_parameter_result(result, self.name, False, "GetParameters"))
         self.assertFalse(canary.accepted_parameter_result(result, self.name, False, "GetParameter"))
+
+
+    def test_registration_allow_requires_success_and_no_item(self):
+        self.assertTrue(canary.accepted_registration_result(self.result(0, "null\n"), True))
+        for result in (self.result(1, "null"), self.result(0, "{}"),
+                       self.result(0, '{"InstanceArn":{"S":"existing"}}'),
+                       self.result(0, ""), self.result(0, "None")):
+            self.assertFalse(canary.accepted_registration_result(result, True))
+
+    def test_registration_deny_requires_actual_get_item_access_denial(self):
+        denial = "An error occurred (AccessDeniedException) when calling the GetItem operation"
+        self.assertTrue(canary.accepted_registration_result(self.result(254, stderr=denial), False))
+        for result in (self.result(0, "null"), self.result(255, stderr=denial),
+                       self.result(254, stderr="An error occurred (ResourceNotFoundException) when calling the GetItem operation"),
+                       self.result(254, stderr=denial.replace("GetItem", "PutItem")),
+                       self.result(254, stderr="AccessDeniedException")):
+            self.assertFalse(canary.accepted_registration_result(result, False))
+
+    def test_registration_key_is_one_exact_current_instance_arn(self):
+        self.assertEqual(canary.registration_key("i-0123456789abcdef0"), {
+            "InstanceArn": {"S": "arn:aws:ec2:us-west-1:928413605543:instance/i-0123456789abcdef0"}
+        })
+        for value in ("i-*", "runner-iam-canary-first", "i-01234567", "../other"):
+            with self.assertRaises(RuntimeError):
+                canary.registration_key(value)
+
+    def test_registration_probe_never_writes_or_scans(self):
+        text = path.read_text()
+        for operation in ('"put-item"', '"delete-item"', '"scan"', '"query"',
+                          'dynamodb.put_item(', 'dynamodb.delete_item(', 'dynamodb.scan(', 'dynamodb.query('):
+            self.assertNotIn(operation, text)
+        self.assertIn('ProjectionExpression="InstanceArn", ConsistentRead=True', text)
+        self.assertIn('"--projection-expression", "InstanceArn", "--consistent-read"', text)
+
+
+class CanaryFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.source = path.parent.parent.joinpath("runner-bootstrap-canary.tf").read_text()
+
+    def test_only_two_test_hosts_and_two_bound_parameters(self):
+        self.assertEqual(re.findall(r'^resource "([^"]+)" "([^"]+)"', self.source, re.M),
+                         [("aws_instance", "runner_iam_canary"), ("aws_ssm_parameter", "runner_iam_canary")])
+        self.assertIn('for_each = toset(var.enable_github_runner ? ["first", "second"] : [])', self.source)
+        self.assertIn('for_each = aws_instance.runner_iam_canary', self.source)
+        self.assertIn('InstanceArn = each.value.arn', self.source)
+        self.assertIn('name  = "' + canary.PREFIX + '${each.key}"', self.source)
+        self.assertIn('value = "security-canary-not-a-credential"', self.source)
+
+    def test_real_role_without_registration_or_new_permissions(self):
+        self.assertIn('iam_instance_profile        = aws_iam_instance_profile.runner[0].name', self.source)
+        self.assertIn('Role        = "runner-iam-canary"', self.source)
+        self.assertIn('Purpose     = "runner-bootstrap-iam-canary"', self.source)
+        for forbidden in ('user_data', 'provisioner ', 'local-exec', 'remote-exec',
+                          'github_runner_pat', 'secretsmanager', 'dynamodb'):
+            self.assertNotIn(forbidden, self.source)
+
+    def test_small_encrypted_disposable_imdsv2_hosts(self):
+        for field, value in {'instance_type': '"t4g.micro"', 'volume_type': '"gp3"',
+                             'volume_size': '8', 'encrypted': 'true',
+                             'delete_on_termination': 'true', 'http_tokens': '"required"',
+                             'http_put_response_hop_limit': '1', 'cpu_credits': '"standard"'}.items():
+            self.assertRegex(self.source, r'\b' + field + r'\s*=\s*' + re.escape(value) + r'\s*\n')
+        self.assertIn('subnet_id                   = aws_subnet.runner[0].id', self.source)
+        self.assertIn('vpc_security_group_ids      = [aws_security_group.runner[0].id]', self.source)
+
+    def test_reviewed_ami_and_explicit_removal_reminder(self):
+        self.assertIn('owners = ["amazon"]', self.source)
+        self.assertIn('al2023-ami-2023.12.20260831.0-kernel-6.18-arm64', self.source)
+        self.assertEqual(self.source.count('RemoveAfter = "2026-09-13"'), 2)
+        self.assertIn('NOT an automatic expiry policy', self.source)
 
 
 if __name__ == "__main__":
