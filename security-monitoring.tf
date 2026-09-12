@@ -3,10 +3,10 @@
 # independent, intentional automation path and is not altered by these controls.
 
 locals {
-  # Bootstrap visibility and verify delivery/cost before enabling workload posture.
-  # Only after separate posture approval, enable this gate for all five account/regions.
+  # Workload posture approved separately by the owner on 2026-09-12, after the
+  # monitoring foundation. Keep its coverage limited to the five account/regions.
   # This does not gate future-volume encryption or change any existing disk.
-  security_posture_enabled = false
+  security_posture_enabled = true
 
   security_account_ids = [
     data.aws_caller_identity.current.account_id,
