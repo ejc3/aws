@@ -748,14 +748,14 @@ Still open (accepted for now):
 
 ### Temporary runner credential-boundary acceptance
 
-This source prepares a new September 12 acceptance window using the reviewed
-`runner-bootstrap-canary.tf` template. The prior pair was removed for cost cleanup;
-new instances must receive new ARN-bound, literal non-credential parameters. Preparation
-does not mean deployment or IAM-cutoff acceptance. First require a real broker job's
-success, own-token deletion before job startup, and automatic host termination.
+This source removes the September 12 temporary IAM fixtures and their fixture-only
+source guards, retaining the live checker and result tests. Deploy this cleanup only
+after the before/after IAM checks and a real post-cutoff trusted job pass, including
+own-token deletion before job startup and automatic host termination. A merge is not
+proof that acceptance passed or that these billed resources were removed.
 
-Only after that gate, inspect a fresh full plan and require **only these four
-managed-resource creates**, with no updates, replacements, or destroys:
+Only after those gates, inspect a fresh full plan and require **only these four
+managed-resource destroys**, with no creates, updates, or replacements:
 
 ```text
 aws_instance.runner_iam_canary["first"]
@@ -768,31 +768,26 @@ These are two small Amazon Linux IAM-test hosts (`Role=runner-iam-canary`, no jo
 repositories, registrations, or personal logins) and two literal non-credential
 SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
 runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is changed.
-The original pinned Amazon ARM64 AL2023 AMI was revalidated available in us-west-1 on
-September 12; its 8 GiB root is encrypted explicitly for these hosts. The fixture prefix
-still matches the existing checker, but `InstanceArn` derives from each new instance.
-Apply and verify those four test resources first; the checker intentionally fails when
-the required pair is absent. Never read a real PAT or registration token as a substitute.
-
-After the before/after checks and required real post-cutoff job pass, remove this fixture
-file and its fixture-only source guards (retain the live checker/result tests). Review a
-fresh full plan with **only the four addresses above destroyed** and no other changes.
-Then verify both exact instances terminated, their root volumes deleted, and their two
-`/github-runner/bootstrap/security-canary-20260912-*` parameters absent. A source merge
+After applying, verify both exact instances terminated, their root volumes deleted, and
+their two `/github-runner/bootstrap/security-canary-20260912-*` parameters absent. A source merge
 alone does not stop billing. `RemoveAfter=2026-09-13` is a removal reminder,
 not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
 instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
 
-If this window slips, revalidate the AMI and removal date before any apply. The
-[original reviewed template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
-is retained in Git history. Keep fixture names aligned with the checker and bind every
-replacement parameter to its new instance ARN; do not bypass gates because old fixtures
-were removed.
+For a later acceptance window, restore the
+[reviewed September 12 fixture template](https://github.com/ejc3/aws/blob/3bee7e0e63/runner-bootstrap-canary.tf)
+in a separate Terraform change. Revalidate the pinned AMI and removal date, keep fixture
+names aligned with the checker, and bind every replacement parameter to its new instance
+ARN. Require a fresh four-create-only plan and verify the pair before testing. The
+checker deliberately fails when fixtures are absent; never read a real PAT or
+registration token as a substitute or reopen retired PAT grants to recreate a historical
+before-cutoff result. Future post-cutoff checks use `--phase after`.
 
-Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
+For a future post-cutoff check, run from the jumpbox only after Terraform applies the
+four temporary resources and SSH is ready:
 
 ```bash
-python3 scripts/check-runner-iam-canary.py --phase before
+python3 scripts/check-runner-iam-canary.py --phase after
 ```
 
 Each actual EC2 role must read only its own fixture and receive `AccessDenied` for its peer
@@ -802,12 +797,13 @@ simulation only: `before` records the still-open permission; `after` requires an
 deny. Neither phase attempts to fetch the real PAT. The fixtures contain no registration
 credential, and passing this check does not prove controller brokering or CI registration.
 
-Deploy the backward-compatible controller first while retaining the old user-data/PAT
-path; then publish broker user data and prove a real runner registers, deletes its own
-one-host credential before accepting a job, and completes trusted CI. Only after old boots
-have drained may the runner's broad SSM attachment/PAT grant be retired. Re-run with
-`--phase after` and verify the SSM agent still checks in. Do not combine these deployment
-gates into an unobserved single apply.
+The original migration required the backward-compatible controller first, then broker
+user data, then a real runner registering, deleting its own one-host credential before
+accepting a job, and completing trusted CI. The broad SSM attachment/PAT grant was retired
+only after old boots drained. Historical `--phase before` records that old permission;
+it is not a command to restore it. Post-cutoff acceptance also requires the SSM agent to
+keep checking in. Do not collapse future credential-boundary migrations into an
+unobserved single apply.
 
 - All of Pattern B is gated on `var.enable_github_runner` — flip it to `false` to tear the
   self-hosted side down. Two applies now: `aws_dynamodb_table.runner_registration` sets

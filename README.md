@@ -785,15 +785,15 @@ orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.m
 for the protocol and failure behavior. An additive apply alone does not close the old
 PAT or CI escalation paths.
 
-This source prepares fresh temporary runner IAM fixtures for the September 12 acceptance
-window; it does not mean they are deployed or that the cutoff passed. Before creating
-them, require a real broker job's success, own-token deletion before job startup, and
-automatic host termination. Then review a fresh full plan with only two small canary
-hosts and two non-credential parameters, bound to their new instance ARNs. Repeat the
-before/after checks around the separately reviewed IAM cutoff, and remove the fixtures
-through Terraform afterward. `RemoveAfter=2026-09-13` is a reminder, not automatic expiry.
+This source removes the September 12 temporary runner IAM fixtures. Apply cleanup only
+after the before/after IAM checks and real post-cutoff trusted job pass, including
+own-token deletion before job startup and automatic host termination. Require a fresh
+full plan destroying only the two small canary hosts and their two non-credential
+parameters, then verify both instances, their disposable roots, and parameters are gone.
+No live runner, role/profile, Lambda, network, backup, or real credential is removed.
+`RemoveAfter=2026-09-13` was a reminder, not automatic expiry; a merge does not stop billing.
 See the [exact fixture gates and cleanup scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance).
-Neither fixture preparation nor IAM-only checks replace real broker-job acceptance.
+The checker and result tests remain for later reviewed acceptance windows.
 
 The repository also manages:
 
