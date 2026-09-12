@@ -1037,8 +1037,8 @@ $9/month fixed plus metered usage. Deployment requires the reviewed-plan, region
 compatibility and delivery gates below; approval is not evidence of live delivery. The
 owner separately approved paid scanning on September 12, 2026. The source now enables
 the five-region/account Config, Security Hub CSPM and Inspector stage described below;
-the rollout must not merge or apply until the owner confirms the known alert's email
-receipt. A merge alone is not evidence that recording or scanning has started.
+the known alert's actual mailbox receipt was independently verified before rollout.
+A merge alone is not evidence that recording or scanning has started.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
@@ -1158,8 +1158,10 @@ September 12, 2026 acceptance: the owner-authorized GuardDuty high-severity samp
 forwarder and central SNS target each recorded one successful invocation, and SNS
 recorded one publication, two deliveries to its existing email/Lambda subscriptions,
 and zero failures. A preceding severity-2 SSH sample was below the intended notification
-threshold. Actual mailbox receipt still requires the owner's confirmation; AWS delivery
-metrics do not prove that a person received/read the email. Four clean 34-region watchdog
+threshold. Read-only access to the owner's configured mailbox verified the exact positive
+sample message received at 18:06:30 UTC; this closes the delivery gate without inferring
+mailbox receipt from SNS metrics or claiming the owner had read the message.
+Four clean 34-region watchdog
 executions and all five healthy alarms were read back. A bounded standard SSM shell
 session on fcvm produced a 426-byte encrypted, versioned transcript whose unique test
 marker was verified after the session terminated. Retained September 9 S3 flow-log
