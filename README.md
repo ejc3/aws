@@ -3,8 +3,8 @@
 This is the live Terraform control plane for the `ejc3` development fleet. It is not a
 generic module or a tutorial environment: the defaults describe the deployed system.
 
-It manages roughly 195 resources across the main AWS account, an isolated staging account,
-Cloudflare, and several regions. The platform provides:
+It manages fleet infrastructure and account-wide controls across the main AWS account,
+the isolated staging/recovery account, Cloudflare, and several regions. The platform provides:
 
 - persistent ARM64 and x86 bare-metal Firecracker development servers;
 - two independent Terraform administration jumpboxes;
@@ -253,7 +253,8 @@ for history but has a protected Terraform-managed denial of all AWS actions.
 Next.js can read only its two Cloudflare connector credentials and the
 dev-only hop key through its setup policy, not the Cloudflare control-plane API token.
 The separate Cloudflare Access service-token workflow is unchanged. Runner credential
-retirement is a separate, canary-gated rollout; this dev-host change does not complete it.
+retirement followed its own canary gates; the completed September 12 deployment and
+real-job acceptance are recorded under GitHub Actions below.
 
 `security-iam-passwords.tf` sets both accounts' IAM-user console-password minimum to
 14 characters, requires uppercase/lowercase/number/symbol, and prevents reuse of the last
@@ -264,6 +265,10 @@ user console password, so this is a future-login guardrail. It does not create p
 change root/SSO credentials or MFA, or enable centralized root management. Those controls
 are independent; [IAM password policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_passwords_account-policy.html)
 do not govern root or [Identity Center authentication](https://docs.aws.amazon.com/singlesignon/latest/userguide/password-requirements.html).
+Both policies were applied and independently read back on September 12 at 19:07 UTC:
+all strength settings matched, with `ExpirePasswords=false`. The main root had MFA and
+no access keys; recovery root had no password or keys. Centralized root management is
+not enabled, and this audit did not verify the owner's Identity Center MFA settings.
 
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
@@ -774,8 +779,9 @@ has separate deployment gates; merging source is not evidence that a gate is liv
    a real trusted CI registration/job and drain instances booted with the old script.
    Non-secret IAM fixtures test authorization, not registration or job execution.
    New hosts register for one job, delete their bootstrap credential before service
-   startup, and power off when the service ends; EC2 then terminates them. The old
-   PAT grant and broad SSM attachment intentionally still exist in this source.
+   startup, and power off when the service ends; EC2 then terminates them. At this
+   intermediate stage the old PAT grant and broad SSM attachment remained; the
+   separately verified cutoff below removes them.
    The runner release and asset checksums are pinned and automatic updates disabled;
    review each release bump before GitHub's 30-day update deadline (immediately for
    required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
@@ -804,6 +810,9 @@ No live runner, role/profile, Lambda, network, backup, or real credential is rem
 `RemoveAfter=2026-09-13` was a reminder, not automatic expiry; a merge does not stop billing.
 See the [exact fixture gates and cleanup scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance).
 The checker and result tests remain for later reviewed acceptance windows.
+Cleanup was applied on September 12 and independently verified at 19:09 UTC: both
+fixture instances terminated, their two disposable roots and interfaces disappeared,
+and both non-credential parameters were absent. No development disks were removed.
 
 The repository also manages:
 
@@ -821,9 +830,20 @@ credential-bearing state and configures privileged Cloudflare/GitHub providers; 
 that permission set read-only would not prevent administrator access through those secrets.
 A green validation check is not evidence of zero live drift.
 
-This CI identity retirement does not change runner bootstrap, controller behavior, or the
-existing runner PAT grant. Those require a separate controller-first deployment, harmless
-own-versus-other bootstrap canaries, and an in-flight runner check before the PAT cutoff.
+CI identity retirement was separate from runner bootstrap and controller hardening.
+The September 12, 2026 IAM deployment (`2968911`, PRs #104 and #105) removed the
+runner's reusable PAT access and broad SSM attachment, narrowed controller launch and
+runner IPv6 permissions, closed metal-host account-wide command-output reads, and
+retired the unused predecessor dev role with an explicit Deny-all. The exact rendered
+policies passed AWS allow/deny simulations; real before/after EC2-role canaries proved
+own-versus-other SSM and DynamoDB access, and the post-cutoff PAT simulation changed
+from allowed to explicit Deny. Dev SSH/SSM remained healthy. The real post-cutoff
+[trusted ARM64 job](https://github.com/ejc3/fcvm/actions/runs/34672446556/job/103600236701)
+then passed at 18:43:15 UTC: the controller launched it under the narrowed policy,
+its own role assigned IPv6 and deleted the one-use credential at 18:28:49 before
+job startup at 18:28:52. The guest powered itself off; EC2 reported
+`Client.InstanceInitiatedShutdown` and terminated it by 18:49:37, with its exact root
+volume and ENI absent. This is actual post-cutoff acceptance, not only simulation.
 
 ## Bootstrap, authentication, and convergence
 
@@ -1053,10 +1073,10 @@ do not prove existing hosts or disks have been remediated.
 The owner approved the monitoring foundation on September 8, 2026, at approximately
 $9/month fixed plus metered usage. Deployment requires the reviewed-plan, regional
 compatibility and delivery gates below; approval is not evidence of live delivery. The
-owner separately approved paid scanning on September 12, 2026. The source now enables
-the five-region/account Config, Security Hub CSPM and Inspector stage described below;
-the known alert's actual mailbox receipt was independently verified before rollout.
-A merge alone is not evidence that recording or scanning has started.
+owner separately approved paid scanning on September 12, 2026. Live readback now
+confirms the five-account/region Config, Security Hub CSPM and Inspector stage described
+below is enabled; the known alert's actual mailbox receipt was independently verified
+before rollout. Service enablement is not a claim that all findings are remediated.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
@@ -1167,8 +1187,8 @@ watchdog schedule target), three clean watchdog executions and five healthy deli
 alarms. The RSA-2048 signature of one initial main-account `us-west-1` CloudTrail digest
 was verified; it referenced zero log files, and no event-log bodies were read. Event-log
 hashes/full-chain integrity, actual email receipt, an SSM session transcript and a
-flow-log object from the quiet `us-west-2` VPC remain unproven; this is not yet complete
-end-to-end delivery acceptance.
+flow-log object from the quiet `us-west-2` VPC were then unproven. The September 12
+checks below close those delivery gaps.
 
 September 12, 2026 acceptance: the owner-authorized GuardDuty high-severity sample
 `570453a9836e4b60be3faecb4ec18612` (`Backdoor:EC2/C&CActivity.B!DNS`, severity 8,
@@ -1191,6 +1211,49 @@ window across all 34 account/region pairs (102/102 digests and 1,074/1,074 logs 
 This window is not a claim of integrity for all historical log objects; audit log
 bodies were not printed or sent to development hosts.
 
+September 12 paid-posture acceptance: all five Config recorders report recording and
+successful snapshot delivery. Exact snapshot objects from every pair are nonempty,
+AES256-encrypted and versioned in the separate records bucket. Four pending channels
+received one owner-authorized `DeliverConfigSnapshot` acceptance trigger each; the
+recovery account's west1 channel delivered naturally. All five AWS Foundational Security
+Best Practices subscriptions report `READY`; Inspector EC2 and Lambda report `ENABLED`.
+The first enrollment outlasted three provider create waiters but completed in AWS;
+only independently verified resources may have their timeout taints cleared, never
+disable/recreate working scanners to recover from a waiter timeout. Creation waits
+are now explicitly bounded at 20 minutes for these two resource types.
+
+Initial coverage verified successful package scans for ten Lambda functions and all
+six running EC2 instances, including both temporary runner acceptance hosts. The stopped
+x86 and I/O boxes had inactive coverage in this initial inventory. The other three
+posture pairs had no EC2 instances or Lambda functions to scan. Inspector uses its hybrid EC2 mode, so
+agentless fallback may incur temporary snapshot charges. ECR, Lambda code and code
+repository scanning remain disabled; GuardDuty optional protection and runtime agents
+remain outside the approved base-only scope. Following the deduplication rule rollout,
+three consecutive 34-pair watchdog runs at 18:53, 18:58 and 19:03 UTC were clean, and
+all five delivery alarms were healthy.
+
+Initial findings are a remediation backlog, not a failed deployment or a clean audit.
+The bounded 19:03 UTC inventory found active high/critical package findings; exact
+resource, package and remediation evidence is retained privately. Fixes require
+package-owner, vendor-version and Ubuntu ESM entitlement checks; not every flagged
+package has a currently available vendor fix.
+Do not replace fcvm's custom nested-virtualization kernel or restart shared development
+sessions as a side effect of a scanner rollout. Security Hub also reports intentional
+public SSH/ET and disabled optional-service recommendations, alongside genuine control
+gaps requiring separate review. No findings were suppressed or archived. Config's daily
+EC2 inventory and initial control evaluation can lag; freshly enabled services may
+temporarily retain stale failed controls. Recheck the actual service and resource
+before treating every failed control as a new outage or authorizing extra paid services.
+
+Remaining remediation is separate from monitoring acceptance. Ubuntu ESM enrollment
+and targeted package upgrades need an operator entitlement choice; avoid removing
+development dependencies simply to silence findings. Vendor fixes for every reported
+kernel/dependency issue are not yet available. Dolphin has an installed kernel update
+awaiting a separately scheduled reboot, which interrupts shared sessions; preserve
+fcvm's custom NV2 kernel. Both AWS accounts also lack a designated security alternate
+contact. The account API can reuse existing primary contact metadata after the owner
+confirms the security email/title and which name/phone to use; no dashboard is required.
+
 ### Incremental monitoring cost
 
 September 8, 2026 rate checks put the watchdog's CloudWatch component around **$8.06 per
@@ -1205,7 +1268,7 @@ See [CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/),
 
 Usage-based rates in the primary region include GuardDuty management analysis at
 $4.40/million events and flow/DNS analysis at $1.10/GB, plus flow-log delivery to S3 at
-$0.335/GB. The deferred posture stage adds Config at $0.003/continuous or $0.012/daily
+$0.335/GB. The approved posture stage adds Config at $0.003/continuous or $0.012/daily
 configuration item and CSPM at $0.001/security check. Security Hub service-linked
 Config rule evaluations are not separately charged. Recent measured EC2 usage
 (777.46 instance-hours over September 1–7, both accounts) and ten covered functions
@@ -1559,6 +1622,14 @@ leave it stopped, and refresh its token through its own instance role before res
 its connector on the next authorized boot. Do not start an extra replica against a different
 browser manager, because Cloudflare would distribute traffic between unrelated desktops.
 See [Cloudflare token rotation and connection invalidation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/#rotate-a-compromised-token).
+
+September 12, 2026 receipt: revision `cc87713` rotated the AWS tunnel in place and
+published a new Secrets Manager version. ARM fetched it using its own instance role;
+the installed file was verified `ubuntu:ubuntu`, mode `0600`. Existing connections were
+invalidated and a new connector became healthy. The browser-manager process stayed
+running; unauthenticated access returned the Access login redirect and the dedicated
+service-token request reached the application with HTTP 200. The Mac tunnel was not
+changed, and x86 remained stopped with the next-boot refresh requirement above.
 
 ### Development and acceptance
 
