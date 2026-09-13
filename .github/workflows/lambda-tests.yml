@@ -78,3 +78,6 @@ jobs:
 
       - name: Console capture redacts private keys before archiving (offline)
         run: python3 -S -B scripts/test-console-capture-redaction.py
+
+      - name: Boot secrets stay out of traces, readable logs and command lines (offline)
+        run: python3 -S -B scripts/test-boot-secret-hygiene.py
