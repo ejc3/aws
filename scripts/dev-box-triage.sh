@@ -98,12 +98,17 @@ fi
 # ------------------------------------------------------------------------------ real tunnels
 # NOT a curl of the hostname: that returns 302 from Access even when the tunnel is dead.
 hdr "Cloudflare tunnels (authoritative)"
+# The token stays out of xtrace (`bash -x` on this script) and off curl's command line, which
+# any local user can read from /proc/<pid>/cmdline. Tracing is off while the token is held,
+# the header reaches curl on stdin from the printf builtin, and the caller's tracing returns.
+case $- in *x*) cf_xtrace=1 ;; *) cf_xtrace=0 ;; esac
+{ set +x; } 2>/dev/null
 CF_TOKEN=$(aws secretsmanager get-secret-value --secret-id cloudflare-tunnel-token \
              --region "$REGION" --query SecretString --output text 2>/dev/null)
 if [ -n "$CF_TOKEN" ]; then
   for pair in "cc-games:$CC_GAMES_TUNNEL" "dolphin-labs:$DOLPHIN_TUNNEL"; do
     name="${pair%%:*}"; tid="${pair##*:}"
-    body=$(curl -s --max-time 15 -H "Authorization: Bearer $CF_TOKEN" \
+    body=$(printf 'Authorization: Bearer %s\n' "$CF_TOKEN" | curl -s --max-time 15 -H @- \
       "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/cfd_tunnel/$tid" 2>/dev/null)
     line=$(python3 - <<PY
 import json
@@ -120,6 +125,8 @@ PY
 else
   say "  no cloudflare-tunnel-token (the api/account tokens cannot read tunnel status)"
 fi
+unset CF_TOKEN
+if [ "$cf_xtrace" = 1 ]; then set -x; fi
 
 # -------------------------------------------------------------------------------- box vitals
 hdr "Box vitals"
