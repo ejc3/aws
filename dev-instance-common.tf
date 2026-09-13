@@ -283,7 +283,7 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:UnassignIpv6Addresses"
         ]
         Resource = local.dev_server_ipv6_network_interface_arns
-    }] : [])
+    }] : [], local.dev_box_deploy_status_statements)
   })
 }
 
