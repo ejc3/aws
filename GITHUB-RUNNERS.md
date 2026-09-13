@@ -71,12 +71,16 @@ that registers itself back as a self-hosted runner, serves the job, and is reape
 
 **Launch path.** GitHub fires a `workflow_job` webhook — the hook itself is Terraform-managed
 (`github_repository_webhook.runner`, adopted from hook id 589197362) → API Gateway HTTP API
-(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook`
+(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook-front` →
+asynchronous invoke of the `delivery` alias of Lambda `github-runner-webhook`
 (`reserved_concurrent_executions = 1`, so concurrent webhooks can't all read the same count
-and over-launch). The Lambda HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET` on
-every request that arrives through API Gateway, **failing closed** if the secret is unset (the
-cleanup Lambda's direct `lambda:Invoke` retries carry no `requestContext`, so they're trusted
-without a forgeable header); it acts only on `action == "queued"`, reads the job labels to pick
+and over-launch). The front HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET`,
+**failing closed** if the secret is unset, forwards only the action and the `workflow_job`
+fields the webhook reads, and answers 202. The webhook treats everything that arrives through
+the alias, which IAM lets only the front invoke, as a public delivery; the cleanup Lambda's
+and `github-runner-reuse`'s direct `lambda:Invoke` requests use the unqualified function and
+are the only ones whose `launch_count` or `claim_only` it honours. It acts on
+`action == "queued"` (and hands `completed` on, below), reads the job labels to pick
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
@@ -102,10 +106,28 @@ botocore retried `InsufficientInstanceCapacity` four times per exhausted pool, 7
 each, so invocations on the cleanup poll's five-minute cadence ran into the 30-second timeout
 (12 of 113 invocations after 13:00Z that day). RunInstances now makes one attempt per pool,
 and a `completed` delivery is answered 202 at once and checked for reuse in
-`github-runner-reuse`, so reuse never holds the webhook's execution. A burst still drops
-`queued` deliveries, and the five-minute poll is still their retry. A front function with its
-own concurrency, verifying the signature and queueing the event for the webhook
-asynchronously, would stop those drops; it is not built.
+`github-runner-reuse`, so reuse never holds the webhook's execution.
+
+**The front.** `github-runner-webhook-front` (`runner-webhook-front.tf`) takes the deliveries,
+with 20 reserved executions: one CI run delivered about 20 events in 10 seconds, 9 of them
+within 0.32 seconds at 14:10:04Z on 2026-09-13. It verifies, strips and invokes the webhook's
+`delivery` alias with `InvocationType=Event`, so a burst waits in Lambda's asynchronous queue
+instead of being dropped, and the webhook still decides every launch one execution at a time.
+The alias and the unqualified function both have 0 retries and a 300-second maximum event
+age: a function error after a partial launch must not be retried, and a throttled event is
+retried with backoff until it is 300 seconds old, by which time the cleanup poll has run. A
+late forwarded `queued` does not rely on that age. Every complete queue scan records, per
+architecture, when it began (item `queue-scan#<arch>` in the registration table), and the
+webhook skips a forwarded job created before a scan that counted it, because that poll
+already asked for its runner. A late `completed` is dropped sooner: the webhook does not hand
+on a job whose 90-second reuse window has closed, and `github-runner-reuse` checks the same
+window and keeps events at most 120 seconds.
+
+The front goes in over three applies, one per commit, so the move loses no delivery: the
+front and the alias, unwired; then the API Gateway integration switched to the front, after
+its invoke permission exists; then API Gateway's invoke permission on the webhook removed.
+Removing that permission in the same apply as the switch could race it and fail deliveries
+for a few seconds. The webhook's own signature check on API Gateway events stays in its code.
 
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
@@ -805,6 +827,9 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   retry, the completed hand-off and the claim request); and
   `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
   for the cleanup claim and the webhook's conditional warm-host window and claim.
+- **`github-runner-webhook-front-role`**: its own Lambda logs and `lambda:InvokeFunction` on
+  the webhook's `delivery` alias only, with an explicit deny on invoking anything else. No
+  EC2, SSM, DynamoDB or PAT access.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.
@@ -845,13 +870,15 @@ copy blindly.
 
 Closed (were sharp edges, now hardened):
 
-- **The webhook fails closed and verifies every public request.** `verify_signature` rejects
-  when `WEBHOOK_SECRET` is unset, and HMAC verification runs on everything arriving through
-  API Gateway — identified by `requestContext`, which AWS sets and a caller can't forge. The
-  shared secret is set on the GitHub `workflow_job` webhook and in the Lambda env, so an
-  anonymous POST to `/webhook` no longer launches instances and no header skips verification
-  (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
-  by being direct `lambda:Invoke`, which carry no `requestContext`).
+- **Every public request is verified, and fails closed.** `github-runner-webhook-front`
+  rejects a delivery when `WEBHOOK_SECRET` is unset or the signature does not match, before
+  anything is forwarded. The shared secret is set on the GitHub `workflow_job` webhook and in
+  the front's env, so an anonymous POST to `/webhook` launches nothing and no header skips
+  verification (the old `x-internal-invoke: cleanup-retry` bypass is gone). Trust is decided by
+  which ARN was invoked, not by anything in the event: forwarded deliveries arrive through the
+  webhook's `delivery` alias, which only the front's role may invoke, and cleanup and reuse
+  requests use the unqualified function. The webhook still HMAC-verifies any event that carries
+  API Gateway's `requestContext`.
 - **Both halves of that secret come from one Terraform value.** It used to be two hand-copied
   strings, a tfvar and a form field, with nothing checking they still matched — a real
   structural flaw, though NOT what killed the webhook. The measured root cause: the API

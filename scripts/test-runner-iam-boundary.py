@@ -172,6 +172,33 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         producer = block('runner-bootstrap.tf', 'aws_iam_role_policy', 'runner_bootstrap')
         self.assertNotIn('dynamodb:UpdateItem', producer)
 
+    def test_front_role_may_invoke_only_the_webhook_delivery_alias(self):
+        policy = block('runner-webhook-front.tf', 'aws_iam_role_policy', 'runner_webhook_front')
+        allows = [s for s in statements(policy) if re.search(r'Effect\s*=\s*"Allow"', s)]
+        self.assertEqual(len(allows), 2, allows)
+        invoke = statement(policy, 'InvokeTheWebhookDeliveryAlias')
+        self.assertEqual(actions(invoke), {'lambda:InvokeFunction'})
+        self.assertRegex(invoke, r'Resource\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn$')
+        logs = statement(policy, 'OwnLogs')
+        self.assertEqual(actions(logs), {'logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'})
+        self.assertEqual(set(re.findall(r'log-group:([^"]+)"', logs)),
+                         {'/aws/lambda/github-runner-webhook-front', '/aws/lambda/github-runner-webhook-front:*'})
+        deny = statement(policy, 'DenyInvokingAnythingElse')
+        self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(deny, r'NotResource\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn')
+        self.assertNotRegex(policy, r'Resource\s*=\s*"\*"')
+        role = block('runner-webhook-front.tf', 'aws_iam_role', 'runner_webhook_front')
+        self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', role)
+        function = block('runner-webhook-front.tf', 'aws_lambda_function', 'runner_webhook_front')
+        self.assertRegex(function, r'role\s*=\s*aws_iam_role\.runner_webhook_front\[0\]\.arn')
+
+    def test_the_webhook_role_does_not_widen_for_the_front(self):
+        invoke = [s for s in statements(self.controller) if 'lambda:InvokeFunction' in s]
+        self.assertEqual(len(invoke), 1, invoke)
+        self.assertIn('[for name in ["github-runner-webhook", "github-runner-reuse"]', invoke[0])
+        self.assertNotIn('webhook-front', self.controller)
+        self.assertNotIn(':delivery', self.controller)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
