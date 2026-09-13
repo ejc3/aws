@@ -106,14 +106,18 @@ with Account API Tokens Read+Write. It mints scoped tokens on demand -- that is 
 `dolphin-labs.dev` was bought without a browser:
 
 ```bash
+# Send the token on curl's stdin, never on its command line: argv is readable by every local
+# user through /proc/<pid>/cmdline, and this token can mint other tokens.
+{ set +x; } 2>/dev/null
 M=$(aws secretsmanager get-secret-value --secret-id cloudflare-account-token \
       --region us-west-1 --query SecretString --output text)
 # Registrar Domains Admin = 136d0be1ddc64eaf8516fa6994abfad4
-curl -4 -X POST -H "Authorization: Bearer $M" -H 'Content-Type: application/json' \
+printf 'Authorization: Bearer %s\n' "$M" | curl -4 -X POST -H @- -H 'Content-Type: application/json' \
   -d '{"name":"registrar-agent","policies":[{"effect":"allow",
        "resources":{"com.cloudflare.api.account.<ACCOUNT_ID>":"*"},
        "permission_groups":[{"id":"136d0be1ddc64eaf8516fa6994abfad4"}]}]}' \
   https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/tokens
+unset M
 ```
 
 Three things that cost time and are not guessable:
@@ -473,7 +477,9 @@ Stop/start is the remedy for a wedged box, so recovering it destroys the evidenc
 snapshot with `--latest` first. `dev-diagnostics.tf` now does this automatically on every
 status-check alarm (archived to CloudWatch Logs `/dev-servers/console-capture`, with the
 panic signature quoted in the SNS alert), so the archive should already exist -- check it
-before assuming the cause is unknowable.
+before assuming the cause is unknowable. Private key blocks, including a partial one at
+either end of the buffer, are replaced with `[redacted private key]` before the text is
+matched, archived or emailed: boot-time xtrace has put keys on these consoles before.
 
 The boxes are also configured to make a hang legible rather than silent: `panic_on_oops`
 turns an oops into a reboot (the cmdline carries `panic=-1`) instead of an indefinite
