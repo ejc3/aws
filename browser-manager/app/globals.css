@@ -113,6 +113,7 @@ input::placeholder, textarea::placeholder { color: #77828d; opacity: 1; }
 .desktop-toolbar .button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
 .desktop-display { position: relative; display: flex; flex: 1; min-height: 0; overflow: auto; background: #171d25; }
 .vnc-screen { flex: none; width: 100%; height: 100%; margin: auto; overflow: hidden; }
+.vnc-frozen-frame { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
 .connection-overlay { position: absolute; inset: 0; display: grid; place-items: safe center; padding: 24px; overflow: auto; background: #171d25; }
 .connection-card { max-width: 410px; text-align: center; color: #ecf1f5; }
 .connection-card > svg { color: #97a6b5; margin-bottom: 20px; }

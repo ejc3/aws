@@ -45,6 +45,7 @@ export default function Desktop({ name }: { name: string }) {
   const [viewportError, setViewportError] = useState("");
   const [overlayVisible, setOverlayVisible] = useState(true);
   const everConnected = useRef(false);
+  const [frozenFrame, setFrozenFrame] = useState<string | null>(null);
   const connected = connection === "connected";
   const currentViewport = frame ?? viewport;
   const phoneMode = currentViewport?.mode === "phone";
@@ -104,6 +105,7 @@ export default function Desktop({ name }: { name: string }) {
     setViewportError("");
     setMetadataError("");
     setViewportPending(false);
+    setFrozenFrame(null);
     return () => { viewportRequest.current?.abort(); viewportRequest.current = null; };
   }, [name]);
 
@@ -137,6 +139,12 @@ export default function Desktop({ name }: { name: string }) {
     function connect() {
       if (!isActive()) { loop.setActive(false); setForeground(false); return; }
       const attempt = ++generation;
+      // Freeze the last painted frame across the reconnect: a fresh RFB clears its canvas to
+      // the background colour and the remote desktop takes ~1s to repaint, which otherwise
+      // flashes black even though the header already reads "Connected". Show the snapshot until
+      // the new framebuffer has painted over it.
+      const previous = screen.current?.querySelector("canvas");
+      if (previous && previous.width) { try { setFrozenFrame(previous.toDataURL()); } catch { /* tainted or empty */ } }
       clearTimeout(timeout);
       stopQuality();
       rfb?.disconnect();
@@ -181,6 +189,8 @@ export default function Desktop({ name }: { name: string }) {
           loop.connected();
           setConnection("connected");
           setDetail("");
+          // Drop the frozen snapshot once the live framebuffer has had a moment to paint over it.
+          setTimeout(() => { if (current()) setFrozenFrame(null); }, 700);
         });
         next.addEventListener("disconnect", (event) => {
           const clean = (event as CustomEvent<{ clean: boolean }>).detail.clean;
@@ -348,6 +358,7 @@ export default function Desktop({ name }: { name: string }) {
 
       <section className="desktop-display" aria-label={`${label} remote desktop`}>
         <div ref={screen} className="vnc-screen" style={!fit && currentViewport ? { width: currentViewport.width, height: currentViewport.height } : undefined} />
+        {frozenFrame && <img className="vnc-frozen-frame" src={frozenFrame} alt="" aria-hidden />}
         {!connected && overlayVisible && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}
           <h2>{connection === "connecting" ? "Connecting to your desktop" : "Desktop disconnected"}</h2>
