@@ -33,6 +33,8 @@ ET = between(ADMIN_SCRIPT, "# --------------------------------------------------
 KEY = between(ADMIN_SCRIPT, "# ---------------------------------------------------------------- fcvm-ec2 key\n",
               'echo "admin box ready"')
 REFRESH = rendered(between(CODEX_TF, "cat > /usr/local/bin/codex-agents-refresh <<'GENAGENTS'\n", "\nGENAGENTS\n"))
+FCVM_KEY_MARKER = "FAKEFCVMKEYMATERIAL0123456789"
+FAKE_FCVM_KEY = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{FCVM_KEY_MARKER}\n-----END OPENSSH PRIVATE KEY-----"
 
 
 def executable(path, body):
@@ -79,6 +81,48 @@ class AdminBoxScriptTests(unittest.TestCase):
         self.assertLess(KEY.index("set +x"), fetch)
         self.assertIn("unset FCVM_KEY", KEY[fetch:])
         self.assertIn("set -x", KEY[fetch:])
+
+    def run_key_block(self, prelude, key_present=False, block=None):
+        """Run the real fcvm-ec2 key block with a fake aws and a temp home directory."""
+        tmp = tempfile.mkdtemp()
+        home, stubs = os.path.join(tmp, "home"), os.path.join(tmp, "stubs")
+        os.makedirs(os.path.join(home, ".ssh"))
+        os.makedirs(stubs)
+        executable(os.path.join(stubs, "aws"), '#!/bin/sh\ntouch "$FAKE_AWS_CALLED"\nprintf \'%s\\n\' "$FAKE_KEY"\n')
+        executable(os.path.join(stubs, "install"), '#!/bin/bash\nmkdir -p "${@: -1}"\n')
+        executable(os.path.join(stubs, "chown"), "#!/bin/sh\nexit 0\n")
+        key_file = Path(home, ".ssh", "fcvm-ec2")
+        if key_present:
+            key_file.write_text("existing key\n")
+        script = f"{prelude}\n{(block or KEY).replace('/home/ubuntu', home)}\necho after-fcvm-key-block\n"
+        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}", FAKE_KEY=FAKE_FCVM_KEY,
+                   FAKE_AWS_CALLED=os.path.join(tmp, "aws-called"))
+        proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        return proc, key_file, Path(tmp, "aws-called")
+
+    def test_fcvm_key_stays_out_of_the_trace_and_the_callers_tracing_returns(self):
+        proc, key_file, _ = self.run_key_block("set -uxo pipefail")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(FCVM_KEY_MARKER, proc.stdout + proc.stderr)
+        self.assertIn(FCVM_KEY_MARKER, key_file.read_text())
+        self.assertIn("+ echo after-fcvm-key-block", proc.stderr)
+
+    def test_fcvm_key_block_leaves_an_untraced_caller_untraced(self):
+        proc, key_file, _ = self.run_key_block("set -uo pipefail")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse([line for line in proc.stderr.splitlines() if line.startswith("+")], proc.stderr)
+        self.assertIn(FCVM_KEY_MARKER, key_file.read_text())
+
+    def test_an_existing_fcvm_key_is_kept_without_reading_the_secret(self):
+        proc, key_file, aws_called = self.run_key_block("set -uxo pipefail", key_present=True)
+        self.assertIn("fcvm-ec2 key already present", proc.stdout)
+        self.assertEqual(key_file.read_text(), "existing key\n")
+        self.assertFalse(aws_called.exists())
+
+    def test_the_fcvm_key_harness_catches_a_leak(self):
+        self.assertIn("\n  set +x\n", KEY)
+        proc, _, _ = self.run_key_block("set -uxo pipefail", block=KEY.replace("\n  set +x\n", "\n", 1))
+        self.assertIn(FCVM_KEY_MARKER, proc.stderr)
 
     def test_admin_role_is_set_right_before_the_codex_block(self):
         self.assertRegex(ADMIN_TF, r"FLEET_HOST_ROLE=admin\n\$\{local\.codex_remote_control\}")

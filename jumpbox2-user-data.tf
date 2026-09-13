@@ -190,11 +190,14 @@ ${local.codex_remote_control}
 # exactly the way the original jumpbox does. NOT the dev-hop key: that key is deliberately
 # absent from every jumpbox by design (dev-hop-key.tf) -- dev servers reach each other
 # with it, but no jumpbox holds it, and that must stay true for both admin boxes.
-# An existing key is never replaced, and xtrace is off while the private key is in memory.
+# An existing key is never replaced. xtrace is off while the private key is in memory, and
+# the caller's tracing is restored afterwards rather than forced on, as dev-hop-key.tf does:
+# a caller running without -x must not start tracing everything after this block.
 FCVM_KEY_FILE=/home/ubuntu/.ssh/fcvm-ec2
 if [ -s "$FCVM_KEY_FILE" ]; then
   echo "fcvm-ec2 key already present -- leaving it alone"
 else
+  case $- in *x*) FCVM_XTRACE=1 ;; *) FCVM_XTRACE="" ;; esac
   set +x
   FCVM_KEY=$(aws secretsmanager get-secret-value --secret-id fcvm-ec2-ssh-key \
     --region us-west-1 --query SecretString --output text 2>/dev/null)
@@ -208,7 +211,8 @@ else
     echo "WARNING: fcvm-ec2-ssh-key secret is empty or unreadable -- this box cannot reach the rest of the fleet until it is populated (see fcvm-ec2-key-backup.tf)"
   fi
   unset FCVM_KEY
-  set -x
+  if [ -n "$FCVM_XTRACE" ]; then set -x; fi
+  unset FCVM_XTRACE
 fi
 
 echo "admin box ready"
