@@ -614,9 +614,10 @@ RUNNER_SSH_SETUP
     /tmp/user_data.sh
   SCRIPT
 
-  # Persistent volume IDs for dev servers (manually swapped, not terraform-managed)
-  # These are the root volumes we preserve across spot instance recreation
-  arm_persistent_volume_arn = "arn:aws:ec2:us-west-1:928413605543:volume/vol-09e5c3cee32bb67dc"
+  # Root volumes to back up. The ARM volume is built by terraform from the move image
+  # (firecracker-dev.tf), so its ID changes on every move and is derived. The x86 volume is
+  # still manually swapped, not terraform-managed.
+  arm_persistent_volume_arn = var.enable_firecracker_instance ? "arn:aws:ec2:us-west-1:928413605543:volume/${aws_instance.firecracker_dev[0].root_block_device[0].volume_id}" : ""
   x86_persistent_volume_arn = "arn:aws:ec2:us-west-1:928413605543:volume/vol-071f114b67441e776"
 }
 
