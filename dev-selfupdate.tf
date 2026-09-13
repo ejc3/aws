@@ -198,7 +198,10 @@ chmod 755 /usr/local/bin/pbox
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------
   selfupdate_setup = <<-EOT
-cat > /usr/local/bin/dev-selfupdate.sh <<'SELFUPD'
+# Written beside the target and renamed into place, never rewritten in place: this block
+# normally runs INSIDE the updater it replaces, and bash reads a running script from its
+# byte offset, so an in-place rewrite makes the old updater resume mid-line in the new text.
+cat > /usr/local/bin/dev-selfupdate.sh.new <<'SELFUPD'
 #!/bin/bash
 set -uo pipefail
 case "$(uname -m)" in
@@ -210,6 +213,13 @@ STATE=/var/lib/dev-selfupdate
 LOG=/var/log/dev-selfupdate.log
 mkdir -p "$STATE"
 TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+
+# Every apply appends a whole setup run, so only root and adm may read the log. Asserted
+# before the first write of every run, which also corrects a file an earlier version left
+# 0644 -- in place, without truncating it. logrotate recreates it the same way.
+[ -e "$LOG" ] || install -m 0640 -o root -g adm /dev/null "$LOG"
+chmod 0640 "$LOG"
+chgrp adm "$LOG"
 
 if ! aws s3 cp "s3://ejc3-dev-scripts/user-data/$KEY" "$TMP" --region us-west-1 >/dev/null 2>&1; then
   echo "$(date -Is) fetch failed" >> "$LOG"
@@ -232,7 +242,30 @@ else
   printf 'FAILED applying %s on %s -- see /var/log/dev-selfupdate.log\n' "$${NEW:0:12}" "$(date -Is)" > "$STATE/status"
 fi
 SELFUPD
-chmod +x /usr/local/bin/dev-selfupdate.sh
+chmod +x /usr/local/bin/dev-selfupdate.sh.new
+mv -f /usr/local/bin/dev-selfupdate.sh.new /usr/local/bin/dev-selfupdate.sh
+
+# The updater's log is rotated like the other system logs and recreated 0640 root:adm.
+# Ubuntu's /etc/logrotate.conf supplies the `su root adm` that /var/log's permissions need.
+cat > /etc/logrotate.d/dev-selfupdate <<'LOGROTATE'
+/var/log/dev-selfupdate.log {
+    monthly
+    rotate 6
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+LOGROTATE
+chmod 644 /etc/logrotate.d/dev-selfupdate
+
+# Tighten a log an earlier updater created 0644 now, not at the next boot: this block
+# usually runs inside that updater, which is appending to the file as it goes.
+if [ -e /var/log/dev-selfupdate.log ]; then
+  chmod 0640 /var/log/dev-selfupdate.log
+  chgrp adm /var/log/dev-selfupdate.log || echo "WARNING: could not give /var/log/dev-selfupdate.log to group adm"
+fi
 
 cat > /etc/systemd/system/dev-selfupdate.service <<'SVC'
 [Unit]

@@ -275,7 +275,18 @@ fi
 #      the box, it just leaves the previous version in place and says so.
 #   3. Checks the units that matter afterwards and logs loudly if any died, so a bad change
 #      surfaces in `journalctl -u setup-sync` instead of as a mystery outage tomorrow.
-cat > /usr/local/bin/setup-sync <<'SETUPSYNC'
+#
+# setup-sync's run log holds this whole script's output, so only root and adm may read it.
+# An earlier setup-sync created it 0644, and this script usually runs inside that setup-sync
+# with the file open, so tighten it now rather than at the next sync.
+if [ -e /var/log/setup-sync.log ]; then
+  chmod 0640 /var/log/setup-sync.log
+  chgrp adm /var/log/setup-sync.log || echo "WARNING: could not give /var/log/setup-sync.log to group adm"
+fi
+# Written beside the target and renamed into place, never rewritten in place: this block
+# runs INSIDE the setup-sync it replaces, and bash reads a running script from its byte
+# offset, so an in-place rewrite makes the old setup-sync resume mid-line in the new text.
+cat > /usr/local/bin/setup-sync.new <<'SETUPSYNC'
 #!/bin/bash
 set -uo pipefail
 BUCKET=ejc3-dev-scripts
@@ -299,6 +310,12 @@ if ! bash -n "$NEXT" 2>/tmp/setup-syntax.err; then
 fi
 
 echo "setup-sync: running"
+# The run log holds the whole setup's output, so only root and adm may read it. Set before
+# the redirect below writes to it (a redirect keeps an existing file's mode), including on
+# a file an earlier version left 0644.
+[ -e /var/log/setup-sync.log ] || install -m 0640 -o root -g adm /dev/null /var/log/setup-sync.log
+chmod 0640 /var/log/setup-sync.log
+chgrp adm /var/log/setup-sync.log
 bash "$NEXT" >/var/log/setup-sync.log 2>&1
 RC=$?
 echo "setup-sync: finished rc=$RC"
@@ -335,7 +352,8 @@ fi
 printf '%s' "$ETAG" > "$STATE/applied-etag"
 echo "setup-sync: healthy, recorded etag"
 SETUPSYNC
-chmod 755 /usr/local/bin/setup-sync
+chmod 755 /usr/local/bin/setup-sync.new
+mv -f /usr/local/bin/setup-sync.new /usr/local/bin/setup-sync
 
 cat > /etc/systemd/system/setup-sync.service <<'SSSVC'
 [Unit]
