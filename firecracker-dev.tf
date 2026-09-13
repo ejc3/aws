@@ -123,6 +123,11 @@ resource "aws_network_interface" "firecracker_dev" {
   security_groups   = [aws_security_group.firecracker_dev[0].id]
   ipv6_prefix_count = 1
 
+  # The host always gets its own IPv6 address too, not just the /80 its VMs route. The ENI
+  # created by the 2026-09-13 move came up without one, and cloud-init only turns on DHCPv6
+  # for an interface that has an address when the box boots.
+  ipv6_address_count = 1
+
   tags = {
     Name = "fcvm-metal-arm-eni"
   }
