@@ -44,6 +44,18 @@ else
     bad "user_data has a syntax error: $(head -2 /tmp/ud-syntax.$$)"
 fi
 rm -f /tmp/ud-syntax.$$
+# EC2 receives the script without its whole-line comments (runner_user_data_document).
+SHIPPED=$(mktemp)
+awk '!/^[[:space:]]*#/ || /^#!/' "$USERDATA" > "$SHIPPED"
+if bash -n "$SHIPPED" 2>/dev/null \
+   && [ "$(grep -c '^#!/bin/bash$' "$SHIPPED")" = 1 ] \
+   && grep -q 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' "$TF_FILE" \
+   && grep -q 'value = base64gzip(local.runner_user_data_document)' "$TF_FILE"; then
+    ok "the comment-stripped document EC2 receives parses and keeps its shebang"
+else
+    bad "the shipped user data is not the parseable comment-stripped script"
+fi
+rm -f "$SHIPPED"
 
 # --- 2. The gate itself, lifted from the real file.
 FN=$(awk '/^have_global_v6\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$USERDATA")

@@ -788,6 +788,26 @@ def case_invalid_or_oversized_user_data_cannot_allocate_runner():
         assert not ec2.ops("run_instances"), "bad script allocated billable metal"
 
 
+def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
+    """SSM holds base64gzip of the script without its whole-line comments."""
+    source = TF_FILE.read_text()
+    assert 'value = base64gzip(local.runner_user_data_document)' in source
+    assert 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' in source
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    script = (script.replace("${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}",
+                             "ssh-ed25519 " + "x" * 68)
+              .replace("${local.runner_registration_table_name}", "github-runner-registration")
+              .replace("$${", "${"))
+    shipped = "\n".join(line for line in script.split("\n")
+                        if not line.strip().startswith("#") or line.startswith("#!"))
+    assert shipped.startswith("#!/bin/bash\n")
+    wire = base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)).decode()
+    # The controller must still recognize the document it launches with.
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
+    # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
+    assert len(wire) <= 8192 - 512, len(wire)
+
+
 def case_controller_recognizes_real_terraform_user_data_document():
     source = TF_FILE.read_text()
     script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
