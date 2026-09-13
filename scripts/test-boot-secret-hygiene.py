@@ -44,20 +44,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Sites found in this tree that are NOT fixed on this branch. Each is still reported on every
-# run; the test fails if a new finding appears or if one of these disappears (delete the
-# entry then, so the list cannot silently outlive the fix).
-EXPECTED_TO_FIX_IN_128 = {
-    # runner-autoscale.tf runner_user_data runs under `set -euxo pipefail`; the runner branch
-    # (#128) owns these lines, so they are left for it rather than conflicting here. #128
-    # fixes all three: whichever of #128 and this change merges second deletes them.
-    "runner-autoscale.tf:runner_user_data:traced-fetch:TOKEN6":
-        "IMDSv2 token assigned before the `set +x`; traced into cloud-init output and the console",
-    "runner-autoscale.tf:runner_user_data:traced-fetch:TOKEN":
-        "IMDSv2 token assigned before the `set +x`; traced into cloud-init output and the console",
-    "runner-autoscale.tf:runner_user_data:secret-arg:--token $REG_TOKEN":
-        "registration token expanded onto sudo's command line, which sudo logs to auth.log",
-}
+# Known sites that are not fixed yet. Each is still reported on every run; the test fails if a
+# new finding appears or if one of these disappears (delete the entry then, so the list cannot
+# silently outlive the fix). #128 fixed the three runner_user_data sites this list started
+# with: IMDSv2 TOKEN6 and TOKEN, and `--token "$REG_TOKEN"` on sudo's command line.
+EXPECTED_TO_FIX_IN_128 = {}
 
 # Reviewed sites that are safe without an explicit `set +x`, with the reason.
 JUSTIFIED = {
