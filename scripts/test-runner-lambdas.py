@@ -713,6 +713,24 @@ def case_every_new_runner_declares_the_registration_protocol():
     assert tags["RunnerRegistrationProtocol"] == "ddb-v1", tags
 
 
+def case_every_new_runner_is_excluded_from_inspector_agent_scanning():
+    """Inspector's SSM agent installs its scanner with apt about 90 s after boot.
+
+    A runner is a one-job host, and a CI job's apt-get fails on the held lock: on
+    2026-09-13 three fcvm jobs lost "Install dependencies" to that install. The
+    exclusion tag has to be on the instance from launch, before the agent registers.
+    """
+    for arch in ("arm64", "x86_64"):
+        ec2 = FakeEC2()
+        webhook(ec2)["launch_runner"](arch)
+        calls = ec2.ops("run_instances")
+        assert len(calls) == 1, (arch, calls)
+        instance_tags = next(spec["Tags"] for spec in calls[0]["TagSpecifications"]
+                             if spec["ResourceType"] == "instance")
+        tags = {tag["Key"]: tag["Value"] for tag in instance_tags}
+        assert "InspectorEc2Exclusion" in tags, (arch, tags)
+
+
 def case_controller_first_accepts_older_pat_script_without_unused_credential():
     for claims in (False, True):
         script = '#!/bin/bash\n' + ('REGISTRATION_TABLE="table"\n' if claims else '')
