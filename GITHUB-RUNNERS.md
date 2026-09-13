@@ -160,6 +160,25 @@ aws ec2 describe-instance-types --instance-types <type> \
 `case_every_launchable_type_has_instance_storage` in `scripts/test-runner-lambdas.py` fails
 if a storeless type is added back.
 
+**Measured.** fcvm PR #924 (run `34768256944`) ran `iostat -dxmty 10` over every disk in
+each self-hosted job:
+
+| Job | Duration | Read + written | btrfs set MB/s p95 / p99 / max | IOPS p95 / max |
+|---|---|---|---|---|
+| Host-Root-x64-SnapshotEnabled (`c5d.metal`) | 36 min | 466 GB | 992 / 2675 / 3575 | 15.5k / 47.8k |
+| Host-arm64 (`c7gd.metal`) | 19 min | 102 GB | p95 367, max 3108 | max 41.3k |
+| Container-arm64 (`c7gd.metal`) | 26 min | 155 GB | p95 312, max 3445 | max 39.9k |
+
+A fluid-queue replay of those samples against one gp3 volume adds disk wait: a maxed volume
+(1000 MB/s, 16000 IOPS) adds 4.8 minutes to the x64 job (13%) and 1.3 to 1.5 minutes to the
+arm64 jobs (6–7%); 500 MB/s and 8000 IOPS add 13.3 minutes to the x64 job (37%); baseline
+gp3 adds over an hour. At us-west-1 gp3 prices ($0.096/GB-month, $0.006/IOPS-month above
+3000, $0.048/MiBps-month above 125) a maxed ~500 GB volume costs about $0.23/h, so
+`c5.metal` (about $0.70/h spot) with that volume, running 13% longer, lands within about 7% of
+`r5d.metal` per job. Storeless types stay excluded, now on measurement. The gp3 root volume
+also ran up to its 125 MB/s baseline in these jobs: `nvme2n1` peaked at 125 MB/s on arm64
+and `nvme4n1` at 114 MB/s on x86.
+
 **What holds a slot.** The cap counts runners that can *take work*, not EC2 instances that
 exist. The Lambda reads the same PAT from SSM, lists `GET /repos/ejc3/fcvm/actions/runners`,
 and counts an instance only if GitHub has `runner-<instance-id>` **online**, or the instance
