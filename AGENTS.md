@@ -244,6 +244,23 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - Reintroduce a Make/container wrapper around Terraform
 - **NEVER add Claude Code attribution to git commits** - no "Generated with Claude Code" or "Co-Authored-By: Claude" in commit messages
 
+### Code review
+
+Greptile reviews pull requests. `.greptile/` holds its settings, rules and context, and
+`scripts/test-greptile-config.py` pins them.
+
+- A push does not start a review. Comment `@greptileai review`: Greptile reacts 👍 and runs
+  the `Greptile Review` check, whose summary reads `N files reviewed, M comments added`.
+- Findings arrive as inline comments. `main` requires conversation resolution, so answer
+  each one and resolve its thread before merging, then ask for another review. A clean
+  re-review adds no comments and no review object.
+- Greptile writes its summary into the PR description below `<!-- greptile_comment -->`.
+  Edit only the text above that marker.
+- Greptile read #135's instructions from the PR's head commit, so a PR that edits
+  `.greptile/` changes its own review. Changing a rule's severity, scope or text, the
+  instructions, `files.json` or `rules.md` fails the pin test until the matching pin in
+  `scripts/test-greptile-config.py` changes in the same PR.
+
 ### Common Pitfalls
 
 **Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on

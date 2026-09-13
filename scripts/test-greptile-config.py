@@ -7,7 +7,9 @@ PR's head commit, so a PR changes its own review, and nothing else notices when 
 flips:
 
 - triggerOnUpdates or triggerOnDrafts true: every push or draft spends a review credit.
-- shouldUpdateDescription true: Greptile writes its summary into the hand-written PR body.
+- shouldUpdateDescription true: Greptile's docs say it updates the PR description instead of
+  posting a review comment. With it false, #135 and #138 still got a summary block below
+  `<!-- greptile_comment -->` in their descriptions.
 - updateSummaryOnly true: no inline comments, so required conversation resolution on main
   never blocks on a finding.
 - statusCheck false: the per-commit "Greptile Review" check becomes a top-level
