@@ -1718,44 +1718,8 @@ USERSHELL
   chsh -s /usr/bin/zsh "$u" 2>/dev/null || true
 done
 
-# ---------------------------------------------------------------- codex hook paths
-# atuin's codex integration writes hooks.json with a bare `atuin hook codex`. atuin is
-# installed to ~/.atuin/bin, which is on the login PATH but NOT in the environment Codex
-# runs hooks in -- so every Bash tool call fired the hook and it died with exit 127,
-# printing "error: hook exited with code 127" into the middle of the session. Harmless but
-# constant, and it looks like the agent is broken. Rewrite to the absolute path.
-for u in ${join(" ", local.nextjs_users)} ubuntu; do
-  id -u "$u" >/dev/null 2>&1 || continue
-  HOOKS="/home/$u/.codex/hooks.json"
-  ATUIN="/home/$u/.atuin/bin/atuin"
-  [ -f "$HOOKS" ] && [ -x "$ATUIN" ] || continue
-  python3 - "$HOOKS" "$ATUIN" <<'HOOKFIX'
-import json, sys
-path, atuin = sys.argv[1], sys.argv[2]
-try:
-    doc = json.load(open(path))
-except Exception:
-    raise SystemExit(0)
-changed = 0
-def walk(node):
-    global changed
-    if isinstance(node, dict):
-        cmd = node.get("command")
-        if isinstance(cmd, str) and cmd.startswith("atuin "):
-            node["command"] = atuin + cmd[len("atuin"):]
-            changed += 1
-        for v in node.values():
-            walk(v)
-    elif isinstance(node, list):
-        for v in node:
-            walk(v)
-walk(doc)
-if changed:
-    json.dump(doc, open(path, "w"), indent=2)
-    print(f"codex hooks: absolute-pathed {changed} command(s)")
-HOOKFIX
-  chown "$u:$u" "$HOOKS" 2>/dev/null || true
-done
+# Atuin agent hooks (one absolute-path hook per event for Claude Code and Codex) are
+# normalized inside local.user_shell_env above, for every account on every box.
 
 # ---------------------------------------------------------------- git identity
 # Derived from `gh api user`, never hardcoded, so it cannot drift from the account that is
