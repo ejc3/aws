@@ -71,12 +71,16 @@ that registers itself back as a self-hosted runner, serves the job, and is reape
 
 **Launch path.** GitHub fires a `workflow_job` webhook — the hook itself is Terraform-managed
 (`github_repository_webhook.runner`, adopted from hook id 589197362) → API Gateway HTTP API
-(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook`
+(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook-front` →
+asynchronous invoke of the `delivery` alias of Lambda `github-runner-webhook`
 (`reserved_concurrent_executions = 1`, so concurrent webhooks can't all read the same count
-and over-launch). The Lambda HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET` on
-every request that arrives through API Gateway, **failing closed** if the secret is unset (the
-cleanup Lambda's direct `lambda:Invoke` retries carry no `requestContext`, so they're trusted
-without a forgeable header); it acts only on `action == "queued"`, reads the job labels to pick
+and over-launch). The front HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET`,
+**failing closed** if the secret is unset, forwards only the action and the `workflow_job`
+fields the webhook reads, and answers 202. The webhook treats everything that arrives through
+the alias, which IAM lets only the front invoke, as a public delivery; the cleanup Lambda's
+and `github-runner-reuse`'s direct `lambda:Invoke` requests use the unqualified function and
+are the only ones whose `launch_count` or `claim_only` it honours. It acts on
+`action == "queued"` (and hands `completed` on, below), reads the job labels to pick
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
@@ -102,10 +106,28 @@ botocore retried `InsufficientInstanceCapacity` four times per exhausted pool, 7
 each, so invocations on the cleanup poll's five-minute cadence ran into the 30-second timeout
 (12 of 113 invocations after 13:00Z that day). RunInstances now makes one attempt per pool,
 and a `completed` delivery is answered 202 at once and checked for reuse in
-`github-runner-reuse`, so reuse never holds the webhook's execution. A burst still drops
-`queued` deliveries, and the five-minute poll is still their retry. A front function with its
-own concurrency, verifying the signature and queueing the event for the webhook
-asynchronously, would stop those drops; it is not built.
+`github-runner-reuse`, so reuse never holds the webhook's execution.
+
+**The front.** `github-runner-webhook-front` (`runner-webhook-front.tf`) takes the deliveries,
+with 20 reserved executions: one CI run delivered about 20 events in 10 seconds, 9 of them
+within 0.32 seconds at 14:10:04Z on 2026-09-13. It verifies, strips and invokes the webhook's
+`delivery` alias with `InvocationType=Event`, so a burst waits in Lambda's asynchronous queue
+instead of being dropped, and the webhook still decides every launch one execution at a time.
+The alias and the unqualified function both have 0 retries and a 300-second maximum event
+age: a function error after a partial launch must not be retried, and a throttled event is
+retried with backoff until it is 300 seconds old, by which time the cleanup poll has run. A
+late forwarded `queued` does not rely on that age. Every complete queue scan records, per
+architecture, when it began (item `queue-scan#<arch>` in the registration table), and the
+webhook skips a forwarded job created before a scan that counted it, because that poll
+already asked for its runner. A late `completed` is dropped sooner: the webhook does not hand
+on a job whose 90-second reuse window has closed, and `github-runner-reuse` checks the same
+window and keeps events at most 120 seconds.
+
+The front goes in over three applies, one per commit, so the move loses no delivery: the
+front and the alias, unwired; then the API Gateway integration switched to the front, after
+its invoke permission exists; then API Gateway's invoke permission on the webhook removed.
+Removing that permission in the same apply as the switch could race it and fail deliveries
+for a few seconds. The webhook's own signature check on API Gateway events stays in its code.
 
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
@@ -137,6 +159,26 @@ aws ec2 describe-instance-types --instance-types <type> \
 
 `case_every_launchable_type_has_instance_storage` in `scripts/test-runner-lambdas.py` fails
 if a storeless type is added back.
+
+**Measured.** fcvm PR #924 (run `34768256944`) ran `iostat -dxmty 10` over every disk in
+each self-hosted job:
+
+| Job | Duration | Read + written | btrfs set MB/s p95 / p99 / max | IOPS p95 / max | Extra wait on a maxed gp3 |
+|---|---|---|---|---|---|
+| Host-Root-x64-SnapshotEnabled (`c5d.metal`) | 36 min | 466 GB | 992 / 2675 / 3575 | 15.5k / 47.8k | 4.8 min (13%) |
+| Host-Root-arm64-SnapshotEnabled (`c7gd.metal`) | 46 min | 505 GB | 758 / 3098 / 3421 | 10.2k / 48.6k | 5.7 min (12%) |
+| Host-Root-arm64-SnapshotDisabled (`r7gd.metal`) | 30 min | 214 GB | 463 / 1565 / 2635 | 5.2k / 36.4k | 1.7 min (6%) |
+| Container-arm64 (`m7gd.metal`) | 26 min | 155 GB | 312 / 2304 / 3445 | 4.5k / 39.9k | 1.5 min (6%) |
+| Host-arm64 (`r7gd.metal`) | 19 min | 102 GB | 367 / 2278 / 3108 | 4.4k / 41.3k | 1.3 min (7%) |
+
+The last column replays each job's samples against one gp3 volume at its maximum (1000 MB/s,
+16000 IOPS). At 500 MB/s and 8000 IOPS the same replay adds 16–37%, and at gp3's baseline it
+adds more than the job itself. At us-west-1 gp3 prices ($0.096/GB-month, $0.006/IOPS-month
+above 3000, $0.048/MiBps-month above 125) a maxed ~500 GB volume costs about $0.23/h, so
+`c5.metal` (about $0.70/h spot) with that volume, running 13% longer, lands within about 7% of
+`r5d.metal` per job. Storeless types stay excluded, now on measurement. The gp3 root volume
+also ran up to its 125 MB/s baseline in these jobs: `nvme2n1` peaked at 125 MB/s on arm64
+and `nvme4n1` at 114 MB/s on x86.
 
 **What holds a slot.** The cap counts runners that can *take work*, not EC2 instances that
 exist. The Lambda reads the same PAT from SSM, lists `GET /repos/ejc3/fcvm/actions/runners`,
@@ -597,7 +639,13 @@ one runner per poll used to fill the pool at one runner every five minutes howev
 the queue was, and a burst of single-launch invocations could overshoot the cap, because
 DescribeInstances is eventually consistent and each invocation can miss the instance the
 previous one just launched. Inside one invocation the handler's own loop bounds the total,
-and the webhook Lambda stays the single authority on the cap.
+and the webhook Lambda stays the single authority on the cap. The count the scan sends as
+`queued_jobs` includes jobs a runner is already on its way to take, so the webhook takes
+those runners off it before launching: instances launched in the last 15 minutes that have
+not registered, warm hosts claimed in the last 5 minutes, and registered idle runners. A
+warm host still waiting is claimed for a queued job rather than taken off. Without that, a
+poll that ran while a job's runner was booting put up a second host for the same job
+whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
 ## Controller-first credential migration
@@ -805,6 +853,9 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   retry, the completed hand-off and the claim request); and
   `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
   for the cleanup claim and the webhook's conditional warm-host window and claim.
+- **`github-runner-webhook-front-role`**: its own Lambda logs and `lambda:InvokeFunction` on
+  the webhook's `delivery` alias only, with an explicit deny on invoking anything else. No
+  EC2, SSM, DynamoDB or PAT access.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.
@@ -845,13 +896,15 @@ copy blindly.
 
 Closed (were sharp edges, now hardened):
 
-- **The webhook fails closed and verifies every public request.** `verify_signature` rejects
-  when `WEBHOOK_SECRET` is unset, and HMAC verification runs on everything arriving through
-  API Gateway — identified by `requestContext`, which AWS sets and a caller can't forge. The
-  shared secret is set on the GitHub `workflow_job` webhook and in the Lambda env, so an
-  anonymous POST to `/webhook` no longer launches instances and no header skips verification
-  (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
-  by being direct `lambda:Invoke`, which carry no `requestContext`).
+- **Every public request is verified, and fails closed.** `github-runner-webhook-front`
+  rejects a delivery when `WEBHOOK_SECRET` is unset or the signature does not match, before
+  anything is forwarded. The shared secret is set on the GitHub `workflow_job` webhook and in
+  the front's env, so an anonymous POST to `/webhook` launches nothing and no header skips
+  verification (the old `x-internal-invoke: cleanup-retry` bypass is gone). Trust is decided by
+  which ARN was invoked, not by anything in the event: forwarded deliveries arrive through the
+  webhook's `delivery` alias, which only the front's role may invoke, and cleanup and reuse
+  requests use the unqualified function. The webhook still HMAC-verifies any event that carries
+  API Gateway's `requestContext`.
 - **Both halves of that secret come from one Terraform value.** It used to be two hand-copied
   strings, a tfvar and a form field, with nothing checking they still matched — a real
   structural flaw, though NOT what killed the webhook. The measured root cause: the API

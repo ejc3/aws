@@ -18,6 +18,8 @@ Exit code 1 if any case fails.
 import contextlib
 import base64
 import gzip
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -29,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TF_FILE = Path(__file__).resolve().parent.parent / "runner-autoscale.tf"
+FRONT_FILE = TF_FILE.parent / "runner-webhook-front.tf"
 NOW = datetime(2026, 8, 7, 20, 0, 0, tzinfo=timezone.utc)
 ACCOUNT_ID = "928413605543"
 REGION = "us-west-1"
@@ -45,14 +48,14 @@ LAUNCH_SUBNETS = [
 # Loading the Lambda source out of the Terraform heredocs
 # --------------------------------------------------------------------------
 
-def extract_lambda_sources():
-    """The two `content = <<-EOF ... EOF` bodies, in file order.
+def extract_lambda_sources(path=None):
+    """The `content = <<-EOF ... EOF` bodies of a Terraform file, in file order.
 
     Terraform strips the indentation of the least-indented line from a `<<-`
     heredoc, which is exactly what textwrap.dedent does, so the text handed to
     exec() here is byte-identical to the lambda_function.py that gets zipped.
     """
-    lines = TF_FILE.read_text().splitlines()
+    lines = (path or TF_FILE).read_text().splitlines()
     sources, body, collecting = [], [], False
     for line in lines:
         if collecting:
@@ -601,12 +604,13 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     # clock against boto3's aware LaunchTime. A fake that returns an aware value
     # either way hides that, so `now()` with no tz returns naive here exactly as
     # the real datetime does.
-    class FixedDatetime(namespace["datetime"]):
-        @classmethod
-        def now(cls, tz=None):
-            return now if tz is not None else now.replace(tzinfo=None)
+    if "datetime" in namespace:
+        class FixedDatetime(namespace["datetime"]):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz is not None else now.replace(tzinfo=None)
 
-    namespace["datetime"] = FixedDatetime
+        namespace["datetime"] = FixedDatetime
     return namespace
 
 
@@ -642,6 +646,17 @@ def job(status, arch, name="job"):
 
 def instance_arn(instance_id):
     return f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:instance/{instance_id}"
+
+
+def registration_calls(dynamodb):
+    """DynamoDB calls on instance registration rows, without the poll's queue-scan records."""
+    return [(op, kw) for op, kw in dynamodb.calls
+            if not kw.get("Key", kw.get("Item", {})).get("InstanceArn", {}).get("S", "").startswith("queue-scan#")]
+
+
+def registration_items(dynamodb):
+    """Instance registration rows, without the poll's queue-scan records."""
+    return {key: item for key, item in dynamodb.items.items() if not key.startswith("queue-scan#")}
 
 
 def registered_item(instance_id="i-lease", runner_id=77, runner_name=None):
@@ -1642,6 +1657,349 @@ def case_completed_jobs_are_checked_in_a_separate_single_execution_function():
     assert re.search(r'maximum_event_age_in_seconds\s*=\s*120', reuse_queue), reuse_queue
     assert '["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:' in source
     assert '"github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"' in source
+
+
+# --------------------------------------------------------------------------
+# Cases: the webhook front
+# --------------------------------------------------------------------------
+
+DELIVERY_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:github-runner-webhook:delivery"
+WEBHOOK_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:github-runner-webhook"
+
+
+def invoked_as(arn):
+    """A Lambda context whose invoked_function_arn is `arn`."""
+    return types.SimpleNamespace(invoked_function_arn=arn, get_remaining_time_in_millis=lambda: 30000)
+
+
+def front(lambda_client=None, secret="testsecret"):
+    return load_lambda(FRONT_SRC, FakeEC2(), FakeSSM(), lambda_client=lambda_client or FakeLambdaClient(),
+                       env={"WEBHOOK_SECRET": secret, "DELIVERY_TARGET": DELIVERY_ARN})
+
+
+def github_delivery(payload, secret="testsecret", signature=None, delivery_id="d-1"):
+    """An API Gateway (payload format 1.0) event carrying one signed GitHub delivery."""
+    body = json.dumps(payload)
+    digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return {"body": body, "isBase64Encoded": False, "requestContext": {"stage": "$default"},
+            "headers": {"X-Hub-Signature-256": f"sha256={digest}" if signature is None else signature,
+                        "X-GitHub-Delivery": delivery_id, "X-GitHub-Event": "workflow_job"}}
+
+
+def forwarded_to_webhook(client):
+    """The one event the front handed the webhook, as the webhook receives it."""
+    (call,) = client.calls
+    return json.loads(call["Payload"])
+
+
+def tf_block(text, kind, name):
+    return re.search(r'^resource "' + kind + r'" "' + name + r'" \{\n.*?^\}', text, re.M | re.S).group()
+
+
+def case_the_front_refuses_deliveries_without_a_valid_signature():
+    payload = {"action": "queued", "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]}}
+    signed = github_delivery(payload)
+    unsigned = dict(signed, headers={"X-GitHub-Delivery": "d-1", "X-GitHub-Event": "workflow_job"})
+    tampered = dict(signed, body=json.dumps({**payload, "launch_count": 4}))
+    for label, event, secret in [
+        ("unsigned", unsigned, "testsecret"),
+        ("signed with another secret", github_delivery(payload, secret="not-the-secret"), "testsecret"),
+        ("not a sha256 signature", github_delivery(payload, signature="sha1=abc"), "testsecret"),
+        ("body changed after signing", tampered, "testsecret"),
+        ("no secret configured", github_delivery(payload, secret=""), ""),
+    ]:
+        client = FakeLambdaClient()
+        result = front(client, secret=secret)["handler"](event, None)
+        assert result == {"statusCode": 401, "body": "Invalid signature"}, (label, result)
+        assert client.calls == [], (label, client.calls)
+
+
+def case_the_front_forwards_only_the_fields_the_webhook_reads():
+    """Trust flags a direct invoke may carry never leave the front, at top level or in the job."""
+    payload = {"action": "queued", "launch_count": 4, "claim_only": True, "queued_jobs": 9,
+               "repository": {"full_name": "ejc3/fcvm"}, "sender": {"login": "someone"},
+               "workflow_job": {"id": 103754892298, "run_id": 34768946845,
+                                "labels": ["self-hosted", "Linux", "arm64"],
+                                "created_at": "2026-09-13T16:33:46Z", "runner_id": None,
+                                "runner_name": None, "steps": [{"name": "Checkout"}],
+                                "launch_count": 4, "claim_only": True}}
+    client = FakeLambdaClient()
+    result = front(client)["handler"](github_delivery(payload, delivery_id="abc-123"), None)
+    assert result == {"statusCode": 202, "body": "Forwarded queued to the runner webhook"}, result
+    (call,) = client.calls
+    assert call["FunctionName"] == DELIVERY_ARN and call["InvocationType"] == "Event", call
+    event = json.loads(call["Payload"])
+    assert sorted(event) == ["body", "delivery", "headers"] and event["headers"] == {}, event
+    assert event["delivery"]["id"] == "abc-123", event
+    assert json.loads(event["body"]) == {"action": "queued", "workflow_job": {
+        "id": 103754892298, "run_id": 34768946845, "labels": ["self-hosted", "Linux", "arm64"],
+        "created_at": "2026-09-13T16:33:46Z", "runner_id": None, "runner_name": None}}, event
+
+
+def case_the_front_answers_other_actions_itself_and_reports_a_failed_hand_off():
+    client = FakeLambdaClient()
+    ignored = front(client)["handler"](github_delivery({"action": "in_progress", "workflow_job": {}}), None)
+    assert ignored == {"statusCode": 200, "body": "Ignoring action: in_progress"}, ignored
+    assert client.calls == [], client.calls
+    queued = github_delivery({"action": "queued", "workflow_job": {"labels": ["ARM64"]}})
+    failed = front(FakeLambdaClient(error=OSError("Lambda unavailable")))["handler"](queued, None)
+    assert failed == {"statusCode": 503, "body": "Delivery not queued"}, failed
+    completed = FakeLambdaClient()
+    front(completed)["handler"](github_delivery(json.loads(completed_event()["body"])), None)
+    assert json.loads(forwarded_to_webhook(completed)["body"]) == json.loads(completed_event()["body"])
+
+
+def case_a_forwarded_delivery_gets_no_trust_whatever_it_carries():
+    """The alias it arrived through decides, so a forwarded body cannot set launch_count or claim_only."""
+    body = json.dumps({"action": "queued", "launch_count": 4, "claim_only": True,
+                       "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"],
+                                        "created_at": NOW.isoformat()}})
+    ec2 = FakeEC2([])
+    forwarded = webhook(ec2)["handler"]({"body": body, "headers": {}}, invoked_as(DELIVERY_ARN))
+    assert forwarded["body"].startswith("Launched 1 arm64 runner(s)"), forwarded
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    # The same event through the unqualified function is the controller's own request.
+    trusted = webhook(FakeEC2([]))["handler"]({"body": body, "headers": {}}, invoked_as(WEBHOOK_ARN))
+    assert trusted["body"] == "No warm arm64 host left to claim", trusted
+    # And a real signed delivery carried by the front launches exactly one runner.
+    client = FakeLambdaClient()
+    front(client)["handler"](github_delivery(json.loads(body)), None)
+    ec2 = FakeEC2([])
+    carried = webhook(ec2)["handler"](forwarded_to_webhook(client), invoked_as(DELIVERY_ARN))
+    assert carried["body"].startswith("Launched 1 arm64 runner(s)"), carried
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+
+
+def case_a_late_forwarded_job_the_queue_scan_already_counted_launches_nothing():
+    def scanned(seconds_ago):
+        return FakeDynamoDB([{"InstanceArn": {"S": "queue-scan#arm64"},
+                              "ScanStartedAt": {"N": f"{NOW_EPOCH - seconds_ago:.3f}"},
+                              "QueuedJobs": {"N": "1"}}])
+
+    def queued(created_seconds_ago):
+        return {"body": json.dumps({"action": "queued", "workflow_job": {
+            "labels": ["self-hosted", "Linux", "arm64"],
+            "created_at": (NOW - timedelta(seconds=created_seconds_ago)).isoformat()}}), "headers": {}}
+
+    ec2 = FakeEC2([])
+    counted = webhook(ec2, dynamodb=scanned(30))["handler"](queued(60), invoked_as(DELIVERY_ARN))
+    assert counted["body"].endswith("already counted this job"), counted
+    assert launched_types(ec2) == [], launched_types(ec2)
+    for label, dynamodb, age, context in [
+        ("queued after the scan began", scanned(30), 10, invoked_as(DELIVERY_ARN)),
+        ("no scan recorded", FakeDynamoDB(), 60, invoked_as(DELIVERY_ARN)),
+        ("not forwarded", scanned(30), 60, invoked_as(WEBHOOK_ARN)),
+    ]:
+        ec2 = FakeEC2([])
+        result = webhook(ec2, dynamodb=dynamodb)["handler"](queued(age), context)
+        assert result["body"].startswith("Launched 1 arm64 runner(s)"), (label, result)
+
+
+def case_only_a_complete_queue_scan_records_what_this_poll_asked_for():
+    def scans(budget=None, lambda_client=None):
+        dynamodb = FakeDynamoDB()
+        github = FakeGitHub(runs=[run(8001, "in_progress")], jobs={8001: [job("queued", "arm64")]})
+        module = cleanup(FakeEC2(), github, lambda_client=lambda_client, dynamodb=dynamodb)
+        if budget is not None:
+            module["QUEUE_SCAN_TIME_BUDGET_SECONDS"] = budget
+        with contextlib.redirect_stdout(io.StringIO()):
+            module["handler"]({}, None)
+        return {key: item for key, item in dynamodb.items.items() if key.startswith("queue-scan#")}
+
+    def recorded(arch, count):
+        return {"InstanceArn": {"S": f"queue-scan#{arch}"},
+                "ScanStartedAt": {"N": f"{NOW.timestamp():.3f}"}, "QueuedJobs": {"N": str(count)}}
+
+    assert scans() == {"queue-scan#arm64": recorded("arm64", 1),
+                       "queue-scan#x86_64": recorded("x86_64", 0)}, scans()
+    assert scans(budget=-1) == {}, scans(budget=-1)
+    # An arm64 request the webhook never received covers nothing.
+    refused = scans(lambda_client=FakeLambdaClient(error=OSError("Lambda unavailable")))
+    assert refused == {"queue-scan#x86_64": recorded("x86_64", 0)}, refused
+
+
+def case_a_completed_delivery_that_waited_past_its_window_is_not_handed_on():
+    client = FakeLambdaClient()
+    late = webhook(FakeEC2(), lambda_client=client)["handler"](
+        completed_event(completed_seconds_ago=91), invoked_as(DELIVERY_ARN))
+    assert late == {"statusCode": 200, "body": f"Not reusing runner-{WARM}: its reuse window has closed"}, late
+    assert client.calls == [], client.calls
+
+
+def case_the_front_is_wired_to_the_webhook_delivery_alias():
+    front_tf, source = FRONT_FILE.read_text(), TF_FILE.read_text()
+    function = tf_block(front_tf, "aws_lambda_function", "runner_webhook_front")
+    for pattern in (r'function_name\s*=\s*"github-runner-webhook-front"',
+                    r'filename\s*=\s*data\.archive_file\.runner_webhook_front\.output_path',
+                    r'reserved_concurrent_executions = 20\n',
+                    r'WEBHOOK_SECRET\s*=\s*random_password\.github_webhook\[0\]\.result',
+                    r'DELIVERY_TARGET\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn'):
+        assert re.search(pattern, function), (pattern, function)
+    permission = tf_block(front_tf, "aws_lambda_permission", "runner_webhook_front")
+    for pattern in (r'function_name\s*=\s*aws_lambda_function\.runner_webhook_front\[0\]\.function_name',
+                    r'principal\s*=\s*"apigateway\.amazonaws\.com"',
+                    r'source_arn\s*=\s*"\$\{aws_apigatewayv2_api\.runner_webhook\[0\]\.execution_arn\}/\*/\*"'):
+        assert re.search(pattern, permission), (pattern, permission)
+    alias = tf_block(front_tf, "aws_lambda_alias", "runner_webhook_delivery")
+    assert re.search(r'name\s*=\s*"delivery"\n', alias), alias
+    assert re.search(r'function_version\s*=\s*"\$LATEST"', alias), alias
+    assert re.search(r'function_name\s*=\s*aws_lambda_function\.runner_webhook\[0\]\.function_name', alias), alias
+    assert webhook(FakeEC2())["DELIVERY_ALIAS"] == "delivery"
+    for text, name, qualified in ((front_tf, "runner_webhook_delivery", True), (source, "runner_webhook", False)):
+        queue = tf_block(text, "aws_lambda_function_event_invoke_config", name)
+        assert re.search(r'maximum_retry_attempts\s*=\s*0\n', queue), queue
+        assert re.search(r'maximum_event_age_in_seconds\s*=\s*300\n', queue), queue
+        has_qualifier = bool(re.search(r'qualifier\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.name', queue))
+        assert has_qualifier == qualified, queue
+    assert re.search(r'reserved_concurrent_executions = 1\n', tf_block(source, "aws_lambda_function", "runner_webhook"))
+
+
+PINNED_BLOCKS = {
+    ("aws_apigatewayv2_api", "runner_webhook"): '''resource "aws_apigatewayv2_api" "runner_webhook" {
+  count         = var.enable_github_runner ? 1 : 0
+  name          = "github-runner-webhook"
+  protocol_type = "HTTP"
+}''',
+    ("aws_apigatewayv2_stage", "runner_webhook"): '''resource "aws_apigatewayv2_stage" "runner_webhook" {
+  count       = var.enable_github_runner ? 1 : 0
+  api_id      = aws_apigatewayv2_api.runner_webhook[0].id
+  name        = "$default"
+  auto_deploy = true
+}''',
+    ("aws_apigatewayv2_route", "runner_webhook"): '''resource "aws_apigatewayv2_route" "runner_webhook" {
+  count     = var.enable_github_runner ? 1 : 0
+  api_id    = aws_apigatewayv2_api.runner_webhook[0].id
+  route_key = "POST /webhook"
+  target    = "integrations/${aws_apigatewayv2_integration.runner_webhook[0].id}"
+}''',
+    ("random_password", "github_webhook"): '''resource "random_password" "github_webhook" {
+  count = var.enable_github_runner ? 1 : 0
+
+  # Alphanumeric on purpose. An HMAC-SHA256 key gains nothing from punctuation, and the
+  # value passes through a Lambda environment variable, a JSON API body and whatever
+  # someone eventually pastes into a shell to debug it. 64 chars is ~380 bits.
+  length  = 64
+  special = false
+}''',
+    ("github_repository_webhook", "runner"): '''resource "github_repository_webhook" "runner" {
+  count      = var.enable_github_runner ? 1 : 0
+  repository = "fcvm"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  # Only the API Gateway is referenced above, so without this the hook could be created
+  # before the Lambda behind that route exists. Ordering it after the function means
+  # GitHub is never pointed at a live URL with nothing to answer it, and it fixes the
+  # direction of a rotation window: Lambda takes the new secret first, GitHub second.
+  #
+  # Rotation (`terraform apply -replace='random_password.github_webhook[0]'`) changes both
+  # halves in one apply, but not atomically -- for the seconds between the two API calls
+  # GitHub still signs with the old value and deliveries 401. That is the fail-closed
+  # direction and the five-minute cleanup poll picks up anything missed, so it is fine.
+  depends_on = [aws_lambda_function.runner_webhook]
+}''',
+}
+
+
+def case_the_github_webhook_its_url_and_its_secret_are_untouched():
+    """The hook, the API behind its URL, and the secret it signs with stay byte for byte as they were."""
+    source = TF_FILE.read_text()
+    for (kind, name), pinned in PINNED_BLOCKS.items():
+        assert tf_block(source, kind, name) == pinned, (kind, name, tf_block(source, kind, name))
+
+
+def case_api_gateway_sends_deliveries_to_the_front():
+    integration = tf_block(TF_FILE.read_text(), "aws_apigatewayv2_integration", "runner_webhook")
+    for pattern in (r'integration_type\s*=\s*"AWS_PROXY"',
+                    r'integration_uri\s*=\s*aws_lambda_function\.runner_webhook_front\[0\]\.invoke_arn\n',
+                    r'integration_method\s*=\s*"POST"',
+                    r'depends_on = \[aws_lambda_permission\.runner_webhook_front\]'):
+        assert re.search(pattern, integration), (pattern, integration)
+    assert "runner_webhook[0].invoke_arn" not in integration, integration
+
+
+def case_api_gateway_cannot_invoke_the_webhook_itself():
+    """Only the front answers API Gateway; the webhook is reachable by IAM-authed invokes alone."""
+    for path in (TF_FILE, FRONT_FILE):
+        permissions = re.findall(r'^resource "aws_lambda_permission" "[^"]+" \{\n.*?^\}',
+                                 path.read_text(), re.M | re.S)
+        for permission in permissions:
+            if "apigateway.amazonaws.com" in permission:
+                assert "aws_lambda_function.runner_webhook_front[0].function_name" in permission, \
+                    (path.name, permission)
+    assert not re.search(r'^resource "aws_lambda_permission" "runner_webhook" \{', TF_FILE.read_text(), re.M)
+
+
+# --------------------------------------------------------------------------
+# Cases: the poll's demand, less what will absorb it
+# --------------------------------------------------------------------------
+
+def poll_request(queued_jobs, arch="arm64"):
+    """The cleanup poll's direct invoke: its whole queued demand for one architecture."""
+    labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+    return {"body": json.dumps({"action": "queued", "workflow_job": {"labels": labels},
+                                "queued_jobs": queued_jobs,
+                                "launch_count": min(queued_jobs, 4)}),
+            "headers": {}}
+
+
+def case_a_queued_job_whose_runner_is_booting_gets_no_second_host():
+    """The double launch: the poll counted the job its own launch is booting for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(1), None)
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "1 starting or idle arm64 runner(s) already cover the 1 queued job(s)", result
+
+
+def case_two_queued_jobs_with_one_booting_runner_get_one_launch():
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "running", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(2), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_an_idle_runner_absorbs_one_queued_job():
+    for queued, launches in ((1, 0), (2, 1)):
+        ec2 = FakeEC2([instance("i-idle", "c7gd.metal", "running", 60, arch="arm64")])
+        github = FakeGitHub(runners=[{"id": 5, "name": "runner-i-idle", "status": "online", "busy": False}])
+        webhook(ec2, github=github)["handler"](poll_request(queued), None)
+        assert len(launched_types(ec2)) == launches, (queued, launched_types(ec2))
+
+
+def case_a_starting_host_past_its_timeout_no_longer_absorbs():
+    """A launch pending past BOOT_GRACE_MINUTES, or a claim older than CLAIM_GRACE_MINUTES, covers nothing."""
+    ec2 = FakeEC2([instance("i-stalled", "c7gd.metal", "pending", 16, arch="arm64")])
+    webhook(ec2)["handler"](poll_request(1), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    for claimed_minutes_ago, launches in ((1, 0), (6, 1)):
+        ec2 = FakeEC2([stream_host()])
+        dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 60,
+                                            claimed_at=NOW_EPOCH - claimed_minutes_ago * 60)])
+        webhook(ec2, dynamodb=dynamodb)["handler"](poll_request(1), None)
+        assert len(launched_types(ec2)) == launches, (claimed_minutes_ago, launched_types(ec2))
+
+
+def case_a_waiting_warm_host_is_claimed_for_the_poll_not_subtracted():
+    """Subtracted, it would never be claimed and would power off while its job waited a poll."""
+    ec2, ssm = FakeEC2([stream_host()]), FakeSSM()
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](poll_request(1), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert launched_types(ec2) == [], launched_types(ec2)
+
+
+def case_a_single_delivery_is_not_cut_by_runners_booting_for_other_jobs():
+    """One queued delivery says nothing about which job a booting runner is for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](queued_event(), invoked_as(DELIVERY_ARN))
+    assert len(launched_types(ec2)) == 1, (result, launched_types(ec2))
 
 
 def case_a_queued_job_claims_a_warm_host_before_launching_metal():
@@ -3321,7 +3679,7 @@ def case_a_missing_account_id_makes_every_registration_unread():
                          env={"RUNNER_ACCOUNT_ID": ""})["handler"]({}, None)
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
     assert result["held"] == ["i-lease"], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_reaping_claim_that_did_not_land_holds():
@@ -3331,7 +3689,7 @@ def case_a_reaping_claim_that_did_not_land_holds():
         tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
     assert result["held"] == ["i-lease"], result
-    assert dynamodb.items == {}, dynamodb.items
+    assert registration_items(dynamodb) == {}, dynamodb.items
 
 
 def case_a_reaping_claim_whose_answer_was_lost_is_resolved_by_a_consistent_read():
@@ -3398,7 +3756,7 @@ def case_an_unreadable_registration_table_does_not_suppress_the_ceiling():
         result = cleanup(ec2, FakeGitHub(runners=[]), dynamodb=dynamodb)["handler"]({}, None)
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_lost_registration_row_cannot_hold_an_instance_past_the_ceiling():
@@ -3422,7 +3780,7 @@ def case_a_lost_registration_row_cannot_hold_an_instance_past_the_ceiling():
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
     assert result["held"] == [], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
@@ -3951,12 +4309,17 @@ CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
 
 
 def main():
-    global WEBHOOK_SRC, CLEANUP_SRC
+    global WEBHOOK_SRC, CLEANUP_SRC, FRONT_SRC
     sources = extract_lambda_sources()
     if len(sources) != 2:
         print(f"FAIL: expected 2 Lambda heredocs in {TF_FILE.name}, found {len(sources)}")
         return 1
     WEBHOOK_SRC, CLEANUP_SRC = sources
+    fronts = extract_lambda_sources(FRONT_FILE)
+    if len(fronts) != 1:
+        print(f"FAIL: expected 1 Lambda heredoc in {FRONT_FILE.name}, found {len(fronts)}")
+        return 1
+    FRONT_SRC = fronts[0]
 
     failures = 0
     for case in CASES:

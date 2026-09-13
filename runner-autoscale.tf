@@ -125,6 +125,12 @@ data "archive_file" "runner_webhook" {
       # The completed handler has no queue view of its own. It asks GitHub for at
       # most this long, and a look it did not finish hands out nothing.
       QUEUE_CHECK_BUDGET_SECONDS = 8
+      # github-runner-webhook-front forwards verified GitHub deliveries through this
+      # alias of this function, and IAM lets only the front invoke it. Whatever an
+      # event arriving through it says, it is a public delivery: no launch_count, no
+      # claim_only. The controller's own invokes - the cleanup poll and
+      # github-runner-reuse - use the unqualified function and keep their trust.
+      DELIVERY_ALIAS = 'delivery'
 
       def get_user_data():
           """Fetch user_data from SSM Parameter Store"""
@@ -990,9 +996,9 @@ data "archive_file" "runner_webhook" {
 
           Checking a host for reuse reads EC2, the runner roster, the registration
           row and up to QUEUE_CHECK_BUDGET_SECONDS of GitHub's queue. This function
-          runs one execution at a time behind API Gateway, a delivery that arrives
-          while that execution is busy is throttled, and GitHub does not redeliver
-          it. So only the checks that need no call run here.
+          runs one execution at a time and every delivery waits behind it, so only
+          the checks that need no call run here. A job whose reuse window closed
+          while its delivery waited is not handed on at all.
           """
           job = payload.get('workflow_job')
           job = job if isinstance(job, dict) else {}
@@ -1000,6 +1006,10 @@ data "archive_file" "runner_webhook" {
           if (not isinstance(name, str) or not RUNNER_INSTANCE_NAME.fullmatch(name)
                   or job.get('conclusion') not in REUSABLE_CONCLUSIONS):
               return {'statusCode': 200, 'body': 'Ignoring completed job: not a successful runner-i-* job'}
+          completed_at = parse_utc(job.get('completed_at'))
+          if (completed_at is None or completed_at.timestamp() + REUSE_WINDOW_SECONDS
+                  < datetime.now(timezone.utc).timestamp() + CLAIM_MARGIN_SECONDS):
+              return {'statusCode': 200, 'body': f'Not reusing {name}: its reuse window has closed'}
           handoff = {'workflow_job': {key: job.get(key) for key in
                                       ('runner_name', 'runner_id', 'labels', 'conclusion', 'completed_at')}}
           try:
@@ -1013,6 +1023,31 @@ data "archive_file" "runner_webhook" {
       def reuse_handler(event, context):
           """Entry point of github-runner-reuse, which runs this same source."""
           return handle_completed(event if isinstance(event, dict) else {})
+
+      def forwarded_delivery(context):
+          """Whether this invocation came through DELIVERY_ALIAS, which only the front may invoke."""
+          arn = getattr(context, 'invoked_function_arn', None)
+          return isinstance(arn, str) and arn.endswith(f':{DELIVERY_ALIAS}')
+
+      def parse_utc(value):
+          """A GitHub timestamp as an aware datetime, or None."""
+          try:
+              parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+          except ValueError:
+              return None
+          return parsed if parsed.tzinfo is not None else None
+
+      def queue_scan_started_at(arch):
+          """When the cleanup poll's latest complete queue scan for arch began, or None."""
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table:
+              return None
+          try:
+              item = dynamodb.get_item(TableName=table, Key={'InstanceArn': {'S': f'queue-scan#{arch}'}},
+                                       ConsistentRead=True).get('Item') or {}
+              return float(item['ScanStartedAt']['N'])
+          except Exception:
+              return None
 
       def handle_completed(payload):
           """Check a finished runner-i-* job's host for reuse. Runs in github-runner-reuse.
@@ -1108,6 +1143,13 @@ data "archive_file" "runner_webhook" {
               if not verify_signature(body, signature, secret):
                   return {'statusCode': 401, 'body': 'Invalid signature'}
 
+          # github-runner-webhook-front verified a forwarded delivery, stripped it to
+          # the fields read here, and sent it through DELIVERY_ALIAS. It is told apart
+          # by that alias, which only the front may invoke, never by anything in the
+          # event, and it gets no more trust than a delivery from API Gateway.
+          forwarded = forwarded_delivery(context)
+          public = forwarded or 'requestContext' in event
+
           payload = json.loads(body)
           action = payload.get('action', '')
 
@@ -1123,6 +1165,18 @@ data "archive_file" "runner_webhook" {
           labels = workflow_job.get('labels', [])
           arch = detect_architecture(labels)
 
+          # A forwarded delivery can wait in the async queue behind this function's one
+          # execution. If a complete cleanup queue scan began after the job was queued,
+          # that scan counted the job and asked for its runner, and launching here as
+          # well would put up a second host for it.
+          if forwarded:
+              queued_at = parse_utc(workflow_job.get('created_at'))
+              scanned_at = queue_scan_started_at(arch)
+              if queued_at is not None and scanned_at is not None and queued_at.timestamp() < scanned_at:
+                  detail = f'The {arch} queue scan begun at {scanned_at:.0f} already counted this job'
+                  print(detail)
+                  return {'statusCode': 200, 'body': detail}
+
           # Check per-architecture capacity. queued_jobs is supplied by the cleanup
           # Lambda's poll (it counts them); a real GitHub delivery is one job.
           max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
@@ -1135,8 +1189,8 @@ data "archive_file" "runner_webhook" {
           # github-runner-reuse asks for a warm host this way when a finished job's
           # host should take queued work. Such a request claims a host or does
           # nothing: it never launches, and a miss is not reported as starvation.
-          # Honoured only on an IAM-authed direct invoke, like launch_count.
-          claim_only = 'requestContext' not in event and payload.get('claim_only') is True
+          # Honoured only on the controller's own direct invokes, like launch_count.
+          claim_only = not public and payload.get('claim_only') is True
           refused = 'reuse-missed' if claim_only else 'blocked'
           capacity = get_capacity(arch)
 
@@ -1160,14 +1214,35 @@ data "archive_file" "runner_webhook" {
           # serialized by reserved concurrency 1 - can each miss the instance the
           # previous one just launched and overshoot the cap. Inside one invocation
           # the loop counts its own launches, which no consistency lag can hide.
-          # launch_count is honored only on IAM-authed direct invokes (no
-          # requestContext), so a signed public delivery cannot amplify.
+          # launch_count is honored only on the controller's own direct invokes -
+          # neither through API Gateway nor through DELIVERY_ALIAS - so a signed
+          # public delivery cannot amplify.
           requested = 1
-          if 'requestContext' not in event:
+          if not public:
               try:
                   requested = max(1, min(int(payload.get('launch_count', 1)), max_runners))
               except (TypeError, ValueError):
                   requested = 1
+          # The poll's queued_jobs is every queued job it found for the architecture,
+          # including jobs something is already on its way to take. Launching for all
+          # of them put a second host on a job whose runner was still booting whenever
+          # the pool had room. So the poll's request is cut to what nothing will
+          # absorb: runners launched but not yet registered and inside
+          # BOOT_GRACE_MINUTES, warm hosts claimed inside CLAIM_GRACE_MINUTES
+          # (get_capacity counts both as booting), and registered idle runners. A warm
+          # host still waiting to be claimed is not subtracted: it takes a job only
+          # once claimed, and the loop below claims it before launching anything. An
+          # unreadable roster reports none of these, so nothing is cut then. Only a
+          # request carrying the poll's count is cut: any other request is one job,
+          # and a runner already starting or idle may be there for a different one.
+          if not public and not claim_only and 'queued_jobs' in payload:
+              absorbing = capacity['booting'] + capacity['idle']
+              requested = min(requested, max(queued_jobs - absorbing, 0))
+              if requested == 0:
+                  detail = (f'{absorbing} starting or idle {arch} runner(s) already cover '
+                            f'the {queued_jobs} queued job(s)')
+                  emit_decision(arch, queued_jobs, capacity, max_runners, 'covered', detail)
+                  return {'statusCode': 200, 'body': detail}
           # Slots are bounded by the healthy-capacity cap, checked >= 1 above. A
           # warm host fills a slot first: it serves the job without a cold boot and
           # adds no instance, so the instance ceiling bounds launches alone. A claim
@@ -1500,12 +1575,18 @@ resource "aws_apigatewayv2_stage" "runner_webhook" {
   auto_deploy = true
 }
 
+# Deliveries go to github-runner-webhook-front (runner-webhook-front.tf), which verifies them
+# and queues them for the webhook. integration_uri updates this integration in place, so the
+# route, its target and the URL GitHub posts to are unchanged; depends_on puts API Gateway's
+# permission to invoke the front in place before any request can reach it.
 resource "aws_apigatewayv2_integration" "runner_webhook" {
   count              = var.enable_github_runner ? 1 : 0
   api_id             = aws_apigatewayv2_api.runner_webhook[0].id
   integration_type   = "AWS_PROXY"
-  integration_uri    = aws_lambda_function.runner_webhook[0].invoke_arn
+  integration_uri    = aws_lambda_function.runner_webhook_front[0].invoke_arn
   integration_method = "POST"
+
+  depends_on = [aws_lambda_permission.runner_webhook_front]
 }
 
 resource "aws_apigatewayv2_route" "runner_webhook" {
@@ -1515,14 +1596,11 @@ resource "aws_apigatewayv2_route" "runner_webhook" {
   target    = "integrations/${aws_apigatewayv2_integration.runner_webhook[0].id}"
 }
 
-resource "aws_lambda_permission" "runner_webhook" {
-  count         = var.enable_github_runner ? 1 : 0
-  statement_id  = "AllowAPIGateway"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.runner_webhook[0].function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.runner_webhook[0].execution_arn}/*/*"
-}
+# API Gateway has no permission to invoke the webhook itself. Deliveries reach it only through
+# github-runner-webhook-front and its delivery alias. The permission that let API Gateway call
+# the webhook directly was removed one apply after the integration moved to the front: in the
+# same apply, its deletion and the integration update have no ordering between them, and a
+# delivery could have met the old integration without the permission.
 
 # ============================================
 # Variables
@@ -3118,6 +3196,7 @@ data "archive_file" "runner_cleanup" {
                       demand['arm64'] += 1
           if scan is not None:
               scan['complete'] = complete
+              scan['started_at'] = scan_start.timestamp()
           return demand
 
       def cleanup_expired_bootstrap_parameters(now):
@@ -3189,6 +3268,26 @@ data "archive_file" "runner_cleanup" {
           else:
               result['truncated'] = True
           return result
+
+      def record_queue_scan(arch, started_at, queued):
+          """Tell the webhook a complete scan counted every arch job queued before started_at.
+
+          Deliveries from github-runner-webhook-front can wait in the webhook's async
+          queue. The webhook skips a forwarded queued job created before this, because
+          this scan already counted it and this poll already asked for its runner.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table:
+              return
+          try:
+              dynamodb.update_item(
+                  TableName=table,
+                  Key={'InstanceArn': {'S': f'queue-scan#{arch}'}},
+                  UpdateExpression='SET ScanStartedAt = :started, QueuedJobs = :queued',
+                  ExpressionAttributeValues={':started': {'N': f'{started_at:.3f}'},
+                                             ':queued': {'N': str(queued)}})
+          except Exception as e:
+              print(f'Could not record the {arch} queue scan: {type(e).__name__}')
 
       def handler(event, context):
           now = datetime.now(timezone.utc)
@@ -3770,13 +3869,16 @@ data "archive_file" "runner_cleanup" {
                   demand = queued_demand(pat, max_runners, demand_scan)
                   print(f'Queued self-hosted jobs by architecture: {demand}')
                   webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
+                  # Architectures this poll asked runners for, or that had nothing queued.
+                  covered = []
                   for arch in sorted(demand):
                       queued_jobs = demand[arch]
                       labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
                       # ONE invoke per architecture, carrying the whole deficit as
-                      # launch_count and the raw demand as queued_jobs (the latter
-                      # rides into the webhook's decision record). The webhook
-                      # launches launch_count runners inside a single invocation,
+                      # launch_count and the raw demand as queued_jobs. The webhook
+                      # takes its starting and idle runners off queued_jobs, records
+                      # it in its decision line, and launches at most launch_count
+                      # runners inside a single invocation,
                       # where its own loop count bounds the total - a burst of
                       # single-launch invocations, even serialized by reserved
                       # concurrency 1, can each miss the instance the previous one
@@ -3784,6 +3886,7 @@ data "archive_file" "runner_cleanup" {
                       # and overshoot MAX_RUNNERS.
                       count = min(queued_jobs, max_runners)
                       if count <= 0:
+                          covered.append(arch)
                           continue
                       # Direct invoke: no requestContext, so the handler trusts it
                       # without a header. Skips HMAC, which API Gateway callers cannot.
@@ -3804,8 +3907,12 @@ data "archive_file" "runner_cleanup" {
                               Payload=json.dumps(payload)
                           )
                           launched.extend([arch] * count)
+                          covered.append(arch)
                       except Exception as e:
                           print(f'Failed to invoke webhook for {arch}: {e}')
+                  if demand_scan.get('complete'):
+                      for arch in covered:
+                          record_queue_scan(arch, demand_scan['started_at'], demand[arch])
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
@@ -3885,15 +3992,23 @@ resource "aws_lambda_function" "runner_cleanup" {
   depends_on = [aws_iam_role_policy.runner_bootstrap_controller]
 }
 
-# Async invocations (the cleanup poll's direct invokes) must never be retried by
-# Lambda itself: a retry after a partial launch re-reads eventually-consistent
-# DescribeInstances, can miss the instances the failed attempt already launched,
-# and overshoots the cap. The 5-minute poll IS the retry path, and it re-derives
-# the deficit from fresh state.
+# Async invocations of the unqualified function (the cleanup poll's requests and
+# github-runner-reuse's claim requests) must never be retried by Lambda itself: a retry
+# after a partial launch re-reads eventually-consistent DescribeInstances, can miss the
+# instances the failed attempt already launched, and overshoots the cap. The 5-minute
+# poll IS the retry path, and it re-derives the deficit from fresh state.
+#
+# Throttles are not function errors, and Lambda keeps retrying a throttled event until it
+# is maximum_event_age_in_seconds old. A poll request that has waited a whole poll interval
+# is overtaken by the next poll's, and a claim request is worthless 90 seconds after its
+# job ended, so nothing here is worth running after 300 seconds. Forwarded GitHub
+# deliveries arrive through the delivery alias, whose config in runner-webhook-front.tf has
+# the same two settings.
 resource "aws_lambda_function_event_invoke_config" "runner_webhook" {
-  count                  = var.enable_github_runner ? 1 : 0
-  function_name          = aws_lambda_function.runner_webhook[0].function_name
-  maximum_retry_attempts = 0
+  count                        = var.enable_github_runner ? 1 : 0
+  function_name                = aws_lambda_function.runner_webhook[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 300
 }
 
 # Completed jobs are checked for warm-host reuse here, not in the webhook. The check reads

@@ -208,7 +208,7 @@ The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer
 the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly.
 
 ```text
-GitHub workflow jobs -> API Gateway -> Lambda -> disposable Spot runners
+GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> disposable Spot runners
 
 Cloudflare Access -> outbound tunnel -> nextjs-dev -> 127.0.0.1 project ports
 
