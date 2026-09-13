@@ -183,6 +183,40 @@ class FakeClientError(Exception):
         self.response = {"Error": {"Code": code, "Message": message}}
 
 
+def condition_holds(item, expression, names, values):
+    """Evaluate the AND-only condition expressions the Lambdas write.
+
+    Enough of DynamoDB's grammar for those and no more: a term this cannot
+    read fails the case rather than passing it.
+    """
+    if not expression:
+        return True
+    for term in expression.split(" AND "):
+        term = term.strip()
+        absent = re.fullmatch(r"attribute_not_exists\(([#\w]+)\)", term)
+        if absent:
+            if item is not None and names.get(absent.group(1), absent.group(1)) in item:
+                return False
+            continue
+        compare = re.fullmatch(r"([#\w]+) (=|>=) (:\w+)", term)
+        assert compare, f"FakeDynamoDB cannot evaluate {term!r}"
+        if item is None:
+            return False
+        have = item.get(names.get(compare.group(1), compare.group(1)))
+        want = values[compare.group(3)]
+        if not have or set(have) != set(want):
+            return False
+        (kind, got), = have.items()
+        expected = want[kind]
+        if kind == "N":
+            got, expected = int(got), int(expected)
+        if compare.group(2) == "=" and got != expected:
+            return False
+        if compare.group(2) == ">=" and not got >= expected:
+            return False
+    return True
+
+
 class FakeDynamoDB:
     """Registration rows with conditional-create semantics.
 
@@ -196,7 +230,7 @@ class FakeDynamoDB:
     """
 
     def __init__(self, items=(), put_error=None, write_then_error=False,
-                 concurrent_item=None, get_error=None):
+                 concurrent_item=None, get_error=None, update_error=None, before_update=None):
         self.items = {}
         for item in items:
             self.items[item["InstanceArn"]["S"]] = item
@@ -204,6 +238,11 @@ class FakeDynamoDB:
         self.write_then_error = write_then_error
         self.concurrent_item = concurrent_item
         self.get_error = get_error
+        # UpdateItem rejected after its condition passed, and a callable run once
+        # before the next UpdateItem is evaluated: another writer getting there
+        # first, which is how a claim race is staged.
+        self.update_error = update_error
+        self.before_update = before_update
         self.calls = []
 
     def get_item(self, **kw):
@@ -213,6 +252,27 @@ class FakeDynamoDB:
             raise self.get_error
         item = self.items.get(kw["Key"]["InstanceArn"]["S"])
         return {"Item": item} if item is not None else {}
+
+    def update_item(self, **kw):
+        self.calls.append(("update_item", kw))
+        if self.before_update is not None:
+            hook, self.before_update = self.before_update, None
+            hook(self, kw)
+        arn = kw["Key"]["InstanceArn"]["S"]
+        item = self.items.get(arn)
+        names = kw.get("ExpressionAttributeNames", {})
+        values = kw.get("ExpressionAttributeValues", {})
+        if not condition_holds(item, kw.get("ConditionExpression"), names, values):
+            raise FakeClientError("ConditionalCheckFailedException")
+        if self.update_error:
+            raise self.update_error
+        assert kw["UpdateExpression"].startswith("SET "), kw
+        updated = dict(item or {"InstanceArn": {"S": arn}})
+        for assignment in kw["UpdateExpression"][len("SET "):].split(","):
+            attr, value = (part.strip() for part in assignment.split("="))
+            updated[names.get(attr, attr)] = values[value]
+        self.items[arn] = updated
+        return {}
 
     def put_item(self, **kw):
         self.calls.append(("put_item", kw))
@@ -295,11 +355,19 @@ class FakeSSM:
 
 
 class FakeLambdaClient:
-    def __init__(self):
+    def __init__(self, error=None):
         self.invokes = []
+        self.calls = []
+        self.error = error
 
     def invoke(self, **kw):
-        self.invokes.append(json.loads(json.loads(kw["Payload"])["body"]))
+        self.calls.append(kw)
+        if self.error:
+            raise self.error
+        payload = json.loads(kw["Payload"])
+        # Webhook-shaped events carry a body; the reuse function takes the job itself.
+        if "body" in payload:
+            self.invokes.append(json.loads(payload["body"]))
 
     def arch_invokes(self):
         """Total runners REQUESTED per architecture.
@@ -475,7 +543,7 @@ def capture_emf(emit, **kwargs):
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
-                dynamodb=None):
+                dynamodb=None, launch_ec2=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
@@ -491,6 +559,10 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     client_options = []
     def client(service, **kw):
         client_options.append((service, kw))
+        # The webhook's RunInstances client is its one EC2 client built with a
+        # config; a case can hand it a separate fake to see which calls use it.
+        if service == "ec2" and "config" in kw and launch_ec2 is not None:
+            return launch_ec2
         return clients[service]
     fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
@@ -515,6 +587,7 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         "INSTANCE_PROFILE": "runner-profile",
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
+        "REUSE_FUNCTION": "github-runner-reuse",
         "MAX_RUNNERS": "4",
         "REGISTRATION_TABLE": "github-runner-registration",
         "RUNNER_ACCOUNT_ID": ACCOUNT_ID,
@@ -813,7 +886,7 @@ def case_controller_recognizes_real_terraform_user_data_document():
     script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
     wire = base64.b64encode(gzip.compress(script.encode())).decode()
     # IAM cutoff keeps the broker document; it cannot restore a PAT-reading boot.
-    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True, True)
     assert '/github-runner/pat' not in script
     runner_grants = (TF_FILE.parent / 'runner-vpc.tf').read_text()
     assert 'aws_iam_policy.ssm_managed_instance.arn' in runner_grants
@@ -1292,6 +1365,485 @@ def case_unusable_launch_subnets_refuse_before_allocating_metal():
             raise AssertionError(f"LAUNCH_SUBNETS={value!r} was accepted")
         assert not ec2.ops("run_instances"), (value, ec2.calls)
         assert not any("registration-token" in url for url in github.requests), value
+
+
+# --------------------------------------------------------------------------
+# Cases: a stream of jobs on a warm host
+# --------------------------------------------------------------------------
+
+WARM = "i-0123456789abcdef1"
+WARM_TOO = "i-0123456789abcdef2"
+NOW_EPOCH = int(NOW.timestamp())
+STREAM_SSM_USER_DATA = base64.b64encode(gzip.compress(
+    b'#!/bin/bash\nREGISTRATION_TABLE="github-runner-registration"\n'
+    b'BOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"\n'
+    b'ExecStart=/usr/local/sbin/fcvm-runner-job next\n'
+)).decode()
+
+
+def stream_host(instance_id=WARM, arch="arm64", age_minutes=90, state="running", protocol="ddb-v2"):
+    """A runner whose user data registers again after a job, between jobs."""
+    return instance(instance_id, "c7gd.metal" if arch == "arm64" else "r5d.metal", state,
+                    age_minutes, arch=arch, tags={"RunnerRegistrationProtocol": protocol})
+
+
+def stream_row(instance_id=WARM, runner_id=77, available_until=None, claimed_at=None):
+    item = registered_item(instance_id, runner_id)
+    if available_until is not None:
+        item["AvailableUntil"] = {"N": str(available_until)}
+    if claimed_at is not None:
+        item["ClaimedAt"] = {"N": str(claimed_at)}
+    return item
+
+
+def stream_item(dynamodb, instance_id=WARM):
+    return dynamodb.items[instance_arn(instance_id)]
+
+
+def completed_event(instance_id=WARM, arch="arm64", runner_id=77, conclusion="success",
+                    completed_seconds_ago=10, runner_name=None):
+    labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+    return {"body": json.dumps({"action": "completed", "workflow_job": {
+        "runner_name": runner_name or f"runner-{instance_id}", "runner_id": runner_id,
+        "labels": labels, "conclusion": conclusion,
+        "completed_at": (NOW - timedelta(seconds=completed_seconds_ago)).isoformat()}})}
+
+
+def queued_event(arch="arm64", launch_count=None):
+    body = {"action": "queued", "workflow_job": {
+        "labels": ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]}}
+    if launch_count is not None:
+        body["launch_count"] = launch_count
+    return {"body": json.dumps(body)}
+
+
+def queue_of(arch="arm64", queued=1, run_id=5001):
+    """FakeGitHub arguments for one in-progress run holding `queued` queued jobs."""
+    return {"runs": [run(run_id, "in_progress")],
+            "jobs": {run_id: [job("queued", arch)] * queued + [job("in_progress", arch)]}}
+
+
+def bootstrap_names(ssm):
+    return [put["Name"] for put in ssm.puts]
+
+
+def reuse(ec2, **kw):
+    """The webhook source as github-runner-reuse runs it, with a recording Lambda client."""
+    kw.setdefault("github", FakeGitHub())
+    kw.setdefault("lambda_client", FakeLambdaClient())
+    return load_lambda(WEBHOOK_SRC, ec2, kw.pop("ssm", FakeSSM()), **kw)
+
+
+def as_handoff(event):
+    """What the webhook hands github-runner-reuse for a completed delivery."""
+    return {"workflow_job": json.loads(event["body"])["workflow_job"]}
+
+
+def case_a_completed_job_hands_its_warm_host_the_next_queued_job():
+    """Queued work the pool cannot absorb goes to the host that just finished.
+
+    Three hops, each run as Lambda runs it. The webhook answers the delivery and
+    hands the job to github-runner-reuse without a read. The reuse function opens
+    the host's window and, seeing more queued work than idle and starting runners
+    can take, asks the webhook for a claim. The webhook, the one function that
+    decides capacity, claims the host and brokers its instance-bound credential.
+    """
+    ssm, dynamodb, ec2 = FakeSSM(), FakeDynamoDB([stream_row()]), FakeEC2([stream_host()])
+    github, front, back = FakeGitHub(**queue_of(queued=2)), FakeLambdaClient(), FakeLambdaClient()
+    accepted = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                       lambda_client=front)["handler"](completed_event(), None)
+    assert accepted == {"statusCode": 202, "body": f"Checking runner-{WARM} for reuse"}, accepted
+    (handoff,) = front.calls
+    assert handoff["FunctionName"] == "github-runner-reuse", handoff
+    assert handoff["InvocationType"] == "Event", handoff
+
+    checked = reuse(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                    lambda_client=back)["reuse_handler"](json.loads(handoff["Payload"]), None)
+    assert checked["statusCode"] == 202, checked
+    (request,) = back.calls
+    assert request["FunctionName"] == "github-runner-webhook", request
+    assert request["InvocationType"] == "Event", request
+    assert back.invokes == [{"action": "queued", "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                             "queued_jobs": 1, "launch_count": 1, "claim_only": True}], back.invokes
+    assert ssm.puts == [] and "ClaimedAt" not in stream_item(dynamodb), (ssm.puts, stream_item(dynamodb))
+
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github)["handler"](
+        json.loads(request["Payload"]), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
+    tags = {t["Key"]: t["Value"] for t in ssm.puts[0]["Tags"]}
+    assert tags["InstanceArn"] == instance_arn(WARM), tags
+    item = stream_item(dynamodb)
+    assert item["ClaimedAt"] == {"N": str(NOW_EPOCH)}, item
+    assert item["AvailableUntil"] == {"N": str(NOW_EPOCH - 10 + 120)}, item
+    assert not ec2.ops("run_instances"), ec2.calls
+
+
+def case_the_webhook_hands_a_completed_job_on_without_reading_anything():
+    """The webhook's one execution is never held by a reuse check."""
+    ec2, ssm, dynamodb = FakeEC2([stream_host()]), FakeSSM(), FakeDynamoDB([stream_row()])
+    github, front = FakeGitHub(**queue_of(queued=3)), FakeLambdaClient()
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                     lambda_client=front)["handler"](completed_event(), None)
+    assert result["statusCode"] == 202, result
+    assert (ec2.calls, dynamodb.calls, github.requests, ssm.journal) == ([], [], [], []), \
+        (ec2.calls, dynamodb.calls, github.requests, ssm.journal)
+    assert json.loads(front.calls[0]["Payload"]) == {"workflow_job": {
+        "runner_name": f"runner-{WARM}", "runner_id": 77,
+        "labels": ["self-hosted", "Linux", "ARM64"], "conclusion": "success",
+        "completed_at": (NOW - timedelta(seconds=10)).isoformat()}}, front.calls
+    for event in (completed_event(conclusion="failure"), completed_event(runner_name="GitHub Actions 12")):
+        skipped = FakeLambdaClient()
+        ignored = webhook(FakeEC2(), lambda_client=skipped)["handler"](event, None)
+        assert ignored["statusCode"] == 200 and skipped.calls == [], (ignored, skipped.calls)
+    refused = webhook(FakeEC2(), lambda_client=FakeLambdaClient(error=OSError("Lambda unavailable")))[
+        "handler"](completed_event(), None)
+    assert refused["statusCode"] == 503, refused
+
+
+def case_a_completed_job_with_nothing_waiting_holds_its_host_for_a_queued_event():
+    dynamodb, github, back = FakeDynamoDB([stream_row()]), FakeGitHub(), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["statusCode"] == 200, result
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+    item = stream_item(dynamodb)
+    assert item["AvailableUntil"] == {"N": str(NOW_EPOCH - 10 + 120)}, item
+    assert "ClaimedAt" not in item, item
+    assert not any("registration-token" in url for url in github.requests), github.requests
+
+
+def case_queued_work_the_idle_pool_already_covers_does_not_take_the_warm_host():
+    """One queued job and one idle online runner: that runner takes it."""
+    idle = instance(WARM_TOO, "c7gd.metal", "running", 60, arch="arm64")
+    github = FakeGitHub(runners=[{"id": 9, "name": f"runner-{WARM_TOO}", "status": "online",
+                                  "busy": False}], **queue_of(queued=1))
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host(), idle]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+
+
+def case_a_completed_event_hands_out_nothing_it_cannot_prove():
+    """Every guard on the completed path, each with queued work waiting behind it."""
+    variants = [
+        ("a GitHub-hosted runner", {"event": completed_event(runner_name="GitHub Actions 12")}),
+        ("a failed job", {"event": completed_event(conclusion="failure")}),
+        ("a cancelled job", {"event": completed_event(conclusion="cancelled")}),
+        ("a timed-out job", {"event": completed_event(conclusion="timed_out")}),
+        ("a reuse window that has closed", {"event": completed_event(completed_seconds_ago=91)}),
+        ("a ddb-v1 host", {"host": stream_host(protocol="ddb-v1")}),
+        ("a host past the soft cap", {"host": stream_host(age_minutes=12 * 60 + 1)}),
+        ("a host that is shutting down", {"host": stream_host(state="shutting-down")}),
+        ("a job for the other architecture", {"event": completed_event(arch="x86_64")}),
+        ("a row that names a later runner", {"item": stream_row(runner_id=78)}),
+        ("a window already open", {"item": stream_row(available_until=NOW_EPOCH + 60)}),
+    ]
+    for label, variant in variants:
+        item = variant.get("item", stream_row())
+        window_before = item.get("AvailableUntil")
+        dynamodb, back = FakeDynamoDB([item]), FakeLambdaClient()
+        result = reuse(FakeEC2([variant.get("host", stream_host())]), dynamodb=dynamodb,
+                       github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)["reuse_handler"](
+                           as_handoff(variant.get("event", completed_event())), None)
+        assert result["statusCode"] == 200, (label, result)
+        assert back.calls == [], (label, back.calls)
+        assert stream_item(dynamodb).get("AvailableUntil") == window_before, (label, stream_item(dynamodb))
+        assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
+
+
+def case_a_queue_check_that_cannot_finish_hands_out_nothing():
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    module = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
+                   github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)
+    answered = module["github_get"]
+
+    def runs_unreachable(pat, url):
+        if "/actions/runs" in url:
+            raise OSError("GitHub is unreachable")
+        return answered(pat, url)
+
+    module["github_get"] = runs_unreachable
+    result = module["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+
+
+def case_a_claim_only_request_claims_a_warm_host_or_nothing():
+    """github-runner-reuse's request never launches, and a miss is not starvation."""
+    request = {"body": json.dumps({"action": "queued",
+                                   "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                                   "queued_jobs": 1, "launch_count": 1, "claim_only": True}),
+               "headers": {}}
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        missed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row()]))["handler"](request, None)
+    assert missed["body"] == "No warm arm64 host left to claim", missed
+    assert not ec2.ops("run_instances") and ssm.puts == [], (ec2.calls, ssm.puts)
+    line = json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert line["decision"] == "reuse-missed" and line["ScaleUpStarved"] == 0, line
+    claimed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)]))[
+        "handler"](request, None)
+    assert claimed["body"] == f"Reused 1 warm arm64 host(s): {WARM}", claimed
+
+
+def case_a_public_delivery_cannot_ask_for_claim_only():
+    """claim_only, like launch_count, is honoured only on an IAM-authed direct invoke."""
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+    body = json.dumps({"action": "queued", "claim_only": True,
+                       "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]}})
+    sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    ec2 = FakeEC2([])
+    result = webhook(ec2, env={"WEBHOOK_SECRET": secret})["handler"](
+        {"body": body, "requestContext": {}, "headers": {"x-hub-signature-256": sig}}, None)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_run_instances_is_made_without_botocore_retries():
+    """An exhausted spot pool costs one call, not four retries of the same pool.
+
+    On 2026-09-13 botocore retried InsufficientInstanceCapacity four times per pool
+    ("reached max retries: 4"), 7 to 15 seconds each, and invocations ran into the
+    30-second timeout while the webhook's single execution was held.
+    """
+    describer, launcher = FakeEC2(), FakeEC2()
+    module = load_lambda(WEBHOOK_SRC, describer, FakeSSM(), github=FakeGitHub(), launch_ec2=launcher)
+    module["launch_runner"]("arm64")
+    assert len(launcher.ops("run_instances")) == 1, launcher.calls
+    assert describer.ops("run_instances") == [], describer.calls
+    retries = [kw["config"].retries for service, kw in module["_test_client_options"]
+               if service == "ec2" and "config" in kw]
+    assert retries == [{"total_max_attempts": 1}], retries
+
+
+def case_completed_jobs_are_checked_in_a_separate_single_execution_function():
+    source = TF_FILE.read_text()
+
+    def resource(kind, name):
+        return re.search(r'^resource "' + kind + r'" "' + name + r'" \{\n.*?^\}', source, re.M | re.S).group()
+
+    hook_fn = resource("aws_lambda_function", "runner_webhook")
+    reuse_fn = resource("aws_lambda_function", "runner_reuse")
+    reuse_queue = resource("aws_lambda_function_event_invoke_config", "runner_reuse")
+    assert re.search(r'reserved_concurrent_executions = 1\n', hook_fn), hook_fn
+    assert re.search(r'REUSE_FUNCTION\s*=\s*aws_lambda_function\.runner_reuse\[0\]\.function_name', hook_fn)
+    for pattern in (r'filename\s*=\s*data\.archive_file\.runner_webhook\.output_path',
+                    r'handler\s*=\s*"lambda_function\.reuse_handler"',
+                    r'function_name\s*=\s*"github-runner-reuse"',
+                    r'reserved_concurrent_executions = 1\n',
+                    r'WEBHOOK_FUNCTION\s*=\s*"github-runner-webhook"'):
+        assert re.search(pattern, reuse_fn), (pattern, reuse_fn)
+    assert re.search(r'maximum_retry_attempts\s*=\s*0', reuse_queue), reuse_queue
+    assert re.search(r'maximum_event_age_in_seconds\s*=\s*120', reuse_queue), reuse_queue
+    assert '["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:' in source
+    assert '"github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"' in source
+
+
+def case_a_queued_job_claims_a_warm_host_before_launching_metal():
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert not ec2.ops("run_instances"), ec2.calls
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
+    assert stream_item(dynamodb)["ClaimedAt"] == {"N": str(NOW_EPOCH)}
+
+
+def case_two_queued_jobs_cannot_both_claim_one_warm_host():
+    """One token per host: the job that loses the host launches instead.
+
+    In turn, the second event reads the claim and counts the host as starting.
+    Concurrently, both read the host as available, and the conditional write
+    gives it to exactly one of them.
+    """
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    ec2 = FakeEC2([stream_host()])
+    first_ssm, second_ssm = FakeSSM(), FakeSSM()
+    first = webhook(ec2, ssm=first_ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    second = webhook(ec2, ssm=second_ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    assert first["body"] == f"Reused 1 warm arm64 host(s): {WARM}", first
+    assert second["body"].startswith("Launched 1 arm64 runner(s)"), second
+    assert bootstrap_names(first_ssm) + bootstrap_names(second_ssm) == [
+        f"/github-runner/bootstrap/{WARM}", "/github-runner/bootstrap/i-new-c7gd.metal"]
+
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+
+    def rival_claims_first(fake, kw):
+        fake.items[instance_arn(WARM)]["ClaimedAt"] = {"N": str(NOW_EPOCH)}
+
+    dynamodb.before_update = rival_claims_first
+    ssm = FakeSSM()
+    result = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb)["handler"](
+        queued_event(), None)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+    assert f"/github-runner/bootstrap/{WARM}" not in bootstrap_names(ssm), ssm.puts
+
+
+def case_a_warm_host_whose_window_is_closing_gets_no_token():
+    """Too little window left to be sure the host is still waiting: launch instead."""
+    def window_closes(fake, kw):
+        fake.items[instance_arn(WARM)]["AvailableUntil"] = {"N": str(NOW_EPOCH + 10)}
+
+    for label, item, hook in [
+        ("closing when read", stream_row(available_until=NOW_EPOCH + 29), None),
+        ("closed by the time of the claim", stream_row(available_until=NOW_EPOCH + 100), window_closes),
+    ]:
+        dynamodb = FakeDynamoDB([item], before_update=hook)
+        ssm = FakeSSM()
+        result = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb)["handler"](
+            queued_event(), None)
+        assert result["body"].startswith("Launched 1 arm64 runner(s)"), (label, result)
+        assert f"/github-runner/bootstrap/{WARM}" not in bootstrap_names(ssm), (label, ssm.puts)
+        assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
+    module = webhook(FakeEC2(), dynamodb=FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 29)]))
+    assert module["claim_host"](WARM, NOW_EPOCH) is False
+
+
+def case_a_claimed_warm_host_counts_as_starting_until_its_grace_ends():
+    for claimed_minutes_ago, counted in ((1, 1), (6, 0)):
+        dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 60,
+                                            claimed_at=NOW_EPOCH - claimed_minutes_ago * 60)])
+        capacity = webhook(FakeEC2([stream_host()]), dynamodb=dynamodb)["get_capacity"]("arm64")
+        assert capacity["counted"] == counted, (claimed_minutes_ago, capacity)
+        assert capacity["available"] == [], (claimed_minutes_ago, capacity)
+
+
+def case_the_cleanup_retry_prefers_warm_hosts_too():
+    """The poll's direct invoke runs the same handler: warm hosts first, then launches."""
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](queued_event(launch_count=2), None)
+    assert result["body"] == (f"Reused 1 warm arm64 host(s): {WARM}; "
+                              "Launched 1 arm64 runner(s) (c7gd.metal): i-new-c7gd.metal"), result
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}",
+                                    "/github-runner/bootstrap/i-new-c7gd.metal"], ssm.puts
+
+
+def case_a_signed_completed_delivery_is_handed_on_and_in_progress_is_still_ignored():
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+
+    def signed(body, signature=None):
+        digest = hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        return {"body": body, "requestContext": {},
+                "headers": {"X-Hub-Signature-256": signature or f"sha256={digest}"}}
+
+    front = FakeLambdaClient()
+    module = webhook(FakeEC2([stream_host()]), env={"WEBHOOK_SECRET": secret}, lambda_client=front)
+    forged = module["handler"](signed(completed_event()["body"], signature="sha256=00"), None)
+    assert forged["statusCode"] == 401 and front.calls == [], (forged, front.calls)
+    accepted = module["handler"](signed(completed_event()["body"]), None)
+    assert accepted["statusCode"] == 202 and len(front.calls) == 1, (accepted, front.calls)
+    progress = json.dumps({"action": "in_progress", "workflow_job": {"labels": ["ARM64"]}})
+    assert module["handler"](signed(progress), None)["body"] == "Ignoring action: in_progress"
+    assert len(front.calls) == 1, front.calls
+
+
+def case_only_user_data_that_registers_again_is_tagged_for_reuse():
+    for ssm, protocol in ((FakeSSM(user_data=STREAM_SSM_USER_DATA), "ddb-v2"), (FakeSSM(), "ddb-v1")):
+        ec2 = FakeEC2()
+        webhook(ec2, ssm=ssm)["launch_runner"]("arm64")
+        tags = {t["Key"]: t["Value"]
+                for t in ec2.ops("run_instances")[0]["TagSpecifications"][0]["Tags"]}
+        assert tags["RunnerRegistrationProtocol"] == protocol, (protocol, tags)
+
+
+def case_the_reuse_window_closes_before_the_host_stops_waiting():
+    """The controller's timing against the host's, each read from its own source."""
+    source = TF_FILE.read_text()
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    host_wait = int(re.search(r'^BOOTSTRAP_DEADLINE=\$\(\(SECONDS \+ (\d+)\)\)$', script, re.M).group(1))
+    poll_seconds = int(re.search(r'^  sleep (\d+)$', script, re.M).group(1))
+    hook, reaper = webhook(FakeEC2()), cleanup(FakeEC2(), FakeGitHub())
+    latest_write = hook["REUSE_WINDOW_SECONDS"] - hook["CLAIM_MARGIN_SECONDS"]
+    assert latest_write + poll_seconds < host_wait, (latest_write, poll_seconds, host_wait)
+    assert hook["MAX_REUSE_AGE_HOURS"] == reaper["MAX_INSTANCE_AGE_HOURS"]
+    assert hook["STREAM_PROTOCOL"] in reaper["REGISTRATION_PROTOCOLS"]
+    wire = base64.b64encode(gzip.compress(script.encode())).decode()
+    assert hook["user_data_protocol"](wire) == (True, True, True)
+
+
+def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
+    """SSM holds base64gzip of the script without its whole-line comments."""
+    source = TF_FILE.read_text()
+    assert 'value = base64gzip(local.runner_user_data_document)' in source
+    assert 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' in source
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    script = (script.replace("${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}",
+                             "ssh-ed25519 " + "x" * 68)
+              .replace("${local.runner_registration_table_name}", "github-runner-registration")
+              .replace("$${", "${"))
+    shipped = "\n".join(line for line in script.split("\n")
+                        if not line.strip().startswith("#") or line.startswith("#!"))
+    assert shipped.startswith("#!/bin/bash\n") and "\n#!/bin/bash\n" in shipped
+    size = len(base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)))
+    # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
+    assert size <= 8192 - 512, size
+
+
+def idle_poll(runners, runs=(), jobs=None, recheck=None, delete_error=False, scan_budget=None):
+    """One cleanup poll over one runner inside its lease and under the soft cap."""
+    journal = []
+    ec2 = FakeEC2([instance("i-idle", "c7gd.metal", "running", 60, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  journal=journal)
+    github = FakeGitHub(runners=runners, runs=list(runs), jobs=jobs or {}, recheck=recheck,
+                        delete_error=delete_error, journal=journal)
+    module = cleanup(ec2, github)
+    if scan_budget is not None:
+        module["QUEUE_SCAN_TIME_BUDGET_SECONDS"] = scan_budget
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = module["handler"]({}, None)
+    return result, ec2, journal
+
+
+def case_an_idle_runner_with_nothing_queued_is_deregistered_then_terminated():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)])
+    assert result["idle_terminated"] == ["i-idle"], result
+    assert terminated_ids(ec2) == ["i-idle"], terminated_ids(ec2)
+    assert journal.index("github:DELETE:/actions/runners/77") < journal.index("ec2:terminate:i-idle"), journal
+
+
+def case_an_idle_runner_waits_while_its_architecture_has_queued_work():
+    for queued_arch, survives in (("arm64", True), ("x86_64", False)):
+        result, ec2, _ = idle_poll([runner_record("i-idle", busy=False)],
+                                   runs=[run(6001, "in_progress")],
+                                   jobs={6001: [job("queued", queued_arch)]})
+        assert (still_running(ec2) == ["i-idle"]) == survives, (queued_arch, still_running(ec2))
+
+
+def case_a_refused_deregistration_leaves_the_idle_host_running():
+    result, ec2, _ = idle_poll([runner_record("i-idle", busy=False)], delete_error=True)
+    assert result["idle_terminated"] == [], result
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+
+
+def case_an_idle_runner_that_took_a_job_since_the_snapshot_is_left_alone():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)],
+                                     recheck={77: runner_record("i-idle", busy=True)})
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+    assert not any(entry.startswith("github:DELETE:") for entry in journal), journal
+
+
+def case_an_unfinished_queue_scan_ends_no_idle_runner():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)],
+                                     runs=[run(6002, "queued")], jobs={6002: []}, scan_budget=-1)
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+    assert not any(entry.startswith("github:DELETE:") for entry in journal), journal
+
+
+def case_a_ddb_v2_host_is_judged_by_its_registration_row_like_ddb_v1():
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(tags={"RunnerRegistrationProtocol": "ddb-v2"},
+                                   runners=[runner_record("i-other")], dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
 
 
 # --------------------------------------------------------------------------
@@ -2234,9 +2786,13 @@ def case_the_roster_answer_is_recorded_on_the_instance():
     inst = instance("i-lease", "c7g.metal", "running", 60, arch="arm64",
                     tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})
     ec2 = FakeEC2([inst])
+    # Queued arm64 work keeps the idle sweep off this runner, which would otherwise
+    # end an idle registration with nothing queued before the second poll.
     with contextlib.redirect_stdout(io.StringIO()):
         first = cleanup(ec2, FakeGitHub(
-            runners=[runner_record("i-lease", busy=False)]))["handler"]({}, None)
+            runners=[runner_record("i-lease", busy=False)],
+            runs=[run(7001, "in_progress")],
+            jobs={7001: [job("queued", "arm64")]}))["handler"]({}, None)
     assert terminated_ids(ec2) == [], terminated_ids(ec2)
     tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
     assert tags.get("RunnerSeenAt") == NOW.isoformat(), tags

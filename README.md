@@ -709,11 +709,15 @@ after its protected resources exist; `prevent_destroy` is intended to stop that 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
 Labels select the architecture; the launcher tries several metal families when capacity is
 scarce, moving a family that just failed for capacity to the back of that order. Each new
-instance carries `RunnerRegistrationProtocol=ddb-v1`. After GitHub configuration, bootstrap
+instance carries `RunnerRegistrationProtocol=ddb-v2`. After GitHub configuration, bootstrap
 validates the exact identity in `.runner`, conditionally records `State=registered` under its
 instance ARN in DynamoDB, and starts the service only after that identity is confirmed.
+Registrations are ephemeral, one job each, but a host whose job succeeded can take another:
+it waits three minutes, and a `completed` event with queued work behind it, or a later
+`queued` event, claims the host through a conditional update of its row and brokers it a
+fresh instance-bound credential. A host whose job failed, or that nobody claims, powers off.
 
-Cleanup runs every five minutes. A registered `ddb-v1` runner is checked by its exact
+Cleanup runs every five minutes. A registered `ddb-v1` or `ddb-v2` runner is checked by its exact
 GitHub runner id, and one with no row is reaped after its lease through a conditional
 `State=reaping` claim on that row, so a bootstrap arriving at the same moment finds the row
 taken and does not start the service. A missing row beside evidence that the runner did
@@ -722,7 +726,8 @@ and the instance is held to the age ceiling rather than reaped. Instances launch
 existed keep the roster-based rules: a renewed lease or a `RunnerSeenAt` stamp holds them
 on roster absence, and a readable roster that has never listed one expires its lease.
 Cleanup also reaps stalled launches, terminates jobs running for more than three hours,
-and counts queued jobs to retry scale-up.
+counts queued jobs to retry scale-up, and deregisters, then terminates, an idle registered
+runner whose architecture has nothing queued.
 
 A runner instance lives at most **13 hours 30 minutes**, checked on the five-minute poll,
 so the observed maximum is that plus one interval. Past 12 hours it drains:

@@ -163,6 +163,15 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertNotIn('parameter/github-runner/*', self.controller)
         self.assertNotIn('arn:aws:logs:*:*:*', self.controller)
 
+    def test_controller_registration_writes_stay_on_the_registration_table(self):
+        rows = [s for s in statements(self.controller) if 'dynamodb:' in s]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(actions(rows[0]), {'dynamodb:GetItem', 'dynamodb:PutItem',
+                                            'dynamodb:UpdateItem'})
+        self.assertRegex(rows[0], r'Resource\s*=\s*aws_dynamodb_table\.runner_registration\[0\]\.arn')
+        producer = block('runner-bootstrap.tf', 'aws_iam_role_policy', 'runner_bootstrap')
+        self.assertNotIn('dynamodb:UpdateItem', producer)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
