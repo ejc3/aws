@@ -182,11 +182,22 @@ it is suppressed while GitHub is unreachable, where `online` is 0 by constructio
 Advanced tier, base64+gzip — too big for Lambda's 4 KB env limit). On boot it sets up the box
 (btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads only its controller-
 brokered **registration token** from `/github-runner/bootstrap/<instance-id>`, and runs
-`config.sh --url https://github.com/ejc3/fcvm --token <reg> --name runner-<instance-id>
---labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate`. The controller
-uses the PAT to call GitHub's registration-token endpoint; bootstrap has no PAT fallback.
-Xtrace is switched off before reading the short-lived token. Older boots may still be
-running the prior PAT-reading script until the separately verified drain.
+`config.sh --url https://github.com/ejc3/fcvm --name runner-<instance-id>
+--labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate` as
+`ubuntu`. The controller uses the PAT to call GitHub's registration-token endpoint; bootstrap
+has no PAT fallback. Older boots may still be running the prior PAT-reading script until the
+separately verified drain.
+
+The token is on no command line. sudo writes the command it runs to `auth.log` and the
+journal as `COMMAND=`, and the job user `ubuntu` reads both through `adm`; `ps` shows every
+process's arguments to every user. So `sudo -u ubuntu bash -c` takes the token on stdin, and
+that unprivileged shell hands it to `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, which the
+runner (2.337.0, `CommandSettings`) reads when `--token` is absent and removes from its own
+environment. sudo logs the literal `$(cat)` in its place, and it still resets the
+environment, so the runner's `.env` and `.path` are what they were. Xtrace is off wherever a
+token is held: the IMDSv2 session tokens in user data, which echoes the MAC, ENI, region and
+instance id they fetch instead, and the session token and registration token in
+`fcvm-runner-job`, even when it runs under `bash -x` or `SHELLOPTS=xtrace`.
 
 After `config.sh`, bootstrap reads the identity GitHub assigned from
 `/opt/actions-runner/.runner` (camelCase keys: `agentName` must equal `runner-<instance-id>`
@@ -291,6 +302,13 @@ a row that still names the previous runner, a matching identity and a successful
 `after` starts the next-job unit only for `SERVICE_RESULT=success`. The fake `config.sh`
 writes `.runner` in the runner's real camelCase shape and refuses to configure over a previous
 registration's files.
+
+The fakes hand out canary tokens, and the `sudo` stub records its arguments, resets the
+environment and refuses `VAR=value`, `-E` and `--preserve-env`. Registration runs untraced,
+under `bash -x` and under `SHELLOPTS=xtrace`; each IMDS block of user data runs traced and
+untraced. In every run no canary reaches stdout, stderr, sudo's arguments or `config.sh`'s
+arguments, `config.sh` still receives the registration token, and tracing ends as it began.
+The same IMDS block with its pause removed does trace its token, so that check can fail.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`). Its first pass over the fleet is EC2-only and terminates every instance

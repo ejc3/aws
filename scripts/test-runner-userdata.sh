@@ -247,6 +247,38 @@ else
     bad "registration credential can reach cloud-init xtrace (set+x=$TRACE_OFF_LINE token=$TOKEN_LINE)"
 fi
 
+# sudo writes the command line it runs to auth.log and the journal as COMMAND=, and
+# the job user reads both through adm; ps shows every process's arguments to every
+# user. So the credential is on no command line: it crosses sudo on stdin and
+# reaches config.sh in its environment, while sudo keeps env_reset.
+# Comments may name the flags; only code counts.
+USERDATA_CODE=$(grep -v '^[[:space:]]*#' "$USERDATA")
+# shellcheck disable=SC2016 # The patterns match literal text in the user data.
+if ! grep -q -- '--token' <<<"$USERDATA_CODE" \
+   && ! grep -Eq -- '--preserve-env|sudo( [^|]*)? -E( |$)' <<<"$USERDATA_CODE" \
+   && grep -qF 'sudo -u ubuntu bash -c '\''ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --url' <<<"$USERDATA_CODE" \
+   && grep -qF -- '--disableupdate <<<"$REG_TOKEN"' <<<"$USERDATA_CODE"; then
+    ok "the registration credential reaches config.sh on stdin and in its environment, on no command line"
+else
+    bad "the registration credential can reach sudo's COMMAND= log or ps"
+fi
+
+# Every IMDSv2 session-token request and decrypted parameter read runs with xtrace
+# paused in the shell that makes it. fcvm-runner-job is a process of its own, so a
+# pause earlier in user data does not count for it.
+UNPAUSED=$(awk '
+  /<<'\''RUNNER_JOB'\''$/ { paused = 0; next }
+  /^[[:space:]]*(\{ )?set \+x(; \} 2>\/dev\/null)?$/ { paused = 1 }
+  /^[[:space:]]*if \[ -n "\$[A-Z_]+XTRACE" \]; then set -x; fi$/ { paused = 0 }
+  /latest\/api\/token|--with-decryption/ && !paused { print NR ": " $0 }
+' "$USERDATA")
+if [ -z "$UNPAUSED" ] && grep -q 'latest/api/token' "$USERDATA" \
+   && grep -q -- '--with-decryption' "$USERDATA"; then
+    ok "every IMDSv2 token request and decrypted read runs with xtrace paused in its own shell"
+else
+    bad "a token is fetched while xtrace can be on: $(printf '%s' "$UNPAUSED" | tr '\n' ' ')"
+fi
+
 if ! grep -Eq '^PAT=|ssm get-parameter --name /github-runner/pat|Authorization: token' "$USERDATA" \
    && grep -q -- '--ephemeral' "$USERDATA" \
    && grep -q -- '--disableupdate' "$USERDATA" \
@@ -446,7 +478,13 @@ sed 's/${local\.runner_registration_table_name}/github-runner-registration/g' "$
   | sed "s|/etc/systemd/system|$REG_TMP/systemd|g; s|^cd /opt/actions-runner\$|cd \"$REG_TMP/work\"|" \
   > "$REG_BLOCK"
 
-cat > "$REG_TMP/bin/aws" <<'FAKE_AWS'
+# Fake credentials. Each is a canary: it may reach the fake that checks it, and
+# nothing else -- not stdout, not stderr, and no command line.
+REG_CANARY=fake-registration-canary-5d2e81
+IMDS_CANARY=fake-imds-session-canary-7c41a9
+with_canaries() { sed "s/@REG_CANARY@/$REG_CANARY/g; s/@IMDS_CANARY@/$IMDS_CANARY/g"; }
+
+with_canaries > "$REG_TMP/bin/aws" <<'FAKE_AWS'
 #!/bin/bash
 set -eu
 if [ "$1 $2" = "ssm get-parameter" ]; then
@@ -460,7 +498,7 @@ if [ "$1 $2" = "ssm get-parameter" ]; then
     if [ "$FAKE_SCENARIO" = credential_late ] && [ "$(grep -c '^token-read$' "$JOURNAL")" = 1 ]; then
         exit 1
     fi
-    echo registration-token
+    echo @REG_CANARY@
 elif [ "$1 $2" = "ssm delete-parameter" ]; then
     [ "$AWS_MAX_ATTEMPTS" = 1 ] || exit 95
     case " $* " in
@@ -524,13 +562,17 @@ else
 fi
 FAKE_AWS
 
-cat > "$REG_TMP/bin/curl" <<'FAKE_CURL'
+with_canaries > "$REG_TMP/bin/curl" <<'FAKE_CURL'
 #!/bin/bash
 set -eu
 case "$*" in
   *latest/api/token*)
-    echo imdsv2-token ;;
+    echo @IMDS_CANARY@ ;;
   *dynamic/instance-identity/document*)
+    case " $* " in
+      *" -H X-aws-ec2-metadata-token: @IMDS_CANARY@ "*) : ;;
+      *) echo "identity document read without the session token" >&2; exit 91 ;;
+    esac
     if [ "$FAKE_SCENARIO" = wrong_region ]; then
         printf '%s\n' '{"accountId":"928413605543","region":"us-east-1"}'
         exit 0
@@ -541,19 +583,35 @@ case "$*" in
 esac
 FAKE_CURL
 
+# sudo writes the command line it runs to auth.log and the journal as COMMAND=, so
+# the stub records exactly that. It also does what env_reset does -- nothing from the
+# caller's environment reaches the command, SHELLOPTS included -- and refuses the
+# forms that carry the caller's variables across: VAR=value, -E and --preserve-env.
+# Only the harness's JOURNAL and FAKE_* pass, so the fakes behind it can report.
 cat > "$REG_TMP/bin/sudo" <<'FAKE_SUDO'
 #!/bin/bash
 set -eu
-if [ "${1:-}" = -u ]; then shift 2; fi
-exec "$@"
+printf '%s\n' "$*" >> "$JOURNAL.sudo"
+case " $* " in
+  *" -E "*|*" --preserve-env"*) echo "sudo keeps the caller's environment" >&2; exit 96 ;;
+esac
+[ "${1:-}" = -u ] || { echo "sudo does not name the user to run as" >&2; exit 96; }
+shift 2
+case "${1:-}" in
+  -*|*=*) echo "sudo keeps the caller's environment" >&2; exit 96 ;;
+esac
+exec env -i PATH="$PATH" JOURNAL="$JOURNAL" FAKE_SCENARIO="$FAKE_SCENARIO" \
+  FAKE_AGENT_ID="$FAKE_AGENT_ID" "$@"
 FAKE_SUDO
 
 # The runner writes `.runner` with camelCase keys (RunnerSettings goes
 # through VssCamelCasePropertyNamesContractResolver); the fake writes the
 # same shape, so a bootstrap that reads the wrong key fails here.
-cat > "$REG_TMP/work/config.sh" <<'FAKE_CONFIG'
+with_canaries > "$REG_TMP/work/config.sh" <<'FAKE_CONFIG'
 #!/bin/bash
 set -eu
+# ps shows these arguments to every user on the host.
+printf '%s\n' "$*" >> "$JOURNAL.config-args"
 case " $* " in
   *" --ephemeral "*) : ;;
   *) echo "registration is not ephemeral" >&2; exit 92 ;;
@@ -563,6 +621,23 @@ case " $* " in
   *) echo "registration permits an unverified wrapper update" >&2; exit 92 ;;
 esac
 echo config >> "$JOURNAL"
+# Runner 2.337.0 takes the token from --token or, when that is absent, from
+# ACTIONS_RUNNER_INPUT_TOKEN (CommandSettings.GetArg); unattended configuration
+# with neither fails. The name comes from --name, as the real runner's does.
+TOKEN=${ACTIONS_RUNNER_INPUT_TOKEN:-}
+NAME=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --token) TOKEN=$2; shift ;;
+    --name) NAME=$2; shift ;;
+  esac
+  shift
+done
+if [ "$TOKEN" != @REG_CANARY@ ]; then
+    echo "config.sh did not receive the registration credential" >&2
+    exit 94
+fi
+echo token-received >> "$JOURNAL"
 # The real config.sh refuses to configure over a previous registration's files.
 if [ -e .runner ] || [ -e .credentials ] || [ -e .credentials_rsaparams ]; then
     echo "runner is already configured" >&2
@@ -574,7 +649,7 @@ case "$FAKE_SCENARIO" in
     printf '{"agentId":%s,"agentName":"runner-someone-else"}\n' "$FAKE_AGENT_ID" > .runner
     exit 0 ;;
 esac
-printf '{"agentId":%s,"agentName":"runner-%s","poolId":1,"poolName":"Default","serverUrl":"https://pipelines.actions.githubusercontent.com/x","gitHubUrl":"https://github.com/ejc3/fcvm","workFolder":"_work"}\n' "$FAKE_AGENT_ID" "$INSTANCE_ID" > .runner
+printf '{"agentId":%s,"agentName":"%s","poolId":1,"poolName":"Default","serverUrl":"https://pipelines.actions.githubusercontent.com/x","gitHubUrl":"https://github.com/ejc3/fcvm","workFolder":"_work"}\n' "$FAKE_AGENT_ID" "$NAME" > .runner
 FAKE_CONFIG
 
 cat > "$REG_TMP/work/svc.sh" <<'FAKE_SVC'
@@ -609,10 +684,17 @@ chmod +x "$REG_TMP/bin/aws" "$REG_TMP/bin/curl" "$REG_TMP/bin/sudo" \
   "$REG_TMP/bin/systemctl" "$REG_TMP/bin/sleep" \
   "$REG_TMP/work/config.sh" "$REG_TMP/work/svc.sh" "$REG_BLOCK"
 
+REG_TRACE=
 registration_case() { # scenario expected_rc expected_service expected_delete [first|next]
     local scenario=$1 want_rc=$2 want_service=$3 want_delete=$4 mode=${5:-first} rc=0
-    local journal="$REG_TMP/$scenario.log" agent_id=77
-    : > "$journal"
+    local journal="$REG_TMP/$scenario.log" agent_id=77 output="$REG_TMP/$scenario.output"
+    local label="$scenario${REG_TRACE:+ under $REG_TRACE}"
+    local run=(bash)
+    case "$REG_TRACE" in
+      "bash -x") run=(bash -x) ;;
+      SHELLOPTS=xtrace) run=(env SHELLOPTS=xtrace bash) ;;
+    esac
+    : > "$journal"; : > "$journal.sudo"; : > "$journal.config-args"
     rm -rf "$REG_TMP/work/.runner" "$REG_TMP/work/.credentials" \
       "$REG_TMP/work/.credentials_rsaparams" "$REG_TMP/work/.service" "$REG_TMP/systemd"
     if [ "$mode" = next ]; then
@@ -632,27 +714,54 @@ registration_case() { # scenario expected_rc expected_service expected_delete [f
       FAKE_SCENARIO="$scenario" FAKE_MODE="$mode" FAKE_AGENT_ID="$agent_id" \
       JOURNAL="$journal" FAKE_SYSTEMD_DIR="$REG_TMP/systemd" \
       INSTANCE_ID=i-test RUNNER_LABEL=ARM64 REGION=us-west-1 \
-        bash "$REG_BLOCK" "$mode"
-    ) >"$REG_TMP/$scenario.output" 2>&1 || rc=$?
+        "${run[@]}" "$REG_BLOCK" "$mode"
+    ) >"$output" 2>&1 || rc=$?
     if [ "$mode" = next ] && grep -q '^svc:install' "$journal"; then
-        bad "$scenario: a next job reinstalled the runner service"
+        bad "$label: a next job reinstalled the runner service"
         return
     fi
-    if grep -q 'registration-token' "$REG_TMP/$scenario.output"; then
-        bad "$scenario: registration credential leaked to bootstrap output"
+    # stdout and stderr together, as cloud-init's log and the journal take them.
+    if grep -qF -e "$REG_CANARY" -e "$IMDS_CANARY" "$output"; then
+        bad "$label: a credential reached stdout or stderr"
+        return
+    fi
+    if grep -qF -e "$REG_CANARY" -e "$IMDS_CANARY" "$journal.sudo"; then
+        bad "$label: a credential is on sudo's command line, which sudo logs as COMMAND="
+        return
+    fi
+    if grep -qF -e "$REG_CANARY" -e "$IMDS_CANARY" "$journal.config-args"; then
+        bad "$label: a credential is on config.sh's command line, which ps shows every user"
+        return
+    fi
+    if grep -q '^config$' "$journal"; then
+        if ! grep -q '^token-received$' "$journal"; then
+            bad "$label: config.sh ran without the registration credential"
+            return
+        fi
+        if [ "$(cut -d' ' -f1-2 "$journal.sudo" | sort -u)" != "-u ubuntu" ]; then
+            bad "$label: config.sh did not run as ubuntu through sudo ($(tr '\n' ' ' < "$journal.sudo"))"
+            return
+        fi
+    fi
+    if [ -z "$REG_TRACE" ] && grep -q '^+' "$output"; then
+        bad "$label: fcvm-runner-job turned xtrace on for a caller that had it off"
+        return
+    fi
+    if [ -n "$REG_TRACE" ] && [ "$rc" = 0 ] && ! grep -qx '+ ./svc.sh start' "$output"; then
+        bad "$label: xtrace did not resume once the credential was unset"
         return
     fi
     if [ "$rc" != 0 ] && ! grep -q '^systemctl:--no-block poweroff$' "$journal"; then
-        bad "$scenario: failed bootstrap did not request disposable-host shutdown"
+        bad "$label: failed bootstrap did not request disposable-host shutdown"
         return
     fi
     if [ "$rc" = 0 ] && grep -q '^systemctl:--no-block poweroff$' "$journal"; then
-        bad "$scenario: successful bootstrap powered off before its job"
+        bad "$label: successful bootstrap powered off before its job"
         return
     fi
     if { [ "$scenario" = credential_missing ] || [ "$scenario" = next_no_token ]; } \
        && [ "$(grep -c '^token-read$' "$journal")" != 36 ]; then
-        bad "$scenario: credential polling exceeded or missed the bounded retry gate"
+        bad "$label: credential polling exceeded or missed the bounded retry gate"
         return
     fi
     local service=0 deleted=0
@@ -663,15 +772,15 @@ registration_case() { # scenario expected_rc expected_service expected_delete [f
         delete_line=$(grep -n '^delete$' "$journal" | head -1 | cut -d: -f1)
         start_line=$(grep -n '^svc:start$' "$journal" | head -1 | cut -d: -f1)
         if [ -z "$delete_line" ] || [ "$delete_line" -ge "$start_line" ]; then
-            bad "$scenario: service started before credential deletion"
+            bad "$label: service started before credential deletion"
             return
         fi
     fi
     if [ "$rc" = "$want_rc" ] && [ "$service" = "$want_service" ] \
        && [ "$deleted" = "$want_delete" ]; then
-        ok "$scenario (rc=$rc service=$service delete=$deleted)"
+        ok "$label (rc=$rc service=$service delete=$deleted)"
     else
-        bad "$scenario: rc=$rc service=$service delete=$deleted, wanted $want_rc/$want_service/$want_delete ($(tr '\n' ' ' < "$journal"))"
+        bad "$label: rc=$rc service=$service delete=$deleted, wanted $want_rc/$want_service/$want_delete ($(tr '\n' ' ' < "$journal"))"
     fi
 }
 
@@ -705,6 +814,19 @@ registration_case next_invalid_identity 1 0 1 next
 registration_case next_row_moved        1 0 1 next
 registration_case next_not_registered   1 0 1 next
 
+echo "registration with xtrace on:"
+# fcvm-runner-job pauses tracing around both of its secrets whatever its caller did:
+# bash -x traces the script itself, SHELLOPTS=xtrace every bash beneath it too.
+for REG_TRACE in "bash -x" SHELLOPTS=xtrace; do
+    registration_case bootstrap           0 1 1
+    registration_case credential_late     0 1 1
+    registration_case config_failure      1 0 1
+    registration_case wrong_region        1 0 1
+    registration_case next_token          0 1 1 next
+    registration_case next_delete_failure 1 0 0 next
+done
+REG_TRACE=
+
 echo "after a job:"
 after_case() { # service_result expected_systemctl_call
     local result=$1 want=$2 journal="$REG_TMP/after-${1:-unset}.log"
@@ -721,6 +843,108 @@ after_case success   "--no-block start fcvm-runner-next.service"
 after_case exit-code "--no-block poweroff"
 after_case signal    "--no-block poweroff"
 after_case ""        "--no-block poweroff"
+
+# --- 7. IMDSv2 session tokens in user data. User data runs under set -x, and
+#        cloud-init copies xtrace into its log, the journal and the serial console.
+#        Run each block that holds a token as written, with a canary token, traced
+#        and untraced.
+echo "IMDS session tokens in user data:"
+IMDS_TMP="$REG_TMP/imds"
+mkdir -p "$IMDS_TMP/bin"
+with_canaries > "$IMDS_TMP/bin/curl" <<'FAKE_IMDS_CURL'
+#!/bin/bash
+set -eu
+case " $* " in
+  *" -X PUT http://169.254.169.254/latest/api/token "*)
+    printf '%s' @IMDS_CANARY@
+    exit 0 ;;
+  *" -H X-aws-ec2-metadata-token: @IMDS_CANARY@ "*)
+    echo header >> "$IMDS_JOURNAL" ;;
+  *) echo "metadata read without the session token" >&2; exit 97 ;;
+esac
+case "$*" in
+  */latest/meta-data/mac) echo 0a:1b:2c:3d:4e:5f ;;
+  */latest/meta-data/network/interfaces/macs/0a:1b:2c:3d:4e:5f/interface-id) echo eni-0fake ;;
+  */latest/meta-data/placement/region) echo us-west-1 ;;
+  */latest/meta-data/instance-id) echo i-0fake ;;
+  *) echo "unexpected metadata path" >&2; exit 97 ;;
+esac
+FAKE_IMDS_CURL
+chmod +x "$IMDS_TMP/bin/curl"
+
+imds_block() { # n: the nth block of user data that pauses xtrace for an IMDS token
+    awk -v n="$1" '
+      /^case \$- in \*x\*\) IMDS_XTRACE=1 ;; \*\) IMDS_XTRACE= ;; esac$/ { c++ }
+      c == n { print }
+      c == n && /^if \[ -n "\$IMDS_XTRACE" \]; then set -x; fi$/ { exit }
+    ' "$USERDATA"
+}
+
+imds_case() { # n trace(on|off) expected_log_line token_variable
+    local n=$1 trace=$2 want=$3 var=$4 dir="$IMDS_TMP/$1-$2" rc=0 block
+    local label="IMDS block $n ($var), xtrace $trace"
+    block=$(imds_block "$n")
+    if ! printf '%s\n' "$block" | grep -q "^$var=\$(curl -s -X PUT "; then
+        bad "$label: no block that pauses xtrace fetches $var"
+        return
+    fi
+    mkdir -p "$dir"; : > "$dir/journal"
+    {
+        echo 'set -euo pipefail'
+        if [ "$trace" = on ]; then echo 'set -x'; fi
+        printf '%s\n' "$block"
+        echo ': imds-trace-sentinel'
+        # shellcheck disable=SC2016 # The generated script expands these, not this one.
+        echo 'if [ -n "${TOKEN6+set}${TOKEN+set}" ]; then echo "an IMDS token outlived its block"; exit 98; fi'
+    } > "$dir/run.sh"
+    ( PATH="$IMDS_TMP/bin:$PATH" IMDS_JOURNAL="$dir/journal" bash "$dir/run.sh" ) \
+        > "$dir/stdout" 2> "$dir/stderr" || rc=$?
+    if [ "$rc" != 0 ]; then
+        bad "$label: rc=$rc ($(tr '\n' ' ' < "$dir/stdout"))"
+        return
+    fi
+    if grep -qF "$IMDS_CANARY" "$dir/stdout" "$dir/stderr"; then
+        bad "$label: the session token reached stdout or stderr"
+        return
+    fi
+    if ! grep -q '^header$' "$dir/journal"; then
+        bad "$label: metadata was never read with the session token"
+        return
+    fi
+    if ! grep -qxF "$want" "$dir/stdout"; then
+        bad "$label: the values the trace used to show are not logged"
+        return
+    fi
+    if [ "$trace" = on ] && ! grep -qx '+ : imds-trace-sentinel' "$dir/stderr"; then
+        bad "$label: xtrace did not resume after the block"
+        return
+    fi
+    if [ "$trace" = off ] && grep -q '^+' "$dir/stderr"; then
+        bad "$label: the block turned xtrace on for a caller that had it off"
+        return
+    fi
+    ok "$label: token untraced and unset, values logged, tracing as before"
+}
+IMDS_LOG1='IMDS: MAC=0a:1b:2c:3d:4e:5f ENI_ID=eni-0fake REGION=us-west-1'
+IMDS_LOG2='IMDS: INSTANCE_ID=i-0fake'
+imds_case 1 on  "$IMDS_LOG1" TOKEN6
+imds_case 1 off "$IMDS_LOG1" TOKEN6
+imds_case 2 on  "$IMDS_LOG2" TOKEN
+imds_case 2 off "$IMDS_LOG2" TOKEN
+
+# A check that cannot fail proves nothing: the same block without its pause must
+# put the token exactly where the check above looks.
+{
+    echo 'set -euxo pipefail'
+    imds_block 1 | grep -vxF '{ set +x; } 2>/dev/null'
+} > "$IMDS_TMP/unpaused.sh"
+PATH="$IMDS_TMP/bin:$PATH" IMDS_JOURNAL=/dev/null bash "$IMDS_TMP/unpaused.sh" \
+    > /dev/null 2> "$IMDS_TMP/unpaused.stderr" || true
+if grep -qF "$IMDS_CANARY" "$IMDS_TMP/unpaused.stderr"; then
+    ok "without its pause the same block traces the token, so that check can fail"
+else
+    bad "the IMDS leak check cannot see a traced token"
+fi
 
 echo
 echo "passed=$PASS failed=$FAIL"

@@ -1749,10 +1749,19 @@ have_global_v6() {
   return 1
 }
 
+# An IMDSv2 session token must not reach xtrace, which cloud-init copies into its log,
+# the journal and the serial console: not its assignment, and not the curl header
+# lines that carry it. Tracing pauses while a token is held and resumes only if the
+# caller had it on; the values the trace used to show are echoed instead.
+case $- in *x*) IMDS_XTRACE=1 ;; *) IMDS_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
 ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
+unset TOKEN6
+echo "IMDS: MAC=$MAC ENI_ID=$ENI_ID REGION=$REGION"
+if [ -n "$IMDS_XTRACE" ]; then set -x; fi
 
 # Idempotent: only add an address if the ENI has none, and retry the API rather
 # than letting one throttled call decide the fate of the instance.
@@ -1807,8 +1816,13 @@ chmod 700 /home/ubuntu/.ssh
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 
 snap start amazon-ssm-agent || true
+case $- in *x*) IMDS_XTRACE=1 ;; *) IMDS_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+echo "IMDS: INSTANCE_ID=$INSTANCE_ID"
+if [ -n "$IMDS_XTRACE" ]; then set -x; fi
 ARCH=$(uname -m)
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -1932,10 +1946,17 @@ case "$MODE" in
   *) echo "FATAL: unknown fcvm-runner-job mode $MODE"; exit 1 ;;
 esac
 
+# This script holds two secrets: an IMDSv2 session token here, and the registration
+# credential below. Neither reaches xtrace, even when the script runs under bash -x or
+# with SHELLOPTS=xtrace; tracing resumes as the caller had it once each is unset.
+case $- in *x*) JOB_XTRACE=1 ;; *) JOB_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
   -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
 IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
   http://169.254.169.254/latest/dynamic/instance-identity/document)
+unset TOKEN
+if [ -n "$JOB_XTRACE" ]; then set -x; fi
 ACCOUNT_ID=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
   '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
 IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
@@ -1973,6 +1994,8 @@ fi
 
 # The controller can only tag a credential after RunInstances returns the id,
 # and brokers a next job's only while this host can still be waiting for it.
+case $- in *x*) JOB_XTRACE=1 ;; *) JOB_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 BOOTSTRAP_DEADLINE=$((SECONDS + 180))
 for BOOTSTRAP_ATTEMPT in $(seq 1 36); do
   if [ "$SECONDS" -ge "$BOOTSTRAP_DEADLINE" ]; then break; fi
@@ -1987,9 +2010,16 @@ if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "None" ]; then
   echo "FATAL: no instance-bound registration credential; refusing to register this runner"
   exit 1
 fi
-sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-  --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate
+# The credential goes on no command line. sudo logs the command it runs as COMMAND=
+# in auth.log and the journal, which the job user reads through adm, and ps shows
+# every process's arguments to every user. So it crosses sudo on stdin, and the
+# unprivileged shell hands it to config.sh as ACTIONS_RUNNER_INPUT_TOKEN, which the
+# runner reads when --token is absent and removes from its own environment. sudo
+# still resets the environment, so the runner's .env and .path do not change.
+sudo -u ubuntu bash -c 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --url https://github.com/ejc3/fcvm "$@"' config \
+  --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate <<<"$REG_TOKEN"
 unset REG_TOKEN
+if [ -n "$JOB_XTRACE" ]; then set -x; fi
 
 # `.runner` is the identity GitHub assigned, written by config.sh with
 # camelCase keys (the runner serialises RunnerSettings through
@@ -2078,9 +2108,11 @@ EOF
   # EC2 receives the script above without its whole-line comments. They stay here for
   # readers; shipped, they no longer fit. Once the next-job loop moved into the script,
   # Terraform's base64gzip of it measured about 8,740 characters against the 8,192 the
-  # Advanced tier allows, and about 6,436 without comments. A `#!` line is not a comment
-  # and is kept. No line in the script carries data that starts with `#`, and
-  # scripts/test-runner-userdata.sh checks that the stripped document still parses.
+  # Advanced tier allows, and about 6,436 without comments. Pausing xtrace around the
+  # IMDSv2 and registration tokens took the stripped script to about 6,624. A `#!` line
+  # is not a comment and is kept. No line in the script carries data that starts with
+  # `#`, and scripts/test-runner-userdata.sh checks that the stripped document still
+  # parses.
   runner_user_data_document = join("\n", [
     for line in split("\n", local.runner_user_data) : line
     if !startswith(trimspace(line), "#") || startswith(line, "#!")
@@ -2099,7 +2131,7 @@ EOF
 # base64gzip brought it to 4,712; the registration claim took it to about 6,100. The
 # next-job loop took the commented script past the limit again, so the value is now
 # base64gzip of local.runner_user_data_document, the script without its whole-line
-# comments: about 6,400 characters. What reads back from SSM has no comments.
+# comments: about 6,600 characters. What reads back from SSM has no comments.
 #
 # Safe because BOTH decoders are already in the path, and neither is new behaviour:
 #   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
