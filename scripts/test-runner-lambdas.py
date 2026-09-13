@@ -1925,6 +1925,18 @@ def case_api_gateway_sends_deliveries_to_the_front():
     assert "runner_webhook[0].invoke_arn" not in integration, integration
 
 
+def case_api_gateway_cannot_invoke_the_webhook_itself():
+    """Only the front answers API Gateway; the webhook is reachable by IAM-authed invokes alone."""
+    for path in (TF_FILE, FRONT_FILE):
+        permissions = re.findall(r'^resource "aws_lambda_permission" "[^"]+" \{\n.*?^\}',
+                                 path.read_text(), re.M | re.S)
+        for permission in permissions:
+            if "apigateway.amazonaws.com" in permission:
+                assert "aws_lambda_function.runner_webhook_front[0].function_name" in permission, \
+                    (path.name, permission)
+    assert not re.search(r'^resource "aws_lambda_permission" "runner_webhook" \{', TF_FILE.read_text(), re.M)
+
+
 def case_a_queued_job_claims_a_warm_host_before_launching_metal():
     ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
     dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])

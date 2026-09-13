@@ -1576,14 +1576,11 @@ resource "aws_apigatewayv2_route" "runner_webhook" {
   target    = "integrations/${aws_apigatewayv2_integration.runner_webhook[0].id}"
 }
 
-resource "aws_lambda_permission" "runner_webhook" {
-  count         = var.enable_github_runner ? 1 : 0
-  statement_id  = "AllowAPIGateway"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.runner_webhook[0].function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.runner_webhook[0].execution_arn}/*/*"
-}
+# API Gateway has no permission to invoke the webhook itself. Deliveries reach it only through
+# github-runner-webhook-front and its delivery alias. The permission that let API Gateway call
+# the webhook directly was removed one apply after the integration moved to the front: in the
+# same apply, its deletion and the integration update have no ordering between them, and a
+# delivery could have met the old integration without the permission.
 
 # ============================================
 # Variables
