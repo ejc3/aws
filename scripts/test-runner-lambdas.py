@@ -1937,6 +1937,71 @@ def case_api_gateway_cannot_invoke_the_webhook_itself():
     assert not re.search(r'^resource "aws_lambda_permission" "runner_webhook" \{', TF_FILE.read_text(), re.M)
 
 
+# --------------------------------------------------------------------------
+# Cases: the poll's demand, less what will absorb it
+# --------------------------------------------------------------------------
+
+def poll_request(queued_jobs, arch="arm64"):
+    """The cleanup poll's direct invoke: its whole queued demand for one architecture."""
+    labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+    return {"body": json.dumps({"action": "queued", "workflow_job": {"labels": labels},
+                                "queued_jobs": queued_jobs,
+                                "launch_count": min(queued_jobs, 4)}),
+            "headers": {}}
+
+
+def case_a_queued_job_whose_runner_is_booting_gets_no_second_host():
+    """The double launch: the poll counted the job its own launch is booting for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(1), None)
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "1 starting or idle arm64 runner(s) already cover the 1 queued job(s)", result
+
+
+def case_two_queued_jobs_with_one_booting_runner_get_one_launch():
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "running", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(2), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_an_idle_runner_absorbs_one_queued_job():
+    for queued, launches in ((1, 0), (2, 1)):
+        ec2 = FakeEC2([instance("i-idle", "c7gd.metal", "running", 60, arch="arm64")])
+        github = FakeGitHub(runners=[{"id": 5, "name": "runner-i-idle", "status": "online", "busy": False}])
+        webhook(ec2, github=github)["handler"](poll_request(queued), None)
+        assert len(launched_types(ec2)) == launches, (queued, launched_types(ec2))
+
+
+def case_a_starting_host_past_its_timeout_no_longer_absorbs():
+    """A launch pending past BOOT_GRACE_MINUTES, or a claim older than CLAIM_GRACE_MINUTES, covers nothing."""
+    ec2 = FakeEC2([instance("i-stalled", "c7gd.metal", "pending", 16, arch="arm64")])
+    webhook(ec2)["handler"](poll_request(1), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    for claimed_minutes_ago, launches in ((1, 0), (6, 1)):
+        ec2 = FakeEC2([stream_host()])
+        dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 60,
+                                            claimed_at=NOW_EPOCH - claimed_minutes_ago * 60)])
+        webhook(ec2, dynamodb=dynamodb)["handler"](poll_request(1), None)
+        assert len(launched_types(ec2)) == launches, (claimed_minutes_ago, launched_types(ec2))
+
+
+def case_a_waiting_warm_host_is_claimed_for_the_poll_not_subtracted():
+    """Subtracted, it would never be claimed and would power off while its job waited a poll."""
+    ec2, ssm = FakeEC2([stream_host()]), FakeSSM()
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](poll_request(1), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert launched_types(ec2) == [], launched_types(ec2)
+
+
+def case_a_single_delivery_is_not_cut_by_runners_booting_for_other_jobs():
+    """One queued delivery says nothing about which job a booting runner is for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](queued_event(), invoked_as(DELIVERY_ARN))
+    assert len(launched_types(ec2)) == 1, (result, launched_types(ec2))
+
+
 def case_a_queued_job_claims_a_warm_host_before_launching_metal():
     ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
     dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])

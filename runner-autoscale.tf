@@ -1223,6 +1223,26 @@ data "archive_file" "runner_webhook" {
                   requested = max(1, min(int(payload.get('launch_count', 1)), max_runners))
               except (TypeError, ValueError):
                   requested = 1
+          # The poll's queued_jobs is every queued job it found for the architecture,
+          # including jobs something is already on its way to take. Launching for all
+          # of them put a second host on a job whose runner was still booting whenever
+          # the pool had room. So the poll's request is cut to what nothing will
+          # absorb: runners launched but not yet registered and inside
+          # BOOT_GRACE_MINUTES, warm hosts claimed inside CLAIM_GRACE_MINUTES
+          # (get_capacity counts both as booting), and registered idle runners. A warm
+          # host still waiting to be claimed is not subtracted: it takes a job only
+          # once claimed, and the loop below claims it before launching anything. An
+          # unreadable roster reports none of these, so nothing is cut then. Only a
+          # request carrying the poll's count is cut: any other request is one job,
+          # and a runner already starting or idle may be there for a different one.
+          if not public and not claim_only and 'queued_jobs' in payload:
+              absorbing = capacity['booting'] + capacity['idle']
+              requested = min(requested, max(queued_jobs - absorbing, 0))
+              if requested == 0:
+                  detail = (f'{absorbing} starting or idle {arch} runner(s) already cover '
+                            f'the {queued_jobs} queued job(s)')
+                  emit_decision(arch, queued_jobs, capacity, max_runners, 'covered', detail)
+                  return {'statusCode': 200, 'body': detail}
           # Slots are bounded by the healthy-capacity cap, checked >= 1 above. A
           # warm host fills a slot first: it serves the job without a cold boot and
           # adds no instance, so the instance ceiling bounds launches alone. A claim
@@ -3855,9 +3875,10 @@ data "archive_file" "runner_cleanup" {
                       queued_jobs = demand[arch]
                       labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
                       # ONE invoke per architecture, carrying the whole deficit as
-                      # launch_count and the raw demand as queued_jobs (the latter
-                      # rides into the webhook's decision record). The webhook
-                      # launches launch_count runners inside a single invocation,
+                      # launch_count and the raw demand as queued_jobs. The webhook
+                      # takes its starting and idle runners off queued_jobs, records
+                      # it in its decision line, and launches at most launch_count
+                      # runners inside a single invocation,
                       # where its own loop count bounds the total - a burst of
                       # single-launch invocations, even serialized by reserved
                       # concurrency 1, can each miss the instance the previous one

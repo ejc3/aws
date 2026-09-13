@@ -619,7 +619,13 @@ one runner per poll used to fill the pool at one runner every five minutes howev
 the queue was, and a burst of single-launch invocations could overshoot the cap, because
 DescribeInstances is eventually consistent and each invocation can miss the instance the
 previous one just launched. Inside one invocation the handler's own loop bounds the total,
-and the webhook Lambda stays the single authority on the cap.
+and the webhook Lambda stays the single authority on the cap. The count the scan sends as
+`queued_jobs` includes jobs a runner is already on its way to take, so the webhook takes
+those runners off it before launching: instances launched in the last 15 minutes that have
+not registered, warm hosts claimed in the last 5 minutes, and registered idle runners. A
+warm host still waiting is claimed for a queued job rather than taken off. Without that, a
+poll that ran while a job's runner was booting put up a second host for the same job
+whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
 ## Controller-first credential migration
