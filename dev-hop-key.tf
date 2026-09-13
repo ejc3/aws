@@ -56,16 +56,19 @@ resource "aws_secretsmanager_secret_version" "dev_hop" {
 locals {
   dev_hop_targets = {
     for k, v in {
-      fcvm-arm = { tag = "fcvm-metal-arm", enabled = var.enable_firecracker_instance, ip = var.enable_firecracker_instance ? aws_eip.firecracker_dev[0].public_ip : "" }
-      fcvm-x86 = { tag = "fcvm-metal-x86", enabled = var.enable_x86_dev_instance, ip = var.enable_x86_dev_instance ? aws_eip.x86_dev[0].public_ip : "" }
-      nextjs   = { tag = "nextjs-dev", enabled = var.enable_nextjs_dev, ip = var.enable_nextjs_dev ? aws_eip.nextjs_dev[0].public_ip : "" }
-      io       = { tag = "io-box", enabled = true, ip = local.io_box_private_ip }
+      fcvm-arm = { tag = "fcvm-metal-arm", user = "ubuntu", enabled = var.enable_firecracker_instance, ip = var.enable_firecracker_instance ? aws_eip.firecracker_dev[0].public_ip : "" }
+      fcvm-x86 = { tag = "fcvm-metal-x86", user = "ubuntu", enabled = var.enable_x86_dev_instance, ip = var.enable_x86_dev_instance ? aws_eip.x86_dev[0].public_ip : "" }
+      nextjs   = { tag = "nextjs-dev", user = "ubuntu", enabled = var.enable_nextjs_dev, ip = var.enable_nextjs_dev ? aws_eip.nextjs_dev[0].public_ip : "" }
+      # Same box as nextjs, but the dolphin-labs checkout lives in ejc3's account, so this hop
+      # logs in as ejc3. nextjs-user-data.tf authorizes the hop key for ejc3 to match.
+      dolphin = { tag = "dolphin-labs", user = "ejc3", enabled = var.enable_nextjs_dev, ip = var.enable_nextjs_dev ? aws_eip.nextjs_dev[0].public_ip : "" }
+      io      = { tag = "io-box", user = "ubuntu", enabled = true, ip = local.io_box_private_ip }
     } : k => v if v.enabled
   }
 
   dev_hop_ssh_config = join("\n", [
     for alias, t in local.dev_hop_targets :
-    "Host ${alias} ${t.tag}\n    HostName ${t.ip}\n    User ubuntu\n    IdentityFile ~/.ssh/dev_hop\n    StrictHostKeyChecking accept-new\n"
+    "Host ${alias} ${t.tag}\n    HostName ${t.ip}\n    User ${t.user}\n    IdentityFile ~/.ssh/dev_hop\n    StrictHostKeyChecking accept-new\n"
   ])
 }
 
@@ -150,5 +153,5 @@ HOP
 
 output "dev_hop_usage" {
   description = "How to hop between dev servers"
-  value       = "from any dev server, as ubuntu: ssh fcvm-arm | ssh fcvm-x86 | ssh nextjs | ssh io"
+  value       = "from any dev server, as ubuntu: ssh fcvm-arm | ssh fcvm-x86 | ssh nextjs | ssh dolphin (ejc3 on nextjs) | ssh io"
 }

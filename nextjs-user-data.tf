@@ -94,6 +94,11 @@ locals {
     # survive. If a key here is no longer wanted, move it to nextjs_retired_user_keys
     # rather than deleting the line, or the append-only installer leaves it authorized.
     ejc3 = [
+      # The fleet hop key, so `ssh dolphin` from the metal boxes lands in ejc3's account where
+      # the dolphin-labs checkout lives. Not an escalation: the same key already reaches ubuntu
+      # on this box, and ubuntu has passwordless sudo here. Dev boxes still hold no key that
+      # reaches a jumpbox.
+      trimspace(tls_private_key.dev_hop.public_key_openssh),
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZTP2GqL7R1kFzSqoI6QLo3j/VacE9MK+tuXmHLCAFn hatch",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILzudSh+XRY5YsnNnAWDTjKXNeZUueYq/etoVXsTrpx4 grok-bot-box-ejc3",
