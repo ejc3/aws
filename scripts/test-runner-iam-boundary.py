@@ -75,7 +75,8 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertEqual(actions(ipv6), {'ec2:AssignIpv6Addresses'})
         self.assertIn(':network-interface/*', ipv6)
         self.assertIn('"aws:ResourceTag/Role" = "github-runner"', ipv6)
-        self.assertIn('"ec2:Subnet" = aws_subnet.runner[0].arn', ipv6)
+        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', ipv6)
+        self.assertNotIn(':subnet/*', ipv6)
 
     def test_launch_pins_ami_owner_purpose_and_exact_network_inputs(self):
         image = statement(self.controller, 'LaunchApprovedRunnerImages')
@@ -83,11 +84,42 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertRegex(image, r'"ec2:Owner"\s*=\s*data.aws_caller_identity.current.account_id')
         self.assertIn('"aws:ResourceTag/Purpose" = "github-runner"', image)
         network = statement(self.controller, 'LaunchExactRunnerNetwork')
-        for reference in ['aws_subnet.runner[0].arn', 'aws_security_group.runner[0].arn',
+        for reference in ['local.runner_launch_subnet_arns', 'aws_security_group.runner[0].arn',
                           ':key-pair/fcvm-ec2']:
             self.assertIn(reference, network)
         self.assertNotIn(':subnet/*', network)
         self.assertNotIn(':security-group/*', network)
+        eni = statement(self.controller, 'LaunchTaggedRunnerENI')
+        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', eni)
+        self.assertNotIn(':subnet/*', eni)
+
+    def test_launch_subnets_are_exactly_the_two_runner_subnets(self):
+        vpc = source('runner-vpc.tf')
+        self.assertRegex(vpc, r'\n  runner_launch_subnets\s*=\s*concat\(aws_subnet\.runner_us_west_1c, aws_subnet\.runner\)\n')
+        self.assertRegex(vpc, r'\n  runner_launch_subnet_arns\s*=\s*local\.runner_launch_subnets\[\*\]\.arn\n')
+        # Changing either address would replace the subnet live runners occupy.
+        original = block('runner-vpc.tf', 'aws_subnet', 'runner')
+        self.assertRegex(original, r'\n  cidr_block\s*=\s*"10\.1\.1\.0/24"\n')
+        self.assertRegex(original, r'\n  availability_zone\s*=\s*"us-west-1a"\n')
+        self.assertRegex(original, r'ipv6_cidr_block\s*=\s*cidrsubnet\(aws_vpc\.runner\[0\]\.ipv6_cidr_block, 8, 1\)')
+        added = block('runner-vpc.tf', 'aws_subnet', 'runner_us_west_1c')
+        self.assertRegex(added, r'\n  cidr_block\s*=\s*"10\.1\.2\.0/24"\n')
+        self.assertRegex(added, r'\n  availability_zone\s*=\s*"us-west-1c"\n')
+        self.assertRegex(added, r'ipv6_cidr_block\s*=\s*cidrsubnet\(aws_vpc\.runner\[0\]\.ipv6_cidr_block, 8, 2\)')
+        self.assertRegex(added, r'assign_ipv6_address_on_creation\s*=\s*true')
+        self.assertRegex(added, r'map_public_ip_on_launch\s*=\s*true')
+        # fcvm's build-ami.sh requires Name=github-runner-subnet to match exactly one subnet.
+        self.assertNotRegex(added, r'Name\s*=\s*"github-runner-subnet"')
+        association = block('runner-vpc.tf', 'aws_route_table_association', 'runner_us_west_1c')
+        self.assertRegex(association, r'subnet_id\s*=\s*aws_subnet\.runner_us_west_1c\[0\]\.id')
+        self.assertRegex(association, r'route_table_id\s*=\s*aws_route_table\.runner\[0\]\.id')
+
+    def test_launcher_update_waits_for_new_subnet_route_and_ipv6_grant(self):
+        function = block('runner-autoscale.tf', 'aws_lambda_function', 'runner_webhook')
+        dependencies = re.search(r'depends_on = \[(.*?)\n  \]', function, re.S).group(1)
+        for dependency in ['aws_route_table_association.runner_us_west_1c,',
+                           'aws_iam_role_policy.runner,', 'aws_iam_role_policy.runner_lambda,']:
+            self.assertIn(dependency, dependencies)
 
     def test_all_created_resources_require_tags_profile_and_encryption(self):
         for sid in ['LaunchTaggedRunnerInstance', 'LaunchTaggedRunnerENI', 'LaunchEncryptedRunnerVolume']:

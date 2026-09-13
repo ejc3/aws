@@ -81,9 +81,13 @@ an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
 per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
-`c7gd`/`m7gd`/`r7gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
-that recently failed for capacity moved to the back of that order. Each instance is tagged
-with a `LeaseExpires` 60 minutes out.
+`c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
+in the us-west-1c runner subnet first and then in us-west-1a (see
+[Network posture](#network-posture)), with any type that recently failed for capacity in an
+AZ moved to the back for that AZ only. `r5d.metal` leads x86 because it has the same CPU
+generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, and its spot
+price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
+`LeaseExpires` 60 minutes out.
 
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
@@ -357,10 +361,12 @@ is the only record distinguishing our termination from an AWS spot reclaim.
 
 The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
-only), and these runners are not ephemeral, so one instance can legitimately chain many
-short jobs past 12h of age. Every fcvm CI job finishes in well under 2 hours, so a 12h-old
-runner has outlived its usefulness. Raise `MAX_INSTANCE_AGE_HOURS`, not the grace, if a
-legitimately long job is ever added — the grace is sized to one job, not to a working day.
+only). These runners register with `--ephemeral`, and the runner service's drop-in powers
+the host off when the runner exits, which terminates the instance, so one instance serves
+one job and never chains jobs. Every fcvm CI job finishes in well under 2 hours, so a
+12h-old runner is not doing legitimate work and is quite likely wedged. Raise
+`MAX_INSTANCE_AGE_HOURS`, not the grace, if a legitimately long job is ever added — the
+grace is sized to one job, not to a working day.
 
 The grace exists because the cap used to terminate whatever the runner was doing. On
 2026-08-28/29 it killed `i-09fff3a7d97fd4066` at 12.07h and `i-02fefa9deeb59e9c8` at 12.02h
@@ -457,8 +463,11 @@ runner, so it stops counting toward the cap. The cleanup Lambda stamps `Capacity
 it and terminates it — the tag has to be written first, because terminating rewrites the
 state reason to `Client.UserInitiatedShutdown` and the evidence would be lost. And the
 launcher reads that record — AWS's own capacity state reasons, the tag, and anything
-stalling right now — to move failed types to the back of the list. Back, not out: if every
-type has failed the list is only reordered, so a launch is still attempted.
+stalling right now — to move failed types to the back of the list. The verdict is kept per
+(type, AZ), read from the record's `Placement` because a terminated record no longer carries
+a `SubnetId`, so `c7gd.metal` running dry in us-west-1a does not hold back `c7gd.metal` in
+us-west-1c. Back, not out: if every pair has failed the list is only reordered, so a launch
+is still attempted.
 
 **The queue poll counts jobs, not a sample of runs.** It asks for runs with `status=queued`
 *and* `status=in_progress`, pages both, pages each run's jobs, and counts the queued
@@ -616,7 +625,7 @@ the denies first, creates this attachment before destroying the broad Core attac
 and does not change the role/profile or the bootstrap/DynamoDB producer.
 
 The controller's EC2 grants now require the own-account `Purpose=github-runner` images
-already selected by its code, exact runner subnet/security group/keypair/profile, IMDSv2,
+already selected by its code, exact runner subnets/security group/keypair/profile, IMDSv2,
 encrypted volumes, and `Role=github-runner` tags on every new instance, volume and ENI.
 Tag-on-create is constrained by [EC2's service-supplied creation context](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html).
 Outside launch, only the existing runner lease/health keys can change. An explicit deny
@@ -624,7 +633,7 @@ rejects every other tag key, including case variants of ownership tags, even und
 additive broad tag Allow. This prevents adopting an arbitrary dev/admin host or AMI.
 Termination is limited to `Role=github-runner` instances and the existing cleanup
 exception `Name=ami-builder-temp`; the controller cannot assign that Name to an existing
-host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnet.
+host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnets.
 
 Offline guards and rendered-policy IAM simulations are review evidence, not a real EC2
 launch/SSM-agent test. Require the after-cutoff canaries (own read succeeds; peer single
@@ -668,7 +677,7 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 - **`github-runner-instance-role`** (after cutoff): `dev-ssm-managed-instance` for
   SSM connectivity without account-wide parameter reads. Only the exact source-instance
   bootstrap credential can be read/deleted; reusable, peer, batch, path and history
-  reads are explicitly denied. IPv6 assignment requires a tagged runner ENI in the
+  reads are explicitly denied. IPv6 assignment requires a tagged runner ENI in a
   runner subnet; interface metadata reads remain account-wide. `dynamodb:GetItem` + `dynamodb:PutItem` on
   `github-runner-registration`, restricted by `dynamodb:LeadingKeys` to
   `${ec2:SourceInstanceARN}`, so a runner can claim and read its own row and no other
@@ -691,11 +700,24 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 
 ## Network posture
 
-Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — a
-single public `/24` (`10.1.1.0/24`) in **`us-west-1a` only**, internet gateway, dual-stack
-IPv6, public IP on launch. That one AZ is the ceiling on the spot fallback: the launcher
-walks several instance types but never another subnet/AZ, so a `us-west-1a` capacity gap
-fails the launch outright (the cleanup poll is the only retry). The security group allows
+Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — two
+public `/24`s sharing one route table and internet gateway, both dual-stack IPv6 with a
+public IP on launch: `10.1.2.0/24` in **`us-west-1c`** (`aws_subnet.runner_us_west_1c`) and
+`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). `local.runner_launch_subnets` in
+`runner-vpc.tf` is the order the launcher uses (it reaches the Lambda as `LAUNCH_SUBNETS`),
+and the launch and IPv6 IAM grants are pinned to exactly that list.
+
+The launcher tries every instance type in us-west-1c before any in us-west-1a, for both
+architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
+no instance, while us-west-1c ARM metal spot was 60–67% cheaper and had a better
+single-instance placement score (4 against 2). x86 prices were about the same in both, so
+there the second AZ adds resilience. Capacity backoff is kept per (type, AZ), so an
+exhausted pool in one AZ never holds back the same type in the other. If `run_instances`
+refuses every pair, the launch fails and the cleanup poll is the retry.
+
+The AMI builder stays in us-west-1a: fcvm's `scripts/build-ami.sh` looks up exactly one
+subnet by `Name=github-runner-subnet`, and `github-actions-ami-builder` may launch only
+there, so the us-west-1c subnet carries a different Name. The security group allows
 **inbound SSH (22) from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) **and the
 operator's three static EIPs** (jumpbox + the two dev servers, so the `dev_to_runner` debug
 path works) and all egress; shell access from anywhere else is via **SSM Session Manager**
