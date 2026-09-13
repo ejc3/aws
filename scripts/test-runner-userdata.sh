@@ -30,6 +30,12 @@ trap 'rm -f "$USERDATA"' EXIT
 awk '/runner_user_data = <<-EOF/{f=1;next} f&&/^EOF$/{exit} f' "$TF_FILE" \
   | sed 's/\$\${/${/g' > "$USERDATA"
 [ -s "$USERDATA" ] || { echo "extracted an EMPTY user_data from $TF_FILE" >&2; exit 2; }
+# Registration runs as its own script, written out by user data at boot and run
+# again after every job, so that body is what the registration cases execute.
+JOB_SCRIPT=$(mktemp)
+trap 'rm -f "$USERDATA" "$JOB_SCRIPT"' EXIT
+awk "/<<'RUNNER_JOB'\$/{f=1;next} f&&/^RUNNER_JOB\$/{exit} f" "$USERDATA" > "$JOB_SCRIPT"
+[ -s "$JOB_SCRIPT" ] || { echo "extracted an EMPTY fcvm-runner-job from $TF_FILE" >&2; exit 2; }
 
 PASS=0; FAIL=0
 ok()   { echo "  ok   $1"; PASS=$((PASS+1)); }
@@ -44,14 +50,20 @@ else
     bad "user_data has a syntax error: $(head -2 /tmp/ud-syntax.$$)"
 fi
 rm -f /tmp/ud-syntax.$$
+if bash -n "$JOB_SCRIPT" 2>/dev/null; then
+    ok "fcvm-runner-job parses ($(wc -l < "$JOB_SCRIPT") lines)"
+else
+    bad "fcvm-runner-job has a syntax error"
+fi
 # EC2 receives the script without its whole-line comments (runner_user_data_document).
 SHIPPED=$(mktemp)
 awk '!/^[[:space:]]*#/ || /^#!/' "$USERDATA" > "$SHIPPED"
 if bash -n "$SHIPPED" 2>/dev/null \
-   && [ "$(grep -c '^#!/bin/bash$' "$SHIPPED")" = 1 ] \
+   && awk "/<<'RUNNER_JOB'\$/{f=1;next} f&&/^RUNNER_JOB\$/{exit} f" "$SHIPPED" | bash -n \
+   && [ "$(grep -c '^#!/bin/bash$' "$SHIPPED")" = 2 ] \
    && grep -q 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' "$TF_FILE" \
    && grep -q 'value = base64gzip(local.runner_user_data_document)' "$TF_FILE"; then
-    ok "the comment-stripped document EC2 receives parses and keeps its shebang"
+    ok "the comment-stripped document EC2 receives parses and keeps both shebangs"
 else
     bad "the shipped user data is not the parseable comment-stripped script"
 fi
@@ -246,11 +258,32 @@ fi
 
 if grep -q '^Restart=no$' "$USERDATA" \
    && grep -q '^Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1$' "$USERDATA" \
-   && grep -q '^ExecStopPost=+/usr/bin/systemctl --no-block poweroff$' "$USERDATA" \
+   && grep -q '^ExecStopPost=+/usr/local/sbin/fcvm-runner-job after$' "$USERDATA" \
    && grep -q "InstanceInitiatedShutdownBehavior='terminate'" "$TF_FILE"; then
-    ok "a finished single-job service powers off and EC2 terminates the host"
+    ok "a finished job hands its host to fcvm-runner-job, and a host that powers off is terminated"
 else
-    bad "single-job completion can leave an idle runner host or restart the service"
+    bad "a finished job can leave an idle host, restart the service, or skip the next-job decision"
+fi
+
+NEXT_UNIT=$(awk "/<<'NEXT_JOB_SERVICE'\$/{f=1;next} f&&/^NEXT_JOB_SERVICE\$/{exit} f" "$USERDATA")
+if printf '%s\n' "$NEXT_UNIT" | grep -qx 'FailureAction=poweroff' \
+   && printf '%s\n' "$NEXT_UNIT" | grep -qx 'Type=oneshot' \
+   && printf '%s\n' "$NEXT_UNIT" | grep -qx 'EnvironmentFile=/etc/fcvm-runner.env' \
+   && printf '%s\n' "$NEXT_UNIT" | grep -qx 'ExecStart=/usr/local/sbin/fcvm-runner-job next' \
+   && printf '%s\n' "$NEXT_UNIT" | grep -qx 'TimeoutStartSec=600'; then
+    ok "the next-job unit runs once, bounded, and powers the host off when it fails"
+else
+    bad "the next-job unit can hang, restart, or fail without powering the host off"
+fi
+
+JOB_END_LINE=$(grep -n '^RUNNER_JOB$' "$USERDATA" | head -1 | cut -d: -f1)
+FIRST_LINE=$(grep -n '/usr/local/sbin/fcvm-runner-job first$' "$USERDATA" | head -1 | cut -d: -f1)
+if grep -q '> /etc/fcvm-runner.env$' "$USERDATA" \
+   && grep -q '^chmod 755 /usr/local/sbin/fcvm-runner-job$' "$USERDATA" \
+   && [ -n "$JOB_END_LINE" ] && [ -n "$FIRST_LINE" ] && [ "$JOB_END_LINE" -lt "$FIRST_LINE" ]; then
+    ok "boot installs the job script and its environment, then registers through it"
+else
+    bad "boot does not register through the installed fcvm-runner-job"
 fi
 
 if grep -q 'AWS_MAX_ATTEMPTS=1 timeout --kill-after=2 12 aws ssm' "$USERDATA" \
@@ -331,7 +364,7 @@ fi
 #        ordering cannot prove the losing branch actually stops before svc.sh.
 echo "registration interleavings:"
 REG_TMP=$(mktemp -d)
-trap 'rm -f "$USERDATA"; rm -rf "$REG_TMP"' EXIT
+trap 'rm -f "$USERDATA" "$JOB_SCRIPT"; rm -rf "$REG_TMP"' EXIT
 mkdir -p "$REG_TMP/bin" "$REG_TMP/work"
 
 # Execute the real package block without network access. Good-package cases mock
@@ -407,14 +440,11 @@ download_case checksum_failure arm64 1 0
 download_case download_failure x64 1 0
 download_case unsupported ppc64 1 0
 
-REG_BLOCK="$REG_TMP/registration.sh"
-{
-    echo 'set -euo pipefail'
-    # shellcheck disable=SC2016 # Replace a literal Terraform interpolation in the extracted text.
-    sed -n '/# Do not xtrace either token/,$p' "$USERDATA" \
-      | sed 's/${local\.runner_registration_table_name}/github-runner-registration/g' \
-      | sed "s|/etc/systemd/system|$REG_TMP/systemd|g"
-} > "$REG_BLOCK"
+REG_BLOCK="$REG_TMP/fcvm-runner-job"
+# shellcheck disable=SC2016 # Replace a literal Terraform interpolation in the extracted text.
+sed 's/${local\.runner_registration_table_name}/github-runner-registration/g' "$JOB_SCRIPT" \
+  | sed "s|/etc/systemd/system|$REG_TMP/systemd|g; s|^cd /opt/actions-runner\$|cd \"$REG_TMP/work\"|" \
+  > "$REG_BLOCK"
 
 cat > "$REG_TMP/bin/aws" <<'FAKE_AWS'
 #!/bin/bash
@@ -426,7 +456,7 @@ if [ "$1 $2" = "ssm get-parameter" ]; then
       *" --name /github-runner/bootstrap/i-test "*) : ;;
       *) echo "bootstrap requested someone else's credential: $*" >&2; exit 90 ;;
     esac
-    [ "$FAKE_SCENARIO" = credential_missing ] && exit 1
+    case "$FAKE_SCENARIO" in credential_missing|next_no_token) exit 1 ;; esac
     if [ "$FAKE_SCENARIO" = credential_late ] && [ "$(grep -c '^token-read$' "$JOURNAL")" = 1 ]; then
         exit 1
     fi
@@ -437,18 +467,22 @@ elif [ "$1 $2" = "ssm delete-parameter" ]; then
       *" --name /github-runner/bootstrap/i-test "*) : ;;
       *) echo "bootstrap deletes someone else's credential" >&2; exit 90 ;;
     esac
-    [ "$FAKE_SCENARIO" = credential_delete_failure ] && exit 1
+    case "$FAKE_SCENARIO" in credential_delete_failure|next_delete_failure) exit 1 ;; esac
     echo delete >> "$JOURNAL"
 elif [ "$1 $2" = "dynamodb put-item" ]; then
     echo put-item >> "$JOURNAL"
-    # The claim IS the conditional create. A put without it overwrites a row
-    # cleanup may already own, so the fake refuses to answer one.
-    case " $* " in
-      *" --condition-expression attribute_not_exists(InstanceArn) "*) : ;;
-      *) echo "put-item is not a conditional create: $*" >&2; exit 90 ;;
+    # The claim IS the conditional write: a create at boot, and for a next job a
+    # replace of only the row that still names the previous runner (77). A put
+    # without its condition overwrites a row cleanup may already own, so the fake
+    # refuses to answer one.
+    case "$FAKE_MODE: $* " in
+      "first:"*" --condition-expression attribute_not_exists(InstanceArn) "*) : ;;
+      "next:"*" --condition-expression #s = :registered AND RunnerId = :previous --expression-attribute-names {\"#s\":\"State\"} --expression-attribute-values {\":registered\":{\"S\":\"registered\"},\":previous\":{\"N\":\"77\"}} "*) : ;;
+      *) echo "put-item is not the expected conditional write: $*" >&2; exit 90 ;;
     esac
     case "$FAKE_SCENARIO" in
       bootstrap|credential_delete_failure|credential_late|invalid_service|install_failure|start_failure) exit 0 ;;
+      next_token|next_delete_failure) exit 0 ;;
     esac
     exit 1
 elif [ "$1 $2" = "dynamodb get-item" ]; then
@@ -459,26 +493,31 @@ elif [ "$1 $2" = "dynamodb get-item" ]; then
       *" --consistent-read "*) : ;;
       *) echo "get-item is not a consistent read: $*" >&2; exit 90 ;;
     esac
-    if [ "$FAKE_SCENARIO" = unknown_registered ]; then
+    registered_row() { # runner id
         jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
-          --arg instance "$INSTANCE_ID" \
+          --arg instance "$INSTANCE_ID" --arg id "$1" \
           '{Item:{InstanceArn:{S:$arn},State:{S:"registered"},
             InstanceId:{S:$instance},RunnerName:{S:("runner-"+$instance)},
-            RunnerId:{N:"77"},RegisteredAt:{S:"2026-08-07T20:00:00Z"}}}'
-    elif [ "$FAKE_SCENARIO" = foreign_registered ]; then
-        jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
-          --arg instance "$INSTANCE_ID" \
-          '{Item:{InstanceArn:{S:$arn},State:{S:"registered"},
-            InstanceId:{S:$instance},RunnerName:{S:("runner-"+$instance)},
-            RunnerId:{N:"78"},RegisteredAt:{S:"2026-08-07T20:00:00Z"}}}'
-    elif [ "$FAKE_SCENARIO" = cleanup ]; then
+            RunnerId:{N:$id},RegisteredAt:{S:"2026-08-07T20:00:00Z"}}}'
+    }
+    reaping_row() {
         jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
           --arg instance "$INSTANCE_ID" \
           '{Item:{InstanceArn:{S:$arn},State:{S:"reaping"},
             InstanceId:{S:$instance},ReapingAt:{S:"2026-08-07T20:00:00Z"}}}'
-    else
-        exit 1
+    }
+    if ! grep -q '^put-item$' "$JOURNAL"; then
+        # A next job reads the row it is about to replace, before it registers.
+        if [ "$FAKE_SCENARIO" = next_not_registered ]; then reaping_row; else registered_row 77; fi
+        exit 0
     fi
+    case "$FAKE_SCENARIO" in
+      unknown_registered) registered_row 77 ;;
+      foreign_registered|next_lost_answer) registered_row 78 ;;
+      next_row_moved) registered_row 99 ;;
+      cleanup) reaping_row ;;
+      *) exit 1 ;;
+    esac
 else
     echo "unexpected aws call: $*" >&2
     exit 90
@@ -489,6 +528,8 @@ cat > "$REG_TMP/bin/curl" <<'FAKE_CURL'
 #!/bin/bash
 set -eu
 case "$*" in
+  *latest/api/token*)
+    echo imdsv2-token ;;
   *dynamic/instance-identity/document*)
     if [ "$FAKE_SCENARIO" = wrong_region ]; then
         printf '%s\n' '{"accountId":"928413605543","region":"us-east-1"}'
@@ -522,12 +563,18 @@ case " $* " in
   *) echo "registration permits an unverified wrapper update" >&2; exit 92 ;;
 esac
 echo config >> "$JOURNAL"
-[ "$FAKE_SCENARIO" = config_failure ] && exit 1
-if [ "$FAKE_SCENARIO" = invalid_identity ]; then
-    echo '{"agentId":77,"agentName":"runner-someone-else"}' > .runner
-    exit 0
+# The real config.sh refuses to configure over a previous registration's files.
+if [ -e .runner ] || [ -e .credentials ] || [ -e .credentials_rsaparams ]; then
+    echo "runner is already configured" >&2
+    exit 93
 fi
-printf '{"agentId":77,"agentName":"runner-%s","poolId":1,"poolName":"Default","serverUrl":"https://pipelines.actions.githubusercontent.com/x","gitHubUrl":"https://github.com/ejc3/fcvm","workFolder":"_work"}\n' "$INSTANCE_ID" > .runner
+[ "$FAKE_SCENARIO" = config_failure ] && exit 1
+case "$FAKE_SCENARIO" in
+  invalid_identity|next_invalid_identity)
+    printf '{"agentId":%s,"agentName":"runner-someone-else"}\n' "$FAKE_AGENT_ID" > .runner
+    exit 0 ;;
+esac
+printf '{"agentId":%s,"agentName":"runner-%s","poolId":1,"poolName":"Default","serverUrl":"https://pipelines.actions.githubusercontent.com/x","gitHubUrl":"https://github.com/ejc3/fcvm","workFolder":"_work"}\n' "$FAKE_AGENT_ID" "$INSTANCE_ID" > .runner
 FAKE_CONFIG
 
 cat > "$REG_TMP/work/svc.sh" <<'FAKE_SVC'
@@ -562,18 +609,35 @@ chmod +x "$REG_TMP/bin/aws" "$REG_TMP/bin/curl" "$REG_TMP/bin/sudo" \
   "$REG_TMP/bin/systemctl" "$REG_TMP/bin/sleep" \
   "$REG_TMP/work/config.sh" "$REG_TMP/work/svc.sh" "$REG_BLOCK"
 
-registration_case() { # scenario expected_rc expected_service expected_delete
-    local scenario=$1 want_rc=$2 want_service=$3 want_delete=$4 rc=0
-    local journal="$REG_TMP/$scenario.log"
+registration_case() { # scenario expected_rc expected_service expected_delete [first|next]
+    local scenario=$1 want_rc=$2 want_service=$3 want_delete=$4 mode=${5:-first} rc=0
+    local journal="$REG_TMP/$scenario.log" agent_id=77
     : > "$journal"
-    rm -f "$REG_TMP/work/.runner"
+    rm -rf "$REG_TMP/work/.runner" "$REG_TMP/work/.credentials" \
+      "$REG_TMP/work/.credentials_rsaparams" "$REG_TMP/work/.service" "$REG_TMP/systemd"
+    if [ "$mode" = next ]; then
+        # What the host's first registration and its finished job leave behind.
+        # GitHub gives the next registration a new id.
+        agent_id=78
+        printf '{"agentId":77,"agentName":"runner-i-test"}\n' > "$REG_TMP/work/.runner"
+        echo '{}' > "$REG_TMP/work/.credentials"
+        echo '{}' > "$REG_TMP/work/.credentials_rsaparams"
+        echo "actions.runner.ejc3-fcvm.runner-i-test.service" > "$REG_TMP/work/.service"
+        mkdir -p "$REG_TMP/systemd/actions.runner.ejc3-fcvm.runner-i-test.service.d"
+        : > "$REG_TMP/systemd/actions.runner.ejc3-fcvm.runner-i-test.service.d/ephemeral.conf"
+    fi
     (
       cd "$REG_TMP/work"
       PATH="$REG_TMP/bin:$PATH" \
-      FAKE_SCENARIO="$scenario" JOURNAL="$journal" FAKE_SYSTEMD_DIR="$REG_TMP/systemd" \
-      INSTANCE_ID=i-test RUNNER_LABEL=ARM64 TOKEN=imdsv2-token REGION=us-west-1 \
-        bash "$REG_BLOCK"
+      FAKE_SCENARIO="$scenario" FAKE_MODE="$mode" FAKE_AGENT_ID="$agent_id" \
+      JOURNAL="$journal" FAKE_SYSTEMD_DIR="$REG_TMP/systemd" \
+      INSTANCE_ID=i-test RUNNER_LABEL=ARM64 REGION=us-west-1 \
+        bash "$REG_BLOCK" "$mode"
     ) >"$REG_TMP/$scenario.output" 2>&1 || rc=$?
+    if [ "$mode" = next ] && grep -q '^svc:install' "$journal"; then
+        bad "$scenario: a next job reinstalled the runner service"
+        return
+    fi
     if grep -q 'registration-token' "$REG_TMP/$scenario.output"; then
         bad "$scenario: registration credential leaked to bootstrap output"
         return
@@ -586,7 +650,8 @@ registration_case() { # scenario expected_rc expected_service expected_delete
         bad "$scenario: successful bootstrap powered off before its job"
         return
     fi
-    if [ "$scenario" = credential_missing ] && [ "$(grep -c '^token-read$' "$journal")" != 36 ]; then
+    if { [ "$scenario" = credential_missing ] || [ "$scenario" = next_no_token ]; } \
+       && [ "$(grep -c '^token-read$' "$journal")" != 36 ]; then
         bad "$scenario: credential polling exceeded or missed the bounded retry gate"
         return
     fi
@@ -627,6 +692,35 @@ registration_case unread             1 0 1
 # this bootstrap's claim. Only the identity predicates refuse it: its State is
 # `registered` and its ARN, InstanceId and RunnerName all match.
 registration_case foreign_registered 1 0 1
+
+echo "next job on the same host:"
+# The row a next job replaces must still name the host's previous runner (77);
+# GitHub gives the new registration 78. No credential, a failed delete, a wrong
+# identity or a row that moved on all power the host off without a service.
+registration_case next_token            0 1 1 next
+registration_case next_lost_answer      0 1 1 next
+registration_case next_no_token         1 0 1 next
+registration_case next_delete_failure   1 0 0 next
+registration_case next_invalid_identity 1 0 1 next
+registration_case next_row_moved        1 0 1 next
+registration_case next_not_registered   1 0 1 next
+
+echo "after a job:"
+after_case() { # service_result expected_systemctl_call
+    local result=$1 want=$2 journal="$REG_TMP/after-${1:-unset}.log"
+    : > "$journal"
+    ( PATH="$REG_TMP/bin:$PATH" JOURNAL="$journal" SERVICE_RESULT="$result" \
+        bash "$REG_BLOCK" after ) > "$REG_TMP/after-${1:-unset}.output" 2>&1 || true
+    if [ "$(tr '\n' ' ' < "$journal")" = "systemctl:$want " ]; then
+        ok "service result '${result:-unset}' -> systemctl $want"
+    else
+        bad "service result '${result:-unset}': wanted systemctl $want, got $(tr '\n' ' ' < "$journal")"
+    fi
+}
+after_case success   "--no-block start fcvm-runner-next.service"
+after_case exit-code "--no-block poweroff"
+after_case signal    "--no-block poweroff"
+after_case ""        "--no-block poweroff"
 
 echo
 echo "passed=$PASS failed=$FAIL"

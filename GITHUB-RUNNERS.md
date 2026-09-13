@@ -183,10 +183,46 @@ deregistration. Even after a successful claim, the token parameter must be delet
 service startup. Registration and reaping
 compete for one conditional create, so exactly one of them wins.
 
-The launcher tags every new instance `RunnerRegistrationProtocol=ddb-v1`, which says which
-handshake its user data runs and nothing about whether it succeeded. The tag is never
-backfilled: an instance without it predates the handshake and stays on the rules below that
-need no row.
+The launcher tags every new instance `RunnerRegistrationProtocol` with the handshake its user
+data runs, and nothing about whether it succeeded: `ddb-v2` when the document registers again
+after each job (it carries the `fcvm-runner-job next` unit below), `ddb-v1` for the
+single-job document before it. The tag is never backfilled: an instance without it predates
+the handshake and stays on the rules below that need no row. Cleanup judges `ddb-v1` and
+`ddb-v2` instances the same way, by their row.
+
+**A stream of jobs on a warm host.** A registration is still `--ephemeral`, one job each, but
+a host no longer is. User data installs the registration tail as
+`/usr/local/sbin/fcvm-runner-job` and runs it as `first` at boot. The runner service's drop-in
+runs it as `after` from `ExecStopPost`: a service that ended with `SERVICE_RESULT=success`
+starts the oneshot `fcvm-runner-next.service`, and anything else powers the host off. `next`
+deletes the finished registration's local `.runner` and `.credentials*` files, reads its own
+row and requires it to be `registered` for this instance, then waits the same three minutes
+and 36 polls as a first boot for a new `/github-runner/bootstrap/<instance-id>` credential.
+With one, it runs the same `config.sh --ephemeral` and `.runner` identity check, replaces its
+row with the new runner id only while the row still names the previous one
+(`#s = :registered AND RunnerId = :previous`, resolved through a consistent read when the
+answer is lost), deletes the credential, and only then starts the service. No credential, or
+any failure, powers the host off; the unit also has `FailureAction=poweroff` and a ten-minute
+start timeout. Nothing reusable reaches the host: every job's credential is minted by the
+controller, bound to the instance ARN, and deleted before that job's service starts.
+
+The host's row decides who gets that credential. The webhook Lambda also handles
+`workflow_job` `completed`, which the existing `workflow_job` subscription already delivers,
+for `runner-i-*` runners whose job concluded `success` or `failure`. It acts only on a
+running `ddb-v2` instance of the job's architecture younger than `MAX_REUSE_AGE_HOURS` (12,
+the soft cap), and only while `completed_at` plus `REUSE_WINDOW_SECONDS` (120) still leaves
+`CLAIM_MARGIN_SECONDS` (30). When GitHub shows more queued jobs for that architecture than
+idle online runners and starting ones can take (a look at in-progress and queued runs of at
+most eight seconds, where an unfinished look counts as no), one conditional `UpdateItem` sets
+`AvailableUntil` and `ClaimedAt` on the row, only while it is `registered`, still names the
+runner that finished, and has no window yet, and the credential is brokered to that instance.
+Otherwise the same write sets `AvailableUntil` alone. A `queued` event, and the cleanup poll's
+retry, which runs the same handler, first claims such a host with `SET ClaimedAt` under
+`#s = :registered AND AvailableUntil >= :now_plus_30 AND attribute_not_exists(ClaimedAt)`,
+brokers to it, and launches only when no claim wins. The latest credential is therefore
+written 90 seconds after the job completed, against a host that waits at least 180. A claimed
+host counts toward the cap as starting for `CLAIM_GRACE_MINUTES` (5), and the host's next
+registration replaces the row, which clears both attributes for the job after it.
 
 Two of those setup steps are **gates, and they run before `config.sh`**: a runner that
 cannot host a job must not join the pool, because from CI's side a broken runner is
@@ -222,13 +258,17 @@ all three gates refuse the shapes they exist for and that each precedes registra
 `.runner` identity is read after `config.sh` and claimed before `svc.sh`; and, by executing
 the registration tail against fake `aws`, `curl`, `config.sh` and `svc.sh`, that bootstrap
 starts the service when it wins or when a lost answer reads back as its own item, and stops
-without starting it when cleanup won or the row cannot be read. The fake `config.sh` writes
-`.runner` in the runner's real camelCase shape.
+without starting it when cleanup won or the row cannot be read. It runs the extracted
+`fcvm-runner-job` in all three modes: `next` starts the service only with a fresh credential,
+a row that still names the previous runner, a matching identity and a successful delete, and
+`after` starts the next-job unit only for `SERVICE_RESULT=success`. The fake `config.sh`
+writes `.runner` in the runner's real camelCase shape and refuses to configure over a previous
+registration's files.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`). Its first pass over the fleet is EC2-only and terminates every instance
 past the 13h30m hard ceiling before the PAT is read or GitHub is asked anything. It then
-does nine things, six of them using the PAT: deregisters GitHub runners whose instance is
+does ten things, seven of them using the PAT: deregisters GitHub runners whose instance is
 gone; renews the lease on busy runners (+60m), lets the lease of runners GitHub reports idle
 expire, then terminates anything past its lease, re-reading that one runner by id and
 deregistering it whenever the roster or its registration row supplied an id (instances
@@ -243,6 +283,14 @@ mean the row was lost rather than never written; drains runners past the 12h sof
 GitHub's queued jobs to launch what the queue actually needs. GitHub doesn't redeliver
 webhooks, so this poll is the retry, and it passes the per-architecture queued count along
 so the decision record has the demand side too.
+
+Last, a registered runner GitHub reports online and idle inside its lease is **deregistered,
+then terminated**, when its architecture has nothing queued and the queue scan was complete.
+Deregistration goes first here, the reverse of the lease path: GitHub refuses to remove a
+runner that is running a job, so a job handed out after the fresh by-id read that precedes it
+survives, and a refused deregistration leaves the instance running. A terminate that fails
+afterwards leaves a host with no registration, whose runner exits and whose `fcvm-runner-job`
+powers it off. A truncated scan terminates nothing.
 
 **Why job duration is the health signal.** A wedged host keeps its assigned job, so
 `busy` stays true and the lease renews forever; the host is still online, so a liveness check
@@ -324,7 +372,7 @@ registered, and dies at its lease. The stamp is also written only after the ceil
 for that instance, because a stalled `CreateTags` ahead of it would defer the one bound that
 must run.
 
-**A `ddb-v1` instance is judged by its row, not by the roster.** The cleanup Lambda reads
+**A `ddb-v1` or `ddb-v2` instance is judged by its row, not by the roster.** The cleanup Lambda reads
 the instance's DynamoDB item with a consistent read. `State=registered` carries the runner
 id bootstrap read from `.runner`; cleanup asks `GET /repos/ejc3/fcvm/actions/runners/<id>`
 for that one runner and uses its `busy`/`status` only if the answer's id and name match.
@@ -372,10 +420,12 @@ is the only record distinguishing our termination from an AWS spot reclaim.
 
 The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
-only). These runners register with `--ephemeral`, and the runner service's drop-in powers
-the host off when the runner exits, which terminates the instance, so one instance serves
-one job and never chains jobs. Every fcvm CI job finishes in well under 2 hours, so a
-12h-old runner is not doing legitimate work and is quite likely wedged. Raise
+only). These runners register with `--ephemeral`, one registration per job. A host whose
+runner exits cleanly waits a few minutes for the controller to hand it the next queued job
+and otherwise powers off, which terminates it, so an instance chains jobs only while work
+keeps arriving for it, and the controller hands no job to a host past the soft cap. Every
+fcvm CI job finishes in well under 2 hours, so past 12h an instance is finishing the last job
+it was given, or it is wedged. Raise
 `MAX_INSTANCE_AGE_HOURS`, not the grace, if a legitimately long job is ever added — the
 grace is sized to one job, not to a working day.
 
@@ -455,10 +505,11 @@ drains instead, and the ceiling bounds how long that lasts.
 
 A draining runner is **not** deregistered while GitHub reports it busy. GitHub documents that
 DELETE as forcing the runner's removal and does not say what happens to a job it is part-way
-through, and a forced removal that ends the job is the same failure. What stops a drained
-runner picking up new work is that the poll which first observes it idle terminates it, so
-the exposure is at most one 5-minute interval after its job ends. A job started inside
-that window and still running at the ceiling is still killed; that residual case is what the
+through, and a forced removal that ends the job is the same failure. A draining host cannot
+pick up new work: its registration is ephemeral and ends with the job it holds, and the
+controller hands no host past the soft cap another one. A registration past the soft cap that
+is still waiting for its job is terminated by the first poll that observes it idle. A job
+still running when the grace runs out is still killed; that residual case is what the
 `HARD-CEILING KILL` line is for. Closing it entirely would need an on-box graceful shutdown
 (`Runner.Listener` finishing its job and exiting), which the Lambda has no channel to request.
 
@@ -551,7 +602,7 @@ retirement of the old runner PAT/SSM grant and broad controller launch permissio
 Keep a fresh reviewed plan between those gates. A token broker cannot be proved by an
 IAM-only fixture check or by an additive apply that still serves the old script.
 
-### Instance-bound, single-job bootstrap
+### Instance-bound bootstrap, one registration per job
 
 New user data fetches only `/github-runner/bootstrap/<its-instance-id>`, with no PAT
 fallback. It admits credential polling for at most three minutes and 36 attempts;
@@ -567,9 +618,11 @@ Registration uses `--ephemeral --disableupdate`, so automatic updates cannot rep
 verified wrapper. The credential is unset from the shell and its SSM
 parameter must be successfully deleted before service installation/start; an uncertain
 delete never starts a job. The service drop-in disables systemd restarts, bounds unknown
-GitHub service-wrapper failures, and requests poweroff on service exit. The controller's
-instance-initiated shutdown setting turns that into termination. Any failure in the
-registration tail attempts bounded credential deletion and requests poweroff; earlier
+GitHub service-wrapper failures, and runs `fcvm-runner-job after` on service exit, which
+starts the next-job unit only after `SERVICE_RESULT=success` and otherwise requests poweroff.
+The controller's instance-initiated shutdown setting turns poweroff into termination. Any
+failure in the registration tail, at boot or for a next job, attempts bounded credential
+deletion and requests poweroff; earlier
 NVMe/IPv6/download failures retain the controller's existing startup/lease reaping.
 Controller cleanup remains the fallback if a shutdown request fails.
 
@@ -702,7 +755,8 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   roles and services;
   `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;
   `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
-  `dynamodb:GetItem` + `dynamodb:PutItem` on the registration table, for the cleanup claim.
+  `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
+  for the cleanup claim and the webhook's conditional warm-host window and claim.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.
