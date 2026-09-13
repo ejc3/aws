@@ -32,6 +32,13 @@ TF_FILE = Path(__file__).resolve().parent.parent / "runner-autoscale.tf"
 NOW = datetime(2026, 8, 7, 20, 0, 0, tzinfo=timezone.utc)
 ACCOUNT_ID = "928413605543"
 REGION = "us-west-1"
+# LAUNCH_SUBNETS as Terraform renders it: us-west-1c first, then us-west-1a.
+SUBNET_C = "subnet-usw1c"
+SUBNET_A = "subnet-usw1a"
+LAUNCH_SUBNETS = [
+    {"subnet_id": SUBNET_C, "availability_zone": "us-west-1c"},
+    {"subnet_id": SUBNET_A, "availability_zone": "us-west-1a"},
+]
 
 
 # --------------------------------------------------------------------------
@@ -121,7 +128,11 @@ class FakeEC2:
     def run_instances(self, **kw):
         self.calls.append(("run_instances", kw))
         self.journal.append(f"ec2:run_instances:{kw['InstanceType']}")
-        error = self.run_instances_errors.get(kw["InstanceType"])
+        # Keyed by instance type (refused in every subnet) or by (subnet, type)
+        # (refused in that subnet only): a spot pool is one type in one AZ.
+        subnet = kw["NetworkInterfaces"][0]["SubnetId"]
+        error = (self.run_instances_errors.get((subnet, kw["InstanceType"]))
+                 or self.run_instances_errors.get(kw["InstanceType"]))
         if error:
             raise Exception(error)
         return {"Instances": [{"InstanceId": f"i-new-{kw['InstanceType']}"}]}
@@ -497,7 +508,7 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     if github is not None:
         namespace["urllib"] = github.as_urllib()
     namespace["os"].environ.update({
-        "SUBNET_ID": "subnet-test",
+        "LAUNCH_SUBNETS": json.dumps(LAUNCH_SUBNETS),
         "SECURITY_GROUP_ID": "sg-test",
         "INSTANCE_PROFILE": "runner-profile",
         "USER_DATA_PARAM": "/github-runner/user-data",
@@ -525,7 +536,10 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
 
 
 def instance(instance_id, instance_type, state, age_minutes, arch="x86_64", tags=None,
-             state_reason=None):
+             state_reason=None, az=None):
+    """One DescribeInstances record. `az` sets Placement, which EC2 keeps on a
+    terminated record after dropping its SubnetId; without it the record's AZ is
+    unknown, and the launcher treats a failure on it as a failure in every AZ."""
     all_tags = {"Role": "github-runner", "Name": f"github-runner-{arch}"}
     all_tags.update(tags or {})
     record = {
@@ -537,6 +551,8 @@ def instance(instance_id, instance_type, state, age_minutes, arch="x86_64", tags
     }
     if state_reason:
         record["StateReason"] = {"Code": state_reason}
+    if az:
+        record["Placement"] = {"AvailabilityZone": az}
     return record
 
 
@@ -589,6 +605,12 @@ def launched_types(ec2):
     return [kw["InstanceType"] for kw in ec2.ops("run_instances")]
 
 
+def launched_pools(ec2):
+    """(subnet, instance type) of every run_instances attempt, in order."""
+    return [(kw["NetworkInterfaces"][0]["SubnetId"], kw["InstanceType"])
+            for kw in ec2.ops("run_instances")]
+
+
 def type_order(arch="x86_64"):
     """The launcher's own list, so these cases follow it instead of pinning it.
 
@@ -598,47 +620,54 @@ def type_order(arch="x86_64"):
 
 
 def case_aws_capacity_verdict_advances_the_type():
-    """AWS's own state reason on a dead instance moves the launcher along."""
-    ec2 = FakeEC2([instance("i-dead", "c5d.metal", "terminated", 60,
+    """AWS's own state reason on a dead instance moves the launcher along in that AZ."""
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-dead", head, "terminated", 60, az="us-west-1c",
                             state_reason="Server.InsufficientInstanceCapacity")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_stalled_pending_launch_advances_the_type():
     """A launch still pending past the startup window is a capacity failure."""
-    ec2 = FakeEC2([instance("i-stuck", "c5d.metal", "pending", 20)])
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_capacity_failed_tag_advances_the_type():
     """The tag the cleanup Lambda stamps survives the instance's termination."""
-    ec2 = FakeEC2([instance("i-reaped", "c5d.metal", "terminated", 30,
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-reaped", head, "terminated", 30, az="us-west-1c",
                             tags={"CapacityFailedAt": NOW.isoformat()})])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_pending_inside_the_startup_window_is_not_a_failure():
     """A metal instance that is merely still booting must not rotate the list."""
-    ec2 = FakeEC2([instance("i-booting", "c5d.metal", "pending", 5)])
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5d.metal"], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
 
 def case_every_type_failed_still_launches():
-    """Deprioritising must never empty the list."""
-    module = webhook(FakeEC2([]))
-    every = module["get_instance_types"]("x86_64")
-    dead = [instance(f"i-{t}", t, "terminated", 10, state_reason="Server.InsufficientInstanceCapacity")
-            for t in every]
+    """Deprioritising must never empty the list, in any AZ."""
+    every = type_order()
+    dead = [instance(f"i-{t}-{az}", t, "terminated", 10, az=az,
+                     state_reason="Server.InsufficientInstanceCapacity")
+            for t in every for az in ("us-west-1c", "us-west-1a")]
     ec2 = FakeEC2(dead)
     module = webhook(ec2)
-    order = module["get_instance_types"]("x86_64", set(every))
-    assert sorted(order) == sorted(every), order
+    subnets = module["get_launch_subnets"]()
+    failed = module["capacity_failures"](dead, NOW)
+    assert len(failed) == len(every) * len(subnets), failed
+    order = module["launch_candidates"]("x86_64", subnets, failed)
+    assert order == module["launch_candidates"]("x86_64", subnets), order
     module["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [every[0]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, every[0])], launched_pools(ec2)
 
 
 def case_every_launchable_type_has_instance_storage():
@@ -921,11 +950,16 @@ def case_incident_replay_three_dead_c5d_launches():
     report instance-terminated-no-capacity until 20:31. The old loop saw no
     exception, so every retry picked c5d.metal again and the rest of the list
     was never tried.
+
+    c5d.metal was the head of the x86 list then. The husks here take whatever
+    heads it now, because being the head is what the replay is about. They
+    carry no Placement, which the launcher matches to every AZ.
     """
+    head = type_order()[0]
     ec2 = FakeEC2([
-        instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
-        instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
-        instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
+        instance("i-001e64c56eb71053b", head, "pending", 79),
+        instance("i-012093644a97c1b37", head, "pending", 74),
+        instance("i-00ead8c13e0bfffff", head, "pending", 69),
     ])
     # GitHub is reachable and has no runner registered for any husk -- required:
     # without a GitHub view, get_capacity deliberately degrades to the instance
@@ -945,11 +979,12 @@ def case_handler_launches_next_type_when_the_pool_is_all_husks():
     "Max x86_64 runners (4) reached". All four are dead launches, so the pool is
     really empty and the next instance type is the one to try.
     """
+    head = type_order()[0]
     ec2 = FakeEC2([
-        instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
-        instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
-        instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
-        instance("i-0fb9768c36e56129d", "c5d.metal", "pending", 60),
+        instance("i-001e64c56eb71053b", head, "pending", 79),
+        instance("i-012093644a97c1b37", head, "pending", 74),
+        instance("i-00ead8c13e0bfffff", head, "pending", 69),
+        instance("i-0fb9768c36e56129d", head, "pending", 60),
     ])
     event = {"body": json.dumps({
         "action": "queued",
@@ -1070,6 +1105,123 @@ def case_one_arch_failure_does_not_rotate_the_other():
     ec2 = FakeEC2([instance("i-x", "c5d.metal", "pending", 40, arch="x86_64")])
     webhook(ec2)["launch_runner"]("arm64")
     assert launched_types(ec2) == ["c7gd.metal"], launched_types(ec2)
+
+
+# --------------------------------------------------------------------------
+# Cases: two runner subnets, us-west-1c tried first
+# --------------------------------------------------------------------------
+
+def case_x86_order_leads_with_r5d_and_arm_order_is_unchanged():
+    """r5d.metal: c5d.metal's CPU generation, 96 vCPUs and 4x900GB NVMe, 4x the RAM,
+    and a spot price 17-20% lower in both runner AZs on 2026-09-13."""
+    module = webhook(FakeEC2([]))
+    x86, arm = module["get_instance_types"]("x86_64"), module["get_instance_types"]("arm64")
+    assert x86 == ["r5d.metal", "c5d.metal", "m5d.metal", "m6id.metal"], x86
+    assert arm == ["c7gd.metal", "m7gd.metal", "r7gd.metal"], arm
+
+
+def case_every_type_is_tried_in_us_west_1c_before_us_west_1a():
+    for arch in ("arm64", "x86_64"):
+        module = webhook(FakeEC2([]))
+        types = module["get_instance_types"](arch)
+        order = module["launch_candidates"](arch, module["get_launch_subnets"]())
+        assert order == ([(SUBNET_C, "us-west-1c", t) for t in types]
+                         + [(SUBNET_A, "us-west-1a", t) for t in types]), order
+        ec2 = FakeEC2([])
+        webhook(ec2)["launch_runner"](arch)
+        assert launched_pools(ec2) == [(SUBNET_C, types[0])], (arch, launched_pools(ec2))
+
+
+def case_terraform_hands_the_launcher_us_west_1c_first():
+    """The order the Lambda walks is Terraform's, so check it at the source."""
+    vpc = (TF_FILE.parent / "runner-vpc.tf").read_text()
+    refs = re.search(r"\n  runner_launch_subnets\s*=\s*concat\(([^)]*)\)\n", vpc).group(1)
+    zones = []
+    for ref in refs.split(","):
+        name = ref.strip().split(".", 1)[1]
+        body = re.search(r'^resource "aws_subnet" "' + re.escape(name) + r'" \{\n.*?^\}',
+                         vpc, re.M | re.S).group()
+        zones.append(re.search(r'\n  availability_zone\s*=\s*"([^"]+)"', body).group(1))
+    assert zones == ["us-west-1c", "us-west-1a"], zones
+    source = TF_FILE.read_text()
+    assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_launch_subnets : "
+                     r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
+                     source), "LAUNCH_SUBNETS is not rendered from local.runner_launch_subnets"
+    assert not re.search(r"^\s*SUBNET_ID\s*=", source, re.M), "the Lambda is still given one SUBNET_ID"
+
+
+def case_capacity_exhausted_in_us_west_1c_falls_through_to_us_west_1a():
+    """The motivating case: ARM spot refused in one AZ is not refused in the other."""
+    types = type_order("arm64")
+    ec2 = FakeEC2(run_instances_errors={(SUBNET_C, t): "InsufficientInstanceCapacity" for t in types})
+    _, instance_type = webhook(ec2)["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, t) for t in types] + [(SUBNET_A, types[0])], \
+        launched_pools(ec2)
+    assert instance_type == types[0], instance_type
+
+
+def case_capacity_backoff_is_per_type_and_az():
+    """A c7gd.metal failure in us-west-1a must not hold c7gd.metal back in us-west-1c.
+
+    Keyed by type alone, the cheapest ARM pool would be skipped every time the
+    exhausted AZ had just refused the same type.
+    """
+    head, second = type_order("arm64")[:2]
+    failed_in_a = instance("i-dead-a", head, "terminated", 30, arch="arm64", az="us-west-1a",
+                           state_reason="Server.InsufficientInstanceCapacity")
+    ec2 = FakeEC2([failed_in_a])
+    module = webhook(ec2)
+    module["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
+    order = module["launch_candidates"]("arm64", module["get_launch_subnets"](),
+                                        module["capacity_failures"]([failed_in_a], NOW))
+    assert order[0] == (SUBNET_C, "us-west-1c", head), order
+    assert order[-1] == (SUBNET_A, "us-west-1a", head), order
+
+    # The same failure in us-west-1c moves that AZ on to the next type instead.
+    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c")])
+    webhook(ec2)["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, second)], launched_pools(ec2)
+
+
+def case_a_refused_pool_is_not_retried_within_one_batch():
+    """A refusal raised by run_instances leaves no instance record, so the batch remembers it."""
+    head, second = type_order("arm64")[:2]
+    ec2 = FakeEC2(run_instances_errors={(SUBNET_C, head): "InsufficientInstanceCapacity"})
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+                                 "launch_count": 2})}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_C, second)], \
+        launched_pools(ec2)
+
+
+def case_single_subnet_environment_still_launches():
+    """SUBNET_ID from the previous controller's environment: one subnet, AZ unknown."""
+    head, second = type_order()[:2]
+    ec2 = FakeEC2([instance("i-dead", head, "terminated", 30, az="us-west-1a",
+                            state_reason="Server.InsufficientInstanceCapacity")])
+    webhook(ec2, env={"LAUNCH_SUBNETS": "", "SUBNET_ID": "subnet-legacy"})["launch_runner"]("x86_64")
+    # An unknown subnet AZ matches every failure record: the old per-type backoff.
+    assert launched_pools(ec2) == [("subnet-legacy", second)], launched_pools(ec2)
+
+
+def case_unusable_launch_subnets_refuse_before_allocating_metal():
+    for value in ("not json", "null", "[]", "{}", '{"subnet_id": "subnet-x"}', '["subnet-x"]',
+                  '[{"subnet_id": "subnet-x"}]',
+                  '[{"subnet_id": "", "availability_zone": "us-west-1c"}]',
+                  '[{"subnet_id": 7, "availability_zone": "us-west-1c"}]'):
+        ec2 = FakeEC2()
+        github = FakeGitHub()
+        module = webhook(ec2, github=github, env={"LAUNCH_SUBNETS": value})
+        try:
+            module["launch_runner"]("arm64")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"LAUNCH_SUBNETS={value!r} was accepted")
+        assert not ec2.ops("run_instances"), (value, ec2.calls)
+        assert not any("registration-token" in url for url in github.requests), value
 
 
 # --------------------------------------------------------------------------

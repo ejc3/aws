@@ -503,12 +503,18 @@ data "archive_file" "runner_webhook" {
               return False
           return now - instance['LaunchTime'] >= timedelta(minutes=STARTUP_TIMEOUT_MINUTES)
 
-      def capacity_failed_types(instances, now):
-          """Instance types whose most recent launch died for want of capacity.
+      def capacity_failures(instances, now):
+          """(availability zone, instance type) pairs whose recent launch died for want of capacity.
 
           Three signals, all read from the one instance record: AWS's own state
           reason, the CapacityFailedAt tag the cleanup Lambda stamps on a launch it
           reaps for never booting, and a launch that is stalling right now.
+
+          Keyed by AZ as well as type, because a spot pool is one type in one AZ:
+          us-west-1a running out of c7gd.metal says nothing about us-west-1c. The AZ
+          comes from Placement, not SubnetId: a terminated instance's record, which
+          is where the capacity verdict survives, keeps Placement and drops SubnetId.
+          A record with no AZ gives None, which launch_candidates() matches to every AZ.
           """
           failed = set()
           for instance in instances:
@@ -518,19 +524,15 @@ data "archive_file" "runner_webhook" {
               if (instance.get('StateReason', {}).get('Code') in CAPACITY_STATE_REASONS
                       or get_tag(instance, 'CapacityFailedAt')
                       or is_stalled_launch(instance, now)):
-                  failed.add(instance_type)
+                  az = (instance.get('Placement') or {}).get('AvailabilityZone')
+                  failed.add((az, instance_type))
           return failed
 
-      def get_instance_types(arch, deprioritized=()):
-          """Instance types to try for architecture, recent capacity failures last.
+      def get_instance_types(arch):
+          """Instance types to try for architecture, most preferred first.
 
-          Reordering, never filtering: a type that just failed goes to the back but
-          stays in the list, so a launch is still attempted when every type has
-          failed. The loop in launch_runner cannot discover a capacity failure on
-          its own - run_instances returns an instance ID for a spot request AWS
-          cannot fulfil and kills the instance afterwards, so no exception is ever
-          raised to advance it. The previous attempt's outcome is what advances the
-          list, which is why this takes the failures as an argument.
+          launch_candidates() walks this order within each subnet, and is what moves
+          recent capacity failures to the back.
           """
           # ARM types must ALSO be Graviton3 or newer (family digit >= 7).
           # fcvm's nested-virtualisation tests need FEAT_NV2, which Graviton2
@@ -552,12 +554,62 @@ data "archive_file" "runner_webhook" {
           # Verify additions with:
           #   aws ec2 describe-instance-types --instance-types <t> \
           #     --query 'InstanceTypes[].InstanceStorageSupported'
+          #
+          # x86 leads with r5d.metal: the same CPU generation, 96 vCPU and 4x900GB
+          # NVMe as c5d.metal with 4x the RAM, and on 2026-09-13 its spot price was
+          # 17-20% below c5d.metal's in both runner AZs.
           if arch == 'x86_64':
-              types = ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal']
-          else:
-              types = ['c7gd.metal', 'm7gd.metal', 'r7gd.metal']
-          return ([t for t in types if t not in deprioritized]
-                  + [t for t in types if t in deprioritized])
+              return ['r5d.metal', 'c5d.metal', 'm5d.metal', 'm6id.metal']
+          return ['c7gd.metal', 'm7gd.metal', 'r7gd.metal']
+
+      def get_launch_subnets():
+          """Runner subnets, most preferred first, as (subnet_id, availability_zone).
+
+          LAUNCH_SUBNETS is the JSON list Terraform renders from
+          local.runner_launch_subnets. SUBNET_ID, the single subnet the previous
+          controller was given, is still honoured as one subnet with no known AZ,
+          for an environment that predates LAUNCH_SUBNETS. A malformed list raises
+          before anything is fetched, minted or launched.
+          """
+          raw = os.environ.get('LAUNCH_SUBNETS')
+          if not raw:
+              return [(os.environ['SUBNET_ID'], None)]
+          try:
+              subnets = [(entry['subnet_id'], entry['availability_zone']) for entry in json.loads(raw)]
+          except (ValueError, TypeError, KeyError):
+              raise RuntimeError('LAUNCH_SUBNETS is not a list of subnets; refusing to launch') from None
+          if not subnets or not all(isinstance(value, str) and value for pair in subnets for value in pair):
+              raise RuntimeError('LAUNCH_SUBNETS names no usable subnet; refusing to launch')
+          return subnets
+
+      def launch_candidates(arch, subnets, failed=()):
+          """(subnet_id, availability_zone, instance_type) in the order to try them.
+
+          Every type in the first subnet before any in the next, keeping the type
+          order within each. Terraform lists us-west-1c first for both
+          architectures: its ARM metal spot was cheaper with a better placement
+          score, x86 cost the same in both, and a second AZ is what the type
+          fallback alone could never provide.
+
+          Reordering, never filtering: a (type, AZ) pair that just failed goes to
+          the back but stays in the list, so a launch is still attempted when every
+          pair has failed, and a failure in one AZ never holds back that type in
+          another. An AZ unknown on either side matches, which is the old per-type
+          backoff. The loop in launch_runner cannot discover a capacity failure on
+          its own - run_instances returns an instance ID for a spot request AWS
+          cannot fulfil and kills the instance afterwards, so no exception is ever
+          raised to advance it. The previous attempt's outcome is what advances the
+          list, which is why this takes the failures as an argument.
+          """
+          def recently_failed(az, instance_type):
+              return any(failed_type == instance_type
+                         and (failed_az is None or az is None or failed_az == az)
+                         for failed_az, failed_type in failed)
+          ordered = [(subnet_id, az, instance_type)
+                     for subnet_id, az in subnets
+                     for instance_type in get_instance_types(arch)]
+          return ([c for c in ordered if not recently_failed(c[1], c[2])]
+                  + [c for c in ordered if recently_failed(c[1], c[2])])
 
       # Lease duration in minutes - runners auto-terminate after this unless renewed
       LEASE_DURATION_MINUTES = 60
@@ -566,20 +618,31 @@ data "archive_file" "runner_webhook" {
           """Calculate lease expiry time (now + LEASE_DURATION_MINUTES)"""
           return (datetime.now(timezone.utc) + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
 
-      def launch_runner(arch='arm64'):
-          """Launch a new spot runner instance, trying multiple instance types"""
+      def launch_runner(arch='arm64', failed_here=None):
+          """Launch a new spot runner instance, trying each subnet and instance type.
+
+          failed_here holds the (AZ, type) pairs whose run_instances raised in this
+          invocation, and the handler passes one set to every launch in a batch. A
+          refusal raised by run_instances leaves no instance record for the next
+          launch to read, so without it each launch in a batch would retry every
+          pair that had just refused, inside the 30-second function timeout.
+          """
           ami_id = get_latest_runner_ami(arch)
           if not ami_id:
               raise Exception(f"No runner AMI found for architecture: {arch}")
+          subnets = get_launch_subnets()
+          if failed_here is None:
+              failed_here = set()
 
-          # Which types just failed decides where this attempt starts. Without it
+          # Which pools just failed decides where this attempt starts. Without it
           # every retry re-picks the head of the list: on 2026-08-07 the poll
           # launched c5d.metal at 18:41, 18:46 and 18:51 and never reached
           # c5.metal, c6i.metal or m5d.metal at all.
-          deprioritized = capacity_failed_types(describe_runner_instances(arch), datetime.now(timezone.utc))
-          if deprioritized:
-              print(f'Recent capacity failures on {sorted(deprioritized)}, trying other types first')
-          instance_types = get_instance_types(arch, deprioritized)
+          recent = capacity_failures(describe_runner_instances(arch), datetime.now(timezone.utc))
+          if recent:
+              pools = sorted(f'{instance_type} in {az or "an unknown AZ"}' for az, instance_type in recent)
+              print(f'Recent capacity failures on {pools}, trying other pools first')
+          candidates = launch_candidates(arch, subnets, recent | failed_here)
           last_error = None
 
           # x86 AMI is from 300GB dev instance, ARM is smaller
@@ -594,7 +657,7 @@ data "archive_file" "runner_webhook" {
           broker, claims_registration = user_data_protocol(user_data)
           registration_token = get_registration_token() if broker else None
 
-          for instance_type in instance_types:
+          for subnet_id, az, instance_type in candidates:
               try:
                   response = ec2.run_instances(
                       MinCount=1,
@@ -604,7 +667,7 @@ data "archive_file" "runner_webhook" {
                       KeyName='fcvm-ec2',
                       NetworkInterfaces=[{
                           'DeviceIndex': 0,
-                          'SubnetId': os.environ['SUBNET_ID'],
+                          'SubnetId': subnet_id,
                           'Groups': [os.environ['SECURITY_GROUP_ID']],
                           'AssociatePublicIpAddress': True,
                           'Ipv6PrefixCount': 1,
@@ -644,12 +707,14 @@ data "archive_file" "runner_webhook" {
                   )
               except Exception as e:
                   last_error = e
-                  print(f"Failed to launch {instance_type}: {e}, trying next...")
+                  failed_here.add((az, instance_type))
+                  print(f"Failed to launch {instance_type} in {az or subnet_id}: {e}, trying next...")
                   continue
 
               # Do not put this in the capacity-fallback try. Once EC2 accepted
               # a launch, a broker error must never launch another instance type.
               instance_id = response['Instances'][0]['InstanceId']
+              print(f'Launched {instance_id} ({instance_type}) in {subnet_id} ({az or "unknown AZ"})')
               if not broker:
                   # Only the transitional, already-deployed script uses its old
                   # PAT grant. This controller never sends that PAT to the host.
@@ -670,7 +735,7 @@ data "archive_file" "runner_webhook" {
                   raise RunnerBootstrapError(f'Credential provisioning failed for {instance_id}; no launch retry') from None
               return instance_id, instance_type
 
-          raise last_error or Exception(f"All instance types failed for {arch}")
+          raise last_error or Exception(f"All subnets and instance types failed for {arch}")
 
       def handler(event, context):
           # Parse webhook
@@ -750,9 +815,12 @@ data "archive_file" "runner_webhook" {
 
           launched_here = []
           instance_type = None
+          # (AZ, type) pairs run_instances refused in this invocation, shared by
+          # every launch in the batch so none of them retries a refusal.
+          failed_here = set()
           try:
               for _ in range(budget):
-                  spot_id, instance_type = launch_runner(arch)
+                  spot_id, instance_type = launch_runner(arch, failed_here)
                   launched_here.append(spot_id)
           except RunnerBootstrapError as e:
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
@@ -787,7 +855,9 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
-      SUBNET_ID         = aws_subnet.runner[0].id
+      # Ordered [{subnet_id, availability_zone}] from local.runner_launch_subnets.
+      # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
+      LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       # Constant breaks the old inverse dependency. A new controller must be
@@ -812,6 +882,10 @@ resource "aws_lambda_function" "runner_webhook" {
     aws_iam_role_policy.runner_bootstrap,
     aws_iam_role_policy.runner_bootstrap_controller,
     aws_lambda_function.runner_cleanup,
+    # A runner launched into us-west-1c before its route exists can reach nothing,
+    # and one launched before the IPv6 grant covers that subnet fails the IPv6 gate.
+    aws_route_table_association.runner_us_west_1c,
+    aws_iam_role_policy.runner,
   ]
 }
 
@@ -870,11 +944,10 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid    = "LaunchExactRunnerNetwork"
         Effect = "Allow"
         Action = "ec2:RunInstances"
-        Resource = [
-          aws_subnet.runner[0].arn,
+        Resource = concat(local.runner_launch_subnet_arns, [
           aws_security_group.runner[0].arn,
           "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:key-pair/fcvm-ec2",
-        ]
+        ])
       },
       {
         Sid      = "LaunchTaggedRunnerInstance"
@@ -893,7 +966,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner" }
-          ArnEquals    = { "ec2:Subnet" = aws_subnet.runner[0].arn }
+          ArnEquals    = { "ec2:Subnet" = local.runner_launch_subnet_arns }
         }
       },
       {
@@ -1597,10 +1670,11 @@ data "archive_file" "runner_cleanup" {
       #
       # 12h is a deliberate LOCAL policy, not a platform limit. GitHub allows a
       # self-hosted job to run for up to 5 days (the 6h cap is for GitHub-hosted
-      # runners only), and these runners are not ephemeral, so one instance can
-      # legitimately chain many short jobs past 12h of age. Every ejc3/fcvm CI job
-      # finishes in well under 2 hours, so a runner this old has outlived its
-      # usefulness and is quite likely wedged.
+      # runners only). These runners register with --ephemeral, and their service
+      # drop-in powers the host off when the runner exits, which terminates the
+      # instance: one instance serves one job and never chains jobs. Every
+      # ejc3/fcvm CI job finishes in well under 2 hours, so an instance still alive
+      # at 12h is not doing legitimate work and is quite likely wedged.
       #
       # Past this age the instance DRAINS rather than dying: it is terminated on the
       # first poll that observes it idle, and a job already in flight is left to

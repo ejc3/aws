@@ -63,6 +63,45 @@ resource "aws_route_table_association" "runner" {
   route_table_id = aws_route_table.runner[0].id
 }
 
+# Second runner subnet, in us-west-1c. A spot pool is one instance type in one AZ, so
+# walking more types in us-west-1a could not get past an AZ-wide shortage: over the 7
+# days to 2026-09-13, 78% of ARM launch attempts there got no instance, while us-west-1c
+# ARM metal spot was 60-67% cheaper with a better placement score (4 against 2).
+#
+# Its own Name on purpose: fcvm's scripts/build-ami.sh finds the AMI builder's subnet by
+# the exact tag Name=github-runner-subnet and refuses to run unless that matches one
+# subnet. The builder stays in us-west-1a (github-ami-builder.tf).
+resource "aws_subnet" "runner_us_west_1c" {
+  count                   = var.enable_github_runner ? 1 : 0
+  vpc_id                  = aws_vpc.runner[0].id
+  cidr_block              = "10.1.2.0/24"
+  availability_zone       = "us-west-1c"
+  map_public_ip_on_launch = true
+
+  # IPv6 support, as in us-west-1a: user data refuses to register without it
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc.runner[0].ipv6_cidr_block, 8, 2)
+  assign_ipv6_address_on_creation = true
+
+  tags = {
+    Name = "github-runner-subnet-us-west-1c"
+  }
+}
+
+resource "aws_route_table_association" "runner_us_west_1c" {
+  count          = var.enable_github_runner ? 1 : 0
+  subnet_id      = aws_subnet.runner_us_west_1c[0].id
+  route_table_id = aws_route_table.runner[0].id
+}
+
+locals {
+  # Every subnet a runner may launch into, most preferred first. The webhook Lambda
+  # tries every instance type in one subnet before the next (LAUNCH_SUBNETS), and the
+  # launch and IPv6 IAM grants are pinned to exactly this list, so a subnet the
+  # launcher tries is always one its runner is allowed to boot in.
+  runner_launch_subnets     = concat(aws_subnet.runner_us_west_1c, aws_subnet.runner)
+  runner_launch_subnet_arns = local.runner_launch_subnets[*].arn
+}
+
 # Security group - SSH only from within the runner VPC (use SSM from outside), outbound for internet
 resource "aws_security_group" "runner" {
   count       = var.enable_github_runner ? 1 : 0
@@ -162,7 +201,7 @@ resource "aws_iam_role_policy" "runner" {
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
         Condition = {
           StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
-          ArnEquals    = { "ec2:Subnet" = aws_subnet.runner[0].arn }
+          ArnEquals    = { "ec2:Subnet" = local.runner_launch_subnet_arns }
         }
       }
     ]
