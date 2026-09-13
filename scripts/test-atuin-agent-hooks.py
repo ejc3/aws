@@ -129,6 +129,18 @@ class MainTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(hooks).st_mode), 0o644)
         self.assertEqual(self.run_main(), "")
 
+    def test_a_symlinked_config_keeps_the_link_and_updates_its_target(self):
+        binary = self.binary()
+        os.makedirs(os.path.join(self.home, "dotfiles"))
+        target = self.write("dotfiles/claude-settings.json", json.dumps({"hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "atuin hook claude-code"}]}]}}))
+        link = os.path.join(self.home, ".claude", "settings.json")
+        os.symlink(target, link)
+        self.run_main()
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), target)
+        self.assertEqual(commands(json.load(open(target)), "PreToolUse"), [binary + " hook claude-code"])
+
     def test_missing_or_malformed_configs_are_skipped_untouched(self):
         self.binary()
         broken = self.write(".codex/hooks.json", "{not json")

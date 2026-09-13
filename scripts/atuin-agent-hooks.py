@@ -73,14 +73,18 @@ def normalize(doc, agent, binary):
 
 
 def write_json(path, doc):
-    """Replace path atomically, keeping its permission bits."""
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".atuin-hooks-")
+    """Replace the file atomically, keeping its permission bits.
+
+    A symlinked config is followed, so the link survives and its target is updated.
+    """
+    target = os.path.realpath(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".atuin-hooks-")
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(doc, fh, indent=2)
             fh.write("\n")
-        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
-        os.replace(tmp, path)
+        os.chmod(tmp, os.stat(target).st_mode & 0o7777)
+        os.replace(tmp, target)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
