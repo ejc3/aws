@@ -151,6 +151,59 @@ else
     bad "silent gate(s) exit without a FATAL line: $(printf '%s' "$SILENT_GATES" | tr '\n' ' ')"
 fi
 
+# --- 4b. A runner must not take a job while a package install is running. A CI
+#         job's apt-get fails at once on a held lock, and on 2026-09-13 three
+#         fcvm jobs lost "Install dependencies" that way: Amazon Inspector's
+#         SSM agent ran `apt install ./inspector-vm-scanner.deb` about 90 s after
+#         boot, while the runner was already taking work.
+echo "package installs:"
+BUSY_FN=$(awk '/^apt_locks_busy\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$USERDATA")
+QUIET_FN=$(awk '/^wait_for_apt_quiet\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$USERDATA")
+if [ -z "$BUSY_FN" ] || [ -z "$QUIET_FN" ]; then
+    bad "apt_locks_busy / wait_for_apt_quiet not found in user_data (no install gate)"
+else
+    ok "extracted apt_locks_busy and wait_for_apt_quiet from the deployed user_data"
+    PROC_TMP=$(mktemp -d)
+    fake_proc() {  # name, then the files one process holds open
+        local root="$PROC_TMP/$1" n=0 f
+        shift
+        mkdir -p "$root/4242/fd"
+        for f in "$@"; do ln -s "$f" "$root/4242/fd/$n"; n=$((n + 1)); done
+        printf '%s' "$root"
+    }
+    busy_case() {  # label, want_rc, proc root
+        ( eval "$BUSY_FN"; apt_locks_busy "$3" ); local got=$?
+        if [ "$got" = "$2" ]; then ok "$1 (rc=$got)"; else bad "$1: wanted rc=$2, got rc=$got"; fi
+    }
+    busy_case "no process holds an apt lock" 1 "$(fake_proc quiet /var/log/syslog /dev/null)"
+    busy_case "the dpkg frontend lock is held" 0 "$(fake_proc frontend /dev/null /var/lib/dpkg/lock-frontend)"
+    busy_case "the apt lists lock is held" 0 "$(fake_proc lists /var/lib/apt/lists/lock)"
+    busy_case "the archives lock is held" 0 "$(fake_proc archives /var/cache/apt/archives/lock)"
+
+    quiet_case() {  # label, want_rc, busy checks before quiet ("forever" = never quiet), deadline
+        (
+          eval "$QUIET_FN"
+          CHECKS=0
+          sleep() { :; }
+          BUSY_FOR=$3
+          apt_locks_busy() { CHECKS=$((CHECKS + 1)); [ "$BUSY_FOR" = forever ] || [ "$CHECKS" -le "$BUSY_FOR" ]; }
+          wait_for_apt_quiet 3 "$4"
+        ); local got=$?
+        if [ "$got" = "$2" ]; then ok "$1 (rc=$got)"; else bad "$1: wanted rc=$2, got rc=$got"; fi
+    }
+    quiet_case "an install that finishes lets the runner register" 0 5 30
+    quiet_case "an install still running at the deadline refuses registration" 1 forever 1
+    rm -rf "$PROC_TMP"
+fi
+gate_precedes_registration "package install gate" "apt or dpkg is still installing"
+SSM_START_LINE=$(grep -n "snap start amazon-ssm-agent" "$USERDATA" | head -1 | cut -d: -f1)
+QUIET_CALL_LINE=$(grep -n "if ! wait_for_apt_quiet" "$USERDATA" | head -1 | cut -d: -f1)
+if [ -n "$SSM_START_LINE" ] && [ -n "$QUIET_CALL_LINE" ] && [ "$SSM_START_LINE" -lt "$QUIET_CALL_LINE" ]; then
+    ok "the install gate runs after the SSM agent that pushes installs starts (line $QUIET_CALL_LINE > $SSM_START_LINE)"
+else
+    bad "the install gate does not follow the SSM agent start (ssm=$SSM_START_LINE gate=$QUIET_CALL_LINE)"
+fi
+
 # --- 5. Registration provenance must be persisted before the service can take
 #        work. Successful config reads the runner id GitHub assigned, atomically
 #        claims this instance ARN in DynamoDB, and only then starts the service.

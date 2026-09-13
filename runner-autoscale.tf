@@ -678,7 +678,10 @@ data "archive_file" "runner_webhook" {
                           'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
                       }],
                       UserData=user_data,
-                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1},
+                      # InstanceMetadataTags lets Inspector's SSM plugin read
+                      # InspectorEc2Exclusion; without it the plugin still runs.
+                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
+                                       'InstanceMetadataTags': 'enabled'},
                       InstanceInitiatedShutdownBehavior='terminate',
                       InstanceMarketOptions={
                           'MarketType': 'spot',
@@ -691,6 +694,9 @@ data "archive_file" "runner_webhook" {
                               {'Key': 'Role', 'Value': 'github-runner'},
                               {'Key': 'Architecture', 'Value': arch},
                               {'Key': 'LeaseExpires', 'Value': lease_expiry},
+                              # Keeps Amazon Inspector's SSM agent from installing its
+                              # scanner with apt while this one-job host takes work.
+                              {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
                               # Which registration handshake this instance's
                               # user data runs. It says nothing about whether
                               # registration succeeded; the cleanup Lambda reads
@@ -988,7 +994,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "RunnerRegistrationProtocol"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
         }
       },
       {
@@ -1441,6 +1447,43 @@ fi
 tar xzf runner.tar.gz
 rm runner.tar.gz
 chown -R ubuntu:ubuntu /opt/actions-runner
+
+# A runner must not take a job while a package install is running: a CI job's
+# apt-get fails at once on a held lock. On 2026-09-13 three fcvm jobs lost
+# "Install dependencies" to Amazon Inspector's SSM agent running
+# `apt install ./inspector-vm-scanner.deb` about 90 s after boot. Runners carry
+# InspectorEc2Exclusion; this gate covers any other install the agent pushes.
+#
+# apt_locks_busy reports whether any process has an apt or dpkg lock file open,
+# read from /proc so it depends on no tool the image might lack.
+apt_locks_busy() {
+  local root=$${1:-/proc} fd target
+  for fd in "$root"/[0-9]*/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case "$target" in
+      /var/lib/dpkg/lock-frontend|/var/lib/dpkg/lock|/var/lib/apt/lists/lock|/var/cache/apt/archives/lock) return 0 ;;
+    esac
+  done
+  return 1
+}
+# wait_for_apt_quiet QUIET_CHECKS DEADLINE_S: 0 once the locks have been free for
+# QUIET_CHECKS consecutive one-second checks, 1 if the deadline passes first.
+wait_for_apt_quiet() {
+  local quiet=0 deadline=$((SECONDS + $2))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if apt_locks_busy; then quiet=0; else quiet=$((quiet + 1)); fi
+    if [ "$quiet" -ge "$1" ]; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+# The check reads every open file descriptor each second; keep that out of xtrace.
+set +x
+if ! wait_for_apt_quiet 20 600; then
+  echo "FATAL: apt or dpkg is still installing after 600 s; refusing to register this runner"
+  exit 1
+fi
+set -x
 
 # Do not xtrace either token into cloud-init or the serial console.
 set +x

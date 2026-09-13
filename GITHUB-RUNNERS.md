@@ -205,9 +205,20 @@ indistinguishable from a code defect.
   `2600:1f1c:208:c01::baca` while the OS had nothing, and every routed and IPv6 test in the
   fcvm suite failed with `No global IPv6 address found on host` — on a PR that had touched
   only `bench/chromium/*.py`.
+- **Package installs.** A job's `apt-get` fails at once on a held dpkg lock, so user_data
+  waits until no process has an apt or dpkg lock file open for 20 consecutive seconds
+  (read from `/proc/*/fd`), and refuses to register after 600 s. On 2026-09-13 three fcvm
+  jobs failed "Install dependencies" because Amazon Inspector's SSM agent was running
+  `apt install ./inspector-vm-scanner.deb` about 90 s after boot. The webhook Lambda also
+  tags every runner `InspectorEc2Exclusion=true` and launches it with
+  `InstanceMetadataTags=enabled`. The tag alone only suppresses findings; Inspector stops
+  invoking its SSM plugin only when it can read the tag through instance metadata. The key
+  is in `TagOnlyDuringRunnerLaunch`, whose `aws:TagKeys` list denies a launch that sends
+  any unlisted key. Enabling metadata tags also restricts tag keys to letters, digits and
+  `+ - = . , _ : @`.
 
 `scripts/test-runner-userdata.sh` extracts the real heredoc from the `.tf` and checks that
-both gates refuse the shapes they exist for and that each precedes registration; that the
+all three gates refuse the shapes they exist for and that each precedes registration; that the
 `.runner` identity is read after `config.sh` and claimed before `svc.sh`; and, by executing
 the registration tail against fake `aws`, `curl`, `config.sh` and `svc.sh`, that bootstrap
 starts the service when it wins or when a lost answer reads back as its own item, and stops
