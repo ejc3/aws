@@ -80,16 +80,29 @@ locals {
 locals {
   dev_hop_setup = <<-HOP
 # Fetch the shared dev-hop key and wire up host aliases.
+#
+# HOPJSON holds the PRIVATE key, so tracing is off from the fetch until it is unset. The
+# metal boxes run this under `set -euxo pipefail`, where the assignment, the `[ -n ]` test and
+# both printf pipelines each printed the key into cloud-init-output.log, the journal,
+# dev-selfupdate.log and the EC2 serial console (readable through ec2:GetConsoleOutput).
+# The caller's tracing is restored afterwards; nothing below this block touches the key.
+case $- in *x*) HOP_XTRACE=1 ;; *) HOP_XTRACE="" ;; esac
+set +x
+HOP_OK=""
 HOPJSON=$(aws secretsmanager get-secret-value --secret-id dev-hop-ssh-key \
-  --region us-west-1 --query SecretString --output text 2>/dev/null)
-
+  --region us-west-1 --query SecretString --output text 2>/dev/null) || HOPJSON=""
 if [ -n "$HOPJSON" ]; then
   install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
-
   printf '%s' "$HOPJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["private"])' \
     > /home/ubuntu/.ssh/dev_hop
   printf '%s' "$HOPJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["public"])' \
     > /home/ubuntu/.ssh/dev_hop.pub
+  HOP_OK=1
+fi
+unset HOPJSON
+if [ -n "$HOP_XTRACE" ]; then set -x; fi
+
+if [ -n "$HOP_OK" ]; then
   chmod 600 /home/ubuntu/.ssh/dev_hop
   chmod 644 /home/ubuntu/.ssh/dev_hop.pub
   chown ubuntu:ubuntu /home/ubuntu/.ssh/dev_hop /home/ubuntu/.ssh/dev_hop.pub
