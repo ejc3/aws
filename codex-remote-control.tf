@@ -116,11 +116,19 @@ systemctl daemon-reload
 # GENERATED, not static: this box carries ~26 repositories and the interesting ones change.
 # A hardcoded project list would be wrong within weeks, so it is rebuilt from what is
 # actually on disk, newest first. Regenerate any time with `codex-agents-refresh`.
+#
+# Host-aware: a metal dev box is a disposable sandbox with full sudo, while an admin jumpbox
+# holds AWS administrator credentials and the key to every dev box. Telling an agent on a
+# jumpbox that "the VM is the isolation boundary, install whatever you need" is dangerous, so
+# the caller sets FLEET_HOST_ROLE (metal, the default, or admin) and it is recorded for later
+# refreshes.
+printf '%s\n' "$${FLEET_HOST_ROLE:-metal}" > /etc/fleet-host-role
 cat > /usr/local/bin/codex-agents-refresh <<'GENAGENTS'
 #!/bin/bash
 # Rebuild ~/Documents/Codex/AGENTS.md from the repos currently on this box.
 set -uo pipefail
 OUT=/home/ubuntu/Documents/Codex/AGENTS.md
+ROLE=$(cat /etc/fleet-host-role 2>/dev/null || echo metal)
 install -d -o ubuntu -g ubuntu -m 755 /home/ubuntu/Documents/Codex
 TMP=$(mktemp)
 {
@@ -150,15 +158,55 @@ HEAD
   done | sort -rn | head -14 | while IFS='|' read -r _ n date remote; do
     printf -- '- `~/%s` — %s (last commit %s)\n' "$n" "$remote" "$date"
   done
-  cat <<'TAIL'
+  cat <<'COMMON'
 
 Repositories under `github.com/ejc3/` are the user's own. Others are upstream forks —
 treat those as read-only unless explicitly asked to change them.
 
 ## This machine
 
-- `fcvm-metal-arm`: 64 vCPU ARM64 bare metal, running a custom nested-virtualisation
-  kernel. Build in parallel — `make -j$(nproc)` and `cargo build -j$(nproc)` are expected.
+COMMON
+  if [ "$ROLE" = admin ]; then
+    cat <<'ADMIN'
+- An **admin jumpbox**. Its instance role has **AWS AdministratorAccess**, and it holds (or
+  can restore) the key that reaches every dev box. It is **not a sandbox**: treat every
+  command as able to change production, and stay read-only unless the task is a change.
+- Small: 2 vCPU on a burstable instance, with `/home/ubuntu` on a gp3 volume capped at
+  125 MB/s. Do not run builds, test suites, or recursive searches over `/home/ubuntu` or `/`
+  here; saturating the disk stalls SSH for everyone. Heavy work belongs on a dev box.
+- Infrastructure lives in `~/aws` (Terraform, remote state). Apply only from a fresh git
+  worktree of `origin/main`, read the plan first, and never leave a change applied but
+  uncommitted.
+- Ask before restarting, stopping, or rebooting any host.
+
+## Other machines
+
+The dev boxes accept SSH from here as `ubuntu` with `~/.ssh/fcvm-ec2`. Look up current
+addresses instead of trusting a remembered one:
+
+```bash
+aws ec2 describe-instances --region us-west-1 \
+  --filters Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,PublicIpAddress]' \
+  --output text
+```
+
+Nothing on a dev box may ever be given a way to connect back to a jumpbox: no key, no
+forced command, and no SSM or queue that a jumpbox acts on.
+
+## Long jobs
+
+Run anything longer than a minute under `tmux` or `nohup`, and put the heavy part on a dev
+box.
+ADMIN
+  else
+    case "$(uname -m)" in
+      aarch64) NAME=fcvm-metal-arm ;;
+      *) NAME=fcvm-metal-x86 ;;
+    esac
+    printf -- '- `%s`: %s-vCPU %s bare metal. Build in parallel: `make -j$(nproc)` and\n' "$NAME" "$(nproc)" "$(uname -m)"
+    printf -- '  `cargo build -j$(nproc)` are expected.\n'
+    cat <<'METAL'
 - You have **full passwordless sudo**. The VM is the isolation boundary, so install
   whatever you need.
 - It is a **spot instance**: it can be reclaimed and restarted at any time. Anything not
@@ -173,21 +221,21 @@ treat those as read-only unless explicitly asked to change them.
 Reachable from here as `ubuntu` with a dedicated hop key, no password:
 
 ```bash
-ssh nextjs      # the kids' Next.js box (cc-games.dev)
-ssh fcvm-x86    # x86 metal dev server
+METAL
+    grep -hE '^Host ' /home/ubuntu/.ssh/config.d-devhop 2>/dev/null | awk '{print "ssh " $2}'
+    cat <<'METALTAIL'
 ```
 
-There is deliberately **no general-purpose key to the jumpbox** on this machine. The one
-exception is a forced-command key used only by `pbox` (see pbox-key.tf) -- it can trigger
-`scripts/parallel-box.sh` on the jumpbox and nothing else, no matter what is sent over it.
-Do not add any other key to the jumpbox.
+There is deliberately **no key to any jumpbox** on this machine, and there must never be
+one: no SSH key, no forced command, and no SSM or queue that a jumpbox acts on.
 
 ## Long jobs
 
 Builds and test suites here can run for many minutes. Run them under `tmux` or `nohup` so
 they survive your session ending, and avoid unbounded recursive searches over `/home/ubuntu`
 — it holds multiple kernel trees and node_modules directories.
-TAIL
+METALTAIL
+  fi
 } > "$TMP"
 install -m 644 -o ubuntu -g ubuntu "$TMP" "$OUT"
 rm -f "$TMP"

@@ -1,9 +1,16 @@
 # jumpbox2-user-data.tf
 #
-# Full boot-time bootstrap for jumpbox-2 (jumpbox2.tf). Everything the original jumpbox has
-# by hand, this box gets from `terraform apply` alone: shell, tmux + Eternal Terminal,
-# AWS CLI, terraform itself, git/gh authenticated as ejc3, Claude Code and Codex with
-# remote control, and the fcvm-ec2 key needed to reach the rest of the fleet.
+# Full boot-time bootstrap for both admin boxes: jumpbox-2 (jumpbox2.tf) and the original
+# jumpbox (jumpbox.tf). Everything an admin box needs comes from `terraform apply` alone:
+# shell, tmux + Eternal Terminal, AWS CLI, terraform itself, git/gh authenticated as ejc3,
+# Claude Code and Codex with remote control, and the fcvm-ec2 key needed to reach the rest of
+# the fleet. Published as user-data/jumpbox2.sh and user-data/jumpbox.sh. Each instance's
+# bootstrap fetches its copy at first boot; a running box converges by re-fetching and
+# re-running it.
+#
+# Every step checks before it acts, so a re-run on a configured box only changes what it
+# owns: a working Eternal Terminal of any version is kept, an existing gh login is left
+# alone, and an existing fcvm-ec2 key is never overwritten.
 #
 # Runs as root (cloud-init's default), matching every other box's user_data convention --
 # per-user steps drop privileges explicitly with `sudo -u ubuntu`.
@@ -63,17 +70,28 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
 fi
 
 # ---------------------------------------------------------------- eternal terminal (prebuilt)
-if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
+# Keep any working etserver that is already installed. The original jumpbox runs 6.2.11
+# from /usr/local/bin and ET is how its owner reaches it, so a re-run must never swap the
+# binary under a live connection. Only a box with no working etserver gets the 7.x build.
+ET_BIN=""
+for candidate in /usr/bin/etserver /usr/local/bin/etserver; do
+  # Check OUTPUT, not exit status: some builds print their version then exit non-zero.
+  if [ -x "$candidate" ] && "$candidate" --version 2>&1 </dev/null | grep -qE '[0-9]+\.[0-9]+'; then
+    ET_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$ET_BIN" ]; then
   apt-get install -y libprotobuf32t64 libsodium23 >/dev/null 2>&1 || \
     apt-get install -y libprotobuf32t64 >/dev/null 2>&1 || \
     echo "WARNING: could not install ET runtime deps"
   EARCH=$(uname -m)
   if curl -fsSL --retry 3 "https://github.com/ejc3/EternalTerminal/releases/download/binaries-7.x/et-$EARCH.tar.gz" -o /tmp/et.tgz && [ -s /tmp/et.tgz ]; then
     if tar xzf /tmp/et.tgz -C /tmp && [ -s /tmp/etserver ]; then
-      # Check OUTPUT, not exit status: this build prints its version then aborts non-zero.
       chmod +x /tmp/et /tmp/etserver /tmp/etterminal 2>/dev/null
       if /tmp/etserver --version 2>&1 </dev/null | grep -q "7\."; then
         install -m 755 /tmp/et /tmp/etserver /tmp/etterminal /usr/bin/
+        ET_BIN=/usr/bin/etserver
       else
         echo "WARNING: downloaded etserver did not report a 7.x version; leaving ET uninstalled"
       fi
@@ -83,16 +101,18 @@ if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
     echo "WARNING: could not fetch Eternal Terminal binary"
   fi
 fi
-if [ -x /usr/bin/etserver ]; then
-cat > /etc/systemd/system/etserver.service <<'UNIT'
+if [ -n "$ET_BIN" ]; then
+  # Rewriting the unit never restarts a running etserver: `enable --now` only starts one
+  # that is not active, and a changed unit takes effect at the next restart or boot.
+  cat > /etc/systemd/system/etserver.service <<UNIT
 [Unit]
 Description=Eternal Terminal Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/etserver --port 2022
-Restart=on-failure
+ExecStart=$ET_BIN --port 2022
+Restart=always
 RestartSec=5
 
 [Install]
@@ -159,7 +179,9 @@ fi
 # ---------------------------------------------------------------- codex, with remote control
 # Same setup as the metal boxes and nextjs-dev: standalone install, config.toml, and the
 # codex-rc@ systemd unit. The unit only ENABLES once ~/.codex/auth.json exists -- `codex
-# login --device-auth` is the other manual step, same reason as claude above.
+# login --device-auth` is the other manual step, same reason as claude above. The admin
+# role gives Codex sessions jumpbox guidance, not the dev-box sandbox guidance.
+FLEET_HOST_ROLE=admin
 ${local.codex_remote_control}
 
 # ---------------------------------------------------------------- fcvm-ec2 key
@@ -167,20 +189,29 @@ ${local.codex_remote_control}
 # Manager backup (fcvm-ec2-key-backup.tf) so this box can reach the rest of the fleet
 # exactly the way the original jumpbox does. NOT the dev-hop key: that key is deliberately
 # absent from every jumpbox by design (dev-hop-key.tf) -- dev servers reach each other
-# with it, but no jumpbox holds it, and that must stay true for jumpbox-2 too.
-FCVM_KEY=$(aws secretsmanager get-secret-value --secret-id fcvm-ec2-ssh-key \
-  --region us-west-1 --query SecretString --output text 2>/dev/null)
-if [ -n "$FCVM_KEY" ]; then
-  install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
-  printf '%s\n' "$FCVM_KEY" > /home/ubuntu/.ssh/fcvm-ec2
-  chmod 600 /home/ubuntu/.ssh/fcvm-ec2
-  chown ubuntu:ubuntu /home/ubuntu/.ssh/fcvm-ec2
-  echo "fcvm-ec2 key restored"
+# with it, but no jumpbox holds it, and that must stay true for both admin boxes.
+# An existing key is never replaced, and xtrace is off while the private key is in memory.
+FCVM_KEY_FILE=/home/ubuntu/.ssh/fcvm-ec2
+if [ -s "$FCVM_KEY_FILE" ]; then
+  echo "fcvm-ec2 key already present -- leaving it alone"
 else
-  echo "WARNING: fcvm-ec2-ssh-key secret is empty or unreadable -- this box cannot reach the rest of the fleet until it is populated (see fcvm-ec2-key-backup.tf)"
+  set +x
+  FCVM_KEY=$(aws secretsmanager get-secret-value --secret-id fcvm-ec2-ssh-key \
+    --region us-west-1 --query SecretString --output text 2>/dev/null)
+  if [ -n "$FCVM_KEY" ]; then
+    install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
+    printf '%s\n' "$FCVM_KEY" > "$FCVM_KEY_FILE"
+    chmod 600 "$FCVM_KEY_FILE"
+    chown ubuntu:ubuntu "$FCVM_KEY_FILE"
+    echo "fcvm-ec2 key restored"
+  else
+    echo "WARNING: fcvm-ec2-ssh-key secret is empty or unreadable -- this box cannot reach the rest of the fleet until it is populated (see fcvm-ec2-key-backup.tf)"
+  fi
+  unset FCVM_KEY
+  set -x
 fi
 
-echo "jumpbox-2 ready"
+echo "admin box ready"
 SCRIPT
 }
 
@@ -191,4 +222,14 @@ resource "aws_s3_object" "jumpbox_2_user_data" {
   content      = local.jumpbox_2_user_data
   content_type = "text/x-shellscript"
   tags         = { Name = "jumpbox-2-user-data" }
+}
+
+# The same script for the original jumpbox, fetched by its bootstrap (jumpbox.tf).
+resource "aws_s3_object" "jumpbox_user_data" {
+  count        = var.enable_jumpbox ? 1 : 0
+  bucket       = aws_s3_bucket.dev_scripts.id
+  key          = "user-data/jumpbox.sh"
+  content      = local.jumpbox_2_user_data
+  content_type = "text/x-shellscript"
+  tags         = { Name = "jumpbox-user-data" }
 }
