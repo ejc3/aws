@@ -183,9 +183,9 @@ resource "aws_instance" "firecracker_dev" {
   instance_type = var.firecracker_instance_type
   key_name      = var.firecracker_key_name
 
-  # A poweroff inside the OS stops the box rather than terminating it. Explicit so a rebuilt
-  # instance cannot land on a different default.
-  instance_initiated_shutdown_behavior = "stop"
+  # Shutdown behaviour is deliberately not set: AWS refuses to modify it on spot instances
+  # (that failed the create in #116), and a spot instance whose interruption behaviour is
+  # stop already launches with stop.
 
   # Network configuration - uses explicit ENI for IPv6 /64 prefix delegation
   network_interface {
