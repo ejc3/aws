@@ -44,6 +44,74 @@ export function vncArguments({ display, authFile, socketPath }) {
   ];
 }
 
+// Chrome-for-Testing is fingerprinted and blocked by some bot protections (e.g. Akamai on the
+// My-Verizon login) even with a normal user-agent string. These are the launch arguments Playwright
+// applies by default; a browser started with them (plus the Client-Hint mask below) presents like a
+// mainstream Chrome and clears that gate. --no-startup-window is omitted: the desktop opens a window
+// with the start URL.
+const PLAYWRIGHT_ARGS = [
+  '--disable-field-trial-config', '--disable-background-networking', '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows', '--disable-back-forward-cache', '--disable-breakpad',
+  '--disable-client-side-phishing-detection', '--disable-component-extensions-with-background-pages',
+  '--disable-component-update', '--disable-default-apps', '--disable-dev-shm-usage', '--disable-extensions',
+  '--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints',
+  '--allow-pre-commit-input', '--disable-hang-monitor', '--disable-ipc-flooding-protection',
+  '--disable-popup-blocking', '--disable-prompt-on-repost', '--disable-renderer-backgrounding',
+  '--force-color-profile=srgb', '--metrics-recording-only', '--password-store=basic', '--use-mock-keychain',
+  '--no-service-autorun', '--export-tagged-pdf', '--disable-search-engine-choice-screen', '--disable-infobars',
+  '--disable-sync', '--enable-unsafe-swiftshader', '--no-sandbox',
+];
+
+// maskChromeUserAgent hides the remaining Chrome-for-Testing identity — the sec-ch-ua Client-Hint
+// brands and navigator.userAgentData that launch flags cannot change — via a CDP UA-metadata
+// override, and clears navigator.webdriver. It speaks CDP over the private inherited debugging pipe
+// (fds 3/4): a pipe, never a TCP port, consistent with the macOS transport. Best-effort — any pipe
+// failure leaves the browser exactly as launched.
+function maskChromeUserAgent(child, url) {
+  try {
+    const writer = child.stdio[3], reader = child.stdio[4];
+    if (!writer || !reader) return;
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+    const userAgentMetadata = {
+      brands: [{ brand: 'Not_A Brand', version: '8' }, { brand: 'Chromium', version: '131' }, { brand: 'Google Chrome', version: '131' }],
+      fullVersion: '131.0.6778.86',
+      fullVersionList: [{ brand: 'Not_A Brand', version: '8.0.0.0' }, { brand: 'Chromium', version: '131.0.6778.86' }, { brand: 'Google Chrome', version: '131.0.6778.86' }],
+      platform: 'Windows', platformVersion: '15.0.0', architecture: 'x86', model: '', mobile: false, bitness: '64', wow64: false,
+    };
+    let id = 0, buffer = Buffer.alloc(0);
+    const masked = new Set();
+    const send = (method, params = {}, sessionId) => {
+      try { writer.write(`${JSON.stringify({ id: ++id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`); } catch { /* pipe closed */ }
+    };
+    writer.on('error', () => {});
+    reader.on('error', () => {});
+    reader.on('data', (part) => {
+      try {
+        buffer = Buffer.concat([buffer, part]);
+        let end;
+        while ((end = buffer.indexOf(0)) !== -1) {
+          const packet = buffer.subarray(0, end); buffer = buffer.subarray(end + 1);
+          let message;
+          try { message = JSON.parse(packet.toString('utf8')); } catch { continue; }
+          if (message.method === 'Target.attachedToTarget') {
+            const sessionId = message.params?.sessionId;
+            const type = message.params?.targetInfo?.type;
+            if (sessionId && type === 'page' && !masked.has(sessionId)) {
+              masked.add(sessionId);
+              send('Emulation.setUserAgentOverride', { userAgent, userAgentMetadata }, sessionId);
+              send('Page.addScriptToEvaluateOnNewDocument', { source: "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" }, sessionId);
+              send('Page.enable', {}, sessionId);
+              if (url && url !== 'about:blank') send('Page.navigate', { url }, sessionId);
+            }
+            if (sessionId) send('Runtime.runIfWaitingForDebugger', {}, sessionId);
+          }
+        }
+      } catch { /* ignore malformed frame */ }
+    });
+    send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  } catch { /* masking is best-effort */ }
+}
+
 /** Only these fixed programs are launched. Native subprocesses never inherit a shell or CDP port. */
 export async function launchDesktop({ runtimeDir, profile, browserBin, url, signal }) {
   const children = [];
@@ -155,8 +223,16 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       `--user-data-dir=${profile}`, '--ozone-platform=x11', '--no-first-run',
       '--no-default-browser-check', '--force-renderer-accessibility=basic',
       `--force-device-scale-factor=${VNC_PIXEL_RATIO}`,
-      '--start-maximized', '--window-size=1440,900', url,
-    ], env);
+      // Present as a mainstream desktop Chrome: the default Chrome-for-Testing UA is
+      // fingerprinted and blocked by some sites' bot protection (e.g. Akamai on Verizon login).
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      '--disable-blink-features=AutomationControlled',
+      ...PLAYWRIGHT_ARGS,
+      '--remote-debugging-pipe',
+      // Launch blank so no unmasked request reaches a bot-protected origin; the mask navigates.
+      '--start-maximized', '--window-size=1440,900', 'about:blank',
+    ], env, ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']);
+    maskChromeUserAgent(browser, url);
     let navigationReader;
     const getNavigation = () => {
       if (closing || signal.aborted || resizeAbort.signal.aborted) return Promise.resolve({ canGoBack: null });
