@@ -55,6 +55,9 @@ if command -v terraform >/dev/null 2>&1; then
   tflog="/tmp/stop-hook-tfplan.log"
   terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
   rc=$?
+  # Dev boxes cannot read state; tell them what this plan found (applied-status.tf).
+  # Publishes only from a clean origin/main checkout and never blocks the stop.
+  bash scripts/publish-applied-status.sh "$rc" "$tflog" >/dev/null 2>&1 || true
   if [ "$rc" -eq 2 ]; then
     problems+=("Terraform drift: live AWS does not match config (terraform plan shows changes). Review $tflog and either 'terraform apply' the intended change or reconcile config to match live BEFORE stopping, so nothing is lost.")
   elif [ "$rc" -ne 0 ]; then

@@ -63,3 +63,6 @@ jobs:
 
       - name: Runner release freshness guards (offline)
         run: python3 -S -B scripts/test-runner-release-freshness.py
+
+      - name: Applied-status publisher (offline)
+        run: bash scripts/test-publish-applied-status.sh
