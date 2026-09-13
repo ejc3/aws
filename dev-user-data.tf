@@ -237,6 +237,10 @@ sysctl -p /etc/sysctl.d/99-fcvm.conf \
 PODMANSYS
 
   # Interactive shell setup: starship, fzf, atuin, zsh plugins, .zshrc (identical on both arches)
+  # Normalizes the shell-history hooks Atuin's installer adds to Claude Code and Codex (see
+  # the script's docstring). Tested offline by scripts/test-atuin-agent-hooks.py.
+  atuin_agent_hooks_py = file("${path.module}/scripts/atuin-agent-hooks.py")
+
   # Per-user interactive shell environment: starship, fzf, atuin, zsh plugins, .zshrc,
   # .tmux.conf and t-claude. Deliberately user-AGNOSTIC -- every path is ~-relative, so
   # the same body sets up whichever account runs it. dev boxes run it for ubuntu; the
@@ -260,6 +264,11 @@ TOML
 [ -d ~/.fzf ] || git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 [ -f ~/.fzf.zsh ] || ~/.fzf/install --all --no-bash --no-fish
 curl --proto '=https' --tlsv1.2 -sSf https://setup.atuin.sh | bash
+# The installer above adds a shell-history hook to Claude Code and Codex each time it runs.
+# Keep exactly one per event, by absolute path (scripts/atuin-agent-hooks.py explains why).
+python3 - "$HOME" <<'ATUINHOOKS' || echo "WARNING: could not normalize Atuin agent hooks"
+${local.atuin_agent_hooks_py}
+ATUINHOOKS
 [ -d ~/.zsh/zsh-autosuggestions ] || git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
 [ -d ~/.zsh/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'

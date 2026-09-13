@@ -66,3 +66,6 @@ jobs:
 
       - name: Applied-status publisher (offline)
         run: bash scripts/test-publish-applied-status.sh
+
+      - name: Atuin agent hook normalizer (offline)
+        run: python3 -S -B scripts/test-atuin-agent-hooks.py
