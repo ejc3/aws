@@ -59,11 +59,22 @@ data "archive_file" "runner_webhook" {
       import re
       import time
       import urllib.request
+      from botocore.config import Config
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
+      # RunInstances only, with botocore's own retries off. A spot pool with no
+      # capacity answers InsufficientInstanceCapacity, and the default client
+      # retried that same pool four times with backoff ("reached max retries: 4"):
+      # on 2026-09-13 one exhausted pool cost 7 to 15 seconds, and two or three of
+      # them ran invocations into the 30-second timeout while this function's one
+      # execution was held and the deliveries arriving meanwhile were throttled.
+      # The launcher moves on to the next pool itself.
+      launch_ec2 = boto3.client('ec2', region_name='us-west-1',
+                                config=Config(retries={'total_max_attempts': 1}))
       ssm = boto3.client('ssm', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
 
@@ -104,9 +115,13 @@ data "archive_file" "runner_webhook" {
       MAX_REUSE_AGE_HOURS = 12
       # The protocol tag on hosts whose user data registers again after a job.
       STREAM_PROTOCOL = 'ddb-v2'
-      # A cancelled or timed-out job can leave processes or mounts behind, so only
-      # a job that ran to its own end hands its host on.
-      REUSABLE_CONCLUSIONS = ('success', 'failure')
+      # Only a job that succeeded hands its host on. A failed job is the likeliest
+      # to leave leaked VMs, D-state processes or a full disk behind: before
+      # --ephemeral one bad host, runner-i-0ea78b39da373fcca on 2026-08-06, failed
+      # every job it picked up. A fresh host for the job after a failure is the
+      # cheaper mistake. A host whose job ended any other way gets no credential
+      # and powers off when its wait ends.
+      REUSABLE_CONCLUSIONS = ('success',)
       # The completed handler has no queue view of its own. It asks GitHub for at
       # most this long, and a look it did not finish hands out nothing.
       QUEUE_CHECK_BUDGET_SECONDS = 8
@@ -719,7 +734,7 @@ data "archive_file" "runner_webhook" {
 
           for subnet_id, az, instance_type in candidates:
               try:
-                  response = ec2.run_instances(
+                  response = launch_ec2.run_instances(
                       MinCount=1,
                       MaxCount=1,
                       ImageId=ami_id,
@@ -878,24 +893,20 @@ data "archive_file" "runner_webhook" {
               print(f'{instance_id}: not claimed ({error_code(e) or type(e).__name__})')
               return False
 
-      def open_reuse_window(instance_id, runner_id, until_epoch, claim_epoch=None):
-          """Record that this host's runner finished; with claim_epoch, claim it in the same write.
+      def open_reuse_window(instance_id, runner_id, until_epoch):
+          """Record that this host's runner finished, so a queued job can claim the host.
 
           Only while the row still names the runner that finished and no window is
           open for that registration yet, so a duplicate or late completed event
           for an earlier registration of the same host changes nothing.
           """
-          update = 'SET AvailableUntil = :until'
           values = {':until': {'N': str(until_epoch)}, ':registered': {'S': 'registered'},
                     ':runner': {'N': str(runner_id)}}
-          if claim_epoch is not None:
-              update += ', ClaimedAt = :now'
-              values[':now'] = {'N': str(claim_epoch)}
           try:
               dynamodb.update_item(
                   TableName=os.environ.get('REGISTRATION_TABLE', ''),
                   Key=registration_key(instance_id),
-                  UpdateExpression=update,
+                  UpdateExpression='SET AvailableUntil = :until',
                   ConditionExpression=('#s = :registered AND RunnerId = :runner '
                                        'AND attribute_not_exists(AvailableUntil)'),
                   ExpressionAttributeNames={'#s': 'State'},
@@ -974,12 +985,43 @@ data "archive_file" "runner_webhook" {
                   pass
               raise RunnerBootstrapError(f'Credential provisioning failed for warm host {instance_id}') from None
 
-      def handle_completed(payload):
-          """A runner-i-* job finished: hand its host the next job, or hold the host for one.
+      def defer_completed(payload):
+          """Answer a completed delivery at once and hand the job to github-runner-reuse.
 
-          The host is handed a credential now only when GitHub shows more queued
-          jobs for its architecture than idle and starting runners can take.
-          Otherwise its row records a reuse window a queued event can claim.
+          Checking a host for reuse reads EC2, the runner roster, the registration
+          row and up to QUEUE_CHECK_BUDGET_SECONDS of GitHub's queue. This function
+          runs one execution at a time behind API Gateway, a delivery that arrives
+          while that execution is busy is throttled, and GitHub does not redeliver
+          it. So only the checks that need no call run here.
+          """
+          job = payload.get('workflow_job')
+          job = job if isinstance(job, dict) else {}
+          name = job.get('runner_name')
+          if (not isinstance(name, str) or not RUNNER_INSTANCE_NAME.fullmatch(name)
+                  or job.get('conclusion') not in REUSABLE_CONCLUSIONS):
+              return {'statusCode': 200, 'body': 'Ignoring completed job: not a successful runner-i-* job'}
+          handoff = {'workflow_job': {key: job.get(key) for key in
+                                      ('runner_name', 'runner_id', 'labels', 'conclusion', 'completed_at')}}
+          try:
+              lambda_client.invoke(FunctionName=os.environ.get('REUSE_FUNCTION', ''),
+                                   InvocationType='Event', Payload=json.dumps(handoff))
+          except Exception as e:
+              print(f'Could not hand {name} to the reuse function: {type(e).__name__}')
+              return {'statusCode': 503, 'body': f'Not reusing {name}: the reuse function is unavailable'}
+          return {'statusCode': 202, 'body': f'Checking {name} for reuse'}
+
+      def reuse_handler(event, context):
+          """Entry point of github-runner-reuse, which runs this same source."""
+          return handle_completed(event if isinstance(event, dict) else {})
+
+      def handle_completed(payload):
+          """Check a finished runner-i-* job's host for reuse. Runs in github-runner-reuse.
+
+          Opens the host's reuse window, so a queued event can claim it. When GitHub
+          also shows more queued jobs for its architecture than idle and starting
+          runners can take, it asks the webhook, asynchronously, for a claim_only
+          request. The webhook is the one function that decides capacity, one
+          execution at a time; this function launches nothing and claims nothing.
           Either way the host powers itself off when its wait ends with nothing.
           """
           job = payload.get('workflow_job')
@@ -1012,6 +1054,10 @@ data "archive_file" "runner_webhook" {
               return {'statusCode': 200, 'body': (f'Not reusing {name}: not a running {arch} '
                                                   f'{STREAM_PROTOCOL} host under {MAX_REUSE_AGE_HOURS}h')}
 
+          if not open_reuse_window(instance_id, runner_id, until):
+              return {'statusCode': 200,
+                      'body': f'Not reusing {name}: its registration moved on or is already held'}
+
           max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
           capacity = get_capacity(arch)
           absorbable = capacity['idle'] + capacity['booting']
@@ -1021,25 +1067,25 @@ data "archive_file" "runner_webhook" {
               if pat:
                   wanted = queued_jobs_at_least(pat, arch, absorbable + 1)
           if wanted is not True:
-              held = open_reuse_window(instance_id, runner_id, until)
-              return {'statusCode': 200, 'body': (f'{"Holding" if held else "Not holding"} {name} '
-                                                  f'for a queued job until {until} (queue check: {wanted})')}
+              return {'statusCode': 200, 'body': (f'Holding {name} for a queued job until {until} '
+                                                  f'(queue check: {wanted})')}
+          request = {'body': json.dumps({
+                         'action': 'queued',
+                         'workflow_job': {'labels': ['self-hosted', 'Linux',
+                                                     'X64' if arch == 'x86_64' else 'ARM64']},
+                         'queued_jobs': absorbable + 1,
+                         'launch_count': 1,
+                         'claim_only': True,
+                     }),
+                     'headers': {}}
           try:
-              registration_token = get_registration_token()
+              lambda_client.invoke(FunctionName=os.environ.get('WEBHOOK_FUNCTION', ''),
+                                   InvocationType='Event', Payload=json.dumps(request))
           except Exception as e:
-              print(f'No registration credential for {instance_id}: {type(e).__name__}')
-              return {'statusCode': 503, 'body': f'Not reusing {name}: no registration credential'}
-          if not open_reuse_window(instance_id, runner_id, until, claim_epoch=now_epoch):
-              return {'statusCode': 200,
-                      'body': f'Not reusing {name}: its registration moved on or is already held'}
-          try:
-              broker_to_host(instance_id, registration_token)
-          except RunnerBootstrapError as e:
-              emit_decision(arch, absorbable + 1, capacity, max_runners, 'launch-failed', str(e))
-              return {'statusCode': 503, 'body': str(e)}
-          detail = f'Reused warm {arch} host {instance_id} for a queued job'
-          emit_decision(arch, absorbable + 1, capacity, max_runners, 'reused', detail)
-          return {'statusCode': 200, 'body': detail}
+              print(f'Could not ask the webhook to claim a warm {arch} host: {type(e).__name__}')
+              return {'statusCode': 503, 'body': f'Holding {name}, but the claim request failed'}
+          return {'statusCode': 202, 'body': (f'Holding {name} and asked the webhook to hand a warm '
+                                              f'{arch} host a queued job')}
 
       def handler(event, context):
           # Parse webhook
@@ -1068,7 +1114,7 @@ data "archive_file" "runner_webhook" {
           # A finished job on one of these runners may hand its host the next job.
           # Every other action except queued is ignored, as it always was.
           if action == 'completed':
-              return handle_completed(payload)
+              return defer_completed(payload)
           if action != 'queued':
               return {'statusCode': 200, 'body': f'Ignoring action: {action}'}
 
@@ -1086,11 +1132,17 @@ data "archive_file" "runner_webhook" {
               queued_jobs = int(payload.get('queued_jobs', 1))
           except (TypeError, ValueError):
               queued_jobs = 1
+          # github-runner-reuse asks for a warm host this way when a finished job's
+          # host should take queued work. Such a request claims a host or does
+          # nothing: it never launches, and a miss is not reported as starvation.
+          # Honoured only on an IAM-authed direct invoke, like launch_count.
+          claim_only = 'requestContext' not in event and payload.get('claim_only') is True
+          refused = 'reuse-missed' if claim_only else 'blocked'
           capacity = get_capacity(arch)
 
           if capacity['counted'] >= max_runners:
               detail = f'Max {arch} runners ({max_runners}) reached'
-              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
               return {'statusCode': 200, 'body': detail}
 
           # Reusing a warm host adds no instance, so the instance ceiling refuses
@@ -1098,7 +1150,7 @@ data "archive_file" "runner_webhook" {
           if capacity['instances'] >= max_runners + LAUNCH_HEADROOM and not capacity['available']:
               detail = (f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
                         f'with only {capacity["counted"]} able to take work')
-              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
               return {'statusCode': 200, 'body': detail}
 
           # How many to launch in THIS invocation. A real GitHub delivery is always
@@ -1121,7 +1173,7 @@ data "archive_file" "runner_webhook" {
           # adds no instance, so the instance ceiling bounds launches alone. A claim
           # that loses its race falls through to a launch.
           slots = min(requested, max_runners - capacity['counted'])
-          launch_room = max_runners + LAUNCH_HEADROOM - capacity['instances']
+          launch_room = 0 if claim_only else max_runners + LAUNCH_HEADROOM - capacity['instances']
           available = list(capacity['available'])
 
           reused_here = []
@@ -1160,9 +1212,10 @@ data "archive_file" "runner_webhook" {
                             f'{e} (after {len(launched_here)} launched this invocation)')
               raise
           if not reused_here and not launched_here:
-              detail = (f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
+              detail = (f'No warm {arch} host left to claim' if claim_only else
+                        f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
                         f'with only {capacity["counted"]} able to take work')
-              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
               return {'statusCode': 200, 'body': detail}
           parts = []
           if reused_here:
@@ -1201,6 +1254,8 @@ resource "aws_lambda_function" "runner_webhook" {
       # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.
       SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
+      # Completed jobs are checked for reuse there; the runner_reuse resource says why.
+      REUSE_FUNCTION = aws_lambda_function.runner_reuse[0].function_name
       # Warm-host reuse reads and claims hosts through their registration rows.
       REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
       INSTANCE_PROFILE   = aws_iam_instance_profile.runner[0].name
@@ -1262,7 +1317,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
       {
         Effect = "Allow"
         Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = flatten([for name in ["github-runner-webhook", "github-runner-cleanup"] : [
+        Resource = flatten([for name in ["github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"] : [
           "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}",
           "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}:*",
         ]])
@@ -1411,7 +1466,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
       {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
-        Resource = "arn:aws:lambda:us-west-1:928413605543:function:github-runner-webhook"
+        Resource = [for name in ["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:us-west-1:928413605543:function:${name}"]
       },
       {
         Effect = "Allow"
@@ -3807,6 +3862,52 @@ resource "aws_lambda_function_event_invoke_config" "runner_webhook" {
   count                  = var.enable_github_runner ? 1 : 0
   function_name          = aws_lambda_function.runner_webhook[0].function_name
   maximum_retry_attempts = 0
+}
+
+# Completed jobs are checked for warm-host reuse here, not in the webhook. The check reads
+# EC2, the runner roster, the registration row and up to 8 seconds of GitHub's queue. The
+# webhook runs one execution at a time behind API Gateway, so there that work would hold the
+# execution while queued deliveries arrive, are throttled, and are never redelivered: on
+# 2026-09-13, before this, 69 of 80 retained queued deliveries had already failed that way.
+# Same source and role as the webhook, and it launches and claims nothing: when a warm host
+# should take queued work it sends the webhook a claim_only request, so the webhook stays the
+# one function that decides capacity. One execution at a time here too, which keeps it to one
+# GitHub queue look at once. A check is worthless once the reuse window has passed, so the
+# async queue keeps an event at most 120 seconds and never retries a failed one.
+resource "aws_lambda_function" "runner_reuse" {
+  count            = var.enable_github_runner ? 1 : 0
+  filename         = data.archive_file.runner_webhook.output_path
+  source_code_hash = data.archive_file.runner_webhook.output_base64sha256
+  function_name    = "github-runner-reuse"
+  role             = aws_iam_role.runner_lambda[0].arn
+  handler          = "lambda_function.reuse_handler"
+  runtime          = "python3.12"
+  timeout          = 30
+
+  reserved_concurrent_executions = 1
+
+  environment {
+    variables = {
+      # A literal, as in the cleanup function: the webhook references this function.
+      WEBHOOK_FUNCTION   = "github-runner-webhook"
+      REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
+      RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
+      MAX_RUNNERS        = tostring(local.runner_max_per_arch)
+    }
+  }
+
+  tags = {
+    Name = "github-runner-reuse"
+  }
+
+  depends_on = [aws_iam_role_policy.runner_lambda]
+}
+
+resource "aws_lambda_function_event_invoke_config" "runner_reuse" {
+  count                        = var.enable_github_runner ? 1 : 0
+  function_name                = aws_lambda_function.runner_reuse[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 120
 }
 
 resource "aws_cloudwatch_event_rule" "runner_cleanup" {

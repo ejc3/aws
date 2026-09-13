@@ -712,10 +712,10 @@ scarce, moving a family that just failed for capacity to the back of that order.
 instance carries `RunnerRegistrationProtocol=ddb-v2`. After GitHub configuration, bootstrap
 validates the exact identity in `.runner`, conditionally records `State=registered` under its
 instance ARN in DynamoDB, and starts the service only after that identity is confirmed.
-Registrations are ephemeral, one job each, but a host whose job finished cleanly waits three
-minutes for another: a `completed` event with queued work behind it, or a later `queued`
-event, claims the host through a conditional update of its row and brokers it a fresh
-instance-bound credential. A host nobody claims powers off.
+Registrations are ephemeral, one job each, but a host whose job succeeded can take another:
+it waits three minutes, and a `completed` event with queued work behind it, or a later
+`queued` event, claims the host through a conditional update of its row and brokers it a
+fresh instance-bound credential. A host whose job failed, or that nobody claims, powers off.
 
 Cleanup runs every five minutes. A registered `ddb-v1` or `ddb-v2` runner is checked by its exact
 GitHub runner id, and one with no row is reaped after its lease through a conditional

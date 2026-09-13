@@ -355,11 +355,19 @@ class FakeSSM:
 
 
 class FakeLambdaClient:
-    def __init__(self):
+    def __init__(self, error=None):
         self.invokes = []
+        self.calls = []
+        self.error = error
 
     def invoke(self, **kw):
-        self.invokes.append(json.loads(json.loads(kw["Payload"])["body"]))
+        self.calls.append(kw)
+        if self.error:
+            raise self.error
+        payload = json.loads(kw["Payload"])
+        # Webhook-shaped events carry a body; the reuse function takes the job itself.
+        if "body" in payload:
+            self.invokes.append(json.loads(payload["body"]))
 
     def arch_invokes(self):
         """Total runners REQUESTED per architecture.
@@ -535,7 +543,7 @@ def capture_emf(emit, **kwargs):
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
-                dynamodb=None):
+                dynamodb=None, launch_ec2=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
@@ -551,6 +559,10 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     client_options = []
     def client(service, **kw):
         client_options.append((service, kw))
+        # The webhook's RunInstances client is its one EC2 client built with a
+        # config; a case can hand it a separate fake to see which calls use it.
+        if service == "ec2" and "config" in kw and launch_ec2 is not None:
+            return launch_ec2
         return clients[service]
     fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
@@ -575,6 +587,7 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         "INSTANCE_PROFILE": "runner-profile",
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
+        "REUSE_FUNCTION": "github-runner-reuse",
         "MAX_RUNNERS": "4",
         "REGISTRATION_TABLE": "github-runner-registration",
         "RUNNER_ACCOUNT_ID": ACCOUNT_ID,
@@ -1414,19 +1427,49 @@ def bootstrap_names(ssm):
     return [put["Name"] for put in ssm.puts]
 
 
+def reuse(ec2, **kw):
+    """The webhook source as github-runner-reuse runs it, with a recording Lambda client."""
+    kw.setdefault("github", FakeGitHub())
+    kw.setdefault("lambda_client", FakeLambdaClient())
+    return load_lambda(WEBHOOK_SRC, ec2, kw.pop("ssm", FakeSSM()), **kw)
+
+
+def as_handoff(event):
+    """What the webhook hands github-runner-reuse for a completed delivery."""
+    return {"workflow_job": json.loads(event["body"])["workflow_job"]}
+
+
 def case_a_completed_job_hands_its_warm_host_the_next_queued_job():
     """Queued work the pool cannot absorb goes to the host that just finished.
 
-    The host's registration ended with its job, so it is neither online nor
-    booting; its row is how the controller knows it. One conditional write
-    opens its reuse window and claims it, and the credential goes to that
-    instance's own bound parameter, exactly as for a launch.
+    Three hops, each run as Lambda runs it. The webhook answers the delivery and
+    hands the job to github-runner-reuse without a read. The reuse function opens
+    the host's window and, seeing more queued work than idle and starting runners
+    can take, asks the webhook for a claim. The webhook, the one function that
+    decides capacity, claims the host and brokers its instance-bound credential.
     """
     ssm, dynamodb, ec2 = FakeSSM(), FakeDynamoDB([stream_row()]), FakeEC2([stream_host()])
-    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb,
-                     github=FakeGitHub(**queue_of(queued=2)))["handler"](completed_event(), None)
-    assert result == {"statusCode": 200,
-                      "body": f"Reused warm arm64 host {WARM} for a queued job"}, result
+    github, front, back = FakeGitHub(**queue_of(queued=2)), FakeLambdaClient(), FakeLambdaClient()
+    accepted = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                       lambda_client=front)["handler"](completed_event(), None)
+    assert accepted == {"statusCode": 202, "body": f"Checking runner-{WARM} for reuse"}, accepted
+    (handoff,) = front.calls
+    assert handoff["FunctionName"] == "github-runner-reuse", handoff
+    assert handoff["InvocationType"] == "Event", handoff
+
+    checked = reuse(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                    lambda_client=back)["reuse_handler"](json.loads(handoff["Payload"]), None)
+    assert checked["statusCode"] == 202, checked
+    (request,) = back.calls
+    assert request["FunctionName"] == "github-runner-webhook", request
+    assert request["InvocationType"] == "Event", request
+    assert back.invokes == [{"action": "queued", "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                             "queued_jobs": 1, "launch_count": 1, "claim_only": True}], back.invokes
+    assert ssm.puts == [] and "ClaimedAt" not in stream_item(dynamodb), (ssm.puts, stream_item(dynamodb))
+
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github)["handler"](
+        json.loads(request["Payload"]), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
     assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
     tags = {t["Key"]: t["Value"] for t in ssm.puts[0]["Tags"]}
     assert tags["InstanceArn"] == instance_arn(WARM), tags
@@ -1436,13 +1479,35 @@ def case_a_completed_job_hands_its_warm_host_the_next_queued_job():
     assert not ec2.ops("run_instances"), ec2.calls
 
 
+def case_the_webhook_hands_a_completed_job_on_without_reading_anything():
+    """The webhook's one execution is never held by a reuse check."""
+    ec2, ssm, dynamodb = FakeEC2([stream_host()]), FakeSSM(), FakeDynamoDB([stream_row()])
+    github, front = FakeGitHub(**queue_of(queued=3)), FakeLambdaClient()
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                     lambda_client=front)["handler"](completed_event(), None)
+    assert result["statusCode"] == 202, result
+    assert (ec2.calls, dynamodb.calls, github.requests, ssm.journal) == ([], [], [], []), \
+        (ec2.calls, dynamodb.calls, github.requests, ssm.journal)
+    assert json.loads(front.calls[0]["Payload"]) == {"workflow_job": {
+        "runner_name": f"runner-{WARM}", "runner_id": 77,
+        "labels": ["self-hosted", "Linux", "ARM64"], "conclusion": "success",
+        "completed_at": (NOW - timedelta(seconds=10)).isoformat()}}, front.calls
+    for event in (completed_event(conclusion="failure"), completed_event(runner_name="GitHub Actions 12")):
+        skipped = FakeLambdaClient()
+        ignored = webhook(FakeEC2(), lambda_client=skipped)["handler"](event, None)
+        assert ignored["statusCode"] == 200 and skipped.calls == [], (ignored, skipped.calls)
+    refused = webhook(FakeEC2(), lambda_client=FakeLambdaClient(error=OSError("Lambda unavailable")))[
+        "handler"](completed_event(), None)
+    assert refused["statusCode"] == 503, refused
+
+
 def case_a_completed_job_with_nothing_waiting_holds_its_host_for_a_queued_event():
-    ssm, dynamodb, github = FakeSSM(), FakeDynamoDB([stream_row()]), FakeGitHub()
-    result = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb,
-                     github=github)["handler"](completed_event(), None)
+    dynamodb, github, back = FakeDynamoDB([stream_row()]), FakeGitHub(), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
     assert result["statusCode"] == 200, result
     assert result["body"].startswith(f"Holding runner-{WARM}"), result
-    assert ssm.puts == [], ssm.puts
+    assert back.calls == [], back.calls
     item = stream_item(dynamodb)
     assert item["AvailableUntil"] == {"N": str(NOW_EPOCH - 10 + 120)}, item
     assert "ClaimedAt" not in item, item
@@ -1454,17 +1519,18 @@ def case_queued_work_the_idle_pool_already_covers_does_not_take_the_warm_host():
     idle = instance(WARM_TOO, "c7gd.metal", "running", 60, arch="arm64")
     github = FakeGitHub(runners=[{"id": 9, "name": f"runner-{WARM_TOO}", "status": "online",
                                   "busy": False}], **queue_of(queued=1))
-    ssm, dynamodb = FakeSSM(), FakeDynamoDB([stream_row()])
-    result = webhook(FakeEC2([stream_host(), idle]), ssm=ssm, dynamodb=dynamodb,
-                     github=github)["handler"](completed_event(), None)
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host(), idle]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
     assert result["body"].startswith(f"Holding runner-{WARM}"), result
-    assert ssm.puts == [], ssm.puts
+    assert back.calls == [], back.calls
 
 
 def case_a_completed_event_hands_out_nothing_it_cannot_prove():
     """Every guard on the completed path, each with queued work waiting behind it."""
     variants = [
         ("a GitHub-hosted runner", {"event": completed_event(runner_name="GitHub Actions 12")}),
+        ("a failed job", {"event": completed_event(conclusion="failure")}),
         ("a cancelled job", {"event": completed_event(conclusion="cancelled")}),
         ("a timed-out job", {"event": completed_event(conclusion="timed_out")}),
         ("a reuse window that has closed", {"event": completed_event(completed_seconds_ago=91)}),
@@ -1476,20 +1542,22 @@ def case_a_completed_event_hands_out_nothing_it_cannot_prove():
         ("a window already open", {"item": stream_row(available_until=NOW_EPOCH + 60)}),
     ]
     for label, variant in variants:
-        ssm = FakeSSM()
-        dynamodb = FakeDynamoDB([variant.get("item", stream_row())])
-        result = webhook(FakeEC2([variant.get("host", stream_host())]), ssm=ssm,
-                         dynamodb=dynamodb, github=FakeGitHub(**queue_of(queued=3)))["handler"](
-                             variant.get("event", completed_event()), None)
+        item = variant.get("item", stream_row())
+        window_before = item.get("AvailableUntil")
+        dynamodb, back = FakeDynamoDB([item]), FakeLambdaClient()
+        result = reuse(FakeEC2([variant.get("host", stream_host())]), dynamodb=dynamodb,
+                       github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)["reuse_handler"](
+                           as_handoff(variant.get("event", completed_event())), None)
         assert result["statusCode"] == 200, (label, result)
-        assert ssm.puts == [], (label, ssm.puts)
+        assert back.calls == [], (label, back.calls)
+        assert stream_item(dynamodb).get("AvailableUntil") == window_before, (label, stream_item(dynamodb))
         assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
 
 
 def case_a_queue_check_that_cannot_finish_hands_out_nothing():
-    ssm, dynamodb = FakeSSM(), FakeDynamoDB([stream_row()])
-    module = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb,
-                     github=FakeGitHub(**queue_of(queued=3)))
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    module = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
+                   github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)
     answered = module["github_get"]
 
     def runs_unreachable(pat, url):
@@ -1498,9 +1566,82 @@ def case_a_queue_check_that_cannot_finish_hands_out_nothing():
         return answered(pat, url)
 
     module["github_get"] = runs_unreachable
-    result = module["handler"](completed_event(), None)
+    result = module["reuse_handler"](as_handoff(completed_event()), None)
     assert result["body"].startswith(f"Holding runner-{WARM}"), result
-    assert ssm.puts == [], ssm.puts
+    assert back.calls == [], back.calls
+
+
+def case_a_claim_only_request_claims_a_warm_host_or_nothing():
+    """github-runner-reuse's request never launches, and a miss is not starvation."""
+    request = {"body": json.dumps({"action": "queued",
+                                   "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                                   "queued_jobs": 1, "launch_count": 1, "claim_only": True}),
+               "headers": {}}
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        missed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row()]))["handler"](request, None)
+    assert missed["body"] == "No warm arm64 host left to claim", missed
+    assert not ec2.ops("run_instances") and ssm.puts == [], (ec2.calls, ssm.puts)
+    line = json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert line["decision"] == "reuse-missed" and line["ScaleUpStarved"] == 0, line
+    claimed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)]))[
+        "handler"](request, None)
+    assert claimed["body"] == f"Reused 1 warm arm64 host(s): {WARM}", claimed
+
+
+def case_a_public_delivery_cannot_ask_for_claim_only():
+    """claim_only, like launch_count, is honoured only on an IAM-authed direct invoke."""
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+    body = json.dumps({"action": "queued", "claim_only": True,
+                       "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]}})
+    sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    ec2 = FakeEC2([])
+    result = webhook(ec2, env={"WEBHOOK_SECRET": secret})["handler"](
+        {"body": body, "requestContext": {}, "headers": {"x-hub-signature-256": sig}}, None)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_run_instances_is_made_without_botocore_retries():
+    """An exhausted spot pool costs one call, not four retries of the same pool.
+
+    On 2026-09-13 botocore retried InsufficientInstanceCapacity four times per pool
+    ("reached max retries: 4"), 7 to 15 seconds each, and invocations ran into the
+    30-second timeout while the webhook's single execution was held.
+    """
+    describer, launcher = FakeEC2(), FakeEC2()
+    module = load_lambda(WEBHOOK_SRC, describer, FakeSSM(), github=FakeGitHub(), launch_ec2=launcher)
+    module["launch_runner"]("arm64")
+    assert len(launcher.ops("run_instances")) == 1, launcher.calls
+    assert describer.ops("run_instances") == [], describer.calls
+    retries = [kw["config"].retries for service, kw in module["_test_client_options"]
+               if service == "ec2" and "config" in kw]
+    assert retries == [{"total_max_attempts": 1}], retries
+
+
+def case_completed_jobs_are_checked_in_a_separate_single_execution_function():
+    source = TF_FILE.read_text()
+
+    def resource(kind, name):
+        return re.search(r'^resource "' + kind + r'" "' + name + r'" \{\n.*?^\}', source, re.M | re.S).group()
+
+    hook_fn = resource("aws_lambda_function", "runner_webhook")
+    reuse_fn = resource("aws_lambda_function", "runner_reuse")
+    reuse_queue = resource("aws_lambda_function_event_invoke_config", "runner_reuse")
+    assert re.search(r'reserved_concurrent_executions = 1\n', hook_fn), hook_fn
+    assert re.search(r'REUSE_FUNCTION\s*=\s*aws_lambda_function\.runner_reuse\[0\]\.function_name', hook_fn)
+    for pattern in (r'filename\s*=\s*data\.archive_file\.runner_webhook\.output_path',
+                    r'handler\s*=\s*"lambda_function\.reuse_handler"',
+                    r'function_name\s*=\s*"github-runner-reuse"',
+                    r'reserved_concurrent_executions = 1\n',
+                    r'WEBHOOK_FUNCTION\s*=\s*"github-runner-webhook"'):
+        assert re.search(pattern, reuse_fn), (pattern, reuse_fn)
+    assert re.search(r'maximum_retry_attempts\s*=\s*0', reuse_queue), reuse_queue
+    assert re.search(r'maximum_event_age_in_seconds\s*=\s*120', reuse_queue), reuse_queue
+    assert '["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:' in source
+    assert '"github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"' in source
 
 
 def case_a_queued_job_claims_a_warm_host_before_launching_metal():
@@ -1583,7 +1724,7 @@ def case_the_cleanup_retry_prefers_warm_hosts_too():
                                     "/github-runner/bootstrap/i-new-c7gd.metal"], ssm.puts
 
 
-def case_a_signed_completed_delivery_is_handled_and_in_progress_is_still_ignored():
+def case_a_signed_completed_delivery_is_handed_on_and_in_progress_is_still_ignored():
     import hmac as hmac_mod
     import hashlib
     secret = "testsecret"
@@ -1593,17 +1734,15 @@ def case_a_signed_completed_delivery_is_handled_and_in_progress_is_still_ignored
         return {"body": body, "requestContext": {},
                 "headers": {"X-Hub-Signature-256": signature or f"sha256={digest}"}}
 
-    ssm, dynamodb = FakeSSM(), FakeDynamoDB([stream_row()])
-    module = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb,
-                     env={"WEBHOOK_SECRET": secret})
+    front = FakeLambdaClient()
+    module = webhook(FakeEC2([stream_host()]), env={"WEBHOOK_SECRET": secret}, lambda_client=front)
     forged = module["handler"](signed(completed_event()["body"], signature="sha256=00"), None)
-    assert forged["statusCode"] == 401, forged
-    assert "AvailableUntil" not in stream_item(dynamodb), stream_item(dynamodb)
-    held = module["handler"](signed(completed_event()["body"]), None)
-    assert held["body"].startswith(f"Holding runner-{WARM}"), held
+    assert forged["statusCode"] == 401 and front.calls == [], (forged, front.calls)
+    accepted = module["handler"](signed(completed_event()["body"]), None)
+    assert accepted["statusCode"] == 202 and len(front.calls) == 1, (accepted, front.calls)
     progress = json.dumps({"action": "in_progress", "workflow_job": {"labels": ["ARM64"]}})
     assert module["handler"](signed(progress), None)["body"] == "Ignoring action: in_progress"
-    assert ssm.puts == [], ssm.puts
+    assert len(front.calls) == 1, front.calls
 
 
 def case_only_user_data_that_registers_again_is_tagged_for_reuse():

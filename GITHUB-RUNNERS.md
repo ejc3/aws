@@ -89,6 +89,24 @@ generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, 
 price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.
 
+**One execution at a time, and what it costs.** The webhook Lambda has run with
+`reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent
+invocations all read the same runner count before any launch and put up more instances than
+`MAX_RUNNERS`. A delivery that arrives while that one execution is busy is throttled, and
+GitHub never redelivers it. Of the 236 deliveries GitHub retained on 2026-09-13 (back to
+2026-09-11 04:15Z), 62 of 80 `queued`, 36 of 71 `in_progress` and 30 of 85 `completed` got a
+503 after about 0.2 seconds, and 7 more `queued` hit GitHub's 10-second limit; the function's
+`Throttles` metric reached 69 in one hour. Two things held the execution. A burst of `queued`
+deliveries for one run arrives within seconds while each launch takes about 3 seconds. And
+botocore retried `InsufficientInstanceCapacity` four times per exhausted pool, 7 to 15 seconds
+each, so invocations on the cleanup poll's five-minute cadence ran into the 30-second timeout
+(12 of 113 invocations after 13:00Z that day). RunInstances now makes one attempt per pool,
+and a `completed` delivery is answered 202 at once and checked for reuse in
+`github-runner-reuse`, so reuse never holds the webhook's execution. A burst still drops
+`queued` deliveries, and the five-minute poll is still their retry. A front function with its
+own concurrency, verifying the signature and queueing the event for the webhook
+asynchronously, would stop those drops; it is not built.
+
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
 or `m6gd.metal` fails every `test_kvm` case. Storage is necessary, not sufficient.
@@ -206,18 +224,27 @@ any failure, powers the host off; the unit also has `FailureAction=poweroff` and
 start timeout. Nothing reusable reaches the host: every job's credential is minted by the
 controller, bound to the instance ARN, and deleted before that job's service starts.
 
-The host's row decides who gets that credential. The webhook Lambda also handles
-`workflow_job` `completed`, which the existing `workflow_job` subscription already delivers,
-for `runner-i-*` runners whose job concluded `success` or `failure`. It acts only on a
+The host's row decides who gets that credential. The webhook Lambda answers a `workflow_job`
+`completed` delivery, which the existing `workflow_job` subscription already delivers, with 202
+and hands the job to `github-runner-reuse`, the same code in a function with its own single
+execution (see "One execution at a time" above), for `runner-i-*` runners whose job concluded
+`success`. A failed job is the likeliest to leave
+leaked VMs, D-state processes or a full disk behind (before `--ephemeral`, one bad host,
+`runner-i-0ea78b39da373fcca` on 2026-08-06, failed every job it picked up), so a host whose
+job failed, or was cancelled or timed out, gets no credential and powers off when its wait
+ends. The host's `after` step cannot see the job's conclusion, only its runner's exit, so this
+filter lives in the controller. It acts only on a
 running `ddb-v2` instance of the job's architecture younger than `MAX_REUSE_AGE_HOURS` (12,
 the soft cap), and only while `completed_at` plus `REUSE_WINDOW_SECONDS` (120) still leaves
-`CLAIM_MARGIN_SECONDS` (30). When GitHub shows more queued jobs for that architecture than
-idle online runners and starting ones can take (a look at in-progress and queued runs of at
-most eight seconds, where an unfinished look counts as no), one conditional `UpdateItem` sets
-`AvailableUntil` and `ClaimedAt` on the row, only while it is `registered`, still names the
-runner that finished, and has no window yet, and the credential is brokered to that instance.
-Otherwise the same write sets `AvailableUntil` alone. A `queued` event, and the cleanup poll's
-retry, which runs the same handler, first claims such a host with `SET ClaimedAt` under
+`CLAIM_MARGIN_SECONDS` (30). There one conditional `UpdateItem` sets `AvailableUntil` on the
+row, only while it is `registered`, still names the runner that finished, and has no window
+yet. When GitHub also shows more queued jobs for that architecture than idle online runners
+and starting ones can take (a look at in-progress and queued runs of at most eight seconds,
+where an unfinished look counts as no), the reuse function asks the webhook, asynchronously,
+for a `claim_only` request, which claims a warm host or does nothing and is honoured only on a
+direct invoke. The webhook stays the only function that claims a host or launches one, one
+execution at a time. A `queued` event, the cleanup poll's retry and that request all run the
+same handler, which first claims such a host with `SET ClaimedAt` under
 `#s = :registered AND AvailableUntil >= :now_plus_30 AND attribute_not_exists(ClaimedAt)`,
 brokers to it, and launches only when no claim wins. The latest credential is therefore
 written 90 seconds after the job completed, against a host that waits at least 180. A claimed
@@ -529,7 +556,9 @@ stalling right now — to move failed types to the back of the list. The verdict
 (type, AZ), read from the record's `Placement` because a terminated record no longer carries
 a `SubnetId`, so `c7gd.metal` running dry in us-west-1a does not hold back `c7gd.metal` in
 us-west-1c. Back, not out: if every pair has failed the list is only reordered, so a launch
-is still attempted.
+is still attempted. Each pool gets one `RunInstances` attempt: the default botocore client
+retried `InsufficientInstanceCapacity` four times per pool, 7 to 15 seconds each, and ran the
+webhook into its 30-second timeout.
 
 **The queue poll counts jobs, not a sample of runs.** It asks for runs with `status=queued`
 *and* `status=in_progress`, pages both, pages each run's jobs, and counts the queued
@@ -754,7 +783,8 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `github-runner-instance-role` and only to EC2, with explicit denies for other
   roles and services;
   `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;
-  `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
+  `lambda:InvokeFunction` on the webhook and `github-runner-reuse` functions (the cleanup
+  retry, the completed hand-off and the claim request); and
   `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
   for the cleanup claim and the webhook's conditional warm-host window and claim.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
