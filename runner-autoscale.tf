@@ -857,7 +857,9 @@ resource "aws_lambda_function" "runner_webhook" {
     variables = {
       # Ordered [{subnet_id, availability_zone}] from local.runner_launch_subnets.
       # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
-      LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
+      LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
+      # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.
+      SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       # Constant breaks the old inverse dependency. A new controller must be

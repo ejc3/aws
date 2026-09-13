@@ -509,6 +509,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         namespace["urllib"] = github.as_urllib()
     namespace["os"].environ.update({
         "LAUNCH_SUBNETS": json.dumps(LAUNCH_SUBNETS),
+        # Terraform sets both; LAUNCH_SUBNETS must win.
+        "SUBNET_ID": SUBNET_A,
         "SECURITY_GROUP_ID": "sg-test",
         "INSTANCE_PROFILE": "runner-profile",
         "USER_DATA_PARAM": "/github-runner/user-data",
@@ -1147,7 +1149,9 @@ def case_terraform_hands_the_launcher_us_west_1c_first():
     assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_launch_subnets : "
                      r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
                      source), "LAUNCH_SUBNETS is not rendered from local.runner_launch_subnets"
-    assert not re.search(r"^\s*SUBNET_ID\s*=", source, re.M), "the Lambda is still given one SUBNET_ID"
+    # Kept for the previous controller code during the apply; it must stay the us-west-1a subnet.
+    assert re.search(r"\n      SUBNET_ID\s*=\s*aws_subnet\.runner\[0\]\.id\n", source), \
+        "SUBNET_ID is not the us-west-1a subnet"
 
 
 def case_capacity_exhausted_in_us_west_1c_falls_through_to_us_west_1a():
