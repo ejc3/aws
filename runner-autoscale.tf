@@ -1555,12 +1555,18 @@ resource "aws_apigatewayv2_stage" "runner_webhook" {
   auto_deploy = true
 }
 
+# Deliveries go to github-runner-webhook-front (runner-webhook-front.tf), which verifies them
+# and queues them for the webhook. integration_uri updates this integration in place, so the
+# route, its target and the URL GitHub posts to are unchanged; depends_on puts API Gateway's
+# permission to invoke the front in place before any request can reach it.
 resource "aws_apigatewayv2_integration" "runner_webhook" {
   count              = var.enable_github_runner ? 1 : 0
   api_id             = aws_apigatewayv2_api.runner_webhook[0].id
   integration_type   = "AWS_PROXY"
-  integration_uri    = aws_lambda_function.runner_webhook[0].invoke_arn
+  integration_uri    = aws_lambda_function.runner_webhook_front[0].invoke_arn
   integration_method = "POST"
+
+  depends_on = [aws_lambda_permission.runner_webhook_front]
 }
 
 resource "aws_apigatewayv2_route" "runner_webhook" {

@@ -1915,6 +1915,16 @@ def case_the_github_webhook_its_url_and_its_secret_are_untouched():
         assert tf_block(source, kind, name) == pinned, (kind, name, tf_block(source, kind, name))
 
 
+def case_api_gateway_sends_deliveries_to_the_front():
+    integration = tf_block(TF_FILE.read_text(), "aws_apigatewayv2_integration", "runner_webhook")
+    for pattern in (r'integration_type\s*=\s*"AWS_PROXY"',
+                    r'integration_uri\s*=\s*aws_lambda_function\.runner_webhook_front\[0\]\.invoke_arn\n',
+                    r'integration_method\s*=\s*"POST"',
+                    r'depends_on = \[aws_lambda_permission\.runner_webhook_front\]'):
+        assert re.search(pattern, integration), (pattern, integration)
+    assert "runner_webhook[0].invoke_arn" not in integration, integration
+
+
 def case_a_queued_job_claims_a_warm_host_before_launching_metal():
     ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
     dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
