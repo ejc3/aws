@@ -339,11 +339,13 @@ resource "aws_iam_role_policy" "backup_recovery" {
         # Creation times let the daily-capture and monthly-test checks give a volume
         # created after their deadline a grace period instead of reporting it missing
         # (moving a dev box gives it a new root volume). EC2 Describe* has no
-        # resource-level scope; this reads volume metadata only.
-        Sid      = "ReadVolumeCreationTimes"
-        Effect   = "Allow"
-        Action   = "ec2:DescribeVolumes"
-        Resource = "*"
+        # resource-level scope, so the region is the only narrowing available: the
+        # checks read the protected volumes through a primary-region client.
+        Sid       = "ReadVolumeCreationTimes"
+        Effect    = "Allow"
+        Action    = "ec2:DescribeVolumes"
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
       },
       {
         Effect   = "Allow"

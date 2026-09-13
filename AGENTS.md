@@ -669,7 +669,12 @@ set `firecracker_move_from_instance_id` to its instance ID and `firecracker_avai
 to the target in `firecracker-dev.tf`, merge, and apply from a fresh worktree. Terraform images
 the stopped disk, builds the new box from that image before destroying the old one, moves the
 Elastic IP, and keeps the SSH host keys. The target AZ needs a subnet in
-`local.subnet_ids_by_az` (`main.tf`). The old root volume is left as a rollback copy.
+`local.subnet_ids_by_az` (`main.tf`). The old root volume is left as a rollback copy. Once the
+new box checks out and a completed backup holds the disk as of the move (the new root volume's
+first daily backup, or the old volume's if it ran after the stop), set
+`firecracker_move_from_instance_id` back to `""` and apply, which deletes the move image. While
+it is set, any later replacement boots from that dated image and rolls the disk back to the day
+of the move.
 
 **Volume Swap Procedure** (x86 only, after terraform creates new instance):
 ```bash
