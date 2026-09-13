@@ -117,7 +117,7 @@ APPROVED_RULES = {
     "aws-apply-time-limits-validate-cannot-catch": (
         "medium",
         ["*.tf", "modules/**/*.tf"],
-        "9977bd145cf260f5ba0c0d52a25c33dd56a239f828dd02cee0d82c6889dced15",
+        "4fb8a760d52a0db1b7defb661ebd97a167708f6090fb2fd8b819cb435318c3d0",
     ),
     "aws-unattended-boot-script-robustness": (
         "medium",
@@ -148,7 +148,7 @@ APPROVED_FILES = {
         "8626513d453e09d47c0ba169df315dfbda701f841b3b234f864b2bc601c84819",
     ),
 }
-APPROVED_RULES_MD_SHA256 = "d986097b8af8a56500058a3e7d017dc0d278620b372d2a158745f6f4fd88976f"
+APPROVED_RULES_MD_SHA256 = "bee096e7439030046e7aa63203df589012fc80245b4acefe942892a5fb60bef9"
 REPIN = "If the change is intended, update its pin in scripts/test-greptile-config.py in the same PR"
 RULE_IDS = set(APPROVED_RULES)
 # A rule without scope applies to every file; only these may omit it.

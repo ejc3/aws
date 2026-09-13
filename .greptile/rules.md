@@ -65,11 +65,11 @@ and CI files, and `README.md` to the rollout-gate and operator-helper files.
 
 ## Measured limits
 
-- On origin/main 2073aa4 (2026-09-13), `base64gzip(local.runner_user_data)` is 7,584
-  characters, with both Terraform interpolations padded to 40 characters, against the
-  8,192-character Advanced-tier limit: about 600 characters of headroom. The 4,712 and
-  "about 6,100" figures in the comment beside `aws_ssm_parameter.runner_user_data` are
-  older than the current script.
+- `/github-runner/user-data` holds `base64gzip(local.runner_user_data_document)`, the runner
+  script without its whole-line comments (#137). The value applied from b7ef4ff measured
+  6,988 characters on 2026-09-13 against the 8,192-character Advanced-tier limit: about
+  1,200 characters of headroom. The figures in the comment beside
+  `aws_ssm_parameter.runner_user_data` record how it got there, not its current size.
 - The inline policies on `dev-server-role` totalled 8,679 non-whitespace characters in a
   state snapshot taken on 2026-09-13, against IAM's 10,240-character aggregate limit for
   one role.
@@ -121,7 +121,8 @@ The kids' full passwordless sudo on nextjs-dev is deliberate: the instance is th
   AWS refuses to modify on spot instances, so the create failed right after
   `RunInstances` and left the new instance tainted (#117). #122 renamed an SSM parameter
   because names starting with `aws` are reserved. The runner user data once reached 11,184
-  base64 characters against the 8,192-character Advanced-tier limit.
+  base64 characters against the 8,192-character Advanced-tier limit, and on 2026-09-13 #134
+  and #136 took it to 8,476, failing the apply until #137 stopped encoding comment lines.
 - `aws-unattended-boot-script-robustness`: a `grep` with no match on a storeless instance
   type killed the runner bootstrap under `set -e`; an indented shebang made the kernel run
   `/bin/sh`; the `runner_key` block in `~/.ssh/config` grew to three identical copies.
