@@ -10,8 +10,10 @@ Three leaks shaped these checks:
   * scripts/dev-box-triage.sh put the Cloudflare token on curl's command line, readable by
     any local user through /proc/<pid>/cmdline.
 
-THE STATIC CHECK executes nothing. It reads every Terraform heredoc and scripts/*.sh as
-shell. Each assignment from a secret fetch -- `aws secretsmanager get-secret-value`,
+THE STATIC CHECK executes nothing. It reads every Terraform heredoc and every scripts/*.sh
+except the test-*.sh harnesses as shell; a harness holds fetch text as data (an awk program
+that looks for `--with-decryption`, a fake's case pattern) and fetches no real secret.
+Each assignment from a secret fetch -- `aws secretsmanager get-secret-value`,
 `--with-decryption`, the IMDS `/api/token`, `gh auth token` -- needs tracing definitely off
 at that point in the same shell: an unconditional `set +x` earlier in that shell that no
 later `set -x`, not even a conditional restore, has undone. A heredoc body or a function
@@ -47,7 +49,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # entry then, so the list cannot silently outlive the fix).
 EXPECTED_TO_FIX_IN_128 = {
     # runner-autoscale.tf runner_user_data runs under `set -euxo pipefail`; the runner branch
-    # (#128) owns these lines, so they are left for it rather than conflicting here.
+    # (#128) owns these lines, so they are left for it rather than conflicting here. #128
+    # fixes all three: whichever of #128 and this change merges second deletes them.
     "runner-autoscale.tf:runner_user_data:traced-fetch:TOKEN6":
         "IMDSv2 token assigned before the `set +x`; traced into cloud-init output and the console",
     "runner-autoscale.tf:runner_user_data:traced-fetch:TOKEN":
@@ -462,9 +465,12 @@ def terraform_units():
             i = j + 1
 
 
-def script_units():
-    for path in sorted((ROOT / "scripts").glob("*.sh")):
-        yield path.relative_to(ROOT).as_posix(), path.read_text().split("\n"), 1
+def script_units(root=ROOT):
+    # The test-*.sh harnesses stay out: they match fetch text in awk and grep programs and
+    # fake case patterns, and none of that text fetches anything on a host.
+    for path in sorted((root / "scripts").glob("*.sh")):
+        if not path.name.startswith("test-"):
+            yield path.relative_to(root).as_posix(), path.read_text().split("\n"), 1
 
 
 def scan(units):
@@ -488,6 +494,10 @@ def unit_text(unit):
 
 def ids(sink):
     return sorted(f.id for f in sink.findings)
+
+
+# A line that only turns tracing off, bare or silenced: `set +x`, `{ set +x; } 2>/dev/null`.
+PAUSE = re.compile(r"^\s*(?:set\s+\+x|\{\s*set\s+\+x\s*;\s*\}(?:\s*2>\s*/dev/null)?)\s*$")
 
 
 # ------------------------------------------------------------------------ repository scan
@@ -519,15 +529,47 @@ class RepositoryScanTests(unittest.TestCase):
                      ("scripts/dev-box-triage.sh", "CF_TOKEN"), ("runner-autoscale.tf:runner_user_data", "REG_TOKEN")):
             self.assertIn(site, untraced)
 
+    def test_test_harnesses_are_left_out_of_the_scan(self):
+        # A harness checks user data with an awk program like this one; it is a pattern the
+        # scanner alone would read as a traced fetch, not a fetch.
+        harness = ("#!/bin/bash\nset -uo pipefail\nUNPAUSED=$(awk '\n"
+                   "  /latest\\/api\\/token|--with-decryption/ && !paused { print NR }\n' \"$USERDATA\")\n")
+        self.assertEqual(ids(scan_text(harness)), ["fixture:traced-fetch:UNPAUSED"])
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "scripts").mkdir()
+            (Path(tmp) / "scripts" / "test-runner-userdata.sh").write_text(harness)
+            (Path(tmp) / "scripts" / "admin.sh").write_text(f"#!/bin/bash\nset -x\n{FETCH_LINE}\n")
+            self.assertEqual(ids(scan(script_units(Path(tmp)))), ["scripts/admin.sh:traced-fetch:X"])
+
+    def without_pause_before_fetch(self, unit, var):
+        """The unit with the xtrace pause nearest above its first untraced fetch of `var` deleted.
+
+        Not the unit's first `set +x`: a unit can pause more than once, and a fetch inside a
+        heredoc of its own (REG_TOKEN can sit in one) is guarded by the pause nearest above it.
+        """
+        text = unit_text(unit)
+        lines = text.split("\n")
+        site = next((s for s in scan_text(text, unit).sites if s.var == var and s.off), None)
+        self.assertIsNotNone(site, f"{unit} has no untraced fetch of {var}")
+        fetch = site.line - 1
+        self.assertRegex(lines[fetch], rf"\b{var}=")
+        pause = next((k for k in range(fetch - 1, -1, -1) if PAUSE.match(lines[k])), None)
+        self.assertIsNotNone(pause, f"{unit} has no xtrace pause above its {var} fetch")
+        return "\n".join(lines[:pause] + lines[pause + 1:])
+
     def test_real_blocks_are_reported_once_their_protection_is_removed(self):
+        for unit, var in (("dev-hop-key.tf:dev_hop_setup", "HOPJSON"),
+                          ("jumpbox2-user-data.tf:jumpbox_2_user_data", "FCVM_KEY"),
+                          ("dev-instance-common.tf:gh_auth_script", "GH_TOKEN"),
+                          ("runner-autoscale.tf:runner_user_data", "REG_TOKEN"),
+                          ("scripts/dev-box-triage.sh", "CF_TOKEN")):
+            with self.subTest(unit=unit, kind=f"traced-fetch:{var}", old="the pause nearest above the fetch"):
+                finding = f"{unit}:traced-fetch:{var}"
+                self.assertNotIn(finding, ids(scan_text(unit_text(unit), unit)))
+                self.assertIn(finding, ids(scan_text(self.without_pause_before_fetch(unit, var), unit)))
         cases = (
-            ("dev-hop-key.tf:dev_hop_setup", "\nset +x\n", "\n", "traced-fetch:HOPJSON"),
             ("dev-hop-key.tf:dev_hop_setup", "\nHOPJSON=$(", '\nif [ -n "$HOP_XTRACE" ]; then set -x; fi\nHOPJSON=$(',
              "traced-fetch:HOPJSON"),
-            ("jumpbox2-user-data.tf:jumpbox_2_user_data", "\n  set +x\n", "\n", "traced-fetch:FCVM_KEY"),
-            ("dev-instance-common.tf:gh_auth_script", "\n      set +x\n", "\n", "traced-fetch:GH_TOKEN"),
-            ("runner-autoscale.tf:runner_user_data", "\nset +x\n", "\n", "traced-fetch:REG_TOKEN"),
-            ("scripts/dev-box-triage.sh", "\n{ set +x; } 2>/dev/null\n", "\n", "traced-fetch:CF_TOKEN"),
             ("scripts/dev-box-triage.sh", "printf 'Authorization: Bearer %s\\n' \"$CF_TOKEN\" | curl -s --max-time 15 -H @-",
              'curl -s --max-time 15 -H "Authorization: Bearer $CF_TOKEN"', "bearer-arg:$CF_TOKEN"),
         )
