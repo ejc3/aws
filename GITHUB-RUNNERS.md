@@ -210,7 +210,12 @@ indistinguishable from a code defect.
   (read from `/proc/*/fd`), and refuses to register after 600 s. On 2026-09-13 three fcvm
   jobs failed "Install dependencies" because Amazon Inspector's SSM agent was running
   `apt install ./inspector-vm-scanner.deb` about 90 s after boot. The webhook Lambda also
-  tags every runner `InspectorEc2Exclusion=true`, which keeps Inspector from scanning it.
+  tags every runner `InspectorEc2Exclusion=true` and launches it with
+  `InstanceMetadataTags=enabled`. The tag alone only suppresses findings; Inspector stops
+  invoking its SSM plugin only when it can read the tag through instance metadata. The key
+  is in `TagOnlyDuringRunnerLaunch`, whose `aws:TagKeys` list denies a launch that sends
+  any unlisted key. Enabling metadata tags also restricts tag keys to letters, digits and
+  `+ - = . , _ : @`.
 
 `scripts/test-runner-userdata.sh` extracts the real heredoc from the `.tf` and checks that
 all three gates refuse the shapes they exist for and that each precedes registration; that the

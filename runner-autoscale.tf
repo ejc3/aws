@@ -678,7 +678,10 @@ data "archive_file" "runner_webhook" {
                           'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
                       }],
                       UserData=user_data,
-                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1},
+                      # InstanceMetadataTags lets Inspector's SSM plugin read
+                      # InspectorEc2Exclusion; without it the plugin still runs.
+                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
+                                       'InstanceMetadataTags': 'enabled'},
                       InstanceInitiatedShutdownBehavior='terminate',
                       InstanceMarketOptions={
                           'MarketType': 'spot',
@@ -991,7 +994,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "RunnerRegistrationProtocol"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
         }
       },
       {

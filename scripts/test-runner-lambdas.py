@@ -719,6 +719,8 @@ def case_every_new_runner_is_excluded_from_inspector_agent_scanning():
     A runner is a one-job host, and a CI job's apt-get fails on the held lock: on
     2026-09-13 three fcvm jobs lost "Install dependencies" to that install. The
     exclusion tag has to be on the instance from launch, before the agent registers.
+    The tag alone only suppresses findings: Inspector still invokes its SSM plugin
+    unless the instance's tags are readable through instance metadata.
     """
     for arch in ("arm64", "x86_64"):
         ec2 = FakeEC2()
@@ -729,6 +731,32 @@ def case_every_new_runner_is_excluded_from_inspector_agent_scanning():
                              if spec["ResourceType"] == "instance")
         tags = {tag["Key"]: tag["Value"] for tag in instance_tags}
         assert "InspectorEc2Exclusion" in tags, (arch, tags)
+        assert calls[0]["MetadataOptions"].get("InstanceMetadataTags") == "enabled", (arch, calls[0]["MetadataOptions"])
+
+
+def case_every_launch_tag_key_is_one_the_launch_policy_allows():
+    """RunInstances with a tag key outside TagOnlyDuringRunnerLaunch is denied outright.
+
+    The policy's aws:TagKeys list is ForAllValues, so one unlisted key in any tag
+    specification fails every launch, and the fake EC2 here would never notice.
+    Instance tags are also served through IMDS, which accepts only keys made of
+    letters, digits and + - = . , _ : @.
+    """
+    source = TF_FILE.read_text()
+    policy = re.search(r'^resource "aws_iam_role_policy" "runner_lambda" \{\n.*?^\}',
+                       source, re.M | re.S).group()
+    launch = next(s for s in re.split(r'\n      \},\n      \{\n', policy)
+                  if re.search(r'Sid\s*=\s*"TagOnlyDuringRunnerLaunch"', s))
+    allowed = set(re.findall(r'"([^"]+)"', re.search(r'"aws:TagKeys"\s*=\s*\[(.*?)\]', launch).group(1)))
+    for arch in ("arm64", "x86_64"):
+        ec2 = FakeEC2()
+        webhook(ec2)["launch_runner"](arch)
+        for call in ec2.ops("run_instances"):
+            keys = {tag["Key"] for spec in call["TagSpecifications"] for tag in spec["Tags"]}
+            assert "RunnerRegistrationProtocol" in keys, (arch, keys)
+            assert keys <= allowed, (arch, sorted(keys - allowed), sorted(allowed))
+            for key in keys:
+                assert re.fullmatch(r"[A-Za-z0-9+\-=.,_:@]+", key), (arch, key)
 
 
 def case_controller_first_accepts_older_pat_script_without_unused_credential():
