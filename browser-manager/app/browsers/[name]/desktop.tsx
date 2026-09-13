@@ -43,6 +43,8 @@ export default function Desktop({ name }: { name: string }) {
   const [viewportPending, setViewportPending] = useState(false);
   const [metadataError, setMetadataError] = useState("");
   const [viewportError, setViewportError] = useState("");
+  const [overlayVisible, setOverlayVisible] = useState(true);
+  const everConnected = useRef(false);
   const connected = connection === "connected";
   const currentViewport = frame ?? viewport;
   const phoneMode = currentViewport?.mode === "phone";
@@ -51,6 +53,16 @@ export default function Desktop({ name }: { name: string }) {
     if (!connected || !foreground || !screen.current) return;
     return attachTouchScroll(screen.current);
   }, [connected, foreground, fit, frame?.width, frame?.height]);
+
+  // Hold the reconnect interstitial back for a few seconds so a brief drop (tab wake, network
+  // blip) that reconnects quickly never flashes the overlay over the last frame. The first
+  // connect and a hard auth error still show immediately.
+  useEffect(() => {
+    if (connected) { everConnected.current = true; setOverlayVisible(false); return; }
+    if (connection === "error" || !everConnected.current) { setOverlayVisible(true); return; }
+    const grace = setTimeout(() => setOverlayVisible(true), 5000);
+    return () => clearTimeout(grace);
+  }, [connected, connection]);
 
   useEffect(() => {
     const target = screen.current;
@@ -336,7 +348,7 @@ export default function Desktop({ name }: { name: string }) {
 
       <section className="desktop-display" aria-label={`${label} remote desktop`}>
         <div ref={screen} className="vnc-screen" style={!fit && currentViewport ? { width: currentViewport.width, height: currentViewport.height } : undefined} />
-        {!connected && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
+        {!connected && overlayVisible && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}
           <h2>{connection === "connecting" ? "Connecting to your desktop" : "Desktop disconnected"}</h2>
           <p>{detail || "Opening a private connection to your browser."}</p>
