@@ -473,7 +473,9 @@ Stop/start is the remedy for a wedged box, so recovering it destroys the evidenc
 snapshot with `--latest` first. `dev-diagnostics.tf` now does this automatically on every
 status-check alarm (archived to CloudWatch Logs `/dev-servers/console-capture`, with the
 panic signature quoted in the SNS alert), so the archive should already exist -- check it
-before assuming the cause is unknowable.
+before assuming the cause is unknowable. Private key blocks, including a partial one at
+either end of the buffer, are replaced with `[redacted private key]` before the text is
+matched, archived or emailed: boot-time xtrace has put keys on these consoles before.
 
 The boxes are also configured to make a hang legible rather than silent: `panic_on_oops`
 turns an oops into a reboot (the cmdline carries `panic=-1`) instead of an indefinite
