@@ -8,7 +8,7 @@
 # time the repo's Stop hook plans (.claude/hooks/verify-consistent.sh ->
 # scripts/publish-applied-status.sh), and only from a clean origin/main checkout:
 #
-#   aws ssm get-parameter --region us-west-1 --name /aws-infra/applied-status \
+#   aws ssm get-parameter --region us-west-1 --name /infra/applied-status \
 #     --query Parameter.Value --output text
 #
 #   {"main":"<sha>","subject":"...","plan":"clean|pending|error","pending_count":N,
@@ -17,8 +17,9 @@
 # A merged PR is applied when its merge commit is an ancestor of "main" and "plan" is
 # "clean". Terraform owns the parameter; the jumpbox writes its value, so value is ignored.
 
+# Not /aws-...: SSM reserves parameter names that start with "aws" or "ssm".
 resource "aws_ssm_parameter" "applied_status" {
-  name        = "/aws-infra/applied-status"
+  name        = "/infra/applied-status"
   description = "Non-secret result of the jumpbox's last full plan of origin/main (see applied-status.tf)"
   type        = "String"
   tier        = "Standard"

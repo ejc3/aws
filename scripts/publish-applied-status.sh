@@ -10,7 +10,7 @@ set -uo pipefail
 
 rc="${1:?terraform plan exit code}"
 log="${2:?plan log path}"
-param="${APPLIED_STATUS_PARAM:-/aws-infra/applied-status}"
+param="${APPLIED_STATUS_PARAM:-/infra/applied-status}"
 region="${AWS_REGION:-us-west-1}"
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0

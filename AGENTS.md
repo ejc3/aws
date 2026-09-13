@@ -244,7 +244,7 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 
 **Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on
 purpose: state holds credentials. To check from a dev box whether main is applied, read
-`/aws-infra/applied-status` (see `applied-status.tf`). The jumpbox's Stop hook publishes it
+`/infra/applied-status` (see `applied-status.tf`). The jumpbox's Stop hook publishes it
 after every plan of a clean origin/main.
 
 **Credential ownership**: Personal Codex, Claude, GitHub, and Vercel device logins belong
