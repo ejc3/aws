@@ -242,6 +242,11 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 
 ### Common Pitfalls
 
+**Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on
+purpose: state holds credentials. To check from a dev box whether main is applied, read
+`/infra/applied-status` (see `applied-status.tf`). The jumpbox's Stop hook publishes it
+after every plan of a clean origin/main.
+
 **Credential ownership**: Personal Codex, Claude, GitHub, and Vercel device logins belong
 to one Unix user. Never seed them from Terraform, copy them between users, or overwrite a
 working personal login with a bootstrap token.
@@ -659,10 +664,17 @@ aws ec2 describe-spot-instance-requests --region us-west-1 \
 # Then start-instances will work
 ```
 
-**Volume Swap Procedure** (after terraform creates new instance):
+**Moving fcvm-metal-arm between AZs** is terraform-native, with no manual swap: stop the box,
+set `firecracker_move_from_instance_id` to its instance ID and `firecracker_availability_zone`
+to the target in `firecracker-dev.tf`, merge, and apply from a fresh worktree. Terraform images
+the stopped disk, builds the new box from that image before destroying the old one, moves the
+Elastic IP, and keeps the SSH host keys. The target AZ needs a subnet in
+`local.subnet_ids_by_az` (`main.tf`). The old root volume is left as a rollback copy.
+
+**Volume Swap Procedure** (x86 only, after terraform creates new instance):
 ```bash
 INSTANCE_ID="i-xxx"  # New instance ID from terraform output
-PERSISTENT_VOL="vol-09e5c3cee32bb67dc"  # ARM dev server
+PERSISTENT_VOL="vol-071f114b67441e776"  # x86 dev server
 
 # 1. Stop the new instance
 aws ec2 stop-instances --instance-ids $INSTANCE_ID --region us-west-1
@@ -698,22 +710,23 @@ aws ec2 delete-volume --volume-id $CURRENT_VOL --region us-west-1
 
 # 6. Re-associate EIP (terraform loses the association on recreate)
 # ARM: eipalloc-034a515771765d101, x86: eipalloc-0173c9b5e3d294cc5
-EIP_ALLOC="eipalloc-034a515771765d101"  # ARM
+EIP_ALLOC="eipalloc-0173c9b5e3d294cc5"  # x86
 aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $EIP_ALLOC --region us-west-1
 
 # 7. Wait for instance and clear old SSH host key
 aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region us-west-1
-IP="184.72.40.255"  # ARM EIP
+IP="50.18.109.164"  # x86 EIP
 ssh-keygen -R $IP
 ssh -i ~/.ssh/fcvm-ec2 -o StrictHostKeyChecking=accept-new ubuntu@$IP "hostname; uptime"
 echo "Done!"
 ```
 
 **Persistent Volume IDs** (don't delete these!):
-- ARM (fcvm-metal-arm): `vol-09e5c3cee32bb67dc`, EIP: `184.72.40.255` (`eipalloc-034a515771765d101`)
+- ARM (fcvm-metal-arm): root volume is built by terraform and changes on every move
+  (`terraform state show 'aws_instance.firecracker_dev[0]'`); EIP: `184.72.40.255` (`eipalloc-034a515771765d101`)
 - x86 (fcvm-metal-x86): `vol-071f114b67441e776`, EIP: `50.18.109.164` (`eipalloc-0173c9b5e3d294cc5`)
 
-**When to run the manual swap**: After `terraform apply` creates a new instance (you'll see a new instance ID in the output). Check if data is missing, then run the swap.
+**When to run the manual swap** (x86): After `terraform apply` creates a new instance (you'll see a new instance ID in the output). Check if data is missing, then run the swap.
 
 ## Common Tasks
 

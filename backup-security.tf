@@ -336,6 +336,16 @@ resource "aws_iam_role_policy" "backup_recovery" {
         }
       },
       {
+        # Creation times let the daily-capture and monthly-test checks give a volume
+        # created after their deadline a grace period instead of reporting it missing
+        # (moving a dev box gives it a new root volume). EC2 Describe* has no
+        # resource-level scope; this reads volume metadata only.
+        Sid      = "ReadVolumeCreationTimes"
+        Effect   = "Allow"
+        Action   = "ec2:DescribeVolumes"
+        Resource = "*"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.backup_recovery.arn}:*"

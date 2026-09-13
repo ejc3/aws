@@ -403,6 +403,29 @@ chmod +x /usr/local/bin/firecracker && rm -rf /tmp/fc.tgz /tmp/release-*
 
 ${local.podman_sysctl_setup}
 
+# Host IPv6. IPv6 forwarding is on for the routed Firecracker VMs, and with forwarding on,
+# networkd ignores router advertisements, so its DHCPv6 client never starts and the host has
+# no IPv6 address of its own even though the ENI has one (ipv6_address_count in
+# firecracker-dev.tf). cloud-init renders DHCPv4 only unless the ENI had an address at the
+# instance's first boot, and it never re-renders on reboot. This drop-in requests DHCPv6 and
+# accepts RAs on the primary interface, and netplan's generator reads it on every boot.
+# Applying it live reconfigures the interface, so that only happens while the box is still
+# booting (the bootstrap and dev-selfupdate run then); a later manual run leaves it for the
+# next boot.
+IPV6_IF=$(ip -o -4 route show default | awk '{print $5; exit}')
+if [ -n "$IPV6_IF" ]; then
+  IPV6_NETPLAN=$(printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      dhcp6: true\n      accept-ra: true' "$IPV6_IF")
+  if [ "$(cat /etc/netplan/60-fcvm-ipv6.yaml 2>/dev/null)" != "$IPV6_NETPLAN" ]; then
+    printf '%s\n' "$IPV6_NETPLAN" > /etc/netplan/60-fcvm-ipv6.yaml
+    chmod 600 /etc/netplan/60-fcvm-ipv6.yaml
+    netplan generate || echo "WARNING: netplan generate failed for 60-fcvm-ipv6.yaml"
+    case "$(systemctl is-system-running 2>/dev/null || true)" in
+      initializing|starting) netplan apply || echo "WARNING: netplan apply failed; host IPv6 comes up on the next boot" ;;
+      *) echo "host IPv6: netplan drop-in written; it takes effect on the next boot" ;;
+    esac
+  fi
+fi
+
 # Shell setup
 ${local.shell_setup}
 

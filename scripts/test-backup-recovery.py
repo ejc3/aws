@@ -106,6 +106,27 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("daily capture missing/older", missing[0])
         self.assertEqual(primary.started, [])
 
+    def test_new_volume_gets_48h_grace_for_first_capture_and_copy(self):
+        for created, expected in [({RESOURCE: NOW - timedelta(hours=10)}, 0),
+                                  ({RESOURCE: NOW - timedelta(hours=49)}, 2),
+                                  ({}, 2), (None, 2)]:
+            with self.subTest(created=created):
+                missing, errors = module.reconcile(Backup(), Backup(), Backup(), CONFIG, NOW, created)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(missing), expected)
+
+    def test_volume_creation_times_filters_and_skips_deleted_volumes(self):
+        gone = "arn:aws:ec2:us-west-1:111111111111:volume/vol-deleted"
+        created = NOW - timedelta(hours=5)
+        paginator = SimpleNamespace(paginate=Mock(return_value=[
+            {"Volumes": [{"VolumeId": "vol-example", "CreateTime": created}]}]))
+        ec2 = SimpleNamespace(get_paginator=Mock(return_value=paginator))
+        self.assertEqual(module.volume_creation_times(ec2, [RESOURCE, gone]), {RESOURCE: created})
+        ec2.get_paginator.assert_called_once_with("describe_volumes")
+        paginator.paginate.assert_called_once_with(
+            Filters=[{"Name": "volume-id", "Values": ["vol-deleted", "vol-example"]}])
+        self.assertEqual(module.volume_creation_times(ec2, []), {})
+
     def test_wrong_dr_key_never_crosses_accounts(self):
         dr = Backup([dict(POINT, EncryptionKeyArn="aws/ebs")])
         _, errors = module.reconcile(Backup([POINT]), dr, Backup(), CONFIG, NOW)
@@ -512,13 +533,22 @@ class MonthlyRestoreTests(unittest.TestCase):
             get_restore_testing_plan=Mock(return_value={"RestoreTestingPlan": plan or PLAN}),
             get_paginator=Mock(return_value=paginator))
 
-    def health(self, stage, now=None, config=None):
-        return module.monthly_restore_health(stage, config or CONFIG, now or SCHEDULED + timedelta(hours=3))
+    def health(self, stage, now=None, config=None, created=None):
+        return module.monthly_restore_health(stage, config or CONFIG, now or SCHEDULED + timedelta(hours=3), created)
 
     def test_cold_bootstrap_does_not_require_a_preexisting_monthly_test(self):
         stage = self.stage()
         self.assertEqual(self.health(stage, NOW), [])
         stage.get_paginator.assert_not_called()
+
+    def test_volume_created_within_48h_of_the_test_is_first_required_next_month(self):
+        stage = self.stage()
+        for created, expected in [({RESOURCE: SCHEDULED - timedelta(hours=47)}, 0),
+                                  ({RESOURCE: SCHEDULED + timedelta(days=2)}, 0),
+                                  ({RESOURCE: SCHEDULED - timedelta(hours=49)}, 1),
+                                  ({}, 1), (None, 1)]:
+            with self.subTest(created=created):
+                self.assertEqual(len(self.health(stage, created=created)), expected)
 
     def test_missing_job_is_detected_without_any_event_after_start_window(self):
         stage = self.stage()
@@ -735,7 +765,8 @@ class CanaryRestoreTests(unittest.TestCase):
 
 
 class HandlerTests(unittest.TestCase):
-    def run_handler(self, restore_jobs, event=None, expected_error=None, listed_jobs=None, config_changes=None):
+    def run_handler(self, restore_jobs, event=None, expected_error=None, listed_jobs=None, config_changes=None,
+                    volume_created=None):
         # The same per-source API returns both monthly and canary jobs. Plan-wide
         # cleanup inventory is separate, as in AWS, and carries no source field.
         resource_jobs = restore_jobs + [job for jobs in (listed_jobs or {}).values() for job in jobs]
@@ -747,7 +778,9 @@ class HandlerTests(unittest.TestCase):
             resource_paginator if operation == "list_restore_jobs_by_protected_resource"
             else restore_paginator
         )
-        clients = {service: Mock() for service in ["backup", "sts", "sns", "cloudwatch"]}
+        clients = {service: Mock() for service in ["backup", "sts", "sns", "cloudwatch", "ec2"]}
+        clients["ec2"].get_paginator.return_value.paginate.return_value = [{"Volumes": [
+            {"VolumeId": "vol-example", "CreateTime": volume_created or SCHEDULED - timedelta(days=60)}]}]
         clients["sts"].assume_role.return_value = {"Credentials": {
             "AccessKeyId": "mock", "SecretAccessKey": "mock", "SessionToken": "mock"}}
         stage_session = Mock()
@@ -774,6 +807,12 @@ class HandlerTests(unittest.TestCase):
         metrics = clients["cloudwatch"].put_metric_data.call_args.kwargs["MetricData"]
         self.assertEqual({metric["MetricName"]: metric["Value"] for metric in metrics},
                          {"MissingRecoveryCopies": 0, "UnhealthyRestoreTests": 1, "RecoveryControllerErrors": 1})
+
+    def test_hourly_invocation_accepts_new_volume_without_monthly_test(self):
+        clients = self.run_handler([], volume_created=SCHEDULED + timedelta(hours=1))
+        metrics = clients["cloudwatch"].put_metric_data.call_args.kwargs["MetricData"]
+        self.assertTrue(all(metric["Value"] == 0 for metric in metrics))
+        clients["ec2"].get_paginator.assert_called_with("describe_volumes")
 
     def test_hourly_invocation_alarms_for_failed_job_even_when_event_was_lost(self):
         self.run_handler([dict(RESTORE_JOB, Status="FAILED")], expected_error="monthly restore test FAILED")

@@ -142,6 +142,47 @@ resource "aws_subnet" "subnet_a" {
   }
 }
 
+# us-west-1c. Dropped from terraform in 02268cf but never deleted from AWS, and still associated
+# with the public route table, so it is imported rather than recreated. It gives the metal boxes
+# somewhere to go when us-west-1a has no spot capacity.
+import {
+  to = aws_subnet.subnet_b
+  id = "subnet-04b574af100ff5387"
+}
+
+resource "aws_subnet" "subnet_b" {
+  vpc_id            = local.vpc_id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-west-1c"
+
+  # IPv6 support; fcvm-metal-arm needs it for its routed /64 prefix
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block, 8, 2)
+  assign_ipv6_address_on_creation = true
+
+  tags = {
+    Name = "${var.project_name}-subnet-b"
+  }
+}
+
+import {
+  to = aws_route_table_association.subnet_b
+  id = "subnet-04b574af100ff5387/rtb-003c0a0a5c556fa1e"
+}
+
+resource "aws_route_table_association" "subnet_b" {
+  subnet_id      = aws_subnet.subnet_b.id
+  route_table_id = aws_route_table.public.id
+}
+
+# One subnet per AZ, so placing a box in an AZ is a single variable
+# (e.g. firecracker_availability_zone).
+locals {
+  subnet_ids_by_az = {
+    (aws_subnet.subnet_a.availability_zone) = aws_subnet.subnet_a.id
+    (aws_subnet.subnet_b.availability_zone) = aws_subnet.subnet_b.id
+  }
+}
+
 # Data source for availability zones
 data "aws_availability_zones" "available" {
   state = "available"

@@ -34,6 +34,28 @@ def latest(points, resource):
                key=lambda point: point["CreationDate"], default=None)
 
 
+def volume_creation_times(ec2, resources):
+    """CreateTime for each configured volume that still exists.
+
+    Filter rather than VolumeIds, so a deleted volume cannot fail the whole lookup. A
+    volume absent from the answer gets no grace: a lost volume still reports missing.
+    """
+    ids = sorted({resource.rsplit("/", 1)[-1] for resource in resources})
+    if not ids:
+        return {}
+    by_id = {volume["VolumeId"]: volume["CreateTime"]
+             for volume in pages(ec2, "describe_volumes", "Volumes",
+                                 Filters=[{"Name": "volume-id", "Values": ids}])}
+    return {resource: by_id[resource.rsplit("/", 1)[-1]] for resource in resources
+            if resource.rsplit("/", 1)[-1] in by_id}
+
+
+def created_after(created, resource, cutoff):
+    """True only when the volume's creation time is known and later than cutoff."""
+    when = (created or {}).get(resource)
+    return when is not None and when > cutoff
+
+
 def final_retention(point):
     """GFS is based on capture time, never an intermediate TTL or retry date."""
     captured = point["CreationDate"].astimezone(timezone.utc)
@@ -179,12 +201,14 @@ def monthly_test_start(plan, now):
     return scheduled if plan["CreationTime"] <= scheduled else None
 
 
-def monthly_restore_health(stage, config, now):
+def monthly_restore_health(stage, config, now, created=None):
     """Require the latest scheduled test for every allowed source, even with no events.
 
     Use the per-resource API, not optional newer SourceResourceArn response fields:
     older Lambda SDK models drop those fields, and recovery points may have expired.
     An unrelated plan/role or a successful test of another volume cannot satisfy this.
+    A volume created less than 48h before the scheduled test had no copied recovery point
+    for that test to restore, so it is first required at the following month's test.
     """
     plan = stage.get_restore_testing_plan(
         RestoreTestingPlanName=config["restore_plan"])["RestoreTestingPlan"]
@@ -195,6 +219,8 @@ def monthly_restore_health(stage, config, now):
         return []
     errors = []
     for resource in sorted(set(config["volumes"])):
+        if created_after(created, resource, scheduled - timedelta(hours=48)):
+            continue
         jobs = pages(stage, "list_restore_jobs_by_protected_resource", "RestoreJobs",
                      ResourceArn=resource,
                      ByRecoveryPointCreationDateAfter=scheduled - timedelta(days=36))
@@ -360,7 +386,7 @@ def expired_cleanup_candidates(primary, dr, config, pending_raw, dr_raw, stage_p
     return cleanup, errors
 
 
-def reconcile(primary, dr, stage, config, now):
+def reconcile(primary, dr, stage, config, now, created=None):
     allowed = set(config["volumes"])
     hop_volumes = set(config["cmk_hop_volumes"])
     if not hop_volumes <= allowed or config["processing_vault"] == config["primary_vault"]:
@@ -396,9 +422,13 @@ def reconcile(primary, dr, stage, config, now):
         # snapshot. Only bootstrap a recent legacy point newer than this pipeline.
         source = latest(primary_points + pending_points + dr_points + stage_points, resource)
         destination = latest(stage_points, resource)
-        if source is None or source["CreationDate"] < now - timedelta(hours=48):
+        # A volume younger than the 48h window has not had its first scheduled capture
+        # and copy yet (moving a dev box gives it a new root volume). Only a known
+        # creation time earns this; an unknown or deleted volume still reports missing.
+        new_volume = created_after(created, resource, now - timedelta(hours=48))
+        if not new_volume and (source is None or source["CreationDate"] < now - timedelta(hours=48)):
             missing.append("daily capture missing/older than 48h: " + resource)
-        if destination is None or destination["CreationDate"] < now - timedelta(hours=48):
+        if not new_volume and (destination is None or destination["CreationDate"] < now - timedelta(hours=48)):
             missing.append("cross-account copy missing/older than 48h: " + resource)
         seed = latest(primary_points, resource)
         current = latest(pending_points + dr_points + stage_points, resource)
@@ -503,7 +533,9 @@ def handler(event, context):
                     Message=json.dumps(event, default=str))
     try:
         canary_test_start(config)
-        missing, errors = reconcile(primary, dr, stage, config, now)
+        created = volume_creation_times(
+            boto3.client("ec2", region_name=config["primary_region"]), config["volumes"])
+        missing, errors = reconcile(primary, dr, stage, config, now, created)
         # The periodic pass also handles a missed restore-completed event.
         restore_jobs = []
         restore_errors = []
@@ -533,7 +565,7 @@ def handler(event, context):
         # Query current metadata after validation so a just-validated job can count
         # as healthy. Missing/failed monthly tests remain visible if events vanish.
         restore_errors.extend(canary_restore_health(stage, config, now))
-        restore_errors.extend(monthly_restore_health(stage, config, now))
+        restore_errors.extend(monthly_restore_health(stage, config, now, created))
         errors.extend(restore_errors)
         boto3.client("cloudwatch", region_name=config["primary_region"]).put_metric_data(
             Namespace="FleetBackup", MetricData=[

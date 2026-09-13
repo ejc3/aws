@@ -95,7 +95,7 @@ resource "aws_iam_role_policy" "nextjs_dev" {
   role = aws_iam_role.nextjs_dev.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "ReadOwnSetupScript"
         Effect   = "Allow"
@@ -126,7 +126,7 @@ resource "aws_iam_role_policy" "nextjs_dev" {
         Action   = "ec2:DescribeInstances"
         Resource = "*"
       }
-    ]
+    ], local.dev_box_deploy_status_statements)
   })
 }
 
