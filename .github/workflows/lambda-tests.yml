@@ -81,3 +81,6 @@ jobs:
 
       - name: Boot secrets stay out of traces, readable logs and command lines (offline)
         run: python3 -S -B scripts/test-boot-secret-hygiene.py
+
+      - name: Greptile review settings and rule scopes (offline)
+        run: python3 -S -B scripts/test-greptile-config.py
