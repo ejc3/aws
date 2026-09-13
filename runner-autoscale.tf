@@ -1621,6 +1621,18 @@ else
   exit 1
 fi
 EOF
+
+  # EC2 receives the script above without its whole-line comments. They stay here for
+  # readers; shipped, they no longer fit. With the apt-install gate (#134) Terraform's
+  # base64gzip of the full script measured 8,476 characters against the 8,192 the
+  # Advanced tier allows, and the apply failed with "The specified parameter value is too
+  # large". A `#!` line is not a comment and is kept. No line inside a heredoc in this
+  # script starts with `#`, and scripts/test-runner-userdata.sh checks that the stripped
+  # document still parses.
+  runner_user_data_document = join("\n", [
+    for line in split("\n", local.runner_user_data) : line
+    if !startswith(trimspace(line), "#") || startswith(line, "#!")
+  ])
 }
 
 # SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
@@ -1649,7 +1661,7 @@ resource "aws_ssm_parameter" "runner_user_data" {
   name  = "/github-runner/user-data"
   type  = "String"
   tier  = "Advanced"
-  value = base64gzip(local.runner_user_data)
+  value = base64gzip(local.runner_user_data_document)
   tags = {
     Name = "github-runner-user-data"
   }
