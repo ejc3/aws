@@ -72,3 +72,6 @@ jobs:
 
       - name: Admin box setup and Codex host guidance (offline)
         run: python3 -S -B scripts/test-admin-box-setup.py
+
+      - name: Dev-hop private key never reaches xtrace output (offline)
+        run: python3 -S -B scripts/test-dev-hop-xtrace.py
