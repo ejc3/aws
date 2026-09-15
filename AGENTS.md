@@ -206,6 +206,9 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
+- A one-year, all-upfront EC2 Instance Savings Plan for t4g in us-west-1 (`savings-plans.tf`)
+  commits $0.141/h: nextjs-dev as t4g.xlarge plus one t4g.large jumpbox. It cannot be
+  cancelled. Keep those boxes in the t4g family until it ends, or the commitment is paid but unused
 - There is no application database. DynamoDB is limited to Terraform locking and runner
   registration claims. Older notes about Aurora Serverless auto-pause no longer apply
 
