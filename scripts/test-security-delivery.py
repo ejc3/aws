@@ -924,7 +924,7 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertIsNotNone(regions)
         self.assertEqual(set(re.findall(r'"([a-z0-9-]+)"', regions.group(1))), GUARDDUTY_ANALYST_REGIONS)
         self.assertRegex(REGIONAL, re.compile(r'guardduty_optional_features\s*=\s*concat\(\s*local\.guardduty_base_optional_features,\s*'
-            r'contains\(local\.guardduty_ai_analyst_regions, data\.aws_region\.current\.name\)\s*\?\s*\["AI_ANALYST"\]\s*:\s*\[\]', re.S))
+            r'contains\(local\.guardduty_ai_analyst_regions, data\.aws_region\.current\.region\)\s*\?\s*\["AI_ANALYST"\]\s*:\s*\[\]', re.S))
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
         self.assertIn('type_name = "AWS::GuardDuty::Detector"', detector)
         self.assertRegex(detector, r'Enable\s*=\s*true')
@@ -946,7 +946,7 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertTrue(GUARDDUTY_ANALYST_REGIONS.issubset(REGIONS))
         self.assertNotIn("us-west-1", GUARDDUTY_ANALYST_REGIONS)
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
-        self.assertIn("contains(local.guardduty_reviewed_regions, data.aws_region.current.name)", detector)
+        self.assertIn("contains(local.guardduty_reviewed_regions, data.aws_region.current.region)", detector)
 
     @staticmethod
     def expanded_guardduty_expression(expression):
@@ -977,7 +977,7 @@ class TerraformSafetyTests(unittest.TestCase):
     def native_guardduty_desired_states(self):
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
         desired = detector.split("desired_state = ", 1)[1].split("\n  lifecycle", 1)[0]
-        desired = self.expanded_guardduty_expression(desired).replace("data.aws_region.current.name", "region")
+        desired = self.expanded_guardduty_expression(desired).replace("data.aws_region.current.region", "region")
         return self.native_json_value('{for region in ' + json.dumps(REGIONS) + ' : region => jsondecode(' + desired + ')}')
 
     @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free regional matrix guard runs above")
@@ -1001,7 +1001,7 @@ class TerraformSafetyTests(unittest.TestCase):
                 self.assertNotIn("DataSources", state)
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
         region_guard = re.search(r'precondition\s*\{\s*condition\s*=(.*?)\n\s*error_message', detector, re.S).group(1)
-        region_guard = self.expanded_guardduty_expression(region_guard).replace("data.aws_region.current.name", "region")
+        region_guard = self.expanded_guardduty_expression(region_guard).replace("data.aws_region.current.region", "region")
         guarded = self.native_json_value('{for region in ' + json.dumps(REGIONS + ["af-south-1", "future-region-1"]) + ' : region => ' + region_guard + '}')
         self.assertEqual(guarded, {**{region: True for region in REGIONS}, "af-south-1": False, "future-region-1": False})
 
@@ -1032,7 +1032,7 @@ class TerraformSafetyTests(unittest.TestCase):
                 fixtures.append(("malformed features", malformed, False))
             rendered_cases = {}
             for index, (label, properties, expected) in enumerate(fixtures):
-                rendered = self.expanded_guardduty_expression(expression).replace("data.aws_region.current.name", json.dumps(region))
+                rendered = self.expanded_guardduty_expression(expression).replace("data.aws_region.current.region", json.dumps(region))
                 rendered = rendered.replace("self.properties", json.dumps(json.dumps(properties)))
                 rendered_cases[str(index)] = (label, rendered, expected)
             actual = self.native_json_value('{' + ','.join(json.dumps(index) + ' = (' + rendered + ')' for index, (_, rendered, _) in rendered_cases.items()) + '}')
