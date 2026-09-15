@@ -1137,7 +1137,7 @@ substitute for disabling supported features. Regional handler support must still
 verified during deployment: schema validation is not proof that each regional service
 accepts every feature. Do not silently omit an unsupported feature or accept an
 unreviewed provider upgrade. See [CreateDetector defaults](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_CreateDetector.html)
-and [Cloud Control resource](https://registry.terraform.io/providers/hashicorp/aws/5.100.0/docs/resources/cloudcontrolapi_resource).
+and [Cloud Control resource](https://registry.terraform.io/providers/hashicorp/aws/6.64.0/docs/resources/cloudcontrolapi_resource).
 The pinned generic resource has no import handler. Preserve versioned Terraform state;
 if its state entry is lost, recover the reviewed state version rather than creating a
 second detector. A failed live-property postcondition requires an administrator to
