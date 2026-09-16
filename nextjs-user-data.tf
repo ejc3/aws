@@ -87,7 +87,13 @@ locals {
   # one -- so every additional key had to be installed by hand, which meant terraform did not
   # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
-    skevh = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"]
+    skevh = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local",
+      # Odo, Steve's Muse agent. Installed by hand on skevh on 2026-09-15 and declared here
+      # on 2026-09-16 so a rebuild keeps it. Its comment "hatch" is also on one of ejc3's
+      # keys, so identify this one by fingerprint SHA256:JjkaJiaQsOmP6it1Ur0N4AfKb3Ujlu3oSH1F64xRP8U.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICdxS/iqNTTCvqMdm3uozUZund8S4d8H7/hLCCY+Oy7q hatch",
+    ]
     # All of ejc3's keys, including two that were installed by hand and existed only on
     # the running instance -- invisible to terraform and silently lost on any rebuild.
     # Adopted 2026-09-11 by reading them off the box; declaring them is what makes them
