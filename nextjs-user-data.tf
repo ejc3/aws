@@ -108,6 +108,10 @@ locals {
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZTP2GqL7R1kFzSqoI6QLo3j/VacE9MK+tuXmHLCAFn hatch",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILzudSh+XRY5YsnNnAWDTjKXNeZUueYq/etoVXsTrpx4 grok-bot-box-ejc3",
+      # For dolphin access, declared 2026-09-17 at the owner's request. Generated off the box,
+      # so unlike the keys above this is a new grant rather than an adoption of something the
+      # instance already authorized: SHA256:tsfGYA0b848cRjsAWRAIG59lR7593BA06LaSncfyQOA.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM3U+Or6AG9kj/94JubpeKkNz7Jo872Piljcom/Gyj2P dolphin",
     ]
   }
 
