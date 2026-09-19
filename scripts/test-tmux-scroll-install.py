@@ -20,6 +20,7 @@ SELFUPDATE = (ROOT / "dev-selfupdate.tf").read_text()
 START = "# The scroll-native tmux, installed BESIDE the normal one as tmux-scroll rather than over it."
 END = "# Claude Code -- the NATIVE installer, per user."
 RELEASE = "binaries-scroll-native"
+TABLE = SELFUPDATE.split("TABLE='", 1)[1].split("'", 1)[0]
 
 
 def block():
@@ -113,19 +114,98 @@ class TmuxScrollInstallTests(unittest.TestCase):
         self.assertIn(b"scroll-replay", installed.read_bytes())
 
     def test_the_metal_boxes_get_it_through_the_prebuilt_binary_table(self):
-        table = SELFUPDATE.split("TABLE='", 1)[1].split("'", 1)[0]
-        rows = [r.split("|") for r in table.splitlines() if r.strip()]
+        rows = [r.split("|") for r in TABLE.splitlines() if r.strip()]
         scroll = [r for r in rows if r[1] == RELEASE]
-        self.assertEqual(len(scroll), 1, table)
-        repo, tag, prefix, binaries, dest, service, vercmd = scroll[0]
+        self.assertEqual(len(scroll), 1, TABLE)
+        repo, tag, prefix, binaries, dest, service, vercmd, marker = scroll[0]
         self.assertEqual(repo, "ejc3/tmux")
         self.assertEqual(prefix, "tmux-scroll", "the asset prefix must match the release asset name")
         self.assertEqual(binaries, "tmux-scroll", "installing it as `tmux` would replace the normal one")
         self.assertEqual(dest, "/usr/local/bin")
         self.assertEqual(service, "", "no service restarts for a binary nothing runs yet")
         self.assertEqual(vercmd, f"{dest}/{binaries} -V")
+        self.assertEqual(marker, "scroll-replay", "-V alone cannot tell the patched build from a stock one")
         for row in rows:
-            self.assertEqual(len(row), 7, f"every row needs 7 fields: {row}")
+            self.assertIn(len(row), (7, 8), f"a row has 7 fields, or 8 with a marker: {row}")
+
+
+class PrebuiltBinaryUpdaterTests(unittest.TestCase):
+    """The weekly updater on the metal boxes, run for real against stubbed releases."""
+
+    def run_updater(self, payload=GENUINE, installed=None, live_session=False):
+        tmp = Path(tempfile.mkdtemp(prefix="test-bin-update."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        bindir, usrbin, stubs = tmp / "usr-local-bin", tmp / "usr-bin", tmp / "stubs"
+        socks, state, assets = tmp / "socks", tmp / "state", tmp / "assets"
+        for d in (bindir, usrbin, stubs, socks, state, assets):
+            d.mkdir()
+
+        # One release tarball per asset prefix, so every row in the real table resolves.
+        for prefix, names in (("tmux-scroll", ["tmux-scroll"]), ("tmux", ["tmux"]),
+                              ("et", ["et", "etserver", "etterminal"])):
+            body = payload if prefix == "tmux-scroll" else GENUINE
+            staging = assets / prefix
+            staging.mkdir()
+            for n in names:
+                (staging / n).write_bytes(body)
+                (staging / n).chmod(0o755)
+            with tarfile.open(assets / f"{prefix}.tar.gz", "w:gz") as tar:
+                for n in names:
+                    tar.add(staging / n, arcname=n)
+
+        calls = tmp / "calls"
+        calls.touch()
+        (stubs / "curl").write_text(
+            "#!/bin/bash\n"
+            f'echo "curl $*" >> {calls}\n'
+            'out=""; url=""\n'
+            'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift;; http*) url="$1";; esac; shift; done\n'
+            'name=$(basename "$url"); prefix=${name%%-*}\n'
+            'case "$name" in tmux-scroll-*) prefix=tmux-scroll;; esac\n'
+            f'cp {assets}/$prefix.tar.gz "$out" 2>/dev/null\n')
+        (stubs / "sudo").write_text('#!/bin/bash\n[ "$1" = -u ] && shift 2\nexec "$@"\n')
+        (stubs / "systemctl").write_text(f'#!/bin/bash\necho "systemctl $*" >> {calls}\nexit 0\n')
+        for f in ("curl", "sudo", "systemctl"):
+            (stubs / f).chmod(0o755)
+
+        if installed is not None:
+            (bindir / "tmux-scroll").write_bytes(installed)
+            (bindir / "tmux-scroll").chmod(0o755)
+        if live_session:
+            # A server is up: the client answers `list-sessions`, which is the updater's probe.
+            (socks / "tmux-1000").mkdir()
+            for name in ("tmux-scroll", "tmux"):
+                (bindir / name).write_bytes(
+                    b'#!/bin/sh\n[ "$1" = list-sessions ] && exit 0\n[ "$1" = -V ] && echo "tmux next-3.8"\nexit 0\n')
+                (bindir / name).chmod(0o755)
+
+        script = SELFUPDATE.split("  bin_update = <<-EOT\n", 1)[1].split("\nEOT\n", 1)[0]
+        script = script.split("cat > /usr/local/bin/dev-bin-update.sh <<'BINUPD'\n", 1)[1].split("\nBINUPD\n", 1)[0]
+        for original, replacement in (("$${", "${"), ("/usr/local/bin", str(bindir)), ("/usr/bin", str(usrbin)),
+                                      ("/var/lib/dev-bin-update", str(state)), ("/tmp/tmux-*", f"{socks}/tmux-*")):
+            script = script.replace(original, replacement)
+        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120)
+        return proc, bindir / "tmux-scroll", calls.read_text()
+
+    def test_a_genuine_asset_is_installed(self):
+        proc, installed, _ = self.run_updater()
+        self.assertTrue(installed.exists(), proc.stdout[-1500:] + proc.stderr[-800:])
+        self.assertIn(b"scroll-replay", installed.read_bytes())
+
+    def test_an_asset_without_the_marker_is_refused(self):
+        marked = GENUINE + b"# already installed\n"
+        proc, installed, _ = self.run_updater(payload=STOCK, installed=marked)
+        self.assertIn("does not contain", proc.stdout, proc.stdout[-1500:])
+        self.assertEqual(installed.read_bytes(), marked, "a stock build replaced the patched one")
+
+    def test_an_update_is_deferred_while_a_server_is_live(self):
+        """Swapping a tmux binary under a live server locks its sessions out on the next
+        attach (protocol mismatch), so both tmux rows must wait, not just the original one."""
+        proc, _, _ = self.run_updater(live_session=True)
+        deferred = [l for l in proc.stdout.splitlines() if "has live sessions" in l]
+        self.assertTrue(any("[tmux-scroll]" in l for l in deferred), proc.stdout[-1500:])
+        self.assertTrue(any("[tmux]" in l for l in deferred), proc.stdout[-1500:])
 
 
 if __name__ == "__main__":
