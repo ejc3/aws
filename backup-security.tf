@@ -1,7 +1,7 @@
 # One long-term history in the recovery account, outside the workload region.
 # Bootstrap is additive: keep the old schedules until copies AND restores are proven.
-# Unencrypted EBS snapshots copy directly. Only the two aws/ebs-encrypted roots need
-# a same-account cross-region re-encryption step; never replace live disks for this.
+# Unencrypted EBS snapshots copy directly. Only the aws/ebs-encrypted roots need a
+# same-account cross-region re-encryption step; never replace live disks for this.
 # AWS documents this two-step pattern for EBS as well as RDS:
 # https://aws.amazon.com/blogs/storage/protecting-amazon-rds-db-instances-encrypted-using-kms-aws-managed-key-with-cross-account-and-cross-region-backups/
 
@@ -23,6 +23,11 @@ locals {
   backup_cmk_hop_volume_arns = compact([
     local.nextjs_root_volume_arn,
     var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
+    # The 2026-09-13 AZ move rebuilt this root from an aws_ami_from_instance image; the
+    # new volume came up on the account's default alias/aws/ebs key instead of whatever
+    # it had before, and that key can't be shared cross-account directly. Same fix as
+    # nextjs/jumpbox_2: re-encrypt through the DR vault's customer key before copying out.
+    local.arm_persistent_volume_arn,
   ])
   backup_snapshot_arns = [
     "arn:aws:ec2:${var.aws_region}::snapshot/*",
