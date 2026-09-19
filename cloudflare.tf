@@ -270,6 +270,59 @@ resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
 }
 
 # ---------------------------------------------------------------------------------
+# The family board's wall screens (family.cc-games.dev/tv and /ink).
+#
+# A TV or an e-ink tablet cannot sit through a Google login, and a 24h session would have
+# someone hunting for the remote every morning. So the board pairs its screens itself, the
+# way a TV app does: the screen shows a short code, a signed-in person types it into
+# /pair (which stays behind the login above), and the screen gets a long-lived cookie that
+# is only good for the two family-safe wall pages. See docs/DESIGN.md in ejc3/family.
+#
+# For that to work the paths a not-yet-paired screen needs must reach the app without an
+# Access login. This application covers exactly those paths and bypasses Access on them;
+# a more specific path wins over the wildcard application above. Everything else on the
+# hostname, including /pair, /api/pair, the home page and /api/feeds, stays behind Google.
+#
+# What this exposes, and why that is acceptable:
+#   /tv, /ink            the pairing screen until paired; the app checks the cookie itself
+#   /api/device/*        start (hands out a worthless code), poll, and the feed endpoint,
+#                        which answers 401 without a valid device cookie
+#   /_next/*            the site's compiled JavaScript, CSS and fonts; nothing private
+# The app trusts only Access's SIGNED token for identity (never the plain email header),
+# precisely because these paths can be reached without going through a login.
+# ---------------------------------------------------------------------------------
+resource "cloudflare_zero_trust_access_policy" "family_wall_screens_bypass" {
+  account_id = var.cloudflare_account_id
+  name       = "family wall screens pair themselves"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "family_wall_screens" {
+  account_id = var.cloudflare_account_id
+  name       = "family board wall screens"
+  type       = "self_hosted"
+  domain     = "family.cc-games.dev/tv"
+
+  destinations = [
+    { type = "public", uri = "family.cc-games.dev/tv" },
+    { type = "public", uri = "family.cc-games.dev/ink" },
+    { type = "public", uri = "family.cc-games.dev/api/device/*" },
+    { type = "public", uri = "family.cc-games.dev/_next/*" },
+  ]
+
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.family_wall_screens_bypass.id
+      precedence = 1
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------------
 # Service token: non-interactive access, for anything that cannot sit through a Google
 # login -- scripts, health checks, or an agent that wants to fetch the running site.
 #

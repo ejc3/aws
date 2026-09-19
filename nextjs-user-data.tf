@@ -46,6 +46,25 @@ locals {
     } : u => z if contains(keys(local.nextjs_zone_tunnel), z)
   }
 
+  # Hostnames that are declared here rather than published with `ndev`. `ndev` ties a
+  # hostname to the publishing account's zone on purpose (see nextjs_user_zone), which is
+  # the right default and the wrong tool for the one site whose AUDIENCE is on the other
+  # zone: the family board is built under ejc3 but is for the kids, the TV and the e-ink
+  # tablet, who can pass cc-games' Google sign-in and not dolphin-labs' GitHub-org gate.
+  #
+  # A pinned route is only a registry row: hostname -> local port. The app itself is still
+  # an ordinary `ndev <slug>` instance (here ndev@ejc3-family, whose port is derived from
+  # its dolphin-labs hostname). Keeping this a short, reviewed list in Terraform, rather
+  # than a flag on `ndev`, preserves the property that nobody can put something on the
+  # other project's domain by accident.
+  nextjs_pinned_routes = {
+    "family.cc-games.dev" = { zone = local.nextjs_domain, port = 3722, user = "ejc3", dir = "/home/ejc3/family" }
+  }
+  nextjs_pinned_rows = join("\n", [
+    for h, r in local.nextjs_pinned_routes :
+    "pin_route ${r.zone} ${h} ${r.port} ${r.user} ${r.dir}" if contains(keys(local.nextjs_zone_tunnel), r.zone)
+  ])
+
   # The case arms below are built as data rather than with %{ for } directives inside the
   # heredoc: the directive form trims the newlines between arms and emits the whole case
   # statement on one line. Valid shell, but unreadable when debugging on the box.
@@ -1151,6 +1170,19 @@ done
 
 # Build each zone's ingress from its registry. Also the reason a fresh box has a working
 # tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
+# Pinned routes (local.nextjs_pinned_routes). Appended to the zone's registry before the
+# rebuild below, so they are part of the first ingress this boot writes. Idempotent, and a
+# row someone removed by hand comes back on the next boot, which is the point of pinning.
+pin_route() {
+  local zone="$1" host="$2" port="$3" who="$4" dir="$5" reg="/var/lib/ndev/registry-$1"
+  case "$host" in *".$zone") ;; *) echo "pin: $host is not under $zone, skipping"; return 0 ;; esac
+  touch "$reg"
+  grep -v -P "^\Q$host\E\t" "$reg" > "$reg.new" || true
+  printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir" >> "$reg.new"
+  sort -u "$reg.new" > "$reg" && rm -f "$reg.new"
+}
+${local.nextjs_pinned_rows}
+
 ${local.nextjs_zone_rebuild}
 
 # Templated per zone: cloudflared serves ONE tunnel per process, so two zones means two
