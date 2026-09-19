@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { writeFile, chmod } from 'node:fs/promises';
+import { appendFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -67,7 +68,17 @@ const PLAYWRIGHT_ARGS = [
 // override, and clears navigator.webdriver. It speaks CDP over the private inherited debugging pipe
 // (fds 3/4): a pipe, never a TCP port, consistent with the macOS transport. Best-effort — any pipe
 // failure leaves the browser exactly as launched.
-function maskChromeUserAgent(child, url) {
+// isAppSchemeRedirect is true for a URL whose scheme is a custom app scheme the desktop
+// browser cannot follow (vsfapp:, myapp:, …) — i.e. a well-formed scheme that is NOT one of
+// the web/browser-internal schemes. These are the OAuth "open in the app" deep links we
+// capture to a file so a headless operator can read a redirect the desktop swallows.
+export function isAppSchemeRedirect(u) {
+  return typeof u === 'string'
+    && /^[a-z][a-z0-9+.-]*:/i.test(u)
+    && !/^(https?|wss?|ftp|about|chrome|chrome-extension|devtools|data|blob|file|view-source|javascript):/i.test(u);
+}
+
+function maskChromeUserAgent(child, url, captureFile) {
   try {
     const writer = child.stdio[3], reader = child.stdio[4];
     if (!writer || !reader) return;
@@ -101,9 +112,17 @@ function maskChromeUserAgent(child, url) {
               send('Emulation.setUserAgentOverride', { userAgent, userAgentMetadata }, sessionId);
               send('Page.addScriptToEvaluateOnNewDocument', { source: "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" }, sessionId);
               send('Page.enable', {}, sessionId);
+              // Capture custom-scheme redirects the browser cannot follow (e.g. an OAuth flow
+              // that ends at vsfapp://…?code=…): the URL appears as a requestWillBeSent we log
+              // to a file, so a headless operator can read a deep-link the desktop can't open.
+              if (captureFile) send('Network.enable', {}, sessionId);
               if (url && url !== 'about:blank') send('Page.navigate', { url }, sessionId);
             }
             if (sessionId) send('Runtime.runIfWaitingForDebugger', {}, sessionId);
+          } else if (captureFile && message.method === 'Network.requestWillBeSent') {
+            if (isAppSchemeRedirect(message.params?.request?.url)) {
+              try { appendFileSync(captureFile, message.params.request.url + '\n'); } catch { /* best-effort */ }
+            }
           }
         }
       } catch { /* ignore malformed frame */ }
@@ -232,7 +251,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       // Launch blank so no unmasked request reaches a bot-protected origin; the mask navigates.
       '--start-maximized', '--window-size=1440,900', 'about:blank',
     ], env, ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']);
-    maskChromeUserAgent(browser, url);
+    maskChromeUserAgent(browser, url, join(runtimeDir, 'app-redirects.log'));
     let navigationReader;
     const getNavigation = () => {
       if (closing || signal.aborted || resizeAbort.signal.aborted) return Promise.resolve({ canGoBack: null });
