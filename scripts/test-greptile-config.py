@@ -114,7 +114,7 @@ APPROVED_RULES = {
          "cloudflare.tf", "github-actions.tf", "github-ami-builder.tf", "dev-staging-bootstrap.tf",
          "codeartifact.tf", "scripts/*.py", "scripts/*.sh", ".github/workflows/lambda-tests.yml",
          ".github/workflows/drift.yml", ".github/workflows/runner-release-freshness.yml"],
-        "292b27319a7ab41a3640ef2ec6e91ed4743a69360d6419d400e4625c149c8a7f",
+        "fd81660cbc4976db1516ba7e3a7429164f8356b8cb6939e09bc134035b447bf4",
     ),
     "aws-apply-time-limits-validate-cannot-catch": (
         "medium",

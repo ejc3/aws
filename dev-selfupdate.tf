@@ -45,16 +45,22 @@ cat > /usr/local/bin/dev-bin-update.sh <<'BINUPD'
 set -uo pipefail
 ARCH=$(uname -m)
 
-# repo|release-tag|asset-prefix|binaries|install-dir|service-to-restart|version-cmd
+# repo|release-tag|asset-prefix|binaries|install-dir|service-to-restart|version-cmd|marker
+#
+# MARKER is optional: a string the downloaded binary must contain. `-V` only proves that a
+# tmux runs, and the only reason tmux-scroll exists is its `scroll-replay` option -- a stock
+# build republished under that tag would pass every other check, install cleanly, and then be
+# rejected by t-claude, leaving scrollback broken with nothing in the log to say why.
 # tmux installs to /usr/local/bin so it shadows the distro package in PATH without
 # fighting dpkg -- removing the tarball reverts cleanly to Ubuntu's 3.4.
 TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
-ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V'
+ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V
+ejc3/tmux|binaries-scroll-native|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V|scroll-replay'
 
 # Read the table on fd 3, NOT stdin. A command inside the loop (etserver -V, which
 # aborts on this build) consumed the remaining stdin and silently ate every entry after
 # the first -- tmux was never processed at all. Everything inside also gets </dev/null.
-while IFS='|' read -r repo tag prefix bins dir svc vercmd <&3; do
+while IFS='|' read -r repo tag prefix bins dir svc vercmd marker <&3; do
   [ -n "$repo" ] || continue
   url="https://github.com/$repo/releases/download/$tag/$prefix-$ARCH.tar.gz"
   state="/var/lib/dev-bin-update/$prefix"
@@ -85,6 +91,17 @@ while IFS='|' read -r repo tag prefix bins dir svc vercmd <&3; do
     rm -rf "$tmp"; continue
   fi
 
+  # A row may pin a string the binary has to contain (see MARKER above).
+  if [ -n "$${marker:-}" ]; then
+    for b in $bins; do
+      if ! grep -qa "$marker" "$tmp/$b"; then
+        echo "bin-update[$prefix]: asset does not contain '$marker' -- refusing it and"
+        echo "                     keeping the current binary"
+        rm -rf "$tmp"; continue 2
+      fi
+    done
+  fi
+
   # tmux keeps LONG-LIVED detached servers holding the user's Claude sessions. Swapping
   # the binary under a running server bumps the client-server protocol, so a later
   # `tmux attach` fails with "protocol version mismatch" and the phone user loses access
@@ -92,21 +109,23 @@ while IFS='|' read -r repo tag prefix bins dir svc vercmd <&3; do
   # but the sessions belong to the ubuntu user, whose server socket lives in
   # /tmp/tmux-1000/ -- `tmux list-sessions` as root looks in /tmp/tmux-0/ and sees
   # nothing. Probe each real user's socket dir explicitly, as that user.
-  if [ "$prefix" = "tmux" ]; then
+  case "$prefix" in tmux|tmux-scroll)
     deferred=0
+    client="$dir/$${bins%% *}"
     for sockdir in /tmp/tmux-*; do
       [ -d "$sockdir" ] || continue
       uid=$(basename "$sockdir" | sed "s/^tmux-//")
       case "$uid" in ""|*[!0-9]*) continue ;; esac
       owner=$(stat -c %U "$sockdir" 2>/dev/null) || continue
-      if sudo -u "$owner" "$dir/tmux" list-sessions >/dev/null 2>&1 </dev/null; then
-        echo "bin-update[tmux]: user $owner has live sessions; deferring to avoid a"
-        echo "                  protocol-mismatch lockout (retries next run)"
+      if sudo -u "$owner" "$client" list-sessions >/dev/null 2>&1 </dev/null; then
+        echo "bin-update[$prefix]: user $owner has live sessions; deferring to avoid a"
+        echo "                     protocol-mismatch lockout (retries next run)"
         deferred=1; break
       fi
     done
     if [ "$deferred" -eq 1 ]; then rm -rf "$tmp"; continue; fi
-  fi
+    ;;
+  esac
 
   [ -n "$svc" ] && systemctl stop "$svc" 2>/dev/null </dev/null
   mkdir -p "$dir"

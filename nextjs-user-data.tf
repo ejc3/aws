@@ -1612,6 +1612,37 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
     apt-get install -y tmux || true
   fi
 fi
+# The scroll-native tmux, installed BESIDE the normal one as tmux-scroll rather than over it.
+#
+# Claude's conversation only reaches the terminal's own scrollback (swipe-to-scroll on a
+# phone) if tmux hands the scrolled-off lines to the terminal instead of repainting a region.
+# The scroll-native branch adds `scroll-replay` for exactly that; a stock tmux loses those
+# lines on any big scroll. t-claude looks for this binary by name and checks it really is the
+# patched build (it greps it for `scroll-replay`), so the name and the check matter more than
+# the version string.
+#
+# BESIDE, not over: replacing /usr/local/bin/tmux cannot change the RUNNING server -- a tmux
+# server keeps the binary it started with -- so it would leave every box one restart away from
+# a version its sessions never asked for. A separate name lets t-claude pick it up for the next
+# server while the current one keeps running.
+if [ ! -x /usr/local/bin/tmux-scroll ] || ! grep -qa scroll-replay /usr/local/bin/tmux-scroll; then
+  # Own directory per run: a fixed /tmp name would be a file another account can pre-create.
+  TSTMP=$(mktemp -d)
+  TSARCH=$(uname -m)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/binaries-scroll-native/tmux-scroll-$TSARCH.tar.gz" -o "$TSTMP/tmux-scroll.tgz" && [ -s "$TSTMP/tmux-scroll.tgz" ]; then
+    # Prove it is the patched build and that it runs BEFORE it replaces anything: the whole
+    # point of this binary is the option, and a truncated download would still untar.
+    tar xzf "$TSTMP/tmux-scroll.tgz" -C "$TSTMP" \
+      && grep -qa scroll-replay "$TSTMP/tmux-scroll" \
+      && "$TSTMP/tmux-scroll" -V >/dev/null 2>&1 \
+      && install -m 755 "$TSTMP/tmux-scroll" /usr/local/bin/tmux-scroll \
+      || echo "WARNING: scroll-native tmux failed its checks; keeping any installed copy"
+  else
+    echo "WARNING: could not download the scroll-native tmux (native scrollback stays degraded)"
+  fi
+  rm -rf "$TSTMP"
+fi
+
 # Claude Code -- the NATIVE installer, per user. See dev-user-data.tf for the full reasoning:
 # npm's "latest" lagged the native channel (2.1.241 vs 2.1.246), a root-owned global install
 # cannot be updated by a normal user so every start retried and failed, and having both
