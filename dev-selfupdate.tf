@@ -49,7 +49,8 @@ ARCH=$(uname -m)
 # tmux installs to /usr/local/bin so it shadows the distro package in PATH without
 # fighting dpkg -- removing the tarball reverts cleanly to Ubuntu's 3.4.
 TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
-ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V'
+ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V
+ejc3/tmux|binaries-scroll-native|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V'
 
 # Read the table on fd 3, NOT stdin. A command inside the loop (etserver -V, which
 # aborts on this build) consumed the remaining stdin and silently ate every entry after
