@@ -316,6 +316,24 @@ start at user login and reconnect the tunnel after failures. The route is
 only public-key login for `ejcampbell`. Keep the Mac awake and online. These are local
 Mac services, not the optional EC2 Mac, and no AWS inbound port is needed.
 
+The MacBook also has Peekaboo 4.4.0 installed for screen control over this same SSH
+connection. Its menu-bar app starts at user login, with Screen Recording,
+Accessibility, and Event Synthesizing enabled. The `peekaboo` command is available
+in noninteractive SSH sessions and explicitly uses that app's local Bridge socket.
+Keep the Mac logged in, awake, and unlocked for UI control.
+
+```bash
+# Run from fcvm-arm; the screenshot is initially saved on the Mac.
+ssh macbook 'peekaboo permissions status'
+ssh macbook 'peekaboo see --mode screen --no-elements --path /tmp/macbook-screen.png'
+scp macbook:/tmp/macbook-screen.png .
+```
+
+For UI actions, `peekaboo see --app <app> --window-title <title> --json` returns a
+snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo type`,
+and `peekaboo press`; inspect the UI again after each action. These Mac-local app
+permissions and login services are configured on the Mac, not by AWS Terraform.
+
 ## Start a Codex session
 
 Codex is installed per Unix account on the metal boxes, `jumpbox-2`, and `nextjs-dev`.
