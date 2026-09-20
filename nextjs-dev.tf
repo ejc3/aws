@@ -40,6 +40,19 @@ variable "nextjs_instance_type" {
   default = "t4g.xlarge"
 }
 
+variable "nextjs_dolphin_gdocs_access_enabled" {
+  # TEMPORARY, added 2026-09-20 at the owner's request so dolphin (ejc3 on this box) can run
+  # scripts/gdoc.py. Revert to false the next day this is reviewed (target: 2026-09-21) --
+  # docs/gdoc-integration.md's security model is explicit that this refresh token "lives in
+  # Secrets Manager, never on disk or in source control. The client secret stays on the
+  # jumpbox." Every account with this grant can read the refresh token via the AWS CLI and
+  # edit any document the authorizing Google account can reach, so this widens that boundary
+  # for as long as it stays true.
+  description = "Grant nextjs-dev's role read access to the Google Docs OAuth secrets. Temporary -- turn off."
+  type        = bool
+  default     = true
+}
+
 variable "nextjs_volume_size" {
   # Extended from 100 to 200 on 2026-09-11 when the shared root filled again. Dolphin and
   # the other users keep their projects, node_modules, browser downloads, and caches here.
@@ -87,6 +100,12 @@ data "aws_secretsmanager_secret" "nextjs_connector" {
   name = each.value
 }
 
+# See var.nextjs_dolphin_gdocs_access_enabled -- temporary.
+data "aws_secretsmanager_secret" "nextjs_gdocs" {
+  for_each = var.nextjs_dolphin_gdocs_access_enabled ? toset(["google-docs-oauth-desktop", "google-docs-oauth-token"]) : []
+  name     = each.value
+}
+
 resource "aws_iam_instance_profile" "nextjs_dev" {
   name = "nextjs-dev-profile"
   role = aws_iam_role.nextjs_dev.name
@@ -117,7 +136,7 @@ resource "aws_iam_role_policy" "nextjs_dev" {
           aws_secretsmanager_secret.dev_hop.arn,
           ], local.dolphin_enabled ? [
           data.aws_secretsmanager_secret.nextjs_connector["cloudflare-dolphin-tunnel-credentials"].arn,
-        ] : [])
+        ] : [], [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn])
       },
       {
         # devhop-refresh resolves the other dev servers' private IPs at boot, because they
