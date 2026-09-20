@@ -438,6 +438,9 @@ fi
 # Shell setup
 ${local.shell_setup}
 
+# Only ARM terminates the outbound SSH tunnels from the two Macs.
+${local.mac_reverse_tunnel_setup}
+
 # Claude Code -- the NATIVE installer, deliberately not npm.
 #
 # npm was the wrong channel. On 2026-08-26 the registry's "latest" was 2.1.241 while the

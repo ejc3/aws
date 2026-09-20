@@ -293,6 +293,29 @@ during that period, or its worktree has uncommitted changes. Only `github.com/ej
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
 
+### SSH back to the Macs
+
+From `fcvm-arm` as `ubuntu`, use these distinct reverse-tunnel aliases:
+
+| Command | Listener on fcvm-arm | Destination |
+|---|---|---|
+| `ssh mac` | `127.0.0.1:2222` | The original Mac, as `ejcampbell` |
+| `ssh macbook` | `127.0.0.1:2223` | EJ's MacBook Pro, as `ejcampbell` |
+
+`mac-reverse-tunnels.tf` installs the aliases only in the ARM bootstrap, in
+`~/.ssh/config.d-mac-tunnels`, and pins the MacBook's verified public host key in
+`~/.ssh/known_hosts.mac-tunnels`. Its installer migrates the old standalone alias blocks
+out of `~/.ssh/config` and is safe to rerun. Both aliases use the pre-existing
+`~/.ssh/to-mac` key on the ARM box's persistent root; Terraform does not rotate or copy
+that private key. Restoring it is a prerequisite on an entirely fresh ARM root.
+
+The Macs initiate the outbound tunnels. On EJ's MacBook Pro, the
+`com.ejcampbell.fcvm-macbook.sshd` and `com.ejcampbell.fcvm-macbook.tunnel` LaunchAgents
+start at user login and reconnect the tunnel after failures. The route is
+`fcvm-arm 127.0.0.1:2223 -> MacBook 127.0.0.1:22222`; the MacBook's SSH listener accepts
+only public-key login for `ejcampbell`. Keep the Mac awake and online. These are local
+Mac services, not the optional EC2 Mac, and no AWS inbound port is needed.
+
 ## Start a Codex session
 
 Codex is installed per Unix account on the metal boxes, `jumpbox-2`, and `nextjs-dev`.
