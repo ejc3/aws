@@ -109,7 +109,8 @@ needs:
 - the existing `fcvm-ec2` EC2 key pair and its private key;
 - the existing `AWSBackupDefaultServiceRole`;
 - the Cloudflare `cc-games.dev` zone and Secrets Manager values
-  `cloudflare-tunnel-token` (including Workers Scripts Read/Write),
+  `cloudflare-tunnel-token` (including Workers Scripts Read/Write, D1 Write,
+  Secrets Store Write, and Access: Service Tokens Write for Skyhook),
   `cloudflare-tunnel-credentials`, and
   `cloudflare-google-idp`;
 - the raw user-owned Cloudflare token in
@@ -622,7 +623,9 @@ existing tunnel sessions. An unchanged rebuild does not restart either connector
 The `colton-games-stage` Worker is deployed from `CoderColton/colton-games` with Wrangler
 and OpenNext. Terraform owns the Worker envelope and its Worker-native Access boundary;
 Workers Builds owns versions, application assets, bindings, and deployments. This prevents
-an infrastructure apply from replacing an application bundle.
+an infrastructure apply from replacing an application bundle. Skyhook's staging storage
+and runtime credentials are separately managed in `skyhook-leaderboard.tf`; provisioning
+them alone does not deploy or enable the leaderboard (see the next section).
 
 The existing Worker is adopted through the checked-in import block with both `workers.dev`
 and preview URLs still disabled, matching its current remote state. Read the plan and stop if
@@ -650,7 +653,9 @@ unavailable in the Custom Token permission list. Keep the template's User → AP
 Edit permission (called API Tokens Write by the API), then add account-level Workers
 Builds Configuration Edit and Workers Scripts Read scoped only to account
 `12ea67fb7ced068de03f35c22688e436`. Those permissions let Terraform configure Builds and
-mint the narrower Workers Scripts Write token that build jobs receive. Store the raw
+mint the account-scoped Workers Scripts Write / Secrets Store Write token that build jobs
+receive. Secrets Store Write is required to bind the signing secret; it does not justify
+any additional management permission. Store the raw
 control-token string in the existing Secrets Manager container without JSON wrapping.
 Terraform creates the deploy token; do not make or paste a second deploy credential.
 
@@ -741,10 +746,12 @@ Roll this out in order; do not collapse the safety gates into one apply:
    ```
 
    The saved plan should contain only the account Workers subdomain and any other already
-   reviewed base configuration from this change. It must not create Builds credentials,
-   connections, triggers, or environment maps; update the Worker; change Access; or
-   destroy anything. Apply the saved plan immediately and require the follow-up plan to
-   be empty.
+   reviewed base configuration from this change. If introducing Skyhook in this same
+   apply, also allow its explicitly reviewed additive resources and **only** the extra
+   `skyhook_dev` policy attachment to the existing staging Access application (see below).
+   It must not create Builds credentials, connections, triggers, or environment maps;
+   update the Worker; remove/change existing Access policies; or destroy anything.
+   Apply the saved plan immediately and require the follow-up plan to be empty.
 5. Create and store the raw control token, then have the `CoderColton` repository owner
    complete the repository-only GitHub App authorization.
 6. Change only `colton_games_workers_builds_enabled` to true. Re-plan immediately. This
@@ -766,6 +773,145 @@ Roll this out in order; do not collapse the safety gates into one apply:
 
 Every gate change is a reviewed, committed Terraform change. Do not disable either gate
 after its protected resources exist; `prevent_destroy` is intended to stop that rollback.
+
+### Skyhook staging global leaderboard
+
+Tracked in [ejc3/aws#147](https://github.com/ejc3/aws/issues/147). This is the infrastructure
+handoff, **not an activation claim**. The 2026-09-20 application audit found the Node dev
+site reporting `available:false` and the staging Worker returning 404. Both existing
+Workers Builds/URL gates remain false in this change. Production continues on Vercel;
+no DNS, tunnel, instance, bootstrap script, Worker code, or production routing changes.
+
+`skyhook-leaderboard.tf` declares:
+
+| Resource | Purpose and boundary |
+|---|---|
+| `skyhook-leaderboard-stage` D1 database | Shared staging/dev/preview scores, protected from destroy; no production data |
+| Account Secrets Store `games` | Adopt the existing account store if present; protected from destroy |
+| `skyhook-leaderboard-stage` stored secret | Terraform-generated 64-character signing key, `workers` scope; no credential output |
+| `skyhook-stage-dev-proxy` Access service token | One-year runtime token accepted only by the existing staging Worker's Access application |
+| `skyhook-leaderboard-stage-proxy` AWS secret | JSON `{upstream_url, client_id, client_secret}` for a future server-only Node proxy; 30-day recovery and destruction guard |
+| `nextjs-skyhook-leaderboard-stage` IAM policy | `GetSecretValue` on that one secret ARN, attached only to the enabled Next.js dev role |
+
+The signing key stays in Cloudflare and encrypted Terraform state, not on the dev box.
+The AWS secret contains only the runtime Access credential and fixed upstream URL, never
+an administrative API token. The dev role is shared by the instance: this is **not Unix
+user isolation** on a host with shared sudo access. It must never receive a production
+leaderboard credential or permission to fetch the wildcard `cc-games` automation token.
+
+Worker-native Access cannot limit this credential to `/api/skyhook/*`: it grants access
+to **the staging Worker and its previews**. The proxy must enforce the narrower route
+allowlist in application code. Existing human and automation policies stay attached;
+the new policy is not attached to any other Access application. No new bypass policy or
+public leaderboard endpoint is introduced. Trusted preview code can use staging bindings,
+so continue to restrict builds to trusted branches. A future production board needs its
+own database, signing key, credential, and reviewed serving-path decision.
+
+#### Administration-host provisioning and handoff
+
+1. Read the staging rollout above and keep its gates false. Complete the existing
+   backend-versioning sequence, including the 15-minute propagation wait and a non-null
+   state object VersionId, **before creating these credentials**. The Terraform dependency
+   orders writes but cannot prove propagation. Do not read state, secret payloads, or run
+   a live plan from a dev host or GitHub runner.
+2. On the administration host, verify the ordinary account-scoped provider credential has
+   `D1 Write`, `Secrets Store Write`, `Access: Service Tokens Write`, and the existing
+   `Access: Apps and Policies Write` permissions. Credential administration remains in
+   the approved Terraform/admin workflow; do not mutate resources using an HTTP script.
+   The Builds control credential still only mints the deployment token. That token gains
+   **Secrets Store Write**, required even for binding an existing secret. D1 binding by
+   explicit database ID does not need D1 Read/Write, and builds must not apply migrations.
+   See [Secrets Store permissions](https://developers.cloudflare.com/secrets-store/access-control/)
+   and [Worker binding authorization](https://developers.cloudflare.com/workers/authorization/#bindings).
+3. Inventory Secrets Store metadata on the administration host before planning a create.
+   Cloudflare supports [one store per account](https://developers.cloudflare.com/workers/wrangler/commands/secrets-store/).
+   If one exists, preserve its name in `cloudflare_secrets_store.games`, review that source
+   change, and adopt it with Terraform import ID `<account_id>/<store_id>`; never create a
+   second store, rename/recreate an existing store, or steal ownership from another
+   Terraform state. If another state owns it, stop and agree on an explicit ownership
+   handoff. Also check for an existing database/secret with the intended names: do not
+   replace data or overwrite a previously deployed signing key.
+4. From a clean reviewed checkout on the jumpbox, run locked init, validate, then a fresh
+   full saved plan. Review before applying the exact plan; re-plan if it becomes stale.
+   The expected changes are the new staging resources, one additional policy attachment
+   on the existing Access application, and the exact-ARN dev role policy. If Builds was
+   already enabled by a separate reviewed rollout, an in-place deployment-token permission
+   update is also expected; with today's gates false, no Builds token is created here.
+   Stop for deletes/replacements, Worker code/URL changes, changed existing policy IDs,
+   instance/bootstrap changes, or unrelated drift. Do not skip the Access update to force
+   a partial success. Require a fresh empty plan after applying. The earlier rollout's
+   base-plan description must include these explicitly reviewed additive resources if
+   these changes are being introduced at the same time.
+5. Hand off only `terraform output -json skyhook_leaderboard_stage`. It includes the
+   actual database/store identifiers, the fixed upstream URL, and the proxy secret ARN,
+   **not secret values**. Copy its `wrangler` binding entries into the application repo's
+   existing configuration without replacing other bindings. Keep the explicit D1 ID;
+   don't let Wrangler auto-provision a name-only database. Never publish state or plan
+   JSON as an artifact, and do not print the AWS secret's payload.
+
+The pinned `ejc3/cloudflare` **5.24.0 implementation** supports the required secret
+`name`, `scopes`, and sensitive `value` attributes; its generated resource documentation
+is stale. This change keeps Terraform/provider pins and the lockfile unchanged and uses
+typed resources only. Secret values remain in sensitive Terraform state; sensitive does
+not mean state-free. The database, store, signing key, and AWS secret container have
+`prevent_destroy` guards. Signing-key rotation requires explicit review because it
+invalidates existing runner cookies (it does not delete scores). Review service-token
+rotation before its `expires_at`: a Terraform replacement must publish the new AWS secret
+version and policy, followed by a server credential refresh and a real request check.
+Expiry/revocation must fail closed, never fall back to unauthenticated access.
+
+#### Application work still required after apply
+
+Provisioning alone cannot enable `https://colton.cc-games.dev`: its Next.js server runs
+on Node, not inside a Worker. Coordinate these changes in `CoderColton/colton-games`:
+
+- Deploy the actual OpenNext API and binding configuration through Wrangler/Workers
+  Builds, following the existing staged Access/URL rollout. Do not replace Worker code
+  with Terraform, enable a URL ahead of protection, or move Vercel production implicitly.
+- Reach **schema revision 3** with the approved application migration runner: apply only
+  unapplied `0001_leaderboard.sql`, `0002_sixty_courses.sql`, `0003_finale.sql`, in that
+  order, from `migrations/skyhook`. Each migration must be atomic; preserve scores, run
+  tokens, limits and indexes. The current contract covers **courses 1–61** and season
+  **`skyhook-v2`**. Keep migrations out of PR builds and keep fake test scores off live boards.
+- Implement a server-only, same-origin Node proxy for exactly GET `status`, POST `runs`,
+  and GET/POST `leaderboard` below `/api/skyhook/`. Fetch the one AWS secret using the
+  instance role on the server, validate its fixed HTTPS upstream, and send Access headers
+  only to that host. Do not follow redirects with credentials or permit arbitrary paths,
+  URLs, or forwarded caller headers. Validate the browser's original same-origin Origin
+  before setting the upstream Origin. Forward only the `skyhook_runner` cookie; preserve
+  its HttpOnly/SameSite=Strict/path behavior on the dev hostname, not Access cookies.
+  Never expose credentials in `NEXT_PUBLIC_*`, the HTML, logs, browser responses or error
+  messages. Handle credential expiry/backend errors as unavailable; no local fake-global
+  fallback. This PR grants secret retrieval but does not install a secret file or restart
+  any server. Implement refresh/caching and failure behavior with the proxy.
+- Preserve the backend's abuse controls when forwarding. Cloudflare sees the proxy's
+  address for all dev users: do not trust browser-supplied IP headers to work around this.
+  The current per-address run limit is shared by dev players; review that explicitly if
+  usage outgrows it. Runner cookies still separate browser identities.
+
+#### Acceptance before calling it live
+
+An admin must verify the real plan and provider permissions; credential-free validation
+cannot prove account readiness. Check unauthenticated denial and authenticated access to
+the protected Worker and previews, with the dev credential rejected on unrelated apps.
+Then require `available:true` on **the intended game hostname**, submit a genuine completed
+run (including course 61), and observe it from a second browser. Slower submissions must
+not replace faster ones; replayed/invalid runs must fail. Verify shared scores survive a
+Worker redeploy/server restart, the remembered nickname survives course changes/reload,
+and no credential appears in browser traffic or generated HTML. Test expired/revoked
+credential handling without weakening Access. Issue #147 remains open until this
+end-to-end acceptance is complete; merging the infrastructure PR alone is not completion.
+
+Offline checks, safe on dev hosts and in CI:
+
+```bash
+terraform fmt -check -recursive
+terraform init -backend=false -lockfile=readonly
+terraform validate
+python3 scripts/test-skyhook-leaderboard.py
+python3 scripts/test-ci-security.py
+python3 scripts/test-dev-credential-boundary.py
+```
 
 ## GitHub Actions and package infrastructure
 
@@ -1823,6 +1969,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Metal dev boxes | `firecracker-dev.tf`, `x86-dev.tf`, `dev-user-data.tf` |
 | Shared dev setup | `dev-instance-common.tf`, `dev-selfupdate.tf`, `dev-hop-key.tf`, `dev-ebs.tf` |
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
+| Skyhook staging leaderboard | `skyhook-leaderboard.tf`, `scripts/test-skyhook-leaderboard.py` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |

@@ -37,3 +37,6 @@ jobs:
 
       - name: Verify CI privilege boundaries
         run: python3 scripts/test-ci-security.py
+
+      - name: Verify Skyhook leaderboard boundaries
+        run: python3 scripts/test-skyhook-leaderboard.py

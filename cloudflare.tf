@@ -11,7 +11,8 @@
 # CREDENTIALS: the API token lives in Secrets Manager (cloudflare-tunnel-token) and must be
 # scoped to this account with only what the resources below need -- Tunnel Write, Access Apps
 # and Policies Write, Access Organizations/Identity Providers Write, Workers Scripts
-# Read/Write, DNS Write, and Zone Read/Write.
+# Read/Write, DNS Write, and Zone Read/Write. Skyhook adds account-scoped D1 Write,
+# Secrets Store Write, and Access: Service Tokens Write (see skyhook-leaderboard.tf).
 # It is never written to disk or into the repo.
 #
 # The IdP permission is the non-obvious one: without it `terraform import` on the identity
@@ -488,6 +489,10 @@ resource "cloudflare_zero_trust_access_application" "colton_games_stage" {
       id         = cloudflare_zero_trust_access_policy.cc_games_service.id
       precedence = 2
     },
+    {
+      id         = cloudflare_zero_trust_access_policy.skyhook_dev.id
+      precedence = 3
+    },
   ]
 }
 
@@ -507,6 +512,14 @@ data "cloudflare_api_token_permission_groups_list" "workers_scripts_write" {
   name     = "Workers%20Scripts%20Write"
 }
 
+# Binding a Secrets Store secret requires Edit/Write even though builds do not
+# rotate the value. Read is metadata-only and would fail application deployment.
+data "cloudflare_api_token_permission_groups_list" "secrets_store_write" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_builds_enabled ? 1 : 0
+  name     = "Secrets%20Store%20Write"
+}
+
 resource "cloudflare_api_token" "colton_games_build_deploy" {
   provider = cloudflare.workers_builds
   count    = local.colton_games_workers_builds_enabled ? 1 : 0
@@ -514,9 +527,10 @@ resource "cloudflare_api_token" "colton_games_build_deploy" {
 
   policies = [{
     effect = "allow"
-    permission_groups = [{
-      id = one(data.cloudflare_api_token_permission_groups_list.workers_scripts_write[0].result).id
-    }]
+    permission_groups = [
+      { id = one(data.cloudflare_api_token_permission_groups_list.workers_scripts_write[0].result).id },
+      { id = one(data.cloudflare_api_token_permission_groups_list.secrets_store_write[0].result).id },
+    ]
     resources = jsonencode({
       "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*"
     })

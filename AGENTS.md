@@ -167,8 +167,9 @@ recovery/monitoring infrastructure.
   DynamoDB locks
 - Roughly 195 managed resources across `us-west-1`, `us-west-2`, `us-east-1`, the isolated
   staging account, and Cloudflare
-- No application database or Aurora. DynamoDB is used for Terraform locking and the runner
-  registration handshake
+- Skyhook's staging leaderboard has Terraform-managed Cloudflare D1/Secrets Store
+  declarations; activation needs the separate application rollout in README.md. No Aurora.
+  DynamoDB is used for Terraform locking and the runner registration handshake
 
 ## User Workflow
 
@@ -206,8 +207,8 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
-- There is no application database. DynamoDB is limited to Terraform locking and runner
-  registration claims. Older notes about Aurora Serverless auto-pause no longer apply
+- Skyhook uses a staging-only Cloudflare D1 database, not Aurora. DynamoDB is limited to
+  Terraform locking and runner registration claims. Older Aurora auto-pause notes do not apply
 
 ### File Structure
 
@@ -217,6 +218,7 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 ├── variables.tf                    # Opinionated variables and defaults
 ├── firecracker-dev.tf/x86-dev.tf   # Persistent Spot metal boxes
 ├── nextjs-dev.tf/cloudflare.tf      # Kids' environment, Access, and Workers Builds
+├── skyhook-leaderboard.tf           # Staging D1, signing key, and dev runtime credential
 ├── io-box.tf/parallel-box.tf        # Ephemeral I/O and burst compute
 ├── runner-autoscale.tf              # Disposable GitHub runners
 ├── .terraform.lock.hcl              # Shared provider selections
@@ -285,8 +287,9 @@ ephemerally, so the value is not stored in state. At
 template** because Custom Token cannot grant API Tokens Edit. Retain User → API Tokens →
 Edit (API name: API Tokens Write) and add Workers Builds Configuration Edit plus Workers
 Scripts Read for account `12ea67fb7ced068de03f35c22688e436`. Terraform then mints the
-narrower Workers Scripts Write deploy token. Start the GitHub connection in Cloudflare at
-Workers & Pages → target Worker → Settings → Builds → Connect → GitHub. The `CoderColton`
+narrower Workers Scripts Write / Secrets Store Write deploy token. Start the GitHub
+connection in Cloudflare at Workers & Pages → target Worker → Settings → Builds → Connect
+→ GitHub. The `CoderColton`
 repository owner must authorize only `CoderColton/colton-games`; `ejc3` has write, not
 admin, and cannot grant the App. When authorization returns to Cloudflare, stop before
 selecting/saving the repository or any build settings. Terraform owns the connection and
@@ -306,6 +309,19 @@ and repository connections have no read/list endpoint or import path. Keep backe
 versioning and every related `prevent_destroy` guard. Never disable the Builds gate after
 these resources exist, and never apply a plan that replaces them without explicit recovery
 intent.
+
+**Skyhook leaderboard boundary**: `skyhook-leaderboard.tf` is staging/dev/preview only;
+no production cutover or automatic activation. First follow README's backend-versioning
+gate and inventory/adopt the account's sole Secrets Store on the administration host.
+Never recreate an existing database or overwrite an existing signing key. The signing
+key stays in Cloudflare/state; the Next.js role may read only the new runtime Access
+credential's exact AWS secret ARN. That token reaches the entire staging Worker (including
+previews), not only API paths; the application proxy must enforce a fixed route allowlist.
+No wildcard dev Access token, signing key, or administrative API token on the dev host.
+IAM is instance-scoped, not Unix-user isolation. Keep Worker code/bindings/migrations in
+the app repo, gates unchanged, and #147 open until real two-browser acceptance. Apply all
+three app migrations to schema revision 3 (61 courses, `skyhook-v2`). Credential-free
+tests live in `scripts/test-skyhook-leaderboard.py`; a green result is not a live plan.
 
 **GitHub runs credential-free validation, not live drift**: `drift.yml` installs locked
 providers with `-backend=false`, runs `validate`, and checks CI boundaries. Never restore
@@ -773,8 +789,8 @@ Do not add a speculative option. Region placement is intentional: the main fleet
 copies use `us-east-1`.
 
 **Add deployment options**:
-Prefer the deployed opinionated path. There is no application database and no Aurora
-auto-pause; DynamoDB is limited to locking and runner registration claims.
+Prefer the deployed opinionated path. Skyhook has staging-only Cloudflare D1 declarations;
+there is no Aurora auto-pause. DynamoDB is limited to locking and runner registration claims.
 
 ## Philosophy in Action
 
