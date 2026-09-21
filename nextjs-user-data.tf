@@ -1701,6 +1701,14 @@ ${local.dev_hop_setup}
 # The exposure is therefore cost, not access, and it is capped.
 ${local.pbox_setup}
 
+# ---------------------------------------------------------------- gbox
+# The on-demand GPU test box (gpu-box.tf), for measuring the kids' browser games on a real
+# GPU. Same trust shape as pbox: the instance role's tag-scoped gpu-box-control grant is
+# box-wide (every account here has sudo), and what bounds it is the policy -- four small
+# NVIDIA types, one tag, one template -- plus the watchdog (30 idle minutes) and the box's
+# own hard lifetime. It uses the hop key below, as pbox does.
+${local.gbox_setup}
+
 # ejc3's copy of the hop key. dev_hop_setup above installs it for `ubuntu` only, and
 # /home/ubuntu is 0700 -- but `pbox up` ends by SSHing to the new box as the invoking
 # user, so without this ejc3 could launch a box and then not reach it.

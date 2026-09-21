@@ -204,7 +204,9 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 
 - The dev boxes are the cost. Two metal spot instances dominate; the small boxes are noise
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
-  box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
+  box. `parallel-box-watchdog.tf` terminates burst compute and the GPU test box
+  (`gpu-box.tf`) after 30m CPU idle, and the GPU box at 4h from launch (its own shutdown
+  timer is only a backup)
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
 - There is no application database. DynamoDB is limited to Terraform locking and runner
   registration claims. Older notes about Aurora Serverless auto-pause no longer apply
