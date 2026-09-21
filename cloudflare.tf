@@ -447,7 +447,7 @@ resource "cloudflare_zero_trust_access_application" "family_wall_assets" {
   account_id = var.cloudflare_account_id
   name       = "family board compiled assets"
   type       = "self_hosted"
-  domain     = "family.cc-games.dev/_next"
+  domain     = "family.cc-games.dev/_next/*"
 
   destinations = [
     { type = "public", uri = "family.cc-games.dev/_next/*" },
