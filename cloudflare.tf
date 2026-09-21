@@ -322,20 +322,20 @@ resource "cloudflare_zero_trust_access_application" "warp_enrollment" {
   ]
 }
 
-# "This request comes from a device running this account's WARP client."
+# "This request comes from a device running this account's WARP client." Used by the
+# family wall screens to require devices enrolled in this Zero Trust account.
+#
+# type = "warp" is a simple boolean check (is the WARP client running), not a
+# platform-specific one: verified live against the API that description, match and
+# enabled are all silently accepted on create/update and then absent from every
+# subsequent read -- Cloudflare does not persist them for this rule type, which made
+# every plan after a clean apply show a perpetual diff trying to "add" them back.
+# Removed here rather than papered over with ignore_changes, since they were never
+# part of this type's actual schema.
 resource "cloudflare_zero_trust_device_posture_rule" "warp_enrolled" {
-  account_id  = var.cloudflare_account_id
-  name        = "Runs this account's WARP client"
-  description = "Used by the family wall screens. Passes only on devices enrolled in this Zero Trust account."
-  type        = "warp"
-  match = [
-    { platform = "android" },
-    { platform = "ios" },
-    { platform = "mac" },
-    { platform = "windows" },
-    { platform = "linux" },
-    { platform = "chromeos" },
-  ]
+  account_id = var.cloudflare_account_id
+  name       = "Runs this account's WARP client"
+  type       = "warp"
 }
 
 resource "cloudflare_zero_trust_access_policy" "family_wall_screens_warp" {
