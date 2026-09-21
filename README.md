@@ -573,17 +573,20 @@ household's day on the living-room TV, an e-ink tablet and phones):
   in `local.nextjs_pinned_routes` (`nextjs-user-data.tf`) and written into the zone registry
   at boot, not published with `ndev`, so the zone-follows-account rule above still holds for
   everything anyone can type. Add to that list only for the same reason.
-- *Four paths that skip Access.* On `family.cc-games.dev` only, `/tv`, `/ink`,
-  `/api/device/*` and `/_next/*` bypass Access (`cloudflare_zero_trust_access_application.
-  family_wall_screens` in `cloudflare.tf`). A TV cannot sit through a Google login, so the
-  board pairs its screens itself: an unpaired screen shows a short code, a signed-in person
-  approves it at `/pair` (which stays behind Google), and the screen gets a long-lived cookie
-  good only for those wall pages. Without that cookie the bypassed paths serve a pairing
-  screen, a code that is worthless until approved, a 401, and the site's static assets. The
-  app authenticates people from Access's signed token, never the plain email header, because
-  of this bypass. Everything else on the hostname, and every other `cc-games.dev` hostname,
-  is still behind the Google allowlist. To audit: `curl -I https://family.cc-games.dev/`
-  must be a 302 to the Access login; `/tv` is expected to be a 200.
+- *Wall-screen paths with their own Access application.* On `family.cc-games.dev` only,
+  `/tv`, `/ink` and `/api/device/*` are not behind the Google allowlist but behind
+  `cloudflare_zero_trust_access_application.family_wall_screens` (`cloudflare.tf`), because a
+  TV cannot sit through a Google login. Cloudflare lets a request through only from a device
+  enrolled in this account's WARP client by someone on the allowlist (signed in through WARP,
+  so the screen shows no login page), or from the home screen proxy, which adds the
+  `family-wall-screen-proxy` service token (Secrets Manager `family-wall-screen-proxy-access`;
+  it works on these paths and nowhere else). Behind that, the app still pairs each screen:
+  an unpaired screen shows a short code that a signed-in person approves at `/pair` (which
+  stays behind Google). `/_next/*`, the site's compiled assets, bypasses Access in a separate
+  application because the phone pages share it. Everything else on the hostname, and every
+  other `cc-games.dev` hostname, is still behind the Google allowlist. To audit:
+  `curl -I https://family.cc-games.dev/` and `curl -I https://family.cc-games.dev/tv` must
+  both be a 302 to the Access login; `/_next/static/...` is expected to be a 200.
 
 Once credentials exist and their units have been enabled, services and remote-control
 agents start at boot. A reboot restores the published URLs without another interactive
