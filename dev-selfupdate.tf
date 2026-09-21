@@ -213,6 +213,15 @@ PBOXB64
 chmod 755 /usr/local/bin/pbox
   EOT
 
+  # `gbox` -- up/down for the on-demand GPU test box (gpu-box.tf). Same embedding as pbox,
+  # for the same reason: one script, installed verbatim, never a wrapper that drifts.
+  gbox_setup = <<-EOT
+base64 -d > /usr/local/bin/gbox <<'GBOXB64'
+${base64encode(file("${path.module}/scripts/gpu-box.sh"))}
+GBOXB64
+chmod 755 /usr/local/bin/gbox
+  EOT
+
   # ---------------------------------------------------------------------------
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------

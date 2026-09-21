@@ -255,6 +255,17 @@ data "aws_iam_policy_document" "parallel_box_control" {
       variable = "aws:RequestTag/Name"
       values   = [for b in local.parallel_boxes : b.name]
     }
+
+    # Only through the parallel-box launch templates. This role also holds gpu-box-control
+    # (gpu-box.tf), and IAM authorizes each resource of a RunInstances call against the
+    # UNION of both policies: without this pin, a template-less call tagged Name=parallel-box
+    # could borrow the GPU box's x86 AMI and subnets and launch any x86 type, and a gpu-box
+    # could borrow this policy's PassRole or its world-open security group.
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [for lt in aws_launch_template.parallel_box : lt.arn]
+    }
   }
 
   # The things the call REFERENCES rather than creates. Pinned to exact ARNs: this role
@@ -273,6 +284,13 @@ data "aws_iam_policy_document" "parallel_box_control" {
       ],
       [for lt in aws_launch_template.parallel_box : lt.arn],
     )
+
+    # Same template pin as above, for the same union reason.
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [for lt in aws_launch_template.parallel_box : lt.arn]
+    }
   }
 
   # Tagging at launch. ec2:CreateAction pins this to RunInstances, so it cannot be used
