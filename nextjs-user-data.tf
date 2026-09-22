@@ -1549,10 +1549,36 @@ for u in ${join(" ", local.nextjs_users)}; do
   /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
 done
 
+# A restart kills everything in the unit's cgroup (KillMode=control-group): the agent, its
+# tmux server and every background job it started -- on 2026-09-20 that wiped a multi-hour
+# build with nine running workflows. So do not restart a service whose user has a session
+# that wrote to its transcript recently; the update is already installed and takes effect on
+# that session's next start. Tune with AGENT_UPDATE_IDLE_MIN (minutes of silence that count
+# as idle, default 60).
+IDLE_MIN="$${AGENT_UPDATE_IDLE_MIN:-60}"
+case "$IDLE_MIN" in ''|*[!0-9]*) echo "WARNING: AGENT_UPDATE_IDLE_MIN=$IDLE_MIN is not a number, using 60"; IDLE_MIN=60 ;; esac
+recent_session() {  # recent_session <user> <claude-rc|codex-rc> -> prints one recently written session file, exit 0 if any
+  local u="$1" dir
+  case "$2" in
+    claude-rc) dir="/home/$u/.claude/projects" ;;
+    codex-rc)  dir="/home/$u/.codex/sessions" ;;
+    *) return 1 ;;
+  esac
+  [ -d "$dir" ] || return 1
+  local hit
+  hit=$(find "$dir" -type f \( -name '*.jsonl' -o -name '*.json' \) -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)
+  [ -n "$hit" ] && { echo "$hit"; return 0; }
+  return 1
+}
+
 for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   for s in claude-rc codex-rc; do
     systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
+    if active=$(recent_session "$u" "$s"); then
+      echo "SKIPPED restart of $s@$u: a session was active in the last $${IDLE_MIN} min ($active)"
+      continue
+    fi
     systemctl restart "$s@$u" && echo "restarted $s@$u"
   done
 done
