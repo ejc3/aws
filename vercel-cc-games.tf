@@ -7,8 +7,7 @@
 # Rollout is staged so production never redirects to a domain that is not serving yet:
 #   stage 2 (this file): cc-games.app becomes a project domain, ccgames.app redirects to it,
 #                        the existing colton-games.com pair is imported AS IT IS.
-#   stage 3:             once https://cc-games.app is serving, point colton-games.com and
-#                        www.colton-games.com at it.
+#   stage 3 (done):      colton-games.com and www.colton-games.com redirect to cc-games.app.
 # Only production is redirected. The dev URLs under cc-games.dev are a separate Cloudflare
 # tunnel and are not touched.
 #
@@ -69,29 +68,24 @@ resource "vercel_project_domain" "ccgames_app" {
   redirect_status_code = 308
 }
 
-# Already live in Vercel. Imported unchanged so stage 3 can retarget them in one small diff.
-import {
-  to = vercel_project_domain.colton_games_com
-  id = "${var.vercel_team_id}/${local.colton_games_vercel_project_id}/colton-games.com"
-}
-
-import {
-  to = vercel_project_domain.colton_games_com_www
-  id = "${var.vercel_team_id}/${local.colton_games_vercel_project_id}/www.colton-games.com"
-}
-
+# The old production domains now redirect to cc-games.app (308). cc-games.app was confirmed
+# serving over HTTPS before this change, so production never redirects to a domain that is
+# not live. colton-games.vercel.app is Vercel's own hostname and is left alone. (Both
+# domains were imported into state in stage 2.)
 resource "vercel_project_domain" "colton_games_com" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "colton-games.com"
-  redirect             = "www.colton-games.com"
+  redirect             = vercel_project_domain.cc_games_app.domain
   redirect_status_code = 308
 }
 
 resource "vercel_project_domain" "colton_games_com_www" {
-  team_id    = var.vercel_team_id
-  project_id = data.vercel_project.colton_games.id
-  domain     = "www.colton-games.com"
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "www.colton-games.com"
+  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect_status_code = 308
 }
 
 resource "cloudflare_dns_record" "cc_games_app_apex" {
