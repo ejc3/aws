@@ -88,6 +88,24 @@ resource "vercel_project_domain" "colton_games_com_www" {
   redirect_status_code = 308
 }
 
+# www variants. Every hostname a person might type ends up on https://cc-games.app: the
+# apex and www of both spellings redirect to it, and http:// is upgraded by Vercel.
+resource "vercel_project_domain" "www_cc_games_app" {
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "www.cc-games.app"
+  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect_status_code = 308
+}
+
+resource "vercel_project_domain" "www_ccgames_app" {
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "www.ccgames.app"
+  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect_status_code = 308
+}
+
 resource "cloudflare_dns_record" "cc_games_app_apex" {
   zone_id = var.cc_games_app_zone_id
   name    = "cc-games.app"
@@ -106,4 +124,24 @@ resource "cloudflare_dns_record" "ccgames_app_apex" {
   proxied = false
   ttl     = 300
   comment = "vercel apex; redirects to cc-games.app"
+}
+
+resource "cloudflare_dns_record" "cc_games_app_www" {
+  zone_id = var.cc_games_app_zone_id
+  name    = "www"
+  type    = "CNAME"
+  content = "cname.vercel-dns.com"
+  proxied = false
+  ttl     = 300
+  comment = "vercel www; redirects to cc-games.app"
+}
+
+resource "cloudflare_dns_record" "ccgames_app_www" {
+  zone_id = var.ccgames_app_zone_id
+  name    = "www"
+  type    = "CNAME"
+  content = "cname.vercel-dns.com"
+  proxied = false
+  ttl     = 300
+  comment = "vercel www; redirects to cc-games.app"
 }
