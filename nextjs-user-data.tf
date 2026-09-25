@@ -451,65 +451,85 @@ set -uo pipefail
 WHO="$${1:?usage: claude-rc-ensure <user>}"
 H="/home/$WHO"
 tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
-win=$(tm list-windows -a -F '#{window_id}' | head -1)
-[ -n "$win" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
+# EVERY window, not just the first (fixed 2026-09-25 by Claude): agents-start can launch more
+# than one managed claude per user (~/.config/agent-extra-dirs), and the first-window-only
+# version never looked at the others. Each window is judged on its own screen and rate-limited
+# on its own, so a repair in one never blocks or triggers another.
 pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
-
-# Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
-# repair re-triggers the repair, forever.
-pane() { tm capture-pane -p -S -25 -t "$win"; }
-P="$(pane)"
-
-# The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
-# cannot succeed no matter how many times /remote-control retries it. Note this is NOT the
-# same as the bare "Remote Control disconnected." line, which is also what a deliberate
-# disconnect prints -- matching that would make the script chase its own tail.
-case "$P" in
-  *"Couldn't reconnect to your Remote Control session"*) ;;
-  *) echo "claude-rc-ensure: $WHO nothing to repair"; exit 0 ;;
-esac
-
-# An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
-case "$P" in
-  *"Session creation failed"*) echo "claude-rc-ensure: $WHO upstream 503, leaving alone"; exit 0 ;;
-esac
+# -a lists a window once per session that shows it (t-claude's grouped views share windows), so
+# de-duplicate by window id or one window would be judged -- and repaired -- several times.
+wins=$(tm list-windows -a -F '#{window_id}' | sort -u)
+[ -n "$wins" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
 
 STATEDIR=/var/lib/claude-rc-ensure
 mkdir -p "$STATEDIR"
-STAMP="$STATEDIR/$WHO"
-now=$(date +%s)
-last=$(cat "$STAMP" 2>/dev/null || echo 0)
-if [ $((now - last)) -lt 3600 ]; then
-  echo "claude-rc-ensure: $WHO repaired within the last hour, backing off"
-  exit 0
-fi
-echo "$now" > "$STAMP"
 
-echo "claude-rc-ensure: $WHO reconnect is dead -- dropping the stale binding"
-tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-case "$(pane)" in
-  *"Disconnect this session"*)
-    tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
-    ;;
-  *)
-    echo "claude-rc-ensure: $WHO disconnect menu never appeared; leaving the session alone" >&2
-    tm send-keys -t "$win" Escape
-    exit 0
-    ;;
-esac
+repair_window() {
+  local win="$1" label key STAMP now last P
+  label=$(tm display-message -p -t "$win" '#{session_name}:#{window_name}')
+  # Rate-limit key: the folder t-claude stamped on the window (stable across tmux restarts);
+  # the window name, then its id, when it has none.
+  key=$(tm display-message -p -t "$win" '#{@tclaude_path}')
+  [ -n "$key" ] || key="$label"
+  [ -n "$key" ] || key="$win"
+  STAMP="$STATEDIR/$WHO-$(printf '%s' "$key" | cksum | awk '{print $1}')"
 
-tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-case "$(pane)" in
-  *"Enable Remote Control"*)
-    tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
-    echo "claude-rc-ensure: $WHO re-enabled"
-    ;;
-  *)
-    echo "claude-rc-ensure: $WHO enable menu never appeared; leaving the session alone" >&2
-    tm send-keys -t "$win" Escape
-    exit 0
-    ;;
-esac
+  # Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
+  # repair re-triggers the repair, forever.
+  pane() { tm capture-pane -p -S -25 -t "$win"; }
+  P="$(pane)"
+
+  # The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
+  # cannot succeed no matter how many times /remote-control retries it. Note this is NOT the
+  # same as the bare "Remote Control disconnected." line, which is also what a deliberate
+  # disconnect prints -- matching that would make the script chase its own tail.
+  case "$P" in
+    *"Couldn't reconnect to your Remote Control session"*) ;;
+    *) echo "claude-rc-ensure: $WHO $label nothing to repair"; return 0 ;;
+  esac
+
+  # An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
+  case "$P" in
+    *"Session creation failed"*) echo "claude-rc-ensure: $WHO $label upstream 503, leaving alone"; return 0 ;;
+  esac
+
+  now=$(date +%s)
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 3600 ]; then
+    echo "claude-rc-ensure: $WHO $label repaired within the last hour, backing off"
+    return 0
+  fi
+  echo "$now" > "$STAMP"
+
+  echo "claude-rc-ensure: $WHO $label reconnect is dead -- dropping the stale binding"
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  case "$(pane)" in
+    *"Disconnect this session"*)
+      tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
+      ;;
+    *)
+      echo "claude-rc-ensure: $WHO $label disconnect menu never appeared; leaving the session alone" >&2
+      tm send-keys -t "$win" Escape
+      return 0
+      ;;
+  esac
+
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  case "$(pane)" in
+    *"Enable Remote Control"*)
+      tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
+      echo "claude-rc-ensure: $WHO $label re-enabled"
+      ;;
+    *)
+      echo "claude-rc-ensure: $WHO $label enable menu never appeared; leaving the session alone" >&2
+      tm send-keys -t "$win" Escape
+      return 0
+      ;;
+  esac
+}
+
+for w in $wins; do repair_window "$w"; done
+exit 0
 RCENSURE
 chmod 755 /usr/local/bin/claude-rc-ensure
 
@@ -1037,6 +1057,26 @@ zsh -c "
   t-claude --auto --remote-control
 "
 echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
+
+# Extra managed folders (added 2026-09-25 by Claude, Starfall Arena handoff to Connor). Optional,
+# per user: ~/.config/agent-extra-dirs lists one folder per line (# comments and blanks skipped).
+# Each gets the same `t-claude --auto --remote-control` as WORKDIR above: its own tmux window,
+# keyed by folder, resuming that folder's newest conversation. No file = no change. Revert with
+# the .bak-20260925 copy beside this script.
+EXTRA="$HOME/.config/agent-extra-dirs"
+if [ -f "$EXTRA" ]; then
+  while IFS= read -r XD || [ -n "$XD" ]; do
+    case "$XD" in ''|'#'*) continue ;; esac
+    [ -d "$XD" ] || { echo "agents-start: $WHO extra dir $XD missing, skipped" >&2; continue; }
+    [ "$XD" = "$WORKDIR" ] && continue
+    zsh -c "
+      source ~/.config/t-claude.zsh 2>/dev/null || exit 1
+      cd '$XD' || exit 1
+      t-claude --auto --remote-control
+    " </dev/null
+    echo "agents-start: t-claude invoked for $WHO in $XD"
+  done < "$EXTRA"
+fi
 
 # Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
 # resumed conversation carries a Remote Control binding that is dead whenever the process that
