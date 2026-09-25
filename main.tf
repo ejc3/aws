@@ -21,6 +21,10 @@ terraform {
       source  = "integrations/github"
       version = "~> 6.0"
     }
+    vercel = {
+      source  = "vercel/vercel"
+      version = "~> 5.17"
+    }
   }
 
   backend "s3" {
