@@ -345,12 +345,30 @@ open vnc://localhost:5901   # sign in as the Mac account skevh
 ```
 
 Signing in as `skevh` opens that user's own macOS session, even while `ejcampbell` is at
-the console. The connector runs on the MacBook as the `cloudflared` system service, with the
-token from the `macbook-vnc-tunnel-token` secret:
+the console. The connector runs on the MacBook as a launchd daemon that reads the token from a root-only
+file. Do not use `cloudflared service install <token>`: the token would sit in the process
+arguments, where any other local user on the Mac can read it and run a connector for this
+tunnel. Here it travels through a pipe and a mode-0600 file only:
 
 ```bash
-sudo cloudflared service install "$(aws secretsmanager get-secret-value --region us-west-1 \
-  --secret-id macbook-vnc-tunnel-token --query SecretString --output text)"
+sudo install -d -m 700 /etc/cloudflared
+aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-vnc-tunnel-token \
+  --query SecretString --output text \
+  | sudo sh -c 'umask 077; cat > /etc/cloudflared/macbook-vnc.token'
+sudo tee /Library/LaunchDaemons/com.cloudflare.macbook-vnc.plist >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cloudflare.macbook-vnc</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/cloudflared</string><string>tunnel</string>
+    <string>--no-autoupdate</string><string>run</string>
+    <string>--token-file</string><string>/etc/cloudflared/macbook-vnc.token</string>
+  </array>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
+PLIST
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.cloudflare.macbook-vnc.plist
 ```
 
 The Mac-side account, Screen Sharing allow-list (`com.apple.access_screensharing`), and

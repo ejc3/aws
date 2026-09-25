@@ -19,9 +19,55 @@
 
 locals {
   macbook_vnc_hostname = "macbook-vnc.cc-games.dev"
+  # Rides on the dolphin GitHub identity provider, so it exists only while the zone does.
+  macbook_vnc_enabled = local.dolphin_enabled
+}
+
+# Adding count moved every address to [0]; these keep the live resources instead of
+# replacing them.
+moved {
+  from = cloudflare_zero_trust_access_policy.macbook_vnc
+  to   = cloudflare_zero_trust_access_policy.macbook_vnc[0]
+}
+
+moved {
+  from = cloudflare_zero_trust_access_application.macbook_vnc
+  to   = cloudflare_zero_trust_access_application.macbook_vnc[0]
+}
+
+moved {
+  from = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc
+  to   = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc[0]
+}
+
+moved {
+  from = cloudflare_zero_trust_tunnel_cloudflared_config.macbook_vnc
+  to   = cloudflare_zero_trust_tunnel_cloudflared_config.macbook_vnc[0]
+}
+
+moved {
+  from = cloudflare_dns_record.macbook_vnc
+  to   = cloudflare_dns_record.macbook_vnc[0]
+}
+
+moved {
+  from = aws_secretsmanager_secret.macbook_vnc_tunnel
+  to   = aws_secretsmanager_secret.macbook_vnc_tunnel[0]
+}
+
+moved {
+  from = aws_secretsmanager_secret_version.macbook_vnc_tunnel
+  to   = aws_secretsmanager_secret_version.macbook_vnc_tunnel[0]
+}
+
+moved {
+  from = aws_secretsmanager_secret_policy.macbook_vnc_tunnel
+  to   = aws_secretsmanager_secret_policy.macbook_vnc_tunnel[0]
 }
 
 resource "cloudflare_zero_trust_access_policy" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   account_id       = var.cloudflare_account_id
   name             = "MacBook Screen Sharing (dolphin-labs-hq members)"
   decision         = "allow"
@@ -37,6 +83,8 @@ resource "cloudflare_zero_trust_access_policy" "macbook_vnc" {
 }
 
 resource "cloudflare_zero_trust_access_application" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   account_id                = var.cloudflare_account_id
   name                      = "MacBook Screen Sharing"
   domain                    = local.macbook_vnc_hostname
@@ -48,21 +96,25 @@ resource "cloudflare_zero_trust_access_application" "macbook_vnc" {
   # The policy attachment MUST be declared here; see cc_games_dev in cloudflare.tf.
   policies = [
     {
-      id         = cloudflare_zero_trust_access_policy.macbook_vnc.id
+      id         = cloudflare_zero_trust_access_policy.macbook_vnc[0].id
       precedence = 1
     },
   ]
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   account_id = var.cloudflare_account_id
   name       = "macbook-vnc"
   config_src = "cloudflare"
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   account_id = var.cloudflare_account_id
-  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc.id
+  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc[0].id
   config = {
     ingress = [
       {
@@ -72,7 +124,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "macbook_vnc" {
           access = {
             required  = true
             team_name = "ejc3"
-            aud_tag   = [cloudflare_zero_trust_access_application.macbook_vnc.aud]
+            aud_tag   = [cloudflare_zero_trust_access_application.macbook_vnc[0].aud]
           }
         }
       },
@@ -84,10 +136,12 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "macbook_vnc" {
 
 # Overrides the *.cc-games.dev wildcard (which points at the nextjs-dev tunnel).
 resource "cloudflare_dns_record" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   zone_id = var.cc_games_zone_id
   name    = local.macbook_vnc_hostname
   type    = "CNAME"
-  content = "${cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc.id}.cfargotunnel.com"
+  content = "${cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc[0].id}.cfargotunnel.com"
   proxied = true
   ttl     = 1
   comment = "MacBook Screen Sharing for skevh; GitHub org-gated"
@@ -98,12 +152,16 @@ resource "cloudflare_dns_record" "macbook_vnc" {
 }
 
 data "cloudflare_zero_trust_tunnel_cloudflared_token" "macbook_vnc" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   account_id = var.cloudflare_account_id
-  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc.id
+  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.macbook_vnc[0].id
 }
 
 # Connector token only: it runs this one tunnel and cannot administer the account.
 resource "aws_secretsmanager_secret" "macbook_vnc_tunnel" {
+  count = local.macbook_vnc_enabled ? 1 : 0
+
   name                    = "macbook-vnc-tunnel-token"
   description             = "Connector token for the MacBook Screen Sharing tunnel only"
   recovery_window_in_days = 30
@@ -111,12 +169,16 @@ resource "aws_secretsmanager_secret" "macbook_vnc_tunnel" {
 }
 
 resource "aws_secretsmanager_secret_version" "macbook_vnc_tunnel" {
-  secret_id     = aws_secretsmanager_secret.macbook_vnc_tunnel.id
-  secret_string = data.cloudflare_zero_trust_tunnel_cloudflared_token.macbook_vnc.token
+  count = local.macbook_vnc_enabled ? 1 : 0
+
+  secret_id     = aws_secretsmanager_secret.macbook_vnc_tunnel[0].id
+  secret_string = data.cloudflare_zero_trust_tunnel_cloudflared_token.macbook_vnc[0].token
 }
 
 resource "aws_secretsmanager_secret_policy" "macbook_vnc_tunnel" {
-  secret_arn = aws_secretsmanager_secret.macbook_vnc_tunnel.arn
+  count = local.macbook_vnc_enabled ? 1 : 0
+
+  secret_arn = aws_secretsmanager_secret.macbook_vnc_tunnel[0].arn
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -124,7 +186,7 @@ resource "aws_secretsmanager_secret_policy" "macbook_vnc_tunnel" {
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.macbook_vnc_tunnel.arn
+      Resource  = aws_secretsmanager_secret.macbook_vnc_tunnel[0].arn
       Condition = {
         ArnNotLike = {
           "aws:PrincipalArn" = [
@@ -140,10 +202,10 @@ resource "aws_secretsmanager_secret_policy" "macbook_vnc_tunnel" {
 }
 
 output "macbook_vnc" {
-  description = "MacBook Screen Sharing route (no credentials)"
-  value = {
+  description = "MacBook Screen Sharing route (no credentials); null while the dolphin zone is off"
+  value = local.macbook_vnc_enabled ? {
     hostname           = local.macbook_vnc_hostname
-    tunnel_secret_name = aws_secretsmanager_secret.macbook_vnc_tunnel.name
+    tunnel_secret_name = aws_secretsmanager_secret.macbook_vnc_tunnel[0].name
     client_command     = "cloudflared access tcp --hostname ${local.macbook_vnc_hostname} --url localhost:5901  # then open vnc://localhost:5901"
-  }
+  } : null
 }
