@@ -332,6 +332,31 @@ ssh macbook 'peekaboo see --mode screen --no-elements --path /tmp/macbook-screen
 scp macbook:/tmp/macbook-screen.png .
 ```
 
+### Screen Sharing on the MacBook (skevh)
+
+`macbook-vnc.tf` publishes the MacBook's macOS Screen Sharing (port 5900) at
+`macbook-vnc.cc-games.dev` through its own `macbook-vnc` tunnel. Access requires GitHub
+login and membership in `dolphin-labs-hq`, the same rule as `*.dolphin-labs.dev`. The route
+is TCP, so connect with `cloudflared` and Apple's Screen Sharing app:
+
+```bash
+cloudflared access tcp --hostname macbook-vnc.cc-games.dev --url localhost:5901
+open vnc://localhost:5901   # sign in as the Mac account skevh
+```
+
+Signing in as `skevh` opens that user's own macOS session, even while `ejcampbell` is at
+the console. The connector runs on the MacBook as the `cloudflared` system service, with the
+token from the `macbook-vnc-tunnel-token` secret:
+
+```bash
+sudo cloudflared service install "$(aws secretsmanager get-secret-value --region us-west-1 \
+  --secret-id macbook-vnc-tunnel-token --query SecretString --output text)"
+```
+
+The Mac-side account, Screen Sharing allow-list (`com.apple.access_screensharing`), and
+`pmset` settings are configured on the Mac, not by Terraform. FileVault means nothing is
+reachable after a reboot until someone unlocks the disk at the machine.
+
 For UI actions, `peekaboo see --app <app> --window-title <title> --json` returns a
 snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo type`,
 and `peekaboo press`; inspect the UI again after each action. These Mac-local app
