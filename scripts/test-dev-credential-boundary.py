@@ -182,6 +182,19 @@ class DevCredentialBoundaryTests(unittest.TestCase):
                        'narrow, resource/tag-scoped IAM directly, never an admin-host hop']:
             self.assertIn(phrase, readme)
 
+    def test_bedrock_invoke_allows_only_claude_and_the_two_named_deepseek_models(self):
+        policy = block('dev-instance-common.tf', 'resource', 'dev_server', 'aws_iam_role_policy')
+        bedrock = re.search(r'Sid\s*=\s*"BedrockRuntimeInvoke".*?Resource\s*=\s*\[(.*?)\]', policy, re.S)
+        self.assertIsNotNone(bedrock)
+        resources = re.findall(r'"(arn:aws:bedrock:[^"]+)"', bedrock.group(1))
+        self.assertEqual(resources, [
+            'arn:aws:bedrock:*::foundation-model/anthropic.*',
+            'arn:aws:bedrock:*::foundation-model/deepseek.v3.2',
+            'arn:aws:bedrock:*::foundation-model/deepseek.r1-v1:0',
+            'arn:aws:bedrock:*:928413605543:inference-profile/*',
+        ])
+        self.assertNotIn('deepseek.*', bedrock.group(1))
+
     def test_nextjs_policy_uses_only_connector_arns_and_existing_hop_key(self):
         policy = block('nextjs-dev.tf', 'resource', 'nextjs_dev', 'aws_iam_role_policy')
         self.assertEqual(policy.count('data.aws_secretsmanager_secret.nextjs_connector['), 2)
