@@ -456,10 +456,30 @@ tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
 # version never looked at the others. Each window is judged on its own screen and rate-limited
 # on its own, so a repair in one never blocks or triggers another.
 pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
+
+# Only a window that IS a claude is ever judged, let alone typed into: t-claude must have keyed
+# it (@tclaude_path) AND a claude process of this user must sit below its pane. Without this, a
+# shell that merely PRINTS the reconnect error (a log tail, this script's own output) would
+# match the failure string below and be sent "/remote-control" plus Enter as if it were a
+# prompt. pane_current_command cannot answer this: t-claude runs claude under a python3
+# wrapper, so a live claude pane reads "python3" (zsh -> python3 -> claude).
+runs_claude() {
+  local pid
+  for pid in $(pgrep -u "$WHO" -x claude); do
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+      [ "$pid" = "$1" ] && return 0
+      pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
+}
 # -a lists a window once per session that shows it (t-claude's grouped views share windows), so
-# de-duplicate by window id or one window would be judged -- and repaired -- several times.
-wins=$(tm list-windows -a -F '#{window_id}' | sort -u)
-[ -n "$wins" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
+# de-duplicate by line or one window would be judged -- and repaired -- several times.
+wins=$(tm list-windows -a -F '#{window_id} #{pane_pid} #{@tclaude_path}' | sort -u \
+  | while read -r wid panepid keyed; do
+      [ -n "$keyed" ] && runs_claude "$panepid" && echo "$wid"
+    done)
+[ -n "$wins" ] || { echo "claude-rc-ensure: $WHO has no claude window"; exit 0; }
 
 STATEDIR=/var/lib/claude-rc-ensure
 mkdir -p "$STATEDIR"
