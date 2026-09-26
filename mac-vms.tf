@@ -19,7 +19,7 @@
 #   skevh -- GitHub members of dolphin-labs-hq, like *.dolphin-labs.dev
 #
 # The VM itself (Tart install, image, launchd agents, in-VM connector, SSH keys, the
-# admin password below) is set up on the MacBook; see README "macOS VMs on the MacBook".
+# admin password, see below) is set up on the MacBook; see README "macOS VMs on the MacBook".
 
 locals {
   mac_vms = merge(
@@ -170,7 +170,9 @@ resource "aws_secretsmanager_secret_version" "mac_vm_tunnel" {
   secret_string = data.cloudflare_zero_trust_tunnel_cloudflared_token.mac_vm[each.key].token
 }
 
-# Replaces the image's well-known admin/admin. Alphanumeric so it survives any shell.
+# Generated and stored, but NOT applied inside the guest: nothing here or in the runbook sets it,
+# so a VM keeps the Tart image's default admin password until someone changes it on the MacBook.
+# Alphanumeric so it survives any shell if it is applied by hand.
 resource "random_password" "mac_vm_admin" {
   for_each = local.mac_vms
 

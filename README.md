@@ -351,14 +351,17 @@ own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
 
 ```bash
 cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
-open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-admin-password
+open vnc://localhost:5901   # sign in as admin (the image's default password unless changed on the MacBook)
 ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
 ```
 
 SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
 `nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
-`nextjs_user_keys` in `skevh`. The `admin` password replaces the image's `admin`/`admin`
-and exists only for Screen Sharing. Inside each VM, the connector is a launchd daemon that
+`nextjs_user_keys` in `skevh`. The `admin` account is for Screen Sharing only. Its login is
+whatever is set inside the VM, the Tart image's default `admin` unless someone changed it on the
+MacBook. Terraform stores a generated value as `mac-vm-<vm>-admin-password` in Secrets Manager
+but nothing applies it in the guest, so do not assume it is the password. Access is the real
+gate: both hostnames sit behind Cloudflare Access with origin enforcement. Inside each VM, the connector is a launchd daemon that
 reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
 
 On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
