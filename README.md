@@ -332,53 +332,45 @@ ssh macbook 'peekaboo see --mode screen --no-elements --path /tmp/macbook-screen
 scp macbook:/tmp/macbook-screen.png .
 ```
 
-### Screen Sharing on the MacBook (skevh)
-
-`macbook-vnc.tf` publishes the MacBook's macOS Screen Sharing (port 5900) at
-`macbook-vnc.cc-games.dev` through its own `macbook-vnc` tunnel. Access requires GitHub
-login and membership in `dolphin-labs-hq`, the same rule as `*.dolphin-labs.dev`. The route
-is TCP, so connect with `cloudflared` and Apple's Screen Sharing app:
-
-```bash
-cloudflared access tcp --hostname macbook-vnc.cc-games.dev --url localhost:5901
-open vnc://localhost:5901   # sign in as the Mac account skevh
-```
-
-Signing in as `skevh` opens that user's own macOS session, even while `ejcampbell` is at
-the console. The connector runs on the MacBook as a launchd daemon that reads the token from a root-only
-file. Do not use `cloudflared service install <token>`: the token would sit in the process
-arguments, where any other local user on the Mac can read it and run a connector for this
-tunnel. Here it travels through a pipe and a mode-0600 file only:
-
-```bash
-sudo install -d -m 700 /etc/cloudflared
-aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-vnc-tunnel-token \
-  --query SecretString --output text \
-  | sudo sh -c 'umask 077; cat > /etc/cloudflared/macbook-vnc.token'
-sudo tee /Library/LaunchDaemons/com.cloudflare.macbook-vnc.plist >/dev/null <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.cloudflare.macbook-vnc</string>
-  <key>ProgramArguments</key><array>
-    <string>/opt/homebrew/bin/cloudflared</string><string>tunnel</string>
-    <string>--no-autoupdate</string><string>run</string>
-    <string>--token-file</string><string>/etc/cloudflared/macbook-vnc.token</string>
-  </array>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-</dict></plist>
-PLIST
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.cloudflare.macbook-vnc.plist
-```
-
-The Mac-side account, Screen Sharing allow-list (`com.apple.access_screensharing`), and
-`pmset` settings are configured on the Mac, not by Terraform. FileVault means nothing is
-reachable after a reboot until someone unlocks the disk at the machine.
-
 For UI actions, `peekaboo see --app <app> --window-title <title> --json` returns a
 snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo type`,
 and `peekaboo press`; inspect the UI again after each action. These Mac-local app
 permissions and login services are configured on the Mac, not by AWS Terraform.
+
+### macOS VMs on the MacBook (ejc3, skevh)
+
+The MacBook runs two [Tart](https://tart.run) macOS VMs, `ejc3` for EJ and `skevh` for
+Steve, cloned from `ghcr.io/cirruslabs/macos-tahoe-base`. Each signs its `admin` account
+in at boot, so it always has a desktop, and runs its own `cloudflared` connector for its
+own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
+
+| VM | Screen Sharing | SSH | Access |
+|---|---|---|---|
+| `ejc3` | `ejc3-mac.cc-games.dev` | `ejc3-mac-ssh.cc-games.dev` | EJ only (Google or one-time PIN) |
+| `skevh` | `skevh-mac.cc-games.dev` | `skevh-mac-ssh.cc-games.dev` | GitHub members of `dolphin-labs-hq` |
+
+```bash
+cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
+open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-admin-password
+ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
+```
+
+SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
+`nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
+`nextjs_user_keys` in `skevh`. The `admin` password replaces the image's `admin`/`admin`
+and exists only for Screen Sharing. Inside each VM, the connector is a launchd daemon that
+reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
+
+On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
+`tart run --no-graphics <vm>` with KeepAlive while `ejcampbell` is logged in; Tart needs an
+unlocked login keychain, so the VMs start after that login, and after a reboot only once
+FileVault is unlocked at the machine. Local admin from the MacBook:
+
+```bash
+tart list
+tart exec <vm> <command>      # through the guest agent, no network needed
+tart run --vnc <vm>            # watch the screen (stop the LaunchAgent first)
+```
 
 ## Start a Codex session
 
