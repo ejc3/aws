@@ -170,9 +170,10 @@ resource "aws_secretsmanager_secret_version" "mac_vm_tunnel" {
   secret_string = data.cloudflare_zero_trust_tunnel_cloudflared_token.mac_vm[each.key].token
 }
 
-# Generated and stored, but NOT applied inside the guest: nothing here or in the runbook sets it,
-# so a VM keeps the Tart image's default admin password until someone changes it on the MacBook.
-# Alphanumeric so it survives any shell if it is applied by hand.
+# The Screen Sharing login for the guest's admin account. Terraform only generates and STORES it;
+# nothing here applies it inside a guest. Both running guests were set to it by hand (verified
+# 2026-09-26: the secret authenticates, admin/admin does not), but a VM rebuilt from the Tart image
+# starts with the image default until it is set again. Alphanumeric so it survives any shell.
 resource "random_password" "mac_vm_admin" {
   for_each = local.mac_vms
 
