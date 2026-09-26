@@ -260,8 +260,11 @@ resource "aws_iam_role_policy" "dev_server" {
         # invoked via cross-region inference profiles (us.anthropic.*), which
         # require BOTH the inference-profile ARN and the underlying
         # foundation-model ARNs in every routed region — hence the region
-        # wildcard. Foundation models are scoped to anthropic.* for least
-        # privilege; inference profiles are account-pinned.
+        # wildcard. Foundation models are scoped to anthropic.* (Claude) and
+        # deepseek.* (DeepSeek on Bedrock, used by opencode) for least privilege;
+        # cross-region DeepSeek profiles (us.deepseek.*) are covered by the
+        # account-pinned inference-profile line. First-use Marketplace
+        # auto-subscribe (granted above) enables model access on first invoke.
         Sid    = "BedrockRuntimeInvoke"
         Effect = "Allow"
         Action = [
@@ -272,6 +275,7 @@ resource "aws_iam_role_policy" "dev_server" {
         ]
         Resource = [
           "arn:aws:bedrock:*::foundation-model/anthropic.*",
+          "arn:aws:bedrock:*::foundation-model/deepseek.*",
           "arn:aws:bedrock:*:928413605543:inference-profile/*"
         ]
       }
