@@ -260,11 +260,13 @@ resource "aws_iam_role_policy" "dev_server" {
         # invoked via cross-region inference profiles (us.anthropic.*), which
         # require BOTH the inference-profile ARN and the underlying
         # foundation-model ARNs in every routed region — hence the region
-        # wildcard. Foundation models are scoped to anthropic.* (Claude) and
-        # deepseek.* (DeepSeek on Bedrock, used by opencode) for least privilege;
-        # cross-region DeepSeek profiles (us.deepseek.*) are covered by the
-        # account-pinned inference-profile line. First-use Marketplace
-        # auto-subscribe (granted above) enables model access on first invoke.
+        # wildcard. Foundation models are scoped to anthropic.* (Claude) plus exactly two
+        # DeepSeek models used by opencode (deepseek.v3.2, with deepseek.r1-v1:0 as its
+        # fallback), so a new DeepSeek release is not authorized until it is added here.
+        # The us.deepseek.* cross-region profile is covered by the account-pinned
+        # inference-profile line. First-use Marketplace auto-subscribe (granted above)
+        # enables model access on first invoke. This role's inline policies total about
+        # 9.9k of IAM's 10,240-character limit (compact), so measure before adding more.
         Sid    = "BedrockRuntimeInvoke"
         Effect = "Allow"
         Action = [
@@ -275,7 +277,8 @@ resource "aws_iam_role_policy" "dev_server" {
         ]
         Resource = [
           "arn:aws:bedrock:*::foundation-model/anthropic.*",
-          "arn:aws:bedrock:*::foundation-model/deepseek.*",
+          "arn:aws:bedrock:*::foundation-model/deepseek.v3.2",
+          "arn:aws:bedrock:*::foundation-model/deepseek.r1-v1:0",
           "arn:aws:bedrock:*:928413605543:inference-profile/*"
         ]
       }
