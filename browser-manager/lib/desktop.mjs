@@ -58,7 +58,13 @@ const PLAYWRIGHT_ARGS = [
   '--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints',
   '--allow-pre-commit-input', '--disable-hang-monitor', '--disable-ipc-flooding-protection',
   '--disable-popup-blocking', '--disable-prompt-on-repost', '--disable-renderer-backgrounding',
-  '--force-color-profile=srgb', '--metrics-recording-only', '--password-store=basic', '--use-mock-keychain',
+  // NB: Playwright's default args include --metrics-recording-only, but we drop it here. That
+  // flag makes Chrome record UMA metrics to <profile>/DeferredBrowserMetrics/*.pma and never
+  // upload or prune them; harmless for Playwright's per-test browsers but our browsers are
+  // long-lived, so it grows unbounded (a real incident: ~112GB / 27k files filled the root
+  // disk). --disable-background-networking (above) already stops metrics upload. Command-line
+  // flags are not visible to a page, so this does not change the anti-bot fingerprint.
+  '--force-color-profile=srgb', '--password-store=basic', '--use-mock-keychain',
   '--no-service-autorun', '--export-tagged-pdf', '--disable-search-engine-choice-screen', '--disable-infobars',
   '--disable-sync', '--enable-unsafe-swiftshader', '--no-sandbox',
 ];

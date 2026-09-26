@@ -337,6 +337,44 @@ snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo t
 and `peekaboo press`; inspect the UI again after each action. These Mac-local app
 permissions and login services are configured on the Mac, not by AWS Terraform.
 
+### macOS VMs on the MacBook (ejc3, skevh)
+
+The MacBook runs two [Tart](https://tart.run) macOS VMs, `ejc3` for EJ and `skevh` for
+Steve, cloned from `ghcr.io/cirruslabs/macos-tahoe-base`. Each signs its `admin` account
+in at boot, so it always has a desktop, and runs its own `cloudflared` connector for its
+own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
+
+| VM | Screen Sharing | SSH | Access |
+|---|---|---|---|
+| `ejc3` | `ejc3-mac.cc-games.dev` | `ejc3-mac-ssh.cc-games.dev` | EJ only (Google or one-time PIN) |
+| `skevh` | `skevh-mac.cc-games.dev` | `skevh-mac-ssh.cc-games.dev` | GitHub members of `dolphin-labs-hq` |
+
+```bash
+cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
+open vnc://localhost:5901   # sign in as admin (the image's default password unless changed on the MacBook)
+ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
+```
+
+SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
+`nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
+`nextjs_user_keys` in `skevh`. The `admin` password is used only for Screen Sharing; SSH never
+uses it. That password is whatever is set inside the VM, the Tart image's default `admin` unless
+someone changed it on the MacBook. Terraform stores a generated value as `mac-vm-<vm>-admin-password` in Secrets Manager
+but nothing applies it in the guest, so do not assume it is the password. Access is the real
+gate: both hostnames sit behind Cloudflare Access with origin enforcement. Inside each VM, the connector is a launchd daemon that
+reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
+
+On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
+`tart run --no-graphics <vm>` with KeepAlive while `ejcampbell` is logged in; Tart needs an
+unlocked login keychain, so the VMs start after that login, and after a reboot only once
+FileVault is unlocked at the machine. Local admin from the MacBook:
+
+```bash
+tart list
+tart exec <vm> <command>      # through the guest agent, no network needed
+tart run --vnc <vm>            # watch the screen (stop the LaunchAgent first)
+```
+
 ## Start a Codex session
 
 Codex is installed per Unix account on the metal boxes, `jumpbox-2`, and `nextjs-dev`.
