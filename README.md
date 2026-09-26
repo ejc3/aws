@@ -357,9 +357,9 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 
 SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
 `nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
-`nextjs_user_keys` in `skevh`. The `admin` account is for Screen Sharing only. Its login is
-whatever is set inside the VM, the Tart image's default `admin` unless someone changed it on the
-MacBook. Terraform stores a generated value as `mac-vm-<vm>-admin-password` in Secrets Manager
+`nextjs_user_keys` in `skevh`. The `admin` password is used only for Screen Sharing; SSH never
+uses it. That password is whatever is set inside the VM, the Tart image's default `admin` unless
+someone changed it on the MacBook. Terraform stores a generated value as `mac-vm-<vm>-admin-password` in Secrets Manager
 but nothing applies it in the guest, so do not assume it is the password. Access is the real
 gate: both hostnames sit behind Cloudflare Access with origin enforcement. Inside each VM, the connector is a launchd daemon that
 reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
