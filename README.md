@@ -351,17 +351,20 @@ own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
 
 ```bash
 cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
-open vnc://localhost:5901   # sign in as admin (the image's default password unless changed on the MacBook)
+open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-admin-password
 ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
 ```
 
 SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
 `nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
 `nextjs_user_keys` in `skevh`. The `admin` password is used only for Screen Sharing; SSH never
-uses it. That password is whatever is set inside the VM, the Tart image's default `admin` unless
-someone changed it on the MacBook. Terraform stores a generated value as `mac-vm-<vm>-admin-password` in Secrets Manager
-but nothing applies it in the guest, so do not assume it is the password. Access is the real
-gate: both hostnames sit behind Cloudflare Access with origin enforcement. Inside each VM, the connector is a launchd daemon that
+uses it. It is the generated secret `mac-vm-<vm>-admin-password`: both running guests accept it
+and reject the image's `admin`/`admin` (checked 2026-09-26 with `dscl . -authonly admin ...`
+through `tart exec -i <vm>`, reading the password from stdin). Terraform only STORES the value.
+Nothing applies it inside a guest, so a VM created or rebuilt from the Tart image starts with
+the image default until someone sets the secret by hand on the MacBook and re-runs that check.
+Access is the real gate: both hostnames sit behind Cloudflare Access with origin enforcement.
+Inside each VM, the connector is a launchd daemon that
 reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
 
 On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
