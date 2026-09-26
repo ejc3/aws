@@ -355,8 +355,9 @@ open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-adm
 ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
 ```
 
-SSH accepts keys only: EJ's `id_rsa.pub` in `ejc3`, and Steve's key from
-`nextjs-user-data.tf` in `skevh`. The `admin` password replaces the image's `admin`/`admin`
+SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
+`nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
+`nextjs_user_keys` in `skevh`. The `admin` password replaces the image's `admin`/`admin`
 and exists only for Screen Sharing. Inside each VM, the connector is a launchd daemon that
 reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
 
