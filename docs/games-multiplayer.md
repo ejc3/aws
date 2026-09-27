@@ -196,8 +196,11 @@ To take the platform off the internet, fastest first:
   done
   ```
 
-- **Close the public entry.** `terraform apply -var mp_router_desired_count=0` stops the
-  router: the ALB then answers 503 and no connection reaches an engine.
+- **Close the public entry.** Commit `mp_router_desired_count` defaulting to `0`
+  (`games-multiplayer.tf`) and apply it from main: the router stops, the ALB answers 503 and no
+  connection reaches an engine. A one-shot `terraform apply -var mp_router_desired_count=0`
+  acts faster, but the next ordinary apply restarts the router; use it only together with that
+  commit.
 
 Other switches:
 
@@ -278,7 +281,8 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    (`ReadTaskNetworkInterfaces`, games-multiplayer.tf), which the launcher uses to find an
    engine's address; it exposes the region's ENI inventory to a compromised deployment.
 6. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
-   a public IPv4 for outbound traffic and have **unrestricted egress**; inbound is router-only.
+   a public IPv4 for outbound traffic and have **unrestricted egress**; inbound is router-only
+   (for engines the lobby launches: the caller picks each task's security groups, below).
    The container runs as root with a writable root filesystem.
 
 **What an attacker can and cannot do**
@@ -287,8 +291,8 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | --- | --- | --- |
 | Anyone on the internet | Reach the ALB and router; hold connections open (idle timeout 3600 s); consume the router's single 0.25 vCPU with a distributed flood | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
-| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
-| A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (today only SSH and ET, which are already public); use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress) |
+| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); choose each task's subnets and security groups (`RunTask`'s network configuration has no IAM condition), so attach the router's group, which every engine admits, to reach any engine directly, or the ALB's group with a public IP to serve its own ports to the internet; read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
+| A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (SSH and ET, which are already public); reach the I/O box's NFS export over the inter-region peer (TCP 2049 is admitted from all of 10.0.0.0/16, read-write, root-squashed) and read, fill or poison the shared scratch; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress, unless it was launched with the router's group, above) |
 
 **Cost-abuse limits, and what happens at each**
 
@@ -318,6 +322,10 @@ running engines.
 
 **Open gaps, most severe first** (not yet fixed; see the review for each):
 
+0. The launcher's caller picks each task's subnets and security groups, which IAM cannot
+   restrict, so a compromised deployment can put a task in the router's group (trusted by
+   every engine) or the ALB's group with a public IP. Fix: launch through an AWS-controlled
+   path that sets the network itself (a launch Lambda the launcher may only invoke).
 1. No AWS-side cap on concurrent engines, and no ECS spend alarm. Fix: the sweeper stops the
    newest engines beyond a ceiling every minute and publishes the count; an alarm on that
    count and on ECS `EstimatedCharges`.
@@ -327,8 +335,10 @@ running engines.
 3. The lobby's admission limits live in the games repo's defaults. Pin them in the Vercel env
    from Terraform.
 4. Engines share the admin VPC's subnets with unrestricted egress, run as root, and receive the
-   preview protection-bypass secret. Fix: dedicated engine subnets with egress limited to what
-   engines need, a non-root read-only container, and callbacks that do not need the bypass.
+   preview protection-bypass secret; from those subnets they reach the I/O box's read-write NFS
+   export over the peer. Fix: dedicated engine subnets with egress limited to what engines
+   need, the I/O box's NFS rule narrowed to the hosts that mount it, a non-root read-only
+   container, and callbacks that do not need the bypass.
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
 
