@@ -391,6 +391,21 @@ class LaunchTests(unittest.TestCase):
         jobs_calls = [p for p in pages_seen if "/jobs" in p]
         self.assertIn("/runs/999/", jobs_calls[0], "the oldest run must be inspected first")
 
+    def test_a_single_job_whose_host_died_is_relaunched_without_waiting_out_its_claim(self):
+        app, ec2, *_ = load_app()
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+        ec2.instances[0]["State"]["Name"] = "terminated"   # the host failed; the job is still queued
+        self.assertEqual(self.deliver(app)["outcome"], "launched",
+                         "a listed, terminated host's claim must not hold its own job")
+
+    def test_a_scan_stops_at_its_time_share(self):
+        app, *_ = load_app()
+        calls = []
+        app.github = lambda method, path, pat, body=None: calls.append(path) or {"workflow_runs": [], "jobs": []}
+        app.DEADLINE[0] = 0   # this repo's share is already spent
+        self.assertEqual(app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT"), [])
+        self.assertEqual(calls, [], "no GitHub call may start after the repo's deadline")
+
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
         ssm.fail_put = True

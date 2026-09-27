@@ -26,6 +26,7 @@ appears in user data.
 """
 import json
 import os
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -146,11 +147,22 @@ def job_size(cfg, labels):
     return size
 
 
+# Wall clock, not just call count, bounds a reconcile: github() may take up to its timeout per
+# call. handler() gives each repo an equal share of the invocation's remaining time (minus a
+# reserve for publishing counts), and a repo's scan stops at its share.
+DEADLINE = [float('inf')]
+RESERVE_SECONDS = 15
+
+
+def out_of_time():
+    return time.monotonic() >= DEADLINE[0]
+
+
 def pages(repo, path, key, pat, budget):
     """Every item under `key` across a paginated GitHub list, 100 per page, while the shared
-    call budget lasts (budget is a one-element list so callers share it)."""
+    call budget and this repo's time share last (budget is a one-element list so callers share it)."""
     page = 1
-    while budget[0] > 0:
+    while budget[0] > 0 and not out_of_time():
         budget[0] -= 1
         sep = '&' if '?' in path else '?'
         items = github('GET', f'{path}{sep}per_page=100&page={page}', pat).get(key) or []
@@ -174,7 +186,7 @@ def queued_jobs(repo, cfg, pat):
         for run in pages(repo, f'/repos/{repo}/actions/runs?status={status}', 'workflow_runs', pat, budget):
             runs[run['id']] = run
     for run in sorted(runs.values(), key=lambda r: (r.get('created_at') or '', r['id'])):
-        if budget[0] <= 0:
+        if budget[0] <= 0 or out_of_time():
             print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
             break
         for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
@@ -373,16 +385,18 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     """Launch for `job_id` unless it already has a host or the repo is at its cap."""
     if any(tag(i, 'JobId') == job_id for i in live):
         return 'exists', token
-    claimed = active_claims(repo)
-    if job_id in claimed:
-        return 'claimed', token
     # A claim only stands in for a launch EC2 does not list yet. Once listed, in any state, the
     # host counts by its real state (running -> in `live`; finished -> not at all) and the claim
-    # goes, so short jobs do not hold cap slots for CLAIM_SECONDS after they end.
-    listed = seen_jobs(repo)
+    # goes: short jobs do not hold cap slots, and a job whose host failed and terminated while it
+    # stayed queued is relaunched now rather than when the claim expires. Clean up FIRST, before
+    # deciding this job is "claimed".
+    claimed, listed = active_claims(repo), seen_jobs(repo)
     for done in claimed & listed:
         release(repo, done)
-    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | (claimed - listed)
+    claimed -= listed
+    if job_id in claimed:
+        return 'claimed', token
+    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | claimed
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
@@ -466,18 +480,28 @@ def publish_counts(results):
 
 
 def handler(event, context):
+    started = time.monotonic()
+    DEADLINE[0] = float('inf')
     repos, subnets = config()
     if event.get('reconcile') or event.get('source') == 'aws.events':
         # Each repo on its own: one repo's revoked token or GitHub timeout must not stop the
         # other's launches and reaping. The invocation still fails afterwards, for the alarm.
         results, failed = [], []
-        for repo, cfg in repos.items():
+        remaining = (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
+        order = list(repos.items())
+        # Alternate which repo goes first, so a slow one cannot always take the time the other needs.
+        if int(time.time() // 120) % 2:
+            order.reverse()
+        for index, (repo, cfg) in enumerate(order):
+            share = max(0.0, remaining - (time.monotonic() - started)) / (len(order) - index)
+            DEADLINE[0] = time.monotonic() + share
             try:
                 results.append(reconcile(repo, cfg, subnets))
             except Exception as error:
                 failed.append(repo)
                 print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
                 results.append({'repo': repo, 'error': type(error).__name__})
+        DEADLINE[0] = float('inf')
         publish_counts(results)
         if failed:
             raise RuntimeError(f'reconcile failed for {", ".join(failed)}')

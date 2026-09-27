@@ -690,7 +690,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
   `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
 - **Reconcile.** Every 2 minutes it reads every page of queued and in-progress runs and checks their
-  jobs oldest run first (at most 120 GitHub calls a round), launches for queued jobs that have no
+  jobs oldest run first (at most 120 GitHub calls a round, and each repo gets an equal share of
+  the invocation's time, first repo alternating), launches for queued jobs that have no
   host, and reaps hosts
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
 - **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
