@@ -493,6 +493,17 @@ class MigrateTests(Base):
                 self.bu.cmd_migrate(self.margs())
         self.assertEqual(self.w.psql_files, [])
 
+    def test_newer_database_revision_than_this_migration_is_refused(self):
+        # Regression: `have >= want` used to treat a database already past this migration's
+        # target as "already applied" and return quietly. That is a rollback: source_ref
+        # points at an OLDER commit than what is actually deployed, and running (or silently
+        # skipping) its migration against a newer, possibly incompatible schema must fail
+        # loudly instead of reporting success.
+        self.w.db_revision = 2
+        with self.assertRaisesRegex(self.bu.StepError, "newer than this migration"):
+            self.bu.cmd_migrate(self.margs())
+        self.assertEqual(self.w.psql_files, [])
+
     def test_url_that_stops_decrypting_after_the_plan_fails(self):
         self.w.decrypt = {"pg": None}
         with self.assertRaisesRegex(self.bu.StepError, "gone since the plan"):
@@ -537,7 +548,8 @@ class PreflightTests(Base):
         code, out, err = self.run_preflight()
         self.assertEqual(code, 0, err)
         result = json.loads(out)
-        self.assertEqual(result, {"token_scope": "team", "db_host": "aws-0-us-east-1.pooler.supabase.com"})
+        self.assertEqual(result, {"token_scope": "team", "db_host": "aws-0-us-east-1.pooler.supabase.com",
+                                   "oidc_state": '{"enabled": true, "issuerMode": "team"}'})
         self.assertTrue(all(isinstance(v, str) for v in result.values()))
         self.assertEqual([m for m, _, _ in self.w.http_log if m != "GET"], [])
         self.assertFalse(any(c[:2] in (["aws", "s3"], ["aws", "codebuild"]) or "put-secret-value" in c
@@ -703,6 +715,14 @@ class TerraformWiringTests(unittest.TestCase):
                            ("vercel_project_protection_bypass", "games_mp")):
             self.assertIn("data.external.games_mp_preflight", self.block(self.bu, kind, name))
         self.assertNotIn("supabase-db-url", self.bu)
+
+    def test_oidc_recheck_is_retriggered_by_live_drift_not_a_constant(self):
+        # Regression: triggers_replace used to be {project, mode}, both literals that never
+        # change, so the OIDC fix-it provisioner would never run a second time no matter how
+        # far Vercel's setting drifted after the first apply. It must depend on something the
+        # plan-time preflight actually reads live, so a plan notices drift and reruns it.
+        oidc = self.block(self.bu, "terraform_data", "games_mp_vercel_oidc")
+        self.assertIn("data.external.games_mp_preflight.result.oidc_state", oidc)
 
     def test_a_key_rotation_is_a_new_router_task_definition(self):
         # Pinning the secret by version id makes a rotation change the task definition ARN,

@@ -553,12 +553,21 @@ def cmd_migrate(args):
     ensure_psql()
     have = current_revision(env)
     log("database (%s, %s): mp_private revision %s, migration sets %s" % (where, env["PGHOST"], have, want))
-    if have >= want:
+    if have == want:
         log("migration already applied; nothing to do")
         return
     if have < 0:
         raise StepError("mp_private exists but its schema_revision marker is %s; fix by hand, not by re-running"
                         % ("missing" if have == -1 else "empty"))
+    if have > want:
+        # source_ref rolled back to a commit whose migration file targets an OLDER revision
+        # than what is already live. Running it would be a no-op at best; deploying THIS
+        # source against a newer, possibly incompatible schema is the real danger, so this
+        # must fail loudly rather than silently report "already applied" (have >= want did
+        # exactly that, which is the bug this replaces).
+        raise StepError("database is at revision %d, newer than this migration's target %d; "
+                        "games_mp_source_ref is older than what is deployed and must not run against it"
+                        % (have, want))
     if have > 0:
         raise StepError("database is at revision %d but this migration starts from nothing; a later "
                         "migration must bring it to %d" % (have, want))
@@ -630,6 +639,12 @@ def cmd_preflight(_args):
             project = v.project()  # also carries oidcTokenConfig and protectionBypass
             if project.get("id") != project_id:
                 problems.append("Vercel returned project %r, expected %s" % (project.get("id"), project_id))
+            # Read into the result, not into `problems`: this proves the setting is
+            # observable, it does not assert it is already correct (cmd_vercel_oidc's own
+            # job, run at apply time, is to fix it if not). Feeding this into
+            # terraform_data.games_mp_vercel_oidc's triggers_replace is what makes a plan
+            # notice OIDC drift at all; a constant trigger never would.
+            result["oidc_state"] = json.dumps(project.get("oidcTokenConfig") or {}, sort_keys=True)
             envs = v.envs()
         except StepError as e:
             problems.append("cannot read the Vercel project or its env with vercel-api-token: %s" % e)
@@ -678,6 +693,7 @@ def cmd_preflight(_args):
                          "".join("  - %s\n" % p for p in problems))
         return 1
     result.setdefault("db_host", "none")
+    result.setdefault("oidc_state", "unknown")
     json.dump(result, sys.stdout)
     return 0
 

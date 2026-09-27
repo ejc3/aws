@@ -508,6 +508,13 @@ resource "terraform_data" "games_mp_vercel_oidc" {
   triggers_replace = {
     project = local.colton_games_vercel_project_id
     mode    = "team"
+    # Live oidcTokenConfig, read fresh by every plan (data.external.games_mp_preflight is
+    # not deferred to apply). If Vercel drifts out of Team issuer mode after this first
+    # converges, that shows up here as a changed trigger, so terraform_data is replaced and
+    # its creation provisioner (cmd_vercel_oidc) runs again and puts it back. Without this,
+    # the two constants above never change and the provisioner would never run a second time
+    # at all, however far OIDC drifted.
+    live = data.external.games_mp_preflight.result.oidc_state
   }
 
   provisioner "local-exec" {
