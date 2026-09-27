@@ -156,6 +156,10 @@ class WiringTests(unittest.TestCase):
         self.assertIn("--from /home/ubuntu/.local/state/fcvm-claude/repos", unit)
         self.assertIn("codex login status", unit, "skip cleanly while Codex is not logged in")
         self.assertIn("systemctl start --no-block fcvm-codex-seed.service", CLAUDE_RC)
+        timer = CLAUDE_RC.split("cat > /etc/systemd/system/fcvm-codex-seed.timer <<'TIMER'", 1)[1].split("\nTIMER\n", 1)[0]
+        self.assertIn("OnUnitInactiveSec=15min", timer, "a boot while logged out must retry, not wait for a reboot")
+        self.assertIn("systemctl enable --now fcvm-codex-seed.timer", CLAUDE_RC)
+        self.assertIn("RemainAfterExit=yes", unit, "without it the timer would re-run a successful seed forever")
 
     def test_nextjs_seeds_only_ejc3_colton_and_connor(self):
         self.assertIn('nextjs_codex_seed_users = ["colton", "connor", "ejc3"]', NEXTJS)

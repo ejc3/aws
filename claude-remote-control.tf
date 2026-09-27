@@ -391,8 +391,24 @@ TimeoutStartSec=1800
 [Install]
 WantedBy=multi-user.target
 UNIT
+# Retry until it succeeds. A boot while Codex is logged out (or before first login) SKIPS the
+# unit, and nothing else would run it again until the next reboot. The timer re-runs it 15
+# minutes after it last went inactive; once it succeeds, RemainAfterExit keeps it active, so the
+# timer stops firing and the seed runs once per boot.
+cat > /etc/systemd/system/fcvm-codex-seed.timer <<'TIMER'
+[Unit]
+Description=Retry Codex thread seeding until it succeeds (e.g. after `codex login`)
+
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target
+TIMER
 systemctl daemon-reload
 systemctl enable fcvm-codex-seed.service >/dev/null 2>&1 || true
+systemctl enable --now fcvm-codex-seed.timer >/dev/null 2>&1 || true
 # --no-block: this setup often runs inside dev-selfupdate at boot, and the seed waits on the
 # launcher and on model turns.
 systemctl start --no-block fcvm-codex-seed.service >/dev/null 2>&1 || true
