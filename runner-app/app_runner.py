@@ -165,7 +165,7 @@ def job_size(cfg, labels):
 # call. handler() gives each repo an equal share of the invocation's remaining time (minus a
 # reserve for publishing counts), and a repo's scan stops at its share.
 DEADLINE = [float('inf')]
-RESERVE_SECONDS = 35
+RESERVE_SECONDS = 45
 
 
 def out_of_time(need=0.0):
@@ -179,8 +179,8 @@ def out_of_time(need=0.0):
 # timeout), so at most one call is in flight past the deadline. The exception is HANDOFF: the
 # credential handoff and cleanup after EC2 accepted a launch, and releasing a claim, which must
 # finish. RESERVE_SECONDS covers the longest of those past the deadline -- a handoff whose
-# credential write fails and whose host is then terminated (2 bounded calls; the parameter's
-# tidy-up is skipped when late) -- plus publishing the counts: 3 x 11 s.
+# credential write fails, whose host is then terminated and whose claim is released (3 bounded
+# calls; the parameter's tidy-up is skipped when late) -- plus publishing the counts: 4 x 11 s.
 class OutOfTime(Exception):
     pass
 

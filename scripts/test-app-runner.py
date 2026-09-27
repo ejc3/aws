@@ -370,8 +370,8 @@ class LaunchTests(unittest.TestCase):
 
     def test_the_reserve_outlasts_a_launch_handoff(self):
         app, *_ = load_app()
-        # A failed handoff past the deadline (credential write, terminate) plus publishing.
-        self.assertGreaterEqual(app.RESERVE_SECONDS, 3 * (3 + 8), "a failed handoff after the last attempt must fit")
+        # A failed handoff past the deadline (credential write, terminate, claim release) plus publishing.
+        self.assertGreaterEqual(app.RESERVE_SECONDS, 4 * (3 + 8), "a failed handoff after the last attempt must fit")
 
     def test_a_failed_handoff_past_the_deadline_terminates_but_skips_the_tidy_up(self):
         app, ec2, ssm, _ = load_app()
