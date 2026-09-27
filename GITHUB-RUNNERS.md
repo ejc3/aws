@@ -819,15 +819,18 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write. Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
 
-**Four GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
+**Six GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
 clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners,
-`github-webhook-admin-pat` owns the webhook, and `games/colton-games-read` (owned by
+`github-webhook-admin-pat` owns the webhook, `games/colton-games-read` (owned by
 CoderColton, Contents read-only on `colton-games`, jumpbox-readable only) lets the games
-multiplayer bring-up download the pinned commit it builds. The dev PAT is read by machines that run
+multiplayer bring-up download the pinned commit it builds, and the two
+`github-runner/repo-pat/*` tokens (one per repo, each owned by that repo's owner) register
+runners and own the hook for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs`. The dev PAT is read by machines that run
 other people's code; before the cutoff, the runner PAT was too. Neither may hold
 webhook-write: that would let a compromised dev host or a leaked legacy runner token
 repoint the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by

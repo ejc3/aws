@@ -1534,13 +1534,15 @@ resource "aws_iam_role_policy" "runner_lambda" {
         }
       },
       {
-        Effect = "Allow"
-        Action = ["ssm:GetParameter"]
-        Resource = concat(
-          [for name in ["pat", "user-data"] : "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/${name}"],
-          # Per-repo controller tokens for the non-fcvm repos (runner-repos.tf).
-          ["arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/repo-pat/*"],
-        )
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = [for name in ["pat", "user-data"] : "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/${name}"]
+      },
+      {
+        # Per-repo controller tokens for the non-fcvm repos (runner-repos.tf).
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [for s in aws_secretsmanager_secret.github_runner_repo_pat : s.arn]
       },
       {
         Effect   = "Allow"

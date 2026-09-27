@@ -165,7 +165,19 @@ terraform apply \
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
-console or AWS CLI without printing their values. This is a one-time secret-payload
+console or AWS CLI without printing their values.
+
+The runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` also need one
+controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (containers
+from `runner-repos.tf`, created by the normal apply; Terraform never holds the value). Each is a
+fine-grained token limited to that one repo with Administration and Webhooks read-write, minted
+by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
+org admin for `dolphin-labs`. Put each value without echoing it:
+
+```bash
+read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+  --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin; unset T
+``` This is a one-time secret-payload
 bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
 
