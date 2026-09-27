@@ -55,7 +55,7 @@ ARCH=$(uname -m)
 # fighting dpkg -- removing the tarball reverts cleanly to Ubuntu's 3.4.
 TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
 ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V
-ejc3/tmux|binaries-scroll-native|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V|scroll-replay'
+ejc3/tmux|${local.tmux_scroll_tag}|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V|scroll-replay'
 
 # Read the table on fd 3, NOT stdin. A command inside the loop (etserver -V, which
 # aborts on this build) consumed the remaining stdin and silently ate every entry after
