@@ -670,6 +670,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   claim is released and the error raised, so `github-app-runner-errors` fires.
   Every attempt carries its own `ClientToken` (the claim's nonce plus an attempt number), so the
   SDK's own retries cannot duplicate one.
+- **Stale deliveries.** A delivery can wait in Lambda's async queue until after the reconcile ran
+  its job; before launching for one, the controller asks GitHub whether the job is still queued.
 - **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite

@@ -703,5 +703,11 @@ def handler(event, context):
     pat = repo_pat(cfg)
     if not pat:
         return {'skipped': 'no controller token'}
+    # A delivery can wait in Lambda's async queue while the reconcile launches for its job, and a
+    # short job can finish before the delivery runs: its event still says "queued". Ask GitHub.
+    status = github('GET', f"/repos/{repo}/actions/jobs/{job['id']}", pat).get('status')
+    if status != 'queued':
+        print(f"{repo}: delivery for job {job['id']} is stale (now {status}); nothing to launch")
+        return {'ignored': 'no longer queued'}
     outcome, _ = ensure_runner(repo, cfg, subnets, pat, str(job['id']), size, app_instances(repo))
     return {'repo': repo, 'job': job['id'], 'size': size, 'outcome': outcome}

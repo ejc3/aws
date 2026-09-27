@@ -155,7 +155,7 @@ class FakeSecrets:
 
 class FakeGitHub:
     def __init__(self):
-        self.calls, self.runs, self.jobs, self.runners = [], {}, {}, {}
+        self.calls, self.runs, self.jobs, self.runners, self.job_status = [], {}, {}, {}, {}
 
     def __call__(self, method, path, pat, body=None):
         self.calls.append((method, path, pat))
@@ -165,6 +165,9 @@ class FakeGitHub:
         if m:
             runs = self.runs.get((m.group(1), m.group(2)), [])
             return {"total_count": len(runs), "workflow_runs": [{"id": r} for r in runs]}
+        m = re.match(r"/repos/(.+?)/actions/jobs/(\d+)$", path)
+        if m:
+            return {"id": int(m.group(2)), "status": self.job_status.get(int(m.group(2)), "queued")}
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs", path)
         if m:
             return {"jobs": self.jobs.get(int(m.group(2)), [])}
@@ -604,6 +607,12 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.deliver(app, repo="ejc3/fcvm"), {"ignored": "repo"})
         self.assertEqual(self.deliver(app, action="completed"), {"ignored": "action"})
         self.assertEqual(self.deliver(app, labels=("self-hosted", "ARM64")), {"ignored": "labels"})
+        self.assertEqual(ec2.launched, [])
+
+    def test_a_stale_delivery_for_a_job_no_longer_queued_launches_nothing(self):
+        app, ec2, *_ = load_app()
+        app.github.job_status[7] = "completed"   # the reconcile already ran it; the delivery waited
+        self.assertEqual(self.deliver(app), {"ignored": "no longer queued"})
         self.assertEqual(ec2.launched, [])
 
     def test_no_token_yet_launches_nothing(self):
