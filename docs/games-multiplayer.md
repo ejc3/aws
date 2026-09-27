@@ -179,12 +179,20 @@ To take the platform off the internet, fastest first:
     --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
   ```
 
-- **Stop running engines.** Every engine task carries the `match` tag; the router does not.
+- **Stop running engines.** Tell the router apart by its task-definition family,
+  `games-mp-router`, never by `group` or tags: a `RunTask` caller chooses both, so a malicious
+  engine started with `group=service:mp-router` would survive a group-based filter. The family is
+  the one thing the launcher cannot use (it is denied `RunTask` on it), which is also why the
+  sweeper keys on it (`games-multiplayer/sweeper.py`).
 
   ```bash
   for t in $(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); do
-    aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" --query 'tasks[0].group' --output text \
-      | grep -q '^service:mp-router$' || aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null
+    td=$(aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" \
+      --query 'tasks[0].taskDefinitionArn' --output text)
+    case "${td##*/}" in
+      games-mp-router:*) ;;
+      *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null ;;
+    esac
   done
   ```
 
