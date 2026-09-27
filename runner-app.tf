@@ -98,10 +98,85 @@ resource "aws_iam_role" "runner_app_lambda" {
   })
 }
 
+# The job host's own role. Jobs here run other people's code (every writer on the served repos,
+# and their dependencies), and anything on the host can use this role through IMDS. So it can do
+# exactly one thing: read and delete ITS OWN bootstrap credential, the parameter the controller
+# tagged with this instance's ARN. Not fcvm's github-runner-instance-role, which also carries SSM
+# agent connectivity, account-wide DescribeNetworkInterfaces, the session-audit bucket write and a
+# row in fcvm's registration table, and would pass on any grant later added for fcvm's runners.
+# The host needs nothing else: IPv6 is assigned at launch, and there is no SSM agent use.
+resource "aws_iam_role" "runner_app_instance" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "github-app-runner-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+
+  tags = { Name = "github-app-runner-instance-role" }
+}
+
+resource "aws_iam_role_policy" "runner_app_instance" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "consume-own-bootstrap-credential-only"
+  role  = aws_iam_role.runner_app_instance[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ConsumeOwnBootstrapCredential"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:DeleteParameter"]
+        Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+        Condition = {
+          StringEquals = { "ssm:resourceTag/InstanceArn" = "$${ec2:SourceInstanceARN}" }
+          Null         = { "ec2:SourceInstanceARN" = "false" }
+        }
+      },
+      {
+        # Another host's still-booting credential stays unreadable even if a broad SSM Allow
+        # is ever attached here by mistake.
+        Sid      = "DenyOtherBootstrapCredentials"
+        Effect   = "Deny"
+        Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath", "ssm:DeleteParameter"]
+        Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+        Condition = {
+          StringNotEqualsIfExists = { "ssm:resourceTag/InstanceArn" = "$${ec2:SourceInstanceARN}" }
+        }
+      },
+      {
+        Sid         = "DenyEveryOtherParameterPayload"
+        Effect      = "Deny"
+        Action      = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath"]
+        NotResource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+      },
+      {
+        Sid      = "DenyBulkAndHistoricalParameterPayloads"
+        Effect   = "Deny"
+        Action   = ["ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "runner_app" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "github-app-runner-profile"
+  role  = aws_iam_role.runner_app_instance[0].name
+}
+
 # Launch, tag and terminate only github-app-runner instances, only from Canonical's images,
-# only into the runner subnets with github-app-runner-sg and github-runner-profile (whose role
-# cannot read any token). Broker a host's own bootstrap credential exactly as fcvm's controller
-# does. Read only the served repos' controller tokens.
+# only into the runner subnets with github-app-runner-sg and github-app-runner-profile (whose
+# role can consume its own bootstrap credential and nothing else). Broker a host's own
+# bootstrap credential exactly as fcvm's controller does. Read only the served repos'
+# controller tokens.
 resource "aws_iam_role_policy" "runner_app_lambda" {
   count = var.enable_github_runner ? 1 : 0
   name  = "github-app-runner"
@@ -159,7 +234,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-app-runner", "ec2:MetadataHttpTokens" = "required" }
-          ArnEquals    = { "ec2:InstanceProfile" = aws_iam_instance_profile.runner[0].arn }
+          ArnEquals    = { "ec2:InstanceProfile" = aws_iam_instance_profile.runner_app[0].arn }
         }
       },
       {
@@ -214,7 +289,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Sid      = "PassRunnerRoleToEC2Only"
         Effect   = "Allow"
         Action   = "iam:PassRole"
-        Resource = aws_iam_role.runner[0].arn
+        Resource = aws_iam_role.runner_app_instance[0].arn
         Condition = {
           StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
         }
@@ -223,7 +298,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Sid         = "DenyPassingOtherRoles"
         Effect      = "Deny"
         Action      = "iam:PassRole"
-        NotResource = aws_iam_role.runner[0].arn
+        NotResource = aws_iam_role.runner_app_instance[0].arn
       },
       {
         # The same instance-bound handoff fcvm uses (runner-bootstrap.tf): created only after
@@ -274,6 +349,9 @@ resource "aws_lambda_function" "runner_app" {
   handler          = "app_runner.handler"
   runtime          = "python3.12"
   timeout          = 120
+  # The first reconcile used 104 of the default 128 MB (boto3 alone is most of it); a larger
+  # listing would run out. 256 MB also doubles the CPU share, which shortens every round.
+  memory_size = 256
 
   # One decision at a time, so two deliveries for the same job cannot both launch.
   reserved_concurrent_executions = 1
@@ -284,7 +362,7 @@ resource "aws_lambda_function" "runner_app" {
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SECURITY_GROUP_ID = aws_security_group.runner_app[0].id
-      INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
+      INSTANCE_PROFILE  = aws_iam_instance_profile.runner_app[0].name
       RUNNER_ACCOUNT_ID = data.aws_caller_identity.current.account_id
       # A VM is registered in about two minutes; metal needed fifteen.
       BOOT_GRACE_MINUTES   = "10"
@@ -401,6 +479,25 @@ resource "aws_cloudwatch_metric_alarm" "app_runner_reconcile_silent" {
   statistic           = "SampleCount"
   period              = 300
   treat_missing_data  = "breaching"
+}
+
+# Per repo: the combined alarm above fires only when BOTH repos are saturated together, so one
+# repo over-launching on its own would go unseen. Each repo's LiveRunners above its own cap.
+resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
+  for_each            = var.enable_github_runner ? local.runner_app_config : {}
+  alarm_name          = "too-many-app-runners-${each.value.label}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3 # 15 minutes
+  threshold           = each.value.max
+  alarm_description   = "More ${each.key} app runners than its cap of ${each.value.max}, for 15+ minutes - the controller is over-launching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "LiveRunners"
+  dimensions          = { Repo = each.key }
+  statistic           = "Maximum"
+  period              = 300
+  treat_missing_data  = "notBreaching"
 }
 
 resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {

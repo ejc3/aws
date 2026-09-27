@@ -3321,6 +3321,33 @@ data "archive_file" "runner_cleanup" {
               ]
           )
 
+          # Fleet size and the oldest host, as EMF (no IAM needed), emitted FIRST so a poll that
+          # times out later still reports. The alarms too-many-runners, runner-long-running and
+          # runner-cleanup-silent (cost-alerts.tf) read these: AWS/EC2 has no per-tag instance
+          # count, and the query they used before could never return data.
+          # Never allowed to break the sweep below: an instance without a readable LaunchTime
+          # counts toward LiveRunners but not the age.
+          fleet = [i for r in response.get('Reservations', []) for i in r.get('Instances', [])]
+          oldest_minutes = 0
+          for i in fleet:
+              try:
+                  oldest_minutes = max(oldest_minutes, (now - i['LaunchTime']).total_seconds() / 60)
+              except Exception:
+                  pass
+          print(json.dumps({
+              '_aws': {
+                  'Timestamp': int(now.timestamp() * 1000),
+                  'CloudWatchMetrics': [{
+                      'Namespace': 'GitHubRunners',
+                      'Dimensions': [[]],
+                      'Metrics': [{'Name': 'LiveRunners', 'Unit': 'Count'},
+                                  {'Name': 'OldestRunnerAgeMinutes', 'Unit': 'None'}]
+                  }]
+              },
+              'LiveRunners': len(fleet),
+              'OldestRunnerAgeMinutes': round(oldest_minutes, 1),
+          }))
+
           terminated = []
           renewed = []
           expired = []

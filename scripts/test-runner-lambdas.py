@@ -2600,6 +2600,43 @@ def case_one_unreadable_instance_cannot_block_another_ceiling_kill():
     assert "i-broken" in buf.getvalue(), "the skipped instance must be named in the log"
 
 
+def cleanup_emf(buf):
+    for line in buf.getvalue().splitlines():
+        if line.startswith("{") and "OldestRunnerAgeMinutes" in line:
+            return json.loads(line)
+    return None
+
+
+def case_cleanup_publishes_the_fleet_size_and_oldest_runner_age():
+    """too-many-runners and runner-long-running alarm on these, so every sweep must emit them.
+
+    The alarms used to query the Role tag through Metrics Insights, which is not an EC2
+    dimension, so they never had data. A sweep that stops emitting must be caught by
+    runner-cleanup-silent, which only works if a healthy sweep always emits.
+    """
+    ec2 = FakeEC2([instance("i-new", "c7g.metal", "running", 10, arch="arm64"),
+                   instance("i-old", "c7g.metal", "running", 95, arch="arm64")])
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cleanup(ec2, FakeGitHub(runners=[runner_record()]))["handler"]({}, None)
+    emf = cleanup_emf(buf)
+    assert emf is not None, buf.getvalue()
+    spec = emf["_aws"]["CloudWatchMetrics"][0]
+    assert spec["Namespace"] == "GitHubRunners" and spec["Dimensions"] == [[]], spec
+    assert emf["LiveRunners"] == 2, emf
+    assert 94 <= emf["OldestRunnerAgeMinutes"] <= 96, emf
+
+
+def case_cleanup_metrics_survive_an_instance_with_no_launch_time():
+    broken = instance("i-broken", "c7g.metal", "running", 120, arch="arm64")
+    del broken["LaunchTime"]
+    ec2 = FakeEC2([broken, instance("i-ok", "c7g.metal", "running", 30, arch="arm64")])
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cleanup(ec2, FakeGitHub(runners=[runner_record()]))["handler"]({}, None)
+    emf = cleanup_emf(buf)
+    assert emf is not None and emf["LiveRunners"] == 2, buf.getvalue()
+    assert 29 <= emf["OldestRunnerAgeMinutes"] <= 31, emf
+
+
 def case_stuck_scan_still_works_on_a_timestamp_with_no_offset():
     """Surviving a bad timestamp is not enough; the scan must still do its job.
 

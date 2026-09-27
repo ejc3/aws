@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import types
@@ -34,7 +35,7 @@ REPOS = {
 SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
 ENV = {"REPOS": json.dumps(REPOS), "LAUNCH_SUBNETS": json.dumps(SUBNETS), "SECURITY_GROUP_ID": "sg-app",
-       "INSTANCE_PROFILE": "github-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012",
+       "INSTANCE_PROFILE": "github-app-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012",
        "CLAIMS_TABLE": "github-app-runner-claims"}
 NOW = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
 
@@ -851,6 +852,36 @@ class ReconcileTests(unittest.TestCase):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_the_credential_poll_waits_through_access_denied(self):
+        # Before the controller writes the parameter there is no tag for the role's condition to
+        # match, so SSM answers AccessDenied. That must mean "not yet", not "give up".
+        text = BOOTSTRAP.read_text()
+        poll = text.split("REG_TOKEN=$(python3 - \"$INSTANCE_ID\" <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tmp = Path(tempfile.mkdtemp(prefix="poll."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        (tmp / "botocore").mkdir()
+        (tmp / "botocore" / "__init__.py").write_text("")
+        (tmp / "botocore" / "exceptions.py").write_text(
+            "class ClientError(Exception):\n"
+            "    def __init__(self, code):\n"
+            "        super().__init__(code); self.response = {'Error': {'Code': code}}\n")
+        (tmp / "boto3.py").write_text(
+            "import botocore.exceptions as e\n"
+            "class _NotFound(Exception): pass\n"
+            "class _SSM:\n"
+            "    class exceptions: ParameterNotFound = _NotFound\n"
+            "    calls = 0\n"
+            "    def get_parameter(self, Name, WithDecryption):\n"
+            "        _SSM.calls += 1\n"
+            "        if _SSM.calls == 1: raise e.ClientError('AccessDeniedException')\n"
+            "        return {'Parameter': {'Value': 'TOKEN'}}\n"
+            "    def delete_parameter(self, Name): pass\n"
+            "def client(name): return _SSM()\n")
+        out = subprocess.run(["python3", "-c", poll, "i-0123"], capture_output=True, text=True,
+                             env={"PYTHONPATH": str(tmp), "PATH": "/usr/bin:/bin"}, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "TOKEN")
+
     def test_bootstrap_is_ephemeral_verified_and_keeps_the_token_off_argv(self):
         text = BOOTSTRAP.read_text()
         subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=True)
@@ -932,6 +963,10 @@ class FrontTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
+    def test_the_controller_has_room_beyond_its_first_measured_memory(self):
+        block = APP_TF.split('resource "aws_lambda_function" "runner_app"', 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(block, r"memory_size\s*=\s*256", "104 of 128 MB was used by an empty reconcile")
+
     def test_pools_are_x86_only_and_diversified(self):
         sizes = re.search(r"runner_app_sizes = \{(.*?)\n  \}", APP_TF, re.S).group(1)
         for size, types_ in re.findall(r"(\w+)\s*=\s*\[([^\]]+)\]", sizes):
@@ -959,6 +994,44 @@ class WiringTests(unittest.TestCase):
         self.assertIn('"ec2:Owner" = local.runner_app_ami_owner', policy)
         self.assertNotRegex(policy, r'Action\s*=\s*"ec2:\*"')
         self.assertIn("aws_secretsmanager_secret.github_runner_repo_pat[repo].arn", policy)
+
+    def test_app_hosts_get_their_own_role_that_reads_only_their_own_credential(self):
+        """App runners run outside code; fcvm's github-runner-role can write security records
+        and describe the fleet's ENIs. The app role's only Allow is the host's own credential."""
+        policy = re.search(r'resource "aws_iam_role_policy" "runner_app_instance" \{.*?\n\}', APP_TF, re.S).group()
+        allows = re.findall(r'Effect\s*=\s*"Allow"\s*\n\s*Action\s*=\s*(\[[^\]]*\]|"[^"]*")', policy)
+        self.assertEqual(allows, ['["ssm:GetParameter", "ssm:DeleteParameter"]'], allows)
+        allow = policy.split('Sid      = "ConsumeOwnBootstrapCredential"', 1)[1].split("},\n      {", 1)[0]
+        self.assertIn("parameter/github-runner/bootstrap/*", allow)
+        self.assertIn('"ssm:resourceTag/InstanceArn" = "$${ec2:SourceInstanceARN}"', allow)
+        self.assertIn('"ec2:SourceInstanceARN" = "false"', allow)
+        self.assertIn("DenyOtherBootstrapCredentials", policy)
+        self.assertIn("DenyEveryOtherParameterPayload", policy)
+        self.assertNotRegex(policy, r"s3:|ec2:Describe|ssm:\*|\"\*\"\s*\n\s*Resource", "no S3, EC2 or wildcard actions")
+        attachments = re.findall(r'resource "aws_iam_role_policy_attachment" "[^"]+" \{[^}]*runner_app_instance', APP_TF)
+        self.assertEqual(attachments, [], "no managed policies on the app runner role")
+        profile = re.search(r'resource "aws_iam_instance_profile" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("role  = aws_iam_role.runner_app_instance[0].name", profile)
+
+    def test_controller_launches_and_passes_only_the_app_role(self):
+        policy = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('"ec2:InstanceProfile" = aws_iam_instance_profile.runner_app[0].arn', policy)
+        passrole = policy.split('Action   = "iam:PassRole"', 1)[1].split("}\n      },", 1)[0]
+        self.assertIn("Resource = aws_iam_role.runner_app_instance[0].arn", passrole)
+        self.assertIn('"iam:PassedToService" = "ec2.amazonaws.com"', passrole)
+        self.assertIn("NotResource = aws_iam_role.runner_app_instance[0].arn", policy)
+        self.assertNotIn("aws_iam_role.runner[0]", APP_TF, "fcvm's runner role must not reach app hosts")
+        self.assertNotIn("aws_iam_instance_profile.runner[0]", APP_TF)
+        self.assertIn("INSTANCE_PROFILE  = aws_iam_instance_profile.runner_app[0].name", APP_TF)
+
+    def test_each_repo_alarms_above_its_own_cap(self):
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("for_each            = var.enable_github_runner ? local.runner_app_config : {}", alarm)
+        self.assertIn("threshold           = each.value.max", alarm)
+        self.assertIn('metric_name         = "LiveRunners"', alarm)
+        self.assertIn("dimensions          = { Repo = each.key }", alarm)
+        self.assertIn("'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text(),
+                      "the controller must publish the per-repo series this alarm reads")
 
 
 if __name__ == "__main__":

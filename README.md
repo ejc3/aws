@@ -1050,9 +1050,12 @@ Terraform.
   original `us-east-1` history retain their lifecycles; neither receives new scheduled
   fleet copies. The active recovery pipeline below replaces the old staging-copy
   path without replacing live disks or deleting that existing history.
-- Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
-  `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
-  through SNS/email.
+- Daily cost reports, AWS Budget notifications (`daily-cost-alert`, all services, $200/day;
+  `ec2-daily`, EC2 compute + EC2-Other, $150/day), runner-count/age alarms (from the
+  `GitHubRunners` metrics the runner cleanup publishes every 5 minutes, with
+  `runner-cleanup-silent` when it stops), the per-repo `too-many-app-runners-<label>` alarms,
+  the `runner-scale-up-starved` alarm, and instance-status alarms publish through SNS/email.
+  Account billing alerts are off, so nothing here reads `AWS/Billing`.
 - The original jumpbox's protected home volume and the fully reproducible `jumpbox-2`
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
