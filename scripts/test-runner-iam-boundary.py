@@ -172,10 +172,13 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         producer = block('runner-bootstrap.tf', 'aws_iam_role_policy', 'runner_bootstrap')
         self.assertNotIn('dynamodb:UpdateItem', producer)
 
-    def test_front_role_may_invoke_only_the_webhook_delivery_alias(self):
+    def test_front_role_may_invoke_only_the_webhook_delivery_alias_and_the_app_runner(self):
         policy = block('runner-webhook-front.tf', 'aws_iam_role_policy', 'runner_webhook_front')
         allows = [s for s in statements(policy) if re.search(r'Effect\s*=\s*"Allow"', s)]
-        self.assertEqual(len(allows), 2, allows)
+        self.assertEqual(len(allows), 3, allows)
+        app = statement(policy, 'InvokeTheAppRunner')
+        self.assertEqual(actions(app), {'lambda:InvokeFunction'})
+        self.assertRegex(app, r'Resource\s*=\s*aws_lambda_function\.runner_app\[0\]\.arn$')
         invoke = statement(policy, 'InvokeTheWebhookDeliveryAlias')
         self.assertEqual(actions(invoke), {'lambda:InvokeFunction'})
         self.assertRegex(invoke, r'Resource\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn$')
@@ -185,7 +188,7 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
                          {'/aws/lambda/github-runner-webhook-front', '/aws/lambda/github-runner-webhook-front:*'})
         deny = statement(policy, 'DenyInvokingAnythingElse')
         self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
-        self.assertRegex(deny, r'NotResource\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn')
+        self.assertRegex(deny, r'NotResource\s*=\s*\[aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn, aws_lambda_function\.runner_app\[0\]\.arn\]')
         self.assertNotRegex(policy, r'Resource\s*=\s*"\*"')
         role = block('runner-webhook-front.tf', 'aws_iam_role', 'runner_webhook_front')
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', role)

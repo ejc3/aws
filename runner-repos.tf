@@ -6,7 +6,8 @@
 #
 # STEP 1 (this file, for now): each repo's controller token. A runner registration token needs
 # repo ADMIN, so each repo's owner mints a fine-grained token limited to that one repo with
-# Administration RW (register, list, remove runners) and Webhooks RW (the workflow_job hook):
+# Administration RW (register, list, remove runners), Webhooks RW (the workflow_job hook) and
+# Actions read-only (the reconcile lists queued runs and their jobs):
 #   CoderColton/colton-games       minted by CoderColton (ejc3 has write, not admin there)
 #   dolphin-labs-hq/dolphin-labs   minted by ejc3 as org admin
 #
@@ -18,7 +19,7 @@
 #   printf %s "$TOKEN" | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin
 #
-# Only administration and the runner Lambda role may read it. The runner INSTANCE role has no
+# Only administration and the runner controllers (runner_lambda, runner_app_lambda) may read it. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
   runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"]
@@ -28,7 +29,7 @@ resource "aws_secretsmanager_secret" "github_runner_repo_pat" {
   for_each = var.enable_github_runner ? toset(local.runner_extra_repos) : toset([])
 
   name                    = "github-runner/repo-pat/${each.value}"
-  description             = "Fine-grained GitHub token for ${each.value} only: Administration RW + Webhooks RW (runner controller). Set by hand."
+  description             = "Fine-grained GitHub token for ${each.value} only: Administration RW + Webhooks RW + Actions read (runner controller). Set by hand."
   recovery_window_in_days = 7
   tags                    = { Name = "github-runner-repo-pat", Managed = "terraform" }
 }
@@ -49,7 +50,8 @@ resource "aws_secretsmanager_secret_policy" "github_runner_repo_pat" {
         ArnNotLike = {
           # local.games_mp_admin_principals (games-multiplayer.tf) is the account's standard
           # administration set: root, the jumpbox admin role, SSO administrators.
-          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_lambda[0].arn])
+          # github-app-runner (runner-app.tf) is the controller that actually uses these tokens.
+          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_lambda[0].arn, aws_iam_role.runner_app_lambda[0].arn])
         }
       }
     }]

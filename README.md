@@ -153,32 +153,38 @@ state or a different account is not a supported bootstrap and can collide with o
 live infrastructure. Recover the backend state first, or inventory and import every
 pre-existing resource before any full apply.
 
-The alert address, runner PAT, and SSH-key backup use Terraform-managed containers whose
-payloads are intentionally kept out of Terraform state. For a true cold start, create
-those three containers only after state/import reconciliation is complete:
+The alert address, runner PAT, SSH-key backup and the two app-runner controller tokens use
+Terraform-managed containers whose payloads are intentionally kept out of Terraform state.
+For a true cold start, create those containers only after state/import reconciliation is
+complete. `enable_runner_app_webhooks=false` keeps this apply from reading the controller
+tokens, which do not exist yet:
 
 ```bash
-terraform apply \
+terraform apply -var enable_runner_app_webhooks=false \
   -target=aws_ssm_parameter.alert_email \
   -target='aws_ssm_parameter.github_runner_pat[0]' \
-  -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key
+  -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["CoderColton/colton-games"]' \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]'
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
 console or AWS CLI without printing their values.
 
 The runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` also need one
-controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (containers
-from `runner-repos.tf`, created by the normal apply; Terraform never holds the value). Each is a
-fine-grained token limited to that one repo with Administration and Webhooks read-write, minted
+controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
+containers created above, from `runner-repos.tf`; Terraform never holds the value). The full
+apply reads both to create the repos' webhooks, so populate them before it. Each is a
+fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
 org admin for `dolphin-labs`. Put each value without echoing it:
 
 ```bash
 read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
   --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin; unset T
-``` This is a one-time secret-payload
-bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
+```
+
+This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
 
 Do not create the Workers Builds control-token container in this generic bootstrap. Its

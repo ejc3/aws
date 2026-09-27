@@ -648,6 +648,84 @@ poll that ran while a job's runner was booting put up a second host for the same
 whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
+## Pattern C — ephemeral x86 spot runners for other repos
+
+`CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` run on ordinary x86 spot VMs, not
+metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
+controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
+`runner-app/`).
+
+- **Routing.** The same front (`github-runner-webhook-front`) routes by `repository.full_name`
+  after the signature check. `ejc3/fcvm`, and deliveries naming no repository, take Pattern B's
+  path unchanged. The two served repos go to Lambda `github-app-runner`, `queued` only.
+  Anything else is answered and dropped.
+- **Labels.** A job is served only if every label it asks for is one these runners carry:
+  `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
+  (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
+- **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
+  to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
+  A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
+  keeps the claim. No pool is tried after the repo's reconcile deadline. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
+  claim is released and the error raised, so `github-app-runner-errors` fires.
+  Every attempt carries its own `ClientToken` (the claim's nonce plus an attempt number), so the
+  SDK's own retries cannot duplicate one.
+- **Stale deliveries.** A delivery can wait in Lambda's async queue until after the reconcile ran
+  its job; before launching for one, the controller asks GitHub whether the job is still queued.
+  A delivery is also bounded by the invocation's deadline, so a slow round of pool refusals stops
+  and releases its claim instead of timing out while holding it.
+- **Inspector.** Hosts carry `InspectorEc2Exclusion=true` with instance metadata tags enabled,
+  so Inspector's SSM plugin skips them instead of apt-installing its scanner mid-boot.
+- **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
+  (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
+  while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
+  failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
+  with its `JobId`. Each repo has its own cap (8), counted as the hosts `DescribeInstances` lists
+  plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
+  is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
+  Each check takes the claims first, then a fresh listing, and counts a host by its state in that
+  listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
+  nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
+  of the same job never releases the claim of its relaunch. A host covers the job it is tagged
+  for only while it is not busy: GitHub may give it another job with the same labels, and a busy
+  ephemeral host tagged for a still-queued job is running something else, so the job gets its own
+  host. The cap counts hosts, not job tags.
+  Neither repo can starve fcvm's.
+- **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
+  (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
+  zero would hide its hosts. `too-many-app-runners` fires above the combined cap;
+  `github-app-runner-reconcile-silent` fires when no total arrives for 15 minutes, because then
+  some repo is not being reaped. One repo's failure (a
+  revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
+  still fails for `github-app-runner-errors`.
+- **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
+  actions/runner (pinned, sha256-verified) and takes its registration token from
+  `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the
+  shared runner role can read only the parameter tagged with its own instance ARN. The token
+  reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
+  `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
+- **Reconcile.** Every 2 minutes it walks queued and in-progress runs oldest first, from the last
+  page back, reading each run's jobs as it goes, so the oldest queued job is reached however many
+  newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
+  the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
+  so jobs it finds always have time to launch), launches for queued jobs that have no host,
+  oldest first, stopping at the repo's cap or the end of its share. The share is enforced at the
+  call: once it is spent no AWS call (a botocore `before-call` hook) or GitHub request starts,
+  except the credential handoff after an accepted launch and claim releases, and every call is
+  bounded (connect 3 s, read 8 s, one attempt), so at most one call runs past it. It reaps hosts (also
+  within the share; a host is judged "never registered" only from a complete runner listing and
+  after rechecking its own name, since it may have registered since the listing; an
+  idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
+  because it took a job since the listing)
+  that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
+- **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
+  existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own
+  bootstrap credential. Every writer on these (private) repos can run code here, so they must
+  not be made public while these runners are attached.
+- **Tokens.** Each repo's controller token is `github-runner/repo-pat/<owner>/<repo>`
+  (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
+  created with the same tokens through an `ephemeral` read, so the tokens never enter state.
+
 ## Controller-first credential migration
 
 The controller can classify both legacy PAT-reading user data and the instance-bound
@@ -819,7 +897,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
-| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write. Never in TF state: Terraform manages no version |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs). Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
@@ -859,8 +937,13 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
   for the cleanup claim and the webhook's conditional warm-host window and claim.
 - **`github-runner-webhook-front-role`**: its own Lambda logs and `lambda:InvokeFunction` on
-  the webhook's `delivery` alias only, with an explicit deny on invoking anything else. No
-  EC2, SSM, DynamoDB or PAT access.
+  exactly two targets, the webhook's `delivery` alias and `github-app-runner` (Pattern C),
+  with an explicit deny on invoking anything else. No EC2, SSM, DynamoDB or PAT access.
+- **`github-app-runner-lambda`** (Pattern C's controller): read the two per-repo tokens;
+  `RunInstances` only with Canonical images, into the runner subnets, with
+  `github-app-runner-sg`, IMDSv2 and tag `Role=github-app-runner`; terminate only instances
+  with that tag; pass only the runner role, only to EC2; write and delete only the
+  instance-bound `/github-runner/bootstrap/*` credential.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.

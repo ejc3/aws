@@ -9,7 +9,12 @@
 # to its 10-second timeout.
 #
 # The front verifies the signature, keeps only what the webhook reads, answers 202, and
-# invokes the webhook asynchronously. Lambda puts a throttled asynchronous event back in its
+# invokes the webhook asynchronously.
+#
+# It also ROUTES by repository.full_name. ejc3/fcvm (and any delivery that names no repository,
+# which is how fcvm's own deliveries were always handled) goes to github-runner-webhook exactly
+# as before. A repo served by runner-app.tf goes to github-app-runner, queued jobs only; every
+# other repository is answered and dropped. Lambda puts a throttled asynchronous event back in its
 # queue and retries it, so a burst waits instead of being dropped, and the webhook still
 # decides every launch one execution at a time.
 
@@ -38,6 +43,8 @@ data "archive_file" "runner_webhook_front" {
       # from here. The webhook refuses them on this path anyway; see DELIVERY_ALIAS there.
       JOB_FIELDS = ('id', 'run_id', 'labels', 'created_at', 'runner_id', 'runner_name',
                     'conclusion', 'completed_at')
+      # What github-app-runner reads. It needs only queued jobs: its hosts are ephemeral.
+      APP_JOB_FIELDS = ('id', 'run_id', 'labels')
 
       def verify_signature(body, signature, secret):
           """GitHub's X-Hub-Signature-256 over the raw body. No secret rejects everything."""
@@ -71,6 +78,24 @@ data "archive_file" "runner_webhook_front" {
           job = payload.get('workflow_job')
           job = job if isinstance(job, dict) else {}
           delivery = str(headers.get('x-github-delivery', ''))[:64]
+          repository = payload.get('repository')
+          repo = repository.get('full_name') if isinstance(repository, dict) else None
+          if isinstance(repo, str) and repo.lower() != os.environ.get('FCVM_REPO', 'ejc3/fcvm').lower():
+              served = {r.lower(): r for r in json.loads(os.environ.get('APP_REPOS') or '[]')}
+              if repo.lower() not in served:
+                  return {'statusCode': 200, 'body': f'Ignoring repository: {repo[:100]}'}
+              if action != 'queued':
+                  return {'statusCode': 200, 'body': f'Ignoring action for {served[repo.lower()]}: {action}'}
+              app_event = {'repo': served[repo.lower()], 'action': action,
+                           'workflow_job': {key: job[key] for key in APP_JOB_FIELDS if key in job},
+                           'delivery': {'id': delivery, 'received_at': time.time()}}
+              try:
+                  lambda_client.invoke(FunctionName=os.environ['APP_DELIVERY_TARGET'], InvocationType='Event',
+                                       Payload=json.dumps(app_event))
+              except Exception as e:
+                  print(f'Delivery {delivery} not queued for the app runner: {type(e).__name__}')
+                  return {'statusCode': 503, 'body': 'Delivery not queued'}
+              return {'statusCode': 202, 'body': f'Forwarded {action} to the app runner'}
           event_for_webhook = {
               'body': json.dumps({'action': action,
                                   'workflow_job': {key: job[key] for key in JOB_FIELDS if key in job}}),
@@ -103,7 +128,7 @@ resource "aws_iam_role" "runner_webhook_front" {
   })
 }
 
-# Its own logs and the webhook's delivery alias, nothing else: no EC2, SSM, DynamoDB, PAT or
+# Its own logs, the webhook's delivery alias and the app runner, nothing else: no EC2, SSM, DynamoDB, PAT or
 # other function. The deny keeps that true under any policy attached to this role later.
 resource "aws_iam_role_policy" "runner_webhook_front" {
   count = var.enable_github_runner ? 1 : 0
@@ -129,10 +154,17 @@ resource "aws_iam_role_policy" "runner_webhook_front" {
         Resource = aws_lambda_alias.runner_webhook_delivery[0].arn
       },
       {
+        # Deliveries for the repos runner-app.tf serves.
+        Sid      = "InvokeTheAppRunner"
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = aws_lambda_function.runner_app[0].arn
+      },
+      {
         Sid         = "DenyInvokingAnythingElse"
         Effect      = "Deny"
         Action      = ["lambda:InvokeFunction", "lambda:InvokeAsync", "lambda:InvokeFunctionUrl"]
-        NotResource = aws_lambda_alias.runner_webhook_delivery[0].arn
+        NotResource = [aws_lambda_alias.runner_webhook_delivery[0].arn, aws_lambda_function.runner_app[0].arn]
       },
     ]
   })
@@ -158,6 +190,10 @@ resource "aws_lambda_function" "runner_webhook_front" {
     variables = {
       WEBHOOK_SECRET  = random_password.github_webhook[0].result
       DELIVERY_TARGET = aws_lambda_alias.runner_webhook_delivery[0].arn
+      # Routing by repository (runner-app.tf).
+      FCVM_REPO           = "ejc3/fcvm"
+      APP_REPOS           = jsonencode(keys(local.runner_app_repos))
+      APP_DELIVERY_TARGET = aws_lambda_function.runner_app[0].arn
     }
   }
 
