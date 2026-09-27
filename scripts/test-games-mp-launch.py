@@ -670,9 +670,10 @@ class TerraformTests(unittest.TestCase):
     def test_the_current_sim_version_is_the_current_tag_without_its_commit(self):
         self.assertIn('regex("^(.+)-[0-9a-f]{12}$", local.mp_engine_tags[id])[0]', GAMES)
         self.assertIn("for id in keys(local.mp_engine_task_defs) : id =>", GAMES)
-        # Both tag sources are validated to the shape the function and the lobby accept.
-        self.assertIn(r'can(regex("^[A-Za-z0-9._-]{1,64}$", v))', GAMES)
-        self.assertIn(r'can(regex("^[A-Za-z0-9._-]{1,64}-[0-9a-f]{12}$", t))', GAMES)
+        # Both tag sources are validated to a subset of the shape the function and the lobby
+        # accept: the same characters, but starting like a Docker tag (not "." or "-").
+        self.assertIn(r'can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$", v))', GAMES)
+        self.assertIn(r'can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}-[0-9a-f]{12}$", t))', GAMES)
         self.assertEqual(self.lf_sim_shape(), "[A-Za-z0-9._-]{1,64}")
 
     def lf_sim_shape(self):
