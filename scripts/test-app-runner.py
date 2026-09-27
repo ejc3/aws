@@ -367,7 +367,35 @@ class LaunchTests(unittest.TestCase):
 
     def test_the_reserve_outlasts_a_launch_handoff(self):
         app, *_ = load_app()
-        self.assertGreaterEqual(app.RESERVE_SECONDS, 2 * (3 + 8), "a handoff after the last attempt must fit")
+        # A failed handoff past the deadline (credential write, terminate) plus publishing.
+        self.assertGreaterEqual(app.RESERVE_SECONDS, 3 * (3 + 8), "a failed handoff after the last attempt must fit")
+
+    def test_a_failed_handoff_past_the_deadline_terminates_but_skips_the_tidy_up(self):
+        app, ec2, ssm, _ = load_app()
+        ssm.fail_put = True
+        app.DEADLINE[0] = time.monotonic() + 100
+        real = ec2.run_instances
+        def accepted_late(**kw):
+            out = real(**kw)
+            app.DEADLINE[0] = 0
+            return out
+        ec2.run_instances = accepted_late
+        outcome, _ = app.ensure_runner(COLTON, REPOS[COLTON], app.config()[1], "PAT", "7", "xl", [])
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(ec2.terminated, [ec2.instances[0]["InstanceId"]])
+        self.assertEqual(ssm.deleted, [], "the parameter tidy-up must not run past the deadline")
+
+    def test_a_subnet_out_of_addresses_falls_through_to_the_next_pool(self):
+        app, ec2, *_ = load_app()
+        calls = []
+        real = ec2.run_instances
+        def full_first_subnet(**kw):
+            calls.append(kw["NetworkInterfaces"][0]["SubnetId"])
+            if len(calls) == 1:
+                raise Refused("InsufficientFreeAddressesInSubnet")
+            return real(**kw)
+        ec2.run_instances = full_first_subnet
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
 
     def test_launches_use_a_client_with_sdk_retries_off(self):
         # A retried InsufficientInstanceCapacity cost 7-15 s per pool on the metal controller.

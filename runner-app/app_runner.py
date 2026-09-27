@@ -62,8 +62,7 @@ ec2 = boto3.client('ec2', region_name=REGION, config=BOUNDED)
 launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(
     connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
 # RunInstances at its worst (connect + read above). An attempt starts only if this much of the
-# repo's share is left; RESERVE_SECONDS covers the credential handoff after it (bounded SSM,
-# at most 2 x 11 s) and publishing the counts.
+# repo's share is left; RESERVE_SECONDS covers what may follow it past the deadline (below).
 LAUNCH_ATTEMPT_SECONDS = 3 + 10
 ssm = boto3.client('ssm', region_name=REGION, config=BOUNDED)
 secrets = boto3.client('secretsmanager', region_name=REGION, config=BOUNDED)
@@ -91,7 +90,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #                         job's claim and let a later round decide
 #   anything else      -> definite refusal; raise LaunchRefused so the error alarm fires
 CAPACITY_CODES = {'InsufficientInstanceCapacity', 'Unsupported', 'SpotMaxPriceTooLow',
-                  'InsufficientCapacityOnHost', 'UnfulfillableCapacity'}
+                  'InsufficientCapacityOnHost', 'UnfulfillableCapacity', 'InsufficientFreeAddressesInSubnet'}
 AMBIGUOUS_CODES = {'InternalError', 'InternalFailure', 'ServiceUnavailable', 'Unavailable',
                    'RequestLimitExceeded', 'Throttling', 'ThrottlingException', 'RequestTimeout',
                    'RequestTimeoutException'}
@@ -166,7 +165,7 @@ def job_size(cfg, labels):
 # call. handler() gives each repo an equal share of the invocation's remaining time (minus a
 # reserve for publishing counts), and a repo's scan stops at its share.
 DEADLINE = [float('inf')]
-RESERVE_SECONDS = 25
+RESERVE_SECONDS = 35
 
 
 def out_of_time(need=0.0):
@@ -179,7 +178,9 @@ def out_of_time(need=0.0):
 # start, and the reconcile stops with what it has. Every call is bounded (BOUNDED, github()'s
 # timeout), so at most one call is in flight past the deadline. The exception is HANDOFF: the
 # credential handoff and cleanup after EC2 accepted a launch, and releasing a claim, which must
-# finish. RESERVE_SECONDS covers one in-flight call or one handoff, plus publishing the counts.
+# finish. RESERVE_SECONDS covers the longest of those past the deadline -- a handoff whose
+# credential write fails and whose host is then terminated (2 bounded calls; the parameter's
+# tidy-up is skipped when late) -- plus publishing the counts: 3 x 11 s.
 class OutOfTime(Exception):
     pass
 
@@ -425,10 +426,13 @@ def settle(repo, instance_id, instance_type, subnet, job_id, labels, token):
             # The host may still be alive: an ambiguous outcome, so the claim must stay.
             print(f'{repo}: could not terminate {instance_id} ({type(cleanup).__name__}); keeping the claim')
             return None, False
-        try:
-            ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
-        except Exception:
-            pass
+        # Tidy-up only: the parameter is readable by that (now terminated) host alone, and
+        # fcvm's cleanup sweeps it once expired. Past the deadline, leave it.
+        if not out_of_time():
+            try:
+                ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
+            except Exception:
+                pass
         return None, True
     print(f"{repo}: launched {instance_id} ({instance_type}, {subnet['availability_zone']}) for job {job_id} [{labels}]")
     return instance_id, False
