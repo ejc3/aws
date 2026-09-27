@@ -1460,7 +1460,9 @@ credential boundary, credential-free ordinary CI, protected backups and Access p
 
 **Outside users.** Two surfaces now let people outside the owner reach AWS resources this
 repo runs. Unlike the dev hosts, they are not behind Cloudflare Access, and their users are
-not trusted with root:
+not trusted: multiplayer players get no shell anywhere, while a runner job gets root on its own
+disposable VM (the `runner` account has passwordless sudo), so the boundary there is the VM,
+its instance role and its network, not the account:
 
 - **Games multiplayer.** The public lobby at `cc-games.app` launches Fargate match engines,
   and anyone on the internet can connect to `play.cc-games.app`, an internet-facing ALB.
