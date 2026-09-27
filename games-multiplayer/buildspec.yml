@@ -1,0 +1,21 @@
+# CodeBuild project games-mp-images (games-multiplayer-bringup.tf).
+#
+# The source is the pinned CoderColton/colton-games commit, uploaded to S3 by the jumpbox
+# (bringup.py build), with bringup.py itself added at .games-mp/bringup.py. That driver
+# builds and pushes ONLY the tags ECR lacks (tags are immutable, so an existing tag means
+# "already pushed"), after checking that the repo's scripts/mp-images.mjs would produce
+# exactly the tags Terraform put in the task definitions (GAMES_MP_EXPECT).
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 24
+      python: 3.12
+  build:
+    commands:
+      - test "$(cat .games-mp/SOURCE_REF | cut -c1-12)" = "$GAMES_MP_SHA12"
+      - python3 .games-mp/bringup.py codebuild-images

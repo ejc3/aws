@@ -10,7 +10,11 @@
 #                                 `games/mp-router`, service `mp-router`, port 8080,
 #                                 https://play.cc-games.app (+ *.play.cc-games.app)
 # Changing a name here without changing that file breaks the lobby, the router or the
-# image build script. Apply order and costs: docs/games-multiplayer.md.
+# image build script. Bring-up, shipping and costs: docs/games-multiplayer.md.
+#
+# games-multiplayer-bringup.tf is the other half: it builds the images (CodeBuild),
+# generates the secrets, writes the Vercel env, applies the Supabase migration and waits
+# for a healthy router, so ONE `terraform apply` goes from nothing to a working platform.
 #
 #   browser --wss://play.cc-games.app/m/<id>?t=<token>--> ALB games-play (443, ACM)
 #       --> mp-router service (games-router SG; verifies the HMAC token, proxies)
@@ -23,19 +27,49 @@
 # always-on task against ~$33/month plus data for a NAT gateway. Nothing can connect IN to
 # a task except through the security-group chain below.
 #
-# FIRST APPLY IS SAFE BEFORE ANY IMAGE EXISTS. The router's task definition and service,
-# and each engine's task definition, are created only once their image tag variable is
-# set. Everything they depend on (ECR, cluster, IAM, ALB, certificate, DNS, secret,
-# sweeper) is created unconditionally, so images can be pushed after the first apply.
+# IMAGES COME FROM ONE PINNED COMMIT. var.games_mp_source_ref names a commit of
+# CoderColton/colton-games; its image tags are derived from it (router `<sha12>`, engine
+# `<simVersion>-<sha12>`, the same scheme as the repo's scripts/mp-images.mjs), CodeBuild
+# builds whatever ECR lacks, and the task definitions are created only after that build
+# succeeded. Shipping a new version = changing that one variable and applying.
+
+# The pin must include engine-side preview support: engines launched by a preview lobby
+# call back its protected *.vercel.app URL with x-vercel-protection-bypass (MP_API_BYPASS,
+# passed by the lobby). 38bcb780 (games repo PR #62, mp/preview) has it.
+variable "games_mp_source_ref" {
+  description = "Full 40-hex commit of CoderColton/colton-games whose multiplayer images (and mp migration) this stack runs."
+  type        = string
+  default     = "38bcb78010d2d40f50035d6e03f080ddb661c243"
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.games_mp_source_ref))
+    error_message = "games_mp_source_ref must be a full 40-character lowercase commit sha, not a branch or a short sha."
+  }
+}
+
+variable "games_mp_sim_versions" {
+  description = "Each game's SIM_VERSION at games_mp_source_ref (server/<game>/version.mjs). The build fails if the repo disagrees."
+  type        = map(string)
+  default     = { mptest = "mptest-1" }
+}
+
+# EMERGENCY SWITCH. false = no CodeBuild run during apply; the task definitions then use the
+# explicit tags below (which must already be in ECR), exactly like the pre-automation stack.
+# Use it when CodeBuild or GitHub is down and a known-good image must be pinned.
+variable "games_mp_build" {
+  description = "Build images with CodeBuild during apply. false = use mp_router_image_tag / mp_engine_image_tags as given."
+  type        = bool
+  default     = true
+}
 
 variable "mp_router_image_tag" {
-  description = "Tag of games/mp-router to run (e.g. a git sha). Empty = no router service yet; set it after the first image is pushed."
+  description = "Only when games_mp_build = false: games/mp-router tag to run. Empty = no router service."
   type        = string
   default     = ""
 }
 
 variable "mp_engine_image_tags" {
-  description = "Engine image tag (the game's simVersion) per game id in local.mp_games. A game with no entry has no task definition yet."
+  description = "Only when games_mp_build = false: engine tag per game id. A game with no entry has no task definition."
   type        = map(string)
   default     = {}
 }
@@ -81,9 +115,10 @@ variable "mp_router_envs" {
 }
 
 locals {
-  # ADDING A GAME IS ONE ENTRY HERE (plus its image tag in var.mp_engine_image_tags once
-  # the image is pushed). The key is the contract's game id: it names the ECR repository
-  # `games/<id>-engine`, the task definition `games-<id>`, and the log stream prefix.
+  # ADDING A GAME IS ONE ENTRY HERE plus its SIM_VERSION in var.games_mp_sim_versions (and
+  # an image in the games repo's scripts/mp-images.mjs). The key is the contract's game
+  # id: it names the ECR repository `games/<id>-engine`, the task definition `games-<id>`,
+  # and the log stream prefix.
   # Sizes are the contract's 2 vCPU / 4 GB; a game may override them if it needs to.
   mp_games = {
     mptest = { cpu = 2048, memory = 4096 }
@@ -118,12 +153,22 @@ locals {
     "https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app",
   ]
 
+  games_mp_sha12 = substr(var.games_mp_source_ref, 0, 12)
+
+  # The tags the task definitions run. With the build on they are derived from the pinned
+  # commit; CodeBuild is told to produce exactly these and fails if the repo disagrees.
+  mp_router_tag = var.games_mp_build ? local.games_mp_sha12 : var.mp_router_image_tag
+  mp_engine_tags = var.games_mp_build ? {
+    for id in keys(local.mp_games) : id => "${var.games_mp_sim_versions[id]}-${local.games_mp_sha12}"
+    if contains(keys(var.games_mp_sim_versions), id)
+  } : var.mp_engine_image_tags
+
   mp_engine_task_defs = {
     for id, cfg in local.mp_games : id => cfg
-    if lookup(var.mp_engine_image_tags, id, "") != ""
+    if lookup(local.mp_engine_tags, id, "") != ""
   }
 
-  mp_router_enabled = var.mp_router_image_tag != ""
+  mp_router_enabled = local.mp_router_tag != ""
 
   # Vercel team slug and project. The OIDC issuer, audience and subject all embed these
   # strings; renaming the team or project in Vercel changes the token claims and locks the
@@ -141,10 +186,9 @@ locals {
 # match only against equal simVersions and a match launches the image with that tag, so a
 # tag that could be re-pushed would let two matches of the "same" version run different
 # code, and a running match's image could change under a reconnect. For the router, the
-# tag is what var.mp_router_image_tag pins, and a rollback to a previous tag must mean the
-# previous bytes. The cost: an engine fix that does not change simulation behaviour still
-# needs a new tag (bump simVersion, or the build script uses `<simVersion>-<n>`), and the
-# build script must treat "tag already exists" as "already pushed", not an error.
+# tag is the commit it was built from, and a rollback to a previous commit must mean the
+# previous bytes. Every tag carries the commit (`<sha12>`, `<simVersion>-<sha12>`), so a fix
+# is always a new tag, and the build treats "tag already exists" as "already pushed".
 #
 # Scan on push is the free basic scan. Keeping the last 20 images bounds storage (a few
 # cents) while leaving far more history than any rollback or simVersion overlap needs.
@@ -224,34 +268,35 @@ resource "aws_cloudwatch_log_group" "games_mp_router" {
 # Token key secret
 # -------------------------------------------------------------------------------------
 #
-# Container only; EJ sets the value outside Terraform so it never enters state (the same
-# pattern as vercel_api_token in vercel.tf). The value is the contract's MP_TOKEN_KEYS:
+# The value is generated by Terraform (games-multiplayer-bringup.tf) in the contract's
+# MP_TOKEN_KEYS format:
 #
-#   kid1:<base64 of 32+ random bytes>[,kid2:<...>]
+#   kid1:<base64 of 32 random bytes>[,kid2:<...>]
 #
-# The first key signs, every listed key verifies. Rotate by prepending a new key, waiting
-# for both the lobby and the router to pick it up (tokens live 120 s), then dropping the
-# old one. The SAME string goes into the Vercel project's MP_TOKEN_KEYS env var: the lobby
-# signs with it, the router verifies with it.
+# The first key signs, every listed key verifies. The SAME string is written to the Vercel
+# project's MP_TOKEN_KEYS: the lobby signs with it, the router verifies with it. Rotation is
+# var.games_mp_token_kids (see there). The value is in Terraform state, which lives in the
+# encrypted, versioned S3 backend that only administration can read.
 #
-# Set it from the jumpbox (the key goes through stdin, never argv, which every local user
-# can read in /proc/<pid>/cmdline):
-#
-#   printf 'kid1:%s' "$(openssl rand -base64 32)" | aws secretsmanager put-secret-value \
-#     --region us-west-1 --secret-id games/mp-token-keys --secret-string file:///dev/stdin
-#
-# The router reads it only at task start (ECS injects it), so after changing it run
-# `aws ecs update-service --cluster games --service mp-router --force-new-deployment`
-# (a documented operational action, like a reboot; it changes no managed configuration).
-#
-# No prevent_destroy: unlike the one-time Cloudflare tokens, this key is minted locally
-# and every token it signs expires in two minutes, so losing it costs one re-mint.
+# No prevent_destroy: every token this key signs expires in two minutes, so losing it costs
+# one re-mint (the next apply).
 
 resource "aws_secretsmanager_secret" "games_mp_token_keys" {
   name                    = "games/mp-token-keys"
-  description             = "MP_TOKEN_KEYS for the games mp-router: kid1:<base64 32+ bytes>[,kid2:...]. Value set outside Terraform."
+  description             = "MP_TOKEN_KEYS for the games mp-router: kid1:<base64 32+ bytes>[,kid2:...]. Generated by Terraform."
   recovery_window_in_days = 7
   tags                    = { Name = "games/mp-token-keys", Managed = "terraform", Project = "games-multiplayer" }
+}
+
+locals {
+  # Who may read the games secrets besides a secret's own consumer: the same administration
+  # set as vercel_api_token (vercel.tf).
+  games_mp_admin_principals = [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
+    aws_iam_role.jumpbox_admin[0].arn,
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AdministratorAccess_*",
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*",
+  ]
 }
 
 # Only administration and the router's execution role may read it. Anyone holding this
@@ -268,13 +313,7 @@ resource "aws_secretsmanager_secret_policy" "games_mp_token_keys" {
       Resource  = aws_secretsmanager_secret.games_mp_token_keys.arn
       Condition = {
         ArnNotLike = {
-          "aws:PrincipalArn" = [
-            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
-            aws_iam_role.jumpbox_admin[0].arn,
-            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AdministratorAccess_*",
-            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*",
-            aws_iam_role.games_mp_router_execution.arn,
-          ]
+          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.games_mp_router_execution.arn])
         }
       }
     }]
@@ -831,11 +870,10 @@ resource "cloudflare_dns_record" "games_play" {
 # Router service
 # -------------------------------------------------------------------------------------
 #
-# Absent until var.mp_router_image_tag is set. An ECS service pointed at an image that
-# does not exist yet would sit in a pull-fail loop (and a task definition with an empty
-# tag is not a valid image reference), so the first apply creates everything around the
-# router and the second, after the image is pushed, creates the router itself. Until then
-# the ALB answers 503 (no healthy targets), which is the honest answer.
+# Created only after its image exists: the task definition depends on the CodeBuild step
+# (terraform_data.games_mp_build), so a new tag is never registered before it is pushed,
+# and an ECS service never sits in a pull-fail loop. With games_mp_build = false the
+# router exists once mp_router_image_tag is set (that tag must already be in ECR).
 
 resource "aws_ecs_task_definition" "games_mp_router" {
   count = local.mp_router_enabled ? 1 : 0
@@ -855,7 +893,7 @@ resource "aws_ecs_task_definition" "games_mp_router" {
 
   container_definitions = jsonencode([{
     name         = "mp-router"
-    image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:${var.mp_router_image_tag}"
+    image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:${local.mp_router_tag}"
     essential    = true
     portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
     environment = [
@@ -867,8 +905,12 @@ resource "aws_ecs_task_definition" "games_mp_router" {
       { name = "MP_ALLOWED_ORIGINS", value = join(",", local.mp_allowed_origins) },
       { name = "MP_TARGET_CIDRS", value = join(",", [for s in local.mp_subnets : s.cidr_block]) },
     ]
+    # Pinned to the exact secret VERSION (<arn>:<json-key>:<version-stage>:<version-id>, the
+    # first two empty). A key rotation writes a new version, which changes this task
+    # definition, so ECS rolls the router onto the new keys and the rollout is identified
+    # by its own task definition ARN: a rollback can never pass for the rotated deployment.
     secrets = [
-      { name = "MP_TOKEN_KEYS", valueFrom = aws_secretsmanager_secret.games_mp_token_keys.arn },
+      { name = "MP_TOKEN_KEYS", valueFrom = "${aws_secretsmanager_secret.games_mp_token_keys.arn}:::${aws_secretsmanager_secret_version.games_mp_token_keys.version_id}" },
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -882,7 +924,10 @@ resource "aws_ecs_task_definition" "games_mp_router" {
     stopTimeout = 30
   }])
 
-  tags = { Name = "games-mp-router", Project = "games-multiplayer" }
+  tags = { Name = "games-mp-router", Project = "games-multiplayer", ImageTag = local.mp_router_tag }
+
+  # The image must be in ECR before a task definition names it.
+  depends_on = [terraform_data.games_mp_build]
 }
 
 # Zero-downtime rollout: minimum 100% / maximum 200% means ECS starts the new task, waits
@@ -934,7 +979,8 @@ resource "aws_ecs_service" "games_mp_router" {
 # Engine task definitions: games-<game>
 # -------------------------------------------------------------------------------------
 #
-# One per entry in local.mp_games that has an image tag. The lobby launches these with
+# One per entry in local.mp_games that has an image tag, registered only after the build
+# pushed that tag. The lobby launches these with
 # RunTask, adding MATCH_ID, MATCH_SECRET and MP_API as container overrides and tagging the
 # task (see the sweeper below).
 #
@@ -963,7 +1009,7 @@ resource "aws_ecs_task_definition" "games_engine" {
 
   container_definitions = jsonencode([{
     name         = "engine"
-    image        = "${aws_ecr_repository.games_mp["games/${each.key}-engine"].repository_url}:${var.mp_engine_image_tags[each.key]}"
+    image        = "${aws_ecr_repository.games_mp["games/${each.key}-engine"].repository_url}:${local.mp_engine_tags[each.key]}"
     essential    = true
     portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
     environment = [
@@ -983,7 +1029,9 @@ resource "aws_ecs_task_definition" "games_engine" {
     stopTimeout = 30
   }])
 
-  tags = { Name = "games-${each.key}", Project = "games-multiplayer", SimVersion = var.mp_engine_image_tags[each.key] }
+  tags = { Name = "games-${each.key}", Project = "games-multiplayer", ImageTag = local.mp_engine_tags[each.key] }
+
+  depends_on = [terraform_data.games_mp_build]
 }
 
 # -------------------------------------------------------------------------------------
@@ -1187,21 +1235,11 @@ resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_silent" {
 # Outputs
 # -------------------------------------------------------------------------------------
 
-# Copy these into the colton-games Vercel project's env (all three environments):
-#   terraform output -json games_mp_vercel_env
-# Also set AWS_REGION=us-west-1 there: Vercel otherwise sets AWS_REGION to the function's
-# own region, which can move (https://vercel.com/docs/oidc/aws).
+# The non-secret Vercel settings, for reference. Terraform itself writes them (and the
+# secrets) to the colton-games project: games-multiplayer-bringup.tf.
 output "games_mp_vercel_env" {
-  description = "Vercel env vars for the multiplayer lobby's ECS launcher"
-  value = {
-    MP_ROLE_ARN     = aws_iam_role.games_mp_launcher.arn
-    MP_CLUSTER      = aws_ecs_cluster.games.name
-    MP_SUBNETS      = join(",", [for s in local.mp_subnets : s.id])
-    MP_ENGINE_SG    = aws_security_group.games_engine.id
-    MP_REGION       = var.aws_region
-    MP_LAUNCHER     = "ecs"
-    MP_PUBLIC_ENTRY = "wss://${local.mp_play_domain}"
-  }
+  description = "Non-secret multiplayer settings Terraform writes to the colton-games Vercel project"
+  value       = local.games_mp_vercel_shared_config
 }
 
 output "games_mp_alb_dns_name" {

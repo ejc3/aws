@@ -1,8 +1,10 @@
 # Colton Games production on Vercel, with cc-games.app as its primary domain.
 #
-# The project lives in the Vercel team `coltons-projects-7f9a4e8b`. This stack manages its
-# DOMAINS only. The project's settings and env vars stay in Vercel for now: several env values
-# are database credentials, and importing them would copy those into Terraform state.
+# The project lives in the Vercel team `coltons-projects-7f9a4e8b`. This file manages its
+# DOMAINS. The project's settings and env vars stay in Vercel: several env values are database
+# credentials, and importing them would copy those into Terraform state. The one exception is
+# the multiplayer set (MP_*, CRON_SECRET, AWS_ROLE_ARN/AWS_REGION, Preview's Skyhook pair and
+# the automation bypass), which Terraform creates and owns: games-multiplayer-bringup.tf.
 #
 # Rollout is staged so production never redirects to a domain that is not serving yet:
 #   stage 2 (this file): cc-games.app becomes a project domain, ccgames.app redirects to it,
