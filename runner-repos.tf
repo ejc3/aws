@@ -6,7 +6,8 @@
 #
 # STEP 1 (this file, for now): each repo's controller token. A runner registration token needs
 # repo ADMIN, so each repo's owner mints a fine-grained token limited to that one repo with
-# Administration RW (register, list, remove runners) and Webhooks RW (the workflow_job hook):
+# Administration RW (register, list, remove runners), Webhooks RW (the workflow_job hook) and
+# Actions read-only (the reconcile lists queued runs and their jobs):
 #   CoderColton/colton-games       minted by CoderColton (ejc3 has write, not admin there)
 #   dolphin-labs-hq/dolphin-labs   minted by ejc3 as org admin
 #
@@ -28,7 +29,7 @@ resource "aws_secretsmanager_secret" "github_runner_repo_pat" {
   for_each = var.enable_github_runner ? toset(local.runner_extra_repos) : toset([])
 
   name                    = "github-runner/repo-pat/${each.value}"
-  description             = "Fine-grained GitHub token for ${each.value} only: Administration RW + Webhooks RW (runner controller). Set by hand."
+  description             = "Fine-grained GitHub token for ${each.value} only: Administration RW + Webhooks RW + Actions read (runner controller). Set by hand."
   recovery_window_in_days = 7
   tags                    = { Name = "github-runner-repo-pat", Managed = "terraform" }
 }

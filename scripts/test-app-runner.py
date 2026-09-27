@@ -66,6 +66,8 @@ class FakeEC2:
         self.attempts = getattr(self, "attempts", []) + [kw]
         if getattr(self, "ambiguous", False):
             raise TimeoutError("Read timeout on endpoint URL")
+        if getattr(self, "refuse_code", None):
+            raise Refused(self.refuse_code)
         if kw["InstanceType"] in self.refuse:
             raise Refused("InsufficientInstanceCapacity")
         iid = "i-%017x" % self.next
@@ -86,18 +88,24 @@ class FakeDynamo:
             pass
 
     def __init__(self):
-        self.items, self.deleted = {}, []
+        self.items, self.deleted, self.queries = {}, [], []
 
     def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues):
-        pk, t = Item["pk"]["S"], int(ExpressionAttributeValues[":now"]["N"])
-        held = self.items.get(pk)
+        key, t = (Item["repo"]["S"], Item["job"]["S"]), int(ExpressionAttributeValues[":now"]["N"])
+        held = self.items.get(key)
         if held is not None and int(held["expires_at"]["N"]) >= t:
-            raise self.exceptions.ConditionalCheckFailedException(pk)
-        self.items[pk] = Item
+            raise self.exceptions.ConditionalCheckFailedException(key)
+        self.items[key] = Item
+
+    def query(self, TableName, ConsistentRead, KeyConditionExpression, ExpressionAttributeValues, **kw):
+        self.queries.append(ConsistentRead)
+        repo = ExpressionAttributeValues[":repo"]["S"]
+        return {"Items": [item for (r, _), item in self.items.items() if r == repo]}
 
     def delete_item(self, TableName, Key):
-        self.deleted.append(Key["pk"]["S"])
-        self.items.pop(Key["pk"]["S"], None)
+        key = (Key["repo"]["S"], Key["job"]["S"])
+        self.deleted.append(key)
+        self.items.pop(key, None)
 
 
 class FakeCloudWatch:
@@ -309,6 +317,31 @@ class LaunchTests(unittest.TestCase):
         self.assertIsNone(app.repo_pat(REPOS[COLTON]), "no value yet is the expected bootstrap state")
         with self.assertRaises(Refused):
             app.repo_pat(REPOS[DOLPHIN])
+
+    def test_the_cap_holds_in_a_burst_the_listing_has_not_caught_up_with(self):
+        # Distinct jobs, each redelivered after the listing "lost" the previous launches: the
+        # consistent claims still count them against the repo's cap (3 for dolphin here).
+        app, ec2, *_ = load_app()
+        outcomes = []
+        for job in range(1, 6):
+            outcomes.append(self.deliver(app, repo=DOLPHIN, labels=("self-hosted", "dolphin", "l"), job=job)["outcome"])
+            ec2.instances.clear()
+        self.assertEqual(outcomes, ["launched"] * 3 + ["cap"] * 2)
+        self.assertTrue(all(app.fake_dynamo.queries), "the cap must be counted with a consistent read")
+
+    def test_a_definite_launch_refusal_is_raised_and_frees_the_job(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse_code = "UnauthorizedOperation"
+        with self.assertRaises(app.LaunchRefused):
+            self.deliver(app)
+        self.assertEqual(len(app.fake_dynamo.deleted), 1)
+        self.assertEqual(len(ec2.attempts), 1, "a definite refusal must not be tried on every other pool")
+
+    def test_throttling_is_ambiguous_and_keeps_the_claim(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse_code = "RequestLimitExceeded"
+        self.assertEqual(self.deliver(app)["outcome"], "failed")
+        self.assertEqual(app.fake_dynamo.deleted, [])
 
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()

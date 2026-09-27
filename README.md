@@ -170,7 +170,7 @@ console or AWS CLI without printing their values.
 The runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` also need one
 controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (containers
 from `runner-repos.tf`, created by the normal apply; Terraform never holds the value). Each is a
-fine-grained token limited to that one repo with Administration and Webhooks read-write, minted
+fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
 org admin for `dolphin-labs`. Put each value without echoing it:
 

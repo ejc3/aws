@@ -241,7 +241,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         # One launch claim per job (app_runner.py claim()): conditional put, release on failure.
         Sid      = "LaunchClaims"
         Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Action   = ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.runner_app_claims[0].arn
       },
       {
@@ -339,10 +339,16 @@ resource "aws_dynamodb_table" "runner_app_claims" {
   count        = var.enable_github_runner ? 1 : 0
   name         = "github-app-runner-claims"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
+  hash_key     = "repo"
+  range_key    = "job"
 
   attribute {
-    name = "pk"
+    name = "repo"
+    type = "S"
+  }
+
+  attribute {
+    name = "job"
     type = "S"
   }
 

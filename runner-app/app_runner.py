@@ -69,9 +69,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 
-# RunInstances errors that mean nothing was created (see launch()).
+# How launch() treats a RunInstances error:
+#   capacity refusal   -> nothing created; try the next pool
+#   ambiguous          -> may have created an instance (no response, throttling, 5xx); keep the
+#                         job's claim and let a later round decide
+#   anything else      -> definite refusal; raise LaunchRefused so the error alarm fires
 CAPACITY_CODES = {'InsufficientInstanceCapacity', 'Unsupported', 'SpotMaxPriceTooLow',
                   'InsufficientCapacityOnHost', 'UnfulfillableCapacity'}
+AMBIGUOUS_CODES = {'InternalError', 'InternalFailure', 'ServiceUnavailable', 'Unavailable',
+                   'RequestLimitExceeded', 'Throttling', 'ThrottlingException', 'RequestTimeout',
+                   'RequestTimeoutException'}
+
+
+class LaunchRefused(Exception):
+    pass
 
 def now():
     return datetime.now(timezone.utc)
@@ -250,12 +261,16 @@ def launch(repo, cfg, subnets, size, job_id, token):
             except Exception as error:
                 last_error = error
                 code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
-                if code not in CAPACITY_CODES:
+                if code in CAPACITY_CODES:
+                    print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
+                    continue
+                if code is None or code in AMBIGUOUS_CODES:
                     print(f"{repo}: launch for job {job_id} ended ambiguously ({type(error).__name__} {code}); "
                           'not trying another pool this round')
                     return None, False
-                print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
-                continue
+                # Definite (UnauthorizedOperation, InvalidAMIID.*, a quota ...): nothing was created,
+                # and retrying other pools or later rounds will not help. Make it loud.
+                raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}') from error
             instance_id = response['Instances'][0]['InstanceId']
             try:
                 broker(instance_id, *token)
@@ -282,18 +297,33 @@ def claim(repo, job_id):
     try:
         dynamodb.put_item(
             TableName=os.environ['CLAIMS_TABLE'],
-            Item={'pk': {'S': f'{repo}#{job_id}'}, 'expires_at': {'N': str(t + CLAIM_SECONDS)},
+            Item={'repo': {'S': repo}, 'job': {'S': job_id}, 'expires_at': {'N': str(t + CLAIM_SECONDS)},
                   'ttl': {'N': str(t + 86400)}},
-            ConditionExpression='attribute_not_exists(pk) OR expires_at < :now',
+            ConditionExpression='attribute_not_exists(job) OR expires_at < :now',
             ExpressionAttributeValues={':now': {'N': str(t)}})
         return True
     except dynamodb.exceptions.ConditionalCheckFailedException:
         return False
 
 
+def active_claims(repo):
+    """Jobs this repo launched for (or is launching for) within CLAIM_SECONDS. A consistent read:
+    together with the serialized controller (reserved concurrency 1) it makes the repo cap hold
+    even when DescribeInstances has not caught up with a burst of launches."""
+    t, found, page = int(now().timestamp()), set(), {}
+    while True:
+        response = dynamodb.query(
+            TableName=os.environ['CLAIMS_TABLE'], ConsistentRead=True,
+            KeyConditionExpression='repo = :repo', ExpressionAttributeValues={':repo': {'S': repo}}, **page)
+        found |= {item['job']['S'] for item in response.get('Items', []) if int(item['expires_at']['N']) >= t}
+        if 'LastEvaluatedKey' not in response:
+            return found
+        page = {'ExclusiveStartKey': response['LastEvaluatedKey']}
+
+
 def release(repo, job_id):
     try:
-        dynamodb.delete_item(TableName=os.environ['CLAIMS_TABLE'], Key={'pk': {'S': f'{repo}#{job_id}'}})
+        dynamodb.delete_item(TableName=os.environ['CLAIMS_TABLE'], Key={'repo': {'S': repo}, 'job': {'S': job_id}})
     except Exception as error:  # the claim then just expires
         print(f'{repo}: could not release the claim for job {job_id}: {type(error).__name__}')
 
@@ -302,7 +332,12 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     """Launch for `job_id` unless it already has a host or the repo is at its cap."""
     if any(tag(i, 'JobId') == job_id for i in live):
         return 'exists', token
-    if len(live) >= int(cfg['max']):
+    claimed = active_claims(repo)
+    if job_id in claimed:
+        return 'claimed', token
+    # Hosts the listing shows, plus launches it may not show yet (their claims).
+    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | claimed
+    if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
     if not claim(repo, job_id):
@@ -311,9 +346,9 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
         token = token or registration_token(repo, pat)
         instance_id, definite = launch(repo, cfg, subnets, size, job_id, token)
     except Exception:
-        # Anything raised here came before any RunInstances request (the token, the AMI lookup):
-        # launch() handles every error from RunInstances itself. Nothing was launched, so free
-        # the job for the next round instead of holding it for CLAIM_SECONDS.
+        # Anything raised here launched nothing: a failure before RunInstances (the token, the
+        # AMI lookup) or a definite RunInstances refusal (LaunchRefused). Free the job for the
+        # next round rather than holding it for CLAIM_SECONDS, and let the error reach the alarm.
         release(repo, job_id)
         raise
     if instance_id:
