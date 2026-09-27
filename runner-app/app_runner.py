@@ -59,7 +59,11 @@ ec2 = boto3.client('ec2', region_name=REGION, config=BOUNDED)
 # the default client retried that same pool with backoff for 7-15 seconds before launch() could
 # move on. launch() walks the pools itself, and each attempt has its own ClientToken.
 launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(
-    connect_timeout=3, read_timeout=20, retries={'total_max_attempts': 1}))
+    connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+# RunInstances at its worst (connect + read above). An attempt starts only if this much of the
+# repo's share is left; RESERVE_SECONDS covers the credential handoff after it (bounded SSM,
+# at most 2 x 11 s) and publishing the counts.
+LAUNCH_ATTEMPT_SECONDS = 3 + 10
 ssm = boto3.client('ssm', region_name=REGION, config=BOUNDED)
 secrets = boto3.client('secretsmanager', region_name=REGION, config=BOUNDED)
 dynamodb = boto3.client('dynamodb', region_name=REGION, config=BOUNDED)
@@ -159,11 +163,12 @@ def job_size(cfg, labels):
 # call. handler() gives each repo an equal share of the invocation's remaining time (minus a
 # reserve for publishing counts), and a repo's scan stops at its share.
 DEADLINE = [float('inf')]
-RESERVE_SECONDS = 15
+RESERVE_SECONDS = 25
 
 
-def out_of_time():
-    return time.monotonic() >= DEADLINE[0]
+def out_of_time(need=0.0):
+    """True once the repo's share is spent, or has less than `need` seconds left."""
+    return time.monotonic() + need >= DEADLINE[0]
 
 
 def pages(repo, path, key, pat, budget):
@@ -315,7 +320,7 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
         for instance_type in cfg['sizes'][size]:
             # Each attempt may take the launch client's full read timeout: none starts after
             # the repo's deadline. Every earlier attempt was a capacity refusal, so nothing exists.
-            if out_of_time():
+            if out_of_time(LAUNCH_ATTEMPT_SECONDS):
                 print(f'{repo}: out of time before a pool accepted job {job_id}; next round retries')
                 return None, True
             attempt += 1
@@ -452,8 +457,12 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
-    # Hosts by instance (two hosts can carry one JobId, above), plus claims not yet listed.
-    in_use = {i['InstanceId'] for i in running} | set(claimed)
+    # Hosts by instance (two hosts can carry one JobId, above), plus claims for launches not in
+    # `running` at all. A launch this invocation made is in `live` (with its ClientToken) but not
+    # yet listed: its claim must stay, but it is one slot, not two.
+    held = {i.get('ClientToken') or '' for i in running}
+    unseen = {job for job, nonce in claimed.items() if not (nonce and any(t.startswith(nonce + '-') for t in held))}
+    in_use = {i['InstanceId'] for i in running} | unseen
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
@@ -471,7 +480,7 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
         raise
     if instance_id:
         live.append({'InstanceId': instance_id, 'Tags': [{'Key': 'JobId', 'Value': job_id}],
-                     'LaunchTime': now(), 'State': {'Name': 'pending'}})
+                     'LaunchTime': now(), 'State': {'Name': 'pending'}, 'ClientToken': f'{nonce}-local'})
         return 'launched', token
     if definite:
         release(repo, job_id)

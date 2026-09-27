@@ -74,8 +74,9 @@ class FakeEC2:
         iid = "i-%017x" % self.next
         self.next += 1
         tags = kw["TagSpecifications"][0]["Tags"]
-        self.instances.append({"InstanceId": iid, "Tags": tags, "LaunchTime": NOW, "State": {"Name": "pending"},
-                               "ClientToken": kw["ClientToken"]})
+        if not getattr(self, "listing_lags", False):
+            self.instances.append({"InstanceId": iid, "Tags": tags, "LaunchTime": NOW, "State": {"Name": "pending"},
+                                   "ClientToken": kw["ClientToken"]})
         self.launched.append(kw)
         return {"Instances": [{"InstanceId": iid}]}
 
@@ -331,6 +332,18 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(len(ec2.attempts), 1, "no pool may be tried after the deadline")
         self.assertEqual(len(app.fake_dynamo.deleted), 1, "nothing launched: the job must not wait out its claim")
 
+    def test_no_launch_attempt_starts_without_time_for_one_to_finish(self):
+        app, ec2, *_ = load_app()
+        app.DEADLINE[0] = time.monotonic() + app.LAUNCH_ATTEMPT_SECONDS - 3
+        outcome, _ = app.ensure_runner(COLTON, REPOS[COLTON], app.config()[1], "PAT", "7", "xl", [])
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(getattr(ec2, "attempts", []), [])
+        self.assertEqual(len(app.fake_dynamo.deleted), 1, "nothing launched: the claim goes")
+
+    def test_the_reserve_outlasts_a_launch_handoff(self):
+        app, *_ = load_app()
+        self.assertGreaterEqual(app.RESERVE_SECONDS, 2 * (3 + 8), "a handoff after the last attempt must fit")
+
     def test_launches_use_a_client_with_sdk_retries_off(self):
         # A retried InsufficientInstanceCapacity cost 7-15 s per pool on the metal controller.
         app, ec2, *_ = load_app()
@@ -584,6 +597,17 @@ class ReconcileTests(unittest.TestCase):
                                        busy=frozenset({"i-a", "i-b"}))
         self.assertEqual(outcome, "cap", "three hosts are three slots, whatever their tags")
         self.assertEqual(ec2.launched, [])
+
+    def test_a_burst_the_listing_has_not_caught_up_with_fills_the_cap_exactly(self):
+        # Each launch is in `live` and holds a claim until EC2 lists it: one slot, not two.
+        app, ec2, *_ = load_app()
+        ec2.listing_lags = True
+        gh = app.github
+        gh.runs[(DOLPHIN, "queued")] = [1]
+        gh.jobs[1] = [{"id": 100 + n, "status": "queued", "labels": ["self-hosted", "dolphin", "l"]} for n in range(5)]
+        result = app.reconcile(DOLPHIN, REPOS[DOLPHIN], app.config()[1])
+        self.assertEqual(len(ec2.launched), int(REPOS[DOLPHIN]["max"]))
+        self.assertEqual(result["outcomes"], {"launched": int(REPOS[DOLPHIN]["max"]), "cap": 1})
 
     def test_one_repos_failure_does_not_stop_the_other_and_counts_are_published(self):
         app, *_ = load_app()
