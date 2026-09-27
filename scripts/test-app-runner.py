@@ -406,6 +406,36 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT"), [])
         self.assertEqual(calls, [], "no GitHub call may start after the repo's deadline")
 
+    def backlog(self, app, jobs=50, spend_share_after_scan=False):
+        calls = []
+        app.repo_pat = lambda cfg: "PAT"
+        app.reap = lambda repo, cfg, pat, instances, runners: []
+        app.app_instances = lambda repo: []
+        app.list_runners = lambda repo, pat: {}
+        def queued(repo, cfg, pat):
+            if spend_share_after_scan:
+                app.DEADLINE[0] = 0   # the scan used up the repo's share
+            return [(str(n), "s") for n in range(jobs)]
+        app.queued_jobs = queued
+        def ensure(repo, cfg, subnets, pat, job_id, size, live, token=None):
+            calls.append(job_id)
+            return ("launched" if len(calls) <= int(cfg["max"]) else "cap"), "tok"
+        app.ensure_runner = ensure
+        return calls, app.reconcile(DOLPHIN, REPOS[DOLPHIN], ["subnet-a"])
+
+    def test_a_backlog_stops_at_the_cap(self):
+        app, *_ = load_app()
+        calls, result = self.backlog(app)
+        cap = int(REPOS[DOLPHIN]["max"])
+        self.assertEqual(len(calls), cap + 1, "every job after the first 'cap' would only repeat the same scans")
+        self.assertEqual(result["outcomes"], {"launched": cap, "cap": 1})
+
+    def test_a_backlog_stops_at_the_time_share(self):
+        app, *_ = load_app()
+        calls, result = self.backlog(app, spend_share_after_scan=True)
+        self.assertEqual(calls, [], "no job may be processed after the repo's deadline")
+        self.assertEqual(result["outcomes"], {"deferred": 1})
+
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
         ssm.fail_put = True

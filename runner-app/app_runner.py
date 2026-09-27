@@ -463,8 +463,15 @@ def reconcile(repo, cfg, subnets):
     live = reap(repo, cfg, pat, app_instances(repo), list_runners(repo, pat))
     outcomes, token = {}, None
     for job_id, size in queued_jobs(repo, cfg, pat):
+        # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
+        # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
+        if out_of_time():
+            outcomes['deferred'] = outcomes.get('deferred', 0) + 1
+            break
         outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token)
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if outcome == 'cap':
+            break
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
     return {'repo': repo, 'outcomes': outcomes, 'live': len(live)}
 
