@@ -1118,9 +1118,16 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
 
 **A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
 open a pull request from a fork. Require approval for workflows from all outside
-collaborators in the repo's Actions settings; have the controller refuse jobs whose run comes
-from a fork (the run's `head_repository`), and never serve `pull_request_target`; and give it
-its own cap and alarm.
+collaborators, with the owner's `gh` login (`durablerun` is `first_time_contributors` today):
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+gh api repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval   # check
+```
+
+Also have the controller refuse jobs whose run comes from a fork (the run's
+`head_repository`), never serve `pull_request_target`, and give the repo its own cap and alarm.
 
 **Open gaps, most severe first**
 

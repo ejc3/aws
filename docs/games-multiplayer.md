@@ -334,8 +334,10 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 
 **Monitoring.** Sweeper errors and silence (`games-mp-sweeper-errors`,
 `games-mp-sweeper-not-running`), the account's daily budget, and router and engine logs in
-CloudWatch (14-day retention). ALB access logs are **off** (live), so there is no record of who
-connected. The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
+CloudWatch (14-day retention). ALB access logs are **off** (live), so there is no
+request-level HTTP record; the VPC flow log (`aws_flow_log.security_main`, all traffic, archived
+to the security-audit bucket under `vpc-flow/`) still records every connection to the ALB's
+network interfaces by source address and port. The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
 client-address logic relies on. There is no alarm on router health, ALB 5xx, or the number of
 running engines.
 
