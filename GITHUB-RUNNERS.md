@@ -1023,12 +1023,13 @@ Still open (accepted for now):
 ## Threat model: runners for other repos
 
 Runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` (Pattern C,
-`runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller lands with #172) are the
+`runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
 second place people outside the owner run code on AWS resources we manage. Every writer on
 those repos, and every bot that opens pull requests there (for example
 `app/dolphin-refresh-bot`), can run any command on a runner VM by editing a workflow. Treat
-every job as hostile. Checked against the code and live state on 2026-09-27; the Pattern C
-controller itself was not yet applied, so its parts are checked in code only.
+every job as hostile. Checked against the code and live state on 2026-09-27, after #172 was
+applied: the controller, its schedule, both webhooks and the alarms exist, and its first
+reconcile ran clean.
 
 **What a malicious job can do**
 
@@ -1080,12 +1081,12 @@ its own cap and alarm.
 1. App runners share fcvm's instance role, so a job can write into the session-audit prefix
    of the security-records bucket, enumerate every network interface in the account, and
    write its own row in fcvm's registration table; any grant added for fcvm runners reaches
-   them too. Fix: a dedicated instance role for app runners that can only consume its own
-   bootstrap credential.
-2. fcvm's runner security group admits SSH from the whole runner VPC. Fix: allow runner-to-
-   runner SSH only from fcvm's own runner group.
-3. `too-many-app-runners` fires only when both repos are at their cap together. Fix: a
-   per-repo alarm below the cap.
+   them too. Fix, in #175: a dedicated instance role for app runners that can only consume
+   its own bootstrap credential.
+2. fcvm's runner security group admits SSH from the whole runner VPC. Fix, in #175: allow
+   runner-to-runner SSH only from fcvm's own runner group.
+3. `too-many-app-runners` fires only when both repos are at their cap together. Fix, in
+   #175: a per-repo alarm at each repo's cap.
 4. Colton's controller token expires 2026-10-27; `colton-games` runners stop registering then.
    Renew it with a one-year expiry.
 
