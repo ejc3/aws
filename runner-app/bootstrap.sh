@@ -52,6 +52,7 @@ import sys
 import time
 
 import boto3
+import botocore.exceptions
 
 ssm = boto3.client('ssm')
 name = f'/github-runner/bootstrap/{sys.argv[1]}'
@@ -60,6 +61,13 @@ for _ in range(60):
         value = ssm.get_parameter(Name=name, WithDecryption=True)['Parameter']['Value']
         break
     except ssm.exceptions.ParameterNotFound:
+        time.sleep(2)
+    except botocore.exceptions.ClientError as error:
+        # The role may read only a parameter tagged with this instance's ARN. Before the
+        # controller has written it there is no tag to match, so IAM answers AccessDenied, not
+        # ParameterNotFound: that is "not yet", within the same bounded wait.
+        if error.response.get('Error', {}).get('Code') not in ('AccessDeniedException', 'AccessDenied'):
+            raise
         time.sleep(2)
 else:
     sys.exit('no bootstrap credential arrived')

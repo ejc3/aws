@@ -225,6 +225,11 @@ class RunnerCostAlarmTests(unittest.TestCase):
         self.assertNotIn('SCHEMA(\\"AWS/EC2\\"', source('cost-alerts.tf'))
         self.assertNotRegex(source('cost-alerts.tf'), r'namespace\s*=\s*"AWS/Billing"')
 
+    def test_the_fleet_alarm_is_set_at_both_architecture_pools_cap(self):
+        # LiveRunners counts arm64 and x86_64 together; each pool may run runner_max_per_arch.
+        alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'too_many_runners')
+        self.assertRegex(alarm, r'threshold\s*=\s*2 \* local\.runner_max_per_arch')
+
     def test_fleet_alarms_read_the_cleanup_metrics(self):
         emitted = source('runner-autoscale.tf')
         for name, metric in [('too_many_runners', 'LiveRunners'),

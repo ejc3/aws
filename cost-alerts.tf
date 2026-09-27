@@ -272,15 +272,17 @@ resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
   alarm_name          = "too-many-runners"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 6 # 30 minutes (6 x 5min periods)
-  threshold           = 4
-  alarm_description   = "More than 4 runners running for 30+ minutes - check for stuck jobs"
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
-  namespace           = "GitHubRunners"
-  metric_name         = "LiveRunners"
-  statistic           = "Maximum"
-  period              = 300
+  # LiveRunners counts both architecture pools (arm64 and x86_64), each capped at
+  # local.runner_max_per_arch, so the fleet's cap is twice that.
+  threshold          = 2 * local.runner_max_per_arch
+  alarm_description  = "More runners than both architecture pools' caps (${2 * local.runner_max_per_arch}) for 30+ minutes - check for stuck jobs or a runaway controller"
+  alarm_actions      = [aws_sns_topic.cost_alerts.arn]
+  ok_actions         = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data = "notBreaching"
+  namespace          = "GitHubRunners"
+  metric_name        = "LiveRunners"
+  statistic          = "Maximum"
+  period             = 300
 }
 
 # The cleanup Lambda enforces every runner's lease and age ceiling. No LiveRunners for 15

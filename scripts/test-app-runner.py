@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import types
@@ -851,6 +852,36 @@ class ReconcileTests(unittest.TestCase):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_the_credential_poll_waits_through_access_denied(self):
+        # Before the controller writes the parameter there is no tag for the role's condition to
+        # match, so SSM answers AccessDenied. That must mean "not yet", not "give up".
+        text = BOOTSTRAP.read_text()
+        poll = text.split("REG_TOKEN=$(python3 - \"$INSTANCE_ID\" <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tmp = Path(tempfile.mkdtemp(prefix="poll."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        (tmp / "botocore").mkdir()
+        (tmp / "botocore" / "__init__.py").write_text("")
+        (tmp / "botocore" / "exceptions.py").write_text(
+            "class ClientError(Exception):\n"
+            "    def __init__(self, code):\n"
+            "        super().__init__(code); self.response = {'Error': {'Code': code}}\n")
+        (tmp / "boto3.py").write_text(
+            "import botocore.exceptions as e\n"
+            "class _NotFound(Exception): pass\n"
+            "class _SSM:\n"
+            "    class exceptions: ParameterNotFound = _NotFound\n"
+            "    calls = 0\n"
+            "    def get_parameter(self, Name, WithDecryption):\n"
+            "        _SSM.calls += 1\n"
+            "        if _SSM.calls == 1: raise e.ClientError('AccessDeniedException')\n"
+            "        return {'Parameter': {'Value': 'TOKEN'}}\n"
+            "    def delete_parameter(self, Name): pass\n"
+            "def client(name): return _SSM()\n")
+        out = subprocess.run(["python3", "-c", poll, "i-0123"], capture_output=True, text=True,
+                             env={"PYTHONPATH": str(tmp), "PATH": "/usr/bin:/bin"}, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "TOKEN")
+
     def test_bootstrap_is_ephemeral_verified_and_keeps_the_token_off_argv(self):
         text = BOOTSTRAP.read_text()
         subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=True)
