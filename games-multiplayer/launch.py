@@ -360,18 +360,32 @@ def start(env, event):
 def _run_task(ecs, params, match):
     """RunTask with clientToken = the match id, so a retry after a lost response cannot start a
     second engine. ECS answers a reused token with that token's ORIGINAL task, which after a
-    failed or stopped engine is a terminal one, or with ConflictException if the parameters
-    changed. Either way the match needs a genuinely new engine: launch once more with a token
-    of its own (checked against the ceiling already, and still one engine)."""
+    failed or stopped engine is a terminal one, or, if the parameters changed, with
+    ConflictException naming the task(s) already tied to the token. Only when that original
+    task is confirmed terminal does the match get a new engine, under a token of its own; a live
+    one, or one ECS cannot show yet (a cold start can see neither the listing nor the task), is
+    returned as the match's engine instead."""
     try:
         out = ecs.run_task(**params)
         task = (out.get("tasks") or [{}])[0]
-        if task.get("desiredStatus") != "STOPPED" and task.get("lastStatus") not in _STOPPING:
+        if not _terminal(task):
             return out
     except Exception as error:  # botocore ClientError; the code is what matters
-        if (getattr(error, "response", None) or {}).get("Error", {}).get("Code") != "ConflictException":
+        response = getattr(error, "response", None) or {}
+        if response.get("Error", {}).get("Code") != "ConflictException":
             raise
+        originals = [a for a in response.get("resourceIds") or [] if isinstance(a, str)]
+        if not originals:
+            raise  # cannot prove the original engine is gone: do not start another
+        seen = _describe(ecs, originals)
+        for arn in originals:
+            if arn not in seen or not _terminal(seen[arn]):
+                return {"tasks": [{"taskArn": arn}], "failures": []}
     return ecs.run_task(**dict(params, clientToken="%s-%s" % (match, uuid.uuid4().hex[:12])))
+
+
+def _terminal(task):
+    return task.get("desiredStatus") == "STOPPED" or task.get("lastStatus") in _STOPPING
 
 
 def _existing_engine(ecs, env, match):

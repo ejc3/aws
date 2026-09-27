@@ -158,7 +158,7 @@ class FakeECS:
         if token in self.tokens:
             original, arn = self.tokens[token]
             if original != kwargs:
-                raise Conflict()
+                raise Conflict([arn])
             return {"tasks": [dict(self.tasks[arn])], "failures": []}
         arn = TASK + "new%03d" % len(self.run)
         self.tokens[token] = (dict(kwargs), arn)
@@ -175,8 +175,11 @@ class FakeECS:
 
 
 class Conflict(Exception):
-    """botocore's ClientError for ECS ConflictException (a clientToken reused with other params)."""
-    response = {"Error": {"Code": "ConflictException"}}
+    """botocore's ClientError for ECS ConflictException (a clientToken reused with other params);
+    ECS names the task(s) already tied to the token in resourceIds."""
+    def __init__(self, arns):
+        super().__init__("ConflictException")
+        self.response = {"Error": {"Code": "ConflictException"}, "resourceIds": list(arns)}
 
 
 def start_event(n=1, **over):
@@ -454,6 +457,16 @@ class LaunchTests(unittest.TestCase):
         self.assertNotEqual(out["taskArn"], first["taskArn"], "ECS returned the dead task for the reused token")
         self.assertEqual(ecs.tasks[out["taskArn"]]["desiredStatus"], "RUNNING")
         self.assertNotEqual(ecs.run[-1]["clientToken"], match(50), "the replacement needs a token of its own")
+
+    def test_a_cold_retry_with_changed_parameters_never_starts_a_second_engine(self):
+        # The original engine is live but ECS shows it nowhere yet; the retry's parameters differ,
+        # so RunTask raises a conflict naming it. That is the match's engine, not a dead one.
+        ecs = FakeECS([], visible=False)
+        first = self.invoke(ecs, start_event(50))
+        self.lf._recent.clear()   # a fresh execution environment
+        out = self.invoke(ecs, start_event(50, hardCapSec=900))
+        self.assertEqual(out["taskArn"], first["taskArn"])
+        self.assertEqual(len(ecs.tokens), 1, "no second engine under a fresh token")
 
     def test_a_replacement_with_changed_parameters_survives_the_token_conflict(self):
         ecs = FakeECS([])
