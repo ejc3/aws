@@ -1053,8 +1053,12 @@ reconcile ran clean.
 **What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
 only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
 with the secrets' resource policies); read another job's registration token (instance-bound);
-connect to another runner of the same kind (no inbound); reach the admin fleet's VPC (the
-runner VPC is not peered with it); launch or stop instances.
+connect to another runner of the same kind (no inbound); reach the admin fleet over a private
+route (the runner VPC is not peered with it); launch or stop instances. A job does have the
+internet, so it can reach the admin fleet's public endpoints like anyone else: SSH and Eternal
+Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-only, and the
+shared instance role can list every ENI in the account to find them (#175 gives app runners
+their own role without it). That is an internet attacker's access, not more.
 
 **Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
 every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
