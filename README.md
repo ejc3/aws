@@ -1466,7 +1466,8 @@ not trusted with root:
   and anyone on the internet can connect to `play.cc-games.app`, an internet-facing ALB.
   Join tokens, an origin allowlist, per-IP limits and router-only engine ingress protect it.
   The engines' task role has no permissions. The limits on launches live in the lobby's code;
-  AWS itself caps only each task's lifetime. See the threat model in
+  on the AWS side only the sweeper bounds each task's lifetime (about 4h15), and only while its
+  sweeps and `StopTask` calls succeed. See the threat model in
   [`docs/games-multiplayer.md`](docs/games-multiplayer.md).
 - **Runners for other repos.** Every writer on `CoderColton/colton-games` and
   `dolphin-labs-hq/dolphin-labs` can run any code on our x86 spot runner VMs. They are

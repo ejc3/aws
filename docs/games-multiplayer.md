@@ -185,14 +185,24 @@ To take the platform off the internet, fastest first:
   the one thing the launcher cannot use (it is denied `RunTask` on it), which is also why the
   sweeper keys on it (`games-multiplayer/sweeper.py`).
 
+  An IAM deny takes a little while to apply everywhere, and a compromised launcher can start
+  tasks until it does, so one pass is not enough: repeat until three passes in a row, 20
+  seconds apart, find nothing but the router.
+
   ```bash
-  for t in $(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); do
-    td=$(aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" \
-      --query 'tasks[0].taskDefinitionArn' --output text)
-    case "${td##*/}" in
-      games-mp-router:*) ;;
-      *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null ;;
-    esac
+  quiet=0
+  while [ "$quiet" -lt 3 ]; do
+    found=0
+    for t in $(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); do
+      td=$(aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" \
+        --query 'tasks[0].taskDefinitionArn' --output text)
+      case "${td##*/}" in
+        games-mp-router:*) ;;
+        *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null; found=1 ;;
+      esac
+    done
+    if [ "$found" -eq 0 ]; then quiet=$((quiet + 1)); else quiet=0; fi
+    sleep 20
   done
   ```
 
