@@ -161,7 +161,8 @@ class FakeGitHub:
             return {"token": "REGTOKEN", "expires_at": "2026-09-27T17:00:00Z"}
         m = re.match(r"/repos/(.+?)/actions/runs\?status=(\w+)", path)
         if m:
-            return {"workflow_runs": [{"id": r} for r in self.runs.get((m.group(1), m.group(2)), [])]}
+            runs = self.runs.get((m.group(1), m.group(2)), [])
+            return {"total_count": len(runs), "workflow_runs": [{"id": r} for r in runs]}
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs", path)
         if m:
             return {"jobs": self.jobs.get(int(m.group(2)), [])}
@@ -382,16 +383,38 @@ class LaunchTests(unittest.TestCase):
                                   "status": "queued", "labels": ["self-hosted", "dolphin", "l"]}]}
             # Newest first, as GitHub lists them: pages 1-2 are 200 newer runs, page 3 the oldest.
             if "status=queued" in path and page <= 2:
-                return {"workflow_runs": [{"id": page * 100 + n, "created_at": f"2026-09-27T1{page}:00:{n:02d}Z"}
-                                          for n in range(100)]}
+                return {"total_count": 201, "workflow_runs": [{"id": page * 100 + n, "created_at": f"2026-09-27T1{page}:00:{n:02d}Z"}
+                                                              for n in range(100)]}
             if "status=queued" in path:
-                return {"workflow_runs": [{"id": 999, "created_at": "2026-09-27T09:00:00Z"}]}
-            return {"workflow_runs": []}
+                return {"total_count": 201, "workflow_runs": [{"id": 999, "created_at": "2026-09-27T09:00:00Z"}]}
+            return {"total_count": 0, "workflow_runs": []}
         app.github = github
         jobs = app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT")
         self.assertIn("999001", [j for j, _ in jobs], "the oldest run, on page 3, was never inspected")
         jobs_calls = [p for p in pages_seen if "/jobs" in p]
         self.assertIn("/runs/999/", jobs_calls[0], "the oldest run must be inspected first")
+
+    def test_a_slow_run_listing_still_reaches_the_oldest_runs_jobs(self):
+        # 1,000 queued runs and a GitHub that takes 10 s per run page: listing every page first
+        # would use the whole 50 s scan before reading a single job.
+        app, *_ = load_app()
+        clock = [0.0]
+        app.time = types.SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 0)
+        app.DEADLINE[0] = 50
+        def github(method, path, pat, body=None):
+            page = int(path.rsplit("page=", 1)[1])
+            if "/jobs" in path:
+                run = int(path.split("/runs/")[1].split("/")[0])
+                return {"jobs": [{"id": run, "status": "queued", "labels": ["self-hosted", "dolphin", "l"]}]}
+            if "status=queued" not in path:
+                return {"total_count": 0, "workflow_runs": []}
+            clock[0] += 10
+            return {"total_count": 1000, "workflow_runs": [
+                {"id": (10 - page) * 100 + n, "created_at": f"2026-09-{27 - page:02d}T00:00:{n:02d}Z"} for n in range(100)]}
+        app.github = github
+        jobs = [int(j) for j, _ in app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT")]
+        self.assertIn(0, jobs, "the oldest run (last page) must be reached")
+        self.assertEqual(jobs[:3], [0, 1, 2], "oldest first")
 
     def test_a_single_job_whose_host_died_is_relaunched_without_waiting_out_its_claim(self):
         app, ec2, *_ = load_app()

@@ -693,8 +693,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   shared runner role can read only the parameter tagged with its own instance ARN. The token
   reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
   `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
-- **Reconcile.** Every 2 minutes it reads every page of queued and in-progress runs and checks their
-  jobs oldest run first (at most 120 GitHub calls a round, and each repo gets an equal share of
+- **Reconcile.** Every 2 minutes it walks queued and in-progress runs oldest first, from the last
+  page back, reading each run's jobs as it goes, so the oldest queued job is reached however many
+  newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
   so jobs it finds always have time to launch), launches for queued jobs that have no host,
   oldest first, stopping at the repo's cap or the end of its share, and reaps hosts (also

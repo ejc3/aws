@@ -25,6 +25,7 @@ instance role can read and delete only the parameter tagged with its own ARN. Th
 appears in user data.
 """
 import json
+import math
 import os
 import time
 import uuid
@@ -47,6 +48,7 @@ VOLUME_GB = int(os.environ.get('VOLUME_GB', '80'))
 # GitHub calls one reconcile may spend listing runs and jobs (queued_jobs()). Every 2 minutes
 # per repo, 120 calls is at most 3,600/hour, inside the token's 5,000.
 SCAN_CALL_BUDGET = 120
+MAX_RUN_PAGES = 10   # GitHub lists at most 1,000 runs for a status-filtered query
 
 ec2 = boto3.client('ec2', region_name=REGION)
 # RunInstances only, with botocore's own retries off, as in the metal controller
@@ -175,23 +177,48 @@ def pages(repo, path, key, pat, budget):
     print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
 
 
+def runs_oldest_first(repo, status, pat, budget):
+    """This status's runs, OLDEST first, one page at a time. GitHub lists newest first, so page 1
+    (read once, for total_count) holds the newest; walking back from the last page reaches the
+    oldest runs first however many newer ones there are."""
+    if budget[0] <= 0 or out_of_time():
+        return
+    path = f'/repos/{repo}/actions/runs?status={status}&per_page=100'
+    budget[0] -= 1
+    first = github('GET', f'{path}&page=1', pat)
+    last = min(MAX_RUN_PAGES, max(1, math.ceil(int(first.get('total_count') or 0) / 100)))
+    for page in range(last, 0, -1):
+        if page == 1:
+            body = first
+        elif budget[0] <= 0 or out_of_time():
+            return
+        else:
+            budget[0] -= 1
+            body = github('GET', f'{path}&page={page}', pat)
+        yield from sorted(body.get('workflow_runs') or [], key=lambda r: (r.get('created_at') or '', r['id']))
+
+
 def queued_jobs(repo, cfg, pat):
     """[(job_id, size)] for this repo's queued jobs that ask for our labels.
 
-    Every page of queued and in-progress runs (one call per 100 runs), then each run's jobs
-    OLDEST run first: a job whose delivery was lost or whose first launch was refused is the one
-    most at risk of waiting, and must be found however many newer runs there are. Bounded by
-    SCAN_CALL_BUDGET calls per reconcile (well inside 5,000/hour).
+    Queued and in-progress runs, OLDEST first, each run's jobs read as soon as the run is: a job
+    whose delivery was lost or whose first launch was refused is the one most at risk of waiting,
+    and it must be reached however many newer runs there are and however slowly GitHub answers.
+    Reading every run page before any job could spend the whole share listing runs. Which status
+    goes first alternates by round, so neither starves the other. Bounded by SCAN_CALL_BUDGET
+    calls per reconcile (well inside 5,000/hour) and the repo's deadline.
     """
-    found, seen, budget, runs = [], set(), [SCAN_CALL_BUDGET], {}
-    for status in ('queued', 'in_progress'):
-        for run in pages(repo, f'/repos/{repo}/actions/runs?status={status}', 'workflow_runs', pat, budget):
-            runs[run['id']] = run
-    for run in sorted(runs.values(), key=lambda r: (r.get('created_at') or '', r['id'])):
-        if budget[0] <= 0 or out_of_time():
-            print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
-            break
-        for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
+    found, seen, runs_seen, budget = [], set(), set(), [SCAN_CALL_BUDGET]
+    statuses = ('queued', 'in_progress') if int(time.time() // 120) % 2 == 0 else ('in_progress', 'queued')
+    for status in statuses:
+        for run in runs_oldest_first(repo, status, pat, budget):
+            if run['id'] in runs_seen:
+                continue
+            runs_seen.add(run['id'])
+            if budget[0] <= 0 or out_of_time():
+                print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls or its time share')
+                break
+            for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
                 if job.get('id') in seen or job.get('status') != 'queued':
                     continue
                 seen.add(job.get('id'))
