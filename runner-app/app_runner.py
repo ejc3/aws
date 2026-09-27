@@ -462,7 +462,9 @@ def reap(repo, cfg, pat, live, runners, complete=True):
         if reason:
             print(f'{repo}: terminating {instance_id}: {reason}')
             ec2.terminate_instances(InstanceIds=[instance_id])
-            if runner is not None:
+            # Past the deadline now, the record waits: next round its host is gone and the
+            # offline-runner sweep below removes it.
+            if runner is not None and not out_of_time():
                 try:
                     github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
                 except urllib.error.HTTPError as error:

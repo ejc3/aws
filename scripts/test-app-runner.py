@@ -540,6 +540,18 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(deleted, [f"/repos/{COLTON}/actions/runners/{n}" for n in (31, 33, 34)])
 
 
+    def test_a_terminate_that_ends_past_the_deadline_leaves_the_runner_record_for_next_round(self):
+        app, ec2, *_ = load_app()
+        real = ec2.terminate_instances
+        def slow(InstanceIds):
+            real(InstanceIds)
+            app.DEADLINE[0] = 0   # the call returned after the repo's share ended
+        ec2.terminate_instances = slow
+        runner = {"i-idle": {"id": 31, "name": "i-idle", "busy": False, "status": "online", "labels": [{"name": "cc-games"}]}}
+        app.reap(COLTON, REPOS[COLTON], "PAT", [instance("i-idle", COLTON, "3", 12)], runner)
+        self.assertEqual(ec2.terminated, ["i-idle"])
+        self.assertEqual(app.github.calls, [], "no DELETE may start after the deadline")
+
     def test_a_partial_runner_listing_never_counts_a_host_as_unregistered(self):
         app, ec2, *_ = load_app()
         hosts = [instance("i-neverup", COLTON, "2", 11), instance("i-ancient", COLTON, "5", 200)]
