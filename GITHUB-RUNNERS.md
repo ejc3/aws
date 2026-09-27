@@ -220,6 +220,14 @@ indistinguishable from one that never launched. `runner-zero-online` fires after
 it is suppressed while GitHub is unreachable, where `online` is 0 by construction and
 `runner-pat-unusable` covers the gap.
 
+The cleanup poll (every 5 minutes) publishes the fleet itself: `GitHubRunners/LiveRunners`
+(running `Role=github-runner` hosts) and `OldestRunnerAgeMinutes`. `too-many-runners` fires
+above 4 for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
+legitimately reach that on a heavy day), and `runner-cleanup-silent` when no count arrives for
+15 minutes, because then nothing is enforcing leases or age ceilings. These replace alarms
+that counted instances by tag through EC2 Metrics Insights, which cannot work (a tag is not a
+dimension) and so never fired.
+
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
 Advanced tier, base64+gzip — too big for Lambda's 4 KB env limit). On boot it sets up the box
 (btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads only its controller-
@@ -693,15 +701,17 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
-  zero would hide its hosts. `too-many-app-runners` fires above the combined cap;
-  `github-app-runner-reconcile-silent` fires when no total arrives for 15 minutes, because then
-  some repo is not being reaped. One repo's failure (a
+  zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
+  `too-many-app-runners-<label>` above one repo's own cap, so a single repo running away is
+  visible even while the total is under the combined cap; `github-app-runner-reconcile-silent`
+  fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
+  repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
   still fails for `github-app-runner-errors`.
 - **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
   actions/runner (pinned, sha256-verified) and takes its registration token from
   `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the
-  shared runner role can read only the parameter tagged with its own instance ARN. The token
+  host's role can read only the parameter tagged with its own instance ARN. The token
   reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
   `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
 - **Reconcile.** Every 2 minutes it walks queued and in-progress runs oldest first, from the last
@@ -718,10 +728,16 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
   because it took a job since the listing)
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
-- **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
-  existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own
-  bootstrap credential. Every writer on these (private) repos can run code here, so they must
-  not be made public while these runners are attached.
+- **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all, and fcvm's
+  `github-runner-sg` does not admit it (its SSH rule is self-referencing, not the VPC CIDR).
+  Jobs run as their own role, `github-app-runner-instance-role` (profile
+  `github-app-runner-profile`), not fcvm's: its only Allow is `ssm:GetParameter` and
+  `ssm:DeleteParameter` on the `/github-runner/bootstrap/*` parameter tagged with the calling
+  instance's ARN, with explicit denies for any other parameter. No SSM agent policy, no EC2
+  reads, no S3 (fcvm's role may write session records to the security-records bucket and
+  describe ENIs; an app job can do neither), no PATs, no Secrets Manager. Every writer on
+  these (private) repos can run code here, so they must not be made public while these
+  runners are attached.
 - **Tokens.** Each repo's controller token is `github-runner/repo-pat/<owner>/<repo>`
   (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
   created with the same tokens through an `ephemeral` read, so the tokens never enter state.
@@ -733,10 +749,10 @@ bootstrap now published by this source. During the original migration, controlle
 deployment preceded bootstrap publication; the PAT grant and broad runner SSM attachment
 remained until real CI acceptance and old-boot drain. This source contains the later
 [gated IAM cutoff](#runner-iam-cutoff), so do not republish a legacy PAT-reading document.
-The independent `iam:PassRole` escalation is closed: both controller
-Lambdas may pass only `github-runner-instance-role`, only to EC2. Explicit denies
-protect against another policy allowing any other role or service. The existing
-launcher already uses exactly `github-runner-profile`, so this does not change jobs.
+The independent `iam:PassRole` escalation is closed: fcvm's controller may pass only
+`github-runner-instance-role`, and Pattern C's only `github-app-runner-instance-role`, each
+only to EC2. Explicit denies protect against another policy allowing any other role or
+service.
 
 The launcher classifies the exact document fetched from SSM before allocating an
 instance. Old scripts mint no unused bootstrap credential. For a broker script, it
@@ -892,7 +908,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 |--|--|--|--|--|
 | **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-lambda-role` after the gated IAM cutoff; legacy job-host access is removed in that stage | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
-| **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
+| **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | the controller that created it and that booting instance (`github-runner-instance-role` for fcvm, `github-app-runner-instance-role` for Pattern C) | GitHub API, ~1h lifetime; controller removes expired leftovers |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
@@ -941,9 +957,14 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   with an explicit deny on invoking anything else. No EC2, SSM, DynamoDB or PAT access.
 - **`github-app-runner-lambda`** (Pattern C's controller): read the two per-repo tokens;
   `RunInstances` only with Canonical images, into the runner subnets, with
-  `github-app-runner-sg`, IMDSv2 and tag `Role=github-app-runner`; terminate only instances
-  with that tag; pass only the runner role, only to EC2; write and delete only the
-  instance-bound `/github-runner/bootstrap/*` credential.
+  `github-app-runner-sg`, `github-app-runner-profile`, IMDSv2 and tag `Role=github-app-runner`;
+  terminate only instances with that tag; `iam:PassRole` only on
+  `github-app-runner-instance-role`, only to EC2 (explicit deny on any other role); write and
+  delete only the instance-bound `/github-runner/bootstrap/*` credential.
+- **`github-app-runner-instance-role`** (Pattern C's hosts): read and delete only its own
+  instance-bound bootstrap credential; everything else is implicit or explicit deny. The
+  per-repo token secrets' resource policies admit only the administrators and the two
+  controllers, so this role cannot read them even if an Allow were attached.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.
@@ -969,10 +990,11 @@ refuses every pair, the launch fails and the cleanup poll is the retry.
 
 The AMI builder stays in us-west-1a: fcvm's `scripts/build-ami.sh` looks up exactly one
 subnet by `Name=github-runner-subnet`, and `github-actions-ami-builder` may launch only
-there, so the us-west-1c subnet carries a different Name. The security group allows
-**inbound SSH (22) from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) **and the
-operator's three static EIPs** (jumpbox + the two dev servers, so the `dev_to_runner` debug
-path works) and all egress; shell access from anywhere else is via **SSM Session Manager**
+there, so the us-west-1c subnet carries a different Name. `github-runner-sg` allows **inbound SSH (22)
+only from other members of itself and from the operator's three static EIPs** (jumpbox + the
+two dev servers, so the `dev_to_runner` debug path works) and all egress. It used to admit the
+whole VPC (`10.1.0.0/16` + its IPv6 block); Pattern C's hosts share that VPC and run outside
+code, so that rule is gone; shell access from anywhere else is via **SSM Session Manager**
 (the runner role retains the parameter-free SSM connectivity policy). SSH is closed to the public internet
 at large; everything else (webhook, registration, job dispatch) is runner-initiated outbound
 to GitHub and the AWS APIs.
@@ -1007,9 +1029,9 @@ Closed (were sharp edges, now hardened):
   `configuration.secret`, so there is no second copy to drift. This ownership begins at
   the one-time import + apply documented below — until that apply lands on a given state,
   the live hook still carries whatever secret it had before, and deliveries keep failing.
-- **SSH is restricted to known hosts.** Port 22 is reachable from `10.1.0.0/16` (intra-VPC)
-  and the operator's three static EIPs (jumpbox + the two dev servers) — not the public
-  internet; shell access from anywhere else is via SSM Session Manager. The runners still run
+- **SSH is restricted to known hosts.** Port 22 is reachable from other fcvm runners
+  (`github-runner-sg` members) and the operator's three static EIPs (jumpbox + the two dev
+  servers) — not Pattern C's hosts in the same VPC, and not the public internet; shell access from anywhere else is via SSM Session Manager. The runners still run
   with `/dev/kvm` exposed and `iptables -P FORWARD ACCEPT`, so keeping them off the open
   internet matters.
 

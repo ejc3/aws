@@ -202,6 +202,49 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertNotIn('webhook-front', self.controller)
         self.assertNotIn(':delivery', self.controller)
 
+    def test_fcvm_runner_ssh_is_self_and_operator_eips_only(self):
+        sg = block('runner-vpc.tf', 'aws_security_group', 'runner')
+        ingress = re.findall(r'\n  ingress \{\n.*?\n  \}', sg, re.S)
+        self.assertEqual(len(ingress), 1, ingress)
+        rule = ingress[0]
+        self.assertRegex(rule, r'from_port\s*=\s*22\b')
+        self.assertRegex(rule, r'\bself\s*=\s*true\b')
+        self.assertNotIn('aws_vpc.runner', rule, 'the whole VPC (and every app runner in it) must not reach port 22')
+        self.assertNotIn('ipv6_cidr_blocks', rule)
+        cidrs = re.search(r'cidr_blocks\s*=\s*\[\n(.*?)\n\s*\]', rule, re.S).group(1)
+        self.assertEqual(re.findall(r'aws_eip\.(\w+)\[0\]\.public_ip', cidrs),
+                         ['jumpbox', 'firecracker_dev', 'x86_dev'])
+        self.assertNotRegex(cidrs, r'"\d+\.\d+\.\d+\.\d+/\d+"')
+
+
+class RunnerCostAlarmTests(unittest.TestCase):
+    """The runner alarms must read series that exist; an alarm on a query that returns no
+    data is permanently OK (notBreaching) and never fires."""
+
+    def test_no_alarm_queries_ec2_by_tag(self):
+        self.assertNotIn('SCHEMA(\\"AWS/EC2\\"', source('cost-alerts.tf'))
+        self.assertNotRegex(source('cost-alerts.tf'), r'namespace\s*=\s*"AWS/Billing"')
+
+    def test_fleet_alarms_read_the_cleanup_metrics(self):
+        emitted = source('runner-autoscale.tf')
+        for name, metric in [('too_many_runners', 'LiveRunners'),
+                             ('runner_long_running', 'OldestRunnerAgeMinutes'),
+                             ('runner_cleanup_silent', 'LiveRunners')]:
+            alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', name)
+            self.assertRegex(alarm, r'namespace\s*=\s*"GitHubRunners"', name)
+            self.assertRegex(alarm, r'metric_name\s*=\s*"' + metric + '"', name)
+            self.assertIn(f"'{metric}':", emitted, f'{metric} is not emitted by the cleanup Lambda')
+        self.assertIn("'Namespace': 'GitHubRunners'", emitted)
+        silent = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'runner_cleanup_silent')
+        self.assertRegex(silent, r'treat_missing_data\s*=\s*"breaching"')
+
+    def test_ec2_spend_is_a_budget_not_a_billing_alarm(self):
+        self.assertNotIn('"high_ec2_spend"', source('cost-alerts.tf'))
+        budget = block('cost-alerts.tf', 'aws_budgets_budget', 'ec2_daily')
+        self.assertRegex(budget, r'time_unit\s*=\s*"DAILY"')
+        self.assertIn('Amazon Elastic Compute Cloud - Compute', budget)
+        self.assertIn('aws_sns_topic.cost_alerts', budget)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

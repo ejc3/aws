@@ -102,7 +102,12 @@ locals {
   runner_launch_subnet_arns = local.runner_launch_subnets[*].arn
 }
 
-# Security group - SSH only from within the runner VPC (use SSM from outside), outbound for internet
+# Security group - SSH only from fcvm's own runners and the operator EIPs, outbound for internet.
+#
+# Runner-to-runner SSH is limited to THIS group (self), not the whole runner VPC CIDR: the VPC
+# also holds Pattern C's app runners (runner-app.tf), which run other repos' code and must not
+# reach these metal hosts' sshd. Runners hold no private keys (only dev_to_runner's public half),
+# and operator SSH comes from the EIPs below, so nothing legitimate used the wider CIDR.
 resource "aws_security_group" "runner" {
   count       = var.enable_github_runner ? 1 : 0
   name        = "github-runner-sg"
@@ -113,14 +118,13 @@ resource "aws_security_group" "runner" {
     from_port = 22
     to_port   = 22
     protocol  = "tcp"
+    self      = true # fcvm runner-to-runner only
     cidr_blocks = [
-      aws_vpc.runner[0].cidr_block,                 # intra-VPC runner-to-runner
       "${aws_eip.jumpbox[0].public_ip}/32",         # jumpbox (management host)
       "${aws_eip.firecracker_dev[0].public_ip}/32", # fcvm-metal-arm dev server
       "${aws_eip.x86_dev[0].public_ip}/32",         # fcvm-metal-x86 dev server
     ]
-    ipv6_cidr_blocks = [aws_vpc.runner[0].ipv6_cidr_block]
-    description      = "SSH from the runner VPC + operator EIPs (jumpbox, dev servers); SSM elsewhere"
+    description = "SSH from fcvm runners (self) + operator EIPs (jumpbox, dev servers); SSM elsewhere"
   }
 
   egress {
