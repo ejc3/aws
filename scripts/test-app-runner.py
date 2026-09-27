@@ -319,6 +319,18 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(read, [])
         self.assertEqual(app.github.calls, [])
 
+    def test_pool_probing_stops_at_the_deadline_and_frees_the_job(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse = {t for size in SIZES.values() for t in size}
+        real = ec2.run_instances
+        def slow(**kw):
+            app.DEADLINE[0] = 0   # this refusal came back after the repo's share ended
+            return real(**kw)
+        ec2.run_instances = slow
+        self.assertEqual(self.deliver(app)["outcome"], "failed")
+        self.assertEqual(len(ec2.attempts), 1, "no pool may be tried after the deadline")
+        self.assertEqual(len(app.fake_dynamo.deleted), 1, "nothing launched: the job must not wait out its claim")
+
     def test_launches_use_a_client_with_sdk_retries_off(self):
         # A retried InsufficientInstanceCapacity cost 7-15 s per pool on the metal controller.
         app, ec2, *_ = load_app()
@@ -466,7 +478,7 @@ class LaunchTests(unittest.TestCase):
                 clock[0] = app.DEADLINE[0]
             return [(str(n), "s") for n in range(jobs)]
         app.queued_jobs = queued
-        def ensure(repo, cfg, subnets, pat, job_id, size, live, token=None):
+        def ensure(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=frozenset()):
             calls.append(job_id)
             if share_ends_after is not None and len(calls) >= share_ends_after:
                 clock[0] += 1000
@@ -547,6 +559,31 @@ class ReconcileTests(unittest.TestCase):
         app.handler({"reconcile": True}, None)
         launched = [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] for kw in ec2.launched]
         self.assertEqual(launched, ["11"])
+
+    def test_a_busy_host_tagged_for_a_still_queued_job_does_not_cover_it(self):
+        # GitHub gave the host launched for job 11 another job with the same labels. It is busy
+        # while 11 is still queued, and an ephemeral runner takes one job: 11 needs its own host.
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "in_progress")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        ec2.instances.append(instance("i-tagged11", COLTON, "11", 5))
+        gh.runners[COLTON] = {"i-tagged11": {"id": 41, "name": "i-tagged11", "busy": True, "status": "online",
+                                             "labels": [{"name": "cc-games"}]}}
+        app.handler({"reconcile": True}, None)
+        launched = [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] for kw in ec2.launched]
+        self.assertEqual(launched, ["11"])
+
+    def test_the_cap_counts_hosts_not_job_tags(self):
+        # Dolphin's cap is 3: two hosts tagged for job 5 (one busy on another job) and one for 6.
+        app, ec2, *_ = load_app()
+        hosts = [instance("i-a", DOLPHIN, "5", 5, size="l"), instance("i-b", DOLPHIN, "5", 5, size="l"),
+                 instance("i-c", DOLPHIN, "6", 5, size="l")]
+        ec2.instances += hosts
+        outcome, _ = app.ensure_runner(DOLPHIN, REPOS[DOLPHIN], app.config()[1], "PAT", "5", "l", list(hosts),
+                                       busy=frozenset({"i-a", "i-b"}))
+        self.assertEqual(outcome, "cap", "three hosts are three slots, whatever their tags")
+        self.assertEqual(ec2.launched, [])
 
     def test_one_repos_failure_does_not_stop_the_other_and_counts_are_published(self):
         app, *_ = load_app()

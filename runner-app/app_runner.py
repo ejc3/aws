@@ -313,6 +313,11 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
     # reconcile sees any host that did start (its JobId tag) and launches only if none did.
     for subnet in subnets:
         for instance_type in cfg['sizes'][size]:
+            # Each attempt may take the launch client's full read timeout: none starts after
+            # the repo's deadline. Every earlier attempt was a capacity refusal, so nothing exists.
+            if out_of_time():
+                print(f'{repo}: out of time before a pool accepted job {job_id}; next round retries')
+                return None, True
             attempt += 1
             try:
                 response = launch_ec2.run_instances(
@@ -422,14 +427,18 @@ def release(repo, job_id):
         print(f'{repo}: could not release the claim for job {job_id}: {type(error).__name__}')
 
 
-def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
-    """Launch for `job_id` unless it already has a host or the repo is at its cap."""
+def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=frozenset()):
+    """Launch for `job_id` unless it already has a host or the repo is at its cap.
+
+    `busy` names hosts whose runner is running a job. A host tagged for this job cannot serve it
+    if it is busy while the job is still queued: GitHub gave it another job with the same labels,
+    and an ephemeral runner takes only one. The job then needs a host of its own."""
     # Claims first, then a fresh listing: every launch whose claim was read is, in that listing,
     # either not yet visible (the claim stands in for it) or visible and counted by its real
     # state. `live`, taken earlier in the invocation, is only added to that, never trusted alone.
     claimed, listed = active_claims(repo), listed_instances(repo)
     running = live + [i for i in listed if i.get('State', {}).get('Name') in LIVE_STATES]
-    if any(tag(i, 'JobId') == job_id for i in running):
+    if any(tag(i, 'JobId') == job_id and i['InstanceId'] not in busy for i in running):
         return 'exists', token
     # A claim goes once ITS OWN launch is listed, in any state (its nonce prefixes the host's
     # ClientToken): short jobs do not hold cap slots, and a job whose host failed and terminated
@@ -443,7 +452,8 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
-    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in running} | set(claimed)
+    # Hosts by instance (two hosts can carry one JobId, above), plus claims not yet listed.
+    in_use = {i['InstanceId'] for i in running} | set(claimed)
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
@@ -524,7 +534,9 @@ def reconcile(repo, cfg, subnets):
     pat = repo_pat(cfg)
     if not pat:
         return {'repo': repo, 'skipped': 'no controller token'}
-    live = reap(repo, cfg, pat, app_instances(repo), *list_runners(repo, pat))
+    runners, complete = list_runners(repo, pat)
+    live = reap(repo, cfg, pat, app_instances(repo), runners, complete)
+    busy = frozenset(name for name, runner in runners.items() if runner.get('busy'))
     outcomes, token = {}, None
     # The scan gets half the remaining share, so jobs it finds always have time to launch: a
     # queue big or slow enough to use the whole share would otherwise be found and dropped on
@@ -542,7 +554,7 @@ def reconcile(repo, cfg, subnets):
         if out_of_time():
             outcomes['deferred'] = outcomes.get('deferred', 0) + 1
             break
-        outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token)
+        outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
         if outcome == 'cap':
             break

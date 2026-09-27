@@ -666,7 +666,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
-  keeps the claim. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
+  keeps the claim. No pool is tried after the repo's reconcile deadline. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
   claim is released and the error raised, so `github-app-runner-errors` fires.
   Every attempt carries its own `ClientToken` (the claim's nonce plus an attempt number), so the
   SDK's own retries cannot duplicate one.
@@ -680,7 +680,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
   listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
   nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
-  of the same job never releases the claim of its relaunch.
+  of the same job never releases the claim of its relaunch. A host covers the job it is tagged
+  for only while it is not busy: GitHub may give it another job with the same labels, and a busy
+  ephemeral host tagged for a still-queued job is running something else, so the job gets its own
+  host. The cap counts hosts, not job tags.
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo and in total.
   `too-many-app-runners` fires above the combined cap; `github-app-runner-reconcile-silent` fires
