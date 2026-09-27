@@ -61,9 +61,9 @@ variable "mp_env" {
 # development is left out on purpose. A development lobby runs on a laptop from
 # `vercel env pull`; if it could mint router-accepted tokens, the signing key would have
 # to sit in a .env.local file on that laptop. Local development uses MP_LAUNCHER=local
-# and its own throwaway key instead, so it never needs this router. (The launcher role
-# still trusts development, so a laptop CAN start an ECS engine; nobody could join it
-# through the router, and the sweeper reaps it at its cap.)
+# and its own throwaway key instead, so it never needs this router. The launcher role
+# (games-mp-launcher) trusts the same two environments, so the envs that can start an
+# engine and the envs whose players can reach it are one list; keep them in step.
 variable "mp_router_envs" {
   description = "Token `n` values the router accepts (MP_ENVS, comma-joined). Must include var.mp_env."
   type        = list(string)
@@ -423,16 +423,16 @@ resource "aws_iam_openid_connect_provider" "vercel" {
   tags           = { Name = "vercel-${local.vercel_team_slug}", Project = "games-multiplayer" }
 }
 
-# TRUST: exactly the colton-games project in this team, for exactly three environments.
+# TRUST: exactly the colton-games project in this team, for exactly two environments.
 # Both conditions are StringEquals against full values, not StringLike, so no other project
 # in the team, no Custom Environment, and no other Vercel team can assume the role.
 #   production  - cc-games.app
 #   preview     - PR and branch deployments (they launch real tasks; the sweeper and the
 #                 per-task hard cap bound what a bad preview can cost)
-#   development - tokens that `vercel env pull` hands a team member for local dev, valid
-#                 12 h. Anyone who can pull the project's env can launch tasks from a
-#                 laptop; that is the point of allowing it, and why the role can do so
-#                 little else.
+# development is deliberately NOT trusted. Its tokens are what `vercel env pull` hands
+# any team member (valid 12 h), so trusting it would let a laptop start real Fargate
+# tasks. Local development uses MP_LAUNCHER=local instead, and the router does not accept
+# development tokens either (var.mp_router_envs), so the two lists match.
 resource "aws_iam_role" "games_mp_launcher" {
   name        = "games-mp-launcher"
   description = "Assumed by the colton-games Vercel project via OIDC to start and stop match engines"
@@ -448,7 +448,7 @@ resource "aws_iam_role" "games_mp_launcher" {
         StringEquals = {
           "${local.vercel_oidc_host}:aud" = "https://vercel.com/${local.vercel_team_slug}"
           "${local.vercel_oidc_host}:sub" = [
-            for env in ["production", "preview", "development"] :
+            for env in ["production", "preview"] :
             "owner:${local.vercel_team_slug}:project:${local.vercel_project_name}:environment:${env}"
           ]
         }
@@ -990,7 +990,7 @@ resource "aws_ecs_task_definition" "games_engine" {
 # THE RULE THE LOBBY MUST FOLLOW: every RunTask sets tags
 #   game    = the game id                    (e.g. mptest)
 #   match   = the match id
-#   env     = MP_ENV of the launching lobby  (production / preview / development)
+#   env     = MP_ENV of the launching lobby  (production / preview)
 #   hardcap = the match's hard cap in SECONDS (spec limits.hardCapSec)
 # The sweeper stops any standalone task in the cluster older than hardcap + 10 min, or
 # older than 2 h when hardcap is missing or not a positive integer; hardcap is clamped to

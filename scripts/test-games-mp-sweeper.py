@@ -215,6 +215,11 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertRegex(service, r'propagate_tags\s*=\s*"SERVICE"')
         self.assertIn('"games-role" = "router"', service)
 
+    def test_launcher_trusts_only_production_and_preview(self):
+        role = re.search(r'resource "aws_iam_role" "games_mp_launcher" \{.*?\n\}', self.tf, re.S).group()
+        self.assertIn('for env in ["production", "preview"] :', role)
+        self.assertNotIn("development", role.split("assume_role_policy", 1)[1])
+
     def test_router_accepts_a_list_of_envs(self):
         self.assertIn('{ name = "MP_ENVS", value = join(",", var.mp_router_envs) }', self.tf)
         self.assertRegex(self.tf, r'default\s*=\s*\["production", "preview"\]')

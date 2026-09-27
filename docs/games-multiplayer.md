@@ -59,8 +59,8 @@ Everything runs from the jumpbox. Read each plan before applying it.
    The old task definition revision stays ACTIVE, so matches on the old version can still
    launch while clients update.
 
-5. **Put the outputs into the colton-games Vercel project env** (production, preview and
-   development):
+5. **Put the outputs into the colton-games Vercel project env** (Production and Preview;
+   Development gets none of them, since local development uses `MP_LAUNCHER=local`):
 
    ```bash
    terraform output -json games_mp_vercel_env
@@ -114,10 +114,10 @@ environments hold the key:
   `.env.local` on a laptop. Local development uses `MP_LAUNCHER=local` with its own
   throwaway key, and never needs this router.
 
-The launcher role still trusts Development, so a laptop can start an ECS engine. Nobody
-could join that engine through the router, and the sweeper stops it at its cap. To let
-Development use the router after all, add `development` to `mp_router_envs` and give
-Development the key.
+The launcher role's OIDC trust covers the same two environments, Production and Preview,
+so a laptop's `vercel env pull` token can neither start an ECS engine nor reach the router.
+To bring Development in after all, add it to both the launcher trust and `mp_router_envs`,
+and give it the key.
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26)
 
