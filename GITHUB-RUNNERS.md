@@ -1057,8 +1057,13 @@ connect to another runner of the same kind (no inbound); reach the admin fleet's
 runner VPC is not peered with it); launch or stop instances.
 
 **Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
-every launch, and the `too-many-app-runners` alarm fires at 16 across both. Each VM lives at
-most 3 hours. The worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
+every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
+detects the controller launching past its caps, not the caps being reached (8 + 8 is normal
+saturation and does not alarm). The reconcile terminates any VM older than 3 hours, but only
+while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own
+shutdown, and if the reconcile stops, `github-app-runner-errors` or
+`github-app-runner-reconcile-silent` fires and the VM runs until someone terminates it. With
+reaping working, the worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
 
 **Shutting it off**
 
@@ -1067,8 +1072,14 @@ most 3 hours. The worst case, both repos kept saturated with 64-core VMs, is abo
 2. Terminate what is running. The controller may terminate only `Role=github-app-runner`:
    `aws ec2 describe-instances --filters Name=tag:Role,Values=github-app-runner` then
    `terminate-instances`.
-3. `enable_runner_app_webhooks = false` removes the hooks. The repo's owner can also revoke
-   its controller token in GitHub, which stops registration outright.
+3. Remove the hooks while Terraform can still read the tokens it deletes them with:
+   `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
+   -target='github_repository_webhook.runner_app_dolphin_labs[0]'`, then commit
+   `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
+   does not work: it also drops the token reads, so the providers have no credentials to
+   delete with. The repo's owner can instead revoke its controller token in GitHub, which
+   stops registration outright; plans then fail at that repo's provider until its hook is
+   deleted in the repo's settings and removed from state (`terraform state rm`).
 
 **A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
 open a pull request from a fork. Require approval for workflows from all outside
@@ -1085,10 +1096,12 @@ its own cap and alarm.
    its own bootstrap credential.
 2. fcvm's runner security group admits SSH from the whole runner VPC. Fix, in #175: allow
    runner-to-runner SSH only from fcvm's own runner group.
-3. `too-many-app-runners` fires only when both repos are at their cap together. Fix, in
-   #175: a per-repo alarm at each repo's cap.
-4. Colton's controller token expires 2026-10-27; `colton-games` runners stop registering then.
-   Renew it with a one-year expiry.
+3. `too-many-app-runners` watches only the combined total, so one repo over-launching past its
+   own cap is invisible while the other is idle. Fix, in #175: a per-repo alarm at each
+   repo's cap.
+4. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
+   `dolphin-labs` 2027-09-28. That repo's runners stop registering when its token expires;
+   renew each before then (Regenerate in GitHub keeps its permissions).
 
 ## Operating it
 

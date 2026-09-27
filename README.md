@@ -1945,7 +1945,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Colton Games' production domains on Vercel (`cc-games.app`, with `ccgames.app` and `colton-games.com` redirecting) | `vercel.tf`, `vercel-cc-games.tf` |
-| tmux-scroll and t-claude pin shared by every box | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
+| tmux-scroll and t-claude pin (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset) | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer/` (sweeper, bring-up steps, buildspec), `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
