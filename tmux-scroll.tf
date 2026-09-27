@@ -55,6 +55,7 @@ resource "terraform_data" "admin_tmux_tclaude" {
     sha256    = local.tmux_scroll_sha256_aarch64
     tclaude   = local.tclaude_ref
     installer = filesha256("${path.module}/scripts/admin-tmux-tclaude.sh")
+    wrapper   = filesha256("${path.module}/scripts/ssm-admin-tmux-tclaude.sh")
   }
 
   provisioner "local-exec" {
