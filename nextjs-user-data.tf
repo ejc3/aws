@@ -96,6 +96,9 @@ locals {
   # nothing. This list only decides which accounts must EXIST; removing a name from it does
   # not delete the account.
   nextjs_users = ["colton", "connor", "ejc3", "skevh"]
+  # Accounts whose boot-launched folders also get a Codex thread (codex-seed@<user>), so each
+  # folder shows up in their Codex app. Deliberately not everyone: skevh is left out.
+  nextjs_codex_seed_users = ["colton", "connor", "ejc3"]
 
   # Keys the account owner logs in with, on top of the shared fcvm key above. Declared
   # here rather than pasted into the box so a rebuild does not lose someone's access --
@@ -624,6 +627,13 @@ for u in ${join(" ", local.nextjs_users)}; do
   if [ -s "/home/$u/.codex/auth.json" ]; then
     systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true
     systemctl is-active --quiet "codex-rc@$u.service"       || systemctl start "codex-rc@$u.service" >/dev/null 2>&1 || true
+    # A Codex thread for each folder agents-start opened, only for these accounts. --no-block:
+    # a new folder costs a model turn, and this watcher must not wait on it.
+    case " ${join(" ", local.nextjs_codex_seed_users)} " in *" $u "*)
+      systemctl enable "codex-seed@$u.service" >/dev/null 2>&1 || true
+      systemctl is-active --quiet "codex-seed@$u.service" || systemctl start --no-block "codex-seed@$u.service" >/dev/null 2>&1 || true
+      ;;
+    esac
   fi
 done
 AGENTSENABLE
@@ -1066,6 +1076,11 @@ set -uo pipefail
 WHO="$1"
 export HOME="/home/$WHO"
 WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
+# Every folder this run opens a window for, for codex-seed@<user> (seeds a Codex thread in each).
+DIRS_STATE="$HOME/.local/state/agents-start"
+mkdir -p "$DIRS_STATE"
+DIRS_NEW=$(mktemp "$DIRS_STATE/dirs.XXXXXX")
+printf '%s\n' "$WORKDIR" > "$DIRS_NEW"
 zsh -c "
   source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
   cd '$WORKDIR' || exit 1
@@ -1095,8 +1110,10 @@ if [ -f "$EXTRA" ]; then
       t-claude --auto --remote-control
     " </dev/null
     echo "agents-start: t-claude invoked for $WHO in $XD"
+    printf '%s\n' "$XD" >> "$DIRS_NEW"
   done < "$EXTRA"
 fi
+mv -f "$DIRS_NEW" "$DIRS_STATE/dirs"
 
 # Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
 # resumed conversation carries a Remote Control binding that is dead whenever the process that
@@ -1156,6 +1173,32 @@ UNIT
 #
 # Uses the standalone binary explicitly: `codex remote-control` refuses to run against the
 # npm/system install, and $PATH is not dependable inside a unit.
+${local.codex_seed_thread_install}
+# A Codex thread in every folder agents-start opened a window for (its list:
+# ~/.local/state/agents-start/dirs), so each shows up in the Codex app. Enabled by
+# agents-enable for local.nextjs_codex_seed_users only. Folders that already have a thread are
+# only checked.
+cat > /etc/systemd/system/codex-seed@.service <<'UNIT'
+[Unit]
+Description=Seed a Codex thread for each folder agents-start opened for %i
+After=claude-rc@%i.service codex-rc@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+ExecCondition=/bin/sh -c 'test -s /home/%i/.local/state/agents-start/dirs && /home/%i/.local/bin/codex login status >/dev/null 2>&1'
+ExecStart=/usr/local/bin/codex-seed-thread --from /home/%i/.local/state/agents-start/dirs
+Environment=CODEX_BIN=/home/%i/.local/bin/codex
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/codex-rc@.service <<'UNIT'
 [Unit]
 Description=Codex app-server daemon with remote control for %i
