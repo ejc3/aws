@@ -55,9 +55,10 @@ variable "games_mp_sim_versions" {
 
   validation {
     # The lobby's simVersion shape (colton-games lib/multiplayer/games.ts SIM_VERSION, and the
-    # SQL); games-mp-launch refuses any other, so a version outside it could never launch.
-    condition     = alltrue([for v in values(var.games_mp_sim_versions) : can(regex("^[A-Za-z0-9._-]{1,64}$", v))])
-    error_message = "Each games_mp_sim_versions value must be 1-64 of A-Z a-z 0-9 . _ - (the lobby's simVersion shape)."
+    # SQL), narrowed to a Docker-valid first character: the engine image tag starts with it,
+    # and a tag cannot begin with "." or "-".
+    condition     = alltrue([for v in values(var.games_mp_sim_versions) : can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$", v))])
+    error_message = "Each games_mp_sim_versions value must be 1-64 of A-Z a-z 0-9 . _ -, starting with a letter, digit or _ (it begins the image tag)."
   }
 }
 
@@ -83,7 +84,7 @@ variable "mp_engine_image_tags" {
 
   validation {
     # games-mp-launch reads the simVersion out of the tag (local.mp_engine_sim_versions).
-    condition     = alltrue([for t in values(var.mp_engine_image_tags) : t == "" || can(regex("^[A-Za-z0-9._-]{1,64}-[0-9a-f]{12}$", t))])
+    condition     = alltrue([for t in values(var.mp_engine_image_tags) : t == "" || can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}-[0-9a-f]{12}$", t))])
     error_message = "Each mp_engine_image_tags value must be <simVersion>-<sha12> (or empty), as the build tags them."
   }
 }

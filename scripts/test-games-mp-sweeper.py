@@ -297,6 +297,18 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
         self.assertIn("task-definition/${local.mp_router_family}:*", deny)
 
+    def test_sim_versions_and_engine_tags_start_like_a_docker_tag(self):
+        # The engine image tag is <simVersion>-<sha12>; a Docker tag cannot begin with "." or "-".
+        import re as _re
+        for name in ("games_mp_sim_versions", "mp_engine_image_tags"):
+            var = self.tf.split('variable "%s"' % name, 1)[1].split("\n}\n", 1)[0]
+            pattern = _re.search(r'regex\("(\^[^"]+)"', var).group(1).replace("\\\\", "\\")
+            for bad in (".v2", "-v2"):
+                value = bad if name == "games_mp_sim_versions" else bad + "-0123456789ab"
+                self.assertIsNone(_re.match(pattern, value), (name, value))
+            ok = "v2" if name == "games_mp_sim_versions" else "v2-0123456789ab"
+            self.assertIsNotNone(_re.match(pattern, ok), name)
+
     def test_the_engine_ceiling_must_be_a_whole_number(self):
         # Both Lambdas int() it at start-up: "10.5" would fail every launch and every sweep.
         var = self.tf.split('variable "games_mp_engine_ceiling"', 1)[1].split("\n}\n", 1)[0]
