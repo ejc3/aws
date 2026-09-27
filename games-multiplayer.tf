@@ -90,7 +90,10 @@ locals {
   }
 
   mp_cluster_name = "games"
-  mp_port         = 8080
+  # The router's task definition family. The sweeper exempts exactly this family and the
+  # launcher is denied RunTask on it; one local so the two can never disagree.
+  mp_router_family = "games-mp-router"
+  mp_port          = 8080
 
   # Engines launch in exactly these subnets. MP_SUBNETS (the launcher) and MP_TARGET_CIDRS
   # (the router's "a token may only point here" check) both derive from this one list so
@@ -481,7 +484,7 @@ resource "aws_iam_role_policy" "games_mp_launcher" {
         Sid      = "NeverRunTheRouter"
         Effect   = "Deny"
         Action   = "ecs:RunTask"
-        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/games-mp-router:*"
+        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_router_family}:*"
       },
       {
         # RunTask requires PassRole for the task definition's roles and for any override.
@@ -837,7 +840,7 @@ resource "cloudflare_dns_record" "games_play" {
 resource "aws_ecs_task_definition" "games_mp_router" {
   count = local.mp_router_enabled ? 1 : 0
 
-  family                   = "games-mp-router"
+  family                   = local.mp_router_family
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = 256
@@ -992,10 +995,11 @@ resource "aws_ecs_task_definition" "games_engine" {
 #   match   = the match id
 #   env     = MP_ENV of the launching lobby  (production / preview)
 #   hardcap = the match's hard cap in SECONDS (spec limits.hardCapSec)
-# The sweeper stops any standalone task in the cluster older than hardcap + 10 min, or
+# The sweeper stops any task in the cluster older than hardcap + 10 min, or
 # older than 2 h when hardcap is missing or not a positive integer; hardcap is clamped to
-# 4 h. "Standalone" means not started by an ECS service, so the router is never touched
-# and a launcher bug that forgets the tags still gets the 2 h limit rather than none.
+# 4 h. Every task counts except the router's task definition family, games-mp-router,
+# which the launcher cannot RunTask; group, startedBy and tags are caller-set on RunTask
+# and never exempt anything. A launcher bug that forgets the tags still gets 2 h.
 # The engine's own timers should always win; the sweeper firing means an engine hung.
 #
 # Source: games-multiplayer/sweeper.py (offline test: scripts/test-games-mp-sweeper.py).
@@ -1079,7 +1083,10 @@ resource "aws_lambda_function" "games_mp_sweeper" {
       GRACE_SEC         = "600"
       DEFAULT_LIMIT_SEC = "7200"
       MAX_HARDCAP_SEC   = "14400"
-      SNS_TOPIC_ARN     = aws_sns_topic.cost_alerts.arn
+      # The ONLY exemption: the router's family, which the launcher is denied RunTask on
+      # (NeverRunTheRouter).
+      ROUTER_FAMILY = local.mp_router_family
+      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
   }
 

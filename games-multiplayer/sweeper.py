@@ -6,10 +6,17 @@ Lambda is the part that does not trust that: every 5 minutes it stops any engine
 outlived its cap, so a hung engine, a crash loop that never posts a result, or a launcher
 bug costs at most one cap plus one grace period, never a month of Fargate.
 
-What counts as an engine: any task in the cluster that an ECS service did NOT start. The
-only service is `mp-router` (group `service:mp-router`); everything else is launched by the
-Vercel lobby with RunTask, one task per match. That is deliberately wider than "has a
-`match` tag": a launcher bug that forgets the tags must not buy a task immortality.
+What counts as an engine: every task in the cluster EXCEPT those of the router's task
+definition family (`games-mp-router`). That is deliberately wider than "has a `match`
+tag": a launcher bug that forgets the tags must not buy a task immortality.
+
+The exemption keys on the task definition family and on nothing the launcher controls.
+RunTask lets the caller set `group` (it could claim "service:mp-router"), `startedBy`
+and every tag, so none of those may exempt a task. The family comes from the task
+definition ARN, and the launcher's IAM policy explicitly denies RunTask on the router's
+family (NeverRunTheRouter in games-multiplayer.tf). The only launcher-set value the
+sweeper reads is `hardcap`, and it can only move the limit within [GRACE, MAX_HARDCAP +
+GRACE]; missing or garbage means the 2 h default.
 
 The lobby tags every RunTask with `game`, `match`, `env` and `hardcap` (seconds). The
 limit for a task is `hardcap + GRACE_SEC` when `hardcap` is a sane positive integer, and
@@ -32,6 +39,7 @@ GRACE_SEC = int(os.environ.get("GRACE_SEC", "600"))
 DEFAULT_LIMIT_SEC = int(os.environ.get("DEFAULT_LIMIT_SEC", "7200"))
 MAX_HARDCAP_SEC = int(os.environ.get("MAX_HARDCAP_SEC", "14400"))
 SNS_TOPIC = os.environ.get("SNS_TOPIC_ARN", "")
+ROUTER_FAMILY = os.environ.get("ROUTER_FAMILY", "games-mp-router")
 
 # Tasks already on their way out. Stopping them again is a no-op at best.
 _STOPPING = {"DEACTIVATING", "STOPPING", "DEPROVISIONING", "STOPPED", "DELETED"}
@@ -60,8 +68,15 @@ def limit_seconds(tags):
     return min(cap, MAX_HARDCAP_SEC) + GRACE_SEC
 
 
+def task_family(task):
+    # arn:aws:ecs:<region>:<account>:task-definition/<family>:<revision>
+    arn = str(task.get("taskDefinitionArn", ""))
+    return arn.rsplit("/", 1)[-1].rsplit(":", 1)[0] if "/" in arn else ""
+
+
 def is_engine(task):
-    return not str(task.get("group", "")).startswith("service:")
+    # Never `group`, `startedBy` or tags: RunTask callers set those freely.
+    return task_family(task) != ROUTER_FAMILY
 
 
 def _running_task_arns(ecs):

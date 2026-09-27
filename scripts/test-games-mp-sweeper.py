@@ -20,7 +20,7 @@ CLUSTER_ARN_PREFIX = "arn:aws:ecs:us-west-1:928413605543:task/games/"
 
 
 def load_sweeper():
-    for key in ("CLUSTER", "GRACE_SEC", "DEFAULT_LIMIT_SEC", "MAX_HARDCAP_SEC", "SNS_TOPIC_ARN"):
+    for key in ("CLUSTER", "GRACE_SEC", "DEFAULT_LIMIT_SEC", "MAX_HARDCAP_SEC", "SNS_TOPIC_ARN", "ROUTER_FAMILY"):
         os.environ.pop(key, None)
     os.environ["SNS_TOPIC_ARN"] = "arn:aws:sns:us-west-1:928413605543:cost-alerts"
     spec = importlib.util.spec_from_file_location("sweeper", ROOT / "games-multiplayer" / "sweeper.py")
@@ -29,14 +29,22 @@ def load_sweeper():
     return mod
 
 
-def task(n, age_sec, tags=None, group="family:games-mptest", status="RUNNING"):
-    return {
+TD_PREFIX = "arn:aws:ecs:us-west-1:928413605543:task-definition/"
+
+
+def task(n, age_sec, tags=None, group="family:games-mptest", status="RUNNING",
+         family="games-mptest", started_by=None):
+    t = {
         "taskArn": CLUSTER_ARN_PREFIX + "t%03d" % n,
+        "taskDefinitionArn": TD_PREFIX + "%s:7" % family,
         "group": group,
         "lastStatus": status,
         "createdAt": NOW - datetime.timedelta(seconds=age_sec),
         "tags": [{"key": k, "value": v} for k, v in (tags or {}).items()],
     }
+    if started_by:
+        t["startedBy"] = started_by
+    return t
 
 
 class FakeECS:
@@ -120,13 +128,35 @@ class SweeperTests(unittest.TestCase):
         ])
         self.assertEqual(self.stopped_ids(ecs), ["t001"])
 
-    def test_router_service_tasks_are_never_touched(self):
+    def test_router_family_tasks_are_never_touched(self):
         ecs, results = self.run_with([
-            task(1, 90 * 86400, {}, group="service:mp-router"),
-            task(2, 90 * 86400, {"match": "x", "hardcap": "1"}, group="service:mp-router"),
+            task(1, 90 * 86400, {}, group="service:mp-router", family="games-mp-router"),
+            task(2, 90 * 86400, {"match": "x", "hardcap": "1"}, group="service:mp-router",
+                 family="games-mp-router"),
         ])
         self.assertEqual(ecs.stopped, [])
         self.assertEqual(results, [])
+
+    def test_launcher_spoofable_fields_never_exempt_an_engine(self):
+        # RunTask callers set group, startedBy and tags. An engine that claims to be the
+        # router through any of them is still swept (Codex review, 1784331).
+        ecs, _ = self.run_with([
+            task(1, 7201, {}, group="service:mp-router"),
+            task(2, 7201, {"match": "m2"}, group="service:mp-router",
+                 started_by="ecs-svc/1234567890123456789"),
+            task(3, 7201, {"games-role": "router", "aws:ecs:serviceName": "mp-router"}),
+            task(4, 7201, {"match": "m4"}, group="family:games-mp-router"),
+        ])
+        self.assertEqual(self.stopped_ids(ecs), ["t001", "t002", "t003", "t004"])
+
+    def test_family_is_matched_exactly(self):
+        # A game id that merely starts with the router's name is an engine.
+        ecs, _ = self.run_with([
+            task(1, 7201, {}, family="games-mp-router2"),
+            task(2, 7201, {}, family="games-mp-route"),
+        ])
+        self.assertEqual(self.stopped_ids(ecs), ["t001", "t002"])
+        self.assertEqual(self.sw.task_family({}), "")
 
     def test_untagged_standalone_task_still_gets_the_default_limit(self):
         # A launcher bug that drops the tags must not make a task immortal.
@@ -186,6 +216,14 @@ class TerraformWiringTests(unittest.TestCase):
     def test_env_limits_match_the_documented_rule(self):
         for key, value in [("GRACE_SEC", "600"), ("DEFAULT_LIMIT_SEC", "7200"), ("MAX_HARDCAP_SEC", "14400")]:
             self.assertRegex(self.tf, r'%s\s*=\s*"%s"' % (key, value))
+
+    def test_exempt_family_is_the_one_the_launcher_cannot_run(self):
+        self.assertRegex(self.tf, r'mp_router_family\s*=\s*"games-mp-router"')
+        self.assertRegex(self.tf, r'ROUTER_FAMILY\s*=\s*local\.mp_router_family')
+        self.assertRegex(self.tf, r'family\s*=\s*local\.mp_router_family')
+        deny = self.sid_block("NeverRunTheRouter")
+        self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
+        self.assertIn("task-definition/${local.mp_router_family}:*", deny)
 
     def test_schedule_is_every_five_minutes(self):
         self.assertIn('schedule_expression = "rate(5 minutes)"', self.tf)

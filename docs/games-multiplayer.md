@@ -86,9 +86,12 @@ After a token-key change, restart the router so it reads the new value:
   `MP_ENGINE_SG`, and `assignPublicIp=ENABLED`.
 - Set the tags `game`, `match`, `env` and `hardcap`. `hardcap` is the match's hard cap in
   seconds.
-- The sweeper runs every 5 minutes. It stops any standalone task in the cluster older than
+- The sweeper runs every 5 minutes. It stops any task in the cluster older than
   `hardcap` + 10 minutes. If `hardcap` is missing or invalid, the limit is 2 hours, and
   `hardcap` is clamped to 4 hours.
+- The only task the sweeper never stops is one from the router's task definition family,
+  `games-mp-router`, which the launcher is denied RunTask on. RunTask's `group`,
+  `startedBy` and tags are set by the caller, so none of them exempts a task.
 - The launcher can tag only at RunTask, so it can't extend a running task's cap later.
 - The launcher's StopTask works only on tasks that carry the `match` tag, so the lobby can
   stop its own engines. It can never stop a router task: those are started by the ECS
