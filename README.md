@@ -1458,9 +1458,11 @@ not trusted with root:
 
 - **Games multiplayer.** The public lobby at `cc-games.app` launches Fargate match engines,
   and anyone on the internet can connect to `play.cc-games.app`, an internet-facing ALB.
-  Join tokens, an origin allowlist, per-IP limits and router-only engine ingress protect it.
-  The engines' task role has no permissions. The limits on launches live in the lobby's code;
-  AWS itself caps only each task's lifetime. See the threat model in
+  A WAF (per-IP rate limit, AWS managed rules), join tokens, an origin allowlist, per-IP
+  limits in the router and router-only engine ingress protect it. The engines' task role has
+  no permissions and their egress is HTTPS-only. The lobby's launch limits are pinned by
+  Terraform, and AWS enforces its own ceiling on concurrent engines (the sweeper stops the
+  newest above it every minute) as well as each task's lifetime. See the threat model in
   [`docs/games-multiplayer.md`](docs/games-multiplayer.md).
 - **Runners for other repos.** Every writer on `CoderColton/colton-games` and
   `dolphin-labs-hq/dolphin-labs` can run any code on our x86 spot runner VMs. They are
@@ -1940,7 +1942,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Colton Games' production domains on Vercel (`cc-games.app`, with `ccgames.app` and `colton-games.com` redirecting) | `vercel.tf`, `vercel-cc-games.tf` |
 | tmux-scroll and t-claude pin shared by every box | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
-| Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer/` (sweeper, bring-up steps, buildspec), `docs/games-multiplayer.md` |
+| Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (sweeper, bring-up steps, buildspec), `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,

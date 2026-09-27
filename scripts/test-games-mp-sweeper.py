@@ -20,7 +20,8 @@ CLUSTER_ARN_PREFIX = "arn:aws:ecs:us-west-1:928413605543:task/games/"
 
 
 def load_sweeper():
-    for key in ("CLUSTER", "GRACE_SEC", "DEFAULT_LIMIT_SEC", "MAX_HARDCAP_SEC", "SNS_TOPIC_ARN", "ROUTER_FAMILY"):
+    for key in ("CLUSTER", "GRACE_SEC", "DEFAULT_LIMIT_SEC", "MAX_HARDCAP_SEC", "SNS_TOPIC_ARN", "ROUTER_FAMILY",
+                "ENGINE_CEILING", "METRIC_NAMESPACE"):
         os.environ.pop(key, None)
     os.environ["SNS_TOPIC_ARN"] = "arn:aws:sns:us-west-1:928413605543:cost-alerts"
     spec = importlib.util.spec_from_file_location("sweeper", ROOT / "games-multiplayer" / "sweeper.py")
@@ -78,6 +79,16 @@ class FakeECS:
         self.stopped.append((cluster, task, reason))
 
 
+class FakeCloudWatch:
+    def __init__(self, error=None):
+        self.put, self.error = [], error
+
+    def put_metric_data(self, Namespace, MetricData):
+        if self.error:
+            raise self.error
+        self.put.append((Namespace, {m["MetricName"]: m["Value"] for m in MetricData}))
+
+
 class FakeSNS:
     def __init__(self):
         self.published = []
@@ -90,10 +101,11 @@ class SweeperTests(unittest.TestCase):
     def setUp(self):
         self.sw = load_sweeper()
         self.sns = FakeSNS()
+        self.cw = FakeCloudWatch()
 
     def run_with(self, tasks, **kw):
         ecs = FakeECS(tasks, **kw)
-        self.sw._clients.update({"ecs": ecs, "sns": self.sns})
+        self.sw._clients.update({"ecs": ecs, "sns": self.sns, "cloudwatch": self.cw})
         return ecs, self.sw.sweep(now=NOW)
 
     def stopped_ids(self, ecs):
@@ -193,8 +205,39 @@ class SweeperTests(unittest.TestCase):
         self.run_with([task(1, 9000, {"match": "m1"})])
         self.assertEqual(self.sns.published, [])
 
+    def test_ceiling_stops_the_newest_engines_and_never_the_router(self):
+        self.sw.ENGINE_CEILING = 3
+        tasks = [task(n, 1000 - n * 10, {"match": "m%d" % n, "hardcap": "3600"}) for n in range(1, 7)]
+        tasks.append(task(99, 5, family="games-mp-router", group="service:mp-router"))   # newest of all
+        ecs, results = self.run_with(tasks)
+        # Six engines, ceiling 3: the three newest (t004, t005, t006) go; the router is not counted.
+        self.assertEqual(self.stopped_ids(ecs), ["t004", "t005", "t006"])
+        self.assertTrue(all("ceiling 3" in r for _, _, r in ecs.stopped))
+        self.assertEqual([s for _, s, _ in self.sns.published], ["games-mp-sweeper: engine ceiling reached"])
+        self.assertEqual(self.cw.put[-1], ("GamesMultiplayer", {"RunningEngines": 3, "EnginesStopped": 3}))
+
+    def test_at_or_below_the_ceiling_nothing_is_stopped(self):
+        self.sw.ENGINE_CEILING = 3
+        ecs, _ = self.run_with([task(n, 100, {"match": "m%d" % n}) for n in range(1, 4)])
+        self.assertEqual(ecs.stopped, [])
+        self.assertEqual(self.sns.published, [])
+
+    def test_age_stops_count_before_the_ceiling(self):
+        # An over-age engine stopped for age no longer counts toward the ceiling.
+        self.sw.ENGINE_CEILING = 2
+        ecs, _ = self.run_with([task(1, 9000, {}), task(2, 100, {}), task(3, 50, {})])
+        self.assertEqual(self.stopped_ids(ecs), ["t001"])
+
+    def test_running_engines_is_published_every_run_and_a_metrics_outage_does_not_fail_it(self):
+        self.run_with([task(1, 100, {"match": "a"})])
+        self.assertEqual(self.cw.put[-1], ("GamesMultiplayer", {"RunningEngines": 1, "EnginesStopped": 0}))
+        self.cw.error = RuntimeError("Throttling")
+        ecs, results = self.run_with([task(1, 9000, {})])
+        self.assertEqual(self.stopped_ids(ecs), ["t001"], "the sweep still acts when metrics fail")
+
     def test_handler_summary(self):
-        self.sw._clients.update({"ecs": FakeECS([task(1, 10, {"match": "a"}), task(2, 9000, {})]), "sns": self.sns})
+        self.sw._clients.update({"ecs": FakeECS([task(1, 10, {"match": "a"}), task(2, 9000, {})]), "sns": self.sns,
+                                 "cloudwatch": self.cw})
         orig = self.sw.sweep
         self.sw.sweep = lambda: orig(now=NOW)
         try:
@@ -225,8 +268,13 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
         self.assertIn("task-definition/${local.mp_router_family}:*", deny)
 
-    def test_schedule_is_every_five_minutes(self):
-        self.assertIn('schedule_expression = "rate(5 minutes)"', self.tf)
+    def test_schedule_is_every_minute_with_a_ceiling_above_the_lobby_caps(self):
+        self.assertIn('schedule_expression = "rate(1 minute)"', self.tf)
+        self.assertIn('ENGINE_CEILING   = tostring(var.games_mp_engine_ceiling)', self.tf)
+        caps = re.search(r'games_mp_lobby_max_active = \{ production = (\d+), preview = (\d+) \}', self.tf)
+        ceiling = re.search(r'variable "games_mp_engine_ceiling" \{.*?default\s*=\s*(\d+)', self.tf, re.S)
+        self.assertGreater(int(ceiling.group(1)), int(caps.group(1)) + int(caps.group(2)),
+                           "the AWS ceiling must sit above what the lobby itself allows")
 
     def test_launcher_can_only_tag_at_launch(self):
         block = re.search(r'Sid\s*=\s*"TagTasksAtLaunch".*?\n      \}', self.tf, re.S).group()

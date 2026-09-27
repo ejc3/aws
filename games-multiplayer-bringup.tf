@@ -495,9 +495,14 @@ locals {
   games_mp_vercel_env = merge(
     { for k, v in local.games_mp_vercel_shared_config : k => { targets = ["production", "preview"], sensitive = false, value = v } },
     {
-      "MP_ENV/production"                       = { targets = ["production"], sensitive = false, value = "production" }
-      "MP_ENV/preview"                          = { targets = ["preview"], sensitive = false, value = "preview" }
-      "MP_API/production"                       = { targets = ["production"], sensitive = false, value = "https://cc-games.app" }
+      "MP_ENV/production" = { targets = ["production"], sensitive = false, value = "production" }
+      "MP_ENV/preview"    = { targets = ["preview"], sensitive = false, value = "preview" }
+      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.app" }
+      # Launch admission (games-multiplayer.tf locals): pinned here, not left to code defaults.
+      "MP_MAX_ACTIVE_MATCHES/production"        = { targets = ["production"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.production) }
+      "MP_MAX_ACTIVE_MATCHES/preview"           = { targets = ["preview"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.preview) }
+      "MP_IP_MAX_ACTIVE"                        = { targets = ["production", "preview"], sensitive = false, value = tostring(local.games_mp_ip_max_active) }
+      "MP_IP_MAX_PER_HOUR"                      = { targets = ["production", "preview"], sensitive = false, value = tostring(local.games_mp_ip_max_per_hour) }
       "SKYHOOK_LEADERBOARD_ENVIRONMENT/preview" = { targets = ["preview"], sensitive = false, value = "preview" }
       "MP_TOKEN_KEYS"                           = { targets = ["production", "preview"], sensitive = true, value = null }
       "MP_TEST_KEY"                             = { targets = ["production", "preview"], sensitive = true, value = null }

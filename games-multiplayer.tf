@@ -74,10 +74,45 @@ variable "mp_engine_image_tags" {
   default     = {}
 }
 
-variable "mp_router_desired_count" {
-  description = "mp-router tasks. One is plenty for a family; the router is stateless, so raising this is the whole scaling story."
+# Launch limits, in one place: the lobby enforces the per-environment caps and per-IP rates
+# in SQL at the launch claim (colton-games lib/multiplayer/config.ts), and Terraform writes
+# them to its Vercel env (games-multiplayer-bringup.tf) so they are not code defaults. The
+# AWS side does not trust the lobby: the sweeper counts running engines and stops the newest
+# above var.games_mp_engine_ceiling, and alarms when more run than these caps allow.
+locals {
+  games_mp_lobby_max_active = { production = 20, preview = 5 }
+  games_mp_ip_max_active    = 3
+  games_mp_ip_max_per_hour  = 10
+  # Most engines a correctly behaving lobby can have running at once.
+  games_mp_lobby_engines_max = sum(values(local.games_mp_lobby_max_active))
+}
+
+variable "games_mp_engine_ceiling" {
+  description = "Most match engines the sweeper lets run at once; above it, it stops the newest. A little above the lobby's caps (they sum to 25), for engines still exiting after their match."
   type        = number
-  default     = 1
+  default     = 30
+  validation {
+    condition     = var.games_mp_engine_ceiling >= 1 && var.games_mp_engine_ceiling <= 200
+    error_message = "games_mp_engine_ceiling must be 1..200."
+  }
+}
+
+variable "mp_router_desired_count" {
+  description = "mp-router tasks at creation. After that, autoscaling owns the count between mp_router_min_count and mp_router_max_count; this is not reapplied."
+  type        = number
+  default     = 2
+}
+
+variable "mp_router_min_count" {
+  description = "Fewest mp-router tasks autoscaling keeps. 2 so one task is never a single point of failure; 0 (with mp_router_max_count = 0) takes play.cc-games.app off the internet."
+  type        = number
+  default     = 2
+}
+
+variable "mp_router_max_count" {
+  description = "Most mp-router tasks autoscaling may run."
+  type        = number
+  default     = 6
 }
 
 variable "mp_env" {
@@ -717,15 +752,38 @@ resource "aws_vpc_security_group_ingress_rule" "games_engine_from_router" {
   description                  = "player traffic via mp-router, the ONLY way in"
 }
 
-# Engines need the internet: ECR pulls and HTTPS callbacks to the lobby on Vercel, whose
-# addresses are not fixed. The public IP is outbound-only because ingress is router-only.
+# Engines need HTTPS and nothing else: the lobby callbacks on Vercel (spec, ready, heartbeat,
+# result: colton-games server/mp-kit/api.mjs), whose addresses are not fixed, plus the image
+# pull and log delivery Fargate makes over the task's ENI. So 443 only, v4 and v6; an engine
+# running hostile code cannot reach SSH, databases or anything else on the internet or in
+# this VPC. DNS to the VPC resolver is not filtered by security groups.
+# create_before_destroy: the new 443 rules exist before the old allow-all ones go, so a live
+# engine never loses its callbacks mid-match.
 resource "aws_vpc_security_group_egress_rule" "games_engine" {
   for_each          = { v4 = { cidr4 = "0.0.0.0/0", cidr6 = null }, v6 = { cidr4 = null, cidr6 = "::/0" } }
   security_group_id = aws_security_group.games_engine.id
-  ip_protocol       = "-1"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
   cidr_ipv4         = each.value.cidr4
   cidr_ipv6         = each.value.cidr6
-  description       = "all outbound (${each.key}): ECR, Vercel callbacks"
+  description       = "HTTPS only (${each.key}): Vercel callbacks, ECR, logs"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# The ECS task metadata endpoint, where an engine reads its own private IP
+# (resolveEngineIp in mp-kit/api.mjs). Link-local traffic is not filtered by security groups;
+# this rule states the dependency so tightening egress can never silently break it.
+resource "aws_vpc_security_group_egress_rule" "games_engine_task_metadata" {
+  security_group_id = aws_security_group.games_engine.id
+  ip_protocol       = "tcp"
+  from_port         = 80
+  to_port           = 80
+  cidr_ipv4         = "169.254.170.2/32"
+  description       = "ECS task metadata endpoint (engine's own IP)"
 }
 
 # -------------------------------------------------------------------------------------
@@ -794,7 +852,16 @@ resource "aws_lb" "games_play" {
   idle_timeout               = 3600
   drop_invalid_header_fields = true
 
+  # games-multiplayer-edge.tf: the bucket, its delivery policy and 30-day expiry.
+  access_logs {
+    bucket  = aws_s3_bucket.games_play_alb_logs.id
+    prefix  = "games-play"
+    enabled = true
+  }
+
   tags = { Name = "games-play", Project = "games-multiplayer" }
+
+  depends_on = [aws_s3_bucket_policy.games_play_alb_logs]
 }
 
 # Router targets. deregistration_delay 30: when a router task is replaced, the ALB stops
@@ -973,6 +1040,11 @@ resource "aws_ecs_service" "games_mp_router" {
   depends_on = [aws_lb_listener.games_play_https]
 
   tags = { Name = "mp-router", Project = "games-multiplayer", "games-role" = "router" }
+
+  # Application Auto Scaling owns the running count (games-multiplayer-edge.tf).
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
 }
 
 # -------------------------------------------------------------------------------------
@@ -1100,10 +1172,17 @@ resource "aws_iam_role_policy" "games_mp_sweeper" {
         Resource = "${aws_cloudwatch_log_group.games_mp_sweeper.arn}:*"
       },
       {
-        # Only to report a StopTask that FAILED; routine stops are just logged.
+        # To report a StopTask that FAILED and a ceiling stop; routine age stops are just logged.
         Effect   = "Allow"
         Action   = "sns:Publish"
         Resource = aws_sns_topic.cost_alerts.arn
+      },
+      {
+        # RunningEngines / EnginesStopped every run (games-mp-engines-over-lobby-caps reads it).
+        Effect    = "Allow"
+        Action    = "cloudwatch:PutMetricData"
+        Resource  = "*"
+        Condition = { StringEquals = { "cloudwatch:namespace" = "GamesMultiplayer" } }
       },
     ]
   })
@@ -1135,6 +1214,9 @@ resource "aws_lambda_function" "games_mp_sweeper" {
       # (NeverRunTheRouter).
       ROUTER_FAMILY = local.mp_router_family
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
+      # AWS-side ceiling on concurrent engines, independent of the lobby.
+      ENGINE_CEILING   = tostring(var.games_mp_engine_ceiling)
+      METRIC_NAMESPACE = "GamesMultiplayer"
     }
   }
 
@@ -1167,24 +1249,25 @@ resource "aws_iam_role_policy" "games_mp_sweeper_scheduler" {
   })
 }
 
-# Every 5 minutes, so a hung engine overstays by at most cap + 10 min + 5 min.
+# Every minute: a hung engine overstays by at most cap + 10 min + 1 min, and a launch burst
+# above the engine ceiling is cut back within a minute.
 resource "aws_scheduler_schedule" "games_mp_sweeper" {
   name       = "games-mp-sweeper"
   group_name = "default"
 
   flexible_time_window { mode = "OFF" }
 
-  schedule_expression = "rate(5 minutes)"
+  schedule_expression = "rate(1 minute)"
 
   target {
     arn      = aws_lambda_function.games_mp_sweeper.arn
     role_arn = aws_iam_role.games_mp_sweeper_scheduler.arn
 
-    # A missed sweep is replaced by the next one five minutes later; retrying stale ones
-    # would only pile invocations up.
+    # A missed sweep is replaced by the next one a minute later; retrying stale ones would
+    # only pile invocations up.
     retry_policy {
       maximum_retry_attempts       = 0
-      maximum_event_age_in_seconds = 300
+      maximum_event_age_in_seconds = 60
     }
   }
 }
@@ -1229,6 +1312,50 @@ resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_silent" {
   treat_missing_data  = "breaching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
+# More engines running than the lobby's own caps allow, for 5 minutes: something is launching
+# around the lobby (a preview deployment with launcher credentials, a leaked role session) or
+# the lobby's admission is broken. The ceiling above still caps the damage; this says why.
+resource "aws_cloudwatch_metric_alarm" "games_mp_engines_over_lobby_caps" {
+  alarm_name          = "games-mp-engines-over-lobby-caps"
+  alarm_description   = "More match engines are running than the colton-games lobby's caps allow (${local.games_mp_lobby_engines_max}) for 5 minutes; the sweeper stops the newest above ${var.games_mp_engine_ceiling}. Check who can launch (games-mp-launcher)."
+  namespace           = "GamesMultiplayer"
+  metric_name         = "RunningEngines"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 5
+  datapoints_to_alarm = 5
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = local.games_mp_lobby_engines_max
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
+# ECS/Fargate spend. AWS/Billing EstimatedCharges does not exist in this account (billing
+# alerts are not enabled; `aws cloudwatch list-metrics --namespace AWS/Billing` is empty in
+# every region), so a Budgets budget filtered to ECS is the alarm here. It lags by hours:
+# the engine ceiling is the real-time control, this is the backstop that sees the bill.
+resource "aws_budgets_budget" "games_ecs_daily" {
+  name         = "games-ecs-daily"
+  budget_type  = "COST"
+  limit_amount = "15"
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
+
+  cost_filter {
+    name   = "Service"
+    values = ["Amazon Elastic Container Service"]
+  }
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 100
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.cost_alerts.arn]
+  }
 }
 
 # -------------------------------------------------------------------------------------

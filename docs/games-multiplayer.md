@@ -196,8 +196,13 @@ To take the platform off the internet, fastest first:
   done
   ```
 
-- **Close the public entry.** `terraform apply -var mp_router_desired_count=0` stops the
-  router: the ALB then answers 503 and no connection reaches an engine.
+- **Close the public entry.** Autoscaling owns the router count (2 to 6), so set its range to
+  zero: `terraform apply -var mp_router_min_count=0 -var mp_router_max_count=0`. The router
+  tasks stop, the ALB answers 503, and no connection reaches an engine.
+- **Tighten the edge.** The WAF's per-IP limit is `limit` in `rate-per-ip`
+  (`games-multiplayer-edge.tf`); lowering it and applying takes effect within a minute.
+- **Lower the engine ceiling.** `-var games_mp_engine_ceiling=<n>`: within a minute the sweeper
+  stops the newest engines above it.
 
 Other switches:
 
@@ -251,10 +256,16 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 
 1. **Browser → ALB** (`games-multiplayer.tf`, `aws_lb.games_play`). Ports 80 and 443 from
    anywhere, IPv4 and IPv6; 80 only redirects. TLS policy `ELBSecurityPolicy-TLS13-1-2-2021-06`,
-   `drop_invalid_header_fields = true`. **No WAF** (live: `get-web-acl-for-resource` returns
-   none).
-2. **ALB → mp-router** (`aws_ecs_service.games_mp_router`). The router's security group admits
-   only the ALB. The router (games repo `server/mp-router/`) requires a valid join token,
+   `drop_invalid_header_fields = true`. **WAF** web ACL `games-play`
+   (`games-multiplayer-edge.tf`): blocks any IP above 6,000 requests per 60 s, blocks the AWS
+   IP-reputation and known-bad-inputs managed groups, and runs the common rule set in COUNT
+   until its matches on game traffic have been reviewed. WebSocket frames after the upgrade
+   are not WAF requests, so play costs one request per connection. Blocks and counts are
+   logged to `aws-waf-logs-games-play` (30 days); ALB access logs go to
+   `games-play-alb-logs-<account>` (30 days).
+2. **ALB → mp-router** (`aws_ecs_service.games_mp_router`). At least two router tasks,
+   autoscaled on CPU up to six, so one task is never every match's single point of failure.
+   The router's security group admits only the ALB. The router (games repo `server/mp-router/`) requires a valid join token,
    checks `Origin` against `MP_ALLOWED_ORIGINS` (live: the three production hosts and
    Colton's preview pattern; no-`Origin` clients are refused because `MP_ALLOW_NO_ORIGIN` is
    unset), and limits each client to 20 open connections and 50 requests/s (burst 100). The
@@ -278,57 +289,76 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    (`ReadTaskNetworkInterfaces`, games-multiplayer.tf), which the launcher uses to find an
    engine's address; it exposes the region's ENI inventory to a compromised deployment.
 6. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
-   a public IPv4 for outbound traffic and have **unrestricted egress**; inbound is router-only.
-   The container runs as root with a writable root filesystem.
+   a public IPv4 for outbound traffic; their egress is **TCP 443 only** (plus the ECS task
+   metadata endpoint), which is all the engine kit uses: HTTPS callbacks to the lobby, image
+   pulls and logs. Inbound is router-only. The container still runs as root with a writable
+   root filesystem.
 
 **What an attacker can and cannot do**
 
 | Attacker | Can | Cannot |
 | --- | --- | --- |
-| Anyone on the internet | Reach the ALB and router; hold connections open (idle timeout 3600 s); consume the router's single 0.25 vCPU with a distributed flood | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host |
+| Anyone on the internet | Reach the ALB and router, up to 6,000 requests per IP per minute; hold connections open (idle timeout 3600 s); push a *distributed* flood that stays under the per-IP limit against 2–6 autoscaled routers | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host; get past the WAF from a known-bad IP |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
-| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
-| A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (today only SSH and ET, which are already public); use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress) |
+| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image, with HTTPS-only egress. The sweeper stops the newest engines above `games_mp_engine_ceiling` (30) every minute and alarms, but that is cleanup, not admission control: between sweeps the caller can launch up to the account's Fargate quota (4,000 vCPU, about 2,000 engines) and relaunch what is stopped (open gap below). Each engine runs until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed). Read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
+| A compromised engine | Reach any host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach SSH, databases or any non-443 service, here or on the internet |
 
 **Cost-abuse limits, and what happens at each**
 
-- **Lobby admission (games repo, enforced in SQL; not set by Terraform).** At most
-  `MP_MAX_ACTIVE_MATCHES` (default 20) unfinished matches per environment; per client
-  `MP_IP_MAX_ACTIVE` (3) unfinished and `MP_IP_MAX_PER_HOUR` (10) launches; one unfinished
-  seat per player. At the limit the lobby answers `429 launch-limit` or `503 capacity`.
-  Saturated by many clients, that is at most 40 engines (20 per environment), about $3.80/hour.
-  Today production exposes only the hidden `mptest` game, which needs `MP_TEST_KEY`, so the
-  public cannot launch anything yet.
+- **Lobby admission (games repo, enforced in SQL at the launch claim; values pinned by
+  Terraform** in the Vercel env, `games-multiplayer.tf` locals). At most
+  `MP_MAX_ACTIVE_MATCHES` unfinished matches per environment (production 20, preview 5); per
+  client `MP_IP_MAX_ACTIVE` (3) unfinished and `MP_IP_MAX_PER_HOUR` (10) launches; one
+  unfinished seat per player. At the limit the lobby answers `429 launch-limit` or
+  `503 capacity`. Saturated, that is 25 engines, about $2.40/hour. Today production exposes only
+  the hidden `mptest` game, which needs `MP_TEST_KEY`, so the public cannot launch anything yet.
+- **AWS-side engine ceiling, independent of the lobby.** Every minute the sweeper counts running
+  engines (every task except the router's family) and, above `games_mp_engine_ceiling` (30),
+  stops the newest excess ones and alerts. It publishes `GamesMultiplayer/RunningEngines`;
+  `games-mp-engines-over-lobby-caps` pages when more than the lobby's 25 run for 5 minutes,
+  which means something is launching around the lobby.
 - **Per-match caps.** Each engine exits at its own `hardCapSec` (30 minutes for `mptest`);
   the sweeper stops any task at `hardcap` + 10 minutes (the hardcap itself clamped to 4 hours), or 2
   hours + 10 minutes without a valid tag, plus up to one sweep interval. That is a bound only
   while sweeps and `StopTask` succeed: a failed stop is caught and alerted, and the task keeps
   running until someone intervenes. Two alarms page if the sweeper errors or stops running.
-- **No AWS-side limit on how many engines run at once.** A caller holding the launcher's
-  credentials is limited only by the Fargate quota. Fargate bills under ECS, so the existing
-  `high-ec2-spend` alarm (EC2 only) does not see it; the account-wide $200/day budget does, but
-  billing data arrives hours late. This is the top open gap (below).
+- **Engine ceiling (detective, not preventive).** Every minute the sweeper stops the newest
+  engines above `games_mp_engine_ceiling` (30) and alarms. It bounds sustained cost, not a burst:
+  between sweeps a holder of the launcher's credentials can still launch up to the Fargate quota.
+  True admission control needs launches to go through an AWS-controlled path (open gap below).
+- **Spend.** Budget `games-ecs-daily` ($15/day, ECS only) plus the account's $200/day budget.
+  Both lag by hours; the ceiling is the fastest control. `AWS/Billing` metrics are not
+  published in this account (billing alerts are off), so `EstimatedCharges` alarms, including
+  the older `high-ec2-daily-spend`, never have data.
 
 **Monitoring.** Sweeper errors and silence (`games-mp-sweeper-errors`,
-`games-mp-sweeper-not-running`), the account's daily budget, and router and engine logs in
-CloudWatch (14-day retention). ALB access logs are **off** (live), so there is no record of who
-connected. The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
-client-address logic relies on. There is no alarm on router health, ALB 5xx, or the number of
-running engines.
+`games-mp-sweeper-not-running`); running engines (`games-mp-engines-over-lobby-caps`); router
+health (`games-play-unhealthy-router`, `games-play-no-healthy-router`); 5xx share at the router
+and the ALB (`games-play-target-5xx-rate`, `games-play-elb-5xx-rate`); the ECS and account
+budgets; WAF metrics and logs; ALB access logs; router and engine logs in CloudWatch (14-day
+retention). The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
+client-address logic relies on.
 
-**Open gaps, most severe first** (not yet fixed; see the review for each):
+**Closed** (2026-09-27): the AWS-side engine ceiling (detective: a sweep every minute) and its alarm, the ECS budget, the WAF,
+two-plus autoscaled routers, ALB access logs, router health and 5xx alarms, HTTPS-only engine
+egress, and the lobby's limits pinned in Terraform.
 
-1. No AWS-side cap on concurrent engines, and no ECS spend alarm. Fix: the sweeper stops the
-   newest engines beyond a ceiling every minute and publishes the count; an alarm on that
-   count and on ECS `EstimatedCharges`.
-2. No WAF or rate-based rule on the ALB; one 0.25 vCPU router with no autoscaling; no ALB
-   access logs. Fix: a WAFv2 web ACL with a per-IP rate rule and AWS managed rules; two router
-   tasks with target-tracking autoscaling; ALB access logs to S3; alarms on healthy hosts and 5xx.
-3. The lobby's admission limits live in the games repo's defaults. Pin them in the Vercel env
-   from Terraform.
-4. Engines share the admin VPC's subnets with unrestricted egress, run as root, and receive the
-   preview protection-bypass secret. Fix: dedicated engine subnets with egress limited to what
-   engines need, a non-root read-only container, and callbacks that do not need the bypass.
+**Still open, most severe first:**
+
+1. **No admission control on launches.** The launcher's credentials call `RunTask` directly, so
+   the ceiling is enforced only by the next sweep: a burst can reach the Fargate quota between
+   sweeps, and IAM cannot restrict container overrides. The launcher also trusts **Preview**
+   deployments, so every writer on `CoderColton/colton-games` (and every dependency a branch build
+   pulls in) can obtain those credentials. Fix: route launches through an AWS Lambda that checks
+   the ceiling with consistent counting and starts tasks with fixed settings (the launcher role
+   keeps only `lambda:InvokeFunction`); as a stopgap, drop Preview from the launcher trust.
+2. The common managed rule set runs in COUNT. Review its matches in `aws-waf-logs-games-play`
+   after real play, then flip `common` to BLOCK.
+3. Engines share the admin VPC's subnets (defence in depth; their egress is now 443-only), run
+   as root with a writable root filesystem, and receive the preview protection-bypass secret.
+   Fix: dedicated engine subnets, a non-root read-only container, callbacks without the bypass.
+4. Billing alerts are off account-wide, so no `EstimatedCharges` alarm can fire. Turning them on
+   is an account setting outside Terraform (Billing preferences, "Receive Billing Alerts").
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
 
@@ -340,10 +370,12 @@ CodeBuild ARM small costs $0.00425 per build minute.
 | --- | --- |
 | ALB `games-play`: hours, about $18.40, plus its two public IPv4 addresses, $7.30 | about $26 |
 | ALB LCUs at family scale | about $1–3 |
-| `mp-router`, 0.25 vCPU / 0.5 GB: compute about $8.30, plus public IPv4 $3.65 | about $12 |
+| `mp-router`, 2 tasks (autoscaling's minimum) at 0.25 vCPU / 0.5 GB: compute about $16.60, plus public IPv4 $7.30 | about $24 |
+| WAF `games-play`: $5 per web ACL plus $1 per rule (4), plus $0.60 per million requests; the three AWS managed groups carry no extra fee | about $9–10 |
+| WAF logs (blocks and counts only) and ALB access logs, 30 days each | under $1 |
 | Secrets Manager, 3 secrets at $0.40 | $1.20 |
-| ECR storage, 14-day logs, sweeper Lambda and Scheduler, the build bucket | under $2 |
-| **Always on** | **about $42** |
+| ECR storage, 14-day logs, sweeper Lambda (now every minute) and Scheduler, the build bucket | under $2 |
+| **Always on** | **about $64** |
 | Per build: about 5 minutes of CodeBuild | about $0.02 |
 | Per match: 2 vCPU / 4 GB plus a public IPv4, about $0.096 per hour | **about $0.016 per 10-minute match** |
 

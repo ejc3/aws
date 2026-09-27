@@ -26,6 +26,13 @@ a compromised or buggy launcher cannot tag a task with a year-long cap.
 Age is measured from `createdAt`, which every task has from the moment RunTask accepts it,
 so a task stuck in PENDING (image pull loop, no capacity) is aged too.
 
+ENGINE CEILING. Age alone cannot bound spend: the launcher can start engines far faster than
+they age out (the account's Fargate quota allows ~2,000). So every run, after the age pass,
+the sweeper counts the engines still running and, above ENGINE_CEILING, stops the NEWEST
+excess ones: established matches survive and a burst loses its latest launches. It alerts
+once per run when it does, and publishes RunningEngines (namespace METRIC_NAMESPACE) every
+run, which the running-engines alarm reads. It runs every minute.
+
 No AWS SDK beyond boto3 (bundled in the Lambda runtime). Tested offline by
 scripts/test-games-mp-sweeper.py against a fake ECS client.
 """
@@ -40,6 +47,8 @@ DEFAULT_LIMIT_SEC = int(os.environ.get("DEFAULT_LIMIT_SEC", "7200"))
 MAX_HARDCAP_SEC = int(os.environ.get("MAX_HARDCAP_SEC", "14400"))
 SNS_TOPIC = os.environ.get("SNS_TOPIC_ARN", "")
 ROUTER_FAMILY = os.environ.get("ROUTER_FAMILY", "games-mp-router")
+ENGINE_CEILING = int(os.environ.get("ENGINE_CEILING", "40"))
+METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "GamesMultiplayer")
 
 # Tasks already on their way out. Stopping them again is a no-op at best.
 _STOPPING = {"DEACTIVATING", "STOPPING", "DEPROVISIONING", "STOPPED", "DELETED"}
@@ -107,7 +116,7 @@ def sweep(now=None):
     ecs = _client("ecs")
     now = now or datetime.datetime.now(datetime.timezone.utc)
     arns = _running_task_arns(ecs)
-    results = []
+    results, created = [], {}
     for i in range(0, len(arns), 100):
         described = ecs.describe_tasks(cluster=CLUSTER, tasks=arns[i : i + 100], include=["TAGS"])
         for task in described.get("tasks", []):
@@ -117,6 +126,7 @@ def sweep(now=None):
             tags = {t["key"]: t["value"] for t in task.get("tags", []) if "key" in t}
             age = (now - task["createdAt"]).total_seconds()
             limit = limit_seconds(tags)
+            created[arn] = task["createdAt"]
             entry = {
                 "task": arn,
                 "match": tags.get("match"),
@@ -148,7 +158,49 @@ def sweep(now=None):
                     % (arn, tags.get("match"), tags.get("game"), age, limit, e),
                 )
             results.append(entry)
+    _enforce_ceiling(ecs, results, created)
+    _publish(results)
     return results
+
+
+def _enforce_ceiling(ecs, results, created):
+    """Above ENGINE_CEILING running engines, stop the newest excess ones."""
+    alive = [r for r in results if r["action"] == "ok"]
+    excess = len(alive) - ENGINE_CEILING
+    if excess <= 0:
+        return
+    newest = sorted(alive, key=lambda r: created[r["task"]], reverse=True)[:excess]
+    reason = "games-mp-sweeper: %d engines > ceiling %d; stopping the newest" % (len(alive), ENGINE_CEILING)
+    failed = 0
+    for entry in newest:
+        try:
+            ecs.stop_task(cluster=CLUSTER, task=entry["task"], reason=reason[:255])
+            entry["action"] = "ceiling_stopped"
+        except Exception as e:  # noqa: BLE001 - keep stopping the rest
+            entry["action"] = "ceiling_stop_failed"
+            entry["error"] = str(e)
+            failed += 1
+    _notify(
+        "games-mp-sweeper: engine ceiling reached",
+        "%d match engines were running, above the ceiling of %d. Stopped the %d newest%s.\n"
+        "Something is launching engines faster than matches end: check the lobby, the launcher "
+        "role and who can deploy colton-games." % (
+            len(alive), ENGINE_CEILING, excess,
+            " (%d stop(s) FAILED)" % failed if failed else ""),
+    )
+
+
+def _publish(results):
+    """RunningEngines every run (the alarm treats a missing value as the sweeper not running)."""
+    running = sum(1 for r in results if r["action"] in ("ok", "stop_failed", "ceiling_stop_failed"))
+    stopped = sum(1 for r in results if r["action"] in ("stopped", "ceiling_stopped"))
+    try:
+        _client("cloudwatch").put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=[
+            {"MetricName": "RunningEngines", "Value": running, "Unit": "Count"},
+            {"MetricName": "EnginesStopped", "Value": stopped, "Unit": "Count"},
+        ])
+    except Exception as e:  # noqa: BLE001 - a lost datapoint must not fail the sweep
+        print("put_metric_data failed: %s" % e)
 
 
 def lambda_handler(event, context):
