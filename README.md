@@ -13,7 +13,8 @@ the isolated staging/recovery account, Cloudflare, and several regions. The plat
 - autoscaled ARM64 and x86 GitHub Actions runners;
 - backups, cross-region/cross-account recovery, and cost alerts;
 - credential-free Terraform validation in GitHub, with live plans confined to admin hosts;
-- scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access.
+- scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access
+  (Claude models, plus two named DeepSeek models for opencode on the metal boxes).
 
 ## Start here
 
@@ -1457,6 +1458,25 @@ are not yet available, and this risk acceptance does not mean the packages are f
 Keep scanners, alerts and the remediation backlog enabled. Preserve the dev-to-admin
 credential boundary, credential-free ordinary CI, protected backups and Access policies.
 
+**Outside users.** Two surfaces now let people outside the owner reach AWS resources this
+repo runs. Unlike the dev hosts, they are not behind Cloudflare Access, and their users are
+not trusted with root:
+
+- **Games multiplayer.** The public lobby at `cc-games.app` launches Fargate match engines,
+  and anyone on the internet can connect to `play.cc-games.app`, an internet-facing ALB.
+  Join tokens, an origin allowlist, per-IP limits and router-only engine ingress protect it.
+  The engines' task role has no permissions. The limits on launches live in the lobby's code;
+  AWS itself caps only each task's lifetime. See the threat model in
+  [`docs/games-multiplayer.md`](docs/games-multiplayer.md).
+- **Runners for other repos.** Every writer on `CoderColton/colton-games` and
+  `dolphin-labs-hq/dolphin-labs` can run any code on our x86 spot runner VMs. They are
+  ephemeral and have no inbound access, and the tokens that register them are out of reach.
+  See "Threat model: runners for other repos" in [`GITHUB-RUNNERS.md`](GITHUB-RUNNERS.md).
+
+For both, prioritize cost abuse (launches and VMs someone else can start), anything that
+reaches an admin credential or another tenant's work, and anything that turns a public
+request into host execution. Each document lists its open gaps and how to shut it off.
+
 ### Incremental monitoring cost
 
 September 8, 2026 rate checks put the watchdog's CloudWatch component around **$8.06 per
@@ -1917,13 +1937,15 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Shared dev setup | `dev-instance-common.tf`, `dev-selfupdate.tf`, `dev-hop-key.tf`, `dev-ebs.tf` |
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
-| GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
+| GitHub runners and OIDC | `runner-autoscale.tf`, `runner-webhook-front.tf`, `runner-repos.tf` (per-repo tokens for the other repos' runners), `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
+| Colton Games' production domains on Vercel (`cc-games.app`, with `ccgames.app` and `colton-games.com` redirecting) | `vercel.tf`, `vercel-cc-games.tf` |
+| tmux-scroll and t-claude pin shared by every box | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer/` (sweeper, bring-up steps, buildspec), `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 

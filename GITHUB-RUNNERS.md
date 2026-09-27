@@ -1020,6 +1020,75 @@ Still open (accepted for now):
   executes privileged code and has an instance-bound AWS identity, so untrusted PRs
   must not be automatically approved for self-hosted CI.
 
+## Threat model: runners for other repos
+
+Runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` (Pattern C,
+`runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller lands with #172) are the
+second place people outside the owner run code on AWS resources we manage. Every writer on
+those repos, and every bot that opens pull requests there (for example
+`app/dolphin-refresh-bot`), can run any command on a runner VM by editing a workflow. Treat
+every job as hostile. Checked against the code and live state on 2026-09-27; the Pattern C
+controller itself was not yet applied, so its parts are checked in code only.
+
+**What a malicious job can do**
+
+- **Anything on its own VM, as root.** The runner has passwordless sudo, as GitHub-hosted
+  runners do (the workflows install packages). The VM is ephemeral: one job, then it powers
+  off and terminates. A job can keep it alive past its end, but the reconcile reaps any host
+  that has sat idle for 10 minutes or is older than 3 hours.
+- **Reach the internet.** Egress is unrestricted, and no inbound rule exists
+  (`github-app-runner-sg`), so nothing can connect to a job from outside, or from another job.
+- **Use the instance role through the metadata service.** App runners share
+  `github-runner-instance-role` with fcvm's metal runners. Live, that role can: read and delete
+  only the bootstrap credential tagged with its own instance ARN; get and put its own row in
+  the `github-runner-registration` DynamoDB table; `ec2:DescribeNetworkInterfaces` across the
+  account; assign IPv6 addresses to tagged runner ENIs; write objects under
+  `ejc3-security-records-928413605543/sessions/*` (the session-audit prefix); and run the SSM
+  agent. It cannot read any PAT, Secrets Manager secret, or other SSM parameter.
+- **Reach fcvm's metal runners' SSH port.** They share the runner VPC, and fcvm's runner
+  group admits SSH from the whole VPC CIDR. They accept only the admin and dev-to-runner keys,
+  neither of which is on an app runner.
+
+**What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
+only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
+with the secrets' resource policies); read another job's registration token (instance-bound);
+connect to another runner of the same kind (no inbound); reach the admin fleet's VPC (the
+runner VPC is not peered with it); launch or stop instances.
+
+**Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
+every launch, and the `too-many-app-runners` alarm fires at 16 across both. Each VM lives at
+most 3 hours. The worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
+
+**Shutting it off**
+
+1. Set the repo's `max` to 0 in `runner-app.tf` and apply: no new VMs, even from the reconcile,
+   which launches for queued jobs without any webhook.
+2. Terminate what is running. The controller may terminate only `Role=github-app-runner`:
+   `aws ec2 describe-instances --filters Name=tag:Role,Values=github-app-runner` then
+   `terminate-instances`.
+3. `enable_runner_app_webhooks = false` removes the hooks. The repo's owner can also revoke
+   its controller token in GitHub, which stops registration outright.
+
+**A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
+open a pull request from a fork. Require approval for workflows from all outside
+collaborators in the repo's Actions settings; have the controller refuse jobs whose run comes
+from a fork (the run's `head_repository`), and never serve `pull_request_target`; and give it
+its own cap and alarm.
+
+**Open gaps, most severe first**
+
+1. App runners share fcvm's instance role, so a job can write into the session-audit prefix
+   of the security-records bucket, enumerate every network interface in the account, and
+   write its own row in fcvm's registration table; any grant added for fcvm runners reaches
+   them too. Fix: a dedicated instance role for app runners that can only consume its own
+   bootstrap credential.
+2. fcvm's runner security group admits SSH from the whole runner VPC. Fix: allow runner-to-
+   runner SSH only from fcvm's own runner group.
+3. `too-many-app-runners` fires only when both repos are at their cap together. Fix: a
+   per-repo alarm below the cap.
+4. Colton's controller token expires 2026-10-27; `colton-games` runners stop registering then.
+   Renew it with a one-year expiry.
+
 ## Operating it
 
 ### Temporary runner credential-boundary acceptance
