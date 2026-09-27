@@ -231,10 +231,17 @@ def fetch_source(ref, repo, cache_dir, region, pat_secret):
     if status != 200 or not isinstance(raw, (bytes, bytearray)):
         raise StepError("GitHub zipball %s@%s -> %s" % (repo, ref[:12], status))
     data = repack_zipball(raw, ref, driver)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    # A unique temporary name: the build and migrate steps may download the same commit at
+    # the same time, and each must publish a complete file atomically.
+    fd, tmp = tempfile.mkstemp(dir=cache_dir, prefix=".%s." % ref[:12], suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     log("source %s@%s: %d bytes" % (repo, ref[:12], len(data)))
     return path
 
@@ -469,12 +476,23 @@ def migration_revision(sql):
     return int(found[0])
 
 
-# 0 = never applied; -1 = mp_private exists without the marker table; -2 = empty marker.
-REVISION_SQL = (
-    "SELECT CASE WHEN to_regclass('mp_private.schema_revision') IS NULL THEN "
-    "CASE WHEN EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'mp_private') THEN -1 ELSE 0 END "
-    "ELSE (SELECT coalesce(max(revision), -2) FROM mp_private.schema_revision WHERE id = 1) END"
+# Two statements, not one CASE: PostgreSQL resolves every relation a statement names when it
+# parses it, so a query that mentions mp_private.schema_revision fails on a fresh database
+# even inside a branch that would not run.
+PRESENCE_SQL = (
+    "SELECT (to_regclass('mp_private.schema_revision') IS NOT NULL)::int, "
+    "(EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'mp_private'))::int"
 )
+MARKER_SQL = "SELECT coalesce(max(revision), -2) FROM mp_private.schema_revision WHERE id = 1"
+
+
+def current_revision(env):
+    """0 = never applied; -1 = mp_private exists without the marker table; -2 = empty marker;
+    otherwise the recorded revision."""
+    table, schema = (int(x) for x in psql(env, "-A", "-t", "-F", ",", "-c", PRESENCE_SQL).strip().split(","))
+    if not table:
+        return -1 if schema else 0
+    return int(psql(env, "-A", "-t", "-c", MARKER_SQL).strip())
 
 
 def psql(env, *args):
@@ -530,7 +548,7 @@ def cmd_migrate(args):
             % (args.url_key, args.url_secret, args.region, args.url_secret))
     env = pg_env(url, args.ca)
     ensure_psql()
-    have = int(psql(env, "-A", "-t", "-c", REVISION_SQL).strip())
+    have = current_revision(env)
     log("database (%s, %s): mp_private revision %s, migration sets %s" % (where, env["PGHOST"], have, want))
     if have >= want:
         log("migration already applied; nothing to do")
@@ -548,7 +566,7 @@ def cmd_migrate(args):
         psql(env, "-f", sql_path)
     finally:
         os.unlink(sql_path)
-    have = int(psql(env, "-A", "-t", "-c", REVISION_SQL).strip())
+    have = current_revision(env)
     if have != want:
         raise StepError("migration ran but mp_private.schema_revision is %s, expected %s" % (have, want))
     log("migration %s applied; mp_private at revision %d (verified)" % (args.file, have))

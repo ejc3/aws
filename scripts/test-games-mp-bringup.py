@@ -124,11 +124,20 @@ class World:
         if argv[:2] == ["docker", "pull"] or argv[:2] == ["docker", "tag"]:
             return done("")
         if argv[0] == "psql":
+            # db_revision: 0 = fresh, -1 = schema without marker table, -2 = empty marker.
             if "-f" in argv:
                 self.psql_files.append(Path(argv[argv.index("-f") + 1]).read_text())
                 self.db_revision = 1
                 return done("")
-            return done("%d\n" % self.db_revision)
+            sql = argv[argv.index("-c") + 1]
+            table = self.db_revision not in (0, -1)
+            if "mp_private.schema_revision WHERE" in sql or "FROM mp_private.schema_revision" in sql:
+                if not table:
+                    # What PostgreSQL does: the relation is resolved at parse time.
+                    return done("", 1, 'ERROR:  relation "mp_private.schema_revision" does not exist')
+                return done("%d\n" % self.db_revision)
+            sep = argv[argv.index("-F") + 1] if "-F" in argv else "|"
+            return done("%d%s%d\n" % (int(table), sep, int(self.db_revision != 0)))
         raise AssertionError("unexpected command %r" % argv)
 
     # ---- HTTP (Vercel and GitHub)
@@ -235,6 +244,22 @@ class SourceTests(Base):
         self.assertTrue(all(z.getinfo(n).external_attr >> 16 == 0o40755 for n in names if n.endswith("/")))
         self.assertEqual(z.read(".games-mp/bringup.py"), b"driver")
         self.assertEqual(z.read(".games-mp/SOURCE_REF").decode().strip(), REF)
+
+    def test_concurrent_downloads_each_publish_a_complete_file(self):
+        # Two steps racing on an empty cache: every temporary file is unique and no .tmp is left.
+        seen = []
+        real_mkstemp = self.bu.tempfile.mkstemp
+
+        def spy(**kw):
+            fd, path = real_mkstemp(**kw)
+            seen.append(path)
+            return fd, path
+        self.bu.tempfile = types.SimpleNamespace(mkstemp=spy, NamedTemporaryFile=tempfile.NamedTemporaryFile)
+        p = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
+        os.unlink(p)
+        self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual([n for n in os.listdir(self.cache) if n.endswith(".tmp")], [])
 
     def test_source_is_downloaded_once_per_commit(self):
         p1 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
