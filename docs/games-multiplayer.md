@@ -134,15 +134,6 @@ until they update.
 - **Preview Supabase values.** If the integration rotates its keys, bump
   `games_mp_preview_supabase_sync` and apply.
 
-## Known gap: engines on Preview
-
-Engines launched by a preview lobby call back that preview's protected `*.vercel.app` URL.
-To get through Vercel's deployment protection they must send `x-vercel-protection-bypass`,
-using the `MP_API_BYPASS` value the lobby passes them. The pinned commit `c76e5bdf` predates
-that engine change, which is on the games repo's `mp/preview` branch. Production is
-unaffected. Before relying on multiplayer in previews, move `games_mp_source_ref` to a commit
-that has the engine change.
-
 ## Emergency switches
 
 - **`games_mp_build = false`** stops CodeBuild runs. The task definitions then use

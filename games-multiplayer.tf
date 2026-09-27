@@ -33,15 +33,13 @@
 # builds whatever ECR lacks, and the task definitions are created only after that build
 # succeeded. Shipping a new version = changing that one variable and applying.
 
-# PREVIEW NEEDS ENGINE-SIDE BYPASS SUPPORT. Engines launched by a preview lobby call back a
-# protected *.vercel.app URL and must send x-vercel-protection-bypass (MP_API_BYPASS, which
-# the lobby passes them). c76e5bdf predates that engine change (games repo, branch
-# mp/preview); production is unaffected. Move this ref to a commit that has it before
-# relying on multiplayer in previews.
+# The pin must include engine-side preview support: engines launched by a preview lobby
+# call back its protected *.vercel.app URL with x-vercel-protection-bypass (MP_API_BYPASS,
+# passed by the lobby). 38bcb780 (games repo PR #62, mp/preview) has it.
 variable "games_mp_source_ref" {
   description = "Full 40-hex commit of CoderColton/colton-games whose multiplayer images (and mp migration) this stack runs."
   type        = string
-  default     = "c76e5bdf083fe32628b5c8fee9e6ab867e291369"
+  default     = "38bcb78010d2d40f50035d6e03f080ddb661c243"
 
   validation {
     condition     = can(regex("^[0-9a-f]{40}$", var.games_mp_source_ref))
