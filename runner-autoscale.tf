@@ -1539,6 +1539,12 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = [for name in ["pat", "user-data"] : "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/${name}"]
       },
       {
+        # Per-repo controller tokens for the non-fcvm repos (runner-repos.tf).
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [for s in aws_secretsmanager_secret.github_runner_repo_pat : s.arn]
+      },
+      {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = [for name in ["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:us-west-1:928413605543:function:${name}"]
