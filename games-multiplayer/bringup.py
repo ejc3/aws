@@ -6,6 +6,8 @@ games-multiplayer-bringup.tf. Every step is idempotent: it checks the live state
 only changes what is missing, then verifies. A failed check exits non-zero, which fails the
 apply loudly.
 
+    preflight         (terraform plan, data "external") read-only: prove every later step can
+                      run, or stop the plan before anything changes
     build             upload the pinned games-repo source to S3, run CodeBuild, wait for it
     codebuild-images  (inside CodeBuild) build and push only the image tags that are missing
     vercel-oidc       make sure the Vercel project issues OIDC tokens in Team issuer mode
@@ -60,8 +62,12 @@ class StepError(Exception):
     """A check failed. The message is printed and the apply fails."""
 
 
+# The preflight speaks Terraform's external-program protocol on stdout, so it logs to stderr.
+LOG_STREAM = None
+
+
 def log(msg):
-    print("[games-mp] %s" % msg, flush=True)
+    print("[games-mp] %s" % msg, file=LOG_STREAM or sys.stdout, flush=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -403,6 +409,18 @@ def cmd_vercel_oidc(args):
     log("Vercel OIDC now on, Team issuer mode (verified)")
 
 
+def preview_targets(envs, key):
+    """(Preview-only variables named `key`, problem). A variable that reaches Preview together
+    with another environment or a branch is a problem: editing it would change Production or
+    Development."""
+    same = [e for e in envs if e.get("key") == key and "preview" in (e.get("target") or [])]
+    mixed = [e for e in same if sorted(e.get("target") or []) != ["preview"] or e.get("gitBranch")]
+    if mixed:
+        return same, ("%s already reaches Preview together with another environment or branch; "
+                      "refusing to edit it (that would change Production/Development)" % key)
+    return same, None
+
+
 def cmd_preview_supabase(args):
     """Copies each KEY:TYPE from Production to a Preview-ONLY variable. Writes only variables
     whose target is exactly ["preview"]; anything else with the same key is left alone, and a
@@ -415,14 +433,11 @@ def cmd_preview_supabase(args):
             raise StepError("bad type for %s" % key)
         value = production_value(v, envs, key)
         if value is None:
-            log("WARNING: %s: Production value missing or not decryptable with this token; "
-                "Preview is left as it is (multiplayer on Preview answers 503 until it is set)" % key)
-            continue
-        same = [e for e in envs if e.get("key") == key and "preview" in (e.get("target") or [])]
-        mixed = [e for e in same if sorted(e.get("target") or []) != ["preview"] or e.get("gitBranch")]
-        if mixed:
-            raise StepError("%s already reaches Preview together with another environment or branch; "
-                            "refusing to edit it (that would change Production/Development)" % key)
+            # The plan-time preflight proved this decrypts; failing here means it changed since.
+            raise StepError("%s: Production value missing or no longer decryptable" % key)
+        same, problem = preview_targets(envs, key)
+        if problem:
+            raise StepError(problem)
         body = {"value": value, "type": vtype, "target": ["preview"],
                 "comment": "copied from Production by games-mp bring-up (ejc3/aws)"}
         if same:
@@ -519,17 +534,10 @@ def ensure_psql():
 
 
 def database_url(args):
-    """(url, where) from the Vercel Supabase integration, else the Secrets Manager fallback."""
-    try:
-        v = vercel_from_args(args)
-        url = production_value(v, v.envs(), args.url_key)
-        if url:
-            return url, "Vercel %s (Production)" % args.url_key
-        log("Vercel did not return a decryptable %s; trying secret %s" % (args.url_key, args.url_secret))
-    except StepError as e:
-        log("Vercel lookup failed (%s); trying secret %s" % (e, args.url_secret))
-    url = read_secret(args.url_secret, args.region)
-    return (url, "secret %s" % args.url_secret) if url else (None, None)
+    """(url, where): the Supabase integration's own URL, decrypted from the Vercel project's
+    Production env at apply time. One source; the plan-time preflight proved it decrypts."""
+    v = vercel_from_args(args)
+    return production_value(v, v.envs(), args.url_key), "Vercel %s (Production)" % args.url_key
 
 
 def cmd_migrate(args):
@@ -539,13 +547,8 @@ def cmd_migrate(args):
     want = migration_revision(sql)
     url, where = database_url(args)
     if not url:
-        # The one prerequisite a human may have to supply. Failing (not skipping) keeps the
-        # step tainted, so the next apply retries it once the secret has a value.
-        raise StepError(
-            "no database URL: Vercel did not return a decryptable %s and secret %s has no value. Set it once:\n"
-            "  printf '%%s' 'postgres://...' | aws secretsmanager put-secret-value --region %s "
-            "--secret-id %s --secret-string file:///dev/stdin\nthen apply again (or set games_mp_migrate = false)."
-            % (args.url_key, args.url_secret, args.region, args.url_secret))
+        # The plan-time preflight proved this source had a value; failing here means it changed.
+        raise StepError("the database URL from %s is gone since the plan; plan again" % where)
     env = pg_env(url, args.ca)
     ensure_psql()
     have = current_revision(env)
@@ -570,6 +573,113 @@ def cmd_migrate(args):
     if have != want:
         raise StepError("migration ran but mp_private.schema_revision is %s, expected %s" % (have, want))
     log("migration %s applied; mp_private at revision %d (verified)" % (args.file, have))
+
+
+# --------------------------------------------------------------------------------------
+# preflight (plan time, read-only)
+# --------------------------------------------------------------------------------------
+#
+# Runs as Terraform `data "external"` during every plan on the jumpbox. It only READS: the
+# two credentials from Secrets Manager, the Vercel project and its env (decrypting the
+# values later steps copy or use, then discarding them), the token's own metadata, the
+# pinned commit on GitHub, and whether psql can run here. Every problem is reported at
+# once, and any problem fails the plan, so an apply never starts with a step that cannot
+# finish. It prints no secret and returns none to Terraform (nothing sensitive in state).
+
+
+def token_scope(vercel, team_id, now_ms):
+    """('team'|'user'|'unverifiable', problem). Vercel tokens carry scopes (a user, or one
+    team) and an expiry, but no per-endpoint permissions, so this proves the token is live
+    and covers the team, not that a write will be accepted."""
+    status, data = http("GET", "%s/v5/user/tokens/current" % VERCEL_API,
+                        {"Authorization": "Bearer " + vercel.token})
+    if status != 200 or not isinstance(data, dict) or "token" not in data:
+        return "unverifiable", None
+    tok = data["token"]
+    if tok.get("revokedAt") or tok.get("leakedAt"):
+        return "", "the Vercel token (vercel-api-token) is revoked or marked leaked; store a new one"
+    if tok.get("expiresAt") and tok["expiresAt"] < now_ms + 7 * 86400 * 1000:
+        return "", "the Vercel token (vercel-api-token) expires within 7 days; store a new one"
+    scopes = tok.get("scopes") or []
+    if any(sc.get("type") == "team" and sc.get("teamId") == team_id for sc in scopes):
+        return "team", None
+    # No scopes at all is an unrestricted user token (seen on a CLI login, 2026-09-27).
+    if not scopes or any(sc.get("type") == "user" for sc in scopes):
+        return "user", None
+    return "", "the Vercel token (vercel-api-token) is not scoped to team %s" % team_id
+
+
+def cmd_preflight(_args):
+    global LOG_STREAM
+    LOG_STREAM = sys.stderr
+    q = json.load(sys.stdin)
+    region, team_id, project_id = q["region"], q["team_id"], q["project_id"]
+    problems, result = [], {}
+
+    token = read_secret(q["vercel_token_secret"], region)
+    if not token:
+        problems.append("secret %s has no value (the Vercel API token)" % q["vercel_token_secret"])
+    else:
+        v = Vercel(token, team_id, project_id)
+        scope, problem = token_scope(v, team_id, int(time.time() * 1000))
+        result["token_scope"] = scope
+        if problem:
+            problems.append(problem)
+        envs = None
+        try:
+            project = v.project()  # also carries oidcTokenConfig and protectionBypass
+            if project.get("id") != project_id:
+                problems.append("Vercel returned project %r, expected %s" % (project.get("id"), project_id))
+            envs = v.envs()
+        except StepError as e:
+            problems.append("cannot read the Vercel project or its env with vercel-api-token: %s" % e)
+        if envs is not None:
+            for key in [k for k in q.get("copy_keys", "").split(",") if k]:
+                if production_value(v, envs, key) is None:
+                    problems.append("vercel-api-token cannot decrypt %s on Production, which Preview's Supabase "
+                                    "copy needs; use a token of a team member who can read the integration's "
+                                    "env vars" % key)
+                _, problem = preview_targets(envs, key)
+                if problem:
+                    problems.append(problem)
+            if q.get("migrate") == "true":
+                url = production_value(v, envs, q["url_key"])
+                if url is None:
+                    problems.append(
+                        "vercel-api-token cannot decrypt %s on Production (the Supabase integration's database "
+                        "URL the migration uses). Store a token of a colton-games team member in secret "
+                        "vercel-api-token, or set games_mp_migrate = false" % q["url_key"])
+                else:
+                    try:
+                        env = pg_env(url, "-")
+                        result["db_host"] = env["PGHOST"]
+                    except StepError as e:
+                        problems.append("%s on Production: %s" % (q["url_key"], e))
+
+    if q.get("build") == "true" or q.get("migrate") == "true":
+        pat = read_secret(q["github_pat_secret"], region)
+        if not pat:
+            problems.append("secret %s has no value (GitHub read credential for %s)" % (q["github_pat_secret"], q["repo"]))
+        else:
+            status, data = http("GET", "%s/repos/%s/commits/%s" % (GITHUB_API, q["repo"], q["ref"]),
+                                {"Authorization": "Bearer " + pat, "Accept": "application/vnd.github+json"})
+            if status != 200 or not isinstance(data, dict) or data.get("sha") != q["ref"]:
+                problems.append("GitHub: %s@%s is not readable with %s (HTTP %s)"
+                                % (q["repo"], q["ref"], q["github_pat_secret"], status))
+
+    if q.get("migrate") == "true" and not shutil.which("psql"):
+        can_install = shutil.which("apt-get") and RUN(["sudo", "-n", "true"], capture_output=True).returncode == 0
+        if not can_install:
+            problems.append("psql is missing and cannot be installed without a password: "
+                            "sudo apt-get install -y postgresql-client")
+
+    if problems:
+        sys.stderr.write("games-mp preflight failed; nothing has been changed:\n" +
+                         "".join("  - %s\n" % p for p in problems))
+        return 1
+    result.setdefault("db_host", "none")
+    json.dump(result, sys.stdout)
+    return 0
 
 
 # --------------------------------------------------------------------------------------
@@ -709,6 +819,7 @@ def main(argv=None):
     b.add_argument("--poll", type=int, default=15)
 
     sub.add_parser("codebuild-images")
+    sub.add_parser("preflight")
 
     o = sub.add_parser("vercel-oidc")
     common(o, vercel=True)
@@ -722,7 +833,6 @@ def main(argv=None):
     m.add_argument("--file", required=True)
     m.add_argument("--ca", required=True)
     m.add_argument("--url-key", default="POSTGRES_URL_NON_POOLING")
-    m.add_argument("--url-secret", default="games/supabase-db-url")
 
     w = sub.add_parser("wait-healthy")
     common(w)
@@ -739,17 +849,17 @@ def main(argv=None):
     handler = {
         "build": cmd_build,
         "codebuild-images": cmd_codebuild_images,
+        "preflight": cmd_preflight,
         "vercel-oidc": cmd_vercel_oidc,
         "preview-supabase": cmd_preview_supabase,
         "migrate": cmd_migrate,
         "wait-healthy": cmd_wait_healthy,
     }[args.cmd]
     try:
-        handler(args)
+        return handler(args) or 0
     except StepError as e:
         log("FAILED %s: %s" % (args.cmd, e))
         return 1
-    return 0
 
 
 if __name__ == "__main__":

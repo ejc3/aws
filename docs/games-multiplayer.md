@@ -20,10 +20,33 @@ From the jumpbox:
 cd ~/aws && git pull --ff-only && terraform plan && terraform apply
 ```
 
-One apply goes from nothing to a healthy router. The steps that are not plain resources
-run `games-multiplayer/bringup.py` on the jumpbox with its administrator role. Each step
-checks live state first, changes only what is missing, verifies the result, and fails the
-apply loudly if anything is wrong. With nothing changed, a second apply is an empty plan.
+One apply goes from nothing to a healthy router.
+
+**The plan checks first.** Before anything changes, `terraform plan` runs a read-only
+preflight (`data "external" "games_mp_preflight"`, `bringup.py preflight`). It proves that
+every later step can finish:
+
+- The Vercel token (`vercel-api-token`) is live, not revoked or leaked, not expiring within
+  7 days, and scoped to the team, or is a user token.
+- The token can read the colton-games project, including its OIDC and protection-bypass
+  settings, and the project's env list.
+- It can decrypt, on Production, the values the apply uses: the integration's
+  `POSTGRES_URL_NON_POOLING` and the Supabase values copied to Preview.
+- No variable with a copied key already spans Preview and another environment.
+- `github-pat-ejc3` can read the pinned commit.
+- `psql` is on the jumpbox, or can be installed without a password.
+
+It reports every problem at once, with the exact fix, and fails the plan, so nothing
+changes. It prints no secret and returns none to Terraform.
+
+One thing it cannot prove by reading: that Vercel will accept the env and bypass writes.
+Vercel tokens carry a scope and an expiry but no per-endpoint permissions. Every fact it
+checks was also confirmed by hand on 2026-09-27 with a team member's login.
+
+**Then the apply runs the steps.** The steps that are not plain resources run
+`games-multiplayer/bringup.py` on the jumpbox with its administrator role. Each step checks
+live state first, changes only what is missing, and verifies the result; anything else
+fails the apply. With nothing changed, a second apply is an empty plan.
 
 | Step | What it does |
 | --- | --- |
@@ -33,8 +56,8 @@ apply loudly if anything is wrong. With nothing changed, a second apply is an em
 | **Vercel env** | Terraform owns the multiplayer set on the colton-games project (see below), and only that set. |
 | **Automation bypass** | Protection Bypass for Automation is on, with `is_env_var`, so deployments see it as `VERCEL_AUTOMATION_BYPASS_SECRET`. The lobby passes it to engines as `MP_API_BYPASS`. |
 | **OIDC** (`terraform_data.games_mp_vercel_oidc`) | GETs the project and PATCHes only `oidcTokenConfig` to `{enabled, team}` if it differs, then verifies with another GET. It was already set on 2026-09-27. |
-| **Preview Supabase** (`terraform_data.games_mp_preview_supabase`) | Copies `SUPABASE_URL` and `SUPABASE_SECRET_KEY` from Production into Preview-only variables. It never writes a variable that reaches Production or Development. |
-| **Migration** (`terraform_data.games_mp_migration`) | Applies `supabase/migrations/20260926000000_mp.sql` from the same pinned commit. It connects with `psql` using `sslmode=verify-full` against the pinned Supabase Root 2021 CA. It reads `mp_private.schema_revision` first: at the file's revision it does nothing, and a partial or out-of-order state stops it. It runs nothing else. |
+| **Preview Supabase** (`terraform_data.games_mp_preview_supabase`) | Copies `SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL` and `SUPABASE_SECRET_KEY` from Production into Preview-only variables. It never writes a variable that reaches Production or Development. |
+| **Migration** (`terraform_data.games_mp_migration`) | Applies `supabase/migrations/20260926000000_mp.sql` from the same pinned commit. It connects with `psql` using the Supabase integration's own `POSTGRES_URL_NON_POOLING`, decrypted from Vercel at apply time, with `sslmode=verify-full` against the pinned Supabase Root 2021 CA. It reads `mp_private.schema_revision` first: at the file's revision it does nothing, and a partial or out-of-order state stops it. It runs nothing else. |
 | **Health** (`terraform_data.games_mp_healthy`) | Waits for the router's new deployment to report COMPLETED (a rollback fails the apply), for a healthy target, and for `GET /healthz` = `200 ok`. The health request goes to the ALB with the certificate verified for `play.cc-games.app`. It gives up after 15 minutes and fails the apply. |
 
 ### The Vercel env Terraform writes
@@ -49,7 +72,7 @@ apply loudly if anything is wrong. With nothing changed, a second apply is an em
 | `MP_TOKEN_KEYS`, `MP_TEST_KEY`, `CRON_SECRET` (sensitive) | yes | same values |
 | `MP_COOKIE_SECRET` (sensitive) | its own value | its own value |
 | `SKYHOOK_LEADERBOARD_ENVIRONMENT=preview`, `SKYHOOK_LEADERBOARD_SECRET` (sensitive, preview's own) | no | yes |
-| `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | the integration's own variables | copied by the Preview Supabase step |
+| `SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SECRET_KEY` | the integration's own variables | copied by the Preview Supabase step |
 
 Development gets none of them. Local development uses `MP_LAUNCHER=local`. The launcher
 role and the router trust only Production and Preview.
@@ -133,17 +156,8 @@ that has the engine change.
 - **Merging the games PRs to production**, which is EJ's "push to prod". Terraform
   prepares everything, but the lobby code and its env reach users only with a production
   deployment.
-- **Only if Vercel will not decrypt the integration's `POSTGRES_URL_NON_POOLING`**: the
-  migration step fails with this exact instruction. Set the fallback secret once, then apply
-  again; the failed step is retried.
-
-  ```bash
-  printf '%s' 'postgres://...' | aws secretsmanager put-secret-value --region us-west-1 \
-    --secret-id games/supabase-db-url --secret-string file:///dev/stdin
-  ```
-
-  Use the Supabase session-pooler URL (IPv4). The direct `db.<ref>.supabase.co` host has
-  only an IPv6 address.
+- **Fixing whatever a failed preflight names**, for example storing a new Vercel token. The
+  plan fails with the exact fix, and nothing has changed.
 
 ## What the lobby must do on RunTask
 
@@ -181,9 +195,9 @@ CodeBuild ARM small costs $0.00425 per build minute.
 | ALB `games-play`: hours, about $18.40, plus its two public IPv4 addresses, $7.30 | about $26 |
 | ALB LCUs at family scale | about $1–3 |
 | `mp-router`, 0.25 vCPU / 0.5 GB: compute about $8.30, plus public IPv4 $3.65 | about $12 |
-| Secrets Manager, 5 secrets at $0.40 | $2 |
+| Secrets Manager, 3 secrets at $0.40 | $1.20 |
 | ECR storage, 14-day logs, sweeper Lambda and Scheduler, the build bucket | under $2 |
-| **Always on** | **about $43** |
+| **Always on** | **about $42** |
 | Per build: about 5 minutes of CodeBuild | about $0.02 |
 | Per match: 2 vCPU / 4 GB plus a public IPv4, about $0.096 per hour | **about $0.016 per 10-minute match** |
 

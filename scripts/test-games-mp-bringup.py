@@ -74,6 +74,9 @@ class World:
         self.services = None
         self.target_states = ["healthy"]
         self.dry_run = DRY_RUN
+        self.sudo = True
+        self.token_meta = (200, {"token": {"scopes": [{"type": "team", "teamId": "team_x", "createdAt": 1}]}})
+        self.github_commit = 200
         bu.RUN = self.run
         bu.http = self.http
         bu.SLEEP = self.sleep
@@ -93,6 +96,8 @@ class World:
             if sid in self.secrets:
                 return done(self.secrets[sid] + "\n")
             return done("", 255, "An error occurred (ResourceNotFoundException) when calling GetSecretValue")
+        if argv[:3] == ["sudo", "-n", "true"]:
+            return done("", 0 if self.sudo else 1)
         if argv[:3] == ["aws", "ecr", "describe-images"]:
             repo = argv[argv.index("--repository-name") + 1]
             tag = argv[argv.index("--image-ids") + 1].split("=", 1)[1]
@@ -145,10 +150,16 @@ class World:
         self.http_log.append((method, url, body))
         path = url.split("?")[0]
         if "api.github.com" in url:
+            if "/commits/" in url:
+                assert headers["Authorization"] == "Bearer " + GITHUB_PAT
+                sha = url.rsplit("/", 1)[1]
+                return self.github_commit, ({"sha": sha} if self.github_commit == 200 else {"message": "Not Found"})
             return 200, make_zipball()
+        if path.endswith("/v5/user/tokens/current"):
+            return self.token_meta
         assert headers["Authorization"] == "Bearer " + VERCEL_TOKEN
         if method == "GET" and re.search(r"/v9/projects/[^/]+$", path):
-            return 200, {"oidcTokenConfig": dict(self.oidc)}
+            return 200, {"id": path.rsplit("/", 1)[1], "oidcTokenConfig": dict(self.oidc)}
         if method == "PATCH" and re.search(r"/v9/projects/[^/]+$", path):
             if self.oidc_patch_effective:
                 self.oidc = dict(body["oidcTokenConfig"])
@@ -418,12 +429,13 @@ class VercelTests(Base):
             self.bu.cmd_preview_supabase(args(keys="SUPABASE_URL:encrypted"))
         self.assertEqual(self.writes(), [])
 
-    def test_undecryptable_production_value_is_skipped_with_a_warning(self):
+    def test_undecryptable_production_value_fails_without_writing(self):
+        # The preflight proves this at plan time; at apply it is a hard failure, not a skip.
         self.prod_envs()
         self.w.decrypt["e2"] = None
-        self.bu.cmd_preview_supabase(args(keys="SUPABASE_SECRET_KEY:sensitive"))
+        with self.assertRaisesRegex(self.bu.StepError, "SUPABASE_SECRET_KEY"):
+            self.bu.cmd_preview_supabase(args(keys="SUPABASE_SECRET_KEY:sensitive"))
         self.assertEqual(self.writes(), [])
-        self.assertIn("WARNING: SUPABASE_SECRET_KEY", self.out.getvalue())
 
 
 class MigrateTests(Base):
@@ -431,7 +443,7 @@ class MigrateTests(Base):
 
     def margs(self, **kw):
         return args(cache_dir=self.cache, file="supabase/migrations/20260926000000_mp.sql", ca=self.CA,
-                    url_key="POSTGRES_URL_NON_POOLING", url_secret="games/supabase-db-url", **kw)
+                    url_key="POSTGRES_URL_NON_POOLING", **kw)
 
     def setUp(self):
         super().setUp()
@@ -481,15 +493,118 @@ class MigrateTests(Base):
                 self.bu.cmd_migrate(self.margs())
         self.assertEqual(self.w.psql_files, [])
 
-    def test_secret_fallback_then_loud_failure(self):
+    def test_url_that_stops_decrypting_after_the_plan_fails(self):
         self.w.decrypt = {"pg": None}
-        self.w.secrets["games/supabase-db-url"] = DB_URL
-        self.bu.cmd_migrate(self.margs())
-        self.assertIn("secret games/supabase-db-url", self.out.getvalue())
-        del self.w.secrets["games/supabase-db-url"]
-        self.w.db_revision = 0
-        with self.assertRaisesRegex(self.bu.StepError, "put-secret-value"):
+        with self.assertRaisesRegex(self.bu.StepError, "gone since the plan"):
             self.bu.cmd_migrate(self.margs())
+        self.assertEqual(self.w.psql_files, [])
+
+
+class PreflightTests(Base):
+    QUERY = {"region": "us-west-1", "team_id": "team_x", "project_id": "prj_x",
+             "vercel_token_secret": "vercel-api-token",
+             "copy_keys": "SUPABASE_URL,NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SECRET_KEY",
+             "url_key": "POSTGRES_URL_NON_POOLING",
+             "migrate": "true", "build": "true", "repo": "CoderColton/colton-games", "ref": REF,
+             "github_pat_secret": "github-pat-ejc3"}
+
+    def setUp(self):
+        super().setUp()
+        self.bu.shutil = types.SimpleNamespace(which=lambda name: "/usr/bin/" + name)
+        self.w.vercel_envs = [
+            {"id": "e1", "key": "SUPABASE_URL", "target": ["development", "production"]},
+            {"id": "e3", "key": "NEXT_PUBLIC_SUPABASE_URL", "target": ["development", "production"]},
+            {"id": "e2", "key": "SUPABASE_SECRET_KEY", "target": ["development", "production"]},
+            {"id": "pg", "key": "POSTGRES_URL_NON_POOLING", "target": ["development", "production"]},
+        ]
+        self.w.decrypt = {"e1": "https://x.supabase.co", "e3": "https://x.supabase.co", "e2": SERVICE_KEY, "pg": DB_URL}
+
+    def run_preflight(self, **overrides):
+        q = dict(self.QUERY, **overrides)
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(q))
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = self.bu.main(["preflight"])
+        finally:
+            sys.stdin = old
+        for secret in (VERCEL_TOKEN, GITHUB_PAT, DB_PASSWORD, SERVICE_KEY, "s3cr3t-p%40ss%2Fword"):
+            self.assertNotIn(secret, out.getvalue() + err.getvalue())
+        return code, out.getvalue(), err.getvalue()
+
+    def test_all_good_returns_strings_only_and_makes_no_writes(self):
+        code, out, err = self.run_preflight()
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result, {"token_scope": "team", "db_host": "aws-0-us-east-1.pooler.supabase.com"})
+        self.assertTrue(all(isinstance(v, str) for v in result.values()))
+        self.assertEqual([m for m, _, _ in self.w.http_log if m != "GET"], [])
+        self.assertFalse(any(c[:2] in (["aws", "s3"], ["aws", "codebuild"]) or "put-secret-value" in c
+                             for c in self.w.calls))
+
+    def test_undecryptable_database_url_fails_the_plan(self):
+        self.w.decrypt["pg"] = None
+        code, out, err = self.run_preflight()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("nothing has been changed", err)
+        self.assertIn("cannot decrypt POSTGRES_URL_NON_POOLING", err)
+
+    def test_non_postgres_database_url_fails_the_plan(self):
+        self.w.decrypt["pg"] = "https://not-a-database"
+        code, _, err = self.run_preflight()
+        self.assertEqual(code, 1)
+        self.assertIn("not a postgres:// URL", err)
+
+    def test_every_problem_is_reported_at_once(self):
+        self.w.decrypt["e2"] = None
+        self.w.vercel_envs.append({"id": "m", "key": "SUPABASE_URL", "target": ["preview", "production"]})
+        self.w.github_commit = 404
+        self.w.token_meta = (200, {"token": {"revokedAt": 1, "scopes": []}})
+        self.bu.shutil = types.SimpleNamespace(which=lambda name: None)
+        code, _, err = self.run_preflight()
+        self.assertEqual(code, 1)
+        for needle in ("cannot decrypt SUPABASE_SECRET_KEY", "refusing to edit", "GitHub:", "revoked", "psql is missing"):
+            self.assertIn(needle, err)
+
+    def test_token_scope_rules(self):
+        now = 10 ** 13
+        v = self.bu.Vercel(VERCEL_TOKEN, "team_x", "prj_x")
+        cases = [
+            ((200, {"token": {"scopes": [{"type": "team", "teamId": "team_x"}]}}), ("team", None)),
+            ((200, {"token": {"scopes": [{"type": "user"}]}}), ("user", None)),
+            ((200, {"token": {"type": "token", "scopes": []}}), ("user", None)),
+            ((403, {"error": {"code": "forbidden"}}), ("unverifiable", None)),
+        ]
+        for meta, want in cases:
+            self.w.token_meta = meta
+            self.assertEqual(self.bu.token_scope(v, "team_x", now), want)
+        for tok, needle in (({"scopes": [{"type": "team", "teamId": "other"}]}, "not scoped"),
+                            ({"expiresAt": now + 1000, "scopes": [{"type": "user"}]}, "expires"),
+                            ({"leakedAt": 1, "scopes": [{"type": "user"}]}, "leaked")):
+            self.w.token_meta = (200, {"token": tok})
+            self.assertIn(needle, self.bu.token_scope(v, "team_x", now)[1])
+
+    def test_unreadable_project_fails(self):
+        orig = self.w.http
+
+        def forbidden(method, url, headers=None, body=None, timeout=30):
+            if "/v9/projects/" in url:
+                return 403, {"error": {"code": "forbidden"}}
+            return orig(method, url, headers, body, timeout)
+        self.bu.http = forbidden
+        code, _, err = self.run_preflight()
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read the Vercel project", err)
+
+    def test_migrate_and_build_off_skip_their_checks(self):
+        self.w.decrypt["pg"] = None
+        self.w.github_commit = 404
+        self.bu.shutil = types.SimpleNamespace(which=lambda name: None)
+        code, out, err = self.run_preflight(migrate="false", build="false")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["db_host"], "none")
 
 
 class HealthTests(Base):
@@ -577,6 +692,17 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertTrue(used)
         self.assertLessEqual(used, subcommands)
         self.assertIn("codebuild-images", (GM / "buildspec.yml").read_text())
+
+    def test_preflight_runs_at_plan_time_and_gates_every_step(self):
+        data = re.search(r'data "external" "games_mp_preflight" \{.*?\n\}', self.bu, re.S).group()
+        # A managed-resource reference in the query would defer the read to apply time.
+        self.assertNotRegex(data, r"\b(aws|vercel|terraform_data|random)_[a-z0-9_]+\.")
+        for kind, name in (("terraform_data", "games_mp_build"), ("terraform_data", "games_mp_vercel_oidc"),
+                           ("terraform_data", "games_mp_preview_supabase"), ("terraform_data", "games_mp_migration"),
+                           ("vercel_project_environment_variable", "games_mp"),
+                           ("vercel_project_protection_bypass", "games_mp")):
+            self.assertIn("data.external.games_mp_preflight", self.block(self.bu, kind, name))
+        self.assertNotIn("supabase-db-url", self.bu)
 
     def test_a_key_rotation_is_a_new_router_task_definition(self):
         # Pinning the secret by version id makes a rotation change the task definition ARN,

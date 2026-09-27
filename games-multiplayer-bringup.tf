@@ -13,6 +13,13 @@
 #   verified     the apply waits for the new router deployment, a healthy target and a
 #                200 `ok` from https://play.cc-games.app/healthz, and fails otherwise
 #
+# PLAN-TIME PREFLIGHT. Before anything changes, `terraform plan` runs a read-only check
+# (data "external" games_mp_preflight, bringup.py preflight) that proves every later step
+# can finish: the Vercel token reads the project, its env and settings, decrypts what the
+# Preview copy and the migration need, and is live and scoped to the team; the pinned
+# commit is readable on GitHub; psql can run here. Any gap fails the PLAN with the exact
+# fix, so an apply either does everything or does not start.
+#
 # The steps that are not plain resources are terraform_data local-execs running
 # games-multiplayer/bringup.py on the jumpbox with its administrator role. Each one checks
 # live state first, changes only what is missing, verifies, and exits non-zero on failure.
@@ -58,10 +65,14 @@ variable "games_mp_migrate" {
 }
 
 locals {
-  games_mp_repo      = "CoderColton/colton-games"
-  games_mp_bringup   = "${path.module}/games-multiplayer/bringup.py"
-  games_mp_cache_dir = "${path.module}/.terraform/games-mp"
-  games_mp_migration = "supabase/migrations/20260926000000_mp.sql"
+  # Copied Production -> Preview: the URL and server key the site reads first
+  # (lib/skyhook/supabase-config.ts: SUPABASE_URL || NEXT_PUBLIC_SUPABASE_URL,
+  # SUPABASE_SECRET_KEY || SUPABASE_SERVICE_ROLE_KEY), plus the public URL for the browser.
+  games_mp_preview_copy = "SUPABASE_URL:encrypted,NEXT_PUBLIC_SUPABASE_URL:encrypted,SUPABASE_SECRET_KEY:sensitive"
+  games_mp_repo         = "CoderColton/colton-games"
+  games_mp_bringup      = "${path.module}/games-multiplayer/bringup.py"
+  games_mp_cache_dir    = "${path.module}/.terraform/games-mp"
+  games_mp_migration    = "supabase/migrations/20260926000000_mp.sql"
 
   # MP_TOKEN_KEYS: kid:<base64 32 bytes>, first signs. The router gets it from Secrets
   # Manager, the lobby from Vercel; both are written from this one value.
@@ -148,23 +159,10 @@ resource "aws_secretsmanager_secret_version" "games_mp_cron_secret" {
   secret_string = random_password.games_mp_cron_secret.result
 }
 
-# FALLBACK ONLY, container only. bringup.py migrate first reads the Supabase integration's
-# POSTGRES_URL_NON_POOLING from the Vercel project (Production) at apply time. Only if
-# Vercel will not decrypt it does it read this secret, whose value EJ sets once:
-#   printf '%s' 'postgres://...' | aws secretsmanager put-secret-value --region us-west-1 \
-#     --secret-id games/supabase-db-url --secret-string file:///dev/stdin
-resource "aws_secretsmanager_secret" "games_supabase_db_url" {
-  name                    = "games/supabase-db-url"
-  description             = "Fallback Postgres URL for the games Supabase project (mp migration). Value set outside Terraform, only if Vercel cannot provide it."
-  recovery_window_in_days = 7
-  tags                    = { Name = "games/supabase-db-url", Managed = "terraform", Project = "games-multiplayer" }
-}
-
 resource "aws_secretsmanager_secret_policy" "games_mp_admin_only" {
   for_each = {
     test_key    = aws_secretsmanager_secret.games_mp_test_key.arn
     cron_secret = aws_secretsmanager_secret.games_mp_cron_secret.arn
-    db_url      = aws_secretsmanager_secret.games_supabase_db_url.arn
   }
   secret_arn = each.value
   policy = jsonencode({
@@ -178,6 +176,40 @@ resource "aws_secretsmanager_secret_policy" "games_mp_admin_only" {
       Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
     }]
   })
+}
+
+# -------------------------------------------------------------------------------------
+# Plan-time preflight (read-only)
+# -------------------------------------------------------------------------------------
+#
+# Every input is a literal or a variable, never a managed resource's attribute, so
+# Terraform reads it during the plan instead of deferring it to the apply. It returns only
+# non-secret facts: the database host the migration will reach, and how the token's scope
+# was proven. On 2026-09-27 every fact it checks was confirmed by hand with a team
+# member's login (OIDC in Team mode, no bypass yet, the integration's variables type
+# `encrypted` and decryptable on Production), so it is a formality that catches a problem
+# with the Terraform-held token specifically.
+#
+# What it CANNOT prove read-only: that Vercel will accept the env and bypass writes. Vercel
+# tokens have a user or team scope and an expiry but no per-endpoint permissions, so a
+# live, unrevoked token scoped to this team (or a user token) is as far as a read can go.
+
+data "external" "games_mp_preflight" {
+  program = ["python3", local.games_mp_bringup, "preflight"]
+
+  query = {
+    region              = var.aws_region
+    team_id             = var.vercel_team_id
+    project_id          = local.colton_games_vercel_project_id
+    vercel_token_secret = "vercel-api-token"
+    copy_keys           = join(",", [for kv in split(",", local.games_mp_preview_copy) : split(":", kv)[0]])
+    url_key             = "POSTGRES_URL_NON_POOLING"
+    migrate             = tostring(var.games_mp_migrate)
+    build               = tostring(var.games_mp_build)
+    repo                = local.games_mp_repo
+    ref                 = var.games_mp_source_ref
+    github_pat_secret   = "github-pat-ejc3"
+  }
 }
 
 # -------------------------------------------------------------------------------------
@@ -372,6 +404,7 @@ resource "terraform_data" "games_mp_build" {
   }
 
   depends_on = [
+    data.external.games_mp_preflight,
     aws_iam_role_policy.games_mp_codebuild,
     aws_ecr_repository.games_mp,
     aws_s3_bucket_policy.games_mp_build,
@@ -441,7 +474,8 @@ locals {
 }
 
 resource "vercel_project_environment_variable" "games_mp" {
-  for_each = local.games_mp_vercel_env
+  for_each   = local.games_mp_vercel_env
+  depends_on = [data.external.games_mp_preflight]
 
   team_id    = var.vercel_team_id
   project_id = local.colton_games_vercel_project_id
@@ -462,6 +496,7 @@ resource "vercel_project_protection_bypass" "games_mp" {
   secret     = random_password.games_mp_bypass.result
   is_env_var = true
   note       = "games multiplayer: engine callbacks and remote e2e (ejc3/aws)"
+  depends_on = [data.external.games_mp_preflight]
 }
 
 # OIDC Team issuer mode. The provider can set oidc_token_config only on a whole
@@ -478,13 +513,15 @@ resource "terraform_data" "games_mp_vercel_oidc" {
   provisioner "local-exec" {
     command = "python3 ${local.games_mp_bringup} vercel-oidc --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id}"
   }
+
+  depends_on = [data.external.games_mp_preflight]
 }
 
 # Preview's Supabase connection. The integration (store_XlZp0ZAQE6nghCEU) is connected to
 # Production and Development only. Vercel's API has no documented call to add an
 # environment to an EXISTING integration connection (only "connect resource to project",
 # whose effect on the live Production connection is undocumented), so this step copies the
-# two values the lobby and Skyhook read, SUPABASE_URL and SUPABASE_SECRET_KEY, from
+# values the lobby and Skyhook read (games_mp_preview_copy) from
 # Production into Preview-only variables. It never writes a variable that reaches
 # Production or Development, and refuses if one with the same key spans Preview and
 # another environment. The values pass through memory only: not in config, not in state.
@@ -492,13 +529,15 @@ resource "terraform_data" "games_mp_vercel_oidc" {
 resource "terraform_data" "games_mp_preview_supabase" {
   triggers_replace = {
     project = local.colton_games_vercel_project_id
-    keys    = "SUPABASE_URL:encrypted,SUPABASE_SECRET_KEY:sensitive"
+    keys    = local.games_mp_preview_copy
     sync    = var.games_mp_preview_supabase_sync
   }
 
   provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} preview-supabase --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --keys SUPABASE_URL:encrypted,SUPABASE_SECRET_KEY:sensitive"
+    command = "python3 ${local.games_mp_bringup} preview-supabase --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --keys ${local.games_mp_preview_copy}"
   }
+
+  depends_on = [data.external.games_mp_preflight]
 }
 
 # -------------------------------------------------------------------------------------
@@ -515,9 +554,9 @@ resource "terraform_data" "games_mp_preview_supabase" {
 #     revision; refuses a partial or out-of-order state instead of guessing;
 #   - runs only that one file (which never names skyhook_private or site_private, checked),
 #     then verifies the revision.
-# With no URL from Vercel and none in games/supabase-db-url, it FAILS the apply with the
-# exact instruction; that is the one prerequisite a human may have to supply. A failed
-# step is retried by the next apply (Terraform re-creates a tainted resource).
+# The URL is the Supabase integration's POSTGRES_URL_NON_POOLING, decrypted from the Vercel
+# project's Production env at apply time and never stored. The plan-time preflight proved
+# it decrypts, so there is one path and no fallback.
 resource "terraform_data" "games_mp_migration" {
   count = var.games_mp_migrate ? 1 : 0
 
@@ -527,10 +566,10 @@ resource "terraform_data" "games_mp_migration" {
   }
 
   provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} migrate --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --cache-dir ${local.games_mp_cache_dir} --file ${local.games_mp_migration} --ca ${path.module}/games-multiplayer/supabase-root-2021-ca.crt --url-secret ${aws_secretsmanager_secret.games_supabase_db_url.name}"
+    command = "python3 ${local.games_mp_bringup} migrate --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --cache-dir ${local.games_mp_cache_dir} --file ${local.games_mp_migration} --ca ${path.module}/games-multiplayer/supabase-root-2021-ca.crt"
   }
 
-  depends_on = [aws_secretsmanager_secret_policy.games_mp_admin_only]
+  depends_on = [data.external.games_mp_preflight, aws_secretsmanager_secret_policy.games_mp_admin_only]
 }
 
 # -------------------------------------------------------------------------------------
