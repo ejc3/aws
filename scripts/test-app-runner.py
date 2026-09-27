@@ -171,9 +171,12 @@ class FakeGitHub:
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs", path)
         if m:
             return {"jobs": self.jobs.get(int(m.group(2)), [])}
-        m = re.match(r"/repos/(.+?)/actions/runners\?", path)
+        m = re.match(r"/repos/(.+?)/actions/runners\?(?:name=([^&]+))?", path)
         if m:
-            return {"runners": list(self.runners.get(m.group(1), {}).values())}
+            runners = list(self.runners.get(m.group(1), {}).values())
+            if m.group(2):
+                runners = [r for r in runners if r.get("name") == m.group(2)]
+            return {"runners": runners}
         return {}
 
 
@@ -818,6 +821,14 @@ class ReconcileTests(unittest.TestCase):
         app.app_instances = lambda repo: scanned.append(repo) or []
         self.assertEqual(app.reconcile(COLTON, REPOS[COLTON], []), {"repo": COLTON, "skipped": "no time left"})
         self.assertEqual(scanned, [])
+
+    def test_a_host_that_registered_after_the_listing_is_not_killed(self):
+        app, ec2, *_ = load_app()
+        app.github.runners[COLTON] = {"i-late": {"id": 51, "name": "i-late", "busy": True, "status": "online",
+                                                 "labels": [{"name": "cc-games"}]}}
+        keep = app.reap(COLTON, REPOS[COLTON], "PAT", [instance("i-late", COLTON, "8", 11)], {})
+        self.assertEqual(ec2.terminated, [], "it registered after the round's listing and may be starting a job")
+        self.assertEqual([i["InstanceId"] for i in keep], ["i-late"])
 
     def test_a_partial_runner_listing_never_counts_a_host_as_unregistered(self):
         app, ec2, *_ = load_app()

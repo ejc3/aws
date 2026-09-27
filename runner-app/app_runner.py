@@ -31,6 +31,7 @@ import os
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -287,6 +288,12 @@ def list_runners(repo, pat):
         if len(runners) < 100:
             return out, True
     return out, False
+
+
+def registered_now(repo, name, pat):
+    """True if a runner called `name` is registered right now (GitHub filters by exact name)."""
+    body = github('GET', f'/repos/{repo}/actions/runners?name={urllib.parse.quote(name)}', pat)
+    return any(r.get('name') == name for r in body.get('runners') or [])
 
 
 def registration_token(repo, pat):
@@ -556,7 +563,9 @@ def reap(repo, cfg, pat, live, runners, complete=True):
         reason, idle = None, False
         if age > MAX_LIFETIME:
             reason = f'older than {MAX_LIFETIME}'
-        elif runner is None and complete and age > BOOT_GRACE:
+        elif runner is None and complete and age > BOOT_GRACE and not registered_now(repo, instance_id, pat):
+            # The listing is from the start of the round: a slow boot may have registered since,
+            # and could be starting a job. Recheck this one name before killing it.
             reason = f'not registered after {BOOT_GRACE}'
         elif runner is not None and not runner.get('busy') and age > IDLE_LIMIT:
             reason, idle = f'idle after {IDLE_LIMIT}', True

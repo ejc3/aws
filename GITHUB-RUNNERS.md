@@ -713,7 +713,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   call: once it is spent no AWS call (a botocore `before-call` hook) or GitHub request starts,
   except the credential handoff after an accepted launch and claim releases, and every call is
   bounded (connect 3 s, read 8 s, one attempt), so at most one call runs past it. It reaps hosts (also
-  within the share; a host is judged "never registered" only from a complete runner listing; an
+  within the share; a host is judged "never registered" only from a complete runner listing and
+  after rechecking its own name, since it may have registered since the listing; an
   idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
   because it took a job since the listing)
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
