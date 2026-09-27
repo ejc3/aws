@@ -98,9 +98,14 @@ until they update.
 
 ## Rotating secrets
 
-- **Token key.** Set `games_mp_token_kids = ["kid2", "kid1"]` and apply. The router rolls
-  onto a new task definition with both keys, and the lobby signs with `kid2` from its next deployment. Once Production
-  has redeployed, set `["kid2"]` and apply again.
+- **Token key.** Deployments keep the `MP_TOKEN_KEYS` they were built with, and every
+  Production and Preview deployment shares the one router, so:
+  1. Set `games_mp_token_kids = ["kid2", "kid1"]` and apply. The router rolls onto a new
+     task definition that accepts both keys.
+  2. Redeploy Production, and redeploy or retire every Preview deployment still in use.
+     Until then they keep signing with `kid1`, which the router still accepts.
+  3. Wait at least two minutes, so every token signed with `kid1` has expired.
+  4. Set `["kid2"]` and apply.
 - **Any other generated secret.** Run `terraform apply -replace=random_password.<name>`,
   then redeploy the site. Replacing `games_mp_cookie_secret` resets every guest identity.
 - **Preview Supabase values.** If the integration rotates its keys, bump

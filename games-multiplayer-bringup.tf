@@ -31,7 +31,7 @@
 # option for keeping these out of state.
 
 variable "games_mp_token_kids" {
-  description = "Token key ids, newest first. The first signs, all verify. Rotate: prepend a new id, apply, redeploy production, then drop the old id and apply."
+  description = "Token key ids, newest first. The first signs, all verify. Rotate: prepend a new id and apply; redeploy Production and every Preview still in use (or let them go); only then drop the old id and apply."
   type        = list(string)
   default     = ["kid1"]
 
