@@ -20,7 +20,37 @@ From the jumpbox:
 cd ~/aws && git pull --ff-only && terraform plan && terraform apply
 ```
 
-One apply goes from nothing to a healthy router.
+One apply goes from nothing to a healthy router, once the one input below exists.
+
+**First time only: Colton's read token.** The pinned commit lives in `CoderColton/colton-games`,
+a private repo on Colton's personal account. Only a token Colton owns can be limited to it:
+a fine-grained token owned by anyone else cannot reach another user's personal repo, and
+`github-pat-ejc3` is readable by every dev box anyway. The preflight reads this token, so a
+plan fails until it exists, and Terraform cannot create its secret while the plan fails.
+Break that loop once:
+
+1. Colton, signed in as `CoderColton`, creates a token at
+   <https://github.com/settings/personal-access-tokens/new>: resource owner `CoderColton`,
+   **Only select repositories** → `colton-games`, Repository permissions → **Contents:
+   Read-only**, nothing else. GitHub shows it once.
+2. From a fresh worktree off `origin/main`, create only the empty secret. The targeted plan
+   must show exactly these two resources and nothing else:
+
+   ```bash
+   terraform apply -target=aws_secretsmanager_secret.games_mp_github_read \
+                   -target=aws_secretsmanager_secret_policy.games_mp_github_read
+   ```
+
+3. Put the token in without echoing it or placing it in argv (paste, Enter):
+
+   ```bash
+   read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+     --secret-id games/colton-games-read --secret-string file:///dev/stdin \
+     --query VersionId --output text; unset T
+   ```
+
+4. Plan and apply normally. When the token nears its expiry (GitHub sends a reminder), Colton
+   regenerates it and step 3 replaces the value; nothing else changes.
 
 **The plan checks first.** Before anything changes, `terraform plan` runs a read-only
 preflight (`data "external" "games_mp_preflight"`, `bringup.py preflight`). It proves that
@@ -33,7 +63,8 @@ every later step can finish:
 - It can decrypt, on Production, the values the apply uses: the integration's
   `POSTGRES_URL_NON_POOLING` and the Supabase values copied to Preview.
 - No variable with a copied key already spans Preview and another environment.
-- `games/colton-games-read` (Colton's read-only token for `colton-games`) can read the pinned commit.
+- `games/colton-games-read` (Colton's read-only token for `colton-games`, see *First time
+  only* above) can read the pinned commit.
 - `psql` is on the jumpbox, or can be installed without a password.
 
 It reports every problem at once, with the exact fix, and fails the plan, so nothing
