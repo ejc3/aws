@@ -174,6 +174,30 @@ class FakeGitHub:
         return {}
 
 
+class Hooked:
+    """A fake client behind botocore's before-call event: every public method fires the
+    registered handlers first, as a real client does for every operation."""
+    def __init__(self, fake):
+        hooks = []
+        object.__setattr__(self, "_fake", fake)
+        object.__setattr__(self, "_hooks", hooks)
+        object.__setattr__(self, "meta", types.SimpleNamespace(
+            events=types.SimpleNamespace(register=lambda event, fn: hooks.append(fn))))
+
+    def __getattr__(self, name):
+        attr = getattr(self._fake, name)
+        if name.startswith("_") or isinstance(attr, type) or not callable(attr):
+            return attr
+        def call(*args, **kwargs):
+            for hook in self._hooks:
+                hook(event_name=f"before-call.{name}")
+            return attr(*args, **kwargs)
+        return call
+
+    def __setattr__(self, name, value):
+        setattr(self._fake, name, value)
+
+
 def load_app(tokens=None):
     ec2, ssm, dynamo, cw = FakeEC2(), FakeSSM(), FakeDynamo(), FakeCloudWatch()
     secrets = FakeSecrets(tokens if tokens is not None else {
@@ -184,7 +208,7 @@ def load_app(tokens=None):
         configs.append((name, config))
         if name == "ec2" and config is not None and config.retries.get("total_max_attempts") == 1:
             ec2.launch_config = config
-        return {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets, "dynamodb": dynamo, "cloudwatch": cw}[name]
+        return Hooked({"ec2": ec2, "ssm": ssm, "secretsmanager": secrets, "dynamodb": dynamo, "cloudwatch": cw}[name])
     fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
     fake_botocore, fake_config = types.ModuleType("botocore"), types.ModuleType("botocore.config")
@@ -196,7 +220,7 @@ def load_app(tokens=None):
     spec = importlib.util.spec_from_file_location("app_runner_under_test", APP)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.github = FakeGitHub()
+    mod.real_github, mod.github = mod.github, FakeGitHub()
     mod.now = lambda: NOW
     mod.fake_dynamo, mod.fake_cloudwatch, mod.client_configs = dynamo, cw, configs
     return mod, ec2, ssm, secrets
@@ -624,7 +648,59 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(namespace, "GitHubAppRunner")
         repos = {d["Dimensions"][0]["Value"] for d in data}
         self.assertIn(DOLPHIN, repos, "the healthy repo was still reconciled and counted")
-        self.assertIn("ALL", repos)
+        self.assertNotIn("ALL", repos, "a total that counts the failed repo as zero would hide its hosts")
+
+    def test_a_round_that_counted_every_repo_publishes_the_total(self):
+        app, ec2, *_ = load_app()
+        ec2.instances.append(instance("i-busy", COLTON, "4", 30))
+        app.github.runners[COLTON] = {"i-busy": {"id": 32, "name": "i-busy", "busy": True, "status": "online",
+                                                 "labels": [{"name": "cc-games"}]}}
+        app.handler({"reconcile": True}, None)
+        _, data = app.fake_cloudwatch.metrics[-1]
+        counts = {d["Dimensions"][0]["Value"]: d["Value"] for d in data}
+        self.assertEqual(counts, {COLTON: 1, DOLPHIN: 0, "ALL": 1})
+
+    def test_no_aws_call_or_github_request_starts_after_the_deadline(self):
+        app, *_ = load_app()
+        app.DEADLINE[0] = 0
+        with self.assertRaises(app.OutOfTime):
+            app.listed_instances(COLTON)
+        with self.assertRaises(app.OutOfTime):
+            app.real_github("GET", f"/repos/{COLTON}/actions/runners", "PAT")
+        app.fake_dynamo.items[(COLTON, "7")] = {"expires_at": {"N": "0"}}
+        app.release(COLTON, "7")
+        self.assertEqual(app.fake_dynamo.deleted, [(COLTON, "7")], "releasing a claim must still finish")
+
+    def test_a_reconcile_that_runs_out_of_time_mid_job_stops_and_reports_its_count(self):
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "queued")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        ec2.instances.append(instance("i-busy", COLTON, "4", 30))
+        gh.runners[COLTON] = {"i-busy": {"id": 32, "name": "i-busy", "busy": True, "status": "online",
+                                         "labels": [{"name": "cc-games"}]}}
+        app.DEADLINE[0] = time.monotonic() + 100
+        def slow_claims(repo):
+            app.DEADLINE[0] = 0   # the claims query returned after the repo's deadline
+            return {}
+        app.active_claims = slow_claims
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["stopped"], "no time left")
+        self.assertEqual(result["live"], 1)
+        self.assertEqual(ec2.launched, [])
+
+    def test_a_launch_ec2_accepted_is_handed_its_credential_past_the_deadline(self):
+        app, ec2, ssm, _ = load_app()
+        app.DEADLINE[0] = time.monotonic() + 100
+        real = ec2.run_instances
+        def accepted_late(**kw):
+            out = real(**kw)
+            app.DEADLINE[0] = 0
+            return out
+        ec2.run_instances = accepted_late
+        outcome, _ = app.ensure_runner(COLTON, REPOS[COLTON], app.config()[1], "PAT", "7", "xl", [])
+        self.assertEqual(outcome, "launched", "a host without its credential would idle until reaped")
+        self.assertEqual(ec2.terminated, [])
 
     def test_reaps_unregistered_idle_and_overage_hosts_and_offline_ghosts(self):
         app, ec2, *_ = load_app()

@@ -685,9 +685,11 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   ephemeral host tagged for a still-queued job is running something else, so the job gets its own
   host. The cap counts hosts, not job tags.
   Neither repo can starve fcvm's.
-- **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo and in total.
-  `too-many-app-runners` fires above the combined cap; `github-app-runner-reconcile-silent` fires
-  when no count arrives for 15 minutes, because then nothing is reaping. One repo's failure (a
+- **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
+  (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
+  zero would hide its hosts. `too-many-app-runners` fires above the combined cap;
+  `github-app-runner-reconcile-silent` fires when no total arrives for 15 minutes, because then
+  some repo is not being reaped. One repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
   still fails for `github-app-runner-errors`.
 - **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
@@ -701,7 +703,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
   so jobs it finds always have time to launch), launches for queued jobs that have no host,
-  oldest first, stopping at the repo's cap or the end of its share, and reaps hosts (also
+  oldest first, stopping at the repo's cap or the end of its share. The share is enforced at the
+  call: once it is spent no AWS call (a botocore `before-call` hook) or GitHub request starts,
+  except the credential handoff after an accepted launch and claim releases, and every call is
+  bounded (connect 3 s, read 8 s, one attempt), so at most one call runs past it. It reaps hosts (also
   within the share; a host is judged "never registered" only from a complete runner listing; an
   idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
   because it took a job since the listing)

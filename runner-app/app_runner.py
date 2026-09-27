@@ -24,6 +24,7 @@ writes /github-runner/bootstrap/<instance-id> tagged with that instance's ARN, a
 instance role can read and delete only the parameter tagged with its own ARN. The token never
 appears in user data.
 """
+import contextlib
 import json
 import math
 import os
@@ -52,7 +53,7 @@ MAX_RUN_PAGES = 10   # GitHub lists at most 1,000 runs for a status-filtered que
 
 # Bounded clients: botocore's defaults (60 s reads, several retries) let one stalled call eat a
 # repo's time share and the publishing reserve. Every call here fails in well under that.
-BOUNDED = Config(connect_timeout=3, read_timeout=8, retries={'total_max_attempts': 2, 'mode': 'standard'})
+BOUNDED = Config(connect_timeout=3, read_timeout=8, retries={'total_max_attempts': 1})
 ec2 = boto3.client('ec2', region_name=REGION, config=BOUNDED)
 # RunInstances only, with botocore's own retries off, as in the metal controller
 # (runner-autoscale.tf): a pool with no spot capacity answers InsufficientInstanceCapacity, and
@@ -109,6 +110,8 @@ def config():
 
 # ---------------------------------------------------------------- GitHub
 def github(method, path, pat, body=None):
+    if not HANDOFF[0] and out_of_time():
+        raise OutOfTime(f'GitHub {method} {path}')
     req = urllib.request.Request(
         'https://api.github.com' + path, method=method,
         data=None if body is None else json.dumps(body).encode(),
@@ -169,6 +172,37 @@ RESERVE_SECONDS = 25
 def out_of_time(need=0.0):
     """True once the repo's share is spent, or has less than `need` seconds left."""
     return time.monotonic() + need >= DEADLINE[0]
+
+
+# The deadline is enforced at the call, not only where each caller remembers to check: once a
+# repo's share is spent, no AWS call (botocore's before-call event) and no GitHub request may
+# start, and the reconcile stops with what it has. Every call is bounded (BOUNDED, github()'s
+# timeout), so at most one call is in flight past the deadline. The exception is HANDOFF: the
+# credential handoff and cleanup after EC2 accepted a launch, and releasing a claim, which must
+# finish. RESERVE_SECONDS covers one in-flight call or one handoff, plus publishing the counts.
+class OutOfTime(Exception):
+    pass
+
+
+HANDOFF = [False]
+
+
+@contextlib.contextmanager
+def handoff():
+    HANDOFF[0] = True
+    try:
+        yield
+    finally:
+        HANDOFF[0] = False
+
+
+def refuse_after_deadline(event_name=None, **_):
+    if not HANDOFF[0] and out_of_time():
+        raise OutOfTime(event_name or 'an AWS call')
+
+
+for _client in (ec2, launch_ec2, ssm, secrets, dynamodb):
+    _client.meta.events.register('before-call', refuse_after_deadline)
 
 
 def pages(repo, path, key, pat, budget):
@@ -355,6 +389,8 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                         {'ResourceType': 'volume', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                         {'ResourceType': 'network-interface', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                     ])
+            except OutOfTime:
+                raise
             except Exception as error:
                 last_error = error
                 code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
@@ -369,27 +405,33 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                 # and retrying other pools or later rounds will not help. Make it loud.
                 raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}') from error
             instance_id = response['Instances'][0]['InstanceId']
-            try:
-                broker(instance_id, *token)
-            except Exception as error:
-                # EC2 accepted it; without its credential it can only idle. Never launch another
-                # type for the same job: the reconcile retries once this one is gone.
-                print(f'{repo}: bootstrap credential for {instance_id} failed ({type(error).__name__}); terminating')
-                try:
-                    ec2.terminate_instances(InstanceIds=[instance_id])
-                except Exception as cleanup:
-                    # The host may still be alive: an ambiguous outcome, so the claim must stay.
-                    print(f'{repo}: could not terminate {instance_id} ({type(cleanup).__name__}); keeping the claim')
-                    return None, False
-                try:
-                    ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
-                except Exception:
-                    pass
-                return None, True
-            print(f"{repo}: launched {instance_id} ({instance_type}, {subnet['availability_zone']}) for job {job_id} [{labels}]")
-            return instance_id, False
+            with handoff():
+                return settle(repo, instance_id, instance_type, subnet, job_id, labels, token)
     print(f'{repo}: every pool refused a {size} runner for job {job_id}: {last_error}')
     return None, True
+
+
+def settle(repo, instance_id, instance_type, subnet, job_id, labels, token):
+    """After EC2 accepted a launch: hand the host its credential, or terminate it."""
+    try:
+        broker(instance_id, *token)
+    except Exception as error:
+        # EC2 accepted it; without its credential it can only idle. Never launch another
+        # type for the same job: the reconcile retries once this one is gone.
+        print(f'{repo}: bootstrap credential for {instance_id} failed ({type(error).__name__}); terminating')
+        try:
+            ec2.terminate_instances(InstanceIds=[instance_id])
+        except Exception as cleanup:
+            # The host may still be alive: an ambiguous outcome, so the claim must stay.
+            print(f'{repo}: could not terminate {instance_id} ({type(cleanup).__name__}); keeping the claim')
+            return None, False
+        try:
+            ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
+        except Exception:
+            pass
+        return None, True
+    print(f"{repo}: launched {instance_id} ({instance_type}, {subnet['availability_zone']}) for job {job_id} [{labels}]")
+    return instance_id, False
 
 
 # ---------------------------------------------------------------- policy
@@ -427,7 +469,8 @@ def active_claims(repo):
 
 def release(repo, job_id):
     try:
-        dynamodb.delete_item(TableName=os.environ['CLAIMS_TABLE'], Key={'repo': {'S': repo}, 'job': {'S': job_id}})
+        with handoff():
+            dynamodb.delete_item(TableName=os.environ['CLAIMS_TABLE'], Key={'repo': {'S': repo}, 'job': {'S': job_id}})
     except Exception as error:  # the claim then just expires
         print(f'{repo}: could not release the claim for job {job_id}: {type(error).__name__}')
 
@@ -548,6 +591,16 @@ def reap(repo, cfg, pat, live, runners, complete=True):
 
 
 def reconcile(repo, cfg, subnets):
+    result = {'repo': repo}
+    try:
+        return reconcile_repo(repo, cfg, subnets, result)
+    except OutOfTime as stop:
+        print(f'{repo}: reconcile stopped at its time share, before {stop}')
+        result['stopped'] = 'no time left'
+        return result
+
+
+def reconcile_repo(repo, cfg, subnets, result):
     # An earlier repo may have used this one's share already: start nothing.
     if out_of_time():
         print(f'{repo}: reconcile skipped; its time share was already spent')
@@ -562,6 +615,9 @@ def reconcile(repo, cfg, subnets):
     live = reap(repo, cfg, pat, app_instances(repo), runners, complete)
     busy = frozenset(name for name, runner in runners.items() if runner.get('busy'))
     outcomes, token = {}, None
+    # From here on, a stop at the deadline still reports these (live grows with each launch).
+    result['outcomes'] = outcomes
+    result['live'] = len(live)
     # The scan gets half the remaining share, so jobs it finds always have time to launch: a
     # queue big or slow enough to use the whole share would otherwise be found and dropped on
     # every round.
@@ -580,20 +636,26 @@ def reconcile(repo, cfg, subnets):
             break
         outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        result['live'] = len(live)
         if outcome == 'cap':
             break
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
-    return {'repo': repo, 'outcomes': outcomes, 'live': len(live)}
+    return result
 
 
 def publish_counts(results):
-    """LiveRunners per repo and in total, every reconcile. The too-many and not-running alarms
-    read this: AWS/EC2 has no per-tag instance count to alarm on."""
+    """LiveRunners per repo, and in total when every repo was counted. The too-many and
+    reconcile-silent alarms read this: AWS/EC2 has no per-tag instance count to alarm on. A total
+    that silently counted a skipped or failed repo as zero would hide its hosts from the
+    too-many alarm, so a round without every count publishes no total; rounds like that in a
+    row trip reconcile-silent (missing = breaching), which is what they are."""
     data = [{'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
              'Value': r['live'], 'Unit': 'Count'} for r in results if 'live' in r]
-    data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
-                 'Value': sum(r.get('live', 0) for r in results), 'Unit': 'Count'})
-    cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
+    if all('live' in r for r in results):
+        data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
+                     'Value': sum(r['live'] for r in results), 'Unit': 'Count'})
+    if data:
+        cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
 
 
 def handler(event, context):
