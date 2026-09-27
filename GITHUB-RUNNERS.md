@@ -672,6 +672,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   SDK's own retries cannot duplicate one.
 - **Stale deliveries.** A delivery can wait in Lambda's async queue until after the reconcile ran
   its job; before launching for one, the controller asks GitHub whether the job is still queued.
+  A delivery is also bounded by the invocation's deadline, so a slow round of pool refusals stops
+  and releases its claim instead of timing out while holding it.
+- **Inspector.** Hosts carry `InspectorEc2Exclusion=true` with instance metadata tags enabled,
+  so Inspector's SSM plugin skips them instead of apt-installing its scanner mid-boot.
 - **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite

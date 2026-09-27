@@ -615,6 +615,22 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.deliver(app), {"ignored": "no longer queued"})
         self.assertEqual(ec2.launched, [])
 
+    def test_instance_metadata_exposes_tags_so_inspector_honours_its_exclusion(self):
+        app, ec2, *_ = load_app()
+        self.deliver(app)
+        (kw,) = ec2.launched
+        self.assertEqual(kw["MetadataOptions"]["InstanceMetadataTags"], "enabled")
+        self.assertEqual(kw["MetadataOptions"]["HttpTokens"], "required")
+
+    def test_a_delivery_is_bounded_by_the_invocation_and_leaves_no_claim(self):
+        app, ec2, *_ = load_app()
+        context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: (app.RESERVE_SECONDS - 5) * 1000)
+        event = {"repo": COLTON, "action": "queued", "workflow_job": {"id": 7, "labels": ["self-hosted", "cc-games", "xl"]}}
+        self.assertEqual(app.handler(event, context)["outcome"], "out of time")
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(app.fake_dynamo.items, {}, "a claim left behind would block the job for 15 minutes")
+        self.assertEqual(app.DEADLINE[0], float("inf"))
+
     def test_no_token_yet_launches_nothing(self):
         app, ec2, *_ = load_app(tokens={})
         self.assertEqual(self.deliver(app), {"skipped": "no controller token"})

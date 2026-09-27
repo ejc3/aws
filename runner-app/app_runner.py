@@ -375,7 +375,11 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                     BlockDeviceMappings=[{'DeviceName': '/dev/sda1', 'Ebs': {
                         'VolumeSize': VOLUME_GB, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}}],
                     UserData=data,
-                    MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1},
+                    # InstanceMetadataTags: Inspector's SSM plugin reads InspectorEc2Exclusion from
+                    # instance metadata. Without it the tag only hides findings, and the plugin still
+                    # apt-installs its scanner mid-boot (GITHUB-RUNNERS.md, Inspector).
+                    MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
+                                     'InstanceMetadataTags': 'enabled'},
                     InstanceInitiatedShutdownBehavior='terminate',
                     InstanceMarketOptions={'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time'}},
                     TagSpecifications=[
@@ -700,6 +704,19 @@ def handler(event, context):
     size = job_size(cfg, job.get('labels'))
     if not size or job.get('id') is None:
         return {'ignored': 'labels'}
+    # A delivery is bounded by the invocation too: stopping at a deadline releases its claim,
+    # where a Lambda timeout would leave the job blocked until the claim expired.
+    DEADLINE[0] = started + (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
+    try:
+        return deliver(repo, cfg, subnets, job, size)
+    except OutOfTime as stop:
+        print(f"{repo}: delivery for job {job['id']} stopped at the invocation's deadline, before {stop}")
+        return {'repo': repo, 'job': job['id'], 'size': size, 'outcome': 'out of time'}
+    finally:
+        DEADLINE[0] = float('inf')
+
+
+def deliver(repo, cfg, subnets, job, size):
     pat = repo_pat(cfg)
     if not pat:
         return {'skipped': 'no controller token'}
