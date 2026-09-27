@@ -33,6 +33,11 @@
 # builds whatever ECR lacks, and the task definitions are created only after that build
 # succeeded. Shipping a new version = changing that one variable and applying.
 
+# PREVIEW NEEDS ENGINE-SIDE BYPASS SUPPORT. Engines launched by a preview lobby call back a
+# protected *.vercel.app URL and must send x-vercel-protection-bypass (MP_API_BYPASS, which
+# the lobby passes them). c76e5bdf predates that engine change (games repo, branch
+# mp/preview); production is unaffected. Move this ref to a commit that has it before
+# relying on multiplayer in previews.
 variable "games_mp_source_ref" {
   description = "Full 40-hex commit of CoderColton/colton-games whose multiplayer images (and mp migration) this stack runs."
   type        = string
@@ -902,8 +907,12 @@ resource "aws_ecs_task_definition" "games_mp_router" {
       { name = "MP_ALLOWED_ORIGINS", value = join(",", local.mp_allowed_origins) },
       { name = "MP_TARGET_CIDRS", value = join(",", [for s in local.mp_subnets : s.cidr_block]) },
     ]
+    # Pinned to the exact secret VERSION (<arn>:<json-key>:<version-stage>:<version-id>, the
+    # first two empty). A key rotation writes a new version, which changes this task
+    # definition, so ECS rolls the router onto the new keys and the rollout is identified
+    # by its own task definition ARN: a rollback can never pass for the rotated deployment.
     secrets = [
-      { name = "MP_TOKEN_KEYS", valueFrom = aws_secretsmanager_secret.games_mp_token_keys.arn },
+      { name = "MP_TOKEN_KEYS", valueFrom = "${aws_secretsmanager_secret.games_mp_token_keys.arn}:::${aws_secretsmanager_secret_version.games_mp_token_keys.version_id}" },
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -919,8 +928,8 @@ resource "aws_ecs_task_definition" "games_mp_router" {
 
   tags = { Name = "games-mp-router", Project = "games-multiplayer", ImageTag = local.mp_router_tag }
 
-  # The image must be in ECR, and the key the task injects must have a value.
-  depends_on = [terraform_data.games_mp_build, aws_secretsmanager_secret_version.games_mp_token_keys]
+  # The image must be in ECR before a task definition names it.
+  depends_on = [terraform_data.games_mp_build]
 }
 
 # Zero-downtime rollout: minimum 100% / maximum 200% means ECS starts the new task, waits
@@ -947,14 +956,6 @@ resource "aws_ecs_service" "games_mp_router" {
   deployment_circuit_breaker {
     enable   = true
     rollback = true
-  }
-
-  # ECS injects MP_TOKEN_KEYS only when a task starts, and a new secret version does not
-  # change the task definition. Hashing the value here makes a key rotation roll the router
-  # (same zero-downtime rollout) in the same apply that writes the new version.
-  force_new_deployment = true
-  triggers = {
-    token_keys = sha256(local.games_mp_token_keys)
   }
 
   network_configuration {

@@ -27,7 +27,7 @@ apply loudly if anything is wrong. With nothing changed, a second apply is an em
 
 | Step | What it does |
 | --- | --- |
-| **Secrets** | The random provider generates the token key (`kid1:<base64 32 bytes>`), `MP_TEST_KEY`, `CRON_SECRET`, `MP_COOKIE_SECRET` (one per environment), Preview's `SKYHOOK_LEADERBOARD_SECRET` and the automation-bypass secret. The token key, test key and cron secret also go to Secrets Manager (`games/mp-token-keys`, `games/mp-test-key`, `games/mp-cron-secret`). The router reads its key from there. |
+| **Secrets** | The random provider generates the token key (`kid1:<base64 32 bytes>`), `MP_TEST_KEY`, `CRON_SECRET`, `MP_COOKIE_SECRET` (one per environment), Preview's `SKYHOOK_LEADERBOARD_SECRET` and the automation-bypass secret. The token key, test key and cron secret also go to Secrets Manager (`games/mp-token-keys`, `games/mp-test-key`, `games/mp-cron-secret`). The router's task definition names the exact version of its key, so a new key version is a new task definition that the health step verifies. |
 | **Images** (`terraform_data.games_mp_build`) | Skips everything if ECR already has both tags. Otherwise the jumpbox downloads the pinned commit (`games_mp_source_ref`) with `github-pat-ejc3` and uploads it to `s3://games-mp-build-<account>/sources/`. It then runs the CodeBuild project `games-mp-images` (ARM, 2 vCPU) and waits for SUCCEEDED. The build checks that the repo's `scripts/mp-images.mjs` produces exactly the tags Terraform expects, then builds and pushes only the missing ones. Tags are router `<sha12>` and engine `<simVersion>-<sha12>`. The build role has no GitHub or Secrets Manager access. |
 | **Task definitions and router** | `games-mp-router`, `games-mptest` and the `mp-router` service are created only after the images exist. The service rolls with no downtime: the new task is started before the old one drains. |
 | **Vercel env** | Terraform owns the multiplayer set on the colton-games project (see below), and only that set. |
@@ -98,13 +98,22 @@ until they update.
 
 ## Rotating secrets
 
-- **Token key.** Set `games_mp_token_kids = ["kid2", "kid1"]` and apply. The router restarts
-  with both keys, and the lobby signs with `kid2` from its next deployment. Once Production
+- **Token key.** Set `games_mp_token_kids = ["kid2", "kid1"]` and apply. The router rolls
+  onto a new task definition with both keys, and the lobby signs with `kid2` from its next deployment. Once Production
   has redeployed, set `["kid2"]` and apply again.
 - **Any other generated secret.** Run `terraform apply -replace=random_password.<name>`,
   then redeploy the site. Replacing `games_mp_cookie_secret` resets every guest identity.
 - **Preview Supabase values.** If the integration rotates its keys, bump
   `games_mp_preview_supabase_sync` and apply.
+
+## Known gap: engines on Preview
+
+Engines launched by a preview lobby call back that preview's protected `*.vercel.app` URL.
+To get through Vercel's deployment protection they must send `x-vercel-protection-bypass`,
+using the `MP_API_BYPASS` value the lobby passes them. The pinned commit `c76e5bdf` predates
+that engine change, which is on the games repo's `mp/preview` branch. Production is
+unaffected. Before relying on multiplayer in previews, move `games_mp_source_ref` to a commit
+that has the engine change.
 
 ## Emergency switches
 

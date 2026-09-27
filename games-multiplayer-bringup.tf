@@ -545,9 +545,10 @@ resource "terraform_data" "games_mp_migration" {
 resource "terraform_data" "games_mp_healthy" {
   count = local.mp_router_enabled ? 1 : 0
 
+  # The task definition ARN changes with the image AND with every token-key version
+  # (the secret is pinned by version id), so this covers rotations too.
   triggers_replace = {
     task_definition = aws_ecs_task_definition.games_mp_router[0].arn
-    token_keys      = sha256(local.games_mp_token_keys)
   }
 
   provisioner "local-exec" {

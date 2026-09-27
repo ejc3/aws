@@ -578,10 +578,13 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertLessEqual(used, subcommands)
         self.assertIn("codebuild-images", (GM / "buildspec.yml").read_text())
 
-    def test_router_redeploys_when_the_token_keys_change(self):
-        service = self.block(self.tf, "aws_ecs_service", "games_mp_router")
-        self.assertIn("token_keys = sha256(local.games_mp_token_keys)", service)
-        self.assertIn("force_new_deployment = true", service)
+    def test_a_key_rotation_is_a_new_router_task_definition(self):
+        # Pinning the secret by version id makes a rotation change the task definition ARN,
+        # which is what the health step tracks (a rollback cannot pass for the new keys).
+        td = self.block(self.tf, "aws_ecs_task_definition", "games_mp_router")
+        self.assertIn(':::${aws_secretsmanager_secret_version.games_mp_token_keys.version_id}"', td)
+        healthy = self.block(self.bu, "terraform_data", "games_mp_healthy")
+        self.assertIn("aws_ecs_task_definition.games_mp_router[0].arn", healthy)
 
 
 if __name__ == "__main__":
