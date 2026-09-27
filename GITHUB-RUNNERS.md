@@ -1090,22 +1090,30 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
    stops registration outright; plans then fail at that repo's provider until its hook is
    gone from GitHub and from state, and the gate is off. The gate covers both repos, so:
 
-   1. Delete the revoked repo's hook through the API with the owner's own `gh` login
-      (CoderColton for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin
-      for `dolphin-labs`), matched by the Terraform webhook URL, and drop it from state:
+   1. An administrator, on a jumpbox, reads the hook URL and gives it to the repo's owner:
+      `terraform output -raw runner_webhook_url` (not a secret; GitHub shows it to the repo's
+      admins).
+   2. The owner deletes the hook with their own `gh` login on their own account (CoderColton
+      for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin for
+      `dolphin-labs`), and confirms it is gone. Their login never leaves their account:
 
       ```bash
+      set -euo pipefail
       R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
-      URL=$(terraform output -raw runner_webhook_url)
+      URL='<from step 1>'
       ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
+      [ -n "$ID" ] || { echo "no hook with that URL" >&2; exit 1; }
       gh api -X DELETE "repos/$R/hooks/$ID"
-      terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'   # or _dolphin_labs
+      gh api "repos/$R/hooks" --jq "[.[] | select(.config.url == \"$URL\")] | length"   # must print 0
       ```
 
-   2. Remove the other repo's hook while its token still works:
+   3. Only after the owner reports `0`, the administrator drops it from state on the jumpbox:
+      `terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'` (or
+      `_dolphin_labs`). Dropping it before then would leave a live hook unmanaged.
+   4. Remove the other repo's hook while its token still works:
       `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'` (or
       `_colton_games`). No other resource then uses the revoked repo's provider.
-   3. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
+   5. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
       would read the revoked token again and try to recreate the deleted hook.
 
 **A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can

@@ -280,9 +280,11 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    client address is the one the ALB appended to `X-Forwarded-For` (`MP_TRUSTED_HOPS=1`), so
    a client cannot spoof it; IPv6 clients are limited per /64.
 3. **Join token.** HMAC-SHA256 with the keys in `games/mp-token-keys`, bound to one match,
-   one environment and one seat, and valid for two minutes. Only the Vercel lobby (which holds
-   `MP_TOKEN_KEYS` on Production and Preview) can mint one; the router's execution role and
-   administrators are the only AWS readers (secret policy, `games-multiplayer.tf`).
+   one environment and one seat, and valid for two minutes. The key is symmetric, so everything
+   that verifies a token can also mint one: the Vercel lobby (`MP_TOKEN_KEYS` on Production and
+   Preview) and the router, which gets the key as `MP_TOKEN_KEYS` to check tokens. The router's
+   execution role and administrators are the only AWS readers (secret policy,
+   `games-multiplayer.tf`).
 4. **Router → engine.** The router forwards only to addresses inside `MP_TARGET_CIDRS`
    (the two engine subnets), and its security group's egress reaches only the engine group on
    8080 plus HTTPS. The engine group admits only the router, which is why an engine may trust
@@ -308,6 +310,7 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | Anyone on the internet | Reach the ALB and router; hold connections open (idle timeout 3600 s); consume the router's single 0.25 vCPU with a distributed flood | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
 | A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), including `taskRoleArn`: the launcher may pass the engine execution role too, so a task can run *with* it and read every engine ECR repository and write engine logs; run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); choose each task's subnets and security groups (`RunTask`'s network configuration has no IAM condition), so attach the router's group, which every engine admits, to reach any engine directly, or the ALB's group with a public IP to serve its own ports to the internet; read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
+| A compromised router (it parses internet input) | Mint valid join tokens for any match (it holds the HMAC key), so join any match as any seat; see and drop every player's traffic; reach every engine | Launch or stop tasks; read other secrets (its execution role reads only its key); reach the admin fleet except its public SSH/ET ports |
 | A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (SSH and ET, which are already public); reach the I/O box's NFS export over the inter-region peer (TCP 2049 is admitted from all of 10.0.0.0/16, read-write, root-squashed) and read, fill or poison the shared scratch; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role, for engines the lobby launches honestly; see the row above for a task given the execution role); reach another engine (router-only ingress, unless it was launched with the router's group, above) |
 
 **Cost-abuse limits, and what happens at each**
@@ -356,6 +359,9 @@ running engines.
    export over the peer. Fix: dedicated engine subnets with egress limited to what engines
    need, the I/O box's NFS rule narrowed to the hosts that mount it, a non-root read-only
    container, and callbacks that do not need the bypass.
+5. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
+   private key only the lobby holds and verify with its public key in the router (Ed25519),
+   so a compromised router can no longer mint tokens.
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
 
