@@ -208,7 +208,7 @@ data "external" "games_mp_preflight" {
     build               = tostring(var.games_mp_build)
     repo                = local.games_mp_repo
     ref                 = var.games_mp_source_ref
-    github_pat_secret   = "github-pat-ejc3"
+    github_pat_secret   = local.games_mp_github_read_secret
   }
 }
 
@@ -217,9 +217,17 @@ data "external" "games_mp_preflight" {
 # -------------------------------------------------------------------------------------
 #
 # SOURCE. CoderColton/colton-games is private. The build does NOT get a GitHub credential:
-# the jumpbox (bringup.py build) downloads the pinned commit with the existing read
-# credential `github-pat-ejc3`, repacks it, and uploads it to this bucket; CodeBuild reads
-# only that object. Rejected alternatives:
+# the jumpbox (bringup.py build and migrate) downloads the pinned commit with the read
+# token in secret `games/colton-games-read`, repacks it, and uploads it to this bucket;
+# CodeBuild reads only that object. Rejected alternatives:
+#   - `github-pat-ejc3`, the dev boxes' clone credential: it is a fine-grained token owned
+#     by ejc3, and a fine-grained token can only reach repos owned by its creator or an
+#     org they belong to, never another user's personal repo, collaborator or not. It is
+#     also readable by every dev box (dev-instance-common.tf), so widening it would hand
+#     Colton's repo to agents running there. Its 404 on the first jumpbox plan is how this
+#     was found (2026-09-27).
+#   - a classic ejc3 PAT with `repo` scope: it would reach colton-games, but read AND write
+#     on every repo ejc3 can touch, parked on the jumpbox for a build step.
 #   - CodeBuild's own GitHub source with the PAT (source auth SECRETS_MANAGER): the build
 #     runs the games repo's code, which could then read ejc3's PAT through the build role.
 #   - a CodeConnections GitHub connection: it starts PENDING until someone completes a
@@ -227,6 +235,43 @@ data "external" "games_mp_preflight" {
 #     collaborator, not the owner) cannot approve. Two human steps, forever in the loop.
 #   - the repo's `github` provider token: it is the webhook-admin PAT for ejc3's repos and
 #     cannot read CoderColton's.
+
+# Colton's fine-grained token: resource owner CoderColton, only colton-games, Contents:
+# Read-only. Created by Colton at https://github.com/settings/personal-access-tokens/new
+# and written straight into this secret, never through Terraform, so the value is not in
+# state. Only administration can read it; the CodeBuild role has no Secrets Manager access
+# at all, and no dev box role is granted it.
+#
+# Bootstrap: the preflight reads this secret, so it must exist (with a value) before a full
+# plan can pass. Create the container alone first:
+#   terraform apply -target=aws_secretsmanager_secret.games_mp_github_read \
+#                   -target=aws_secretsmanager_secret_policy.games_mp_github_read
+# then put the token in, then plan normally.
+locals {
+  games_mp_github_read_secret = "games/colton-games-read"
+}
+
+resource "aws_secretsmanager_secret" "games_mp_github_read" {
+  name                    = local.games_mp_github_read_secret
+  description             = "Fine-grained GitHub token owned by CoderColton: colton-games, Contents read-only. Set by hand."
+  recovery_window_in_days = 7
+  tags                    = { Name = local.games_mp_github_read_secret, Managed = "terraform", Project = "games-multiplayer" }
+}
+
+resource "aws_secretsmanager_secret_policy" "games_mp_github_read" {
+  secret_arn = aws_secretsmanager_secret.games_mp_github_read.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.games_mp_github_read.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
 
 resource "aws_s3_bucket" "games_mp_build" {
   bucket = "games-mp-build-${data.aws_caller_identity.current.account_id}"
@@ -397,7 +442,7 @@ resource "terraform_data" "games_mp_build" {
   }
 
   provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} build --region ${var.aws_region} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --project ${aws_codebuild_project.games_mp_images.name} --bucket ${aws_s3_bucket.games_mp_build.bucket} --cache-dir ${local.games_mp_cache_dir} --expect \"$GAMES_MP_EXPECT\""
+    command = "python3 ${local.games_mp_bringup} build --region ${var.aws_region} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --github-pat-secret ${local.games_mp_github_read_secret} --project ${aws_codebuild_project.games_mp_images.name} --bucket ${aws_s3_bucket.games_mp_build.bucket} --cache-dir ${local.games_mp_cache_dir} --expect \"$GAMES_MP_EXPECT\""
     environment = {
       GAMES_MP_EXPECT = jsonencode(local.games_mp_expected_images)
     }
@@ -573,7 +618,7 @@ resource "terraform_data" "games_mp_migration" {
   }
 
   provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} migrate --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --cache-dir ${local.games_mp_cache_dir} --file ${local.games_mp_migration} --ca ${path.module}/games-multiplayer/supabase-root-2021-ca.crt"
+    command = "python3 ${local.games_mp_bringup} migrate --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --github-pat-secret ${local.games_mp_github_read_secret} --cache-dir ${local.games_mp_cache_dir} --file ${local.games_mp_migration} --ca ${path.module}/games-multiplayer/supabase-root-2021-ca.crt"
   }
 
   depends_on = [data.external.games_mp_preflight, aws_secretsmanager_secret_policy.games_mp_admin_only]

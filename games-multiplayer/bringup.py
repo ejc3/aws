@@ -824,7 +824,7 @@ def main(argv=None):
             sp.add_argument("--ref", required=True)
             sp.add_argument("--repo", default="CoderColton/colton-games")
             sp.add_argument("--cache-dir", required=True)
-            sp.add_argument("--github-pat-secret", default="github-pat-ejc3")
+            sp.add_argument("--github-pat-secret", required=True)
 
     b = sub.add_parser("build")
     common(b, source=True)

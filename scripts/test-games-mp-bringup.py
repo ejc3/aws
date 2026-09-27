@@ -61,7 +61,7 @@ class World:
         self.calls = []            # argv of every RUN
         self.envs = []             # env of every RUN that passed one
         self.ecr = set()           # (repo, tag) present
-        self.secrets = {"vercel-api-token": VERCEL_TOKEN, "github-pat-ejc3": GITHUB_PAT}
+        self.secrets = {"vercel-api-token": VERCEL_TOKEN, "games/colton-games-read": GITHUB_PAT}
         self.builds = []           # statuses to return in order
         self.http_log = []
         self.vercel_envs = []
@@ -210,7 +210,7 @@ COMMIT;
 
 def args(**kw):
     base = dict(region="us-west-1", team_id="team_x", project_id="prj_x", vercel_token_secret="vercel-api-token",
-                ref=REF, repo="CoderColton/colton-games", github_pat_secret="github-pat-ejc3")
+                ref=REF, repo="CoderColton/colton-games", github_pat_secret="games/colton-games-read")
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -266,15 +266,15 @@ class SourceTests(Base):
             seen.append(path)
             return fd, path
         self.bu.tempfile = types.SimpleNamespace(mkstemp=spy, NamedTemporaryFile=tempfile.NamedTemporaryFile)
-        p = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
+        p = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
         os.unlink(p)
-        self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
+        self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
         self.assertEqual(len(set(seen)), 2)
         self.assertEqual([n for n in os.listdir(self.cache) if n.endswith(".tmp")], [])
 
     def test_source_is_downloaded_once_per_commit(self):
-        p1 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
-        p2 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "github-pat-ejc3")
+        p1 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
+        p2 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
         self.assertEqual(p1, p2)
         self.assertEqual(len([h for h in self.w.http_log if "github" in h[1]]), 1)
         self.assertNoSecretsLeaked()
@@ -517,7 +517,7 @@ class PreflightTests(Base):
              "copy_keys": "SUPABASE_URL,NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SECRET_KEY",
              "url_key": "POSTGRES_URL_NON_POOLING",
              "migrate": "true", "build": "true", "repo": "CoderColton/colton-games", "ref": REF,
-             "github_pat_secret": "github-pat-ejc3"}
+             "github_pat_secret": "games/colton-games-read"}
 
     def setUp(self):
         super().setUp()
@@ -723,6 +723,17 @@ class TerraformWiringTests(unittest.TestCase):
         # plan-time preflight actually reads live, so a plan notices drift and reruns it.
         oidc = self.block(self.bu, "terraform_data", "games_mp_vercel_oidc")
         self.assertIn("data.external.games_mp_preflight.result.oidc_state", oidc)
+
+    def test_source_download_uses_only_the_colton_games_read_token(self):
+        # github-pat-ejc3 is the dev boxes' credential: every dev box can read it, and as a
+        # fine-grained ejc3 token it cannot reach CoderColton's personal repo at all.
+        self.assertNotIn('"github-pat-ejc3"', self.bu)  # never a value; the comments explain why
+        self.assertIn("github_pat_secret   = local.games_mp_github_read_secret", self.bu)
+        for step in ("games_mp_build", "games_mp_migration"):
+            self.assertIn("--github-pat-secret ${local.games_mp_github_read_secret}",
+                          self.block(self.bu, "terraform_data", step))
+        policy = self.block(self.bu, "aws_secretsmanager_secret_policy", "games_mp_github_read")
+        self.assertIn("local.games_mp_admin_principals", policy)
 
     def test_a_key_rotation_is_a_new_router_task_definition(self):
         # Pinning the secret by version id makes a rotation change the task definition ARN,
