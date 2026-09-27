@@ -1073,9 +1073,14 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
 
 1. Set the repo's `max` to 0 in `runner-app.tf` and apply: no new VMs, even from the reconcile,
    which launches for queued jobs without any webhook.
-2. Terminate what is running. The controller may terminate only `Role=github-app-runner`:
-   `aws ec2 describe-instances --filters Name=tag:Role,Values=github-app-runner` then
-   `terminate-instances`.
+2. Terminate what is running (add `Name=tag:Repo,Values=<owner>/<repo>` for one repo):
+
+   ```bash
+   ids=$(aws ec2 describe-instances --region us-west-1 \
+     --filters Name=tag:Role,Values=github-app-runner Name=instance-state-name,Values=pending,running,stopping,stopped \
+     --query 'Reservations[].Instances[].InstanceId' --output text)
+   [ -n "$ids" ] && aws ec2 terminate-instances --region us-west-1 --instance-ids $ids
+   ```
 3. Remove the hooks while Terraform can still read the tokens it deletes them with:
    `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
    -target='github_repository_webhook.runner_app_dolphin_labs[0]'`, then commit
@@ -1083,17 +1088,25 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
    does not work: it also drops the token reads, so the providers have no credentials to
    delete with. The repo's owner can instead revoke its controller token in GitHub, which
    stops registration outright; plans then fail at that repo's provider until its hook is
-   deleted and removed from state. Delete it through the API with the owner's own `gh` login
-   (CoderColton for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin
-   for `dolphin-labs`), matching the hook by our API Gateway URL:
+   gone from GitHub and from state, and the gate is off. The gate covers both repos, so:
 
-   ```bash
-   R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
-   URL=$(terraform output -raw runner_webhook_url)
-   ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
-   gh api -X DELETE "repos/$R/hooks/$ID"
-   terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'   # or _dolphin_labs
-   ```
+   1. Delete the revoked repo's hook through the API with the owner's own `gh` login
+      (CoderColton for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin
+      for `dolphin-labs`), matched by the Terraform webhook URL, and drop it from state:
+
+      ```bash
+      R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
+      URL=$(terraform output -raw runner_webhook_url)
+      ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
+      gh api -X DELETE "repos/$R/hooks/$ID"
+      terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'   # or _dolphin_labs
+      ```
+
+   2. Remove the other repo's hook while its token still works:
+      `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'` (or
+      `_colton_games`). No other resource then uses the revoked repo's provider.
+   3. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
+      would read the revoked token again and try to recreate the deleted hook.
 
 **A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
 open a pull request from a fork. Require approval for workflows from all outside
