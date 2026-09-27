@@ -1061,16 +1061,11 @@ reconcile ran clean.
   that has sat idle for 10 minutes or is older than 3 hours.
 - **Reach the internet.** Egress is unrestricted, and no inbound rule exists
   (`github-app-runner-sg`), so nothing can connect to a job from outside, or from another job.
-- **Use the instance role through the metadata service.** App runners share
-  `github-runner-instance-role` with fcvm's metal runners. Live, that role can: read and delete
-  only the bootstrap credential tagged with its own instance ARN; get and put its own row in
-  the `github-runner-registration` DynamoDB table; `ec2:DescribeNetworkInterfaces` across the
-  account; assign IPv6 addresses to tagged runner ENIs; write objects under
-  `ejc3-security-records-928413605543/sessions/*` (the session-audit prefix); and run the SSM
-  agent. It cannot read any PAT, Secrets Manager secret, or other SSM parameter.
-- **Reach fcvm's metal runners' SSH port.** They share the runner VPC, and fcvm's runner
-  group admits SSH from the whole VPC CIDR. They accept only the admin and dev-to-runner keys,
-  neither of which is on an app runner.
+- **Use the instance role through the metadata service.** App runners have their own
+  `github-app-runner-instance-role`, whose only permission is to read and then delete the
+  bootstrap credential tagged with its own instance ARN. It cannot read any other parameter,
+  PAT or secret, list EC2 or network interfaces, write to S3, or touch fcvm's registration
+  table (checked with `simulate-principal-policy`).
 
 **What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
 only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
@@ -1078,9 +1073,9 @@ with the secrets' resource policies); read another job's registration token (ins
 connect to another runner of the same kind (no inbound); reach the admin fleet over a private
 route (the runner VPC is not peered with it); launch or stop instances. A job does have the
 internet, so it can reach the admin fleet's public endpoints like anyone else: SSH and Eternal
-Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-only, and the
-shared instance role can list every ENI in the account to find them (#175 gives app runners
-their own role without it). That is an internet attacker's access, not more.
+Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-only. That is an
+internet attacker's access, not more. Nor can it reach fcvm's metal runners' SSH: their group
+admits SSH only from itself and the operator addresses.
 
 **Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
 every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
@@ -1151,19 +1146,13 @@ gh api repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval   #
 Also have the controller refuse jobs whose run comes from a fork (the run's
 `head_repository`), never serve `pull_request_target`, and give the repo its own cap and alarm.
 
+**Closed** (#175): app runners have their own instance role, which can only read and delete
+their own bootstrap credential; fcvm's runner group admits SSH only from itself and the
+operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
+
 **Open gaps, most severe first**
 
-1. App runners share fcvm's instance role, so a job can write into the session-audit prefix
-   of the security-records bucket, enumerate every network interface in the account, and
-   write its own row in fcvm's registration table; any grant added for fcvm runners reaches
-   them too. Fix, in #175: a dedicated instance role for app runners that can only consume
-   its own bootstrap credential.
-2. fcvm's runner security group admits SSH from the whole runner VPC. Fix, in #175: allow
-   runner-to-runner SSH only from fcvm's own runner group.
-3. `too-many-app-runners` watches only the combined total, so one repo over-launching past its
-   own cap is invisible while the other is idle. Fix, in #175: a per-repo alarm at each
-   repo's cap.
-4. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
+1. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
    `dolphin-labs` 2027-09-28. That repo's runners stop registering when its token expires;
    renew each before then (Regenerate in GitHub keeps its permissions).
 
