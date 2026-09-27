@@ -45,7 +45,12 @@ cat > /usr/local/bin/dev-bin-update.sh <<'BINUPD'
 set -uo pipefail
 ARCH=$(uname -m)
 
-# repo|release-tag|asset-prefix|binaries|install-dir|service-to-restart|version-cmd|marker
+# repo|release-tag|asset-prefix|binaries|install-dir|service-to-restart|version-cmd|marker|pins
+#
+# PINS is optional: space-separated <arch>:<sha256> of the release tarball. When a row has pins,
+# only a tarball matching this box's arch pin is extracted, and an arch without a pin keeps its
+# current copy. Without it, a changed asset under the same tag would install with no Terraform
+# change at all. tmux-scroll's pin is the one in tmux-scroll.tf.
 #
 # MARKER is optional: a string the downloaded binary must contain. `-V` only proves that a
 # tmux runs, and the only reason tmux-scroll exists is its `scroll-replay` option -- a stock
@@ -55,13 +60,20 @@ ARCH=$(uname -m)
 # fighting dpkg -- removing the tarball reverts cleanly to Ubuntu's 3.4.
 TABLE='ejc3/EternalTerminal|binaries-7.x|et|et etserver etterminal|/usr/bin|etserver.service|/usr/bin/etserver --version
 ejc3/tmux|binaries-3.x|tmux|tmux|/usr/local/bin||/usr/local/bin/tmux -V
-ejc3/tmux|binaries-scroll-native|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V|scroll-replay'
+ejc3/tmux|${local.tmux_scroll_tag}|tmux-scroll|tmux-scroll|/usr/local/bin||/usr/local/bin/tmux-scroll -V|scroll-replay|aarch64:${local.tmux_scroll_sha256_aarch64}'
 
 # Read the table on fd 3, NOT stdin. A command inside the loop (etserver -V, which
 # aborts on this build) consumed the remaining stdin and silently ate every entry after
 # the first -- tmux was never processed at all. Everything inside also gets </dev/null.
-while IFS='|' read -r repo tag prefix bins dir svc vercmd marker <&3; do
+while IFS='|' read -r repo tag prefix bins dir svc vercmd marker pins <&3; do
   [ -n "$repo" ] || continue
+  want=""
+  if [ -n "$${pins:-}" ]; then
+    for p in $pins; do [ "$${p%%:*}" = "$ARCH" ] && want="$${p#*:}"; done
+    if [ -z "$want" ]; then
+      echo "bin-update[$prefix]: no pinned build for $ARCH (keeping current)"; continue
+    fi
+  fi
   url="https://github.com/$repo/releases/download/$tag/$prefix-$ARCH.tar.gz"
   state="/var/lib/dev-bin-update/$prefix"
   mkdir -p "$state"
@@ -72,6 +84,11 @@ while IFS='|' read -r repo tag prefix bins dir svc vercmd marker <&3; do
   fi
 
   sum=$(sha256sum "$tmp/a.tar.gz" | awk '{print $1}')
+  if [ -n "$want" ] && [ "$sum" != "$want" ]; then
+    echo "bin-update[$prefix]: $url does not match its pinned sha256 -- refusing it and keeping"
+    echo "                     the current binary"
+    rm -rf "$tmp"; continue
+  fi
   if [ "$sum" = "$(cat "$state/sha256" 2>/dev/null)" ] && $vercmd >/dev/null 2>&1 </dev/null; then
     echo "bin-update[$prefix]: already current"; rm -rf "$tmp"; continue
   fi
