@@ -1522,6 +1522,25 @@ resource "aws_cloudwatch_metric_alarm" "games_mp_engines_over_lobby_caps" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
+# The count above is published by the sweeper every minute, even when it is 0. The sweeper
+# swallows a failed PutMetricData so the sweep itself still succeeds, which the silence alarm
+# (invocations) would not notice: alarm on the metric itself going missing.
+resource "aws_cloudwatch_metric_alarm" "games_mp_engine_count_missing" {
+  alarm_name          = "games-mp-engine-count-missing"
+  alarm_description   = "GamesMultiplayer/RunningEngines has not been published for 10 minutes: the engine-count alarm is blind. Check games-mp-sweeper's log for put_metric_data failures."
+  namespace           = "GamesMultiplayer"
+  metric_name         = "RunningEngines"
+  statistic           = "SampleCount"
+  period              = 300
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
 # ECS/Fargate spend. AWS/Billing EstimatedCharges does not exist in this account (billing
 # alerts are not enabled; `aws cloudwatch list-metrics --namespace AWS/Billing` is empty in
 # every region), so a Budgets budget filtered to ECS is the alarm here. It lags by hours:

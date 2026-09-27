@@ -309,6 +309,13 @@ class TerraformWiringTests(unittest.TestCase):
             ok = "v2" if name == "games_mp_sim_versions" else "v2-0123456789ab"
             self.assertIsNotNone(_re.match(pattern, ok), name)
 
+    def test_a_missing_engine_count_alarms(self):
+        # The sweeper swallows PutMetricData failures; the metric going missing must alarm.
+        alarm = self.tf.split('resource "aws_cloudwatch_metric_alarm" "games_mp_engine_count_missing"', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('metric_name         = "RunningEngines"', alarm)
+        self.assertIn('treat_missing_data  = "breaching"', alarm)
+        self.assertIn('statistic           = "SampleCount"', alarm)
+
     def test_the_engine_ceiling_must_be_a_whole_number(self):
         # Both Lambdas int() it at start-up: "10.5" would fail every launch and every sweep.
         var = self.tf.split('variable "games_mp_engine_ceiling"', 1)[1].split("\n}\n", 1)[0]

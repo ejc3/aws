@@ -242,7 +242,9 @@ def run_task_input(env, req, task_definition):
         "launchType": "FARGATE",
         "count": 1,
         # A retried launch (same match) returns the same task instead of starting a second.
-        "clientToken": req["matchId"],
+        # Scoped to the environment: a preview launch can never hold, or collide with, the
+        # token of a production match (match ids are visible to both lobbies).
+        "clientToken": "%s-%s" % (env, req["matchId"]),
         # stop finds the match's task with ListTasks startedBy.
         "startedBy": req["matchId"],
         "networkConfiguration": {"awsvpcConfiguration": {
@@ -347,7 +349,7 @@ def start(env, event):
     ceiling = min(ENGINE_CEILING, int(ENVIRONMENTS[env]["ceiling"]))
     if total >= ENGINE_CEILING or in_env >= ceiling:
         raise Refused("capacity")
-    out = _run_task(ecs, run_task_input(env, req, task_definition), req["matchId"])
+    out = _run_task(ecs, run_task_input(env, req, task_definition), env, req["matchId"])
     tasks = out.get("tasks") or []
     if not tasks or not tasks[0].get("taskArn"):
         reasons = ", ".join(str(f.get("reason")) for f in out.get("failures") or []) or "no reason given"
@@ -357,7 +359,7 @@ def start(env, event):
     return {"ok": True, "taskArn": arn, "taskDefinition": task_definition, "engines": total + 1}
 
 
-def _run_task(ecs, params, match):
+def _run_task(ecs, params, env, match):
     """RunTask with clientToken = the match id, so a retry after a lost response cannot start a
     second engine. ECS answers a reused token with that token's ORIGINAL task, which after a
     failed or stopped engine is a terminal one, or, if the parameters changed, with
@@ -379,9 +381,16 @@ def _run_task(ecs, params, match):
             raise  # cannot prove the original engine is gone: do not start another
         seen = _describe(ecs, originals)
         for arn in originals:
-            if arn not in seen or not _terminal(seen[arn]):
-                return {"tasks": [{"taskArn": arn}], "failures": []}
-    return ecs.run_task(**dict(params, clientToken="%s-%s" % (match, uuid.uuid4().hex[:12])))
+            if arn not in seen:
+                return {"tasks": [{"taskArn": arn}], "failures": []}   # ours, not listed yet
+            task = seen[arn]
+            if _terminal(task):
+                continue
+            if _tag(task, "env") != env or _tag(task, "match") != match:
+                # Never adopt another environment's or match's engine as this one's.
+                raise RuntimeError("clientToken for %s/%s is tied to a foreign task %s" % (env, match, arn))
+            return {"tasks": [{"taskArn": arn}], "failures": []}
+    return ecs.run_task(**dict(params, clientToken="%s-%s-%s" % (env, match, uuid.uuid4().hex[:12])))
 
 
 def _terminal(task):

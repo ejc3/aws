@@ -222,7 +222,7 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(call["taskDefinition"], task_definition)
         self.assertEqual(call["launchType"], "FARGATE")
         self.assertEqual(call["count"], 1)
-        self.assertEqual(call["clientToken"], match(1))
+        self.assertEqual(call["clientToken"], "production-" + match(1))
         self.assertEqual(call["startedBy"], match(1))
         self.assertEqual(call["networkConfiguration"], {"awsvpcConfiguration": {
             "subnets": ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"],
@@ -456,7 +456,7 @@ class LaunchTests(unittest.TestCase):
         self.assertIsNone(out.get("repeat"), "a stopped task is not the match's engine")
         self.assertNotEqual(out["taskArn"], first["taskArn"], "ECS returned the dead task for the reused token")
         self.assertEqual(ecs.tasks[out["taskArn"]]["desiredStatus"], "RUNNING")
-        self.assertNotEqual(ecs.run[-1]["clientToken"], match(50), "the replacement needs a token of its own")
+        self.assertNotEqual(ecs.run[-1]["clientToken"], "production-" + match(50), "the replacement needs a token of its own")
 
     def test_a_cold_retry_with_changed_parameters_never_starts_a_second_engine(self):
         # The original engine is live but ECS shows it nowhere yet; the retry's parameters differ,
@@ -467,6 +467,21 @@ class LaunchTests(unittest.TestCase):
         out = self.invoke(ecs, start_event(50, hardCapSec=900))
         self.assertEqual(out["taskArn"], first["taskArn"])
         self.assertEqual(len(ecs.tokens), 1, "no second engine under a fresh token")
+
+    def test_tokens_are_scoped_to_the_environment(self):
+        ecs = FakeECS([])
+        self.invoke(ecs, preview_event(50), qualifier="preview")
+        self.invoke(ecs, start_event(50))
+        self.assertEqual([c["clientToken"] for c in ecs.run], ["preview-" + match(50), "production-" + match(50)])
+        self.assertEqual(len({c["clientToken"] for c in ecs.run}), 2, "a preview launch must not hold production's token")
+
+    def test_a_conflict_never_adopts_another_environments_engine(self):
+        # Suppose the production token were somehow tied to a live PREVIEW engine: refuse it.
+        foreign = engine(50, env="preview")
+        ecs = FakeECS([foreign])
+        ecs.tokens["production-" + match(50)] = ({"other": "request"}, foreign["taskArn"])
+        with self.assertRaises(RuntimeError):
+            self.invoke(ecs, start_event(50))
 
     def test_a_replacement_with_changed_parameters_survives_the_token_conflict(self):
         ecs = FakeECS([])
