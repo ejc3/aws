@@ -2,7 +2,7 @@
 
 Every match engine is a standalone Fargate task in the `games` cluster that is supposed to
 exit on its own (match over, 60 s with nobody connected, or the game's hard cap). This
-Lambda is the part that does not trust that: every 5 minutes it stops any engine that has
+Lambda is the part that does not trust that: every minute it stops any engine that has
 outlived its cap, so a hung engine, a crash loop that never posts a result, or a launcher
 bug costs at most one cap plus one grace period, never a month of Fargate.
 
@@ -10,24 +10,25 @@ What counts as an engine: every task in the cluster EXCEPT those of the router's
 definition family (`games-mp-router`). That is deliberately wider than "has a `match`
 tag": a launcher bug that forgets the tags must not buy a task immortality.
 
-The exemption keys on the task definition family and on nothing the launcher controls.
+The exemption keys on the task definition family and on nothing a RunTask caller controls.
 RunTask lets the caller set `group` (it could claim "service:mp-router"), `startedBy`
 and every tag, so none of those may exempt a task. The family comes from the task
-definition ARN, and the launcher's IAM policy explicitly denies RunTask on the router's
-family (NeverRunTheRouter in games-multiplayer.tf). The only launcher-set value the
-sweeper reads is `hardcap`, and it can only move the limit within [GRACE, MAX_HARDCAP +
-GRACE]; missing or garbage means the 2 h default.
+definition ARN. Only games-mp-launch may RunTask an engine, and its IAM policy explicitly
+denies RunTask on the router's family (NeverRunTheRouter in games-multiplayer.tf). The only
+caller-set value the sweeper reads is `hardcap`, and it can only move the limit within
+[GRACE, MAX_HARDCAP + GRACE]; missing or garbage means the 2 h default.
 
-The lobby tags every RunTask with `game`, `match`, `env` and `hardcap` (seconds). The
+games-mp-launch tags every RunTask with `game`, `match`, `env` and `hardcap` (seconds). The
 limit for a task is `hardcap + GRACE_SEC` when `hardcap` is a sane positive integer, and
 DEFAULT_LIMIT_SEC when it is missing or garbage. `hardcap` is clamped to MAX_HARDCAP_SEC so
-a compromised or buggy launcher cannot tag a task with a year-long cap.
+a buggy or bypassed launch cannot tag a task with a year-long cap.
 
 Age is measured from `createdAt`, which every task has from the moment RunTask accepts it,
 so a task stuck in PENDING (image pull loop, no capacity) is aged too.
 
-ENGINE CEILING. Age alone cannot bound spend: the launcher can start engines far faster than
-they age out (the account's Fargate quota allows ~2,000). So every run, after the age pass,
+ENGINE CEILING. Age alone cannot bound spend. games-mp-launch refuses launches at the same
+ceiling, so this pass is the backstop for engines started around it (an administrator) and for
+its few-seconds counting gap after a cold start (see launch.py). Every run, after the age pass,
 the sweeper counts the engines still running and, above ENGINE_CEILING, stops the NEWEST
 excess ones: established matches survive and a burst loses its latest launches. It alerts
 once per run when it does, and publishes RunningEngines (namespace METRIC_NAMESPACE) every
@@ -183,8 +184,8 @@ def _enforce_ceiling(ecs, results, created):
     _notify(
         "games-mp-sweeper: engine ceiling reached",
         "%d match engines were running, above the ceiling of %d. Stopped the %d newest%s.\n"
-        "Something is launching engines faster than matches end: check the lobby, the launcher "
-        "role and who can deploy colton-games." % (
+        "games-mp-launch refuses at this ceiling, so either something launched around it "
+        "(check RunTask in CloudTrail) or it overshot just after a cold start (its log)." % (
             len(alive), ENGINE_CEILING, excess,
             " (%d stop(s) FAILED)" % failed if failed else ""),
     )

@@ -19,8 +19,9 @@
 #   browser --wss://play.cc-games.app/m/<id>?t=<token>--> ALB games-play (443, ACM)
 #       --> mp-router service (games-router SG; verifies the HMAC token, proxies)
 #           --> the match's engine task, private IP from the token (games-engine SG)
-#   Vercel lobby --OIDC--> role games-mp-launcher --ecs:RunTask--> engine task
-#   EventBridge Scheduler (5 min) --> games-mp-sweeper Lambda --ecs:StopTask--> over-age engines
+#   Vercel lobby --OIDC--> role games-mp-launcher[-preview] --lambda:InvokeFunction-->
+#       games-mp-launch:<production|preview> (admission) --ecs:RunTask--> engine task
+#   EventBridge Scheduler (1 min) --> games-mp-sweeper Lambda --ecs:StopTask--> over-age engines
 #
 # Everything is in us-west-1, in the existing `main` VPC's public subnets a/b. Tasks get a
 # public IPv4 for OUTBOUND only (ECR pulls, callbacks to Vercel): that is ~$3.65/month per
@@ -77,8 +78,9 @@ variable "mp_engine_image_tags" {
 # Launch limits, in one place: the lobby enforces the per-environment caps and per-IP rates
 # in SQL at the launch claim (colton-games lib/multiplayer/config.ts), and Terraform writes
 # them to its Vercel env (games-multiplayer-bringup.tf) so they are not code defaults. The
-# AWS side does not trust the lobby: the sweeper counts running engines and stops the newest
-# above var.games_mp_engine_ceiling, and alarms when more run than these caps allow.
+# AWS side does not trust the lobby: games-mp-launch refuses a launch at
+# var.games_mp_engine_ceiling (and at a smaller preview ceiling), the sweeper stops the newest
+# engines above the same ceiling, and an alarm fires when more run than these caps allow.
 locals {
   games_mp_lobby_max_active = { production = 20, preview = 5 }
   games_mp_ip_max_active    = 3
@@ -88,7 +90,7 @@ locals {
 }
 
 variable "games_mp_engine_ceiling" {
-  description = "Most match engines the sweeper lets run at once; above it, it stops the newest. A little above the lobby's caps (they sum to 25), for engines still exiting after their match."
+  description = "Most match engines running at once: games-mp-launch refuses to launch at it, and the sweeper stops the newest above it. A little above the lobby's caps (they sum to 25), for engines still exiting after their match."
   type        = number
   default     = 30
   validation {
@@ -116,7 +118,7 @@ variable "mp_router_max_count" {
 }
 
 variable "mp_env" {
-  description = "Default MP_ENV baked into the engine task definitions (the launcher overrides it per match) and the router's primary env. The router accepts the whole of mp_router_envs."
+  description = "Default MP_ENV baked into the engine task definitions (games-mp-launch overrides it per match) and the router's primary env. The router accepts the whole of mp_router_envs."
   type        = string
   default     = "production"
 }
@@ -130,9 +132,10 @@ variable "mp_env" {
 # development is left out on purpose. A development lobby runs on a laptop from
 # `vercel env pull`; if it could mint router-accepted tokens, the signing key would have
 # to sit in a .env.local file on that laptop. Local development uses MP_LAUNCHER=local
-# and its own throwaway key instead, so it never needs this router. The launcher role
-# (games-mp-launcher) trusts the same two environments, so the envs that can start an
-# engine and the envs whose players can reach it are one list; keep them in step.
+# and its own throwaway key instead, so it never needs this router. The launcher roles
+# (games-mp-launcher, games-mp-launcher-preview) trust the same two environments, so the envs
+# that can start an engine and the envs whose players can reach it are one list; keep them
+# in step.
 variable "mp_router_envs" {
   description = "Token `n` values the router accepts (MP_ENVS, comma-joined). Must include var.mp_env."
   type        = list(string)
@@ -160,12 +163,13 @@ locals {
   }
 
   mp_cluster_name = "games"
-  # The router's task definition family. The sweeper exempts exactly this family and the
-  # launcher is denied RunTask on it; one local so the two can never disagree.
+  # The router's task definition family. The sweeper and games-mp-launch exempt exactly this
+  # family from the engine count, and the launch function is denied RunTask on it; one local
+  # so they can never disagree.
   mp_router_family = "games-mp-router"
   mp_port          = 8080
 
-  # Engines launch in exactly these subnets. MP_SUBNETS (the launcher) and MP_TARGET_CIDRS
+  # Engines launch in exactly these subnets. SUBNETS (games-mp-launch) and MP_TARGET_CIDRS
   # (the router's "a token may only point here" check) both derive from this one list so
   # they cannot drift apart. Narrower than the whole VPC on purpose: the VPC also holds the
   # dev boxes and jumpboxes, and a token (or a stolen token key) must never be able to aim
@@ -276,9 +280,9 @@ resource "aws_ecs_cluster" "games" {
   tags = { Name = local.mp_cluster_name, Project = "games-multiplayer" }
 }
 
-# FARGATE is the default. FARGATE_SPOT is registered so the launcher CAN choose it
-# (capacityProviderStrategy on RunTask) for bot-only or test matches; it is not the
-# default because a Spot reclaim gives two minutes' notice and ends a live match.
+# FARGATE is the default. FARGATE_SPOT is registered so a launch CAN use it
+# (capacityProviderStrategy on RunTask) for bot-only or test matches; games-mp-launch does
+# not today, because a Spot reclaim gives two minutes' notice and ends a live match.
 resource "aws_ecs_cluster_capacity_providers" "games" {
   cluster_name       = aws_ecs_cluster.games.name
   capacity_providers = ["FARGATE", "FARGATE_SPOT"]
@@ -359,11 +363,11 @@ resource "aws_secretsmanager_secret_policy" "games_mp_token_keys" {
 # Task IAM
 # -------------------------------------------------------------------------------------
 #
-# TWO execution roles, not one. The launcher (Vercel) must be able to pass the engine's
+# TWO execution roles, not one. The launch function must be able to pass the engine's
 # execution role, and RunTask lets the caller override executionRoleArn. If engines and
-# the router shared one execution role, the role Vercel can pass would also be the role
-# that can read the token key. Split, the role Vercel can pass can pull images and write
-# engine logs and nothing else.
+# the router shared one execution role, the role it can pass would also be the role that
+# can read the token key. Split, the role it can pass can pull images and write engine logs
+# and nothing else.
 
 locals {
   ecs_tasks_trust = jsonencode({
@@ -453,7 +457,7 @@ resource "aws_iam_role_policy" "games_mp_router_execution" {
 
 # Engines get NO AWS permissions. They talk only to Vercel (HTTPS, per-match secret) and
 # to players via the router. The role exists so the task definition names a role the
-# launcher is allowed to pass, rather than letting a RunTask override pick one.
+# launch function is allowed to pass, rather than letting a RunTask override pick one.
 resource "aws_iam_role" "games_engine_task" {
   name               = "games-engine-task"
   description        = "Match engine task role. Deliberately has no policies."
@@ -470,7 +474,7 @@ resource "aws_iam_role" "games_mp_router_task" {
 }
 
 # -------------------------------------------------------------------------------------
-# Vercel OIDC and the launcher role
+# Vercel OIDC and the launcher roles
 # -------------------------------------------------------------------------------------
 #
 # The lobby (Vercel functions) gets AWS credentials by exchanging its Vercel OIDC token
@@ -500,19 +504,30 @@ resource "aws_iam_openid_connect_provider" "vercel" {
   tags           = { Name = "vercel-${local.vercel_team_slug}", Project = "games-multiplayer" }
 }
 
-# TRUST: exactly the colton-games project in this team, for exactly two environments.
+# TRUST: exactly the colton-games project in this team, one role per environment.
 # Both conditions are StringEquals against full values, not StringLike, so no other project
-# in the team, no Custom Environment, and no other Vercel team can assume the role.
-#   production  - cc-games.app
-#   preview     - PR and branch deployments (they launch real tasks; the sweeper and the
-#                 per-task hard cap bound what a bad preview can cost)
+# in the team, no Custom Environment, and no other Vercel team can assume either role.
+#   production  - cc-games.app                       -> games-mp-launcher
+#   preview     - PR and branch deployments          -> games-mp-launcher-preview
+# Two roles, not one, because each may invoke only its own alias of games-mp-launch, and the
+# alias is what fixes the engine's environment and the per-environment ceiling. With one
+# shared role, a Preview build could invoke the production alias.
 # development is deliberately NOT trusted. Its tokens are what `vercel env pull` hands
 # any team member (valid 12 h), so trusting it would let a laptop start real Fargate
 # tasks. Local development uses MP_LAUNCHER=local instead, and the router does not accept
-# development tokens either (var.mp_router_envs), so the two lists match.
+# development tokens either (var.mp_router_envs), so the lists match.
+locals {
+  games_mp_launcher_role_names = {
+    production = "games-mp-launcher"
+    preview    = "games-mp-launcher-preview"
+  }
+}
+
 resource "aws_iam_role" "games_mp_launcher" {
-  name        = "games-mp-launcher"
-  description = "Assumed by the colton-games Vercel project via OIDC to start and stop match engines"
+  for_each = local.games_mp_launcher_role_names
+
+  name        = each.value
+  description = "Assumed by colton-games ${each.key} deployments via Vercel OIDC to invoke games-mp-launch:${each.key}"
   # A lobby request is short; one hour is the minimum and plenty.
   max_session_duration = 3600
   assume_role_policy = jsonencode({
@@ -524,131 +539,251 @@ resource "aws_iam_role" "games_mp_launcher" {
       Condition = {
         StringEquals = {
           "${local.vercel_oidc_host}:aud" = "https://vercel.com/${local.vercel_team_slug}"
-          "${local.vercel_oidc_host}:sub" = [
-            for env in ["production", "preview"] :
-            "owner:${local.vercel_team_slug}:project:${local.vercel_project_name}:environment:${env}"
-          ]
+          "${local.vercel_oidc_host}:sub" = "owner:${local.vercel_team_slug}:project:${local.vercel_project_name}:environment:${each.key}"
         }
       }
     }]
   })
-  tags = { Name = "games-mp-launcher", Project = "games-multiplayer" }
+  tags = { Name = each.value, Project = "games-multiplayer" }
 }
 
+# The production role kept its name and address history; only the preview role is new.
+moved {
+  from = aws_iam_role.games_mp_launcher
+  to   = aws_iam_role.games_mp_launcher["production"]
+}
+
+# The launcher's ONLY permission: invoke its own alias of the launch function. No ECS, no
+# PassRole, no EC2: every RunTask and StopTask is built by games-mp-launch (below), which is
+# where admission control lives. The Resource is the qualified alias ARN, and an identity
+# policy on a qualified ARN covers only that qualifier: not the bare function, not $LATEST,
+# not a version number, not the other environment's alias.
 resource "aws_iam_role_policy" "games_mp_launcher" {
-  name = "run-and-stop-match-engines"
-  role = aws_iam_role.games_mp_launcher.id
+  for_each = local.games_mp_launcher_role_names
+
+  name = "invoke-games-mp-launch"
+  role = aws_iam_role.games_mp_launcher[each.key].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        # Any revision of any games-<game> engine task definition, only on this cluster.
-        Sid      = "RunEngineTasks"
-        Effect   = "Allow"
-        Action   = "ecs:RunTask"
-        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/games-*:*"
-        Condition = {
-          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }
-        }
-      },
-      {
-        # games-* also matches the router's task definition, whose execution role injects
-        # the token key. RunTask on it already fails because the launcher cannot pass the
-        # router's roles, but that is an indirect guarantee; this makes it explicit.
-        Sid      = "NeverRunTheRouter"
-        Effect   = "Deny"
-        Action   = "ecs:RunTask"
-        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_router_family}:*"
-      },
-      {
-        # RunTask requires PassRole for the task definition's roles and for any override.
-        # Only the two engine roles, and only to ECS tasks.
-        Sid      = "PassOnlyEngineRoles"
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
-        Resource = [aws_iam_role.games_engine_task.arn, aws_iam_role.games_engine_execution.arn]
-        Condition = {
-          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
-        }
-      },
-      {
-        # RunTask with `tags` also authorises ecs:TagResource on the new task. Allowed only
-        # as part of RunTask, so the launcher cannot retag existing tasks (e.g. raise a
-        # running task's `hardcap` to dodge the sweeper).
-        Sid      = "TagTasksAtLaunch"
-        Effect   = "Allow"
-        Action   = "ecs:TagResource"
-        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
-        Condition = {
-          StringEquals = { "ecs:CreateAction" = "RunTask" }
-        }
-      },
-      {
-        # Read-only, so cluster-wide: the lobby may look at any task here, router included.
-        Sid       = "DescribeTasksInThisCluster"
-        Effect    = "Allow"
-        Action    = "ecs:DescribeTasks"
-        Resource  = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
-        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
-      },
-      {
-        # StopTask reaches ENGINE tasks only: ones in this cluster that carry the `match`
-        # tag, which the lobby sets on every RunTask, so its own cleanup of its own tasks
-        # works. Router tasks are started by the ECS service, never carry `match`, and so
-        # are outside this Allow. ecs:StopTask supports exactly two condition keys,
-        # aws:ResourceTag/${TagKey} and ecs:cluster, on the `task` resource
-        # (https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html,
-        # machine-readable: https://servicereference.us-east-1.amazonaws.com/v1/ecs/ecs.json,
-        # checked 2026-09-27). The launcher cannot add `match` to an existing task: its
-        # only TagResource grant is at RunTask creation (TagTasksAtLaunch), and router tasks
-        # are never created by its RunTask.
-        Sid      = "StopOnlyMatchEngines"
-        Effect   = "Allow"
-        Action   = "ecs:StopTask"
-        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
-        Condition = {
-          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }
-          Null      = { "aws:ResourceTag/match" = "false" }
-        }
-      },
-      {
-        # Belt and braces for the router: its service propagates the service tag
-        # games-role=router onto every task it starts (aws_ecs_service.games_mp_router), and
-        # this Deny wins over any Allow. It keys on our own tag rather than the ECS-managed
-        # aws:ecs:serviceName tag because AWS does not document that aws:-prefixed managed
-        # tags are evaluated as aws:ResourceTag conditions; a condition on a key IAM never
-        # sees would silently match nothing. The launcher could stamp games-role on a task
-        # it launches itself, but that only stops IT from stopping that task; the sweeper
-        # has no such Deny and still reaps it.
-        Sid      = "NeverStopTheRouter"
-        Effect   = "Deny"
-        Action   = ["ecs:StopTask", "ecs:TagResource", "ecs:UntagResource"]
-        Resource = "*"
-        Condition = {
-          StringEquals = { "aws:ResourceTag/games-role" = "router" }
-        }
-      },
-      {
-        # ListTasks is authorised against the cluster via the ecs:cluster condition.
-        Sid      = "ListTasksInThisCluster"
-        Effect   = "Allow"
-        Action   = "ecs:ListTasks"
-        Resource = "*"
-        Condition = {
-          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }
-        }
-      },
-      {
-        # To read a task's private IP from its ENI when the engine does not report it.
-        # EC2 Describe* has no resource-level scope; the region is the only narrowing.
-        Sid       = "ReadTaskNetworkInterfaces"
-        Effect    = "Allow"
-        Action    = "ec2:DescribeNetworkInterfaces"
-        Resource  = "*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
-      },
-    ]
+    Statement = [{
+      Sid      = "InvokeOwnLaunchAlias"
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_alias.games_mp_launch[each.key].arn
+    }]
   })
+}
+
+moved {
+  from = aws_iam_role_policy.games_mp_launcher
+  to   = aws_iam_role_policy.games_mp_launcher["production"]
+}
+
+# -------------------------------------------------------------------------------------
+# Launch function: the only RunTask of an engine, and admission control
+# -------------------------------------------------------------------------------------
+#
+# The lobby invokes games-mp-launch:<its environment> with
+#   {"action":"start","matchId","game","secret","hardCapSec","apiBase"[,"apiBypass"]}
+#   {"action":"stop","matchId"}
+# and the function builds the RunTask itself: the pinned task definition for the game, the
+# engine subnets and security group, the engine environment from validated fields, and the
+# tags. Before launching, it counts the running engines (every task that is not the router's
+# family) and refuses at var.games_mp_engine_ceiling in total, or at the caller environment's
+# own ceiling (games_mp_launch_environments). Reserved concurrency 1 serializes admission;
+# the source explains why that is enough and what it cannot cover
+# (games-multiplayer/launch.py). The sweeper stays as the backstop for anything launched
+# around it (an administrator) and for engines that never exit.
+
+locals {
+  games_mp_launch_environments = {
+    production = {
+      ceiling  = var.games_mp_engine_ceiling
+      api_base = "^https://cc-games\\.app$"
+      bypass   = false
+    }
+    # A Preview build is any writer's code, so it gets a small share of the ceiling: a
+    # compromised preview can never take production's engines. 8 = the lobby's preview cap
+    # (5) plus room for engines still exiting after their match.
+    preview = {
+      ceiling = min(8, var.games_mp_engine_ceiling)
+      # Its own deployment URL (https://$VERCEL_URL), the pattern the router's origin
+      # allowlist uses for previews, so engines call back only this project's previews.
+      api_base = "^https://${local.vercel_project_name}-[a-z0-9-]+-${local.vercel_team_slug}\\.vercel\\.app$"
+      bypass   = true
+    }
+  }
+}
+
+data "archive_file" "games_mp_launch" {
+  type        = "zip"
+  source_file = "${path.module}/games-multiplayer/launch.py"
+  output_path = "${path.module}/.terraform/games-mp-launch.zip"
+}
+
+resource "aws_cloudwatch_log_group" "games_mp_launch" {
+  name              = "/aws/lambda/games-mp-launch"
+  retention_in_days = 14
+}
+
+resource "aws_iam_role" "games_mp_launch" {
+  name        = "games-mp-launch"
+  description = "games-mp-launch Lambda: RunTask the pinned engine task definitions, StopTask engines"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id } }
+    }]
+  })
+  tags = { Name = "games-mp-launch", Project = "games-multiplayer" }
+}
+
+resource "aws_iam_role_policy" "games_mp_launch" {
+  name = "launch-and-stop-match-engines"
+  role = aws_iam_role.games_mp_launch.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      # Exactly the task definition revisions the function's TASK_DEFINITIONS names, only on
+      # this cluster. (No statement when no engine is registered: IAM rejects an empty list.)
+      length(aws_ecs_task_definition.games_engine) == 0 ? [] : [{
+        Sid       = "RunPinnedEngineTaskDefinitions"
+        Effect    = "Allow"
+        Action    = "ecs:RunTask"
+        Resource  = [for td in aws_ecs_task_definition.games_engine : td.arn]
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
+      }],
+      [
+        {
+          # The Allow above never names the router; this keeps it so even if a game id ever
+          # collided with its family name.
+          Sid      = "NeverRunTheRouter"
+          Effect   = "Deny"
+          Action   = "ecs:RunTask"
+          Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_router_family}:*"
+        },
+        {
+          # RunTask needs PassRole for the task definition's two roles. Only those, only to ECS.
+          Sid      = "PassOnlyEngineRoles"
+          Effect   = "Allow"
+          Action   = "iam:PassRole"
+          Resource = [aws_iam_role.games_engine_task.arn, aws_iam_role.games_engine_execution.arn]
+          Condition = {
+            StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
+          }
+        },
+        {
+          # RunTask with `tags` also authorises ecs:TagResource on the new task; only then.
+          Sid      = "TagTasksAtLaunch"
+          Effect   = "Allow"
+          Action   = "ecs:TagResource"
+          Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
+          Condition = {
+            StringEquals = { "ecs:CreateAction" = "RunTask" }
+          }
+        },
+        {
+          # Counting engines and finding a match's task.
+          Sid       = "ListTasksInThisCluster"
+          Effect    = "Allow"
+          Action    = "ecs:ListTasks"
+          Resource  = "*"
+          Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
+        },
+        {
+          Sid       = "DescribeTasksInThisCluster"
+          Effect    = "Allow"
+          Action    = "ecs:DescribeTasks"
+          Resource  = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
+          Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
+        },
+        {
+          # The code stops only tasks of an engine family whose env and match tags are the
+          # caller's; IAM adds that the task must carry `match` and be in this cluster.
+          Sid      = "StopOnlyMatchEngines"
+          Effect   = "Allow"
+          Action   = "ecs:StopTask"
+          Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
+          Condition = {
+            ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }
+            Null      = { "aws:ResourceTag/match" = "false" }
+          }
+        },
+        {
+          # Belt and braces for the router: its service propagates games-role=router onto
+          # every task it starts (aws_ecs_service.games_mp_router), and this Deny wins.
+          Sid      = "NeverStopTheRouter"
+          Effect   = "Deny"
+          Action   = ["ecs:StopTask", "ecs:TagResource", "ecs:UntagResource"]
+          Resource = "*"
+          Condition = {
+            StringEquals = { "aws:ResourceTag/games-role" = "router" }
+          }
+        },
+        {
+          Sid      = "WriteOwnLogs"
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = "${aws_cloudwatch_log_group.games_mp_launch.arn}:*"
+        },
+      ],
+    )
+  })
+}
+
+resource "aws_lambda_function" "games_mp_launch" {
+  function_name    = "games-mp-launch"
+  role             = aws_iam_role.games_mp_launch.arn
+  handler          = "launch.lambda_handler"
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  timeout          = 30
+  memory_size      = 128
+  filename         = data.archive_file.games_mp_launch.output_path
+  source_code_hash = data.archive_file.games_mp_launch.output_base64sha256
+  # Aliases need published versions; every code or config change publishes one and both
+  # aliases move to it below.
+  publish = true
+  # ONE invocation at a time: admission (count, then RunTask) can never interleave. It is
+  # also the launch rate limit. Never raise it without replacing the count with an atomic one.
+  reserved_concurrent_executions = 1
+
+  logging_config {
+    log_format = "Text"
+    log_group  = aws_cloudwatch_log_group.games_mp_launch.name
+  }
+
+  environment {
+    variables = {
+      CLUSTER          = aws_ecs_cluster.games.name
+      SUBNETS          = join(",", [for s in local.mp_subnets : s.id])
+      SECURITY_GROUP   = aws_security_group.games_engine.id
+      TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })
+      ROUTER_FAMILY    = local.mp_router_family
+      ENGINE_CEILING   = tostring(var.games_mp_engine_ceiling)
+      ENVIRONMENTS     = jsonencode(local.games_mp_launch_environments)
+      MIN_HARDCAP_SEC  = "60"
+      # The sweeper's MAX_HARDCAP_SEC: a hardcap it would clamp is refused here instead.
+      MAX_HARDCAP_SEC = "14400"
+      SETTLE_SEC      = "120"
+    }
+  }
+
+  tags = { Name = "games-mp-launch", Project = "games-multiplayer" }
+}
+
+# One alias per Vercel environment. The function reads which one it was invoked through
+# (context.invoked_function_arn, set by Lambda), and each launcher role may invoke only its own.
+resource "aws_lambda_alias" "games_mp_launch" {
+  for_each = local.games_mp_launch_environments
+
+  name             = each.key
+  description      = "colton-games ${each.key} lobby (role ${local.games_mp_launcher_role_names[each.key]})"
+  function_name    = aws_lambda_function.games_mp_launch.function_name
+  function_version = aws_lambda_function.games_mp_launch.version
 }
 
 # -------------------------------------------------------------------------------------
@@ -1015,7 +1150,7 @@ resource "aws_ecs_service" "games_mp_router" {
   health_check_grace_period_seconds  = 30
   enable_ecs_managed_tags            = true
   # Copies the service tags below onto every router task. games-role=router is what the
-  # launcher's NeverStopTheRouter Deny keys on; do not drop it or the propagation.
+  # launch function's NeverStopTheRouter Deny keys on; do not drop it or the propagation.
   propagate_tags = "SERVICE"
 
   deployment_circuit_breaker {
@@ -1052,9 +1187,9 @@ resource "aws_ecs_service" "games_mp_router" {
 # -------------------------------------------------------------------------------------
 #
 # One per entry in local.mp_games that has an image tag, registered only after the build
-# pushed that tag. The lobby launches these with
-# RunTask, adding MATCH_ID, MATCH_SECRET and MP_API as container overrides and tagging the
-# task (see the sweeper below).
+# pushed that tag. Only games-mp-launch runs these (the exact revision below, the newest),
+# adding MATCH_ID, MATCH_SECRET and MP_API as container overrides and tagging the task (see
+# the sweeper below).
 #
 # skip_destroy = true: moving a game to a new simVersion registers a new revision, and the
 # old revision stays ACTIVE instead of being deregistered. Clients still on the old
@@ -1110,16 +1245,17 @@ resource "aws_ecs_task_definition" "games_engine" {
 # Sweeper: the backstop for engines that do not exit
 # -------------------------------------------------------------------------------------
 #
-# THE RULE THE LOBBY MUST FOLLOW: every RunTask sets tags
+# games-mp-launch sets these tags on every RunTask:
 #   game    = the game id                    (e.g. mptest)
 #   match   = the match id
-#   env     = MP_ENV of the launching lobby  (production / preview)
-#   hardcap = the match's hard cap in SECONDS (spec limits.hardCapSec)
+#   env     = the alias it was invoked through (production / preview)
+#   hardcap = the match's hard cap in SECONDS (spec limits.hardCapSec, 60..14400)
 # The sweeper stops any task in the cluster older than hardcap + 10 min, or
 # older than 2 h when hardcap is missing or not a positive integer; hardcap is clamped to
 # 4 h. Every task counts except the router's task definition family, games-mp-router,
-# which the launcher cannot RunTask; group, startedBy and tags are caller-set on RunTask
-# and never exempt anything. A launcher bug that forgets the tags still gets 2 h.
+# which nothing but the router service runs; group, startedBy and tags are caller-set on
+# RunTask and never exempt anything, so a task an administrator starts without tags still
+# gets 2 h.
 # The engine's own timers should always win; the sweeper firing means an engine hung.
 #
 # Source: games-multiplayer/sweeper.py (offline test: scripts/test-games-mp-sweeper.py).
@@ -1210,7 +1346,7 @@ resource "aws_lambda_function" "games_mp_sweeper" {
       GRACE_SEC         = "600"
       DEFAULT_LIMIT_SEC = "7200"
       MAX_HARDCAP_SEC   = "14400"
-      # The ONLY exemption: the router's family, which the launcher is denied RunTask on
+      # The ONLY exemption: the router's family, which games-mp-launch is denied RunTask on
       # (NeverRunTheRouter).
       ROUTER_FAMILY = local.mp_router_family
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
@@ -1314,12 +1450,12 @@ resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_silent" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
-# More engines running than the lobby's own caps allow, for 5 minutes: something is launching
-# around the lobby (a preview deployment with launcher credentials, a leaked role session) or
-# the lobby's admission is broken. The ceiling above still caps the damage; this says why.
+# More engines running than the lobby's own caps allow, for 5 minutes: the lobby's admission is
+# broken, a compromised deployment is launching through games-mp-launch up to its ceilings, or
+# an administrator launched around it. The ceiling still caps the damage; this says why.
 resource "aws_cloudwatch_metric_alarm" "games_mp_engines_over_lobby_caps" {
   alarm_name          = "games-mp-engines-over-lobby-caps"
-  alarm_description   = "More match engines are running than the colton-games lobby's caps allow (${local.games_mp_lobby_engines_max}) for 5 minutes; the sweeper stops the newest above ${var.games_mp_engine_ceiling}. Check who can launch (games-mp-launcher)."
+  alarm_description   = "More match engines are running than the colton-games lobby's caps allow (${local.games_mp_lobby_engines_max}) for 5 minutes; games-mp-launch refuses at ${var.games_mp_engine_ceiling} and the sweeper stops the newest above it. Check the lobby's admission and games-mp-launch's log."
   namespace           = "GamesMultiplayer"
   metric_name         = "RunningEngines"
   statistic           = "Maximum"

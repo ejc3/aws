@@ -260,11 +260,22 @@ class TerraformWiringTests(unittest.TestCase):
         for key, value in [("GRACE_SEC", "600"), ("DEFAULT_LIMIT_SEC", "7200"), ("MAX_HARDCAP_SEC", "14400")]:
             self.assertRegex(self.tf, r'%s\s*=\s*"%s"' % (key, value))
 
-    def test_exempt_family_is_the_one_the_launcher_cannot_run(self):
+    def launch_statement(self, sid):
+        """One statement of the launch function's policy (the only RunTask grant), by braces."""
+        policy = re.search(r'^resource "aws_iam_role_policy" "games_mp_launch" \{\n.*?^\}', self.tf,
+                           re.S | re.M).group()
+        at = re.search(r'Sid\s*=\s*"%s"' % sid, policy)
+        begin, depth = policy.rindex("{", 0, at.start()), 0
+        for i in range(begin, len(policy)):
+            depth += {"{": 1, "}": -1}.get(policy[i], 0)
+            if depth == 0:
+                return policy[begin:i + 1]
+
+    def test_exempt_family_is_the_one_the_launch_function_cannot_run(self):
         self.assertRegex(self.tf, r'mp_router_family\s*=\s*"games-mp-router"')
         self.assertRegex(self.tf, r'ROUTER_FAMILY\s*=\s*local\.mp_router_family')
         self.assertRegex(self.tf, r'family\s*=\s*local\.mp_router_family')
-        deny = self.sid_block("NeverRunTheRouter")
+        deny = self.launch_statement("NeverRunTheRouter")
         self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
         self.assertIn("task-definition/${local.mp_router_family}:*", deny)
 
@@ -276,35 +287,24 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertGreater(int(ceiling.group(1)), int(caps.group(1)) + int(caps.group(2)),
                            "the AWS ceiling must sit above what the lobby itself allows")
 
-    def test_launcher_can_only_tag_at_launch(self):
-        block = re.search(r'Sid\s*=\s*"TagTasksAtLaunch".*?\n      \}', self.tf, re.S).group()
-        self.assertIn('"ecs:CreateAction" = "RunTask"', block)
-
-    def sid_block(self, sid):
-        return re.search(r'Sid\s*=\s*"%s".*?\n      \}' % sid, self.tf, re.S).group()
-
-    def test_launcher_stops_only_match_tagged_tasks_in_the_cluster(self):
-        block = self.sid_block("StopOnlyMatchEngines")
-        self.assertRegex(block, r'Action\s*=\s*"ecs:StopTask"')
-        self.assertIn('"aws:ResourceTag/match" = "false"', block)
-        self.assertIn('"ecs:cluster" = aws_ecs_cluster.games.arn', block)
-        # No other launcher statement may grant StopTask.
-        policy = re.search(r'resource "aws_iam_role_policy" "games_mp_launcher" \{.*?\n\}', self.tf, re.S).group()
-        allows = [b for b in re.findall(r'\{\s*\n(?:(?!\n      \}).)*?Effect\s*=\s*"Allow".*?\n      \}', policy, re.S)]
-        self.assertEqual([b for b in allows if "ecs:StopTask" in b and "StopOnlyMatchEngines" not in b], [])
+    def test_only_the_launch_function_may_run_or_stop_engines_besides_the_sweeper(self):
+        # The lobby's roles may only invoke games-mp-launch (scripts/test-games-mp-launch.py).
+        for path in ROOT.glob("*.tf"):
+            text = path.read_text()
+            for action in ("ecs:RunTask", "ecs:StopTask"):
+                for m in re.finditer(r'"%s"' % action, text):
+                    owner = re.findall(r'^resource "aws_iam_role_policy" "(\w+)"', text[:m.start()], re.M)
+                    self.assertIn((path.name, owner[-1] if owner else None),
+                                  {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper")},
+                                  "%s granted outside the launch function and the sweeper" % action)
 
     def test_router_is_denied_and_carries_the_denied_tag(self):
-        block = self.sid_block("NeverStopTheRouter")
+        block = self.launch_statement("NeverStopTheRouter")
         self.assertRegex(block, r'Effect\s*=\s*"Deny"')
         self.assertIn('"aws:ResourceTag/games-role" = "router"', block)
         service = re.search(r'resource "aws_ecs_service" "games_mp_router" \{.*?\n\}', self.tf, re.S).group()
         self.assertRegex(service, r'propagate_tags\s*=\s*"SERVICE"')
         self.assertIn('"games-role" = "router"', service)
-
-    def test_launcher_trusts_only_production_and_preview(self):
-        role = re.search(r'resource "aws_iam_role" "games_mp_launcher" \{.*?\n\}', self.tf, re.S).group()
-        self.assertIn('for env in ["production", "preview"] :', role)
-        self.assertNotIn("development", role.split("assume_role_policy", 1)[1])
 
     def test_router_accepts_a_list_of_envs(self):
         self.assertIn('{ name = "MP_ENVS", value = join(",", var.mp_router_envs) }', self.tf)
