@@ -177,8 +177,10 @@ def load_app(tokens=None):
     secrets = FakeSecrets(tokens if tokens is not None else {
         f"github-runner/repo-pat/{COLTON}": "PAT-COLTON", f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN"})
     fake_boto3 = types.ModuleType("boto3")
+    configs = []
     def client(name, region_name=None, config=None):
-        if name == "ec2" and config is not None:
+        configs.append((name, config))
+        if name == "ec2" and config is not None and config.retries.get("total_max_attempts") == 1:
             ec2.launch_config = config
         return {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets, "dynamodb": dynamo, "cloudwatch": cw}[name]
     fake_boto3.client = client
@@ -194,7 +196,7 @@ def load_app(tokens=None):
     spec.loader.exec_module(mod)
     mod.github = FakeGitHub()
     mod.now = lambda: NOW
-    mod.fake_dynamo, mod.fake_cloudwatch = dynamo, cw
+    mod.fake_dynamo, mod.fake_cloudwatch, mod.client_configs = dynamo, cw, configs
     return mod, ec2, ssm, secrets
 
 
@@ -298,6 +300,24 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(len(app.fake_dynamo.deleted), 1, "an ambiguous error may have launched: keep the claim")
         ec2.ambiguous = False
         self.assertEqual(self.deliver(app)["outcome"], "claimed")
+
+    def test_every_aws_client_has_bounded_timeouts(self):
+        app, *_ = load_app()
+        self.assertEqual(len(app.client_configs), 6)
+        for name, config in app.client_configs:
+            self.assertIsNotNone(config, f"{name}: botocore's default 60 s reads can eat the publishing reserve")
+            self.assertLessEqual(config.connect_timeout, 5, name)
+            self.assertLessEqual(config.read_timeout, 20, name)
+            self.assertLessEqual(config.retries["total_max_attempts"], 2, name)
+
+    def test_a_repo_whose_share_is_already_spent_starts_no_call(self):
+        app, ec2, *_ = load_app()
+        app.DEADLINE[0] = 0
+        read = []
+        app.repo_pat = lambda cfg: read.append(cfg) or "PAT"
+        self.assertEqual(app.reconcile(DOLPHIN, REPOS[DOLPHIN], []), {"repo": DOLPHIN, "skipped": "no time left"})
+        self.assertEqual(read, [])
+        self.assertEqual(app.github.calls, [])
 
     def test_launches_use_a_client_with_sdk_retries_off(self):
         # A retried InsufficientInstanceCapacity cost 7-15 s per pool on the metal controller.

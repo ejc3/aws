@@ -50,16 +50,20 @@ VOLUME_GB = int(os.environ.get('VOLUME_GB', '80'))
 SCAN_CALL_BUDGET = 120
 MAX_RUN_PAGES = 10   # GitHub lists at most 1,000 runs for a status-filtered query
 
-ec2 = boto3.client('ec2', region_name=REGION)
+# Bounded clients: botocore's defaults (60 s reads, several retries) let one stalled call eat a
+# repo's time share and the publishing reserve. Every call here fails in well under that.
+BOUNDED = Config(connect_timeout=3, read_timeout=8, retries={'total_max_attempts': 2, 'mode': 'standard'})
+ec2 = boto3.client('ec2', region_name=REGION, config=BOUNDED)
 # RunInstances only, with botocore's own retries off, as in the metal controller
 # (runner-autoscale.tf): a pool with no spot capacity answers InsufficientInstanceCapacity, and
 # the default client retried that same pool with backoff for 7-15 seconds before launch() could
 # move on. launch() walks the pools itself, and each attempt has its own ClientToken.
-launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(retries={'total_max_attempts': 1}))
-ssm = boto3.client('ssm', region_name=REGION)
-secrets = boto3.client('secretsmanager', region_name=REGION)
-dynamodb = boto3.client('dynamodb', region_name=REGION)
-cloudwatch = boto3.client('cloudwatch', region_name=REGION)
+launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(
+    connect_timeout=3, read_timeout=20, retries={'total_max_attempts': 1}))
+ssm = boto3.client('ssm', region_name=REGION, config=BOUNDED)
+secrets = boto3.client('secretsmanager', region_name=REGION, config=BOUNDED)
+dynamodb = boto3.client('dynamodb', region_name=REGION, config=BOUNDED)
+cloudwatch = boto3.client('cloudwatch', region_name=REGION, config=BOUNDED)
 
 # A launch claim per job (table CLAIMS_TABLE) makes "one host per job" hold across
 # invocations. DescribeInstances is eventually consistent: a redelivery seconds after a launch
@@ -513,6 +517,10 @@ def reap(repo, cfg, pat, live, runners, complete=True):
 
 
 def reconcile(repo, cfg, subnets):
+    # An earlier repo may have used this one's share already: start nothing.
+    if out_of_time():
+        print(f'{repo}: reconcile skipped; its time share was already spent')
+        return {'repo': repo, 'skipped': 'no time left'}
     pat = repo_pat(cfg)
     if not pat:
         return {'repo': repo, 'skipped': 'no controller token'}
