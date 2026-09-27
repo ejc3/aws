@@ -1901,6 +1901,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
+| Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer/sweeper.py`, `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,
