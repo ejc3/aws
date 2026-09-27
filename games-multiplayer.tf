@@ -1141,6 +1141,48 @@ resource "aws_scheduler_schedule" "games_mp_sweeper" {
   }
 }
 
+# The sweeper is the only cost backstop for a hung engine, so a broken sweeper must not be
+# silent. Two different failures, two alarms, both to the same topic as the other cost alerts:
+#   errors  - the function ran and raised (an IAM regression on ListTasks/DescribeTasks, an ECS
+#             API error, or the 60 s timeout). Lambda counts all of these in AWS/Lambda Errors.
+#   silent  - the function did NOT run at all (the Scheduler role lost lambda:InvokeFunction,
+#             the schedule was disabled or deleted). That produces no Errors datapoint, so
+#             absence of Invocations is the signal; missing data counts as breaching.
+# The schedule itself keeps retries off: the next sweep is five minutes away, and the alarms
+# are what make a persistent failure visible.
+resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_errors" {
+  alarm_name          = "games-mp-sweeper-errors"
+  alarm_description   = "games-mp-sweeper raised or timed out; hung match engines may be running uncapped"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.games_mp_sweeper.function_name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_silent" {
+  alarm_name          = "games-mp-sweeper-not-running"
+  alarm_description   = "games-mp-sweeper has not been invoked for 15 minutes (schedule or its role broken); hung match engines may be running uncapped"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  dimensions          = { FunctionName = aws_lambda_function.games_mp_sweeper.function_name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
 # -------------------------------------------------------------------------------------
 # Outputs
 # -------------------------------------------------------------------------------------
