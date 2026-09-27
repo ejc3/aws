@@ -242,6 +242,8 @@ class RunnerCostAlarmTests(unittest.TestCase):
         self.assertIn("'Namespace': 'GitHubRunners'", emitted)
         silent = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'runner_cleanup_silent')
         self.assertRegex(silent, r'treat_missing_data\s*=\s*"breaching"')
+        # Breaching on missing data: it must go away with the fleet, or a teardown alarms forever.
+        self.assertRegex(silent, r'count\s*=\s*var\.enable_github_runner \? 1 : 0')
 
     def test_ec2_spend_is_a_budget_not_a_billing_alarm(self):
         self.assertNotIn('"high_ec2_spend"', source('cost-alerts.tf'))

@@ -288,6 +288,9 @@ resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
 # The cleanup Lambda enforces every runner's lease and age ceiling. No LiveRunners for 15
 # minutes means it is not running, and nothing is ending stuck or idle metal.
 resource "aws_cloudwatch_metric_alarm" "runner_cleanup_silent" {
+  # Only while the cleanup Lambda exists: missing data is breaching, so after a deliberate
+  # enable_github_runner = false it would sit in ALARM forever.
+  count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "runner-cleanup-silent"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 3
