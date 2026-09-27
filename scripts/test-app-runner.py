@@ -414,9 +414,9 @@ class LaunchTests(unittest.TestCase):
         app.time = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
         app.DEADLINE[0] = clock[0] + 100
         app.repo_pat = lambda cfg: "PAT"
-        app.reap = lambda repo, cfg, pat, instances, runners: []
+        app.reap = lambda repo, cfg, pat, instances, runners, complete=True: []
         app.app_instances = lambda repo: []
-        app.list_runners = lambda repo, pat: {}
+        app.list_runners = lambda repo, pat: ({}, True)
         def queued(repo, cfg, pat):
             scan_deadline.append(app.DEADLINE[0] - clock[0])
             if scan_uses_its_whole_share:
@@ -538,6 +538,26 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(sorted(ec2.terminated), ["i-ancient", "i-idle", "i-neverup"])
         deleted = sorted(p for m, p, _ in app.github.calls if m == "DELETE")
         self.assertEqual(deleted, [f"/repos/{COLTON}/actions/runners/{n}" for n in (31, 33, 34)])
+
+
+    def test_a_partial_runner_listing_never_counts_a_host_as_unregistered(self):
+        app, ec2, *_ = load_app()
+        hosts = [instance("i-neverup", COLTON, "2", 11), instance("i-ancient", COLTON, "5", 200)]
+        keep = app.reap(COLTON, REPOS[COLTON], "PAT", hosts, {}, complete=False)
+        self.assertEqual(ec2.terminated, ["i-ancient"], "absence from a partial listing proves nothing")
+        self.assertEqual([i["InstanceId"] for i in keep], ["i-neverup"])
+
+    def test_reaping_and_the_runner_listing_stop_at_the_repos_deadline(self):
+        app, ec2, *_ = load_app()
+        app.DEADLINE[0] = 0
+        self.assertEqual(app.list_runners(COLTON, "PAT"), ({}, False))
+        label = [{"name": "cc-games"}]
+        hosts = [instance("i-neverup", COLTON, "2", 11), instance("i-ancient", COLTON, "5", 200)]
+        ghost = {"i-gone": {"id": 34, "name": "i-gone", "busy": False, "status": "offline", "labels": label}}
+        keep = app.reap(COLTON, REPOS[COLTON], "PAT", hosts, ghost)
+        self.assertEqual(ec2.terminated, [])
+        self.assertEqual(app.github.calls, [], "no GitHub request may start after the deadline")
+        self.assertEqual(len(keep), 2, "hosts not reaped this round still count as live")
 
 
 class BootstrapTests(unittest.TestCase):

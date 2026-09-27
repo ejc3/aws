@@ -202,16 +202,20 @@ def queued_jobs(repo, cfg, pat):
 
 
 def list_runners(repo, pat):
-    """{runner name: runner record} for this repo's self-hosted runners."""
+    """({runner name: runner record}, complete) for this repo's self-hosted runners. `complete` is
+    False when the listing stopped early -- at the repo's deadline, or past 500 runners -- and a
+    host's absence from it then proves nothing."""
     out = {}
     for page in range(1, 6):
+        if out_of_time():
+            return out, False
         body = github('GET', f'/repos/{repo}/actions/runners?per_page=100&page={page}', pat)
         runners = body.get('runners') or []
         for runner in runners:
             out[runner.get('name')] = runner
         if len(runners) < 100:
-            break
-    return out
+            return out, True
+    return out, False
 
 
 def registration_token(repo, pat):
@@ -433,17 +437,25 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     return 'failed', token
 
 
-def reap(repo, cfg, pat, live, runners):
-    """Terminate hosts that never registered, sat idle or outlived any job; return survivors."""
+def reap(repo, cfg, pat, live, runners, complete=True):
+    """Terminate hosts that never registered, sat idle or outlived any job; return survivors.
+
+    Each terminate or DELETE is a request, so none starts after the repo's deadline: the rest
+    wait for the next round and count as live until then. "Never registered" is judged only
+    from a complete runner listing, or a busy host missing from a partial one would be killed."""
     keep, t = [], now()
-    for instance in live:
+    for index, instance in enumerate(live):
+        if out_of_time():
+            print(f'{repo}: reaping stopped at its time share; {len(live) - index} hosts wait for the next round')
+            keep += live[index:]
+            break
         instance_id = instance['InstanceId']
         age = t - instance['LaunchTime']
         runner = runners.get(instance_id)
         reason = None
         if age > MAX_LIFETIME:
             reason = f'older than {MAX_LIFETIME}'
-        elif runner is None and age > BOOT_GRACE:
+        elif runner is None and complete and age > BOOT_GRACE:
             reason = f'not registered after {BOOT_GRACE}'
         elif runner is not None and not runner.get('busy') and age > IDLE_LIMIT:
             reason = f'idle after {IDLE_LIMIT}'
@@ -461,6 +473,8 @@ def reap(repo, cfg, pat, live, runners):
     for name, runner in runners.items():
         ours = cfg['label'].lower() in {str(l.get('name', '')).lower() for l in runner.get('labels') or []}
         if ours and str(name).startswith('i-') and name not in live_ids and runner.get('status') == 'offline':
+            if out_of_time():
+                break
             print(f'{repo}: removing offline runner {name} (its host is gone)')
             try:
                 github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
@@ -473,7 +487,7 @@ def reconcile(repo, cfg, subnets):
     pat = repo_pat(cfg)
     if not pat:
         return {'repo': repo, 'skipped': 'no controller token'}
-    live = reap(repo, cfg, pat, app_instances(repo), list_runners(repo, pat))
+    live = reap(repo, cfg, pat, app_instances(repo), *list_runners(repo, pat))
     outcomes, token = {}, None
     # The scan gets half the remaining share, so jobs it finds always have time to launch: a
     # queue big or slow enough to use the whole share would otherwise be found and dropped on
