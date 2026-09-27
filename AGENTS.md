@@ -481,8 +481,10 @@ Codex is logged in. nextjs-dev does the same per user with `codex-seed@<user>`, 
 thread is only checked.
 
 The tmux these sessions run is `tmux-scroll` (t-claude prefers it), pinned by release tag and
-sha256 in `tmux-scroll.tf` for every box: the metal updater, nextjs-dev's setup and a one-shot
-SSM install on both jumpboxes all use that one pin.
+sha256 in `tmux-scroll.tf`: the metal updater, nextjs-dev's setup and a one-shot SSM install on
+both jumpboxes all use that one pin. **Exception: fcvm-metal-x86.** The pinned release has only
+an aarch64 build, so the x86 box keeps whatever tmux-scroll it already has (its updater logs "no
+pinned build for x86_64") until an x86_64 asset is published and pinned.
 
 All metal repositories run as `ubuntu` and therefore share one tmux server. Keep one
 aggregate systemd service and one cgroup; do not create per-repository units. Stopping or
