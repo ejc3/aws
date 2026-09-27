@@ -1711,20 +1711,45 @@ fi
 # server keeps the binary it started with -- so it would leave every box one restart away from
 # a version its sessions never asked for. A separate name lets t-claude pick it up for the next
 # server while the current one keeps running.
-if [ ! -x /usr/local/bin/tmux-scroll ] || ! grep -qa scroll-replay /usr/local/bin/tmux-scroll; then
+#
+# PINNED, and upgraded when the pin moves (tmux-scroll.tf holds the release tag and sha256).
+# This used to install only when the binary was missing, so the box never left its first build.
+# /var/lib/tmux-scroll/sha256 records which pinned tarball is installed; a matching record and a
+# genuine binary skip the download entirely.
+TS_TAG="${local.tmux_scroll_tag}"
+TS_SHA="${local.tmux_scroll_sha256_aarch64}"
+TS_STATE=/var/lib/tmux-scroll
+if [ "$(uname -m)" != aarch64 ]; then
+  echo "WARNING: no pinned tmux-scroll build for $(uname -m); keeping any installed copy"
+elif [ -x /usr/local/bin/tmux-scroll ] && grep -qa scroll-replay /usr/local/bin/tmux-scroll \
+     && [ "$(cat "$TS_STATE/sha256" 2>/dev/null)" = "$TS_SHA" ]; then
+  : # already the pinned build
+else
   # Own directory per run: a fixed /tmp name would be a file another account can pre-create.
   TSTMP=$(mktemp -d)
-  TSARCH=$(uname -m)
-  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/binaries-scroll-native/tmux-scroll-$TSARCH.tar.gz" -o "$TSTMP/tmux-scroll.tgz" && [ -s "$TSTMP/tmux-scroll.tgz" ]; then
+  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/$TS_TAG/tmux-scroll-aarch64.tar.gz" -o "$TSTMP/tmux-scroll.tgz" \
+     && echo "$TS_SHA  $TSTMP/tmux-scroll.tgz" | sha256sum -c --quiet -; then
     # Prove it is the patched build and that it runs BEFORE it replaces anything: the whole
-    # point of this binary is the option, and a truncated download would still untar.
-    tar xzf "$TSTMP/tmux-scroll.tgz" -C "$TSTMP" \
-      && grep -qa scroll-replay "$TSTMP/tmux-scroll" \
-      && "$TSTMP/tmux-scroll" -V >/dev/null 2>&1 \
-      && install -m 755 "$TSTMP/tmux-scroll" /usr/local/bin/tmux-scroll \
-      || echo "WARNING: scroll-native tmux failed its checks; keeping any installed copy"
+    # point of this binary is the option.
+    if tar xzf "$TSTMP/tmux-scroll.tgz" -C "$TSTMP" \
+       && grep -qa scroll-replay "$TSTMP/tmux-scroll" \
+       && "$TSTMP/tmux-scroll" -V >/dev/null 2>&1; then
+      # Rename, then install: a running binary cannot be overwritten in place ("Text file
+      # busy"). A live server keeps the build it started with either way, and every build
+      # from 3.7b on speaks the same client/server protocol (see tmux-scroll.tf).
+      mkdir -p "$TS_STATE"
+      [ -e /usr/local/bin/tmux-scroll ] && mv -f /usr/local/bin/tmux-scroll /usr/local/bin/tmux-scroll.prev
+      if install -m 755 "$TSTMP/tmux-scroll" /usr/local/bin/tmux-scroll; then
+        echo "$TS_SHA" > "$TS_STATE/sha256"
+      else
+        [ -e /usr/local/bin/tmux-scroll.prev ] && mv -f /usr/local/bin/tmux-scroll.prev /usr/local/bin/tmux-scroll
+        echo "WARNING: could not install the scroll-native tmux; restored the previous copy"
+      fi
+    else
+      echo "WARNING: scroll-native tmux failed its checks; keeping any installed copy"
+    fi
   else
-    echo "WARNING: could not download the scroll-native tmux (native scrollback stays degraded)"
+    echo "WARNING: could not download the pinned scroll-native tmux, or it did not match its sha256 (keeping any installed copy)"
   fi
   rm -rf "$TSTMP"
 fi
