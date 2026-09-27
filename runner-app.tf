@@ -427,8 +427,9 @@ resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {
 # that repo's own controller token (Webhooks RW, runner-repos.tf), read ephemerally so it never
 # enters state. A provider cannot for_each, hence one alias per owner.
 #
-# Gated separately because the tokens are put into their secrets by hand after runner-repos.tf
-# applies: until then there is no secret version to read.
+# Gated separately because the tokens are put into their secrets by hand: until then there is
+# no secret version to read. A cold start creates the containers with this set false (README,
+# Prerequisites), populates them, then runs the full apply with the default.
 variable "enable_runner_app_webhooks" {
   description = "Create the workflow_job webhooks on the served repos (needs their controller tokens in Secrets Manager)"
   type        = bool
