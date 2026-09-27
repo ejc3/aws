@@ -667,9 +667,16 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   Any other launch error stops the round, because EC2 may have created an instance behind it.
   Every attempt carries its own `ClientToken`, so the SDK's own retries cannot duplicate one.
-- **Dedupe and caps.** Each VM is tagged with its `JobId`, so a redelivery or a reconcile never
-  launches a second host for a job. Each repo has its own cap (8) and alarm
-  (`too-many-app-runners`), so neither can starve fcvm's.
+- **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
+  (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
+  while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
+  failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
+  with its `JobId`. Each repo has its own cap (8), so neither can starve fcvm's.
+- **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo and in total.
+  `too-many-app-runners` fires above the combined cap; `github-app-runner-reconcile-silent` fires
+  when no count arrives for 15 minutes, because then nothing is reaping. One repo's failure (a
+  revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
+  still fails for `github-app-runner-errors`.
 - **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
   actions/runner (pinned, sha256-verified) and takes its registration token from
   `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the

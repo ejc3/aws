@@ -47,6 +47,17 @@ RUNS_PER_STATUS = 30
 ec2 = boto3.client('ec2', region_name=REGION)
 ssm = boto3.client('ssm', region_name=REGION)
 secrets = boto3.client('secretsmanager', region_name=REGION)
+dynamodb = boto3.client('dynamodb', region_name=REGION)
+cloudwatch = boto3.client('cloudwatch', region_name=REGION)
+
+# A launch claim per job (table CLAIMS_TABLE) makes "one host per job" hold across
+# invocations. DescribeInstances is eventually consistent: a redelivery seconds after a launch
+# may not see the new host by its JobId tag yet. The claim is a conditional write, strongly
+# consistent, so exactly one invocation launches. A definite failure releases it so the next
+# round retries at once; an ambiguous one keeps it until CLAIM_SECONDS pass, by which time the
+# tag is visible if a host did start.
+CLAIM_SECONDS = 15 * 60
+METRIC_NAMESPACE = 'GitHubAppRunner'
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -231,7 +242,7 @@ def launch(repo, cfg, subnets, size, job_id, token):
                 if code not in CAPACITY_CODES:
                     print(f"{repo}: launch for job {job_id} ended ambiguously ({type(error).__name__} {code}); "
                           'not trying another pool this round')
-                    return None
+                    return None, False
                 print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
                 continue
             instance_id = response['Instances'][0]['InstanceId']
@@ -246,14 +257,36 @@ def launch(repo, cfg, subnets, size, job_id, token):
                     ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
                 except Exception:
                     pass
-                return None
+                return None, True
             print(f"{repo}: launched {instance_id} ({instance_type}, {subnet['availability_zone']}) for job {job_id} [{labels}]")
-            return instance_id
+            return instance_id, False
     print(f'{repo}: every pool refused a {size} runner for job {job_id}: {last_error}')
-    return None
+    return None, True
 
 
 # ---------------------------------------------------------------- policy
+def claim(repo, job_id):
+    """True if this invocation may launch for the job (see CLAIM_SECONDS)."""
+    t = int(now().timestamp())
+    try:
+        dynamodb.put_item(
+            TableName=os.environ['CLAIMS_TABLE'],
+            Item={'pk': {'S': f'{repo}#{job_id}'}, 'expires_at': {'N': str(t + CLAIM_SECONDS)},
+                  'ttl': {'N': str(t + 86400)}},
+            ConditionExpression='attribute_not_exists(pk) OR expires_at < :now',
+            ExpressionAttributeValues={':now': {'N': str(t)}})
+        return True
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def release(repo, job_id):
+    try:
+        dynamodb.delete_item(TableName=os.environ['CLAIMS_TABLE'], Key={'pk': {'S': f'{repo}#{job_id}'}})
+    except Exception as error:  # the claim then just expires
+        print(f'{repo}: could not release the claim for job {job_id}: {type(error).__name__}')
+
+
 def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     """Launch for `job_id` unless it already has a host or the repo is at its cap."""
     if any(tag(i, 'JobId') == job_id for i in live):
@@ -261,12 +294,16 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     if len(live) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
+    if not claim(repo, job_id):
+        return 'claimed', token
     token = token or registration_token(repo, pat)
-    instance_id = launch(repo, cfg, subnets, size, job_id, token)
+    instance_id, definite = launch(repo, cfg, subnets, size, job_id, token)
     if instance_id:
         live.append({'InstanceId': instance_id, 'Tags': [{'Key': 'JobId', 'Value': job_id}],
                      'LaunchTime': now(), 'State': {'Name': 'pending'}})
         return 'launched', token
+    if definite:
+        release(repo, job_id)
     return 'failed', token
 
 
@@ -319,10 +356,33 @@ def reconcile(repo, cfg, subnets):
     return {'repo': repo, 'outcomes': outcomes, 'live': len(live)}
 
 
+def publish_counts(results):
+    """LiveRunners per repo and in total, every reconcile. The too-many and not-running alarms
+    read this: AWS/EC2 has no per-tag instance count to alarm on."""
+    data = [{'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
+             'Value': r['live'], 'Unit': 'Count'} for r in results if 'live' in r]
+    data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
+                 'Value': sum(r.get('live', 0) for r in results), 'Unit': 'Count'})
+    cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
+
+
 def handler(event, context):
     repos, subnets = config()
     if event.get('reconcile') or event.get('source') == 'aws.events':
-        return [reconcile(repo, cfg, subnets) for repo, cfg in repos.items()]
+        # Each repo on its own: one repo's revoked token or GitHub timeout must not stop the
+        # other's launches and reaping. The invocation still fails afterwards, for the alarm.
+        results, failed = [], []
+        for repo, cfg in repos.items():
+            try:
+                results.append(reconcile(repo, cfg, subnets))
+            except Exception as error:
+                failed.append(repo)
+                print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
+                results.append({'repo': repo, 'error': type(error).__name__})
+        publish_counts(results)
+        if failed:
+            raise RuntimeError(f'reconcile failed for {", ".join(failed)}')
+        return results
     repo = event.get('repo')
     if repo not in repos:
         print(f'ignoring a delivery for {repo!r}: not a served repo')

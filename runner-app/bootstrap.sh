@@ -23,6 +23,10 @@ IMDS_TOKEN=$(curl -fsS -X PUT "$IMDS/api/token" -H 'X-aws-ec2-metadata-token-ttl
 INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "$IMDS/meta-data/instance-id")
 echo "github-app-runner: $INSTANCE_ID for $REPO [$LABELS] at $(date -Is)"
 
+# Wait for the dpkg lock instead of failing: a fresh Ubuntu often runs apt-daily or
+# unattended-upgrades while user data starts. System-wide, so it also covers apt calls made
+# by the runner's own installdependencies.sh.
+echo 'DPkg::Lock::Timeout "300";' > /etc/apt/apt.conf.d/90github-app-runner-lock-timeout
 apt-get update -q
 apt-get install -y -q python3-boto3 git curl jq unzip zip build-essential ca-certificates
 

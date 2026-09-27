@@ -238,6 +238,21 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         }
       },
       {
+        # One launch claim per job (app_runner.py claim()): conditional put, release on failure.
+        Sid      = "LaunchClaims"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource = aws_dynamodb_table.runner_app_claims[0].arn
+      },
+      {
+        # Its own runner-count metric, which the alarms below read.
+        Sid       = "PublishRunnerCounts"
+        Effect    = "Allow"
+        Action    = "cloudwatch:PutMetricData"
+        Resource  = "*"
+        Condition = { StringEquals = { "cloudwatch:namespace" = "GitHubAppRunner" } }
+      },
+      {
         Sid      = "DeleteBrokeredCredentialOnly"
         Effect   = "Allow"
         Action   = "ssm:DeleteParameter"
@@ -266,6 +281,7 @@ resource "aws_lambda_function" "runner_app" {
   environment {
     variables = {
       REPOS             = jsonencode(local.runner_app_config)
+      CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SECURITY_GROUP_ID = aws_security_group.runner_app[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
@@ -317,6 +333,33 @@ resource "aws_lambda_permission" "runner_app_reconcile" {
 
 # ============================================ alarms
 # Separate from too-many-runners (which counts Role=github-runner, fcvm's metal only).
+# One claim per job (app_runner.py claim()). Items expire by their own `expires_at`; TTL only
+# garbage-collects them a day later.
+resource "aws_dynamodb_table" "runner_app_claims" {
+  count        = var.enable_github_runner ? 1 : 0
+  name         = "github-app-runner-claims"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = false
+  }
+
+  tags = { Name = "github-app-runner-claims" }
+}
+
+# The controller publishes GitHubAppRunner/LiveRunners (Repo=ALL and per repo) on every
+# 2-minute reconcile. AWS/EC2 has no per-tag instance count, so this is the only reliable one.
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "too-many-app-runners"
@@ -326,15 +369,32 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   alarm_description   = "More app-repo runners than every repo's cap allows, for 15+ minutes - the controller is over-launching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "LiveRunners"
+  dimensions          = { Repo = "ALL" }
+  statistic           = "Maximum"
+  period              = 300
   treat_missing_data  = "notBreaching"
+}
 
-  metric_query {
-    id          = "app_runner_count"
-    expression  = "SELECT COUNT(InstanceId) FROM SCHEMA(\"AWS/EC2\", InstanceId) WHERE Role = 'github-app-runner'"
-    label       = "Running app runners"
-    period      = 300
-    return_data = true
-  }
+# No count at all for 15 minutes means the reconcile is not running, so nothing reaps hosts
+# or enforces lifetimes. Missing data is the signal here.
+resource "aws_cloudwatch_metric_alarm" "app_runner_reconcile_silent" {
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "github-app-runner-reconcile-silent"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  threshold           = 0
+  alarm_description   = "github-app-runner published no runner count for 15 minutes: its reconcile (reaping, lifetimes) is not running"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "LiveRunners"
+  dimensions          = { Repo = "ALL" }
+  statistic           = "SampleCount"
+  period              = 300
+  treat_missing_data  = "breaching"
 }
 
 resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {

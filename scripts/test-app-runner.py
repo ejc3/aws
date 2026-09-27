@@ -32,7 +32,8 @@ REPOS = {
 SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
 ENV = {"REPOS": json.dumps(REPOS), "LAUNCH_SUBNETS": json.dumps(SUBNETS), "SECURITY_GROUP_ID": "sg-app",
-       "INSTANCE_PROFILE": "github-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012"}
+       "INSTANCE_PROFILE": "github-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012",
+       "CLAIMS_TABLE": "github-app-runner-claims"}
 NOW = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
 
 
@@ -76,6 +77,35 @@ class FakeEC2:
 
     def terminate_instances(self, InstanceIds):
         self.terminated += InstanceIds
+
+
+class FakeDynamo:
+    """The launch-claim table: a conditional put that only one caller can win."""
+    class exceptions:
+        class ConditionalCheckFailedException(Exception):
+            pass
+
+    def __init__(self):
+        self.items, self.deleted = {}, []
+
+    def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues):
+        pk, t = Item["pk"]["S"], int(ExpressionAttributeValues[":now"]["N"])
+        held = self.items.get(pk)
+        if held is not None and int(held["expires_at"]["N"]) >= t:
+            raise self.exceptions.ConditionalCheckFailedException(pk)
+        self.items[pk] = Item
+
+    def delete_item(self, TableName, Key):
+        self.deleted.append(Key["pk"]["S"])
+        self.items.pop(Key["pk"]["S"], None)
+
+
+class FakeCloudWatch:
+    def __init__(self):
+        self.metrics = []
+
+    def put_metric_data(self, Namespace, MetricData):
+        self.metrics.append((Namespace, MetricData))
 
 
 class FakeSSM:
@@ -130,11 +160,12 @@ class FakeGitHub:
 
 
 def load_app(tokens=None):
-    ec2, ssm = FakeEC2(), FakeSSM()
+    ec2, ssm, dynamo, cw = FakeEC2(), FakeSSM(), FakeDynamo(), FakeCloudWatch()
     secrets = FakeSecrets(tokens if tokens is not None else {
         f"github-runner/repo-pat/{COLTON}": "PAT-COLTON", f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN"})
     fake_boto3 = types.ModuleType("boto3")
-    fake_boto3.client = lambda name, region_name=None: {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets}[name]
+    fake_boto3.client = lambda name, region_name=None: {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets,
+                                                        "dynamodb": dynamo, "cloudwatch": cw}[name]
     sys.modules["boto3"] = fake_boto3
     for k, v in ENV.items():
         __import__("os").environ[k] = v
@@ -143,6 +174,7 @@ def load_app(tokens=None):
     spec.loader.exec_module(mod)
     mod.github = FakeGitHub()
     mod.now = lambda: NOW
+    mod.fake_dynamo, mod.fake_cloudwatch = dynamo, cw
     return mod, ec2, ssm, secrets
 
 
@@ -226,6 +258,27 @@ class LaunchTests(unittest.TestCase):
         self.assertTrue(all(tokens), "RunInstances without a ClientToken is not idempotent under SDK retries")
         self.assertEqual(len(set(tokens)), len(tokens))
 
+    def test_a_redelivery_before_the_host_is_listed_launches_nothing(self):
+        # DescribeInstances is eventually consistent: hide the first host from the listing and
+        # redeliver. The strongly consistent claim must still stop a second launch.
+        app, ec2, *_ = load_app()
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+        ec2.instances.clear()
+        self.assertEqual(self.deliver(app)["outcome"], "claimed")
+        self.assertEqual(len(ec2.launched), 1)
+
+    def test_a_definite_failure_releases_the_claim_and_an_ambiguous_one_keeps_it(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse = {t for size in SIZES.values() for t in size}
+        self.assertEqual(self.deliver(app)["outcome"], "failed")
+        self.assertEqual(len(app.fake_dynamo.deleted), 1, "every pool refused: the claim must go so the job retries")
+        ec2.refuse = set()
+        ec2.ambiguous = True
+        self.assertEqual(self.deliver(app)["outcome"], "failed")
+        self.assertEqual(len(app.fake_dynamo.deleted), 1, "an ambiguous error may have launched: keep the claim")
+        ec2.ambiguous = False
+        self.assertEqual(self.deliver(app)["outcome"], "claimed")
+
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
         ssm.fail_put = True
@@ -259,6 +312,22 @@ class ReconcileTests(unittest.TestCase):
         app.handler({"reconcile": True}, None)
         launched = [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] for kw in ec2.launched]
         self.assertEqual(launched, ["11"])
+
+    def test_one_repos_failure_does_not_stop_the_other_and_counts_are_published(self):
+        app, *_ = load_app()
+        real = app.reconcile
+        def flaky(repo, cfg, subnets):
+            if repo == COLTON:
+                raise RuntimeError("HTTP Error 401: Bad credentials")
+            return real(repo, cfg, subnets)
+        app.reconcile = flaky
+        with self.assertRaisesRegex(RuntimeError, "reconcile failed for CoderColton/colton-games"):
+            app.handler({"source": "aws.events"}, None)
+        namespace, data = app.fake_cloudwatch.metrics[-1]
+        self.assertEqual(namespace, "GitHubAppRunner")
+        repos = {d["Dimensions"][0]["Value"] for d in data}
+        self.assertIn(DOLPHIN, repos, "the healthy repo was still reconciled and counted")
+        self.assertIn("ALL", repos)
 
     def test_reaps_unregistered_idle_and_overage_hosts_and_offline_ghosts(self):
         app, ec2, *_ = load_app()
