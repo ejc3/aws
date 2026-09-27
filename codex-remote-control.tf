@@ -35,6 +35,18 @@
 # unconfined shells are exempt. Test the bwrap binary itself.
 
 locals {
+  # The boot-time Codex seeder (scripts/codex-seed-thread.py), installed on every box whose boot
+  # launcher opens tmux windows: fcvm-codex-seed.service (claude-remote-control.tf) and
+  # codex-seed@<user>.service (nextjs-user-data.tf). A Codex app only lists a project once it has
+  # a thread there, so each launched folder gets one, started through the running daemon with a
+  # single seed message. Folders that already have a thread are left alone.
+  codex_seed_thread_install = <<-SEEDINSTALL
+cat > /usr/local/bin/codex-seed-thread <<'CODEXSEED'
+${file("${path.module}/scripts/codex-seed-thread.py")}
+CODEXSEED
+chmod 755 /usr/local/bin/codex-seed-thread
+SEEDINSTALL
+
   codex_remote_control = <<-CODEX
 # ---------------------------------------------------------------- codex remote control
 CODEX_BIN="/home/ubuntu/.local/bin/codex"

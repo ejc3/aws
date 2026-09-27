@@ -256,6 +256,9 @@ fi
 
 sort -u "$REPOS" -o "$REPOS"
 mkdir -p "$STATE"
+# The exact folders this boot opens windows for. fcvm-codex-seed.service reads it, so Codex
+# gets a thread in the same set and the two can never disagree.
+cp "$REPOS" "$STATE/repos"
 if [ ! -s "$REPOS" ]; then
   echo "fcvm-claude: no host-local repositories are currently active"
   printf 'ready=0 failed=0 at=%s\n' "$(date -Is)" > "$STATE/last-start"
@@ -362,5 +365,36 @@ systemctl daemon-reload
 # Enable even before the personal Claude login exists. ExecCondition skips cleanly while
 # auth is absent/expired, and a later boot retries without another provisioning pass.
 systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
+
+# ------------------------------------------------------------- Codex thread per window
+# Every folder that got a tmux window above also gets a Codex thread, so it shows up in the
+# Codex app. Runs after the launcher (which writes the list) and the Codex daemon; a folder
+# that already has a thread is only checked, so after the first boot this is quick.
+${local.codex_seed_thread_install}
+cat > /etc/systemd/system/fcvm-codex-seed.service <<'UNIT'
+[Unit]
+Description=Seed a Codex thread for every repository fcvm-claude-rc opened a window for
+After=fcvm-claude-rc.service codex-rc@ubuntu.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Environment=HOME=/home/ubuntu
+WorkingDirectory=/home/ubuntu
+ExecCondition=/bin/sh -c 'test -s /home/ubuntu/.local/state/fcvm-claude/repos && /home/ubuntu/.local/bin/codex login status >/dev/null 2>&1'
+ExecStart=/usr/local/bin/codex-seed-thread --from /home/ubuntu/.local/state/fcvm-claude/repos
+# A new folder costs one short model turn; the first boot after this lands may seed several.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable fcvm-codex-seed.service >/dev/null 2>&1 || true
+# --no-block: this setup often runs inside dev-selfupdate at boot, and the seed waits on the
+# launcher and on model turns.
+systemctl start --no-block fcvm-codex-seed.service >/dev/null 2>&1 || true
   SETUP
 }
