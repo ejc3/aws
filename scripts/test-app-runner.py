@@ -14,6 +14,7 @@ import textwrap
 import time
 import types
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -651,10 +652,43 @@ class ReconcileTests(unittest.TestCase):
             real(InstanceIds)
             app.DEADLINE[0] = 0   # the call returned after the repo's share ended
         ec2.terminate_instances = slow
+        # Over its lifetime (terminated first, even while busy); its record is deleted after.
+        runner = {"i-ancient": {"id": 33, "name": "i-ancient", "busy": True, "status": "online", "labels": [{"name": "cc-games"}]}}
+        app.reap(COLTON, REPOS[COLTON], "PAT", [instance("i-ancient", COLTON, "5", 200)], runner)
+        self.assertEqual(ec2.terminated, ["i-ancient"])
+        self.assertEqual(app.github.calls, [], "no DELETE may start after the deadline")
+
+    def test_an_idle_runner_is_deregistered_before_its_host_is_terminated(self):
+        app, ec2, *_ = load_app()
+        order = []
+        real_terminate, real_github = ec2.terminate_instances, app.github
+        ec2.terminate_instances = lambda InstanceIds: order.append("terminate") or real_terminate(InstanceIds)
+        app.github = lambda method, path, pat, body=None: order.append(method) or real_github(method, path, pat, body)
         runner = {"i-idle": {"id": 31, "name": "i-idle", "busy": False, "status": "online", "labels": [{"name": "cc-games"}]}}
         app.reap(COLTON, REPOS[COLTON], "PAT", [instance("i-idle", COLTON, "3", 12)], runner)
-        self.assertEqual(ec2.terminated, ["i-idle"])
-        self.assertEqual(app.github.calls, [], "no DELETE may start after the deadline")
+        self.assertEqual(order, ["DELETE", "terminate"], "terminating first can kill a job taken since the listing")
+
+    def test_a_runner_that_took_a_job_since_the_listing_keeps_its_host(self):
+        # GitHub refuses to deregister a runner that is running a job.
+        app, ec2, *_ = load_app()
+        def github(method, path, pat, body=None):
+            raise urllib.error.HTTPError(path, 422, "runner is running a job", {}, None)
+        app.github = github
+        runner = {"i-idle": {"id": 31, "name": "i-idle", "busy": False, "status": "online", "labels": [{"name": "cc-games"}]}}
+        keep = app.reap(COLTON, REPOS[COLTON], "PAT", [instance("i-idle", COLTON, "3", 12)], runner)
+        self.assertEqual(ec2.terminated, [])
+        self.assertEqual([i["InstanceId"] for i in keep], ["i-idle"])
+
+    def test_no_ec2_scan_starts_after_a_runner_listing_that_ended_past_the_deadline(self):
+        app, *_ = load_app()
+        scanned = []
+        def listing(repo, pat):
+            app.DEADLINE[0] = 0
+            return {}, True
+        app.list_runners = listing
+        app.app_instances = lambda repo: scanned.append(repo) or []
+        self.assertEqual(app.reconcile(COLTON, REPOS[COLTON], []), {"repo": COLTON, "skipped": "no time left"})
+        self.assertEqual(scanned, [])
 
     def test_a_partial_runner_listing_never_counts_a_host_as_unregistered(self):
         app, ec2, *_ = load_app()

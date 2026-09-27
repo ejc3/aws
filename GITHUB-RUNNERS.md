@@ -702,7 +702,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
   so jobs it finds always have time to launch), launches for queued jobs that have no host,
   oldest first, stopping at the repo's cap or the end of its share, and reaps hosts (also
-  within the share; a host is judged "never registered" only from a complete runner listing)
+  within the share; a host is judged "never registered" only from a complete runner listing; an
+  idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
+  because it took a job since the listing)
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
 - **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
   existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own

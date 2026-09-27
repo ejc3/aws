@@ -502,13 +502,25 @@ def reap(repo, cfg, pat, live, runners, complete=True):
         instance_id = instance['InstanceId']
         age = t - instance['LaunchTime']
         runner = runners.get(instance_id)
-        reason = None
+        reason, idle = None, False
         if age > MAX_LIFETIME:
             reason = f'older than {MAX_LIFETIME}'
         elif runner is None and complete and age > BOOT_GRACE:
             reason = f'not registered after {BOOT_GRACE}'
         elif runner is not None and not runner.get('busy') and age > IDLE_LIMIT:
-            reason = f'idle after {IDLE_LIMIT}'
+            reason, idle = f'idle after {IDLE_LIMIT}', True
+        if reason and idle:
+            # `busy` is from the listing at the start of the round: GitHub may have given this
+            # runner a job since, and terminating first would kill it. Deregister FIRST --
+            # GitHub refuses to remove a runner that is running a job -- and terminate only
+            # once that succeeded. (Pattern B uses the same order, for the same reason.)
+            try:
+                github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
+            except urllib.error.HTTPError as error:
+                print(f'{repo}: keeping {instance_id}: GitHub refused to deregister its runner ({error.code})')
+                keep.append(instance)
+                continue
+            runner = None
         if reason:
             print(f'{repo}: terminating {instance_id}: {reason}')
             ec2.terminate_instances(InstanceIds=[instance_id])
@@ -544,6 +556,9 @@ def reconcile(repo, cfg, subnets):
     if not pat:
         return {'repo': repo, 'skipped': 'no controller token'}
     runners, complete = list_runners(repo, pat)
+    if out_of_time():
+        print(f'{repo}: reconcile stopped after the runner listing; its time share is spent')
+        return {'repo': repo, 'skipped': 'no time left'}
     live = reap(repo, cfg, pat, app_instances(repo), runners, complete)
     busy = frozenset(name for name, runner in runners.items() if runner.get('busy'))
     outcomes, token = {}, None
