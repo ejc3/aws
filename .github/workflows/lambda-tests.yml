@@ -95,6 +95,12 @@ jobs:
       - name: Games multiplayer engine sweeper (offline)
         run: python3 -S -B scripts/test-games-mp-sweeper.py
 
+      - name: Games multiplayer launch admission (offline)
+        run: python3 -S -B scripts/test-games-mp-launch.py
+
+      - name: play.cc-games.app edge protections (offline)
+        run: python3 -S -B scripts/test-games-mp-edge.py
+
       - name: Games multiplayer bring-up steps (offline)
         run: python3 -S -B scripts/test-games-mp-bringup.py
 

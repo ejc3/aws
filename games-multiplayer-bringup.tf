@@ -468,6 +468,9 @@ resource "terraform_data" "games_mp_build" {
 #   MP_ENV   production / preview (the lobby requires MP_ENV == VERCEL_ENV)
 #   MP_API   production only: https://cc-games.app. Preview derives https://$VERCEL_URL per
 #            deployment, so engines call back the preview that launched them.
+#   MP_LAUNCH_ROLE_ARN, MP_LAUNCH_FUNCTION  each environment's own launcher role and its own
+#            alias of games-mp-launch (games-multiplayer.tf): the alias fixes the engines'
+#            environment and ceiling, so Preview must never hold production's.
 #   Preview only: SKYHOOK_LEADERBOARD_ENVIRONMENT=preview and its own Skyhook key, because
 #            Preview now shares the Supabase database (rows are scoped by environment).
 # Development gets nothing: local development uses MP_LAUNCHER=local, and the launcher
@@ -475,13 +478,9 @@ resource "terraform_data" "games_mp_build" {
 
 locals {
   games_mp_vercel_shared_config = {
-    MP_ROLE_ARN = aws_iam_role.games_mp_launcher.arn
-    # Vercel's own convention; the lobby reads MP_ROLE_ARN first and falls back to this.
-    AWS_ROLE_ARN = aws_iam_role.games_mp_launcher.arn
-    MP_CLUSTER   = aws_ecs_cluster.games.name
-    MP_SUBNETS   = join(",", [for s in local.mp_subnets : s.id])
-    MP_ENGINE_SG = aws_security_group.games_engine.id
-    MP_REGION    = var.aws_region
+    # The launch function's region. The cluster, subnets and security group are
+    # games-mp-launch's own settings now; the lobby never names them.
+    MP_REGION = var.aws_region
     # Pins the AWS SDK's region; Vercel otherwise sets AWS_REGION to the function's own
     # region, which can move (https://vercel.com/docs/oidc/aws).
     AWS_REGION      = var.aws_region
@@ -495,9 +494,21 @@ locals {
   games_mp_vercel_env = merge(
     { for k, v in local.games_mp_vercel_shared_config : k => { targets = ["production", "preview"], sensitive = false, value = v } },
     {
-      "MP_ENV/production"                       = { targets = ["production"], sensitive = false, value = "production" }
-      "MP_ENV/preview"                          = { targets = ["preview"], sensitive = false, value = "preview" }
-      "MP_API/production"                       = { targets = ["production"], sensitive = false, value = "https://cc-games.app" }
+      "MP_ENV/production" = { targets = ["production"], sensitive = false, value = "production" }
+      "MP_ENV/preview"    = { targets = ["preview"], sensitive = false, value = "preview" }
+      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.app" }
+      # New key names rather than per-environment copies of MP_ROLE_ARN: Terraform may create
+      # the per-environment variables before it deletes the shared one, and Vercel refuses two
+      # variables with one key on the same target.
+      "MP_LAUNCH_ROLE_ARN/production" = { targets = ["production"], sensitive = false, value = aws_iam_role.games_mp_launcher["production"].arn }
+      "MP_LAUNCH_ROLE_ARN/preview"    = { targets = ["preview"], sensitive = false, value = aws_iam_role.games_mp_launcher["preview"].arn }
+      "MP_LAUNCH_FUNCTION/production" = { targets = ["production"], sensitive = false, value = aws_lambda_alias.games_mp_launch["production"].arn }
+      "MP_LAUNCH_FUNCTION/preview"    = { targets = ["preview"], sensitive = false, value = aws_lambda_alias.games_mp_launch["preview"].arn }
+      # Launch admission (games-multiplayer.tf locals): pinned here, not left to code defaults.
+      "MP_MAX_ACTIVE_MATCHES/production"        = { targets = ["production"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.production) }
+      "MP_MAX_ACTIVE_MATCHES/preview"           = { targets = ["preview"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.preview) }
+      "MP_IP_MAX_ACTIVE"                        = { targets = ["production", "preview"], sensitive = false, value = tostring(local.games_mp_ip_max_active) }
+      "MP_IP_MAX_PER_HOUR"                      = { targets = ["production", "preview"], sensitive = false, value = tostring(local.games_mp_ip_max_per_hour) }
       "SKYHOOK_LEADERBOARD_ENVIRONMENT/preview" = { targets = ["preview"], sensitive = false, value = "preview" }
       "MP_TOKEN_KEYS"                           = { targets = ["production", "preview"], sensitive = true, value = null }
       "MP_TEST_KEY"                             = { targets = ["production", "preview"], sensitive = true, value = null }
