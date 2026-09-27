@@ -823,9 +823,11 @@ reviewed Terraform removal plan after both acceptance stages pass.
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
 
-**Three GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
-clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners, and
-`github-webhook-admin-pat` owns the webhook. The dev PAT is read by machines that run
+**Four GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
+clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners,
+`github-webhook-admin-pat` owns the webhook, and `games/colton-games-read` (owned by
+CoderColton, Contents read-only on `colton-games`, jumpbox-readable only) lets the games
+multiplayer bring-up download the pinned commit it builds. The dev PAT is read by machines that run
 other people's code; before the cutoff, the runner PAT was too. Neither may hold
 webhook-write: that would let a compromised dev host or a leaked legacy runner token
 repoint the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by

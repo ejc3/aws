@@ -127,6 +127,11 @@ needs:
   `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
   repository permission is `Webhooks: Read and write` on `ejc3/fcvm`, used by the
   `integrations/github` provider to own the runner webhook;
+- for games multiplayer, the `games/colton-games-read` Secrets Manager value: a
+  fine-grained token that Colton creates as `CoderColton`, limited to
+  `colton-games` with Contents read-only. The plan-time preflight reads it, so create the
+  empty secret with a targeted apply first; the exact steps are under *First time only* in
+  [`docs/games-multiplayer.md`](docs/games-multiplayer.md);
 - current ARM64 and x86 runner AMIs tagged `Purpose=github-runner`;
 - the Google OAuth callback
   `https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback` when Google login is enabled.
