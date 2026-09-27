@@ -190,15 +190,21 @@ To take the platform off the internet, fastest first:
   seconds apart, find nothing but the router.
 
   ```bash
+  # A failed AWS call must never count as a quiet pass: it resets the count instead.
   quiet=0
   while [ "$quiet" -lt 3 ]; do
     found=0
-    for t in $(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); do
+    if ! tasks=$(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); then
+      echo "list-tasks failed; not a quiet pass" >&2; found=1; tasks=
+    fi
+    for t in $tasks; do
       td=$(aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" \
-        --query 'tasks[0].taskDefinitionArn' --output text)
+        --query 'tasks[0].taskDefinitionArn' --output text) || { echo "describe failed: $t" >&2; found=1; continue; }
       case "${td##*/}" in
         games-mp-router:*) ;;
-        *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null; found=1 ;;
+        *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null \
+             || echo "stop failed: $t" >&2
+           found=1 ;;
       esac
     done
     if [ "$found" -eq 0 ]; then quiet=$((quiet + 1)); else quiet=0; fi

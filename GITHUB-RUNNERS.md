@@ -1079,7 +1079,17 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
    does not work: it also drops the token reads, so the providers have no credentials to
    delete with. The repo's owner can instead revoke its controller token in GitHub, which
    stops registration outright; plans then fail at that repo's provider until its hook is
-   deleted in the repo's settings and removed from state (`terraform state rm`).
+   deleted and removed from state. Delete it through the API with the owner's own `gh` login
+   (CoderColton for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin
+   for `dolphin-labs`), matching the hook by our API Gateway URL:
+
+   ```bash
+   R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
+   URL=$(terraform output -raw runner_webhook_url)
+   ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
+   gh api -X DELETE "repos/$R/hooks/$ID"
+   terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'   # or _dolphin_labs
+   ```
 
 **A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
 open a pull request from a fork. Require approval for workflows from all outside
