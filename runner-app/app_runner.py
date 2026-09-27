@@ -32,6 +32,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config
 
 REGION = 'us-west-1'
 ROLE = 'github-app-runner'
@@ -45,6 +46,11 @@ VOLUME_GB = int(os.environ.get('VOLUME_GB', '80'))
 RUNS_PER_STATUS = 30
 
 ec2 = boto3.client('ec2', region_name=REGION)
+# RunInstances only, with botocore's own retries off, as in the metal controller
+# (runner-autoscale.tf): a pool with no spot capacity answers InsufficientInstanceCapacity, and
+# the default client retried that same pool with backoff for 7-15 seconds before launch() could
+# move on. launch() walks the pools itself, and each attempt has its own ClientToken.
+launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(retries={'total_max_attempts': 1}))
 ssm = boto3.client('ssm', region_name=REGION)
 secrets = boto3.client('secretsmanager', region_name=REGION)
 dynamodb = boto3.client('dynamodb', region_name=REGION)
@@ -96,8 +102,13 @@ def repo_pat(cfg):
     try:
         value = secrets.get_secret_value(SecretId=cfg['pat_secret'])['SecretString']
     except Exception as error:
-        print(f"no controller token in {cfg['pat_secret']}: {type(error).__name__}")
-        return None
+        # Only "no value yet" is expected. AccessDenied, a KMS failure or a network error must
+        # propagate: returning None would skip the repo while every alarm stays green.
+        code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
+        if code == 'ResourceNotFoundException':
+            print(f"no controller token in {cfg['pat_secret']} yet")
+            return None
+        raise
     return value.strip() or None
 
 
@@ -207,7 +218,7 @@ def launch(repo, cfg, subnets, size, job_id, token):
     for subnet in subnets:
         for instance_type in cfg['sizes'][size]:
             try:
-                response = ec2.run_instances(
+                response = launch_ec2.run_instances(
                     # botocore's own retries resend these exact arguments, so one token per
                     # attempt makes a retried request return the instance it already created.
                     ClientToken=str(uuid.uuid4()),
@@ -296,8 +307,15 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
         return 'cap', token
     if not claim(repo, job_id):
         return 'claimed', token
-    token = token or registration_token(repo, pat)
-    instance_id, definite = launch(repo, cfg, subnets, size, job_id, token)
+    try:
+        token = token or registration_token(repo, pat)
+        instance_id, definite = launch(repo, cfg, subnets, size, job_id, token)
+    except Exception:
+        # Anything raised here came before any RunInstances request (the token, the AMI lookup):
+        # launch() handles every error from RunInstances itself. Nothing was launched, so free
+        # the job for the next round instead of holding it for CLAIM_SECONDS.
+        release(repo, job_id)
+        raise
     if instance_id:
         live.append({'InstanceId': instance_id, 'Tags': [{'Key': 'JobId', 'Value': job_id}],
                      'LaunchTime': now(), 'State': {'Name': 'pending'}})

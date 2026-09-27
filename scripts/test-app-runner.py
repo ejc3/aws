@@ -135,7 +135,9 @@ class FakeSecrets:
     def get_secret_value(self, SecretId):
         self.read.append(SecretId)
         if SecretId not in self.values:
-            raise RuntimeError("ResourceNotFoundException")
+            raise Refused("ResourceNotFoundException")
+        if self.values[SecretId] is PermissionError:
+            raise Refused("AccessDeniedException")
         return {"SecretString": self.values[SecretId]}
 
 
@@ -164,9 +166,16 @@ def load_app(tokens=None):
     secrets = FakeSecrets(tokens if tokens is not None else {
         f"github-runner/repo-pat/{COLTON}": "PAT-COLTON", f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN"})
     fake_boto3 = types.ModuleType("boto3")
-    fake_boto3.client = lambda name, region_name=None: {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets,
-                                                        "dynamodb": dynamo, "cloudwatch": cw}[name]
+    def client(name, region_name=None, config=None):
+        if name == "ec2" and config is not None:
+            ec2.launch_config = config
+        return {"ec2": ec2, "ssm": ssm, "secretsmanager": secrets, "dynamodb": dynamo, "cloudwatch": cw}[name]
+    fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
+    fake_botocore, fake_config = types.ModuleType("botocore"), types.ModuleType("botocore.config")
+    fake_config.Config = lambda **kw: types.SimpleNamespace(**kw)
+    fake_botocore.config = fake_config
+    sys.modules["botocore"], sys.modules["botocore.config"] = fake_botocore, fake_config
     for k, v in ENV.items():
         __import__("os").environ[k] = v
     spec = importlib.util.spec_from_file_location("app_runner_under_test", APP)
@@ -278,6 +287,28 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(len(app.fake_dynamo.deleted), 1, "an ambiguous error may have launched: keep the claim")
         ec2.ambiguous = False
         self.assertEqual(self.deliver(app)["outcome"], "claimed")
+
+    def test_launches_use_a_client_with_sdk_retries_off(self):
+        # A retried InsufficientInstanceCapacity cost 7-15 s per pool on the metal controller.
+        app, ec2, *_ = load_app()
+        self.assertEqual(ec2.launch_config.retries, {"total_max_attempts": 1})
+
+    def test_a_failure_before_any_launch_request_releases_the_claim(self):
+        app, ec2, *_ = load_app()
+        real = app.registration_token
+        app.registration_token = lambda repo, pat: (_ for _ in ()).throw(RuntimeError("GitHub 503"))
+        with self.assertRaises(RuntimeError):
+            self.deliver(app)
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(len(app.fake_dynamo.deleted), 1, "nothing launched: the job must not wait out the claim")
+        app.registration_token = real
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+
+    def test_an_unreadable_token_fails_loudly_but_a_missing_one_skips(self):
+        app, *_ = load_app(tokens={f"github-runner/repo-pat/{DOLPHIN}": PermissionError})
+        self.assertIsNone(app.repo_pat(REPOS[COLTON]), "no value yet is the expected bootstrap state")
+        with self.assertRaises(Refused):
+            app.repo_pat(REPOS[DOLPHIN])
 
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
