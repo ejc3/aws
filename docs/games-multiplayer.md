@@ -273,7 +273,10 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    `coltons-projects-7f9a4e8b`, environments `production` and `preview` only. The role can
    `RunTask` only `games-*` task definitions in cluster `games` (live simulation: engine
    allowed, router **explicitly denied**), pass only the two engine roles, tag only at launch,
-   and stop only `match`-tagged tasks. It cannot read any secret or touch EC2 (simulated).
+   and stop only `match`-tagged tasks. It cannot read any secret (simulated). Its only EC2 access
+   is read-only `ec2:DescribeNetworkInterfaces`, on every ENI in us-west-1
+   (`ReadTaskNetworkInterfaces`, games-multiplayer.tf), which the launcher uses to find an
+   engine's address; it exposes the region's ENI inventory to a compromised deployment.
 6. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
    a public IPv4 for outbound traffic and have **unrestricted egress**; inbound is router-only.
    The container runs as root with a writable root filesystem.
@@ -284,7 +287,7 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | --- | --- | --- |
 | Anyone on the internet | Reach the ALB and router; hold connections open (idle timeout 3600 s); consume the router's single 0.25 vCPU with a distributed flood | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
-| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (at most 4 hours); read the lobby's Supabase data | Run the router's task definition; stop the router; pass any other role; read AWS secrets; touch EC2 or other accounts |
+| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), so run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
 | A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (today only SSH and ET, which are already public); use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress) |
 
 **Cost-abuse limits, and what happens at each**
@@ -297,8 +300,10 @@ against the code and live state on 2026-09-27 unless marked otherwise.
   Today production exposes only the hidden `mptest` game, which needs `MP_TEST_KEY`, so the
   public cannot launch anything yet.
 - **Per-match caps.** Each engine exits at its own `hardCapSec` (30 minutes for `mptest`);
-  the sweeper stops any task at `hardcap` + 10 minutes, 2 hours without a valid tag, 4 hours at
-  most. Two alarms page if the sweeper errors or stops running.
+  the sweeper stops any task at `hardcap` + 10 minutes (the hardcap itself clamped to 4 hours), or 2
+  hours + 10 minutes without a valid tag, plus up to one sweep interval. That is a bound only
+  while sweeps and `StopTask` succeed: a failed stop is caught and alerted, and the task keeps
+  running until someone intervenes. Two alarms page if the sweeper errors or stops running.
 - **No AWS-side limit on how many engines run at once.** A caller holding the launcher's
   credentials is limited only by the Fargate quota. Fargate bills under ECS, so the existing
   `high-ec2-spend` alarm (EC2 only) does not see it; the account-wide $200/day budget does, but
