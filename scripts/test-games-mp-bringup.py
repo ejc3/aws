@@ -107,7 +107,11 @@ class World:
         if argv[:3] == ["aws", "s3", "cp"]:
             return done("")
         if argv[:3] == ["aws", "codebuild", "start-build"]:
-            self.start_request = json.loads(input)
+            raw = argv[argv.index("--cli-input-json") + 1]
+            # What the real CLI v2 does: a file:///dev/stdin input fails to parse.
+            if raw.startswith("file://"):
+                return done("", 252, "Error parsing parameter 'cli-input-json': Invalid JSON received.")
+            self.start_request = json.loads(raw)
             return done(json.dumps({"build": {"id": "games-mp-images:1"}}))
         if argv[:3] == ["aws", "codebuild", "batch-get-builds"]:
             status = self.builds.pop(0) if len(self.builds) > 1 else self.builds[0]
