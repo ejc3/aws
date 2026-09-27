@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -73,7 +74,8 @@ class FakeEC2:
         iid = "i-%017x" % self.next
         self.next += 1
         tags = kw["TagSpecifications"][0]["Tags"]
-        self.instances.append({"InstanceId": iid, "Tags": tags, "LaunchTime": NOW, "State": {"Name": "pending"}})
+        self.instances.append({"InstanceId": iid, "Tags": tags, "LaunchTime": NOW, "State": {"Name": "pending"},
+                               "ClientToken": kw["ClientToken"]})
         self.launched.append(kw)
         return {"Instances": [{"InstanceId": iid}]}
 
@@ -406,35 +408,68 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT"), [])
         self.assertEqual(calls, [], "no GitHub call may start after the repo's deadline")
 
-    def backlog(self, app, jobs=50, spend_share_after_scan=False):
-        calls = []
+    def backlog(self, app, jobs=50, scan_uses_its_whole_share=False, share_ends_after=None):
+        """reconcile() over a queue of `jobs`, on a fake clock with 100 s left in the repo's share."""
+        clock, calls, scan_deadline = [1000.0], [], []
+        app.time = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+        app.DEADLINE[0] = clock[0] + 100
         app.repo_pat = lambda cfg: "PAT"
         app.reap = lambda repo, cfg, pat, instances, runners: []
         app.app_instances = lambda repo: []
         app.list_runners = lambda repo, pat: {}
         def queued(repo, cfg, pat):
-            if spend_share_after_scan:
-                app.DEADLINE[0] = 0   # the scan used up the repo's share
+            scan_deadline.append(app.DEADLINE[0] - clock[0])
+            if scan_uses_its_whole_share:
+                clock[0] = app.DEADLINE[0]
             return [(str(n), "s") for n in range(jobs)]
         app.queued_jobs = queued
         def ensure(repo, cfg, subnets, pat, job_id, size, live, token=None):
             calls.append(job_id)
+            if share_ends_after is not None and len(calls) >= share_ends_after:
+                clock[0] += 1000
             return ("launched" if len(calls) <= int(cfg["max"]) else "cap"), "tok"
         app.ensure_runner = ensure
-        return calls, app.reconcile(DOLPHIN, REPOS[DOLPHIN], ["subnet-a"])
+        return calls, app.reconcile(DOLPHIN, REPOS[DOLPHIN], ["subnet-a"]), scan_deadline
 
     def test_a_backlog_stops_at_the_cap(self):
         app, *_ = load_app()
-        calls, result = self.backlog(app)
+        calls, result, _ = self.backlog(app)
         cap = int(REPOS[DOLPHIN]["max"])
         self.assertEqual(len(calls), cap + 1, "every job after the first 'cap' would only repeat the same scans")
         self.assertEqual(result["outcomes"], {"launched": cap, "cap": 1})
 
     def test_a_backlog_stops_at_the_time_share(self):
         app, *_ = load_app()
-        calls, result = self.backlog(app, spend_share_after_scan=True)
-        self.assertEqual(calls, [], "no job may be processed after the repo's deadline")
-        self.assertEqual(result["outcomes"], {"deferred": 1})
+        calls, result, _ = self.backlog(app, share_ends_after=1)
+        self.assertEqual(calls, ["0"], "no job may be processed after the repo's deadline")
+        self.assertEqual(result["outcomes"], {"launched": 1, "deferred": 1})
+
+    def test_a_scan_that_uses_its_whole_budget_still_leaves_time_to_launch(self):
+        app, *_ = load_app()
+        calls, result, scan = self.backlog(app, scan_uses_its_whole_share=True)
+        self.assertEqual(scan, [50.0], "the scan gets half the share")
+        self.assertEqual(result["outcomes"]["launched"], int(REPOS[DOLPHIN]["max"]),
+                         "jobs the scan found must be launched, not dropped at the deadline")
+
+    def test_a_stale_snapshot_does_not_relaunch_a_listed_host(self):
+        # The invocation's `live` was taken before the host was listed; the claim-cleanup listing
+        # sees it. The job has a host: releasing the claim and launching again is a duplicate.
+        app, ec2, *_ = load_app()
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+        outcome, _ = app.ensure_runner(COLTON, REPOS[COLTON], app.config()[1], "PAT", "7", "xl", [])
+        self.assertEqual(outcome, "exists")
+        self.assertEqual(len(ec2.launched), 1)
+
+    def test_an_older_host_of_the_same_job_does_not_release_a_newer_claim(self):
+        app, ec2, *_ = load_app()
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+        first = ec2.instances[0]
+        first["State"]["Name"] = "terminated"   # the host died; the job is still queued
+        self.assertEqual(self.deliver(app)["outcome"], "launched")
+        ec2.instances = [first]   # the relaunch is not listed yet; only the dead host is
+        self.assertEqual(self.deliver(app)["outcome"], "claimed",
+                         "the dead host's JobId must not release the relaunch's claim")
+        self.assertEqual(len(ec2.launched), 2)
 
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()

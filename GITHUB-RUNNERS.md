@@ -668,7 +668,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
   keeps the claim. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
   claim is released and the error raised, so `github-app-runner-errors` fires.
-  Every attempt carries its own `ClientToken`, so the SDK's own retries cannot duplicate one.
+  Every attempt carries its own `ClientToken` (the claim's nonce plus an attempt number), so the
+  SDK's own retries cannot duplicate one.
 - **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
@@ -676,7 +677,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   with its `JobId`. Each repo has its own cap (8), counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
-  Once a launch is listed, in any state, its claim is dropped: a finished host frees its slot at once.
+  Each check takes the claims first, then a fresh listing, and counts a host by its state in that
+  listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
+  nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
+  of the same job never releases the claim of its relaunch.
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo and in total.
   `too-many-app-runners` fires above the combined cap; `github-app-runner-reconcile-silent` fires
@@ -691,8 +695,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
 - **Reconcile.** Every 2 minutes it reads every page of queued and in-progress runs and checks their
   jobs oldest run first (at most 120 GitHub calls a round, and each repo gets an equal share of
-  the invocation's time, first repo alternating), launches for queued jobs that have no
-  host, and reaps hosts
+  the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
+  so jobs it finds always have time to launch), launches for queued jobs that have no host,
+  oldest first, stopping at the repo's cap or the end of its share, and reaps hosts
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
 - **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
   existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own

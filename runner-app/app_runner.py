@@ -62,9 +62,11 @@ cloudwatch = boto3.client('cloudwatch', region_name=REGION)
 # A launch claim per job (table CLAIMS_TABLE) makes "one host per job" hold across
 # invocations. DescribeInstances is eventually consistent: a redelivery seconds after a launch
 # may not see the new host by its JobId tag yet. The claim is a conditional write, strongly
-# consistent, so exactly one invocation launches. A definite failure releases it so the next
-# round retries at once; an ambiguous one keeps it until CLAIM_SECONDS pass, by which time the
-# tag is visible if a host did start.
+# consistent, so exactly one invocation launches. Each claim carries a random nonce that
+# prefixes the ClientToken of every RunInstances attempt it makes, so the claim is released only
+# when THAT launch is listed -- never by an older host of the same job. A definite failure
+# releases it so the next round retries at once; an ambiguous one keeps it until CLAIM_SECONDS
+# pass, by which time the host is listed if one did start.
 CLAIM_SECONDS = 15 * 60
 METRIC_NAMESPACE = 'GitHubAppRunner'
 
@@ -226,14 +228,14 @@ def tag(instance, key):
     return next((t['Value'] for t in instance.get('Tags', []) if t['Key'] == key), None)
 
 
-def seen_jobs(repo):
-    """JobIds of every app runner EC2 still lists for this repo, in ANY state (terminated hosts
-    stay listed for about an hour). Once a launch is listed, its claim has done its job."""
+def listed_instances(repo):
+    """Every app runner EC2 still lists for this repo, in ANY state (terminated hosts stay listed
+    for about an hour). Once a claim's own launch is listed, its claim has done its job."""
     listed = ec2.get_paginator('describe_instances').paginate(Filters=[
         {'Name': 'tag:Role', 'Values': [ROLE]},
         {'Name': 'tag:Repo', 'Values': [repo]},
     ])
-    return {tag(i, 'JobId') for page in listed for r in page['Reservations'] for i in r['Instances']} - {None}
+    return [i for page in listed for r in page['Reservations'] for i in r['Instances']]
 
 
 def app_instances(repo):
@@ -265,22 +267,24 @@ def broker(instance_id, token, expires):
         ])
 
 
-def launch(repo, cfg, subnets, size, job_id, token):
+def launch(repo, cfg, subnets, size, job_id, token, nonce):
     """One spot VM for `size`, trying each subnet and instance type in order."""
     ami = ssm.get_parameter(Name=CANONICAL_AMI_PARAM)['Parameter']['Value']
     labels = f"{cfg['label']},{size}"
     data = user_data(repo, labels)
-    last_error = None
+    last_error, attempt = None, 0
     # Only these mean EC2 created nothing, so another pool is safe to try. Anything else -- a
     # timeout, a throttle, a 5xx -- may have launched an instance after all, so stop: the next
     # reconcile sees any host that did start (its JobId tag) and launches only if none did.
     for subnet in subnets:
         for instance_type in cfg['sizes'][size]:
+            attempt += 1
             try:
                 response = launch_ec2.run_instances(
                     # botocore's own retries resend these exact arguments, so one token per
                     # attempt makes a retried request return the instance it already created.
-                    ClientToken=str(uuid.uuid4()),
+                    # The claim's nonce prefixes it, which is how the claim finds its own host.
+                    ClientToken=f'{nonce}-{attempt}',
                     MinCount=1, MaxCount=1, ImageId=ami, InstanceType=instance_type,
                     NetworkInterfaces=[{
                         'DeviceIndex': 0, 'SubnetId': subnet['subnet_id'],
@@ -345,30 +349,32 @@ def launch(repo, cfg, subnets, size, job_id, token):
 
 # ---------------------------------------------------------------- policy
 def claim(repo, job_id):
-    """True if this invocation may launch for the job (see CLAIM_SECONDS)."""
-    t = int(now().timestamp())
+    """The claim's nonce if this invocation may launch for the job (see CLAIM_SECONDS), else None."""
+    t, nonce = int(now().timestamp()), uuid.uuid4().hex
     try:
         dynamodb.put_item(
             TableName=os.environ['CLAIMS_TABLE'],
-            Item={'repo': {'S': repo}, 'job': {'S': job_id}, 'expires_at': {'N': str(t + CLAIM_SECONDS)},
-                  'ttl': {'N': str(t + 86400)}},
+            Item={'repo': {'S': repo}, 'job': {'S': job_id}, 'nonce': {'S': nonce},
+                  'expires_at': {'N': str(t + CLAIM_SECONDS)}, 'ttl': {'N': str(t + 86400)}},
             ConditionExpression='attribute_not_exists(job) OR expires_at < :now',
             ExpressionAttributeValues={':now': {'N': str(t)}})
-        return True
+        return nonce
     except dynamodb.exceptions.ConditionalCheckFailedException:
-        return False
+        return None
 
 
 def active_claims(repo):
-    """Jobs this repo launched for (or is launching for) within CLAIM_SECONDS. A consistent read:
+    """{job: nonce} for the jobs this repo launched for (or is launching for) within
+    CLAIM_SECONDS. A consistent read:
     together with the serialized controller (reserved concurrency 1) it makes the repo cap hold
     even when DescribeInstances has not caught up with a burst of launches."""
-    t, found, page = int(now().timestamp()), set(), {}
+    t, found, page = int(now().timestamp()), {}, {}
     while True:
         response = dynamodb.query(
             TableName=os.environ['CLAIMS_TABLE'], ConsistentRead=True,
             KeyConditionExpression='repo = :repo', ExpressionAttributeValues={':repo': {'S': repo}}, **page)
-        found |= {item['job']['S'] for item in response.get('Items', []) if int(item['expires_at']['N']) >= t}
+        found.update({item['job']['S']: item.get('nonce', {}).get('S', '')
+                      for item in response.get('Items', []) if int(item['expires_at']['N']) >= t})
         if 'LastEvaluatedKey' not in response:
             return found
         page = {'ExclusiveStartKey': response['LastEvaluatedKey']}
@@ -383,28 +389,35 @@ def release(repo, job_id):
 
 def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     """Launch for `job_id` unless it already has a host or the repo is at its cap."""
-    if any(tag(i, 'JobId') == job_id for i in live):
+    # Claims first, then a fresh listing: every launch whose claim was read is, in that listing,
+    # either not yet visible (the claim stands in for it) or visible and counted by its real
+    # state. `live`, taken earlier in the invocation, is only added to that, never trusted alone.
+    claimed, listed = active_claims(repo), listed_instances(repo)
+    running = live + [i for i in listed if i.get('State', {}).get('Name') in LIVE_STATES]
+    if any(tag(i, 'JobId') == job_id for i in running):
         return 'exists', token
-    # A claim only stands in for a launch EC2 does not list yet. Once listed, in any state, the
-    # host counts by its real state (running -> in `live`; finished -> not at all) and the claim
-    # goes: short jobs do not hold cap slots, and a job whose host failed and terminated while it
-    # stayed queued is relaunched now rather than when the claim expires. Clean up FIRST, before
-    # deciding this job is "claimed".
-    claimed, listed = active_claims(repo), seen_jobs(repo)
-    for done in claimed & listed:
-        release(repo, done)
-    claimed -= listed
+    # A claim goes once ITS OWN launch is listed, in any state (its nonce prefixes the host's
+    # ClientToken): short jobs do not hold cap slots, and a job whose host failed and terminated
+    # while it stayed queued is relaunched now rather than when the claim expires. A claim with
+    # no listed host of its own -- even if an older host of the same job is listed -- stays.
+    # Clean up FIRST, before deciding this job is "claimed".
+    tokens = {i.get('ClientToken') or '' for i in listed}
+    for job, nonce in list(claimed.items()):
+        if nonce and any(t.startswith(nonce + '-') for t in tokens):
+            release(repo, job)
+            del claimed[job]
     if job_id in claimed:
         return 'claimed', token
-    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | claimed
+    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in running} | set(claimed)
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
-    if not claim(repo, job_id):
+    nonce = claim(repo, job_id)
+    if not nonce:
         return 'claimed', token
     try:
         token = token or registration_token(repo, pat)
-        instance_id, definite = launch(repo, cfg, subnets, size, job_id, token)
+        instance_id, definite = launch(repo, cfg, subnets, size, job_id, token, nonce)
     except Exception:
         # Anything raised here launched nothing: a failure before RunInstances (the token, the
         # AMI lookup) or a definite RunInstances refusal (LaunchRefused). Free the job for the
@@ -462,7 +475,17 @@ def reconcile(repo, cfg, subnets):
         return {'repo': repo, 'skipped': 'no controller token'}
     live = reap(repo, cfg, pat, app_instances(repo), list_runners(repo, pat))
     outcomes, token = {}, None
-    for job_id, size in queued_jobs(repo, cfg, pat):
+    # The scan gets half the remaining share, so jobs it finds always have time to launch: a
+    # queue big or slow enough to use the whole share would otherwise be found and dropped on
+    # every round.
+    share_end = DEADLINE[0]
+    if share_end != float('inf'):
+        DEADLINE[0] = time.monotonic() + max(0.0, share_end - time.monotonic()) / 2
+    try:
+        jobs = queued_jobs(repo, cfg, pat)
+    finally:
+        DEADLINE[0] = share_end
+    for job_id, size in jobs:
         # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
         # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
         if out_of_time():
