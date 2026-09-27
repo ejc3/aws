@@ -88,5 +88,8 @@ jobs:
       - name: Boot secrets stay out of traces, readable logs and command lines (offline)
         run: python3 -S -B scripts/test-boot-secret-hygiene.py
 
+      - name: Games multiplayer engine sweeper (offline)
+        run: python3 -S -B scripts/test-games-mp-sweeper.py
+
       - name: Greptile review settings and rule scopes (offline)
         run: python3 -S -B scripts/test-greptile-config.py
