@@ -648,6 +648,44 @@ poll that ran while a job's runner was booting put up a second host for the same
 whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
+## Pattern C — ephemeral x86 spot runners for other repos
+
+`CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` run on ordinary x86 spot VMs, not
+metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
+controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
+`runner-app/`).
+
+- **Routing.** The same front (`github-runner-webhook-front`) routes by `repository.full_name`
+  after the signature check. `ejc3/fcvm`, and deliveries naming no repository, take Pattern B's
+  path unchanged. The two served repos go to Lambda `github-app-runner`, `queued` only.
+  Anything else is answered and dropped.
+- **Labels.** A job is served only if every label it asks for is one these runners carry:
+  `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
+  (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
+- **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
+  to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
+  Any other launch error stops the round, because EC2 may have created an instance behind it.
+  Every attempt carries its own `ClientToken`, so the SDK's own retries cannot duplicate one.
+- **Dedupe and caps.** Each VM is tagged with its `JobId`, so a redelivery or a reconcile never
+  launches a second host for a job. Each repo has its own cap (8) and alarm
+  (`too-many-app-runners`), so neither can starve fcvm's.
+- **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
+  actions/runner (pinned, sha256-verified) and takes its registration token from
+  `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the
+  shared runner role can read only the parameter tagged with its own instance ARN. The token
+  reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
+  `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
+- **Reconcile.** Every 2 minutes it launches for queued jobs that have no host, and reaps hosts
+  that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
+- **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
+  existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own
+  bootstrap credential. Every writer on these (private) repos can run code here, so they must
+  not be made public while these runners are attached.
+- **Tokens.** Each repo's controller token is `github-runner/repo-pat/<owner>/<repo>`
+  (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
+  created with the same tokens through an `ephemeral` read, so the tokens never enter state.
+
 ## Controller-first credential migration
 
 The controller can classify both legacy PAT-reading user data and the instance-bound
@@ -819,7 +857,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
-| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write. Never in TF state: Terraform manages no version |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write. Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
@@ -859,8 +897,13 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
   for the cleanup claim and the webhook's conditional warm-host window and claim.
 - **`github-runner-webhook-front-role`**: its own Lambda logs and `lambda:InvokeFunction` on
-  the webhook's `delivery` alias only, with an explicit deny on invoking anything else. No
-  EC2, SSM, DynamoDB or PAT access.
+  exactly two targets, the webhook's `delivery` alias and `github-app-runner` (Pattern C),
+  with an explicit deny on invoking anything else. No EC2, SSM, DynamoDB or PAT access.
+- **`github-app-runner-lambda`** (Pattern C's controller): read the two per-repo tokens;
+  `RunInstances` only with Canonical images, into the runner subnets, with
+  `github-app-runner-sg`, IMDSv2 and tag `Role=github-app-runner`; terminate only instances
+  with that tag; pass only the runner role, only to EC2; write and delete only the
+  instance-bound `/github-runner/bootstrap/*` credential.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.

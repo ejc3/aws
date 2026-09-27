@@ -26,6 +26,7 @@ appears in user data.
 """
 import json
 import os
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -49,6 +50,11 @@ secrets = boto3.client('secretsmanager', region_name=REGION)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+
+
+# RunInstances errors that mean nothing was created (see launch()).
+CAPACITY_CODES = {'InsufficientInstanceCapacity', 'Unsupported', 'SpotMaxPriceTooLow',
+                  'InsufficientCapacityOnHost', 'UnfulfillableCapacity'}
 
 def now():
     return datetime.now(timezone.utc)
@@ -184,10 +190,16 @@ def launch(repo, cfg, subnets, size, job_id, token):
     labels = f"{cfg['label']},{size}"
     data = user_data(repo, labels)
     last_error = None
+    # Only these mean EC2 created nothing, so another pool is safe to try. Anything else -- a
+    # timeout, a throttle, a 5xx -- may have launched an instance after all, so stop: the next
+    # reconcile sees any host that did start (its JobId tag) and launches only if none did.
     for subnet in subnets:
         for instance_type in cfg['sizes'][size]:
             try:
                 response = ec2.run_instances(
+                    # botocore's own retries resend these exact arguments, so one token per
+                    # attempt makes a retried request return the instance it already created.
+                    ClientToken=str(uuid.uuid4()),
                     MinCount=1, MaxCount=1, ImageId=ami, InstanceType=instance_type,
                     NetworkInterfaces=[{
                         'DeviceIndex': 0, 'SubnetId': subnet['subnet_id'],
@@ -215,7 +227,12 @@ def launch(repo, cfg, subnets, size, job_id, token):
                     ])
             except Exception as error:
                 last_error = error
-                print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {type(error).__name__}")
+                code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
+                if code not in CAPACITY_CODES:
+                    print(f"{repo}: launch for job {job_id} ended ambiguously ({type(error).__name__} {code}); "
+                          'not trying another pool this round')
+                    return None
+                print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
                 continue
             instance_id = response['Instances'][0]['InstanceId']
             try:

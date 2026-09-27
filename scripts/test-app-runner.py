@@ -37,7 +37,10 @@ NOW = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
 
 
 class Refused(Exception):
-    pass
+    """A botocore-style ClientError: carries the EC2 error code where launch() reads it."""
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
 
 
 class FakeEC2:
@@ -59,6 +62,9 @@ class FakeEC2:
         return P()
 
     def run_instances(self, **kw):
+        self.attempts = getattr(self, "attempts", []) + [kw]
+        if getattr(self, "ambiguous", False):
+            raise TimeoutError("Read timeout on endpoint URL")
         if kw["InstanceType"] in self.refuse:
             raise Refused("InsufficientInstanceCapacity")
         iid = "i-%017x" % self.next
@@ -205,6 +211,21 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.deliver(app)["outcome"], "launched")
         self.assertEqual(ec2.launched[0]["InstanceType"], "c7i.16xlarge")
 
+    def test_an_ambiguous_launch_error_tries_no_other_pool(self):
+        # EC2 may have created an instance behind a timeout; another pool could be a duplicate.
+        app, ec2, *_ = load_app()
+        ec2.ambiguous = True
+        self.assertNotEqual(self.deliver(app)["outcome"], "launched")
+        self.assertEqual(len(ec2.attempts), 1, "an ambiguous error must not fall through to another pool")
+
+    def test_every_launch_attempt_carries_its_own_client_token(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse = {"c7a.16xlarge"}
+        self.deliver(app)
+        tokens = [kw.get("ClientToken") for kw in ec2.attempts]
+        self.assertTrue(all(tokens), "RunInstances without a ClientToken is not idempotent under SDK retries")
+        self.assertEqual(len(set(tokens)), len(tokens))
+
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
         ssm.fail_put = True
@@ -266,7 +287,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('sha256sum -c -', text)
         self.assertRegex(text, r"RUNNER_SHA256='[0-9a-f]{64}'")
         self.assertIn("--ephemeral", text)
-        self.assertIn("read -r t;", text, "the token must reach config.sh on stdin, not argv")
+        self.assertIn("ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh", text)
+        self.assertNotIn('--token "$t"', text, "the registration token must never be on config.sh argv")
         self.assertIn("ssm.delete_parameter(Name=name)", text)
         self.assertIn("@@REPO@@", text)
         self.assertIn("@@LABELS@@", text)

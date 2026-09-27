@@ -64,10 +64,12 @@ print(value)
 PY
 )
 
-# The token goes to config.sh on stdin, not argv, so it never shows in a process listing.
+# The token reaches config.sh as ACTIONS_RUNNER_INPUT_TOKEN, never as an argument: argv is
+# readable by every local process through /proc/<pid>/cmdline, and the token is live until
+# registration completes. Same as fcvm's bootstrap (runner-autoscale.tf).
 cd "$DIR"
 printf '%s' "$REG_TOKEN" | sudo -u runner -H bash -c \
-  'read -r t; ./config.sh --unattended --url "https://github.com/$1" --token "$t" --name "$2" --labels "$3" --ephemeral --disableupdate --work _work' \
+  'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work _work' \
   _ "$REPO" "$INSTANCE_ID" "$LABELS"
 unset REG_TOKEN
 
