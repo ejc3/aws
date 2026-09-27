@@ -194,6 +194,31 @@ class TerraformWiringTests(unittest.TestCase):
         block = re.search(r'Sid\s*=\s*"TagTasksAtLaunch".*?\n      \}', self.tf, re.S).group()
         self.assertIn('"ecs:CreateAction" = "RunTask"', block)
 
+    def sid_block(self, sid):
+        return re.search(r'Sid\s*=\s*"%s".*?\n      \}' % sid, self.tf, re.S).group()
+
+    def test_launcher_stops_only_match_tagged_tasks_in_the_cluster(self):
+        block = self.sid_block("StopOnlyMatchEngines")
+        self.assertRegex(block, r'Action\s*=\s*"ecs:StopTask"')
+        self.assertIn('"aws:ResourceTag/match" = "false"', block)
+        self.assertIn('"ecs:cluster" = aws_ecs_cluster.games.arn', block)
+        # No other launcher statement may grant StopTask.
+        policy = re.search(r'resource "aws_iam_role_policy" "games_mp_launcher" \{.*?\n\}', self.tf, re.S).group()
+        allows = [b for b in re.findall(r'\{\s*\n(?:(?!\n      \}).)*?Effect\s*=\s*"Allow".*?\n      \}', policy, re.S)]
+        self.assertEqual([b for b in allows if "ecs:StopTask" in b and "StopOnlyMatchEngines" not in b], [])
+
+    def test_router_is_denied_and_carries_the_denied_tag(self):
+        block = self.sid_block("NeverStopTheRouter")
+        self.assertRegex(block, r'Effect\s*=\s*"Deny"')
+        self.assertIn('"aws:ResourceTag/games-role" = "router"', block)
+        service = re.search(r'resource "aws_ecs_service" "games_mp_router" \{.*?\n\}', self.tf, re.S).group()
+        self.assertRegex(service, r'propagate_tags\s*=\s*"SERVICE"')
+        self.assertIn('"games-role" = "router"', service)
+
+    def test_router_accepts_a_list_of_envs(self):
+        self.assertIn('{ name = "MP_ENVS", value = join(",", var.mp_router_envs) }', self.tf)
+        self.assertRegex(self.tf, r'default\s*=\s*\["production", "preview"\]')
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

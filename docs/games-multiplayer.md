@@ -71,7 +71,7 @@ Everything runs from the jumpbox. Read each plan before applying it.
    | `MP_ROLE_ARN` | the launcher role. The contract's launcher reads `AWS_ROLE_ARN`, Vercel's convention, so set that to the same ARN until the two names are aligned |
    | `MP_CLUSTER`, `MP_SUBNETS`, `MP_ENGINE_SG`, `MP_REGION`, `MP_LAUNCHER`, `MP_PUBLIC_ENTRY` | as output |
    | `AWS_REGION` | `us-west-1`. Vercel otherwise sets it to the function's own region |
-   | `MP_TOKEN_KEYS` | the string from step 2, marked sensitive |
+   | `MP_TOKEN_KEYS` | the string from step 2, marked sensitive, in **Production and Preview only** (see below) |
 
    The project needs **Secure backend access with OIDC federation** on, in **Team** issuer
    mode. The launcher must call `awsCredentialsProvider({ roleArn })` **without** an
@@ -90,6 +90,34 @@ After a token-key change, restart the router so it reads the new value:
   `hardcap` + 10 minutes. If `hardcap` is missing or invalid, the limit is 2 hours, and
   `hardcap` is clamped to 4 hours.
 - The launcher can tag only at RunTask, so it can't extend a running task's cap later.
+- The launcher's StopTask works only on tasks that carry the `match` tag, so the lobby can
+  stop its own engines. It can never stop a router task: those are started by the ECS
+  service, carry no `match` tag, and carry `games-role=router`, which an explicit Deny
+  blocks.
+- Tagging tasks at launch needs the account's long task-ARN format. It is on by default
+  for current accounts. If RunTask with tags ever fails, check it (read-only) with
+  `aws ecs list-account-settings --effective-settings --name taskLongArnFormat --region us-west-1`.
+
+## Environments and the router
+
+One router serves every lobby environment. The lobby puts its env in each join token's
+`n`. The router accepts a token whose `n` is any value in `MP_ENVS`, which is
+`var.mp_router_envs` comma-joined, `production,preview` by default. `MP_ENV` is still set,
+to the primary env.
+
+This check is a correctness guard, not a security boundary: any lobby that holds
+`MP_TOKEN_KEYS` can mint a token with any `n`. The real boundary is which Vercel
+environments hold the key:
+
+- **Production and Preview hold it**, and the router accepts both.
+- **Development does not.** `vercel env pull` would otherwise write the signing key into a
+  `.env.local` on a laptop. Local development uses `MP_LAUNCHER=local` with its own
+  throwaway key, and never needs this router.
+
+The launcher role still trusts Development, so a laptop can start an ECS engine. Nobody
+could join that engine through the router, and the sweeper stops it at its cap. To let
+Development use the router after all, add `development` to `mp_router_envs` and give
+Development the key.
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26)
 

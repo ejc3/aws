@@ -47,9 +47,37 @@ variable "mp_router_desired_count" {
 }
 
 variable "mp_env" {
-  description = "MP_ENV for the router and engines. Join tokens carry `n`; the router rejects a token whose n differs, so this must match the lobby that mints them."
+  description = "Default MP_ENV baked into the engine task definitions (the launcher overrides it per match) and the router's primary env. The router accepts the whole of mp_router_envs."
   type        = string
   default     = "production"
+}
+
+# ONE router serves every lobby environment. A join token carries `n` (the minting lobby's
+# env); the router accepts a token whose n is any value in MP_ENVS. This is a correctness
+# guard (a token is only honoured by the deployment family that minted it), NOT a security
+# boundary: every lobby that holds MP_TOKEN_KEYS can mint a token with any n. The boundary
+# is which Vercel environments get MP_TOKEN_KEYS at all -- Production and Preview only.
+#
+# development is left out on purpose. A development lobby runs on a laptop from
+# `vercel env pull`; if it could mint router-accepted tokens, the signing key would have
+# to sit in a .env.local file on that laptop. Local development uses MP_LAUNCHER=local
+# and its own throwaway key instead, so it never needs this router. (The launcher role
+# still trusts development, so a laptop CAN start an ECS engine; nobody could join it
+# through the router, and the sweeper reaps it at its cap.)
+variable "mp_router_envs" {
+  description = "Token `n` values the router accepts (MP_ENVS, comma-joined). Must include var.mp_env."
+  type        = list(string)
+  default     = ["production", "preview"]
+
+  validation {
+    condition     = length(var.mp_router_envs) > 0 && alltrue([for e in var.mp_router_envs : can(regex("^[a-z0-9-]+$", e))])
+    error_message = "mp_router_envs must be a non-empty list of lowercase env names (no commas)."
+  }
+
+  validation {
+    condition     = contains(var.mp_router_envs, var.mp_env)
+    error_message = "mp_router_envs must include var.mp_env."
+  }
 }
 
 locals {
@@ -479,10 +507,49 @@ resource "aws_iam_role_policy" "games_mp_launcher" {
         }
       },
       {
-        Sid      = "InspectAndStopTasksInThisCluster"
+        # Read-only, so cluster-wide: the lobby may look at any task here, router included.
+        Sid       = "DescribeTasksInThisCluster"
+        Effect    = "Allow"
+        Action    = "ecs:DescribeTasks"
+        Resource  = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
+      },
+      {
+        # StopTask reaches ENGINE tasks only: ones in this cluster that carry the `match`
+        # tag, which the lobby sets on every RunTask, so its own cleanup of its own tasks
+        # works. Router tasks are started by the ECS service, never carry `match`, and so
+        # are outside this Allow. ecs:StopTask supports exactly two condition keys,
+        # aws:ResourceTag/${TagKey} and ecs:cluster, on the `task` resource
+        # (https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html,
+        # machine-readable: https://servicereference.us-east-1.amazonaws.com/v1/ecs/ecs.json,
+        # checked 2026-09-27). The launcher cannot add `match` to an existing task: its
+        # only TagResource grant is at RunTask creation (TagTasksAtLaunch), and router tasks
+        # are never created by its RunTask.
+        Sid      = "StopOnlyMatchEngines"
         Effect   = "Allow"
-        Action   = ["ecs:DescribeTasks", "ecs:StopTask"]
+        Action   = "ecs:StopTask"
         Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }
+          Null      = { "aws:ResourceTag/match" = "false" }
+        }
+      },
+      {
+        # Belt and braces for the router: its service propagates the service tag
+        # games-role=router onto every task it starts (aws_ecs_service.games_mp_router), and
+        # this Deny wins over any Allow. It keys on our own tag rather than the ECS-managed
+        # aws:ecs:serviceName tag because AWS does not document that aws:-prefixed managed
+        # tags are evaluated as aws:ResourceTag conditions; a condition on a key IAM never
+        # sees would silently match nothing. The launcher could stamp games-role on a task
+        # it launches itself, but that only stops IT from stopping that task; the sweeper
+        # has no such Deny and still reaps it.
+        Sid      = "NeverStopTheRouter"
+        Effect   = "Deny"
+        Action   = ["ecs:StopTask", "ecs:TagResource", "ecs:UntagResource"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/games-role" = "router" }
+        }
       },
       {
         # ListTasks is authorised against the cluster via the ecs:cluster condition.
@@ -790,7 +857,10 @@ resource "aws_ecs_task_definition" "games_mp_router" {
     portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
     environment = [
       { name = "PORT", value = tostring(local.mp_port) },
+      # MP_ENVS is what the router checks a token's `n` against (any listed value);
+      # MP_ENV stays for logs and for code that wants the primary env.
       { name = "MP_ENV", value = var.mp_env },
+      { name = "MP_ENVS", value = join(",", var.mp_router_envs) },
       { name = "MP_ALLOWED_ORIGINS", value = join(",", local.mp_allowed_origins) },
       { name = "MP_TARGET_CIDRS", value = join(",", [for s in local.mp_subnets : s.cidr_block]) },
     ]
@@ -829,7 +899,9 @@ resource "aws_ecs_service" "games_mp_router" {
   deployment_maximum_percent         = 200
   health_check_grace_period_seconds  = 30
   enable_ecs_managed_tags            = true
-  propagate_tags                     = "SERVICE"
+  # Copies the service tags below onto every router task. games-role=router is what the
+  # launcher's NeverStopTheRouter Deny keys on; do not drop it or the propagation.
+  propagate_tags = "SERVICE"
 
   deployment_circuit_breaker {
     enable   = true
@@ -852,7 +924,7 @@ resource "aws_ecs_service" "games_mp_router" {
   # ECS refuses to attach a target group that no load balancer uses yet.
   depends_on = [aws_lb_listener.games_play_https]
 
-  tags = { Name = "mp-router", Project = "games-multiplayer" }
+  tags = { Name = "mp-router", Project = "games-multiplayer", "games-role" = "router" }
 }
 
 # -------------------------------------------------------------------------------------
