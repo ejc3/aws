@@ -674,8 +674,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
   failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
   with its `JobId`. Each repo has its own cap (8), counted as the hosts `DescribeInstances` lists
-  plus the unexpired claims (a consistent read, and the controller is serialized), so a burst of
-  launches the listing has not caught up with still cannot pass it. Neither repo can starve fcvm's.
+  plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
+  is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
+  Once a launch is listed, in any state, its claim is dropped: a finished host frees its slot at once.
+  Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo and in total.
   `too-many-app-runners` fires above the combined cap; `github-app-runner-reconcile-silent` fires
   when no count arrives for 15 minutes, because then nothing is reaping. One repo's failure (a
@@ -687,7 +689,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   shared runner role can read only the parameter tagged with its own instance ARN. The token
   reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
   `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
-- **Reconcile.** Every 2 minutes it launches for queued jobs that have no host, and reaps hosts
+- **Reconcile.** Every 2 minutes it reads every page of queued and in-progress runs and checks their
+  jobs oldest run first (at most 120 GitHub calls a round), launches for queued jobs that have no
+  host, and reaps hosts
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
 - **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all. Jobs get the
   existing runner instance role: no PATs, no Secrets Manager, no parameter outside their own

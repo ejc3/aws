@@ -343,6 +343,54 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.deliver(app)["outcome"], "failed")
         self.assertEqual(app.fake_dynamo.deleted, [])
 
+    def test_a_finished_host_frees_its_cap_slot_at_once(self):
+        # Three short jobs launched and finished (listed as terminated) inside the claim window:
+        # their claims must not keep the repo "full".
+        app, ec2, *_ = load_app()
+        launched = []
+        for job in (1, 2, 3):
+            # The listing has not caught up with any of them yet, so all three claims stand.
+            self.assertEqual(self.deliver(app, repo=DOLPHIN, labels=("self-hosted", "dolphin", "l"), job=job)["outcome"], "launched")
+            launched += ec2.instances
+            ec2.instances = []
+        self.assertEqual(len(app.fake_dynamo.items), 3)
+        # Then they show up, already finished and terminated (a short job).
+        for i in launched:
+            i["State"]["Name"] = "terminated"
+        ec2.instances = launched
+        self.assertEqual(self.deliver(app, repo=DOLPHIN, labels=("self-hosted", "dolphin", "l"), job=4)["outcome"], "launched",
+                         "finished hosts' claims kept the repo at its cap")
+        self.assertEqual(len(app.fake_dynamo.deleted), 3, "listed launches release their claims")
+
+    def test_a_failed_cleanup_after_launch_keeps_the_claim(self):
+        app, ec2, ssm, _ = load_app()
+        ssm.fail_put = True
+        ec2.terminate_instances = lambda InstanceIds: (_ for _ in ()).throw(TimeoutError("terminate timed out"))
+        self.assertEqual(self.deliver(app)["outcome"], "failed")
+        self.assertEqual(app.fake_dynamo.deleted, [], "the host may be alive: releasing would allow a duplicate")
+
+    def test_the_queue_scan_reads_every_page(self):
+        app, *_ = load_app()
+        pages_seen = []
+        def github(method, path, pat, body=None):
+            pages_seen.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            if "/jobs" in path:
+                return {"jobs": [{"id": int(path.split("/runs/")[1].split("/")[0]) * 1000 + page,
+                                  "status": "queued", "labels": ["self-hosted", "dolphin", "l"]}]}
+            # Newest first, as GitHub lists them: pages 1-2 are 200 newer runs, page 3 the oldest.
+            if "status=queued" in path and page <= 2:
+                return {"workflow_runs": [{"id": page * 100 + n, "created_at": f"2026-09-27T1{page}:00:{n:02d}Z"}
+                                          for n in range(100)]}
+            if "status=queued" in path:
+                return {"workflow_runs": [{"id": 999, "created_at": "2026-09-27T09:00:00Z"}]}
+            return {"workflow_runs": []}
+        app.github = github
+        jobs = app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT")
+        self.assertIn("999001", [j for j, _ in jobs], "the oldest run, on page 3, was never inspected")
+        jobs_calls = [p for p in pages_seen if "/jobs" in p]
+        self.assertIn("/runs/999/", jobs_calls[0], "the oldest run must be inspected first")
+
     def test_a_failed_credential_handoff_terminates_and_tries_nothing_else(self):
         app, ec2, ssm, _ = load_app()
         ssm.fail_put = True

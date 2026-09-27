@@ -43,7 +43,9 @@ BOOT_GRACE = timedelta(minutes=int(os.environ.get('BOOT_GRACE_MINUTES', '10')))
 IDLE_LIMIT = timedelta(minutes=int(os.environ.get('IDLE_MINUTES', '10')))
 MAX_LIFETIME = timedelta(minutes=int(os.environ.get('MAX_LIFETIME_MINUTES', '180')))
 VOLUME_GB = int(os.environ.get('VOLUME_GB', '80'))
-RUNS_PER_STATUS = 30
+# GitHub calls one reconcile may spend listing runs and jobs (queued_jobs()). Every 2 minutes
+# per repo, 120 calls is at most 3,600/hour, inside the token's 5,000.
+SCAN_CALL_BUDGET = 120
 
 ec2 = boto3.client('ec2', region_name=REGION)
 # RunInstances only, with botocore's own retries off, as in the metal controller
@@ -144,14 +146,38 @@ def job_size(cfg, labels):
     return size
 
 
+def pages(repo, path, key, pat, budget):
+    """Every item under `key` across a paginated GitHub list, 100 per page, while the shared
+    call budget lasts (budget is a one-element list so callers share it)."""
+    page = 1
+    while budget[0] > 0:
+        budget[0] -= 1
+        sep = '&' if '?' in path else '?'
+        items = github('GET', f'{path}{sep}per_page=100&page={page}', pat).get(key) or []
+        yield from items
+        if len(items) < 100:
+            return
+        page += 1
+    print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
+
+
 def queued_jobs(repo, cfg, pat):
-    """[(job_id, size)] for this repo's queued jobs that ask for our labels."""
-    found, seen = [], set()
+    """[(job_id, size)] for this repo's queued jobs that ask for our labels.
+
+    Every page of queued and in-progress runs (one call per 100 runs), then each run's jobs
+    OLDEST run first: a job whose delivery was lost or whose first launch was refused is the one
+    most at risk of waiting, and must be found however many newer runs there are. Bounded by
+    SCAN_CALL_BUDGET calls per reconcile (well inside 5,000/hour).
+    """
+    found, seen, budget, runs = [], set(), [SCAN_CALL_BUDGET], {}
     for status in ('queued', 'in_progress'):
-        runs = github('GET', f'/repos/{repo}/actions/runs?status={status}&per_page={RUNS_PER_STATUS}', pat)
-        for run in (runs.get('workflow_runs') or [])[:RUNS_PER_STATUS]:
-            jobs = github('GET', f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100", pat)
-            for job in jobs.get('jobs') or []:
+        for run in pages(repo, f'/repos/{repo}/actions/runs?status={status}', 'workflow_runs', pat, budget):
+            runs[run['id']] = run
+    for run in sorted(runs.values(), key=lambda r: (r.get('created_at') or '', r['id'])):
+        if budget[0] <= 0:
+            print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
+            break
+        for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
                 if job.get('id') in seen or job.get('status') != 'queued':
                     continue
                 seen.add(job.get('id'))
@@ -186,6 +212,16 @@ def registration_token(repo, pat):
 # ---------------------------------------------------------------- EC2
 def tag(instance, key):
     return next((t['Value'] for t in instance.get('Tags', []) if t['Key'] == key), None)
+
+
+def seen_jobs(repo):
+    """JobIds of every app runner EC2 still lists for this repo, in ANY state (terminated hosts
+    stay listed for about an hour). Once a launch is listed, its claim has done its job."""
+    listed = ec2.get_paginator('describe_instances').paginate(Filters=[
+        {'Name': 'tag:Role', 'Values': [ROLE]},
+        {'Name': 'tag:Repo', 'Values': [repo]},
+    ])
+    return {tag(i, 'JobId') for page in listed for r in page['Reservations'] for i in r['Instances']} - {None}
 
 
 def app_instances(repo):
@@ -278,7 +314,12 @@ def launch(repo, cfg, subnets, size, job_id, token):
                 # EC2 accepted it; without its credential it can only idle. Never launch another
                 # type for the same job: the reconcile retries once this one is gone.
                 print(f'{repo}: bootstrap credential for {instance_id} failed ({type(error).__name__}); terminating')
-                ec2.terminate_instances(InstanceIds=[instance_id])
+                try:
+                    ec2.terminate_instances(InstanceIds=[instance_id])
+                except Exception as cleanup:
+                    # The host may still be alive: an ambiguous outcome, so the claim must stay.
+                    print(f'{repo}: could not terminate {instance_id} ({type(cleanup).__name__}); keeping the claim')
+                    return None, False
                 try:
                     ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
                 except Exception:
@@ -335,8 +376,13 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None):
     claimed = active_claims(repo)
     if job_id in claimed:
         return 'claimed', token
-    # Hosts the listing shows, plus launches it may not show yet (their claims).
-    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | claimed
+    # A claim only stands in for a launch EC2 does not list yet. Once listed, in any state, the
+    # host counts by its real state (running -> in `live`; finished -> not at all) and the claim
+    # goes, so short jobs do not hold cap slots for CLAIM_SECONDS after they end.
+    listed = seen_jobs(repo)
+    for done in claimed & listed:
+        release(repo, done)
+    in_use = {tag(i, 'JobId') or i['InstanceId'] for i in live} | (claimed - listed)
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
