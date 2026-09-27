@@ -349,6 +349,9 @@ resource "aws_lambda_function" "runner_app" {
   handler          = "app_runner.handler"
   runtime          = "python3.12"
   timeout          = 120
+  # The first reconcile used 104 of the default 128 MB (boto3 alone is most of it); a larger
+  # listing would run out. 256 MB also doubles the CPU share, which shortens every round.
+  memory_size = 256
 
   # One decision at a time, so two deliveries for the same job cannot both launch.
   reserved_concurrent_executions = 1

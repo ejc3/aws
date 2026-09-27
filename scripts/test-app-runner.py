@@ -932,6 +932,10 @@ class FrontTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
+    def test_the_controller_has_room_beyond_its_first_measured_memory(self):
+        block = APP_TF.split('resource "aws_lambda_function" "runner_app"', 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(block, r"memory_size\s*=\s*256", "104 of 128 MB was used by an empty reconcile")
+
     def test_pools_are_x86_only_and_diversified(self):
         sizes = re.search(r"runner_app_sizes = \{(.*?)\n  \}", APP_TF, re.S).group(1)
         for size, types_ in re.findall(r"(\w+)\s*=\s*\[([^\]]+)\]", sizes):
