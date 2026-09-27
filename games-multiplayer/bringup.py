@@ -294,8 +294,10 @@ def cmd_build(args):
             {"name": "GAMES_MP_SHA12", "value": args.ref[:12], "type": "PLAINTEXT"},
         ],
     }
-    started = aws("codebuild", "start-build", "--region", args.region, "--cli-input-json", "file:///dev/stdin",
-                  input_text=json.dumps(request))
+    # Inline, not file:///dev/stdin: AWS CLI v2 rejects --cli-input-json read from stdin
+    # ("Invalid JSON received", even for "{}"), which failed the first jumpbox apply
+    # (2026-09-27). The request holds no secret: a project name, an S3 key, image tags.
+    started = aws("codebuild", "start-build", "--region", args.region, "--cli-input-json", json.dumps(request))
     build_id = started["build"]["id"]
     log("CodeBuild %s started" % build_id)
     deadline = CLOCK() + args.timeout
