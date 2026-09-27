@@ -1020,6 +1020,131 @@ Still open (accepted for now):
   executes privileged code and has an instance-bound AWS identity, so untrusted PRs
   must not be automatically approved for self-hosted CI.
 
+## Threat model: runners for other repos
+
+Runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` (Pattern C,
+`runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
+second place people outside the owner run code on AWS resources we manage. Every writer on
+those repos, and every bot that opens pull requests there (for example
+`app/dolphin-refresh-bot`), can run any command on a runner VM by editing a workflow. Treat
+every job as hostile. Checked against the code and live state on 2026-09-27, after #172 was
+applied: the controller, its schedule, both webhooks and the alarms exist, and its first
+reconcile ran clean.
+
+**What a malicious job can do**
+
+- **Anything on its own VM, as root.** The runner has passwordless sudo, as GitHub-hosted
+  runners do (the workflows install packages). The VM is ephemeral: one job, then it powers
+  off and terminates. A job can keep it alive past its end, but the reconcile reaps any host
+  that has sat idle for 10 minutes or is older than 3 hours.
+- **Reach the internet.** Egress is unrestricted, and no inbound rule exists
+  (`github-app-runner-sg`), so nothing can connect to a job from outside, or from another job.
+- **Use the instance role through the metadata service.** App runners share
+  `github-runner-instance-role` with fcvm's metal runners. Live, that role can: read and delete
+  only the bootstrap credential tagged with its own instance ARN; get and put its own row in
+  the `github-runner-registration` DynamoDB table; `ec2:DescribeNetworkInterfaces` across the
+  account; assign IPv6 addresses to tagged runner ENIs; write objects under
+  `ejc3-security-records-928413605543/sessions/*` (the session-audit prefix); and run the SSM
+  agent. It cannot read any PAT, Secrets Manager secret, or other SSM parameter.
+- **Reach fcvm's metal runners' SSH port.** They share the runner VPC, and fcvm's runner
+  group admits SSH from the whole VPC CIDR. They accept only the admin and dev-to-runner keys,
+  neither of which is on an app runner.
+
+**What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
+only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
+with the secrets' resource policies); read another job's registration token (instance-bound);
+connect to another runner of the same kind (no inbound); reach the admin fleet over a private
+route (the runner VPC is not peered with it); launch or stop instances. A job does have the
+internet, so it can reach the admin fleet's public endpoints like anyone else: SSH and Eternal
+Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-only, and the
+shared instance role can list every ENI in the account to find them (#175 gives app runners
+their own role without it). That is an internet attacker's access, not more.
+
+**Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
+every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
+detects the controller launching past its caps, not the caps being reached (8 + 8 is normal
+saturation and does not alarm). The reconcile terminates any VM older than 3 hours, but only
+while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own
+shutdown, and if the reconcile stops, `github-app-runner-errors` or
+`github-app-runner-reconcile-silent` fires and the VM runs until someone terminates it. With
+reaping working, the worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
+
+**Shutting it off**
+
+1. Set the repo's `max` to 0 in `runner-app.tf` and apply: no new VMs, even from the reconcile,
+   which launches for queued jobs without any webhook.
+2. Terminate what is running (add `Name=tag:Repo,Values=<owner>/<repo>` for one repo):
+
+   ```bash
+   ids=$(aws ec2 describe-instances --region us-west-1 \
+     --filters Name=tag:Role,Values=github-app-runner Name=instance-state-name,Values=pending,running,stopping,stopped \
+     --query 'Reservations[].Instances[].InstanceId' --output text)
+   [ -n "$ids" ] && aws ec2 terminate-instances --region us-west-1 --instance-ids $ids
+   ```
+3. Remove the hooks while Terraform can still read the tokens it deletes them with:
+   `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
+   -target='github_repository_webhook.runner_app_dolphin_labs[0]'`, then commit
+   `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
+   does not work: it also drops the token reads, so the providers have no credentials to
+   delete with. The repo's owner can instead revoke its controller token in GitHub, which
+   stops registration outright; plans then fail at that repo's provider until its hook is
+   gone from GitHub and from state, and the gate is off. The gate covers both repos, so:
+
+   1. An administrator, on a jumpbox, reads the hook URL and gives it to the repo's owner:
+      `terraform output -raw runner_webhook_url` (not a secret; GitHub shows it to the repo's
+      admins).
+   2. The owner deletes the hook with their own `gh` login on their own account (CoderColton
+      for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin for
+      `dolphin-labs`), and confirms it is gone. Their login never leaves their account:
+
+      ```bash
+      set -euo pipefail
+      R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
+      URL='<from step 1>'
+      ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
+      [ -n "$ID" ] || { echo "no hook with that URL" >&2; exit 1; }
+      gh api -X DELETE "repos/$R/hooks/$ID"
+      gh api "repos/$R/hooks" --jq "[.[] | select(.config.url == \"$URL\")] | length"   # must print 0
+      ```
+
+   3. Only after the owner reports `0`, the administrator drops it from state on the jumpbox:
+      `terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'` (or
+      `_dolphin_labs`). Dropping it before then would leave a live hook unmanaged.
+   4. Remove the other repo's hook while its token still works:
+      `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'` (or
+      `_colton_games`). No other resource then uses the revoked repo's provider.
+   5. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
+      would read the revoked token again and try to recreate the deleted hook.
+
+**A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
+open a pull request from a fork. Require approval for workflows from all outside
+collaborators, with the owner's `gh` login (`durablerun` is `first_time_contributors` today):
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+gh api repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval   # check
+```
+
+Also have the controller refuse jobs whose run comes from a fork (the run's
+`head_repository`), never serve `pull_request_target`, and give the repo its own cap and alarm.
+
+**Open gaps, most severe first**
+
+1. App runners share fcvm's instance role, so a job can write into the session-audit prefix
+   of the security-records bucket, enumerate every network interface in the account, and
+   write its own row in fcvm's registration table; any grant added for fcvm runners reaches
+   them too. Fix, in #175: a dedicated instance role for app runners that can only consume
+   its own bootstrap credential.
+2. fcvm's runner security group admits SSH from the whole runner VPC. Fix, in #175: allow
+   runner-to-runner SSH only from fcvm's own runner group.
+3. `too-many-app-runners` watches only the combined total, so one repo over-launching past its
+   own cap is invisible while the other is idle. Fix, in #175: a per-repo alarm at each
+   repo's cap.
+4. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
+   `dolphin-labs` 2027-09-28. That repo's runners stop registering when its token expires;
+   renew each before then (Regenerate in GitHub keeps its permissions).
+
 ## Operating it
 
 ### Temporary runner credential-boundary acceptance

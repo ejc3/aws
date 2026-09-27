@@ -167,6 +167,59 @@ until they update.
 
 ## Emergency switches
 
+To take the platform off the internet, fastest first:
+
+- **No new matches.** The launcher role is the lobby's only way to start a task. Break-glass
+  (AGENTS.md allows documented recovery): attach a deny-all inline policy, then record it and
+  remove it by hand afterwards, because Terraform does not manage other inline policies on the
+  role and would leave it in place:
+
+  ```bash
+  aws iam put-role-policy --role-name games-mp-launcher --policy-name emergency-deny \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
+  ```
+
+- **Stop running engines.** Tell the router apart by its task-definition family,
+  `games-mp-router`, never by `group` or tags: a `RunTask` caller chooses both, so a malicious
+  engine started with `group=service:mp-router` would survive a group-based filter. The family is
+  the one thing the launcher cannot use (it is denied `RunTask` on it), which is also why the
+  sweeper keys on it (`games-multiplayer/sweeper.py`).
+
+  An IAM deny takes a little while to apply everywhere, and a compromised launcher can start
+  tasks until it does, so one pass is not enough: repeat until three passes in a row, 20
+  seconds apart, find nothing but the router.
+
+  ```bash
+  # A failed AWS call must never count as a quiet pass: it resets the count instead.
+  quiet=0
+  while [ "$quiet" -lt 3 ]; do
+    found=0
+    if ! tasks=$(aws ecs list-tasks --region us-west-1 --cluster games --query 'taskArns[]' --output text); then
+      echo "list-tasks failed; not a quiet pass" >&2; found=1; tasks=
+    fi
+    for t in $tasks; do
+      td=$(aws ecs describe-tasks --region us-west-1 --cluster games --tasks "$t" \
+        --query 'tasks[0].taskDefinitionArn' --output text) || { echo "describe failed: $t" >&2; found=1; continue; }
+      case "${td##*/}" in
+        games-mp-router:*) ;;
+        *) aws ecs stop-task --region us-west-1 --cluster games --task "$t" >/dev/null \
+             || echo "stop failed: $t" >&2
+           found=1 ;;
+      esac
+    done
+    if [ "$found" -eq 0 ]; then quiet=$((quiet + 1)); else quiet=0; fi
+    sleep 20
+  done
+  ```
+
+- **Close the public entry.** Commit `mp_router_desired_count` defaulting to `0`
+  (`games-multiplayer.tf`) and apply it from main: the router stops, the ALB answers 503 and no
+  connection reaches an engine. A one-shot `terraform apply -var mp_router_desired_count=0`
+  acts faster, but the next ordinary apply restarts the router; use it only together with that
+  commit.
+
+Other switches:
+
 - **`games_mp_build = false`** stops CodeBuild runs. The task definitions then use
   `mp_router_image_tag` and `mp_engine_image_tags` exactly as given, and those tags must
   already be in ECR. Use it when GitHub or CodeBuild is down and a known-good image must be
@@ -205,6 +258,112 @@ are Production and Preview only. Preview origins
 (`https://colton-games-<hash>-coltons-projects-7f9a4e8b.vercel.app` and the
 `colton-games-git-<branch>-...` aliases) match the router's `MP_ALLOWED_ORIGINS` entry
 `https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app`, where `*` is one DNS label.
+
+## Security design and threat model
+
+This is the first surface where people outside the family reach AWS resources we run. The
+site at `cc-games.app` is public, so anyone can ask the lobby for a match, and
+`play.cc-games.app` is an internet-facing ALB with no Cloudflare or Access in front. Checked
+against the code and live state on 2026-09-27 unless marked otherwise.
+
+**The chain, and what each hop checks**
+
+1. **Browser → ALB** (`games-multiplayer.tf`, `aws_lb.games_play`). Ports 80 and 443 from
+   anywhere, IPv4 and IPv6; 80 only redirects. TLS policy `ELBSecurityPolicy-TLS13-1-2-2021-06`,
+   `drop_invalid_header_fields = true`. **No WAF** (live: `get-web-acl-for-resource` returns
+   none).
+2. **ALB → mp-router** (`aws_ecs_service.games_mp_router`). The router's security group admits
+   only the ALB. The router (games repo `server/mp-router/`) requires a valid join token,
+   checks `Origin` against `MP_ALLOWED_ORIGINS` (live: the three production hosts and
+   Colton's preview pattern; no-`Origin` clients are refused because `MP_ALLOW_NO_ORIGIN` is
+   unset), and limits each client to 20 open connections and 50 requests/s (burst 100). The
+   client address is the one the ALB appended to `X-Forwarded-For` (`MP_TRUSTED_HOPS=1`), so
+   a client cannot spoof it; IPv6 clients are limited per /64.
+3. **Join token.** HMAC-SHA256 with the keys in `games/mp-token-keys`, bound to one match,
+   one environment and one seat, and valid for two minutes. The key is symmetric, so everything
+   that verifies a token can also mint one: the Vercel lobby (`MP_TOKEN_KEYS` on Production and
+   Preview) and the router, which gets the key as `MP_TOKEN_KEYS` to check tokens. The router's
+   execution role and administrators are the only AWS readers (secret policy,
+   `games-multiplayer.tf`).
+4. **Router → engine.** The router forwards only to addresses inside `MP_TARGET_CIDRS`
+   (the two engine subnets), and its security group's egress reaches only the engine group on
+   8080 plus HTTPS. The engine group admits only the router, which is why an engine may trust
+   the router's `X-MP-*` identity headers.
+5. **Lobby → AWS.** Vercel functions exchange a Vercel OIDC token for the `games-mp-launcher`
+   role; no AWS key is stored. The trust is exactly project `colton-games` in team
+   `coltons-projects-7f9a4e8b`, environments `production` and `preview` only. The role can
+   `RunTask` only `games-*` task definitions in cluster `games` (live simulation: engine
+   allowed, router **explicitly denied**), pass only the two engine roles, tag only at launch,
+   and stop only `match`-tagged tasks. It cannot read any secret (simulated). Its only EC2 access
+   is read-only `ec2:DescribeNetworkInterfaces`, on every ENI in us-west-1
+   (`ReadTaskNetworkInterfaces`, games-multiplayer.tf), which the launcher uses to find an
+   engine's address; it exposes the region's ENI inventory to a compromised deployment.
+6. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
+   a public IPv4 for outbound traffic and have **unrestricted egress**; inbound is router-only
+   (for engines the lobby launches: the caller picks each task's security groups, below).
+   The container runs as root with a writable root filesystem.
+
+**What an attacker can and cannot do**
+
+| Attacker | Can | Cannot |
+| --- | --- | --- |
+| Anyone on the internet | Reach the ALB and router; hold connections open (idle timeout 3600 s); consume the router's single 0.25 vCPU with a distributed flood | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host |
+| A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
+| A compromised Vercel deployment, or code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Call `RunTask` with any container override (IAM cannot restrict overrides), including `taskRoleArn`: the launcher may pass the engine execution role too, so a task can run *with* it and read every engine ECR repository and write engine logs; run arbitrary commands in an engine image with open egress, **as many as the account's Fargate quota allows** (4,000 vCPU, about 2,000 engines), each until the sweeper stops it (about 4h15 at most, and only while sweeps and `StopTask` succeed); choose each task's subnets and security groups (`RunTask`'s network configuration has no IAM condition), so attach the router's group, which every engine admits, to reach any engine directly, or the ALB's group with a public IP to serve its own ports to the internet; read the lobby's Supabase data; list every ENI in us-west-1 (read-only `ec2:DescribeNetworkInterfaces`) | Run the router's task definition; stop the router; pass any other role; read AWS secrets; change anything in EC2; touch other accounts |
+| A compromised router (it parses internet input) | Mint valid join tokens for any match (it holds the HMAC key), so join any match as any seat; see and drop every player's traffic; reach every engine | Launch or stop tasks; read other secrets (its execution role reads only its key); connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
+| A compromised engine | Reach the internet; reach other hosts in the same subnets on ports their groups allow (SSH and ET, which are already public); reach the I/O box's NFS export over the inter-region peer (TCP 2049 is admitted from all of 10.0.0.0/16, read-write, root-squashed) and read, fill or poison the shared scratch; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role, for engines the lobby launches honestly; see the row above for a task given the execution role); reach another engine (router-only ingress, unless it was launched with the router's group, above) |
+
+**Cost-abuse limits, and what happens at each**
+
+- **Lobby admission (games repo, enforced in SQL; not set by Terraform).** At most
+  `MP_MAX_ACTIVE_MATCHES` (default 20) unfinished matches per environment; per client
+  `MP_IP_MAX_ACTIVE` (3) unfinished and `MP_IP_MAX_PER_HOUR` (10) launches; one unfinished
+  seat per player. At the limit the lobby answers `429 launch-limit` or `503 capacity`.
+  Saturated by many clients, that is at most 40 engines (20 per environment), about $3.80/hour.
+  Today production exposes only the hidden `mptest` game, which needs `MP_TEST_KEY`, so the
+  public cannot launch anything yet.
+- **Per-match caps.** Each engine exits at its own `hardCapSec` (30 minutes for `mptest`);
+  the sweeper stops any task at `hardcap` + 10 minutes (the hardcap itself clamped to 4 hours), or 2
+  hours + 10 minutes without a valid tag, plus up to one sweep interval. That is a bound only
+  while sweeps and `StopTask` succeed: a failed stop is caught and alerted, and the task keeps
+  running until someone intervenes. Two alarms page if the sweeper errors or stops running.
+- **No AWS-side limit on how many engines run at once.** A caller holding the launcher's
+  credentials is limited only by the Fargate quota. Fargate bills under ECS, so the existing
+  `high-ec2-spend` alarm (EC2 only) does not see it; the account-wide $200/day budget does, but
+  billing data arrives hours late. This is the top open gap (below).
+
+**Monitoring.** Sweeper errors and silence (`games-mp-sweeper-errors`,
+`games-mp-sweeper-not-running`), the account's daily budget, and router and engine logs in
+CloudWatch (14-day retention). ALB access logs are **off** (live), so there is no
+request-level HTTP record; the VPC flow log (`aws_flow_log.security_main`, all traffic, archived
+to the security-audit bucket under `vpc-flow/`) still records every connection to the ALB's
+network interfaces by source address and port. The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
+client-address logic relies on. There is no alarm on router health, ALB 5xx, or the number of
+running engines.
+
+**Open gaps, most severe first** (not yet fixed; see the review for each):
+
+0. The launcher's caller picks each task's subnets, security groups and task role, which IAM
+   cannot restrict: a compromised deployment can put a task in the router's group (trusted by
+   every engine), in the ALB's group with a public IP, or run it with the engine execution
+   role (ECR reads, log writes). Fix: launch through an AWS-controlled path that sets all of
+   these itself (a launch Lambda the launcher may only invoke).
+1. No AWS-side cap on concurrent engines, and no ECS spend alarm. Fix: the sweeper stops the
+   newest engines beyond a ceiling every minute and publishes the count; an alarm on that
+   count and on ECS `EstimatedCharges`.
+2. No WAF or rate-based rule on the ALB; one 0.25 vCPU router with no autoscaling; no ALB
+   access logs. Fix: a WAFv2 web ACL with a per-IP rate rule and AWS managed rules; two router
+   tasks with target-tracking autoscaling; ALB access logs to S3; alarms on healthy hosts and 5xx.
+3. The lobby's admission limits live in the games repo's defaults. Pin them in the Vercel env
+   from Terraform.
+4. Engines share the admin VPC's subnets with unrestricted egress, run as root, and receive the
+   preview protection-bypass secret; from those subnets they reach the I/O box's read-write NFS
+   export over the peer. Fix: dedicated engine subnets with egress limited to what engines
+   need, the I/O box's NFS rule narrowed to the hosts that mount it, a non-root read-only
+   container, and callbacks that do not need the bypass.
+5. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
+   private key only the lobby holds and verify with its public key in the router (Ed25519),
+   so a compromised router can no longer mint tokens.
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
 

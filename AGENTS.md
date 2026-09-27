@@ -330,15 +330,17 @@ The long-lived development and administration instances are:
 | jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
 | fcvm-metal-arm | c7gd.metal (64 vCPU) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
-| nextjs-dev | t4g.medium (2 vCPU / 4GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
+| nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
 reported `capacity-not-available` and the kids' URLs were simply down with no ETA. Spot
 placement score was 3/10 in every US region and for every alternative instance type, so
-neither moving region nor changing family was a way out. Sized down large -> medium so the
-durable option costs about what the unreliable one did (~$29/mo vs ~$24/mo spot).
+neither moving region nor changing family was a way out. It was first sized down large ->
+medium so the durable option cost about what the unreliable one did (~$29/mo vs ~$24/mo spot),
+then doubled to t4g.xlarge on 2026-09-15 (#139) once four accounts shared it: at 4 GB it paged
+until the disk saturated.
 
 ### Shape of the shared-box design
 
@@ -466,9 +468,23 @@ reflog movement and dirty worktrees seed checkouts automatically. Do not use Cla
 `history.jsonl` as the activity signal: `claude-code-sync` merges it across ARM and x86;
 the launcher reads it only as a bounded index of possible nested roots and still requires
 host-local Git activity. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
-uses t-claude's default path-derived sessions. It is guarded by a verified pinned
-t-claude implementation and live `claude auth status`, so credentials remain personal and
-Terraform never seeds or copies them.
+uses t-claude's default path-derived sessions. t-claude follows its `main` branch, so the unit
+is guarded by an integrity check (`zsh -n` on the installed file) rather than a fixed hash,
+and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
+copies them.
+
+Every folder that gets a window at boot also gets a Codex thread, so it shows up in the Codex
+app: `fcvm-codex-seed.service` reads the launcher's list (`~/.local/state/fcvm-claude/repos`)
+and seeds one message per folder through the running Codex daemon, and a timer retries until
+Codex is logged in. nextjs-dev does the same per user with `codex-seed@<user>`, for
+`local.nextjs_codex_seed_users` only (Colton, Connor and ejc3). A folder that already has a
+thread is only checked.
+
+The tmux these sessions run is `tmux-scroll` (t-claude prefers it), pinned by release tag and
+sha256 in `tmux-scroll.tf`: the metal updater, nextjs-dev's setup and a one-shot SSM install on
+both jumpboxes all use that one pin. **Exception: fcvm-metal-x86.** The pinned release has only
+an aarch64 build, so the x86 box keeps whatever tmux-scroll it already has (its updater logs "no
+pinned build for x86_64") until an x86_64 asset is published and pinned.
 
 All metal repositories run as `ubuntu` and therefore share one tmux server. Keep one
 aggregate systemd service and one cgroup; do not create per-repository units. Stopping or
