@@ -56,11 +56,25 @@ data "archive_file" "runner_webhook" {
       import hashlib
       import base64
       import zlib
+      import re
+      import time
       import urllib.request
+      from botocore.config import Config
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
+      # RunInstances only, with botocore's own retries off. A spot pool with no
+      # capacity answers InsufficientInstanceCapacity, and the default client
+      # retried that same pool four times with backoff ("reached max retries: 4"):
+      # on 2026-09-13 one exhausted pool cost 7 to 15 seconds, and two or three of
+      # them ran invocations into the 30-second timeout while this function's one
+      # execution was held and the deliveries arriving meanwhile were throttled.
+      # The launcher moves on to the next pool itself.
+      launch_ec2 = boto3.client('ec2', region_name='us-west-1',
+                                config=Config(retries={'total_max_attempts': 1}))
       ssm = boto3.client('ssm', region_name='us-west-1')
+      dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
 
@@ -81,6 +95,42 @@ data "archive_file" "runner_webhook" {
       # worth of reaping lag and cap the blast radius of a bad signal at two extra
       # instances per architecture.
       LAUNCH_HEADROOM = 2
+
+      # A host whose runner exits cleanly after a job waits for its next
+      # registration credential for the same 180 seconds user data gives a first
+      # boot (fcvm-runner-job next). The controller hands one over only while
+      # REUSE_WINDOW_SECONDS have not passed since the job's completed_at, and
+      # only with CLAIM_MARGIN_SECONDS of that still to go. The host starts
+      # waiting after its job completed, so no credential is written after it
+      # stopped looking: the latest is written 90 seconds after completed_at,
+      # against a wait that ends no sooner than 180 seconds after it.
+      REUSE_WINDOW_SECONDS = 120
+      CLAIM_MARGIN_SECONDS = 30
+      # A claimed host counts toward the cap as starting for this long, like a
+      # booting instance, so the next queued event does not launch metal for the
+      # job a warm host is about to register for.
+      CLAIM_GRACE_MINUTES = 5
+      # Kept in step with MAX_INSTANCE_AGE_HOURS in the cleanup Lambda: a host past
+      # the soft cap drains and is never handed another job.
+      MAX_REUSE_AGE_HOURS = 12
+      # The protocol tag on hosts whose user data registers again after a job.
+      STREAM_PROTOCOL = 'ddb-v2'
+      # Only a job that succeeded hands its host on. A failed job is the likeliest
+      # to leave leaked VMs, D-state processes or a full disk behind: before
+      # --ephemeral one bad host, runner-i-0ea78b39da373fcca on 2026-08-06, failed
+      # every job it picked up. A fresh host for the job after a failure is the
+      # cheaper mistake. A host whose job ended any other way gets no credential
+      # and powers off when its wait ends.
+      REUSABLE_CONCLUSIONS = ('success',)
+      # The completed handler has no queue view of its own. It asks GitHub for at
+      # most this long, and a look it did not finish hands out nothing.
+      QUEUE_CHECK_BUDGET_SECONDS = 8
+      # github-runner-webhook-front forwards verified GitHub deliveries through this
+      # alias of this function, and IAM lets only the front invoke it. Whatever an
+      # event arriving through it says, it is a public delivery: no launch_count, no
+      # claim_only. The controller's own invokes - the cleanup poll and
+      # github-runner-reuse - use the unqualified function and keep their trust.
+      DELIVERY_ALIAS = 'delivery'
 
       def get_user_data():
           """Fetch user_data from SSM Parameter Store"""
@@ -116,7 +166,10 @@ data "archive_file" "runner_webhook" {
           claims = any(line.lstrip().startswith('REGISTRATION_TABLE=') for line in script.splitlines())
           if broker and not claims:
               raise RuntimeError('Broker user data must claim registration; refusing to launch')
-          return broker, claims
+          # The next-job unit is what makes a host register again after a job, so
+          # only a document carrying it is tagged, and reused, as STREAM_PROTOCOL.
+          stream = broker and 'ExecStart=/usr/local/sbin/fcvm-runner-job next' in script.splitlines()
+          return broker, claims, stream
 
       def get_latest_runner_ami(arch='arm64'):
           """Get the latest available AMI for the specified architecture"""
@@ -214,8 +267,8 @@ data "archive_file" "runner_webhook" {
       ROSTER_PAGE_LIMIT = 10
       ROSTER_PAGE_SIZE = 100
 
-      def get_online_runner_names():
-          """Names of runners GitHub can currently reach, or None if that is unknown.
+      def get_online_runners():
+          """Runners GitHub can currently reach, as {name: busy}, or None if that is unknown.
 
           None is deliberately distinct from the empty set: it means GitHub could
           not be asked, and callers must fall back to counting instances instead of
@@ -241,7 +294,7 @@ data "archive_file" "runner_webhook" {
           if not pat:
               print('No usable PAT in SSM; runner health is unknown')
               return None
-          names = set()
+          online = {}
           seen_names = set()
           collected = 0
           total = None
@@ -296,7 +349,7 @@ data "archive_file" "runner_webhook" {
                           return None
                       seen_names.add(name)
                       if r['status'] == 'online':
-                          names.add(name)
+                          online[name] = r.get('busy')
                   collected += len(batch)
                   # Reaching total_count ends the read. A roster of exactly
                   # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
@@ -316,7 +369,12 @@ data "archive_file" "runner_webhook" {
               print(f'Runner list came back with {collected} of the {total} GitHub reports; '
                     f'runner health is unknown')
               return None
-          return names
+          return online
+
+      def get_online_runner_names():
+          """Names of the runners get_online_runners() found online, or None."""
+          runners = get_online_runners()
+          return None if runners is None else set(runners)
 
       def get_capacity(arch):
           """Count runner instances for arch that can actually take work.
@@ -334,6 +392,12 @@ data "archive_file" "runner_webhook" {
           reached" until AWS terminated them at 20:31. Such an instance is neither
           online nor inside the grace window, so it stops counting here at exactly
           the moment the cleanup Lambda becomes willing to reap it.
+
+          A warm STREAM_PROTOCOL host between jobs has no registration at all,
+          so its row answers for it: claimed for a job inside CLAIM_GRACE_MINUTES
+          counts as starting, and a reuse window with CLAIM_MARGIN_SECONDS left
+          and no claim lists it under `available`, uncounted, for a queued job
+          to claim. `idle` is the online runners GitHub reports holding no job.
           """
           filters = [
               {'Name': 'tag:Role', 'Values': ['github-runner']},
@@ -347,27 +411,44 @@ data "archive_file" "runner_webhook" {
           if not instances:
               # Nothing to classify, so don't spend a GitHub call on it. This is the
               # cold-start case, which is also the one that must answer fastest.
-              return {'counted': 0, 'instances': 0, 'online': 0, 'booting': 0, 'degraded': False}
+              return {'counted': 0, 'instances': 0, 'online': 0, 'booting': 0, 'idle': 0,
+                      'available': [], 'degraded': False}
 
-          online_names = get_online_runner_names()
-          if online_names is None:
+          online_runners = get_online_runners()
+          if online_runners is None:
               # Health is unknown, so degrade to the pre-2026-08-07 instance count.
               # Over-counting only delays CI and self-heals on the next poll;
               # under-counting launches metal spot instances on data we could not
               # verify. Fail toward the cheaper mistake.
               return {'counted': len(instances), 'instances': len(instances),
-                      'online': 0, 'booting': 0, 'degraded': True}
+                      'online': 0, 'booting': 0, 'idle': 0, 'available': [], 'degraded': True}
 
           now = datetime.now(timezone.utc)
-          online = 0
-          booting = 0
+          now_epoch = int(now.timestamp())
+          online = booting = idle = claimed = 0
+          available = []
           for inst in instances:
-              if f'runner-{inst["InstanceId"]}' in online_names:
+              name = f'runner-{inst["InstanceId"]}'
+              if name in online_runners:
                   online += 1
+                  if online_runners[name] is False:
+                      idle += 1
               elif now - inst['LaunchTime'] < timedelta(minutes=BOOT_GRACE_MINUTES):
                   booting += 1
-          return {'counted': online + booting, 'instances': len(instances),
-                  'online': online, 'booting': booting, 'degraded': False}
+              elif get_tag(inst, 'RunnerRegistrationProtocol') == STREAM_PROTOCOL:
+                  row = read_stream_row(inst['InstanceId'])
+                  if row is None:
+                      continue
+                  if row['claimed_at'] is not None:
+                      if now_epoch - row['claimed_at'] < CLAIM_GRACE_MINUTES * 60:
+                          claimed += 1
+                  elif (row['available_until'] is not None
+                        and row['available_until'] >= now_epoch + CLAIM_MARGIN_SECONDS
+                        and now - inst['LaunchTime'] < timedelta(hours=MAX_REUSE_AGE_HOURS)):
+                      available.append(inst['InstanceId'])
+          return {'counted': online + booting + claimed, 'instances': len(instances),
+                  'online': online, 'booting': booting + claimed, 'idle': idle,
+                  'available': available, 'degraded': False}
 
       def emit_decision(arch, queued_jobs, capacity, max_runners, decision, detail):
           """One CloudWatch Embedded Metric Format line per scale-up decision.
@@ -503,12 +584,18 @@ data "archive_file" "runner_webhook" {
               return False
           return now - instance['LaunchTime'] >= timedelta(minutes=STARTUP_TIMEOUT_MINUTES)
 
-      def capacity_failed_types(instances, now):
-          """Instance types whose most recent launch died for want of capacity.
+      def capacity_failures(instances, now):
+          """(availability zone, instance type) pairs whose recent launch died for want of capacity.
 
           Three signals, all read from the one instance record: AWS's own state
           reason, the CapacityFailedAt tag the cleanup Lambda stamps on a launch it
           reaps for never booting, and a launch that is stalling right now.
+
+          Keyed by AZ as well as type, because a spot pool is one type in one AZ:
+          us-west-1a running out of c7gd.metal says nothing about us-west-1c. The AZ
+          comes from Placement, not SubnetId: a terminated instance's record, which
+          is where the capacity verdict survives, keeps Placement and drops SubnetId.
+          A record with no AZ gives None, which launch_candidates() matches to every AZ.
           """
           failed = set()
           for instance in instances:
@@ -518,19 +605,15 @@ data "archive_file" "runner_webhook" {
               if (instance.get('StateReason', {}).get('Code') in CAPACITY_STATE_REASONS
                       or get_tag(instance, 'CapacityFailedAt')
                       or is_stalled_launch(instance, now)):
-                  failed.add(instance_type)
+                  az = (instance.get('Placement') or {}).get('AvailabilityZone')
+                  failed.add((az, instance_type))
           return failed
 
-      def get_instance_types(arch, deprioritized=()):
-          """Instance types to try for architecture, recent capacity failures last.
+      def get_instance_types(arch):
+          """Instance types to try for architecture, most preferred first.
 
-          Reordering, never filtering: a type that just failed goes to the back but
-          stays in the list, so a launch is still attempted when every type has
-          failed. The loop in launch_runner cannot discover a capacity failure on
-          its own - run_instances returns an instance ID for a spot request AWS
-          cannot fulfil and kills the instance afterwards, so no exception is ever
-          raised to advance it. The previous attempt's outcome is what advances the
-          list, which is why this takes the failures as an argument.
+          launch_candidates() walks this order within each subnet, and is what moves
+          recent capacity failures to the back.
           """
           # ARM types must ALSO be Graviton3 or newer (family digit >= 7).
           # fcvm's nested-virtualisation tests need FEAT_NV2, which Graviton2
@@ -552,12 +635,62 @@ data "archive_file" "runner_webhook" {
           # Verify additions with:
           #   aws ec2 describe-instance-types --instance-types <t> \
           #     --query 'InstanceTypes[].InstanceStorageSupported'
+          #
+          # x86 leads with r5d.metal: the same CPU generation, 96 vCPU and 4x900GB
+          # NVMe as c5d.metal with 4x the RAM, and on 2026-09-13 its spot price was
+          # 17-20% below c5d.metal's in both runner AZs.
           if arch == 'x86_64':
-              types = ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal']
-          else:
-              types = ['c7gd.metal', 'm7gd.metal', 'r7gd.metal']
-          return ([t for t in types if t not in deprioritized]
-                  + [t for t in types if t in deprioritized])
+              return ['r5d.metal', 'c5d.metal', 'm5d.metal', 'm6id.metal']
+          return ['c7gd.metal', 'm7gd.metal', 'r7gd.metal']
+
+      def get_launch_subnets():
+          """Runner subnets, most preferred first, as (subnet_id, availability_zone).
+
+          LAUNCH_SUBNETS is the JSON list Terraform renders from
+          local.runner_launch_subnets. SUBNET_ID, the single subnet the previous
+          controller was given, is still honoured as one subnet with no known AZ,
+          for an environment that predates LAUNCH_SUBNETS. A malformed list raises
+          before anything is fetched, minted or launched.
+          """
+          raw = os.environ.get('LAUNCH_SUBNETS')
+          if not raw:
+              return [(os.environ['SUBNET_ID'], None)]
+          try:
+              subnets = [(entry['subnet_id'], entry['availability_zone']) for entry in json.loads(raw)]
+          except (ValueError, TypeError, KeyError):
+              raise RuntimeError('LAUNCH_SUBNETS is not a list of subnets; refusing to launch') from None
+          if not subnets or not all(isinstance(value, str) and value for pair in subnets for value in pair):
+              raise RuntimeError('LAUNCH_SUBNETS names no usable subnet; refusing to launch')
+          return subnets
+
+      def launch_candidates(arch, subnets, failed=()):
+          """(subnet_id, availability_zone, instance_type) in the order to try them.
+
+          Every type in the first subnet before any in the next, keeping the type
+          order within each. Terraform lists us-west-1c first for both
+          architectures: its ARM metal spot was cheaper with a better placement
+          score, x86 cost the same in both, and a second AZ is what the type
+          fallback alone could never provide.
+
+          Reordering, never filtering: a (type, AZ) pair that just failed goes to
+          the back but stays in the list, so a launch is still attempted when every
+          pair has failed, and a failure in one AZ never holds back that type in
+          another. An AZ unknown on either side matches, which is the old per-type
+          backoff. The loop in launch_runner cannot discover a capacity failure on
+          its own - run_instances returns an instance ID for a spot request AWS
+          cannot fulfil and kills the instance afterwards, so no exception is ever
+          raised to advance it. The previous attempt's outcome is what advances the
+          list, which is why this takes the failures as an argument.
+          """
+          def recently_failed(az, instance_type):
+              return any(failed_type == instance_type
+                         and (failed_az is None or az is None or failed_az == az)
+                         for failed_az, failed_type in failed)
+          ordered = [(subnet_id, az, instance_type)
+                     for subnet_id, az in subnets
+                     for instance_type in get_instance_types(arch)]
+          return ([c for c in ordered if not recently_failed(c[1], c[2])]
+                  + [c for c in ordered if recently_failed(c[1], c[2])])
 
       # Lease duration in minutes - runners auto-terminate after this unless renewed
       LEASE_DURATION_MINUTES = 60
@@ -566,20 +699,31 @@ data "archive_file" "runner_webhook" {
           """Calculate lease expiry time (now + LEASE_DURATION_MINUTES)"""
           return (datetime.now(timezone.utc) + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
 
-      def launch_runner(arch='arm64'):
-          """Launch a new spot runner instance, trying multiple instance types"""
+      def launch_runner(arch='arm64', failed_here=None):
+          """Launch a new spot runner instance, trying each subnet and instance type.
+
+          failed_here holds the (AZ, type) pairs whose run_instances raised in this
+          invocation, and the handler passes one set to every launch in a batch. A
+          refusal raised by run_instances leaves no instance record for the next
+          launch to read, so without it each launch in a batch would retry every
+          pair that had just refused, inside the 30-second function timeout.
+          """
           ami_id = get_latest_runner_ami(arch)
           if not ami_id:
               raise Exception(f"No runner AMI found for architecture: {arch}")
+          subnets = get_launch_subnets()
+          if failed_here is None:
+              failed_here = set()
 
-          # Which types just failed decides where this attempt starts. Without it
+          # Which pools just failed decides where this attempt starts. Without it
           # every retry re-picks the head of the list: on 2026-08-07 the poll
           # launched c5d.metal at 18:41, 18:46 and 18:51 and never reached
           # c5.metal, c6i.metal or m5d.metal at all.
-          deprioritized = capacity_failed_types(describe_runner_instances(arch), datetime.now(timezone.utc))
-          if deprioritized:
-              print(f'Recent capacity failures on {sorted(deprioritized)}, trying other types first')
-          instance_types = get_instance_types(arch, deprioritized)
+          recent = capacity_failures(describe_runner_instances(arch), datetime.now(timezone.utc))
+          if recent:
+              pools = sorted(f'{instance_type} in {az or "an unknown AZ"}' for az, instance_type in recent)
+              print(f'Recent capacity failures on {pools}, trying other pools first')
+          candidates = launch_candidates(arch, subnets, recent | failed_here)
           last_error = None
 
           # x86 AMI is from 300GB dev instance, ARM is smaller
@@ -591,12 +735,12 @@ data "archive_file" "runner_webhook" {
           # allocate metal that cannot bootstrap. Never interpolate the token
           # into user data: EC2 exposes that to the instance and control plane.
           user_data = get_user_data()
-          broker, claims_registration = user_data_protocol(user_data)
+          broker, claims_registration, stream = user_data_protocol(user_data)
           registration_token = get_registration_token() if broker else None
 
-          for instance_type in instance_types:
+          for subnet_id, az, instance_type in candidates:
               try:
-                  response = ec2.run_instances(
+                  response = launch_ec2.run_instances(
                       MinCount=1,
                       MaxCount=1,
                       ImageId=ami_id,
@@ -604,7 +748,7 @@ data "archive_file" "runner_webhook" {
                       KeyName='fcvm-ec2',
                       NetworkInterfaces=[{
                           'DeviceIndex': 0,
-                          'SubnetId': os.environ['SUBNET_ID'],
+                          'SubnetId': subnet_id,
                           'Groups': [os.environ['SECURITY_GROUP_ID']],
                           'AssociatePublicIpAddress': True,
                           'Ipv6PrefixCount': 1,
@@ -615,7 +759,10 @@ data "archive_file" "runner_webhook" {
                           'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
                       }],
                       UserData=user_data,
-                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1},
+                      # InstanceMetadataTags lets Inspector's SSM plugin read
+                      # InspectorEc2Exclusion; without it the plugin still runs.
+                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
+                                       'InstanceMetadataTags': 'enabled'},
                       InstanceInitiatedShutdownBehavior='terminate',
                       InstanceMarketOptions={
                           'MarketType': 'spot',
@@ -628,11 +775,15 @@ data "archive_file" "runner_webhook" {
                               {'Key': 'Role', 'Value': 'github-runner'},
                               {'Key': 'Architecture', 'Value': arch},
                               {'Key': 'LeaseExpires', 'Value': lease_expiry},
+                              # Keeps Amazon Inspector's SSM agent from installing its
+                              # scanner with apt while this one-job host takes work.
+                              {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
                               # Which registration handshake this instance's
                               # user data runs. It says nothing about whether
                               # registration succeeded; the cleanup Lambda reads
                               # that from the DynamoDB row this tag points at.
-                          ] + ([{'Key': 'RunnerRegistrationProtocol', 'Value': 'ddb-v1'}]
+                          ] + ([{'Key': 'RunnerRegistrationProtocol',
+                                 'Value': STREAM_PROTOCOL if stream else 'ddb-v1'}]
                                if claims_registration else [])
                       }, {
                           'ResourceType': 'volume',
@@ -644,12 +795,14 @@ data "archive_file" "runner_webhook" {
                   )
               except Exception as e:
                   last_error = e
-                  print(f"Failed to launch {instance_type}: {e}, trying next...")
+                  failed_here.add((az, instance_type))
+                  print(f"Failed to launch {instance_type} in {az or subnet_id}: {e}, trying next...")
                   continue
 
               # Do not put this in the capacity-fallback try. Once EC2 accepted
               # a launch, a broker error must never launch another instance type.
               instance_id = response['Instances'][0]['InstanceId']
+              print(f'Launched {instance_id} ({instance_type}) in {subnet_id} ({az or "unknown AZ"})')
               if not broker:
                   # Only the transitional, already-deployed script uses its old
                   # PAT grant. This controller never sends that PAT to the host.
@@ -670,7 +823,304 @@ data "archive_file" "runner_webhook" {
                   raise RunnerBootstrapError(f'Credential provisioning failed for {instance_id}; no launch retry') from None
               return instance_id, instance_type
 
-          raise last_error or Exception(f"All instance types failed for {arch}")
+          raise last_error or Exception(f"All subnets and instance types failed for {arch}")
+
+      # Warm hosts. A runner registers --ephemeral, so its registration ends with
+      # its job; a STREAM_PROTOCOL host then waits for one more credential and
+      # powers off without one. Its registration row is the only arbiter of who
+      # gets it: `completed` opens a reuse window on the row, and one conditional
+      # update claims the host for exactly one job.
+
+      RUNNER_INSTANCE_NAME = re.compile(r'runner-(i-[0-9a-f]{8}(?:[0-9a-f]{9})?)')
+
+      def registration_key(instance_id):
+          """The registration row's key, or None without a usable account id."""
+          account = os.environ.get('RUNNER_ACCOUNT_ID', '')
+          if not re.fullmatch(r'[0-9]{12}', account):
+              return None
+          return {'InstanceArn': {'S': f'arn:aws:ec2:us-west-1:{account}:instance/{instance_id}'}}
+
+      def error_code(error):
+          response = getattr(error, 'response', None)
+          return response.get('Error', {}).get('Code') if isinstance(response, dict) else None
+
+      def read_stream_row(instance_id):
+          """A warm host's registered row as {runner_id, available_until, claimed_at}, or None.
+
+          None is an absent row, an unreadable table, or a row that is not this
+          instance's registered row. None of those makes a host reusable or counts it.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          key = registration_key(instance_id)
+          if not table or key is None:
+              return None
+          try:
+              item = dynamodb.get_item(TableName=table, Key=key, ConsistentRead=True).get('Item')
+          except Exception as e:
+              print(f'{instance_id}: registration row unread: {type(e).__name__}')
+              return None
+          if (not isinstance(item, dict) or item.get('State') != {'S': 'registered'}
+                  or item.get('InstanceId') != {'S': instance_id}):
+              return None
+
+          def number(name):
+              try:
+                  return int(item[name]['N'])
+              except (KeyError, TypeError, ValueError):
+                  return None
+
+          return {'runner_id': number('RunnerId'), 'available_until': number('AvailableUntil'),
+                  'claimed_at': number('ClaimedAt')}
+
+      def claim_host(instance_id, now_epoch):
+          """Take one available host for one job. True only when this write won.
+
+          The row must still be registered, its reuse window must have
+          CLAIM_MARGIN_SECONDS left, and no claim may exist for this registration.
+          The host's next registration replaces the row, which is what clears the
+          claim for the job after it. A lost answer counts as lost: the host waits
+          out its window and powers off, and a launch serves this slot instead.
+          """
+          try:
+              dynamodb.update_item(
+                  TableName=os.environ.get('REGISTRATION_TABLE', ''),
+                  Key=registration_key(instance_id),
+                  UpdateExpression='SET ClaimedAt = :now',
+                  ConditionExpression=('#s = :registered AND AvailableUntil >= :deadline '
+                                       'AND attribute_not_exists(ClaimedAt)'),
+                  ExpressionAttributeNames={'#s': 'State'},
+                  ExpressionAttributeValues={
+                      ':now': {'N': str(now_epoch)},
+                      ':registered': {'S': 'registered'},
+                      ':deadline': {'N': str(now_epoch + CLAIM_MARGIN_SECONDS)},
+                  })
+              return True
+          except Exception as e:
+              print(f'{instance_id}: not claimed ({error_code(e) or type(e).__name__})')
+              return False
+
+      def open_reuse_window(instance_id, runner_id, until_epoch):
+          """Record that this host's runner finished, so a queued job can claim the host.
+
+          Only while the row still names the runner that finished and no window is
+          open for that registration yet, so a duplicate or late completed event
+          for an earlier registration of the same host changes nothing.
+          """
+          values = {':until': {'N': str(until_epoch)}, ':registered': {'S': 'registered'},
+                    ':runner': {'N': str(runner_id)}}
+          try:
+              dynamodb.update_item(
+                  TableName=os.environ.get('REGISTRATION_TABLE', ''),
+                  Key=registration_key(instance_id),
+                  UpdateExpression='SET AvailableUntil = :until',
+                  ConditionExpression=('#s = :registered AND RunnerId = :runner '
+                                       'AND attribute_not_exists(AvailableUntil)'),
+                  ExpressionAttributeNames={'#s': 'State'},
+                  ExpressionAttributeValues=values)
+              return True
+          except Exception as e:
+              print(f'{instance_id}: reuse window not opened ({error_code(e) or type(e).__name__})')
+              return False
+
+      def queued_jobs_at_least(pat, arch, need):
+          """True once GitHub shows `need` queued self-hosted jobs for arch.
+
+          False when every in-progress and queued run was read and fewer were
+          found. None when the look did not finish - a failed call, a listing
+          longer than one page, or the time budget - and None hands out nothing.
+          """
+          deadline = time.monotonic() + QUEUE_CHECK_BUDGET_SECONDS
+          found = 0
+          try:
+              run_ids = []
+              for status in ('in_progress', 'queued'):
+                  data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs'
+                                         f'?status={status}&per_page=100')
+                  runs = data.get('workflow_runs')
+                  if not isinstance(runs, list) or data.get('total_count') != len(runs):
+                      return None
+                  run_ids.extend(run.get('id') for run in runs)
+              for run_id in dict.fromkeys(run_ids):
+                  if time.monotonic() >= deadline:
+                      print(f'Queue check ran out of its {QUEUE_CHECK_BUDGET_SECONDS}s budget')
+                      return None
+                  data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs/'
+                                         f'{run_id}/jobs?filter=latest&per_page=100')
+                  jobs = data.get('jobs')
+                  if not isinstance(jobs, list) or data.get('total_count') != len(jobs):
+                      return None
+                  for job in jobs:
+                      labels = [str(label).lower() for label in job.get('labels', [])]
+                      if (job.get('status') == 'queued' and 'self-hosted' in labels
+                              and detect_architecture(labels) == arch):
+                          found += 1
+                          if found >= need:
+                              return True
+          except Exception as e:
+              print(f'Queue check failed: {type(e).__name__}: {e}')
+              return None
+          return False
+
+      def reusable_host(instance_id, arch, now):
+          """The EC2 record of a running STREAM_PROTOCOL host of arch under the reuse age, or None."""
+          try:
+              reservations = ec2.describe_instances(InstanceIds=[instance_id])['Reservations']
+          except Exception as e:
+              print(f'{instance_id}: cannot read the instance: {type(e).__name__}')
+              return None
+          for reservation in reservations:
+              for inst in reservation['Instances']:
+                  if (inst.get('State', {}).get('Name') == 'running'
+                          and get_tag(inst, 'Role') == 'github-runner'
+                          and get_tag(inst, 'Name') == f'github-runner-{arch}'
+                          and get_tag(inst, 'RunnerRegistrationProtocol') == STREAM_PROTOCOL
+                          and now - inst['LaunchTime'] < timedelta(hours=MAX_REUSE_AGE_HOURS)):
+                      return inst
+          return None
+
+      def broker_to_host(instance_id, registration_token):
+          """Hand one claimed host the credential for its next registration."""
+          try:
+              broker_registration_token(instance_id, *registration_token)
+          except Exception as error:
+              print(f'REUSE BROKER FAILED for {instance_id}: {type(error).__name__}')
+              # A lost PutParameter answer may have left the credential.
+              try:
+                  ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
+              except Exception:
+                  pass
+              raise RunnerBootstrapError(f'Credential provisioning failed for warm host {instance_id}') from None
+
+      def defer_completed(payload):
+          """Answer a completed delivery at once and hand the job to github-runner-reuse.
+
+          Checking a host for reuse reads EC2, the runner roster, the registration
+          row and up to QUEUE_CHECK_BUDGET_SECONDS of GitHub's queue. This function
+          runs one execution at a time and every delivery waits behind it, so only
+          the checks that need no call run here. A job whose reuse window closed
+          while its delivery waited is not handed on at all.
+          """
+          job = payload.get('workflow_job')
+          job = job if isinstance(job, dict) else {}
+          name = job.get('runner_name')
+          if (not isinstance(name, str) or not RUNNER_INSTANCE_NAME.fullmatch(name)
+                  or job.get('conclusion') not in REUSABLE_CONCLUSIONS):
+              return {'statusCode': 200, 'body': 'Ignoring completed job: not a successful runner-i-* job'}
+          completed_at = parse_utc(job.get('completed_at'))
+          if (completed_at is None or completed_at.timestamp() + REUSE_WINDOW_SECONDS
+                  < datetime.now(timezone.utc).timestamp() + CLAIM_MARGIN_SECONDS):
+              return {'statusCode': 200, 'body': f'Not reusing {name}: its reuse window has closed'}
+          handoff = {'workflow_job': {key: job.get(key) for key in
+                                      ('runner_name', 'runner_id', 'labels', 'conclusion', 'completed_at')}}
+          try:
+              lambda_client.invoke(FunctionName=os.environ.get('REUSE_FUNCTION', ''),
+                                   InvocationType='Event', Payload=json.dumps(handoff))
+          except Exception as e:
+              print(f'Could not hand {name} to the reuse function: {type(e).__name__}')
+              return {'statusCode': 503, 'body': f'Not reusing {name}: the reuse function is unavailable'}
+          return {'statusCode': 202, 'body': f'Checking {name} for reuse'}
+
+      def reuse_handler(event, context):
+          """Entry point of github-runner-reuse, which runs this same source."""
+          return handle_completed(event if isinstance(event, dict) else {})
+
+      def forwarded_delivery(context):
+          """Whether this invocation came through DELIVERY_ALIAS, which only the front may invoke."""
+          arn = getattr(context, 'invoked_function_arn', None)
+          return isinstance(arn, str) and arn.endswith(f':{DELIVERY_ALIAS}')
+
+      def parse_utc(value):
+          """A GitHub timestamp as an aware datetime, or None."""
+          try:
+              parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+          except ValueError:
+              return None
+          return parsed if parsed.tzinfo is not None else None
+
+      def queue_scan_started_at(arch):
+          """When the cleanup poll's latest complete queue scan for arch began, or None."""
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table:
+              return None
+          try:
+              item = dynamodb.get_item(TableName=table, Key={'InstanceArn': {'S': f'queue-scan#{arch}'}},
+                                       ConsistentRead=True).get('Item') or {}
+              return float(item['ScanStartedAt']['N'])
+          except Exception:
+              return None
+
+      def handle_completed(payload):
+          """Check a finished runner-i-* job's host for reuse. Runs in github-runner-reuse.
+
+          Opens the host's reuse window, so a queued event can claim it. When GitHub
+          also shows more queued jobs for its architecture than idle and starting
+          runners can take, it asks the webhook, asynchronously, for a claim_only
+          request. The webhook is the one function that decides capacity, one
+          execution at a time; this function launches nothing and claims nothing.
+          Either way the host powers itself off when its wait ends with nothing.
+          """
+          job = payload.get('workflow_job')
+          job = job if isinstance(job, dict) else {}
+          name = job.get('runner_name')
+          match = RUNNER_INSTANCE_NAME.fullmatch(name) if isinstance(name, str) else None
+          labels = job.get('labels') if isinstance(job.get('labels'), list) else []
+          labels = [str(label).lower() for label in labels]
+          runner_id = job.get('runner_id')
+          if (not match or 'self-hosted' not in labels or not isinstance(runner_id, int)
+                  or isinstance(runner_id, bool) or runner_id <= 0):
+              return {'statusCode': 200, 'body': 'Ignoring completed job: not a runner-i-* host'}
+          if job.get('conclusion') not in REUSABLE_CONCLUSIONS:
+              return {'statusCode': 200,
+                      'body': f'Not reusing {name}: its job concluded {job.get("conclusion")!r}'}
+          try:
+              completed_at = datetime.fromisoformat(str(job.get('completed_at')).replace('Z', '+00:00'))
+          except ValueError:
+              completed_at = None
+          if completed_at is None or completed_at.tzinfo is None:
+              return {'statusCode': 200, 'body': f'Not reusing {name}: no usable completed_at'}
+          now = datetime.now(timezone.utc)
+          now_epoch = int(now.timestamp())
+          until = int(completed_at.timestamp()) + REUSE_WINDOW_SECONDS
+          if until < now_epoch + CLAIM_MARGIN_SECONDS:
+              return {'statusCode': 200, 'body': f'Not reusing {name}: its reuse window has closed'}
+          instance_id = match.group(1)
+          arch = detect_architecture(labels)
+          if reusable_host(instance_id, arch, now) is None:
+              return {'statusCode': 200, 'body': (f'Not reusing {name}: not a running {arch} '
+                                                  f'{STREAM_PROTOCOL} host under {MAX_REUSE_AGE_HOURS}h')}
+
+          if not open_reuse_window(instance_id, runner_id, until):
+              return {'statusCode': 200,
+                      'body': f'Not reusing {name}: its registration moved on or is already held'}
+
+          max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
+          capacity = get_capacity(arch)
+          absorbable = capacity['idle'] + capacity['booting']
+          wanted = None
+          if not capacity['degraded'] and capacity['counted'] < max_runners:
+              pat = get_github_pat()
+              if pat:
+                  wanted = queued_jobs_at_least(pat, arch, absorbable + 1)
+          if wanted is not True:
+              return {'statusCode': 200, 'body': (f'Holding {name} for a queued job until {until} '
+                                                  f'(queue check: {wanted})')}
+          request = {'body': json.dumps({
+                         'action': 'queued',
+                         'workflow_job': {'labels': ['self-hosted', 'Linux',
+                                                     'X64' if arch == 'x86_64' else 'ARM64']},
+                         'queued_jobs': absorbable + 1,
+                         'launch_count': 1,
+                         'claim_only': True,
+                     }),
+                     'headers': {}}
+          try:
+              lambda_client.invoke(FunctionName=os.environ.get('WEBHOOK_FUNCTION', ''),
+                                   InvocationType='Event', Payload=json.dumps(request))
+          except Exception as e:
+              print(f'Could not ask the webhook to claim a warm {arch} host: {type(e).__name__}')
+              return {'statusCode': 503, 'body': f'Holding {name}, but the claim request failed'}
+          return {'statusCode': 202, 'body': (f'Holding {name} and asked the webhook to hand a warm '
+                                              f'{arch} host a queued job')}
 
       def handler(event, context):
           # Parse webhook
@@ -693,10 +1143,20 @@ data "archive_file" "runner_webhook" {
               if not verify_signature(body, signature, secret):
                   return {'statusCode': 401, 'body': 'Invalid signature'}
 
+          # github-runner-webhook-front verified a forwarded delivery, stripped it to
+          # the fields read here, and sent it through DELIVERY_ALIAS. It is told apart
+          # by that alias, which only the front may invoke, never by anything in the
+          # event, and it gets no more trust than a delivery from API Gateway.
+          forwarded = forwarded_delivery(context)
+          public = forwarded or 'requestContext' in event
+
           payload = json.loads(body)
           action = payload.get('action', '')
 
-          # Only act on queued jobs
+          # A finished job on one of these runners may hand its host the next job.
+          # Every other action except queued is ignored, as it always was.
+          if action == 'completed':
+              return defer_completed(payload)
           if action != 'queued':
               return {'statusCode': 200, 'body': f'Ignoring action: {action}'}
 
@@ -704,6 +1164,18 @@ data "archive_file" "runner_webhook" {
           workflow_job = payload.get('workflow_job', {})
           labels = workflow_job.get('labels', [])
           arch = detect_architecture(labels)
+
+          # A forwarded delivery can wait in the async queue behind this function's one
+          # execution. If a complete cleanup queue scan began after the job was queued,
+          # that scan counted the job and asked for its runner, and launching here as
+          # well would put up a second host for it.
+          if forwarded:
+              queued_at = parse_utc(workflow_job.get('created_at'))
+              scanned_at = queue_scan_started_at(arch)
+              if queued_at is not None and scanned_at is not None and queued_at.timestamp() < scanned_at:
+                  detail = f'The {arch} queue scan begun at {scanned_at:.0f} already counted this job'
+                  print(detail)
+                  return {'statusCode': 200, 'body': detail}
 
           # Check per-architecture capacity. queued_jobs is supplied by the cleanup
           # Lambda's poll (it counts them); a real GitHub delivery is one job.
@@ -714,17 +1186,25 @@ data "archive_file" "runner_webhook" {
               queued_jobs = int(payload.get('queued_jobs', 1))
           except (TypeError, ValueError):
               queued_jobs = 1
+          # github-runner-reuse asks for a warm host this way when a finished job's
+          # host should take queued work. Such a request claims a host or does
+          # nothing: it never launches, and a miss is not reported as starvation.
+          # Honoured only on the controller's own direct invokes, like launch_count.
+          claim_only = not public and payload.get('claim_only') is True
+          refused = 'reuse-missed' if claim_only else 'blocked'
           capacity = get_capacity(arch)
 
           if capacity['counted'] >= max_runners:
               detail = f'Max {arch} runners ({max_runners}) reached'
-              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
               return {'statusCode': 200, 'body': detail}
 
-          if capacity['instances'] >= max_runners + LAUNCH_HEADROOM:
+          # Reusing a warm host adds no instance, so the instance ceiling refuses
+          # outright only when there is no warm host to hand the job to.
+          if capacity['instances'] >= max_runners + LAUNCH_HEADROOM and not capacity['available']:
               detail = (f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
                         f'with only {capacity["counted"]} able to take work')
-              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
               return {'statusCode': 200, 'body': detail}
 
           # How many to launch in THIS invocation. A real GitHub delivery is always
@@ -734,25 +1214,68 @@ data "archive_file" "runner_webhook" {
           # serialized by reserved concurrency 1 - can each miss the instance the
           # previous one just launched and overshoot the cap. Inside one invocation
           # the loop counts its own launches, which no consistency lag can hide.
-          # launch_count is honored only on IAM-authed direct invokes (no
-          # requestContext), so a signed public delivery cannot amplify.
+          # launch_count is honored only on the controller's own direct invokes -
+          # neither through API Gateway nor through DELIVERY_ALIAS - so a signed
+          # public delivery cannot amplify.
           requested = 1
-          if 'requestContext' not in event:
+          if not public:
               try:
                   requested = max(1, min(int(payload.get('launch_count', 1)), max_runners))
               except (TypeError, ValueError):
                   requested = 1
-          # Bounded by whichever ceiling is tighter: healthy-capacity cap or the
-          # absolute instance ceiling. Both were checked >= 1 slot free above.
-          budget = min(requested,
-                       max_runners - capacity['counted'],
-                       max_runners + LAUNCH_HEADROOM - capacity['instances'])
+          # The poll's queued_jobs is every queued job it found for the architecture,
+          # including jobs something is already on its way to take. Launching for all
+          # of them put a second host on a job whose runner was still booting whenever
+          # the pool had room. So the poll's request is cut to what nothing will
+          # absorb: runners launched but not yet registered and inside
+          # BOOT_GRACE_MINUTES, warm hosts claimed inside CLAIM_GRACE_MINUTES
+          # (get_capacity counts both as booting), and registered idle runners. A warm
+          # host still waiting to be claimed is not subtracted: it takes a job only
+          # once claimed, and the loop below claims it before launching anything. An
+          # unreadable roster reports none of these, so nothing is cut then. Only a
+          # request carrying the poll's count is cut: any other request is one job,
+          # and a runner already starting or idle may be there for a different one.
+          if not public and not claim_only and 'queued_jobs' in payload:
+              absorbing = capacity['booting'] + capacity['idle']
+              requested = min(requested, max(queued_jobs - absorbing, 0))
+              if requested == 0:
+                  detail = (f'{absorbing} starting or idle {arch} runner(s) already cover '
+                            f'the {queued_jobs} queued job(s)')
+                  emit_decision(arch, queued_jobs, capacity, max_runners, 'covered', detail)
+                  return {'statusCode': 200, 'body': detail}
+          # Slots are bounded by the healthy-capacity cap, checked >= 1 above. A
+          # warm host fills a slot first: it serves the job without a cold boot and
+          # adds no instance, so the instance ceiling bounds launches alone. A claim
+          # that loses its race falls through to a launch.
+          slots = min(requested, max_runners - capacity['counted'])
+          launch_room = 0 if claim_only else max_runners + LAUNCH_HEADROOM - capacity['instances']
+          available = list(capacity['available'])
 
+          reused_here = []
           launched_here = []
           instance_type = None
+          # (AZ, type) pairs run_instances refused in this invocation, shared by
+          # every launch in the batch so none of them retries a refusal.
+          failed_here = set()
           try:
-              for _ in range(budget):
-                  spot_id, instance_type = launch_runner(arch)
+              for _ in range(slots):
+                  host = None
+                  if available:
+                      # Fetched before any claim, as a launch fetches it before
+                      # RunInstances: a GitHub outage must not strand a claimed host.
+                      registration_token = get_registration_token()
+                      now_epoch = int(datetime.now(timezone.utc).timestamp())
+                      while available and host is None:
+                          candidate = available.pop(0)
+                          if claim_host(candidate, now_epoch):
+                              host = candidate
+                  if host is not None:
+                      broker_to_host(host, registration_token)
+                      reused_here.append(host)
+                      continue
+                  if len(launched_here) >= launch_room:
+                      break
+                  spot_id, instance_type = launch_runner(arch, failed_here)
                   launched_here.append(spot_id)
           except RunnerBootstrapError as e:
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
@@ -763,8 +1286,21 @@ data "archive_file" "runner_webhook" {
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed',
                             f'{e} (after {len(launched_here)} launched this invocation)')
               raise
-          detail = f'Launched {len(launched_here)} {arch} runner(s) ({instance_type}): {",".join(launched_here)}'
-          emit_decision(arch, queued_jobs, capacity, max_runners, 'launched', detail)
+          if not reused_here and not launched_here:
+              detail = (f'No warm {arch} host left to claim' if claim_only else
+                        f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
+                        f'with only {capacity["counted"]} able to take work')
+              emit_decision(arch, queued_jobs, capacity, max_runners, refused, detail)
+              return {'statusCode': 200, 'body': detail}
+          parts = []
+          if reused_here:
+              parts.append(f'Reused {len(reused_here)} warm {arch} host(s): {",".join(reused_here)}')
+          if launched_here:
+              parts.append(f'Launched {len(launched_here)} {arch} runner(s) ({instance_type}): '
+                           f'{",".join(launched_here)}')
+          detail = '; '.join(parts)
+          emit_decision(arch, queued_jobs, capacity, max_runners,
+                        'launched' if launched_here else 'reused', detail)
           return {'statusCode': 200, 'body': detail}
     EOF
     filename = "lambda_function.py"
@@ -787,9 +1323,17 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
+      # Ordered [{subnet_id, availability_zone}] from local.runner_launch_subnets.
+      # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
+      LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
+      # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.
       SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
-      INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
+      # Completed jobs are checked for reuse there; the runner_reuse resource says why.
+      REUSE_FUNCTION = aws_lambda_function.runner_reuse[0].function_name
+      # Warm-host reuse reads and claims hosts through their registration rows.
+      REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
+      INSTANCE_PROFILE   = aws_iam_instance_profile.runner[0].name
       # Constant breaks the old inverse dependency. A new controller must be
       # active before the parameter begins requesting broker credentials.
       USER_DATA_PARAM   = "/github-runner/user-data"
@@ -812,6 +1356,10 @@ resource "aws_lambda_function" "runner_webhook" {
     aws_iam_role_policy.runner_bootstrap,
     aws_iam_role_policy.runner_bootstrap_controller,
     aws_lambda_function.runner_cleanup,
+    # A runner launched into us-west-1c before its route exists can reach nothing,
+    # and one launched before the IPv6 grant covers that subnet fails the IPv6 gate.
+    aws_route_table_association.runner_us_west_1c,
+    aws_iam_role_policy.runner,
   ]
 }
 
@@ -844,7 +1392,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
       {
         Effect = "Allow"
         Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = flatten([for name in ["github-runner-webhook", "github-runner-cleanup"] : [
+        Resource = flatten([for name in ["github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"] : [
           "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}",
           "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${name}:*",
         ]])
@@ -870,11 +1418,10 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid    = "LaunchExactRunnerNetwork"
         Effect = "Allow"
         Action = "ec2:RunInstances"
-        Resource = [
-          aws_subnet.runner[0].arn,
+        Resource = concat(local.runner_launch_subnet_arns, [
           aws_security_group.runner[0].arn,
           "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:key-pair/fcvm-ec2",
-        ]
+        ])
       },
       {
         Sid      = "LaunchTaggedRunnerInstance"
@@ -893,7 +1440,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner" }
-          ArnEquals    = { "ec2:Subnet" = aws_subnet.runner[0].arn }
+          ArnEquals    = { "ec2:Subnet" = local.runner_launch_subnet_arns }
         }
       },
       {
@@ -913,7 +1460,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "RunnerRegistrationProtocol"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
         }
       },
       {
@@ -992,15 +1539,24 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = [for name in ["pat", "user-data"] : "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/${name}"]
       },
       {
+        # Per-repo controller tokens for the non-fcvm repos (runner-repos.tf).
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [for s in aws_secretsmanager_secret.github_runner_repo_pat : s.arn]
+      },
+      {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
-        Resource = "arn:aws:lambda:us-west-1:928413605543:function:github-runner-webhook"
+        Resource = [for name in ["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:us-west-1:928413605543:function:${name}"]
       },
       {
         Effect = "Allow"
+        # GetItem and PutItem for the cleanup claim; UpdateItem for the webhook's
+        # conditional reuse window and one-job claim on a warm host's row.
         Action = [
           "dynamodb:GetItem",
-          "dynamodb:PutItem"
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
         ]
         Resource = aws_dynamodb_table.runner_registration[0].arn
       }
@@ -1025,12 +1581,18 @@ resource "aws_apigatewayv2_stage" "runner_webhook" {
   auto_deploy = true
 }
 
+# Deliveries go to github-runner-webhook-front (runner-webhook-front.tf), which verifies them
+# and queues them for the webhook. integration_uri updates this integration in place, so the
+# route, its target and the URL GitHub posts to are unchanged; depends_on puts API Gateway's
+# permission to invoke the front in place before any request can reach it.
 resource "aws_apigatewayv2_integration" "runner_webhook" {
   count              = var.enable_github_runner ? 1 : 0
   api_id             = aws_apigatewayv2_api.runner_webhook[0].id
   integration_type   = "AWS_PROXY"
-  integration_uri    = aws_lambda_function.runner_webhook[0].invoke_arn
+  integration_uri    = aws_lambda_function.runner_webhook_front[0].invoke_arn
   integration_method = "POST"
+
+  depends_on = [aws_lambda_permission.runner_webhook_front]
 }
 
 resource "aws_apigatewayv2_route" "runner_webhook" {
@@ -1040,14 +1602,11 @@ resource "aws_apigatewayv2_route" "runner_webhook" {
   target    = "integrations/${aws_apigatewayv2_integration.runner_webhook[0].id}"
 }
 
-resource "aws_lambda_permission" "runner_webhook" {
-  count         = var.enable_github_runner ? 1 : 0
-  statement_id  = "AllowAPIGateway"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.runner_webhook[0].function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.runner_webhook[0].execution_arn}/*/*"
-}
+# API Gateway has no permission to invoke the webhook itself. Deliveries reach it only through
+# github-runner-webhook-front and its delivery alias. The permission that let API Gateway call
+# the webhook directly was removed one apply after the integration moved to the front: in the
+# same apply, its deletion and the integration update have no ordering between them, and a
+# delivery could have met the old integration without the permission.
 
 # ============================================
 # Variables
@@ -1274,10 +1833,19 @@ have_global_v6() {
   return 1
 }
 
+# An IMDSv2 session token must not reach xtrace, which cloud-init copies into its log,
+# the journal and the serial console: not its assignment, and not the curl header
+# lines that carry it. Tracing pauses while a token is held and resumes only if the
+# caller had it on; the values the trace used to show are echoed instead.
+case $- in *x*) IMDS_XTRACE=1 ;; *) IMDS_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
 ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
+unset TOKEN6
+echo "IMDS: MAC=$MAC ENI_ID=$ENI_ID REGION=$REGION"
+if [ -n "$IMDS_XTRACE" ]; then set -x; fi
 
 # Idempotent: only add an address if the ENI has none, and retry the API rather
 # than letting one throttled call decide the fate of the instance.
@@ -1332,8 +1900,13 @@ chmod 700 /home/ubuntu/.ssh
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 
 snap start amazon-ssm-agent || true
+case $- in *x*) IMDS_XTRACE=1 ;; *) IMDS_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+echo "IMDS: INSTANCE_ID=$INSTANCE_ID"
+if [ -n "$IMDS_XTRACE" ]; then set -x; fi
 ARCH=$(uname -m)
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -1367,8 +1940,72 @@ tar xzf runner.tar.gz
 rm runner.tar.gz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
+# A runner must not take a job while a package install is running: a CI job's
+# apt-get fails at once on a held lock. On 2026-09-13 three fcvm jobs lost
+# "Install dependencies" to Amazon Inspector's SSM agent running
+# `apt install ./inspector-vm-scanner.deb` about 90 s after boot. Runners carry
+# InspectorEc2Exclusion; this gate covers any other install the agent pushes.
+#
+# apt_locks_busy reports whether any process has an apt or dpkg lock file open,
+# read from /proc so it depends on no tool the image might lack.
+apt_locks_busy() {
+  local root=$${1:-/proc} fd target
+  for fd in "$root"/[0-9]*/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case "$target" in
+      /var/lib/dpkg/lock-frontend|/var/lib/dpkg/lock|/var/lib/apt/lists/lock|/var/cache/apt/archives/lock) return 0 ;;
+    esac
+  done
+  return 1
+}
+# wait_for_apt_quiet QUIET_CHECKS DEADLINE_S: 0 once the locks have been free for
+# QUIET_CHECKS consecutive one-second checks, 1 if the deadline passes first.
+wait_for_apt_quiet() {
+  local quiet=0 deadline=$((SECONDS + $2))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if apt_locks_busy; then quiet=0; else quiet=$((quiet + 1)); fi
+    if [ "$quiet" -ge "$1" ]; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+# The check reads every open file descriptor each second; keep that out of xtrace.
+set +x
+if ! wait_for_apt_quiet 20 600; then
+  echo "FATAL: apt or dpkg is still installing after 600 s; refusing to register this runner"
+  exit 1
+fi
+set -x
+
 # Do not xtrace either token into cloud-init or the serial console.
 set +x
+# fcvm-runner-job registers this host for one job at a time: `first` at boot,
+# `next` after a job whose runner exited cleanly, and `after`, the runner
+# service's ExecStopPost, picks between `next` and poweroff. Any failure, or no
+# credential inside the wait, powers the host off, which terminates it.
+printf 'INSTANCE_ID=%s\nREGION=%s\nRUNNER_LABEL=%s\n' "$INSTANCE_ID" "$REGION" "$RUNNER_LABEL" > /etc/fcvm-runner.env
+cat > /etc/systemd/system/fcvm-runner-next.service <<'NEXT_JOB_SERVICE'
+[Unit]
+Description=Register this runner host for its next job, or power it off
+FailureAction=poweroff
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/fcvm-runner.env
+ExecStart=/usr/local/sbin/fcvm-runner-job next
+TimeoutStartSec=600
+NEXT_JOB_SERVICE
+cat > /usr/local/sbin/fcvm-runner-job <<'RUNNER_JOB'
+#!/bin/bash
+set -euo pipefail
+MODE=$1
+if [ "$MODE" = after ]; then
+  if [ "$${SERVICE_RESULT:-}" = success ]; then
+    exec systemctl --no-block start fcvm-runner-next.service
+  fi
+  echo "runner service ended with result $${SERVICE_RESULT:-unknown}; not taking another job"
+  exec systemctl --no-block poweroff
+fi
+cd /opt/actions-runner
 BOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"
 REG_TOKEN=""
 bootstrap_ssm() {
@@ -1388,9 +2025,61 @@ runner_bootstrap_exit() {
   exit "$status"
 }
 trap runner_bootstrap_exit EXIT
+case "$MODE" in
+  first|next) ;;
+  *) echo "FATAL: unknown fcvm-runner-job mode $MODE"; exit 1 ;;
+esac
 
-# The controller can only tag the credential after RunInstances returns the id.
-# Bound the publication/SSM IAM propagation race; no reusable PAT fallback.
+# This script holds two secrets: an IMDSv2 session token here, and the registration
+# credential below. Neither reaches xtrace, even when the script runs under bash -x or
+# with SHELLOPTS=xtrace; tracing resumes as the caller had it once each is unset.
+case $- in *x*) JOB_XTRACE=1 ;; *) JOB_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
+TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/dynamic/instance-identity/document)
+unset TOKEN
+if [ -n "$JOB_XTRACE" ]; then set -x; fi
+ACCOUNT_ID=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+  '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
+IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+  '.region | select(type == "string" and length > 0)')
+if [ "$IDENTITY_REGION" != "$REGION" ]; then
+  echo "FATAL: instance identity region $IDENTITY_REGION does not match $REGION; refusing to register this runner"
+  exit 1
+fi
+INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$INSTANCE_ID"
+REGISTRATION_TABLE="${local.runner_registration_table_name}"
+RUNNER_NAME="runner-$INSTANCE_ID"
+REGISTRATION_KEY=$(jq -cn --arg arn "$INSTANCE_ARN" '{InstanceArn: {S: $arn}}')
+
+# At boot, bootstrap and cleanup both conditionally create this row. A next job
+# replaces it only while it still names this host's previous runner.
+CLAIM=(--condition-expression 'attribute_not_exists(InstanceArn)')
+if [ "$MODE" = next ]; then
+  # GitHub removed the ephemeral registration when its job ended, and config.sh
+  # refuses to configure over the local files that registration left.
+  rm -f .runner .credentials .credentials_rsaparams
+  if ! PREVIOUS_RUNNER_ID=$(aws dynamodb get-item --table-name "$REGISTRATION_TABLE" \
+      --key "$REGISTRATION_KEY" --consistent-read --region "$REGION" --output json \
+      | jq -er --arg arn "$INSTANCE_ARN" --arg instance_id "$INSTANCE_ID" \
+        --arg runner_name "$RUNNER_NAME" '.Item | select(.InstanceArn.S == $arn
+        and .State.S == "registered" and .InstanceId.S == $instance_id
+        and .RunnerName.S == $runner_name) | .RunnerId.N'); then
+    echo "FATAL: registration row does not name this host's previous runner; refusing to take another job"
+    exit 1
+  fi
+  CLAIM=(--condition-expression '#s = :registered AND RunnerId = :previous'
+    --expression-attribute-names '{"#s":"State"}'
+    --expression-attribute-values "$(jq -cn --arg id "$PREVIOUS_RUNNER_ID" \
+      '{":registered": {S: "registered"}, ":previous": {N: $id}}')")
+fi
+
+# The controller can only tag a credential after RunInstances returns the id,
+# and brokers a next job's only while this host can still be waiting for it.
+case $- in *x*) JOB_XTRACE=1 ;; *) JOB_XTRACE= ;; esac
+{ set +x; } 2>/dev/null
 BOOTSTRAP_DEADLINE=$((SECONDS + 180))
 for BOOTSTRAP_ATTEMPT in $(seq 1 36); do
   if [ "$SECONDS" -ge "$BOOTSTRAP_DEADLINE" ]; then break; fi
@@ -1401,108 +2090,117 @@ for BOOTSTRAP_ATTEMPT in $(seq 1 36); do
   fi
   sleep 5
 done
-if [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != "None" ]; then
-  RUNNER_NAME="runner-$INSTANCE_ID"
-  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate
-  unset REG_TOKEN
+if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "None" ]; then
+  echo "FATAL: no instance-bound registration credential; refusing to register this runner"
+  exit 1
+fi
+# The credential goes on no command line. sudo logs the command it runs as COMMAND=
+# in auth.log and the journal, which the job user reads through adm, and ps shows
+# every process's arguments to every user. So it crosses sudo on stdin, and the
+# unprivileged shell hands it to config.sh as ACTIONS_RUNNER_INPUT_TOKEN, which the
+# runner reads when --token is absent and removes from its own environment. sudo
+# still resets the environment, so the runner's .env and .path do not change.
+sudo -u ubuntu bash -c 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --url https://github.com/ejc3/fcvm "$@"' config \
+  --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate <<<"$REG_TOKEN"
+unset REG_TOKEN
+if [ -n "$JOB_XTRACE" ]; then set -x; fi
 
-  # `.runner` is the identity GitHub assigned, written by config.sh with
-  # camelCase keys (the runner serialises RunnerSettings through
-  # VssCamelCasePropertyNamesContractResolver). Refuse to start when config
-  # wrote anything other than this instance's name, or no positive id.
-  if ! RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
-    select(.agentName == $expected)
-    | .agentId
-    | select(type == "number" and . > 0 and floor == .)
-  ' .runner); then
-    echo "FATAL: configured runner identity does not match this instance; refusing to start runner service"
+# `.runner` is the identity GitHub assigned, written by config.sh with
+# camelCase keys (the runner serialises RunnerSettings through
+# VssCamelCasePropertyNamesContractResolver). Refuse to start when config
+# wrote anything other than this instance's name, or no positive id.
+if ! RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
+  select(.agentName == $expected)
+  | .agentId
+  | select(type == "number" and . > 0 and floor == .)
+' .runner); then
+  echo "FATAL: configured runner identity does not match this instance; refusing to start runner service"
+  exit 1
+fi
+REGISTERED_AT=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)
+REGISTRATION_ITEM=$(jq -cn \
+  --arg arn "$INSTANCE_ARN" \
+  --arg instance_id "$INSTANCE_ID" \
+  --arg runner_name "$RUNNER_NAME" \
+  --arg runner_id "$RUNNER_ID" \
+  --arg registered_at "$REGISTERED_AT" \
+  '{InstanceArn: {S: $arn}, State: {S: "registered"},
+    InstanceId: {S: $instance_id}, RunnerName: {S: $runner_name},
+    RunnerId: {N: $runner_id}, RegisteredAt: {S: $registered_at}}')
+
+# Start the service only when this write won, or when a consistent read proves
+# that a PutItem whose answer was lost did in fact write this exact identity.
+if ! aws dynamodb put-item \
+    --table-name "$REGISTRATION_TABLE" \
+    --item "$REGISTRATION_ITEM" \
+    "$${CLAIM[@]}" \
+    --region "$REGION"; then
+  REGISTRATION_ROW=$(aws dynamodb get-item \
+    --table-name "$REGISTRATION_TABLE" \
+    --key "$REGISTRATION_KEY" \
+    --consistent-read \
+    --region "$REGION" \
+    --output json 2>/dev/null || true)
+  if ! printf '%s' "$REGISTRATION_ROW" | jq -e \
+      --arg arn "$INSTANCE_ARN" \
+      --arg instance_id "$INSTANCE_ID" \
+      --arg runner_name "$RUNNER_NAME" \
+      --arg runner_id "$RUNNER_ID" \
+      '.Item.InstanceArn.S == $arn
+       and .Item.State.S == "registered"
+       and .Item.InstanceId.S == $instance_id
+       and .Item.RunnerName.S == $runner_name
+       and .Item.RunnerId.N == $runner_id' >/dev/null; then
+    echo "FATAL: cleanup won or registration ownership is unknown; refusing to start runner service"
+    # The controller owns GitHub deregistration; no PAT is available on the
+    # job host. Its cleanup pass removes the offline orphan after reap.
     exit 1
   fi
+fi
 
-  IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
-    http://169.254.169.254/latest/dynamic/instance-identity/document)
-  ACCOUNT_ID=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
-    '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
-  IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
-    '.region | select(type == "string" and length > 0)')
-  if [ "$IDENTITY_REGION" != "$REGION" ]; then
-    echo "FATAL: instance identity region $IDENTITY_REGION does not match $REGION; refusing to register this runner"
-    exit 1
-  fi
-  INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$INSTANCE_ID"
-  REGISTRATION_TABLE="${local.runner_registration_table_name}"
-  REGISTERED_AT=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)
-  REGISTRATION_KEY=$(jq -cn --arg arn "$INSTANCE_ARN" \
-    '{InstanceArn: {S: $arn}}')
-  REGISTRATION_ITEM=$(jq -cn \
-    --arg arn "$INSTANCE_ARN" \
-    --arg instance_id "$INSTANCE_ID" \
-    --arg runner_name "$RUNNER_NAME" \
-    --arg runner_id "$RUNNER_ID" \
-    --arg registered_at "$REGISTERED_AT" \
-    '{InstanceArn: {S: $arn}, State: {S: "registered"},
-      InstanceId: {S: $instance_id}, RunnerName: {S: $runner_name},
-      RunnerId: {N: $runner_id}, RegisteredAt: {S: $registered_at}}')
-
-  # Bootstrap and cleanup both conditionally create this row. Bootstrap starts
-  # the service only when it won, or when a consistent read proves that a
-  # PutItem whose answer was lost did in fact write this exact identity.
-  if ! aws dynamodb put-item \
-      --table-name "$REGISTRATION_TABLE" \
-      --item "$REGISTRATION_ITEM" \
-      --condition-expression 'attribute_not_exists(InstanceArn)' \
-      --region "$REGION"; then
-    REGISTRATION_ROW=$(aws dynamodb get-item \
-      --table-name "$REGISTRATION_TABLE" \
-      --key "$REGISTRATION_KEY" \
-      --consistent-read \
-      --region "$REGION" \
-      --output json 2>/dev/null || true)
-    if ! printf '%s' "$REGISTRATION_ROW" | jq -e \
-        --arg arn "$INSTANCE_ARN" \
-        --arg instance_id "$INSTANCE_ID" \
-        --arg runner_name "$RUNNER_NAME" \
-        --arg runner_id "$RUNNER_ID" \
-        '.Item.InstanceArn.S == $arn
-         and .Item.State.S == "registered"
-         and .Item.InstanceId.S == $instance_id
-         and .Item.RunnerName.S == $runner_name
-         and .Item.RunnerId.N == $runner_id' >/dev/null; then
-      echo "FATAL: cleanup won or registration ownership is unknown; refusing to start runner service"
-      # The controller owns GitHub deregistration now; no PAT is available on
-      # the job host. Its cleanup pass removes the offline orphan after reap.
-      exit 1
-    fi
-  fi
-
-  # Jobs must never inherit a still-readable registration credential. Failure
-  # to delete is a hard gate, not a warning followed by service startup.
-  if ! bootstrap_ssm delete-parameter --name "$BOOTSTRAP_PARAM"; then
-    echo "FATAL: bootstrap credential deletion failed; refusing to start runner service"
-    exit 1
-  fi
+# Jobs must never inherit a still-readable registration credential. Failure
+# to delete is a hard gate, not a warning followed by service startup.
+if ! bootstrap_ssm delete-parameter --name "$BOOTSTRAP_PARAM"; then
+  echo "FATAL: bootstrap credential deletion failed; refusing to start runner service"
+  exit 1
+fi
+if [ "$MODE" = first ]; then
   ./svc.sh install ubuntu
-  RUNNER_SERVICE=$(tr -d '\r\n' < .service)
-  if [[ ! "$RUNNER_SERVICE" =~ ^actions\.runner\.[A-Za-z0-9_.-]+\.service$ ]]; then
-    echo "FATAL: invalid runner service identity; refusing to start runner service"
-    exit 1
-  fi
+fi
+RUNNER_SERVICE=$(tr -d '\r\n' < .service)
+if [[ ! "$RUNNER_SERVICE" =~ ^actions\.runner\.[A-Za-z0-9_.-]+\.service$ ]]; then
+  echo "FATAL: invalid runner service identity; refusing to start runner service"
+  exit 1
+fi
+if [ "$MODE" = first ]; then
   mkdir -p "/etc/systemd/system/$RUNNER_SERVICE.d"
   cat > "/etc/systemd/system/$RUNNER_SERVICE.d/ephemeral.conf" <<'EPHEMERAL_SERVICE'
 [Service]
 Restart=no
 Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1
-ExecStopPost=+/usr/bin/systemctl --no-block poweroff
+ExecStopPost=+/usr/local/sbin/fcvm-runner-job after
 EPHEMERAL_SERVICE
   systemctl daemon-reload
-  ./svc.sh start
-  trap - EXIT
-else
-  echo "FATAL: no instance-bound registration credential; refusing to register this runner"
-  exit 1
 fi
+./svc.sh start
+trap - EXIT
+RUNNER_JOB
+chmod 755 /usr/local/sbin/fcvm-runner-job
+INSTANCE_ID="$INSTANCE_ID" REGION="$REGION" RUNNER_LABEL="$RUNNER_LABEL" /usr/local/sbin/fcvm-runner-job first
 EOF
+
+  # EC2 receives the script above without its whole-line comments. They stay here for
+  # readers; shipped, they no longer fit. Once the next-job loop moved into the script,
+  # Terraform's base64gzip of it measured about 8,740 characters against the 8,192 the
+  # Advanced tier allows, and about 6,436 without comments. Pausing xtrace around the
+  # IMDSv2 and registration tokens took the stripped script to about 6,624. A `#!` line
+  # is not a comment and is kept. No line in the script carries data that starts with
+  # `#`, and scripts/test-runner-userdata.sh checks that the stripped document still
+  # parses.
+  runner_user_data_document = join("\n", [
+    for line in split("\n", local.runner_user_data) : line
+    if !startswith(trimspace(line), "#") || startswith(line, "#!")
+  ])
 }
 
 # SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
@@ -1514,8 +2212,10 @@ EOF
 #   ValidationException: The specified parameter value is too large.
 #   Advanced-tier parameters support a maximum parameter value of 8192 characters.
 #
-# base64gzip brought it to 4,712; the registration claim takes it to about 6,100,
-# still under the limit with room for the script to keep growing.
+# base64gzip brought it to 4,712; the registration claim took it to about 6,100. The
+# next-job loop took the commented script past the limit again, so the value is now
+# base64gzip of local.runner_user_data_document, the script without its whole-line
+# comments: about 6,600 characters. What reads back from SSM has no comments.
 #
 # Safe because BOTH decoders are already in the path, and neither is new behaviour:
 #   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
@@ -1531,7 +2231,7 @@ resource "aws_ssm_parameter" "runner_user_data" {
   name  = "/github-runner/user-data"
   type  = "String"
   tier  = "Advanced"
-  value = base64gzip(local.runner_user_data)
+  value = base64gzip(local.runner_user_data_document)
   tags = {
     Name = "github-runner-user-data"
   }
@@ -1581,7 +2281,10 @@ data "archive_file" "runner_cleanup" {
       # The launcher tags every instance with the registration handshake its
       # user data runs. Only this value has a DynamoDB row to read.
       PROTOCOL_TAG = 'RunnerRegistrationProtocol'
-      REGISTRATION_PROTOCOL = 'ddb-v1'
+      # ddb-v2 is ddb-v1 that registers again after each job on the same host
+      # (fcvm-runner-job next in user data), replacing its row with the new
+      # runner id. Cleanup judges both by that row.
+      REGISTRATION_PROTOCOLS = ('ddb-v1', 'ddb-v2')
       # Lease duration - busy runners get extended, idle runners expire
       LEASE_DURATION_MINUTES = 60
 
@@ -1597,10 +2300,14 @@ data "archive_file" "runner_cleanup" {
       #
       # 12h is a deliberate LOCAL policy, not a platform limit. GitHub allows a
       # self-hosted job to run for up to 5 days (the 6h cap is for GitHub-hosted
-      # runners only), and these runners are not ephemeral, so one instance can
-      # legitimately chain many short jobs past 12h of age. Every ejc3/fcvm CI job
-      # finishes in well under 2 hours, so a runner this old has outlived its
-      # usefulness and is quite likely wedged.
+      # runners only). These runners register with --ephemeral, one registration
+      # per job. A host whose runner exits cleanly waits a few minutes for the
+      # webhook Lambda to hand it the next queued job and otherwise powers off,
+      # which terminates it, so an instance chains jobs only while work keeps
+      # arriving for it. The webhook Lambda hands no job to a host past this age
+      # (MAX_REUSE_AGE_HOURS). Every ejc3/fcvm CI job finishes in well under 2
+      # hours, so past 12h an instance is finishing the last job it was given, or
+      # it is wedged.
       #
       # Past this age the instance DRAINS rather than dying: it is terminated on the
       # first poll that observes it idle, and a job already in flight is left to
@@ -1631,13 +2338,14 @@ data "archive_file" "runner_cleanup" {
       # absolute lifetime at 13h30m, well inside the property ejc3/fcvm#871 needs:
       # a wedged host dies on a schedule nothing broken can extend.
       #
-      # Be clear about what it does NOT cover. A draining runner stays registered
-      # and schedulable (the DRAIN branch says why it is not deregistered), so
-      # GitHub can hand it a fresh job in the up-to-5-minute gap between its last
-      # job ending and the poll that notices. A job starting late in the window can
-      # still be cut short at the ceiling, and no value of this constant prevents
-      # that - only an on-box graceful shutdown would, which this Lambda has no
-      # channel to request. The drain removes the guaranteed kill of every job in
+      # Be clear about what it does NOT cover. A job still running when the grace
+      # runs out is cut short at the ceiling, and no value of this constant
+      # prevents that - only an on-box graceful shutdown would, which this Lambda
+      # has no channel to request. What a draining host cannot do is pick up a
+      # fresh job: its registration is ephemeral and ends with the job it holds,
+      # and the webhook Lambda hands no host past the soft cap another one. A
+      # registration past the soft cap that is still waiting for its job is the
+      # TERMINATE_IDLE case. The drain removes the guaranteed kill of every job in
       # flight at 12h; it does not make the ceiling harmless.
       #
       # If fcvm ever gains a legitimately long job, raise the SOFT CAP, not this.
@@ -2452,7 +3160,7 @@ data "archive_file" "runner_cleanup" {
                   if j.get('status') == 'queued'
                   and 'self-hosted' in [l.lower() for l in j.get('labels', [])]]
 
-      def queued_demand(pat, cap):
+      def queued_demand(pat, cap, scan=None):
           """Count queued self-hosted jobs per architecture.
 
           Three bounds, each reported when it fires: the saturation exit (both
@@ -2463,20 +3171,28 @@ data "archive_file" "runner_cleanup" {
           timeout is not catchable and would kill the whole poll). Truncation
           under-counts demand; the next poll corrects it. A run with no queued
           jobs contributes nothing rather than consuming a sample slot.
+
+          `scan`, when given, gets `complete`: True only when every run the
+          listings returned was read. Zero after an early exit is a lower bound,
+          not evidence that nothing is queued.
           """
           demand = {'arm64': 0, 'x86_64': 0}
           scan_start = datetime.now(timezone.utc)
-          run_ids = list(dict.fromkeys(
-              list_run_ids(pat, 'queued', QUEUE_SCAN_MAX_RUNS)
-              + list_run_ids(pat, 'in_progress', QUEUE_SCAN_MAX_RUNS)
-          ))
+          queued_runs = list_run_ids(pat, 'queued', QUEUE_SCAN_MAX_RUNS)
+          in_progress_runs = list_run_ids(pat, 'in_progress', QUEUE_SCAN_MAX_RUNS)
+          run_ids = list(dict.fromkeys(queued_runs + in_progress_runs))
+          # A listing that reached its cap may have more runs behind it.
+          complete = (len(queued_runs) < QUEUE_SCAN_MAX_RUNS
+                      and len(in_progress_runs) < QUEUE_SCAN_MAX_RUNS)
           for scanned, run_id in enumerate(run_ids):
               if all(count >= cap for count in demand.values()):
                   print(f'Queue scan satisfied after {scanned} of {len(run_ids)} runs')
+                  complete = False
                   break
               elapsed = (datetime.now(timezone.utc) - scan_start).total_seconds()
               if elapsed > QUEUE_SCAN_TIME_BUDGET_SECONDS:
                   print(f'Queue scan hit its {QUEUE_SCAN_TIME_BUDGET_SECONDS}s budget after {scanned} of {len(run_ids)} runs; demand is a lower bound')
+                  complete = False
                   break
               for job in queued_self_hosted_jobs(pat, run_id):
                   labels = [l.lower() for l in job.get('labels', [])]
@@ -2484,6 +3200,9 @@ data "archive_file" "runner_cleanup" {
                       demand['x86_64'] += 1
                   else:
                       demand['arm64'] += 1
+          if scan is not None:
+              scan['complete'] = complete
+              scan['started_at'] = scan_start.timestamp()
           return demand
 
       def cleanup_expired_bootstrap_parameters(now):
@@ -2556,6 +3275,26 @@ data "archive_file" "runner_cleanup" {
               result['truncated'] = True
           return result
 
+      def record_queue_scan(arch, started_at, queued):
+          """Tell the webhook a complete scan counted every arch job queued before started_at.
+
+          Deliveries from github-runner-webhook-front can wait in the webhook's async
+          queue. The webhook skips a forwarded queued job created before this, because
+          this scan already counted it and this poll already asked for its runner.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table:
+              return
+          try:
+              dynamodb.update_item(
+                  TableName=table,
+                  Key={'InstanceArn': {'S': f'queue-scan#{arch}'}},
+                  UpdateExpression='SET ScanStartedAt = :started, QueuedJobs = :queued',
+                  ExpressionAttributeValues={':started': {'N': f'{started_at:.3f}'},
+                                             ':queued': {'N': str(queued)}})
+          except Exception as e:
+              print(f'Could not record the {arch} queue scan: {type(e).__name__}')
+
       def handler(event, context):
           now = datetime.now(timezone.utc)
 
@@ -2582,6 +3321,33 @@ data "archive_file" "runner_cleanup" {
               ]
           )
 
+          # Fleet size and the oldest host, as EMF (no IAM needed), emitted FIRST so a poll that
+          # times out later still reports. The alarms too-many-runners, runner-long-running and
+          # runner-cleanup-silent (cost-alerts.tf) read these: AWS/EC2 has no per-tag instance
+          # count, and the query they used before could never return data.
+          # Never allowed to break the sweep below: an instance without a readable LaunchTime
+          # counts toward LiveRunners but not the age.
+          fleet = [i for r in response.get('Reservations', []) for i in r.get('Instances', [])]
+          oldest_minutes = 0
+          for i in fleet:
+              try:
+                  oldest_minutes = max(oldest_minutes, (now - i['LaunchTime']).total_seconds() / 60)
+              except Exception:
+                  pass
+          print(json.dumps({
+              '_aws': {
+                  'Timestamp': int(now.timestamp() * 1000),
+                  'CloudWatchMetrics': [{
+                      'Namespace': 'GitHubRunners',
+                      'Dimensions': [[]],
+                      'Metrics': [{'Name': 'LiveRunners', 'Unit': 'Count'},
+                                  {'Name': 'OldestRunnerAgeMinutes', 'Unit': 'None'}]
+                  }]
+              },
+              'LiveRunners': len(fleet),
+              'OldestRunnerAgeMinutes': round(oldest_minutes, 1),
+          }))
+
           terminated = []
           renewed = []
           expired = []
@@ -2597,6 +3363,10 @@ data "archive_file" "runner_cleanup" {
           # Instances EC2 refused to terminate. They are STILL RUNNING, so they must
           # never appear in `terminated`, and the poll must not read as a clean sweep.
           terminate_failed = []
+          # Registered runners GitHub reported online and idle inside their lease,
+          # as (instance id, Name tag, runner id, runner name). Phase 7 ends the
+          # ones whose architecture has nothing queued.
+          idle_candidates = []
 
           # The ceiling pass. It walks the whole fleet reading nothing but
           # InstanceId and LaunchTime and terminates every instance over the
@@ -2736,7 +3506,7 @@ data "archive_file" "runner_cleanup" {
                       protocol = get_tag(instance, PROTOCOL_TAG)
                       registration = None
                       runner_info = runners.get(runner_name, {})
-                      if protocol == REGISTRATION_PROTOCOL:
+                      if protocol in REGISTRATION_PROTOCOLS:
                           # This instance's bootstrap claims registration in
                           # DynamoDB before it starts the runner service, so
                           # the row is the registration evidence and the row's
@@ -2790,7 +3560,7 @@ data "archive_file" "runner_cleanup" {
                       # bootstrap needs, and terminates only once that row is
                       # its. A `reaping` row from an earlier poll is a claim
                       # already won and a terminate to retry.
-                      if protocol == REGISTRATION_PROTOCOL and (
+                      if protocol in REGISTRATION_PROTOCOLS and (
                               registration is None
                               or (isinstance(registration, dict)
                                   and registration['state'] == 'reaping')):
@@ -2856,10 +3626,11 @@ data "archive_file" "runner_cleanup" {
                           mark_seen(instance_id, now)
 
                       if action == TERMINATE_IDLE:
-                          # Past the soft cap and holding nothing: go now, before GitHub
-                          # can hand it another job. This is what stops a drained runner
-                          # taking further work, so it fires on the first poll that
-                          # observes idleness rather than waiting for lease expiry.
+                          # Past the soft cap and holding nothing: go now. The
+                          # registration is still waiting for its one job, and a job
+                          # handed to a host this old could be cut short at the
+                          # ceiling, so this fires on the first poll that observes
+                          # idleness rather than waiting for lease expiry.
                           #
                           # Confirmed against a FRESH read first, because the snapshot
                           # this decision came from is tens of seconds old by now and
@@ -2989,6 +3760,10 @@ data "archive_file" "runner_cleanup" {
                               terminate_failed.append(instance_id)
                       else:
                           print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
+                          if (runner_info.get('id') and runner_info.get('busy') is False
+                                  and runner_info.get('status') == 'online'):
+                              idle_candidates.append((instance_id, get_tag(instance, 'Name') or '',
+                                                      runner_info['id'], runner_name))
                   except Exception as e:
                       broken = instance.get('InstanceId') if isinstance(instance, dict) else None
                       print(f'UNREADABLE INSTANCE RECORD ({broken or "no InstanceId"}): '
@@ -3119,19 +3894,24 @@ data "archive_file" "runner_cleanup" {
           # here. That makes this poll the last line of defence, and it has to see
           # the whole queue rather than a sample of it.
           launched = []
+          demand = None
+          demand_scan = {}
           if pat:
               try:
                   max_runners = int(os.environ.get('MAX_RUNNERS', '4'))
-                  demand = queued_demand(pat, max_runners)
+                  demand = queued_demand(pat, max_runners, demand_scan)
                   print(f'Queued self-hosted jobs by architecture: {demand}')
                   webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
+                  # Architectures this poll asked runners for, or that had nothing queued.
+                  covered = []
                   for arch in sorted(demand):
                       queued_jobs = demand[arch]
                       labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
                       # ONE invoke per architecture, carrying the whole deficit as
-                      # launch_count and the raw demand as queued_jobs (the latter
-                      # rides into the webhook's decision record). The webhook
-                      # launches launch_count runners inside a single invocation,
+                      # launch_count and the raw demand as queued_jobs. The webhook
+                      # takes its starting and idle runners off queued_jobs, records
+                      # it in its decision line, and launches at most launch_count
+                      # runners inside a single invocation,
                       # where its own loop count bounds the total - a burst of
                       # single-launch invocations, even serialized by reserved
                       # concurrency 1, can each miss the instance the previous one
@@ -3139,6 +3919,7 @@ data "archive_file" "runner_cleanup" {
                       # and overshoot MAX_RUNNERS.
                       count = min(queued_jobs, max_runners)
                       if count <= 0:
+                          covered.append(arch)
                           continue
                       # Direct invoke: no requestContext, so the handler trusts it
                       # without a header. Skips HMAC, which API Gateway callers cannot.
@@ -3159,12 +3940,52 @@ data "archive_file" "runner_cleanup" {
                               Payload=json.dumps(payload)
                           )
                           launched.extend([arch] * count)
+                          covered.append(arch)
                       except Exception as e:
                           print(f'Failed to invoke webhook for {arch}: {e}')
+                  if demand_scan.get('complete'):
+                      for arch in covered:
+                          record_queue_scan(arch, demand_scan['started_at'], demand[arch])
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'bootstrap_cleanup': bootstrap_cleanup}
+          # Phase 7: a registered runner that is idle while its architecture has
+          # nothing queued is deregistered, then terminated, instead of waiting out
+          # its lease. Registrations are ephemeral and a warm host is handed the
+          # next job within a few minutes of its last, so an idle registration with
+          # no queue behind it is capacity nobody is going to use.
+          #
+          # Deregistration goes FIRST here, the reverse of the lease path. GitHub
+          # refuses to remove a runner that is running a job, so a job handed out
+          # after the fresh read below survives, and a refused deregistration
+          # leaves the instance alone. If the terminate then fails, the host is left
+          # with no registration: its runner exits and fcvm-runner-job powers it off.
+          #
+          # Only on a complete queue scan. A truncated scan under-counts, and zero
+          # from a partial read is not evidence that nothing is queued.
+          idle_terminated = []
+          if pat and demand is not None and demand_scan.get('complete'):
+              for instance_id, name_tag, runner_id, runner_name in idle_candidates:
+                  if context is not None and context.get_remaining_time_in_millis() < 30000:
+                      print('Idle sweep stopped with under 30s of the invocation left')
+                      break
+                  arch = name_tag.removeprefix('github-runner-')
+                  if demand.get(arch, 1) > 0 or instance_id in terminated:
+                      continue
+                  if not still_idle(runner_id, runner_name, pat):
+                      print(f'{instance_id}: idle with nothing queued, but not idle on a fresh read; leaving it')
+                      continue
+                  if not deregister_runner(runner_id, pat):
+                      print(f'{instance_id}: GitHub did not deregister {runner_name}; leaving it running')
+                      continue
+                  if terminate(instance_id, 'idle with nothing queued'):
+                      print(f'Terminating idle: {instance_id} ({runner_name} idle, nothing queued for {arch})')
+                      terminated.append(instance_id)
+                      idle_terminated.append(instance_id)
+                  else:
+                      terminate_failed.append(instance_id)
+
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF
     filename = "lambda_function.py"
   }
@@ -3204,15 +4025,69 @@ resource "aws_lambda_function" "runner_cleanup" {
   depends_on = [aws_iam_role_policy.runner_bootstrap_controller]
 }
 
-# Async invocations (the cleanup poll's direct invokes) must never be retried by
-# Lambda itself: a retry after a partial launch re-reads eventually-consistent
-# DescribeInstances, can miss the instances the failed attempt already launched,
-# and overshoots the cap. The 5-minute poll IS the retry path, and it re-derives
-# the deficit from fresh state.
+# Async invocations of the unqualified function (the cleanup poll's requests and
+# github-runner-reuse's claim requests) must never be retried by Lambda itself: a retry
+# after a partial launch re-reads eventually-consistent DescribeInstances, can miss the
+# instances the failed attempt already launched, and overshoots the cap. The 5-minute
+# poll IS the retry path, and it re-derives the deficit from fresh state.
+#
+# Throttles are not function errors, and Lambda keeps retrying a throttled event until it
+# is maximum_event_age_in_seconds old. A poll request that has waited a whole poll interval
+# is overtaken by the next poll's, and a claim request is worthless 90 seconds after its
+# job ended, so nothing here is worth running after 300 seconds. Forwarded GitHub
+# deliveries arrive through the delivery alias, whose config in runner-webhook-front.tf has
+# the same two settings.
 resource "aws_lambda_function_event_invoke_config" "runner_webhook" {
-  count                  = var.enable_github_runner ? 1 : 0
-  function_name          = aws_lambda_function.runner_webhook[0].function_name
-  maximum_retry_attempts = 0
+  count                        = var.enable_github_runner ? 1 : 0
+  function_name                = aws_lambda_function.runner_webhook[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 300
+}
+
+# Completed jobs are checked for warm-host reuse here, not in the webhook. The check reads
+# EC2, the runner roster, the registration row and up to 8 seconds of GitHub's queue. The
+# webhook runs one execution at a time behind API Gateway, so there that work would hold the
+# execution while queued deliveries arrive, are throttled, and are never redelivered: on
+# 2026-09-13, before this, 69 of 80 retained queued deliveries had already failed that way.
+# Same source and role as the webhook, and it launches and claims nothing: when a warm host
+# should take queued work it sends the webhook a claim_only request, so the webhook stays the
+# one function that decides capacity. One execution at a time here too, which keeps it to one
+# GitHub queue look at once. A check is worthless once the reuse window has passed, so the
+# async queue keeps an event at most 120 seconds and never retries a failed one.
+resource "aws_lambda_function" "runner_reuse" {
+  count            = var.enable_github_runner ? 1 : 0
+  filename         = data.archive_file.runner_webhook.output_path
+  source_code_hash = data.archive_file.runner_webhook.output_base64sha256
+  function_name    = "github-runner-reuse"
+  role             = aws_iam_role.runner_lambda[0].arn
+  handler          = "lambda_function.reuse_handler"
+  runtime          = "python3.12"
+  timeout          = 30
+
+  reserved_concurrent_executions = 1
+
+  environment {
+    variables = {
+      # A literal, as in the cleanup function: the webhook references this function.
+      WEBHOOK_FUNCTION   = "github-runner-webhook"
+      REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
+      RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
+      MAX_RUNNERS        = tostring(local.runner_max_per_arch)
+    }
+  }
+
+  tags = {
+    Name = "github-runner-reuse"
+  }
+
+  depends_on = [aws_iam_role_policy.runner_lambda]
+}
+
+resource "aws_lambda_function_event_invoke_config" "runner_reuse" {
+  count                        = var.enable_github_runner ? 1 : 0
+  function_name                = aws_lambda_function.runner_reuse[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 120
 }
 
 resource "aws_cloudwatch_event_rule" "runner_cleanup" {

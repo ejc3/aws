@@ -270,6 +270,205 @@ resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
 }
 
 # ---------------------------------------------------------------------------------
+# The family board's wall screens (family.cc-games.dev/tv and /ink).
+#
+# Two locks, one outside the app and one inside it:
+#
+#   1. Cloudflare (this file). /tv, /ink and /api/device/* are reachable only by
+#        - a device enrolled in this account's WARP client by someone on the allowlist
+#          (the e-ink tablet; a TV that can run the Cloudflare One app), which Access
+#          signs in through WARP so nobody types a password on a screen, or
+#        - the home screen proxy: a small reverse proxy on the house network that adds
+#          the service token below to every request, for screens that cannot run WARP.
+#          It only works for these paths, because only this application accepts it.
+#   2. The app. Behind Cloudflare, a screen still has to be paired: it shows a code and a
+#      signed-in person types it into /pair (which stays behind the Google login on the
+#      wildcard application). See docs/KIOSK.md and docs/DESIGN.md in ejc3/family.
+#
+# /_next/* (the site's compiled JavaScript, CSS and fonts; nothing private) stays open in
+# an application of its own. It is shared with the phone pages, and the phones are neither
+# enrolled in WARP nor behind the proxy.
+# ---------------------------------------------------------------------------------
+
+# Device enrollment permissions: who may enroll a device into this account's WARP client.
+# Cloudflare allows one application of type "warp" per account. If one was already made in
+# the dashboard, import it rather than letting this create a second:
+#   terraform import cloudflare_zero_trust_access_application.warp_enrollment <account_id>/<app_id>
+resource "cloudflare_zero_trust_access_policy" "warp_enrollment" {
+  account_id       = var.cloudflare_account_id
+  name             = "may enroll devices in WARP"
+  decision         = "allow"
+  session_duration = "24h"
+
+  include = [
+    for email in var.dev_allowed_emails : { email = { email = email } }
+  ]
+}
+
+resource "cloudflare_zero_trust_access_application" "warp_enrollment" {
+  account_id       = var.cloudflare_account_id
+  name             = "Warp Login App"
+  type             = "warp"
+  session_duration = "24h"
+  allowed_idps = concat(
+    cloudflare_zero_trust_access_identity_provider.google[*].id,
+    [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
+  )
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.warp_enrollment.id
+      precedence = 1
+    },
+  ]
+}
+
+# "This request comes from a device running this account's WARP client." Used by the
+# family wall screens to require devices enrolled in this Zero Trust account.
+#
+# type = "warp" is a simple boolean check (is the WARP client running), not a
+# platform-specific one: verified live against the API that description, match and
+# enabled are all silently accepted on create/update and then absent from every
+# subsequent read -- Cloudflare does not persist them for this rule type, which made
+# every plan after a clean apply show a perpetual diff trying to "add" them back.
+# Removed here rather than papered over with ignore_changes, since they were never
+# part of this type's actual schema.
+resource "cloudflare_zero_trust_device_posture_rule" "warp_enrolled" {
+  account_id = var.cloudflare_account_id
+  name       = "Runs this account's WARP client"
+  type       = "warp"
+}
+
+resource "cloudflare_zero_trust_access_policy" "family_wall_screens_warp" {
+  account_id       = var.cloudflare_account_id
+  name             = "family wall screens: enrolled devices"
+  decision         = "allow"
+  session_duration = "24h"
+
+  include = [
+    for email in var.dev_allowed_emails : { email = { email = email } }
+  ]
+  require = [{
+    device_posture = { integration_uid = cloudflare_zero_trust_device_posture_rule.warp_enrolled.id }
+  }]
+}
+
+# The home screen proxy's credential. It lives on the proxy in the house; nothing on the
+# dev box reads it. Same shape as the other service tokens in this file: finite lifetime,
+# its own non_identity policy, the secret in Secrets Manager and nowhere else.
+resource "cloudflare_zero_trust_access_service_token" "family_wall_proxy" {
+  account_id = var.cloudflare_account_id
+  name       = "family-wall-screen-proxy"
+  duration   = "8760h" # 1 year
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "family_wall_proxy" {
+  account_id       = var.cloudflare_account_id
+  name             = "family wall screens: home screen proxy"
+  decision         = "non_identity"
+  session_duration = "24h"
+
+  include = [{
+    service_token = { token_id = cloudflare_zero_trust_access_service_token.family_wall_proxy.id }
+  }]
+}
+
+resource "aws_secretsmanager_secret" "family_wall_proxy" {
+  name        = "family-wall-screen-proxy-access"
+  description = "Cloudflare Access service token for the home proxy in front of the family board's wall screens (/tv, /ink, /api/device/* only)"
+  tags        = { Name = "family-wall-screen-proxy-access", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "family_wall_proxy" {
+  secret_id = aws_secretsmanager_secret.family_wall_proxy.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.family_wall_proxy.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.family_wall_proxy.client_secret
+    base_url      = "https://family.cc-games.dev"
+  })
+}
+
+resource "cloudflare_zero_trust_access_application" "family_wall_screens" {
+  account_id       = var.cloudflare_account_id
+  name             = "family board wall screens"
+  type             = "self_hosted"
+  domain           = "family.cc-games.dev/tv"
+  session_duration = "24h"
+
+  destinations = [
+    { type = "public", uri = "family.cc-games.dev/tv" },
+    { type = "public", uri = "family.cc-games.dev/ink" },
+    { type = "public", uri = "family.cc-games.dev/api/device/*" },
+  ]
+
+  # An enrolled device is signed in through WARP: no login page on the screen.
+  allow_authenticate_via_warp = true
+  allowed_idps = concat(
+    cloudflare_zero_trust_access_identity_provider.google[*].id,
+    [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
+  )
+  # This application shares its hostname with the wildcard one; scope its cookie to its
+  # own paths so the two sign-ins do not overwrite each other.
+  path_cookie_attribute = true
+
+  # As with cc_games_dev: the attachment MUST be declared here, or an apply drops it and
+  # the paths fall back to the wildcard application.
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.family_wall_screens_warp.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.family_wall_proxy.id
+      precedence = 2
+    },
+  ]
+}
+
+# Was family_wall_screens_bypass, attached to all four paths; now it covers /_next only.
+moved {
+  from = cloudflare_zero_trust_access_policy.family_wall_screens_bypass
+  to   = cloudflare_zero_trust_access_policy.family_wall_assets_bypass
+}
+
+resource "cloudflare_zero_trust_access_policy" "family_wall_assets_bypass" {
+  account_id = var.cloudflare_account_id
+  name       = "family board compiled assets"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "family_wall_assets" {
+  account_id = var.cloudflare_account_id
+  name       = "family board compiled assets"
+  type       = "self_hosted"
+  domain     = "family.cc-games.dev/_next/*"
+
+  destinations = [
+    { type = "public", uri = "family.cc-games.dev/_next/*" },
+  ]
+
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.family_wall_assets_bypass.id
+      precedence = 1
+    },
+  ]
+}
+
+# The app verifies Access's signed token against this list of audiences
+# (FAMILY_ACCESS_AUDS in the site's .env.local).
+output "family_wall_screens_aud" {
+  description = "Access audience tag of the family wall-screen application; add it to FAMILY_ACCESS_AUDS on the dev box"
+  value       = cloudflare_zero_trust_access_application.family_wall_screens.aud
+}
+
+# ---------------------------------------------------------------------------------
 # Service token: non-interactive access, for anything that cannot sit through a Google
 # login -- scripts, health checks, or an agent that wants to fetch the running site.
 #

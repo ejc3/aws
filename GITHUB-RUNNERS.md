@@ -71,19 +71,63 @@ that registers itself back as a self-hosted runner, serves the job, and is reape
 
 **Launch path.** GitHub fires a `workflow_job` webhook — the hook itself is Terraform-managed
 (`github_repository_webhook.runner`, adopted from hook id 589197362) → API Gateway HTTP API
-(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook`
+(`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook-front` →
+asynchronous invoke of the `delivery` alias of Lambda `github-runner-webhook`
 (`reserved_concurrent_executions = 1`, so concurrent webhooks can't all read the same count
-and over-launch). The Lambda HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET` on
-every request that arrives through API Gateway, **failing closed** if the secret is unset (the
-cleanup Lambda's direct `lambda:Invoke` retries carry no `requestContext`, so they're trusted
-without a forgeable header); it acts only on `action == "queued"`, reads the job labels to pick
+and over-launch). The front HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET`,
+**failing closed** if the secret is unset, forwards only the action and the `workflow_job`
+fields the webhook reads, and answers 202. The webhook treats everything that arrives through
+the alias, which IAM lets only the front invoke, as a public delivery; the cleanup Lambda's
+and `github-runner-reuse`'s direct `lambda:Invoke` requests use the unqualified function and
+are the only ones whose `launch_count` or `claim_only` it honours. It acts on
+`action == "queued"` (and hands `completed` on, below), reads the job labels to pick
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
 per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
-`c7gd`/`m7gd`/`r7gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
-that recently failed for capacity moved to the back of that order. Each instance is tagged
-with a `LeaseExpires` 60 minutes out.
+`c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
+in the us-west-1c runner subnet first and then in us-west-1a (see
+[Network posture](#network-posture)), with any type that recently failed for capacity in an
+AZ moved to the back for that AZ only. `r5d.metal` leads x86 because it has the same CPU
+generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, and its spot
+price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
+`LeaseExpires` 60 minutes out.
+
+**One execution at a time, and what it costs.** The webhook Lambda has run with
+`reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent
+invocations all read the same runner count before any launch and put up more instances than
+`MAX_RUNNERS`. A delivery that arrives while that one execution is busy is throttled, and
+GitHub never redelivers it. Of the 236 deliveries GitHub retained on 2026-09-13 (back to
+2026-09-11 04:15Z), 62 of 80 `queued`, 36 of 71 `in_progress` and 30 of 85 `completed` got a
+503 after about 0.2 seconds, and 7 more `queued` hit GitHub's 10-second limit; the function's
+`Throttles` metric reached 69 in one hour. Two things held the execution. A burst of `queued`
+deliveries for one run arrives within seconds while each launch takes about 3 seconds. And
+botocore retried `InsufficientInstanceCapacity` four times per exhausted pool, 7 to 15 seconds
+each, so invocations on the cleanup poll's five-minute cadence ran into the 30-second timeout
+(12 of 113 invocations after 13:00Z that day). RunInstances now makes one attempt per pool,
+and a `completed` delivery is answered 202 at once and checked for reuse in
+`github-runner-reuse`, so reuse never holds the webhook's execution.
+
+**The front.** `github-runner-webhook-front` (`runner-webhook-front.tf`) takes the deliveries,
+with 20 reserved executions: one CI run delivered about 20 events in 10 seconds, 9 of them
+within 0.32 seconds at 14:10:04Z on 2026-09-13. It verifies, strips and invokes the webhook's
+`delivery` alias with `InvocationType=Event`, so a burst waits in Lambda's asynchronous queue
+instead of being dropped, and the webhook still decides every launch one execution at a time.
+The alias and the unqualified function both have 0 retries and a 300-second maximum event
+age: a function error after a partial launch must not be retried, and a throttled event is
+retried with backoff until it is 300 seconds old, by which time the cleanup poll has run. A
+late forwarded `queued` does not rely on that age. Every complete queue scan records, per
+architecture, when it began (item `queue-scan#<arch>` in the registration table), and the
+webhook skips a forwarded job created before a scan that counted it, because that poll
+already asked for its runner. A late `completed` is dropped sooner: the webhook does not hand
+on a job whose 90-second reuse window has closed, and `github-runner-reuse` checks the same
+window and keeps events at most 120 seconds.
+
+The front goes in over three applies, one per commit, so the move loses no delivery: the
+front and the alias, unwired; then the API Gateway integration switched to the front, after
+its invoke permission exists; then API Gateway's invoke permission on the webhook removed.
+Removing that permission in the same apply as the switch could race it and fail deliveries
+for a few seconds. The webhook's own signature check on API Gateway events stays in its code.
 
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
@@ -115,6 +159,26 @@ aws ec2 describe-instance-types --instance-types <type> \
 
 `case_every_launchable_type_has_instance_storage` in `scripts/test-runner-lambdas.py` fails
 if a storeless type is added back.
+
+**Measured.** fcvm PR #924 (run `34768256944`) ran `iostat -dxmty 10` over every disk in
+each self-hosted job:
+
+| Job | Duration | Read + written | btrfs set MB/s p95 / p99 / max | IOPS p95 / max | Extra wait on a maxed gp3 |
+|---|---|---|---|---|---|
+| Host-Root-x64-SnapshotEnabled (`c5d.metal`) | 36 min | 466 GB | 992 / 2675 / 3575 | 15.5k / 47.8k | 4.8 min (13%) |
+| Host-Root-arm64-SnapshotEnabled (`c7gd.metal`) | 46 min | 505 GB | 758 / 3098 / 3421 | 10.2k / 48.6k | 5.7 min (12%) |
+| Host-Root-arm64-SnapshotDisabled (`r7gd.metal`) | 30 min | 214 GB | 463 / 1565 / 2635 | 5.2k / 36.4k | 1.7 min (6%) |
+| Container-arm64 (`m7gd.metal`) | 26 min | 155 GB | 312 / 2304 / 3445 | 4.5k / 39.9k | 1.5 min (6%) |
+| Host-arm64 (`r7gd.metal`) | 19 min | 102 GB | 367 / 2278 / 3108 | 4.4k / 41.3k | 1.3 min (7%) |
+
+The last column replays each job's samples against one gp3 volume at its maximum (1000 MB/s,
+16000 IOPS). At 500 MB/s and 8000 IOPS the same replay adds 16–37%, and at gp3's baseline it
+adds more than the job itself. At us-west-1 gp3 prices ($0.096/GB-month, $0.006/IOPS-month
+above 3000, $0.048/MiBps-month above 125) a maxed ~500 GB volume costs about $0.23/h, so
+`c5.metal` (about $0.70/h spot) with that volume, running 13% longer, lands within about 7% of
+`r5d.metal` per job. Storeless types stay excluded, now on measurement. The gp3 root volume
+also ran up to its 125 MB/s baseline in these jobs: `nvme2n1` peaked at 125 MB/s on arm64
+and `nvme4n1` at 114 MB/s on x86.
 
 **What holds a slot.** The cap counts runners that can *take work*, not EC2 instances that
 exist. The Lambda reads the same PAT from SSM, lists `GET /repos/ejc3/fcvm/actions/runners`,
@@ -156,15 +220,34 @@ indistinguishable from one that never launched. `runner-zero-online` fires after
 it is suppressed while GitHub is unreachable, where `online` is 0 by construction and
 `runner-pat-unusable` covers the gap.
 
+The cleanup poll (every 5 minutes) publishes the fleet itself: `GitHubRunners/LiveRunners`
+(running `Role=github-runner` hosts) and `OldestRunnerAgeMinutes`. `too-many-runners` fires
+above 8 (both architecture pools' caps, `2 * runner_max_per_arch`) for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
+legitimately reach that on a heavy day), and `runner-cleanup-silent` when no count arrives for
+15 minutes, because then nothing is enforcing leases or age ceilings. These replace alarms
+that counted instances by tag through EC2 Metrics Insights, which cannot work (a tag is not a
+dimension) and so never fired.
+
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
 Advanced tier, base64+gzip — too big for Lambda's 4 KB env limit). On boot it sets up the box
 (btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads only its controller-
 brokered **registration token** from `/github-runner/bootstrap/<instance-id>`, and runs
-`config.sh --url https://github.com/ejc3/fcvm --token <reg> --name runner-<instance-id>
---labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate`. The controller
-uses the PAT to call GitHub's registration-token endpoint; bootstrap has no PAT fallback.
-Xtrace is switched off before reading the short-lived token. Older boots may still be
-running the prior PAT-reading script until the separately verified drain.
+`config.sh --url https://github.com/ejc3/fcvm --name runner-<instance-id>
+--labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate` as
+`ubuntu`. The controller uses the PAT to call GitHub's registration-token endpoint; bootstrap
+has no PAT fallback. Older boots may still be running the prior PAT-reading script until the
+separately verified drain.
+
+The token is on no command line. sudo writes the command it runs to `auth.log` and the
+journal as `COMMAND=`, and the job user `ubuntu` reads both through `adm`; `ps` shows every
+process's arguments to every user. So `sudo -u ubuntu bash -c` takes the token on stdin, and
+that unprivileged shell hands it to `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, which the
+runner (2.337.0, `CommandSettings`) reads when `--token` is absent and removes from its own
+environment. sudo logs the literal `$(cat)` in its place, and it still resets the
+environment, so the runner's `.env` and `.path` are what they were. Xtrace is off wherever a
+token is held: the IMDSv2 session tokens in user data, which echoes the MAC, ENI, region and
+instance id they fetch instead, and the session token and registration token in
+`fcvm-runner-job`, even when it runs under `bash -x` or `SHELLOPTS=xtrace`.
 
 After `config.sh`, bootstrap reads the identity GitHub assigned from
 `/opt/actions-runner/.runner` (camelCase keys: `agentName` must equal `runner-<instance-id>`
@@ -179,10 +262,55 @@ deregistration. Even after a successful claim, the token parameter must be delet
 service startup. Registration and reaping
 compete for one conditional create, so exactly one of them wins.
 
-The launcher tags every new instance `RunnerRegistrationProtocol=ddb-v1`, which says which
-handshake its user data runs and nothing about whether it succeeded. The tag is never
-backfilled: an instance without it predates the handshake and stays on the rules below that
-need no row.
+The launcher tags every new instance `RunnerRegistrationProtocol` with the handshake its user
+data runs, and nothing about whether it succeeded: `ddb-v2` when the document registers again
+after each job (it carries the `fcvm-runner-job next` unit below), `ddb-v1` for the
+single-job document before it. The tag is never backfilled: an instance without it predates
+the handshake and stays on the rules below that need no row. Cleanup judges `ddb-v1` and
+`ddb-v2` instances the same way, by their row.
+
+**A stream of jobs on a warm host.** A registration is still `--ephemeral`, one job each, but
+a host no longer is. User data installs the registration tail as
+`/usr/local/sbin/fcvm-runner-job` and runs it as `first` at boot. The runner service's drop-in
+runs it as `after` from `ExecStopPost`: a service that ended with `SERVICE_RESULT=success`
+starts the oneshot `fcvm-runner-next.service`, and anything else powers the host off. `next`
+deletes the finished registration's local `.runner` and `.credentials*` files, reads its own
+row and requires it to be `registered` for this instance, then waits the same three minutes
+and 36 polls as a first boot for a new `/github-runner/bootstrap/<instance-id>` credential.
+With one, it runs the same `config.sh --ephemeral` and `.runner` identity check, replaces its
+row with the new runner id only while the row still names the previous one
+(`#s = :registered AND RunnerId = :previous`, resolved through a consistent read when the
+answer is lost), deletes the credential, and only then starts the service. No credential, or
+any failure, powers the host off; the unit also has `FailureAction=poweroff` and a ten-minute
+start timeout. Nothing reusable reaches the host: every job's credential is minted by the
+controller, bound to the instance ARN, and deleted before that job's service starts.
+
+The host's row decides who gets that credential. The webhook Lambda answers a `workflow_job`
+`completed` delivery, which the existing `workflow_job` subscription already delivers, with 202
+and hands the job to `github-runner-reuse`, the same code in a function with its own single
+execution (see "One execution at a time" above), for `runner-i-*` runners whose job concluded
+`success`. A failed job is the likeliest to leave
+leaked VMs, D-state processes or a full disk behind (before `--ephemeral`, one bad host,
+`runner-i-0ea78b39da373fcca` on 2026-08-06, failed every job it picked up), so a host whose
+job failed, or was cancelled or timed out, gets no credential and powers off when its wait
+ends. The host's `after` step cannot see the job's conclusion, only its runner's exit, so this
+filter lives in the controller. It acts only on a
+running `ddb-v2` instance of the job's architecture younger than `MAX_REUSE_AGE_HOURS` (12,
+the soft cap), and only while `completed_at` plus `REUSE_WINDOW_SECONDS` (120) still leaves
+`CLAIM_MARGIN_SECONDS` (30). There one conditional `UpdateItem` sets `AvailableUntil` on the
+row, only while it is `registered`, still names the runner that finished, and has no window
+yet. When GitHub also shows more queued jobs for that architecture than idle online runners
+and starting ones can take (a look at in-progress and queued runs of at most eight seconds,
+where an unfinished look counts as no), the reuse function asks the webhook, asynchronously,
+for a `claim_only` request, which claims a warm host or does nothing and is honoured only on a
+direct invoke. The webhook stays the only function that claims a host or launches one, one
+execution at a time. A `queued` event, the cleanup poll's retry and that request all run the
+same handler, which first claims such a host with `SET ClaimedAt` under
+`#s = :registered AND AvailableUntil >= :now_plus_30 AND attribute_not_exists(ClaimedAt)`,
+brokers to it, and launches only when no claim wins. The latest credential is therefore
+written 90 seconds after the job completed, against a host that waits at least 180. A claimed
+host counts toward the cap as starting for `CLAIM_GRACE_MINUTES` (5), and the host's next
+registration replaces the row, which clears both attributes for the job after it.
 
 Two of those setup steps are **gates, and they run before `config.sh`**: a runner that
 cannot host a job must not join the pool, because from CI's side a broken runner is
@@ -201,19 +329,41 @@ indistinguishable from a code defect.
   `2600:1f1c:208:c01::baca` while the OS had nothing, and every routed and IPv6 test in the
   fcvm suite failed with `No global IPv6 address found on host` — on a PR that had touched
   only `bench/chromium/*.py`.
+- **Package installs.** A job's `apt-get` fails at once on a held dpkg lock, so user_data
+  waits until no process has an apt or dpkg lock file open for 20 consecutive seconds
+  (read from `/proc/*/fd`), and refuses to register after 600 s. On 2026-09-13 three fcvm
+  jobs failed "Install dependencies" because Amazon Inspector's SSM agent was running
+  `apt install ./inspector-vm-scanner.deb` about 90 s after boot. The webhook Lambda also
+  tags every runner `InspectorEc2Exclusion=true` and launches it with
+  `InstanceMetadataTags=enabled`. The tag alone only suppresses findings; Inspector stops
+  invoking its SSM plugin only when it can read the tag through instance metadata. The key
+  is in `TagOnlyDuringRunnerLaunch`, whose `aws:TagKeys` list denies a launch that sends
+  any unlisted key. Enabling metadata tags also restricts tag keys to letters, digits and
+  `+ - = . , _ : @`.
 
 `scripts/test-runner-userdata.sh` extracts the real heredoc from the `.tf` and checks that
-both gates refuse the shapes they exist for and that each precedes registration; that the
+all three gates refuse the shapes they exist for and that each precedes registration; that the
 `.runner` identity is read after `config.sh` and claimed before `svc.sh`; and, by executing
 the registration tail against fake `aws`, `curl`, `config.sh` and `svc.sh`, that bootstrap
 starts the service when it wins or when a lost answer reads back as its own item, and stops
-without starting it when cleanup won or the row cannot be read. The fake `config.sh` writes
-`.runner` in the runner's real camelCase shape.
+without starting it when cleanup won or the row cannot be read. It runs the extracted
+`fcvm-runner-job` in all three modes: `next` starts the service only with a fresh credential,
+a row that still names the previous runner, a matching identity and a successful delete, and
+`after` starts the next-job unit only for `SERVICE_RESULT=success`. The fake `config.sh`
+writes `.runner` in the runner's real camelCase shape and refuses to configure over a previous
+registration's files.
+
+The fakes hand out canary tokens, and the `sudo` stub records its arguments, resets the
+environment and refuses `VAR=value`, `-E` and `--preserve-env`. Registration runs untraced,
+under `bash -x` and under `SHELLOPTS=xtrace`; each IMDS block of user data runs traced and
+untraced. In every run no canary reaches stdout, stderr, sudo's arguments or `config.sh`'s
+arguments, `config.sh` still receives the registration token, and tracing ends as it began.
+The same IMDS block with its pause removed does trace its token, so that check can fail.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`). Its first pass over the fleet is EC2-only and terminates every instance
 past the 13h30m hard ceiling before the PAT is read or GitHub is asked anything. It then
-does nine things, six of them using the PAT: deregisters GitHub runners whose instance is
+does ten things, seven of them using the PAT: deregisters GitHub runners whose instance is
 gone; renews the lease on busy runners (+60m), lets the lease of runners GitHub reports idle
 expire, then terminates anything past its lease, re-reading that one runner by id and
 deregistering it whenever the roster or its registration row supplied an id (instances
@@ -228,6 +378,14 @@ mean the row was lost rather than never written; drains runners past the 12h sof
 GitHub's queued jobs to launch what the queue actually needs. GitHub doesn't redeliver
 webhooks, so this poll is the retry, and it passes the per-architecture queued count along
 so the decision record has the demand side too.
+
+Last, a registered runner GitHub reports online and idle inside its lease is **deregistered,
+then terminated**, when its architecture has nothing queued and the queue scan was complete.
+Deregistration goes first here, the reverse of the lease path: GitHub refuses to remove a
+runner that is running a job, so a job handed out after the fresh by-id read that precedes it
+survives, and a refused deregistration leaves the instance running. A terminate that fails
+afterwards leaves a host with no registration, whose runner exits and whose `fcvm-runner-job`
+powers it off. A truncated scan terminates nothing.
 
 **Why job duration is the health signal.** A wedged host keeps its assigned job, so
 `busy` stays true and the lease renews forever; the host is still online, so a liveness check
@@ -309,7 +467,7 @@ registered, and dies at its lease. The stamp is also written only after the ceil
 for that instance, because a stalled `CreateTags` ahead of it would defer the one bound that
 must run.
 
-**A `ddb-v1` instance is judged by its row, not by the roster.** The cleanup Lambda reads
+**A `ddb-v1` or `ddb-v2` instance is judged by its row, not by the roster.** The cleanup Lambda reads
 the instance's DynamoDB item with a consistent read. `State=registered` carries the runner
 id bootstrap read from `.runner`; cleanup asks `GET /repos/ejc3/fcvm/actions/runners/<id>`
 for that one runner and uses its `busy`/`status` only if the answer's id and name match.
@@ -357,10 +515,14 @@ is the only record distinguishing our termination from an AWS spot reclaim.
 
 The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
-only), and these runners are not ephemeral, so one instance can legitimately chain many
-short jobs past 12h of age. Every fcvm CI job finishes in well under 2 hours, so a 12h-old
-runner has outlived its usefulness. Raise `MAX_INSTANCE_AGE_HOURS`, not the grace, if a
-legitimately long job is ever added — the grace is sized to one job, not to a working day.
+only). These runners register with `--ephemeral`, one registration per job. A host whose
+runner exits cleanly waits a few minutes for the controller to hand it the next queued job
+and otherwise powers off, which terminates it, so an instance chains jobs only while work
+keeps arriving for it, and the controller hands no job to a host past the soft cap. Every
+fcvm CI job finishes in well under 2 hours, so past 12h an instance is finishing the last job
+it was given, or it is wedged. Raise
+`MAX_INSTANCE_AGE_HOURS`, not the grace, if a legitimately long job is ever added — the
+grace is sized to one job, not to a working day.
 
 The grace exists because the cap used to terminate whatever the runner was doing. On
 2026-08-28/29 it killed `i-09fff3a7d97fd4066` at 12.07h and `i-02fefa9deeb59e9c8` at 12.02h
@@ -438,10 +600,11 @@ drains instead, and the ceiling bounds how long that lasts.
 
 A draining runner is **not** deregistered while GitHub reports it busy. GitHub documents that
 DELETE as forcing the runner's removal and does not say what happens to a job it is part-way
-through, and a forced removal that ends the job is the same failure. What stops a drained
-runner picking up new work is that the poll which first observes it idle terminates it, so
-the exposure is at most one 5-minute interval after its job ends. A job started inside
-that window and still running at the ceiling is still killed; that residual case is what the
+through, and a forced removal that ends the job is the same failure. A draining host cannot
+pick up new work: its registration is ephemeral and ends with the job it holds, and the
+controller hands no host past the soft cap another one. A registration past the soft cap that
+is still waiting for its job is terminated by the first poll that observes it idle. A job
+still running when the grace runs out is still killed; that residual case is what the
 `HARD-CEILING KILL` line is for. Closing it entirely would need an on-box graceful shutdown
 (`Runner.Listener` finishing its job and exiting), which the Lambda has no channel to request.
 
@@ -457,8 +620,13 @@ runner, so it stops counting toward the cap. The cleanup Lambda stamps `Capacity
 it and terminates it — the tag has to be written first, because terminating rewrites the
 state reason to `Client.UserInitiatedShutdown` and the evidence would be lost. And the
 launcher reads that record — AWS's own capacity state reasons, the tag, and anything
-stalling right now — to move failed types to the back of the list. Back, not out: if every
-type has failed the list is only reordered, so a launch is still attempted.
+stalling right now — to move failed types to the back of the list. The verdict is kept per
+(type, AZ), read from the record's `Placement` because a terminated record no longer carries
+a `SubnetId`, so `c7gd.metal` running dry in us-west-1a does not hold back `c7gd.metal` in
+us-west-1c. Back, not out: if every pair has failed the list is only reordered, so a launch
+is still attempted. Each pool gets one `RunInstances` attempt: the default botocore client
+retried `InsufficientInstanceCapacity` four times per pool, 7 to 15 seconds each, and ran the
+webhook into its 30-second timeout.
 
 **The queue poll counts jobs, not a sample of runs.** It asks for runs with `status=queued`
 *and* `status=in_progress`, pages both, pages each run's jobs, and counts the queued
@@ -479,8 +647,100 @@ one runner per poll used to fill the pool at one runner every five minutes howev
 the queue was, and a burst of single-launch invocations could overshoot the cap, because
 DescribeInstances is eventually consistent and each invocation can miss the instance the
 previous one just launched. Inside one invocation the handler's own loop bounds the total,
-and the webhook Lambda stays the single authority on the cap.
+and the webhook Lambda stays the single authority on the cap. The count the scan sends as
+`queued_jobs` includes jobs a runner is already on its way to take, so the webhook takes
+those runners off it before launching: instances launched in the last 15 minutes that have
+not registered, warm hosts claimed in the last 5 minutes, and registered idle runners. A
+warm host still waiting is claimed for a queued job rather than taken off. Without that, a
+poll that ran while a job's runner was booting put up a second host for the same job
+whenever the pool had room. A single delivery is one job and is never cut this way.
 
+
+## Pattern C — ephemeral x86 spot runners for other repos
+
+`CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` run on ordinary x86 spot VMs, not
+metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
+controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
+`runner-app/`).
+
+- **Routing.** The same front (`github-runner-webhook-front`) routes by `repository.full_name`
+  after the signature check. `ejc3/fcvm`, and deliveries naming no repository, take Pattern B's
+  path unchanged. The two served repos go to Lambda `github-app-runner`, `queued` only.
+  Anything else is answered and dropped.
+- **Labels.** A job is served only if every label it asks for is one these runners carry:
+  `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
+  (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
+- **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
+  to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
+  A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
+  keeps the claim. No pool is tried after the repo's reconcile deadline. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
+  claim is released and the error raised, so `github-app-runner-errors` fires.
+  Every attempt carries its own `ClientToken` (the claim's nonce plus an attempt number), so the
+  SDK's own retries cannot duplicate one.
+- **Stale deliveries.** A delivery can wait in Lambda's async queue until after the reconcile ran
+  its job; before launching for one, the controller asks GitHub whether the job is still queued.
+  A delivery is also bounded by the invocation's deadline, so a slow round of pool refusals stops
+  and releases its claim instead of timing out while holding it.
+- **Inspector.** Hosts carry `InspectorEc2Exclusion=true` with instance metadata tags enabled,
+  so Inspector's SSM plugin skips them instead of apt-installing its scanner mid-boot.
+- **Dedupe and caps.** Before launching, the controller takes a claim for the job in DynamoDB
+  (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
+  while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
+  failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
+  with its `JobId`. Each repo has its own cap (8), counted as the hosts `DescribeInstances` lists
+  plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
+  is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
+  Each check takes the claims first, then a fresh listing, and counts a host by its state in that
+  listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
+  nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
+  of the same job never releases the claim of its relaunch. A host covers the job it is tagged
+  for only while it is not busy: GitHub may give it another job with the same labels, and a busy
+  ephemeral host tagged for a still-queued job is running something else, so the job gets its own
+  host. The cap counts hosts, not job tags.
+  Neither repo can starve fcvm's.
+- **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
+  (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
+  zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
+  `too-many-app-runners-<label>` above one repo's own cap, so a single repo running away is
+  visible even while the total is under the combined cap; `github-app-runner-reconcile-silent`
+  fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
+  repo's failure (a
+  revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
+  still fails for `github-app-runner-errors`.
+- **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
+  actions/runner (pinned, sha256-verified) and takes its registration token from
+  `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the
+  host's role can read only the parameter tagged with its own instance ARN. The token
+  reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
+  `--ephemeral` and powers off when the job ends (shutdown behaviour: terminate).
+- **Reconcile.** Every 2 minutes it walks queued and in-progress runs oldest first, from the last
+  page back, reading each run's jobs as it goes, so the oldest queued job is reached however many
+  newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
+  the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
+  so jobs it finds always have time to launch), launches for queued jobs that have no host,
+  oldest first, stopping at the repo's cap or the end of its share. The share is enforced at the
+  call: once it is spent no AWS call (a botocore `before-call` hook) or GitHub request starts,
+  except the credential handoff after an accepted launch and claim releases, and every call is
+  bounded (connect 3 s, read 8 s, one attempt), so at most one call runs past it. It reaps hosts (also
+  within the share; a host is judged "never registered" only from a complete runner listing and
+  after rechecking its own name, since it may have registered since the listing; an
+  idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
+  because it took a job since the listing)
+  that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
+- **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all, and fcvm's
+  `github-runner-sg` does not admit it (its SSH rule is self-referencing, not the VPC CIDR).
+  Jobs run as their own role, `github-app-runner-instance-role` (profile
+  `github-app-runner-profile`), not fcvm's: its only Allow is `ssm:GetParameter` and
+  `ssm:DeleteParameter` on the `/github-runner/bootstrap/*` parameter tagged with the calling
+  instance's ARN, with explicit denies for any other parameter. No SSM agent policy, no EC2
+  reads, no S3 (fcvm's role may write session records to the security-records bucket and
+  describe ENIs; an app job can do neither), no PATs, no Secrets Manager. Every writer on
+  these (private) repos can run code here, so they must not be made public while these
+  runners are attached.
+- **Tokens.** Each repo's controller token is `github-runner/repo-pat/<owner>/<repo>`
+  (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
+  created with the same tokens through an `ephemeral` read, so the tokens never enter state.
 
 ## Controller-first credential migration
 
@@ -489,10 +749,10 @@ bootstrap now published by this source. During the original migration, controlle
 deployment preceded bootstrap publication; the PAT grant and broad runner SSM attachment
 remained until real CI acceptance and old-boot drain. This source contains the later
 [gated IAM cutoff](#runner-iam-cutoff), so do not republish a legacy PAT-reading document.
-The independent `iam:PassRole` escalation is closed: both controller
-Lambdas may pass only `github-runner-instance-role`, only to EC2. Explicit denies
-protect against another policy allowing any other role or service. The existing
-launcher already uses exactly `github-runner-profile`, so this does not change jobs.
+The independent `iam:PassRole` escalation is closed: fcvm's controller may pass only
+`github-runner-instance-role`, and Pattern C's only `github-app-runner-instance-role`, each
+only to EC2. Explicit denies protect against another policy allowing any other role or
+service.
 
 The launcher classifies the exact document fetched from SSM before allocating an
 instance. Old scripts mint no unused bootstrap credential. For a broker script, it
@@ -531,7 +791,7 @@ retirement of the old runner PAT/SSM grant and broad controller launch permissio
 Keep a fresh reviewed plan between those gates. A token broker cannot be proved by an
 IAM-only fixture check or by an additive apply that still serves the old script.
 
-### Instance-bound, single-job bootstrap
+### Instance-bound bootstrap, one registration per job
 
 New user data fetches only `/github-runner/bootstrap/<its-instance-id>`, with no PAT
 fallback. It admits credential polling for at most three minutes and 36 attempts;
@@ -547,9 +807,11 @@ Registration uses `--ephemeral --disableupdate`, so automatic updates cannot rep
 verified wrapper. The credential is unset from the shell and its SSM
 parameter must be successfully deleted before service installation/start; an uncertain
 delete never starts a job. The service drop-in disables systemd restarts, bounds unknown
-GitHub service-wrapper failures, and requests poweroff on service exit. The controller's
-instance-initiated shutdown setting turns that into termination. Any failure in the
-registration tail attempts bounded credential deletion and requests poweroff; earlier
+GitHub service-wrapper failures, and runs `fcvm-runner-job after` on service exit, which
+starts the next-job unit only after `SERVICE_RESULT=success` and otherwise requests poweroff.
+The controller's instance-initiated shutdown setting turns poweroff into termination. Any
+failure in the registration tail, at boot or for a next job, attempts bounded credential
+deletion and requests poweroff; earlier
 NVMe/IPv6/download failures retain the controller's existing startup/lease reaping.
 Controller cleanup remains the fallback if a shutdown request fails.
 
@@ -616,7 +878,7 @@ the denies first, creates this attachment before destroying the broad Core attac
 and does not change the role/profile or the bootstrap/DynamoDB producer.
 
 The controller's EC2 grants now require the own-account `Purpose=github-runner` images
-already selected by its code, exact runner subnet/security group/keypair/profile, IMDSv2,
+already selected by its code, exact runner subnets/security group/keypair/profile, IMDSv2,
 encrypted volumes, and `Role=github-runner` tags on every new instance, volume and ENI.
 Tag-on-create is constrained by [EC2's service-supplied creation context](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html).
 Outside launch, only the existing runner lease/health keys can change. An explicit deny
@@ -624,7 +886,7 @@ rejects every other tag key, including case variants of ownership tags, even und
 additive broad tag Allow. This prevents adopting an arbitrary dev/admin host or AMI.
 Termination is limited to `Role=github-runner` instances and the existing cleanup
 exception `Name=ami-builder-temp`; the controller cannot assign that Name to an existing
-host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnet.
+host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnets.
 
 Offline guards and rendered-policy IAM simulations are review evidence, not a real EC2
 launch/SSM-agent test. Require the after-cutoff canaries (own read succeeds; peer single
@@ -646,18 +908,24 @@ reviewed Terraform removal plan after both acceptance stages pass.
 |--|--|--|--|--|
 | **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-lambda-role` after the gated IAM cutoff; legacy job-host access is removed in that stage | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
-| **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
+| **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | the controller that created it and that booting instance (`github-runner-instance-role` for fcvm, `github-app-runner-instance-role` for Pattern C) | GitHub API, ~1h lifetime; controller removes expired leftovers |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs). Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
 
-**Three GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
-clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners, and
-`github-webhook-admin-pat` owns the webhook. The dev PAT is read by machines that run
+**Six GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
+clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners,
+`github-webhook-admin-pat` owns the webhook, `games/colton-games-read` (owned by
+CoderColton, Contents read-only on `colton-games`, readable only by administration and the
+`games-mp-poller` Lambda) lets games multiplayer read branch heads and download each new commit
+to build, and the two
+`github-runner/repo-pat/*` tokens (one per repo, each owned by that repo's owner) register
+runners and own the hook for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs`. The dev PAT is read by machines that run
 other people's code; before the cutoff, the runner PAT was too. Neither may hold
 webhook-write: that would let a compromised dev host or a leaked legacy runner token
 repoint the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by
@@ -668,7 +936,7 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 - **`github-runner-instance-role`** (after cutoff): `dev-ssm-managed-instance` for
   SSM connectivity without account-wide parameter reads. Only the exact source-instance
   bootstrap credential can be read/deleted; reusable, peer, batch, path and history
-  reads are explicitly denied. IPv6 assignment requires a tagged runner ENI in the
+  reads are explicitly denied. IPv6 assignment requires a tagged runner ENI in a
   runner subnet; interface metadata reads remain account-wide. `dynamodb:GetItem` + `dynamodb:PutItem` on
   `github-runner-registration`, restricted by `dynamodb:LeadingKeys` to
   `${ec2:SourceInstanceARN}`, so a runner can claim and read its own row and no other
@@ -681,8 +949,23 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `github-runner-instance-role` and only to EC2, with explicit denies for other
   roles and services;
   `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;
-  `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
-  `dynamodb:GetItem` + `dynamodb:PutItem` on the registration table, for the cleanup claim.
+  `lambda:InvokeFunction` on the webhook and `github-runner-reuse` functions (the cleanup
+  retry, the completed hand-off and the claim request); and
+  `dynamodb:GetItem` + `dynamodb:PutItem` + `dynamodb:UpdateItem` on the registration table,
+  for the cleanup claim and the webhook's conditional warm-host window and claim.
+- **`github-runner-webhook-front-role`**: its own Lambda logs and `lambda:InvokeFunction` on
+  exactly two targets, the webhook's `delivery` alias and `github-app-runner` (Pattern C),
+  with an explicit deny on invoking anything else. No EC2, SSM, DynamoDB or PAT access.
+- **`github-app-runner-lambda`** (Pattern C's controller): read the two per-repo tokens;
+  `RunInstances` only with Canonical images, into the runner subnets, with
+  `github-app-runner-sg`, `github-app-runner-profile`, IMDSv2 and tag `Role=github-app-runner`;
+  terminate only instances with that tag; `iam:PassRole` only on
+  `github-app-runner-instance-role`, only to EC2 (explicit deny on any other role); write and
+  delete only the instance-bound `/github-runner/bootstrap/*` credential.
+- **`github-app-runner-instance-role`** (Pattern C's hosts): read and delete only its own
+  instance-bound bootstrap credential; everything else is implicit or explicit deny. The
+  per-repo token secrets' resource policies admit only the administrators and the two
+  controllers, so this role cannot read them even if an Allow were attached.
 - **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
   authority, state, or secret payload access. Old CodeArtifact token/publisher
   resource-policy grants are removed; repositories and packages are retained.
@@ -691,14 +974,28 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 
 ## Network posture
 
-Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — a
-single public `/24` (`10.1.1.0/24`) in **`us-west-1a` only**, internet gateway, dual-stack
-IPv6, public IP on launch. That one AZ is the ceiling on the spot fallback: the launcher
-walks several instance types but never another subnet/AZ, so a `us-west-1a` capacity gap
-fails the launch outright (the cleanup poll is the only retry). The security group allows
-**inbound SSH (22) from within the VPC** (`10.1.0.0/16` + the VPC's IPv6 block) **and the
-operator's three static EIPs** (jumpbox + the two dev servers, so the `dev_to_runner` debug
-path works) and all egress; shell access from anywhere else is via **SSM Session Manager**
+Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — two
+public `/24`s sharing one route table and internet gateway, both dual-stack IPv6 with a
+public IP on launch: `10.1.2.0/24` in **`us-west-1c`** (`aws_subnet.runner_us_west_1c`) and
+`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). `local.runner_launch_subnets` in
+`runner-vpc.tf` is the order the launcher uses (it reaches the Lambda as `LAUNCH_SUBNETS`),
+and the launch and IPv6 IAM grants are pinned to exactly that list.
+
+The launcher tries every instance type in us-west-1c before any in us-west-1a, for both
+architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
+no instance, while us-west-1c ARM metal spot was 60–67% cheaper and had a better
+single-instance placement score (4 against 2). x86 prices were about the same in both, so
+there the second AZ adds resilience. Capacity backoff is kept per (type, AZ), so an
+exhausted pool in one AZ never holds back the same type in the other. If `run_instances`
+refuses every pair, the launch fails and the cleanup poll is the retry.
+
+The AMI builder stays in us-west-1a: fcvm's `scripts/build-ami.sh` looks up exactly one
+subnet by `Name=github-runner-subnet`, and `github-actions-ami-builder` may launch only
+there, so the us-west-1c subnet carries a different Name. `github-runner-sg` allows **inbound SSH (22)
+only from other members of itself and from the operator's three static EIPs** (jumpbox + the
+two dev servers, so the `dev_to_runner` debug path works) and all egress. It used to admit the
+whole VPC (`10.1.0.0/16` + its IPv6 block); Pattern C's hosts share that VPC and run outside
+code, so that rule is gone; shell access from anywhere else is via **SSM Session Manager**
 (the runner role retains the parameter-free SSM connectivity policy). SSH is closed to the public internet
 at large; everything else (webhook, registration, job dispatch) is runner-initiated outbound
 to GitHub and the AWS APIs.
@@ -710,13 +1007,15 @@ copy blindly.
 
 Closed (were sharp edges, now hardened):
 
-- **The webhook fails closed and verifies every public request.** `verify_signature` rejects
-  when `WEBHOOK_SECRET` is unset, and HMAC verification runs on everything arriving through
-  API Gateway — identified by `requestContext`, which AWS sets and a caller can't forge. The
-  shared secret is set on the GitHub `workflow_job` webhook and in the Lambda env, so an
-  anonymous POST to `/webhook` no longer launches instances and no header skips verification
-  (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
-  by being direct `lambda:Invoke`, which carry no `requestContext`).
+- **Every public request is verified, and fails closed.** `github-runner-webhook-front`
+  rejects a delivery when `WEBHOOK_SECRET` is unset or the signature does not match, before
+  anything is forwarded. The shared secret is set on the GitHub `workflow_job` webhook and in
+  the front's env, so an anonymous POST to `/webhook` launches nothing and no header skips
+  verification (the old `x-internal-invoke: cleanup-retry` bypass is gone). Trust is decided by
+  which ARN was invoked, not by anything in the event: forwarded deliveries arrive through the
+  webhook's `delivery` alias, which only the front's role may invoke, and cleanup and reuse
+  requests use the unqualified function. The webhook still HMAC-verifies any event that carries
+  API Gateway's `requestContext`.
 - **Both halves of that secret come from one Terraform value.** It used to be two hand-copied
   strings, a tfvar and a form field, with nothing checking they still matched — a real
   structural flaw, though NOT what killed the webhook. The measured root cause: the API
@@ -731,9 +1030,9 @@ Closed (were sharp edges, now hardened):
   `configuration.secret`, so there is no second copy to drift. This ownership begins at
   the one-time import + apply documented below — until that apply lands on a given state,
   the live hook still carries whatever secret it had before, and deliveries keep failing.
-- **SSH is restricted to known hosts.** Port 22 is reachable from `10.1.0.0/16` (intra-VPC)
-  and the operator's three static EIPs (jumpbox + the two dev servers) — not the public
-  internet; shell access from anywhere else is via SSM Session Manager. The runners still run
+- **SSH is restricted to known hosts.** Port 22 is reachable from other fcvm runners
+  (`github-runner-sg` members) and the operator's three static EIPs (jumpbox + the two dev
+  servers) — not Pattern C's hosts in the same VPC, and not the public internet; shell access from anywhere else is via SSM Session Manager. The runners still run
   with `/dev/kvm` exposed and `iptables -P FORWARD ACCEPT`, so keeping them off the open
   internet matters.
 
@@ -743,6 +1042,120 @@ Still open (accepted for now):
   on `ejc3/fcvm`; after cutoff only the controller reads it. The one-job host still
   executes privileged code and has an instance-bound AWS identity, so untrusted PRs
   must not be automatically approved for self-hosted CI.
+
+## Threat model: runners for other repos
+
+Runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` (Pattern C,
+`runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
+second place people outside the owner run code on AWS resources we manage. Every writer on
+those repos, and every bot that opens pull requests there (for example
+`app/dolphin-refresh-bot`), can run any command on a runner VM by editing a workflow. Treat
+every job as hostile. Checked against the code and live state on 2026-09-27, after #172 was
+applied: the controller, its schedule, both webhooks and the alarms exist, and its first
+reconcile ran clean.
+
+**What a malicious job can do**
+
+- **Anything on its own VM, as root.** The runner has passwordless sudo, as GitHub-hosted
+  runners do (the workflows install packages). The VM is ephemeral: one job, then it powers
+  off and terminates. A job can keep it alive past its end, but the reconcile reaps any host
+  that has sat idle for 10 minutes or is older than 3 hours.
+- **Reach the internet.** Egress is unrestricted, and no inbound rule exists
+  (`github-app-runner-sg`), so nothing can connect to a job from outside, or from another job.
+- **Use the instance role through the metadata service.** App runners have their own
+  `github-app-runner-instance-role`, whose only permission is to read and then delete the
+  bootstrap credential tagged with its own instance ARN. It cannot read any other parameter,
+  PAT or secret, list EC2 or network interfaces, write to S3, or touch fcvm's registration
+  table (checked with `simulate-principal-policy`).
+
+**What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
+only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
+with the secrets' resource policies); read another job's registration token (instance-bound);
+connect to another runner of the same kind (no inbound); reach the admin fleet over a private
+route (the runner VPC is not peered with it); launch or stop instances. A job does have the
+internet, so it can reach the admin fleet's public endpoints like anyone else: SSH and Eternal
+Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-only. That is an
+internet attacker's access, not more. Nor can it reach fcvm's metal runners' SSH: their group
+admits SSH only from itself and the operator addresses.
+
+**Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
+every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
+detects the controller launching past its caps, not the caps being reached (8 + 8 is normal
+saturation and does not alarm). The reconcile terminates any VM older than 3 hours, but only
+while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own
+shutdown, and if the reconcile stops, `github-app-runner-errors` or
+`github-app-runner-reconcile-silent` fires and the VM runs until someone terminates it. With
+reaping working, the worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
+
+**Shutting it off**
+
+1. Set the repo's `max` to 0 in `runner-app.tf` and apply: no new VMs, even from the reconcile,
+   which launches for queued jobs without any webhook.
+2. Terminate what is running (add `Name=tag:Repo,Values=<owner>/<repo>` for one repo):
+
+   ```bash
+   ids=$(aws ec2 describe-instances --region us-west-1 \
+     --filters Name=tag:Role,Values=github-app-runner Name=instance-state-name,Values=pending,running,stopping,stopped \
+     --query 'Reservations[].Instances[].InstanceId' --output text)
+   [ -n "$ids" ] && aws ec2 terminate-instances --region us-west-1 --instance-ids $ids
+   ```
+3. Remove the hooks while Terraform can still read the tokens it deletes them with:
+   `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
+   -target='github_repository_webhook.runner_app_dolphin_labs[0]'`, then commit
+   `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
+   does not work: it also drops the token reads, so the providers have no credentials to
+   delete with. The repo's owner can instead revoke its controller token in GitHub, which
+   stops registration outright; plans then fail at that repo's provider until its hook is
+   gone from GitHub and from state, and the gate is off. The gate covers both repos, so:
+
+   1. An administrator, on a jumpbox, reads the hook URL and gives it to the repo's owner:
+      `terraform output -raw runner_webhook_url` (not a secret; GitHub shows it to the repo's
+      admins).
+   2. The owner deletes the hook with their own `gh` login on their own account (CoderColton
+      for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin for
+      `dolphin-labs`), and confirms it is gone. Their login never leaves their account:
+
+      ```bash
+      set -euo pipefail
+      R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
+      URL='<from step 1>'
+      ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
+      [ -n "$ID" ] || { echo "no hook with that URL" >&2; exit 1; }
+      gh api -X DELETE "repos/$R/hooks/$ID"
+      gh api "repos/$R/hooks" --jq "[.[] | select(.config.url == \"$URL\")] | length"   # must print 0
+      ```
+
+   3. Only after the owner reports `0`, the administrator drops it from state on the jumpbox:
+      `terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'` (or
+      `_dolphin_labs`). Dropping it before then would leave a live hook unmanaged.
+   4. Remove the other repo's hook while its token still works:
+      `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'` (or
+      `_colton_games`). No other resource then uses the revoked repo's provider.
+   5. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
+      would read the revoked token again and try to recreate the deleted hook.
+
+**A public repo needs more** (for example `ejc3/durablerun` before it is attached): anyone can
+open a pull request from a fork. Require approval for workflows from all outside
+collaborators, with the owner's `gh` login (`durablerun` is `first_time_contributors` today):
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+gh api repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval   # check
+```
+
+Also have the controller refuse jobs whose run comes from a fork (the run's
+`head_repository`), never serve `pull_request_target`, and give the repo its own cap and alarm.
+
+**Closed** (#175): app runners have their own instance role, which can only read and delete
+their own bootstrap credential; fcvm's runner group admits SSH only from itself and the
+operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
+
+**Open gaps, most severe first**
+
+1. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
+   `dolphin-labs` 2027-09-28. That repo's runners stop registering when its token expires;
+   renew each before then (Regenerate in GitHub keeps its permissions).
 
 ## Operating it
 

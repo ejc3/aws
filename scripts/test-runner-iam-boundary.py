@@ -75,7 +75,8 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertEqual(actions(ipv6), {'ec2:AssignIpv6Addresses'})
         self.assertIn(':network-interface/*', ipv6)
         self.assertIn('"aws:ResourceTag/Role" = "github-runner"', ipv6)
-        self.assertIn('"ec2:Subnet" = aws_subnet.runner[0].arn', ipv6)
+        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', ipv6)
+        self.assertNotIn(':subnet/*', ipv6)
 
     def test_launch_pins_ami_owner_purpose_and_exact_network_inputs(self):
         image = statement(self.controller, 'LaunchApprovedRunnerImages')
@@ -83,11 +84,42 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertRegex(image, r'"ec2:Owner"\s*=\s*data.aws_caller_identity.current.account_id')
         self.assertIn('"aws:ResourceTag/Purpose" = "github-runner"', image)
         network = statement(self.controller, 'LaunchExactRunnerNetwork')
-        for reference in ['aws_subnet.runner[0].arn', 'aws_security_group.runner[0].arn',
+        for reference in ['local.runner_launch_subnet_arns', 'aws_security_group.runner[0].arn',
                           ':key-pair/fcvm-ec2']:
             self.assertIn(reference, network)
         self.assertNotIn(':subnet/*', network)
         self.assertNotIn(':security-group/*', network)
+        eni = statement(self.controller, 'LaunchTaggedRunnerENI')
+        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', eni)
+        self.assertNotIn(':subnet/*', eni)
+
+    def test_launch_subnets_are_exactly_the_two_runner_subnets(self):
+        vpc = source('runner-vpc.tf')
+        self.assertRegex(vpc, r'\n  runner_launch_subnets\s*=\s*concat\(aws_subnet\.runner_us_west_1c, aws_subnet\.runner\)\n')
+        self.assertRegex(vpc, r'\n  runner_launch_subnet_arns\s*=\s*local\.runner_launch_subnets\[\*\]\.arn\n')
+        # Changing either address would replace the subnet live runners occupy.
+        original = block('runner-vpc.tf', 'aws_subnet', 'runner')
+        self.assertRegex(original, r'\n  cidr_block\s*=\s*"10\.1\.1\.0/24"\n')
+        self.assertRegex(original, r'\n  availability_zone\s*=\s*"us-west-1a"\n')
+        self.assertRegex(original, r'ipv6_cidr_block\s*=\s*cidrsubnet\(aws_vpc\.runner\[0\]\.ipv6_cidr_block, 8, 1\)')
+        added = block('runner-vpc.tf', 'aws_subnet', 'runner_us_west_1c')
+        self.assertRegex(added, r'\n  cidr_block\s*=\s*"10\.1\.2\.0/24"\n')
+        self.assertRegex(added, r'\n  availability_zone\s*=\s*"us-west-1c"\n')
+        self.assertRegex(added, r'ipv6_cidr_block\s*=\s*cidrsubnet\(aws_vpc\.runner\[0\]\.ipv6_cidr_block, 8, 2\)')
+        self.assertRegex(added, r'assign_ipv6_address_on_creation\s*=\s*true')
+        self.assertRegex(added, r'map_public_ip_on_launch\s*=\s*true')
+        # fcvm's build-ami.sh requires Name=github-runner-subnet to match exactly one subnet.
+        self.assertNotRegex(added, r'Name\s*=\s*"github-runner-subnet"')
+        association = block('runner-vpc.tf', 'aws_route_table_association', 'runner_us_west_1c')
+        self.assertRegex(association, r'subnet_id\s*=\s*aws_subnet\.runner_us_west_1c\[0\]\.id')
+        self.assertRegex(association, r'route_table_id\s*=\s*aws_route_table\.runner\[0\]\.id')
+
+    def test_launcher_update_waits_for_new_subnet_route_and_ipv6_grant(self):
+        function = block('runner-autoscale.tf', 'aws_lambda_function', 'runner_webhook')
+        dependencies = re.search(r'depends_on = \[(.*?)\n  \]', function, re.S).group(1)
+        for dependency in ['aws_route_table_association.runner_us_west_1c,',
+                           'aws_iam_role_policy.runner,', 'aws_iam_role_policy.runner_lambda,']:
+            self.assertIn(dependency, dependencies)
 
     def test_all_created_resources_require_tags_profile_and_encryption(self):
         for sid in ['LaunchTaggedRunnerInstance', 'LaunchTaggedRunnerENI', 'LaunchEncryptedRunnerVolume']:
@@ -130,6 +162,95 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertIn('["pat", "user-data"]', self.controller)
         self.assertNotIn('parameter/github-runner/*', self.controller)
         self.assertNotIn('arn:aws:logs:*:*:*', self.controller)
+
+    def test_controller_registration_writes_stay_on_the_registration_table(self):
+        rows = [s for s in statements(self.controller) if 'dynamodb:' in s]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(actions(rows[0]), {'dynamodb:GetItem', 'dynamodb:PutItem',
+                                            'dynamodb:UpdateItem'})
+        self.assertRegex(rows[0], r'Resource\s*=\s*aws_dynamodb_table\.runner_registration\[0\]\.arn')
+        producer = block('runner-bootstrap.tf', 'aws_iam_role_policy', 'runner_bootstrap')
+        self.assertNotIn('dynamodb:UpdateItem', producer)
+
+    def test_front_role_may_invoke_only_the_webhook_delivery_alias_and_the_app_runner(self):
+        policy = block('runner-webhook-front.tf', 'aws_iam_role_policy', 'runner_webhook_front')
+        allows = [s for s in statements(policy) if re.search(r'Effect\s*=\s*"Allow"', s)]
+        self.assertEqual(len(allows), 3, allows)
+        app = statement(policy, 'InvokeTheAppRunner')
+        self.assertEqual(actions(app), {'lambda:InvokeFunction'})
+        self.assertRegex(app, r'Resource\s*=\s*aws_lambda_function\.runner_app\[0\]\.arn$')
+        invoke = statement(policy, 'InvokeTheWebhookDeliveryAlias')
+        self.assertEqual(actions(invoke), {'lambda:InvokeFunction'})
+        self.assertRegex(invoke, r'Resource\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn$')
+        logs = statement(policy, 'OwnLogs')
+        self.assertEqual(actions(logs), {'logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'})
+        self.assertEqual(set(re.findall(r'log-group:([^"]+)"', logs)),
+                         {'/aws/lambda/github-runner-webhook-front', '/aws/lambda/github-runner-webhook-front:*'})
+        deny = statement(policy, 'DenyInvokingAnythingElse')
+        self.assertRegex(deny, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(deny, r'NotResource\s*=\s*\[aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn, aws_lambda_function\.runner_app\[0\]\.arn\]')
+        self.assertNotRegex(policy, r'Resource\s*=\s*"\*"')
+        role = block('runner-webhook-front.tf', 'aws_iam_role', 'runner_webhook_front')
+        self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', role)
+        function = block('runner-webhook-front.tf', 'aws_lambda_function', 'runner_webhook_front')
+        self.assertRegex(function, r'role\s*=\s*aws_iam_role\.runner_webhook_front\[0\]\.arn')
+
+    def test_the_webhook_role_does_not_widen_for_the_front(self):
+        invoke = [s for s in statements(self.controller) if 'lambda:InvokeFunction' in s]
+        self.assertEqual(len(invoke), 1, invoke)
+        self.assertIn('[for name in ["github-runner-webhook", "github-runner-reuse"]', invoke[0])
+        self.assertNotIn('webhook-front', self.controller)
+        self.assertNotIn(':delivery', self.controller)
+
+    def test_fcvm_runner_ssh_is_self_and_operator_eips_only(self):
+        sg = block('runner-vpc.tf', 'aws_security_group', 'runner')
+        ingress = re.findall(r'\n  ingress \{\n.*?\n  \}', sg, re.S)
+        self.assertEqual(len(ingress), 1, ingress)
+        rule = ingress[0]
+        self.assertRegex(rule, r'from_port\s*=\s*22\b')
+        self.assertRegex(rule, r'\bself\s*=\s*true\b')
+        self.assertNotIn('aws_vpc.runner', rule, 'the whole VPC (and every app runner in it) must not reach port 22')
+        self.assertNotIn('ipv6_cidr_blocks', rule)
+        cidrs = re.search(r'cidr_blocks\s*=\s*\[\n(.*?)\n\s*\]', rule, re.S).group(1)
+        self.assertEqual(re.findall(r'aws_eip\.(\w+)\[0\]\.public_ip', cidrs),
+                         ['jumpbox', 'firecracker_dev', 'x86_dev'])
+        self.assertNotRegex(cidrs, r'"\d+\.\d+\.\d+\.\d+/\d+"')
+
+
+class RunnerCostAlarmTests(unittest.TestCase):
+    """The runner alarms must read series that exist; an alarm on a query that returns no
+    data is permanently OK (notBreaching) and never fires."""
+
+    def test_no_alarm_queries_ec2_by_tag(self):
+        self.assertNotIn('SCHEMA(\\"AWS/EC2\\"', source('cost-alerts.tf'))
+        self.assertNotRegex(source('cost-alerts.tf'), r'namespace\s*=\s*"AWS/Billing"')
+
+    def test_the_fleet_alarm_is_set_at_both_architecture_pools_cap(self):
+        # LiveRunners counts arm64 and x86_64 together; each pool may run runner_max_per_arch.
+        alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'too_many_runners')
+        self.assertRegex(alarm, r'threshold\s*=\s*2 \* local\.runner_max_per_arch')
+
+    def test_fleet_alarms_read_the_cleanup_metrics(self):
+        emitted = source('runner-autoscale.tf')
+        for name, metric in [('too_many_runners', 'LiveRunners'),
+                             ('runner_long_running', 'OldestRunnerAgeMinutes'),
+                             ('runner_cleanup_silent', 'LiveRunners')]:
+            alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', name)
+            self.assertRegex(alarm, r'namespace\s*=\s*"GitHubRunners"', name)
+            self.assertRegex(alarm, r'metric_name\s*=\s*"' + metric + '"', name)
+            self.assertIn(f"'{metric}':", emitted, f'{metric} is not emitted by the cleanup Lambda')
+        self.assertIn("'Namespace': 'GitHubRunners'", emitted)
+        silent = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'runner_cleanup_silent')
+        self.assertRegex(silent, r'treat_missing_data\s*=\s*"breaching"')
+        # Breaching on missing data: it must go away with the fleet, or a teardown alarms forever.
+        self.assertRegex(silent, r'count\s*=\s*var\.enable_github_runner \? 1 : 0')
+
+    def test_ec2_spend_is_a_budget_not_a_billing_alarm(self):
+        self.assertNotIn('"high_ec2_spend"', source('cost-alerts.tf'))
+        budget = block('cost-alerts.tf', 'aws_budgets_budget', 'ec2_daily')
+        self.assertRegex(budget, r'time_unit\s*=\s*"DAILY"')
+        self.assertIn('Amazon Elastic Compute Cloud - Compute', budget)
+        self.assertIn('aws_sns_topic.cost_alerts', budget)
 
 
 if __name__ == '__main__':

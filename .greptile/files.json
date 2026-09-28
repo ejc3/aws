@@ -1,0 +1,18 @@
+{
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "description": "Standing operating rules for this repo: the one-way trust direction, credential boundaries, the deliberate IAM exceptions (DevEBS=true volumes, the nextjs-dev role) and the pitfalls behind them"
+    },
+    {
+      "path": "GITHUB-RUNNERS.md",
+      "description": "How CI reaches this AWS account: hosted OIDC runners, the self-hosted autoscaling runners, the secrets inventory and the runner IAM and network boundaries",
+      "scope": ["runner-*.tf", "github-ami-builder.tf", ".github/**", "scripts/*runner*"]
+    },
+    {
+      "path": "README.md",
+      "description": "Operator runbook: the rollout gates and their recorded prerequisites (security posture, backup cleanup and cutover, Colton Games Workers Builds, the Mac host) and the documented behaviour of the ndev and pbox helpers",
+      "scope": ["security-monitoring.tf", "backup-security.tf", "cloudflare.tf", "mac-dev.tf", "nextjs-user-data.tf", "scripts/parallel-box.sh"]
+    }
+  ]
+}

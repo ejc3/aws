@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Pins who can reach the I/O box's read-write NFS export (io-box.tf).
+
+The export crosses an inter-region VPC peer, where a security group cannot reference another
+group, so the only filter is the source CIDR. That is safe only while the CIDRs name exactly
+the subnets NFS clients live in, and those subnets hold nothing else: the games router and
+match engines (games-multiplayer.tf) share the us-west-1 VPC and must never be admitted.
+
+This checks the rule and the exports line, and that every host whose user_data installs the
+NFS client lives in one of the admitted subnets. Offline; reads the Terraform source.
+
+Run from the repo root:  python3 -S -B scripts/test-io-box-nfs.py
+"""
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+IO = (ROOT / "io-box.tf").read_text()
+MAIN = (ROOT / "main.tf").read_text()
+GAMES = (ROOT / "games-multiplayer.tf").read_text()
+
+
+def source(name):
+    return (ROOT / name).read_text()
+
+
+def block(text, kind, name):
+    m = re.search(r'^resource "%s" "%s" \{\n.*?^\}' % (re.escape(kind), re.escape(name)), text, re.S | re.M)
+    if m is None:
+        raise AssertionError("missing %s.%s" % (kind, name))
+    return m.group()
+
+
+def ingress(sg, port):
+    for body in re.findall(r"^  ingress \{\n(.*?)\n  \}", sg, re.S | re.M):
+        if re.search(r"from_port\s*=\s*%d\n" % port, body):
+            return body
+    raise AssertionError("no ingress for port %d" % port)
+
+
+class NfsRuleTests(unittest.TestCase):
+    def test_2049_admits_exactly_the_client_subnets(self):
+        rule = ingress(block(IO, "aws_security_group", "io_box"), 2049)
+        self.assertRegex(rule, r"to_port\s*=\s*2049\n")
+        self.assertRegex(rule, r"cidr_blocks = local\.io_box_nfs_client_cidrs$")
+        # Never a whole VPC again, by expression or by literal.
+        for whole in ("data.aws_vpc.selected.cidr_block", "data.aws_vpc.west2_default.cidr_block",
+                      "10.0.0.0/16", "172.31.0.0/16", "0.0.0.0/0", "ipv6_cidr_blocks"):
+            self.assertNotIn(whole, rule)
+
+    def test_client_cidrs_are_the_dev_fleet_and_the_parallel_box_subnet(self):
+        m = re.search(r"io_box_nfs_client_cidrs = concat\(\n(.*?)\n  \)", IO, re.S)
+        self.assertIsNotNone(m)
+        self.assertEqual([line.strip() for line in m.group(1).splitlines()],
+                         ["[for s in local.dev_fleet_subnets : s.cidr_block],",
+                          "[data.aws_subnet.io_box.cidr_block],"])
+        self.assertIn("dev_fleet_subnets = [aws_subnet.subnet_a, aws_subnet.subnet_b]", MAIN)
+        # The dev fleet list must never pick up a games subnet.
+        fleet = re.search(r"dev_fleet_subnets = \[(.*?)\]", MAIN).group(1)
+        self.assertNotIn("games", fleet)
+        self.assertNotIn("dev_fleet_subnets", re.sub(r"mp_alb_subnets = local\.dev_fleet_subnets", "", GAMES))
+
+    def test_exports_line_uses_the_same_list_and_no_whole_vpc(self):
+        exports = re.search(r"<<'EXPORTS'\n(.*?)\n\s*EXPORTS", IO, re.S).group(1)
+        self.assertIn('/srv/io ${join(" ", [for c in local.io_box_nfs_client_cidrs : '
+                      '"${c}(rw,async,no_subtree_check,root_squash,fsid=0)"])}', exports)
+        self.assertNotRegex(exports, r"\d+\.\d+\.\d+\.\d+/\d+")
+
+    def test_ssh_is_unchanged_and_separate_from_nfs(self):
+        # SSH keeps its own rule; narrowing NFS must not have merged the two.
+        rule = ingress(block(IO, "aws_security_group", "io_box"), 22)
+        self.assertNotIn("2049", rule)
+
+
+class MounterTests(unittest.TestCase):
+    """Every host that installs the /mnt/io automount sits in an admitted subnet."""
+
+    # Files that splice local.io_box_client_setup into a host's boot script.
+    MOUNTERS = (
+        "dev-user-data.tf",        # via local.shell_setup: the ARM and x86 metal boxes
+        "nextjs-user-data.tf",     # nextjs-dev
+        "parallel-box-launch.tf",  # the parallel boxes
+    )
+
+    def test_the_mounters_are_exactly_the_known_ones(self):
+        found = sorted(p.name for p in ROOT.glob("*.tf") if "${local.io_box_client_setup}" in p.read_text())
+        self.assertEqual(found, sorted(self.MOUNTERS),
+                         "a new NFS client: add its subnet to io_box_nfs_client_cidrs and here")
+        dev = source("dev-user-data.tf")
+        self.assertEqual(dev.count("${local.io_box_client_setup}"), 1)
+        self.assertEqual(dev.count("${local.shell_setup}"), 2)  # arm_user_data and x86_user_data
+
+    def test_metal_boxes_and_nextjs_are_in_dev_fleet_subnets(self):
+        self.assertIn("subnet_id         = local.subnet_ids_by_az[var.firecracker_availability_zone]",
+                      source("firecracker-dev.tf"))
+        self.assertIn("subnet_ids_by_az  = { for s in local.dev_fleet_subnets : s.availability_zone => s.id }", MAIN)
+        self.assertIn("subnet_id         = aws_subnet.subnet_a.id", block(source("x86-dev.tf"), "aws_network_interface", "x86_dev"))
+        self.assertIn("subnet_id              = aws_subnet.subnet_a.id",
+                      block(source("nextjs-dev.tf"), "aws_instance", "nextjs_dev"))
+
+    def test_parallel_boxes_launch_in_the_io_box_subnet(self):
+        io_subnet = re.search(r'data "aws_subnet" "io_box" \{[^}]*id\s*=\s*"(subnet-[0-9a-f]+)"', IO).group(1)
+        launch = re.findall(r'subnet_id\s*=\s*"(subnet-[0-9a-f]+)"', source("parallel-box-launch.tf"))
+        self.assertTrue(launch)
+        self.assertEqual(set(launch), {io_subnet})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -40,11 +40,17 @@ import os, json, datetime, boto3
 
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
-# Comma-separated: both parallel boxes (parallel-box2.tf) share this one watchdog.
+# Comma-separated: both parallel boxes (parallel-box2.tf) and the GPU test box
+# (gpu-box.tf) share this one watchdog.
 TAG_NAMES    = os.environ.get("TAG_NAMES", "parallel-box").split(",")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
 # The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
 SNS_REGION   = os.environ.get("SNS_REGION", "us-west-1")
+# Hard lifetime per box name, in minutes, enforced from LaunchTime whatever the box is doing.
+# The GPU box (gpu-box.tf) also arms a shutdown timer on itself, but that timer lives on the
+# box -- a reboot, `shutdown -c` or a launch-time --user-data override disarms it -- so this
+# is the lifetime that cannot be talked out of.
+MAX_AGE      = json.loads(os.environ.get("MAX_AGE_MINUTES", "{}"))
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -77,6 +83,22 @@ def lambda_handler(event, context):
         iid = inst["InstanceId"]
         launch = inst["LaunchTime"]
         age_min = (now - launch).total_seconds() / 60.0
+        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "parallel-box")
+
+        max_age = MAX_AGE.get(name)
+        if max_age is not None and age_min >= max_age:
+            print("terminating %s %s: lifetime %d min reached (age %.0f min)" % (name, iid, max_age, age_min))
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+                results.append({"id": iid, "action": "terminated_lifetime", "age_min": round(age_min, 1)})
+                notify("%s auto-terminated (lifetime)" % name,
+                       "Instance %s (%s) reached its %d-minute lifetime and was terminated." % (iid, name, max_age))
+            except Exception as e:
+                results.append({"id": iid, "action": "terminate_failed", "error": str(e)})
+                notify("%s FAILED to terminate (lifetime)" % name,
+                       "Instance %s (%s) is past its %d-minute lifetime but TerminateInstances failed: %s\n"
+                       "It keeps costing money until someone terminates it." % (iid, name, max_age, e))
+            continue
 
         # Grace period: never reap a box that has not yet had a full idle window to
         # prove itself. Bootstrapping (apt, cloning data) can look idle at the start.
@@ -106,8 +128,12 @@ def lambda_handler(event, context):
             results.append({"id": iid, "action": "busy", "peak_cpu": round(peak, 1)})
             continue
 
-        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "parallel-box")
-        up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
+        if name == "gpu-box":
+            up_cmd = "gbox up"
+            kept = "Nothing on it persists"
+        else:
+            up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
+            kept = "Its 100GB work volume is untouched"
         print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
@@ -115,11 +141,16 @@ def lambda_handler(event, context):
             notify(
                 "%s auto-terminated (idle)" % name,
                 "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%) and was terminated.\n\n"
-                "Its 100GB work volume is untouched -- bring the box back with:\n"
-                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, up_cmd),
+                "%s -- bring the box back with:\n"
+                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, kept, up_cmd),
             )
         except Exception as e:
             results.append({"id": iid, "action": "terminate_failed", "error": str(e)})
+            # Silent failure here is how a box outlives its watchdog (termination protection,
+            # a policy change): say so, loudly.
+            notify("%s FAILED to terminate (idle)" % name,
+                   "Instance %s (%s) is idle but TerminateInstances failed: %s\n"
+                   "It keeps costing money until someone terminates it." % (iid, name, e))
 
     print(json.dumps(results))
     return {"checked": len(instances), "results": results}
@@ -174,7 +205,7 @@ resource "aws_iam_role_policy" "parallel_watchdog" {
         Action   = "ec2:TerminateInstances"
         Resource = "*"
         Condition = {
-          StringEquals = { "ec2:ResourceTag/Name" = ["parallel-box", "parallel-box-2"] }
+          StringEquals = { "ec2:ResourceTag/Name" = ["parallel-box", "parallel-box-2", "gpu-box"] }
         }
       },
       {
@@ -198,11 +229,13 @@ resource "aws_lambda_function" "parallel_watchdog" {
 
   environment {
     variables = {
-      IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
-      IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
-      TAG_NAMES     = "parallel-box,parallel-box-2"
-      SNS_REGION    = var.aws_region
-      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
+      IDLE_MINUTES = tostring(var.parallel_box_idle_minutes)
+      IDLE_CPU_PCT = tostring(var.parallel_box_idle_cpu_pct)
+      TAG_NAMES    = "parallel-box,parallel-box-2,gpu-box"
+      # gpu-box.tf's hard lifetime; the parallel boxes have none (a long job is their point).
+      MAX_AGE_MINUTES = jsonencode({ "gpu-box" = var.gpu_box_max_hours * 60 })
+      SNS_REGION      = var.aws_region
+      SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }
   }
 

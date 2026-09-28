@@ -52,7 +52,7 @@ class SecurityDefaults(unittest.TestCase):
         })
         code = "\n".join(line for line in sharing.splitlines() if not line.lstrip().startswith("#"))
         self.assertEqual(re.sub(r"\s+", "", code),
-            'setting_id="arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:servicesetting/ssm/documents/console/public-sharing-permission"'
+            'setting_id="arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:servicesetting/ssm/documents/console/public-sharing-permission"'
             'setting_value="Disable"lifecycle{prevent_destroy=true}')
 
     def test_exact_both_account_region_sets(self):

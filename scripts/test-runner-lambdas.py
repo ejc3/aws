@@ -18,6 +18,8 @@ Exit code 1 if any case fails.
 import contextlib
 import base64
 import gzip
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -29,23 +31,31 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TF_FILE = Path(__file__).resolve().parent.parent / "runner-autoscale.tf"
+FRONT_FILE = TF_FILE.parent / "runner-webhook-front.tf"
 NOW = datetime(2026, 8, 7, 20, 0, 0, tzinfo=timezone.utc)
 ACCOUNT_ID = "928413605543"
 REGION = "us-west-1"
+# LAUNCH_SUBNETS as Terraform renders it: us-west-1c first, then us-west-1a.
+SUBNET_C = "subnet-usw1c"
+SUBNET_A = "subnet-usw1a"
+LAUNCH_SUBNETS = [
+    {"subnet_id": SUBNET_C, "availability_zone": "us-west-1c"},
+    {"subnet_id": SUBNET_A, "availability_zone": "us-west-1a"},
+]
 
 
 # --------------------------------------------------------------------------
 # Loading the Lambda source out of the Terraform heredocs
 # --------------------------------------------------------------------------
 
-def extract_lambda_sources():
-    """The two `content = <<-EOF ... EOF` bodies, in file order.
+def extract_lambda_sources(path=None):
+    """The `content = <<-EOF ... EOF` bodies of a Terraform file, in file order.
 
     Terraform strips the indentation of the least-indented line from a `<<-`
     heredoc, which is exactly what textwrap.dedent does, so the text handed to
     exec() here is byte-identical to the lambda_function.py that gets zipped.
     """
-    lines = TF_FILE.read_text().splitlines()
+    lines = (path or TF_FILE).read_text().splitlines()
     sources, body, collecting = [], [], False
     for line in lines:
         if collecting:
@@ -121,7 +131,11 @@ class FakeEC2:
     def run_instances(self, **kw):
         self.calls.append(("run_instances", kw))
         self.journal.append(f"ec2:run_instances:{kw['InstanceType']}")
-        error = self.run_instances_errors.get(kw["InstanceType"])
+        # Keyed by instance type (refused in every subnet) or by (subnet, type)
+        # (refused in that subnet only): a spot pool is one type in one AZ.
+        subnet = kw["NetworkInterfaces"][0]["SubnetId"]
+        error = (self.run_instances_errors.get((subnet, kw["InstanceType"]))
+                 or self.run_instances_errors.get(kw["InstanceType"]))
         if error:
             raise Exception(error)
         return {"Instances": [{"InstanceId": f"i-new-{kw['InstanceType']}"}]}
@@ -172,6 +186,40 @@ class FakeClientError(Exception):
         self.response = {"Error": {"Code": code, "Message": message}}
 
 
+def condition_holds(item, expression, names, values):
+    """Evaluate the AND-only condition expressions the Lambdas write.
+
+    Enough of DynamoDB's grammar for those and no more: a term this cannot
+    read fails the case rather than passing it.
+    """
+    if not expression:
+        return True
+    for term in expression.split(" AND "):
+        term = term.strip()
+        absent = re.fullmatch(r"attribute_not_exists\(([#\w]+)\)", term)
+        if absent:
+            if item is not None and names.get(absent.group(1), absent.group(1)) in item:
+                return False
+            continue
+        compare = re.fullmatch(r"([#\w]+) (=|>=) (:\w+)", term)
+        assert compare, f"FakeDynamoDB cannot evaluate {term!r}"
+        if item is None:
+            return False
+        have = item.get(names.get(compare.group(1), compare.group(1)))
+        want = values[compare.group(3)]
+        if not have or set(have) != set(want):
+            return False
+        (kind, got), = have.items()
+        expected = want[kind]
+        if kind == "N":
+            got, expected = int(got), int(expected)
+        if compare.group(2) == "=" and got != expected:
+            return False
+        if compare.group(2) == ">=" and not got >= expected:
+            return False
+    return True
+
+
 class FakeDynamoDB:
     """Registration rows with conditional-create semantics.
 
@@ -185,7 +233,7 @@ class FakeDynamoDB:
     """
 
     def __init__(self, items=(), put_error=None, write_then_error=False,
-                 concurrent_item=None, get_error=None):
+                 concurrent_item=None, get_error=None, update_error=None, before_update=None):
         self.items = {}
         for item in items:
             self.items[item["InstanceArn"]["S"]] = item
@@ -193,6 +241,11 @@ class FakeDynamoDB:
         self.write_then_error = write_then_error
         self.concurrent_item = concurrent_item
         self.get_error = get_error
+        # UpdateItem rejected after its condition passed, and a callable run once
+        # before the next UpdateItem is evaluated: another writer getting there
+        # first, which is how a claim race is staged.
+        self.update_error = update_error
+        self.before_update = before_update
         self.calls = []
 
     def get_item(self, **kw):
@@ -202,6 +255,27 @@ class FakeDynamoDB:
             raise self.get_error
         item = self.items.get(kw["Key"]["InstanceArn"]["S"])
         return {"Item": item} if item is not None else {}
+
+    def update_item(self, **kw):
+        self.calls.append(("update_item", kw))
+        if self.before_update is not None:
+            hook, self.before_update = self.before_update, None
+            hook(self, kw)
+        arn = kw["Key"]["InstanceArn"]["S"]
+        item = self.items.get(arn)
+        names = kw.get("ExpressionAttributeNames", {})
+        values = kw.get("ExpressionAttributeValues", {})
+        if not condition_holds(item, kw.get("ConditionExpression"), names, values):
+            raise FakeClientError("ConditionalCheckFailedException")
+        if self.update_error:
+            raise self.update_error
+        assert kw["UpdateExpression"].startswith("SET "), kw
+        updated = dict(item or {"InstanceArn": {"S": arn}})
+        for assignment in kw["UpdateExpression"][len("SET "):].split(","):
+            attr, value = (part.strip() for part in assignment.split("="))
+            updated[names.get(attr, attr)] = values[value]
+        self.items[arn] = updated
+        return {}
 
     def put_item(self, **kw):
         self.calls.append(("put_item", kw))
@@ -284,11 +358,19 @@ class FakeSSM:
 
 
 class FakeLambdaClient:
-    def __init__(self):
+    def __init__(self, error=None):
         self.invokes = []
+        self.calls = []
+        self.error = error
 
     def invoke(self, **kw):
-        self.invokes.append(json.loads(json.loads(kw["Payload"])["body"]))
+        self.calls.append(kw)
+        if self.error:
+            raise self.error
+        payload = json.loads(kw["Payload"])
+        # Webhook-shaped events carry a body; the reuse function takes the job itself.
+        if "body" in payload:
+            self.invokes.append(json.loads(payload["body"]))
 
     def arch_invokes(self):
         """Total runners REQUESTED per architecture.
@@ -464,7 +546,7 @@ def capture_emf(emit, **kwargs):
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
-                dynamodb=None):
+                dynamodb=None, launch_ec2=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
@@ -480,6 +562,10 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     client_options = []
     def client(service, **kw):
         client_options.append((service, kw))
+        # The webhook's RunInstances client is its one EC2 client built with a
+        # config; a case can hand it a separate fake to see which calls use it.
+        if service == "ec2" and "config" in kw and launch_ec2 is not None:
+            return launch_ec2
         return clients[service]
     fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
@@ -497,11 +583,14 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     if github is not None:
         namespace["urllib"] = github.as_urllib()
     namespace["os"].environ.update({
-        "SUBNET_ID": "subnet-test",
+        "LAUNCH_SUBNETS": json.dumps(LAUNCH_SUBNETS),
+        # Terraform sets both; LAUNCH_SUBNETS must win.
+        "SUBNET_ID": SUBNET_A,
         "SECURITY_GROUP_ID": "sg-test",
         "INSTANCE_PROFILE": "runner-profile",
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
+        "REUSE_FUNCTION": "github-runner-reuse",
         "MAX_RUNNERS": "4",
         "REGISTRATION_TABLE": "github-runner-registration",
         "RUNNER_ACCOUNT_ID": ACCOUNT_ID,
@@ -515,17 +604,21 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     # clock against boto3's aware LaunchTime. A fake that returns an aware value
     # either way hides that, so `now()` with no tz returns naive here exactly as
     # the real datetime does.
-    class FixedDatetime(namespace["datetime"]):
-        @classmethod
-        def now(cls, tz=None):
-            return now if tz is not None else now.replace(tzinfo=None)
+    if "datetime" in namespace:
+        class FixedDatetime(namespace["datetime"]):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz is not None else now.replace(tzinfo=None)
 
-    namespace["datetime"] = FixedDatetime
+        namespace["datetime"] = FixedDatetime
     return namespace
 
 
 def instance(instance_id, instance_type, state, age_minutes, arch="x86_64", tags=None,
-             state_reason=None):
+             state_reason=None, az=None):
+    """One DescribeInstances record. `az` sets Placement, which EC2 keeps on a
+    terminated record after dropping its SubnetId; without it the record's AZ is
+    unknown, and the launcher treats a failure on it as a failure in every AZ."""
     all_tags = {"Role": "github-runner", "Name": f"github-runner-{arch}"}
     all_tags.update(tags or {})
     record = {
@@ -537,6 +630,8 @@ def instance(instance_id, instance_type, state, age_minutes, arch="x86_64", tags
     }
     if state_reason:
         record["StateReason"] = {"Code": state_reason}
+    if az:
+        record["Placement"] = {"AvailabilityZone": az}
     return record
 
 
@@ -551,6 +646,17 @@ def job(status, arch, name="job"):
 
 def instance_arn(instance_id):
     return f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:instance/{instance_id}"
+
+
+def registration_calls(dynamodb):
+    """DynamoDB calls on instance registration rows, without the poll's queue-scan records."""
+    return [(op, kw) for op, kw in dynamodb.calls
+            if not kw.get("Key", kw.get("Item", {})).get("InstanceArn", {}).get("S", "").startswith("queue-scan#")]
+
+
+def registration_items(dynamodb):
+    """Instance registration rows, without the poll's queue-scan records."""
+    return {key: item for key, item in dynamodb.items.items() if not key.startswith("queue-scan#")}
 
 
 def registered_item(instance_id="i-lease", runner_id=77, runner_name=None):
@@ -589,6 +695,12 @@ def launched_types(ec2):
     return [kw["InstanceType"] for kw in ec2.ops("run_instances")]
 
 
+def launched_pools(ec2):
+    """(subnet, instance type) of every run_instances attempt, in order."""
+    return [(kw["NetworkInterfaces"][0]["SubnetId"], kw["InstanceType"])
+            for kw in ec2.ops("run_instances")]
+
+
 def type_order(arch="x86_64"):
     """The launcher's own list, so these cases follow it instead of pinning it.
 
@@ -598,47 +710,54 @@ def type_order(arch="x86_64"):
 
 
 def case_aws_capacity_verdict_advances_the_type():
-    """AWS's own state reason on a dead instance moves the launcher along."""
-    ec2 = FakeEC2([instance("i-dead", "c5d.metal", "terminated", 60,
+    """AWS's own state reason on a dead instance moves the launcher along in that AZ."""
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-dead", head, "terminated", 60, az="us-west-1c",
                             state_reason="Server.InsufficientInstanceCapacity")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_stalled_pending_launch_advances_the_type():
     """A launch still pending past the startup window is a capacity failure."""
-    ec2 = FakeEC2([instance("i-stuck", "c5d.metal", "pending", 20)])
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_capacity_failed_tag_advances_the_type():
     """The tag the cleanup Lambda stamps survives the instance's termination."""
-    ec2 = FakeEC2([instance("i-reaped", "c5d.metal", "terminated", 30,
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-reaped", head, "terminated", 30, az="us-west-1c",
                             tags={"CapacityFailedAt": NOW.isoformat()})])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
 
 
 def case_pending_inside_the_startup_window_is_not_a_failure():
     """A metal instance that is merely still booting must not rotate the list."""
-    ec2 = FakeEC2([instance("i-booting", "c5d.metal", "pending", 5)])
+    head = type_order()[0]
+    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5d.metal"], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
 
 def case_every_type_failed_still_launches():
-    """Deprioritising must never empty the list."""
-    module = webhook(FakeEC2([]))
-    every = module["get_instance_types"]("x86_64")
-    dead = [instance(f"i-{t}", t, "terminated", 10, state_reason="Server.InsufficientInstanceCapacity")
-            for t in every]
+    """Deprioritising must never empty the list, in any AZ."""
+    every = type_order()
+    dead = [instance(f"i-{t}-{az}", t, "terminated", 10, az=az,
+                     state_reason="Server.InsufficientInstanceCapacity")
+            for t in every for az in ("us-west-1c", "us-west-1a")]
     ec2 = FakeEC2(dead)
     module = webhook(ec2)
-    order = module["get_instance_types"]("x86_64", set(every))
-    assert sorted(order) == sorted(every), order
+    subnets = module["get_launch_subnets"]()
+    failed = module["capacity_failures"](dead, NOW)
+    assert len(failed) == len(every) * len(subnets), failed
+    order = module["launch_candidates"]("x86_64", subnets, failed)
+    assert order == module["launch_candidates"]("x86_64", subnets), order
     module["launch_runner"]("x86_64")
-    assert launched_types(ec2) == [every[0]], launched_types(ec2)
+    assert launched_pools(ec2) == [(SUBNET_C, every[0])], launched_pools(ec2)
 
 
 def case_every_launchable_type_has_instance_storage():
@@ -682,6 +801,52 @@ def case_every_new_runner_declares_the_registration_protocol():
     assert tags["RunnerRegistrationProtocol"] == "ddb-v1", tags
 
 
+def case_every_new_runner_is_excluded_from_inspector_agent_scanning():
+    """Inspector's SSM agent installs its scanner with apt about 90 s after boot.
+
+    A runner is a one-job host, and a CI job's apt-get fails on the held lock: on
+    2026-09-13 three fcvm jobs lost "Install dependencies" to that install. The
+    exclusion tag has to be on the instance from launch, before the agent registers.
+    The tag alone only suppresses findings: Inspector still invokes its SSM plugin
+    unless the instance's tags are readable through instance metadata.
+    """
+    for arch in ("arm64", "x86_64"):
+        ec2 = FakeEC2()
+        webhook(ec2)["launch_runner"](arch)
+        calls = ec2.ops("run_instances")
+        assert len(calls) == 1, (arch, calls)
+        instance_tags = next(spec["Tags"] for spec in calls[0]["TagSpecifications"]
+                             if spec["ResourceType"] == "instance")
+        tags = {tag["Key"]: tag["Value"] for tag in instance_tags}
+        assert "InspectorEc2Exclusion" in tags, (arch, tags)
+        assert calls[0]["MetadataOptions"].get("InstanceMetadataTags") == "enabled", (arch, calls[0]["MetadataOptions"])
+
+
+def case_every_launch_tag_key_is_one_the_launch_policy_allows():
+    """RunInstances with a tag key outside TagOnlyDuringRunnerLaunch is denied outright.
+
+    The policy's aws:TagKeys list is ForAllValues, so one unlisted key in any tag
+    specification fails every launch, and the fake EC2 here would never notice.
+    Instance tags are also served through IMDS, which accepts only keys made of
+    letters, digits and + - = . , _ : @.
+    """
+    source = TF_FILE.read_text()
+    policy = re.search(r'^resource "aws_iam_role_policy" "runner_lambda" \{\n.*?^\}',
+                       source, re.M | re.S).group()
+    launch = next(s for s in re.split(r'\n      \},\n      \{\n', policy)
+                  if re.search(r'Sid\s*=\s*"TagOnlyDuringRunnerLaunch"', s))
+    allowed = set(re.findall(r'"([^"]+)"', re.search(r'"aws:TagKeys"\s*=\s*\[(.*?)\]', launch).group(1)))
+    for arch in ("arm64", "x86_64"):
+        ec2 = FakeEC2()
+        webhook(ec2)["launch_runner"](arch)
+        for call in ec2.ops("run_instances"):
+            keys = {tag["Key"] for spec in call["TagSpecifications"] for tag in spec["Tags"]}
+            assert "RunnerRegistrationProtocol" in keys, (arch, keys)
+            assert keys <= allowed, (arch, sorted(keys - allowed), sorted(allowed))
+            for key in keys:
+                assert re.fullmatch(r"[A-Za-z0-9+\-=.,_:@]+", key), (arch, key)
+
+
 def case_controller_first_accepts_older_pat_script_without_unused_credential():
     for claims in (False, True):
         script = '#!/bin/bash\n' + ('REGISTRATION_TABLE="table"\n' if claims else '')
@@ -711,12 +876,32 @@ def case_invalid_or_oversized_user_data_cannot_allocate_runner():
         assert not ec2.ops("run_instances"), "bad script allocated billable metal"
 
 
+def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
+    """SSM holds base64gzip of the script without its whole-line comments."""
+    source = TF_FILE.read_text()
+    assert 'value = base64gzip(local.runner_user_data_document)' in source
+    assert 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' in source
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    script = (script.replace("${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}",
+                             "ssh-ed25519 " + "x" * 68)
+              .replace("${local.runner_registration_table_name}", "github-runner-registration")
+              .replace("$${", "${"))
+    shipped = "\n".join(line for line in script.split("\n")
+                        if not line.strip().startswith("#") or line.startswith("#!"))
+    assert shipped.startswith("#!/bin/bash\n")
+    wire = base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)).decode()
+    # The controller must still recognize the document it launches with.
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
+    # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
+    assert len(wire) <= 8192 - 512, len(wire)
+
+
 def case_controller_recognizes_real_terraform_user_data_document():
     source = TF_FILE.read_text()
     script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
     wire = base64.b64encode(gzip.compress(script.encode())).decode()
     # IAM cutoff keeps the broker document; it cannot restore a PAT-reading boot.
-    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True, True)
     assert '/github-runner/pat' not in script
     runner_grants = (TF_FILE.parent / 'runner-vpc.tf').read_text()
     assert 'aws_iam_policy.ssm_managed_instance.arn' in runner_grants
@@ -921,11 +1106,16 @@ def case_incident_replay_three_dead_c5d_launches():
     report instance-terminated-no-capacity until 20:31. The old loop saw no
     exception, so every retry picked c5d.metal again and the rest of the list
     was never tried.
+
+    c5d.metal was the head of the x86 list then. The husks here take whatever
+    heads it now, because being the head is what the replay is about. They
+    carry no Placement, which the launcher matches to every AZ.
     """
+    head = type_order()[0]
     ec2 = FakeEC2([
-        instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
-        instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
-        instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
+        instance("i-001e64c56eb71053b", head, "pending", 79),
+        instance("i-012093644a97c1b37", head, "pending", 74),
+        instance("i-00ead8c13e0bfffff", head, "pending", 69),
     ])
     # GitHub is reachable and has no runner registered for any husk -- required:
     # without a GitHub view, get_capacity deliberately degrades to the instance
@@ -945,11 +1135,12 @@ def case_handler_launches_next_type_when_the_pool_is_all_husks():
     "Max x86_64 runners (4) reached". All four are dead launches, so the pool is
     really empty and the next instance type is the one to try.
     """
+    head = type_order()[0]
     ec2 = FakeEC2([
-        instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
-        instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
-        instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
-        instance("i-0fb9768c36e56129d", "c5d.metal", "pending", 60),
+        instance("i-001e64c56eb71053b", head, "pending", 79),
+        instance("i-012093644a97c1b37", head, "pending", 74),
+        instance("i-00ead8c13e0bfffff", head, "pending", 69),
+        instance("i-0fb9768c36e56129d", head, "pending", 60),
     ])
     event = {"body": json.dumps({
         "action": "queued",
@@ -1070,6 +1261,947 @@ def case_one_arch_failure_does_not_rotate_the_other():
     ec2 = FakeEC2([instance("i-x", "c5d.metal", "pending", 40, arch="x86_64")])
     webhook(ec2)["launch_runner"]("arm64")
     assert launched_types(ec2) == ["c7gd.metal"], launched_types(ec2)
+
+
+# --------------------------------------------------------------------------
+# Cases: two runner subnets, us-west-1c tried first
+# --------------------------------------------------------------------------
+
+def case_x86_order_leads_with_r5d_and_arm_order_is_unchanged():
+    """r5d.metal: c5d.metal's CPU generation, 96 vCPUs and 4x900GB NVMe, 4x the RAM,
+    and a spot price 17-20% lower in both runner AZs on 2026-09-13."""
+    module = webhook(FakeEC2([]))
+    x86, arm = module["get_instance_types"]("x86_64"), module["get_instance_types"]("arm64")
+    assert x86 == ["r5d.metal", "c5d.metal", "m5d.metal", "m6id.metal"], x86
+    assert arm == ["c7gd.metal", "m7gd.metal", "r7gd.metal"], arm
+
+
+def case_every_type_is_tried_in_us_west_1c_before_us_west_1a():
+    for arch in ("arm64", "x86_64"):
+        module = webhook(FakeEC2([]))
+        types = module["get_instance_types"](arch)
+        order = module["launch_candidates"](arch, module["get_launch_subnets"]())
+        assert order == ([(SUBNET_C, "us-west-1c", t) for t in types]
+                         + [(SUBNET_A, "us-west-1a", t) for t in types]), order
+        ec2 = FakeEC2([])
+        webhook(ec2)["launch_runner"](arch)
+        assert launched_pools(ec2) == [(SUBNET_C, types[0])], (arch, launched_pools(ec2))
+
+
+def case_terraform_hands_the_launcher_us_west_1c_first():
+    """The order the Lambda walks is Terraform's, so check it at the source."""
+    vpc = (TF_FILE.parent / "runner-vpc.tf").read_text()
+    refs = re.search(r"\n  runner_launch_subnets\s*=\s*concat\(([^)]*)\)\n", vpc).group(1)
+    zones = []
+    for ref in refs.split(","):
+        name = ref.strip().split(".", 1)[1]
+        body = re.search(r'^resource "aws_subnet" "' + re.escape(name) + r'" \{\n.*?^\}',
+                         vpc, re.M | re.S).group()
+        zones.append(re.search(r'\n  availability_zone\s*=\s*"([^"]+)"', body).group(1))
+    assert zones == ["us-west-1c", "us-west-1a"], zones
+    source = TF_FILE.read_text()
+    assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_launch_subnets : "
+                     r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
+                     source), "LAUNCH_SUBNETS is not rendered from local.runner_launch_subnets"
+    # Kept for the previous controller code during the apply; it must stay the us-west-1a subnet.
+    assert re.search(r"\n      SUBNET_ID\s*=\s*aws_subnet\.runner\[0\]\.id\n", source), \
+        "SUBNET_ID is not the us-west-1a subnet"
+
+
+def case_capacity_exhausted_in_us_west_1c_falls_through_to_us_west_1a():
+    """The motivating case: ARM spot refused in one AZ is not refused in the other."""
+    types = type_order("arm64")
+    ec2 = FakeEC2(run_instances_errors={(SUBNET_C, t): "InsufficientInstanceCapacity" for t in types})
+    _, instance_type = webhook(ec2)["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, t) for t in types] + [(SUBNET_A, types[0])], \
+        launched_pools(ec2)
+    assert instance_type == types[0], instance_type
+
+
+def case_capacity_backoff_is_per_type_and_az():
+    """A c7gd.metal failure in us-west-1a must not hold c7gd.metal back in us-west-1c.
+
+    Keyed by type alone, the cheapest ARM pool would be skipped every time the
+    exhausted AZ had just refused the same type.
+    """
+    head, second = type_order("arm64")[:2]
+    failed_in_a = instance("i-dead-a", head, "terminated", 30, arch="arm64", az="us-west-1a",
+                           state_reason="Server.InsufficientInstanceCapacity")
+    ec2 = FakeEC2([failed_in_a])
+    module = webhook(ec2)
+    module["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
+    order = module["launch_candidates"]("arm64", module["get_launch_subnets"](),
+                                        module["capacity_failures"]([failed_in_a], NOW))
+    assert order[0] == (SUBNET_C, "us-west-1c", head), order
+    assert order[-1] == (SUBNET_A, "us-west-1a", head), order
+
+    # The same failure in us-west-1c moves that AZ on to the next type instead.
+    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c")])
+    webhook(ec2)["launch_runner"]("arm64")
+    assert launched_pools(ec2) == [(SUBNET_C, second)], launched_pools(ec2)
+
+
+def case_a_refused_pool_is_not_retried_within_one_batch():
+    """A refusal raised by run_instances leaves no instance record, so the batch remembers it."""
+    head, second = type_order("arm64")[:2]
+    ec2 = FakeEC2(run_instances_errors={(SUBNET_C, head): "InsufficientInstanceCapacity"})
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+                                 "launch_count": 2})}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_C, second)], \
+        launched_pools(ec2)
+
+
+def case_single_subnet_environment_still_launches():
+    """SUBNET_ID from the previous controller's environment: one subnet, AZ unknown."""
+    head, second = type_order()[:2]
+    ec2 = FakeEC2([instance("i-dead", head, "terminated", 30, az="us-west-1a",
+                            state_reason="Server.InsufficientInstanceCapacity")])
+    webhook(ec2, env={"LAUNCH_SUBNETS": "", "SUBNET_ID": "subnet-legacy"})["launch_runner"]("x86_64")
+    # An unknown subnet AZ matches every failure record: the old per-type backoff.
+    assert launched_pools(ec2) == [("subnet-legacy", second)], launched_pools(ec2)
+
+
+def case_unusable_launch_subnets_refuse_before_allocating_metal():
+    for value in ("not json", "null", "[]", "{}", '{"subnet_id": "subnet-x"}', '["subnet-x"]',
+                  '[{"subnet_id": "subnet-x"}]',
+                  '[{"subnet_id": "", "availability_zone": "us-west-1c"}]',
+                  '[{"subnet_id": 7, "availability_zone": "us-west-1c"}]'):
+        ec2 = FakeEC2()
+        github = FakeGitHub()
+        module = webhook(ec2, github=github, env={"LAUNCH_SUBNETS": value})
+        try:
+            module["launch_runner"]("arm64")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"LAUNCH_SUBNETS={value!r} was accepted")
+        assert not ec2.ops("run_instances"), (value, ec2.calls)
+        assert not any("registration-token" in url for url in github.requests), value
+
+
+# --------------------------------------------------------------------------
+# Cases: a stream of jobs on a warm host
+# --------------------------------------------------------------------------
+
+WARM = "i-0123456789abcdef1"
+WARM_TOO = "i-0123456789abcdef2"
+NOW_EPOCH = int(NOW.timestamp())
+STREAM_SSM_USER_DATA = base64.b64encode(gzip.compress(
+    b'#!/bin/bash\nREGISTRATION_TABLE="github-runner-registration"\n'
+    b'BOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"\n'
+    b'ExecStart=/usr/local/sbin/fcvm-runner-job next\n'
+)).decode()
+
+
+def stream_host(instance_id=WARM, arch="arm64", age_minutes=90, state="running", protocol="ddb-v2"):
+    """A runner whose user data registers again after a job, between jobs."""
+    return instance(instance_id, "c7gd.metal" if arch == "arm64" else "r5d.metal", state,
+                    age_minutes, arch=arch, tags={"RunnerRegistrationProtocol": protocol})
+
+
+def stream_row(instance_id=WARM, runner_id=77, available_until=None, claimed_at=None):
+    item = registered_item(instance_id, runner_id)
+    if available_until is not None:
+        item["AvailableUntil"] = {"N": str(available_until)}
+    if claimed_at is not None:
+        item["ClaimedAt"] = {"N": str(claimed_at)}
+    return item
+
+
+def stream_item(dynamodb, instance_id=WARM):
+    return dynamodb.items[instance_arn(instance_id)]
+
+
+def completed_event(instance_id=WARM, arch="arm64", runner_id=77, conclusion="success",
+                    completed_seconds_ago=10, runner_name=None):
+    labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+    return {"body": json.dumps({"action": "completed", "workflow_job": {
+        "runner_name": runner_name or f"runner-{instance_id}", "runner_id": runner_id,
+        "labels": labels, "conclusion": conclusion,
+        "completed_at": (NOW - timedelta(seconds=completed_seconds_ago)).isoformat()}})}
+
+
+def queued_event(arch="arm64", launch_count=None):
+    body = {"action": "queued", "workflow_job": {
+        "labels": ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]}}
+    if launch_count is not None:
+        body["launch_count"] = launch_count
+    return {"body": json.dumps(body)}
+
+
+def queue_of(arch="arm64", queued=1, run_id=5001):
+    """FakeGitHub arguments for one in-progress run holding `queued` queued jobs."""
+    return {"runs": [run(run_id, "in_progress")],
+            "jobs": {run_id: [job("queued", arch)] * queued + [job("in_progress", arch)]}}
+
+
+def bootstrap_names(ssm):
+    return [put["Name"] for put in ssm.puts]
+
+
+def reuse(ec2, **kw):
+    """The webhook source as github-runner-reuse runs it, with a recording Lambda client."""
+    kw.setdefault("github", FakeGitHub())
+    kw.setdefault("lambda_client", FakeLambdaClient())
+    return load_lambda(WEBHOOK_SRC, ec2, kw.pop("ssm", FakeSSM()), **kw)
+
+
+def as_handoff(event):
+    """What the webhook hands github-runner-reuse for a completed delivery."""
+    return {"workflow_job": json.loads(event["body"])["workflow_job"]}
+
+
+def case_a_completed_job_hands_its_warm_host_the_next_queued_job():
+    """Queued work the pool cannot absorb goes to the host that just finished.
+
+    Three hops, each run as Lambda runs it. The webhook answers the delivery and
+    hands the job to github-runner-reuse without a read. The reuse function opens
+    the host's window and, seeing more queued work than idle and starting runners
+    can take, asks the webhook for a claim. The webhook, the one function that
+    decides capacity, claims the host and brokers its instance-bound credential.
+    """
+    ssm, dynamodb, ec2 = FakeSSM(), FakeDynamoDB([stream_row()]), FakeEC2([stream_host()])
+    github, front, back = FakeGitHub(**queue_of(queued=2)), FakeLambdaClient(), FakeLambdaClient()
+    accepted = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                       lambda_client=front)["handler"](completed_event(), None)
+    assert accepted == {"statusCode": 202, "body": f"Checking runner-{WARM} for reuse"}, accepted
+    (handoff,) = front.calls
+    assert handoff["FunctionName"] == "github-runner-reuse", handoff
+    assert handoff["InvocationType"] == "Event", handoff
+
+    checked = reuse(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                    lambda_client=back)["reuse_handler"](json.loads(handoff["Payload"]), None)
+    assert checked["statusCode"] == 202, checked
+    (request,) = back.calls
+    assert request["FunctionName"] == "github-runner-webhook", request
+    assert request["InvocationType"] == "Event", request
+    assert back.invokes == [{"action": "queued", "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                             "queued_jobs": 1, "launch_count": 1, "claim_only": True}], back.invokes
+    assert ssm.puts == [] and "ClaimedAt" not in stream_item(dynamodb), (ssm.puts, stream_item(dynamodb))
+
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github)["handler"](
+        json.loads(request["Payload"]), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
+    tags = {t["Key"]: t["Value"] for t in ssm.puts[0]["Tags"]}
+    assert tags["InstanceArn"] == instance_arn(WARM), tags
+    item = stream_item(dynamodb)
+    assert item["ClaimedAt"] == {"N": str(NOW_EPOCH)}, item
+    assert item["AvailableUntil"] == {"N": str(NOW_EPOCH - 10 + 120)}, item
+    assert not ec2.ops("run_instances"), ec2.calls
+
+
+def case_the_webhook_hands_a_completed_job_on_without_reading_anything():
+    """The webhook's one execution is never held by a reuse check."""
+    ec2, ssm, dynamodb = FakeEC2([stream_host()]), FakeSSM(), FakeDynamoDB([stream_row()])
+    github, front = FakeGitHub(**queue_of(queued=3)), FakeLambdaClient()
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github,
+                     lambda_client=front)["handler"](completed_event(), None)
+    assert result["statusCode"] == 202, result
+    assert (ec2.calls, dynamodb.calls, github.requests, ssm.journal) == ([], [], [], []), \
+        (ec2.calls, dynamodb.calls, github.requests, ssm.journal)
+    assert json.loads(front.calls[0]["Payload"]) == {"workflow_job": {
+        "runner_name": f"runner-{WARM}", "runner_id": 77,
+        "labels": ["self-hosted", "Linux", "ARM64"], "conclusion": "success",
+        "completed_at": (NOW - timedelta(seconds=10)).isoformat()}}, front.calls
+    for event in (completed_event(conclusion="failure"), completed_event(runner_name="GitHub Actions 12")):
+        skipped = FakeLambdaClient()
+        ignored = webhook(FakeEC2(), lambda_client=skipped)["handler"](event, None)
+        assert ignored["statusCode"] == 200 and skipped.calls == [], (ignored, skipped.calls)
+    refused = webhook(FakeEC2(), lambda_client=FakeLambdaClient(error=OSError("Lambda unavailable")))[
+        "handler"](completed_event(), None)
+    assert refused["statusCode"] == 503, refused
+
+
+def case_a_completed_job_with_nothing_waiting_holds_its_host_for_a_queued_event():
+    dynamodb, github, back = FakeDynamoDB([stream_row()]), FakeGitHub(), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["statusCode"] == 200, result
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+    item = stream_item(dynamodb)
+    assert item["AvailableUntil"] == {"N": str(NOW_EPOCH - 10 + 120)}, item
+    assert "ClaimedAt" not in item, item
+    assert not any("registration-token" in url for url in github.requests), github.requests
+
+
+def case_queued_work_the_idle_pool_already_covers_does_not_take_the_warm_host():
+    """One queued job and one idle online runner: that runner takes it."""
+    idle = instance(WARM_TOO, "c7gd.metal", "running", 60, arch="arm64")
+    github = FakeGitHub(runners=[{"id": 9, "name": f"runner-{WARM_TOO}", "status": "online",
+                                  "busy": False}], **queue_of(queued=1))
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    result = reuse(FakeEC2([stream_host(), idle]), dynamodb=dynamodb, github=github,
+                   lambda_client=back)["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+
+
+def case_a_completed_event_hands_out_nothing_it_cannot_prove():
+    """Every guard on the completed path, each with queued work waiting behind it."""
+    variants = [
+        ("a GitHub-hosted runner", {"event": completed_event(runner_name="GitHub Actions 12")}),
+        ("a failed job", {"event": completed_event(conclusion="failure")}),
+        ("a cancelled job", {"event": completed_event(conclusion="cancelled")}),
+        ("a timed-out job", {"event": completed_event(conclusion="timed_out")}),
+        ("a reuse window that has closed", {"event": completed_event(completed_seconds_ago=91)}),
+        ("a ddb-v1 host", {"host": stream_host(protocol="ddb-v1")}),
+        ("a host past the soft cap", {"host": stream_host(age_minutes=12 * 60 + 1)}),
+        ("a host that is shutting down", {"host": stream_host(state="shutting-down")}),
+        ("a job for the other architecture", {"event": completed_event(arch="x86_64")}),
+        ("a row that names a later runner", {"item": stream_row(runner_id=78)}),
+        ("a window already open", {"item": stream_row(available_until=NOW_EPOCH + 60)}),
+    ]
+    for label, variant in variants:
+        item = variant.get("item", stream_row())
+        window_before = item.get("AvailableUntil")
+        dynamodb, back = FakeDynamoDB([item]), FakeLambdaClient()
+        result = reuse(FakeEC2([variant.get("host", stream_host())]), dynamodb=dynamodb,
+                       github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)["reuse_handler"](
+                           as_handoff(variant.get("event", completed_event())), None)
+        assert result["statusCode"] == 200, (label, result)
+        assert back.calls == [], (label, back.calls)
+        assert stream_item(dynamodb).get("AvailableUntil") == window_before, (label, stream_item(dynamodb))
+        assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
+
+
+def case_a_queue_check_that_cannot_finish_hands_out_nothing():
+    dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    module = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
+                   github=FakeGitHub(**queue_of(queued=3)), lambda_client=back)
+    answered = module["github_get"]
+
+    def runs_unreachable(pat, url):
+        if "/actions/runs" in url:
+            raise OSError("GitHub is unreachable")
+        return answered(pat, url)
+
+    module["github_get"] = runs_unreachable
+    result = module["reuse_handler"](as_handoff(completed_event()), None)
+    assert result["body"].startswith(f"Holding runner-{WARM}"), result
+    assert back.calls == [], back.calls
+
+
+def case_a_claim_only_request_claims_a_warm_host_or_nothing():
+    """github-runner-reuse's request never launches, and a miss is not starvation."""
+    request = {"body": json.dumps({"action": "queued",
+                                   "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+                                   "queued_jobs": 1, "launch_count": 1, "claim_only": True}),
+               "headers": {}}
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        missed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row()]))["handler"](request, None)
+    assert missed["body"] == "No warm arm64 host left to claim", missed
+    assert not ec2.ops("run_instances") and ssm.puts == [], (ec2.calls, ssm.puts)
+    line = json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert line["decision"] == "reuse-missed" and line["ScaleUpStarved"] == 0, line
+    claimed = webhook(ec2, ssm=ssm, dynamodb=FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)]))[
+        "handler"](request, None)
+    assert claimed["body"] == f"Reused 1 warm arm64 host(s): {WARM}", claimed
+
+
+def case_a_public_delivery_cannot_ask_for_claim_only():
+    """claim_only, like launch_count, is honoured only on an IAM-authed direct invoke."""
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+    body = json.dumps({"action": "queued", "claim_only": True,
+                       "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]}})
+    sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    ec2 = FakeEC2([])
+    result = webhook(ec2, env={"WEBHOOK_SECRET": secret})["handler"](
+        {"body": body, "requestContext": {}, "headers": {"x-hub-signature-256": sig}}, None)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_run_instances_is_made_without_botocore_retries():
+    """An exhausted spot pool costs one call, not four retries of the same pool.
+
+    On 2026-09-13 botocore retried InsufficientInstanceCapacity four times per pool
+    ("reached max retries: 4"), 7 to 15 seconds each, and invocations ran into the
+    30-second timeout while the webhook's single execution was held.
+    """
+    describer, launcher = FakeEC2(), FakeEC2()
+    module = load_lambda(WEBHOOK_SRC, describer, FakeSSM(), github=FakeGitHub(), launch_ec2=launcher)
+    module["launch_runner"]("arm64")
+    assert len(launcher.ops("run_instances")) == 1, launcher.calls
+    assert describer.ops("run_instances") == [], describer.calls
+    retries = [kw["config"].retries for service, kw in module["_test_client_options"]
+               if service == "ec2" and "config" in kw]
+    assert retries == [{"total_max_attempts": 1}], retries
+
+
+def case_completed_jobs_are_checked_in_a_separate_single_execution_function():
+    source = TF_FILE.read_text()
+
+    def resource(kind, name):
+        return re.search(r'^resource "' + kind + r'" "' + name + r'" \{\n.*?^\}', source, re.M | re.S).group()
+
+    hook_fn = resource("aws_lambda_function", "runner_webhook")
+    reuse_fn = resource("aws_lambda_function", "runner_reuse")
+    reuse_queue = resource("aws_lambda_function_event_invoke_config", "runner_reuse")
+    assert re.search(r'reserved_concurrent_executions = 1\n', hook_fn), hook_fn
+    assert re.search(r'REUSE_FUNCTION\s*=\s*aws_lambda_function\.runner_reuse\[0\]\.function_name', hook_fn)
+    for pattern in (r'filename\s*=\s*data\.archive_file\.runner_webhook\.output_path',
+                    r'handler\s*=\s*"lambda_function\.reuse_handler"',
+                    r'function_name\s*=\s*"github-runner-reuse"',
+                    r'reserved_concurrent_executions = 1\n',
+                    r'WEBHOOK_FUNCTION\s*=\s*"github-runner-webhook"'):
+        assert re.search(pattern, reuse_fn), (pattern, reuse_fn)
+    assert re.search(r'maximum_retry_attempts\s*=\s*0', reuse_queue), reuse_queue
+    assert re.search(r'maximum_event_age_in_seconds\s*=\s*120', reuse_queue), reuse_queue
+    assert '["github-runner-webhook", "github-runner-reuse"] : "arn:aws:lambda:' in source
+    assert '"github-runner-webhook", "github-runner-cleanup", "github-runner-reuse"' in source
+
+
+# --------------------------------------------------------------------------
+# Cases: the webhook front
+# --------------------------------------------------------------------------
+
+DELIVERY_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:github-runner-webhook:delivery"
+WEBHOOK_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:github-runner-webhook"
+
+
+def invoked_as(arn):
+    """A Lambda context whose invoked_function_arn is `arn`."""
+    return types.SimpleNamespace(invoked_function_arn=arn, get_remaining_time_in_millis=lambda: 30000)
+
+
+def front(lambda_client=None, secret="testsecret"):
+    return load_lambda(FRONT_SRC, FakeEC2(), FakeSSM(), lambda_client=lambda_client or FakeLambdaClient(),
+                       env={"WEBHOOK_SECRET": secret, "DELIVERY_TARGET": DELIVERY_ARN})
+
+
+def github_delivery(payload, secret="testsecret", signature=None, delivery_id="d-1"):
+    """An API Gateway (payload format 1.0) event carrying one signed GitHub delivery."""
+    body = json.dumps(payload)
+    digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return {"body": body, "isBase64Encoded": False, "requestContext": {"stage": "$default"},
+            "headers": {"X-Hub-Signature-256": f"sha256={digest}" if signature is None else signature,
+                        "X-GitHub-Delivery": delivery_id, "X-GitHub-Event": "workflow_job"}}
+
+
+def forwarded_to_webhook(client):
+    """The one event the front handed the webhook, as the webhook receives it."""
+    (call,) = client.calls
+    return json.loads(call["Payload"])
+
+
+def tf_block(text, kind, name):
+    return re.search(r'^resource "' + kind + r'" "' + name + r'" \{\n.*?^\}', text, re.M | re.S).group()
+
+
+def case_the_front_refuses_deliveries_without_a_valid_signature():
+    payload = {"action": "queued", "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]}}
+    signed = github_delivery(payload)
+    unsigned = dict(signed, headers={"X-GitHub-Delivery": "d-1", "X-GitHub-Event": "workflow_job"})
+    tampered = dict(signed, body=json.dumps({**payload, "launch_count": 4}))
+    for label, event, secret in [
+        ("unsigned", unsigned, "testsecret"),
+        ("signed with another secret", github_delivery(payload, secret="not-the-secret"), "testsecret"),
+        ("not a sha256 signature", github_delivery(payload, signature="sha1=abc"), "testsecret"),
+        ("body changed after signing", tampered, "testsecret"),
+        ("no secret configured", github_delivery(payload, secret=""), ""),
+    ]:
+        client = FakeLambdaClient()
+        result = front(client, secret=secret)["handler"](event, None)
+        assert result == {"statusCode": 401, "body": "Invalid signature"}, (label, result)
+        assert client.calls == [], (label, client.calls)
+
+
+def case_the_front_forwards_only_the_fields_the_webhook_reads():
+    """Trust flags a direct invoke may carry never leave the front, at top level or in the job."""
+    payload = {"action": "queued", "launch_count": 4, "claim_only": True, "queued_jobs": 9,
+               "repository": {"full_name": "ejc3/fcvm"}, "sender": {"login": "someone"},
+               "workflow_job": {"id": 103754892298, "run_id": 34768946845,
+                                "labels": ["self-hosted", "Linux", "arm64"],
+                                "created_at": "2026-09-13T16:33:46Z", "runner_id": None,
+                                "runner_name": None, "steps": [{"name": "Checkout"}],
+                                "launch_count": 4, "claim_only": True}}
+    client = FakeLambdaClient()
+    result = front(client)["handler"](github_delivery(payload, delivery_id="abc-123"), None)
+    assert result == {"statusCode": 202, "body": "Forwarded queued to the runner webhook"}, result
+    (call,) = client.calls
+    assert call["FunctionName"] == DELIVERY_ARN and call["InvocationType"] == "Event", call
+    event = json.loads(call["Payload"])
+    assert sorted(event) == ["body", "delivery", "headers"] and event["headers"] == {}, event
+    assert event["delivery"]["id"] == "abc-123", event
+    assert json.loads(event["body"]) == {"action": "queued", "workflow_job": {
+        "id": 103754892298, "run_id": 34768946845, "labels": ["self-hosted", "Linux", "arm64"],
+        "created_at": "2026-09-13T16:33:46Z", "runner_id": None, "runner_name": None}}, event
+
+
+def case_the_front_answers_other_actions_itself_and_reports_a_failed_hand_off():
+    client = FakeLambdaClient()
+    ignored = front(client)["handler"](github_delivery({"action": "in_progress", "workflow_job": {}}), None)
+    assert ignored == {"statusCode": 200, "body": "Ignoring action: in_progress"}, ignored
+    assert client.calls == [], client.calls
+    queued = github_delivery({"action": "queued", "workflow_job": {"labels": ["ARM64"]}})
+    failed = front(FakeLambdaClient(error=OSError("Lambda unavailable")))["handler"](queued, None)
+    assert failed == {"statusCode": 503, "body": "Delivery not queued"}, failed
+    completed = FakeLambdaClient()
+    front(completed)["handler"](github_delivery(json.loads(completed_event()["body"])), None)
+    assert json.loads(forwarded_to_webhook(completed)["body"]) == json.loads(completed_event()["body"])
+
+
+def case_a_forwarded_delivery_gets_no_trust_whatever_it_carries():
+    """The alias it arrived through decides, so a forwarded body cannot set launch_count or claim_only."""
+    body = json.dumps({"action": "queued", "launch_count": 4, "claim_only": True,
+                       "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"],
+                                        "created_at": NOW.isoformat()}})
+    ec2 = FakeEC2([])
+    forwarded = webhook(ec2)["handler"]({"body": body, "headers": {}}, invoked_as(DELIVERY_ARN))
+    assert forwarded["body"].startswith("Launched 1 arm64 runner(s)"), forwarded
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    # The same event through the unqualified function is the controller's own request.
+    trusted = webhook(FakeEC2([]))["handler"]({"body": body, "headers": {}}, invoked_as(WEBHOOK_ARN))
+    assert trusted["body"] == "No warm arm64 host left to claim", trusted
+    # And a real signed delivery carried by the front launches exactly one runner.
+    client = FakeLambdaClient()
+    front(client)["handler"](github_delivery(json.loads(body)), None)
+    ec2 = FakeEC2([])
+    carried = webhook(ec2)["handler"](forwarded_to_webhook(client), invoked_as(DELIVERY_ARN))
+    assert carried["body"].startswith("Launched 1 arm64 runner(s)"), carried
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+
+
+def case_a_late_forwarded_job_the_queue_scan_already_counted_launches_nothing():
+    def scanned(seconds_ago):
+        return FakeDynamoDB([{"InstanceArn": {"S": "queue-scan#arm64"},
+                              "ScanStartedAt": {"N": f"{NOW_EPOCH - seconds_ago:.3f}"},
+                              "QueuedJobs": {"N": "1"}}])
+
+    def queued(created_seconds_ago):
+        return {"body": json.dumps({"action": "queued", "workflow_job": {
+            "labels": ["self-hosted", "Linux", "arm64"],
+            "created_at": (NOW - timedelta(seconds=created_seconds_ago)).isoformat()}}), "headers": {}}
+
+    ec2 = FakeEC2([])
+    counted = webhook(ec2, dynamodb=scanned(30))["handler"](queued(60), invoked_as(DELIVERY_ARN))
+    assert counted["body"].endswith("already counted this job"), counted
+    assert launched_types(ec2) == [], launched_types(ec2)
+    for label, dynamodb, age, context in [
+        ("queued after the scan began", scanned(30), 10, invoked_as(DELIVERY_ARN)),
+        ("no scan recorded", FakeDynamoDB(), 60, invoked_as(DELIVERY_ARN)),
+        ("not forwarded", scanned(30), 60, invoked_as(WEBHOOK_ARN)),
+    ]:
+        ec2 = FakeEC2([])
+        result = webhook(ec2, dynamodb=dynamodb)["handler"](queued(age), context)
+        assert result["body"].startswith("Launched 1 arm64 runner(s)"), (label, result)
+
+
+def case_only_a_complete_queue_scan_records_what_this_poll_asked_for():
+    def scans(budget=None, lambda_client=None):
+        dynamodb = FakeDynamoDB()
+        github = FakeGitHub(runs=[run(8001, "in_progress")], jobs={8001: [job("queued", "arm64")]})
+        module = cleanup(FakeEC2(), github, lambda_client=lambda_client, dynamodb=dynamodb)
+        if budget is not None:
+            module["QUEUE_SCAN_TIME_BUDGET_SECONDS"] = budget
+        with contextlib.redirect_stdout(io.StringIO()):
+            module["handler"]({}, None)
+        return {key: item for key, item in dynamodb.items.items() if key.startswith("queue-scan#")}
+
+    def recorded(arch, count):
+        return {"InstanceArn": {"S": f"queue-scan#{arch}"},
+                "ScanStartedAt": {"N": f"{NOW.timestamp():.3f}"}, "QueuedJobs": {"N": str(count)}}
+
+    assert scans() == {"queue-scan#arm64": recorded("arm64", 1),
+                       "queue-scan#x86_64": recorded("x86_64", 0)}, scans()
+    assert scans(budget=-1) == {}, scans(budget=-1)
+    # An arm64 request the webhook never received covers nothing.
+    refused = scans(lambda_client=FakeLambdaClient(error=OSError("Lambda unavailable")))
+    assert refused == {"queue-scan#x86_64": recorded("x86_64", 0)}, refused
+
+
+def case_a_completed_delivery_that_waited_past_its_window_is_not_handed_on():
+    client = FakeLambdaClient()
+    late = webhook(FakeEC2(), lambda_client=client)["handler"](
+        completed_event(completed_seconds_ago=91), invoked_as(DELIVERY_ARN))
+    assert late == {"statusCode": 200, "body": f"Not reusing runner-{WARM}: its reuse window has closed"}, late
+    assert client.calls == [], client.calls
+
+
+def case_the_front_is_wired_to_the_webhook_delivery_alias():
+    front_tf, source = FRONT_FILE.read_text(), TF_FILE.read_text()
+    function = tf_block(front_tf, "aws_lambda_function", "runner_webhook_front")
+    for pattern in (r'function_name\s*=\s*"github-runner-webhook-front"',
+                    r'filename\s*=\s*data\.archive_file\.runner_webhook_front\.output_path',
+                    r'reserved_concurrent_executions = 20\n',
+                    r'WEBHOOK_SECRET\s*=\s*random_password\.github_webhook\[0\]\.result',
+                    r'DELIVERY_TARGET\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.arn'):
+        assert re.search(pattern, function), (pattern, function)
+    permission = tf_block(front_tf, "aws_lambda_permission", "runner_webhook_front")
+    for pattern in (r'function_name\s*=\s*aws_lambda_function\.runner_webhook_front\[0\]\.function_name',
+                    r'principal\s*=\s*"apigateway\.amazonaws\.com"',
+                    r'source_arn\s*=\s*"\$\{aws_apigatewayv2_api\.runner_webhook\[0\]\.execution_arn\}/\*/\*"'):
+        assert re.search(pattern, permission), (pattern, permission)
+    alias = tf_block(front_tf, "aws_lambda_alias", "runner_webhook_delivery")
+    assert re.search(r'name\s*=\s*"delivery"\n', alias), alias
+    assert re.search(r'function_version\s*=\s*"\$LATEST"', alias), alias
+    assert re.search(r'function_name\s*=\s*aws_lambda_function\.runner_webhook\[0\]\.function_name', alias), alias
+    assert webhook(FakeEC2())["DELIVERY_ALIAS"] == "delivery"
+    for text, name, qualified in ((front_tf, "runner_webhook_delivery", True), (source, "runner_webhook", False)):
+        queue = tf_block(text, "aws_lambda_function_event_invoke_config", name)
+        assert re.search(r'maximum_retry_attempts\s*=\s*0\n', queue), queue
+        assert re.search(r'maximum_event_age_in_seconds\s*=\s*300\n', queue), queue
+        has_qualifier = bool(re.search(r'qualifier\s*=\s*aws_lambda_alias\.runner_webhook_delivery\[0\]\.name', queue))
+        assert has_qualifier == qualified, queue
+    assert re.search(r'reserved_concurrent_executions = 1\n', tf_block(source, "aws_lambda_function", "runner_webhook"))
+
+
+PINNED_BLOCKS = {
+    ("aws_apigatewayv2_api", "runner_webhook"): '''resource "aws_apigatewayv2_api" "runner_webhook" {
+  count         = var.enable_github_runner ? 1 : 0
+  name          = "github-runner-webhook"
+  protocol_type = "HTTP"
+}''',
+    ("aws_apigatewayv2_stage", "runner_webhook"): '''resource "aws_apigatewayv2_stage" "runner_webhook" {
+  count       = var.enable_github_runner ? 1 : 0
+  api_id      = aws_apigatewayv2_api.runner_webhook[0].id
+  name        = "$default"
+  auto_deploy = true
+}''',
+    ("aws_apigatewayv2_route", "runner_webhook"): '''resource "aws_apigatewayv2_route" "runner_webhook" {
+  count     = var.enable_github_runner ? 1 : 0
+  api_id    = aws_apigatewayv2_api.runner_webhook[0].id
+  route_key = "POST /webhook"
+  target    = "integrations/${aws_apigatewayv2_integration.runner_webhook[0].id}"
+}''',
+    ("random_password", "github_webhook"): '''resource "random_password" "github_webhook" {
+  count = var.enable_github_runner ? 1 : 0
+
+  # Alphanumeric on purpose. An HMAC-SHA256 key gains nothing from punctuation, and the
+  # value passes through a Lambda environment variable, a JSON API body and whatever
+  # someone eventually pastes into a shell to debug it. 64 chars is ~380 bits.
+  length  = 64
+  special = false
+}''',
+    ("github_repository_webhook", "runner"): '''resource "github_repository_webhook" "runner" {
+  count      = var.enable_github_runner ? 1 : 0
+  repository = "fcvm"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  # Only the API Gateway is referenced above, so without this the hook could be created
+  # before the Lambda behind that route exists. Ordering it after the function means
+  # GitHub is never pointed at a live URL with nothing to answer it, and it fixes the
+  # direction of a rotation window: Lambda takes the new secret first, GitHub second.
+  #
+  # Rotation (`terraform apply -replace='random_password.github_webhook[0]'`) changes both
+  # halves in one apply, but not atomically -- for the seconds between the two API calls
+  # GitHub still signs with the old value and deliveries 401. That is the fail-closed
+  # direction and the five-minute cleanup poll picks up anything missed, so it is fine.
+  depends_on = [aws_lambda_function.runner_webhook]
+}''',
+}
+
+
+def case_the_github_webhook_its_url_and_its_secret_are_untouched():
+    """The hook, the API behind its URL, and the secret it signs with stay byte for byte as they were."""
+    source = TF_FILE.read_text()
+    for (kind, name), pinned in PINNED_BLOCKS.items():
+        assert tf_block(source, kind, name) == pinned, (kind, name, tf_block(source, kind, name))
+
+
+def case_api_gateway_sends_deliveries_to_the_front():
+    integration = tf_block(TF_FILE.read_text(), "aws_apigatewayv2_integration", "runner_webhook")
+    for pattern in (r'integration_type\s*=\s*"AWS_PROXY"',
+                    r'integration_uri\s*=\s*aws_lambda_function\.runner_webhook_front\[0\]\.invoke_arn\n',
+                    r'integration_method\s*=\s*"POST"',
+                    r'depends_on = \[aws_lambda_permission\.runner_webhook_front\]'):
+        assert re.search(pattern, integration), (pattern, integration)
+    assert "runner_webhook[0].invoke_arn" not in integration, integration
+
+
+def case_api_gateway_cannot_invoke_the_webhook_itself():
+    """Only the front answers API Gateway; the webhook is reachable by IAM-authed invokes alone."""
+    for path in (TF_FILE, FRONT_FILE):
+        permissions = re.findall(r'^resource "aws_lambda_permission" "[^"]+" \{\n.*?^\}',
+                                 path.read_text(), re.M | re.S)
+        for permission in permissions:
+            if "apigateway.amazonaws.com" in permission:
+                assert "aws_lambda_function.runner_webhook_front[0].function_name" in permission, \
+                    (path.name, permission)
+    assert not re.search(r'^resource "aws_lambda_permission" "runner_webhook" \{', TF_FILE.read_text(), re.M)
+
+
+# --------------------------------------------------------------------------
+# Cases: the poll's demand, less what will absorb it
+# --------------------------------------------------------------------------
+
+def poll_request(queued_jobs, arch="arm64"):
+    """The cleanup poll's direct invoke: its whole queued demand for one architecture."""
+    labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+    return {"body": json.dumps({"action": "queued", "workflow_job": {"labels": labels},
+                                "queued_jobs": queued_jobs,
+                                "launch_count": min(queued_jobs, 4)}),
+            "headers": {}}
+
+
+def case_a_queued_job_whose_runner_is_booting_gets_no_second_host():
+    """The double launch: the poll counted the job its own launch is booting for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(1), None)
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "1 starting or idle arm64 runner(s) already cover the 1 queued job(s)", result
+
+
+def case_two_queued_jobs_with_one_booting_runner_get_one_launch():
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "running", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](poll_request(2), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+
+
+def case_an_idle_runner_absorbs_one_queued_job():
+    for queued, launches in ((1, 0), (2, 1)):
+        ec2 = FakeEC2([instance("i-idle", "c7gd.metal", "running", 60, arch="arm64")])
+        github = FakeGitHub(runners=[{"id": 5, "name": "runner-i-idle", "status": "online", "busy": False}])
+        webhook(ec2, github=github)["handler"](poll_request(queued), None)
+        assert len(launched_types(ec2)) == launches, (queued, launched_types(ec2))
+
+
+def case_a_starting_host_past_its_timeout_no_longer_absorbs():
+    """A launch pending past BOOT_GRACE_MINUTES, or a claim older than CLAIM_GRACE_MINUTES, covers nothing."""
+    ec2 = FakeEC2([instance("i-stalled", "c7gd.metal", "pending", 16, arch="arm64")])
+    webhook(ec2)["handler"](poll_request(1), None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    for claimed_minutes_ago, launches in ((1, 0), (6, 1)):
+        ec2 = FakeEC2([stream_host()])
+        dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 60,
+                                            claimed_at=NOW_EPOCH - claimed_minutes_ago * 60)])
+        webhook(ec2, dynamodb=dynamodb)["handler"](poll_request(1), None)
+        assert len(launched_types(ec2)) == launches, (claimed_minutes_ago, launched_types(ec2))
+
+
+def case_a_waiting_warm_host_is_claimed_for_the_poll_not_subtracted():
+    """Subtracted, it would never be claimed and would power off while its job waited a poll."""
+    ec2, ssm = FakeEC2([stream_host()]), FakeSSM()
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](poll_request(1), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert launched_types(ec2) == [], launched_types(ec2)
+
+
+def case_a_single_delivery_is_not_cut_by_runners_booting_for_other_jobs():
+    """One queued delivery says nothing about which job a booting runner is for."""
+    ec2 = FakeEC2([instance("i-booting", "c7gd.metal", "pending", 5, arch="arm64")])
+    result = webhook(ec2)["handler"](queued_event(), invoked_as(DELIVERY_ARN))
+    assert len(launched_types(ec2)) == 1, (result, launched_types(ec2))
+
+
+def case_a_queued_job_claims_a_warm_host_before_launching_metal():
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    assert result["body"] == f"Reused 1 warm arm64 host(s): {WARM}", result
+    assert not ec2.ops("run_instances"), ec2.calls
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
+    assert stream_item(dynamodb)["ClaimedAt"] == {"N": str(NOW_EPOCH)}
+
+
+def case_two_queued_jobs_cannot_both_claim_one_warm_host():
+    """One token per host: the job that loses the host launches instead.
+
+    In turn, the second event reads the claim and counts the host as starting.
+    Concurrently, both read the host as available, and the conditional write
+    gives it to exactly one of them.
+    """
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    ec2 = FakeEC2([stream_host()])
+    first_ssm, second_ssm = FakeSSM(), FakeSSM()
+    first = webhook(ec2, ssm=first_ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    second = webhook(ec2, ssm=second_ssm, dynamodb=dynamodb)["handler"](queued_event(), None)
+    assert first["body"] == f"Reused 1 warm arm64 host(s): {WARM}", first
+    assert second["body"].startswith("Launched 1 arm64 runner(s)"), second
+    assert bootstrap_names(first_ssm) + bootstrap_names(second_ssm) == [
+        f"/github-runner/bootstrap/{WARM}", "/github-runner/bootstrap/i-new-c7gd.metal"]
+
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+
+    def rival_claims_first(fake, kw):
+        fake.items[instance_arn(WARM)]["ClaimedAt"] = {"N": str(NOW_EPOCH)}
+
+    dynamodb.before_update = rival_claims_first
+    ssm = FakeSSM()
+    result = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb)["handler"](
+        queued_event(), None)
+    assert result["body"].startswith("Launched 1 arm64 runner(s)"), result
+    assert f"/github-runner/bootstrap/{WARM}" not in bootstrap_names(ssm), ssm.puts
+
+
+def case_a_warm_host_whose_window_is_closing_gets_no_token():
+    """Too little window left to be sure the host is still waiting: launch instead."""
+    def window_closes(fake, kw):
+        fake.items[instance_arn(WARM)]["AvailableUntil"] = {"N": str(NOW_EPOCH + 10)}
+
+    for label, item, hook in [
+        ("closing when read", stream_row(available_until=NOW_EPOCH + 29), None),
+        ("closed by the time of the claim", stream_row(available_until=NOW_EPOCH + 100), window_closes),
+    ]:
+        dynamodb = FakeDynamoDB([item], before_update=hook)
+        ssm = FakeSSM()
+        result = webhook(FakeEC2([stream_host()]), ssm=ssm, dynamodb=dynamodb)["handler"](
+            queued_event(), None)
+        assert result["body"].startswith("Launched 1 arm64 runner(s)"), (label, result)
+        assert f"/github-runner/bootstrap/{WARM}" not in bootstrap_names(ssm), (label, ssm.puts)
+        assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
+    module = webhook(FakeEC2(), dynamodb=FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 29)]))
+    assert module["claim_host"](WARM, NOW_EPOCH) is False
+
+
+def case_a_claimed_warm_host_counts_as_starting_until_its_grace_ends():
+    for claimed_minutes_ago, counted in ((1, 1), (6, 0)):
+        dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 60,
+                                            claimed_at=NOW_EPOCH - claimed_minutes_ago * 60)])
+        capacity = webhook(FakeEC2([stream_host()]), dynamodb=dynamodb)["get_capacity"]("arm64")
+        assert capacity["counted"] == counted, (claimed_minutes_ago, capacity)
+        assert capacity["available"] == [], (claimed_minutes_ago, capacity)
+
+
+def case_the_cleanup_retry_prefers_warm_hosts_too():
+    """The poll's direct invoke runs the same handler: warm hosts first, then launches."""
+    ssm, ec2 = FakeSSM(), FakeEC2([stream_host()])
+    dynamodb = FakeDynamoDB([stream_row(available_until=NOW_EPOCH + 100)])
+    result = webhook(ec2, ssm=ssm, dynamodb=dynamodb)["handler"](queued_event(launch_count=2), None)
+    assert result["body"] == (f"Reused 1 warm arm64 host(s): {WARM}; "
+                              "Launched 1 arm64 runner(s) (c7gd.metal): i-new-c7gd.metal"), result
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}",
+                                    "/github-runner/bootstrap/i-new-c7gd.metal"], ssm.puts
+
+
+def case_a_signed_completed_delivery_is_handed_on_and_in_progress_is_still_ignored():
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+
+    def signed(body, signature=None):
+        digest = hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        return {"body": body, "requestContext": {},
+                "headers": {"X-Hub-Signature-256": signature or f"sha256={digest}"}}
+
+    front = FakeLambdaClient()
+    module = webhook(FakeEC2([stream_host()]), env={"WEBHOOK_SECRET": secret}, lambda_client=front)
+    forged = module["handler"](signed(completed_event()["body"], signature="sha256=00"), None)
+    assert forged["statusCode"] == 401 and front.calls == [], (forged, front.calls)
+    accepted = module["handler"](signed(completed_event()["body"]), None)
+    assert accepted["statusCode"] == 202 and len(front.calls) == 1, (accepted, front.calls)
+    progress = json.dumps({"action": "in_progress", "workflow_job": {"labels": ["ARM64"]}})
+    assert module["handler"](signed(progress), None)["body"] == "Ignoring action: in_progress"
+    assert len(front.calls) == 1, front.calls
+
+
+def case_only_user_data_that_registers_again_is_tagged_for_reuse():
+    for ssm, protocol in ((FakeSSM(user_data=STREAM_SSM_USER_DATA), "ddb-v2"), (FakeSSM(), "ddb-v1")):
+        ec2 = FakeEC2()
+        webhook(ec2, ssm=ssm)["launch_runner"]("arm64")
+        tags = {t["Key"]: t["Value"]
+                for t in ec2.ops("run_instances")[0]["TagSpecifications"][0]["Tags"]}
+        assert tags["RunnerRegistrationProtocol"] == protocol, (protocol, tags)
+
+
+def case_the_reuse_window_closes_before_the_host_stops_waiting():
+    """The controller's timing against the host's, each read from its own source."""
+    source = TF_FILE.read_text()
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    host_wait = int(re.search(r'^BOOTSTRAP_DEADLINE=\$\(\(SECONDS \+ (\d+)\)\)$', script, re.M).group(1))
+    poll_seconds = int(re.search(r'^  sleep (\d+)$', script, re.M).group(1))
+    hook, reaper = webhook(FakeEC2()), cleanup(FakeEC2(), FakeGitHub())
+    latest_write = hook["REUSE_WINDOW_SECONDS"] - hook["CLAIM_MARGIN_SECONDS"]
+    assert latest_write + poll_seconds < host_wait, (latest_write, poll_seconds, host_wait)
+    assert hook["MAX_REUSE_AGE_HOURS"] == reaper["MAX_INSTANCE_AGE_HOURS"]
+    assert hook["STREAM_PROTOCOL"] in reaper["REGISTRATION_PROTOCOLS"]
+    wire = base64.b64encode(gzip.compress(script.encode())).decode()
+    assert hook["user_data_protocol"](wire) == (True, True, True)
+
+
+def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
+    """SSM holds base64gzip of the script without its whole-line comments."""
+    source = TF_FILE.read_text()
+    assert 'value = base64gzip(local.runner_user_data_document)' in source
+    assert 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' in source
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    script = (script.replace("${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}",
+                             "ssh-ed25519 " + "x" * 68)
+              .replace("${local.runner_registration_table_name}", "github-runner-registration")
+              .replace("$${", "${"))
+    shipped = "\n".join(line for line in script.split("\n")
+                        if not line.strip().startswith("#") or line.startswith("#!"))
+    assert shipped.startswith("#!/bin/bash\n") and "\n#!/bin/bash\n" in shipped
+    size = len(base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)))
+    # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
+    assert size <= 8192 - 512, size
+
+
+def idle_poll(runners, runs=(), jobs=None, recheck=None, delete_error=False, scan_budget=None):
+    """One cleanup poll over one runner inside its lease and under the soft cap."""
+    journal = []
+    ec2 = FakeEC2([instance("i-idle", "c7gd.metal", "running", 60, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  journal=journal)
+    github = FakeGitHub(runners=runners, runs=list(runs), jobs=jobs or {}, recheck=recheck,
+                        delete_error=delete_error, journal=journal)
+    module = cleanup(ec2, github)
+    if scan_budget is not None:
+        module["QUEUE_SCAN_TIME_BUDGET_SECONDS"] = scan_budget
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = module["handler"]({}, None)
+    return result, ec2, journal
+
+
+def case_an_idle_runner_with_nothing_queued_is_deregistered_then_terminated():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)])
+    assert result["idle_terminated"] == ["i-idle"], result
+    assert terminated_ids(ec2) == ["i-idle"], terminated_ids(ec2)
+    assert journal.index("github:DELETE:/actions/runners/77") < journal.index("ec2:terminate:i-idle"), journal
+
+
+def case_an_idle_runner_waits_while_its_architecture_has_queued_work():
+    for queued_arch, survives in (("arm64", True), ("x86_64", False)):
+        result, ec2, _ = idle_poll([runner_record("i-idle", busy=False)],
+                                   runs=[run(6001, "in_progress")],
+                                   jobs={6001: [job("queued", queued_arch)]})
+        assert (still_running(ec2) == ["i-idle"]) == survives, (queued_arch, still_running(ec2))
+
+
+def case_a_refused_deregistration_leaves_the_idle_host_running():
+    result, ec2, _ = idle_poll([runner_record("i-idle", busy=False)], delete_error=True)
+    assert result["idle_terminated"] == [], result
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+
+
+def case_an_idle_runner_that_took_a_job_since_the_snapshot_is_left_alone():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)],
+                                     recheck={77: runner_record("i-idle", busy=True)})
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+    assert not any(entry.startswith("github:DELETE:") for entry in journal), journal
+
+
+def case_an_unfinished_queue_scan_ends_no_idle_runner():
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)],
+                                     runs=[run(6002, "queued")], jobs={6002: []}, scan_budget=-1)
+    assert still_running(ec2) == ["i-idle"], still_running(ec2)
+    assert not any(entry.startswith("github:DELETE:") for entry in journal), journal
+
+
+def case_a_ddb_v2_host_is_judged_by_its_registration_row_like_ddb_v1():
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(tags={"RunnerRegistrationProtocol": "ddb-v2"},
+                                   runners=[runner_record("i-other")], dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
 
 
 # --------------------------------------------------------------------------
@@ -1466,6 +2598,43 @@ def case_one_unreadable_instance_cannot_block_another_ceiling_kill():
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
     assert "i-broken" in buf.getvalue(), "the skipped instance must be named in the log"
+
+
+def cleanup_emf(buf):
+    for line in buf.getvalue().splitlines():
+        if line.startswith("{") and "OldestRunnerAgeMinutes" in line:
+            return json.loads(line)
+    return None
+
+
+def case_cleanup_publishes_the_fleet_size_and_oldest_runner_age():
+    """too-many-runners and runner-long-running alarm on these, so every sweep must emit them.
+
+    The alarms used to query the Role tag through Metrics Insights, which is not an EC2
+    dimension, so they never had data. A sweep that stops emitting must be caught by
+    runner-cleanup-silent, which only works if a healthy sweep always emits.
+    """
+    ec2 = FakeEC2([instance("i-new", "c7g.metal", "running", 10, arch="arm64"),
+                   instance("i-old", "c7g.metal", "running", 95, arch="arm64")])
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cleanup(ec2, FakeGitHub(runners=[runner_record()]))["handler"]({}, None)
+    emf = cleanup_emf(buf)
+    assert emf is not None, buf.getvalue()
+    spec = emf["_aws"]["CloudWatchMetrics"][0]
+    assert spec["Namespace"] == "GitHubRunners" and spec["Dimensions"] == [[]], spec
+    assert emf["LiveRunners"] == 2, emf
+    assert 94 <= emf["OldestRunnerAgeMinutes"] <= 96, emf
+
+
+def case_cleanup_metrics_survive_an_instance_with_no_launch_time():
+    broken = instance("i-broken", "c7g.metal", "running", 120, arch="arm64")
+    del broken["LaunchTime"]
+    ec2 = FakeEC2([broken, instance("i-ok", "c7g.metal", "running", 30, arch="arm64")])
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cleanup(ec2, FakeGitHub(runners=[runner_record()]))["handler"]({}, None)
+    emf = cleanup_emf(buf)
+    assert emf is not None and emf["LiveRunners"] == 2, buf.getvalue()
+    assert 29 <= emf["OldestRunnerAgeMinutes"] <= 31, emf
 
 
 def case_stuck_scan_still_works_on_a_timestamp_with_no_offset():
@@ -2012,9 +3181,13 @@ def case_the_roster_answer_is_recorded_on_the_instance():
     inst = instance("i-lease", "c7g.metal", "running", 60, arch="arm64",
                     tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})
     ec2 = FakeEC2([inst])
+    # Queued arm64 work keeps the idle sweep off this runner, which would otherwise
+    # end an idle registration with nothing queued before the second poll.
     with contextlib.redirect_stdout(io.StringIO()):
         first = cleanup(ec2, FakeGitHub(
-            runners=[runner_record("i-lease", busy=False)]))["handler"]({}, None)
+            runners=[runner_record("i-lease", busy=False)],
+            runs=[run(7001, "in_progress")],
+            jobs={7001: [job("queued", "arm64")]}))["handler"]({}, None)
     assert terminated_ids(ec2) == [], terminated_ids(ec2)
     tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
     assert tags.get("RunnerSeenAt") == NOW.isoformat(), tags
@@ -2543,7 +3716,7 @@ def case_a_missing_account_id_makes_every_registration_unread():
                          env={"RUNNER_ACCOUNT_ID": ""})["handler"]({}, None)
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
     assert result["held"] == ["i-lease"], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_reaping_claim_that_did_not_land_holds():
@@ -2553,7 +3726,7 @@ def case_a_reaping_claim_that_did_not_land_holds():
         tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
     assert result["held"] == ["i-lease"], result
-    assert dynamodb.items == {}, dynamodb.items
+    assert registration_items(dynamodb) == {}, dynamodb.items
 
 
 def case_a_reaping_claim_whose_answer_was_lost_is_resolved_by_a_consistent_read():
@@ -2620,7 +3793,7 @@ def case_an_unreadable_registration_table_does_not_suppress_the_ceiling():
         result = cleanup(ec2, FakeGitHub(runners=[]), dynamodb=dynamodb)["handler"]({}, None)
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_lost_registration_row_cannot_hold_an_instance_past_the_ceiling():
@@ -2644,7 +3817,7 @@ def case_a_lost_registration_row_cannot_hold_an_instance_past_the_ceiling():
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
     assert result["held"] == [], result
-    assert dynamodb.calls == [], dynamodb.calls
+    assert registration_calls(dynamodb) == [], dynamodb.calls
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
@@ -3173,12 +4346,17 @@ CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
 
 
 def main():
-    global WEBHOOK_SRC, CLEANUP_SRC
+    global WEBHOOK_SRC, CLEANUP_SRC, FRONT_SRC
     sources = extract_lambda_sources()
     if len(sources) != 2:
         print(f"FAIL: expected 2 Lambda heredocs in {TF_FILE.name}, found {len(sources)}")
         return 1
     WEBHOOK_SRC, CLEANUP_SRC = sources
+    fronts = extract_lambda_sources(FRONT_FILE)
+    if len(fronts) != 1:
+        print(f"FAIL: expected 1 Lambda heredoc in {FRONT_FILE.name}, found {len(fronts)}")
+        return 1
+    FRONT_SRC = fronts[0]
 
     failures = 0
     for case in CASES:

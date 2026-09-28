@@ -265,43 +265,62 @@ resource "aws_budgets_budget" "daily_cost" {
 # CloudWatch Alarms
 # ============================================
 
-# Alert if more than 4 runners are running for 30+ minutes
+# fcvm's runner fleet, from GitHubRunners/LiveRunners, which the cleanup Lambda publishes every
+# 5 minutes (runner-autoscale.tf). The EC2 Metrics Insights "count by tag" query these used
+# before cannot return data: Role is a tag, not a dimension of any AWS/EC2 metric.
 resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
   alarm_name          = "too-many-runners"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 6 # 30 minutes (6 x 5min periods)
-  threshold           = 4
-  alarm_description   = "More than 4 runners running for 30+ minutes - check for stuck jobs"
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id          = "runner_count"
-    expression  = "SELECT COUNT(InstanceId) FROM SCHEMA(\"AWS/EC2\", InstanceId) WHERE Role = 'github-runner'"
-    label       = "Running Runners"
-    period      = 300
-    return_data = true
-  }
+  # LiveRunners counts both architecture pools (arm64 and x86_64), each capped at
+  # local.runner_max_per_arch, so the fleet's cap is twice that.
+  threshold          = 2 * local.runner_max_per_arch
+  alarm_description  = "More runners than both architecture pools' caps (${2 * local.runner_max_per_arch}) for 30+ minutes - check for stuck jobs or a runaway controller"
+  alarm_actions      = [aws_sns_topic.cost_alerts.arn]
+  ok_actions         = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data = "notBreaching"
+  namespace          = "GitHubRunners"
+  metric_name        = "LiveRunners"
+  statistic          = "Maximum"
+  period             = 300
 }
 
-# Alert if any runner is running for more than 2 hours
+# The cleanup Lambda enforces every runner's lease and age ceiling. No LiveRunners for 15
+# minutes means it is not running, and nothing is ending stuck or idle metal.
+resource "aws_cloudwatch_metric_alarm" "runner_cleanup_silent" {
+  # Only while the cleanup Lambda exists: missing data is breaching, so after a deliberate
+  # enable_github_runner = false it would sit in ALARM forever.
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "runner-cleanup-silent"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  threshold           = 0
+  alarm_description   = "github-runner-cleanup published no runner count for 15 minutes: leases and age ceilings are not being enforced"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "breaching"
+  namespace           = "GitHubRunners"
+  metric_name         = "LiveRunners"
+  statistic           = "SampleCount"
+  period              = 300
+}
+
+# Alert if any runner is running for more than 2 hours. Warm reuse (up to 12 hours,
+# runner-autoscale.tf) can keep a host busy that long on a heavy day, so read it as "look",
+# not "broken".
 resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
   alarm_name          = "runner-long-running"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 24 # 2 hours (24 x 5min periods)
-  threshold           = 0
+  evaluation_periods  = 1
+  threshold           = 120
   alarm_description   = "Runner(s) running for 2+ hours - possible stuck job"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id          = "runner_count"
-    expression  = "SELECT COUNT(InstanceId) FROM SCHEMA(\"AWS/EC2\", InstanceId) WHERE Role = 'github-runner'"
-    label       = "Running Runners"
-    period      = 300
-    return_data = true
-  }
+  namespace           = "GitHubRunners"
+  metric_name         = "OldestRunnerAgeMinutes"
+  statistic           = "Maximum"
+  period              = 300
 }
 
 # Alert when the autoscaler refuses to launch while fewer runners than the cap
@@ -370,23 +389,29 @@ resource "aws_cloudwatch_metric_alarm" "runner_zero_online" {
   }
 }
 
-# Alert on high EC2 spend (estimated from running hours)
-resource "aws_cloudwatch_metric_alarm" "high_ec2_spend" {
-  alarm_name          = "high-ec2-daily-spend"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "EstimatedCharges"
-  namespace           = "AWS/Billing"
-  period              = 21600 # 6 hours
-  statistic           = "Maximum"
-  threshold           = 100
-  alarm_description   = "EC2 estimated charges exceed $100"
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+# EC2 daily spend. This replaces high-ec2-daily-spend, which read AWS/Billing EstimatedCharges:
+# billing alerts are off in this account, so that metric does not exist and the alarm could
+# never fire. Daily EC2 (compute + EC2-Other) ran $15-148 over 2026-09-13..26, median ~$75, so
+# $150 flags a real outlier without paging on a normal heavy day. daily-cost-alert ($200, all
+# services) still covers the account.
+resource "aws_budgets_budget" "ec2_daily" {
+  name         = "ec2-daily"
+  budget_type  = "COST"
+  limit_amount = "150"
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
 
-  dimensions = {
-    ServiceName = "AmazonEC2"
-    Currency    = "USD"
+  cost_filter {
+    name   = "Service"
+    values = ["Amazon Elastic Compute Cloud - Compute", "EC2 - Other"]
+  }
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 100
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.cost_alerts.arn]
   }
 }
 

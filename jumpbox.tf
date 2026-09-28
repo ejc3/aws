@@ -114,6 +114,28 @@ resource "aws_instance" "jumpbox" {
     Name = "jumpbox"
   }
 
+  # Same thin bootstrap as jumpbox-2 (jumpbox2.tf): fetch the shared admin-box script
+  # (jumpbox2-user-data.tf) from S3 and run it. The running instance predates this and
+  # ignores user_data, so it only takes effect if the jumpbox is rebuilt; a running jumpbox
+  # converges by re-fetching and re-running user-data/jumpbox.sh.
+  user_data = base64encode(<<-BOOTSTRAP
+    #!/bin/bash
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y unzip curl || true
+    if ! command -v aws >/dev/null 2>&1; then
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+      cd /tmp && unzip -qo awscliv2.zip && ./aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
+    fi
+    aws s3 cp s3://ejc3-dev-scripts/user-data/jumpbox.sh /tmp/user_data.sh --region us-west-1
+    chmod +x /tmp/user_data.sh && /tmp/user_data.sh
+  BOOTSTRAP
+  )
+
+  # The bootstrap names the S3 object by path, so make the ordering explicit (jumpbox2.tf
+  # explains the race this prevents on a from-scratch apply).
+  depends_on = [aws_s3_object.jumpbox_user_data]
+
   # Lifecycle - prevent recreation for imported instance
   lifecycle {
     ignore_changes = [
