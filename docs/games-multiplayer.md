@@ -330,20 +330,23 @@ live smoke. They cannot start, retry or promote anything, and cannot read any ot
 a function's or project's environment, or Terraform state.
 
 ```bash
-R="--region us-west-1"
-aws codebuild list-builds-for-project $R --project-name games-mp-images          # main; -preview, games-mp-migrate
-aws codebuild batch-get-builds $R --ids <id> --query 'builds[].[buildStatus,exportedEnvironmentVariables]'
-aws logs filter-log-events $R --log-group-name /aws/lambda/games-mp-release --start-time <ms>
-aws dynamodb get-item $R --table-name games-mp-releases --key '{"id":{"S":"current#main"}}'
-aws dynamodb get-item $R --table-name games-mp-releases --key '{"id":{"S":"schema#main"}}'
-aws ecr describe-images $R --repository-name games/engines
-aws ecs describe-task-definition $R --task-definition games-<game>
-aws cloudwatch describe-alarms $R --alarm-name-prefix games-
+export AWS_REGION=us-west-1   # not R="--region ...": zsh (the dev boxes' shell) does not split $R
+aws codebuild list-builds-for-project --project-name games-mp-images          # main; -preview, games-mp-migrate
+aws codebuild batch-get-builds --ids <id> --query 'builds[].[buildStatus,exportedEnvironmentVariables]'
+aws logs filter-log-events --log-group-name /aws/lambda/games-mp-release --start-time <ms>
+aws dynamodb get-item --table-name games-mp-releases --key '{"id":{"S":"current#main"}}'
+aws dynamodb get-item --table-name games-mp-releases --key '{"id":{"S":"schema#main"}}'
+aws ecr describe-images --repository-name games/engines
+aws ecs list-task-definition-families --family-prefix games-   # list-task-definitions --family-prefix wants a whole family
+aws ecs describe-task-definition --task-definition games-<game>
+aws cloudwatch describe-alarms --alarm-name-prefix games-
 ```
 
 The live smoke reads the key into the environment, never onto a command line:
-`export MP_TEST_KEY=$(aws secretsmanager get-secret-value $R --secret-id games/mp-test-key --query SecretString --output text)`,
+`export MP_TEST_KEY=$(aws secretsmanager get-secret-value --secret-id games/mp-test-key --query SecretString --output text)`,
 then `node scripts/mp-e2e.mjs --remote --base https://cc-games.app --origin https://cc-games.app`.
+Production admits 10 launches per IP per hour (`MP_IP_MAX_PER_HOUR`) and the full scenario
+list needs about 20, so split a full run over two hours with `--only <scenario,...>`.
 
 ## Rotating secrets
 
