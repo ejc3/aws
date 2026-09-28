@@ -340,7 +340,13 @@ aws ecr describe-images --repository-name games/engines
 aws ecs list-task-definition-families --family-prefix games-   # list-task-definitions --family-prefix wants a whole family
 aws ecs describe-task-definition --task-definition games-<game>
 aws cloudwatch describe-alarms --alarm-name-prefix games-
+aws ecs list-tasks --cluster games --desired-status STOPPED
+aws ecs describe-tasks --cluster games --tasks <id> --query 'tasks[].[stopCode,stoppedReason,containers[].exitCode]'
 ```
+
+Name the cluster on every task call: without `--cluster games` the CLI asks about the
+`default` cluster, and IAM denies `task/default/<id>` (the grant covers `task/games/*`).
+ECS forgets a stopped task after about an hour; its output stays in `/games/engines`.
 
 The live smoke reads the key into the environment, never onto a command line:
 `export MP_TEST_KEY=$(aws secretsmanager get-secret-value --secret-id games/mp-test-key --query SecretString --output text)`,
