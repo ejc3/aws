@@ -278,17 +278,17 @@ permission at all.
   games in `local.mp_games`, only on cluster `games`, and denies the router's family;
   `ecs:ListTaskDefinitions` and `ecs:DescribeTaskDefinition` are read-only and take no resource,
   so they are on `*`), `launchType FARGATE`, the engine
-  subnets and security group with `assignPublicIp=ENABLED`, `clientToken` and `startedBy` = the
-  match id. Container `engine` gets `MATCH_ID`, `MATCH_SECRET`, `MP_API`, `GAME_ID`, `MP_ENV`,
+  subnets and security group with `assignPublicIp=ENABLED`, `clientToken` = `<env>-<match id>`
+  and `startedBy` = the match id. Container `engine` gets `MATCH_ID`, `MATCH_SECRET`, `MP_API`, `GAME_ID`, `MP_ENV`,
   `PORT=8080` and, on preview, `MP_API_BYPASS`; tags `game`, `match`, `env`, `hardcap`. Nothing
   else: no command, role, size or capacity provider.
 - **Retries.** Before admission it looks the match up by `startedBy`: if this environment's live
   engine for that match already runs (a retry after a lost response, even in a fresh execution
   environment), it returns that task (`"repeat": true`) instead of counting it against the
-  ceiling or launching again. `clientToken` is the match id, so a retry cannot start a second
-  engine; when the match's engine has died, ECS answers that token with the dead task (or a
-  conflict, if the launch parameters changed), and the function relaunches once with a token of
-  its own.
+  ceiling or launching again. `clientToken` is `<env>-<match id>`, so a preview launch can never
+  hold a production match's token and a retry cannot start a second engine; when the match's
+  engine has died, ECS answers that token with the dead task (or a conflict, if the launch
+  parameters changed), and the function relaunches once with a token of its own.
 - **Admission.** Before `RunTask`, it lists the cluster's running tasks and describes them.
   Every task whose family is not `games-mp-router` and that is not stopping is an engine, the
   sweeper's rule. It refuses (`{"ok":false,"error":"capacity"}`) when the total reaches

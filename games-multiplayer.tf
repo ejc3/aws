@@ -734,13 +734,21 @@ resource "aws_iam_role_policy" "games_mp_launch" {
           Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
         },
         {
-          # ListTagsForResource: DescribeTasks include=TAGS returns tags only with it, and the
-          # per-environment ceiling and stop() read the env and match tags (the sweeper has it too).
           Sid       = "DescribeTasksInThisCluster"
           Effect    = "Allow"
-          Action    = ["ecs:DescribeTasks", "ecs:ListTagsForResource"]
+          Action    = "ecs:DescribeTasks"
           Resource  = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
           Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
+        },
+        {
+          # DescribeTasks include=TAGS returns tags only with this, and the per-environment
+          # ceiling and stop() read the env and match tags (the sweeper has it too). Its own
+          # statement: ecs:ListTagsForResource does not support the ecs:cluster condition key, so
+          # under it the grant would never match. The task ARN already names the cluster.
+          Sid      = "ReadTaskTagsInThisCluster"
+          Effect   = "Allow"
+          Action   = "ecs:ListTagsForResource"
+          Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
         },
         {
           # The code stops only tasks of an engine family whose env and match tags are the

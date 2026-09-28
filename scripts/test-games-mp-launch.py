@@ -693,7 +693,10 @@ class TerraformTests(unittest.TestCase):
 
     def test_the_launch_role_can_read_task_tags(self):
         # DescribeTasks include=TAGS returns no tags without ListTagsForResource.
-        self.assertIn('Action    = ["ecs:DescribeTasks", "ecs:ListTagsForResource"]', GAMES)
+        # Its own statement, with no ecs:cluster condition (that key does not apply to it).
+        stmt = GAMES.split('Sid      = "ReadTaskTagsInThisCluster"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action   = "ecs:ListTagsForResource"', stmt)
+        self.assertNotIn("ecs:cluster", stmt)
 
     def test_the_current_sim_version_is_the_current_tag_without_its_commit(self):
         self.assertIn('regex("^(.+)-[0-9a-f]{12}$", local.mp_engine_tags[id])[0]', GAMES)

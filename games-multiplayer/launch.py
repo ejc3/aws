@@ -360,7 +360,7 @@ def start(env, event):
 
 
 def _run_task(ecs, params, env, match):
-    """RunTask with clientToken = the match id, so a retry after a lost response cannot start a
+    """RunTask with clientToken = <env>-<match id>, so a retry after a lost response cannot start a
     second engine. ECS answers a reused token with that token's ORIGINAL task, which after a
     failed or stopped engine is a terminal one, or, if the parameters changed, with
     ConflictException naming the task(s) already tied to the token. Only when that original
