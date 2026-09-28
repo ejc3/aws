@@ -381,6 +381,10 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
 - `ndev` inside a project publishes it: registers the hostname and starts a systemd unit
 - Each server runs as `ndev@<user>.service`; agents run as `claude-rc@` and `codex-rc@`.
   All are enabled at boot -- a reboot restores every URL with nobody logged in
+- A deleted project directory must not leave a unit restarting forever: `ndev@`'s
+  `ExecCondition` skips it, and `ndev-prune` (setup, setup-sync, nightly timer) unpublishes
+  it -- unit, env, drop-in, registry row and ingress. It keys only on the recorded `DIR` being
+  gone; never widen that to anything a live checkout could match
 - `cloudflare.tf` holds the tunnel, wildcard DNS, Access app and policies. A service token
   (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access.
   Terraform also owns the account Workers subdomain and Colton Games Builds configuration
