@@ -921,8 +921,9 @@ either federated (Pattern A) or stored AWS-side and read through IAM.
 **Six GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
 clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners,
 `github-webhook-admin-pat` owns the webhook, `games/colton-games-read` (owned by
-CoderColton, Contents read-only on `colton-games`, jumpbox-readable only) lets the games
-multiplayer bring-up download the pinned commit it builds, and the two
+CoderColton, Contents read-only on `colton-games`, readable only by administration and the
+`games-mp-poller` Lambda) lets games multiplayer read branch heads and download each new commit
+to build, and the two
 `github-runner/repo-pat/*` tokens (one per repo, each owned by that repo's owner) register
 runners and own the hook for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs`. The dev PAT is read by machines that run
 other people's code; before the cutoff, the runner PAT was too. Neither may hold
