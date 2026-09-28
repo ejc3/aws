@@ -963,6 +963,14 @@ class FrontTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
+    def test_the_controller_may_create_the_spot_request_every_launch_needs(self):
+        # Every launch is spot; RunInstances then also authorizes a spot-instances-request.
+        # Missing it made every launch UnauthorizedOperation on the first real job.
+        stmt = APP_TF.split('Sid      = "LaunchAppSpotRequest"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action   = "ec2:RunInstances"', stmt)
+        self.assertIn("spot-instances-request/*", stmt)
+        self.assertIn("'MarketType': 'spot'", (ROOT / "runner-app" / "app_runner.py").read_text())
+
     def test_the_controller_has_room_beyond_its_first_measured_memory(self):
         block = APP_TF.split('resource "aws_lambda_function" "runner_app"', 1)[1].split("\n}\n", 1)[0]
         self.assertRegex(block, r"memory_size\s*=\s*256", "104 of 128 MB was used by an empty reconcile")

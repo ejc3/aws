@@ -248,6 +248,15 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         }
       },
       {
+        # A spot launch through RunInstances also creates a spot-instances-request, which IAM
+        # authorizes as its own resource; without this every launch is UnauthorizedOperation.
+        # The instance statement above still decides WHAT may launch (tag, profile, IMDSv2).
+        Sid      = "LaunchAppSpotRequest"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:spot-instances-request/*"
+      },
+      {
         Sid      = "LaunchEncryptedAppVolume"
         Effect   = "Allow"
         Action   = "ec2:RunInstances"

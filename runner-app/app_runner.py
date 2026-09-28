@@ -415,7 +415,9 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                     return None, False
                 # Definite (UnauthorizedOperation, InvalidAMIID.*, a quota ...): nothing was created,
                 # and retrying other pools or later rounds will not help. Make it loud.
-                raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}') from error
+                # str(error) carries AWS's encoded authorization message for a denial; an
+                # administrator decodes it with `aws sts decode-authorization-message`.
+                raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}: {error}') from error
             instance_id = response['Instances'][0]['InstanceId']
             with handoff():
                 return settle(repo, instance_id, instance_type, subnet, job_id, labels, token)
