@@ -342,7 +342,8 @@ aws cloudwatch describe-alarms $R --alarm-name-prefix games-
 ```
 
 The live smoke reads the key into the environment, never onto a command line:
-`MP_TEST_KEY=$(aws secretsmanager get-secret-value $R --secret-id games/mp-test-key --query SecretString --output text)`.
+`export MP_TEST_KEY=$(aws secretsmanager get-secret-value $R --secret-id games/mp-test-key --query SecretString --output text)`,
+then `node scripts/mp-e2e.mjs --remote --base https://cc-games.app --origin https://cc-games.app`.
 
 ## Rotating secrets
 

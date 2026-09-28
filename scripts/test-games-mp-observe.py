@@ -86,6 +86,22 @@ class ObserveGrantTests(unittest.TestCase):
                 self.assertRegex(body, r"resources\s*=\s*\[aws_secretsmanager_secret\.games_mp_test_key\.arn\]")
         self.assertIn("ReadMpTestKey", statements())
 
+    def test_the_test_key_resource_policy_admits_exactly_the_dev_roles(self):
+        # Its explicit Deny overrides any identity grant: the dev roles must be named there,
+        # and only on the test key (the cron secret stays administration-only).
+        text = (ROOT / "games-multiplayer-bringup.tf").read_text()
+        policy = re.search(r'resource "aws_secretsmanager_secret_policy" "games_mp_admin_only" \{.*?\n\}', text, re.S).group()
+        self.assertIn("test_key    = { arn = aws_secretsmanager_secret.games_mp_test_key.arn, "
+                      "readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn] }", policy)
+        self.assertIn("cron_secret = { arn = aws_secretsmanager_secret.games_mp_cron_secret.arn, readers = [] }", policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, each.value.readers)', policy)
+
+    def test_builds_are_readable_by_build_arn(self):
+        # BatchGetBuilds is authorized on build/<project>:<id>, not on the project.
+        body = statements()["ReadGamesBuilds"]
+        self.assertIn(':build/${p.name}:*"', body)
+        self.assertIn("p.arn", body)
+
     def test_every_statement_allows_and_star_only_where_the_service_forces_it(self):
         for sid, body in statements().items():
             self.assertNotRegex(body, r'effect\s*=\s*"Deny"', sid)
