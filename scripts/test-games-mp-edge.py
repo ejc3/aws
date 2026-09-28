@@ -296,5 +296,32 @@ class CostTests(unittest.TestCase):
         self.assertIn('"Amazon Elastic Container Service"', budget)
 
 
+class SecondDomainTests(unittest.TestCase):
+    """cc-games.net is for networks that block cc-games.app: it must SERVE, never redirect there."""
+    VERCEL = (ROOT / "vercel-cc-games.tf").read_text()
+
+    def test_cc_games_net_serves_and_its_www_stays_on_net(self):
+        apex = block(self.VERCEL, "vercel_project_domain", "cc_games_net")
+        self.assertIn('domain     = "cc-games.net"', apex)
+        self.assertNotIn("redirect", apex, "cc-games.net must serve the site, not redirect to .app")
+        www = block(self.VERCEL, "vercel_project_domain", "www_cc_games_net")
+        self.assertIn("redirect             = vercel_project_domain.cc_games_net.domain", www)
+        for name in ("cc_games_net_apex", "cc_games_net_www"):
+            record = block(self.VERCEL, "cloudflare_dns_record", name)
+            self.assertIn("zone_id = var.cc_games_net_zone_id", record)
+            self.assertIn("proxied = false", record)
+
+    def test_play_cc_games_net_reaches_the_same_router_with_its_own_certificate(self):
+        self.assertIn('mp_play_domain_net = "play.cc-games.net"', GAMES)
+        self.assertIn('"https://cc-games.net",', GAMES, "the router must accept the .net page's origin")
+        listener_cert = block(GAMES, "aws_lb_listener_certificate", "games_play_net")
+        self.assertIn("listener_arn    = aws_lb_listener.games_play_https.arn", listener_cert)
+        self.assertIn("aws_acm_certificate_validation.games_play_net.certificate_arn", listener_cert)
+        dns = block(GAMES, "cloudflare_dns_record", "games_play_net")
+        self.assertIn("zone_id = var.cc_games_net_zone_id", dns)
+        self.assertIn("content = aws_lb.games_play.dns_name", dns)
+        self.assertIn("proxied = false", dns)
+
+
 if __name__ == "__main__":
     unittest.main()

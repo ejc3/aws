@@ -13,6 +13,12 @@
 # Only production is redirected. The dev URLs under cc-games.dev are a separate Cloudflare
 # tunnel and are not touched.
 #
+# cc-games.net (registered 2026-09-28) SERVES the same production site, deliberately without
+# a redirect: some school networks block cc-games.app, and a redirect to it would be blocked
+# too. Its www redirects to cc-games.net, never to .app. Multiplayer has a matching entry,
+# play.cc-games.net (games-multiplayer.tf), and the lobby hands each player the entry on the
+# domain its page came from.
+#
 # DNS stays at Cloudflare (both .app domains are registered there, and Cloudflare Registrar
 # does not allow other nameservers). The apex records must NOT be proxied: an orange cloud
 # ends TLS at Cloudflare and Vercel's certificate issuance then fails; see
@@ -28,6 +34,12 @@ variable "cc_games_app_zone_id" {
   description = "Cloudflare zone id for cc-games.app (registered through Cloudflare Registrar 2026-09-25)"
   type        = string
   default     = "38302d3b9d8d603a055d42f7a4a86ec9"
+}
+
+variable "cc_games_net_zone_id" {
+  description = "Cloudflare zone id for cc-games.net (registered through Cloudflare Registrar 2026-09-28)"
+  type        = string
+  default     = "7ecab81e3d2db28b0aeabb2f8e04c1e6"
 }
 
 variable "ccgames_app_zone_id" {
@@ -60,6 +72,21 @@ resource "vercel_project_domain" "cc_games_app" {
   team_id    = var.vercel_team_id
   project_id = data.vercel_project.colton_games.id
   domain     = "cc-games.app"
+}
+
+# A second production name, serving directly (see the header): no redirect.
+resource "vercel_project_domain" "cc_games_net" {
+  team_id    = var.vercel_team_id
+  project_id = data.vercel_project.colton_games.id
+  domain     = "cc-games.net"
+}
+
+resource "vercel_project_domain" "www_cc_games_net" {
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "www.cc-games.net"
+  redirect             = vercel_project_domain.cc_games_net.domain
+  redirect_status_code = 308
 }
 
 resource "vercel_project_domain" "ccgames_app" {
@@ -116,6 +143,26 @@ resource "cloudflare_dns_record" "cc_games_app_apex" {
   proxied = false # see the header: proxying breaks Vercel cert issuance
   ttl     = 300
   comment = "vercel apex; Colton Games production"
+}
+
+resource "cloudflare_dns_record" "cc_games_net_apex" {
+  zone_id = var.cc_games_net_zone_id
+  name    = "cc-games.net"
+  type    = "A"
+  content = "76.76.21.21"
+  proxied = false # see the header: proxying breaks Vercel cert issuance
+  ttl     = 300
+  comment = "vercel apex; Colton Games production (second name, no redirect)"
+}
+
+resource "cloudflare_dns_record" "cc_games_net_www" {
+  zone_id = var.cc_games_net_zone_id
+  name    = "www"
+  type    = "CNAME"
+  content = "cname.vercel-dns.com"
+  proxied = false
+  ttl     = 300
+  comment = "vercel www; redirects to cc-games.net"
 }
 
 resource "cloudflare_dns_record" "ccgames_app_apex" {

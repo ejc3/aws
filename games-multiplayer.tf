@@ -170,6 +170,9 @@ locals {
   mp_alb_subnets = local.dev_fleet_subnets
 
   mp_play_domain = "play.cc-games.app"
+  # The same entry under cc-games.net, for networks that block cc-games.app: its own
+  # certificate on the same ALB (SNI) and its own DNS; the router behind it is the same.
+  mp_play_domain_net = "play.cc-games.net"
 
   # Browser origins the router accepts (MP_ALLOWED_ORIGINS, comma-separated). The three
   # production spellings, then Vercel preview deployments of the colton-games project,
@@ -180,6 +183,7 @@ locals {
   # (preview pages get 403 origin) rather than open.
   mp_allowed_origins = [
     "https://cc-games.app",
+    "https://cc-games.net",
     "https://ccgames.app",
     "https://colton-games.vercel.app",
     "https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app",
@@ -1354,6 +1358,43 @@ resource "aws_acm_certificate_validation" "games_play" {
   depends_on              = [cloudflare_dns_record.games_play_acm_validation]
 }
 
+# play.cc-games.net: a second certificate on the same listener (SNI picks it for that name),
+# validated through the cc-games.net zone the same way.
+resource "aws_acm_certificate" "games_play_net" {
+  domain_name               = local.mp_play_domain_net
+  subject_alternative_names = ["*.${local.mp_play_domain_net}"]
+  validation_method         = "DNS"
+
+  tags = { Name = local.mp_play_domain_net, Project = "games-multiplayer" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+locals {
+  games_play_net_validation = one([
+    for dvo in aws_acm_certificate.games_play_net.domain_validation_options : dvo
+    if dvo.domain_name == local.mp_play_domain_net
+  ])
+}
+
+resource "cloudflare_dns_record" "games_play_net_acm_validation" {
+  zone_id = var.cc_games_net_zone_id
+  name    = trimsuffix(local.games_play_net_validation.resource_record_name, ".")
+  type    = local.games_play_net_validation.resource_record_type
+  content = trimsuffix(local.games_play_net_validation.resource_record_value, ".")
+  proxied = false
+  ttl     = 300
+  comment = "ACM DNS validation for play.cc-games.net and *.play.cc-games.net (games-multiplayer.tf)"
+}
+
+resource "aws_acm_certificate_validation" "games_play_net" {
+  certificate_arn         = aws_acm_certificate.games_play_net.arn
+  validation_record_fqdns = [trimsuffix(local.games_play_net_validation.resource_record_name, ".")]
+  depends_on              = [cloudflare_dns_record.games_play_net_acm_validation]
+}
+
 # Dualstack: both subnets carry an IPv6 /64 and the public route table has ::/0 to the
 # IGW (main.tf), which is what an internet-facing dualstack ALB requires. The ALB's DNS
 # name then answers A and AAAA, so the CNAMEs below give players both.
@@ -1448,6 +1489,11 @@ resource "aws_lb_listener" "games_play_https" {
   }
 }
 
+resource "aws_lb_listener_certificate" "games_play_net" {
+  listener_arn    = aws_lb_listener.games_play_https.arn
+  certificate_arn = aws_acm_certificate_validation.games_play_net.certificate_arn
+}
+
 # DNS-only (grey cloud), like the apex records in vercel-cc-games.tf. Proxying through
 # Cloudflare would end TLS at Cloudflare (the ACM certificate would never be seen), add an
 # edge hop to every game packet, and subject WebSockets to Cloudflare's own idle and
@@ -1462,6 +1508,18 @@ resource "cloudflare_dns_record" "games_play" {
   proxied = false
   ttl     = 300
   comment = "games multiplayer entry -> ALB games-play (us-west-1); DNS-only for direct WebSockets"
+}
+
+resource "cloudflare_dns_record" "games_play_net" {
+  for_each = toset(["play", "*.play"])
+
+  zone_id = var.cc_games_net_zone_id
+  name    = each.key
+  type    = "CNAME"
+  content = aws_lb.games_play.dns_name
+  proxied = false
+  ttl     = 300
+  comment = "games multiplayer entry (cc-games.net) -> ALB games-play (us-west-1); DNS-only for direct WebSockets"
 }
 
 # -------------------------------------------------------------------------------------
