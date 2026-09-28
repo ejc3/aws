@@ -217,8 +217,12 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Effect   = "Allow"
         Action   = "ec2:RunInstances"
         Resource = "arn:aws:ec2:us-west-1::image/*"
+        # Canonical's public images report ImageOwnerAlias "amazon", and IAM evaluates
+        # ec2:Owner as that alias, not Canonical's account id; with the id alone every launch
+        # was refused on the image. The controller resolves the AMI from Canonical's SSM
+        # parameter, so this only bounds it to AWS-published images.
         Condition = {
-          StringEquals = { "ec2:Owner" = local.runner_app_ami_owner }
+          StringEquals = { "ec2:Owner" = [local.runner_app_ami_owner, "amazon"] }
         }
       },
       {
