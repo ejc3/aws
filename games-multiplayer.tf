@@ -20,7 +20,7 @@
 #       --> mp-router service (games-router SG; verifies the HMAC token, proxies)
 #           --> the match's engine task, private IP from the token (games-engine SG)
 #   Vercel lobby --OIDC--> role games-mp-launcher[-preview] --lambda:InvokeFunction-->
-#       games-mp-launch:<production|preview> (admission) --ecs:RunTask--> engine task
+#       games-mp-launch-<production|preview> (admission) --ecs:RunTask--> engine task
 #   EventBridge Scheduler (1 min) --> games-mp-sweeper Lambda --ecs:StopTask--> over-age engines
 #
 # Everything is in us-west-1, in the existing `main` VPC's public subnets a/b. Tasks get a
@@ -92,9 +92,10 @@ variable "mp_engine_image_tags" {
 # Launch limits, in one place: the lobby enforces the per-environment caps and per-IP rates
 # in SQL at the launch claim (colton-games lib/multiplayer/config.ts), and Terraform writes
 # them to its Vercel env (games-multiplayer-bringup.tf) so they are not code defaults. The
-# AWS side does not trust the lobby: games-mp-launch refuses a launch at
-# var.games_mp_engine_ceiling (and at a smaller preview ceiling), the sweeper stops the newest
-# engines above the same ceiling, and an alarm fires when more run than these caps allow.
+# AWS side does not trust the lobby: each environment's games-mp-launch function refuses a
+# launch at its share of var.games_mp_engine_ceiling (local.games_mp_launch_environments), the
+# sweeper stops the newest engines above the whole ceiling, and an alarm fires when more run
+# than these caps allow.
 locals {
   games_mp_lobby_max_active = { production = 20, preview = 5 }
   games_mp_ip_max_active    = 3
@@ -104,13 +105,14 @@ locals {
 }
 
 variable "games_mp_engine_ceiling" {
-  description = "Most match engines running at once: games-mp-launch refuses to launch at it, and the sweeper stops the newest above it. A little above the lobby's caps (they sum to 25), for engines still exiting after their match."
+  description = "Most match engines running at once: split between the production and preview games-mp-launch functions (preview min(8, this), production the rest), which refuse to launch at their share, and the sweeper stops the newest above it. A little above the lobby's caps (they sum to 25), for engines still exiting after their match."
   type        = number
   default     = 30
   validation {
-    # 0 is the committed kill switch: games-mp-launch refuses every launch and the sweeper stops
-    # every engine (never the router) within a minute.
-    # Whole numbers only: both Lambdas int() it at start-up, so "10.5" would break every call.
+    # 0 is the committed kill switch: both launch functions' shares are 0, so they refuse every
+    # launch, and the sweeper stops every engine (never the router) within a minute.
+    # Whole numbers only: the Lambdas int() it (or their share) at start-up, so "10.5" would
+    # break every call.
     condition     = floor(var.games_mp_engine_ceiling) == var.games_mp_engine_ceiling && var.games_mp_engine_ceiling >= 0 && var.games_mp_engine_ceiling <= 200
     error_message = "games_mp_engine_ceiling must be a whole number 0..200 (0 stops every match)."
   }
@@ -533,9 +535,9 @@ resource "aws_iam_openid_connect_provider" "vercel" {
 # in the team, no Custom Environment, and no other Vercel team can assume either role.
 #   production  - cc-games.app                       -> games-mp-launcher
 #   preview     - PR and branch deployments          -> games-mp-launcher-preview
-# Two roles, not one, because each may invoke only its own alias of games-mp-launch, and the
-# alias is what fixes the engine's environment and the per-environment ceiling. With one
-# shared role, a Preview build could invoke the production alias.
+# Two roles, not one, because each may invoke only its own environment's launch function
+# (games-mp-launch-<environment>), and the function is what fixes the engine's environment
+# and ceiling. With one shared role, a Preview build could invoke the production function.
 # development is deliberately NOT trusted. Its tokens are what `vercel env pull` hands
 # any team member (valid 12 h), so trusting it would let a laptop start real Fargate
 # tasks. Local development uses MP_LAUNCHER=local instead, and the router does not accept
@@ -551,7 +553,7 @@ resource "aws_iam_role" "games_mp_launcher" {
   for_each = local.games_mp_launcher_role_names
 
   name        = each.value
-  description = "Assumed by colton-games ${each.key} deployments via Vercel OIDC to invoke games-mp-launch:${each.key}"
+  description = "Assumed by colton-games ${each.key} deployments via Vercel OIDC to invoke games-mp-launch-${each.key}"
   # A lobby request is short; one hour is the minimum and plenty.
   max_session_duration = 3600
   assume_role_policy = jsonencode({
@@ -577,11 +579,12 @@ moved {
   to   = aws_iam_role.games_mp_launcher["production"]
 }
 
-# The launcher's ONLY permission: invoke its own alias of the launch function. No ECS, no
-# PassRole, no EC2: every RunTask and StopTask is built by games-mp-launch (below), which is
-# where admission control lives. The Resource is the qualified alias ARN, and an identity
-# policy on a qualified ARN covers only that qualifier: not the bare function, not $LATEST,
-# not a version number, not the other environment's alias.
+# The launcher's ONLY permission: invoke its own environment's launch function. No ECS, no
+# PassRole, no EC2: every RunTask and StopTask is built by games-mp-launch-<environment>
+# (below), which is where admission control lives. The Resource is that one function's
+# unqualified ARN, which is what the lobby invokes; the other environment's function is a
+# different ARN. (The functions publish no versions or aliases, so no qualifier could reach
+# other code or settings anyway.)
 resource "aws_iam_role_policy" "games_mp_launcher" {
   for_each = local.games_mp_launcher_role_names
 
@@ -590,10 +593,10 @@ resource "aws_iam_role_policy" "games_mp_launcher" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid      = "InvokeOwnLaunchAlias"
+      Sid      = "InvokeOwnLaunchFunction"
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_alias.games_mp_launch[each.key].arn
+      Resource = aws_lambda_function.games_mp_launch[each.key].arn
     }]
   })
 }
@@ -604,39 +607,61 @@ moved {
 }
 
 # -------------------------------------------------------------------------------------
-# Launch function: the only RunTask of an engine, and admission control
+# Launch functions: the only RunTask of an engine, and admission control
 # -------------------------------------------------------------------------------------
 #
-# The lobby invokes games-mp-launch:<its environment> with
+# One function per Vercel environment, games-mp-launch-production and games-mp-launch-preview,
+# from the same source. The lobby invokes its own with
 #   {"action":"start","matchId","game","simVersion","secret","hardCapSec","apiBase"[,"apiBypass"]}
 #   {"action":"stop","matchId"}
 # and the function builds the RunTask itself: the game's revision for that simVersion (the
 # pinned current one, or an older ACTIVE one of the same family and ECR repository), the
 # engine subnets and security group, the engine environment from validated fields, and the
-# tags. Before launching, it counts the running engines (every task that is not the router's
-# family) and refuses at var.games_mp_engine_ceiling in total, or at the caller environment's
-# own ceiling (games_mp_launch_environments). Reserved concurrency 1 serializes admission;
-# the source explains why that is enough and what it cannot cover
-# (games-multiplayer/launch.py). The sweeper stays as the backstop for anything launched
-# around it (an administrator) and for engines that never exit.
+# tags. Before launching, it counts its environment's running engines (every task that is not
+# the router's family whose env tag is its environment or missing) and refuses at its own
+# ceiling. Reserved concurrency 1 per function serializes each environment's admission; the
+# source explains why that is enough and what it cannot cover (games-multiplayer/launch.py).
+# The sweeper stays as the backstop for anything launched around them (an administrator) and
+# for engines that never exit.
+#
+# WHY TWO FUNCTIONS. With one function and one concurrency slot, a compromised Preview build
+# could keep that slot busy (synchronous calls, or queued asynchronous ones) and throttle
+# every production launch. Separate functions have separate slots and separate async queues,
+# so Preview can only slow Preview.
+#
+# THE CEILING IS SPLIT, NOT SHARED. Each function enforces only its own environment's share,
+# and the shares sum to var.games_mp_engine_ceiling, so the total is bounded by construction
+# with no lock between the functions: 30 -> production 22 + preview 8; 0 -> 0 + 0.
 
 locals {
+  # A Preview build is any writer's code, so it gets a small share: the lobby's preview cap (5)
+  # plus room for engines still exiting after their match.
+  games_mp_preview_ceiling = min(8, var.games_mp_engine_ceiling)
   games_mp_launch_environments = {
     production = {
-      ceiling  = var.games_mp_engine_ceiling
+      ceiling  = var.games_mp_engine_ceiling - local.games_mp_preview_ceiling
       api_base = "^https://cc-games\\.app$"
       bypass   = false
     }
-    # A Preview build is any writer's code, so it gets a small share of the ceiling: a
-    # compromised preview can never take production's engines. 8 = the lobby's preview cap
-    # (5) plus room for engines still exiting after their match.
     preview = {
-      ceiling = min(8, var.games_mp_engine_ceiling)
+      ceiling = local.games_mp_preview_ceiling
       # Its own deployment URL (https://$VERCEL_URL), the pattern the router's origin
       # allowlist uses for previews, so engines call back only this project's previews.
       api_base = "^https://${local.vercel_project_name}-[a-z0-9-]+-${local.vercel_team_slug}\\.vercel\\.app$"
       bypass   = true
     }
+  }
+}
+
+# The lobby's own caps must fit inside each environment's share, or a correctly behaving
+# lobby gets `capacity` refusals below its cap. A warning, not a validation: lowering the
+# ceiling below them (0 included) is a deliberate emergency brake.
+check "games_mp_lobby_caps_fit_the_launch_ceilings" {
+  assert {
+    condition = var.games_mp_engine_ceiling == 0 || alltrue([
+      for env, cap in local.games_mp_lobby_max_active : cap <= local.games_mp_launch_environments[env].ceiling
+    ])
+    error_message = "A lobby cap (games_mp_lobby_max_active) exceeds its environment's share of games_mp_engine_ceiling; that environment's lobby will be refused below its own cap."
   }
 }
 
@@ -647,13 +672,17 @@ data "archive_file" "games_mp_launch" {
 }
 
 resource "aws_cloudwatch_log_group" "games_mp_launch" {
-  name              = "/aws/lambda/games-mp-launch"
+  for_each = local.games_mp_launch_environments
+
+  name              = "/aws/lambda/games-mp-launch-${each.key}"
   retention_in_days = 14
 }
 
 resource "aws_iam_role" "games_mp_launch" {
-  name        = "games-mp-launch"
-  description = "games-mp-launch Lambda: RunTask engine task definition revisions, StopTask engines"
+  name = "games-mp-launch"
+  # Shared by both environments' functions: they run the same code with the same ECS rights;
+  # what differs (environment, ceiling, callback URL) is each function's own configuration.
+  description = "games-mp-launch-<environment> Lambdas: RunTask engine task definition revisions, StopTask engines"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -777,7 +806,7 @@ resource "aws_iam_role_policy" "games_mp_launch" {
           Sid      = "WriteOwnLogs"
           Effect   = "Allow"
           Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-          Resource = "${aws_cloudwatch_log_group.games_mp_launch.arn}:*"
+          Resource = [for lg in aws_cloudwatch_log_group.games_mp_launch : "${lg.arn}:*"]
         },
       ],
     )
@@ -785,7 +814,9 @@ resource "aws_iam_role_policy" "games_mp_launch" {
 }
 
 resource "aws_lambda_function" "games_mp_launch" {
-  function_name    = "games-mp-launch"
+  for_each = local.games_mp_launch_environments
+
+  function_name    = "games-mp-launch-${each.key}"
   role             = aws_iam_role.games_mp_launch.arn
   handler          = "launch.lambda_handler"
   runtime          = "python3.12"
@@ -794,27 +825,30 @@ resource "aws_lambda_function" "games_mp_launch" {
   memory_size      = 128
   filename         = data.archive_file.games_mp_launch.output_path
   source_code_hash = data.archive_file.games_mp_launch.output_base64sha256
-  # Aliases need published versions; every code or config change publishes one and both
-  # aliases move to it below.
-  publish = true
-  # ONE invocation at a time: admission (count, then RunTask) can never interleave. It is
-  # also the launch rate limit. Never raise it without replacing the count with an atomic one.
+  # ONE invocation at a time per environment: its admission (count, then RunTask) can never
+  # interleave. It is also the environment's launch rate limit. Never raise it without
+  # replacing the count with an atomic one.
   reserved_concurrent_executions = 1
 
   logging_config {
     log_format = "Text"
-    log_group  = aws_cloudwatch_log_group.games_mp_launch.name
+    log_group  = aws_cloudwatch_log_group.games_mp_launch[each.key].name
   }
 
   environment {
     variables = {
+      # This function's environment: the engine's MP_ENV and env tag, and whose engines it
+      # counts and stops. Set here, never by the caller.
+      LAUNCH_ENV   = each.key
+      ENV_CEILING  = tostring(each.value.ceiling)
+      API_BASE     = each.value.api_base
+      ALLOW_BYPASS = tostring(each.value.bypass)
+      # The rest is the same for both environments.
       CLUSTER          = aws_ecs_cluster.games.name
       SUBNETS          = join(",", [for s in local.mp_subnets : s.id])
       SECURITY_GROUP   = aws_security_group.games_engine.id
       TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })
       ROUTER_FAMILY    = local.mp_router_family
-      ENGINE_CEILING   = tostring(var.games_mp_engine_ceiling)
-      ENVIRONMENTS     = jsonencode(local.games_mp_launch_environments)
       MIN_HARDCAP_SEC  = "60"
       # The sweeper's MAX_HARDCAP_SEC: a hardcap it would clamp is refused here instead.
       MAX_HARDCAP_SEC = "14400"
@@ -829,18 +863,19 @@ resource "aws_lambda_function" "games_mp_launch" {
     }
   }
 
-  tags = { Name = "games-mp-launch", Project = "games-multiplayer" }
+  tags = { Name = "games-mp-launch-${each.key}", Project = "games-multiplayer" }
 }
 
-# One alias per Vercel environment. The function reads which one it was invoked through
-# (context.invoked_function_arn, set by Lambda), and each launcher role may invoke only its own.
-resource "aws_lambda_alias" "games_mp_launch" {
+# The lobby invokes synchronously. An asynchronous (InvocationType=Event) call cannot be
+# refused by IAM, so make it worthless: no retries, and an event not run within a minute is
+# dropped, not left queued to occupy the function's one slot later. Each function has its
+# own queue, so this is about Preview's backlog slowing Preview's launches, never production's.
+resource "aws_lambda_function_event_invoke_config" "games_mp_launch" {
   for_each = local.games_mp_launch_environments
 
-  name             = each.key
-  description      = "colton-games ${each.key} lobby (role ${local.games_mp_launcher_role_names[each.key]})"
-  function_name    = aws_lambda_function.games_mp_launch.function_name
-  function_version = aws_lambda_function.games_mp_launch.version
+  function_name                = aws_lambda_function.games_mp_launch[each.key].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 60
 }
 
 # -------------------------------------------------------------------------------------
@@ -1309,7 +1344,7 @@ resource "aws_ecs_task_definition" "games_engine" {
 # games-mp-launch sets these tags on every RunTask:
 #   game    = the game id                    (e.g. mptest)
 #   match   = the match id
-#   env     = the alias it was invoked through (production / preview)
+#   env     = the function's own environment (production / preview)
 #   hardcap = the match's hard cap in SECONDS (spec limits.hardCapSec, 60..14400)
 # The sweeper stops any task in the cluster older than hardcap + 10 min, or
 # older than 2 h when hardcap is missing or not a positive integer; hardcap is clamped to
@@ -1512,11 +1547,12 @@ resource "aws_cloudwatch_metric_alarm" "games_mp_sweeper_silent" {
 }
 
 # More engines running than the lobby's own caps allow, for 5 minutes: the lobby's admission is
-# broken, a compromised deployment is launching through games-mp-launch up to its ceilings, or
-# an administrator launched around it. The ceiling still caps the damage; this says why.
+# broken, a compromised deployment is launching through its games-mp-launch function up to
+# its ceiling, or an administrator launched around them. The ceiling still caps the damage;
+# this says why.
 resource "aws_cloudwatch_metric_alarm" "games_mp_engines_over_lobby_caps" {
   alarm_name          = "games-mp-engines-over-lobby-caps"
-  alarm_description   = "More match engines are running than the colton-games lobby's caps allow (${local.games_mp_lobby_engines_max}) for 5 minutes; games-mp-launch refuses at ${var.games_mp_engine_ceiling} and the sweeper stops the newest above it. Check the lobby's admission and games-mp-launch's log."
+  alarm_description   = "More match engines are running than the colton-games lobby's caps allow (${local.games_mp_lobby_engines_max}) for 5 minutes; games-mp-launch-production refuses at ${local.games_mp_launch_environments.production.ceiling} and games-mp-launch-preview at ${local.games_mp_launch_environments.preview.ceiling}, and the sweeper stops the newest above ${var.games_mp_engine_ceiling}. Check the lobby's admission and the launch functions' logs."
   namespace           = "GamesMultiplayer"
   metric_name         = "RunningEngines"
   statistic           = "Maximum"

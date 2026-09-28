@@ -12,20 +12,24 @@ every RunTask itself:
   (SIM VERSIONS below);
 - the container gets only the environment below, from validated fields; nothing the caller
   sends is passed through as an override, a tag, a command, a role or a size;
-- it refuses to launch when the running engines are at the ceiling.
+- it refuses to launch when its environment's running engines are at its ceiling.
 
-CALLER ENVIRONMENT. The function has two aliases, `production` and `preview`, and each
-Vercel environment's launcher role may invoke only its own (games-multiplayer.tf). The alias
-comes from context.invoked_function_arn, which Lambda sets and the caller cannot forge, so it
-decides the engine's MP_ENV, the `env` tag, the allowed callback URL, whether a Vercel
-protection-bypass secret may be passed, and the per-environment ceiling. An invocation
-through anything else (the bare function name, $LATEST, a version number) is refused.
+CALLER ENVIRONMENT. There is one function per Vercel environment, `games-mp-launch-production`
+and `games-mp-launch-preview` (games-multiplayer.tf), each deployed with its own LAUNCH_ENV and
+settings, and each environment's launcher role may invoke only its own. So the function the
+caller could reach decides the engine's MP_ENV, the `env` tag, the allowed callback URL, whether
+a Vercel protection-bypass secret may be passed, and the ceiling; nothing in the request can.
 
-ADMISSION IS SERIALIZED. The function has reserved concurrency 1 (games-multiplayer.tf), so
-two invocations never run at once and count-then-launch cannot interleave: the repo's usual
-fix for "concurrent callers all read the same count" (runner webhook, GITHUB-RUNNERS.md).
-A DynamoDB conditional counter would also need a decrement on every task stop (an
-EventBridge rule and a second function) to stay true; ECS already knows what is running.
+ADMISSION IS SERIALIZED PER ENVIRONMENT. Each function has reserved concurrency 1
+(games-multiplayer.tf), so two invocations of one environment never run at once and its
+count-then-launch cannot interleave: the repo's usual fix for "concurrent callers all read the
+same count" (runner webhook, GITHUB-RUNNERS.md). The two functions do not share that slot, so a
+Preview build keeping its own function busy never delays a production launch. They need no
+shared lock either: each enforces only its own environment's ceiling on engines tagged with its
+environment, and Terraform splits the total so the two ceilings sum to it (preview min(8,
+total), production the rest). Untagged engines count against both. A DynamoDB conditional
+counter would also need a decrement on every task stop (an EventBridge rule and a second
+function) to stay true; ECS already knows what is running.
 
 ECS reads are eventually consistent: a task started a moment ago may not be listed yet. So
 the function also counts every task it launched in the last SETTLE_SEC seconds (_recent,
@@ -36,9 +40,17 @@ just before it was recycled may not be listed yet: a bounded overshoot of a few 
 most, which the sweeper (games-multiplayer/sweeper.py) stops within a minute.
 
 What is counted: every task in the cluster whose task definition family is not the
-router's, and that is not being stopped: the sweeper's rule. The per-environment count reads
-the `env` tag. That is safe now because only this function (and administrators) can
-RunTask an engine or tag a task; the launcher roles can do neither.
+router's, and that is not being stopped (the sweeper's rule), and whose `env` tag is this
+function's environment or missing. Reading the tag is safe because only these functions (and
+administrators) can RunTask an engine or tag a task; the launcher roles can do neither.
+
+STOP AFTER A FRESH LAUNCH. The same eventual consistency hides a just-started task from
+ListTasks and DescribeTasks, so a stop right after a launch can find nothing. For the task this
+execution environment launched for that match (_recent), stop() then calls StopTask on the ARN
+directly, retrying briefly while ECS does not know it yet, and if it still cannot, answers
+{"ok": false, "error": "not-yet-visible"} so the lobby retries rather than believing it stopped.
+A stop in a fresh execution environment has no such record and can still find nothing; that
+engine runs until it exits or the sweeper's hard cap stops it.
 
 SIM VERSIONS. A match is launched on the engine image of its players' simVersion. The current
 one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS), used
@@ -71,18 +83,31 @@ TASK_DEFINITIONS = json.loads(os.environ.get("TASK_DEFINITIONS", "{}"))
 ENGINE_IMAGES = json.loads(os.environ.get("ENGINE_IMAGES", "{}"))
 LOOKUP_TTL_SEC = int(os.environ.get("LOOKUP_TTL_SEC", "60"))
 ROUTER_FAMILY = os.environ.get("ROUTER_FAMILY", "games-mp-router")
-# Most engines running at once, all environments together (the sweeper's ceiling).
-ENGINE_CEILING = int(os.environ.get("ENGINE_CEILING", "30"))
-# Alias -> {"ceiling": n, "api_base": regex, "bypass": bool}.
-ENVIRONMENTS = json.loads(os.environ.get("ENVIRONMENTS", "{}"))
+# This function's environment (production / preview) and its settings. No default: a function
+# deployed without them refuses every call.
+LAUNCH_ENV = os.environ.get("LAUNCH_ENV", "")
+# Most engines of this environment running at once. Terraform splits the total engine ceiling
+# between the environments' functions, so the ceilings sum to it and 0 stops every launch.
+ENV_CEILING = int(os.environ.get("ENV_CEILING", "0"))
+# The callback URL this environment's engines may use (a regex, fullmatched).
+API_BASE = os.environ.get("API_BASE", "")
+# Whether a Vercel protection-bypass secret may be passed (previews only).
+ALLOW_BYPASS = os.environ.get("ALLOW_BYPASS", "false") == "true"
 MIN_HARDCAP_SEC = int(os.environ.get("MIN_HARDCAP_SEC", "60"))
 MAX_HARDCAP_SEC = int(os.environ.get("MAX_HARDCAP_SEC", "14400"))
 SETTLE_SEC = int(os.environ.get("SETTLE_SEC", "120"))
+# StopTask on a task ECS does not know yet: attempts, and the pause before each retry.
+STOP_ATTEMPTS = int(os.environ.get("STOP_ATTEMPTS", "3"))
+STOP_RETRY_SEC = float(os.environ.get("STOP_RETRY_SEC", "0.5"))
 
 ENGINE_CONTAINER = "engine"
 ENGINE_PORT = "8080"
 
 _STOPPING = {"DEACTIVATING", "STOPPING", "DEPROVISIONING", "STOPPED", "DELETED"}
+# What StopTask answers for a task ECS does not know yet: not found (InvalidParameterException,
+# "The referenced task was not found"), or AccessDenied because IAM cannot read the `match` tag
+# its StopOnlyMatchEngines grant requires off a task ECS cannot find.
+_NOT_YET_VISIBLE = {"InvalidParameterException", "ClientException", "AccessDeniedException"}
 
 # Always fullmatch: `$` would also accept a trailing newline.
 MATCH_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -122,13 +147,11 @@ class Refused(Exception):
         self.error, self.field = error, field
 
 
-def caller_environment(context):
-    """The alias this invocation came through, or None. Lambda sets the ARN, not the caller."""
-    parts = str(getattr(context, "invoked_function_arn", "") or "").split(":")
-    # arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>
-    if len(parts) != 8 or parts[5] != "function":
-        return None
-    return parts[7] if parts[7] in ENVIRONMENTS else None
+def caller_environment():
+    """This function's own environment, or None when it was deployed without a usable one."""
+    if LAUNCH_ENV in ("production", "preview") and API_BASE:
+        return LAUNCH_ENV
+    return None
 
 
 def _match_id(event):
@@ -146,7 +169,6 @@ def validate_start(event, env):
         # overrides, tags, taskDefinition, env, cpu...: refused, not silently dropped, so a
         # caller never believes one took effect. (The key is not echoed back or logged.)
         raise Refused("bad-request", "unknown-field")
-    cfg = ENVIRONMENTS[env]
     match = _match_id(event)
     game = event.get("game")
     if not isinstance(game, str) or game not in TASK_DEFINITIONS or game not in ENGINE_IMAGES:
@@ -161,10 +183,10 @@ def validate_start(event, env):
     if isinstance(cap, bool) or not isinstance(cap, int) or not MIN_HARDCAP_SEC <= cap <= MAX_HARDCAP_SEC:
         raise Refused("bad-request", "hardCapSec")
     api = event.get("apiBase")
-    if not isinstance(api, str) or not re.fullmatch(cfg["api_base"], api):
+    if not isinstance(api, str) or not re.fullmatch(API_BASE, api):
         raise Refused("bad-request", "apiBase")
     bypass = event.get("apiBypass")
-    if bypass is not None and (not cfg.get("bypass") or not isinstance(bypass, str) or not BYPASS.fullmatch(bypass)):
+    if bypass is not None and (not ALLOW_BYPASS or not isinstance(bypass, str) or not BYPASS.fullmatch(bypass)):
         raise Refused("bad-request", "apiBypass")
     return {"matchId": match, "game": game, "simVersion": sim, "secret": secret, "hardCapSec": cap,
             "apiBase": api, "apiBypass": bypass}
@@ -307,7 +329,9 @@ def _describe(ecs, arns):
 
 
 def count_engines(ecs, env, now):
-    """(engines running in total, engines running for env), counting just-launched ones."""
+    """(engines running in total, engines running for env), counting just-launched ones.
+
+    Only the second is admission; the total is reported for the log and the reply."""
     for match, (_, _, at) in list(_recent.items()):
         if now - at > SETTLE_SEC:
             del _recent[match]
@@ -346,8 +370,9 @@ def start(env, event):
         return {"ok": True, "taskArn": existing, "repeat": True}
     task_definition = task_definition_for(ecs, req["game"], req["simVersion"], now)
     total, in_env = count_engines(ecs, env, now)
-    ceiling = min(ENGINE_CEILING, int(ENVIRONMENTS[env]["ceiling"]))
-    if total >= ENGINE_CEILING or in_env >= ceiling:
+    # This environment's own ceiling only: the other environment's engines never take its room,
+    # and Terraform's split keeps the sum at the total ceiling (see ADMISSION above).
+    if in_env >= ENV_CEILING:
         raise Refused("capacity")
     out = _run_task(ecs, run_task_input(env, req, task_definition), env, req["matchId"])
     tasks = out.get("tasks") or []
@@ -413,21 +438,51 @@ def stop(env, event):
     ecs = _client("ecs")
     arns = _listed(ecs, startedBy=match)
     known = _recent.get(match)
+    # Only a launch recent enough that ECS may not show it yet; an older one ECS no longer
+    # shows is long gone, and is just forgotten below.
+    known = known if known and known[1] == env and time.monotonic() - known[2] <= SETTLE_SEC else None
     if known and known[0] not in arns:
         arns.append(known[0])
+    seen = _describe(ecs, arns)
     stopped = 0
-    for arn, task in _describe(ecs, arns).items():
+    for arn, task in seen.items():
         if not _alive_engine(task) or _tag(task, "env") != env or _tag(task, "match") != match:
             continue
-        ecs.stop_task(cluster=CLUSTER, task=arn, reason="games-mp-launch: match %s over" % match)
+        ecs.stop_task(cluster=CLUSTER, task=arn, reason=_stop_reason(match))
+        stopped += 1
+    if known and known[0] not in seen:
+        # The engine this environment launched for the match a moment ago, which ECS lists and
+        # describes nowhere yet (see STOP AFTER A FRESH LAUNCH). It is ours: _recent holds only
+        # tasks this function started or found for this environment and match.
+        if not _stop_unseen(ecs, known[0], match):
+            return {"ok": False, "error": "not-yet-visible"}
         stopped += 1
     if stopped:
         _recent.pop(match, None)
     return {"ok": True, "stopped": stopped}
 
 
+def _stop_reason(match):
+    return "games-mp-launch: match %s over" % match
+
+
+def _stop_unseen(ecs, arn, match):
+    """StopTask on a task ECS does not show yet; False while ECS still cannot find it."""
+    for attempt in range(STOP_ATTEMPTS):
+        if attempt:
+            time.sleep(STOP_RETRY_SEC * attempt)
+        try:
+            ecs.stop_task(cluster=CLUSTER, task=arn, reason=_stop_reason(match))
+            return True
+        except Exception as error:  # botocore ClientError; the code is what matters
+            code = (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+            if code not in _NOT_YET_VISIBLE:
+                raise
+    return False
+
+
 def lambda_handler(event, context):
-    env = caller_environment(context)
+    env = caller_environment()
     action = event.get("action") if isinstance(event, dict) else None
     match = event.get("matchId") if isinstance(event, dict) else None
     match = match if isinstance(match, str) and MATCH_ID.fullmatch(match) else None

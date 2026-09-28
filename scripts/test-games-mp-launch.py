@@ -23,7 +23,6 @@ GAMES = (ROOT / "games-multiplayer.tf").read_text()
 BRINGUP = (ROOT / "games-multiplayer-bringup.tf").read_text()
 
 ACCOUNT = "928413605543"
-FUNCTION = "arn:aws:lambda:us-west-1:%s:function:games-mp-launch" % ACCOUNT
 TD = "arn:aws:ecs:us-west-1:%s:task-definition/games-mptest:7" % ACCOUNT
 ROUTER_TD = "arn:aws:ecs:us-west-1:%s:task-definition/games-mp-router:3" % ACCOUNT
 TASK = "arn:aws:ecs:us-west-1:%s:task/games/" % ACCOUNT
@@ -39,32 +38,39 @@ ENV = {
     "ENGINE_IMAGES": json.dumps({"mptest": {"simVersion": CURRENT_SIM, "repository": REPO}}),
     "LOOKUP_TTL_SEC": "60",
     "ROUTER_FAMILY": "games-mp-router",
-    "ENGINE_CEILING": "6",
-    # The regexes exactly as Terraform's jsonencode writes them (see TerraformTests).
-    "ENVIRONMENTS": json.dumps({
-        "production": {"ceiling": 6, "api_base": r"^https://cc-games\.app$", "bypass": False},
-        "preview": {"ceiling": 2,
-                    "api_base": r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$",
-                    "bypass": True},
-    }),
     "MIN_HARDCAP_SEC": "60",
     "MAX_HARDCAP_SEC": "14400",
     "SETTLE_SEC": "120",
+    "STOP_ATTEMPTS": "3",
+    "STOP_RETRY_SEC": "0",   # the tests do not sleep
+}
+
+# Each environment is its own function (games-mp-launch-<env>) with its own settings. Ceilings
+# scaled down from Terraform's 22 + 8: a total of 6, production 4 and preview 2. The regexes are
+# exactly what Terraform writes (see TerraformTests).
+FUNCTIONS = {
+    "production": {"LAUNCH_ENV": "production", "ENV_CEILING": "4",
+                   "API_BASE": r"^https://cc-games\.app$", "ALLOW_BYPASS": "false"},
+    "preview": {"LAUNCH_ENV": "preview", "ENV_CEILING": "2",
+                "API_BASE": r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$",
+                "ALLOW_BYPASS": "true"},
 }
 
 
-def load_launch():
-    for key, value in ENV.items():
+def load_launch(env="production"):
+    """A fresh copy of launch.py configured as that environment's function (its own globals and
+    its own _recent, as two Lambda functions have)."""
+    for key, value in dict(ENV, **FUNCTIONS[env]).items():
         os.environ[key] = value
-    spec = importlib.util.spec_from_file_location("launch", ROOT / "games-multiplayer" / "launch.py")
+    spec = importlib.util.spec_from_file_location("launch_" + env, ROOT / "games-multiplayer" / "launch.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 class Context:
-    def __init__(self, qualifier="production", arn=None):
-        self.invoked_function_arn = arn or ("%s:%s" % (FUNCTION, qualifier) if qualifier else FUNCTION)
+    """Lambda's context. The function reads nothing from it: its environment is its own setting."""
+    invoked_function_arn = "arn:aws:lambda:us-west-1:%s:function:games-mp-launch-production" % ACCOUNT
 
 
 def match(n):
@@ -168,10 +174,29 @@ class FakeECS:
                            "tags": [{"key": k, "value": v} for k, v in tags.items()]}
         return {"tasks": [{"taskArn": arn}], "failures": []}
 
+    # StopTask on a task ECS does not know yet: how many such calls fail with not-found first
+    # (None: every one does), and the error code they fail with.
+    stop_unseen_failures = 0
+    stop_unseen_code = "InvalidParameterException"
+
     def stop_task(self, cluster, task, reason):
         assert cluster == "games" and len(reason) <= 255
         self.calls.append("stop_task")
+        unseen = task not in self.tasks or (not self.visible and self.tasks[task].get("_launched"))
+        if unseen and (self.stop_unseen_failures is None or self.stop_unseen_failures > 0):
+            if self.stop_unseen_failures is not None:
+                self.stop_unseen_failures -= 1
+            raise AwsError(self.stop_unseen_code)
         self.stopped.append(task)
+        if task in self.tasks:
+            self.tasks[task].update(desiredStatus="STOPPED")
+
+
+class AwsError(Exception):
+    """botocore's ClientError, as far as the function reads it."""
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
 
 
 class Conflict(Exception):
@@ -195,16 +220,16 @@ def preview_event(n=1, **over):
 
 class LaunchTests(unittest.TestCase):
     def setUp(self):
-        self.lf = load_launch()
-        self.lf._recent.clear()
-        self.lf._revisions.clear()
-        self.lf._images.clear()
+        # The two functions: production (self.lf) and preview (self.pf).
+        self.fns = {env: load_launch(env) for env in FUNCTIONS}
+        self.lf, self.pf = self.fns["production"], self.fns["preview"]
         self.log = io.StringIO()   # the handler's one line per call
 
-    def invoke(self, ecs, event, qualifier="production", **ctx):
-        self.lf._clients["ecs"] = ecs
+    def invoke(self, ecs, event, env="production"):
+        fn = self.fns[env]
+        fn._clients["ecs"] = ecs
         with contextlib.redirect_stdout(self.log):
-            return self.lf.lambda_handler(event, Context(qualifier, **ctx))
+            return fn.lambda_handler(event, Context())
 
     # -- what a launch is ------------------------------------------------------------------
 
@@ -305,7 +330,6 @@ class LaunchTests(unittest.TestCase):
         ]
         for field, event in cases:
             with self.subTest(field=field, value=event.get(field)):
-                self.lf._recent.clear()
                 ecs = FakeECS()
                 self.assertEqual(self.invoke(ecs, event), {"ok": False, "error": "bad-request", "field": field})
                 self.assertEqual(ecs.calls, [])
@@ -316,7 +340,6 @@ class LaunchTests(unittest.TestCase):
             ("apiBypass", preview_event(apiBypass="has space in it ok")),
         ]:
             with self.subTest(preview=field, value=event.get(field)):
-                self.lf._recent.clear()
                 ecs = FakeECS()
                 self.assertEqual(self.invoke(ecs, event, "preview"),
                                  {"ok": False, "error": "bad-request", "field": field})
@@ -327,13 +350,29 @@ class LaunchTests(unittest.TestCase):
                 self.assertEqual(self.invoke(ecs, event)["error"], "bad-request")
                 self.assertEqual(ecs.calls, [])
 
-    def test_only_an_environment_alias_may_launch(self):
-        for ctx in ({"qualifier": None}, {"qualifier": "$LATEST"}, {"qualifier": "12"},
-                    {"qualifier": "development"}, {"qualifier": "production", "arn": "production"}):
-            with self.subTest(**ctx):
-                ecs = FakeECS()
-                self.assertEqual(self.invoke(ecs, start_event(), **ctx), {"ok": False, "error": "forbidden"})
-                self.assertEqual(ecs.calls, [])
+    def test_a_function_deployed_without_its_environment_refuses_everything(self):
+        for setting, value in (("LAUNCH_ENV", ""), ("LAUNCH_ENV", "development"), ("LAUNCH_ENV", "Production"),
+                               ("API_BASE", "")):
+            with self.subTest(**{setting: value}):
+                self.lf = self.fns["production"] = load_launch("production")
+                setattr(self.lf, setting, value)
+                for event in (start_event(), {"action": "stop", "matchId": match(1)}):
+                    ecs = FakeECS([engine(1)])
+                    self.assertEqual(self.invoke(ecs, event), {"ok": False, "error": "forbidden"})
+                    self.assertEqual(ecs.calls, [])
+
+    def test_the_environment_is_the_functions_whatever_the_caller_sends(self):
+        # Lambda's context (the invoked ARN, any qualifier) and the request are the caller's;
+        # neither can make the preview function launch a production engine.
+        ecs = FakeECS()
+        self.pf._clients["ecs"] = ecs
+        ctx = Context()
+        ctx.invoked_function_arn = "arn:aws:lambda:us-west-1:%s:function:games-mp-launch-production:production" % ACCOUNT
+        with contextlib.redirect_stdout(self.log):
+            self.assertTrue(self.pf.lambda_handler(preview_event(), ctx)["ok"])
+            self.assertEqual(self.pf.lambda_handler(preview_event(2, env="production"), ctx)["field"], "unknown-field")
+        self.assertIn({"key": "env", "value": "preview"}, ecs.run[0]["tags"])
+        self.assertEqual(len(ecs.run), 1)
 
     # -- which revision: the simVersion ---------------------------------------------------------
 
@@ -431,20 +470,25 @@ class LaunchTests(unittest.TestCase):
 
     # -- admission ---------------------------------------------------------------------------
 
-    def test_refuses_at_the_engine_ceiling(self):
-        ecs = FakeECS([engine(n) for n in range(1, 7)])            # ceiling 6
+    def test_refuses_at_the_environments_ceiling(self):
+        ecs = FakeECS([engine(n) for n in range(1, 5)])            # production ceiling 4
         self.assertEqual(self.invoke(ecs, start_event(50)), {"ok": False, "error": "capacity"})
         self.assertEqual(ecs.run, [])
-        ecs = FakeECS([engine(n) for n in range(1, 6)])            # one below
+        ecs = FakeECS([engine(n) for n in range(1, 4)])            # one below
         self.assertTrue(self.invoke(ecs, start_event(50))["ok"])
         self.assertEqual(self.invoke(ecs, start_event(51)), {"ok": False, "error": "capacity"})
         self.assertEqual(len(ecs.run), 1)
+        ecs = FakeECS([engine(1, env="preview"), engine(2, env="preview")])   # preview ceiling 2
+        self.assertEqual(self.invoke(ecs, preview_event(50), "preview"), {"ok": False, "error": "capacity"})
+        self.assertEqual(ecs.run, [])
 
     def test_a_ceiling_of_zero_refuses_every_launch(self):
-        self.lf.ENGINE_CEILING = 0
-        ecs = FakeECS([])
-        self.assertEqual(self.invoke(ecs, start_event(50)), {"ok": False, "error": "capacity"})
-        self.assertEqual(ecs.run, [])
+        # Terraform's split of a total of 0 is 0 and 0 (TerraformTests).
+        for env, event in (("production", start_event(50)), ("preview", preview_event(50))):
+            self.fns[env].ENV_CEILING = 0
+            ecs = FakeECS([])
+            self.assertEqual(self.invoke(ecs, event, env), {"ok": False, "error": "capacity"})
+            self.assertEqual(ecs.run, [])
 
     def test_a_warm_retry_forgets_a_cached_task_that_died_and_launches_again(self):
         ecs = FakeECS([])
@@ -470,7 +514,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_tokens_are_scoped_to_the_environment(self):
         ecs = FakeECS([])
-        self.invoke(ecs, preview_event(50), qualifier="preview")
+        self.invoke(ecs, preview_event(50), "preview")
         self.invoke(ecs, start_event(50))
         self.assertEqual([c["clientToken"] for c in ecs.run], ["preview-" + match(50), "production-" + match(50)])
         self.assertEqual(len({c["clientToken"] for c in ecs.run}), 2, "a preview launch must not hold production's token")
@@ -500,8 +544,8 @@ class LaunchTests(unittest.TestCase):
 
     def test_a_retry_after_a_cold_start_returns_the_running_engine_even_at_the_ceiling(self):
         # The match's engine (t050) started, the response was lost, and the retry lands in a
-        # fresh execution environment with the ceiling (6) full, that engine included.
-        ecs = FakeECS([engine(n) for n in range(1, 6)] + [engine(50)])
+        # fresh execution environment with the ceiling (4) full, that engine included.
+        ecs = FakeECS([engine(n) for n in range(1, 4)] + [engine(50)])
         out = self.invoke(ecs, start_event(50))
         self.assertEqual((out["ok"], out["taskArn"], out.get("repeat")), (True, TASK + "t050", True))
         self.assertEqual(ecs.run, [])
@@ -513,23 +557,48 @@ class LaunchTests(unittest.TestCase):
             self.assertTrue(self.invoke(ecs, start_event(50)).get("repeat") is None)
             self.assertEqual(len(ecs.run), 1)
 
-    def test_the_ceiling_counts_every_environment_together(self):
-        # Production has room of its own (4 of 6), but 6 engines run in total.
-        ecs = FakeECS([engine(n) for n in range(1, 5)] + [engine(5, env="preview"), engine(6, tags={})])
-        self.assertEqual(self.invoke(ecs, start_event(50)), {"ok": False, "error": "capacity"})
-        self.assertEqual(ecs.run, [])
+    def test_each_environment_counts_its_own_engines_and_untagged_ones_only(self):
+        # Production: 2 of its own + 1 untagged of 4; the preview engines are preview's share.
+        ecs = FakeECS([engine(1), engine(2), engine(3, tags={}), engine(4, env="preview"), engine(5, env="preview")])
+        self.assertTrue(self.invoke(ecs, start_event(50))["ok"], "preview's engines never take production's room")
+        self.assertEqual(self.invoke(ecs, start_event(51)), {"ok": False, "error": "capacity"})
+        # Preview (2): its own two fill it, whatever production runs.
+        self.assertEqual(self.invoke(ecs, preview_event(52), "preview"), {"ok": False, "error": "capacity"})
+        self.assertEqual(len(ecs.run), 1)
 
     def test_an_engine_without_an_env_tag_counts_against_every_environment(self):
-        # Preview's ceiling is 2 here. Two engines whose tags could not be read must fill it.
+        # Two engines whose tags could not be read fill preview (2) and take half of production (4).
         ecs = FakeECS([engine(1, tags={}), engine(2, tags={})])
-        self.assertEqual(self.invoke(ecs, preview_event(50), qualifier="preview"), {"ok": False, "error": "capacity"})
+        self.assertEqual(self.invoke(ecs, preview_event(50), "preview"), {"ok": False, "error": "capacity"})
         self.assertEqual(ecs.run, [])
+        self.assertEqual(self.lf.count_engines(ecs, "production", now=0), (2, 2))
+
+    def test_the_shares_bound_the_total_with_no_shared_lock(self):
+        # Both functions launch to their own ceilings against the same cluster; together they
+        # never pass the total (4 + 2), however the calls interleave.
+        ecs = FakeECS([])
+        for n in range(10):
+            self.invoke(ecs, start_event(100 + n))
+            self.invoke(ecs, preview_event(200 + n), "preview")
+        self.assertEqual(len(ecs.run), 6)
+        self.assertEqual(sorted({t["key"]: t["value"] for t in c["tags"]}["env"] for c in ecs.run),
+                         ["preview"] * 2 + ["production"] * 4)
 
     def test_preview_has_its_own_smaller_ceiling_and_cannot_starve_production(self):
         ecs = FakeECS([engine(1, env="preview"), engine(2, env="preview")])   # preview ceiling 2
         self.assertEqual(self.invoke(ecs, preview_event(50), "preview"), {"ok": False, "error": "capacity"})
         self.assertTrue(self.invoke(ecs, start_event(51))["ok"], "production still launches")
         self.assertEqual(len(ecs.run), 1)
+
+    def test_the_two_functions_share_no_state(self):
+        # Separate functions, separate execution environments: preview's launches and caches are
+        # never production's, so one cannot hold or clear the other's bookkeeping.
+        ecs = FakeECS([], visible=False)
+        self.invoke(ecs, preview_event(50), "preview")
+        self.assertEqual(set(self.pf._recent), {match(50)})
+        self.assertEqual(self.lf._recent, {})
+        self.assertEqual(self.lf.count_engines(ecs, "production", now=0), (0, 0),
+                         "preview's unlisted launch is preview's to count")
 
     def test_every_non_router_task_counts_whatever_its_tags_or_group(self):
         tasks = [
@@ -547,14 +616,14 @@ class LaunchTests(unittest.TestCase):
 
     def test_launches_ecs_cannot_see_yet_still_count(self):
         # ECS is eventually consistent: a task started a moment ago may not be listed.
-        ecs = FakeECS([engine(n) for n in range(1, 5)], visible=False)
+        ecs = FakeECS([engine(n) for n in range(1, 3)], visible=False)
         self.assertTrue(self.invoke(ecs, start_event(50))["ok"])
         self.assertTrue(self.invoke(ecs, start_event(51))["ok"])
         self.assertEqual(self.invoke(ecs, start_event(52)), {"ok": False, "error": "capacity"})
         self.assertEqual(len(ecs.run), 2)
 
     def test_a_just_launched_task_ecs_reports_stopped_frees_its_slot(self):
-        ecs = FakeECS([engine(n) for n in range(1, 6)])
+        ecs = FakeECS([engine(n) for n in range(1, 4)])
         self.assertTrue(self.invoke(ecs, start_event(50))["ok"])
         self.assertEqual(self.invoke(ecs, start_event(51))["error"], "capacity")
         ecs.tasks[TASK + "new001"].update(lastStatus="STOPPED", desiredStatus="STOPPED")
@@ -610,6 +679,56 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(3)}), {"ok": True, "stopped": 1})
         self.assertEqual(ecs.stopped, [TASK + "new001"])
 
+    def test_stop_right_after_a_launch_stops_the_task_ecs_cannot_show_yet(self):
+        # ECS lists and describes the new task nowhere yet, but StopTask on its ARN works.
+        ecs = FakeECS(visible=False)
+        arn = self.invoke(ecs, start_event(3))["taskArn"]
+        self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(3)}), {"ok": True, "stopped": 1})
+        self.assertEqual(ecs.stopped, [arn])
+        self.assertEqual(self.lf._recent, {}, "stopped: no longer counted")
+
+    def test_stop_retries_while_ecs_cannot_find_the_new_task(self):
+        for code in ("InvalidParameterException", "AccessDeniedException"):
+            with self.subTest(code=code):
+                self.lf._recent.clear()
+                ecs = FakeECS(visible=False)
+                ecs.stop_unseen_failures, ecs.stop_unseen_code = 2, code
+                arn = self.invoke(ecs, start_event(3))["taskArn"]
+                self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(3)}), {"ok": True, "stopped": 1})
+                self.assertEqual((ecs.stopped, ecs.calls.count("stop_task")), ([arn], 3))
+
+    def test_a_stop_that_cannot_reach_the_new_task_yet_says_so_and_a_retry_stops_it(self):
+        ecs = FakeECS(visible=False)
+        ecs.stop_unseen_failures = None       # ECS cannot find it at all yet
+        arn = self.invoke(ecs, start_event(3))["taskArn"]
+        self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(3)}),
+                         {"ok": False, "error": "not-yet-visible"})
+        self.assertEqual(ecs.calls.count("stop_task"), 3, "STOP_ATTEMPTS, then give up for this call")
+        self.assertEqual(ecs.stopped, [])
+        self.assertIn(match(3), self.lf._recent, "still counted, and still known to the next stop")
+        ecs.visible = ecs.listed = True        # the lobby's retry, once ECS catches up
+        self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(3)}), {"ok": True, "stopped": 1})
+        self.assertEqual(ecs.stopped, [arn])
+
+    def test_a_stop_error_other_than_not_found_is_raised(self):
+        ecs = FakeECS(visible=False)
+        ecs.stop_unseen_failures, ecs.stop_unseen_code = 1, "ThrottlingException"
+        self.invoke(ecs, start_event(3))
+        with self.assertRaises(AwsError):
+            self.invoke(ecs, {"action": "stop", "matchId": match(3)})
+
+    def test_stop_never_stops_an_unseen_task_it_did_not_launch_for_this_match_recently(self):
+        ecs = FakeECS(visible=False)
+        # Another match's launch, and one too old for ECS still to be catching up on.
+        self.invoke(ecs, start_event(4))
+        self.lf._recent[match(5)] = (TASK + "old", "production", -1000.0)
+        for n in (3, 5):
+            self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(n)}), {"ok": True, "stopped": 0})
+        self.assertEqual(ecs.calls.count("stop_task"), 0)
+        # And the preview function knows nothing of production's launch of match 4.
+        self.assertEqual(self.invoke(ecs, {"action": "stop", "matchId": match(4)}, "preview"), {"ok": True, "stopped": 0})
+        self.assertEqual(ecs.stopped, [])
+
     def test_stop_takes_only_a_match_id(self):
         ecs = FakeECS([engine(1)])
         for event in ({"action": "stop", "matchId": match(1), "task": engine(1)["taskArn"]},
@@ -647,14 +766,42 @@ class TerraformTests(unittest.TestCase):
         self.launch_policy = tf_block(GAMES, "aws_iam_role_policy", "games_mp_launch")
         self.launcher_policy = tf_block(GAMES, "aws_iam_role_policy", "games_mp_launcher")
 
-    def test_the_function_packages_this_file_serialized_with_aliases(self):
+    def test_one_function_per_environment_each_serialized_on_its_own(self):
         self.assertIn('source_file = "${path.module}/games-multiplayer/launch.py"', GAMES)
         self.assertRegex(self.fn, r'handler\s*=\s*"launch\.lambda_handler"')
+        self.assertIn("for_each = local.games_mp_launch_environments\n", self.fn)
+        self.assertRegex(self.fn, r'function_name\s*=\s*"games-mp-launch-\$\{each\.key\}"')
+        # Its own concurrency slot per environment: Preview keeping its function busy never
+        # throttles production's.
         self.assertRegex(self.fn, r"reserved_concurrent_executions = 1\n")
-        self.assertRegex(self.fn, r"publish\s*=\s*true")
-        alias = tf_block(GAMES, "aws_lambda_alias", "games_mp_launch")
-        self.assertIn("for_each = local.games_mp_launch_environments", alias)
-        self.assertIn("function_version = aws_lambda_function.games_mp_launch.version", alias)
+        self.assertIn("log_group  = aws_cloudwatch_log_group.games_mp_launch[each.key].name", self.fn)
+        # No versions or aliases: nothing but the function's own configuration picks the environment.
+        self.assertNotRegex(self.fn, r"publish\s*=\s*true")
+        self.assertNotIn('resource "aws_lambda_alias"', GAMES)
+        self.assertNotIn("aws_lambda_alias", BRINGUP)
+
+    def test_async_invocations_are_never_retried_or_left_queued(self):
+        cfg = tf_block(GAMES, "aws_lambda_function_event_invoke_config", "games_mp_launch")
+        self.assertIn("for_each = local.games_mp_launch_environments\n", cfg)
+        self.assertIn("function_name                = aws_lambda_function.games_mp_launch[each.key].function_name", cfg)
+        self.assertIn("maximum_retry_attempts       = 0\n", cfg)
+        self.assertIn("maximum_event_age_in_seconds = 60\n", cfg)
+
+    def test_the_ceiling_is_split_so_the_shares_sum_to_the_total(self):
+        envs = re.search(r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()
+        self.assertIn("games_mp_preview_ceiling = min(8, var.games_mp_engine_ceiling)\n", GAMES)
+        self.assertIn("ceiling  = var.games_mp_engine_ceiling - local.games_mp_preview_ceiling\n", envs)
+        self.assertIn("ceiling = local.games_mp_preview_ceiling\n", envs)
+        self.assertEqual(len(re.findall(r"^\s+ceiling\s*=", envs, re.M)), 2)
+        # min(8, t) <= t for every allowed total (0..200), so neither share goes negative:
+        # 30 -> 22 + 8, 8 -> 0 + 8, 0 -> 0 + 0 (the kill switch stops both).
+        # The lobby's caps fit each share at the default ceiling, and Terraform warns if not.
+        caps = re.search(r"games_mp_lobby_max_active = \{ production = (\d+), preview = (\d+) \}", GAMES)
+        default = int(re.search(r'variable "games_mp_engine_ceiling" \{.*?default\s*=\s*(\d+)', GAMES, re.S).group(1))
+        self.assertLessEqual(int(caps.group(1)), default - min(8, default))
+        self.assertLessEqual(int(caps.group(2)), min(8, default))
+        check = re.search(r'check "games_mp_lobby_caps_fit_the_launch_ceilings" \{.*?\n\}\n', GAMES, re.S).group()
+        self.assertIn("cap <= local.games_mp_launch_environments[env].ceiling", check)
 
     def test_the_function_gets_the_settings_the_tests_assume(self):
         for line in ('TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })',
@@ -662,8 +809,10 @@ class TerraformTests(unittest.TestCase):
                      "simVersion = local.mp_engine_sim_versions[id]",
                      'repository = aws_ecr_repository.games_mp["games/${id}-engine"].repository_url',
                      'LOOKUP_TTL_SEC  = "60"',
-                     "ENGINE_CEILING   = tostring(var.games_mp_engine_ceiling)",
-                     "ENVIRONMENTS     = jsonencode(local.games_mp_launch_environments)",
+                     "LAUNCH_ENV   = each.key",
+                     "ENV_CEILING  = tostring(each.value.ceiling)",
+                     "API_BASE     = each.value.api_base",
+                     "ALLOW_BYPASS = tostring(each.value.bypass)",
                      "SECURITY_GROUP   = aws_security_group.games_engine.id",
                      "ROUTER_FAMILY    = local.mp_router_family",
                      'MAX_HARDCAP_SEC = "14400"'):
@@ -673,13 +822,15 @@ class TerraformTests(unittest.TestCase):
         self.assertIn(r'api_base = "^https://cc-games\\.app$"', envs)
         self.assertIn(r'api_base = "^https://${local.vercel_project_name}-[a-z0-9-]+-${local.vercel_team_slug}\\.vercel\\.app$"',
                       envs)
-        self.assertIn("ceiling = min(8, var.games_mp_engine_ceiling)", envs)
         self.assertEqual(re.findall(r"bypass\s*=\s*(\w+)", envs), ["false", "true"])
-        # The test's ENVIRONMENTS is what those HCL strings render to.
-        rendered = json.loads(ENV["ENVIRONMENTS"])
-        self.assertEqual(rendered["production"]["api_base"], r"^https://cc-games\.app$")
-        self.assertEqual(rendered["preview"]["api_base"],
+        # The test's FUNCTIONS settings are what those HCL values render to (tostring(bool) is
+        # "true"/"false"; HCL's "\\." is the regex's \.).
+        self.assertEqual([FUNCTIONS[e]["ALLOW_BYPASS"] for e in ("production", "preview")], ["false", "true"])
+        self.assertEqual(FUNCTIONS["production"]["API_BASE"], r"^https://cc-games\.app$")
+        self.assertEqual(FUNCTIONS["preview"]["API_BASE"],
                          r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$")
+        for gone in ("ENGINE_CEILING", "ENVIRONMENTS"):
+            self.assertNotRegex(self.fn, r"\b%s\s*=" % gone)
         self.assertIn('vercel_team_slug    = "coltons-projects-7f9a4e8b"', GAMES)
         self.assertIn('vercel_project_name = "colton-games"', GAMES)
 
@@ -741,12 +892,13 @@ class TerraformTests(unittest.TestCase):
         never = statement(self.launch_policy, "NeverStopTheRouter")
         self.assertIn('"aws:ResourceTag/games-role" = "router"', never)
 
-    def test_launcher_roles_can_only_invoke_their_own_alias(self):
+    def test_launcher_roles_can_only_invoke_their_own_environments_function(self):
         self.assertIn("for_each = local.games_mp_launcher_role_names", self.launcher_policy)
         self.assertEqual(re.findall(r'Action\s*=\s*("[^"]*"|\[[^\]]*\])', self.launcher_policy),
                          ['"lambda:InvokeFunction"'])
-        self.assertIn("Resource = aws_lambda_alias.games_mp_launch[each.key].arn", self.launcher_policy)
-        for forbidden in ("ecs:", "iam:", "ec2:", "RunTask", "PassRole", '"*"', "games_mp_launch.arn"):
+        self.assertIn("Resource = aws_lambda_function.games_mp_launch[each.key].arn\n", self.launcher_policy)
+        for forbidden in ("ecs:", "iam:", "ec2:", "RunTask", "PassRole", '"*"', ":*", "games_mp_launch.arn",
+                          "qualified_arn", '["production"]', '["preview"]'):
             self.assertNotIn(forbidden, self.launcher_policy)
         # Nothing else may attach permissions to the launcher roles.
         attached = re.findall(r'role\s*=\s*aws_iam_role\.games_mp_launcher[\[.]', GAMES + BRINGUP)
@@ -768,13 +920,13 @@ class TerraformTests(unittest.TestCase):
             self.assertIn("from = %s.games_mp_launcher\n  to   = %s.games_mp_launcher[\"production\"]" % (kind, kind),
                           GAMES)
 
-    def test_vercel_gets_each_environment_its_own_role_and_alias_and_no_ecs_settings(self):
+    def test_vercel_gets_each_environment_its_own_role_and_function_and_no_ecs_settings(self):
         env = BRINGUP[BRINGUP.index("games_mp_vercel_shared_config = {"):BRINGUP.index("games_mp_vercel_secret_values = {")]
         for e in ("production", "preview"):
             self.assertRegex(env, r'"MP_LAUNCH_ROLE_ARN/%s"\s+= \{ targets = \["%s"\], sensitive = false, '
                                   r'value = aws_iam_role\.games_mp_launcher\["%s"\]\.arn \}' % (e, e, e))
             self.assertRegex(env, r'"MP_LAUNCH_FUNCTION/%s"\s+= \{ targets = \["%s"\], sensitive = false, '
-                                  r'value = aws_lambda_alias\.games_mp_launch\["%s"\]\.arn \}' % (e, e, e))
+                                  r'value = aws_lambda_function\.games_mp_launch\["%s"\]\.arn \}' % (e, e, e))
         for gone in ("MP_ROLE_ARN", "AWS_ROLE_ARN", "MP_CLUSTER", "MP_SUBNETS", "MP_ENGINE_SG"):
             self.assertNotRegex(env, r"\b%s\s*=" % gone)
             self.assertNotIn('"%s' % gone, env)

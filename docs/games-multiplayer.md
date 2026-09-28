@@ -97,7 +97,7 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 | Variable | Production | Preview |
 | --- | --- | --- |
 | `MP_LAUNCH_ROLE_ARN` | `games-mp-launcher` | `games-mp-launcher-preview` |
-| `MP_LAUNCH_FUNCTION` | `games-mp-launch:production` | `games-mp-launch:preview` |
+| `MP_LAUNCH_FUNCTION` | `games-mp-launch-production` (its ARN) | `games-mp-launch-preview` (its ARN) |
 | `MP_REGION`, `AWS_REGION=us-west-1` | yes | yes |
 | `MP_LAUNCHER=ecs`, `MP_PUBLIC_ENTRY=wss://play.cc-games.app` | yes | yes |
 | `MP_ENV` | `production` | `preview` |
@@ -109,8 +109,8 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 
 Development gets none of them. Local development uses `MP_LAUNCHER=local`. The launcher
 roles and the router trust only Production and Preview, and each environment gets its own
-role and its own alias of the launch function. The cluster, subnets and engine security group
-are the launch function's settings; the lobby never names them.
+role and its own launch function. The cluster, subnets and engine security group are the
+launch functions' settings; the lobby never names them.
 
 Vercel applies an env change only when a deployment is built. The new values reach
 Production with its next deployment, and Preview with each new preview.
@@ -179,14 +179,17 @@ default applied from main: a one-shot `terraform apply -var ...` is undone by th
 apply, so never use one on its own.
 
 - **No new matches, and stop what runs.** Commit `games_mp_engine_ceiling` defaulting to `0`
-  and apply: `games-mp-launch` refuses every launch, and within a minute the sweeper stops
-  every engine (never the router, which it tells apart by family). While that commit is in
-  review, break-glass (AGENTS.md allows documented recovery) stops launches at once by
-  throttling the function to zero; the next apply restores its concurrency, so land the commit.
+  and apply: both launch functions' shares become 0, so they refuse every launch, and within a
+  minute the sweeper stops every engine (never the router, which it tells apart by family).
+  While that commit is in review, break-glass (AGENTS.md allows documented recovery) stops
+  launches at once by throttling both functions to zero; the next apply restores their
+  concurrency, so land the commit. To stop only Preview, throttle just `games-mp-launch-preview`.
 
   ```bash
-  aws lambda put-function-concurrency --region us-west-1 --function-name games-mp-launch \
-    --reserved-concurrent-executions 0
+  for env in production preview; do
+    aws lambda put-function-concurrency --region us-west-1 --function-name "games-mp-launch-$env" \
+      --reserved-concurrent-executions 0
+  done
   ```
 
 - **Stop running engines.** Tell the router apart by its task-definition family,
@@ -227,9 +230,11 @@ apply, so never use one on its own.
   stop, the ALB answers 503, and no connection reaches an engine.
 - **Tighten the edge.** The WAF's per-IP limit is `limit` in `rate-per-ip`
   (`games-multiplayer-edge.tf`); lowering it and applying takes effect within a minute.
-- **Lower the engine ceiling.** Commit a lower `games_mp_engine_ceiling` default: the launch function
-  refuses launches at it at once (the preview ceiling is capped by it too), and within a minute
-  the sweeper stops the newest engines above it.
+- **Lower the engine ceiling.** Commit a lower `games_mp_engine_ceiling` default: the launch
+  functions refuse launches at their new shares at once (preview `min(8, ceiling)`, production
+  the rest, so below 8 production gets nothing), and within a minute the sweeper stops the
+  newest engines above it. Terraform warns (check `games_mp_lobby_caps_fit_the_launch_ceilings`)
+  when a share falls below that environment's lobby cap.
 
 Other switches:
 
@@ -247,11 +252,12 @@ Other switches:
 - **Fixing whatever a failed preflight names**, for example storing a new Vercel token. The
   plan fails with the exact fix, and nothing has changed.
 
-## The launch function: how an engine starts
+## The launch functions: how an engine starts
 
-The lobby's roles can do one thing: invoke their own alias of `games-mp-launch`
-(`games-multiplayer.tf`, source `games-multiplayer/launch.py`). They have no ECS, IAM or EC2
-permission at all.
+There is one launch function per environment, `games-mp-launch-production` and
+`games-mp-launch-preview`, deployed from the same source (`games-multiplayer.tf`, source
+`games-multiplayer/launch.py`). The lobby's roles can do one thing: invoke their own
+environment's function. They have no ECS, IAM or EC2 permission at all.
 
 - **Request.** `{"action":"start","matchId","game","simVersion","secret","hardCapSec","apiBase"}`,
   plus `"apiBypass"` from a preview. Any other field (`overrides`, `tags`, `taskDefinition`, `env`,
@@ -261,11 +267,12 @@ permission at all.
   `https://cc-games.app` on production or this project's own `*.vercel.app` deployment URL on
   preview, and only preview may pass a bypass secret. `{"action":"stop","matchId"}` stops that
   match's engine of the caller's own environment, never another environment's or the router.
-- **Environment from the alias.** The function reads which alias it was invoked through from
-  `context.invoked_function_arn`, which Lambda sets. That alias, not the request, decides the
-  engine's `MP_ENV`, its `env` tag, the allowed `apiBase`, the bypass and the ceiling. An
-  invocation of the bare function, `$LATEST` or a version number is refused (`forbidden`), and
-  each launcher role's policy names only its own alias's ARN.
+- **Environment from the function.** Each function's environment is its own configuration
+  (`LAUNCH_ENV`, with its ceiling, allowed `apiBase` and whether a bypass may be passed), set by
+  Terraform. That, not the request or the invoked ARN, decides the engine's `MP_ENV`, its `env`
+  tag, the allowed `apiBase`, the bypass and the ceiling. Each launcher role's policy names only
+  its own environment's function ARN. A function deployed without a usable environment refuses
+  every call (`forbidden`). The functions publish no versions or aliases.
 - **Which revision: the simVersion.** For the game's current simVersion (Terraform passes it
   per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`),
   with no ECS read. For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
@@ -291,26 +298,44 @@ permission at all.
   parameters changed), and the function relaunches once with a token of its own.
 - **Admission.** Before `RunTask`, it lists the cluster's running tasks and describes them.
   Every task whose family is not `games-mp-router` and that is not stopping is an engine, the
-  sweeper's rule. It refuses (`{"ok":false,"error":"capacity"}`) when the total reaches
-  `games_mp_engine_ceiling` (30), or when the caller's environment reaches its own ceiling
-  (production 30, preview 8). The per-environment count reads the `env` tag, which only this
-  function (and administrators) can set.
-- **Why the count is safe.** The function has reserved concurrency 1: one invocation runs at a
-  time, so count-then-launch never interleaves. ECS reads lag a new task by a moment, so it also
-  counts every task it launched in the last two minutes that ECS does not yet show, until ECS
-  reports it stopping. The gap it cannot close: right after a cold start, tasks the previous
-  execution environment launched in its last seconds may be missed, an overshoot of a few
-  engines that the sweeper stops within a minute. A launch that arrives while another runs is
-  throttled; the lobby's client retries it (up to 6 attempts).
-- **Reply.** `{"ok":true,"taskArn","taskDefinition"}`, or `{"ok":false,"error"}` with
-  `capacity`, `unknown-sim-version`, `bad-request` (and the `field`) or `forbidden`. An ECS
-  failure raises (a Lambda error, in its metrics). One log line per call in
-  `/aws/lambda/games-mp-launch`, without the secret or the bypass.
+  sweeper's rule. Each function counts the engines whose `env` tag is its own environment, plus
+  every engine with no readable `env` tag (those count against both), and refuses
+  (`{"ok":false,"error":"capacity"}`) at its own ceiling. The `env` tag is set only by these
+  functions (and administrators).
+- **The ceiling is split, not shared.** `games_mp_engine_ceiling` (30) is divided between the
+  functions: preview `min(8, ceiling)`, production the rest, so 22 + 8 by default and 0 + 0 at
+  the kill switch. The shares sum to the total, so the total is bounded by construction with no
+  lock between the functions, and one environment's engines never take the other's room. The
+  lobby's caps (production 20, preview 5) fit inside the shares; Terraform warns if a lower
+  ceiling makes one not fit.
+- **Why the count is safe.** Each function has reserved concurrency 1: one invocation per
+  environment runs at a time, so that environment's count-then-launch never interleaves, and
+  the two environments never wait on each other's slot. ECS reads lag a new task by a moment, so
+  it also counts every task it launched in the last two minutes that ECS does not yet show,
+  until ECS reports it stopping. The gap it cannot close: right after a cold start, tasks the
+  previous execution environment launched in its last seconds may be missed, an overshoot of a
+  few engines that the sweeper stops within a minute. A launch that arrives while another of
+  the same environment runs is throttled; the lobby's client retries it (up to 6 attempts).
+  Asynchronous invocations (`InvocationType=Event`, which IAM cannot refuse) are never retried
+  and are dropped after 60 seconds (`aws_lambda_function_event_invoke_config`), and each
+  function has its own queue.
+- **Stop right after a launch.** ECS may not list or describe a task it started a moment ago,
+  so a stop can find nothing while the engine is starting. The function then calls `StopTask`
+  directly on the task it launched for that match in the last two minutes (and only that one),
+  retrying briefly while ECS cannot find it; if it still cannot, it answers
+  `{"ok":false,"error":"not-yet-visible"}` and keeps counting the task, and the lobby retries
+  the stop. A stop in a fresh execution environment has no record of that task, so an engine
+  missed there runs until it exits or the sweeper's hard cap.
+- **Reply.** `{"ok":true,"taskArn","taskDefinition"}` for a start, `{"ok":true,"stopped"}` for a
+  stop, or `{"ok":false,"error"}` with `capacity`, `unknown-sim-version`, `not-yet-visible`,
+  `bad-request` (and the `field`) or `forbidden`. An ECS failure raises (a Lambda error, in its
+  metrics). One log line per call in `/aws/lambda/games-mp-launch-<environment>`, without the
+  secret or the bypass.
 
 The sweeper stays as the backstop. It runs every minute, stops any engine older than its
 `hardcap` + 10 minutes (the hardcap clamped to 4 hours; 2 hours without a valid tag), and stops
-the newest engines above the ceiling, which now happens only for launches around the function
-(an administrator) or its cold-start gap. The only task it never stops is one of the router's
+the newest engines above the ceiling, which now happens only for launches around the
+functions (an administrator) or their cold-start gap. The only task it never stops is one of the router's
 family.
 
 ### Cutover from direct RunTask (once)
@@ -319,11 +344,13 @@ Before this, the lobby held `ecs:RunTask` itself. There is no dual path: the app
 
 1. Push the colton-games change that invokes the launch function
    (`lib/multiplayer/launcher/ecs.ts` using `MP_LAUNCH_FUNCTION`, sending the match's
-   `simVersion`; a request without one is refused `bad-request`), but do not deploy it to
-   production yet. A preview built before step 2 answers `503 multiplayer-not-configured`,
+   `simVersion`; a request without one is refused `bad-request`; retrying a stop answered
+   `not-yet-visible`), but do not deploy it to production yet. A preview built before step 2 answers `503 multiplayer-not-configured`,
    because `MP_LAUNCH_FUNCTION` does not exist yet; that is expected.
-2. Plan and apply here. The plan must show: the function, its two aliases, its role and policy,
-   the new `games-mp-launcher-preview` role and policy, the production role's policy replaced
+2. Plan and apply here. The plan must show: the two functions (`games-mp-launch-production`,
+   `games-mp-launch-preview`), their log groups and async-invoke configs, their shared role
+   `games-mp-launch` and its policy, the new `games-mp-launcher-preview` role and policy, the
+   production role's policy replaced
    by `invoke-games-mp-launch` (its role only moves to `["production"]`, not recreated), the
    Vercel variables `MP_LAUNCH_ROLE_ARN` and `MP_LAUNCH_FUNCTION` per environment created, and
    `MP_ROLE_ARN`, `AWS_ROLE_ARN`, `MP_CLUSTER`, `MP_SUBNETS`, `MP_ENGINE_SG` deleted. From this
@@ -332,8 +359,8 @@ Before this, the lobby held `ecs:RunTask` itself. There is no dual path: the app
 3. Redeploy: rebuild the previews that should keep working from the new code, and deploy
    production when the games PRs merge. Vercel applies env only at build, so only deployments
    built after step 2 have the new variables.
-4. Check: start a match on a preview; `games-mp-launch`'s log shows `"env": "preview"` and a
-   task ARN, and `aws ecs describe-tasks` shows its `env=preview` tag.
+4. Check: start a match on a preview; `/aws/lambda/games-mp-launch-preview` shows
+   `"env": "preview"` and a task ARN, and `aws ecs describe-tasks` shows its `env=preview` tag.
 
 ## Environments and the router
 
@@ -384,14 +411,14 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 5. **Lobby → AWS.** Vercel functions exchange a Vercel OIDC token for a launcher role; no AWS
    key is stored. Production assumes `games-mp-launcher`, Preview `games-mp-launcher-preview`;
    each trust is exactly project `colton-games` in team `coltons-projects-7f9a4e8b` and that one
-   environment. Each role's only permission is `lambda:InvokeFunction` on its own alias of
-   `games-mp-launch`: no ECS, no PassRole, no EC2, no secrets.
-6. **Launch function → ECS.** `games-mp-launch` (above) validates the request, counts engines
-   and refuses at the ceilings, then runs a revision of the game's own engine family whose image
+   environment. Each role's only permission is `lambda:InvokeFunction` on its own environment's
+   launch function, `games-mp-launch-<environment>`: no ECS, no PassRole, no EC2, no secrets.
+6. **Launch functions → ECS.** `games-mp-launch-<environment>` (above) validates the request,
+   counts its environment's engines and refuses at its share of the ceiling, then runs a revision of the game's own engine family whose image
    is in the game's own ECR repository with the match's simVersion, in cluster `games` only
    (router **explicitly denied**). It can pass only the two
    engine roles (to ECS tasks only), tag only at launch, and stop only `match`-tagged tasks
-   (router tasks explicitly denied). Reserved concurrency 1.
+   (router tasks explicitly denied). Reserved concurrency 1 per function.
 7. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
    a public IPv4 for outbound traffic; their egress is **TCP 443 only** (plus the ECS task
    metadata endpoint), which is all the engine kit uses: HTTPS callbacks to the lobby, image
@@ -404,8 +431,8 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | --- | --- | --- |
 | Anyone on the internet | Reach the ALB and router, up to 6,000 requests per IP per minute; hold connections open (idle timeout 3600 s); push a *distributed* flood that stays under the per-IP limit against 2–6 autoscaled routers | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host; get past the WAF from a known-bad IP |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
-| Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch:preview`: start up to 8 preview engines of the registered engine images (the preview ceiling), each for up to its `hardCapSec` (at most 4 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the single launch slot busy so production launches are throttled and retried (availability, not cost); read the lobby's Supabase data | Run a command, image, role or size of its choosing; launch production engines or more than 8 of its own; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
-| A compromised production deployment | The same through `games-mp-launch:production`, up to the total ceiling of 30 engines | Everything in the row above except the production alias and ceiling |
+| Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of the registered engine images (the preview share), each for up to its `hardCapSec` (at most 4 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data | Run a command, image, role or size of its choosing; launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
+| A compromised production deployment | The same through `games-mp-launch-production`, up to production's share of 22 engines | Everything in the row above, with production and preview swapped: it cannot launch preview engines or take preview's 8 |
 | A compromised router (it parses internet input) | Mint valid join tokens for any match (it holds the HMAC key), so join any match as any seat; see and drop every player's traffic; reach every engine | Launch or stop tasks; read other secrets (its execution role reads only its key); connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
 | A compromised engine | Reach any host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach SSH, databases or any non-443 service, here or on the internet |
 
@@ -418,15 +445,15 @@ against the code and live state on 2026-09-27 unless marked otherwise.
   unfinished seat per player. At the limit the lobby answers `429 launch-limit` or
   `503 capacity`. Saturated, that is 25 engines, about $2.40/hour. Today production exposes only
   the hidden `mptest` game, which needs `MP_TEST_KEY`, so the public cannot launch anything yet.
-- **AWS-side admission, independent of the lobby.** `games-mp-launch` refuses a launch when
-  `games_mp_engine_ceiling` (30) engines run in total, or 8 for preview (every task except the
-  router's family counts). Saturated, that is 30 engines, about $2.90/hour, and preview alone
-  cannot take more than 8 of them.
+- **AWS-side admission, independent of the lobby.** Each environment's launch function
+  refuses at its share of `games_mp_engine_ceiling` (30): production 22, preview 8 (every task
+  except the router's family counts, untagged ones against both). Saturated, that is 30
+  engines, about $2.90/hour; preview alone cannot take more than 8, nor production more than 22.
 - **AWS-side ceiling backstop.** Every minute the sweeper counts running engines the same way
   and, above the same ceiling, stops the newest excess ones and alerts. It publishes
   `GamesMultiplayer/RunningEngines`; `games-mp-engines-over-lobby-caps` pages when more than the
   lobby's 25 run for 5 minutes, which means the lobby's own admission is broken or something is
-  launching through the function up to its ceilings.
+  launching through a launch function up to its share.
 - **Per-match caps.** Each engine exits at its own `hardCapSec` (30 minutes for `mptest`);
   the sweeper stops any task at `hardcap` + 10 minutes (the hardcap itself clamped to 4 hours), or 2
   hours + 10 minutes without a valid tag, plus up to one sweep interval. That is a bound only
@@ -437,8 +464,8 @@ against the code and live state on 2026-09-27 unless marked otherwise.
   published in this account (billing alerts are off), so `EstimatedCharges` alarms, including
   the older `high-ec2-daily-spend`, never have data.
 
-**Monitoring.** Launch refusals and errors in `/aws/lambda/games-mp-launch` (one line per call)
-and its `AWS/Lambda` metrics; sweeper errors and silence (`games-mp-sweeper-errors`,
+**Monitoring.** Launch refusals and errors in `/aws/lambda/games-mp-launch-production` and
+`/aws/lambda/games-mp-launch-preview` (one line per call) and their `AWS/Lambda` metrics; sweeper errors and silence (`games-mp-sweeper-errors`,
 `games-mp-sweeper-not-running`); running engines (`games-mp-engines-over-lobby-caps`); router
 health (`games-play-unhealthy-router`, `games-play-no-healthy-router`); 5xx share at the router
 and the ALB (`games-play-target-5xx-rate`, `games-play-elb-5xx-rate`); the ECS and account
@@ -450,24 +477,24 @@ client-address logic relies on.
 **Closed** (2026-09-27): the AWS-side engine ceiling (detective: a sweep every minute) and its alarm, the ECS budget, the WAF,
 two-plus autoscaled routers, ALB access logs, router health and 5xx alarms, HTTPS-only engine
 egress, and the lobby's limits pinned in Terraform. Admission control on launches: the lobby
-holds no ECS permission, and `games-mp-launch` builds every `RunTask` from fixed settings and
-refuses at the ceiling, with a separate preview ceiling and alias.
+holds no ECS permission, and a launch function per environment builds every `RunTask` from
+fixed settings and refuses at its share of the ceiling. (2026-09-28) Preview no longer slows
+production launches: each environment has its own function with its own concurrency slot and
+async queue, and the ceiling is split between them (22 + 8) instead of shared, so neither
+needs a lock or can take the other's room. Preview can still spend its own 8 engines for up to
+about 4 hours each; that share is the accepted cost of letting every writer test multiplayer.
 
 **Still open, most severe first:**
 
-1. **Preview can still spend its share and slow production launches.** Every writer on
-   `CoderColton/colton-games` can run 8 engines for up to about 4 hours each, and by keeping
-   `games-mp-launch`'s single slot busy can make production launches wait for retries. Fix, if
-   it matters: a separate function for preview (its own concurrency) with an atomic shared count.
-2. The common managed rule set runs in COUNT. Review its matches in `aws-waf-logs-games-play`
+1. The common managed rule set runs in COUNT. Review its matches in `aws-waf-logs-games-play`
    after real play, then flip `common` to BLOCK.
-3. Engines share the admin VPC's subnets (defence in depth; their egress is now 443-only), run
+2. Engines share the admin VPC's subnets (defence in depth; their egress is now 443-only), run
    as root with a writable root filesystem, and receive the preview protection-bypass secret.
    Fix: dedicated engine subnets, a non-root read-only container, callbacks without the bypass.
-4. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
+3. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
    private key only the lobby holds and verify with its public key in the router (Ed25519),
    so a compromised router can no longer mint tokens.
-5. Billing alerts are off account-wide, so no `EstimatedCharges` alarm can fire. Turning them on
+4. Billing alerts are off account-wide, so no `EstimatedCharges` alarm can fire. Turning them on
    is an account setting outside Terraform (Billing preferences, "Receive Billing Alerts").
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
@@ -484,7 +511,7 @@ CodeBuild ARM small costs $0.00425 per build minute.
 | WAF `games-play`: $5 per web ACL plus $1 per rule (4), plus $0.60 per million requests; the three AWS managed groups carry no extra fee | about $9–10 |
 | WAF logs (blocks and counts only) and ALB access logs, 30 days each | under $1 |
 | Secrets Manager, 3 secrets at $0.40 | $1.20 |
-| ECR storage, 14-day logs, sweeper Lambda (now every minute) and Scheduler, the launch Lambda (one call per match), the build bucket | under $2 |
+| ECR storage, 14-day logs, sweeper Lambda (now every minute) and Scheduler, the two launch Lambdas (one call per match start or stop; reserved concurrency costs nothing), the build bucket | under $2 |
 | **Always on** | **about $64** |
 | Per build: about 5 minutes of CodeBuild | about $0.02 |
 | Per match: 2 vCPU / 4 GB plus a public IPv4, about $0.096 per hour | **about $0.016 per 10-minute match** |

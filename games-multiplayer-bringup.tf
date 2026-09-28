@@ -469,8 +469,9 @@ resource "terraform_data" "games_mp_build" {
 #   MP_API   production only: https://cc-games.app. Preview derives https://$VERCEL_URL per
 #            deployment, so engines call back the preview that launched them.
 #   MP_LAUNCH_ROLE_ARN, MP_LAUNCH_FUNCTION  each environment's own launcher role and its own
-#            alias of games-mp-launch (games-multiplayer.tf): the alias fixes the engines'
-#            environment and ceiling, so Preview must never hold production's.
+#            launch function, games-mp-launch-<environment> (games-multiplayer.tf): the
+#            function fixes the engines' environment and ceiling, so Preview must never hold
+#            production's.
 #   Preview only: SKYHOOK_LEADERBOARD_ENVIRONMENT=preview and its own Skyhook key, because
 #            Preview now shares the Supabase database (rows are scoped by environment).
 # Development gets nothing: local development uses MP_LAUNCHER=local, and the launcher
@@ -502,8 +503,8 @@ locals {
       # variables with one key on the same target.
       "MP_LAUNCH_ROLE_ARN/production" = { targets = ["production"], sensitive = false, value = aws_iam_role.games_mp_launcher["production"].arn }
       "MP_LAUNCH_ROLE_ARN/preview"    = { targets = ["preview"], sensitive = false, value = aws_iam_role.games_mp_launcher["preview"].arn }
-      "MP_LAUNCH_FUNCTION/production" = { targets = ["production"], sensitive = false, value = aws_lambda_alias.games_mp_launch["production"].arn }
-      "MP_LAUNCH_FUNCTION/preview"    = { targets = ["preview"], sensitive = false, value = aws_lambda_alias.games_mp_launch["preview"].arn }
+      "MP_LAUNCH_FUNCTION/production" = { targets = ["production"], sensitive = false, value = aws_lambda_function.games_mp_launch["production"].arn }
+      "MP_LAUNCH_FUNCTION/preview"    = { targets = ["preview"], sensitive = false, value = aws_lambda_function.games_mp_launch["preview"].arn }
       # Launch admission (games-multiplayer.tf locals): pinned here, not left to code defaults.
       "MP_MAX_ACTIVE_MATCHES/production"        = { targets = ["production"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.production) }
       "MP_MAX_ACTIVE_MATCHES/preview"           = { targets = ["preview"], sensitive = false, value = tostring(local.games_mp_lobby_max_active.preview) }

@@ -13,8 +13,9 @@ tag": a launcher bug that forgets the tags must not buy a task immortality.
 The exemption keys on the task definition family and on nothing a RunTask caller controls.
 RunTask lets the caller set `group` (it could claim "service:mp-router"), `startedBy`
 and every tag, so none of those may exempt a task. The family comes from the task
-definition ARN. Only games-mp-launch may RunTask an engine, and its IAM policy explicitly
-denies RunTask on the router's family (NeverRunTheRouter in games-multiplayer.tf). The only
+definition ARN. Only the games-mp-launch functions may RunTask an engine, and their IAM
+policy explicitly denies RunTask on the router's family (NeverRunTheRouter in
+games-multiplayer.tf). The only
 caller-set value the sweeper reads is `hardcap`, and it can only move the limit within
 [GRACE, MAX_HARDCAP + GRACE]; missing or garbage means the 2 h default.
 
@@ -26,9 +27,10 @@ a buggy or bypassed launch cannot tag a task with a year-long cap.
 Age is measured from `createdAt`, which every task has from the moment RunTask accepts it,
 so a task stuck in PENDING (image pull loop, no capacity) is aged too.
 
-ENGINE CEILING. Age alone cannot bound spend. games-mp-launch refuses launches at the same
-ceiling, so this pass is the backstop for engines started around it (an administrator) and for
-its few-seconds counting gap after a cold start (see launch.py). Every run, after the age pass,
+ENGINE CEILING. Age alone cannot bound spend. The games-mp-launch functions (one per
+environment) refuse launches at their shares of the same ceiling, which sum to it, so this pass
+is the backstop for engines started around them (an administrator) and for their few-seconds
+counting gap after a cold start (see launch.py). Every run, after the age pass,
 the sweeper counts the engines still running and, above ENGINE_CEILING, stops the NEWEST
 excess ones: established matches survive and a burst loses its latest launches. It alerts
 once per run when it does, and publishes RunningEngines (namespace METRIC_NAMESPACE) every
@@ -187,8 +189,9 @@ def _enforce_ceiling(ecs, results, created):
     _notify(
         "games-mp-sweeper: engine ceiling reached",
         "%d match engines were running, above the ceiling of %d. Stopped the %d newest%s.\n"
-        "games-mp-launch refuses at this ceiling, so either something launched around it "
-        "(check RunTask in CloudTrail) or it overshot just after a cold start (its log)." % (
+        "The games-mp-launch functions refuse at their shares of this ceiling, so either something "
+        "launched around them (check RunTask in CloudTrail) or one overshot just after a cold start "
+        "(its log)." % (
             counted, ENGINE_CEILING, excess,
             " (%d stop(s) FAILED)" % failed if failed else ""),
     )
