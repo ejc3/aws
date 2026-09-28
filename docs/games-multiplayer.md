@@ -321,6 +321,29 @@ launching (`LEGACY_REPOSITORIES`) and are never expired. New builds push only to
 quota is adjustable in Service Quotas. Production keeps every tagged image: one per game per
 main commit.
 
+### Checking a deploy from a dev box
+
+The metal boxes and nextjs-dev can see what the pipeline did with a push, read-only
+(`games-multiplayer-observe.tf`): builds and their logs, the functions' logs, ECR tags, task
+definitions, the release table, running tasks, the games alarms, and the mp test key for the
+live smoke. They cannot start, retry or promote anything, and cannot read any other secret,
+a function's or project's environment, or Terraform state.
+
+```bash
+R="--region us-west-1"
+aws codebuild list-builds-for-project $R --project-name games-mp-images          # main; -preview, games-mp-migrate
+aws codebuild batch-get-builds $R --ids <id> --query 'builds[].[buildStatus,exportedEnvironmentVariables]'
+aws logs filter-log-events $R --log-group-name /aws/lambda/games-mp-release --start-time <ms>
+aws dynamodb get-item $R --table-name games-mp-releases --key '{"id":{"S":"current#main"}}'
+aws dynamodb get-item $R --table-name games-mp-releases --key '{"id":{"S":"schema#main"}}'
+aws ecr describe-images $R --repository-name games/engines
+aws ecs describe-task-definition $R --task-definition games-<game>
+aws cloudwatch describe-alarms $R --alarm-name-prefix games-
+```
+
+The live smoke reads the key into the environment, never onto a command line:
+`MP_TEST_KEY=$(aws secretsmanager get-secret-value $R --secret-id games/mp-test-key --query SecretString --output text)`.
+
 ## Rotating secrets
 
 - **Join-token keys.** Each entry of `games_mp_token_kids` is one Ed25519 key pair per
