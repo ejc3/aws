@@ -62,7 +62,9 @@ def for_each_keys(body):
             depth -= 1
         elif depth == 0:
             top.append(ch)
-    return re.findall(r'(?:^|[,\n{])\s*"?([A-Za-z0-9_.-]+)"?\s*=', "".join(top))
+    # A key is a quoted string (any characters, which is the point: they are what gets checked)
+    # or a bare identifier.
+    return [q or b for q, b in re.findall(r'(?:^|[,\n{])\s*(?:"([^"]*)"|([A-Za-z0-9_-]+))\s*=', "".join(top))]
 
 
 def dynamic_keys(body, expr):
@@ -73,7 +75,7 @@ def dynamic_keys(body, expr):
     each = re.search(r'dynamic "%s" \{\s*for_each\s*=\s*\{([^\n]*)\}' % k.group(1), body)
     if not each:
         return None
-    return re.findall(r'(?:^|,)\s*"?([^"=,\s]+)"?\s*=', each.group(1))
+    return [q or b for q, b in re.findall(r'(?:^|,)\s*(?:"([^"]*)"|([A-Za-z0-9_-]+))\s*=', each.group(1))]
 
 
 class SecurityGroupDescriptionTests(unittest.TestCase):
