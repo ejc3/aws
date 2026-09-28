@@ -43,13 +43,14 @@
 # It must also have the Ed25519 join-token router and engine kit: the task definition gives
 # the router MP_TOKEN_PUBLIC_KEYS and no MP_TOKEN_KEYS (an older router refuses to boot
 # without the latter), and each games-mp-launch-<environment> gives engines MP_TOKEN_PUBLIC_KEYS and expects them
-# to verify the X-MP-Token the router forwards. 1eb83917 (games repo branch
-# mp-asymmetric-tokens, PR #65, on top of PR #64) has both. Re-pin to the merged commit when
-# that branch merges.
+# to verify the X-MP-Token the router forwards. dae003a9 is the squash of games repo PR #57
+# (the whole multiplayer stack, #58-#65) on main; its image and migration inputs (server/,
+# lib/multiplayer/, supabase/, package-lock.json) are identical to 1eb83917, the
+# mp-asymmetric-tokens branch head this was first applied from.
 variable "games_mp_source_ref" {
   description = "Full 40-hex commit of CoderColton/colton-games whose multiplayer images (and mp migration) this stack runs."
   type        = string
-  default     = "1eb83917d994f362fe1e0efe0e06cd022137781b"
+  default     = "dae003a969d289912b5b097eb390ede51092692e"
 
   validation {
     condition     = can(regex("^[0-9a-f]{40}$", var.games_mp_source_ref))

@@ -685,7 +685,7 @@ class TerraformWiringTests(unittest.TestCase):
     def test_tags_are_derived_from_the_pinned_commit(self):
         self.assertIn("games_mp_sha12 = substr(var.games_mp_source_ref, 0, 12)", self.tf)
         self.assertIn('"${var.games_mp_sim_versions[id]}-${local.games_mp_sha12}"', self.tf)
-        self.assertRegex(self.tf, r'default\s*=\s*"1eb83917d994f362fe1e0efe0e06cd022137781b"')
+        self.assertRegex(self.tf, r'default\s*=\s*"dae003a969d289912b5b097eb390ede51092692e"')
 
     def test_codebuild_role_holds_no_credentials(self):
         policy = self.block(self.bu, "aws_iam_role_policy", "games_mp_codebuild")
