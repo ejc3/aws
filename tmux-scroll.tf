@@ -27,7 +27,7 @@ locals {
   # t-claude (github.com/ejc3/t-claude). The dev boxes and nextjs-dev follow its main branch
   # on every setup run by design (claude-remote-control.tf, dev-user-data.tf). The jumpboxes
   # take this exact commit, because a Terraform step can only re-run when its inputs change.
-  tclaude_ref = "c511453b2cc8527c6eec34a25f3c90216a2f1c11"
+  tclaude_ref = "1775071e5cb87071c421b8ba100bbb11c20c924f"
 
   admin_tmux_boxes = merge(
     var.enable_jumpbox ? { "jumpbox" = aws_instance.jumpbox[0].id } : {},
