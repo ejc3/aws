@@ -263,6 +263,23 @@ Greptile reviews pull requests. `.greptile/` holds its settings, rules and conte
   instructions, `files.json` or `rules.md` fails the pin test until the matching pin in
   `scripts/test-greptile-config.py` changes in the same PR.
 
+**Stop rule: do not churn on reviewer bots.** Codex, CodeRabbit and Greptile always find
+another edge case, so "no findings" is not a goal. On 2026-09-27/28 about 8 hours went into
+review loops: 22 Codex rounds on one PR, and 5 rounds on a one-word fix (#179) spent hardening
+its *test* while the real fix sat unapplied and the repo stayed drifted. Per PR:
+
+1. **Security and correctness P1s:** fix them, with tests. Care here is the point.
+2. **P2s that change what production does:** fix them.
+3. **Tests-of-tests, doc wording and hypothetical edges:** at most one fix round, then a
+   follow-up PR. They never block the merge.
+4. **Merge and apply** once CI is green and the P1s are addressed. Do not re-request review
+   "once more" for a small change. Resolve a thread you disagree with by replying with the
+   evidence.
+5. **A live fix ships first.** For drift, an outage or a found security hole, harden in a
+   follow-up.
+6. **After about three review rounds,** stop and tell the owner what is left and whether it
+   matters.
+
 ### Common Pitfalls
 
 **Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on
