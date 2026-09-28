@@ -688,6 +688,12 @@ honours as Production. Development holds no key at all. Preview origins
 `colton-games-git-<branch>-...` aliases) match the router's `MP_ALLOWED_ORIGINS` entry
 `https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app`, where `*` is one DNS label.
 
+**Two production names.** `cc-games.net` serves the same site as `cc-games.app`, with no
+redirect, for networks (a school) that block `.app`. It has its own multiplayer entry,
+`play.cc-games.net`: a second certificate on the same ALB and the same router, which accepts
+the origin `https://cc-games.net`. `MP_PUBLIC_ENTRY` lists both entries, and the lobby gives
+each player the one on its page's domain, so a player on `.net` never touches `.app`.
+
 ## Security design and threat model
 
 This is the first surface where people outside the family reach AWS resources we run. The
