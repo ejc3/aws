@@ -963,6 +963,12 @@ class FrontTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
+    def test_the_image_statement_matches_how_iam_sees_canonical_images(self):
+        # Live: ami-0150109d3dd43737d is OwnerId 099720109477 with ImageOwnerAlias "amazon",
+        # and RunInstances was refused on it until "amazon" was allowed.
+        stmt = APP_TF.split('Sid      = "LaunchCanonicalImagesOnly"', 1)[1].split("\n      },", 1)[0]
+        self.assertIn('"ec2:Owner" = [local.runner_app_ami_owner, "amazon"]', stmt)
+
     def test_the_controller_may_create_the_spot_request_every_launch_needs(self):
         # Every launch is spot; RunInstances then also authorizes a spot-instances-request.
         # Missing it made every launch UnauthorizedOperation on the first real job.
@@ -999,7 +1005,7 @@ class WiringTests(unittest.TestCase):
         policy = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn('"aws:ResourceTag/Role" = "github-app-runner"', policy)
         self.assertNotIn('"aws:ResourceTag/Role" = "github-runner"\n', policy.split("TerminateAppRunnersOnly")[1].split("}")[0])
-        self.assertIn('"ec2:Owner" = local.runner_app_ami_owner', policy)
+        self.assertIn('"ec2:Owner" = [local.runner_app_ami_owner, "amazon"]', policy)
         self.assertNotRegex(policy, r'Action\s*=\s*"ec2:\*"')
         self.assertIn("aws_secretsmanager_secret.github_runner_repo_pat[repo].arn", policy)
 
