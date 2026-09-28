@@ -224,7 +224,10 @@ Tokens live two minutes and Production does not serve multiplayer yet.
    `games/mp-token-keys`, its version and its policy destroyed; both launch functions,
    `games-mp-launch-production` and `games-mp-launch-preview`, updated in place (new code, and
    `TOKEN_PUBLIC_KEYS`: each its own environment's public keys). New router and engine images
-   for the new commit. Nothing else. In the apply, the router rolls with no downtime (new tasks
+   for the new commit; the new engine revisions carry `MP_TOKEN_VERIFIER=ed25519-v2`, and the
+   pre-cutover ones stay ACTIVE but are never launched again (a client still on an older
+   simVersion gets `unknown-sim-version` until it updates; `mptest` keeps `mptest-1`, so
+   nothing is stranded). Nothing else. In the apply, the router rolls with no downtime (new tasks
    healthy before old ones drain) and the health step waits for the new task definition. The
    launch functions depend on that health step, so they start launching new engines (which accept only the
    `X-MP-Token` a new router forwards) only once every router task forwards it. Engines already
@@ -348,11 +351,16 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   its own environment's function ARN. A function deployed without a usable environment refuses
   every call (`forbidden`). The functions publish no versions or aliases.
 - **Which revision: the simVersion.** For the game's current simVersion (Terraform passes it
-  per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`),
-  with no ECS read. For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
+  per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`).
+  For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
   `skip_destroy` keeps old ones ACTIVE) whose only container is `engine` with image exactly
   `<the game's ECR repository>:<simVersion>-<12 hex>`; the repository is the one Terraform
   created for the game, so a revision pointing at any other image is never run whatever its tag.
+  Either way the revision's container environment must carry `MP_TOKEN_VERIFIER=ed25519-v2`,
+  which Terraform puts on every engine revision whose kit verifies join tokens itself (read
+  once per revision with `DescribeTaskDefinition`, then cached). Revisions registered before
+  that trust the router's `X-MP-*` headers, so they are never launched, even for the older
+  simVersion they carry: a compromised router could otherwise claim any seat on them.
   None: `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched. A lookup (a miss
   too) is cached for a minute per game and simVersion in the warm function.
 - **What it runs.** That revision (IAM allows `RunTask` on `games-<game>:*` for exactly the

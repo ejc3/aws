@@ -1549,7 +1549,8 @@ resource "aws_ecs_service" "games_mp_router" {
 # the family whose engine image is `<this game's repository>:<simVersion>-<sha12>`, refusing
 # (`unknown-sim-version`) when there is none. So never deregister a revision while clients may
 # still send its simVersion, and never register a revision in a games-<game> family by hand:
-# the function would run it for its tag. Old revisions cost nothing; their images are kept
+# the function would run it for its tag. Every revision must carry MP_TOKEN_VERIFIER (below):
+# the function launches none without it, so pre-verification revisions stay unlaunchable. Old revisions cost nothing; their images are kept
 # only while ECR's last-20 lifecycle rule keeps them.
 
 resource "aws_ecs_task_definition" "games_engine" {
@@ -1578,6 +1579,11 @@ resource "aws_ecs_task_definition" "games_engine" {
       { name = "GAME_ID", value = each.key },
       { name = "PORT", value = tostring(local.mp_port) },
       { name = "MP_ENV", value = var.mp_env },
+      # Marks a revision whose engine kit verifies join tokens itself (X-MP-Token with
+      # MP_TOKEN_PUBLIC_KEYS). games-mp-launch launches no revision without it, so an older
+      # simVersion can never select a pre-verification image that trusts the router's X-MP-*
+      # headers. Keep the value in step with TOKEN_VERIFIER in games-multiplayer/launch.py.
+      { name = "MP_TOKEN_VERIFIER", value = "ed25519-v2" },
     ]
     logConfiguration = {
       logDriver = "awslogs"

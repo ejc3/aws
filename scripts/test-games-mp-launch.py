@@ -43,6 +43,15 @@ PREVIEW_KEYS = "preview:preview-kid1:%s" % spki(3)
 # A PKCS#8 Ed25519 private key's DER is 48 bytes: this prefix plus the 32-byte seed.
 PRIVATE_DER = base64.b64encode(bytes.fromhex("302e020100300506032b657004220420") + b"\x07" * 32).decode()
 
+# What Terraform puts in every engine revision's container environment (games_engine).
+VERIFIER_ENTRY = {"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}
+
+
+def legacy(image):
+    """A revision registered before engines verified tokens: the same image shape, no marker."""
+    return [{"name": "engine", "image": image, "environment": [{"name": "GAME_ID", "value": "mptest"}]}]
+
+
 ENV = {
     "CLUSTER": "games",
     "SUBNETS": "subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb",
@@ -162,8 +171,16 @@ class FakeECS:
 
     def describe_task_definition(self, taskDefinition):
         self.calls.append("describe_task_definition")
-        image = self.revisions[taskDefinition]
-        containers = image if isinstance(image, list) else [{"name": "engine", "image": image}]
+        # Terraform's current revision, unless a test lists its own.
+        image = self.revisions.get(taskDefinition, "%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)) if taskDefinition == TD
+                                   else None)
+        if image is None:
+            raise KeyError(taskDefinition)
+        # A plain image is an engine revision Terraform registered: one container, marked as
+        # verifying join tokens. A list is the container definitions exactly (a legacy revision
+        # has no marker).
+        containers = image if isinstance(image, list) else [
+            {"name": "engine", "image": image, "environment": [VERIFIER_ENTRY]}]
         return {"taskDefinition": {"taskDefinitionArn": taskDefinition, "status": "ACTIVE",
                                    "containerDefinitions": containers}}
 
@@ -442,12 +459,46 @@ class LaunchTests(unittest.TestCase):
         TD: "%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)),
     }
 
-    def test_the_current_sim_version_launches_the_pinned_revision_without_reading_ecs(self):
+    def test_the_current_sim_version_launches_the_pinned_revision_reading_it_once(self):
         ecs = FakeECS(revisions={revision(9): "%s:%s-%s" % (REPO, CURRENT_SIM, sha(9)), **self.OLD})
         self.assertTrue(self.invoke(ecs, start_event())["ok"])
         self.assertEqual(ecs.run[0]["taskDefinition"], TD, "the exact family:revision from Terraform")
         self.assertNotIn("list_task_definitions", ecs.calls)
-        self.assertNotIn("describe_task_definition", ecs.calls)
+        self.assertEqual(ecs.calls.count("describe_task_definition"), 1, "its marker, read once")
+        self.assertTrue(self.invoke(ecs, start_event(2))["ok"])
+        self.assertEqual(ecs.calls.count("describe_task_definition"), 1, "then cached")
+
+    # -- token verifier marker ----------------------------------------------------------------
+
+    def test_a_revision_without_the_token_verifier_marker_is_never_launched(self):
+        # An older simVersion whose only revision predates engines verifying tokens: that engine
+        # would trust the router's identity headers, so it is refused and nothing runs.
+        old = "%s:mptest-0-%s" % (REPO, sha(4))
+        for why, entry in [("no environment", [{"name": "engine", "image": old}]),
+                           ("no marker", legacy(old)),
+                           ("another value", [{"name": "engine", "image": old, "environment": [
+                               {"name": "MP_TOKEN_VERIFIER", "value": "hmac-v1"}]}]),
+                           ("marker on the wrong key", [{"name": "engine", "image": old, "environment": [
+                               {"name": "MP_TOKEN_VERIFIERS", "value": "ed25519-v2"}]}])]:
+            with self.subTest(why):
+                self.lf._revisions.clear()
+                self.lf._images.clear()
+                ecs = FakeECS(revisions={revision(4): entry})
+                self.assertEqual(self.invoke(ecs, start_event(simVersion="mptest-0")),
+                                 {"ok": False, "error": "unknown-sim-version"})
+                self.assertEqual(ecs.run, [])
+        # With the marker, the same image launches; a newer unmarked revision is skipped for it.
+        self.lf._revisions.clear()
+        self.lf._images.clear()
+        ecs = FakeECS(revisions={revision(4): old, revision(6): legacy("%s:mptest-0-%s" % (REPO, sha(6)))})
+        reply = self.invoke(ecs, start_event(simVersion="mptest-0"))
+        self.assertEqual(reply["taskDefinition"], revision(4), reply)
+        self.assertEqual([c["taskDefinition"] for c in ecs.run], [revision(4)])
+
+    def test_a_current_revision_without_the_marker_launches_nothing(self):
+        ecs = FakeECS(revisions={TD: legacy("%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)))})
+        self.assertEqual(self.invoke(ecs, start_event()), {"ok": False, "error": "unknown-sim-version"})
+        self.assertEqual(ecs.run, [])
 
     def test_an_older_sim_version_launches_the_newest_revision_with_its_image(self):
         ecs = FakeECS(revisions=self.OLD)
@@ -935,6 +986,16 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('vercel_team_slug    = "coltons-projects-7f9a4e8b"', GAMES)
         self.assertIn('vercel_project_name = "colton-games"', GAMES)
 
+
+    def test_every_engine_revision_terraform_registers_carries_the_token_verifier_marker(self):
+        td = tf_block(GAMES, "aws_ecs_task_definition", "games_engine")
+        self.assertIn('{ name = "MP_TOKEN_VERIFIER", value = "ed25519-v2" },', td)
+        # The same pair launch.py requires, and the one the fake ECS gives Terraform's revisions.
+        lf = load_launch()
+        self.assertEqual(lf.TOKEN_VERIFIER, ("MP_TOKEN_VERIFIER", "ed25519-v2"))
+        self.assertEqual((VERIFIER_ENTRY["name"], VERIFIER_ENTRY["value"]), lf.TOKEN_VERIFIER)
+        # One container: the marker is on the engine container itself.
+        self.assertEqual(len(re.findall(r'^    name\s*=', td, re.M)), 1)
 
     def test_the_launch_role_uses_the_standard_lambda_trust(self):
         # Lambda supplies no aws:SourceAccount when it assumes an execution role: a condition on

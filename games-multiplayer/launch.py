@@ -53,14 +53,21 @@ A stop in a fresh execution environment has no such record and can still find no
 engine runs until it exits or the sweeper's hard cap stops it.
 
 SIM VERSIONS. A match is launched on the engine image of its players' simVersion. The current
-one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS), used
-without any ECS read. Terraform keeps older revisions ACTIVE (skip_destroy), so clients still
+one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS). Terraform keeps older revisions ACTIVE (skip_destroy), so clients still
 on an older simVersion can be matched while a new site rolls out; for those the function lists
 the ACTIVE revisions of `games-<game>` and takes the newest whose only container is `engine`
 with image exactly `<the game's ECR repository>:<simVersion>-<12 hex>`. The repository is the
 one Terraform created for the game (ENGINE_IMAGES), so a revision pointing anywhere else is
 never run whatever its tag. No such revision: refused with `unknown-sim-version`, nothing
-launched. Lookups are cached for LOOKUP_TTL_SEC per (game, simVersion), a miss included, so a
+launched.
+
+TOKEN VERIFIER. Engines built before engines verified join tokens themselves trust the
+router's X-MP-* identity headers, so launching one would let a compromised router claim any of
+its seats. Terraform marks every revision whose kit verifies tokens with the container
+environment entry MP_TOKEN_VERIFIER=ed25519-v2 (TOKEN_VERIFIER), and the function launches no
+revision without it, the current one included (read once per revision, cached): an older
+simVersion whose only revisions predate the marker is refused as `unknown-sim-version`, and a
+current revision without it fails every launch the same way. Lookups are cached for LOOKUP_TTL_SEC per (game, simVersion), a miss included, so a
 caller cycling versions costs one ListTaskDefinitions per version per minute; a revision's
 container definitions never change, so its image is cached for the environment's life.
 
@@ -117,6 +124,10 @@ ENGINE_PORT = "8080"
 # RFC 8410: SEQUENCE { SEQUENCE { OID 1.3.101.112 (Ed25519) } BIT STRING (32-byte key) }.
 _ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 _TOKEN_PUBLIC_KEY = re.compile(r"([a-z][a-z0-9-]{0,31}):([A-Za-z0-9_-]{1,32}):([A-Za-z0-9+/]{59}=)")
+
+# The container environment entry marking an engine revision whose kit verifies join tokens
+# itself (games-multiplayer.tf, aws_ecs_task_definition.games_engine). No marker, no launch.
+TOKEN_VERIFIER = ("MP_TOKEN_VERIFIER", "ed25519-v2")
 
 _STOPPING = {"DEACTIVATING", "STOPPING", "DEPROVISIONING", "STOPPED", "DELETED"}
 # What StopTask answers for a task ECS does not know yet: not found (InvalidParameterException,
@@ -208,11 +219,15 @@ def validate_start(event, env):
 
 
 def _engine_image(ecs, arn):
+    """The revision's engine image, or None unless it is a one-container engine that verifies
+    join tokens itself (TOKEN_VERIFIER in its environment)."""
     if arn not in _images:
         td = ecs.describe_task_definition(taskDefinition=arn).get("taskDefinition") or {}
         containers = td.get("containerDefinitions") or []
         ok = (td.get("taskDefinitionArn") == arn and len(containers) == 1
-              and containers[0].get("name") == ENGINE_CONTAINER)
+              and containers[0].get("name") == ENGINE_CONTAINER
+              and TOKEN_VERIFIER in [(e.get("name"), e.get("value"))
+                                     for e in containers[0].get("environment") or [] if isinstance(e, dict)])
         _images[arn] = containers[0].get("image") if ok else None
     return _images[arn]
 
@@ -248,6 +263,9 @@ def _newest_revision(ecs, game, sim):
 def task_definition_for(ecs, game, sim, now):
     """The revision to launch for a game's simVersion. See SIM VERSIONS above."""
     if sim == ENGINE_IMAGES[game]["simVersion"]:
+        # Terraform's own revision, still read once: it must verify tokens like any other.
+        if _engine_image(ecs, TASK_DEFINITIONS[game]) is None:
+            raise Refused("unknown-sim-version")
         return TASK_DEFINITIONS[game]
     for key, (_, at) in list(_revisions.items()):
         if now - at >= LOOKUP_TTL_SEC:
