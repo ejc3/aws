@@ -514,9 +514,8 @@ locals {
     MP_REGION = var.aws_region
     # Pins the AWS SDK's region; Vercel otherwise sets AWS_REGION to the function's own
     # region, which can move (https://vercel.com/docs/oidc/aws).
-    AWS_REGION      = var.aws_region
-    MP_LAUNCHER     = "ecs"
-    MP_PUBLIC_ENTRY = "wss://${local.mp_play_domain}"
+    AWS_REGION  = var.aws_region
+    MP_LAUNCHER = "ecs"
   }
 
   # "<KEY>" targets both environments; "<KEY>/<env>" targets one. Sensitive values stay out
@@ -527,7 +526,12 @@ locals {
     {
       "MP_ENV/production" = { targets = ["production"], sensitive = false, value = "production" }
       "MP_ENV/preview"    = { targets = ["preview"], sensitive = false, value = "preview" }
-      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.app" }
+      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.net" }
+      # Production serves cc-games.net (canonical) and cc-games.app: the lobby gives each player
+      # the entry on its page's domain, the first by default. Production only: a preview has no
+      # entry of its own and uses the lobby's default (play.cc-games.app), so a preview built
+      # from a branch older than the lobby that reads a list is never handed one.
+      "MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, value = "wss://${local.mp_play_domain_net},wss://${local.mp_play_domain}" }
       # New key names rather than per-environment copies of MP_ROLE_ARN: Terraform may create
       # the per-environment variables before it deletes the shared one, and Vercel refuses two
       # variables with one key on the same target.
