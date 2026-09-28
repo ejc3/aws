@@ -611,9 +611,14 @@ class ReleaseTests(unittest.TestCase):
         self.ddb.put("build#main#" + MAIN, status="building", seq=1, channel="main", commit=MAIN)
         self.ecr.add("games/mptest-engine", "mptest-1-" + MAIN[:12])
         self.ecr.add("games/mp-router", MAIN[:12], "sha256:router-" + MAIN[:4])
-        self.invoke(self.cb.finish("games-mp-images:old", "games-mp-images", MAIN, {
-            "GAMES_MP_IMAGES": json.dumps({"games/mp-router": MAIN[:12], "games/mptest-engine": "mptest-1-" + MAIN[:12]}),
-            "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+        # Under the new buildspec, which exports both names, the unset GAMES_MP_ENGINES is empty.
+        try:
+            self.invoke(self.cb.finish("games-mp-images:old", "games-mp-images", MAIN, {
+                "GAMES_MP_ENGINES": "",
+                "GAMES_MP_IMAGES": json.dumps({"games/mp-router": MAIN[:12], "games/mptest-engine": "mptest-1-" + MAIN[:12]}),
+                "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+        except self.r.ReleaseError as error:
+            self.fail("a previous-driver build was not released: %s" % error)
         [td] = self.ecs.registered
         self.assertEqual(td["containerDefinitions"][0]["image"], REGISTRY + "/games/mptest-engine:mptest-1-" + MAIN[:12])
         self.assertEqual((td["cpu"], td["memory"]), ("2048", "4096"))
@@ -625,6 +630,15 @@ class ReleaseTests(unittest.TestCase):
             self.invoke(self.cb.finish("games-mp-images:old2", "games-mp-images", MAIN2, {
                 "GAMES_MP_IMAGES": json.dumps({"games/starfall-engine": "hl-1-" + MAIN2[:12]}),
                 "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+
+    def test_the_buildspec_still_exports_the_previous_drivers_report(self):
+        # A source archive uploaded before the apply carries the old driver: its report must reach
+        # BatchGetBuilds, or that commit is marked failed and never rebuilt.
+        spec = (GM / "buildspec.yml").read_text()
+        exported = spec.split("exported-variables:", 1)[1].split("\n\n", 1)[0]
+        for name in ("GAMES_MP_ENGINES", "GAMES_MP_IMAGES"):
+            self.assertIn("- " + name, exported)
+            self.assertRegex(spec, r"export [A-Z_ ]*\b%s\b" % name)
 
     def test_the_game_id_and_size_rules_agree_in_all_three_files(self):
         bu = load("bringup", {})

@@ -222,7 +222,9 @@ def built_images(channel, commit, exported):
     channel's engine repository as `<game>_<simVersion>-<its commit's 12 hex>`."""
     where = ENGINE_TEMPLATE[channel]
     raw = exported.get("GAMES_MP_ENGINES")
-    if raw is None:
+    # A previous-driver build under this buildspec sets only GAMES_MP_IMAGES, and CodeBuild may
+    # report the unset GAMES_MP_ENGINES as empty.
+    if not raw:
         return legacy_built_images(channel, commit, exported)
     try:
         engines = json.loads(raw)
