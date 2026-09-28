@@ -54,17 +54,20 @@ def for_each_keys(body):
     while depth and i < len(body):
         depth += {"{": 1, "}": -1}.get(body[i], 0)
         i += 1
-    inner, top, depth = body[start:i - 1], [], 0
-    for j, ch in enumerate(inner):   # keep only the text at nesting depth 0
+    return map_keys(top_level(body[start:i - 1]))
+
+
+def top_level(inner):
+    """The text of a map literal at nesting depth 0 (nested {...} and [...] values removed)."""
+    top, depth = [], 0
+    for ch in inner:
         if ch in "{[":
             depth += 1
         elif ch in "}]":
             depth -= 1
         elif depth == 0:
             top.append(ch)
-    # A key is a quoted string (any characters, which is the point: they are what gets checked)
-    # or a bare identifier.
-    return [q or b for q, b in re.findall(r'(?:^|[,\n{])\s*(?:"([^"]*)"|([A-Za-z0-9_-]+))\s*=', "".join(top))]
+    return "".join(top)
 
 
 def dynamic_keys(body, expr):
@@ -75,7 +78,26 @@ def dynamic_keys(body, expr):
     each = re.search(r'dynamic "%s" \{\s*for_each\s*=\s*\{([^\n]*)\}' % k.group(1), body)
     if not each:
         return None
-    return [q or b for q, b in re.findall(r'(?:^|,)\s*(?:"([^"]*)"|([A-Za-z0-9_-]+))\s*=', each.group(1))]
+    return map_keys(top_level(each.group(1)))
+
+
+KEY = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|([A-Za-z_][A-Za-z0-9_-]*))\s*=')
+
+
+def map_keys(top):
+    """Every key of a map literal's top level (nested values already removed), decoded as
+    Terraform decodes it. All or nothing: an entry that does not parse as `key = ...` makes the
+    whole map unresolvable (None), so no key can slip past unchecked."""
+    keys = []
+    for entry in re.split(r"[,\n]", top):
+        if not entry.strip():
+            continue
+        m = KEY.match(entry)
+        if not m:
+            return None
+        quoted, bare = m.groups()
+        keys.append(bare if quoted is None else re.sub(r"\\(.)", r"\1", quoted))
+    return keys
 
 
 class SecurityGroupDescriptionTests(unittest.TestCase):
@@ -102,6 +124,10 @@ class SecurityGroupDescriptionTests(unittest.TestCase):
         self.assertEqual(render(body, "${var.other}"), [None])
         rendered = [d for name, r, d in descriptions() if name == "games-multiplayer.tf" and r == "games_engine"]
         self.assertIn("HTTPS only (v4): Vercel callbacks, ECR, logs", rendered)
+
+    def test_map_keys_decode_escapes_and_refuse_partial_parses(self):
+        self.assertEqual(map_keys('https = "x", "http\\"4" = "y"'), ["https", 'http"4'])
+        self.assertIsNone(map_keys('https = "x", ??? = "y"'), "an unparsable entry makes the map unresolvable")
 
     def test_the_check_catches_an_apostrophe(self):
         self.assertIsNone(ALLOWED.match("engine's own IP"))
