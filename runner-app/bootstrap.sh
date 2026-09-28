@@ -51,6 +51,13 @@ chown -R runner:runner "$DIR"
 TOOL_CACHE=/opt/hostedtoolcache
 install -d -o runner -g runner "$TOOL_CACHE"
 
+# Jobs run in /home/runner/work/<repo>/<repo>, the hosted runners' layout. actions/cache stores
+# a path outside the workspace (~/.cache/ms-playwright, ~/.npm) relative to the workspace, so a
+# cache saved on a hosted runner restored into actions-runner/.cache instead: a
+# "cache hit" that left Playwright's browsers where nothing looks for them.
+WORK=/home/runner/work
+install -d -o runner -g runner "$WORK"
+
 # This host's one-time registration token. The controller writes it only after EC2 accepted
 # the launch, tagged with this instance's ARN, which is the only parameter this role can read;
 # it is deleted as soon as it is read.
@@ -88,8 +95,8 @@ PY
 # registration completes. Same as fcvm's bootstrap (runner-autoscale.tf).
 cd "$DIR"
 printf '%s' "$REG_TOKEN" | sudo -u runner -H bash -c \
-  'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work _work' \
-  _ "$REPO" "$INSTANCE_ID" "$LABELS"
+  'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work "$4"' \
+  _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"
 unset REG_TOKEN
 
 # .env is read by run.sh and handed to every job: AGENT_TOOLSDIRECTORY for the setup-* actions,
