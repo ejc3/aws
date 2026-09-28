@@ -1010,7 +1010,7 @@ resource "aws_vpc_security_group_egress_rule" "games_engine_task_metadata" {
   from_port         = 80
   to_port           = 80
   cidr_ipv4         = "169.254.170.2/32"
-  description       = "ECS task metadata endpoint (engine's own IP)"
+  description       = "ECS task metadata endpoint (the engine learns its own IP here)"
 }
 
 # -------------------------------------------------------------------------------------

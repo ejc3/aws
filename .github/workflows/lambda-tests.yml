@@ -31,6 +31,9 @@ jobs:
       - name: Backup Terraform topology boundaries
         run: python3 -S -B scripts/test-backup-topology.py
 
+      - name: Security group descriptions use only characters EC2 accepts
+        run: python3 -S -B scripts/test-sg-descriptions.py
+
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 
