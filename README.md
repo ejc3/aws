@@ -647,7 +647,8 @@ the start, leaving the unit inactive rather than restarting it, when the publish
 `ndev-prune` (root) then removes every project whose directory no longer exists: it
 disables the unit and deletes its env file, drop-in and registry row, then rebuilds that
 zone's ingress, restarting the tunnel only if the config changed. A project whose directory
-still exists is never touched. It runs on every setup run, in `setup-sync` before the health
+still exists is never touched. It holds the same lock as `ndev-register`, and if a zone's
+rebuild or tunnel restart fails it keeps that zone's records so the next run retries. It runs on every setup run, in `setup-sync` before the health
 check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it immediately. DNS
 needs nothing because each zone has a single wildcard record.
 

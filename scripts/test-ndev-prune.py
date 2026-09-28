@@ -9,8 +9,10 @@ be unpublished completely, and nothing that still has a directory may be touched
 from pathlib import Path
 import os
 import re
+import fcntl
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -66,13 +68,36 @@ if [ "$1" = --tunnel ]; then
     cc-games.dev) echo games-test-tunnel ;;
     *) exit 1 ;;
   esac
+else
+  case "$1" in
+    ejc3|skevh) echo dolphin-labs.dev ;;
+    colton|connor) echo cc-games.dev ;;
+  esac
 fi
 """)
-        self.install("systemctl", "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_SYSTEMCTL_CALLS\"\nexit 0\n")
+        # Records every call. Optional hooks: slow every call down, recreate a project dir
+        # when its unit is disabled, and fail tunnel restarts while a flag file exists.
+        self.install("systemctl", """#!/bin/bash
+printf '%s\\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
+[ -z "${TEST_SYSTEMCTL_SLEEP:-}" ] || sleep "$TEST_SYSTEMCTL_SLEEP"
+if [ -n "${TEST_REVIVE_LABEL:-}" ] && [ "$*" = "disable --now ndev@$TEST_REVIVE_LABEL.service" ]; then
+  mkdir -p "$TEST_REVIVE_DIR"
+fi
+if [ "$1" = restart ] && [ -e "${TEST_FAIL_RESTART:-/nonexistent}" ]; then exit 1; fi
+exit 0
+""")
+        self.install("id", "#!/bin/bash\nexit 0\n")
         for name in ("npm", "npx", "pnpm", "node"):
             self.install(name, "#!/bin/bash\nprintf '%s %s\\n' \"$0\" \"$*\" >> \"$TEST_NPM_CALLS\"\nexit 0\n")
-        for name, marker in (("ndev-rebuild", "REBUILD"), ("ndev-prune", "PRUNE"), ("ndev-run", "RUN")):
+        for name, marker in (("ndev-rebuild", "REBUILD"), ("ndev-prune", "PRUNE"),
+                             ("ndev-run", "RUN"), ("ndev-register", "REG")):
             self.install(name, self.localize(tool(name, marker)))
+        # The real ndev-rebuild, failing while a flag file exists.
+        (self.bin / "ndev-rebuild").rename(self.bin / "ndev-rebuild.real")
+        self.install("ndev-rebuild", f"""#!/bin/bash
+[ ! -e "${{TEST_FAIL_REBUILD:-/nonexistent}}" ] || exit 1
+exec bash {self.bin}/ndev-rebuild.real "$@"
+""")
 
     def localize(self, text):
         for original, replacement in (
@@ -124,7 +149,7 @@ fi
         out = {}
         for base in (self.ndev, self.config, self.systemd):
             for p in sorted(base.rglob("*")):
-                if p.is_file():
+                if p.is_file() and p.name != ".lock":
                     st = p.stat()
                     out[str(p)] = (p.read_bytes(), st.st_ino, st.st_mtime_ns)
         return out
@@ -288,6 +313,125 @@ fi
         self.run_tool("ndev-prune")
         self.assertFalse((self.ndev / "instances" / "ejc3-foo.env").exists())
         self.assertTrue((self.ndev / "ejc3-foo.env").exists())
+
+    # ------------------------------------------------------ locking and retries
+    def hold_lock(self):
+        fd = os.open(self.ndev / ".lock", os.O_WRONLY | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def spawn(self, name, *args, env=None):
+        return subprocess.Popen(["bash", str(self.bin / name), *args], env=env or self.env,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_prune_waits_for_the_shared_lock(self):
+        self.fleet()
+        fd = self.hold_lock()
+        proc = self.spawn("ndev-prune")
+        time.sleep(0.7)
+        self.assertIsNone(proc.poll(), "ndev-prune ran while the lock was held")
+        self.assertEqual(self.calls_list(), [])
+        self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        os.close(fd)
+        out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertEqual([p.name for p in self.ndev.glob(".prune.*")], [])
+
+    def test_register_waits_for_the_shared_lock(self):
+        project = self.homes / "ejc3" / "worktrees" / "new"
+        project.mkdir(parents=True)
+        (project / "package.json").write_text("{}\n")
+        env = dict(self.env, SUDO_USER="ejc3")
+        fd = self.hold_lock()
+        proc = self.spawn("ndev-register", f"ejc3-new.{DOLPHIN}", "3400", "ejc3", str(project), env=env)
+        time.sleep(0.7)
+        self.assertIsNone(proc.poll(), "ndev-register wrote while the lock was held")
+        self.assertFalse((self.ndev / "instances" / "ejc3-new.env").exists())
+        self.assertFalse((self.ndev / f"registry-{DOLPHIN}").exists())
+        os.close(fd)
+        out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertTrue((self.ndev / "instances" / "ejc3-new.env").exists())
+
+    def test_concurrent_prunes_serialize(self):
+        self.fleet()
+        env = dict(self.env, TEST_SYSTEMCTL_SLEEP="0.2")
+        procs = [self.spawn("ndev-prune", env=env) for _ in range(2)]
+        for proc in procs:
+            out, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0, out + err)
+        calls = self.calls_list()
+        for label in ("skevh-comeback-panel", "skevh-per-game-follow"):
+            self.assertEqual(calls.count(f"disable --now ndev@{label}.service"), 1, calls)
+        self.assertEqual(calls.count(f"restart cloudflared@{DOLPHIN}"), 1, calls)
+
+    def test_project_dir_back_before_cleanup_is_not_removed(self):
+        # The dir reappears after classification (here, as its unit is disabled): the
+        # re-check before deletion must keep the records and undo the disable.
+        self.fleet()
+        revived = self.homes / "skevh" / "worktrees" / "skevh-comeback-panel"
+        env = dict(self.env, TEST_REVIVE_LABEL="skevh-comeback-panel", TEST_REVIVE_DIR=str(revived))
+        proc = self.spawn("ndev-prune", env=env)
+        out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertTrue((self.systemd / "ndev@skevh-comeback-panel.service.d" / "user.conf").exists())
+        self.assertIn(self.dead1, (self.ndev / f"registry-{DOLPHIN}").read_text())
+        self.assertIn("enable --now ndev@skevh-comeback-panel.service", self.calls_list())
+        # The other dead label is still pruned.
+        self.assertFalse((self.ndev / "instances" / "skevh-per-game-follow.env").exists())
+
+    def test_failed_rebuild_keeps_records_for_the_next_run(self):
+        self.fleet()
+        flag = self.root / "fail-rebuild"
+        flag.write_text("")
+        self.env["TEST_FAIL_REBUILD"] = str(flag)
+        first = self.run_tool("ndev-prune")
+        self.assertNotEqual(first.returncode, 0)
+        for label in ("skevh-comeback-panel", "skevh-per-game-follow"):
+            self.assertTrue((self.ndev / "instances" / f"{label}.env").exists())
+            self.assertTrue((self.systemd / f"ndev@{label}.service.d").exists())
+        self.assertIn(self.dead1, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        flag.unlink()
+        self.calls.write_text("")
+        second = self.run_tool("ndev-prune")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertNotIn(self.dead1, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertIn(f"restart cloudflared@{DOLPHIN}", self.calls_list())
+
+    def test_failed_restart_is_retried_although_the_config_is_already_clean(self):
+        self.fleet()
+        flag = self.root / "fail-restart"
+        flag.write_text("")
+        self.env["TEST_FAIL_RESTART"] = str(flag)
+        first = self.run_tool("ndev-prune")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertNotIn(self.dead1, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        flag.unlink()
+        self.calls.write_text("")
+        second = self.run_tool("ndev-prune")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn(f"restart cloudflared@{DOLPHIN}", self.calls_list())
+        self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertFalse((self.ndev / f".restart-{DOLPHIN}").exists())
+        self.calls.write_text("")
+        self.assertEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertEqual(self.calls_list(), [])
+
+    def test_failure_in_one_zone_does_not_hold_back_the_other(self):
+        self.fleet()
+        dead_game, _ = self.publish("connor-old", "connor", GAMES, 3642, live=False)
+        # Fail only dolphin: point its tunnel lookup at nothing.
+        self.install("ndev-zone", (self.bin / "ndev-zone").read_text().replace(
+            "dolphin-labs.dev) echo dolphin-test-tunnel ;;", "dolphin-labs.dev) exit 1 ;;"))
+        r = self.run_tool("ndev-prune")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertFalse((self.ndev / "instances" / "connor-old.env").exists())
+        self.assertNotIn(dead_game, (self.config / f"config-{GAMES}.yml").read_text())
 
     # ------------------------------------------------------------------ ndev-run
     def test_run_check_skips_a_deleted_project(self):

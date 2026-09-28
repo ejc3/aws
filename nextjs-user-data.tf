@@ -840,6 +840,10 @@ case "$DIR" in "/home/$WHO"|"/home/$WHO"/*) ;; *) echo "refusing: $DIR is outsid
 # One registry and one cloudflared config PER ZONE. A single shared registry would mean
 # rewriting both tunnels' ingress on every publish, so a malformed entry from one project
 # could break the other -- the exact coupling the separate tunnels exist to avoid.
+# Shared with ndev-prune and held to exit (write -> rebuild -> enable), so a prune cannot
+# classify this label mid-publish or delete what this publish just wrote.
+exec 9>/var/lib/ndev/.lock
+flock -w 300 9 || { echo "refusing: another ndev publish or prune is still running; try again" >&2; exit 1; }
 REGISTRY=/var/lib/ndev/registry-$ZONE
 grep -v -P "^\Q$HOST\E\t" "$REGISTRY" > "$REGISTRY.new" 2>/dev/null || true
 printf '%s\t%s\t%s\t%s\n' "$HOST" "$PORT" "$WHO" "$DIR" >> "$REGISTRY.new"
@@ -903,8 +907,39 @@ cat > /usr/local/bin/ndev-prune <<'PRUNE'
 set -euo pipefail
 NDEV=/var/lib/ndev
 
+# Shared with ndev-register and held to exit, so a publish can never land between deciding
+# a label is dead and deleting its records, and the two never edit a registry at once.
+exec 9>"$NDEV/.lock"
+flock -w 600 9 || { echo "ndev-prune: timed out waiting for $NDEV/.lock" >&2; exit 1; }
+TMP=$(mktemp "$NDEV/.prune.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
 field() { sed -n "s/^$1=//p" "$2" | head -n 1; }
 is_user() { case " ${join(" ", local.nextjs_users)} " in *" $1 "*) return 0 ;; esac; return 1; }
+# The env files that describe a label; the legacy one counts only for a real user's base label.
+records() {
+  local f
+  for f in "$NDEV/instances/$1.env" "$NDEV/$1.env"; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$NDEV/$1.env" ] && ! is_user "$1"; then continue; fi
+    echo "$f"
+  done
+}
+# dead <label>: true only when it has records and every one names a missing dir under /home.
+dead() {
+  local f dir found=1
+  for f in $(records "$1"); do
+    dir=$(field DIR "$f")
+    case "$dir" in
+      /home/?*) ;;
+      *) echo "ndev-prune: leaving $1 alone: $f has DIR='$dir'" >&2; return 1 ;;
+    esac
+    [ ! -d "$dir" ] || return 1
+    found=0
+  done
+  return "$found"
+}
+hosts_of() { local f; for f in $(records "$1"); do field HOST "$f"; done; }
 
 LABELS=$(
   for f in "$NDEV"/instances/*.env; do [ -f "$f" ] && basename "$f" .env; done
@@ -914,24 +949,8 @@ LABELS=$(
 DEAD=""
 for label in $(printf '%s\n' "$LABELS" | sort -u); do
   case "$label" in *[!a-z0-9-]*|"") echo "ndev-prune: skipping odd label '$label'"; continue ;; esac
-  files=""
-  for f in "$NDEV/instances/$label.env" "$NDEV/$label.env"; do
-    [ -f "$f" ] || continue
-    [ "$f" = "$NDEV/$label.env" ] && ! is_user "$label" && continue
-    files="$files $f"
-  done
-  live=0 dirs=""
-  for f in $files; do
-    dir=$(field DIR "$f")
-    case "$dir" in
-      /home/?*) ;;
-      *) echo "ndev-prune: leaving $label alone: $f has DIR='$dir'"; live=1; break ;;
-    esac
-    [ -d "$dir" ] && { live=1; break; }
-    dirs="$dirs $dir"
-  done
-  [ "$live" = 0 ] || continue
-  echo "ndev-prune: $label is dead ($${dirs# } gone); unpublishing"
+  dead "$label" || continue
+  echo "ndev-prune: $label is dead ($(for f in $(records "$label"); do field DIR "$f"; done | sort -u | tr '\n' ' ')gone); unpublishing"
   DEAD="$DEAD $label"
   systemctl disable --now "ndev@$label.service" >/dev/null 2>&1 || echo "ndev-prune: WARNING could not disable ndev@$label"
   systemctl reset-failed "ndev@$label.service" >/dev/null 2>&1 || true
@@ -947,9 +966,7 @@ for reg in "$NDEV"/registry-*; do
   case "$zone" in *.new) continue ;; esac
   hosts=""
   for label in $DEAD; do
-    for f in "$NDEV/instances/$label.env" "$NDEV/$label.env"; do
-      [ -f "$f" ] || continue
-      h=$(field HOST "$f")
+    for h in $(hosts_of "$label"); do
       case "$h" in *".$zone") hosts="$hosts $h" ;; esac
     done
   done
@@ -961,28 +978,58 @@ for reg in "$NDEV"/registry-*; do
       *" $h "*) if [ -z "$d" ] || [ ! -d "$d" ]; then echo "ndev-prune: removed $h from $zone" >&2; continue; fi ;;
     esac
     printf '%s\n' "$line"
-  done < "$reg" > "$reg.new"
-  cmp -s "$reg.new" "$reg" || cat "$reg.new" > "$reg"
-  rm -f "$reg.new"
+  done < "$reg" > "$TMP"
+  cmp -s "$TMP" "$reg" || cat "$TMP" > "$reg"
 done
 
 # A zone is rebuilt whenever a dead host belongs to it, not only when its registry changed
 # in this run, so a run interrupted after the registry edit still fixes the ingress next time.
-RC=0
+# A failed restart leaves .restart-<zone>: by the next run the config on disk is already
+# clean, so ndev-rebuild reports no change and only the marker says the tunnel still needs it.
+FAILED=""
 for zone in $(printf '%s\n' $ZONES | sort -u); do
   CHANGED=0
   /usr/local/bin/ndev-rebuild "$zone" || CHANGED=$?
+  if [ "$CHANGED" = 0 ] && [ -f "$NDEV/.restart-$zone" ]; then CHANGED=10; fi
   case "$CHANGED" in
-    10) systemctl restart "cloudflared@$zone" || { echo "ndev-prune: WARNING cloudflared@$zone did not restart"; RC=1; } ;;
+    10)
+      if systemctl restart "cloudflared@$zone"; then
+        rm -f "$NDEV/.restart-$zone"
+      else
+        echo "ndev-prune: WARNING cloudflared@$zone did not restart"
+        touch "$NDEV/.restart-$zone"
+        FAILED="$FAILED $zone"
+      fi ;;
     0) ;;
-    *) echo "ndev-prune: WARNING ndev-rebuild $zone failed ($CHANGED)"; RC=1 ;;
+    *) echo "ndev-prune: WARNING ndev-rebuild $zone failed ($CHANGED)"; FAILED="$FAILED $zone" ;;
   esac
 done
 
-# Last, so an interrupted run leaves the env files and the next run finishes the job.
+# Last, so an interrupted run leaves the env files and the next run finishes the job. A
+# label in a zone whose rebuild or restart failed keeps its records for the same reason:
+# they are the only state the next run can find it by. Each label is re-checked first.
+RC=0
 for label in $DEAD; do
+  keep=""
+  for h in $(hosts_of "$label"); do
+    for zone in $FAILED; do
+      case "$h" in *".$zone") keep="$zone" ;; esac
+    done
+  done
+  if [ -n "$keep" ]; then
+    echo "ndev-prune: keeping $label's records so the next run retries $keep"
+    RC=1
+    continue
+  fi
+  if ! dead "$label"; then
+    if [ -n "$(records "$label")" ]; then
+      echo "ndev-prune: $label's project dir is back; kept its records and re-enabled it (run ndev there again if its URL does not route)"
+      systemctl enable --now "ndev@$label.service" >/dev/null 2>&1 || echo "ndev-prune: WARNING could not re-enable ndev@$label"
+    fi
+    continue
+  fi
   rm -f "$NDEV/instances/$label.env"
-  is_user "$label" && rm -f "$NDEV/$label.env"
+  if is_user "$label"; then rm -f "$NDEV/$label.env"; fi
   rm -rf "/etc/systemd/system/ndev@$label.service.d"
 done
 systemctl daemon-reload
