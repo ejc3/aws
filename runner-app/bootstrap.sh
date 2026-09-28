@@ -44,6 +44,13 @@ rm -f /tmp/actions-runner.tgz
 "$DIR/bin/installdependencies.sh"
 chown -R runner:runner "$DIR"
 
+# The tool cache lives where GitHub's hosted images keep it. setup-python's prebuilt
+# interpreters are built with that prefix: from the runner's default _work/_tool, python runs
+# only with the LD_LIBRARY_PATH setup-python exports, so any subprocess started with a clean
+# environment dies with "libpython3.11.so.1.0: cannot open shared object file".
+TOOL_CACHE=/opt/hostedtoolcache
+install -d -o runner -g runner "$TOOL_CACHE"
+
 # This host's one-time registration token. The controller writes it only after EC2 accepted
 # the launch, tagged with this instance's ARN, which is the only parameter this role can read;
 # it is deleted as soon as it is read.
@@ -84,6 +91,10 @@ printf '%s' "$REG_TOKEN" | sudo -u runner -H bash -c \
   'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work _work' \
   _ "$REPO" "$INSTANCE_ID" "$LABELS"
 unset REG_TOKEN
+
+# .env is read by run.sh and handed to every job: AGENT_TOOLSDIRECTORY for the setup-* actions,
+# RUNNER_TOOL_CACHE for the runner's own ${{ runner.tool_cache }}.
+printf 'AGENT_TOOLSDIRECTORY=%s\nRUNNER_TOOL_CACHE=%s\n' "$TOOL_CACHE" "$TOOL_CACHE" >> "$DIR/.env"
 
 sudo -u runner -H ./run.sh
 echo "github-app-runner: job finished at $(date -Is); powering off"

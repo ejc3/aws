@@ -895,6 +895,19 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("@@REPO@@", text)
         self.assertIn("@@LABELS@@", text)
 
+    def test_the_tool_cache_is_where_setup_python_interpreters_expect_it(self):
+        # setup-python's prebuilt Pythons are linked against /opt/hostedtoolcache. From the
+        # runner's default _work/_tool, a subprocess with a clean environment failed to load
+        # libpython (dolphin-labs run 36367645699). The directory must exist, belong to the
+        # runner, and be named in .env after config.sh and before run.sh starts the job.
+        text = BOOTSTRAP.read_text()
+        self.assertIn("TOOL_CACHE=/opt/hostedtoolcache\n", text)
+        self.assertIn('install -d -o runner -g runner "$TOOL_CACHE"', text)
+        env = text.index("printf 'AGENT_TOOLSDIRECTORY=%s\\nRUNNER_TOOL_CACHE=%s\\n' \"$TOOL_CACHE\" \"$TOOL_CACHE\" >> \"$DIR/.env\"")
+        self.assertLess(text.index("exec ./config.sh"), env, "config.sh writes .env; append after it")
+        self.assertLess(env, text.index("sudo -u runner -H ./run.sh"))
+        self.assertLess(text.index('install -d -o runner -g runner "$TOOL_CACHE"'), env)
+
 
 def front_source():
     block = re.search(r'data "archive_file" "runner_webhook_front" \{.*?content\s*=\s*<<-EOF\n(.*?)\n\s*EOF\n', FRONT_TF, re.S)
