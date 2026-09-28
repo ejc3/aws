@@ -113,6 +113,9 @@ jobs:
       - name: Games multiplayer automatic deploys (offline)
         run: python3 -S -B scripts/test-games-mp-deploy.py
 
+      - name: Games pipeline read-only view for the dev boxes
+        run: python3 -S -B scripts/test-games-mp-observe.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
