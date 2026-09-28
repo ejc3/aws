@@ -22,13 +22,47 @@ def descriptions():
         for m in re.finditer(r'resource "(%s)" "([^"]+)" \{(.*?)\n\}' % "|".join(TYPES), text, re.S):
             body = m.group(3)
             for d in re.findall(r'description\s*=\s*"((?:[^"\\]|\\.)*)"', body):
-                yield path.name, m.group(2), d
+                for rendered in render(body, d):
+                    yield path.name, m.group(2), rendered
             for expr in re.findall(r'description\s*=\s*([^"\s][^\n]*?)\s*$', body, re.M):
                 keys = dynamic_keys(body, expr)
                 if keys is None:
                     yield path.name, m.group(2), None
                 for key in keys or []:
                     yield path.name, m.group(2), key
+
+
+def render(body, text):
+    """Each description `text` can become. ${each.key} takes every top-level key of the
+    resource's inline for_each map; any other interpolation yields None (unresolvable)."""
+    if "${" not in text:
+        return [text]
+    if re.sub(r"\$\{each\.key\}", "", text).count("${"):
+        return [None]
+    keys = for_each_keys(body)
+    if keys is None:
+        return [None]
+    return [text.replace("${each.key}", key) for key in keys]
+
+
+def for_each_keys(body):
+    """Top-level keys of the resource's `for_each = { ... }` map literal (it may span lines)."""
+    m = re.search(r"^\s*for_each\s*=\s*\{", body, re.M)
+    if not m:
+        return None
+    depth, i, start = 1, m.end(), m.end()
+    while depth and i < len(body):
+        depth += {"{": 1, "}": -1}.get(body[i], 0)
+        i += 1
+    inner, top, depth = body[start:i - 1], [], 0
+    for j, ch in enumerate(inner):   # keep only the text at nesting depth 0
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        elif depth == 0:
+            top.append(ch)
+    return re.findall(r'(?:^|[,\n{])\s*"?([A-Za-z0-9_.-]+)"?\s*=', "".join(top))
 
 
 def dynamic_keys(body, expr):
@@ -47,10 +81,9 @@ class SecurityGroupDescriptionTests(unittest.TestCase):
         seen = 0
         for name, resource, text in descriptions():
             seen += 1
-            self.assertIsNotNone(text, f"{name} {resource}: a computed description this test cannot resolve; "
+            self.assertIsNotNone(text, f"{name} {resource}: a computed description (or interpolation) this test cannot resolve; "
                                        "make it a literal or teach descriptions() its values")
-            literal = re.sub(r"\$\{[^}]*\}", "", text)   # interpolations are checked where they are set
-            self.assertRegex(literal, ALLOWED, f"{name} {resource}: {text!r}")
+            self.assertRegex(text, ALLOWED, f"{name} {resource}: {text!r}")
             self.assertLess(len(text), 256, f"{name} {resource}")
         self.assertGreater(seen, 20, "the scan found too few descriptions to be looking in the right place")
 
@@ -60,6 +93,13 @@ class SecurityGroupDescriptionTests(unittest.TestCase):
         self.assertIsNone(dynamic_keys(body, "var.something"))
         keys = [d for name, resource, d in descriptions() if name == "gpu-box.tf" and resource == "gpu_box"]
         self.assertIn("dns-udp", keys, "the gpu box's computed egress descriptions are checked")
+
+    def test_each_key_interpolations_are_rendered_for_every_key(self):
+        body = 'for_each = {\n    v4 = { cidr4 = "0.0.0.0/0" }\n    v6 = { cidr6 = "::/0" }\n  }\n  description = "x"\n'
+        self.assertEqual(render(body, "HTTPS (${each.key})"), ["HTTPS (v4)", "HTTPS (v6)"])
+        self.assertEqual(render(body, "${var.other}"), [None])
+        rendered = [d for name, r, d in descriptions() if name == "games-multiplayer.tf" and r == "games_engine"]
+        self.assertIn("HTTPS only (v4): Vercel callbacks, ECR, logs", rendered)
 
     def test_the_check_catches_an_apostrophe(self):
         self.assertIsNone(ALLOWED.match("engine's own IP"))
