@@ -117,14 +117,16 @@ data "aws_iam_policy_document" "games_mp_observe" {
   }
 }
 
-resource "aws_iam_role_policy" "dev_server_games_mp_observe" {
-  name   = "games-mp-observe"
-  role   = aws_iam_role.dev_server.id
-  policy = data.aws_iam_policy_document.games_mp_observe.json
+# A managed policy, not inline: a role's inline policies share one 10,240-byte budget, which
+# both dev roles' existing inline policies already nearly fill (PutRolePolicy LimitExceeded).
+resource "aws_iam_policy" "games_mp_observe" {
+  name        = "games-mp-observe"
+  description = "Dev boxes: read-only view of the games deploy pipeline, plus the mp test key"
+  policy      = data.aws_iam_policy_document.games_mp_observe.json
 }
 
-resource "aws_iam_role_policy" "nextjs_dev_games_mp_observe" {
-  name   = "games-mp-observe"
-  role   = aws_iam_role.nextjs_dev.id
-  policy = data.aws_iam_policy_document.games_mp_observe.json
+resource "aws_iam_role_policy_attachment" "games_mp_observe" {
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
+  policy_arn = aws_iam_policy.games_mp_observe.arn
 }

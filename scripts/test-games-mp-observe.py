@@ -118,11 +118,17 @@ class ObserveGrantTests(unittest.TestCase):
         self.assertNotIn("games_play_waf", body, "WAF logs hold players' addresses")
 
     def test_both_dev_roles_get_it_and_nothing_else_does(self):
-        attached = re.findall(r'role\s*=\s*aws_iam_role\.(\w+)\.id\n\s*policy\s*=\s*data\.aws_iam_policy_document\.games_mp_observe\.json', TF)
-        self.assertEqual(sorted(attached), ["dev_server", "nextjs_dev"])
+        # One managed policy (inline would not fit: the roles' inline budget is nearly full),
+        # attached to exactly the two dev roles.
+        self.assertRegex(TF, r'resource "aws_iam_policy" "games_mp_observe" \{[^}]*policy\s*=\s*data\.aws_iam_policy_document\.games_mp_observe\.json')
+        attach = re.search(r'resource "aws_iam_role_policy_attachment" "games_mp_observe" \{(.*?)\n\}', TF, re.S).group(1)
+        self.assertEqual(sorted(re.findall(r"aws_iam_role\.(\w+)\.name", attach)), ["dev_server", "nextjs_dev"])
+        self.assertIn("policy_arn = aws_iam_policy.games_mp_observe.arn", attach)
         for path in ROOT.glob("*.tf"):
             if path.name != "games-multiplayer-observe.tf":
-                self.assertNotIn("aws_iam_policy_document.games_mp_observe", path.read_text(), path.name)
+                text = path.read_text()
+                self.assertNotIn("aws_iam_policy_document.games_mp_observe", text, path.name)
+                self.assertNotIn("aws_iam_policy.games_mp_observe", text, path.name)
 
     def test_build_environments_hold_no_plaintext_secret(self):
         # BatchGetBuilds returns each build's environment: a secret must reach a build as a
