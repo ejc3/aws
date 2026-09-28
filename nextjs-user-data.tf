@@ -351,6 +351,12 @@ chgrp adm /var/log/setup-sync.log
 bash "$NEXT" >/var/log/setup-sync.log 2>&1
 RC=$?
 echo "setup-sync: finished rc=$RC"
+# 75 means setup stopped on purpose before finishing (it could not take the ndev lock).
+# Other codes keep their old meaning: health below decides.
+if [ "$RC" = 75 ]; then
+  echo "setup-sync: setup stopped early; NOT recording this etag, so the next run retries"
+  exit 1
+fi
 
 # A deleted checkout is not a failed unit: unpublish it before judging health, so one
 # removed worktree cannot hold every future setup run in a retry loop.
@@ -916,6 +922,7 @@ NDEV=/var/lib/ndev
 # same open file returns at once, where opening the file again would wait on setup forever.
 [ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$(readlink -f "$NDEV/.lock")" ] || exec 9>"$NDEV/.lock"
 flock -w 600 9 || { echo "ndev-prune: timed out waiting for $NDEV/.lock" >&2; exit 1; }
+rm -f "$NDEV"/.prune.*        # left by a run that was killed; only prune makes them, under this lock
 TMP=$(mktemp "$NDEV/.prune.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 
@@ -954,7 +961,7 @@ dirs_of() { local f; for f in $(records "$1"); do field DIR "$f"; done | sort -u
 #                      forces the restart even when ndev-rebuild reports no change.
 #   .retained-<label>  prune disabled the label but kept its records for that retry. If its
 #                      directory is back by now, it is re-published rather than left disabled.
-ZONES="" RZ=""
+ZONES="" RZ="" RESTORE_FAILED=""
 for m in "$NDEV"/.retry-*; do [ -f "$m" ] && ZONES="$ZONES $${m#"$NDEV"/.retry-}"; done
 
 # restore <label>: put back the label's own registry row (as ndev-register writes it), queue
@@ -973,8 +980,15 @@ restore() {
       RZ="$RZ $zone" ;;
     *) echo "ndev-prune: WARNING $1: cannot tell the zone of '$host'; run ndev there to restore its route" ;;
   esac
-  systemctl enable --now "ndev@$1.service" >/dev/null 2>&1 || echo "ndev-prune: WARNING could not re-enable ndev@$1"
-  rm -f "$NDEV/.retained-$1"
+  # The marker is the only thing that brings a live-again label back to this function, so
+  # it goes only once the unit is really enabled; a failure keeps (or creates) it.
+  if systemctl enable --now "ndev@$1.service" >/dev/null 2>&1; then
+    rm -f "$NDEV/.retained-$1"
+  else
+    echo "ndev-prune: WARNING could not re-enable ndev@$1; the next run retries"
+    touch "$NDEV/.retained-$1"
+    RESTORE_FAILED=1
+  fi
 }
 
 for m in "$NDEV"/.retained-*; do
@@ -1040,7 +1054,13 @@ for reg in "$NDEV"/registry-*; do
     fi
     printf '%s\n' "$line"
   done < "$reg" > "$TMP"
-  cmp -s "$TMP" "$reg" || cat "$TMP" > "$reg"
+  # The marker goes down BEFORE the rows do: a cross-zone alias row is this zone's only link
+  # to the dead project, so a run killed between here and rebuild_zones would otherwise
+  # leave nothing that tells the next run this zone's ingress is stale.
+  if ! cmp -s "$TMP" "$reg"; then
+    touch "$NDEV/.retry-$zone"
+    cat "$TMP" > "$reg"
+  fi
 done
 
 # A zone is rebuilt whenever a dead label's host or dir belongs to it, not only when its
@@ -1048,24 +1068,29 @@ done
 # ingress next time. Only a zone whose config changed (or that is owed a retry) is restarted.
 FAILED=""
 rebuild_zones() {
-  local zone changed
+  local zone changed owed
   for zone in $(printf '%s\n' "$@" | sort -u); do
+    owed=""
+    [ ! -f "$NDEV/.retry-$zone" ] || owed=1
+    # Marked before anything is attempted and cleared only on success, so a failed rebuild,
+    # a failed restart or a killed run all leave the zone owed to the next run -- including
+    # a restart that failed after the config was already written, which the next rebuild
+    # would otherwise report as unchanged.
+    touch "$NDEV/.retry-$zone"
     changed=0
     /usr/local/bin/ndev-rebuild "$zone" || changed=$?
-    if [ "$changed" = 0 ] && [ -f "$NDEV/.retry-$zone" ]; then changed=10; fi
+    if [ "$changed" = 0 ] && [ -n "$owed" ]; then changed=10; fi
     case "$changed" in
       10)
         if systemctl restart "cloudflared@$zone"; then
           rm -f "$NDEV/.retry-$zone"
         else
           echo "ndev-prune: WARNING cloudflared@$zone did not restart"
-          touch "$NDEV/.retry-$zone"
           FAILED="$FAILED $zone"
         fi ;;
-      0) ;;
+      0) rm -f "$NDEV/.retry-$zone" ;;
       *)
         echo "ndev-prune: WARNING ndev-rebuild $zone failed ($changed)"
-        touch "$NDEV/.retry-$zone"
         FAILED="$FAILED $zone" ;;
     esac
   done
@@ -1100,7 +1125,7 @@ for label in $DEAD; do
   rm -rf "/etc/systemd/system/ndev@$label.service.d"
 done
 [ -z "$${RZ// /}" ] || rebuild_zones $RZ
-[ -z "$FAILED" ] || RC=1
+[ -z "$FAILED$RESTORE_FAILED" ] || RC=1
 systemctl daemon-reload
 exit "$RC"
 PRUNE
@@ -1506,7 +1531,10 @@ systemctl daemon-reload
 # publish is not held up by the user setup in between.
 ndev_lock() {
   exec 9>/var/lib/ndev/.lock
-  flock -w 900 9 || echo "WARNING: /var/lib/ndev/.lock still held after 15 min; continuing without it"
+  # Never go on without it: that is exactly the interleaving the lock exists to prevent.
+  # Exit 75 (EX_TEMPFAIL) is the one code setup-sync treats as "not applied": it leaves the
+  # etag unrecorded, so the whole script runs again in 10 minutes.
+  flock -w 900 9 || { echo "ERROR: /var/lib/ndev/.lock still held after 15 min; stopping setup, setup-sync will retry"; exit 75; }
 }
 ndev_unlock() { flock -u 9; exec 9>&-; }
 ndev_lock

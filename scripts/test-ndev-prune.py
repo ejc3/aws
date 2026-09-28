@@ -83,6 +83,8 @@ printf '%s\\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
 if [ -n "${TEST_REVIVE_LABEL:-}" ] && [ "$*" = "disable --now ndev@$TEST_REVIVE_LABEL.service" ]; then
   mkdir -p "$TEST_REVIVE_DIR"
 fi
+if [ "$1" = enable ] && [ -e "${TEST_KILL_ON_ENABLE:-/nonexistent}" ]; then kill -9 "$PPID"; exit 1; fi
+if [ "$1" = enable ] && [ -e "${TEST_FAIL_ENABLE:-/nonexistent}" ]; then exit 1; fi
 if [ "$1" = restart ] && [ -e "${TEST_FAIL_RESTART:-/nonexistent}" ] &&
    { [ -z "${TEST_FAIL_ZONE:-}" ] || [ "$2" = "cloudflared@$TEST_FAIL_ZONE" ]; }; then exit 1; fi
 exit 0
@@ -96,6 +98,9 @@ exit 0
         # The real ndev-rebuild, failing while a flag file exists.
         (self.bin / "ndev-rebuild").rename(self.bin / "ndev-rebuild.real")
         self.install("ndev-rebuild", f"""#!/bin/bash
+# Simulates the host dying mid-run: kill ndev-prune after its registry edits, before any rebuild.
+if [ -e "${{TEST_KILL_PRUNE:-/nonexistent}}" ] &&
+   {{ [ -z "${{TEST_KILL_ZONE:-}}" ] || [ "$1" = "$TEST_KILL_ZONE" ]; }}; then kill -9 "$PPID"; exit 1; fi
 if [ -e "${{TEST_FAIL_REBUILD:-/nonexistent}}" ] &&
    {{ [ -z "${{TEST_FAIL_ZONE:-}}" ] || [ "$1" = "$TEST_FAIL_ZONE" ]; }}; then exit 1; fi
 exec bash {self.bin}/ndev-rebuild.real "$@"
@@ -305,6 +310,7 @@ exec bash {self.bin}/ndev-rebuild.real "$@"
         self.assertIn("disable --now ndev@skevh-y.service", self.calls_list())
         self.assertFalse([c for c in self.calls_list() if "cloudflared" in c])
         self.assertFalse((self.ndev / "instances" / "skevh-y.env").exists())
+        self.assertEqual([p.name for p in self.ndev.glob(".retry-*")], [])
 
     def test_non_user_legacy_file_cannot_keep_a_dead_instance(self):
         # ndev-run serves instances/<label>.env; a stray same-named file beside it is not a record.
@@ -518,6 +524,135 @@ exec bash {self.bin}/ndev-rebuild.real "$@"
         self.assertFalse((self.ndev / f".retry-{GAMES}").exists())
         self.assertFalse((self.ndev / "instances" / "ejc3-family.env").exists())
 
+    def test_alias_zone_survives_a_prune_killed_before_rebuild(self):
+        host, _ = self.family_with_alias(live=False)
+        flag = self.root / "kill-prune"
+        flag.write_text("")
+        self.env["TEST_KILL_PRUNE"] = str(flag)
+        killed = self.run_tool("ndev-prune")
+        self.assertEqual(killed.returncode, -9, killed.stdout + killed.stderr)
+        # Rows are gone, ingress is not rebuilt yet: the alias zone must be remembered.
+        self.assertNotIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+        self.assertIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+        self.assertTrue((self.ndev / f".retry-{GAMES}").exists())
+        flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+        self.assertNotIn(host, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertIn(f"restart cloudflared@{GAMES}", self.calls_list())
+        self.assertFalse((self.ndev / f".retry-{GAMES}").exists())
+        self.assertFalse((self.ndev / "instances" / "ejc3-family.env").exists())
+        self.assertEqual([p.name for p in self.ndev.glob(".prune.*")], [])
+
+    def test_restart_failure_with_unchanged_registry_is_retried(self):
+        # Registry already clean, ingress stale (an earlier run died after its registry edit
+        # and before any marker existed). The rebuild writes the config, the restart fails;
+        # by the retry the config matches, so only the zone's marker can force the restart.
+        host, _ = self.publish("skevh-z", "skevh", DOLPHIN, 3312, live=False)
+        self.rebuild_all()
+        (self.ndev / f"registry-{DOLPHIN}").write_text("")
+        flag = self.root / "fail-restart"
+        flag.write_text("")
+        self.env["TEST_FAIL_RESTART"] = str(flag)
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertNotIn(host, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertTrue((self.ndev / f".retry-{DOLPHIN}").exists())
+        flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"restart cloudflared@{DOLPHIN}", self.calls_list())
+        self.assertFalse((self.ndev / f".retry-{DOLPHIN}").exists())
+        self.assertFalse((self.ndev / "instances" / "skevh-z.env").exists())
+
+    def test_retained_marker_survives_a_prune_killed_while_re_enabling(self):
+        host, d = self.publish("skevh-back", "skevh", DOLPHIN, 3310, live=False)
+        self.rebuild_all()
+        rebuild_flag, kill_flag = self.root / "fail-rebuild", self.root / "kill-on-enable"
+        rebuild_flag.write_text("")
+        self.env.update(TEST_FAIL_REBUILD=str(rebuild_flag), TEST_KILL_ON_ENABLE=str(kill_flag))
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        rebuild_flag.unlink()
+        d.mkdir(parents=True)
+        (d / "package.json").write_text("{}\n")
+        kill_flag.write_text("")
+        killed = self.run_tool("ndev-prune")
+        self.assertEqual(killed.returncode, -9, killed.stdout + killed.stderr)
+        self.assertTrue((self.ndev / ".retained-skevh-back").exists())
+        kill_flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("enable --now ndev@skevh-back.service", self.calls_list())
+        self.assertFalse((self.ndev / ".retained-skevh-back").exists())
+        self.assertIn(f"  - hostname: {host}\n", (self.config / f"config-{DOLPHIN}.yml").read_text())
+
+    def test_alias_zone_edited_before_a_kill_in_another_zone_is_retried(self):
+        # A dead cc-games project with an alias row on dolphin. Zones rebuild in sorted order,
+        # so prune dies rebuilding cc-games after dolphin's registry lost the alias row but
+        # before rebuild_zones reached dolphin: only the marker written with the row edit
+        # tells the next run that dolphin's ingress is stale.
+        _, d = self.publish("connor-old", "connor", GAMES, 3642, live=False)
+        self.publish("skevh", "skevh", DOLPHIN, 3300, subdir="web")
+        reg = self.ndev / f"registry-{DOLPHIN}"
+        reg.write_text(reg.read_text() + f"connor-alias.{DOLPHIN}\t3642\tconnor\t{d}\n")
+        self.rebuild_all()
+        flag = self.root / "kill-prune"
+        flag.write_text("")
+        self.env.update(TEST_KILL_PRUNE=str(flag), TEST_KILL_ZONE=GAMES)
+        self.assertEqual(self.run_tool("ndev-prune").returncode, -9)
+        self.assertNotIn(f"connor-alias.{DOLPHIN}", reg.read_text())
+        self.assertIn(f"connor-alias.{DOLPHIN}", (self.config / f"config-{DOLPHIN}.yml").read_text())
+        flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(f"connor-alias.{DOLPHIN}", (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertIn(f"restart cloudflared@{DOLPHIN}", self.calls_list())
+        self.assertIn(f"  - hostname: skevh.{DOLPHIN}\n", (self.config / f"config-{DOLPHIN}.yml").read_text())
+
+    def test_retained_marker_stays_until_the_unit_is_enabled(self):
+        host, d = self.publish("skevh-back", "skevh", DOLPHIN, 3310, live=False)
+        self.rebuild_all()
+        rebuild_flag, enable_flag = self.root / "fail-rebuild", self.root / "fail-enable"
+        rebuild_flag.write_text("")
+        self.env.update(TEST_FAIL_REBUILD=str(rebuild_flag), TEST_FAIL_ENABLE=str(enable_flag))
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        rebuild_flag.unlink()
+        d.mkdir(parents=True)
+        (d / "package.json").write_text("{}\n")
+        enable_flag.write_text("")
+        failed = self.run_tool("ndev-prune")
+        self.assertNotEqual(failed.returncode, 0, "a failed re-enable must not look like success")
+        self.assertTrue((self.ndev / ".retained-skevh-back").exists())
+        enable_flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("enable --now ndev@skevh-back.service", self.calls_list())
+        self.assertFalse((self.ndev / ".retained-skevh-back").exists())
+        self.assertIn(f"  - hostname: {host}\n", (self.config / f"config-{DOLPHIN}.yml").read_text())
+
+    def test_failed_re_enable_mid_run_leaves_a_marker(self):
+        self.fleet()
+        revived = self.homes / "skevh" / "worktrees" / "skevh-comeback-panel"
+        enable_flag = self.root / "fail-enable"
+        enable_flag.write_text("")
+        env = dict(self.env, TEST_REVIVE_LABEL="skevh-comeback-panel", TEST_REVIVE_DIR=str(revived),
+                   TEST_FAIL_ENABLE=str(enable_flag))
+        proc = self.spawn("ndev-prune", env=env)
+        out, err = proc.communicate(timeout=10)
+        self.assertNotEqual(proc.returncode, 0, out + err)
+        self.assertTrue((self.ndev / ".retained-skevh-comeback-panel").exists())
+        enable_flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("enable --now ndev@skevh-comeback-panel.service", self.calls_list())
+        self.assertFalse((self.ndev / ".retained-skevh-comeback-panel").exists())
+
     def test_old_two_field_row_is_removed_by_hostname(self):
         host, _ = self.publish("skevh-old", "skevh", DOLPHIN, 3311, live=False)
         reg = self.ndev / f"registry-{DOLPHIN}"
@@ -645,6 +780,57 @@ exec bash {self.bin}/ndev-rebuild.real "$@"
         self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
         self.assertIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
         self.assert_lock_free()
+
+    def test_setup_stops_with_75_when_the_lock_stays_busy(self):
+        self.fleet()
+        shared = self.ndev / "registry"
+        shared.write_text(f"connor.{GAMES}\t3641\tconnor\t{self.homes}/connor/game\n")
+        script = self.setup_stretch()
+        text = script.read_text()
+        self.assertEqual(text.count("flock -w 900 9"), 1)
+        script.write_text(text.replace("flock -w 900 9", "flock -w 1 9"))   # 15 min -> 1 s
+        held = self.hold_lock()
+        try:
+            r = subprocess.run(["bash", str(script)], env=self.env, text=True,
+                               capture_output=True, timeout=30)
+        finally:
+            os.close(held)
+        self.assertEqual(r.returncode, 75, r.stdout + r.stderr)
+        self.assertIn("stopping setup", r.stdout + r.stderr)
+        self.assertTrue(shared.exists())
+        self.assertEqual(self.calls_list(), [])
+        self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+
+    def run_setup_sync(self, published):
+        """The real setup-sync with a fake S3 that serves `published` as the setup script."""
+        state = self.root / "setup-state"
+        self.install("aws", f"""#!/bin/bash
+case "$1 $2" in
+  "s3api head-object") echo '"etag-1"' ;;
+  "s3 cp") cp {self.root}/published.sh "$4" ;;
+esac
+""")
+        (self.root / "published.sh").write_text(published)
+        sync = heredoc("/usr/local/bin/setup-sync.new", "SETUPSYNC")
+        # /tmp/ first: the replacements below are themselves under /tmp.
+        for original, replacement in (("/tmp/", str(self.root) + "/"),
+                                      ("/var/lib/nextjs-setup", str(state)),
+                                      ("/var/log/", str(self.root) + "/log-")):
+            sync = sync.replace(original, replacement)
+        self.install("setup-sync", self.localize(sync))
+        r = self.run_tool("setup-sync")
+        return r, state / "applied-etag"
+
+    def test_setup_sync_retries_a_setup_that_stopped_for_the_lock(self):
+        r, etag = self.run_setup_sync("#!/bin/bash\nexit 75\n")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("NOT recording", r.stdout)
+        self.assertFalse(etag.exists())
+
+    def test_setup_sync_still_records_a_healthy_run(self):
+        r, etag = self.run_setup_sync("#!/bin/bash\nexit 0\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(etag.read_text(), '"etag-1"')
 
     def test_prune_under_setup_reuses_its_lock_instead_of_deadlocking(self):
         self.fleet()
