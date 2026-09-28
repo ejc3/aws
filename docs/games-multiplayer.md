@@ -346,6 +346,9 @@ aws ecs describe-tasks --cluster games --tasks <id> --query 'tasks[].[stopCode,s
 
 Name the cluster on every task call: without `--cluster games` the CLI asks about the
 `default` cluster, and IAM denies `task/default/<id>` (the grant covers `task/games/*`).
+In zsh, split a captured list before passing it on: after `T=$(aws ecs list-tasks ... --output text)`,
+`--tasks $T` is one tab-joined argument, which ECS cannot parse and IAM then denies on `*`; use
+`--tasks ${=T}`.
 ECS forgets a stopped task after about an hour; its output stays in the logs: an engine's in
 `/games/engines`, the router's in `/games/mp-router`.
 
