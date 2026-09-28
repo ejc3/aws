@@ -107,5 +107,8 @@ jobs:
       - name: Games multiplayer bring-up steps (offline)
         run: python3 -S -B scripts/test-games-mp-bringup.py
 
+      - name: I/O box NFS admits only its client subnets (offline)
+        run: python3 -S -B scripts/test-io-box-nfs.py
+
       - name: Greptile review settings and rule scopes (offline)
         run: python3 -S -B scripts/test-greptile-config.py

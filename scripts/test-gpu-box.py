@@ -113,7 +113,7 @@ class GpuBoxTests(unittest.TestCase):
         ingress, egress = sg.split('dynamic "egress"')
         self.assertNotIn('0.0.0.0/0', ingress)
         self.assertIn('aws_eip.nextjs_dev', ingress)
-        # web, DNS and NTP only: io-box exports NFS (2049) read-write to 172.31.0.0/16
+        # web, DNS and NTP only: io-box exports NFS (2049) read-write to us-west-2d, a gbox subnet
         self.assertNotRegex(egress, r'protocol\s*=\s*"-1"')
         self.assertNotIn('2049', egress)
         self.assertEqual(sorted(re.findall(r'\["(?:tcp|udp)", (\d+)\]', egress)), sorted(['443', '80', '53', '53', '123']))

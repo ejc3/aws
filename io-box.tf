@@ -15,10 +15,26 @@
 #
 # us-west-1 <-> us-west-2 latency is about 20ms, so this is for bulk data, caches, and work
 # executed on the box -- not a metadata-heavy live source tree. NFS stays private over an
-# inter-region VPC peer; only SSH and NFSv4 are admitted from the two peered VPCs.
+# inter-region VPC peer: SSH is admitted from the two peered VPCs, NFSv4 only from the
+# subnets its clients live in (local.io_box_nfs_client_cidrs).
 
 locals {
   io_box_private_ip = cidrhost(data.aws_subnet.io_box.cidr_block, 10)
+
+  # Everyone who mounts /srv/io, by the subnet they live in. The security group and the
+  # exports line below both admit exactly these, never a whole VPC: across an inter-region
+  # peer a security group cannot reference another group, so a CIDR is the only filter, and
+  # the us-west-1 VPC also holds the games router and match engines (games-multiplayer.tf),
+  # which must never reach a read-write export.
+  #   dev fleet subnets (main.tf local.dev_fleet_subnets): fcvm-metal-arm (either AZ, by
+  #     var.firecracker_availability_zone), fcvm-metal-x86 and nextjs-dev (subnet_a)
+  #   this box's own us-west-2d subnet: the parallel boxes (parallel-box-launch.tf launches
+  #     into subnet-095349c0fcef8c47f, the same subnet as data.aws_subnet.io_box)
+  # Adding a client in another subnet means adding that subnet here.
+  io_box_nfs_client_cidrs = concat(
+    [for s in local.dev_fleet_subnets : s.cidr_block],
+    [data.aws_subnet.io_box.cidr_block],
+  )
 }
 
 data "aws_vpc" "west2_default" {
@@ -96,15 +112,13 @@ resource "aws_security_group" "io_box" {
     ]
   }
 
+  # Not the whole of either VPC: see local.io_box_nfs_client_cidrs.
   ingress {
-    description = "NFSv4 from the dev fleet and other us-west-2 dev boxes"
+    description = "NFSv4 from the dev fleet and parallel-box subnets only"
     from_port   = 2049
     to_port     = 2049
     protocol    = "tcp"
-    cidr_blocks = [
-      data.aws_vpc.selected.cidr_block,
-      data.aws_vpc.west2_default.cidr_block,
-    ]
+    cidr_blocks = local.io_box_nfs_client_cidrs
   }
 
   egress {
@@ -250,9 +264,12 @@ resource "aws_instance" "io_box" {
 
     # Ubuntu's nfs-kernel-server package creates /etc/exports but not exports.d.
     # Create it explicitly before writing the drop-in (caught on the first real boot).
+    # The same client subnets as the security group. user_data is ignored after creation
+    # (lifecycle below), so this line reaches a box only when it is rebuilt; until then the
+    # security group is what enforces the narrower list.
     mkdir -p /etc/exports.d
     cat > /etc/exports.d/io-box.exports <<'EXPORTS'
-    /srv/io 10.0.0.0/16(rw,async,no_subtree_check,root_squash,fsid=0) 172.31.0.0/16(rw,async,no_subtree_check,root_squash,fsid=0)
+    /srv/io ${join(" ", [for c in local.io_box_nfs_client_cidrs : "${c}(rw,async,no_subtree_check,root_squash,fsid=0)"])}
     EXPORTS
 
     mkdir -p /etc/systemd/system/nfs-kernel-server.service.d

@@ -362,6 +362,34 @@ Before this, the lobby held `ecs:RunTask` itself. There is no dual path: the app
 4. Check: start a match on a preview; `/aws/lambda/games-mp-launch-preview` shows
    `"env": "preview"` and a task ARN, and `aws ecs describe-tasks` shows its `env=preview` tag.
 
+### Moving the router and engines into their own subnets (once)
+
+The router and the engines used to run in the dev fleet's `subnet_a`/`subnet_b`. They now have
+their own (`games-multiplayer.tf`, "Network"), and the ALB stays where it was:
+
+| Subnets | Holds | Route table | ACL |
+| --- | --- | --- | --- |
+| `10.0.1.0/24`, `10.0.2.0/24` (`subnet_a`, `subnet_b`) | dev fleet, jumpboxes, the ALB | public: internet + I/O-box peer | default |
+| `10.0.64.0/24`, `10.0.65.0/24` (`games-engine-a/b`) | match engines | `games-rt`: internet only | `games-engine` |
+| `10.0.66.0/24`, `10.0.67.0/24` (`games-router-a/b`) | `mp-router` | `games-rt`: internet only | default |
+
+Each pair is one subnet in each of `subnet_a`'s and `subnet_b`'s AZs, with an IPv6 /64 like
+theirs, so tasks keep their IPv6 address and engine egress stays 443 on v4 and v6. Tasks still
+get a public IPv4 for outbound; there is no NAT gateway.
+
+The plan adds the four subnets, `games-rt` and its four associations, and the `games-engine`
+ACL; updates in place the `mp-router` service's subnets, `games-mp-launch`'s `SUBNETS` and the
+I/O box's security group; and registers a new router task definition. The ALB, the service
+and the I/O box are not replaced. `games-mp-launch` switches subnets only after the health step
+has seen every router task on the new definition. Apply it when no engine runs
+(`aws ecs list-tasks --cluster games` lists only the router) **and nothing can launch one**
+during the apply, so no engine is left in, or started into, the old subnets. The first time,
+that holds by order: it is applied right after the launch function is created and before any
+lobby that calls it is deployed (CoderColton/colton-games#64). If launches are ever live when
+subnets move, pause them for the apply with the committed switch `games_mp_engine_ceiling = 0`
+(Emergency switches) and restore it afterwards. Check afterwards: a new engine's ENI is in a `games-engine-*` subnet, and a match
+plays.
+
 ## Environments and the router
 
 One router serves Production and Preview. It accepts a join token whose `n` is in
@@ -404,10 +432,11 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    Preview) and the router, which gets the key as `MP_TOKEN_KEYS` to check tokens. The router's
    execution role and administrators are the only AWS readers (secret policy,
    `games-multiplayer.tf`).
-4. **Router → engine.** The router forwards only to addresses inside `MP_TARGET_CIDRS`
-   (the two engine subnets), and its security group's egress reaches only the engine group on
-   8080 plus HTTPS. The engine group admits only the router, which is why an engine may trust
-   the router's `X-MP-*` identity headers.
+4. **Router → engine.** The router runs in its own subnets (`10.0.66.0/24`, `10.0.67.0/24`) and
+   forwards only to addresses inside `MP_TARGET_CIDRS` (the two engine subnets,
+   `10.0.64.0/24` and `10.0.65.0/24`); its security group's egress reaches only the engine
+   group on 8080 plus HTTPS. The engine group admits only the router, which is why an engine may
+   trust the router's `X-MP-*` identity headers.
 5. **Lobby → AWS.** Vercel functions exchange a Vercel OIDC token for a launcher role; no AWS
    key is stored. Production assumes `games-mp-launcher`, Preview `games-mp-launcher-preview`;
    each trust is exactly project `colton-games` in team `coltons-projects-7f9a4e8b` and that one
@@ -419,11 +448,18 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    (router **explicitly denied**). It can pass only the two
    engine roles (to ECS tasks only), tag only at launch, and stop only `match`-tagged tasks
    (router tasks explicitly denied). Reserved concurrency 1 per function.
-7. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines get
-   a public IPv4 for outbound traffic; their egress is **TCP 443 only** (plus the ECS task
-   metadata endpoint), which is all the engine kit uses: HTTPS callbacks to the lobby, image
-   pulls and logs. Inbound is router-only. The container still runs as root with a writable
-   root filesystem.
+7. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines run in
+   their own subnets, `10.0.64.0/24` and `10.0.65.0/24`, apart from the dev fleet. Their route
+   table (`games-rt`) has the internet and nothing else: **no route to the I/O box's VPC peer**,
+   so an engine cannot send a packet toward its NFS export, and the I/O box admits NFS only
+   from the dev-fleet and parallel-box subnets anyway. Engines get a public IPv4 for outbound
+   traffic; their security group's egress is **TCP 443 only** (plus the ECS task metadata
+   endpoint), which is all the engine kit uses: HTTPS callbacks to the lobby, image pulls and
+   logs. Inbound is router-only. Under the security group, the subnets' network ACL
+   `games-engine` is a second, stateless fence: in, 8080 only from the router subnets and
+   replies from the internet; out, 443 to the internet and replies to the router; everything
+   else to or from `10.0.0.0/16` or the VPC's IPv6 /56 is denied. The container still runs as
+   root with a writable root filesystem.
 
 **What an attacker can and cannot do**
 
@@ -434,7 +470,7 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of the registered engine images (the preview share), each for up to its `hardCapSec` (at most 4 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data | Run a command, image, role or size of its choosing; launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
 | A compromised production deployment | The same through `games-mp-launch-production`, up to production's share of 22 engines | Everything in the row above, with production and preview swapped: it cannot launch preview engines or take preview's 8 |
 | A compromised router (it parses internet input) | Mint valid join tokens for any match (it holds the HMAC key), so join any match as any seat; see and drop every player's traffic; reach every engine | Launch or stop tasks; read other secrets (its execution role reads only its key); connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
-| A compromised engine | Reach any host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach SSH, databases or any non-443 service, here or on the internet |
+| A compromised engine | Reach any internet host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach any host in the VPC, on any port, over IPv4 or IPv6 (its own subnets, security group and `games-engine` ACL); route to the I/O box or its NFS export (no peer route, and NFS admits only the dev-fleet and parallel-box subnets); reach SSH, databases or any non-443 service on the internet |
 
 **Cost-abuse limits, and what happens at each**
 
@@ -482,15 +518,18 @@ fixed settings and refuses at its share of the ceiling. (2026-09-28) Preview no 
 production launches: each environment has its own function with its own concurrency slot and
 async queue, and the ceiling is split between them (22 + 8) instead of shared, so neither
 needs a lock or can take the other's room. Preview can still spend its own 8 engines for up to
-about 4 hours each; that share is the accepted cost of letting every writer test multiplayer.
+about 4 hours each; that share is the accepted cost of letting every writer test multiplayer. Engine and router subnets of their own, with no route to the I/O box
+peer and an ACL fencing engines off from the VPC, and the I/O box's NFS narrowed from both
+whole VPCs to its clients' subnets.
 
 **Still open, most severe first:**
 
 1. The common managed rule set runs in COUNT. Review its matches in `aws-waf-logs-games-play`
    after real play, then flip `common` to BLOCK.
-2. Engines share the admin VPC's subnets (defence in depth; their egress is now 443-only), run
-   as root with a writable root filesystem, and receive the preview protection-bypass secret.
-   Fix: dedicated engine subnets, a non-root read-only container, callbacks without the bypass.
+2. Engines run as root with a writable root filesystem and receive the preview
+   protection-bypass secret. Fix: a non-root read-only container, callbacks without the bypass.
+   (Their subnets are closed: engines no longer share the dev fleet's subnets and cannot route
+   to the I/O box's NFS export; see chain item 7.)
 3. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
    private key only the lobby holds and verify with its public key in the router (Ed25519),
    so a compromised router can no longer mint tokens.

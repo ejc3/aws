@@ -178,13 +178,17 @@ resource "aws_route_table_association" "subnet_b" {
   route_table_id = aws_route_table.public.id
 }
 
+# The dev fleet's subnets: jumpboxes, the metal boxes and nextjs-dev live here and nowhere
+# else in this VPC. Only these carry the peer route to the I/O box (the public route table
+# above), and io-box.tf admits NFS from exactly their CIDRs. The games subnets
+# (games-multiplayer.tf) are deliberately NOT in this list: they run code reachable from the
+# internet and have their own route table with no peer route.
+#
 # One subnet per AZ, so placing a box in an AZ is a single variable
 # (e.g. firecracker_availability_zone).
 locals {
-  subnet_ids_by_az = {
-    (aws_subnet.subnet_a.availability_zone) = aws_subnet.subnet_a.id
-    (aws_subnet.subnet_b.availability_zone) = aws_subnet.subnet_b.id
-  }
+  dev_fleet_subnets = [aws_subnet.subnet_a, aws_subnet.subnet_b]
+  subnet_ids_by_az  = { for s in local.dev_fleet_subnets : s.availability_zone => s.id }
 }
 
 # Data source for availability zones

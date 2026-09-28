@@ -230,7 +230,10 @@ historical and must not be reused. Terraform creates its VNC password.
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
-the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly.
+the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
+fleet's subnets (`10.0.1.0/24`, `10.0.2.0/24`) route to the peer. The games router and match
+engines have their own subnets in the same VPC (`10.0.64.0/22`) with no peer route
+(`docs/games-multiplayer.md`).
 
 ```text
 GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> disposable Spot runners
@@ -550,6 +553,15 @@ new parallel boxes receive a bounded soft automount:
 Use it for bulk scratch, caches, and reproducible artifacts. Do not put the only copy of
 source or results there: every stop creates a new empty filesystem. Clients idle-unmount
 after ten minutes so a stopped server does not block boot or hang a shell indefinitely.
+
+NFS (2049) is admitted only from the subnets its clients live in,
+`local.io_box_nfs_client_cidrs` in `io-box.tf`: the dev fleet's `10.0.1.0/24` and `10.0.2.0/24`,
+and the parallel boxes' `172.31.48.0/20` in us-west-2d. It is never a whole VPC: a security
+group cannot be referenced across the inter-region peer, so the source CIDR is the only
+filter. A new NFS client in another subnet needs that subnet added there
+(`scripts/test-io-box-nfs.py` fails until it is). The export line in `/etc/exports.d` is
+rendered from the same list, but only when the box is rebuilt: `user_data` is ignored after
+creation, so until then the security group is what enforces it.
 
 The I/O watchdog queries CPU, disk bytes, and network bytes over the same intended 12-hour
 window. A returned five-minute point with CPU at least 5%, disk I/O at least 1 MiB, or
