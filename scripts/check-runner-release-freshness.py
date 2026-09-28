@@ -29,6 +29,23 @@ def pinned_version(source):
     return pins[0]
 
 
+def pinned_app_version(source):
+    """The app runners' pin (runner-app/bootstrap.sh). It must equal the fcvm pin, so the one
+    freshness verdict covers both fleets."""
+    pins = re.findall(r"^RUNNER_VERSION='([^']+)'$", source, re.M)
+    if len(pins) != 1:
+        raise ValueError("expected exactly one literal RUNNER_VERSION in the app runner bootstrap")
+    version(pins[0])
+    return pins[0]
+
+
+def pinned_versions():
+    pin = pinned_version((ROOT / "runner-autoscale.tf").read_text())
+    if pinned_app_version((ROOT / "runner-app" / "bootstrap.sh").read_text()) != pin:
+        raise ValueError("runner-app/bootstrap.sh and runner-autoscale.tf pin different runner versions")
+    return pin
+
+
 def fetch_releases():
     request = urllib.request.Request(RELEASES_API, headers={
         "Accept": "application/vnd.github+json",
@@ -85,7 +102,7 @@ def assess(pin, releases):
 
 def main():
     try:
-        pin = pinned_version((ROOT / "runner-autoscale.tf").read_text())
+        pin = pinned_versions()
         code, message = assess(pin, fetch_releases())
     except (OSError, ValueError, TypeError, KeyError) as error:
         # Do not echo untrusted API payloads or arbitrary network error strings
