@@ -1642,6 +1642,15 @@ resource "aws_iam_role_policy" "games_mp_sweeper" {
         Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${local.mp_cluster_name}/*"
       },
       {
+        # The router's tasks outlive every hardcap, so only sweeper.py's family check keeps
+        # the age sweep off them; this Deny is the same backstop the launch function has.
+        Sid       = "NeverStopTheRouter"
+        Effect    = "Deny"
+        Action    = "ecs:StopTask"
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:ResourceTag/games-role" = "router" } }
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.games_mp_sweeper.arn}:*"

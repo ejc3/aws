@@ -278,11 +278,13 @@ class TerraformWiringTests(unittest.TestCase):
         for key, value in [("GRACE_SEC", "600"), ("DEFAULT_LIMIT_SEC", "7200"), ("MAX_HARDCAP_SEC", "14400")]:
             self.assertRegex(self.tf, r'%s\s*=\s*"%s"' % (key, value))
 
-    def launch_statement(self, sid):
-        """One statement of the launch function's policy (the only RunTask grant), by braces."""
-        policy = re.search(r'^resource "aws_iam_role_policy" "games_mp_launch" \{\n.*?^\}', self.tf,
+    def launch_statement(self, sid, resource="games_mp_launch"):
+        """One statement of the launch function's policy (the only RunTask grant), or another
+        role policy's, by braces."""
+        policy = re.search(r'^resource "aws_iam_role_policy" "%s" \{\n.*?^\}' % resource, self.tf,
                            re.S | re.M).group()
         at = re.search(r'Sid\s*=\s*"%s"' % sid, policy)
+        self.assertIsNotNone(at, "%s has no %s statement" % (resource, sid))
         begin, depth = policy.rindex("{", 0, at.start()), 0
         for i in range(begin, len(policy)):
             depth += {"{": 1, "}": -1}.get(policy[i], 0)
@@ -345,6 +347,13 @@ class TerraformWiringTests(unittest.TestCase):
         service = re.search(r'resource "aws_ecs_service" "games_mp_router" \{.*?\n\}', self.tf, re.S).group()
         self.assertRegex(service, r'propagate_tags\s*=\s*"SERVICE"')
         self.assertIn('"games-role" = "router"', service)
+
+    def test_the_sweeper_is_denied_the_router_too(self):
+        # Router tasks are older than any hardcap: only this Deny backs up sweeper.py's family check.
+        block = self.launch_statement("NeverStopTheRouter", "games_mp_sweeper")
+        self.assertRegex(block, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(block, r'Action\s*=\s*"ecs:StopTask"')
+        self.assertIn('"aws:ResourceTag/games-role" = "router"', block)
 
     def test_router_accepts_a_list_of_envs(self):
         self.assertIn('{ name = "MP_ENVS", value = join(",", var.mp_router_envs) }', self.tf)
