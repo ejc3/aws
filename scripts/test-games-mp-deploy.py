@@ -792,9 +792,14 @@ class TerraformTests(unittest.TestCase):
     def test_preview_builds_can_push_only_preview_images(self):
         policy = block(DEPLOY, "aws_iam_role_policy", "games_mp_codebuild_preview")
         self.assertIn("Resource = local.games_mp_preview_repo_arns", statement(policy, "PushPreviewImages"))
-        # Exactly the shared preview engine repository: not the legacy per-game ones, never games/*.
-        self.assertIn("games_mp_preview_repo_arns    = [aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn]", DEPLOY)
-        self.assertIn('games_mp_production_repo_arns = [aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].arn, aws_ecr_repository.games_mp["games/mp-router"].arn]', DEPLOY)
+        # The shared preview engine repository and (for the switch) the legacy preview ones; never games/*.
+        preview = re.search(r"games_mp_preview_repo_arns = concat\((.*?)\n  \)", DEPLOY, re.S).group(1)
+        self.assertIn("aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn", preview)
+        self.assertIn('"${local.mp_engine_channels.preview.repository_prefix}${id}-engine"', preview)
+        self.assertNotIn("channels.main", preview)
+        self.assertNotIn("mp-router", preview)
+        production = re.search(r"games_mp_production_repo_arns = concat\((.*?)\n  \)", DEPLOY, re.S).group(1)
+        self.assertNotIn("channels.preview", production)
         for name in ("GAMES_MP_ENGINE_REPOSITORY", "GAMES_MP_MAX_CPU", "GAMES_MP_MAX_MEMORY"):
             self.assertIn(name, block(DEPLOY, "aws_codebuild_project", "games_mp_images_preview"))
             self.assertIn(name, block(BRINGUP_TF, "aws_codebuild_project", "games_mp_images"))

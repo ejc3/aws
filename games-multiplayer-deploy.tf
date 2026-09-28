@@ -72,10 +72,20 @@ locals {
     } } }
   }
 
-  # What each build role pushes to: its channel's engine repository (and main's router), never
-  # the legacy per-game repositories.
-  games_mp_production_repo_arns = [aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].arn, aws_ecr_repository.games_mp["games/mp-router"].arn]
-  games_mp_preview_repo_arns    = [aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn]
+  # What each build role pushes to: its channel's engine repository (and main's router), plus,
+  # FOR THE SWITCH ONLY, the legacy per-game repositories of that channel. A build already
+  # running when this is applied carries the previous driver, which pushes there; revoking the
+  # access mid-build would fail it, and a failed commit is never rebuilt. New builds never push
+  # there. Drop the legacy entries in a later change, once no build from before the switch can
+  # still be running (a build lasts minutes).
+  games_mp_production_repo_arns = concat(
+    [aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].arn, aws_ecr_repository.games_mp["games/mp-router"].arn],
+    [for id in local.mp_legacy_engine_games : aws_ecr_repository.games_mp["${local.mp_engine_channels.main.repository_prefix}${id}-engine"].arn],
+  )
+  games_mp_preview_repo_arns = concat(
+    [aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn],
+    [for id in local.mp_legacy_engine_games : aws_ecr_repository.games_mp["${local.mp_engine_channels.preview.repository_prefix}${id}-engine"].arn],
+  )
 }
 
 # -------------------------------------------------------------------------------------
