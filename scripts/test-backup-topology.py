@@ -114,11 +114,18 @@ class BackupTopologyTests(unittest.TestCase):
             self.assertIn(fragment, protected)
             self.assertIn(fragment, jumpbox)
 
-    def test_only_two_encrypted_roots_get_a_cmk_hop(self):
+    def test_only_the_aws_ebs_encrypted_roots_get_a_cmk_hop(self):
+        # Membership here tracks which roots are actually encrypted with the account's
+        # default alias/aws/ebs key (unshareable cross-account), not a fixed headcount.
+        # fcvm-metal-arm joined this list on 2026-09-19: the 2026-09-13 AZ move rebuilt its
+        # root from an aws_ami_from_instance image, which landed on aws/ebs instead of
+        # whatever key the volume had before.
         hop = compact_list(SECURITY, "backup_cmk_hop_volume_arns")
-        self.assertIn("local.nextjs_root_volume_arn", hop)
-        self.assertIn("aws_instance.jumpbox_2[0].root_block_device[0].volume_id", hop)
-        for unwanted in ("arm_persistent_volume_arn", "x86_persistent_volume_arn", "jumpbox_home"):
+        for wanted in ("local.nextjs_root_volume_arn",
+                       "aws_instance.jumpbox_2[0].root_block_device[0].volume_id",
+                       "local.arm_persistent_volume_arn"):
+            self.assertIn(wanted, hop)
+        for unwanted in ("x86_persistent_volume_arn", "jumpbox_home"):
             self.assertNotIn(unwanted, hop)
         checkpoint = resource("aws_backup_vault", "ejc3_backup_dr_cmk")
         self.assertRegex(checkpoint, r"provider\s*=\s*aws\.dr\b")

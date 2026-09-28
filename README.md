@@ -13,7 +13,8 @@ the isolated staging/recovery account, Cloudflare, and several regions. The plat
 - autoscaled ARM64 and x86 GitHub Actions runners;
 - backups, cross-region/cross-account recovery, and cost alerts;
 - credential-free Terraform validation in GitHub, with live plans confined to admin hosts;
-- scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access.
+- scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access
+  (Claude models, plus two named DeepSeek models for opencode on the metal boxes).
 
 ## Start here
 
@@ -127,6 +128,11 @@ needs:
   `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
   repository permission is `Webhooks: Read and write` on `ejc3/fcvm`, used by the
   `integrations/github` provider to own the runner webhook;
+- for games multiplayer, the `games/colton-games-read` Secrets Manager value: a
+  fine-grained token that Colton creates as `CoderColton`, limited to
+  `colton-games` with Contents read-only. The plan-time preflight reads it, so create the
+  empty secret with a targeted apply first; the exact steps are under *First time only* in
+  [`docs/games-multiplayer.md`](docs/games-multiplayer.md);
 - current ARM64 and x86 runner AMIs tagged `Purpose=github-runner`;
 - the Google OAuth callback
   `https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback` when Google login is enabled.
@@ -148,20 +154,38 @@ state or a different account is not a supported bootstrap and can collide with o
 live infrastructure. Recover the backend state first, or inventory and import every
 pre-existing resource before any full apply.
 
-The alert address, runner PAT, and SSH-key backup use Terraform-managed containers whose
-payloads are intentionally kept out of Terraform state. For a true cold start, create
-those three containers only after state/import reconciliation is complete:
+The alert address, runner PAT, SSH-key backup and the two app-runner controller tokens use
+Terraform-managed containers whose payloads are intentionally kept out of Terraform state.
+For a true cold start, create those containers only after state/import reconciliation is
+complete. `enable_runner_app_webhooks=false` keeps this apply from reading the controller
+tokens, which do not exist yet:
 
 ```bash
-terraform apply \
+terraform apply -var enable_runner_app_webhooks=false \
   -target=aws_ssm_parameter.alert_email \
   -target='aws_ssm_parameter.github_runner_pat[0]' \
-  -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key
+  -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["CoderColton/colton-games"]' \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]'
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
-console or AWS CLI without printing their values. This is a one-time secret-payload
-bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
+console or AWS CLI without printing their values.
+
+The runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` also need one
+controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
+containers created above, from `runner-repos.tf`; Terraform never holds the value). The full
+apply reads both to create the repos' webhooks, so populate them before it. Each is a
+fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
+by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
+org admin for `dolphin-labs`. Put each value without echoing it:
+
+```bash
+read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+  --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin; unset T
+```
+
+This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
 
 Do not create the Workers Builds control-token container in this generic bootstrap. Its
@@ -198,17 +222,21 @@ historical and must not be reused. Terraform creates its VNC password.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 400 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.large` | 200 GB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.xlarge` | 200 GB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
+| `gpu-box` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Launched from `nextjs-dev` with `gbox`; terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
-the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly.
+the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
+fleet's subnets (`10.0.1.0/24`, `10.0.2.0/24`) route to the peer. The games router and match
+engines have their own subnets in the same VPC (`10.0.64.0/22`) with no peer route
+(`docs/games-multiplayer.md`).
 
 ```text
-GitHub workflow jobs -> API Gateway -> Lambda -> disposable Spot runners
+GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> disposable Spot runners
 
 Cloudflare Access -> outbound tunnel -> nextjs-dev -> 127.0.0.1 project ports
 
@@ -240,7 +268,9 @@ address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, 
 `fcvm-ec2` admin key, so ordinary dev-to-dev access does not grant an admin shell on a
 jumpbox. Dev hosts have no authorized dev-to-jumpbox login or privileged delegation path;
 the public SSH endpoint is still network-reachable. `pbox` launches the parallel boxes itself with a tag-scoped IAM
-grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gone.
+grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gone. `gbox` launches the GPU test
+box the same way (`gpu-box.tf`); both grants require their own launch template, so the two
+cannot be combined into a launch neither allows.
 
 The metal, Next.js, and temporary-compute roles use a shared SSM connectivity policy
 without account-wide Parameter Store reads. Application parameter access is explicit;
@@ -292,6 +322,88 @@ repository on this host during the preceding 30 days, its local Git checkout has
 during that period, or its worktree has uncommitted changes. Only `github.com/ejc3/*`
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
+
+### SSH back to the Macs
+
+From `fcvm-arm` as `ubuntu`, use these distinct reverse-tunnel aliases:
+
+| Command | Listener on fcvm-arm | Destination |
+|---|---|---|
+| `ssh mac` | `127.0.0.1:2222` | The original Mac, as `ejcampbell` |
+| `ssh macbook` | `127.0.0.1:2223` | EJ's MacBook Pro, as `ejcampbell` |
+
+`mac-reverse-tunnels.tf` installs the aliases only in the ARM bootstrap, in
+`~/.ssh/config.d-mac-tunnels`, and pins the MacBook's verified public host key in
+`~/.ssh/known_hosts.mac-tunnels`. Its installer migrates the old standalone alias blocks
+out of `~/.ssh/config` and is safe to rerun. Both aliases use the pre-existing
+`~/.ssh/to-mac` key on the ARM box's persistent root; Terraform does not rotate or copy
+that private key. Restoring it is a prerequisite on an entirely fresh ARM root.
+
+The Macs initiate the outbound tunnels. On EJ's MacBook Pro, the
+`com.ejcampbell.fcvm-macbook.sshd` and `com.ejcampbell.fcvm-macbook.tunnel` LaunchAgents
+start at user login and reconnect the tunnel after failures. The route is
+`fcvm-arm 127.0.0.1:2223 -> MacBook 127.0.0.1:22222`; the MacBook's SSH listener accepts
+only public-key login for `ejcampbell`. Keep the Mac awake and online. These are local
+Mac services, not the optional EC2 Mac, and no AWS inbound port is needed.
+
+The MacBook also has Peekaboo 4.4.0 installed for screen control over this same SSH
+connection. Its menu-bar app starts at user login, with Screen Recording,
+Accessibility, and Event Synthesizing enabled. The `peekaboo` command is available
+in noninteractive SSH sessions and explicitly uses that app's local Bridge socket.
+Keep the Mac logged in, awake, and unlocked for UI control.
+
+```bash
+# Run from fcvm-arm; the screenshot is initially saved on the Mac.
+ssh macbook 'peekaboo permissions status'
+ssh macbook 'peekaboo see --mode screen --no-elements --path /tmp/macbook-screen.png'
+scp macbook:/tmp/macbook-screen.png .
+```
+
+For UI actions, `peekaboo see --app <app> --window-title <title> --json` returns a
+snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo type`,
+and `peekaboo press`; inspect the UI again after each action. These Mac-local app
+permissions and login services are configured on the Mac, not by AWS Terraform.
+
+### macOS VMs on the MacBook (ejc3, skevh)
+
+The MacBook runs two [Tart](https://tart.run) macOS VMs, `ejc3` for EJ and `skevh` for
+Steve, cloned from `ghcr.io/cirruslabs/macos-tahoe-base`. Each signs its `admin` account
+in at boot, so it always has a desktop, and runs its own `cloudflared` connector for its
+own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
+
+| VM | Screen Sharing | SSH | Access |
+|---|---|---|---|
+| `ejc3` | `ejc3-mac.cc-games.dev` | `ejc3-mac-ssh.cc-games.dev` | EJ only (Google or one-time PIN) |
+| `skevh` | `skevh-mac.cc-games.dev` | `skevh-mac-ssh.cc-games.dev` | GitHub members of `dolphin-labs-hq` |
+
+```bash
+cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
+open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-admin-password
+ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
+```
+
+SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
+`nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
+`nextjs_user_keys` in `skevh`. The `admin` password is used only for Screen Sharing; SSH never
+uses it. It is the generated secret `mac-vm-<vm>-admin-password`: both running guests accept it
+and reject the image's `admin`/`admin` (checked 2026-09-26 with `dscl . -authonly admin ...`
+through `tart exec -i <vm>`, reading the password from stdin). Terraform only STORES the value.
+Nothing applies it inside a guest, so a VM created or rebuilt from the Tart image starts with
+the image default until someone sets the secret by hand on the MacBook and re-runs that check.
+Access is the real gate: both hostnames sit behind Cloudflare Access with origin enforcement.
+Inside each VM, the connector is a launchd daemon that
+reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
+
+On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
+`tart run --no-graphics <vm>` with KeepAlive while `ejcampbell` is logged in; Tart needs an
+unlocked login keychain, so the VMs start after that login, and after a reboot only once
+FileVault is unlocked at the machine. Local admin from the MacBook:
+
+```bash
+tart list
+tart exec <vm> <command>      # through the guest agent, no network needed
+tart run --vnc <vm>            # watch the screen (stop the LaunchAgent first)
+```
 
 ## Start a Codex session
 
@@ -442,6 +554,15 @@ Use it for bulk scratch, caches, and reproducible artifacts. Do not put the only
 source or results there: every stop creates a new empty filesystem. Clients idle-unmount
 after ten minutes so a stopped server does not block boot or hang a shell indefinitely.
 
+NFS (2049) is admitted only from the subnets its clients live in,
+`local.io_box_nfs_client_cidrs` in `io-box.tf`: the dev fleet's `10.0.1.0/24` and `10.0.2.0/24`,
+and the parallel boxes' `172.31.48.0/20` in us-west-2d. It is never a whole VPC: a security
+group cannot be referenced across the inter-region peer, so the source CIDR is the only
+filter. A new NFS client in another subnet needs that subnet added there
+(`scripts/test-io-box-nfs.py` fails until it is). The export line in `/etc/exports.d` is
+rendered from the same list, but only when the box is rebuilt: `user_data` is ignored after
+creation, so until then the security group is what enforces it.
+
 The I/O watchdog queries CPU, disk bytes, and network bytes over the same intended 12-hour
 window. A returned five-minute point with CPU at least 5%, disk I/O at least 1 MiB, or
 network I/O at least 64 MiB keeps it up. Missing I/O series currently count as zero, so
@@ -479,6 +600,29 @@ the two launch templates -- while the instances themselves are deliberately not 
 That removes the old hazard entirely: an unrelated full apply can no longer propose
 terminating a box in the middle of a live job.
 
+## On-demand GPU box
+
+One small NVIDIA instance for measuring browser games on real graphics hardware; every dev
+box renders WebGL in software. From `nextjs-dev`:
+
+```bash
+gbox up        # launch from its launch template: tries g4dn.xlarge, g5.xlarge, g6.xlarge,
+               # g4dn.2xlarge in each us-west-2 AZ until one has capacity
+gbox status    # type, GPU, and its on-box shutdown timer
+gbox ssh
+gbox down      # terminate; nothing on it persists
+```
+
+Terraform owns the launch template, the security group (SSH in from `nextjs-dev`'s Elastic
+IP only; out only to web, DNS and NTP, so the box cannot reach the fleet's NFS scratch) and the
+tag-scoped managed policy `gpu-box-control` on `nextjs-dev-role`; the instance is never in
+state. The grant launches only this template, only those four types, only the template's root
+disk shape, and only terminates the tagged box. It costs money only while it runs: the
+parallel-box watchdog terminates it after 30 minutes below 5% CPU and at `gpu_box_max_hours`
+(4) from launch, and the box arms its own shutdown timer as a backup. The account needs at least
+8 vCPUs of the us-west-2 "Running On-Demand G and VT instances" quota (`L-DB2E81BA`) for the
+largest type.
+
 ## Temporary EBS for agents
 
 Permanent fleet infrastructure remains Terraform-managed. As a deliberate runtime
@@ -510,6 +654,20 @@ ndev
 `cloudflared` dials out to Cloudflare, so there are no inbound web ports and `next dev`
 remains bound to `127.0.0.1`.
 
+**Deleting a checkout unpublishes it.** `ndev@<label>` has an `ExecCondition` that skips
+the start when the published directory is gone, leaving the unit inactive instead of
+restarting it. `ndev-prune` (root) then removes every project whose directory no longer
+exists: it disables the unit, deletes its env file and drop-in, and drops every registry row
+that carries its hostname or its directory (so a pinned alias in the other zone goes too),
+then rebuilds each affected zone, restarting a tunnel only if its config changed. A project
+whose directory still exists is never touched, and a pinned route whose directory is gone is
+not re-added at boot. `ndev-register`, `ndev-prune` and the setup script's registry writes
+share one lock (`/var/lib/ndev/.lock`). If a zone's rebuild or restart fails, prune keeps
+that project's records and retries the zone on its next run; if the directory has come back
+by then, the project is published again. It runs on every setup run, in `setup-sync` before
+the health check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it
+immediately. DNS needs nothing because each zone has a single wildcard record.
+
 **The zone follows the account, not a flag.** `colton` and `connor` publish to
 `https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.
 `/usr/local/bin/ndev-zone` is the single source of truth for user -> zone -> tunnel, and
@@ -521,6 +679,31 @@ Each zone has its own tunnel, its own credentials, its own registry, and its own
 project's URLs down. Access gates both: `cc-games.dev` through Google or one-time PIN
 against an email allowlist, `dolphin-labs.dev` through GitHub against membership of the
 `dolphin-labs-hq` organization. A separate service token supports non-interactive checks.
+
+**Two deliberate exceptions, both for the family board** (`ejc3/family`, which shows the
+household's day on the living-room TV, an e-ink tablet and phones):
+
+- *A pinned cross-zone hostname.* `family.cc-games.dev` routes to `127.0.0.1:3722`, which is
+  `ejc3`'s `ndev@ejc3-family` service. It is the one hostname on `cc-games.dev` that is not a
+  `colton`/`connor` project: the board is built under `ejc3` but its audience is the kids and
+  the wall screens, who can pass Google sign-in and not the GitHub-org gate. It is declared
+  in `local.nextjs_pinned_routes` (`nextjs-user-data.tf`) and written into the zone registry
+  at boot, not published with `ndev`, so the zone-follows-account rule above still holds for
+  everything anyone can type. Add to that list only for the same reason.
+- *Wall-screen paths with their own Access application.* On `family.cc-games.dev` only,
+  `/tv`, `/ink` and `/api/device/*` are not behind the Google allowlist but behind
+  `cloudflare_zero_trust_access_application.family_wall_screens` (`cloudflare.tf`), because a
+  TV cannot sit through a Google login. Cloudflare lets a request through only from a device
+  enrolled in this account's WARP client by someone on the allowlist (signed in through WARP,
+  so the screen shows no login page), or from the home screen proxy, which adds the
+  `family-wall-screen-proxy` service token (Secrets Manager `family-wall-screen-proxy-access`;
+  it works on these paths and nowhere else). Behind that, the app still pairs each screen:
+  an unpaired screen shows a short code that a signed-in person approves at `/pair` (which
+  stays behind Google). `/_next/*`, the site's compiled assets, bypasses Access in a separate
+  application because the phone pages share it. Everything else on the hostname, and every
+  other `cc-games.dev` hostname, is still behind the Google allowlist. To audit:
+  `curl -I https://family.cc-games.dev/` and `curl -I https://family.cc-games.dev/tv` must
+  both be a 302 to the Access login; `/_next/static/...` is expected to be a 200.
 
 Once credentials exist and their units have been enabled, services and remote-control
 agents start at boot. A reboot restores the published URLs without another interactive
@@ -709,11 +892,15 @@ after its protected resources exist; `prevent_destroy` is intended to stop that 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
 Labels select the architecture; the launcher tries several metal families when capacity is
 scarce, moving a family that just failed for capacity to the back of that order. Each new
-instance carries `RunnerRegistrationProtocol=ddb-v1`. After GitHub configuration, bootstrap
+instance carries `RunnerRegistrationProtocol=ddb-v2`. After GitHub configuration, bootstrap
 validates the exact identity in `.runner`, conditionally records `State=registered` under its
 instance ARN in DynamoDB, and starts the service only after that identity is confirmed.
+Registrations are ephemeral, one job each, but a host whose job succeeded can take another:
+it waits three minutes, and a `completed` event with queued work behind it, or a later
+`queued` event, claims the host through a conditional update of its row and brokers it a
+fresh instance-bound credential. A host whose job failed, or that nobody claims, powers off.
 
-Cleanup runs every five minutes. A registered `ddb-v1` runner is checked by its exact
+Cleanup runs every five minutes. A registered `ddb-v1` or `ddb-v2` runner is checked by its exact
 GitHub runner id, and one with no row is reaped after its lease through a conditional
 `State=reaping` claim on that row, so a bootstrap arriving at the same moment finds the row
 taken and does not start the service. A missing row beside evidence that the runner did
@@ -722,7 +909,8 @@ and the instance is held to the age ceiling rather than reaped. Instances launch
 existed keep the roster-based rules: a renewed lease or a `RunnerSeenAt` stamp holds them
 on roster absence, and a readable roster that has never listed one expires its lease.
 Cleanup also reaps stalled launches, terminates jobs running for more than three hours,
-and counts queued jobs to retry scale-up.
+counts queued jobs to retry scale-up, and deregisters, then terminates, an idle registered
+runner whose architecture has nothing queued.
 
 A runner instance lives at most **13 hours 30 minutes**, checked on the five-minute poll,
 so the observed maximum is that plus one interval. Past 12 hours it drains:
@@ -888,9 +1076,12 @@ Terraform.
   original `us-east-1` history retain their lifecycles; neither receives new scheduled
   fleet copies. The active recovery pipeline below replaces the old staging-copy
   path without replacing live disks or deleting that existing history.
-- Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
-  `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
-  through SNS/email.
+- Daily cost reports, AWS Budget notifications (`daily-cost-alert`, all services, $200/day;
+  `ec2-daily`, EC2 compute + EC2-Other, $150/day), runner-count/age alarms (from the
+  `GitHubRunners` metrics the runner cleanup publishes every 5 minutes, with
+  `runner-cleanup-silent` when it stops), the per-repo `too-many-app-runners-<label>` alarms,
+  the `runner-scale-up-starved` alarm, and instance-status alarms publish through SNS/email.
+  Account billing alerts are off, so nothing here reads `AWS/Billing`.
 - The original jumpbox's protected home volume and the fully reproducible `jumpbox-2`
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
@@ -1132,7 +1323,7 @@ substitute for disabling supported features. Regional handler support must still
 verified during deployment: schema validation is not proof that each regional service
 accepts every feature. Do not silently omit an unsupported feature or accept an
 unreviewed provider upgrade. See [CreateDetector defaults](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_CreateDetector.html)
-and [Cloud Control resource](https://registry.terraform.io/providers/hashicorp/aws/5.100.0/docs/resources/cloudcontrolapi_resource).
+and [Cloud Control resource](https://registry.terraform.io/providers/hashicorp/aws/6.64.0/docs/resources/cloudcontrolapi_resource).
 The pinned generic resource has no import handler. Preserve versioned Terraform state;
 if its state entry is lost, recover the reviewed state version rather than creating a
 second detector. A failed live-property postcondition requires an administrator to
@@ -1295,6 +1486,34 @@ are not yet available, and this risk acceptance does not mean the packages are f
 
 Keep scanners, alerts and the remediation backlog enabled. Preserve the dev-to-admin
 credential boundary, credential-free ordinary CI, protected backups and Access policies.
+
+**Outside users.** Two surfaces now let people outside the owner reach AWS resources this
+repo runs. Unlike the dev hosts, they are not behind Cloudflare Access, and their users are
+not trusted: multiplayer players get no shell anywhere, while a runner job gets root on its own
+disposable VM (the `runner` account has passwordless sudo), so the boundary there is the VM,
+its instance role and its network, not the account:
+
+- **Games multiplayer.** The public lobby at `cc-games.app` launches Fargate match engines,
+  and anyone on the internet can connect to `play.cc-games.app`, an internet-facing ALB.
+  A WAF (per-IP rate limit, AWS managed rules), join tokens, an origin allowlist, per-IP
+  limits in the router and router-only engine ingress protect it. The engines' task role has
+  no permissions and their egress is HTTPS-only. Their images deploy automatically: a push
+  to colton-games `main` reaches production engines (and the router, and mp migrations) with
+  no human step, and any branch's code runs in preview engines only. The lobby's launch limits are pinned by
+  Terraform. The lobby holds no ECS permission: it can only invoke a launch function that
+  builds every `RunTask` from fixed settings and refuses above AWS's own ceiling on concurrent
+  engines (smaller for preview). The sweeper enforces that ceiling and each task's lifetime
+  (about 4h15) every minute as a backstop, and only while its sweeps and `StopTask` calls
+  succeed. See the threat model in
+  [`docs/games-multiplayer.md`](docs/games-multiplayer.md).
+- **Runners for other repos.** Every writer on `CoderColton/colton-games` and
+  `dolphin-labs-hq/dolphin-labs` can run any code on our x86 spot runner VMs. They are
+  ephemeral and have no inbound access, and the tokens that register them are out of reach.
+  See "Threat model: runners for other repos" in [`GITHUB-RUNNERS.md`](GITHUB-RUNNERS.md).
+
+For both, prioritize cost abuse (launches and VMs someone else can start), anything that
+reaches an admin credential or another tenant's work, and anything that turns a public
+request into host execution. Each document lists its open gaps and how to shut it off.
 
 ### Incremental monitoring cost
 
@@ -1756,13 +1975,16 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Shared dev setup | `dev-instance-common.tf`, `dev-selfupdate.tf`, `dev-hop-key.tf`, `dev-ebs.tf` |
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
-| GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
+| GitHub runners and OIDC | `runner-autoscale.tf`, `runner-webhook-front.tf`, `runner-repos.tf` (per-repo tokens for the other repos' runners), `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
+| Colton Games' production domains on Vercel (`cc-games.app`, with `ccgames.app` and `colton-games.com` redirecting) | `vercel.tf`, `vercel-cc-games.tf` |
+| tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
+| Games multiplayer (ECS match engines, `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,

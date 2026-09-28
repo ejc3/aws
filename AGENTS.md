@@ -106,14 +106,18 @@ with Account API Tokens Read+Write. It mints scoped tokens on demand -- that is 
 `dolphin-labs.dev` was bought without a browser:
 
 ```bash
+# Send the token on curl's stdin, never on its command line: argv is readable by every local
+# user through /proc/<pid>/cmdline, and this token can mint other tokens.
+{ set +x; } 2>/dev/null
 M=$(aws secretsmanager get-secret-value --secret-id cloudflare-account-token \
       --region us-west-1 --query SecretString --output text)
 # Registrar Domains Admin = 136d0be1ddc64eaf8516fa6994abfad4
-curl -4 -X POST -H "Authorization: Bearer $M" -H 'Content-Type: application/json' \
+printf 'Authorization: Bearer %s\n' "$M" | curl -4 -X POST -H @- -H 'Content-Type: application/json' \
   -d '{"name":"registrar-agent","policies":[{"effect":"allow",
        "resources":{"com.cloudflare.api.account.<ACCOUNT_ID>":"*"},
        "permission_groups":[{"id":"136d0be1ddc64eaf8516fa6994abfad4"}]}]}' \
   https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/tokens
+unset M
 ```
 
 Three things that cost time and are not guessable:
@@ -200,7 +204,9 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 
 - The dev boxes are the cost. Two metal spot instances dominate; the small boxes are noise
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
-  box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
+  box. `parallel-box-watchdog.tf` terminates burst compute and the GPU test box
+  (`gpu-box.tf`) after 30m CPU idle, and the GPU box at 4h from launch (its own shutdown
+  timer is only a backup)
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
 - There is no application database. DynamoDB is limited to Terraform locking and runner
   registration claims. Older notes about Aurora Serverless auto-pause no longer apply
@@ -239,6 +245,54 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - Cache auth state without re-checking (breaks session expiration)
 - Reintroduce a Make/container wrapper around Terraform
 - **NEVER add Claude Code attribution to git commits** - no "Generated with Claude Code" or "Co-Authored-By: Claude" in commit messages
+
+### Code review
+
+Greptile reviews pull requests. `.greptile/` holds its settings, rules and context, and
+`scripts/test-greptile-config.py` pins them.
+
+- A push does not start a review. Comment `@greptileai review`: Greptile reacts 👍 and runs
+  the `Greptile Review` check, whose summary reads `N files reviewed, M comments added`.
+- Findings arrive as inline comments. `main` requires conversation resolution, so answer
+  each one and resolve its thread before merging, then ask for another review. A clean
+  re-review adds no comments and no review object.
+- Greptile writes its summary into the PR description below `<!-- greptile_comment -->`.
+  Edit only the text above that marker.
+- Greptile read #135's instructions from the PR's head commit, so a PR that edits
+  `.greptile/` changes its own review. Changing a rule's severity, scope or text, the
+  instructions, `files.json` or `rules.md` fails the pin test until the matching pin in
+  `scripts/test-greptile-config.py` changes in the same PR.
+
+**Stop rule: do not churn on reviewer bots.** Codex, CodeRabbit and Greptile always find
+another edge case, so "no findings" is not a goal. On 2026-09-27/28 about 8 hours went into
+review loops: 22 Codex rounds on one PR, and 5 rounds on a one-word fix (#179) spent hardening
+its *test* while the real fix sat unapplied and the repo stayed drifted. Per PR:
+
+1. **Security and correctness P1s:** fix them, with tests. Care here is the point.
+2. **P2s that change what production does:** fix them.
+3. **Tests-of-tests, doc wording and hypothetical edges:** at most one fix round, then a
+   follow-up PR. They never block the merge.
+4. **Merge and apply** once CI is green and the P1s are addressed. Do not re-request review
+   "once more" for a small change. Resolve a thread you disagree with by replying with the
+   evidence.
+5. **A live fix ships first.** For drift, an outage or a found security hole, harden in a
+   follow-up.
+6. **After about three review rounds,** stop and tell the owner what is left and whether it
+   matters.
+
+**Mutation checks: bounded.** Breaking the code to show a new test fails is worth doing, but only
+for what changed. On 2026-09-28 an agent spent 15+ minutes re-running a full 48-mutation set
+(each a whole timing-sensitive test file) after a three-line fix.
+
+- Check only the mutations for the tests you added or changed in this commit, typically 1 to 5.
+  Never re-run the whole historical set.
+- Confirm each mutant really **fails**. A crash, a mutation that did not apply, or a skipped test
+  is not "caught". Check that the file actually changed and that the test output shows a
+  failure, and report a survivor as a survivor.
+- Keep a mutation run to a few minutes. If it would take longer, run the few mutations that
+  matter and say so.
+- Mutation checks are a local, per-change check. There is no CI mutation job, and none is
+  needed per PR.
 
 ### Common Pitfalls
 
@@ -307,15 +361,17 @@ The long-lived development and administration instances are:
 | jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
 | fcvm-metal-arm | c7gd.metal (64 vCPU) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
-| nextjs-dev | t4g.medium (2 vCPU / 4GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
+| nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
 reported `capacity-not-available` and the kids' URLs were simply down with no ETA. Spot
 placement score was 3/10 in every US region and for every alternative instance type, so
-neither moving region nor changing family was a way out. Sized down large -> medium so the
-durable option costs about what the unreliable one did (~$29/mo vs ~$24/mo spot).
+neither moving region nor changing family was a way out. It was first sized down large ->
+medium so the durable option cost about what the unreliable one did (~$29/mo vs ~$24/mo spot),
+then doubled to t4g.xlarge on 2026-09-15 (#139) once four accounts shared it: at 4 GB it paged
+until the disk saturated.
 
 ### Shape of the shared-box design
 
@@ -356,6 +412,11 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
 - `ndev` inside a project publishes it: registers the hostname and starts a systemd unit
 - Each server runs as `ndev@<user>.service`; agents run as `claude-rc@` and `codex-rc@`.
   All are enabled at boot -- a reboot restores every URL with nobody logged in
+- A deleted project directory must not leave a unit restarting forever: `ndev@`'s
+  `ExecCondition` skips it, and `ndev-prune` (setup, setup-sync, nightly timer) unpublishes
+  it -- unit, env, drop-in, every registry row carrying its hostname or dir (pinned aliases
+  included) and ingress. It keys only on the recorded `DIR` being
+  gone; never widen that to anything a live checkout could match
 - `cloudflare.tf` holds the tunnel, wildcard DNS, Access app and policies. A service token
   (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access.
   Terraform also owns the account Workers subdomain and Colton Games Builds configuration
@@ -443,9 +504,23 @@ reflog movement and dirty worktrees seed checkouts automatically. Do not use Cla
 `history.jsonl` as the activity signal: `claude-code-sync` merges it across ARM and x86;
 the launcher reads it only as a bounded index of possible nested roots and still requires
 host-local Git activity. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
-uses t-claude's default path-derived sessions. It is guarded by a verified pinned
-t-claude implementation and live `claude auth status`, so credentials remain personal and
-Terraform never seeds or copies them.
+uses t-claude's default path-derived sessions. t-claude follows its `main` branch, so the unit
+is guarded by an integrity check (`zsh -n` on the installed file) rather than a fixed hash,
+and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
+copies them.
+
+Every folder that gets a window at boot also gets a Codex thread, so it shows up in the Codex
+app: `fcvm-codex-seed.service` reads the launcher's list (`~/.local/state/fcvm-claude/repos`)
+and seeds one message per folder through the running Codex daemon, and a timer retries until
+Codex is logged in. nextjs-dev does the same per user with `codex-seed@<user>`, for
+`local.nextjs_codex_seed_users` only (Colton, Connor and ejc3). A folder that already has a
+thread is only checked.
+
+The tmux these sessions run is `tmux-scroll` (t-claude prefers it), pinned by release tag and
+sha256 in `tmux-scroll.tf`: the metal updater, nextjs-dev's setup and a one-shot SSM install on
+both jumpboxes all use that one pin. **Exception: fcvm-metal-x86.** The pinned release has only
+an aarch64 build, so the x86 box keeps whatever tmux-scroll it already has (its updater logs "no
+pinned build for x86_64") until an x86_64 asset is published and pinned.
 
 All metal repositories run as `ubuntu` and therefore share one tmux server. Keep one
 aggregate systemd service and one cgroup; do not create per-repository units. Stopping or
@@ -473,7 +548,9 @@ Stop/start is the remedy for a wedged box, so recovering it destroys the evidenc
 snapshot with `--latest` first. `dev-diagnostics.tf` now does this automatically on every
 status-check alarm (archived to CloudWatch Logs `/dev-servers/console-capture`, with the
 panic signature quoted in the SNS alert), so the archive should already exist -- check it
-before assuming the cause is unknowable.
+before assuming the cause is unknowable. Private key blocks, including a partial one at
+either end of the buffer, are replaced with `[redacted private key]` before the text is
+matched, archived or emailed: boot-time xtrace has put keys on these consoles before.
 
 The boxes are also configured to make a hang legible rather than silent: `panic_on_oops`
 turns an oops into a reboot (the cmdline carries `panic=-1`) instead of an indefinite
@@ -584,9 +661,12 @@ The ARM, x86, and Next.js dev instances have Elastic IPs for static addressing:
 - IPs persist across stop/start cycles
 - Defined in each instance's .tf file
 
-`io-box` has no EIP and accepts SSH/NFS only from private fleet networks. It receives a
-transient public IPv4 while running for outbound package access, but clients use fixed
-private IP `172.31.48.10` across the inter-region VPC peer.
+`io-box` has no EIP and accepts SSH/NFS only from private fleet networks: SSH from both peered
+VPCs, NFS only from `local.io_box_nfs_client_cidrs` (the dev fleet subnets and the parallel
+boxes' us-west-2d subnet), never a whole VPC, because the games router and engines share the
+us-west-1 VPC. Keep games subnets out of `local.dev_fleet_subnets` and off the peer route. It
+receives a transient public IPv4 while running for outbound package access, but clients use
+fixed private IP `172.31.48.10` across the inter-region VPC peer.
 
 ### Auto-Stop Lambdas
 
@@ -669,7 +749,12 @@ set `firecracker_move_from_instance_id` to its instance ID and `firecracker_avai
 to the target in `firecracker-dev.tf`, merge, and apply from a fresh worktree. Terraform images
 the stopped disk, builds the new box from that image before destroying the old one, moves the
 Elastic IP, and keeps the SSH host keys. The target AZ needs a subnet in
-`local.subnet_ids_by_az` (`main.tf`). The old root volume is left as a rollback copy.
+`local.subnet_ids_by_az` (`main.tf`). The old root volume is left as a rollback copy. Once the
+new box checks out and a completed backup holds the disk as of the move (the new root volume's
+first daily backup, or the old volume's if it ran after the stop), set
+`firecracker_move_from_instance_id` back to `""` and apply, which deletes the move image. While
+it is set, any later replacement boots from that dated image and rolls the disk back to the day
+of the move.
 
 **Volume Swap Procedure** (x86 only, after terraform creates new instance):
 ```bash

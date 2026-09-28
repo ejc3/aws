@@ -2,7 +2,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -43,7 +43,7 @@ locals {
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
   ]
   guardduty_optional_features = concat(local.guardduty_base_optional_features,
-  contains(local.guardduty_ai_analyst_regions, data.aws_region.current.name) ? ["AI_ANALYST"] : [])
+  contains(local.guardduty_ai_analyst_regions, data.aws_region.current.region) ? ["AI_ANALYST"] : [])
   guardduty_runtime_agents = ["EKS_ADDON_MANAGEMENT", "ECS_FARGATE_AGENT_MANAGEMENT", "EC2_AGENT_MANAGEMENT"]
 }
 
@@ -67,7 +67,7 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
   lifecycle {
     prevent_destroy = true
     precondition {
-      condition     = contains(local.guardduty_reviewed_regions, data.aws_region.current.name)
+      condition     = contains(local.guardduty_reviewed_regions, data.aws_region.current.region)
       error_message = "GuardDuty feature availability must be reviewed before adding another Region; do not infer unsupported features from a failed create."
     }
     # The generic provider refreshes properties, not desired_state. Assert the
@@ -253,7 +253,7 @@ resource "aws_sqs_queue_policy" "delivery_failures" {
 # must add posture coverage in the root module when its infrastructure is added.
 resource "aws_iam_role" "config" {
   count = var.posture_enabled ? 1 : 0
-  name  = "security-config-${data.aws_region.current.name}"
+  name  = "security-config-${data.aws_region.current.region}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -338,7 +338,7 @@ resource "aws_securityhub_account" "security" {
 
 resource "aws_securityhub_standards_subscription" "foundational" {
   count         = var.posture_enabled ? 1 : 0
-  standards_arn = "arn:aws:securityhub:${data.aws_region.current.name}::standards/aws-foundational-security-best-practices/v/1.0.0"
+  standards_arn = "arn:aws:securityhub:${data.aws_region.current.region}::standards/aws-foundational-security-best-practices/v/1.0.0"
   depends_on    = [aws_securityhub_account.security]
   # Initial regional enrollment can outlast the provider's three-minute default.
   timeouts { create = "20m" }

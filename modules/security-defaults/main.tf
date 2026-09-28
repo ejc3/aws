@@ -2,7 +2,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -34,7 +34,7 @@ resource "aws_ec2_instance_metadata_defaults" "security" {
 # Existing public documents would need a separate reviewed permission change.
 # Use the full ARN: AWS provider 5.100 normalizes setting_id to ARN on refresh.
 resource "aws_ssm_service_setting" "block_public_document_sharing" {
-  setting_id    = "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:servicesetting/ssm/documents/console/public-sharing-permission"
+  setting_id    = "arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:servicesetting/ssm/documents/console/public-sharing-permission"
   setting_value = "Disable"
   # Deleting this resource resets the setting and would permit public sharing.
   lifecycle { prevent_destroy = true }
