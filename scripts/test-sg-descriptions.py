@@ -17,32 +17,68 @@ def descriptions():
     literal is itself; `<block>.key` inside `dynamic "<block>"` whose for_each is an inline map
     yields each key. Any other expression is yielded as None, so the test fails until it is
     either made a literal or taught here how to resolve it."""
-    for path in sorted(ROOT.glob("*.tf")):
+    # Every Terraform file in the repository, local modules included (not provider caches).
+    for path in sorted(p for p in ROOT.rglob("*.tf") if ".terraform" not in p.parts):
+        name = str(path.relative_to(ROOT))
         text = path.read_text()
         for m in re.finditer(r'resource "(%s)" "([^"]+)" \{(.*?)\n\}' % "|".join(TYPES), text, re.S):
             body = m.group(3)
             for d in re.findall(r'description\s*=\s*"((?:[^"\\]|\\.)*)"', body):
                 for rendered in render(body, d):
-                    yield path.name, m.group(2), rendered
+                    yield name, m.group(2), rendered
             for expr in re.findall(r'description\s*=\s*([^"\s][^\n]*?)\s*$', body, re.M):
                 keys = dynamic_keys(body, expr)
                 if keys is None:
-                    yield path.name, m.group(2), None
+                    yield name, m.group(2), None
                 for key in keys or []:
-                    yield path.name, m.group(2), key
+                    yield name, m.group(2), key
 
 
 def render(body, text):
-    """Each description `text` can become. ${each.key} takes every top-level key of the
-    resource's inline for_each map; any other interpolation yields None (unresolvable)."""
-    if "${" not in text:
-        return [text]
-    if re.sub(r"\$\{each\.key\}", "", text).count("${"):
+    """Each value the quoted description `text` can take, decoded as Terraform decodes it.
+    ${each.key} takes every top-level key of the resource's inline for_each map; any other
+    interpolation, or an escape this cannot decode, yields None (unresolvable)."""
+    pieces = [hcl_unescape(p) for p in text.split("${each.key}")]
+    if None in pieces:
         return [None]
+    if len(pieces) == 1:
+        return pieces
     keys = for_each_keys(body)
     if keys is None:
         return [None]
-    return [text.replace("${each.key}", key) for key in keys]
+    return [key.join(pieces) for key in keys]
+
+
+HCL_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+
+
+def hcl_unescape(text):
+    """A quoted HCL string's value: \\n \\r \\t \\" \\\\ \\uNNNN \\UNNNNNNNN, and $${ / %%{ for a
+    literal ${ / %{. Any other escape, or an interpolation or directive, is None."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            nxt = text[i + 1:i + 2]
+            if nxt in HCL_ESCAPES:
+                out.append(HCL_ESCAPES[nxt])
+                i += 2
+                continue
+            width = {"u": 4, "U": 8}.get(nxt)
+            digits = text[i + 2:i + 2 + width] if width else ""
+            if not width or not re.fullmatch(r"[0-9A-Fa-f]{%d}" % width, digits):
+                return None
+            out.append(chr(int(digits, 16)))
+            i += 2 + width
+            continue
+        if text.startswith(("$${", "%%{"), i):
+            out.append(text[i + 1:i + 3])
+            i += 3
+            continue
+        if text.startswith(("${", "%{"), i):
+            return None
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def for_each_keys(body):
@@ -96,7 +132,10 @@ def map_keys(top):
         if not m:
             return None
         quoted, bare = m.groups()
-        keys.append(bare if quoted is None else re.sub(r"\\(.)", r"\1", quoted))
+        key = bare if quoted is None else hcl_unescape(quoted)
+        if key is None:
+            return None
+        keys.append(key)
     return keys
 
 
@@ -128,6 +167,16 @@ class SecurityGroupDescriptionTests(unittest.TestCase):
     def test_map_keys_decode_escapes_and_refuse_partial_parses(self):
         self.assertEqual(map_keys('https = "x", "http\\"4" = "y"'), ["https", 'http"4'])
         self.assertIsNone(map_keys('https = "x", ??? = "y"'), "an unparsable entry makes the map unresolvable")
+        self.assertEqual(map_keys('"bad\\u0027key" = 1'), ["bad'key"], "a " + "\\u escape decodes to its character")
+        self.assertEqual(map_keys(r'"a\nb" = 1'), ["a\nb"], r"\n is a newline, not n")
+        self.assertIsNone(map_keys(r'"a\qb" = 1'), "an unknown escape is unresolvable")
+        self.assertEqual(render("", "x\\u0027y"), ["x'y"], "literal descriptions are decoded too")
+
+    def test_modules_are_scanned(self):
+        names = {name for name, _, _ in descriptions()}
+        self.assertTrue(any(n.startswith("modules/") for n in names) or
+                        not any("aws_security_group" in p.read_text() for p in (ROOT / "modules").rglob("*.tf")),
+                        "security groups in local modules must be scanned")
 
     def test_the_check_catches_an_apostrophe(self):
         self.assertIsNone(ALLOWED.match("engine's own IP"))
