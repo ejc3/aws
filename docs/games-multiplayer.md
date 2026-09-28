@@ -691,8 +691,11 @@ honours as Production. Development holds no key at all. Preview origins
 **Two production names.** `cc-games.net` serves the same site as `cc-games.app`, with no
 redirect, for networks (a school) that block `.app`. It has its own multiplayer entry,
 `play.cc-games.net`: a second certificate on the same ALB and the same router, which accepts
-the origin `https://cc-games.net`. `MP_PUBLIC_ENTRY` lists both entries, and the lobby gives
-each player the one on its page's domain, so a player on `.net` never touches `.app`.
+the origin `https://cc-games.net`. Pending: until `MP_PUBLIC_ENTRY` lists both entries (set
+once the lobby that picks by domain, CoderColton/colton-games#83, is deployed), the lobby
+still hands every player `wss://play.cc-games.app`, so multiplayer on `.net` needs `.app`.
+Then each player gets the entry on its page's domain, and a player on `.net` never touches
+`.app`.
 
 ## Security design and threat model
 
