@@ -908,6 +908,18 @@ class BootstrapTests(unittest.TestCase):
         self.assertLess(env, text.index("sudo -u runner -H ./run.sh"))
         self.assertLess(text.index('install -d -o runner -g runner "$TOOL_CACHE"'), env)
 
+    def test_jobs_run_in_the_hosted_runners_work_directory(self):
+        # actions/cache records a path outside the workspace relative to the workspace. From
+        # actions-runner/_work, a Playwright cache saved on a hosted runner (workspace
+        # /home/runner/work/<repo>/<repo>) restored one level too deep and the browsers were
+        # missing (dolphin-labs run 36368925976).
+        text = BOOTSTRAP.read_text()
+        self.assertIn("WORK=/home/runner/work\n", text)
+        self.assertIn('install -d -o runner -g runner "$WORK"', text)
+        self.assertIn('--work "$4"\' \\\n  _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"\n', text)
+        self.assertNotIn("--work _work", text)
+        self.assertLess(text.index('install -d -o runner -g runner "$WORK"'), text.index("exec ./config.sh"))
+
 
 def front_source():
     block = re.search(r'data "archive_file" "runner_webhook_front" \{.*?content\s*=\s*<<-EOF\n(.*?)\n\s*EOF\n', FRONT_TF, re.S)
