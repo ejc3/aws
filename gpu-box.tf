@@ -86,10 +86,10 @@ resource "aws_security_group" "gpu_box" {
     }
   }
 
-  # Egress is web, DNS and NTP only -- deliberately not "all". The default VPC's
-  # 172.31.0.0/16 is the range io-box.tf exports its shared NFS scratch to, read-write, and
-  # this box runs a browser on test pages; it has no business reaching port 2049 (or
-  # anything else inside the fleet). Everything it needs -- apt, npm, Playwright's browser
+  # Egress is web, DNS and NTP only -- deliberately not "all". io-box.tf exports its shared
+  # NFS scratch read-write to its own us-west-2d subnet (one of the subnets below), and this
+  # box runs a browser on test pages; it has no business reaching port 2049 (or anything
+  # else inside the fleet). Everything it needs -- apt, npm, Playwright's browser
   # downloads, the game build copied in over the inbound SSH -- is covered here. These
   # subnets assign no IPv6, so there is no v6 rule.
   dynamic "egress" {

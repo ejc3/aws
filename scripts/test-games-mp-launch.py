@@ -841,9 +841,14 @@ class TerraformTests(unittest.TestCase):
                      "API_BASE     = each.value.api_base",
                      "ALLOW_BYPASS = tostring(each.value.bypass)",
                      "SECURITY_GROUP   = aws_security_group.games_engine.id",
+                     # The engines' own subnets (games-rt, no I/O-box peer route; games-engine ACL),
+                     # never the dev fleet's subnet_a/subnet_b.
+                     'SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])',
                      "ROUTER_FAMILY    = local.mp_router_family",
                      'MAX_HARDCAP_SEC = "14400"'):
             self.assertIn(line, self.fn)
+        self.assertIn("mp_engine_subnets = values(aws_subnet.games_engine)", GAMES)
+        self.assertNotRegex(self.fn, r"aws_subnet\.subnet_[ab]|dev_fleet_subnets")
         envs = re.search(r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()
         self.assertEqual(sorted(re.findall(r"^    (\w+) = \{", envs, re.M)), ["preview", "production"])
         self.assertIn(r'api_base = "^https://cc-games\\.app$"', envs)

@@ -23,10 +23,13 @@
 #       games-mp-launch-<production|preview> (admission) --ecs:RunTask--> engine task
 #   EventBridge Scheduler (1 min) --> games-mp-sweeper Lambda --ecs:StopTask--> over-age engines
 #
-# Everything is in us-west-1, in the existing `main` VPC's public subnets a/b. Tasks get a
-# public IPv4 for OUTBOUND only (ECR pulls, callbacks to Vercel): that is ~$3.65/month per
-# always-on task against ~$33/month plus data for a NAT gateway. Nothing can connect IN to
-# a task except through the security-group chain below.
+# Everything is in us-west-1, in the existing `main` VPC. The ALB sits in the public subnets
+# a/b; the router and the engines each have their own subnets (10.0.66-67 and 10.0.64-65, see
+# "Network" below) with a route table that has NO route to the I/O box's VPC peer, and the
+# engine subnets carry a network ACL that refuses the rest of the VPC. Tasks get a public
+# IPv4 for OUTBOUND only (ECR pulls, callbacks to Vercel): that is ~$3.65/month per always-on
+# task against ~$33/month plus data for a NAT gateway. Nothing can connect IN to a task
+# except through the security-group chain below.
 #
 # IMAGES COME FROM ONE PINNED COMMIT. var.games_mp_source_ref names a commit of
 # CoderColton/colton-games; its image tags are derived from it (router `<sha12>`, engine
@@ -192,8 +195,17 @@ locals {
   # (the router's "a token may only point here" check) both derive from this one list so
   # they cannot drift apart. Narrower than the whole VPC on purpose: the VPC also holds the
   # dev boxes and jumpboxes, and a token (or a stolen token key) must never be able to aim
-  # the router at them.
-  mp_subnets = [aws_subnet.subnet_a, aws_subnet.subnet_b]
+  # the router at them. The subnets themselves are in "Network" below.
+  mp_engine_subnets = values(aws_subnet.games_engine)
+  mp_router_subnets = values(aws_subnet.games_router)
+
+  # The router accepts exactly the engine subnets. The move out of the dev fleet's subnets is
+  # applied when no engine runs (docs/games-multiplayer.md), so no old-subnet engine is left
+  # for a router to reach.
+  mp_router_target_cidrs = [for s in local.mp_engine_subnets : s.cidr_block]
+  # The ALB stays in the dev fleet's public subnets: it is AWS-managed, runs none of our
+  # code, and moving it would re-address a live load balancer for no isolation gain.
+  mp_alb_subnets = local.dev_fleet_subnets
 
   mp_play_domain = "play.cc-games.app"
 
@@ -845,7 +857,7 @@ resource "aws_lambda_function" "games_mp_launch" {
       ALLOW_BYPASS = tostring(each.value.bypass)
       # The rest is the same for both environments.
       CLUSTER          = aws_ecs_cluster.games.name
-      SUBNETS          = join(",", [for s in local.mp_subnets : s.id])
+      SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])
       SECURITY_GROUP   = aws_security_group.games_engine.id
       TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })
       ROUTER_FAMILY    = local.mp_router_family
@@ -864,6 +876,13 @@ resource "aws_lambda_function" "games_mp_launch" {
   }
 
   tags = { Name = "games-mp-launch-${each.key}", Project = "games-multiplayer" }
+
+  # An engine subnet without its route table would fall back to the VPC's main table (no
+  # internet: every launch fails its image pull), and without its ACL it would reach the
+  # whole VPC. The functions learn the subnets only once both are in place, and only after
+  # every router task runs the definition that accepts them (games_mp_healthy), so no engine
+  # launches into subnets a router still rejects.
+  depends_on = [aws_route_table_association.games_engine, aws_network_acl.games_engine, terraform_data.games_mp_healthy]
 }
 
 # The lobby invokes synchronously. An asynchronous (InvocationType=Event) call cannot be
@@ -876,6 +895,261 @@ resource "aws_lambda_function_event_invoke_config" "games_mp_launch" {
   function_name                = aws_lambda_function.games_mp_launch[each.key].function_name
   maximum_retry_attempts       = 0
   maximum_event_age_in_seconds = 60
+}
+
+# -------------------------------------------------------------------------------------
+# Network: the router's and the engines' own subnets
+# -------------------------------------------------------------------------------------
+#
+# Engines run code we build but treat as hostile once a match is live, and the router is the
+# internet-facing hop. Neither may share subnets with the dev fleet, for two reasons that a
+# security group alone cannot fix:
+#   - The I/O box (io-box.tf, us-west-2) exports read-write NFS over an INTER-REGION peer,
+#     where security groups cannot be referenced, so its only filter is by source CIDR. The
+#     games tasks must therefore live in CIDRs that are not the NFS clients' CIDRs.
+#   - The dev subnets' route table carries the peer route. These subnets get their own table
+#     with no peer route, so a games task cannot even route a packet toward the I/O box.
+#
+#   10.0.64.0/24, 10.0.65.0/24  engines (AZs of subnet_a, subnet_b)  games-rt + games-engine ACL
+#   10.0.66.0/24, 10.0.67.0/24  router  (AZs of subnet_a, subnet_b)  games-rt, default ACL
+#
+# The router gets its own subnets, rather than staying beside the dev boxes, so that (1) the
+# engine ACL can admit exactly the router's CIDRs instead of the dev fleet's, and (2) the
+# router, which parses untrusted input from the internet, is outside the NFS client CIDRs
+# too. The ALB stays in subnet_a/subnet_b (local.mp_alb_subnets). IPv6 matches the dev
+# subnets (a /64 each, assigned on creation, ::/0 to the IGW): ECS dualStackIPv6 is on for the
+# account, so tasks keep getting an IPv6 address, and engine egress stays 443 on v4 and v6.
+# Public IPv4 on each task (assignPublicIp) instead of a NAT gateway, as before.
+#
+# The /24 index is also the IPv6 /64 index within the VPC's /56 (subnet_a is 1, subnet_b 2),
+# so 10.0.64.0/24 pairs with /64 number 64 (2600:1f1c:494:240::/64 today).
+locals {
+  games_subnet_layout = {
+    a = { az = aws_subnet.subnet_a.availability_zone, engine = 64, router = 66 }
+    b = { az = aws_subnet.subnet_b.availability_zone, engine = 65, router = 67 }
+  }
+}
+
+resource "aws_subnet" "games_engine" {
+  for_each = local.games_subnet_layout
+
+  vpc_id                          = local.vpc_id
+  cidr_block                      = cidrsubnet(data.aws_vpc.selected.cidr_block, 8, each.value.engine)
+  availability_zone               = each.value.az
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block, 8, each.value.engine)
+  assign_ipv6_address_on_creation = true
+  # games-mp-launch asks for a public IPv4 per task (assignPublicIp=ENABLED); nothing else
+  # launches here, so the subnet default stays off.
+  map_public_ip_on_launch = false
+
+  tags = { Name = "games-engine-${each.key}", Project = "games-multiplayer" }
+}
+
+resource "aws_subnet" "games_router" {
+  for_each = local.games_subnet_layout
+
+  vpc_id                          = local.vpc_id
+  cidr_block                      = cidrsubnet(data.aws_vpc.selected.cidr_block, 8, each.value.router)
+  availability_zone               = each.value.az
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block, 8, each.value.router)
+  assign_ipv6_address_on_creation = true
+  map_public_ip_on_launch         = false
+
+  tags = { Name = "games-router-${each.key}", Project = "games-multiplayer" }
+}
+
+# Internet both ways, the VPC's implicit local route, and NOTHING else. Never add the I/O
+# box peer route (or any peer, VPN or transit route) here: that is the whole point of these
+# subnets. Inline routes, like main.tf's public table, so the provider owns the full set.
+resource "aws_route_table" "games" {
+  vpc_id = local.vpc_id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  route {
+    ipv6_cidr_block = "::/0"
+    gateway_id      = aws_internet_gateway.main.id
+  }
+
+  tags = { Name = "games-rt", Project = "games-multiplayer" }
+}
+
+resource "aws_route_table_association" "games_engine" {
+  for_each       = aws_subnet.games_engine
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.games.id
+}
+
+resource "aws_route_table_association" "games_router" {
+  for_each       = aws_subnet.games_router
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.games.id
+}
+
+# The engine subnets' ACL: a second, stateless fence under the games-engine security group
+# (which already admits only the router and sends only 443). The security group is enough
+# while it is right; this makes "an engine cannot talk to the rest of the VPC" true even if a
+# rule is ever loosened there, because an ACL is attached to the subnet, not to the task.
+#
+#   in   8080 from the router subnets          player traffic, the ONLY in-VPC flow; 8080 from
+#                                              anywhere else is denied, v4 and v6
+#   in   1024-65535 tcp from the internet      replies to the engine's own 443 connections
+#   in   ICMP "fragmentation needed" (v4) / "packet too big" (v6), so path-MTU discovery works
+#   out  1024-65535 tcp to the router subnets  replies to the router
+#   out  443 tcp to the internet               Vercel callbacks, ECR, CloudWatch Logs
+#   everything else to or from 10.0.0.0/16 or the VPC's IPv6 /56 is DENIED before the
+#   internet allows, so "the internet" never includes a dev box's address, v4 or v6.
+#
+# Not filtered by ACLs at all (AWS documents these): the VPC DNS resolver, the ECS task
+# metadata endpoint (169.254.170.2) and Amazon Time Sync, which is why they need no rule.
+# Traffic between two engines in the SAME subnet never crosses an ACL; the security group
+# (router-only ingress) is what stops it.
+resource "aws_network_acl" "games_engine" {
+  vpc_id     = local.vpc_id
+  subnet_ids = [for s in local.mp_engine_subnets : s.id]
+
+  dynamic "ingress" {
+    for_each = { for i, s in local.mp_router_subnets : i => s.cidr_block }
+    content {
+      rule_no    = 100 + ingress.key
+      action     = "allow"
+      protocol   = "tcp"
+      cidr_block = ingress.value
+      from_port  = local.mp_port
+      to_port    = local.mp_port
+    }
+  }
+
+  ingress {
+    rule_no    = 110
+    action     = "deny"
+    protocol   = "-1"
+    cidr_block = data.aws_vpc.selected.cidr_block
+    from_port  = 0
+    to_port    = 0
+  }
+
+  ingress {
+    rule_no         = 120
+    action          = "deny"
+    protocol        = "-1"
+    ipv6_cidr_block = aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block
+    from_port       = 0
+    to_port         = 0
+  }
+
+  # 8080 lies inside the reply range below; without these, anyone on the internet could reach
+  # an engine's public IP on it whenever the security group allowed. Only the router may.
+  ingress {
+    rule_no    = 130
+    action     = "deny"
+    protocol   = "tcp"
+    cidr_block = "0.0.0.0/0"
+    from_port  = local.mp_port
+    to_port    = local.mp_port
+  }
+
+  ingress {
+    rule_no         = 131
+    action          = "deny"
+    protocol        = "tcp"
+    ipv6_cidr_block = "::/0"
+    from_port       = local.mp_port
+    to_port         = local.mp_port
+  }
+
+  ingress {
+    rule_no    = 200
+    action     = "allow"
+    protocol   = "tcp"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    rule_no         = 201
+    action          = "allow"
+    protocol        = "tcp"
+    ipv6_cidr_block = "::/0"
+    from_port       = 1024
+    to_port         = 65535
+  }
+
+  ingress {
+    rule_no    = 210
+    action     = "allow"
+    protocol   = "icmp"
+    cidr_block = "0.0.0.0/0"
+    icmp_type  = 3
+    icmp_code  = 4
+    from_port  = 0
+    to_port    = 0
+  }
+
+  ingress {
+    rule_no         = 211
+    action          = "allow"
+    protocol        = "58"
+    ipv6_cidr_block = "::/0"
+    icmp_type       = 2
+    icmp_code       = 0
+    from_port       = 0
+    to_port         = 0
+  }
+
+  dynamic "egress" {
+    for_each = { for i, s in local.mp_router_subnets : i => s.cidr_block }
+    content {
+      rule_no    = 100 + egress.key
+      action     = "allow"
+      protocol   = "tcp"
+      cidr_block = egress.value
+      from_port  = 1024
+      to_port    = 65535
+    }
+  }
+
+  egress {
+    rule_no    = 110
+    action     = "deny"
+    protocol   = "-1"
+    cidr_block = data.aws_vpc.selected.cidr_block
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    rule_no         = 120
+    action          = "deny"
+    protocol        = "-1"
+    ipv6_cidr_block = aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block
+    from_port       = 0
+    to_port         = 0
+  }
+
+  egress {
+    rule_no    = 200
+    action     = "allow"
+    protocol   = "tcp"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  egress {
+    rule_no         = 201
+    action          = "allow"
+    protocol        = "tcp"
+    ipv6_cidr_block = "::/0"
+    from_port       = 443
+    to_port         = 443
+  }
+
+  tags = { Name = "games-engine", Project = "games-multiplayer" }
 }
 
 # -------------------------------------------------------------------------------------
@@ -1075,7 +1349,7 @@ resource "aws_lb" "games_play" {
   load_balancer_type         = "application"
   ip_address_type            = "dualstack"
   security_groups            = [aws_security_group.games_alb.id]
-  subnets                    = [for s in local.mp_subnets : s.id]
+  subnets                    = [for s in local.mp_alb_subnets : s.id]
   idle_timeout               = 3600
   drop_invalid_header_fields = true
 
@@ -1197,7 +1471,7 @@ resource "aws_ecs_task_definition" "games_mp_router" {
       { name = "MP_ENV", value = var.mp_env },
       { name = "MP_ENVS", value = join(",", var.mp_router_envs) },
       { name = "MP_ALLOWED_ORIGINS", value = join(",", local.mp_allowed_origins) },
-      { name = "MP_TARGET_CIDRS", value = join(",", [for s in local.mp_subnets : s.cidr_block]) },
+      { name = "MP_TARGET_CIDRS", value = join(",", local.mp_router_target_cidrs) },
     ]
     # Pinned to the exact secret VERSION (<arn>:<json-key>:<version-stage>:<version-id>, the
     # first two empty). A key rotation writes a new version, which changes this task
@@ -1251,7 +1525,7 @@ resource "aws_ecs_service" "games_mp_router" {
   }
 
   network_configuration {
-    subnets         = [for s in local.mp_subnets : s.id]
+    subnets         = [for s in local.mp_router_subnets : s.id]
     security_groups = [aws_security_group.games_router.id]
     # Outbound only (ECR, logs, secret): the router SG admits nothing but the ALB.
     assign_public_ip = true
@@ -1263,8 +1537,9 @@ resource "aws_ecs_service" "games_mp_router" {
     container_port   = local.mp_port
   }
 
-  # ECS refuses to attach a target group that no load balancer uses yet.
-  depends_on = [aws_lb_listener.games_play_https]
+  # ECS refuses to attach a target group that no load balancer uses yet. The router subnets
+  # must have their route table before a task starts there (else: no image pull).
+  depends_on = [aws_lb_listener.games_play_https, aws_route_table_association.games_router]
 
   tags = { Name = "mp-router", Project = "games-multiplayer", "games-role" = "router" }
 

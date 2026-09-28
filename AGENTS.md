@@ -625,9 +625,12 @@ The ARM, x86, and Next.js dev instances have Elastic IPs for static addressing:
 - IPs persist across stop/start cycles
 - Defined in each instance's .tf file
 
-`io-box` has no EIP and accepts SSH/NFS only from private fleet networks. It receives a
-transient public IPv4 while running for outbound package access, but clients use fixed
-private IP `172.31.48.10` across the inter-region VPC peer.
+`io-box` has no EIP and accepts SSH/NFS only from private fleet networks: SSH from both peered
+VPCs, NFS only from `local.io_box_nfs_client_cidrs` (the dev fleet subnets and the parallel
+boxes' us-west-2d subnet), never a whole VPC, because the games router and engines share the
+us-west-1 VPC. Keep games subnets out of `local.dev_fleet_subnets` and off the peer route. It
+receives a transient public IPv4 while running for outbound package access, but clients use
+fixed private IP `172.31.48.10` across the inter-region VPC peer.
 
 ### Auto-Stop Lambdas
 
