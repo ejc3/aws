@@ -49,6 +49,30 @@ SIGNATURE = re.compile(
     r"Out of memory: Killed process|Kernel panic)"
 )
 
+# Boot-time xtrace has printed private keys onto instance consoles (dev-hop-key.tf and
+# jumpbox2-user-data.tf both did), and this function copies the console into CloudWatch
+# Logs and an email that cannot be recalled. Key blocks are removed before the text is
+# matched, logged or published. The buffer is a window onto a ring buffer, so it can also
+# start or end inside a key; those partial blocks go too.
+_KEY_LABEL = r"[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+# Starts inside a key: everything up to the first END marker with no BEGIN before it. The
+# marker must follow key material, whitespace or a literal \n escape, so an END marker
+# quoted in a traced command cannot wipe the head of the buffer.
+KEY_HEAD = re.compile(r"\A(?:(?!-----BEGIN ).)*?(?<=[\sA-Za-z0-9+/=])-----END " + _KEY_LABEL, re.S)
+KEY_BLOCK = re.compile(r"-----BEGIN " + _KEY_LABEL + r".*?-----END " + _KEY_LABEL, re.S)
+# Ends inside a key: a BEGIN marker with no END after it, taken to the end of the buffer
+# only when what follows could be key material. A marker quoted in a traced grep therefore
+# cannot swallow the panic after it, and the end of the buffer is the part that matters.
+KEY_TAIL = re.compile(r"-----BEGIN " + _KEY_LABEL + r"(?=[\s\\A-Za-z0-9+/=]|\Z).*\Z", re.S)
+REDACTED = "[redacted private key]"
+
+
+def redact(text):
+    """The console text with every whole or partial private key block replaced."""
+    for pattern in (KEY_HEAD, KEY_BLOCK, KEY_TAIL):
+        text = pattern.sub(REDACTED, text)
+    return text
+
 
 def instance_ids_from_alarm(msg):
     """InstanceId out of the alarm's dimensions; [] when it is not an EC2 alarm."""
@@ -63,7 +87,8 @@ def capture(instance_id):
     # Latest=True is the whole point: without it the API answers with a cached
     # snapshot that can predate the incident by hours.
     resp = ec2.get_console_output(InstanceId=instance_id, Latest=True)
-    output = resp.get("Output") or ""
+    # Redacted here, first: the signature match, the archive and the email all use this.
+    output = redact(resp.get("Output") or "")
     if not output:
         return None, [], None
     lines = output.splitlines()

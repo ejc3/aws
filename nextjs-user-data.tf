@@ -46,6 +46,25 @@ locals {
     } : u => z if contains(keys(local.nextjs_zone_tunnel), z)
   }
 
+  # Hostnames that are declared here rather than published with `ndev`. `ndev` ties a
+  # hostname to the publishing account's zone on purpose (see nextjs_user_zone), which is
+  # the right default and the wrong tool for the one site whose AUDIENCE is on the other
+  # zone: the family board is built under ejc3 but is for the kids, the TV and the e-ink
+  # tablet, who can pass cc-games' Google sign-in and not dolphin-labs' GitHub-org gate.
+  #
+  # A pinned route is only a registry row: hostname -> local port. The app itself is still
+  # an ordinary `ndev <slug>` instance (here ndev@ejc3-family, whose port is derived from
+  # its dolphin-labs hostname). Keeping this a short, reviewed list in Terraform, rather
+  # than a flag on `ndev`, preserves the property that nobody can put something on the
+  # other project's domain by accident.
+  nextjs_pinned_routes = {
+    "family.cc-games.dev" = { zone = local.nextjs_domain, port = 3722, user = "ejc3", dir = "/home/ejc3/family" }
+  }
+  nextjs_pinned_rows = join("\n", [
+    for h, r in local.nextjs_pinned_routes :
+    "pin_route ${r.zone} ${h} ${r.port} ${r.user} ${r.dir}" if contains(keys(local.nextjs_zone_tunnel), r.zone)
+  ])
+
   # The case arms below are built as data rather than with %{ for } directives inside the
   # heredoc: the directive form trims the newlines between arms and emits the whole case
   # statement on one line. Valid shell, but unreadable when debugging on the box.
@@ -77,6 +96,9 @@ locals {
   # nothing. This list only decides which accounts must EXIST; removing a name from it does
   # not delete the account.
   nextjs_users = ["colton", "connor", "ejc3", "skevh"]
+  # Accounts whose boot-launched folders also get a Codex thread (codex-seed@<user>), so each
+  # folder shows up in their Codex app. Deliberately not everyone: skevh is left out.
+  nextjs_codex_seed_users = ["colton", "connor", "ejc3"]
 
   # Keys the account owner logs in with, on top of the shared fcvm key above. Declared
   # here rather than pasted into the box so a rebuild does not lose someone's access --
@@ -87,7 +109,13 @@ locals {
   # one -- so every additional key had to be installed by hand, which meant terraform did not
   # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
-    skevh = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"]
+    skevh = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local",
+      # Odo, Steve's Muse agent. Installed by hand on skevh on 2026-09-15 and declared here
+      # on 2026-09-16 so a rebuild keeps it. Its comment "hatch" is also on one of ejc3's
+      # keys, so identify this one by fingerprint SHA256:JjkaJiaQsOmP6it1Ur0N4AfKb3Ujlu3oSH1F64xRP8U.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICdxS/iqNTTCvqMdm3uozUZund8S4d8H7/hLCCY+Oy7q hatch",
+    ]
     # All of ejc3's keys, including two that were installed by hand and existed only on
     # the running instance -- invisible to terraform and silently lost on any rebuild.
     # Adopted 2026-09-11 by reading them off the box; declaring them is what makes them
@@ -102,6 +130,10 @@ locals {
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSxIJ95P2xn4qJpFoGlRMpzstp5RTbj5KJAh2JH5UVi dolphin-labs-instinct-2026-09-11",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZTP2GqL7R1kFzSqoI6QLo3j/VacE9MK+tuXmHLCAFn hatch",
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILzudSh+XRY5YsnNnAWDTjKXNeZUueYq/etoVXsTrpx4 grok-bot-box-ejc3",
+      # For dolphin access, declared 2026-09-17 at the owner's request. Generated off the box,
+      # so unlike the keys above this is a new grant rather than an adoption of something the
+      # instance already authorized: SHA256:tsfGYA0b848cRjsAWRAIG59lR7593BA06LaSncfyQOA.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM3U+Or6AG9kj/94JubpeKkNz7Jo872Piljcom/Gyj2P dolphin",
     ]
   }
 
@@ -275,7 +307,18 @@ fi
 #      the box, it just leaves the previous version in place and says so.
 #   3. Checks the units that matter afterwards and logs loudly if any died, so a bad change
 #      surfaces in `journalctl -u setup-sync` instead of as a mystery outage tomorrow.
-cat > /usr/local/bin/setup-sync <<'SETUPSYNC'
+#
+# setup-sync's run log holds this whole script's output, so only root and adm may read it.
+# An earlier setup-sync created it 0644, and this script usually runs inside that setup-sync
+# with the file open, so tighten it now rather than at the next sync.
+if [ -e /var/log/setup-sync.log ]; then
+  chmod 0640 /var/log/setup-sync.log
+  chgrp adm /var/log/setup-sync.log || echo "WARNING: could not give /var/log/setup-sync.log to group adm"
+fi
+# Written beside the target and renamed into place, never rewritten in place: this block
+# runs INSIDE the setup-sync it replaces, and bash reads a running script from its byte
+# offset, so an in-place rewrite makes the old setup-sync resume mid-line in the new text.
+cat > /usr/local/bin/setup-sync.new <<'SETUPSYNC'
 #!/bin/bash
 set -uo pipefail
 BUCKET=ejc3-dev-scripts
@@ -299,9 +342,25 @@ if ! bash -n "$NEXT" 2>/tmp/setup-syntax.err; then
 fi
 
 echo "setup-sync: running"
+# The run log holds the whole setup's output, so only root and adm may read it. Set before
+# the redirect below writes to it (a redirect keeps an existing file's mode), including on
+# a file an earlier version left 0644.
+[ -e /var/log/setup-sync.log ] || install -m 0640 -o root -g adm /dev/null /var/log/setup-sync.log
+chmod 0640 /var/log/setup-sync.log
+chgrp adm /var/log/setup-sync.log
 bash "$NEXT" >/var/log/setup-sync.log 2>&1
 RC=$?
 echo "setup-sync: finished rc=$RC"
+# 75 means setup stopped on purpose before finishing (it could not take the ndev lock).
+# Other codes keep their old meaning: health below decides.
+if [ "$RC" = 75 ]; then
+  echo "setup-sync: setup stopped early; NOT recording this etag, so the next run retries"
+  exit 1
+fi
+
+# A deleted checkout is not a failed unit: unpublish it before judging health, so one
+# removed worktree cannot hold every future setup run in a retry loop.
+[ ! -x /usr/local/bin/ndev-prune ] || /usr/local/bin/ndev-prune || echo "setup-sync: WARNING ndev-prune failed"
 
 FAILED=""
 for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
@@ -335,7 +394,8 @@ fi
 printf '%s' "$ETAG" > "$STATE/applied-etag"
 echo "setup-sync: healthy, recorded etag"
 SETUPSYNC
-chmod 755 /usr/local/bin/setup-sync
+chmod 755 /usr/local/bin/setup-sync.new
+mv -f /usr/local/bin/setup-sync.new /usr/local/bin/setup-sync
 
 cat > /etc/systemd/system/setup-sync.service <<'SSSVC'
 [Unit]
@@ -404,65 +464,105 @@ set -uo pipefail
 WHO="$${1:?usage: claude-rc-ensure <user>}"
 H="/home/$WHO"
 tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
-win=$(tm list-windows -a -F '#{window_id}' | head -1)
-[ -n "$win" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
+# EVERY window, not just the first (fixed 2026-09-25 by Claude): agents-start can launch more
+# than one managed claude per user (~/.config/agent-extra-dirs), and the first-window-only
+# version never looked at the others. Each window is judged on its own screen and rate-limited
+# on its own, so a repair in one never blocks or triggers another.
 pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
 
-# Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
-# repair re-triggers the repair, forever.
-pane() { tm capture-pane -p -S -25 -t "$win"; }
-P="$(pane)"
-
-# The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
-# cannot succeed no matter how many times /remote-control retries it. Note this is NOT the
-# same as the bare "Remote Control disconnected." line, which is also what a deliberate
-# disconnect prints -- matching that would make the script chase its own tail.
-case "$P" in
-  *"Couldn't reconnect to your Remote Control session"*) ;;
-  *) echo "claude-rc-ensure: $WHO nothing to repair"; exit 0 ;;
-esac
-
-# An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
-case "$P" in
-  *"Session creation failed"*) echo "claude-rc-ensure: $WHO upstream 503, leaving alone"; exit 0 ;;
-esac
+# Only a window that IS a claude is ever judged, let alone typed into: t-claude must have keyed
+# it (@tclaude_path) AND a claude process of this user must sit below its pane. Without this, a
+# shell that merely PRINTS the reconnect error (a log tail, this script's own output) would
+# match the failure string below and be sent "/remote-control" plus Enter as if it were a
+# prompt. pane_current_command cannot answer this: t-claude runs claude under a python3
+# wrapper, so a live claude pane reads "python3" (zsh -> python3 -> claude).
+runs_claude() {
+  local pid
+  for pid in $(pgrep -u "$WHO" -x claude); do
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+      [ "$pid" = "$1" ] && return 0
+      pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
+}
+# -a lists a window once per session that shows it (t-claude's grouped views share windows), so
+# de-duplicate by line or one window would be judged -- and repaired -- several times.
+wins=$(tm list-windows -a -F '#{window_id} #{pane_pid} #{@tclaude_path}' | sort -u \
+  | while read -r wid panepid keyed; do
+      [ -n "$keyed" ] && runs_claude "$panepid" && echo "$wid"
+    done)
+[ -n "$wins" ] || { echo "claude-rc-ensure: $WHO has no claude window"; exit 0; }
 
 STATEDIR=/var/lib/claude-rc-ensure
 mkdir -p "$STATEDIR"
-STAMP="$STATEDIR/$WHO"
-now=$(date +%s)
-last=$(cat "$STAMP" 2>/dev/null || echo 0)
-if [ $((now - last)) -lt 3600 ]; then
-  echo "claude-rc-ensure: $WHO repaired within the last hour, backing off"
-  exit 0
-fi
-echo "$now" > "$STAMP"
 
-echo "claude-rc-ensure: $WHO reconnect is dead -- dropping the stale binding"
-tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-case "$(pane)" in
-  *"Disconnect this session"*)
-    tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
-    ;;
-  *)
-    echo "claude-rc-ensure: $WHO disconnect menu never appeared; leaving the session alone" >&2
-    tm send-keys -t "$win" Escape
-    exit 0
-    ;;
-esac
+repair_window() {
+  local win="$1" label key STAMP now last P
+  label=$(tm display-message -p -t "$win" '#{session_name}:#{window_name}')
+  # Rate-limit key: the folder t-claude stamped on the window (stable across tmux restarts);
+  # the window name, then its id, when it has none.
+  key=$(tm display-message -p -t "$win" '#{@tclaude_path}')
+  [ -n "$key" ] || key="$label"
+  [ -n "$key" ] || key="$win"
+  STAMP="$STATEDIR/$WHO-$(printf '%s' "$key" | cksum | awk '{print $1}')"
 
-tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-case "$(pane)" in
-  *"Enable Remote Control"*)
-    tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
-    echo "claude-rc-ensure: $WHO re-enabled"
-    ;;
-  *)
-    echo "claude-rc-ensure: $WHO enable menu never appeared; leaving the session alone" >&2
-    tm send-keys -t "$win" Escape
-    exit 0
-    ;;
-esac
+  # Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
+  # repair re-triggers the repair, forever.
+  pane() { tm capture-pane -p -S -25 -t "$win"; }
+  P="$(pane)"
+
+  # The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
+  # cannot succeed no matter how many times /remote-control retries it. Note this is NOT the
+  # same as the bare "Remote Control disconnected." line, which is also what a deliberate
+  # disconnect prints -- matching that would make the script chase its own tail.
+  case "$P" in
+    *"Couldn't reconnect to your Remote Control session"*) ;;
+    *) echo "claude-rc-ensure: $WHO $label nothing to repair"; return 0 ;;
+  esac
+
+  # An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
+  case "$P" in
+    *"Session creation failed"*) echo "claude-rc-ensure: $WHO $label upstream 503, leaving alone"; return 0 ;;
+  esac
+
+  now=$(date +%s)
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 3600 ]; then
+    echo "claude-rc-ensure: $WHO $label repaired within the last hour, backing off"
+    return 0
+  fi
+  echo "$now" > "$STAMP"
+
+  echo "claude-rc-ensure: $WHO $label reconnect is dead -- dropping the stale binding"
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  case "$(pane)" in
+    *"Disconnect this session"*)
+      tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
+      ;;
+    *)
+      echo "claude-rc-ensure: $WHO $label disconnect menu never appeared; leaving the session alone" >&2
+      tm send-keys -t "$win" Escape
+      return 0
+      ;;
+  esac
+
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  case "$(pane)" in
+    *"Enable Remote Control"*)
+      tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
+      echo "claude-rc-ensure: $WHO $label re-enabled"
+      ;;
+    *)
+      echo "claude-rc-ensure: $WHO $label enable menu never appeared; leaving the session alone" >&2
+      tm send-keys -t "$win" Escape
+      return 0
+      ;;
+  esac
+}
+
+for w in $wins; do repair_window "$w"; done
+exit 0
 RCENSURE
 chmod 755 /usr/local/bin/claude-rc-ensure
 
@@ -537,6 +637,13 @@ for u in ${join(" ", local.nextjs_users)}; do
   if [ -s "/home/$u/.codex/auth.json" ]; then
     systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true
     systemctl is-active --quiet "codex-rc@$u.service"       || systemctl start "codex-rc@$u.service" >/dev/null 2>&1 || true
+    # A Codex thread for each folder agents-start opened, only for these accounts. --no-block:
+    # a new folder costs a model turn, and this watcher must not wait on it.
+    case " ${join(" ", local.nextjs_codex_seed_users)} " in *" $u "*)
+      systemctl enable "codex-seed@$u.service" >/dev/null 2>&1 || true
+      systemctl is-active --quiet "codex-seed@$u.service" || systemctl start --no-block "codex-seed@$u.service" >/dev/null 2>&1 || true
+      ;;
+    esac
   fi
 done
 AGENTSENABLE
@@ -739,6 +846,13 @@ case "$DIR" in "/home/$WHO"|"/home/$WHO"/*) ;; *) echo "refusing: $DIR is outsid
 # One registry and one cloudflared config PER ZONE. A single shared registry would mean
 # rewriting both tunnels' ingress on every publish, so a malformed entry from one project
 # could break the other -- the exact coupling the separate tunnels exist to avoid.
+# Shared with ndev-prune and setup and held to exit (write -> rebuild -> enable), so a prune
+# cannot classify this label mid-publish or delete what this publish just wrote. fd 9 is
+# reused only when it already is this lock file, and flock runs either way: it returns at
+# once only when that open file really holds the lock. No environment variable is consulted;
+# the users' `NOPASSWD: ALL` sudo rule implies SETENV, so one would be trivially spoofed.
+[ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$(readlink -f /var/lib/ndev/.lock)" ] || exec 9>/var/lib/ndev/.lock
+flock -w 300 9 || { echo "refusing: another ndev publish or prune is still running; try again" >&2; exit 1; }
 REGISTRY=/var/lib/ndev/registry-$ZONE
 grep -v -P "^\Q$HOST\E\t" "$REGISTRY" > "$REGISTRY.new" 2>/dev/null || true
 printf '%s\t%s\t%s\t%s\n' "$HOST" "$PORT" "$WHO" "$DIR" >> "$REGISTRY.new"
@@ -783,6 +897,263 @@ echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$LABEL, enabled at boot)"
 REG
 chmod 755 /usr/local/bin/ndev-register
 
+# Deleting a checkout does not unpublish it. Its ndev@<label> unit, env file, drop-in,
+# registry row and ingress route all outlived the directory: in September 2026 two deleted
+# worktrees under ~skevh/worktrees each restarted 2,859 times, and setup-sync reported
+# failure every ten minutes because enabled units were not active. ndev@.service's
+# ExecCondition now stops the loop; this removes the leftovers.
+cat > /usr/local/bin/ndev-prune <<'PRUNE'
+#!/bin/bash
+# ndev-prune -- retire every published project whose directory no longer exists.
+#
+# A label is dead only when EVERY env file recorded for it (instances/<label>.env and, for
+# a user's base label, the legacy /var/lib/ndev/<label>.env) names a DIR that is not a
+# directory. For a dead label it stops and disables ndev@<label>, removes that label's
+# registry rows, rebuilds the affected zones' ingress with ndev-rebuild (the same code
+# ndev-register and boot use) and restarts only a tunnel whose config changed, then removes
+# the env files and the drop-in. A label with a live DIR is never touched, and a second run
+# finds nothing to do. DNS needs nothing: each zone has one wildcard record.
+set -euo pipefail
+NDEV=/var/lib/ndev
+
+# Shared with ndev-register and setup and held to exit, so a publish can never land between
+# deciding a label is dead and deleting its records, and the two never edit a registry at
+# once. When setup already holds it, it passes the locked file down as fd 9; flock on that
+# same open file returns at once, where opening the file again would wait on setup forever.
+[ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$(readlink -f "$NDEV/.lock")" ] || exec 9>"$NDEV/.lock"
+flock -w 600 9 || { echo "ndev-prune: timed out waiting for $NDEV/.lock" >&2; exit 1; }
+rm -f "$NDEV"/.prune.*        # left by a run that was killed; only prune makes them, under this lock
+TMP=$(mktemp "$NDEV/.prune.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
+field() { sed -n "s/^$1=//p" "$2" | head -n 1; }
+is_user() { case " ${join(" ", local.nextjs_users)} " in *" $1 "*) return 0 ;; esac; return 1; }
+# The env files that describe a label; the legacy one counts only for a real user's base label.
+records() {
+  local f
+  for f in "$NDEV/instances/$1.env" "$NDEV/$1.env"; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$NDEV/$1.env" ] && ! is_user "$1"; then continue; fi
+    echo "$f"
+  done
+}
+# dead <label>: true only when it has records and every one names a missing dir under /home.
+dead() {
+  local f dir found=1
+  for f in $(records "$1"); do
+    dir=$(field DIR "$f")
+    case "$dir" in
+      /home/?*) ;;
+      *) echo "ndev-prune: leaving $1 alone: $f has DIR='$dir'" >&2; return 1 ;;
+    esac
+    [ ! -d "$dir" ] || return 1
+    found=0
+  done
+  return "$found"
+}
+hosts_of() { local f; for f in $(records "$1"); do field HOST "$f"; done; }
+dirs_of() { local f; for f in $(records "$1"); do field DIR "$f"; done | sort -u; }
+
+# Two kinds of state outlive a run that could not finish, and both are retried here:
+#   .retry-<zone>      that zone's rebuild or tunnel restart failed. By the next run its
+#                      registry may already be clean (a cross-zone alias row leaves no other
+#                      trace), so the marker is what brings the zone back for a rebuild, and it
+#                      forces the restart even when ndev-rebuild reports no change.
+#   .retained-<label>  prune disabled the label but kept its records for that retry. If its
+#                      directory is back by now, it is re-published rather than left disabled.
+ZONES="" RZ="" RESTORE_FAILED=""
+for m in "$NDEV"/.retry-*; do [ -f "$m" ] && ZONES="$ZONES $${m#"$NDEV"/.retry-}"; done
+
+# restore <label>: put back the label's own registry row (as ndev-register writes it), queue
+# its zone for a rebuild, and re-enable its unit.
+restore() {
+  local f host port who dir zone reg
+  f=$(records "$1" | head -n 1)
+  host=$(field HOST "$f"); port=$(field PORT "$f"); who=$(field WHO "$f"); dir=$(field DIR "$f")
+  zone=$(/usr/local/bin/ndev-zone "$who" 2>/dev/null || true)
+  case "$host" in
+    ?*".$zone")
+      reg="$NDEV/registry-$zone"
+      touch "$reg"
+      { grep -v -P "^\Q$host\E\t" "$reg" || true; printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir"; } | sort -u > "$TMP"
+      cmp -s "$TMP" "$reg" || cat "$TMP" > "$reg"
+      RZ="$RZ $zone" ;;
+    *) echo "ndev-prune: WARNING $1: cannot tell the zone of '$host'; run ndev there to restore its route" ;;
+  esac
+  # The marker is the only thing that brings a live-again label back to this function, so
+  # it goes only once the unit is really enabled; a failure keeps (or creates) it.
+  if systemctl enable --now "ndev@$1.service" >/dev/null 2>&1; then
+    rm -f "$NDEV/.retained-$1"
+  else
+    echo "ndev-prune: WARNING could not re-enable ndev@$1; the next run retries"
+    touch "$NDEV/.retained-$1"
+    RESTORE_FAILED=1
+  fi
+}
+
+for m in "$NDEV"/.retained-*; do
+  [ -f "$m" ] || continue
+  label="$${m#"$NDEV"/.retained-}"
+  case "$label" in *[!a-z0-9-]*|"") rm -f "$m"; continue ;; esac
+  if [ -z "$(records "$label")" ]; then
+    rm -f "$m"
+  elif ! dead "$label"; then
+    echo "ndev-prune: $label's project dir is back; re-publishing it"
+    restore "$label"
+  fi
+done
+ZONES="$ZONES $RZ" RZ=""
+
+LABELS=$(
+  for f in "$NDEV"/instances/*.env; do [ -f "$f" ] && basename "$f" .env; done
+  for f in "$NDEV"/*.env; do [ -f "$f" ] && is_user "$(basename "$f" .env)" && basename "$f" .env; done
+  true
+)
+DEAD=""
+for label in $(printf '%s\n' "$LABELS" | sort -u); do
+  case "$label" in *[!a-z0-9-]*|"") echo "ndev-prune: skipping odd label '$label'"; continue ;; esac
+  dead "$label" || continue
+  echo "ndev-prune: $label is dead ($(dirs_of "$label" | tr '\n' ' ')gone); unpublishing"
+  DEAD="$DEAD $label"
+  systemctl disable --now "ndev@$label.service" >/dev/null 2>&1 || echo "ndev-prune: WARNING could not disable ndev@$label"
+  systemctl reset-failed "ndev@$label.service" >/dev/null 2>&1 || true
+done
+[ -n "$DEAD$${ZONES// /}" ] || exit 0
+
+# Registry rows: a row belongs to a dead label when it carries one of the label's hostnames
+# OR its recorded project dir. The dir match is what catches an alias in another zone, such
+# as a pinned route (local.nextjs_pinned_routes) to the same checkout. A row is dropped only
+# when its own recorded dir is empty or gone too, so a row pointing at a live checkout survives.
+LZ=""      # label@zone pairs: which zones each dead label's cleanup depends on
+for reg in "$NDEV"/registry-*; do
+  [ -f "$reg" ] || continue
+  zone="$${reg#"$NDEV"/registry-}"
+  case "$zone" in *.new) continue ;; esac
+  hosts="" dirs="" touched=""
+  for label in $DEAD; do
+    mine=""
+    for h in $(hosts_of "$label"); do
+      case "$h" in *".$zone") hosts="$hosts $h"; mine=1 ;; esac
+    done
+    for d in $(dirs_of "$label"); do
+      dirs="$dirs $d"
+      if awk -F'\t' -v d="$d" '$4 == d { found = 1 } END { exit !found }' "$reg"; then mine=1; fi
+    done
+    [ -z "$mine" ] || { LZ="$LZ $label@$zone"; touched=1; }
+  done
+  [ -n "$touched" ] || continue
+  ZONES="$ZONES $zone"
+  while IFS= read -r line || [ -n "$line" ]; do
+    IFS=$'\t' read -r h _ _ d _ <<<"$line"
+    drop=""
+    case " $hosts " in *" $h "*) drop=1 ;; esac
+    if [ -n "$d" ]; then case " $dirs " in *" $d "*) drop=1 ;; esac; fi
+    if [ -n "$drop" ] && { [ -z "$d" ] || [ ! -d "$d" ]; }; then
+      echo "ndev-prune: removed $h from $zone" >&2
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$reg" > "$TMP"
+  # The marker goes down BEFORE the rows do: a cross-zone alias row is this zone's only link
+  # to the dead project, so a run killed between here and rebuild_zones would otherwise
+  # leave nothing that tells the next run this zone's ingress is stale.
+  if ! cmp -s "$TMP" "$reg"; then
+    touch "$NDEV/.retry-$zone"
+    cat "$TMP" > "$reg"
+  fi
+done
+
+# A zone is rebuilt whenever a dead label's host or dir belongs to it, not only when its
+# registry changed in this run, so a run interrupted after the registry edit still fixes the
+# ingress next time. Only a zone whose config changed (or that is owed a retry) is restarted.
+FAILED=""
+rebuild_zones() {
+  local zone changed owed
+  for zone in $(printf '%s\n' "$@" | sort -u); do
+    owed=""
+    [ ! -f "$NDEV/.retry-$zone" ] || owed=1
+    # Marked before anything is attempted and cleared only on success, so a failed rebuild,
+    # a failed restart or a killed run all leave the zone owed to the next run -- including
+    # a restart that failed after the config was already written, which the next rebuild
+    # would otherwise report as unchanged.
+    touch "$NDEV/.retry-$zone"
+    changed=0
+    /usr/local/bin/ndev-rebuild "$zone" || changed=$?
+    if [ "$changed" = 0 ] && [ -n "$owed" ]; then changed=10; fi
+    case "$changed" in
+      10)
+        if systemctl restart "cloudflared@$zone"; then
+          rm -f "$NDEV/.retry-$zone"
+        else
+          echo "ndev-prune: WARNING cloudflared@$zone did not restart"
+          FAILED="$FAILED $zone"
+        fi ;;
+      0) rm -f "$NDEV/.retry-$zone" ;;
+      *)
+        echo "ndev-prune: WARNING ndev-rebuild $zone failed ($changed)"
+        FAILED="$FAILED $zone" ;;
+    esac
+  done
+}
+rebuild_zones $ZONES
+
+# Last, so an interrupted run leaves the env files and the next run finishes the job. A
+# label whose zone failed keeps its records, marked .retained-<label>, because they are the
+# only state the next run can find it by. Each label is re-checked before anything goes.
+RC=0
+for label in $DEAD; do
+  keep=""
+  for pair in $LZ; do
+    [ "$${pair%@*}" = "$label" ] || continue
+    case " $FAILED " in *" $${pair#*@} "*) keep="$${pair#*@}" ;; esac
+  done
+  if [ -n "$keep" ]; then
+    echo "ndev-prune: keeping $label's records so the next run retries $keep"
+    touch "$NDEV/.retained-$label"
+    RC=1
+    continue
+  fi
+  if ! dead "$label"; then
+    if [ -n "$(records "$label")" ]; then
+      echo "ndev-prune: $label's project dir is back; re-publishing it"
+      restore "$label"
+    fi
+    continue
+  fi
+  rm -f "$NDEV/instances/$label.env" "$NDEV/.retained-$label"
+  if is_user "$label"; then rm -f "$NDEV/$label.env"; fi
+  rm -rf "/etc/systemd/system/ndev@$label.service.d"
+done
+[ -z "$${RZ// /}" ] || rebuild_zones $RZ
+[ -z "$FAILED$RESTORE_FAILED" ] || RC=1
+systemctl daemon-reload
+exit "$RC"
+PRUNE
+chmod 755 /usr/local/bin/ndev-prune
+
+# Daily, at night, as well as on every setup run: with ExecCondition a dead project no
+# longer loops, but its hostname would keep a route to a closed port until setup next ran.
+# Nightly because a prune restarts the zone's cloudflared, briefly dropping its connections.
+cat > /etc/systemd/system/ndev-prune.service <<'UNIT'
+[Unit]
+Description=Unpublish ndev projects whose directory has been deleted
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ndev-prune
+UNIT
+cat > /etc/systemd/system/ndev-prune.timer <<'UNIT'
+[Unit]
+Description=Nightly ndev-prune
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 # ---------------------------------------------------------------- durability
 # WHY THESE UNITS EXIST: this box is a spot instance, so AWS reclaims it and restarts it
 # without warning -- twice in one hour on 2026-07-25. cloudflared came back on its own
@@ -798,15 +1169,34 @@ cat > /usr/local/bin/ndev-run <<'RUN'
 #!/bin/bash
 # Started by ndev@<label>.service. Reads what ndev-register recorded and serves it.
 # %i is the hostname left-label (ejc3 or ejc3-<slug>), not necessarily a unix user.
+#
+# `ndev-run --check <label>` is the unit's ExecCondition. Exit 1 there means "skip this
+# start": systemd leaves the unit inactive rather than failed, and Restart=always does not
+# apply to a skipped condition. Without it a deleted checkout made `cd` fail, and the unit
+# restarted every 10 seconds forever.
 set -euo pipefail
+CHECK=""
+if [ "$${1:-}" = "--check" ]; then CHECK=1; shift; fi
 LABEL="$1"
 ENVF="/var/lib/ndev/instances/$LABEL.env"
 # Legacy single-file layout (pre multi-instance): /var/lib/ndev/$USER.env
 if [ ! -f "$ENVF" ] && [ -f "/var/lib/ndev/$LABEL.env" ]; then
   ENVF="/var/lib/ndev/$LABEL.env"
 fi
-[ -f "$ENVF" ] || { echo "$LABEL has not published a project yet" >&2; exit 0; }
-. "$ENVF"
+DIR=""
+[ ! -f "$ENVF" ] || . "$ENVF"
+WHY=""
+if [ ! -f "$ENVF" ]; then
+  WHY="$LABEL has not published a project yet"
+elif [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
+  WHY="ndev@$LABEL: project dir $DIR is gone; run 'sudo ndev-prune' or re-publish with ndev"
+fi
+if [ -n "$WHY" ]; then
+  echo "$WHY" >&2
+  [ -z "$CHECK" ] || exit 1
+  exit 0    # removed while starting: one restart, then the condition skips it
+fi
+[ -z "$CHECK" ] || exit 0
 cd "$DIR"
 # node_modules lives on the root volume and survives reboots, but a fresh volume (or a
 # dependency change) would otherwise leave the service crash-looping on a missing module.
@@ -835,6 +1225,8 @@ User=%i
 WorkingDirectory=/home/%i
 Environment=HOME=/home/%i
 Environment=NODE_ENV=development
+# Skip (inactive, not failed, no restart) when nothing is published or its dir is gone.
+ExecCondition=/usr/local/bin/ndev-run --check %i
 ExecStart=/usr/local/bin/ndev-run %i
 Restart=always
 RestartSec=10
@@ -979,6 +1371,11 @@ set -uo pipefail
 WHO="$1"
 export HOME="/home/$WHO"
 WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
+# Every folder this run opens a window for, for codex-seed@<user> (seeds a Codex thread in each).
+DIRS_STATE="$HOME/.local/state/agents-start"
+mkdir -p "$DIRS_STATE"
+DIRS_NEW=$(mktemp "$DIRS_STATE/dirs.XXXXXX")
+printf '%s\n' "$WORKDIR" > "$DIRS_NEW"
 zsh -c "
   source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
   cd '$WORKDIR' || exit 1
@@ -990,6 +1387,28 @@ zsh -c "
   t-claude --auto --remote-control
 "
 echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
+
+# Extra managed folders (added 2026-09-25 by Claude, Starfall Arena handoff to Connor). Optional,
+# per user: ~/.config/agent-extra-dirs lists one folder per line (# comments and blanks skipped).
+# Each gets the same `t-claude --auto --remote-control` as WORKDIR above: its own tmux window,
+# keyed by folder, resuming that folder's newest conversation. No file = no change. Revert with
+# the .bak-20260925 copy beside this script.
+EXTRA="$HOME/.config/agent-extra-dirs"
+if [ -f "$EXTRA" ]; then
+  while IFS= read -r XD || [ -n "$XD" ]; do
+    case "$XD" in ''|'#'*) continue ;; esac
+    [ -d "$XD" ] || { echo "agents-start: $WHO extra dir $XD missing, skipped" >&2; continue; }
+    [ "$XD" = "$WORKDIR" ] && continue
+    zsh -c "
+      source ~/.config/t-claude.zsh 2>/dev/null || exit 1
+      cd '$XD' || exit 1
+      t-claude --auto --remote-control
+    " </dev/null
+    echo "agents-start: t-claude invoked for $WHO in $XD"
+    printf '%s\n' "$XD" >> "$DIRS_NEW"
+  done < "$EXTRA"
+fi
+mv -f "$DIRS_NEW" "$DIRS_STATE/dirs"
 
 # Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
 # resumed conversation carries a Remote Control binding that is dead whenever the process that
@@ -1049,6 +1468,32 @@ UNIT
 #
 # Uses the standalone binary explicitly: `codex remote-control` refuses to run against the
 # npm/system install, and $PATH is not dependable inside a unit.
+${local.codex_seed_thread_install}
+# A Codex thread in every folder agents-start opened a window for (its list:
+# ~/.local/state/agents-start/dirs), so each shows up in the Codex app. Enabled by
+# agents-enable for local.nextjs_codex_seed_users only. Folders that already have a thread are
+# only checked.
+cat > /etc/systemd/system/codex-seed@.service <<'UNIT'
+[Unit]
+Description=Seed a Codex thread for each folder agents-start opened for %i
+After=claude-rc@%i.service codex-rc@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+ExecCondition=/bin/sh -c 'test -s /home/%i/.local/state/agents-start/dirs && /home/%i/.local/bin/codex login status >/dev/null 2>&1'
+ExecStart=/usr/local/bin/codex-seed-thread --from /home/%i/.local/state/agents-start/dirs
+Environment=CODEX_BIN=/home/%i/.local/bin/codex
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/codex-rc@.service <<'UNIT'
 [Unit]
 Description=Codex app-server daemon with remote control for %i
@@ -1078,6 +1523,21 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+
+# Everything that writes /var/lib/ndev (registries, env files, drop-ins) holds the lock that
+# ndev-register and ndev-prune take, so a user publishing during a setup run cannot interleave
+# with it. The helpers called inside inherit the held lock as fd 9 and reuse it (see
+# ndev-prune) instead of waiting on this script. Released between the two stretches, so a
+# publish is not held up by the user setup in between.
+ndev_lock() {
+  exec 9>/var/lib/ndev/.lock
+  # Never go on without it: that is exactly the interleaving the lock exists to prevent.
+  # Exit 75 (EX_TEMPFAIL) is the one code setup-sync treats as "not applied": it leaves the
+  # etag unrecorded, so the whole script runs again in 10 minutes.
+  flock -w 900 9 || { echo "ERROR: /var/lib/ndev/.lock still held after 15 min; stopping setup, setup-sync will retry"; exit 75; }
+}
+ndev_unlock() { flock -u 9; exec 9>&-; }
+ndev_lock
 
 # Split the old single shared registry into one per zone. Without this the per-zone config
 # is rebuilt from a registry that does not exist yet, so every already-published hostname
@@ -1121,9 +1581,35 @@ Environment=HOME=/home/$u
 EOF
 done
 
+# Unpublish projects whose directory was deleted, before the ingress rebuild below and
+# before the re-enable loop further down, so neither brings a dead one back. The timer
+# repeats it nightly between setup runs.
+/usr/local/bin/ndev-prune || echo "WARNING: ndev-prune did not finish cleanly"
+systemctl enable --now ndev-prune.timer >/dev/null 2>&1 || echo "WARNING: ndev-prune.timer not enabled"
+
 # Build each zone's ingress from its registry. Also the reason a fresh box has a working
 # tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
+# Pinned routes (local.nextjs_pinned_routes). Appended to the zone's registry before the
+# rebuild below, so they are part of the first ingress this boot writes. Idempotent, and a
+# row someone removed by hand comes back on the next boot, which is the point of pinning.
+pin_route() {
+  local zone="$1" host="$2" port="$3" who="$4" dir="$5" reg="/var/lib/ndev/registry-$1"
+  case "$host" in *".$zone") ;; *) echo "pin: $host is not under $zone, skipping"; return 0 ;; esac
+  touch "$reg"
+  grep -v -P "^\Q$host\E\t" "$reg" > "$reg.new" || true
+  # A pinned route follows its checkout: once the directory is gone, drop the row instead of
+  # routing the alias to a port nothing listens on (ndev-prune removes it the same way).
+  if [ -d "$dir" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir" >> "$reg.new"
+  else
+    echo "pin: not routing $host, $dir is gone"
+  fi
+  sort -u "$reg.new" > "$reg" && rm -f "$reg.new"
+}
+${local.nextjs_pinned_rows}
+
 ${local.nextjs_zone_rebuild}
+ndev_unlock
 
 # Templated per zone: cloudflared serves ONE tunnel per process, so two zones means two
 # services. cloudflared@cc-games.dev and cloudflared@dolphin-labs.dev fail and restart
@@ -1423,11 +1909,15 @@ AGENTSMD
   chown "$u:$u" "$CFG" 2>/dev/null || true
   { [ -s "/home/$u/.codex/auth.json" ] && [ -x "$CODEX_STANDALONE" ]; } && systemctl enable --now "codex-rc@$u.service" 2>/dev/null || true
   # Re-enable previously published projects (per-instance env files).
+  ndev_lock
   for envf in /var/lib/ndev/instances/*.env; do
     [ -s "$envf" ] || continue
     # shellcheck disable=SC1090
     WHO_LINE=$(grep -E '^WHO=' "$envf" | head -1 | cut -d= -f2- || true)
     [ "$WHO_LINE" = "$u" ] || continue
+    # ndev-prune ran above and removed dead projects; never re-enable one it missed.
+    DIR_LINE=$(sed -n 's/^DIR=//p' "$envf" | head -1)
+    [ -n "$DIR_LINE" ] && [ -d "$DIR_LINE" ] || { echo "not re-enabling $envf: DIR '$DIR_LINE' is gone"; continue; }
     label=$(basename "$envf" .env)
     DROP_DIR="/etc/systemd/system/ndev@$label.service.d"
     mkdir -p "$DROP_DIR"
@@ -1441,9 +1931,11 @@ EOF
     systemctl enable --now "ndev@$label.service" 2>/dev/null || true
   done
   # Legacy single-file layout until migrated below.
-  if [ -s "/var/lib/ndev/$u.env" ] && [ ! -s "/var/lib/ndev/instances/$u.env" ]; then
+  if [ -s "/var/lib/ndev/$u.env" ] && [ ! -s "/var/lib/ndev/instances/$u.env" ] &&
+     [ -d "$(sed -n 's/^DIR=//p' "/var/lib/ndev/$u.env" | head -1)" ]; then
     systemctl enable --now "ndev@$u.service" 2>/dev/null || true
   fi
+  ndev_unlock
 done
 
 # ---------------------------------------------------------------- nightly agent update
@@ -1489,10 +1981,36 @@ for u in ${join(" ", local.nextjs_users)}; do
   /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
 done
 
+# A restart kills everything in the unit's cgroup (KillMode=control-group): the agent, its
+# tmux server and every background job it started -- on 2026-09-20 that wiped a multi-hour
+# build with nine running workflows. So do not restart a service whose user has a session
+# that wrote to its transcript recently; the update is already installed and takes effect on
+# that session's next start. Tune with AGENT_UPDATE_IDLE_MIN (minutes of silence that count
+# as idle, default 60).
+IDLE_MIN="$${AGENT_UPDATE_IDLE_MIN:-60}"
+case "$IDLE_MIN" in ''|*[!0-9]*) echo "WARNING: AGENT_UPDATE_IDLE_MIN=$IDLE_MIN is not a number, using 60"; IDLE_MIN=60 ;; esac
+recent_session() {  # recent_session <user> <claude-rc|codex-rc> -> prints one recently written session file, exit 0 if any
+  local u="$1" dir
+  case "$2" in
+    claude-rc) dir="/home/$u/.claude/projects" ;;
+    codex-rc)  dir="/home/$u/.codex/sessions" ;;
+    *) return 1 ;;
+  esac
+  [ -d "$dir" ] || return 1
+  local hit
+  hit=$(find "$dir" -type f \( -name '*.jsonl' -o -name '*.json' \) -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)
+  [ -n "$hit" ] && { echo "$hit"; return 0; }
+  return 1
+}
+
 for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   for s in claude-rc codex-rc; do
     systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
+    if active=$(recent_session "$u" "$s"); then
+      echo "SKIPPED restart of $s@$u: a session was active in the last $${IDLE_MIN} min ($active)"
+      continue
+    fi
     systemctl restart "$s@$u" && echo "restarted $s@$u"
   done
 done
@@ -1552,6 +2070,62 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
     apt-get install -y tmux || true
   fi
 fi
+# The scroll-native tmux, installed BESIDE the normal one as tmux-scroll rather than over it.
+#
+# Claude's conversation only reaches the terminal's own scrollback (swipe-to-scroll on a
+# phone) if tmux hands the scrolled-off lines to the terminal instead of repainting a region.
+# The scroll-native branch adds `scroll-replay` for exactly that; a stock tmux loses those
+# lines on any big scroll. t-claude looks for this binary by name and checks it really is the
+# patched build (it greps it for `scroll-replay`), so the name and the check matter more than
+# the version string.
+#
+# BESIDE, not over: replacing /usr/local/bin/tmux cannot change the RUNNING server -- a tmux
+# server keeps the binary it started with -- so it would leave every box one restart away from
+# a version its sessions never asked for. A separate name lets t-claude pick it up for the next
+# server while the current one keeps running.
+#
+# PINNED, and upgraded when the pin moves (tmux-scroll.tf holds the release tag and sha256).
+# This used to install only when the binary was missing, so the box never left its first build.
+# /var/lib/tmux-scroll/sha256 records which pinned tarball is installed; a matching record and a
+# genuine binary skip the download entirely.
+TS_TAG="${local.tmux_scroll_tag}"
+TS_SHA="${local.tmux_scroll_sha256_aarch64}"
+TS_STATE=/var/lib/tmux-scroll
+if [ "$(uname -m)" != aarch64 ]; then
+  echo "WARNING: no pinned tmux-scroll build for $(uname -m); keeping any installed copy"
+elif [ -x /usr/local/bin/tmux-scroll ] && grep -qa scroll-replay /usr/local/bin/tmux-scroll \
+     && [ "$(cat "$TS_STATE/sha256" 2>/dev/null)" = "$TS_SHA" ]; then
+  : # already the pinned build
+else
+  # Own directory per run: a fixed /tmp name would be a file another account can pre-create.
+  TSTMP=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/$TS_TAG/tmux-scroll-aarch64.tar.gz" -o "$TSTMP/tmux-scroll.tgz" \
+     && echo "$TS_SHA  $TSTMP/tmux-scroll.tgz" | sha256sum -c --quiet -; then
+    # Prove it is the patched build and that it runs BEFORE it replaces anything: the whole
+    # point of this binary is the option.
+    if tar xzf "$TSTMP/tmux-scroll.tgz" -C "$TSTMP" \
+       && grep -qa scroll-replay "$TSTMP/tmux-scroll" \
+       && "$TSTMP/tmux-scroll" -V >/dev/null 2>&1; then
+      # Rename, then install: a running binary cannot be overwritten in place ("Text file
+      # busy"). A live server keeps the build it started with either way, and every build
+      # from 3.7b on speaks the same client/server protocol (see tmux-scroll.tf).
+      mkdir -p "$TS_STATE"
+      [ -e /usr/local/bin/tmux-scroll ] && mv -f /usr/local/bin/tmux-scroll /usr/local/bin/tmux-scroll.prev
+      if install -m 755 "$TSTMP/tmux-scroll" /usr/local/bin/tmux-scroll; then
+        echo "$TS_SHA" > "$TS_STATE/sha256"
+      else
+        [ -e /usr/local/bin/tmux-scroll.prev ] && mv -f /usr/local/bin/tmux-scroll.prev /usr/local/bin/tmux-scroll
+        echo "WARNING: could not install the scroll-native tmux; restored the previous copy"
+      fi
+    else
+      echo "WARNING: scroll-native tmux failed its checks; keeping any installed copy"
+    fi
+  else
+    echo "WARNING: could not download the pinned scroll-native tmux, or it did not match its sha256 (keeping any installed copy)"
+  fi
+  rm -rf "$TSTMP"
+fi
+
 # Claude Code -- the NATIVE installer, per user. See dev-user-data.tf for the full reasoning:
 # npm's "latest" lagged the native channel (2.1.241 vs 2.1.246), a root-owned global install
 # cannot be updated by a normal user so every start retried and failed, and having both
@@ -1609,6 +2183,14 @@ ${local.dev_hop_setup}
 # reachable) and parallel-box-watchdog.tf, which terminates an idle box after 30 minutes.
 # The exposure is therefore cost, not access, and it is capped.
 ${local.pbox_setup}
+
+# ---------------------------------------------------------------- gbox
+# The on-demand GPU test box (gpu-box.tf), for measuring the kids' browser games on a real
+# GPU. Same trust shape as pbox: the instance role's tag-scoped gpu-box-control grant is
+# box-wide (every account here has sudo), and what bounds it is the policy -- four small
+# NVIDIA types, one tag, one template -- plus the watchdog (30 idle minutes) and the box's
+# own hard lifetime. It uses the hop key below, as pbox does.
+${local.gbox_setup}
 
 # ejc3's copy of the hop key. dev_hop_setup above installs it for `ubuntu` only, and
 # /home/ubuntu is 0700 -- but `pbox up` ends by SSHing to the new box as the invoking
@@ -1718,44 +2300,8 @@ USERSHELL
   chsh -s /usr/bin/zsh "$u" 2>/dev/null || true
 done
 
-# ---------------------------------------------------------------- codex hook paths
-# atuin's codex integration writes hooks.json with a bare `atuin hook codex`. atuin is
-# installed to ~/.atuin/bin, which is on the login PATH but NOT in the environment Codex
-# runs hooks in -- so every Bash tool call fired the hook and it died with exit 127,
-# printing "error: hook exited with code 127" into the middle of the session. Harmless but
-# constant, and it looks like the agent is broken. Rewrite to the absolute path.
-for u in ${join(" ", local.nextjs_users)} ubuntu; do
-  id -u "$u" >/dev/null 2>&1 || continue
-  HOOKS="/home/$u/.codex/hooks.json"
-  ATUIN="/home/$u/.atuin/bin/atuin"
-  [ -f "$HOOKS" ] && [ -x "$ATUIN" ] || continue
-  python3 - "$HOOKS" "$ATUIN" <<'HOOKFIX'
-import json, sys
-path, atuin = sys.argv[1], sys.argv[2]
-try:
-    doc = json.load(open(path))
-except Exception:
-    raise SystemExit(0)
-changed = 0
-def walk(node):
-    global changed
-    if isinstance(node, dict):
-        cmd = node.get("command")
-        if isinstance(cmd, str) and cmd.startswith("atuin "):
-            node["command"] = atuin + cmd[len("atuin"):]
-            changed += 1
-        for v in node.values():
-            walk(v)
-    elif isinstance(node, list):
-        for v in node:
-            walk(v)
-walk(doc)
-if changed:
-    json.dump(doc, open(path, "w"), indent=2)
-    print(f"codex hooks: absolute-pathed {changed} command(s)")
-HOOKFIX
-  chown "$u:$u" "$HOOKS" 2>/dev/null || true
-done
+# Atuin agent hooks (one absolute-path hook per event for Claude Code and Codex) are
+# normalized inside local.user_shell_env above, for every account on every box.
 
 # ---------------------------------------------------------------- git identity
 # Derived from `gh api user`, never hardcoded, so it cannot drift from the account that is

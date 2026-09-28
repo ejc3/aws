@@ -47,12 +47,18 @@ variable "firecracker_ami" {
 #   2. set firecracker_move_from_instance_id to its instance ID (terraform output
 #      firecracker_dev_instance_id) and firecracker_availability_zone to the target
 #   3. merge, then apply from a fresh worktree
+#   4. once the new box checks out and a completed backup holds the disk as of the move (the new
+#      root volume's first daily backup, or the old volume's if it ran after the stop), set
+#      firecracker_move_from_instance_id back to "" and apply, which deletes the image
 #
 # The new instance is created before the old one is destroyed, so a launch refused for lack of
 # capacity leaves the old box untouched. The Elastic IP, security group and IAM follow, and the
 # SSH host keys come across in the image and are kept (local.firecracker_user_data). The old
 # root volume survives termination (delete_on_termination = false) as a rollback copy; delete it
 # once the new box checks out. A target AZ needs a subnet in local.subnet_ids_by_az (main.tf).
+#
+# Step 4 matters: while the variable is set, any later replacement of the instance boots from
+# that dated image and quietly rolls the disk back to the day of the move.
 # ---------------------------------------------------------------------------------
 variable "firecracker_availability_zone" {
   description = "AZ for fcvm-metal-arm; must be a key of local.subnet_ids_by_az"
@@ -68,7 +74,7 @@ variable "firecracker_availability_zone" {
 variable "firecracker_move_from_instance_id" {
   description = "Instance whose root disk the box is built from after a move; empty boots var.firecracker_ami"
   type        = string
-  default     = "i-0766472741714f88a" # 2026-09-13: us-west-1a -> us-west-1c
+  default     = "" # set only for a move; see steps 2 and 4 above
 }
 
 # Security group for Firecracker dev instance

@@ -20,8 +20,8 @@
 
 # RUNS PERSISTENTLY. Deliberately absent from dev-auto-stop-lambda.tf's INSTANCE_IDS
 # (which reaps only the two metal boxes after 12h idle) -- these URLs are meant to keep
-# working, so the box must not be reaped for being quiet. Cost is kept down by size and
-# spot pricing instead: t4g.large spot is roughly $12/month running 24/7.
+# working, so the box must not be reaped for being quiet. It runs on-demand (see the
+# instance below): t4g.xlarge is $0.16/h in us-west-1, about $117/month running 24/7.
 variable "enable_nextjs_dev" {
   description = "Run the Next.js dev box (stays up; not covered by the idle auto-stop)."
   type        = bool
@@ -29,13 +29,28 @@ variable "enable_nextjs_dev" {
 }
 
 variable "nextjs_instance_type" {
-  description = "t4g.large: 2 vCPU / 8GB Graviton, burstable. Four accounts, each with a `next dev` plus Claude and Codex; the 4GB swapfile absorbs compile spikes rather than carrying steady state."
+  description = "t4g.xlarge: 4 vCPU / 16GB Graviton, burstable. Four accounts, each with a `next dev` plus Claude and Codex; the 4GB swapfile absorbs compile spikes rather than carrying steady state."
   type        = string
   # 8GB, raised from t4g.medium (4GB) on 2026-08-16. At 4GB the kernel paged to /swapfile,
   # swap-in reads pinned the root volume at its 125MB/s ceiling, and with the disk saturated
   # sshd could not complete a handshake and BOTH cloudflared tunnels dropped to zero
   # connections. A session then hit the OOM killer at a 6.7GB peak.
-  default = "t4g.large"
+  # 16GB, raised from t4g.large on 2026-09-15 at the owner's request. All four accounts were
+  # running Claude and `next dev`, three of them Codex too, with 1.15GB of the swapfile in use.
+  default = "t4g.xlarge"
+}
+
+variable "nextjs_dolphin_gdocs_access_enabled" {
+  # TEMPORARY, added 2026-09-20 at the owner's request so dolphin (ejc3 on this box) can run
+  # scripts/gdoc.py. Revert to false the next day this is reviewed (target: 2026-09-21) --
+  # docs/gdoc-integration.md's security model is explicit that this refresh token "lives in
+  # Secrets Manager, never on disk or in source control. The client secret stays on the
+  # jumpbox." Every account with this grant can read the refresh token via the AWS CLI and
+  # edit any document the authorizing Google account can reach, so this widens that boundary
+  # for as long as it stays true.
+  description = "Grant nextjs-dev's role read access to the Google Docs OAuth secrets. Temporary -- turn off."
+  type        = bool
+  default     = true
 }
 
 variable "nextjs_volume_size" {
@@ -85,6 +100,12 @@ data "aws_secretsmanager_secret" "nextjs_connector" {
   name = each.value
 }
 
+# See var.nextjs_dolphin_gdocs_access_enabled -- temporary.
+data "aws_secretsmanager_secret" "nextjs_gdocs" {
+  for_each = var.nextjs_dolphin_gdocs_access_enabled ? toset(["google-docs-oauth-desktop", "google-docs-oauth-token"]) : []
+  name     = each.value
+}
+
 resource "aws_iam_instance_profile" "nextjs_dev" {
   name = "nextjs-dev-profile"
   role = aws_iam_role.nextjs_dev.name
@@ -115,7 +136,7 @@ resource "aws_iam_role_policy" "nextjs_dev" {
           aws_secretsmanager_secret.dev_hop.arn,
           ], local.dolphin_enabled ? [
           data.aws_secretsmanager_secret.nextjs_connector["cloudflare-dolphin-tunnel-credentials"].arn,
-        ] : [])
+        ] : [], [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn])
       },
       {
         # devhop-refresh resolves the other dev servers' private IPs at boot, because they
@@ -193,8 +214,9 @@ resource "aws_instance" "nextjs_dev" {
   # reboot for host maintenance and kernel updates too. This changes how OFTEN the box goes
   # away, not whether it comes back cleanly.
   #
-  # Sized down from large to medium at the same time, so the durable option costs about
-  # what the unreliable one did (~$29/mo vs ~$24/mo spot) rather than $58/mo.
+  # Sized down from large to medium at the same time, so the durable option cost about what
+  # the unreliable one did. It has since gone back up, to large on 2026-08-16 and xlarge on
+  # 2026-09-15; see var.nextjs_instance_type.
 
   root_block_device {
     volume_size           = var.nextjs_volume_size
