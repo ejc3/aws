@@ -9,6 +9,7 @@ may call it.
 
 Run from the repo root:  python3 -S -B scripts/test-games-mp-launch.py
 """
+import base64
 import contextlib
 import importlib.util
 import io
@@ -30,6 +31,18 @@ REPO = "%s.dkr.ecr.us-west-1.amazonaws.com/games/mptest-engine" % ACCOUNT
 CURRENT_SIM = "mptest-1"
 PREVIEW_API = "https://colton-games-abc123xyz-coltons-projects-7f9a4e8b.vercel.app"
 
+
+def spki(fill):
+    """A 44-byte Ed25519 SubjectPublicKeyInfo (RFC 8410) around a stand-in 32-byte key."""
+    return base64.b64encode(bytes.fromhex("302a300506032b6570032100") + bytes([fill]) * 32).decode()
+
+
+# What Terraform writes: each environment's own Ed25519 public keys (games_mp_token_public_keys_by_env).
+PROD_KEYS = "production:production-kid2:%s,production:production-kid1:%s" % (spki(1), spki(2))
+PREVIEW_KEYS = "preview:preview-kid1:%s" % spki(3)
+# A PKCS#8 Ed25519 private key's DER is 48 bytes: this prefix plus the 32-byte seed.
+PRIVATE_DER = base64.b64encode(bytes.fromhex("302e020100300506032b657004220420") + b"\x07" * 32).decode()
+
 ENV = {
     "CLUSTER": "games",
     "SUBNETS": "subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb",
@@ -50,10 +63,11 @@ ENV = {
 # exactly what Terraform writes (see TerraformTests).
 FUNCTIONS = {
     "production": {"LAUNCH_ENV": "production", "ENV_CEILING": "4",
-                   "API_BASE": r"^https://cc-games\.app$", "ALLOW_BYPASS": "false"},
+                   "API_BASE": r"^https://cc-games\.app$", "ALLOW_BYPASS": "false",
+                   "TOKEN_PUBLIC_KEYS": PROD_KEYS},
     "preview": {"LAUNCH_ENV": "preview", "ENV_CEILING": "2",
                 "API_BASE": r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$",
-                "ALLOW_BYPASS": "true"},
+                "ALLOW_BYPASS": "true", "TOKEN_PUBLIC_KEYS": PREVIEW_KEYS},
 }
 
 
@@ -258,6 +272,7 @@ class LaunchTests(unittest.TestCase):
             {"name": "MP_API", "value": "https://cc-games.app"},
             {"name": "GAME_ID", "value": "mptest"},
             {"name": "MP_ENV", "value": "production"},
+            {"name": "MP_TOKEN_PUBLIC_KEYS", "value": PROD_KEYS},
             {"name": "PORT", "value": "8080"},
         ]}]})
         self.assertEqual(call["tags"], [{"key": "game", "value": "mptest"}, {"key": "match", "value": match(1)},
@@ -274,7 +289,50 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(env["MP_ENV"], "preview")
         self.assertEqual(env["MP_API"], PREVIEW_API)
         self.assertEqual(env["MP_API_BYPASS"], "B" * 32)
+        self.assertEqual(env["MP_TOKEN_PUBLIC_KEYS"], PREVIEW_KEYS, "preview's keys, never production's")
         self.assertIn({"key": "env", "value": "preview"}, call["tags"])
+
+    # -- join-token keys -------------------------------------------------------------------
+
+    def test_engines_get_only_their_own_environments_public_keys(self):
+        bad_values = {
+            "a private key": "production:production-kid1:%s" % PRIVATE_DER,
+            "a raw HMAC key": "production:kid1:%s" % base64.b64encode(b"\x05" * 32).decode(),
+            "the retired MP_TOKEN_KEYS shape": "kid1:%s" % base64.b64encode(b"\x05" * 32).decode(),
+            "another environment's key": "%s,%s" % (PROD_KEYS, PREVIEW_KEYS),
+            "a non-Ed25519 SPKI": "production:k:%s" % base64.b64encode(
+                bytes.fromhex("302a300506032b6571032100") + b"\x01" * 32).decode(),
+            "nothing": "",
+            "an empty entry": PROD_KEYS + ",",
+        }
+        for why, value in bad_values.items():
+            with self.subTest(why):
+                self.lf.TOKEN_PUBLIC_KEYS = value
+                ecs = FakeECS()
+                with self.assertRaises(RuntimeError) as err:
+                    self.invoke(ecs, start_event())
+                self.assertEqual(ecs.run, [], "nothing launched")
+                self.assertNotIn(PRIVATE_DER, str(err.exception))
+        # Each function checks against its own environment: production's keys in the preview
+        # function launch nothing either.
+        self.pf.TOKEN_PUBLIC_KEYS = PROD_KEYS
+        ecs = FakeECS()
+        with self.assertRaises(RuntimeError):
+            self.invoke(ecs, preview_event(), "preview")
+        self.assertEqual(ecs.run, [])
+        # A function deployed without the setting refuses too.
+        os.environ.pop("TOKEN_PUBLIC_KEYS", None)
+        bare = importlib.util.module_from_spec(
+            importlib.util.spec_from_file_location("launch_bare", ROOT / "games-multiplayer" / "launch.py"))
+        for key, value in dict(ENV, **FUNCTIONS["production"]).items():
+            if key != "TOKEN_PUBLIC_KEYS":
+                os.environ[key] = value
+        bare.__spec__.loader.exec_module(bare)
+        self.assertEqual(bare.TOKEN_PUBLIC_KEYS, "")
+        bare._clients["ecs"] = ecs = FakeECS()
+        with self.assertRaises(RuntimeError), contextlib.redirect_stdout(self.log):
+            bare.lambda_handler(start_event(), Context())
+        self.assertEqual(ecs.run, [])
 
     # -- caller-supplied overrides and tags ------------------------------------------------
 
@@ -854,6 +912,17 @@ class TerraformTests(unittest.TestCase):
         self.assertIn(r'api_base = "^https://cc-games\\.app$"', envs)
         self.assertIn(r'api_base = "^https://${local.vercel_project_name}-[a-z0-9-]+-${local.vercel_team_slug}\\.vercel\\.app$"',
                       envs)
+        # Each environment's engines get that environment's public keys, and nothing else.
+        self.assertEqual(re.findall(r"token_public_keys = (.*)", envs), [
+            'local.games_mp_token_public_keys_by_env["production"]',
+            'local.games_mp_token_public_keys_by_env["preview"]'])
+        self.assertIn("TOKEN_PUBLIC_KEYS = each.value.token_public_keys", self.fn)
+        by_env = re.search(r"^  games_mp_token_public_keys_by_env = \{.*?\n  \}\n", BRINGUP, re.S | re.M).group()
+        self.assertIn('for env in local.games_mp_token_envs : env => join(",", [', by_env)
+        self.assertIn('"${env}:${env}-${kid}:${local.games_mp_token_public_der["${env}-${kid}"]}"', by_env)
+        self.assertNotRegex(by_env, r"private|signing")
+        # The functions start launching new engine revisions only after the router rollout.
+        self.assertRegex(self.fn, r"depends_on = \[[^\]]*terraform_data\.games_mp_healthy\]")
         self.assertEqual(re.findall(r"bypass\s*=\s*(\w+)", envs), ["false", "true"])
         # The test's FUNCTIONS settings are what those HCL values render to (tostring(bool) is
         # "true"/"false"; HCL's "\\." is the regex's \.).

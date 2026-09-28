@@ -685,7 +685,7 @@ class TerraformWiringTests(unittest.TestCase):
     def test_tags_are_derived_from_the_pinned_commit(self):
         self.assertIn("games_mp_sha12 = substr(var.games_mp_source_ref, 0, 12)", self.tf)
         self.assertIn('"${var.games_mp_sim_versions[id]}-${local.games_mp_sha12}"', self.tf)
-        self.assertRegex(self.tf, r'default\s*=\s*"38bcb78010d2d40f50035d6e03f080ddb661c243"')
+        self.assertRegex(self.tf, r'default\s*=\s*"1eb83917d994f362fe1e0efe0e06cd022137781b"')
 
     def test_codebuild_role_holds_no_credentials(self):
         policy = self.block(self.bu, "aws_iam_role_policy", "games_mp_codebuild")
@@ -740,12 +740,120 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertIn("local.games_mp_admin_principals", policy)
 
     def test_a_key_rotation_is_a_new_router_task_definition(self):
-        # Pinning the secret by version id makes a rotation change the task definition ARN,
-        # which is what the health step tracks (a rollback cannot pass for the new keys).
+        # The router's public keys are in its environment, so a rotation changes the task
+        # definition ARN, which is what the health step tracks (a rollback cannot pass for
+        # the new keys).
         td = self.block(self.tf, "aws_ecs_task_definition", "games_mp_router")
-        self.assertIn(':::${aws_secretsmanager_secret_version.games_mp_token_keys.version_id}"', td)
+        self.assertIn('{ name = "MP_TOKEN_PUBLIC_KEYS", value = local.games_mp_token_public_keys }', td)
         healthy = self.block(self.bu, "terraform_data", "games_mp_healthy")
         self.assertIn("aws_ecs_task_definition.games_mp_router[0].arn", healthy)
+
+
+def all_tf():
+    return {p.name: p.read_text() for p in sorted(ROOT.glob("*.tf"))}
+
+
+def local_expr(text, name):
+    """The expression of `local.<name>` (from `  name =` up to the next top-level local)."""
+    m = re.search(r"^  %s\s*=\s*(.*?)(?=^  (?:#|[a-z_]+\s*=)|^\}\s*$)" % re.escape(name), text, re.S | re.M)
+    if not m:
+        raise AssertionError("local.%s not found" % name)
+    return m.group(1)
+
+
+class JoinTokenKeyTests(unittest.TestCase):
+    """Ed25519 join tokens: the lobby holds each environment's private keys, the router
+    only public ones, and nothing on AWS can read a private key (ejc3/aws#173)."""
+
+    def setUp(self):
+        self.tf = (ROOT / "games-multiplayer.tf").read_text()
+        self.bu = (ROOT / "games-multiplayer-bringup.tf").read_text()
+        self.block = TerraformWiringTests.block.__get__(self)
+
+    def test_keys_are_ed25519_one_pair_per_environment_and_generation(self):
+        key = self.block(self.bu, "tls_private_key", "games_mp_token")
+        self.assertIn('algorithm = "ED25519"', key)
+        self.assertIn("for_each  = local.games_mp_token_pairs", key)
+        self.assertIn('games_mp_token_envs = ["production", "preview"]', self.bu)
+        pairs = local_expr(self.bu, "games_mp_token_pairs")
+        self.assertIn("setproduct(local.games_mp_token_envs, var.games_mp_token_kids)", pairs)
+        self.assertIn('"${pair[0]}-${pair[1]}"', pairs)
+        # The shared HMAC key is gone for good.
+        self.assertNotIn('"random_bytes" "games_mp_token_key"', self.bu)
+        for name, text in all_tf().items():
+            self.assertNotIn("MP_TOKEN_KEYS", re.sub(r"#[^\n]*", "", text), name)
+            self.assertNotIn("games/mp-token-keys", re.sub(r"#[^\n]*", "", text), name)
+
+    def test_the_router_gets_public_keys_only(self):
+        public = local_expr(self.bu, "games_mp_token_public_keys")
+        self.assertIn("local.games_mp_token_public_keys_by_env[env]", public)
+        self.assertIn("contains(var.mp_router_envs, env)", public)
+        by_env = local_expr(self.bu, "games_mp_token_public_keys_by_env")
+        self.assertIn("local.games_mp_token_public_der[", by_env)
+        for text in (public, by_env):
+            for forbidden in ("private", "signing", "tls_private_key"):
+                self.assertNotIn(forbidden, text)
+        public_der = local_expr(self.bu, "games_mp_token_public_der")
+        self.assertIn(".public_key_pem", public_der)
+        self.assertNotRegex(public_der, r"private_key_(pem|openssh|pem_pkcs8)")
+        # Each public key is bound to its own environment: "<env>:<env>-<kid>:<der>".
+        self.assertIn('"${env}:${env}-${kid}:${local.games_mp_token_public_der["${env}-${kid}"]}"', by_env)
+
+        td = re.sub(r"#[^\n]*", "", self.block(self.tf, "aws_ecs_task_definition", "games_mp_router"))
+        self.assertNotRegex(td, r"\bsecrets\s*=")
+        self.assertNotIn("secretsmanager", td)
+        self.assertNotIn("SIGNING", td)
+        for token in re.findall(r"local\.[a-z_]+", td):
+            self.assertNotIn("private", token)
+            self.assertNotIn("signing", token)
+        # Nor any engine: they never see a token.
+        engine = self.block(self.tf, "aws_ecs_task_definition", "games_engine")
+        self.assertNotIn("games_mp_token", engine)
+
+    def test_private_keys_reach_only_the_vercel_lobby(self):
+        # private_key_pem is read in exactly one place, and what is built from it flows only
+        # into the Vercel secret values.
+        uses = [(n, m.start()) for n, t in all_tf().items()
+                for m in re.finditer(r"tls_private_key\.games_mp_token\[[^\]]*\]\.private_key_pem", t)]
+        self.assertEqual([n for n, _ in uses], ["games-multiplayer-bringup.tf"])
+        self.assertIn("private_key_pem", local_expr(self.bu, "games_mp_token_private_der"))
+        refs = {n: len(re.findall(r"local\.games_mp_token_private_der\b", t)) for n, t in all_tf().items()}
+        self.assertEqual({n: c for n, c in refs.items() if c}, {"games-multiplayer-bringup.tf": 1})
+        self.assertIn("local.games_mp_token_private_der[", local_expr(self.bu, "games_mp_token_signing_keys"))
+        signing = [(n, len(re.findall(r"local\.games_mp_token_signing_keys\b", t))) for n, t in all_tf().items()]
+        self.assertEqual([x for x in signing if x[1]], [("games-multiplayer-bringup.tf", 2)])
+        secret_values = local_expr(self.bu, "games_mp_vercel_secret_values")
+        self.assertIn('"MP_TOKEN_SIGNING_KEYS/production"   = local.games_mp_token_signing_keys["production"]', secret_values)
+        self.assertIn('"MP_TOKEN_SIGNING_KEYS/preview"      = local.games_mp_token_signing_keys["preview"]', secret_values)
+        self.assertNotIn("output", "".join(re.findall(r'output "[^"]*" \{[^}]*games_mp_token[^}]*\}', self.bu)))
+
+    def test_each_vercel_environment_gets_only_its_own_signing_keys(self):
+        env = local_expr(self.bu, "games_mp_vercel_env")
+        rows = dict(re.findall(r'"(MP_TOKEN_SIGNING_KEYS/[a-z]+)"\s*=\s*(\{[^}]*\})', env))
+        self.assertEqual(sorted(rows), ["MP_TOKEN_SIGNING_KEYS/preview", "MP_TOKEN_SIGNING_KEYS/production"])
+        self.assertEqual(rows["MP_TOKEN_SIGNING_KEYS/production"],
+                         '{ targets = ["production"], sensitive = true, value = null }')
+        self.assertEqual(rows["MP_TOKEN_SIGNING_KEYS/preview"],
+                         '{ targets = ["preview"], sensitive = true, value = null }')
+        signing = local_expr(self.bu, "games_mp_token_signing_keys")
+        # An environment's value lists only that environment's keys.
+        self.assertIn('for env in local.games_mp_token_envs : env => join(",", [', signing)
+        self.assertIn('"${env}-${kid}:${local.games_mp_token_private_der["${env}-${kid}"]}"', signing)
+
+    def test_the_router_role_cannot_read_any_secret(self):
+        role = self.block(self.tf, "aws_iam_role_policy", "games_mp_router_execution")
+        self.assertNotIn("secretsmanager", role)
+        self.assertNotIn("kms:", role)
+        self.assertNotIn("ssm:", role)
+        actions = re.findall(r'Action\s*=\s*(\[[^\]]*\]|"[^"]*")', role)
+        self.assertEqual(sorted(re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', " ".join(actions))), sorted([
+            "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage",
+            "ecr:GetDownloadUrlForLayer", "logs:CreateLogStream", "logs:PutLogEvents"]))
+        task = self.block(self.tf, "aws_iam_role", "games_mp_router_task")
+        self.assertIn("Deliberately has no policies", task)
+        for name, text in all_tf().items():
+            self.assertNotRegex(text, r'role\s*=\s*aws_iam_role\.games_mp_router_task\.', name)
+            self.assertNotIn("aws_iam_role.games_mp_router_execution.arn]", text, name)
 
 
 if __name__ == "__main__":
