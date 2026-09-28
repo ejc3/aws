@@ -317,6 +317,11 @@ class SecondDomainTests(unittest.TestCase):
         listener_cert = block(GAMES, "aws_lb_listener_certificate", "games_play_net")
         self.assertIn("listener_arn    = aws_lb_listener.games_play_https.arn", listener_cert)
         self.assertIn("aws_acm_certificate_validation.games_play_net.certificate_arn", listener_cert)
+        # Production hands .net pages the .net entry (first) and calls engines back on .net;
+        # previews set no entry of their own.
+        self.assertIn('"MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, '
+                      'value = "wss://${local.mp_play_domain_net},wss://${local.mp_play_domain}" }', BRINGUP)
+        self.assertIn('"MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.net" }', BRINGUP)
         dns = block(GAMES, "cloudflare_dns_record", "games_play_net")
         self.assertIn("zone_id = var.cc_games_net_zone_id", dns)
         self.assertIn("content = aws_lb.games_play.dns_name", dns)

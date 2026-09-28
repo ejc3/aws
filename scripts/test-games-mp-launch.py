@@ -1121,7 +1121,7 @@ class TerraformTests(unittest.TestCase):
         self.assertNotRegex(self.fn, r"aws_subnet\.subnet_[ab]|dev_fleet_subnets")
         envs = re.search(r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()
         self.assertEqual(sorted(re.findall(r"^    (\w+) = \{", envs, re.M)), ["preview", "production"])
-        self.assertIn(r'api_base = "^https://cc-games\\.app$"', envs)
+        self.assertIn(r'api_base = "^https://cc-games\\.(net|app)$"', envs)
         self.assertIn(r'api_base = "^https://${local.vercel_project_name}-[a-z0-9-]+-${local.vercel_team_slug}\\.vercel\\.app$"',
                       envs)
         # Each environment's engines get that environment's public keys, and nothing else.
