@@ -211,9 +211,10 @@ Tokens live two minutes and Production does not serve multiplayer yet.
    reaches Production. Do not deploy it to Production. A preview built from it before step 2
    answers `503 multiplayer-not-configured` (no `MP_TOKEN_SIGNING_KEYS` yet): expected.
 2. **Pin.** `games_mp_source_ref` must be a commit with the Ed25519 router and the
-   token-verifying engine kit (this change pins `1eb83917`; re-pin to the merged commit if it is
-   rebased or squashed). An older router image with this task definition refuses to boot (no
-   `MP_TOKEN_KEYS`), so the health step would fail the apply rather than serve.
+   token-verifying engine kit (first applied at `1eb83917`; now pinned to `dae003a9`, the
+   squash of colton-games #57 on main, whose image inputs are identical). An older router
+   image with this task definition refuses to boot (no `MP_TOKEN_KEYS`), so the health step
+   would fail the apply rather than serve.
 3. **Plan and apply** from a fresh worktree. The plan must show: `random_bytes.games_mp_token_key`
    destroyed; `tls_private_key.games_mp_token["production-kid1"]` and `["preview-kid1"]` created;
    the Vercel `MP_TOKEN_KEYS` variable destroyed and `MP_TOKEN_SIGNING_KEYS` created once per
