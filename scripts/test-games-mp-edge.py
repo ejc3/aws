@@ -265,10 +265,10 @@ class NetworkTests(unittest.TestCase):
 
     def test_engines_and_router_use_the_games_subnets(self):
         fn = block(GAMES, "aws_lambda_function", "games_mp_launch")
-        self.assertIn('SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])', fn)
+        self.assertRegex(fn, r'SUBNETS\s+= join\(",", \[for s in local\.mp_engine_subnets : s\.id\]\)')
         # The launch function switches subnets only after every router accepts them.
-        self.assertIn("depends_on = [aws_route_table_association.games_engine, aws_network_acl.games_engine, "
-                      "terraform_data.games_mp_healthy]", fn)
+        self.assertIn("depends_on = [\n    aws_route_table_association.games_engine, aws_network_acl.games_engine, "
+                      "terraform_data.games_mp_healthy,", fn)
         router_td = block(GAMES, "aws_ecs_task_definition", "games_mp_router")
         self.assertIn('{ name = "MP_TARGET_CIDRS", value = join(",", local.mp_router_target_cidrs) }', router_td)
         # The routers accept exactly the engine subnets, nothing in the dev fleet.

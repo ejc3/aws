@@ -12,9 +12,10 @@
 # Changing a name here without changing that file breaks the lobby, the router or the
 # image build script. Bring-up, shipping and costs: docs/games-multiplayer.md.
 #
-# games-multiplayer-bringup.tf is the other half: it builds the images (CodeBuild),
-# generates the secrets, writes the Vercel env, applies the Supabase migration and waits
-# for a healthy router, so ONE `terraform apply` goes from nothing to a working platform.
+# games-multiplayer-bringup.tf generates the secrets, writes the Vercel env and waits for a
+# healthy router; games-multiplayer-deploy.tf deploys the games repo's commits (images, engine
+# revisions, the router image, the mp migrations) automatically. ONE `terraform apply` goes from
+# nothing to a working platform.
 #
 #   browser --wss://play.cc-games.app/m/<id>?t=<token>--> ALB games-play (443, ACM)
 #       --> mp-router service (games-router SG; verifies the HMAC token, proxies)
@@ -31,73 +32,15 @@
 # task against ~$33/month plus data for a NAT gateway. Nothing can connect IN to a task
 # except through the security-group chain below.
 #
-# IMAGES COME FROM ONE PINNED COMMIT. var.games_mp_source_ref names a commit of
-# CoderColton/colton-games; its image tags are derived from it (router `<sha12>`, engine
-# `<simVersion>-<sha12>`, the same scheme as the repo's scripts/mp-images.mjs), CodeBuild
-# builds whatever ECR lacks, and the task definitions are created only after that build
-# succeeded. Shipping a new version = changing that one variable and applying.
-
-# The pin must include engine-side preview support: engines launched by a preview lobby
-# call back its protected *.vercel.app URL with x-vercel-protection-bypass (MP_API_BYPASS,
-# passed by the lobby). 38bcb780 (games repo PR #62, mp/preview) has it.
-# It must also have the Ed25519 join-token router and engine kit: the task definition gives
-# the router MP_TOKEN_PUBLIC_KEYS and no MP_TOKEN_KEYS (an older router refuses to boot
-# without the latter), and each games-mp-launch-<environment> gives engines MP_TOKEN_PUBLIC_KEYS and expects them
-# to verify the X-MP-Token the router forwards. dae003a9 is the squash of games repo PR #57
-# (the whole multiplayer stack, #58-#65) on main; its image and migration inputs (server/,
-# lib/multiplayer/, supabase/, package-lock.json) are identical to 1eb83917, the
-# mp-asymmetric-tokens branch head this was first applied from.
-variable "games_mp_source_ref" {
-  description = "Full 40-hex commit of CoderColton/colton-games whose multiplayer images (and mp migration) this stack runs."
-  type        = string
-  default     = "dae003a969d289912b5b097eb390ede51092692e"
-
-  validation {
-    condition     = can(regex("^[0-9a-f]{40}$", var.games_mp_source_ref))
-    error_message = "games_mp_source_ref must be a full 40-character lowercase commit sha, not a branch or a short sha."
-  }
-}
-
-variable "games_mp_sim_versions" {
-  description = "Each game's SIM_VERSION at games_mp_source_ref (server/<game>/version.mjs). The build fails if the repo disagrees."
-  type        = map(string)
-  default     = { mptest = "mptest-1" }
-
-  validation {
-    # The lobby's simVersion shape (colton-games lib/multiplayer/games.ts SIM_VERSION, and the
-    # SQL), narrowed to a Docker-valid first character: the engine image tag starts with it,
-    # and a tag cannot begin with "." or "-".
-    condition     = alltrue([for v in values(var.games_mp_sim_versions) : can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$", v))])
-    error_message = "Each games_mp_sim_versions value must be 1-64 of A-Z a-z 0-9 . _ -, starting with a letter, digit or _ (it begins the image tag)."
-  }
-}
-
-# EMERGENCY SWITCH. false = no CodeBuild run during apply; the task definitions then use the
-# explicit tags below (which must already be in ECR), exactly like the pre-automation stack.
-# Use it when CodeBuild or GitHub is down and a known-good image must be pinned.
-variable "games_mp_build" {
-  description = "Build images with CodeBuild during apply. false = use mp_router_image_tag / mp_engine_image_tags as given."
-  type        = bool
-  default     = true
-}
-
-variable "mp_router_image_tag" {
-  description = "Only when games_mp_build = false: games/mp-router tag to run. Empty = no router service."
-  type        = string
-  default     = ""
-}
-
-variable "mp_engine_image_tags" {
-  description = "Only when games_mp_build = false: engine tag per game id, <simVersion>-<sha12>. A game with no entry has no task definition."
-  type        = map(string)
-  default     = {}
-
-  validation {
-    # games-mp-launch reads the simVersion out of the tag (local.mp_engine_sim_versions).
-    condition     = alltrue([for t in values(var.mp_engine_image_tags) : t == "" || can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}-[0-9a-f]{12}$", t))])
-    error_message = "Each mp_engine_image_tags value must be <simVersion>-<sha12> (or empty), as the build tags them."
-  }
-}
+# IMAGES ARE DEPLOYED AUTOMATICALLY, NOT PINNED HERE (games-multiplayer-deploy.tf). Every
+# commit on CoderColton/colton-games main is built (router `<sha12>`, engines
+# `<simVersion>-<sha12>`, the tags of the repo's scripts/mp-images.mjs), its engine revisions
+# are registered, it becomes production's current release, and the router image moves (tag
+# `live`) when the router's own files changed. Every open pull request's head is built into
+# the separate games-preview/* repositories and games-preview-<game> families, which only the
+# preview launch function can run. Terraform owns everything around that: the roles, the
+# network, the ceilings, the alarms, the functions and the router service; it never names an
+# image commit.
 
 # Launch limits, in one place: the lobby enforces the per-environment caps and per-IP rates
 # in SQL at the launch claim (colton-games lib/multiplayer/config.ts), and Terraform writes
@@ -147,7 +90,7 @@ variable "mp_router_max_count" {
 }
 
 variable "mp_env" {
-  description = "Default MP_ENV baked into the engine task definitions (games-mp-launch overrides it per match) and the router's primary env. The router accepts the whole of mp_router_envs."
+  description = "The router's primary env (MP_ENV). The router accepts the whole of mp_router_envs; engines get theirs from their launch function."
   type        = string
   default     = "production"
 }
@@ -231,29 +174,24 @@ locals {
     "https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app",
   ]
 
-  games_mp_sha12 = substr(var.games_mp_source_ref, 0, 12)
+  # The router task definition runs this tag of games/mp-router. It is the one mutable tag in
+  # the games repositories: games-mp-release moves it to a main commit's `<sha12>` image when the
+  # router's files changed, then forces a new deployment, which resolves it again (ECS pins
+  # the digest per deployment, so every task of one deployment runs the same image, and a
+  # rollback returns to the previous deployment's digest). Terraform never changes with it.
+  mp_router_live_tag = "live"
+  # Always on. The switch that takes play.cc-games.app off the internet is
+  # mp_router_min_count = mp_router_max_count = 0 (docs/games-multiplayer.md).
+  mp_router_enabled = true
 
-  # The tags the task definitions run. With the build on they are derived from the pinned
-  # commit; CodeBuild is told to produce exactly these and fails if the repo disagrees.
-  mp_router_tag = var.games_mp_build ? local.games_mp_sha12 : var.mp_router_image_tag
-  mp_engine_tags = var.games_mp_build ? {
-    for id in keys(local.mp_games) : id => "${var.games_mp_sim_versions[id]}-${local.games_mp_sha12}"
-    if contains(keys(var.games_mp_sim_versions), id)
-  } : var.mp_engine_image_tags
-
-  mp_engine_task_defs = {
-    for id, cfg in local.mp_games : id => cfg
-    if lookup(local.mp_engine_tags, id, "") != ""
+  # Where each game's engine revisions live, per channel. Preview families and repositories are
+  # separate so that no preview commit's image can ever be a production revision: only the
+  # preview CodeBuild role pushes to games-preview/*, and only the preview launch function may
+  # run games-preview-<game>.
+  mp_engine_channels = {
+    main    = { family_prefix = "games-", repository_prefix = "games/" }
+    preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/" }
   }
-
-  # The simVersion each current engine revision runs: its tag without the trailing -<sha12>
-  # (both tag variables are validated to that shape). games-mp-launch launches the pinned
-  # revision for exactly this version and looks older ones up by tag.
-  mp_engine_sim_versions = {
-    for id in keys(local.mp_engine_task_defs) : id => regex("^(.+)-[0-9a-f]{12}$", local.mp_engine_tags[id])[0]
-  }
-
-  mp_router_enabled = local.mp_router_tag != ""
 
   # Vercel team slug and project. The OIDC issuer, audience and subject all embed these
   # strings; renaming the team or project in Vercel changes the token claims and locks the
@@ -261,6 +199,15 @@ locals {
   vercel_team_slug    = "coltons-projects-7f9a4e8b"
   vercel_project_name = "colton-games"
   vercel_oidc_host    = "oidc.vercel.com/${local.vercel_team_slug}"
+}
+
+# A game id beginning "preview-" would name the same family as another game's preview engines
+# (games-preview-<game>), so none may.
+check "games_mp_game_ids_do_not_collide_with_preview_families" {
+  assert {
+    condition     = alltrue([for id in keys(local.mp_games) : !startswith(id, "preview-") && can(regex("^[a-z0-9][a-z0-9-]*$", id))])
+    error_message = "A local.mp_games id must be lowercase [a-z0-9-] and must not begin with \"preview-\"."
+  }
 }
 
 # -------------------------------------------------------------------------------------
@@ -275,14 +222,35 @@ locals {
 # previous bytes. Every tag carries the commit (`<sha12>`, `<simVersion>-<sha12>`), so a fix
 # is always a new tag, and the build treats "tag already exists" as "already pushed".
 #
-# Scan on push is the free basic scan. Keeping the last 20 images bounds storage (a few
-# cents) while leaving far more history than any rollback or simVersion overlap needs.
+# The one exception is the router's `live` tag (local.mp_router_live_tag), which
+# games-mp-release moves between main commits' router images; every `<sha12>` tag stays put.
+#
+# RETENTION: never expire a tagged image of a production repository. Every main commit's
+# engine revision stays selectable (an older simVersion launches the newest main revision
+# released for it), and a revision whose image has gone fails every match launched on it.
+# A commit's images share all but their last layers (the repo's few files), so keeping
+# them costs cents. Preview repositories (games-preview/*) expire images 45 days after
+# the push: a preview release record lives 30 days (games-mp-poller rebuilds a still-open
+# pull request's head after that), so no preview revision still selectable ever lacks its
+# image. Scan on push is the free basic scan.
 
 resource "aws_ecr_repository" "games_mp" {
-  for_each = toset(concat([for id in keys(local.mp_games) : "games/${id}-engine"], ["games/mp-router"]))
+  for_each = toset(concat(
+    [for id in keys(local.mp_games) : "games/${id}-engine"],
+    [for id in keys(local.mp_games) : "games-preview/${id}-engine"],
+    ["games/mp-router"],
+  ))
 
   name                 = each.key
-  image_tag_mutability = "IMMUTABLE"
+  image_tag_mutability = each.key == "games/mp-router" ? "IMMUTABLE_WITH_EXCLUSION" : "IMMUTABLE"
+
+  dynamic "image_tag_mutability_exclusion_filter" {
+    for_each = each.key == "games/mp-router" ? [local.mp_router_live_tag] : []
+    content {
+      filter      = image_tag_mutability_exclusion_filter.value
+      filter_type = "WILDCARD"
+    }
+  }
 
   image_scanning_configuration {
     scan_on_push = true
@@ -295,13 +263,24 @@ resource "aws_ecr_lifecycle_policy" "games_mp" {
   for_each   = aws_ecr_repository.games_mp
   repository = each.value.name
   policy = jsonencode({
-    rules = [{
+    rules = startswith(each.key, "games-preview/") ? [{
       rulePriority = 1
-      description  = "Keep the last 20 images"
+      description  = "Preview images: 45 days after the push (their release records live 30)"
       selection = {
         tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 20
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        countNumber = 45
+      }
+      action = { type = "expire" }
+      }] : [{
+      rulePriority = 1
+      description  = "Only untagged images (a tagged image may be a selectable revision's)"
+      selection = {
+        tagStatus   = "untagged"
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        countNumber = 7
       }
       action = { type = "expire" }
     }]
@@ -422,6 +401,8 @@ resource "aws_iam_role_policy" "games_engine_execution" {
         Resource = "*"
       },
       {
+        # Production and preview engine images: which one a task runs is its revision's, and
+        # production launches only production revisions.
         Effect   = "Allow"
         Action   = ["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
         Resource = [for name, repo in aws_ecr_repository.games_mp : repo.arn if name != "games/mp-router"]
@@ -604,10 +585,11 @@ moved {
 # from the same source. The lobby invokes its own with
 #   {"action":"start","matchId","game","simVersion","secret","hardCapSec","apiBase"[,"apiBypass"]}
 #   {"action":"stop","matchId"}
-# and the function builds the RunTask itself: the game's revision for that simVersion (the
-# pinned current one, or an older ACTIVE one of the same family and ECR repository), the
-# engine subnets and security group, the engine environment from validated fields, and the
-# tags. Before launching, it counts its environment's running engines (every task that is not
+# (a preview adds "commit", its VERCEL_GIT_COMMIT_SHA) and the function builds the RunTask
+# itself: the game's revision (production: main's current release for the simVersion, or the
+# newest main release of an older one; preview: exactly its commit's; games-mp-release records
+# both in the releases table), the engine subnets and security group, the engine environment
+# from validated fields, and the tags. Before launching, it counts its environment's running engines (every task that is not
 # the router's family whose env tag is its environment or missing) and refuses at its own
 # ceiling. Reserved concurrency 1 per function serializes each environment's admission; the
 # source explains why that is enough and what it cannot cover (games-multiplayer/launch.py).
@@ -629,6 +611,7 @@ locals {
   games_mp_preview_ceiling = min(8, var.games_mp_engine_ceiling)
   games_mp_launch_environments = {
     production = {
+      channel  = "main"
       ceiling  = var.games_mp_engine_ceiling - local.games_mp_preview_ceiling
       api_base = "^https://cc-games\\.app$"
       bypass   = false
@@ -636,6 +619,7 @@ locals {
       token_public_keys = local.games_mp_token_public_keys_by_env["production"]
     }
     preview = {
+      channel = "preview"
       ceiling = local.games_mp_preview_ceiling
       # Its own deployment URL (https://$VERCEL_URL), the pattern the router's origin
       # allowlist uses for previews, so engines call back only this project's previews.
@@ -672,11 +656,14 @@ resource "aws_cloudwatch_log_group" "games_mp_launch" {
   retention_in_days = 14
 }
 
+# One role per environment: each may run only its own channel's engine families (production
+# games-<game>, preview games-preview-<game>) and read only its own release items, so no
+# preview revision can run as a production engine even if the table said so.
 resource "aws_iam_role" "games_mp_launch" {
-  name = "games-mp-launch"
-  # Shared by both environments' functions: they run the same code with the same ECS rights;
-  # what differs (environment, ceiling, callback URL) is each function's own configuration.
-  description = "games-mp-launch-<environment> Lambdas: RunTask engine task definition revisions, StopTask engines"
+  for_each = local.games_mp_launch_environments
+
+  name        = each.key == "production" ? "games-mp-launch" : "games-mp-launch-${each.key}"
+  description = "games-mp-launch-${each.key} Lambda: RunTask its engine revisions, StopTask its engines"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -688,29 +675,54 @@ resource "aws_iam_role" "games_mp_launch" {
       Action    = "sts:AssumeRole"
     }]
   })
-  tags = { Name = "games-mp-launch", Project = "games-multiplayer" }
+  tags = { Name = each.key == "production" ? "games-mp-launch" : "games-mp-launch-${each.key}", Project = "games-multiplayer" }
+}
+
+# The production role kept its name and address history; only the preview role is new.
+moved {
+  from = aws_iam_role.games_mp_launch
+  to   = aws_iam_role.games_mp_launch["production"]
+}
+
+moved {
+  from = aws_iam_role_policy.games_mp_launch
+  to   = aws_iam_role_policy.games_mp_launch["production"]
 }
 
 resource "aws_iam_role_policy" "games_mp_launch" {
+  for_each = local.games_mp_launch_environments
+
   name = "launch-and-stop-match-engines"
-  role = aws_iam_role.games_mp_launch.id
+  role = aws_iam_role.games_mp_launch[each.key].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = concat(
-      # Any revision of exactly the engine families (games-<game> for each game), only on this
-      # cluster: the current revision, and the older ones skip_destroy keeps ACTIVE for clients
-      # still on an older simVersion. The function picks the revision (launch.py SIM VERSIONS);
-      # `:*` after a family matches only its revisions, as a family name has no colon. A
-      # revision naming any role but the two engine roles fails at PassRole below. (No
-      # statement without a game: IAM rejects an empty Resource list.)
+      # Any revision of exactly this environment's engine families (production games-<game>,
+      # preview games-preview-<game>), only on this cluster. The function picks the revision
+      # (launch.py SIM VERSIONS AND COMMITS); `:*` after a family matches only its revisions,
+      # as a family name has no colon. A revision naming any role but the two engine roles
+      # fails at PassRole below. (No statement without a game: IAM rejects an empty Resource.)
       length(local.mp_games) == 0 ? [] : [{
-        Sid       = "RunEngineFamilyRevisions"
+        Sid       = "RunOwnEngineFamilyRevisions"
         Effect    = "Allow"
         Action    = "ecs:RunTask"
-        Resource  = [for id in keys(local.mp_games) : "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/games-${id}:*"]
+        Resource  = [for id in keys(local.mp_games) : "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_engine_channels[each.value.channel].family_prefix}${id}:*"]
         Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
       }],
       [
+        {
+          # Which revision is current: production reads current#main and sim#<game>#<sim>,
+          # preview reads build#preview#<commit>. Read-only, and only those items.
+          Sid      = "ReadOwnReleaseItems"
+          Effect   = "Allow"
+          Action   = "dynamodb:GetItem"
+          Resource = aws_dynamodb_table.games_mp_releases.arn
+          Condition = {
+            "ForAllValues:StringLike" = {
+              "dynamodb:LeadingKeys" = each.key == "production" ? ["current#main", "sim#*"] : ["build#preview#*"]
+            }
+          }
+        },
         {
           # The Allow above never names the router; this keeps it so even if a game id ever
           # collided with its family name.
@@ -720,12 +732,12 @@ resource "aws_iam_role_policy" "games_mp_launch" {
           Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_router_family}:*"
         },
         {
-          # Finding the revision for an older simVersion: list a family's ACTIVE revisions and
-          # read one's engine image. Read-only, and neither action supports a resource or
-          # condition key (Service Authorization Reference), so "*" is the only Resource.
+          # Checking a revision before launching it: its only container is `engine`, running
+          # exactly the expected image, with the token-verifier marker. Read-only, and it supports
+          # no resource or condition key (Service Authorization Reference), so "*" is the only Resource.
           Sid      = "ReadEngineTaskDefinitions"
           Effect   = "Allow"
-          Action   = ["ecs:ListTaskDefinitions", "ecs:DescribeTaskDefinition"]
+          Action   = "ecs:DescribeTaskDefinition"
           Resource = "*"
         },
         {
@@ -800,7 +812,7 @@ resource "aws_iam_role_policy" "games_mp_launch" {
           Sid      = "WriteOwnLogs"
           Effect   = "Allow"
           Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-          Resource = [for lg in aws_cloudwatch_log_group.games_mp_launch : "${lg.arn}:*"]
+          Resource = "${aws_cloudwatch_log_group.games_mp_launch[each.key].arn}:*"
         },
       ],
     )
@@ -811,7 +823,7 @@ resource "aws_lambda_function" "games_mp_launch" {
   for_each = local.games_mp_launch_environments
 
   function_name    = "games-mp-launch-${each.key}"
-  role             = aws_iam_role.games_mp_launch.arn
+  role             = aws_iam_role.games_mp_launch[each.key].arn
   handler          = "launch.lambda_handler"
   runtime          = "python3.12"
   architectures    = ["arm64"]
@@ -840,21 +852,24 @@ resource "aws_lambda_function" "games_mp_launch" {
       # This environment's join-token PUBLIC keys, for its engines to verify tokens with.
       TOKEN_PUBLIC_KEYS = each.value.token_public_keys
       # The rest is the same for both environments.
-      CLUSTER          = aws_ecs_cluster.games.name
-      SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])
-      SECURITY_GROUP   = aws_security_group.games_engine.id
-      TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })
-      ROUTER_FAMILY    = local.mp_router_family
-      MIN_HARDCAP_SEC  = "60"
-      # The sweeper's MAX_HARDCAP_SEC: a hardcap it would clamp is refused here instead.
-      MAX_HARDCAP_SEC = "14400"
+      CLUSTER         = aws_ecs_cluster.games.name
+      SUBNETS         = join(",", [for s in local.mp_engine_subnets : s.id])
+      SECURITY_GROUP  = aws_security_group.games_engine.id
+      ROUTER_FAMILY   = local.mp_router_family
+      MIN_HARDCAP_SEC = "60"
+      # No match may outlive a draining router: a router rollout keeps each old task's
+      # connections for the target group's deregistration delay (3600 s) before stopping it,
+      # and an engine exits at its hardcap after boot. So a hardcap above the delay is refused.
+      # (The sweeper clamps at 14400 as before; a game that needs longer matches must first
+      # reconnect its clients automatically, then this can rise.)
+      MAX_HARDCAP_SEC = tostring(local.mp_router_drain_sec)
       SETTLE_SEC      = "120"
-      LOOKUP_TTL_SEC  = "60"
-      # Per game: the current revision's simVersion (launched from TASK_DEFINITIONS with no ECS
-      # read) and the ECR repository an older revision's image must be in to be launched.
-      ENGINE_IMAGES = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => {
-        simVersion = local.mp_engine_sim_versions[id]
-        repository = aws_ecr_repository.games_mp["games/${id}-engine"].repository_url
+      # Which revision to launch: games-mp-release's table (launch.py SIM VERSIONS AND COMMITS).
+      RELEASES_TABLE = aws_dynamodb_table.games_mp_releases.name
+      # Per game: this environment's family and the ECR repository its images must come from.
+      GAMES = jsonencode({ for id, _ in local.mp_games : id => {
+        family     = "${local.mp_engine_channels[each.value.channel].family_prefix}${id}"
+        repository = aws_ecr_repository.games_mp["${local.mp_engine_channels[each.value.channel].repository_prefix}${id}-engine"].repository_url
       } })
     }
   }
@@ -868,7 +883,11 @@ resource "aws_lambda_function" "games_mp_launch" {
   # launches into subnets a router still rejects. The same wait covers join tokens: engines
   # accept only the X-MP-Token a current router forwards, and get their environment's public
   # keys from this function, so new engines start only once every router task forwards it.
-  depends_on = [aws_route_table_association.games_engine, aws_network_acl.games_engine, terraform_data.games_mp_healthy]
+  # current#main must exist before the code that reads it (games-multiplayer-deploy.tf).
+  depends_on = [
+    aws_route_table_association.games_engine, aws_network_acl.games_engine, terraform_data.games_mp_healthy,
+    terraform_data.games_mp_current_bootstrap,
+  ]
 }
 
 # The lobby invokes synchronously. An asynchronous (InvocationType=Event) call cannot be
@@ -1351,17 +1370,24 @@ resource "aws_lb" "games_play" {
   depends_on = [aws_s3_bucket_policy.games_play_alb_logs]
 }
 
-# Router targets. deregistration_delay 30: when a router task is replaced, the ALB stops
-# sending it new connections at once and cuts its remaining ones after 30 s. A cut player
-# reconnects with a fresh join token (the lobby mints one per request), so a long drain
-# would only slow rollouts down.
+# Router targets. A ROUTER ROLLOUT NEVER KICKS A LIVE MATCH: when ECS replaces a router task
+# (a release, a key rotation, a scale-in), it first deregisters it and the ALB sends it no new
+# connection but keeps every open one (a player's WebSocket) for deregistration_delay; only
+# then does ECS stop the task. 3600 s is the ALB's maximum, and the launch functions refuse a
+# match hardcap above it (MAX_HARDCAP_SEC), so every match connected through an old task ends
+# before its drain does. The mp-test client does not reconnect by itself, so the drain, not a
+# reconnect, is what keeps a match alive; the cost is an old task running up to an hour.
+locals {
+  mp_router_drain_sec = 3600
+}
+
 resource "aws_lb_target_group" "games_mp_router" {
   name                 = "games-mp-router"
   port                 = local.mp_port
   protocol             = "HTTP"
   target_type          = "ip"
   vpc_id               = local.vpc_id
-  deregistration_delay = 30
+  deregistration_delay = local.mp_router_drain_sec
 
   health_check {
     path                = "/healthz"
@@ -1424,10 +1450,9 @@ resource "cloudflare_dns_record" "games_play" {
 # Router service
 # -------------------------------------------------------------------------------------
 #
-# Created only after its image exists: the task definition depends on the CodeBuild step
-# (terraform_data.games_mp_build), so a new tag is never registered before it is pushed,
-# and an ECS service never sits in a pull-fail loop. With games_mp_build = false the
-# router exists once mp_router_image_tag is set (that tag must already be in ECR).
+# The image is games/mp-router:live, which games-mp-release moves (local.mp_router_live_tag),
+# so a router release changes no Terraform. Created only after `live` exists
+# (terraform_data.games_mp_router_live), so the service never sits in a pull-fail loop.
 
 resource "aws_ecs_task_definition" "games_mp_router" {
   count = local.mp_router_enabled ? 1 : 0
@@ -1447,7 +1472,7 @@ resource "aws_ecs_task_definition" "games_mp_router" {
 
   container_definitions = jsonencode([{
     name         = "mp-router"
-    image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:${local.mp_router_tag}"
+    image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:${local.mp_router_live_tag}"
     essential    = true
     portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
     environment = [
@@ -1473,20 +1498,21 @@ resource "aws_ecs_task_definition" "games_mp_router" {
         awslogs-stream-prefix = "router"
       }
     }
-    # Time for the router to stop accepting and let in-flight HTTP requests finish.
+    # Time for the router to stop accepting and let in-flight HTTP requests finish. SIGTERM
+    # comes only after the ALB drain above, so no live match is still connected by then.
     stopTimeout = 30
   }])
 
-  tags = { Name = "games-mp-router", Project = "games-multiplayer", ImageTag = local.mp_router_tag }
+  tags = { Name = "games-mp-router", Project = "games-multiplayer", ImageTag = local.mp_router_live_tag }
 
   # The image must be in ECR before a task definition names it.
-  depends_on = [terraform_data.games_mp_build]
+  depends_on = [terraform_data.games_mp_router_live]
 }
 
-# Zero-downtime rollout: minimum 100% / maximum 200% means ECS starts the new task, waits
-# for it to pass the ALB health check, and only then drains the old one. With one task
-# there is briefly two. The circuit breaker rolls back to the previous task definition if
-# the new one never becomes healthy (a bad image tag, a missing secret value).
+# Zero-downtime rollout: minimum 100% / maximum 200% means ECS starts the new tasks, waits
+# for them to pass the ALB health check, and only then drains the old ones (for up to an hour,
+# see the target group). The circuit breaker rolls back to the previous deployment if the new
+# one never becomes healthy (a bad image, a missing setting).
 resource "aws_ecs_service" "games_mp_router" {
   count = local.mp_router_enabled ? 1 : 0
 
@@ -1535,72 +1561,23 @@ resource "aws_ecs_service" "games_mp_router" {
 }
 
 # -------------------------------------------------------------------------------------
-# Engine task definitions: games-<game>
+# Engine task definitions: games-<game> and games-preview-<game>
 # -------------------------------------------------------------------------------------
 #
-# One per entry in local.mp_games that has an image tag, registered only after the build
-# pushed that tag. Only games-mp-launch runs these, adding MATCH_ID, MATCH_SECRET and MP_API
-# as container overrides and tagging the task (see the sweeper below).
+# Registered by games-mp-release for every built commit (games-multiplayer-deploy.tf,
+# ENGINE_TEMPLATES there holds their shape: size, roles, logs, MP_TOKEN_VERIFIER), never by
+# Terraform. No revision is ever deregistered: a production revision stays selectable for its
+# simVersion, and a running task never depends on its revision anyway. Never register a
+# revision in these families by hand: only revisions games-mp-release recorded are launched,
+# but a stray one is confusing.
 #
-# skip_destroy = true: moving a game to a new simVersion registers a new revision, and the
-# old revision stays ACTIVE instead of being deregistered. Clients still on the old
-# simVersion can then still be matched onto `games-<game>:<old revision>` while the new
-# site rolls out. The lobby sends each launch the match's simVersion; games-mp-launch runs
-# the revision below for the current one, and for an older one the newest ACTIVE revision of
-# the family whose engine image is `<this game's repository>:<simVersion>-<sha12>`, refusing
-# (`unknown-sim-version`) when there is none. So never deregister a revision while clients may
-# still send its simVersion, and never register a revision in a games-<game> family by hand:
-# the function would run it for its tag. Every revision must carry MP_TOKEN_VERIFIER (below):
-# the function launches none without it, so pre-verification revisions stay unlaunchable. Old revisions cost nothing; their images are kept
-# only while ECR's last-20 lifecycle rule keeps them.
+# The revisions Terraform registered before are kept (skip_destroy) and only leave state.
+removed {
+  from = aws_ecs_task_definition.games_engine
 
-resource "aws_ecs_task_definition" "games_engine" {
-  for_each = local.mp_engine_task_defs
-
-  family                   = "games-${each.key}"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = each.value.cpu
-  memory                   = each.value.memory
-  execution_role_arn       = aws_iam_role.games_engine_execution.arn
-  task_role_arn            = aws_iam_role.games_engine_task.arn
-  skip_destroy             = true
-
-  runtime_platform {
-    operating_system_family = "LINUX"
-    cpu_architecture        = "ARM64"
+  lifecycle {
+    destroy = false
   }
-
-  container_definitions = jsonencode([{
-    name         = "engine"
-    image        = "${aws_ecr_repository.games_mp["games/${each.key}-engine"].repository_url}:${local.mp_engine_tags[each.key]}"
-    essential    = true
-    portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
-    environment = [
-      { name = "GAME_ID", value = each.key },
-      { name = "PORT", value = tostring(local.mp_port) },
-      { name = "MP_ENV", value = var.mp_env },
-      # Marks a revision whose engine kit verifies join tokens itself (X-MP-Token with
-      # MP_TOKEN_PUBLIC_KEYS). games-mp-launch launches no revision without it, so an older
-      # simVersion can never select a pre-verification image that trusts the router's X-MP-*
-      # headers. Keep the value in step with TOKEN_VERIFIER in games-multiplayer/launch.py.
-      { name = "MP_TOKEN_VERIFIER", value = "ed25519-v2" },
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        awslogs-group         = aws_cloudwatch_log_group.games_engines.name
-        awslogs-region        = var.aws_region
-        awslogs-stream-prefix = each.key
-      }
-    }
-    # Room to post a result on SIGTERM (StopTask, the sweeper) before SIGKILL.
-    stopTimeout = 30
-  }])
-
-  tags = { Name = "games-${each.key}", Project = "games-multiplayer", ImageTag = local.mp_engine_tags[each.key] }
-
-  depends_on = [terraform_data.games_mp_build]
 }
 
 # -------------------------------------------------------------------------------------
@@ -1897,7 +1874,3 @@ output "games_mp_ecr_repositories" {
   value       = { for name, repo in aws_ecr_repository.games_mp : name => repo.repository_url }
 }
 
-output "games_mp_engine_task_definitions" {
-  description = "Current task definition (family:revision) per game; older revisions stay ACTIVE"
-  value       = { for id, td in aws_ecs_task_definition.games_engine : id => "${td.family}:${td.revision}" }
-}

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline checks for games-multiplayer/bringup.py, the steps `terraform apply` runs.
+"""Offline checks for games-multiplayer/bringup.py: the steps `terraform apply` runs, and the
+two CodeBuild runs (image builds and migrations) of the automatic deploys.
 
 Every AWS CLI call, HTTP request, psql run and sleep is replaced by a fake, so this needs
 no credentials and no network. It pins the behaviour that makes one apply safe to repeat:
@@ -27,6 +28,7 @@ GM = ROOT / "games-multiplayer"
 REF = "c76e5bdf083fe32628b5c8fee9e6ab867e291369"
 SHA12 = REF[:12]
 EXPECT = {"games/mp-router": SHA12, "games/mptest-engine": "mptest-1-" + SHA12}
+PREVIEW_EXPECT = {"games-preview/mptest-engine": "mptest-1-" + SHA12}
 DB_PASSWORD = "s3cr3t-p@ss/word"
 DB_URL = "postgres://postgres.kmfdnctkbdpcagukwqro:%s@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require" % (
     "s3cr3t-p%40ss%2Fword")
@@ -77,6 +79,13 @@ class World:
         self.sudo = True
         self.token_meta = (200, {"token": {"scopes": [{"type": "team", "teamId": "team_x", "createdAt": 1}]}})
         self.github_commit = 200
+        self.pushed = []           # remote refs pushed
+        self.tasks = {}            # deployment id -> [ip]
+        self.target_health = {}    # ip -> state
+        self.manifests = {}        # (repo, tag) -> manifest
+        self.put_images = []
+        self.ddb = {}              # id -> item (typed)
+        self.task_definitions = {} # arn -> task definition
         bu.RUN = self.run
         bu.http = self.http
         bu.SLEEP = self.sleep
@@ -98,6 +107,53 @@ class World:
             return done("", 255, "An error occurred (ResourceNotFoundException) when calling GetSecretValue")
         if argv[:3] == ["sudo", "-n", "true"]:
             return done("", 0 if self.sudo else 1)
+        if argv[:3] == ["aws", "secretsmanager", "put-secret-value"]:
+            assert argv[argv.index("--secret-string") + 1] == "file:///dev/stdin"
+            self.secrets[argv[argv.index("--secret-id") + 1]] = input
+            return done("v1")
+        if argv[:3] == ["aws", "ecr", "get-login-password"]:
+            return done("ecr-password")
+        if argv[:2] == ["docker", "login"]:
+            assert input == "ecr-password" and "ecr-password" not in argv
+            return done("")
+        if argv[:2] == ["docker", "push"]:
+            ref = argv[2].split("/", 1)[1]
+            repo, tag = ref.rsplit(":", 1)
+            self.pushed.append(ref)
+            self.ecr.add((repo, tag))
+            return done("")
+        if argv[:3] == ["aws", "ecr", "batch-get-image"]:
+            repo = argv[argv.index("--repository-name") + 1]
+            tag = argv[argv.index("--image-ids") + 1].split("=", 1)[1]
+            return done(json.dumps({"images": [{"imageManifest": self.manifests[(repo, tag)],
+                                                "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json"}]}))
+        if argv[:3] == ["aws", "ecr", "put-image"]:
+            repo, tag = argv[argv.index("--repository-name") + 1], argv[argv.index("--image-tag") + 1]
+            self.put_images.append((repo, tag, argv[argv.index("--image-manifest") + 1]))
+            self.ecr.add((repo, tag))
+            return done("{}")
+        if argv[:3] == ["aws", "ecs", "describe-task-definition"]:
+            return done(json.dumps({"taskDefinition": self.task_definitions[argv[argv.index("--task-definition") + 1]]}))
+        if argv[:3] == ["aws", "ecs", "list-task-definitions"]:
+            prefix = argv[argv.index("--family-prefix") + 1]
+            arns = [a for a in sorted(self.task_definitions, key=lambda a: -int(a.rsplit(":", 1)[1]))
+                    if a.split("/", 1)[1].startswith(prefix)]
+            return done(json.dumps({"taskDefinitionArns": arns}))
+        if argv[:3] == ["aws", "dynamodb", "get-item"]:
+            key = json.loads(argv[argv.index("--key") + 1])["id"]["S"]
+            return done(json.dumps({"Item": self.ddb[key]} if key in self.ddb else {}))
+        if argv[:3] == ["aws", "dynamodb", "put-item"]:
+            item = json.loads(argv[argv.index("--item") + 1])
+            assert argv[argv.index("--condition-expression") + 1] == "attribute_not_exists(id)"
+            self.ddb[item["id"]["S"]] = item
+            return done("{}")
+        if argv[:3] == ["aws", "ecs", "list-tasks"]:
+            return done(json.dumps({"taskArns": ["task/" + ip for ip in
+                                                 self.tasks.get(argv[argv.index("--started-by") + 1], [])]}))
+        if argv[:3] == ["aws", "ecs", "describe-tasks"]:
+            arns = argv[argv.index("--tasks") + 1:argv.index("--output")]
+            return done(json.dumps({"tasks": [{"attachments": [{"details": [
+                {"name": "privateIPv4Address", "value": a.split("/", 1)[1]}]}]} for a in arns]}))
         if argv[:3] == ["aws", "ecr", "describe-images"]:
             repo = argv[argv.index("--repository-name") + 1]
             tag = argv[argv.index("--image-ids") + 1].split("=", 1)[1]
@@ -121,22 +177,23 @@ class World:
         if argv[:3] == ["aws", "ecs", "describe-services"]:
             return done(json.dumps(self.services.pop(0) if len(self.services) > 1 else self.services[0]))
         if argv[:3] == ["aws", "elbv2", "describe-target-health"]:
-            st = self.target_states.pop(0) if len(self.target_states) > 1 else self.target_states[0]
-            return done(json.dumps({"TargetHealthDescriptions": [{"TargetHealth": {"State": st}}]}))
+            health = self.target_health if isinstance(self.target_health, dict) else self.target_health.pop(0)
+            return done(json.dumps({"TargetHealthDescriptions": [
+                {"Target": {"Id": ip}, "TargetHealth": {"State": st}} for ip, st in health.items()]}))
         if argv[:2] == ["node", "scripts/mp-images.mjs"]:
             if "--dry-run" in argv:
                 return done(self.dry_run)
-            name = argv[argv.index("--only") + 1]
-            repo = {"router": "games/mp-router", "mptest": "games/mptest-engine"}[name]
-            self.ecr.add((repo, EXPECT[repo]))
+            assert "--push" not in argv, "the driver pushes, under the channel's repository"
+            self.built = getattr(self, "built", []) + [argv[argv.index("--only") + 1]]
             return done("")
         if argv[:2] == ["docker", "pull"] or argv[:2] == ["docker", "tag"]:
             return done("")
         if argv[0] == "psql":
             # db_revision: 0 = fresh, -1 = schema without marker table, -2 = empty marker.
             if "-f" in argv:
-                self.psql_files.append(Path(argv[argv.index("-f") + 1]).read_text())
-                self.db_revision = 1
+                sql = Path(argv[argv.index("-f") + 1]).read_text()
+                self.psql_files.append(sql)
+                self.db_revision = self.bu.migration_revision(sql)
                 return done("")
             sql = argv[argv.index("-c") + 1]
             table = self.db_revision not in (0, -1)
@@ -156,8 +213,7 @@ class World:
         if "api.github.com" in url:
             if "/commits/" in url:
                 assert headers["Authorization"] == "Bearer " + GITHUB_PAT
-                sha = url.rsplit("/", 1)[1]
-                return self.github_commit, ({"sha": sha} if self.github_commit == 200 else {"message": "Not Found"})
+                return self.github_commit, ({"sha": REF} if self.github_commit == 200 else {"message": "Not Found"})
             return 200, make_zipball()
         if path.endswith("/v5/user/tokens/current"):
             return self.token_meta
@@ -210,6 +266,11 @@ CREATE TABLE mp_private.schema_revision (id integer PRIMARY KEY CHECK (id = 1), 
 INSERT INTO mp_private.schema_revision (id, revision) VALUES (1, 1);
 COMMIT;
 """
+MIGRATION_2 = """BEGIN;
+ALTER TABLE mp_private.matches ADD COLUMN note text;
+UPDATE mp_private.schema_revision SET revision = 2 WHERE id = 1;
+COMMIT;
+"""
 
 
 def args(**kw):
@@ -248,8 +309,8 @@ class SourceTests(Base):
                 self.bu.check_ref(bad)
         self.bu.check_ref(REF)
 
-    def test_repack_strips_top_dir_keeps_modes_and_adds_the_driver(self):
-        data = self.bu.repack_zipball(make_zipball(), REF, b"driver")
+    def test_repack_strips_top_dir_keeps_modes_and_adds_our_files(self):
+        data = self.bu.repack_zipball(make_zipball(), REF, b"driver", extra={self.bu.CA_PATH: b"ca"})
         z = zipfile.ZipFile(io.BytesIO(data))
         names = z.namelist()
         self.assertIn("scripts/mp-images.mjs", names)
@@ -259,93 +320,49 @@ class SourceTests(Base):
         self.assertTrue(all(z.getinfo(n).external_attr >> 16 == 0o40755 for n in names if n.endswith("/")))
         self.assertEqual(z.read(".games-mp/bringup.py"), b"driver")
         self.assertEqual(z.read(".games-mp/SOURCE_REF").decode().strip(), REF)
+        self.assertEqual(z.read(".games-mp/supabase-root-2021-ca.crt"), b"ca")
 
-    def test_concurrent_downloads_each_publish_a_complete_file(self):
-        # Two steps racing on an empty cache: every temporary file is unique and no .tmp is left.
-        seen = []
-        real_mkstemp = self.bu.tempfile.mkstemp
-
-        def spy(**kw):
-            fd, path = real_mkstemp(**kw)
-            seen.append(path)
-            return fd, path
-        self.bu.tempfile = types.SimpleNamespace(mkstemp=spy, NamedTemporaryFile=tempfile.NamedTemporaryFile)
-        p = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
-        os.unlink(p)
-        self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
-        self.assertEqual(len(set(seen)), 2)
-        self.assertEqual([n for n in os.listdir(self.cache) if n.endswith(".tmp")], [])
-
-    def test_source_is_downloaded_once_per_commit(self):
-        p1 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
-        p2 = self.bu.fetch_source(REF, "CoderColton/colton-games", self.cache, "us-west-1", "games/colton-games-read")
-        self.assertEqual(p1, p2)
-        self.assertEqual(len([h for h in self.w.http_log if "github" in h[1]]), 1)
-        self.assertNoSecretsLeaked()
-
-
-class BuildTests(Base):
-    def build_args(self):
-        return args(project="games-mp-images", bucket="games-mp-build-1", cache_dir=self.cache,
-                    expect=json.dumps(EXPECT), timeout=600, poll=15)
-
-    def test_existing_tags_skip_codebuild(self):
-        self.w.ecr.update(EXPECT.items())
-        self.bu.cmd_build(self.build_args())
-        self.assertFalse(any(c[:3] == ["aws", "codebuild", "start-build"] for c in self.w.calls))
-        self.assertFalse(any("github" in h[1] for h in self.w.http_log))
-
-    def test_missing_tags_upload_build_wait_verify(self):
-        self.w.builds = ["IN_PROGRESS", "IN_PROGRESS", "SUCCEEDED"]
-        self.bu.cmd_build(self.build_args())
-        cp = [c for c in self.w.calls if c[:3] == ["aws", "s3", "cp"]][0]
-        self.assertEqual(cp[4], "s3://games-mp-build-1/sources/%s.zip" % REF)
-        req = self.w.start_request
-        self.assertEqual(req["sourceLocationOverride"], "games-mp-build-1/sources/%s.zip" % REF)
-        env = {e["name"]: e["value"] for e in req["environmentVariablesOverride"]}
-        self.assertEqual(json.loads(env["GAMES_MP_EXPECT"]), EXPECT)
-        self.assertEqual(env["GAMES_MP_SHA12"], SHA12)
-        self.assertNoSecretsLeaked()
-
-    def test_failed_build_fails_with_the_log_link(self):
-        self.w.builds = ["FAILED"]
-        with self.assertRaisesRegex(self.bu.StepError, "FAILED.*https://logs/x"):
-            self.bu.cmd_build(self.build_args())
-
-    def test_success_without_the_tags_is_still_a_failure(self):
-        self.w.builds = ["SUCCEEDED"]
-        orig = self.w.run
-
-        def no_push(argv, **kw):
-            res = orig(argv, **kw)
-            if argv[:3] == ["aws", "codebuild", "batch-get-builds"]:
-                self.w.ecr.clear()
-            return res
-        self.bu.RUN = no_push
-        with self.assertRaisesRegex(self.bu.StepError, "still lacks"):
-            self.bu.cmd_build(self.build_args())
-
-    def test_a_build_that_never_ends_times_out(self):
-        self.w.builds = ["IN_PROGRESS"]
-        with self.assertRaisesRegex(self.bu.StepError, "still running"):
-            self.bu.cmd_build(self.build_args())
+    def test_the_repos_own_games_mp_directory_never_reaches_codebuild(self):
+        # CodeBuild runs .games-mp/bringup.py: a commit must not be able to supply its own.
+        raw = io.BytesIO(make_zipball())
+        with zipfile.ZipFile(raw, "a") as z:
+            z.writestr("CoderColton-colton-games-c76e5bd/.games-mp/bringup.py", b"evil")
+            z.writestr("CoderColton-colton-games-c76e5bd/.games-mp/SOURCE_REF", b"0" * 40)
+        data = self.bu.repack_zipball(raw.getvalue(), REF, b"driver")
+        z = zipfile.ZipFile(io.BytesIO(data))
+        self.assertEqual([n for n in z.namelist() if n.startswith(".games-mp/")],
+                         [".games-mp/SOURCE_REF", ".games-mp/bringup.py"])
+        self.assertEqual(z.read(".games-mp/bringup.py"), b"driver")
+        with self.assertRaises(self.bu.StepError):
+            self.bu.repack_zipball(make_zipball(), REF, b"driver", extra={"bringup.py": b"x"})
 
 
 class CodeBuildImagesTests(Base):
     def setUp(self):
         super().setUp()
-        os.environ.update(GAMES_MP_EXPECT=json.dumps(EXPECT), GAMES_MP_SHA12=SHA12, ACCOUNT_ID="928413605543",
+        os.environ.update(GAMES_MP_COMMIT=REF, GAMES_MP_CHANNEL="main", ACCOUNT_ID="928413605543",
                           AWS_REGION="us-west-1")
         self.cwd = os.getcwd()
         os.chdir(self.tmp.name)
-        for d, text in (("server/mp-router", "FROM node:24-alpine\n"),
-                        ("server/mptest", "FROM node:24-alpine AS deps\nFROM deps AS x\nFROM node:24-alpine\n")):
+        for d, text in (("server/mp-router", "FROM node:24-alpine\nCOPY lib/multiplayer/token.mjs lib/x.mjs ./lib/\n"
+                                             "COPY --chown=node server/mp-router/*.mjs \\\n  ./server/\n"),
+                        ("server/mptest", "FROM node:24-alpine AS deps\nFROM deps AS x\nFROM node:24-alpine\n"),
+                        ("lib/multiplayer", None), (".games-mp", None), ("supabase/migrations", None)):
             os.makedirs(d)
-            Path(d, "Dockerfile").write_text(text)
+            if text:
+                Path(d, "Dockerfile").write_text(text)
+        for f in ("lib/multiplayer/token.mjs", "lib/x.mjs", "server/mp-router/router.mjs", "server/mp-router/server.mjs"):
+            Path(f).write_text("// " + f)
+        Path(".games-mp/SOURCE_REF").write_text(REF + "\n")
+        Path("supabase/migrations/20260926000000_mp.sql").write_text(MIGRATION)
+        Path("supabase/migrations/20260921000000_skyhook.sql").write_text("CREATE SCHEMA skyhook_private;")
 
     def tearDown(self):
         os.chdir(self.cwd)
         super().tearDown()
+
+    def exports(self):
+        return dict(re.findall(r"^([A-Z_]+)=(.*)$", Path(".games-mp/exports.sh").read_text(), re.M))
 
     def test_parsers_match_the_real_script_output(self):
         got = self.bu.parse_dry_run(DRY_RUN)
@@ -355,26 +372,69 @@ class CodeBuildImagesTests(Base):
                                                           "FROM public.ecr.aws/x/y:1\nFROM node:24-alpine\n"),
                          ["node:24-alpine"])
 
-    def test_builds_only_the_missing_tag(self):
+    def test_main_builds_only_the_missing_tag_and_exports_what_it_built(self):
         self.w.ecr.add(("games/mp-router", SHA12))
         self.bu.cmd_codebuild_images(None)
-        builds = [c for c in self.w.calls if c[:2] == ["node", "scripts/mp-images.mjs"] and "--dry-run" not in c]
-        self.assertEqual(len(builds), 1)
-        self.assertEqual(builds[0][builds[0].index("--only") + 1], "mptest")
-        self.assertIn("--sha", builds[0])
+        self.assertEqual(self.w.built, ["mptest"])
+        self.assertEqual(self.w.pushed, ["games/mptest-engine:mptest-1-" + SHA12])
         pulls = [c for c in self.w.calls if c[:2] == ["docker", "pull"]]
         self.assertEqual(pulls[0][-1], "public.ecr.aws/docker/library/node:24-alpine")
+        ex = self.exports()
+        self.assertEqual(json.loads(ex["GAMES_MP_IMAGES"].strip("'")), EXPECT)
+        self.assertRegex(ex["GAMES_MP_ROUTER_INPUTS"], r"^[0-9a-f]{64}$")
+        self.assertEqual(ex["GAMES_MP_SCHEMA_REVISION"], "1")
+        self.assertNoSecretsLeaked()
+
+    def test_preview_pushes_engines_only_to_the_preview_repositories(self):
+        os.environ["GAMES_MP_CHANNEL"] = "preview"
+        self.bu.cmd_codebuild_images(None)
+        self.assertEqual(self.w.built, ["mptest"], "never the router")
+        self.assertEqual(self.w.pushed, ["games-preview/mptest-engine:mptest-1-" + SHA12])
+        self.assertFalse(any(r.startswith("games/") for r, _ in self.w.ecr))
+        tags = [c for c in self.w.calls if c[:2] == ["docker", "tag"] and "games-preview" in c[-1]]
+        self.assertEqual(tags[0][2], "games/mptest-engine:mptest-1-" + SHA12)
+        ex = self.exports()
+        self.assertEqual(json.loads(ex["GAMES_MP_IMAGES"].strip("'")), PREVIEW_EXPECT)
+        self.assertNotIn("GAMES_MP_ROUTER_INPUTS", ex)
 
     def test_everything_present_builds_nothing(self):
         self.w.ecr.update(EXPECT.items())
         self.bu.cmd_codebuild_images(None)
-        self.assertEqual([c for c in self.w.calls if c[:2] == ["node", "scripts/mp-images.mjs"] and "--dry-run" not in c], [])
+        self.assertEqual(getattr(self.w, "built", []), [])
+        self.assertFalse(any(c[:2] == ["docker", "login"] for c in self.w.calls))
 
-    def test_sim_version_disagreement_fails_before_building(self):
-        self.w.dry_run = DRY_RUN.replace("mptest-1-", "mptest-2-")
-        with self.assertRaisesRegex(self.bu.StepError, "games_mp_sim_versions"):
+    def test_a_tag_without_this_commit_or_another_source_fails_before_building(self):
+        self.w.dry_run = DRY_RUN.replace("mptest-1-" + SHA12, "mptest-1-0123456789ab")
+        with self.assertRaisesRegex(self.bu.StepError, "not with commit"):
             self.bu.cmd_codebuild_images(None)
         self.assertFalse(any("--only" in c for c in self.w.calls))
+        Path(".games-mp/SOURCE_REF").write_text("0" * 40 + "\n")
+        with self.assertRaisesRegex(self.bu.StepError, "not commit"):
+            self.bu.cmd_codebuild_images(None)
+
+    def test_router_inputs_follow_exactly_the_files_its_dockerfile_copies(self):
+        before = self.bu.dockerfile_inputs("server/mp-router/Dockerfile")
+        self.assertEqual(self.bu.dockerfile_inputs("server/mp-router/Dockerfile"), before)
+        Path("server/mptest/engine.mjs").write_text("// engine only")
+        self.assertEqual(self.bu.dockerfile_inputs("server/mp-router/Dockerfile"), before, "an engine file")
+        for changed in ("server/mp-router/router.mjs", "lib/multiplayer/token.mjs", "server/mp-router/Dockerfile"):
+            with self.subTest(changed):
+                old = Path(changed).read_text()
+                Path(changed).write_text(old + "\n// changed")
+                self.assertNotEqual(self.bu.dockerfile_inputs("server/mp-router/Dockerfile"), before)
+                Path(changed).write_text(old)
+        Path("server/mp-router/Dockerfile").write_text("FROM x\nCOPY missing.mjs ./\n")
+        with self.assertRaisesRegex(self.bu.StepError, "matches nothing"):
+            self.bu.dockerfile_inputs("server/mp-router/Dockerfile")
+
+    def test_the_router_inputs_of_the_real_dockerfile_shape(self):
+        # colton-games' router Dockerfile: two COPY lines, no stage copies.
+        Path("server/mp-router/Dockerfile").write_text(
+            "FROM node:24-alpine\nENV A=1\nWORKDIR /app\n"
+            "COPY lib/multiplayer/token.mjs lib/x.mjs ./lib/multiplayer/\n"
+            "COPY server/mp-router/router.mjs server/mp-router/server.mjs ./server/mp-router/\n"
+            "COPY --from=deps /build/node_modules ./node_modules\nUSER node\n")
+        self.assertRegex(self.bu.dockerfile_inputs("server/mp-router/Dockerfile"), r"^[0-9a-f]{64}$")
 
 
 class VercelTests(Base):
@@ -445,15 +505,29 @@ class VercelTests(Base):
 class MigrateTests(Base):
     CA = str(GM / "supabase-root-2021-ca.crt")
 
-    def margs(self, **kw):
-        return args(cache_dir=self.cache, file="supabase/migrations/20260926000000_mp.sql", ca=self.CA,
-                    url_key="POSTGRES_URL_NON_POOLING", **kw)
-
     def setUp(self):
         super().setUp()
-        self.bu.shutil = types.SimpleNamespace(which=lambda name: "/usr/bin/" + name)
         self.w.vercel_envs = [{"id": "pg", "key": "POSTGRES_URL_NON_POOLING", "target": ["development", "production"]}]
         self.w.decrypt = {"pg": DB_URL}
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        os.makedirs(".games-mp")
+        os.makedirs("supabase/migrations")
+        Path(".games-mp/SOURCE_REF").write_text(REF + "\n")
+        Path(self.bu.CA_PATH).write_text(Path(self.CA).read_text())
+        Path("supabase/migrations/20260921000000_skyhook.sql").write_text("CREATE SCHEMA skyhook_private;")
+        Path("supabase/migrations/20260926000000_mp.sql").write_text(MIGRATION)
+        os.environ.update(GAMES_MP_COMMIT=REF, GAMES_MP_DB_URL=DB_URL)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        os.environ.pop("GAMES_MP_DB_URL", None)
+        super().tearDown()
+
+    def migrate(self):
+        os.environ["GAMES_MP_DB_URL"] = DB_URL
+        self.bu.cmd_codebuild_migrate(None)
+        return dict(re.findall(r"^([A-Z_]+)=(.*)$", Path(".games-mp/exports.sh").read_text(), re.M))
 
     def test_pinned_ca_and_tampering(self):
         self.bu.check_ca(self.CA)
@@ -474,45 +548,116 @@ class MigrateTests(Base):
 
     def test_revision_marker_is_required_and_other_schemas_refused(self):
         self.assertEqual(self.bu.migration_revision(MIGRATION), 1)
+        self.assertEqual(self.bu.migration_revision(MIGRATION_2), 2)
         with self.assertRaises(self.bu.StepError):
             self.bu.migration_revision("CREATE SCHEMA mp_private;")
         with self.assertRaisesRegex(self.bu.StepError, "skyhook_private"):
             self.bu.migration_revision("-- skyhook_private\n" + MIGRATION)
 
-    def test_fresh_database_gets_the_migration_once_and_is_verified(self):
-        self.bu.cmd_migrate(self.margs())
-        self.assertEqual(self.w.psql_files, [MIGRATION])
+    def test_only_mp_migrations_in_order_one_to_n(self):
+        self.assertEqual([r for r, _, _ in self.bu.mp_migrations(".")], [1])
+        Path("supabase/migrations/20261001000000_mp_note.sql").write_text(MIGRATION_2)
+        self.assertEqual([(r, p) for r, p, _ in self.bu.mp_migrations(".")],
+                         [(1, "supabase/migrations/20260926000000_mp.sql"),
+                          (2, "supabase/migrations/20261001000000_mp_note.sql")])
+        Path("supabase/migrations/20250101000000_early.sql").write_text(MIGRATION_2)
+        with self.assertRaisesRegex(self.bu.StepError, "1..n"):
+            self.bu.mp_migrations(".")
+
+    def test_fresh_database_gets_each_migration_once_verified(self):
+        Path("supabase/migrations/20261001000000_mp_note.sql").write_text(MIGRATION_2)
+        self.assertEqual(self.migrate()["GAMES_MP_DB_REVISION"], "2")
+        self.assertEqual(self.w.psql_files, [MIGRATION, MIGRATION_2])
         self.assertTrue(all(e["PGSSLMODE"] == "verify-full" for e in self.w.envs))
-        self.assertIn("revision 1 (verified)", self.out.getvalue())
+        self.assertTrue(all(e["PGSSLROOTCERT"].endswith(self.bu.CA_PATH) for e in self.w.envs))
+        self.assertIn("revision 2 (verified)", self.out.getvalue())
         self.assertNoSecretsLeaked()
-        # A second apply finds it applied and runs nothing.
-        self.bu.cmd_migrate(self.margs())
-        self.assertEqual(len(self.w.psql_files), 1)
-        self.assertIn("already applied", self.out.getvalue())
+        self.assertNotIn("GAMES_MP_DB_URL", os.environ, "taken out of the environment before psql runs")
+        # A second run finds it applied and runs nothing.
+        self.assertEqual(self.migrate()["GAMES_MP_DB_REVISION"], "2")
+        self.assertEqual(len(self.w.psql_files), 2)
 
-    def test_partial_or_later_states_are_refused(self):
-        for rev, msg in ((-1, "missing"), (-2, "empty")):
-            self.w.db_revision = rev
-            with self.assertRaisesRegex(self.bu.StepError, msg):
-                self.bu.cmd_migrate(self.margs())
+    def test_a_database_one_behind_gets_only_the_new_one(self):
+        self.w.db_revision = 1
+        Path("supabase/migrations/20261001000000_mp_note.sql").write_text(MIGRATION_2)
+        self.migrate()
+        self.assertEqual(self.w.psql_files, [MIGRATION_2])
+
+    def test_partial_or_newer_states_are_refused(self):
+        for rev, msg in ((-1, "missing"), (-2, "empty"), (2, "newer than this commit")):
+            with self.subTest(rev=rev):
+                self.w.db_revision = rev
+                with self.assertRaisesRegex(self.bu.StepError, msg):
+                    self.migrate()
         self.assertEqual(self.w.psql_files, [])
 
-    def test_newer_database_revision_than_this_migration_is_refused(self):
-        # Regression: `have >= want` used to treat a database already past this migration's
-        # target as "already applied" and return quietly. That is a rollback: source_ref
-        # points at an OLDER commit than what is actually deployed, and running (or silently
-        # skipping) its migration against a newer, possibly incompatible schema must fail
-        # loudly instead of reporting success.
-        self.w.db_revision = 2
-        with self.assertRaisesRegex(self.bu.StepError, "newer than this migration"):
-            self.bu.cmd_migrate(self.margs())
-        self.assertEqual(self.w.psql_files, [])
-
-    def test_url_that_stops_decrypting_after_the_plan_fails(self):
+    def test_the_database_url_is_copied_from_vercel_on_stdin_only_when_it_changed(self):
+        sync = args(secret_id="games/mp-db-url", url_key="POSTGRES_URL_NON_POOLING")
+        self.bu.cmd_sync_db_url(sync)
+        self.assertEqual(self.w.secrets["games/mp-db-url"], DB_URL)
+        puts = [c for c in self.w.calls if "put-secret-value" in c]
+        self.assertEqual(len(puts), 1)
+        self.bu.cmd_sync_db_url(sync)
+        self.assertEqual(len([c for c in self.w.calls if "put-secret-value" in c]), 1, "unchanged: no write")
+        self.assertNoSecretsLeaked()
         self.w.decrypt = {"pg": None}
-        with self.assertRaisesRegex(self.bu.StepError, "gone since the plan"):
-            self.bu.cmd_migrate(self.margs())
-        self.assertEqual(self.w.psql_files, [])
+        with self.assertRaisesRegex(self.bu.StepError, "no longer decryptable"):
+            self.bu.cmd_sync_db_url(sync)
+
+
+class BootstrapTests(Base):
+    REPO_URL = "928413605543.dkr.ecr.us-west-1.amazonaws.com/games/mptest-engine"
+    GAMES = {"mptest": {"family": "games-mptest", "repositoryUrl": REPO_URL}}
+
+    def td(self, n, image, marker=True, family="games-mptest"):
+        arn = "arn:aws:ecs:us-west-1:928413605543:task-definition/%s:%d" % (family, n)
+        env = [{"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}] if marker else []
+        self.w.task_definitions[arn] = {"taskDefinitionArn": arn, "containerDefinitions": [
+            {"name": "engine", "image": image, "environment": env}]}
+        return arn
+
+    def test_current_release_is_the_newest_verifying_production_revision_once(self):
+        self.td(3, "%s:mptest-1-%s" % (self.REPO_URL, SHA12))
+        self.td(4, "%s:mptest-1-%s" % (self.REPO_URL, "a" * 12), marker=False)
+        self.td(9, "%s:mptest-1-%s" % (self.REPO_URL, "b" * 12), family="games-mptest2")
+        rb = args(table="games-mp-releases", games=json.dumps(self.GAMES))
+        self.bu.cmd_releases_bootstrap(rb)
+        item = self.w.ddb["current#main"]
+        self.assertEqual(item["games"]["M"]["mptest"]["M"]["taskDefinition"]["S"],
+                         "arn:aws:ecs:us-west-1:928413605543:task-definition/games-mptest:3")
+        self.assertEqual(item["games"]["M"]["mptest"]["M"]["simVersion"]["S"], "mptest-1")
+        self.assertEqual(item["seq"]["N"], "0", "any automatic release outranks it")
+        # Written once: a second apply leaves whatever the releases made of it.
+        self.w.ddb["current#main"]["commit"] = {"S": "later"}
+        self.bu.cmd_releases_bootstrap(rb)
+        self.assertEqual(self.w.ddb["current#main"]["commit"]["S"], "later")
+
+    def test_nothing_registered_writes_nothing(self):
+        self.bu.cmd_releases_bootstrap(args(table="games-mp-releases", games=json.dumps(self.GAMES)))
+        self.assertEqual(self.w.ddb, {})
+
+
+class RouterLiveTests(Base):
+    def rargs(self):
+        return args(cluster="games", service="mp-router", repository="games/mp-router", tag="live",
+                    timeout=60, poll=20)
+
+    def test_live_starts_as_the_image_the_service_runs(self):
+        td = "arn:aws:ecs:us-west-1:1:task-definition/games-mp-router:4"
+        self.w.services = [{"services": [{"status": "ACTIVE", "taskDefinition": td}]}]
+        self.w.task_definitions[td] = {"containerDefinitions": [
+            {"image": "928413605543.dkr.ecr.us-west-1.amazonaws.com/games/mp-router:" + SHA12}]}
+        self.w.manifests[("games/mp-router", SHA12)] = '{"m": 1}'
+        self.bu.cmd_router_live(self.rargs())
+        self.assertEqual(self.w.put_images, [("games/mp-router", "live", '{"m": 1}')])
+        self.bu.cmd_router_live(self.rargs())
+        self.assertEqual(len(self.w.put_images), 1, "once")
+
+    def test_without_a_service_it_waits_for_the_first_release(self):
+        self.w.services = [{"services": [], "failures": [{"reason": "MISSING"}]}]
+        with self.assertRaisesRegex(self.bu.StepError, "never appeared"):
+            self.bu.cmd_router_live(self.rargs())
+        self.assertEqual(self.w.put_images, [])
 
 
 class PreflightTests(Base):
@@ -520,12 +665,10 @@ class PreflightTests(Base):
              "vercel_token_secret": "vercel-api-token",
              "copy_keys": "SUPABASE_URL,NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SECRET_KEY",
              "url_key": "POSTGRES_URL_NON_POOLING",
-             "migrate": "true", "build": "true", "repo": "CoderColton/colton-games", "ref": REF,
-             "github_pat_secret": "games/colton-games-read"}
+             "repo": "CoderColton/colton-games", "github_pat_secret": "games/colton-games-read"}
 
     def setUp(self):
         super().setUp()
-        self.bu.shutil = types.SimpleNamespace(which=lambda name: "/usr/bin/" + name)
         self.w.vercel_envs = [
             {"id": "e1", "key": "SUPABASE_URL", "target": ["development", "production"]},
             {"id": "e3", "key": "NEXT_PUBLIC_SUPABASE_URL", "target": ["development", "production"]},
@@ -578,10 +721,9 @@ class PreflightTests(Base):
         self.w.vercel_envs.append({"id": "m", "key": "SUPABASE_URL", "target": ["preview", "production"]})
         self.w.github_commit = 404
         self.w.token_meta = (200, {"token": {"revokedAt": 1, "scopes": []}})
-        self.bu.shutil = types.SimpleNamespace(which=lambda name: None)
         code, _, err = self.run_preflight()
         self.assertEqual(code, 1)
-        for needle in ("cannot decrypt SUPABASE_SECRET_KEY", "refusing to edit", "GitHub:", "revoked", "psql is missing"):
+        for needle in ("cannot decrypt SUPABASE_SECRET_KEY", "refusing to edit", "GitHub:", "revoked"):
             self.assertIn(needle, err)
 
     def test_token_scope_rules(self):
@@ -614,13 +756,11 @@ class PreflightTests(Base):
         self.assertEqual(code, 1)
         self.assertIn("cannot read the Vercel project", err)
 
-    def test_migrate_and_build_off_skip_their_checks(self):
-        self.w.decrypt["pg"] = None
-        self.w.github_commit = 404
-        self.bu.shutil = types.SimpleNamespace(which=lambda name: None)
-        code, out, err = self.run_preflight(migrate="false", build="false")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["db_host"], "none")
+    def test_the_poller_token_must_read_main(self):
+        del self.w.secrets["games/colton-games-read"]
+        code, _, err = self.run_preflight()
+        self.assertEqual(code, 1)
+        self.assertIn("games/colton-games-read has no value", err)
 
 
 class HealthTests(Base):
@@ -630,23 +770,31 @@ class HealthTests(Base):
     def svc(self, *deployments):
         return {"services": [{"deployments": list(deployments)}]}
 
+    def dep(self, td, status="PRIMARY", rollout="IN_PROGRESS", running=2, desired=2, id="ecs-svc/new"):
+        return {"id": id, "status": status, "taskDefinition": td, "rolloutState": rollout,
+                "runningCount": running, "desiredCount": desired}
+
     def test_rollout_states(self):
         rs = self.bu.rollout_state
-        self.assertEqual(rs(self.svc({"status": "PRIMARY", "taskDefinition": self.TD, "rolloutState": "IN_PROGRESS"}), self.TD), "wait")
-        self.assertEqual(rs(self.svc({"status": "PRIMARY", "taskDefinition": self.TD, "rolloutState": "COMPLETED", "runningCount": 1}), self.TD), "done")
-        self.assertIn("FAILED", rs(self.svc({"status": "PRIMARY", "taskDefinition": self.OLD, "rolloutState": "IN_PROGRESS"},
-                                            {"status": "ACTIVE", "taskDefinition": self.TD, "rolloutState": "FAILED"}), self.TD))
-        self.assertIn("rolled back", rs(self.svc({"status": "PRIMARY", "taskDefinition": self.OLD, "rolloutState": "COMPLETED", "runningCount": 1}), self.TD))
+        self.assertEqual(rs(self.svc(self.dep(self.TD, running=1)), self.TD), "wait")
+        # Ready before COMPLETED: the old tasks drain for up to an hour after this.
+        self.assertEqual(rs(self.svc(self.dep(self.TD), self.dep(self.OLD, "ACTIVE", "COMPLETED", id="ecs-svc/old")),
+                            self.TD), "ready")
+        self.assertIn("FAILED", rs(self.svc(self.dep(self.OLD), self.dep(self.TD, "ACTIVE", "FAILED")), self.TD))
+        self.assertIn("rolled back", rs(self.svc(self.dep(self.OLD, rollout="COMPLETED")), self.TD))
+        self.assertIn("FAILED", rs(self.svc(self.dep(self.TD, rollout="FAILED")), self.TD))
         self.assertEqual(rs({"services": []}, self.TD), "service not found")
 
     def hargs(self):
         return args(cluster="games", service="mp-router", task_definition_arn=self.TD, target_group_arn="tg",
                     alb_dns="alb.example", host="play.cc-games.app", timeout=120, poll=15)
 
-    def test_waits_for_rollout_target_and_healthz(self):
-        self.w.services = [self.svc({"status": "PRIMARY", "taskDefinition": self.TD, "rolloutState": "IN_PROGRESS"}),
-                           self.svc({"status": "PRIMARY", "taskDefinition": self.TD, "rolloutState": "COMPLETED", "runningCount": 1})]
-        self.w.target_states = ["initial", "healthy"]
+    def test_waits_for_the_new_tasks_to_be_healthy_targets_and_healthz(self):
+        self.w.services = [self.svc(self.dep(self.TD, running=0)), self.svc(self.dep(self.TD))]
+        self.w.tasks = {"ecs-svc/new": ["10.0.66.5", "10.0.67.5"]}
+        # The old tasks are draining; one new one is still initial at first.
+        self.w.target_health = [{"10.0.66.9": "draining", "10.0.66.5": "healthy", "10.0.67.5": "initial"},
+                                {"10.0.66.9": "draining", "10.0.66.5": "healthy", "10.0.67.5": "healthy"}]
         answers = [OSError("refused"), (503, b"no"), (200, b"ok\n")]
 
         def fake(address, host):
@@ -658,12 +806,14 @@ class HealthTests(Base):
         self.bu.healthz_via = fake
         self.bu.socket = types.SimpleNamespace(getaddrinfo=lambda *a: [1])
         self.bu.cmd_wait_healthy(self.hargs())
+        self.assertIn("all healthy targets", self.out.getvalue())
         self.assertIn("200 ok", self.out.getvalue())
 
     def test_never_healthy_fails_loudly(self):
-        self.w.services = [self.svc({"status": "PRIMARY", "taskDefinition": self.TD, "rolloutState": "COMPLETED", "runningCount": 1})]
-        self.w.target_states = ["unhealthy"]
-        with self.assertRaisesRegex(self.bu.StepError, "no healthy mp-router target"):
+        self.w.services = [self.svc(self.dep(self.TD))]
+        self.w.tasks = {"ecs-svc/new": ["10.0.66.5", "10.0.67.5"]}
+        self.w.target_health = {"10.0.66.5": "unhealthy", "10.0.67.5": "healthy"}
+        with self.assertRaisesRegex(self.bu.StepError, "not running and healthy"):
             self.bu.cmd_wait_healthy(self.hargs())
 
     def test_dechunk(self):
@@ -678,21 +828,27 @@ class TerraformWiringTests(unittest.TestCase):
     def block(self, text, kind, name):
         return re.search(r'resource "%s" "%s" \{.*?\n\}' % (kind, name), text, re.S).group()
 
-    def test_task_definitions_wait_for_the_build(self):
-        for name in ("games_mp_router", "games_engine"):
-            self.assertIn("terraform_data.games_mp_build", self.block(self.tf, "aws_ecs_task_definition", name))
-
-    def test_tags_are_derived_from_the_pinned_commit(self):
-        self.assertIn("games_mp_sha12 = substr(var.games_mp_source_ref, 0, 12)", self.tf)
-        self.assertIn('"${var.games_mp_sim_versions[id]}-${local.games_mp_sha12}"', self.tf)
-        self.assertRegex(self.tf, r'default\s*=\s*"dae003a969d289912b5b097eb390ede51092692e"')
+    def test_no_image_commit_is_pinned_in_terraform(self):
+        for name in ("games_mp_source_ref", "games_mp_sim_versions", "games_mp_build", "mp_engine_image_tags",
+                     "mp_router_image_tag", "games_mp_migrate"):
+            for text in (self.tf, self.bu):
+                self.assertNotIn('variable "%s"' % name, text)
+        td = self.block(self.tf, "aws_ecs_task_definition", "games_mp_router")
+        self.assertIn('image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:'
+                      '${local.mp_router_live_tag}"', td)
+        self.assertIn('mp_router_live_tag = "live"', self.tf)
+        self.assertIn("depends_on = [terraform_data.games_mp_router_live]", td)
 
     def test_codebuild_role_holds_no_credentials(self):
         policy = self.block(self.bu, "aws_iam_role_policy", "games_mp_codebuild")
         for forbidden in ("secretsmanager", "iam:", "ecs:", "sts:"):
             self.assertNotIn(forbidden, policy)
+        # Main's code, pushing only production repositories; never the preview ones.
+        self.assertIn('if startswith(name, "games/")', policy)
+        self.assertIn('"${aws_s3_bucket.games_mp_build.arn}/sources/main/*"', policy)
         project = self.block(self.bu, "aws_codebuild_project", "games_mp_images")
         self.assertIn('type      = "S3"', project)
+        self.assertRegex(project, r'name  = "GAMES_MP_CHANNEL"\n      value = "main"')
         self.assertIn('"ARM_CONTAINER"', project)
         self.assertIn("privileged_mode             = true", project)
 
@@ -704,20 +860,24 @@ class TerraformWiringTests(unittest.TestCase):
 
     def test_every_step_calls_a_real_subcommand(self):
         subcommands = set(re.findall(r'"([a-z-]+)": cmd_', (GM / "bringup.py").read_text()))
-        used = set(re.findall(r"bringup\} ([a-z-]+) ", self.bu))
+        deploy = (ROOT / "games-multiplayer-deploy.tf").read_text()
+        used = set(re.findall(r"bringup\} ([a-z-]+) ", self.bu + deploy))
         self.assertTrue(used)
         self.assertLessEqual(used, subcommands)
-        self.assertIn("codebuild-images", (GM / "buildspec.yml").read_text())
+        self.assertIn("python3 .games-mp/bringup.py codebuild-images", (GM / "buildspec.yml").read_text())
+        self.assertIn("python3 .games-mp/bringup.py codebuild-migrate", (GM / "buildspec-migrate.yml").read_text())
 
     def test_preflight_runs_at_plan_time_and_gates_every_step(self):
         data = re.search(r'data "external" "games_mp_preflight" \{.*?\n\}', self.bu, re.S).group()
         # A managed-resource reference in the query would defer the read to apply time.
         self.assertNotRegex(data, r"\b(aws|vercel|terraform_data|random)_[a-z0-9_]+\.")
-        for kind, name in (("terraform_data", "games_mp_build"), ("terraform_data", "games_mp_vercel_oidc"),
-                           ("terraform_data", "games_mp_preview_supabase"), ("terraform_data", "games_mp_migration"),
-                           ("vercel_project_environment_variable", "games_mp"),
-                           ("vercel_project_protection_bypass", "games_mp")):
-            self.assertIn("data.external.games_mp_preflight", self.block(self.bu, kind, name))
+        deploy = (ROOT / "games-multiplayer-deploy.tf").read_text()
+        for text, kind, name in ((self.bu, "terraform_data", "games_mp_vercel_oidc"),
+                                 (self.bu, "terraform_data", "games_mp_preview_supabase"),
+                                 (deploy, "terraform_data", "games_mp_db_url"),
+                                 (self.bu, "vercel_project_environment_variable", "games_mp"),
+                                 (self.bu, "vercel_project_protection_bypass", "games_mp")):
+            self.assertIn("data.external.games_mp_preflight", self.block(text, kind, name))
         self.assertNotIn("supabase-db-url", self.bu)
 
     def test_oidc_recheck_is_retriggered_by_live_drift_not_a_constant(self):
@@ -733,11 +893,11 @@ class TerraformWiringTests(unittest.TestCase):
         # fine-grained ejc3 token it cannot reach CoderColton's personal repo at all.
         self.assertNotIn('"github-pat-ejc3"', self.bu)  # never a value; the comments explain why
         self.assertIn("github_pat_secret   = local.games_mp_github_read_secret", self.bu)
-        for step in ("games_mp_build", "games_mp_migration"):
-            self.assertIn("--github-pat-secret ${local.games_mp_github_read_secret}",
-                          self.block(self.bu, "terraform_data", step))
+        deploy = (ROOT / "games-multiplayer-deploy.tf").read_text()
+        self.assertIn("TOKEN_SECRET    = aws_secretsmanager_secret.games_mp_github_read.name", deploy)
         policy = self.block(self.bu, "aws_secretsmanager_secret_policy", "games_mp_github_read")
-        self.assertIn("local.games_mp_admin_principals", policy)
+        # Administration and the poller only: no CodeBuild role, no dev box.
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.games_mp_poller.arn])", policy)
 
     def test_a_key_rotation_is_a_new_router_task_definition(self):
         # The router's public keys are in its environment, so a rotation changes the task
@@ -806,9 +966,9 @@ class JoinTokenKeyTests(unittest.TestCase):
         for token in re.findall(r"local\.[a-z_]+", td):
             self.assertNotIn("private", token)
             self.assertNotIn("signing", token)
-        # Nor any engine: they never see a token.
-        engine = self.block(self.tf, "aws_ecs_task_definition", "games_engine")
-        self.assertNotIn("games_mp_token", engine)
+        # Nor any engine revision: they get only their environment's public keys, at launch.
+        templates = local_expr((ROOT / "games-multiplayer-deploy.tf").read_text(), "games_mp_engine_templates")
+        self.assertNotIn("games_mp_token", templates)
 
     def test_private_keys_reach_only_the_vercel_lobby(self):
         # private_key_pem is read in exactly one place, and what is built from it flows only

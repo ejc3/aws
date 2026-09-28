@@ -1,14 +1,19 @@
-# CodeBuild project games-mp-images (games-multiplayer-bringup.tf).
+# CodeBuild projects games-mp-images (channel main) and games-mp-images-preview (channel
+# preview), games-multiplayer-bringup.tf and games-multiplayer-deploy.tf.
 #
-# The source is the pinned CoderColton/colton-games commit, uploaded to S3 by the jumpbox
-# (bringup.py build), with bringup.py itself added at .games-mp/bringup.py. That driver
-# builds and pushes ONLY the tags ECR lacks (tags are immutable, so an existing tag means
-# "already pushed"), after checking that the repo's scripts/mp-images.mjs would produce
-# exactly the tags Terraform put in the task definitions (GAMES_MP_EXPECT).
+# The source is one CoderColton/colton-games commit, uploaded to S3 by games-mp-poller with
+# .games-mp/ added (this repo's bringup.py and the commit it is). The driver builds and pushes
+# only the tags ECR lacks (tags are immutable, so an existing tag means "already pushed"), and
+# exports what it built for games-mp-release. GAMES_MP_CHANNEL is the project's own setting;
+# GAMES_MP_COMMIT is the poller's.
 version: 0.2
 
 env:
   shell: bash
+  exported-variables:
+    - GAMES_MP_IMAGES
+    - GAMES_MP_ROUTER_INPUTS
+    - GAMES_MP_SCHEMA_REVISION
 
 phases:
   install:
@@ -17,5 +22,5 @@ phases:
       python: 3.12
   build:
     commands:
-      - test "$(cat .games-mp/SOURCE_REF | cut -c1-12)" = "$GAMES_MP_SHA12"
       - python3 .games-mp/bringup.py codebuild-images
+      - . .games-mp/exports.sh && export GAMES_MP_IMAGES GAMES_MP_ROUTER_INPUTS GAMES_MP_SCHEMA_REVISION

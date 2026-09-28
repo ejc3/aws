@@ -299,15 +299,13 @@ class TerraformWiringTests(unittest.TestCase):
 
     def test_sim_versions_and_engine_tags_start_like_a_docker_tag(self):
         # The engine image tag is <simVersion>-<sha12>; a Docker tag cannot begin with "." or "-".
+        # games-mp-release registers only tags whose simVersion has that shape.
         import re as _re
-        for name in ("games_mp_sim_versions", "mp_engine_image_tags"):
-            var = self.tf.split('variable "%s"' % name, 1)[1].split("\n}\n", 1)[0]
-            pattern = _re.search(r'regex\("(\^[^"]+)"', var).group(1).replace("\\\\", "\\")
-            for bad in (".v2", "-v2"):
-                value = bad if name == "games_mp_sim_versions" else bad + "-0123456789ab"
-                self.assertIsNone(_re.match(pattern, value), (name, value))
-            ok = "v2" if name == "games_mp_sim_versions" else "v2-0123456789ab"
-            self.assertIsNotNone(_re.match(pattern, ok), name)
+        release = (Path(__file__).resolve().parent.parent / "games-multiplayer" / "release.py").read_text()
+        pattern = _re.search(r'SIM_VERSION = re\.compile\(r"([^"]+)"\)', release).group(1)
+        for bad in (".v2", "-v2", ""):
+            self.assertIsNone(_re.fullmatch(pattern, bad), bad)
+        self.assertIsNotNone(_re.fullmatch(pattern, "v2"))
 
     def test_a_missing_engine_count_alarms(self):
         # The sweeper swallows PutMetricData failures; the metric going missing must alarm.

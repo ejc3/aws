@@ -4,14 +4,17 @@ The Colton Games multiplayer platform runs one Fargate task per match. Players e
 through `wss://play.cc-games.app/m/<id>`. The design and the binding names are in the games
 repo (`CoderColton/colton-games`): `docs/MULTIPLAYER.md` and `docs/MULTIPLAYER-CONTRACT.md`.
 
-The Terraform is in two files:
+The Terraform is in three files:
 
 - `games-multiplayer.tf` holds the AWS and Cloudflare resources: ECR, the `games` cluster,
   IAM, the Vercel OIDC trust, security groups, the ALB, the certificate and DNS, the router
-  and engine task definitions, the launch function (the only way an engine starts) and the
+  task definition and service, the launch functions (the only way an engine starts) and the
   sweeper.
-- `games-multiplayer-bringup.tf` holds everything else a working platform needs: images,
-  secrets, Vercel settings, the Supabase migration, and a health check.
+- `games-multiplayer-bringup.tf` holds what a working platform needs besides: secrets, Vercel
+  settings, the main image build project, and a health check.
+- `games-multiplayer-deploy.tf` deploys the games repo automatically: every commit on `main`
+  goes to production and every other branch to preview, with no Terraform change (see
+  [Automatic deploys](#automatic-deploys)).
 
 ## Bring-up: plan, apply, done
 
@@ -21,10 +24,13 @@ From the jumpbox:
 cd ~/aws && git pull --ff-only && terraform plan && terraform apply
 ```
 
-One apply goes from nothing to a healthy router, once the one input below exists.
+One apply goes from nothing to a healthy router, once the one input below exists. On a
+platform built from nothing the apply waits (up to 30 minutes) for the first automatic main
+release to create the router image tag it runs; on an existing one it never names a commit.
 
-**First time only: Colton's read token.** The pinned commit lives in `CoderColton/colton-games`,
-a private repo on Colton's personal account. Only a token Colton owns can be limited to it:
+**First time only: Colton's read token.** The code lives in `CoderColton/colton-games`,
+a private repo on Colton's personal account, and AWS reads it (GitHub is never given an AWS
+credential). Only a token Colton owns can be limited to it:
 a fine-grained token owned by anyone else cannot reach another user's personal repo, and
 `github-pat-ejc3` is readable by every dev box anyway. The preflight reads this token, so a
 plan fails until it exists, and Terraform cannot create its secret while the plan fails.
@@ -65,8 +71,7 @@ every later step can finish:
   `POSTGRES_URL_NON_POOLING` and the Supabase values copied to Preview.
 - No variable with a copied key already spans Preview and another environment.
 - `games/colton-games-read` (Colton's read-only token for `colton-games`, see *First time
-  only* above) can read the pinned commit.
-- `psql` is on the jumpbox, or can be installed without a password.
+  only* above) can read `main`, which is what `games-mp-poller` does every minute.
 
 It reports every problem at once, with the exact fix, and fails the plan, so nothing
 changes. It prints no secret and returns none to Terraform.
@@ -83,14 +88,15 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 | Step | What it does |
 | --- | --- |
 | **Secrets** | The tls provider generates the join-token keys: one Ed25519 key pair per lobby environment (Production, Preview) and per entry of `games_mp_token_kids`, key id `<env>-<kid>` (`production-kid1`, `preview-kid1`). Each environment's private keys go only to its own Vercel `MP_TOKEN_SIGNING_KEYS`; the public keys go to the router's task definition as the plain variable `MP_TOKEN_PUBLIC_KEYS` (`<env>:<env>-<kid>:<base64 SPKI>`), so a key change is a new task definition that the health step verifies, and to each environment's launch function (`games-mp-launch-<environment>`, setting `TOKEN_PUBLIC_KEYS`: that environment's keys only), which gives each engine it starts those public keys. The random provider generates `MP_TEST_KEY`, `CRON_SECRET`, `MP_COOKIE_SECRET` (one per environment), Preview's `SKYHOOK_LEADERBOARD_SECRET` and the automation-bypass secret; the test key and cron secret also go to Secrets Manager (`games/mp-test-key`, `games/mp-cron-secret`). No private token key is in Secrets Manager: nothing on AWS needs one. |
-| **Images** (`terraform_data.games_mp_build`) | Skips everything if ECR already has both tags. Otherwise the jumpbox downloads the pinned commit (`games_mp_source_ref`) with the `games/colton-games-read` token and uploads it to `s3://games-mp-build-<account>/sources/`. It then runs the CodeBuild project `games-mp-images` (ARM, 2 vCPU) and waits for SUCCEEDED. The build checks that the repo's `scripts/mp-images.mjs` produces exactly the tags Terraform expects, then builds and pushes only the missing ones. Tags are router `<sha12>` and engine `<simVersion>-<sha12>`. The build role has no GitHub or Secrets Manager access. |
-| **Task definitions and router** | `games-mp-router`, `games-mptest` and the `mp-router` service are created only after the images exist. The service rolls with no downtime: the new task is started before the old one drains. |
+| **Router image** (`terraform_data.games_mp_router_live`) | Once. The router task definition runs `games/mp-router:live`, the one mutable tag in the games repositories, which the release function moves (see [Automatic deploys](#automatic-deploys)). This step creates it: as the image the `mp-router` service already runs, or, on a platform built from nothing, by waiting for the first main release. |
+| **Current release** (`terraform_data.games_mp_current_bootstrap`) | Once. Writes production's current release (`current#main` in the `games-mp-releases` table) from the newest engine revision Terraform registered before automatic deploys, so production launches never wait for the first release. Written only if missing. |
+| **Router** | The `games-mp-router` task definition and the `mp-router` service are created only after `live` exists. A rollout starts the new tasks before the old ones drain, and the old ones keep their connections for up to an hour. Engine task definitions are the release function's, never Terraform's. |
 | **Vercel env** | Terraform owns the multiplayer set on the colton-games project (see below), and only that set. |
 | **Automation bypass** | Protection Bypass for Automation is on, with `is_env_var`, so deployments see it as `VERCEL_AUTOMATION_BYPASS_SECRET`. The lobby passes it to engines as `MP_API_BYPASS`. |
 | **OIDC** (`terraform_data.games_mp_vercel_oidc`) | GETs the project and PATCHes only `oidcTokenConfig` to `{enabled, team}` if it differs, then verifies with another GET. It was already set on 2026-09-27. |
 | **Preview Supabase** (`terraform_data.games_mp_preview_supabase`) | Copies `SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL` and `SUPABASE_SECRET_KEY` from Production into Preview-only variables. It never writes a variable that reaches Production or Development. |
-| **Migration** (`terraform_data.games_mp_migration`) | Applies `supabase/migrations/20260926000000_mp.sql` from the same pinned commit. It connects with `psql` using the Supabase integration's own `POSTGRES_URL_NON_POOLING`, decrypted from Vercel at apply time, with `sslmode=verify-full` against the pinned Supabase Root 2021 CA. It reads `mp_private.schema_revision` first: at the file's revision it does nothing, and a partial or out-of-order state stops it. It runs nothing else. |
-| **Health** (`terraform_data.games_mp_healthy`) | Waits for the router's new deployment to report COMPLETED (a rollback fails the apply), for a healthy target, and for `GET /healthz` = `200 ok`. The health request goes to the ALB with the certificate verified for `play.cc-games.app`. It gives up after 15 minutes and fails the apply. |
+| **Database URL** (`terraform_data.games_mp_db_url`) | Copies the Supabase integration's own `POSTGRES_URL_NON_POOLING`, decrypted from Vercel's Production env, into `games/mp-db-url`, the one secret `games-mp-migrate` reads (administration and that CodeBuild role only). It writes only when the value changed, on stdin, never to state or disk. Bump `games_mp_db_url_sync` after the integration rotates its password. |
+| **Health** (`terraform_data.games_mp_healthy`) | Waits for the router's new deployment to run its desired count (a circuit-breaker rollback fails the apply), for every one of its tasks to be a healthy target, and for `GET /healthz` = `200 ok`. It does not wait for ECS's COMPLETED, which comes only after the old tasks' hour-long drain. The health request goes to the ALB with the certificate verified for `play.cc-games.app`. It gives up after 15 minutes and fails the apply. |
 
 ### The Vercel env Terraform writes
 
@@ -127,8 +133,9 @@ not secret.
 
 Some values are never written to state or to disk:
 
-- the Vercel API token and the GitHub PAT, which are read at apply time;
-- the Supabase database URL;
+- the Vercel API token and the GitHub read token, which are read at apply time (and by
+  `games-mp-poller`);
+- the Supabase database URL (in `games/mp-db-url` for the migration, never in state);
 - the Supabase values copied to Preview.
 
 `bringup.py` keeps them in memory. It sends them only in HTTP headers, request bodies or a
@@ -140,26 +147,126 @@ For the remote e2e run:
 - `terraform output -raw games_mp_cron_secret`
 - `terraform output -raw games_mp_automation_bypass_secret` (the `x-vercel-protection-bypass` value for previews)
 
-## Shipping a new version
+## Automatic deploys
 
-1. Merge the games-repo change and note its full commit sha.
-2. Set `games_mp_source_ref` to it in `games-multiplayer.tf`, and `games_mp_sim_versions`
-   if a game's `SIM_VERSION` changed. The build fails if the two disagree.
-3. Merge that change, then plan and apply.
+Nothing ships through Terraform any more: there is no pinned commit. AWS pulls from GitHub;
+GitHub holds no AWS credential and can start nothing here.
 
-The apply builds the new tags and registers new task definition revisions. It rolls the
-router and waits for it to be healthy, and applies the migration if the commit has a new
-one. Old engine revisions stay ACTIVE, so clients still on the old version keep matching
-until they update: the launch function runs the revision whose image carries the match's
-simVersion (see "The launch function" below). Never deregister an engine revision while
-clients may still send its simVersion. An old version's image stays in ECR only while the
-repository's last-20 lifecycle rule keeps it; a launch whose image has expired fails its match.
+```
+EventBridge Scheduler, every minute
+  games-mp-poller      reads every branch head of CoderColton/colton-games (Colton's read-only
+                       token), and for each commit it has not seen uploads the source to S3 and
+                       starts a build:
+                         main           games-mp-images          router + engines -> games/*
+                         any other      games-mp-images-preview  engines only     -> games-preview/*
+CodeBuild finished  --EventBridge-->  games-mp-release
+  main       registers games-<game> engine revisions for the commit; runs games-mp-migrate
+             first when the commit's mp schema revision is not the database's; makes the
+             commit production's current release; moves games/mp-router:live and rolls the
+             router when the router's own files changed
+  preview    registers games-preview-<game> revisions for exactly that commit
+  failed     recorded; main and migration failures mail cost-alerts
+```
+
+- **Production** (`games-mp-launch-production`) launches, on every call, the revision in
+  `current#main` of the `games-mp-releases` table for the game's current simVersion, and for an
+  older simVersion (a client still on the previous site) the newest main revision released for
+  it (`sim#<game>#<simVersion>`). A merge reaches new matches about 5 minutes after it lands
+  (poll, build, release). Main releases are ordered by the poller's sequence number, so a slow
+  build of an older commit never replaces a newer release.
+- **Preview** (`games-mp-launch-preview`) launches exactly the revision built from the lobby's
+  own commit: a preview lobby sends `commit` (its `VERCEL_GIT_COMMIT_SHA`) with every launch.
+  Until that commit's images are built and released it answers `engine-building` (a few
+  minutes after the push), and `engine-build-failed` if its build failed; the lobby shows
+  either and requeues the players. Every branch pushed to the repo is built, not only those
+  with a pull request: Vercel builds a preview for every pushed branch, and listing pull
+  requests would need a wider token. A fork's branches are never built.
+- **What changed is what is built.** A main build pushes only the tags ECR lacks (tags are
+  immutable, so an existing tag is already pushed), but every commit gets its own tags and
+  revisions: `games/<game>-engine:<simVersion>-<sha12>`, `games/mp-router:<sha12>`. The router
+  rolls only when its inputs changed: the Dockerfile and every file it copies, hashed by the
+  build (`bringup.py dockerfile_inputs`). Previews build engines only.
+- **Watching it.** `aws dynamodb get-item --region us-west-1 --table-name games-mp-releases
+  --key '{"id":{"S":"current#main"}}'` is production's current release; `build#main#<commit>`
+  and `build#preview#<commit>` are each commit's status (`building`, `migrating`, `released`,
+  `superseded`, `failed`). Logs: `/aws/lambda/games-mp-poller`, `/aws/lambda/games-mp-release`,
+  `/aws/codebuild/games-mp-images`, `/aws/codebuild/games-mp-images-preview`,
+  `/aws/codebuild/games-mp-migrate`.
+- **Rolling production back.** Revert on `main` (the normal path), or, at once, re-promote an
+  earlier released main commit; it takes a fresh sequence number, so it wins until the next
+  merge:
+
+  ```bash
+  aws lambda invoke --region us-west-1 --function-name games-mp-release \
+    --cli-binary-format raw-in-base64-out --payload '{"action":"promote","commit":"<40 hex>"}' out.json
+  ```
+
+- **Stopping deploys.** Commit `games_mp_autodeploy` defaulting to `false` and apply: the poller
+  stops, production keeps its current release, and nothing new is built.
+- **Retrying.** A commit is built once. A failed main build alerts; push a fix (a new commit is
+  a new build), or `aws codebuild retry-build --id <build id>`, whose success is released like
+  the first. A failed release alerts too (`games-mp-release-errors`), and is not retried by
+  itself: fix the cause and re-promote.
+- **The token.** When Colton's `games/colton-games-read` expires, the poller fails every minute
+  and `games-mp-poller-errors` alerts after 15 minutes; Colton regenerates the token and step 3
+  of *First time only* replaces the value.
+
+### What a release never does: kick a live match
+
+- **Engines never change under a match.** A release only decides what the next launch runs.
+  A running task keeps its image and revision; no revision is ever deregistered; production
+  repositories never expire a tagged image (their lifecycle rule removes only untagged ones),
+  so every selectable revision's image is there. Preview repositories expire images 45 days
+  after the push, and a preview release record lives 30 (a branch still there is rebuilt).
+- **Router rollouts drain.** A rollout (a router release, a key rotation, a scale-in) starts the
+  new tasks, waits until they are healthy, then deregisters the old ones. The ALB sends a
+  deregistered task no new connection but keeps every open one, a player's WebSocket
+  included, for the target group's deregistration delay, 3600 s, its maximum; only then does
+  ECS stop the task. The launch functions refuse a match hardcap above 3600 s, and an engine
+  ends its match at its hardcap after boot, so every match connected through an old router
+  ends before that router's drain does. The mp-test client does not reconnect by itself (a
+  reconnect is its "reconnect" button, which fetches a fresh token), so the drain is what keeps
+  a match alive; a game that wants matches longer than an hour must first reconnect its
+  clients automatically on a dropped socket, and then `mp_router_drain_sec` can stay at the
+  ALB's maximum while `MAX_HARDCAP_SEC` rises. The price: an old router task runs up to an hour
+  after each rollout, a few cents.
+- **Migrations run before the release that needs them, and must be backward compatible.**
+  The lobby is on Vercel, which deploys `main` on its own, minutes before this release, and
+  the engines and lobbies already running keep their code. So an mp migration must work with
+  both the previous and the new lobby and engines: add (a column, a function, a new RPC
+  version) in one merge, and remove what the old code used only in a later merge, after
+  every match on the old code has ended (at most an hour and a half). A migration that is not
+  backward compatible must be gated: ship the new code first without depending on it, then
+  the migration. `games-mp-migrate` applies the mp migrations only: the files under
+  `supabase/migrations` that set `mp_private.schema_revision` (the first inserts revision 1,
+  each later one `UPDATE mp_private.schema_revision SET revision = <n> WHERE id = 1`), in
+  file-name order, which must be revisions 1..n. It refuses a database newer than the commit
+  (a rollback never runs against a newer schema) and a partial state, and the release is not
+  promoted when it fails. The site's and Skyhook's migrations there are still applied by hand.
+
+### The trust this adds
+
+- **A push to `main` deploys production.** Whoever can merge to colton-games `main` changes the
+  code production engines and the router run, and the mp database schema (as the Supabase
+  integration's `postgres` role), with no further review. That is the owner's choice: `main`
+  already deploys the production lobby on Vercel.
+- **Any branch's code runs in preview engines.** Every writer on the repo, and every
+  dependency a build pulls in, can run code in `games-mp-images-preview` (privileged Docker,
+  up to 20 minutes, at most 3 at once and 2 new per minute) and in preview engines. Neither
+  can reach production: the preview build role pushes only to `games-preview/*` and reads no
+  secret; its revisions are registered only in the `games-preview-<game>` families, which only
+  the preview launch function (its own role) may run, and the release checks every tag it
+  reports against ECR and its own commit. One preview build can push an image for another
+  branch's commit that has not been built yet; that image still only ever runs as a preview.
+- **Unchanged:** engines have no AWS permission, run in their own subnets with 443-only egress,
+  get only their environment's public keys, and carry the token-verifier marker (the release
+  registers every revision with it). The router rolls only from `main`.
 
 **Adding a game** takes three entries:
 
-- one in `local.mp_games`;
-- its `SIM_VERSION` in `games_mp_sim_versions`;
-- its image in the games repo's `scripts/mp-images.mjs`.
+- one in `local.mp_games` (an id that does not begin with `preview-`);
+- its image in the games repo's `scripts/mp-images.mjs`;
+- nothing else: its repositories, families and releases follow from the first.
 
 ## Rotating secrets
 
@@ -187,8 +294,9 @@ repository's last-20 lifecycle rule keeps it; a launch whose image has expired f
   Id length is at most 20 characters, because the key id on the wire is `<env>-<kid>`.
   **A leaked private key** (one environment's) cannot wait for that: run
   `terraform apply -replace='tls_private_key.games_mp_token["<env>-<kid>"]'`. The router
-  rolls onto the new public key and refuses everything the old one signed as soon as the
-  health step passes; that environment's deployments answer `401 token` from the router until
+  rolls onto the new public key and refuses every new connection the old one signed as soon as
+  the health step passes (connections already open keep their old router task while it drains,
+  up to an hour; stop those matches' engines to cut them); that environment's deployments answer `401 token` from the router until
   they are rebuilt, and its engines already running keep only the old key, so their players
   cannot reconnect (stop them, see Emergency switches). The other environment is untouched:
   its keys are separate.
@@ -210,7 +318,7 @@ Tokens live two minutes and Production does not serve multiplayer yet.
    stack it under anything that ships multiplayer, so no build that reads `MP_TOKEN_KEYS` ever
    reaches Production. Do not deploy it to Production. A preview built from it before step 2
    answers `503 multiplayer-not-configured` (no `MP_TOKEN_SIGNING_KEYS` yet): expected.
-2. **Pin.** `games_mp_source_ref` must be a commit with the Ed25519 router and the
+2. **Pin** (historical: before automatic deploys). `games_mp_source_ref` had to be a commit with the Ed25519 router and the
    token-verifying engine kit (first applied at `1eb83917`; now pinned to `dae003a9`, the
    squash of colton-games #57 on main, whose image inputs are identical). An older router
    image with this task definition refuses to boot (no `MP_TOKEN_KEYS`), so the health step
@@ -316,17 +424,15 @@ apply, so never use one on its own.
 
 Other switches:
 
-- **`games_mp_build = false`** stops CodeBuild runs. The task definitions then use
-  `mp_router_image_tag` and `mp_engine_image_tags` exactly as given, and those tags must
-  already be in ECR. Use it when GitHub or CodeBuild is down and a known-good image must be
-  pinned.
-- **`games_mp_migrate = false`** skips the migration step.
+- **`games_mp_autodeploy = false`** stops the poller: nothing new is built or released, and
+  production keeps its current release. To go back to a known-good release at once, re-promote
+  it (Automatic deploys, "Rolling production back").
 
 ## What still needs a human
 
-- **Merging the games PRs to production**, which is EJ's "push to prod". Terraform
-  prepares everything, but the lobby code and its env reach users only with a production
-  deployment.
+- **Merging the games PRs to production**, which is EJ's "push to prod". A merge to `main`
+  then deploys everything by itself: Vercel the lobby, and `games-mp-release` the engines, the
+  router and the mp migrations.
 - **Fixing whatever a failed preflight names**, for example storing a new Vercel token. The
   plan fails with the exact fix, and nothing has changed.
 
@@ -338,10 +444,12 @@ There is one launch function per environment, `games-mp-launch-production` and
 environment's function. They have no ECS, IAM or EC2 permission at all.
 
 - **Request.** `{"action":"start","matchId","game","simVersion","secret","hardCapSec","apiBase"}`,
-  plus `"apiBypass"` from a preview. Any other field (`overrides`, `tags`, `taskDefinition`, `env`,
-  a size, a role) is refused, not dropped. `matchId` is a lowercase UUID, `game` must have a
-  registered task definition, `simVersion` is the match's (the lobby's shape, 1 to 64 of
-  `A-Za-z0-9._-`, matched in full), `hardCapSec` is 60 to 14,400, `apiBase` must be
+  plus `"apiBypass"` and `"commit"` from a preview. Any other field (`overrides`, `tags`,
+  `taskDefinition`, `env`, a size, a role) is refused, not dropped. `matchId` is a lowercase UUID,
+  `game` must be in `local.mp_games`, `simVersion` is the match's (the lobby's shape, 1 to 64 of
+  `A-Za-z0-9._-`, matched in full), `commit` is 40 lowercase hex (required on preview, ignored
+  on production), `hardCapSec` is 60 to 3,600 (no match may outlive a draining router, see
+  Automatic deploys), `apiBase` must be
   `https://cc-games.app` on production or this project's own `*.vercel.app` deployment URL on
   preview, and only preview may pass a bypass secret. `{"action":"stop","matchId"}` stops that
   match's engine of the caller's own environment, never another environment's or the router.
@@ -351,23 +459,22 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   tag, the allowed `apiBase`, the bypass and the ceiling. Each launcher role's policy names only
   its own environment's function ARN. A function deployed without a usable environment refuses
   every call (`forbidden`). The functions publish no versions or aliases.
-- **Which revision: the simVersion.** For the game's current simVersion (Terraform passes it
-  per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`).
-  For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
-  `skip_destroy` keeps old ones ACTIVE) whose only container is `engine` with image exactly
-  `<the game's ECR repository>:<simVersion>-<12 hex>`; the repository is the one Terraform
-  created for the game, so a revision pointing at any other image is never run whatever its tag.
-  Either way the revision's container environment must carry `MP_TOKEN_VERIFIER=ed25519-v2`,
-  which Terraform puts on every engine revision whose kit verifies join tokens itself (read
-  once per revision with `DescribeTaskDefinition`, then cached). Revisions registered before
-  that trust the router's `X-MP-*` headers, so they are never launched, even for the older
-  simVersion they carry: a compromised router could otherwise claim any seat on them.
-  None: `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched. A lookup (a miss
-  too) is cached for a minute per game and simVersion in the warm function.
-- **What it runs.** That revision (IAM allows `RunTask` on `games-<game>:*` for exactly the
-  games in `local.mp_games`, only on cluster `games`, and denies the router's family;
-  `ecs:ListTaskDefinitions` and `ecs:DescribeTaskDefinition` are read-only and take no resource,
-  so they are on `*`), `launchType FARGATE`, the engine
+- **Which revision.** From `games-mp-release`'s table (`RELEASES_TABLE`), read on every call:
+  production takes `current#main` for the game's current simVersion and `sim#<game>#<simVersion>`
+  for an older one; preview takes `build#preview#<commit>` (`engine-building` until it is
+  released, `engine-build-failed` if its build failed). Whatever the table says, the revision
+  must be of the function's own family (`GAMES`: `games-<game>` on production,
+  `games-preview-<game>` on preview) in this account and region, its only container `engine`
+  running exactly `<the game's repository for that environment>:<simVersion>-<12 hex>` (a
+  preview's: its commit's 12 hex), with `MP_TOKEN_VERIFIER=ed25519-v2` in its environment (read
+  once per revision with `DescribeTaskDefinition`, then cached). Otherwise
+  `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched. Revisions registered
+  before engines verified tokens have no marker and are never launched.
+- **What it runs.** That revision (IAM allows each function's own role `RunTask` on its own
+  families only, `games-<game>:*` or `games-preview-<game>:*` for exactly the games in
+  `local.mp_games`, only on cluster `games`, and denies the router's family;
+  `ecs:DescribeTaskDefinition` is read-only and takes no resource, so it is on `*`; the table
+  reads are `GetItem` on its own items only), `launchType FARGATE`, the engine
   subnets and security group with `assignPublicIp=ENABLED`, `clientToken` = `<env>-<match id>`
   and `startedBy` = the match id. Container `engine` gets `MATCH_ID`, `MATCH_SECRET`, `MP_API`, `GAME_ID`, `MP_ENV`,
   `MP_TOKEN_PUBLIC_KEYS` (the function's own environment's Ed25519 public keys, its
@@ -413,8 +520,8 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   the stop. A stop in a fresh execution environment has no record of that task, so an engine
   missed there runs until it exits or the sweeper's hard cap.
 - **Reply.** `{"ok":true,"taskArn","taskDefinition"}` for a start, `{"ok":true,"stopped"}` for a
-  stop, or `{"ok":false,"error"}` with `capacity`, `unknown-sim-version`, `not-yet-visible`,
-  `bad-request` (and the `field`) or `forbidden`. An ECS failure raises (a Lambda error, in its
+  stop, or `{"ok":false,"error"}` with `capacity`, `unknown-sim-version`, `engine-building`,
+  `engine-build-failed`, `not-yet-visible`, `bad-request` (and the `field`) or `forbidden`. An ECS failure raises (a Lambda error, in its
   metrics). One log line per call in `/aws/lambda/games-mp-launch-<environment>`, without the
   secret or the bypass.
 
@@ -565,7 +672,8 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | --- | --- | --- |
 | Anyone on the internet | Reach the ALB and router, up to 6,000 requests per IP per minute; hold connections open (idle timeout 3600 s); push a *distributed* flood that stays under the per-IP limit against 2–6 autoscaled routers | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host; get past the WAF from a known-bad IP |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
-| Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of the registered engine images (the preview share), each for up to its `hardCapSec` (at most 4 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data | Run a command, image, role or size of its choosing; launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
+| Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of its own branch's engine image (the preview share), each for up to its `hardCapSec` (at most 1 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data. In `games-mp-images-preview`: run as root in a privileged build for up to 20 minutes (3 at once) and push `games-preview/*` images | Run a command, role or size of its choosing in production; push or register anything production runs (no push to `games/*`, no production family); launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
+| A merge to colton-games `main` | Deploy production engines, the router and mp migrations within minutes, with no further review (by design: `main` is production) | Change anything Terraform owns: roles, network, ceilings, keys, the functions |
 | A compromised production deployment | The same through `games-mp-launch-production`, up to production's share of 22 engines | Everything in the row above, with production and preview swapped: it cannot launch preview engines or take preview's 8 |
 | A compromised router task (it parses internet input) | While the compromise lasts, only for connections that pass through it: see their tokens and bytes, and drop or rewrite that traffic (TLS ends at the ALB; router to engine is plain HTTP inside the VPC); replay a token it saw, for that same match and seat, until it expires (two minutes) | Mint a join token: it holds only public keys (it refuses to boot with a signing key), its execution role reads no secret, its task role has no policies. So nothing it can read or leak (env, logs, a memory disclosure) lets anyone mint tokens later, through another router task or from anywhere else, and a Preview-side key cannot pass for Production. Claim a seat it holds no fresh token for: engines verify the token themselves and ignore the router's identity headers. Launch or stop tasks; connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
 | A compromised engine | Reach any internet host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach any host in the VPC, on any port, over IPv4 or IPv6 (its own subnets, security group and `games-engine` ACL); route to the I/O box or its NFS export (no peer route, and NFS admits only the dev-fleet and parallel-box subnets); reach SSH, databases or any non-443 service on the internet |
@@ -652,7 +760,9 @@ CodeBuild ARM small costs $0.00425 per build minute.
 | Secrets Manager, 2 secrets at $0.40 (`games/mp-test-key`, `games/mp-cron-secret`) | $0.80 |
 | ECR storage, 14-day logs, sweeper Lambda (now every minute) and Scheduler, the two launch Lambdas (one call per match start or stop; reserved concurrency costs nothing), the build bucket | under $2 |
 | **Always on** | **about $64** |
-| Per build: about 5 minutes of CodeBuild | about $0.02 |
+| Per build: about 5 minutes of CodeBuild, one per commit on `main` or any other branch | about $0.02 |
+| After each router rollout: the old router tasks drain for up to an hour | about $0.02 |
+| Poller (every minute), release function, releases table | under $1 |
 | Per match: 2 vCPU / 4 GB plus a public IPv4, about $0.096 per hour | **about $0.016 per 10-minute match** |
 
 Internet data out beyond the account's free 100 GB per month costs about $0.09/GB.

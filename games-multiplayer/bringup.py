@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""games-mp bring-up steps that `terraform apply` runs on the jumpbox (and one inside CodeBuild).
+"""games-mp steps: the ones `terraform apply` runs on the jumpbox, and the two CodeBuild runs.
 
-Each step is a subcommand, called from a terraform_data local-exec in
+Most steps are subcommands called from a terraform_data local-exec in
 games-multiplayer-bringup.tf. Every step is idempotent: it checks the live state first and
 only changes what is missing, then verifies. A failed check exits non-zero, which fails the
 apply loudly.
 
     preflight         (terraform plan, data "external") read-only: prove every later step can
                       run, or stop the plan before anything changes
-    build             upload the pinned games-repo source to S3, run CodeBuild, wait for it
-    codebuild-images  (inside CodeBuild) build and push only the image tags that are missing
     vercel-oidc       make sure the Vercel project issues OIDC tokens in Team issuer mode
     preview-supabase  copy the Supabase URL and server key from Production to Preview
-    migrate           apply the pinned mp migration to Supabase once, over verify-full TLS
-    wait-healthy      wait for a healthy router target and a 200 `ok` from /healthz
+    sync-db-url       copy the Supabase integration's database URL into games/mp-db-url, the one
+                      secret games-mp-migrate reads
+    router-live       once: give games/mp-router the `live` tag the router task definition runs
+    releases-bootstrap  once: production's current release before the first automatic one
+    wait-healthy      wait for a healthy router deployment and a 200 `ok` from /healthz
+
+and inside CodeBuild, from the source zip games-mp-poller made (it adds this file at
+.games-mp/bringup.py, see games-multiplayer/poller.py):
+
+    codebuild-images   (games-mp-images, games-mp-images-preview) build and push one commit's
+                       images, only the tags that are missing, and export what was built
+    codebuild-migrate  (games-mp-migrate) apply a main commit's mp migrations over verify-full TLS
 
 SECRETS NEVER LEAVE MEMORY. Tokens and database credentials are read from Secrets Manager or
 the Vercel API into this process, sent only in HTTP headers, request bodies or a child's
@@ -26,12 +34,13 @@ Offline tests: scripts/test-games-mp-bringup.py.
 
 import argparse
 import base64
+import glob
 import hashlib
 import io
 import json
 import os
 import re
-import shutil
+import shlex
 import socket
 import ssl
 import subprocess
@@ -51,7 +60,9 @@ CLOCK = time.monotonic
 
 VERCEL_API = "https://api.vercel.com"
 GITHUB_API = "https://api.github.com"
-DRIVER_PATH = ".games-mp/bringup.py"  # where `build` puts this file inside the source zip
+DRIVER_PATH = ".games-mp/bringup.py"  # where games-mp-poller puts this file inside the source zip
+CA_PATH = ".games-mp/supabase-root-2021-ca.crt"  # and the pinned Supabase CA
+EXPORTS_PATH = ".games-mp/exports.sh"  # what a CodeBuild run exports (buildspec sources it)
 # SHA-256 of the DER of "Supabase Root 2021 CA", the root every Supabase Postgres endpoint
 # (direct and pooler) chains to. Checked against Supabase's published copy
 # (supabase-downloads .../prod/ssl/prod-ca-2021.crt) and the chain served on 2026-09-27.
@@ -175,7 +186,7 @@ def production_value(vercel, envs, key):
 
 
 # --------------------------------------------------------------------------------------
-# Source: the pinned games-repo commit as a CodeBuild-ready zip
+# Source: one games-repo commit as a CodeBuild-ready zip (games-mp-poller makes it)
 # --------------------------------------------------------------------------------------
 
 
@@ -184,10 +195,11 @@ def check_ref(ref):
         raise StepError("source ref must be a full 40-hex commit sha, got %r" % ref)
 
 
-def repack_zipball(raw, ref, driver_source):
+def repack_zipball(raw, ref, driver_source, extra=None):
     """GitHub's zipball nests everything under `<owner>-<repo>-<sha7>/`. CodeBuild wants the
-    repo at the zip root, so strip that folder, keep file modes, and add this driver and the
-    ref it was built from."""
+    repo at the zip root, so strip that folder, keep file modes, and add this driver, the ref it
+    was built from and any `extra` {path: bytes} under .games-mp/. Anything the repo itself has
+    under .games-mp/ is dropped: that directory is ours."""
     src = zipfile.ZipFile(io.BytesIO(raw))
     names = [n for n in src.namelist() if n]
     top = names[0].split("/", 1)[0] + "/"
@@ -197,7 +209,7 @@ def repack_zipball(raw, ref, driver_source):
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
         for info in src.infolist():
             rel = info.filename[len(top):]
-            if not rel:
+            if not rel or rel == ".games-mp/" or rel.startswith(".games-mp/"):
                 continue
             new = zipfile.ZipInfo(rel, info.date_time)
             # GitHub zipballs carry no Unix modes (all zero), and unzip would apply mode 0
@@ -209,59 +221,19 @@ def repack_zipball(raw, ref, driver_source):
                 new.external_attr = (0o100755 if mode & 0o111 else 0o100644) << 16
             new.compress_type = zipfile.ZIP_DEFLATED
             dst.writestr(new, b"" if info.is_dir() else src.read(info))
-        drv = zipfile.ZipInfo(DRIVER_PATH, (2026, 1, 1, 0, 0, 0))
-        drv.external_attr = 0o100755 << 16
-        dst.writestr(drv, driver_source)
-        marker = zipfile.ZipInfo(".games-mp/SOURCE_REF", (2026, 1, 1, 0, 0, 0))
-        marker.external_attr = 0o100644 << 16
-        dst.writestr(marker, ref + "\n")
+        ours = {DRIVER_PATH: driver_source, ".games-mp/SOURCE_REF": (ref + "\n").encode()}
+        ours.update(extra or {})
+        for path, data in sorted(ours.items()):
+            if not path.startswith(".games-mp/"):
+                raise StepError("extra source files go under .games-mp/, not %s" % path)
+            info = zipfile.ZipInfo(path, (2026, 1, 1, 0, 0, 0))
+            info.external_attr = (0o100755 if path == DRIVER_PATH else 0o100644) << 16
+            dst.writestr(info, data)
     return out.getvalue()
 
 
-def fetch_source(ref, repo, cache_dir, region, pat_secret):
-    """Path of the cached, repacked zip for `ref`. Downloads it once per commit."""
-    check_ref(ref)
-    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-    with open(os.path.abspath(__file__), "rb") as f:
-        driver = f.read()
-    # Keyed by the driver too: the zip carries this file into CodeBuild.
-    path = os.path.join(cache_dir, "%s-%s.zip" % (ref, hashlib.sha256(driver).hexdigest()[:12]))
-    if os.path.exists(path):
-        return path
-    token = read_secret(pat_secret, region)
-    if not token:
-        raise StepError("secret %s has no value; it is the GitHub read credential" % pat_secret)
-    status, raw = http("GET", "%s/repos/%s/zipball/%s" % (GITHUB_API, repo, ref),
-                       {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"},
-                       timeout=300)
-    if status != 200 or not isinstance(raw, (bytes, bytearray)):
-        raise StepError("GitHub zipball %s@%s -> %s" % (repo, ref[:12], status))
-    data = repack_zipball(raw, ref, driver)
-    # A unique temporary name: the build and migrate steps may download the same commit at
-    # the same time, and each must publish a complete file atomically.
-    fd, tmp = tempfile.mkstemp(dir=cache_dir, prefix=".%s." % ref[:12], suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
-    log("source %s@%s: %d bytes" % (repo, ref[:12], len(data)))
-    return path
-
-
-def read_from_source(zip_path, member):
-    with zipfile.ZipFile(zip_path) as z:
-        try:
-            return z.read(member).decode()
-        except KeyError:
-            raise StepError("%s is not in the pinned source" % member)
-
-
 # --------------------------------------------------------------------------------------
-# build (jumpbox) and codebuild-images (inside CodeBuild)
+# codebuild-images (inside CodeBuild)
 # --------------------------------------------------------------------------------------
 
 
@@ -274,49 +246,6 @@ def missing_tags(expect, region):
         if not found or not found.get("imageDetails"):
             missing[repo] = tag
     return missing
-
-
-def cmd_build(args):
-    expect = json.loads(args.expect)
-    todo = missing_tags(expect, args.region)
-    if not todo:
-        log("images already in ECR, nothing to build: %s" % ", ".join("%s:%s" % kv for kv in sorted(expect.items())))
-        return
-    log("missing images: %s" % ", ".join("%s:%s" % kv for kv in sorted(todo.items())))
-    zip_path = fetch_source(args.ref, args.repo, args.cache_dir, args.region, args.github_pat_secret)
-    key = "sources/%s.zip" % args.ref
-    aws("s3", "cp", zip_path, "s3://%s/%s" % (args.bucket, key), "--region", args.region, "--only-show-errors", parse=False)
-    request = {
-        "projectName": args.project,
-        "sourceLocationOverride": "%s/%s" % (args.bucket, key),
-        "environmentVariablesOverride": [
-            {"name": "GAMES_MP_EXPECT", "value": json.dumps(expect, sort_keys=True), "type": "PLAINTEXT"},
-            {"name": "GAMES_MP_SHA12", "value": args.ref[:12], "type": "PLAINTEXT"},
-        ],
-    }
-    # Inline, not file:///dev/stdin: AWS CLI v2 rejects --cli-input-json read from stdin
-    # ("Invalid JSON received", even for "{}"), which failed the first jumpbox apply
-    # (2026-09-27). The request holds no secret: a project name, an S3 key, image tags.
-    started = aws("codebuild", "start-build", "--region", args.region, "--cli-input-json", json.dumps(request))
-    build_id = started["build"]["id"]
-    log("CodeBuild %s started" % build_id)
-    deadline = CLOCK() + args.timeout
-    status = "IN_PROGRESS"
-    while True:
-        builds = aws("codebuild", "batch-get-builds", "--region", args.region, "--ids", build_id)["builds"]
-        status = builds[0]["buildStatus"]
-        if status != "IN_PROGRESS":
-            break
-        if CLOCK() > deadline:
-            raise StepError("CodeBuild %s still running after %ds" % (build_id, args.timeout))
-        SLEEP(args.poll)
-    link = builds[0].get("logs", {}).get("deepLink", "")
-    if status != "SUCCEEDED":
-        raise StepError("CodeBuild %s ended %s. Logs: %s" % (build_id, status, link))
-    still = missing_tags(expect, args.region)
-    if still:
-        raise StepError("CodeBuild succeeded but ECR still lacks %s" % still)
-    log("images built and pushed (%s)" % build_id)
 
 
 # Base images named without a registry come from Docker Hub, whose anonymous pull limit
@@ -350,31 +279,98 @@ def parse_dry_run(text):
     return out
 
 
+def dockerfile_inputs(dockerfile, root="."):
+    """SHA-256 over a Dockerfile and every file its COPY/ADD instructions take from the build
+    context (never from another stage): whether a rebuilt image is the same program. The main
+    release rolls the router only when this changes."""
+    with open(os.path.join(root, dockerfile)) as f:
+        text = re.sub(r"\\\n", " ", f.read())
+    files = {dockerfile}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or parts[0].upper() not in ("COPY", "ADD"):
+            continue
+        rest = parts[1].strip()
+        flags = []
+        while rest.startswith("--"):
+            flag, _, rest = rest.partition(" ")
+            flags.append(flag)
+            rest = rest.strip()
+        if any(f.startswith("--from") for f in flags):
+            continue
+        args = json.loads(rest) if rest.startswith("[") else rest.split()
+        for pattern in args[:-1]:
+            matches = sorted(glob.glob(os.path.join(root, pattern), recursive=True))
+            if not matches:
+                raise StepError("%s: COPY source %s matches nothing" % (dockerfile, pattern))
+            for m in matches:
+                walk = [os.path.join(d, n) for d, _, names in os.walk(m) for n in names] if os.path.isdir(m) else [m]
+                files.update(os.path.relpath(w, root) for w in walk)
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        with open(os.path.join(root, rel), "rb") as f:
+            digest.update(rel.encode() + b"\0" + hashlib.sha256(f.read()).digest())
+    return digest.hexdigest()
+
+
+def write_exports(values, path=EXPORTS_PATH):
+    """Shell assignments the buildspec sources, so CodeBuild exports them (its
+    exported-variables); games-mp-release reads them with BatchGetBuilds."""
+    with open(path, "w") as f:
+        for key, value in sorted(values.items()):
+            f.write("%s=%s\n" % (key, shlex.quote(value)))
+
+
+def source_commit():
+    commit = os.environ.get("GAMES_MP_COMMIT", "")
+    check_ref(commit)
+    with open(".games-mp/SOURCE_REF") as f:
+        if f.read().strip() != commit:
+            raise StepError("the source zip is not commit %s" % commit)
+    return commit
+
+
 def cmd_codebuild_images(args):
-    expect = json.loads(os.environ["GAMES_MP_EXPECT"])
-    sha12 = os.environ["GAMES_MP_SHA12"]
+    """Builds and pushes one commit's images. The channel is the project's own setting:
+    main     every image scripts/mp-images.mjs defines, into games/* (router included);
+    preview  engines only, into games-preview/<game>-engine: a preview never ships a router.
+    Tags are the repo's own (`<sha12>`, `<simVersion>-<sha12>`); a tag ECR already has is not
+    rebuilt (tags are immutable: it is already pushed)."""
+    channel = os.environ.get("GAMES_MP_CHANNEL")
+    if channel not in ("main", "preview"):
+        raise StepError("GAMES_MP_CHANNEL must be main or preview")
+    commit = source_commit()
+    sha12 = commit[:12]
     account, region = os.environ["ACCOUNT_ID"], os.environ.get("AWS_REGION", "us-west-1")
-    base = ["node", "scripts/mp-images.mjs", "--account", account, "--region", region, "--sha", sha12]
-    dry = RUN(base + ["--push", "--dry-run"], capture_output=True, text=True)
+    registry = "%s.dkr.ecr.%s.amazonaws.com" % (account, region)
+    script = ["node", "scripts/mp-images.mjs", "--sha", sha12]
+    dry = RUN(script + ["--account", account, "--region", region, "--push", "--dry-run"],
+              capture_output=True, text=True)
     if dry.returncode != 0:
         raise StepError("mp-images.mjs --dry-run failed: %s" % dry.stderr.strip()[-500:])
-    produced = parse_dry_run(dry.stdout)
-    got = {repo: tag for repo, tag, _ in produced.values()}
-    if got != expect:
-        # Terraform derives the tags (games_mp_sim_versions + the sha); the repo's script is
-        # the other half. Disagreeing would push tags no task definition names.
-        raise StepError("the pinned source builds %s but Terraform expects %s; fix var.games_mp_sim_versions"
-                        % (json.dumps(got, sort_keys=True), json.dumps(expect, sort_keys=True)))
-    todo = missing_tags(expect, region)
-    names = [name for name, (repo, _, _) in sorted(produced.items()) if repo in todo]
-    if not names:
-        log("every tag already exists (immutable tags: already pushed)")
-        return
+    targets = {}
+    for name, (repo, tag, dockerfile) in sorted(parse_dry_run(dry.stdout).items()):
+        source = repo
+        engine = re.fullmatch(r"games/([a-z0-9-]+)-engine", repo)
+        if tag != sha12 and not (engine and tag.endswith("-" + sha12)):
+            raise StepError("mp-images.mjs tags %s %s:%s, not with commit %s" % (name, repo, tag, sha12))
+        if channel == "preview":
+            if not engine:
+                continue
+            repo = "games-preview/%s-engine" % engine.group(1)
+        targets[name] = (repo, tag, dockerfile, "%s:%s" % (source, tag))
+    if not targets:
+        raise StepError("mp-images.mjs defines no images to build")
+    images = {repo: tag for repo, tag, _, _ in targets.values()}
+    todo = missing_tags(images, region)
+    names = [name for name, (repo, _, _, _) in sorted(targets.items()) if repo in todo]
+    if names:
+        password = aws("ecr", "get-login-password", "--region", region, parse=False)
+        if RUN(["docker", "login", "--username", "AWS", "--password-stdin", registry],
+               input=password, capture_output=True, text=True).returncode != 0:
+            raise StepError("docker login to %s failed" % registry)
     for name in names:
-        dockerfile = produced[name][2]
-        if not dockerfile:
-            continue
-        with open(dockerfile) as f:
+        with open(targets[name][2]) as f:
             for ref in docker_hub_library_bases(f.read()):
                 mirror = "public.ecr.aws/docker/library/%s" % ref
                 if RUN(["docker", "pull", "--platform", "linux/arm64", mirror]).returncode == 0:
@@ -382,13 +378,28 @@ def cmd_codebuild_images(args):
                 else:
                     log("mirror pull failed for %s; docker build will try Docker Hub" % ref)
     for name in names:
-        log("building and pushing %s" % name)
-        proc = RUN(base + ["--push", "--login", "--only", name])
-        if proc.returncode != 0:
+        repo, tag, _, local = targets[name]
+        log("building %s and pushing %s:%s" % (name, repo, tag))
+        if RUN(script + ["--only", name]).returncode != 0:
             raise StepError("mp-images.mjs --only %s failed" % name)
-    still = missing_tags(expect, region)
+        # mp-images.mjs builds it as games/<...>:<tag>; push it under the channel's repository.
+        remote = "%s/%s:%s" % (registry, repo, tag)
+        for cmd in (["docker", "tag", local, remote], ["docker", "push", remote]):
+            if RUN(cmd).returncode != 0:
+                raise StepError("%s failed" % " ".join(cmd[:2]))
+    still = missing_tags(images, region)
     if still:
         raise StepError("pushed, but ECR still lacks %s" % still)
+    exports = {"GAMES_MP_IMAGES": json.dumps(images, sort_keys=True)}
+    if channel == "main":
+        router = [df for repo, _, df, _ in targets.values() if repo == "games/mp-router"]
+        if len(router) != 1:
+            raise StepError("a main build must build exactly one router image")
+        exports["GAMES_MP_ROUTER_INPUTS"] = dockerfile_inputs(router[0])
+        migrations = mp_migrations(".")
+        exports["GAMES_MP_SCHEMA_REVISION"] = str(migrations[-1][0] if migrations else 0)
+    write_exports(exports)
+    log("built %s (%s): %s" % (commit, channel, json.dumps(images, sort_keys=True)))
 
 
 # --------------------------------------------------------------------------------------
@@ -483,14 +494,41 @@ def check_ca(ca_path):
         raise StepError("%s is not the pinned Supabase Root 2021 CA" % ca_path)
 
 
+MIGRATIONS_DIR = "supabase/migrations"
+# How an mp migration records its revision: the first inserts the marker row, later ones update it.
+_REVISION = re.compile(
+    r"INSERT INTO mp_private\.schema_revision \(id, revision\) VALUES \(1, (\d+)\)"
+    r"|UPDATE mp_private\.schema_revision SET revision = (\d+) WHERE id = 1")
+
+
 def migration_revision(sql):
-    found = re.findall(r"INSERT INTO mp_private\.schema_revision \(id, revision\) VALUES \(1, (\d+)\)", sql)
+    found = _REVISION.findall(sql)
     if len(found) != 1:
-        raise StepError("the migration must set mp_private.schema_revision exactly once")
+        raise StepError("an mp migration must set mp_private.schema_revision exactly once")
     for other in ("skyhook_private", "site_private"):
         if other in sql:
-            raise StepError("the mp migration mentions %s; refusing to run it" % other)
-    return int(found[0])
+            raise StepError("an mp migration mentions %s; refusing to run it" % other)
+    return int(found[0][0] or found[0][1])
+
+
+def mp_migrations(root="."):
+    """[(revision, path, sql)]: the repo's mp migrations (the files under supabase/migrations
+    that set mp_private.schema_revision), in file-name order, which must be revisions 1..n.
+    The other migrations there (the site's, Skyhook's) are applied by hand and never here."""
+    folder = os.path.join(root, MIGRATIONS_DIR)
+    out = []
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        if not name.endswith(".sql"):
+            continue
+        with open(os.path.join(folder, name)) as f:
+            sql = f.read()
+        if "mp_private.schema_revision" not in sql or not _REVISION.search(sql):
+            continue
+        out.append((migration_revision(sql), "%s/%s" % (MIGRATIONS_DIR, name), sql))
+    revisions = [r for r, _, _ in out]
+    if revisions != list(range(1, len(out) + 1)):
+        raise StepError("mp migrations must set revisions 1..n in file-name order, found %s" % revisions)
+    return out
 
 
 # Two statements, not one CASE: PostgreSQL resolves every relation a statement names when it
@@ -521,69 +559,146 @@ def psql(env, *args):
     return proc.stdout
 
 
-def ensure_psql():
-    if shutil.which("psql"):
-        return
-    if shutil.which("apt-get") and RUN(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        log("installing postgresql-client (psql) on this admin box")
-        for cmd in (["apt-get", "install", "-y", "-qq", "postgresql-client"],
-                    ["apt-get", "update", "-qq"],
-                    ["apt-get", "install", "-y", "-qq", "postgresql-client"]):
-            RUN(["sudo", "-n", *cmd], capture_output=True, text=True)
-            if shutil.which("psql"):
-                return
-    raise StepError("psql is not installed and could not be installed: sudo apt-get install -y postgresql-client")
-
-
-def database_url(args):
-    """(url, where): the Supabase integration's own URL, decrypted from the Vercel project's
-    Production env at apply time. One source; the plan-time preflight proved it decrypts."""
-    v = vercel_from_args(args)
-    return production_value(v, v.envs(), args.url_key), "Vercel %s (Production)" % args.url_key
-
-
-def cmd_migrate(args):
-    check_ca(args.ca)
-    zip_path = fetch_source(args.ref, args.repo, args.cache_dir, args.region, args.github_pat_secret)
-    sql = read_from_source(zip_path, args.file)
-    want = migration_revision(sql)
-    url, where = database_url(args)
-    if not url:
-        # The plan-time preflight proved this source had a value; failing here means it changed.
-        raise StepError("the database URL from %s is gone since the plan; plan again" % where)
-    env = pg_env(url, args.ca)
-    ensure_psql()
+def apply_mp_migrations(env, migrations):
+    """Brings mp_private to the last of `migrations`, one file at a time, each verified.
+    Returns the revision it ends at. Refuses a database NEWER than the migrations (a main
+    commit older than what is deployed must never run against it) and a missing marker."""
+    want = migrations[-1][0] if migrations else 0
     have = current_revision(env)
-    log("database (%s, %s): mp_private revision %s, migration sets %s" % (where, env["PGHOST"], have, want))
-    if have == want:
-        log("migration already applied; nothing to do")
-        return
+    log("database %s: mp_private revision %s, this commit's migrations reach %s" % (env["PGHOST"], have, want))
     if have < 0:
         raise StepError("mp_private exists but its schema_revision marker is %s; fix by hand, not by re-running"
                         % ("missing" if have == -1 else "empty"))
     if have > want:
-        # source_ref rolled back to a commit whose migration file targets an OLDER revision
-        # than what is already live. Running it would be a no-op at best; deploying THIS
-        # source against a newer, possibly incompatible schema is the real danger, so this
-        # must fail loudly rather than silently report "already applied" (have >= want did
-        # exactly that, which is the bug this replaces).
-        raise StepError("database is at revision %d, newer than this migration's target %d; "
-                        "games_mp_source_ref is older than what is deployed and must not run against it"
-                        % (have, want))
-    if have > 0:
-        raise StepError("database is at revision %d but this migration starts from nothing; a later "
-                        "migration must bring it to %d" % (have, want))
-    with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
-        f.write(sql)
-        sql_path = f.name
-    try:
-        psql(env, "-f", sql_path)
-    finally:
-        os.unlink(sql_path)
-    have = current_revision(env)
-    if have != want:
-        raise StepError("migration ran but mp_private.schema_revision is %s, expected %s" % (have, want))
-    log("migration %s applied; mp_private at revision %d (verified)" % (args.file, have))
+        raise StepError("database is at mp revision %d, newer than this commit's %d: this commit is older "
+                        "than what is deployed and must not run against it" % (have, want))
+    for revision, path, sql in migrations[have:]:
+        with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
+            f.write(sql)
+            sql_path = f.name
+        try:
+            psql(env, "-f", sql_path)
+        finally:
+            os.unlink(sql_path)
+        now = current_revision(env)
+        if now != revision:
+            raise StepError("%s ran but mp_private.schema_revision is %s, expected %s" % (path, now, revision))
+        log("%s applied; mp_private at revision %d (verified)" % (path, now))
+    return want
+
+
+def cmd_codebuild_migrate(args):
+    """games-mp-migrate: a main commit's mp migrations, from its source zip, against the
+    Supabase database in games/mp-db-url (injected by the buildspec, never on a command line).
+    Runs no code of the repo's: only psql with its .sql files. Exports GAMES_MP_DB_REVISION."""
+    commit = source_commit()
+    url = os.environ.pop("GAMES_MP_DB_URL", "")
+    if not url:
+        raise StepError("GAMES_MP_DB_URL is empty (secret games/mp-db-url)")
+    check_ca(CA_PATH)
+    env = pg_env(url, os.path.abspath(CA_PATH))
+    revision = apply_mp_migrations(env, mp_migrations("."))
+    write_exports({"GAMES_MP_DB_REVISION": str(revision)})
+    log("commit %s: mp_private at revision %d" % (commit, revision))
+
+
+def cmd_sync_db_url(args):
+    """Copies the Supabase integration's own database URL (Production POSTGRES_URL_NON_POOLING,
+    decrypted from Vercel) into the secret games-mp-migrate reads, when it differs. The value
+    goes from memory to Secrets Manager on stdin: never argv, the disk or Terraform state."""
+    v = vercel_from_args(args)
+    url = production_value(v, v.envs(), args.url_key)
+    if not url:
+        raise StepError("Vercel %s (Production) is missing or no longer decryptable" % args.url_key)
+    pg_env(url, "-")  # a postgres:// URL with a user and password, or stop here
+    if read_secret(args.secret_id, args.region) == url:
+        log("%s already holds the current database URL" % args.secret_id)
+        return
+    aws("secretsmanager", "put-secret-value", "--region", args.region, "--secret-id", args.secret_id,
+        "--secret-string", "file:///dev/stdin", "--query", "VersionId", input_text=url, parse=False)
+    if read_secret(args.secret_id, args.region) != url:
+        raise StepError("%s does not hold the database URL after writing it" % args.secret_id)
+    log("%s updated from Vercel %s (verified)" % (args.secret_id, args.url_key))
+
+
+def cmd_router_live(args):
+    """Once: the router task definition runs games/mp-router:live, which games-mp-release moves
+    on every main release that changes the router. Before the first one, `live` is the image the
+    service already runs; on a platform built from nothing, the first main release creates it
+    (games-mp-poller starts that build as soon as it exists), so this waits for it."""
+    def has_live():
+        found = aws("ecr", "describe-images", "--region", args.region, "--repository-name", args.repository,
+                    "--image-ids", "imageTag=%s" % args.tag, check=False)
+        return bool(found and found.get("imageDetails"))
+
+    if has_live():
+        log("%s:%s exists" % (args.repository, args.tag))
+        return
+    svc = aws("ecs", "describe-services", "--region", args.region, "--cluster", args.cluster,
+              "--services", args.service).get("services") or []
+    td = svc[0].get("taskDefinition") if svc and svc[0].get("status") == "ACTIVE" else None
+    if td:
+        image = aws("ecs", "describe-task-definition", "--region", args.region, "--task-definition", td,
+                    )["taskDefinition"]["containerDefinitions"][0]["image"]
+        tag = image.rsplit(":", 1)[1] if ":" in image.rsplit("/", 1)[-1] else ""
+        if not re.fullmatch(r"[0-9a-f]{12}", tag):
+            raise StepError("mp-router runs %s, not a <sha12> image, and %s has no `%s` tag" % (image, args.repository, args.tag))
+        img = aws("ecr", "batch-get-image", "--region", args.region, "--repository-name", args.repository,
+                  "--image-ids", "imageTag=%s" % tag)["images"][0]
+        aws("ecr", "put-image", "--region", args.region, "--repository-name", args.repository,
+            "--image-tag", args.tag, "--image-manifest", img["imageManifest"],
+            "--image-manifest-media-type", img.get("imageManifestMediaType") or
+            "application/vnd.docker.distribution.manifest.v2+json")
+        log("%s:%s now names the running router image (%s)" % (args.repository, args.tag, tag))
+        return
+    deadline = CLOCK() + args.timeout
+    log("no mp-router service yet: waiting for the first main release to create %s:%s" % (args.repository, args.tag))
+    while not has_live():
+        if CLOCK() > deadline:
+            raise StepError("%s:%s never appeared; check games-mp-poller and games-mp-release logs"
+                            % (args.repository, args.tag))
+        SLEEP(args.poll)
+    log("%s:%s exists" % (args.repository, args.tag))
+
+
+def cmd_releases_bootstrap(args):
+    """Once: production's current release (current#main in games-mp-releases) before the first
+    automatic one, so production launches never pause for it. For each game, the newest ACTIVE
+    revision of its production family whose engine image is <its repository>:<sim>-<sha12> and
+    that carries MP_TOKEN_VERIFIER (what Terraform registered). Written only if the item is
+    missing; with no such revision (a platform built from nothing) nothing is written, and the
+    first main release creates it."""
+    games = json.loads(args.games)
+    found = aws("dynamodb", "get-item", "--region", args.region, "--table-name", args.table,
+                "--key", json.dumps({"id": {"S": "current#main"}}), "--consistent-read")
+    if found.get("Item"):
+        log("current#main exists: %s" % found["Item"].get("commit", {}).get("S"))
+        return
+    current, commits = {}, set()
+    for game, where in sorted(games.items()):
+        arns = aws("ecs", "list-task-definitions", "--region", args.region, "--family-prefix", where["family"],
+                   "--status", "ACTIVE", "--sort", "DESC").get("taskDefinitionArns") or []
+        for arn in arns:
+            if arn.rsplit("/", 1)[-1].rsplit(":", 1)[0] != where["family"]:
+                continue
+            td = aws("ecs", "describe-task-definition", "--region", args.region, "--task-definition", arn)["taskDefinition"]
+            c = td["containerDefinitions"]
+            m = re.fullmatch(re.escape(where["repositoryUrl"]) + r":(.+)-([0-9a-f]{12})", c[0].get("image", "")) if len(c) == 1 else None
+            marker = {"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"} in (c[0].get("environment") or [])
+            if m and marker and c[0].get("name") == "engine":
+                current[game] = {"M": {"taskDefinition": {"S": arn}, "simVersion": {"S": m.group(1)}}}
+                commits.add(m.group(2))
+                break
+    if set(current) != set(games):
+        log("no registered revision for %s: the first main release will create current#main"
+            % ", ".join(sorted(set(games) - set(current))))
+        return
+    item = {"id": {"S": "current#main"}, "seq": {"N": "0"}, "games": {"M": current},
+            "commit": {"S": ",".join(sorted(commits))}, "bootstrap": {"BOOL": True}}
+    aws("dynamodb", "put-item", "--region", args.region, "--table-name", args.table, "--item", json.dumps(item),
+        "--condition-expression", "attribute_not_exists(id)")
+    log("current#main bootstrapped from the registered revisions: %s"
+        % ", ".join("%s=%s" % (g, v["M"]["taskDefinition"]["S"].rsplit("/", 1)[-1]) for g, v in sorted(current.items())))
 
 
 # --------------------------------------------------------------------------------------
@@ -592,8 +707,8 @@ def cmd_migrate(args):
 #
 # Runs as Terraform `data "external"` during every plan on the jumpbox. It only READS: the
 # two credentials from Secrets Manager, the Vercel project and its env (decrypting the
-# values later steps copy or use, then discarding them), the token's own metadata, the
-# pinned commit on GitHub, and whether psql can run here. Every problem is reported at
+# values later steps copy or use, then discarding them), the token's own metadata, and
+# whether the GitHub read token can read main. Every problem is reported at
 # once, and any problem fails the plan, so an apply never starts with a step that cannot
 # finish. It prints no secret and returns none to Terraform (nothing sensitive in state).
 
@@ -659,36 +774,30 @@ def cmd_preflight(_args):
                 _, problem = preview_targets(envs, key)
                 if problem:
                     problems.append(problem)
-            if q.get("migrate") == "true":
-                url = production_value(v, envs, q["url_key"])
-                if url is None:
-                    problems.append(
-                        "vercel-api-token cannot decrypt %s on Production (the Supabase integration's database "
-                        "URL the migration uses). Store a token of a colton-games team member in secret "
-                        "vercel-api-token, or set games_mp_migrate = false" % q["url_key"])
-                else:
-                    try:
-                        env = pg_env(url, "-")
-                        result["db_host"] = env["PGHOST"]
-                    except StepError as e:
-                        problems.append("%s on Production: %s" % (q["url_key"], e))
+            # sync-db-url copies it into games/mp-db-url for games-mp-migrate.
+            url = production_value(v, envs, q["url_key"])
+            if url is None:
+                problems.append(
+                    "vercel-api-token cannot decrypt %s on Production (the Supabase integration's database "
+                    "URL games-mp-migrate uses). Store a token of a colton-games team member in secret "
+                    "vercel-api-token" % q["url_key"])
+            else:
+                try:
+                    env = pg_env(url, "-")
+                    result["db_host"] = env["PGHOST"]
+                except StepError as e:
+                    problems.append("%s on Production: %s" % (q["url_key"], e))
 
-    if q.get("build") == "true" or q.get("migrate") == "true":
-        pat = read_secret(q["github_pat_secret"], region)
-        if not pat:
-            problems.append("secret %s has no value (GitHub read credential for %s)" % (q["github_pat_secret"], q["repo"]))
-        else:
-            status, data = http("GET", "%s/repos/%s/commits/%s" % (GITHUB_API, q["repo"], q["ref"]),
-                                {"Authorization": "Bearer " + pat, "Accept": "application/vnd.github+json"})
-            if status != 200 or not isinstance(data, dict) or data.get("sha") != q["ref"]:
-                problems.append("GitHub: %s@%s is not readable with %s (HTTP %s)"
-                                % (q["repo"], q["ref"], q["github_pat_secret"], status))
-
-    if q.get("migrate") == "true" and not shutil.which("psql"):
-        can_install = shutil.which("apt-get") and RUN(["sudo", "-n", "true"], capture_output=True).returncode == 0
-        if not can_install:
-            problems.append("psql is missing and cannot be installed without a password: "
-                            "sudo apt-get install -y postgresql-client")
+    # games-mp-poller reads main and the open pull requests with this token.
+    pat = read_secret(q["github_pat_secret"], region)
+    if not pat:
+        problems.append("secret %s has no value (GitHub read credential for %s)" % (q["github_pat_secret"], q["repo"]))
+    else:
+        status, data = http("GET", "%s/repos/%s/commits/main" % (GITHUB_API, q["repo"]),
+                            {"Authorization": "Bearer " + pat, "Accept": "application/vnd.github+json"})
+        if status != 200 or not isinstance(data, dict) or not re.fullmatch(r"[0-9a-f]{40}", str(data.get("sha"))):
+            problems.append("GitHub: %s main is not readable with %s (HTTP %s)"
+                            % (q["repo"], q["github_pat_secret"], status))
 
     if problems:
         sys.stderr.write("games-mp preflight failed; nothing has been changed:\n" +
@@ -738,30 +847,49 @@ def dechunk(body):
 
 
 def rollout_state(desc, task_definition_arn):
-    """'done', 'wait' or a failure message, from `aws ecs describe-services` output.
+    """'ready', 'wait' or a failure message, from `aws ecs describe-services` output.
 
     Terraform's UpdateService makes the new deployment PRIMARY at once. A circuit-breaker
     rollback marks it FAILED and makes a deployment of the previous task definition PRIMARY,
-    so "PRIMARY runs something else and no deployment of ours is left" is a rollback too."""
+    so "PRIMARY runs something else and no deployment of ours is left" is a rollback too.
+    'ready' is PRIMARY on this task definition, running its desired count, not FAILED. It does
+    not wait for COMPLETED: the old tasks drain at the ALB for up to an hour (live matches keep
+    their connections), and ECS calls the rollout complete only once they have stopped."""
     services = desc.get("services") or []
     if not services:
         return "service not found"
     deployments = services[0].get("deployments") or []
     ours = [d for d in deployments if d.get("taskDefinition") == task_definition_arn]
-    for d in ours:
-        if d.get("rolloutState") == "FAILED":
-            return "rollout FAILED: %s" % (d.get("rolloutStateReason") or "see the service events")
     primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
     if primary is None:
         return "wait"
     if primary.get("taskDefinition") != task_definition_arn:
+        # (A release's own new deployment of the same task definition that failed and rolled
+        # back leaves a PRIMARY on this task definition: that is judged below, not here.)
+        for d in ours:
+            if d.get("rolloutState") == "FAILED":
+                return "rollout FAILED: %s" % (d.get("rolloutStateReason") or "see the service events")
         if not ours:
             return "the service runs %s, not %s (rolled back or replaced)" % (
                 primary.get("taskDefinition"), task_definition_arn)
         return "wait"
-    if primary.get("rolloutState") == "COMPLETED" and primary.get("runningCount", 0) >= 1:
-        return "done"
+    if primary.get("rolloutState") == "FAILED":
+        return "rollout FAILED: %s" % (primary.get("rolloutStateReason") or "see the service events")
+    want = primary.get("desiredCount", 0)
+    if want >= 1 and primary.get("runningCount", 0) >= want:
+        return "ready"
     return "wait"
+
+
+def deployment_ips(args, deployment_id):
+    """Private IPv4 addresses of the deployment's running tasks."""
+    arns = aws("ecs", "list-tasks", "--region", args.region, "--cluster", args.cluster, "--started-by",
+               deployment_id, "--desired-status", "RUNNING").get("taskArns") or []
+    if not arns:
+        return set()
+    tasks = aws("ecs", "describe-tasks", "--region", args.region, "--cluster", args.cluster, "--tasks", *arns)
+    return {d["value"] for t in tasks.get("tasks") or [] for a in t.get("attachments") or []
+            for d in a.get("details") or [] if d.get("name") == "privateIPv4Address"}
 
 
 def cmd_wait_healthy(args):
@@ -769,24 +897,22 @@ def cmd_wait_healthy(args):
     while True:
         desc = aws("ecs", "describe-services", "--region", args.region, "--cluster", args.cluster, "--services", args.service)
         state = rollout_state(desc, args.task_definition_arn)
-        if state == "done":
-            log("mp-router rollout COMPLETED on %s" % args.task_definition_arn.rsplit("/", 1)[-1])
-            break
+        if state == "ready":
+            primary = next(d for d in desc["services"][0]["deployments"] if d.get("status") == "PRIMARY")
+            ips = deployment_ips(args, primary["id"])
+            th = aws("elbv2", "describe-target-health", "--region", args.region, "--target-group-arn", args.target_group_arn)
+            healthy = {d["Target"]["Id"] for d in th.get("TargetHealthDescriptions", [])
+                       if d["TargetHealth"]["State"] == "healthy"}
+            if len(ips) >= primary["desiredCount"] and ips <= healthy:
+                log("mp-router deployment %s on %s: %d tasks, all healthy targets"
+                    % (primary["id"], args.task_definition_arn.rsplit("/", 1)[-1], len(ips)))
+                break
+            state = "wait"
         if state != "wait":
             raise StepError(state)
         if CLOCK() > deadline:
-            raise StepError("mp-router rollout not complete after %ds; check the service events and /games/mp-router logs"
-                            % args.timeout)
-        SLEEP(args.poll)
-    while True:
-        th = aws("elbv2", "describe-target-health", "--region", args.region, "--target-group-arn", args.target_group_arn)
-        states = [d["TargetHealth"]["State"] for d in th.get("TargetHealthDescriptions", [])]
-        if "healthy" in states:
-            log("router target healthy (%s)" % ",".join(states))
-            break
-        if CLOCK() > deadline:
-            raise StepError("no healthy mp-router target after %ds (states: %s). Check /games/mp-router logs."
-                            % (args.timeout, ",".join(states) or "none registered"))
+            raise StepError("mp-router deployment not running and healthy after %ds; check the service events and "
+                            "/games/mp-router logs" % args.timeout)
         SLEEP(args.poll)
     last = ""
     while True:
@@ -816,27 +942,15 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def common(sp, vercel=False, source=False):
+    def common(sp, vercel=False):
         sp.add_argument("--region", default="us-west-1")
         if vercel:
             sp.add_argument("--team-id", required=True)
             sp.add_argument("--project-id", required=True)
             sp.add_argument("--vercel-token-secret", default="vercel-api-token")
-        if source:
-            sp.add_argument("--ref", required=True)
-            sp.add_argument("--repo", default="CoderColton/colton-games")
-            sp.add_argument("--cache-dir", required=True)
-            sp.add_argument("--github-pat-secret", required=True)
-
-    b = sub.add_parser("build")
-    common(b, source=True)
-    b.add_argument("--project", required=True)
-    b.add_argument("--bucket", required=True)
-    b.add_argument("--expect", required=True, help="JSON {repo: tag}")
-    b.add_argument("--timeout", type=int, default=2700)
-    b.add_argument("--poll", type=int, default=15)
 
     sub.add_parser("codebuild-images")
+    sub.add_parser("codebuild-migrate")
     sub.add_parser("preflight")
 
     o = sub.add_parser("vercel-oidc")
@@ -846,11 +960,24 @@ def main(argv=None):
     common(s, vercel=True)
     s.add_argument("--keys", required=True, help="KEY:encrypted|sensitive,...")
 
-    m = sub.add_parser("migrate")
-    common(m, vercel=True, source=True)
-    m.add_argument("--file", required=True)
-    m.add_argument("--ca", required=True)
-    m.add_argument("--url-key", default="POSTGRES_URL_NON_POOLING")
+    d = sub.add_parser("sync-db-url")
+    common(d, vercel=True)
+    d.add_argument("--secret-id", required=True)
+    d.add_argument("--url-key", default="POSTGRES_URL_NON_POOLING")
+
+    r = sub.add_parser("router-live")
+    common(r)
+    r.add_argument("--cluster", required=True)
+    r.add_argument("--service", required=True)
+    r.add_argument("--repository", required=True)
+    r.add_argument("--tag", default="live")
+    r.add_argument("--timeout", type=int, default=1800)
+    r.add_argument("--poll", type=int, default=20)
+
+    rb = sub.add_parser("releases-bootstrap")
+    common(rb)
+    rb.add_argument("--table", required=True)
+    rb.add_argument("--games", required=True, help="JSON {game: {family, repositoryUrl}}")
 
     w = sub.add_parser("wait-healthy")
     common(w)
@@ -865,12 +992,14 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     handler = {
-        "build": cmd_build,
         "codebuild-images": cmd_codebuild_images,
+        "codebuild-migrate": cmd_codebuild_migrate,
         "preflight": cmd_preflight,
         "vercel-oidc": cmd_vercel_oidc,
         "preview-supabase": cmd_preview_supabase,
-        "migrate": cmd_migrate,
+        "sync-db-url": cmd_sync_db_url,
+        "router-live": cmd_router_live,
+        "releases-bootstrap": cmd_releases_bootstrap,
         "wait-healthy": cmd_wait_healthy,
     }[args.cmd]
     try:

@@ -9,7 +9,7 @@ every RunTask itself:
 
 - the cluster, the subnets, the security group and the public-IP setting are fixed here, and
   the task definition is always a revision of the game's own family, chosen by simVersion
-  (SIM VERSIONS below);
+  (SIM VERSIONS AND COMMITS below);
 - the container gets only the environment below, from validated fields; nothing the caller
   sends is passed through as an override, a tag, a command, a role or a size;
 - it refuses to launch when its environment's running engines are at its ceiling.
@@ -52,24 +52,27 @@ directly, retrying briefly while ECS does not know it yet, and if it still canno
 A stop in a fresh execution environment has no such record and can still find nothing; that
 engine runs until it exits or the sweeper's hard cap stops it.
 
-SIM VERSIONS. A match is launched on the engine image of its players' simVersion. The current
-one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS). Terraform keeps older revisions ACTIVE (skip_destroy), so clients still
-on an older simVersion can be matched while a new site rolls out; for those the function lists
-the ACTIVE revisions of `games-<game>` and takes the newest whose only container is `engine`
-with image exactly `<the game's ECR repository>:<simVersion>-<12 hex>`. The repository is the
-one Terraform created for the game (ENGINE_IMAGES), so a revision pointing anywhere else is
-never run whatever its tag. No such revision: refused with `unknown-sim-version`, nothing
-launched.
+SIM VERSIONS AND COMMITS. Engine revisions are registered by games-mp-release (release.py), never
+by hand or by Terraform, and it records which is which in the releases table (RELEASES_TABLE):
+  - production launches the current main release (`current#main`) for the game's current
+    simVersion, and for an older simVersion (clients still on an older site) the newest main
+    revision released for it (`sim#<game>#<simVersion>`);
+  - preview launches exactly the revision built from the lobby's own commit (the request's
+    `commit`, the deployment's VERCEL_GIT_COMMIT_SHA; item `build#preview#<commit>`), and
+    answers `engine-building` until that commit's images are built and released, or
+    `engine-build-failed` if its build failed. Production ignores `commit`: a preview's code
+    never reaches a production engine.
+Whatever the table says, the revision must be of this function's own family for the game
+(GAMES: `games-<game>` on production, `games-preview-<game>` on preview; IAM lets each function
+run only its own families) and run exactly `<its repository>:<simVersion>-<12 hex>` (a preview's:
+its commit's 12 hex), or nothing is launched (`unknown-sim-version`).
 
 TOKEN VERIFIER. Engines built before engines verified join tokens themselves trust the
 router's X-MP-* identity headers, so launching one would let a compromised router claim any of
-its seats. Terraform marks every revision whose kit verifies tokens with the container
-environment entry MP_TOKEN_VERIFIER=ed25519-v2 (TOKEN_VERIFIER), and the function launches no
-revision without it, the current one included (read once per revision, cached): an older
-simVersion whose only revisions predate the marker is refused as `unknown-sim-version`, and a
-current revision without it fails every launch the same way. Lookups are cached for LOOKUP_TTL_SEC per (game, simVersion), a miss included, so a
-caller cycling versions costs one ListTaskDefinitions per version per minute; a revision's
-container definitions never change, so its image is cached for the environment's life.
+its seats. Every engine revision (games-mp-release registers them; Terraform did before) carries
+the container environment entry MP_TOKEN_VERIFIER=ed25519-v2 (TOKEN_VERIFIER), and the function
+launches no revision without it (read once per revision with DescribeTaskDefinition, then
+cached: a revision's container definitions never change).
 
 JOIN-TOKEN KEYS. Every engine verifies players' join tokens itself (colton-games mp-kit), so it
 gets MP_TOKEN_PUBLIC_KEYS: the Ed25519 public keys of this function's environment only
@@ -92,11 +95,12 @@ import time
 CLUSTER = os.environ.get("CLUSTER", "games")
 SUBNETS = [s for s in os.environ.get("SUBNETS", "").split(",") if s]
 SECURITY_GROUP = os.environ.get("SECURITY_GROUP", "")
-# Game id -> the exact task definition ARN (family:revision) Terraform registered: the current one.
-TASK_DEFINITIONS = json.loads(os.environ.get("TASK_DEFINITIONS", "{}"))
-# Game id -> {"simVersion": the current revision's, "repository": the game's ECR repository URL}.
-ENGINE_IMAGES = json.loads(os.environ.get("ENGINE_IMAGES", "{}"))
-LOOKUP_TTL_SEC = int(os.environ.get("LOOKUP_TTL_SEC", "60"))
+# Game id -> {"family": this environment's task definition family for it, "repository": the ECR
+# repository URL its images must come from}. Production: games-<game> and games/<game>-engine;
+# preview: games-preview-<game> and games-preview/<game>-engine (Terraform).
+GAMES = json.loads(os.environ.get("GAMES", "{}"))
+# games-mp-release's table: which revision is current, per simVersion, and per preview commit.
+RELEASES_TABLE = os.environ.get("RELEASES_TABLE", "")
 ROUTER_FAMILY = os.environ.get("ROUTER_FAMILY", "games-mp-router")
 # This function's environment (production / preview) and its settings. No default: a function
 # deployed without them refuses every call.
@@ -139,18 +143,19 @@ _NOT_YET_VISIBLE = {"InvalidParameterException", "ClientException", "AccessDenie
 MATCH_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # The lobby's per-match secret: base64url of 32 random bytes (43 characters).
 SECRET = re.compile(r"[A-Za-z0-9_-]{32,128}")
+# A preview lobby's commit (VERCEL_GIT_COMMIT_SHA): a full lowercase sha.
+COMMIT = re.compile(r"[0-9a-f]{40}")
 # The lobby's simVersion shape (colton-games lib/multiplayer/games.ts SIM_VERSION, and the SQL).
 SIM_VERSION = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Vercel's Protection Bypass for Automation secret (Terraform generates 32 alphanumerics).
 BYPASS = re.compile(r"[A-Za-z0-9_-]{16,128}")
 
-START_FIELDS = {"action", "matchId", "game", "simVersion", "secret", "hardCapSec", "apiBase", "apiBypass"}
+START_FIELDS = {"action", "matchId", "game", "simVersion", "secret", "hardCapSec", "apiBase", "apiBypass",
+                "commit"}
 STOP_FIELDS = {"action", "matchId"}
 
 # Match id -> (task ARN, environment, time.monotonic() at launch). See ECS reads above.
 _recent = {}
-# (game, simVersion) -> (revision ARN or None, time.monotonic() of the lookup). See SIM VERSIONS.
-_revisions = {}
 # Revision ARN -> its engine image, or None when it is not a one-container engine revision.
 _images = {}
 _clients = {}
@@ -197,7 +202,7 @@ def validate_start(event, env):
         raise Refused("bad-request", "unknown-field")
     match = _match_id(event)
     game = event.get("game")
-    if not isinstance(game, str) or game not in TASK_DEFINITIONS or game not in ENGINE_IMAGES:
+    if not isinstance(game, str) or game not in GAMES:
         raise Refused("bad-request", "game")
     sim = event.get("simVersion")
     if not isinstance(sim, str) or not SIM_VERSION.fullmatch(sim):
@@ -214,8 +219,14 @@ def validate_start(event, env):
     bypass = event.get("apiBypass")
     if bypass is not None and (not ALLOW_BYPASS or not isinstance(bypass, str) or not BYPASS.fullmatch(bypass)):
         raise Refused("bad-request", "apiBypass")
+    commit = event.get("commit")
+    if commit is not None and (not isinstance(commit, str) or not COMMIT.fullmatch(commit)):
+        raise Refused("bad-request", "commit")
+    if env == "preview" and commit is None:
+        # A preview runs exactly its own commit's engine; without it there is nothing to pick.
+        raise Refused("bad-request", "commit")
     return {"matchId": match, "game": game, "simVersion": sim, "secret": secret, "hardCapSec": cap,
-            "apiBase": api, "apiBypass": bypass}
+            "apiBase": api, "apiBypass": bypass, "commit": commit if env == "preview" else None}
 
 
 def _engine_image(ecs, arn):
@@ -232,51 +243,83 @@ def _engine_image(ecs, arn):
     return _images[arn]
 
 
-def _newest_revision(ecs, game, sim):
-    """The newest ACTIVE revision of games-<game> running <repository>:<sim>-<sha12>, or None."""
-    # arn:aws:ecs:<region>:<account>:task-definition/games-<game>: -- the current ARN's own
-    # prefix, so another family (familyPrefix games-mp also lists games-mptest), account or
-    # region never qualifies.
-    prefix = TASK_DEFINITIONS[game].rsplit(":", 1)[0] + ":"
-    family = prefix.rsplit("/", 1)[1][:-1]
-    wanted = re.compile(re.escape(ENGINE_IMAGES[game]["repository"]) + ":" + re.escape(sim) + "-[0-9a-f]{12}")
-    revisions, token = [], None
-    while True:
-        kwargs = dict(familyPrefix=family, status="ACTIVE", sort="DESC", maxResults=100)
-        if token:
-            kwargs["nextToken"] = token
-        page = ecs.list_task_definitions(**kwargs)
-        for arn in page.get("taskDefinitionArns", []):
-            rev = arn[len(prefix):] if arn.startswith(prefix) else ""
-            if rev.isdigit() and rev.isascii():
-                revisions.append((int(rev), arn))
-        token = page.get("nextToken")
-        if not token:
-            break
-    for _, arn in sorted(revisions, reverse=True):
-        image = _engine_image(ecs, arn)
-        if isinstance(image, str) and wanted.fullmatch(image):
-            return arn
-    return None
+def _release_item(key):
+    """The releases table's item `key` as plain values, or None."""
+    out = _client("dynamodb").get_item(TableName=RELEASES_TABLE, Key={"id": {"S": key}}, ConsistentRead=True)
+    item = out.get("Item")
+    return _plain(item) if item else None
 
 
-def task_definition_for(ecs, game, sim, now):
-    """The revision to launch for a game's simVersion. See SIM VERSIONS above."""
-    if sim == ENGINE_IMAGES[game]["simVersion"]:
-        # Terraform's own revision, still read once: it must verify tokens like any other.
-        if _engine_image(ecs, TASK_DEFINITIONS[game]) is None:
-            raise Refused("unknown-sim-version")
-        return TASK_DEFINITIONS[game]
-    for key, (_, at) in list(_revisions.items()):
-        if now - at >= LOOKUP_TTL_SEC:
-            del _revisions[key]
-    key = (game, sim)
-    if key not in _revisions:
-        _revisions[key] = (_newest_revision(ecs, game, sim), now)
-    arn = _revisions[key][0]
-    if arn is None:
+def _plain(value):
+    """DynamoDB's typed JSON ({"S": ...}, {"M": ...}) as plain Python values."""
+    if isinstance(value, dict) and len(value) == 1:
+        (kind, inner), = value.items()
+        if kind == "S":
+            return inner
+        if kind == "N":
+            return int(inner) if inner.lstrip("-").isdigit() else float(inner)
+        if kind == "BOOL":
+            return inner
+        if kind == "NULL":
+            return None
+        if kind == "M":
+            return {k: _plain(v) for k, v in inner.items()}
+        if kind == "L":
+            return [_plain(v) for v in inner]
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    return value
+
+
+def _released(item, game):
+    """(taskDefinition, simVersion) of `game` in a release item, or (None, None)."""
+    games = item.get("games") if isinstance(item, dict) else None
+    entry = games.get(game) if isinstance(games, dict) else None
+    if not isinstance(entry, dict):
+        return None, None
+    td, sim = entry.get("taskDefinition"), entry.get("simVersion")
+    return (td, sim) if isinstance(td, str) and isinstance(sim, str) else (None, None)
+
+
+def task_definition_for(ecs, env, req):
+    """The revision to launch. See SIM VERSIONS AND COMMITS above."""
+    game, sim = req["game"], req["simVersion"]
+    if env == "preview":
+        build = _release_item("build#preview#%s" % req["commit"])
+        status = build.get("status") if build else None
+        if status == "failed":
+            raise Refused("engine-build-failed")
+        if status != "released":
+            raise Refused("engine-building")
+        arn, released_sim = _released(build, game)
+        suffix = req["commit"][:12]
+    else:
+        current = _release_item("current#main")
+        arn, released_sim = _released(current or {}, game)
+        if released_sim != sim:
+            older = _release_item("sim#%s#%s" % (game, sim))
+            arn = older.get("taskDefinition") if older else None
+            released_sim = sim if isinstance(arn, str) else None
+        suffix = None
+    if arn is None or released_sim != sim or not _runs(ecs, game, arn, sim, suffix):
         raise Refused("unknown-sim-version")
     return arn
+
+
+def _runs(ecs, game, arn, sim, suffix):
+    """Whether `arn` is a revision of this function's family for `game` whose engine image is
+    exactly <its repository>:<sim>-<12 hex> (the given 12 hex, if any) and verifies tokens."""
+    family, repository = GAMES[game]["family"], GAMES[game]["repository"]
+    # This account and region are the game's repository's: <account>.dkr.ecr.<region>.amazonaws.com/...
+    where = re.match(r"([0-9]{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/", repository)
+    revision = arn.rsplit(":", 1)[1] if ":" in arn else ""
+    if not where or arn != "arn:aws:ecs:%s:%s:task-definition/%s:%s" % (where.group(2), where.group(1), family, revision) \
+            or not (revision.isdigit() and revision.isascii()):
+        return False
+    image = _engine_image(ecs, arn)
+    tail = re.escape(suffix) if suffix else "[0-9a-f]{12}"
+    return isinstance(image, str) and re.fullmatch(
+        re.escape(repository) + ":" + re.escape(sim) + "-" + tail, image) is not None
 
 
 def engine_token_keys(env):
@@ -417,7 +460,7 @@ def start(env, event):
     if existing:
         _recent[req["matchId"]] = (existing, env, now)
         return {"ok": True, "taskArn": existing, "repeat": True}
-    task_definition = task_definition_for(ecs, req["game"], req["simVersion"], now)
+    task_definition = task_definition_for(ecs, env, req)
     total, in_env = count_engines(ecs, env, now)
     # This environment's own ceiling only: the other environment's engines never take its room,
     # and Terraform's split keeps the sum at the total ceiling (see ADMISSION above).

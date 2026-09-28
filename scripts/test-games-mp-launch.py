@@ -3,9 +3,9 @@
 
 The launch function is the admission control for Fargate match engines: the lobby's roles
 can only invoke it, and it builds every RunTask itself and refuses at the engine ceiling.
-This imports the real file and drives it with fake ECS clients (no AWS credentials, no
-network, no boto3), then pins the Terraform that deploys it and the launcher roles that
-may call it.
+This imports the real file and drives it with fake ECS and DynamoDB clients (no AWS
+credentials, no network, no boto3), then pins the Terraform that deploys it and the launcher
+roles that may call it.
 
 Run from the repo root:  python3 -S -B scripts/test-games-mp-launch.py
 """
@@ -28,7 +28,11 @@ TD = "arn:aws:ecs:us-west-1:%s:task-definition/games-mptest:7" % ACCOUNT
 ROUTER_TD = "arn:aws:ecs:us-west-1:%s:task-definition/games-mp-router:3" % ACCOUNT
 TASK = "arn:aws:ecs:us-west-1:%s:task/games/" % ACCOUNT
 REPO = "%s.dkr.ecr.us-west-1.amazonaws.com/games/mptest-engine" % ACCOUNT
+PREVIEW_REPO = "%s.dkr.ecr.us-west-1.amazonaws.com/games-preview/mptest-engine" % ACCOUNT
 CURRENT_SIM = "mptest-1"
+# A preview lobby's commit (VERCEL_GIT_COMMIT_SHA) and the revision games-mp-release registered for it.
+COMMIT = "c0ffee" + "0123456789abcdef0123456789abcdef01"
+PREVIEW_TD = "arn:aws:ecs:us-west-1:%s:task-definition/games-preview-mptest:5" % ACCOUNT
 PREVIEW_API = "https://colton-games-abc123xyz-coltons-projects-7f9a4e8b.vercel.app"
 
 
@@ -56,9 +60,7 @@ ENV = {
     "CLUSTER": "games",
     "SUBNETS": "subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb",
     "SECURITY_GROUP": "sg-0ccccccccccccccccc",
-    "TASK_DEFINITIONS": json.dumps({"mptest": TD}),
-    "ENGINE_IMAGES": json.dumps({"mptest": {"simVersion": CURRENT_SIM, "repository": REPO}}),
-    "LOOKUP_TTL_SEC": "60",
+    "RELEASES_TABLE": "games-mp-releases",
     "ROUTER_FAMILY": "games-mp-router",
     "MIN_HARDCAP_SEC": "60",
     "MAX_HARDCAP_SEC": "14400",
@@ -73,10 +75,12 @@ ENV = {
 FUNCTIONS = {
     "production": {"LAUNCH_ENV": "production", "ENV_CEILING": "4",
                    "API_BASE": r"^https://cc-games\.app$", "ALLOW_BYPASS": "false",
-                   "TOKEN_PUBLIC_KEYS": PROD_KEYS},
+                   "TOKEN_PUBLIC_KEYS": PROD_KEYS,
+                   "GAMES": json.dumps({"mptest": {"family": "games-mptest", "repository": REPO}})},
     "preview": {"LAUNCH_ENV": "preview", "ENV_CEILING": "2",
                 "API_BASE": r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$",
-                "ALLOW_BYPASS": "true", "TOKEN_PUBLIC_KEYS": PREVIEW_KEYS},
+                "ALLOW_BYPASS": "true", "TOKEN_PUBLIC_KEYS": PREVIEW_KEYS,
+                "GAMES": json.dumps({"mptest": {"family": "games-preview-mptest", "repository": PREVIEW_REPO}})},
 }
 
 
@@ -171,9 +175,10 @@ class FakeECS:
 
     def describe_task_definition(self, taskDefinition):
         self.calls.append("describe_task_definition")
-        # Terraform's current revision, unless a test lists its own.
-        image = self.revisions.get(taskDefinition, "%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)) if taskDefinition == TD
-                                   else None)
+        # The current production and preview releases' revisions, unless a test lists its own.
+        default = {TD: "%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)),
+                   PREVIEW_TD: "%s:%s-%s" % (PREVIEW_REPO, CURRENT_SIM, COMMIT[:12])}
+        image = self.revisions.get(taskDefinition, default.get(taskDefinition))
         if image is None:
             raise KeyError(taskDefinition)
         # A plain image is an engine revision Terraform registered: one container, marked as
@@ -223,6 +228,44 @@ class FakeECS:
             self.tasks[task].update(desiredStatus="STOPPED")
 
 
+class FakeDynamo:
+    """The releases table as games-mp-release writes it (plain values in, typed JSON out)."""
+
+    def __init__(self, items=None):
+        self.items = dict(items if items is not None else RELEASED)
+        self.reads = []
+
+    def get_item(self, TableName, Key, ConsistentRead):
+        assert TableName == "games-mp-releases" and ConsistentRead is True
+        key = Key["id"]["S"]
+        self.reads.append(key)
+        item = self.items.get(key)
+        return {"Item": typed(dict(item, id=key))["M"]} if item is not None else {}
+
+
+def typed(value):
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, int):
+        return {"N": str(value)}
+    if isinstance(value, str):
+        return {"S": value}
+    if isinstance(value, dict):
+        return {"M": {k: typed(v) for k, v in value.items()}}
+    raise TypeError(value)
+
+
+def release(td, sim=CURRENT_SIM, **more):
+    return dict({"games": {"mptest": {"taskDefinition": td, "simVersion": sim}}}, **more)
+
+
+# What games-mp-release has written: production's current release and one preview commit's.
+RELEASED = {
+    "current#main": release(TD, commit="d" * 40, seq=7),
+    "build#preview#%s" % COMMIT: release(PREVIEW_TD, status="released", commit=COMMIT),
+}
+
+
 class AwsError(Exception):
     """botocore's ClientError, as far as the function reads it."""
     def __init__(self, code):
@@ -246,7 +289,7 @@ def start_event(n=1, **over):
 
 
 def preview_event(n=1, **over):
-    return start_event(n, **{"apiBase": PREVIEW_API, "apiBypass": "B" * 32, **over})
+    return start_event(n, **{"apiBase": PREVIEW_API, "apiBypass": "B" * 32, "commit": COMMIT, **over})
 
 
 class LaunchTests(unittest.TestCase):
@@ -255,16 +298,18 @@ class LaunchTests(unittest.TestCase):
         self.fns = {env: load_launch(env) for env in FUNCTIONS}
         self.lf, self.pf = self.fns["production"], self.fns["preview"]
         self.log = io.StringIO()   # the handler's one line per call
+        self.ddb = FakeDynamo()
 
     def invoke(self, ecs, event, env="production"):
         fn = self.fns[env]
         fn._clients["ecs"] = ecs
+        fn._clients["dynamodb"] = self.ddb
         with contextlib.redirect_stdout(self.log):
             return fn.lambda_handler(event, Context())
 
     # -- what a launch is ------------------------------------------------------------------
 
-    def test_launches_the_pinned_task_definition_in_the_engine_network(self):
+    def test_launches_the_current_release_in_the_engine_network(self):
         ecs = FakeECS()
         reply = self.invoke(ecs, start_event())
         self.assertEqual(reply["ok"], True)
@@ -347,6 +392,7 @@ class LaunchTests(unittest.TestCase):
         bare.__spec__.loader.exec_module(bare)
         self.assertEqual(bare.TOKEN_PUBLIC_KEYS, "")
         bare._clients["ecs"] = ecs = FakeECS()
+        bare._clients["dynamodb"] = FakeDynamo()
         with self.assertRaises(RuntimeError), contextlib.redirect_stdout(self.log):
             bare.lambda_handler(start_event(), Context())
         self.assertEqual(ecs.run, [])
@@ -398,6 +444,10 @@ class LaunchTests(unittest.TestCase):
             ("hardCapSec", start_event(hardCapSec="1800")),
             ("hardCapSec", start_event(hardCapSec=59)),
             ("hardCapSec", start_event(hardCapSec=14401)),
+            ("commit", start_event(commit="C0FFEE" + COMMIT[6:])),
+            ("commit", start_event(commit=COMMIT[:12])),
+            ("commit", start_event(commit=COMMIT + "\n")),
+            ("commit", start_event(commit=1)),
             ("apiBase", start_event(apiBase="https://cc-games.app.evil.example")),
             ("apiBase", start_event(apiBase="http://cc-games.app")),
             ("apiBase", start_event(apiBase=PREVIEW_API)),       # production calls back production only
@@ -413,6 +463,10 @@ class LaunchTests(unittest.TestCase):
             ("apiBase", preview_event(apiBase="https://evil-abc-coltons-projects-7f9a4e8b.vercel.app")),
             ("apiBase", preview_event(apiBase="https://colton-games-a.b-coltons-projects-7f9a4e8b.vercel.app")),
             ("apiBypass", preview_event(apiBypass="has space in it ok")),
+            # A preview runs exactly its own commit's engine, so it must say which.
+            ("commit", {k: v for k, v in preview_event().items() if k != "commit"}),
+            ("commit", preview_event(commit=None)),
+            ("commit", preview_event(commit="main")),
         ]:
             with self.subTest(preview=field, value=event.get(field)):
                 ecs = FakeECS()
@@ -441,6 +495,7 @@ class LaunchTests(unittest.TestCase):
         # neither can make the preview function launch a production engine.
         ecs = FakeECS()
         self.pf._clients["ecs"] = ecs
+        self.pf._clients["dynamodb"] = self.ddb
         ctx = Context()
         ctx.invoked_function_arn = "arn:aws:lambda:us-west-1:%s:function:games-mp-launch-production:production" % ACCOUNT
         with contextlib.redirect_stdout(self.log):
@@ -449,30 +504,30 @@ class LaunchTests(unittest.TestCase):
         self.assertIn({"key": "env", "value": "preview"}, ecs.run[0]["tags"])
         self.assertEqual(len(ecs.run), 1)
 
-    # -- which revision: the simVersion ---------------------------------------------------------
+    # -- which revision: production -----------------------------------------------------------
 
-    OLD = {
-        revision(3): "%s:mptest-0-%s" % (REPO, sha(3)),
-        revision(4): "%s:mptest-0-%s" % (REPO, sha(4)),     # the newest mptest-0 build
-        revision(5): "%s:mptest-05-%s" % (REPO, sha(5)),    # another version with mptest-0 as a prefix
-        revision(6): "%s:%s-%s" % (REPO, CURRENT_SIM, sha(6)),
-        TD: "%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)),
-    }
-
-    def test_the_current_sim_version_launches_the_pinned_revision_reading_it_once(self):
-        ecs = FakeECS(revisions={revision(9): "%s:%s-%s" % (REPO, CURRENT_SIM, sha(9)), **self.OLD})
+    def test_production_launches_the_current_release_reading_its_marker_once(self):
+        ecs = FakeECS()
         self.assertTrue(self.invoke(ecs, start_event())["ok"])
-        self.assertEqual(ecs.run[0]["taskDefinition"], TD, "the exact family:revision from Terraform")
+        self.assertEqual(ecs.run[0]["taskDefinition"], TD, "current#main's exact family:revision")
+        self.assertEqual(self.ddb.reads, ["current#main"], "read on every launch, nothing else")
         self.assertNotIn("list_task_definitions", ecs.calls)
         self.assertEqual(ecs.calls.count("describe_task_definition"), 1, "its marker, read once")
-        self.assertTrue(self.invoke(ecs, start_event(2))["ok"])
-        self.assertEqual(ecs.calls.count("describe_task_definition"), 1, "then cached")
+        # A release moves current#main: the very next launch runs the new revision.
+        self.ddb.items["current#main"] = release(revision(8))
+        ecs.revisions[revision(8)] = "%s:%s-%s" % (REPO, CURRENT_SIM, sha(8))
+        self.assertEqual(self.invoke(ecs, start_event(2))["taskDefinition"], revision(8))
+        self.assertTrue(self.invoke(ecs, start_event(3))["ok"])
+        self.assertEqual(ecs.calls.count("describe_task_definition"), 2, "each revision read once")
 
-    # -- token verifier marker ----------------------------------------------------------------
+    def test_production_ignores_a_commit(self):
+        # Only a preview names its commit; production runs main's release whatever it says.
+        ecs = FakeECS()
+        reply = self.invoke(ecs, start_event(commit=COMMIT))
+        self.assertEqual(reply["taskDefinition"], TD, reply)
+        self.assertNotIn("build#preview#" + COMMIT, self.ddb.reads)
 
     def test_a_revision_without_the_token_verifier_marker_is_never_launched(self):
-        # An older simVersion whose only revision predates engines verifying tokens: that engine
-        # would trust the router's identity headers, so it is refused and nothing runs.
         old = "%s:mptest-0-%s" % (REPO, sha(4))
         for why, entry in [("no environment", [{"name": "engine", "image": old}]),
                            ("no marker", legacy(old)),
@@ -481,101 +536,116 @@ class LaunchTests(unittest.TestCase):
                            ("marker on the wrong key", [{"name": "engine", "image": old, "environment": [
                                {"name": "MP_TOKEN_VERIFIERS", "value": "ed25519-v2"}]}])]:
             with self.subTest(why):
-                self.lf._revisions.clear()
                 self.lf._images.clear()
+                self.ddb.items["sim#mptest#mptest-0"] = {"taskDefinition": revision(4)}
                 ecs = FakeECS(revisions={revision(4): entry})
                 self.assertEqual(self.invoke(ecs, start_event(simVersion="mptest-0")),
                                  {"ok": False, "error": "unknown-sim-version"})
                 self.assertEqual(ecs.run, [])
-        # With the marker, the same image launches; a newer unmarked revision is skipped for it.
-        self.lf._revisions.clear()
         self.lf._images.clear()
-        ecs = FakeECS(revisions={revision(4): old, revision(6): legacy("%s:mptest-0-%s" % (REPO, sha(6)))})
-        reply = self.invoke(ecs, start_event(simVersion="mptest-0"))
-        self.assertEqual(reply["taskDefinition"], revision(4), reply)
-        self.assertEqual([c["taskDefinition"] for c in ecs.run], [revision(4)])
+        ecs = FakeECS(revisions={revision(4): old})
+        self.assertEqual(self.invoke(ecs, start_event(simVersion="mptest-0"))["taskDefinition"], revision(4))
 
     def test_a_current_revision_without_the_marker_launches_nothing(self):
         ecs = FakeECS(revisions={TD: legacy("%s:%s-%s" % (REPO, CURRENT_SIM, sha(7)))})
         self.assertEqual(self.invoke(ecs, start_event()), {"ok": False, "error": "unknown-sim-version"})
         self.assertEqual(ecs.run, [])
 
-    def test_an_older_sim_version_launches_the_newest_revision_with_its_image(self):
-        ecs = FakeECS(revisions=self.OLD)
+    def test_an_older_sim_version_launches_the_newest_main_release_for_it(self):
+        self.ddb.items["sim#mptest#mptest-0"] = {"taskDefinition": revision(4), "seq": 3}
+        ecs = FakeECS(revisions={revision(4): "%s:mptest-0-%s" % (REPO, sha(4))})
         reply = self.invoke(ecs, start_event(simVersion="mptest-0"))
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(reply["taskDefinition"], revision(4))
         [call] = ecs.run
         self.check_run_task(call, revision(4))
-        # And the version whose name merely starts with it gets its own revision.
-        self.assertEqual(self.invoke(ecs, start_event(2, simVersion="mptest-05"))["taskDefinition"], revision(5))
+        self.assertEqual(self.ddb.reads, ["current#main", "sim#mptest#mptest-0"])
 
-    def test_a_revision_whose_image_is_anywhere_else_is_never_launched(self):
-        elsewhere = {
-            # Newer than the real mptest-0 revision, same tag, other repositories.
-            revision(10): "%s.dkr.ecr.us-west-1.amazonaws.com/games/other-engine:mptest-0-%s" % (ACCOUNT, sha(10)),
-            revision(11): "111111111111.dkr.ecr.us-west-1.amazonaws.com/games/mptest-engine:mptest-0-%s" % sha(11),
-            revision(12): "docker.io/evil/%s:mptest-0-%s" % (REPO, sha(12)),
-            revision(13): "%s/x:mptest-0-%s" % (REPO, sha(13)),
-            revision(14): "%sx:mptest-0-%s" % (REPO, sha(14)),
-            # Our repository, but not <simVersion>-<12 hex> exactly.
-            revision(15): "%s:mptest-0-%s-x" % (REPO, sha(15)),
-            revision(16): "%s:mptest-0-%s" % (REPO, sha(16).upper()),
-            revision(17): "%s:mptest-0-%s" % (REPO, sha(17)[:11]),
-            revision(18): "%s:mptest-0-%s\n" % (REPO, sha(18)),
-            revision(19): "%s@sha256:%s" % (REPO, "a" * 64),
-            # Our image, but a sidecar too, or a container not named engine.
-            revision(20): [{"name": "engine", "image": "%s:mptest-0-%s" % (REPO, sha(20))},
-                           {"name": "sidecar", "image": "docker.io/evil/x"}],
-            revision(21): [{"name": "other", "image": "%s:mptest-0-%s" % (REPO, sha(21))}],
-            # Our image in another family (familyPrefix games-mptest lists games-mptest2 too).
-            revision(30, "games-mptest2"): "%s:mptest-0-%s" % (REPO, sha(30)),
-            revision(40, "games-mp-router"): "%s:mptest-0-%s" % (REPO, sha(40)),
+    def test_a_release_item_naming_anything_else_is_never_launched(self):
+        # Whatever the table says, production runs only games-mptest revisions of its own
+        # repository's <simVersion>-<12 hex> image with the marker.
+        cases = {
+            "a preview revision": (PREVIEW_TD, None),
+            "another family": (revision(30, "games-mptest2"), "%s:mptest-0-%s" % (REPO, sha(30))),
+            "the router's family": (revision(40, "games-mp-router"), "%s:mptest-0-%s" % (REPO, sha(40))),
+            "another account": (revision(2).replace(ACCOUNT, "111111111111"), "%s:mptest-0-%s" % (REPO, sha(2))),
+            "not a revision": (revision(2).rsplit(":", 1)[0] + ":latest", "%s:mptest-0-%s" % (REPO, sha(2))),
+            "the preview repository": (revision(10), "%s:mptest-0-%s" % (PREVIEW_REPO, sha(10))),
+            "another repository": (revision(11), "111111111111.dkr.ecr.us-west-1.amazonaws.com/games/mptest-engine:mptest-0-%s" % sha(11)),
+            "a longer repository": (revision(14), "%sx:mptest-0-%s" % (REPO, sha(14))),
+            "another simVersion": (revision(15), "%s:mptest-05-%s" % (REPO, sha(15))),
+            "not <sim>-<12 hex>": (revision(16), "%s:mptest-0-%s" % (REPO, sha(16).upper())),
+            "a digest": (revision(19), "%s@sha256:%s" % (REPO, "a" * 64)),
+            "a sidecar": (revision(20), [{"name": "engine", "image": "%s:mptest-0-%s" % (REPO, sha(20)),
+                                          "environment": [VERIFIER_ENTRY]},
+                                         {"name": "sidecar", "image": "docker.io/evil/x"}]),
+            "not named engine": (revision(21), [{"name": "other", "image": "%s:mptest-0-%s" % (REPO, sha(21)),
+                                                 "environment": [VERIFIER_ENTRY]}]),
         }
-        ecs = FakeECS(revisions={revision(2): "%s:mptest-0-%s" % (REPO, sha(2)), **elsewhere})
-        reply = self.invoke(ecs, start_event(simVersion="mptest-0"))
-        self.assertEqual(reply["taskDefinition"], revision(2), reply)
-        self.assertEqual([c["taskDefinition"] for c in ecs.run], [revision(2)])
-        # Without the real one, nothing.
-        self.lf._revisions.clear()
-        ecs = FakeECS(revisions=elsewhere)
-        self.assertEqual(self.invoke(ecs, start_event(2, simVersion="mptest-0")),
-                         {"ok": False, "error": "unknown-sim-version"})
-        self.assertEqual(ecs.run, [])
+        for n, (why, (td, image)) in enumerate(cases.items(), 1):
+            with self.subTest(why):
+                self.lf._images.clear()
+                self.ddb.items["sim#mptest#mptest-0"] = {"taskDefinition": td}
+                ecs = FakeECS(revisions={td: image} if image else {})
+                self.assertEqual(self.invoke(ecs, start_event(n, simVersion="mptest-0")),
+                                 {"ok": False, "error": "unknown-sim-version"})
+                self.assertEqual(ecs.run, [])
 
-    def test_an_unknown_sim_version_launches_nothing(self):
+    def test_an_unknown_sim_version_or_no_release_launches_nothing(self):
         for version in ("mptest-9", "mptest", "mptest-0-" + sha(3)):
             with self.subTest(version=version):
-                self.lf._revisions.clear()
-                ecs = FakeECS(revisions=self.OLD)
+                ecs = FakeECS()
                 self.assertEqual(self.invoke(ecs, start_event(simVersion=version)),
                                  {"ok": False, "error": "unknown-sim-version"})
                 self.assertEqual(ecs.run, [])
-                self.assertNotIn("run_task", ecs.calls)
+        # Before the first release (a platform built from nothing), nothing launches.
+        self.ddb.items.pop("current#main")
+        ecs = FakeECS()
+        self.assertEqual(self.invoke(ecs, start_event()), {"ok": False, "error": "unknown-sim-version"})
+        self.assertEqual(ecs.run, [])
 
-    def test_lookups_are_cached_for_a_minute_misses_included(self):
-        ecs = FakeECS(revisions=self.OLD)
-        self.lf._clients["ecs"] = ecs
-        self.assertEqual(self.lf.task_definition_for(ecs, "mptest", "mptest-0", 100.0), revision(4))
-        with self.assertRaises(self.lf.Refused):
-            self.lf.task_definition_for(ecs, "mptest", "mptest-9", 100.0)
-        lists = ecs.calls.count("list_task_definitions")
-        describes = ecs.calls.count("describe_task_definition")
-        self.assertEqual(self.lf.task_definition_for(ecs, "mptest", "mptest-0", 159.0), revision(4))
-        with self.assertRaises(self.lf.Refused):
-            self.lf.task_definition_for(ecs, "mptest", "mptest-9", 159.0)
-        self.assertEqual(ecs.calls.count("list_task_definitions"), lists, "cached within the minute")
-        # A newer mptest-0 revision is found once the minute is up; images already read are not re-read.
-        ecs.revisions[revision(8)] = "%s:mptest-0-%s" % (REPO, sha(8))
-        self.assertEqual(self.lf.task_definition_for(ecs, "mptest", "mptest-0", 160.0), revision(8))
-        self.assertEqual(ecs.calls.count("describe_task_definition"), describes + 1)
-        self.assertEqual(set(self.lf._revisions), {("mptest", "mptest-0")}, "expired entries are dropped")
+    # -- which revision: preview --------------------------------------------------------------
 
-    def test_a_deregistered_revision_is_no_longer_chosen(self):
-        ecs = FakeECS(revisions=self.OLD)
-        self.assertEqual(self.lf.task_definition_for(ecs, "mptest", "mptest-0", 0.0), revision(4))
-        del ecs.revisions[revision(4)]      # INACTIVE: ListTaskDefinitions status=ACTIVE omits it
-        self.assertEqual(self.lf.task_definition_for(ecs, "mptest", "mptest-0", 61.0), revision(3))
+    def test_preview_launches_exactly_its_commits_revision(self):
+        ecs = FakeECS()
+        reply = self.invoke(ecs, preview_event(), "preview")
+        self.assertEqual(reply["taskDefinition"], PREVIEW_TD, reply)
+        self.assertEqual(self.ddb.reads, ["build#preview#" + COMMIT], "never production's items")
+
+    def test_preview_waits_for_its_commits_build(self):
+        for status, error in (("starting", "engine-building"), ("building", "engine-building"),
+                              ("failed", "engine-build-failed"), (None, "engine-building")):
+            with self.subTest(status=status):
+                if status is None:
+                    self.ddb.items.pop("build#preview#" + COMMIT, None)
+                else:
+                    self.ddb.items["build#preview#" + COMMIT] = {"status": status}
+                ecs = FakeECS()
+                self.assertEqual(self.invoke(ecs, preview_event(), "preview"), {"ok": False, "error": error})
+                self.assertNotIn("describe_task_definition", ecs.calls)
+                self.assertEqual(ecs.run, [])
+
+    def test_preview_never_launches_another_commits_or_a_production_image(self):
+        cases = {
+            "another commit's image": (revision(6, "games-preview-mptest"),
+                                       "%s:%s-%s" % (PREVIEW_REPO, CURRENT_SIM, sha(6))),
+            "a production revision": (TD, None),
+            "the production repository": (revision(7, "games-preview-mptest"),
+                                          "%s:%s-%s" % (REPO, CURRENT_SIM, COMMIT[:12])),
+        }
+        for why, (td, image) in cases.items():
+            with self.subTest(why):
+                self.pf._images.clear()
+                self.ddb.items["build#preview#" + COMMIT] = release(td, status="released")
+                ecs = FakeECS(revisions={td: image} if image else {})
+                self.assertEqual(self.invoke(ecs, preview_event(), "preview"),
+                                 {"ok": False, "error": "unknown-sim-version"})
+                self.assertEqual(ecs.run, [])
+        # And another simVersion than the one its commit built.
+        self.ddb.items["build#preview#" + COMMIT] = release(PREVIEW_TD, status="released")
+        ecs = FakeECS()
+        self.assertEqual(self.invoke(ecs, preview_event(simVersion="mptest-0"), "preview"),
+                         {"ok": False, "error": "unknown-sim-version"})
 
     # -- admission ---------------------------------------------------------------------------
 
@@ -940,11 +1010,10 @@ class TerraformTests(unittest.TestCase):
         self.assertIn("cap <= local.games_mp_launch_environments[env].ceiling", check)
 
     def test_the_function_gets_the_settings_the_tests_assume(self):
-        for line in ('TASK_DEFINITIONS = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => td.arn })',
-                     'ENGINE_IMAGES = jsonencode({ for id, td in aws_ecs_task_definition.games_engine : id => {',
-                     "simVersion = local.mp_engine_sim_versions[id]",
-                     'repository = aws_ecr_repository.games_mp["games/${id}-engine"].repository_url',
-                     'LOOKUP_TTL_SEC  = "60"',
+        for line in ("RELEASES_TABLE = aws_dynamodb_table.games_mp_releases.name",
+                     'GAMES = jsonencode({ for id, _ in local.mp_games : id => {',
+                     'family     = "${local.mp_engine_channels[each.value.channel].family_prefix}${id}"',
+                     'repository = aws_ecr_repository.games_mp["${local.mp_engine_channels[each.value.channel].repository_prefix}${id}-engine"].repository_url',
                      "LAUNCH_ENV   = each.key",
                      "ENV_CEILING  = tostring(each.value.ceiling)",
                      "API_BASE     = each.value.api_base",
@@ -954,8 +1023,18 @@ class TerraformTests(unittest.TestCase):
                      # never the dev fleet's subnet_a/subnet_b.
                      'SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])',
                      "ROUTER_FAMILY    = local.mp_router_family",
-                     'MAX_HARDCAP_SEC = "14400"'):
-            self.assertIn(line, self.fn)
+                     "MAX_HARDCAP_SEC = tostring(local.mp_router_drain_sec)"):
+            # Compared with runs of spaces collapsed: terraform fmt realigns the `=` column.
+            self.assertIn(" ".join(line.split()), " ".join(self.fn.split()))
+        # Production runs main's families and repositories, preview its own, never the other's.
+        channels = re.search(r"mp_engine_channels = \{.*?\n  \}\n", GAMES, re.S).group()
+        self.assertIn('main    = { family_prefix = "games-", repository_prefix = "games/" }', channels)
+        self.assertIn('preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/" }', channels)
+        self.assertEqual(re.findall(r'channel\s*=\s*"(\w+)"', envs_block := re.search(
+            r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()), ["main", "preview"])
+        # No match outlives a draining router (the target group's delay is the same local).
+        self.assertIn("mp_router_drain_sec = 3600", GAMES)
+        self.assertIn("deregistration_delay = local.mp_router_drain_sec", GAMES)
         self.assertIn("mp_engine_subnets = values(aws_subnet.games_engine)", GAMES)
         self.assertNotRegex(self.fn, r"aws_subnet\.subnet_[ab]|dev_fleet_subnets")
         envs = re.search(r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()
@@ -973,7 +1052,7 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('"${env}:${env}-${kid}:${local.games_mp_token_public_der["${env}-${kid}"]}"', by_env)
         self.assertNotRegex(by_env, r"private|signing")
         # The functions start launching new engine revisions only after the router rollout.
-        self.assertRegex(self.fn, r"depends_on = \[[^\]]*terraform_data\.games_mp_healthy\]")
+        self.assertRegex(self.fn, r"depends_on = \[[^\]]*terraform_data\.games_mp_healthy[,\]]")
         self.assertEqual(re.findall(r"bypass\s*=\s*(\w+)", envs), ["false", "true"])
         # The test's FUNCTIONS settings are what those HCL values render to (tostring(bool) is
         # "true"/"false"; HCL's "\\." is the regex's \.).
@@ -987,15 +1066,16 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('vercel_project_name = "colton-games"', GAMES)
 
 
-    def test_every_engine_revision_terraform_registers_carries_the_token_verifier_marker(self):
-        td = tf_block(GAMES, "aws_ecs_task_definition", "games_engine")
-        self.assertIn('{ name = "MP_TOKEN_VERIFIER", value = "ed25519-v2" },', td)
-        # The same pair launch.py requires, and the one the fake ECS gives Terraform's revisions.
+    def test_every_engine_revision_carries_the_token_verifier_marker(self):
+        # games-mp-release registers every engine revision now; Terraform registers none.
+        release = (ROOT / "games-multiplayer" / "release.py").read_text()
+        self.assertIn('TOKEN_VERIFIER = {"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}', release)
+        self.assertNotIn('resource "aws_ecs_task_definition" "games_engine"', GAMES)
+        self.assertRegex(GAMES, r'removed \{\n  from = aws_ecs_task_definition\.games_engine\n\n  lifecycle \{\n    destroy = false')
+        # The same pair launch.py requires, and the one the fake ECS gives released revisions.
         lf = load_launch()
         self.assertEqual(lf.TOKEN_VERIFIER, ("MP_TOKEN_VERIFIER", "ed25519-v2"))
         self.assertEqual((VERIFIER_ENTRY["name"], VERIFIER_ENTRY["value"]), lf.TOKEN_VERIFIER)
-        # One container: the marker is on the engine container itself.
-        self.assertEqual(len(re.findall(r'^    name\s*=', td, re.M)), 1)
 
     def test_the_launch_role_uses_the_standard_lambda_trust(self):
         # Lambda supplies no aws:SourceAccount when it assumes an execution role: a condition on
@@ -1011,13 +1091,11 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('Action   = "ecs:ListTagsForResource"', stmt)
         self.assertNotIn("ecs:cluster", stmt)
 
-    def test_the_current_sim_version_is_the_current_tag_without_its_commit(self):
-        self.assertIn('regex("^(.+)-[0-9a-f]{12}$", local.mp_engine_tags[id])[0]', GAMES)
-        self.assertIn("for id in keys(local.mp_engine_task_defs) : id =>", GAMES)
-        # Both tag sources are validated to a subset of the shape the function and the lobby
-        # accept: the same characters, but starting like a Docker tag (not "." or "-").
-        self.assertIn(r'can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$", v))', GAMES)
-        self.assertIn(r'can(regex("^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}-[0-9a-f]{12}$", t))', GAMES)
+    def test_the_sim_version_shapes_agree(self):
+        # The release accepts a subset of what the function and the lobby accept: the same
+        # characters, but starting like a Docker tag (not "." or "-").
+        release = (ROOT / "games-multiplayer" / "release.py").read_text()
+        self.assertIn('SIM_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")', release)
         self.assertEqual(self.lf_sim_shape(), "[A-Za-z0-9._-]{1,64}")
 
     def lf_sim_shape(self):
@@ -1025,17 +1103,19 @@ class TerraformTests(unittest.TestCase):
                          (ROOT / "games-multiplayer" / "launch.py").read_text()).group(1)
 
     def test_launch_role_runs_only_engine_family_revisions_and_passes_only_engine_roles(self):
-        run = statement(self.launch_policy, "RunEngineFamilyRevisions")
+        self.assertIn("for_each = local.games_mp_launch_environments", self.launch_policy)
+        run = statement(self.launch_policy, "RunOwnEngineFamilyRevisions")
         resource = re.search(r"Resource\s*=\s*(.*)", run).group(1)
         self.assertEqual(resource, '[for id in keys(local.mp_games) : "arn:aws:ecs:${var.aws_region}:'
-                                   '${data.aws_caller_identity.current.account_id}:task-definition/games-${id}:*"]')
+                                   '${data.aws_caller_identity.current.account_id}:task-definition/'
+                                   '${local.mp_engine_channels[each.value.channel].family_prefix}${id}:*"]')
         # The only wildcard is the revision after the family's colon.
         self.assertEqual(resource.count("*"), 1)
         self.assertRegex(run, r'Action\s*=\s*"ecs:RunTask"')
         self.assertIn('ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn }', run)
         self.assertEqual(len(re.findall(r'"ecs:RunTask"', self.launch_policy)), 2, "the Allow and the router Deny")
         read = statement(self.launch_policy, "ReadEngineTaskDefinitions")
-        self.assertIn('Action   = ["ecs:ListTaskDefinitions", "ecs:DescribeTaskDefinition"]', read)
+        self.assertIn('Action   = "ecs:DescribeTaskDefinition"', read)
         self.assertRegex(read, r'Effect\s*=\s*"Allow"')
         self.assertRegex(read, r'Resource\s*=\s*"\*"')
         # Engine games are their families: the Allow enumerates local.mp_games, never a bare prefix.
@@ -1053,6 +1133,11 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('"aws:ResourceTag/match" = "false"', stop)
         never = statement(self.launch_policy, "NeverStopTheRouter")
         self.assertIn('"aws:ResourceTag/games-role" = "router"', never)
+        # Its own release items only, read-only.
+        items = statement(self.launch_policy, "ReadOwnReleaseItems")
+        self.assertIn('Action   = "dynamodb:GetItem"', items)
+        self.assertIn('"dynamodb:LeadingKeys" = each.key == "production" ? ["current#main", "sim#*"] : ["build#preview#*"]',
+                      items)
 
     def test_launcher_roles_can_only_invoke_their_own_environments_function(self):
         self.assertIn("for_each = local.games_mp_launcher_role_names", self.launcher_policy)

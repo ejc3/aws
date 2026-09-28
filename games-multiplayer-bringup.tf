@@ -5,27 +5,27 @@
 #
 #   secrets      generated here (random and tls providers) and written to Secrets Manager and
 #                Vercel; the join-token signing keys go to Vercel only
-#   images       built by CodeBuild from the pinned games-repo commit, before any task
-#                definition names them
+#   router       the one-time `live` tag the router task definition runs (the images, engine
+#                revisions, router rollouts and migrations are games-multiplayer-deploy.tf's)
 #   Vercel env   the MP_* settings and secrets on the colton-games project (Production and
 #                Preview), the automation bypass, OIDC in Team issuer mode, and Preview's
 #                Supabase connection
-#   Supabase     the pinned mp migration, applied once over certificate-verified TLS
+#   Supabase     the database URL games-mp-migrate uses, copied into its secret
 #   verified     the apply waits for the new router deployment, a healthy target and a
 #                200 `ok` from https://play.cc-games.app/healthz, and fails otherwise
 #
 # PLAN-TIME PREFLIGHT. Before anything changes, `terraform plan` runs a read-only check
 # (data "external" games_mp_preflight, bringup.py preflight) that proves every later step
 # can finish: the Vercel token reads the project, its env and settings, decrypts what the
-# Preview copy and the migration need, and is live and scoped to the team; the pinned
-# commit is readable on GitHub; psql can run here. Any gap fails the PLAN with the exact
-# fix, so an apply either does everything or does not start.
+# Preview copy and the database-URL sync need, and is live and scoped to the team; the GitHub
+# read token games-mp-poller uses can read main. Any gap fails the PLAN with the exact fix, so
+# an apply either does everything or does not start.
 #
 # The steps that are not plain resources are terraform_data local-execs running
 # games-multiplayer/bringup.py on the jumpbox with its administrator role. Each one checks
 # live state first, changes only what is missing, verifies, and exits non-zero on failure.
-# They re-run only when their inputs change (the source commit, the image tags, ...), so a
-# second apply with nothing changed is an empty plan.
+# They re-run only when their inputs change, so a second apply with nothing changed is an
+# empty plan.
 #
 # SECRETS ARE IN TERRAFORM STATE. The join-token signing keys (tls provider), MP_TEST_KEY,
 # CRON_SECRET, the cookie secrets, Preview's Skyhook secret and the automation bypass are
@@ -61,12 +61,6 @@ variable "games_mp_preview_supabase_sync" {
   default     = "1"
 }
 
-variable "games_mp_migrate" {
-  description = "Apply the pinned mp Supabase migration during apply. false skips the step entirely."
-  type        = bool
-  default     = true
-}
-
 locals {
   # Copied Production -> Preview: the URL and server key the site reads first
   # (lib/skyhook/supabase-config.ts: SUPABASE_URL || NEXT_PUBLIC_SUPABASE_URL,
@@ -74,8 +68,6 @@ locals {
   games_mp_preview_copy = "SUPABASE_URL:encrypted,NEXT_PUBLIC_SUPABASE_URL:encrypted,SUPABASE_SECRET_KEY:sensitive"
   games_mp_repo         = "CoderColton/colton-games"
   games_mp_bringup      = "${path.module}/games-multiplayer/bringup.py"
-  games_mp_cache_dir    = "${path.module}/.terraform/games-mp"
-  games_mp_migration    = "supabase/migrations/20260926000000_mp.sql"
 
   # JOIN-TOKEN KEYS: Ed25519, one key pair per lobby environment and key generation, so
   # minting and verifying need different keys and each environment mints with its own.
@@ -123,12 +115,6 @@ locals {
   games_mp_token_public_keys = join(",", [
     for env in local.games_mp_token_envs : local.games_mp_token_public_keys_by_env[env] if contains(var.mp_router_envs, env)
   ])
-
-  # Exactly the tags the task definitions run; CodeBuild must produce these.
-  games_mp_expected_images = merge(
-    { "games/mp-router" = local.mp_router_tag },
-    { for id, tag in local.mp_engine_tags : "games/${id}-engine" => tag },
-  )
 }
 
 # -------------------------------------------------------------------------------------
@@ -245,22 +231,19 @@ data "external" "games_mp_preflight" {
     vercel_token_secret = "vercel-api-token"
     copy_keys           = join(",", [for kv in split(",", local.games_mp_preview_copy) : split(":", kv)[0]])
     url_key             = "POSTGRES_URL_NON_POOLING"
-    migrate             = tostring(var.games_mp_migrate)
-    build               = tostring(var.games_mp_build)
     repo                = local.games_mp_repo
-    ref                 = var.games_mp_source_ref
     github_pat_secret   = local.games_mp_github_read_secret
   }
 }
 
 # -------------------------------------------------------------------------------------
-# Image builds: CodeBuild from an S3 copy of the pinned commit
+# Image builds: CodeBuild from an S3 copy of one commit
 # -------------------------------------------------------------------------------------
 #
-# SOURCE. CoderColton/colton-games is private. The build does NOT get a GitHub credential:
-# the jumpbox (bringup.py build and migrate) downloads the pinned commit with the read
-# token in secret `games/colton-games-read`, repacks it, and uploads it to this bucket;
-# CodeBuild reads only that object. Rejected alternatives:
+# SOURCE. CoderColton/colton-games is private. No build gets a GitHub credential: games-mp-poller
+# (games-multiplayer-deploy.tf) downloads each new commit with the read token in secret
+# `games/colton-games-read`, repacks it, and uploads it to this bucket; CodeBuild reads only that
+# object. And GitHub gets no AWS credential: AWS pulls. Rejected alternatives:
 #   - `github-pat-ejc3`, the dev boxes' clone credential: it is a fine-grained token owned
 #     by ejc3, and a fine-grained token can only reach repos owned by its creator or an
 #     org they belong to, never another user's personal repo, collaborator or not. It is
@@ -269,8 +252,9 @@ data "external" "games_mp_preflight" {
 #     was found (2026-09-27).
 #   - a classic ejc3 PAT with `repo` scope: it would reach colton-games, but read AND write
 #     on every repo ejc3 can touch, parked on the jumpbox for a build step.
-#   - CodeBuild's own GitHub source with the PAT (source auth SECRETS_MANAGER): the build
-#     runs the games repo's code, which could then read ejc3's PAT through the build role.
+#   - CodeBuild's own GitHub source and webhook: a webhook needs admin on the repo (ejc3 has
+#     write), a source credential is account-wide for every CodeBuild project, and the build
+#     runs the games repo's code, which could then reach that credential through the build.
 #   - a CodeConnections GitHub connection: it starts PENDING until someone completes a
 #     browser handshake and installs the AWS Connector app on CoderColton, which ejc3 (a
 #     collaborator, not the owner) cannot approve. Two human steps, forever in the loop.
@@ -278,10 +262,10 @@ data "external" "games_mp_preflight" {
 #     cannot read CoderColton's.
 
 # Colton's fine-grained token: resource owner CoderColton, only colton-games, Contents:
-# Read-only. Created by Colton at https://github.com/settings/personal-access-tokens/new
+# Read-only (enough for games-mp-poller: branch heads and zipballs). Created by Colton at https://github.com/settings/personal-access-tokens/new
 # and written straight into this secret, never through Terraform, so the value is not in
-# state. Only administration can read it; the CodeBuild role has no Secrets Manager access
-# at all, and no dev box role is granted it.
+# state. Only administration and games-mp-poller can read it; no CodeBuild role has Secrets
+# Manager access to it, and no dev box role is granted it.
 #
 # Bootstrap: the preflight reads this secret, so it must exist (with a value) before a full
 # plan can pass. Create the container alone first:
@@ -304,12 +288,12 @@ resource "aws_secretsmanager_secret_policy" "games_mp_github_read" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationCanRead"
+      Sid       = "OnlyAdministrationAndThePollerCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.games_mp_github_read.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.games_mp_poller.arn]) } }
     }]
   })
 }
@@ -334,7 +318,7 @@ resource "aws_s3_bucket_ownership_controls" "games_mp_build" {
   }
 }
 
-# Sources are only needed for the build that uses them.
+# Sources are only needed for the builds that use them (images, then the migration).
 resource "aws_s3_bucket_lifecycle_configuration" "games_mp_build" {
   bucket = aws_s3_bucket.games_mp_build.id
   rule {
@@ -384,8 +368,10 @@ resource "aws_iam_role" "games_mp_codebuild" {
   tags = { Name = "games-mp-codebuild", Project = "games-multiplayer" }
 }
 
-# Least privilege: read the uploaded sources, write its own logs, push to the games
-# repositories. No Secrets Manager, no GitHub credential, no ECS, no IAM.
+# Least privilege: read main's uploaded sources, write its own logs, push to the PRODUCTION
+# games repositories (games/*, the router included). No Secrets Manager, no GitHub credential,
+# no ECS, no IAM. It runs main's code, which is production's code. Preview builds have their
+# own role (games-multiplayer-deploy.tf) that cannot push here.
 resource "aws_iam_role_policy" "games_mp_codebuild" {
   name = "build-and-push-games-images"
   role = aws_iam_role.games_mp_codebuild.id
@@ -393,10 +379,10 @@ resource "aws_iam_role_policy" "games_mp_codebuild" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadSources"
+        Sid      = "ReadMainSources"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:GetObjectVersion"]
-        Resource = "${aws_s3_bucket.games_mp_build.arn}/sources/*"
+        Resource = "${aws_s3_bucket.games_mp_build.arn}/sources/main/*"
       },
       {
         Sid      = "LocateSourceBucket"
@@ -424,7 +410,7 @@ resource "aws_iam_role_policy" "games_mp_codebuild" {
           "ecr:DescribeImages", "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload",
           "ecr:PutImage", "ecr:UploadLayerPart",
         ]
-        Resource = [for repo in aws_ecr_repository.games_mp : repo.arn]
+        Resource = [for name, repo in aws_ecr_repository.games_mp : repo.arn if startswith(name, "games/")]
       },
     ]
   })
@@ -434,7 +420,7 @@ resource "aws_iam_role_policy" "games_mp_codebuild" {
 # because the build runs docker. Node 24 comes from the image's runtime-versions.
 resource "aws_codebuild_project" "games_mp_images" {
   name          = "games-mp-images"
-  description   = "Builds and pushes the games multiplayer images from a pinned colton-games commit"
+  description   = "Builds and pushes the games multiplayer images of a colton-games main commit (games-mp-poller starts it)"
   service_role  = aws_iam_role.games_mp_codebuild.arn
   build_timeout = 30
 
@@ -453,12 +439,23 @@ resource "aws_codebuild_project" "games_mp_images" {
       name  = "ACCOUNT_ID"
       value = data.aws_caller_identity.current.account_id
     }
+
+    # What this project builds and where it pushes (bringup.py codebuild-images); the poller
+    # sets only GAMES_MP_COMMIT.
+    environment_variable {
+      name  = "GAMES_MP_CHANNEL"
+      value = "main"
+    }
   }
 
-  # Each build overrides the location with sources/<commit>.zip.
+  # One build at a time: games-mp-release orders main releases anyway, and the poller starts
+  # the next head when this one is done.
+  concurrent_build_limit = 1
+
+  # Each build overrides the location with sources/main/<commit>.zip.
   source {
     type      = "S3"
-    location  = "${aws_s3_bucket.games_mp_build.bucket}/sources/pinned.zip"
+    location  = "${aws_s3_bucket.games_mp_build.bucket}/sources/main/none.zip"
     buildspec = file("${path.module}/games-multiplayer/buildspec.yml")
   }
 
@@ -469,32 +466,6 @@ resource "aws_codebuild_project" "games_mp_images" {
   }
 
   tags = { Name = "games-mp-images", Project = "games-multiplayer" }
-}
-
-# Runs once per set of expected tags. Skips CodeBuild entirely when ECR already has them.
-resource "terraform_data" "games_mp_build" {
-  count = var.games_mp_build ? 1 : 0
-
-  triggers_replace = {
-    ref       = var.games_mp_source_ref
-    images    = jsonencode(local.games_mp_expected_images)
-    project   = aws_codebuild_project.games_mp_images.arn
-    buildspec = filesha256("${path.module}/games-multiplayer/buildspec.yml")
-  }
-
-  provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} build --region ${var.aws_region} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --github-pat-secret ${local.games_mp_github_read_secret} --project ${aws_codebuild_project.games_mp_images.name} --bucket ${aws_s3_bucket.games_mp_build.bucket} --cache-dir ${local.games_mp_cache_dir} --expect \"$GAMES_MP_EXPECT\""
-    environment = {
-      GAMES_MP_EXPECT = jsonencode(local.games_mp_expected_images)
-    }
-  }
-
-  depends_on = [
-    data.external.games_mp_preflight,
-    aws_iam_role_policy.games_mp_codebuild,
-    aws_ecr_repository.games_mp,
-    aws_s3_bucket_policy.games_mp_build,
-  ]
 }
 
 # -------------------------------------------------------------------------------------
@@ -649,46 +620,15 @@ resource "terraform_data" "games_mp_preview_supabase" {
 }
 
 # -------------------------------------------------------------------------------------
-# Supabase migration
-# -------------------------------------------------------------------------------------
-#
-# Runs on the jumpbox with psql (installed there on first use if missing), not in CodeBuild:
-# the database URL then never has to be stored anywhere a build can read it, and the
-# jumpbox reaches Supabase over IPv4 and IPv6 alike. The step:
-#   - takes the migration file from the SAME pinned commit as the images;
-#   - connects with sslmode=verify-full against the Supabase Root 2021 CA committed next to
-#     it (fingerprint pinned in bringup.py);
-#   - reads mp_private.schema_revision and does nothing when it is already at the file's
-#     revision; refuses a partial or out-of-order state instead of guessing;
-#   - runs only that one file (which never names skyhook_private or site_private, checked),
-#     then verifies the revision.
-# The URL is the Supabase integration's POSTGRES_URL_NON_POOLING, decrypted from the Vercel
-# project's Production env at apply time and never stored. The plan-time preflight proved
-# it decrypts, so there is one path and no fallback.
-resource "terraform_data" "games_mp_migration" {
-  count = var.games_mp_migrate ? 1 : 0
-
-  triggers_replace = {
-    ref  = var.games_mp_source_ref
-    file = local.games_mp_migration
-  }
-
-  provisioner "local-exec" {
-    command = "python3 ${local.games_mp_bringup} migrate --region ${var.aws_region} --team-id ${var.vercel_team_id} --project-id ${local.colton_games_vercel_project_id} --ref ${var.games_mp_source_ref} --repo ${local.games_mp_repo} --github-pat-secret ${local.games_mp_github_read_secret} --cache-dir ${local.games_mp_cache_dir} --file ${local.games_mp_migration} --ca ${path.module}/games-multiplayer/supabase-root-2021-ca.crt"
-  }
-
-  depends_on = [data.external.games_mp_preflight, aws_secretsmanager_secret_policy.games_mp_admin_only]
-}
-
-# -------------------------------------------------------------------------------------
 # Verification
 # -------------------------------------------------------------------------------------
 #
 # After every router change: waits until the service's PRIMARY deployment runs this task
-# definition and ECS reports the rollout COMPLETED (a circuit-breaker rollback FAILS the
-# apply rather than passing on the old version), a target is healthy, and GET /healthz
-# answers 200 `ok` over TLS with the certificate verified for play.cc-games.app. Bounded:
-# 15 minutes, then it fails loudly.
+# definition with its desired count (a circuit-breaker rollback FAILS the apply rather than
+# passing on the old version), every task of that deployment is a healthy target, and GET
+# /healthz answers 200 `ok` over TLS with the certificate verified for play.cc-games.app. It
+# does not wait for ECS's COMPLETED: the old tasks drain for up to an hour first (live matches
+# keep their connections). Bounded: 15 minutes, then it fails loudly.
 resource "terraform_data" "games_mp_healthy" {
   count = local.mp_router_enabled ? 1 : 0
 
