@@ -624,10 +624,12 @@ locals {
   # plus room for engines still exiting after their match.
   games_mp_preview_ceiling = min(8, var.games_mp_engine_ceiling)
   games_mp_launch_environments = {
+    # api_base: cc-games.net is production's MP_API; cc-games.app stays accepted so a lobby
+    # deployment built before the switch (and any engine it launched) works through the cutover.
     production = {
       channel  = "main"
       ceiling  = var.games_mp_engine_ceiling - local.games_mp_preview_ceiling
-      api_base = "^https://cc-games\\.app$"
+      api_base = "^https://cc-games\\.(net|app)$"
       bypass   = false
       # Engines verify join tokens themselves: this environment's PUBLIC keys only.
       token_public_keys = local.games_mp_token_public_keys_by_env["production"]
