@@ -17,9 +17,13 @@ WHICH CHANNEL is decided by the project that built it, never by anything the bui
   games-mp-migrate         main    the mp Supabase migrations of a main commit, then promote it
 
 A MAIN BUILD (SUCCEEDED):
-  1. registers one engine task definition revision per game in `games-<game>` (the shape
-     Terraform gives it in ENGINE_TEMPLATES, including MP_TOKEN_VERIFIER), for the image
-     `<simVersion>-<sha12>` the build pushed;
+  1. registers one engine task definition revision in `games-<game>` for EACH GAME THE COMMIT
+     DEFINES (its scripts/mp-images.mjs; no list of games lives in Terraform), running
+     `games/engines:<game>_<simVersion>-<sha12>`, the image the build pushed. Everything but the
+     image and the size is fixed by ENGINE_TEMPLATE (roles, log group, network mode, arm64, port,
+     MP_TOKEN_VERIFIER); the size is the commit's own (mp-engine.json), checked against Fargate's
+     sizes and Terraform's maximums (MAX_CPU, MAX_MEMORY), and the game id against the rules
+     that keep its family off the router's and off the preview families;
   2. if the commit's mp schema revision is not the database's (`schema#main`), starts
      games-mp-migrate on the same source and stops here; that build's success continues at 3;
   3. PROMOTES: `current#main` becomes this commit's revisions, unless a newer main commit (a
@@ -57,9 +61,35 @@ PROJECTS = {
 }
 MIGRATE_PROJECT = os.environ.get("MIGRATE_PROJECT", "games-mp-migrate")
 BUCKET = os.environ.get("BUCKET", "")
-# Per game: {"main": {"family", "repository"}, "preview": {...}, "cpu", "memory",
-# "executionRoleArn", "taskRoleArn", "logGroup", "region"}.
-ENGINE_TEMPLATES = json.loads(os.environ.get("ENGINE_TEMPLATES", "{}"))
+# The one shape of every engine revision: {"executionRoleArn", "taskRoleArn", "logGroup",
+# "region", "maxCpu", "maxMemory", "main"/"preview": {"familyPrefix", "repository",
+# "repositoryUrl"}, "legacy": {game: {"main"/"preview": {"repository", "repositoryUrl"}}}}.
+# `legacy` is the per-game repositories from before games were dynamic (mptest): a build made
+# by the previous driver reports those, and is released from them.
+ENGINE_TEMPLATE = json.loads(os.environ.get("ENGINE_TEMPLATE", "{}"))
+# Shared with bringup.py and launch.py (scripts/test-games-mp-deploy.py checks they agree).
+GAME_ID = re.compile(r"[a-z][a-z0-9-]{0,30}[a-z0-9]")
+RESERVED_GAME_IDS = {"mp-router", "engines"}
+DEFAULT_ENGINE_SIZE = (2048, 4096)
+FARGATE_MEMORY = {
+    256: (512, 1024, 2048),
+    512: tuple(range(1024, 4097, 1024)),
+    1024: tuple(range(2048, 8193, 1024)),
+    2048: tuple(range(4096, 16385, 1024)),
+    4096: tuple(range(8192, 30721, 1024)),
+    8192: tuple(range(16384, 61441, 4096)),
+    16384: tuple(range(32768, 122881, 8192)),
+}
+
+
+def valid_game_id(game):
+    return (isinstance(game, str) and GAME_ID.fullmatch(game) is not None
+            and not game.startswith("preview-") and game not in RESERVED_GAME_IDS)
+
+
+def valid_engine_size(cpu, memory):
+    return (type(cpu) is int and type(memory) is int and cpu <= ENGINE_TEMPLATE["maxCpu"]
+            and memory <= ENGINE_TEMPLATE["maxMemory"] and memory in FARGATE_MEMORY.get(cpu, ()))
 ROUTER_REPOSITORY = os.environ.get("ROUTER_REPOSITORY", "games/mp-router")
 ROUTER_LIVE_TAG = os.environ.get("ROUTER_LIVE_TAG", "live")
 CLUSTER = os.environ.get("CLUSTER", "games")
@@ -184,24 +214,65 @@ def build_info(build_id):
 
 
 def built_images(channel, commit, exported):
-    """{game: (tag, simVersion, digest)} for every game, checked against ECR.
+    """{game: {"tag", "simVersion", "digest", "repositoryUrl", "cpu", "memory"}} for every engine
+    the build reports, each checked here and against ECR.
 
-    A preview build runs untrusted code, so its report is only a hint: each tag must be
-    `<simVersion>-<its commit's 12 hex>` and exist in that game's repository for the channel."""
+    A preview build runs untrusted code, so its report is only a hint: every game id must be
+    valid, every size a Fargate size within the maximums, and every image must exist in the
+    channel's engine repository as `<game>_<simVersion>-<its commit's 12 hex>`."""
+    where = ENGINE_TEMPLATE[channel]
+    raw = exported.get("GAMES_MP_ENGINES")
+    # A previous-driver build under this buildspec sets only GAMES_MP_IMAGES, and CodeBuild may
+    # report the unset GAMES_MP_ENGINES as empty.
+    if not raw:
+        return legacy_built_images(channel, commit, exported)
+    try:
+        engines = json.loads(raw)
+    except ValueError:
+        raise ReleaseError("GAMES_MP_ENGINES is not JSON") from None
+    if not isinstance(engines, dict) or not engines:
+        raise ReleaseError("the build reports no engine")
+    out = {}
+    for game, spec in sorted(engines.items()):
+        if not valid_game_id(game):
+            raise ReleaseError("%s: %r is not a valid game id" % (channel, game))
+        if not (isinstance(spec, list) and len(spec) == 3 and isinstance(spec[0], str)
+                and SIM_VERSION.fullmatch(spec[0])):
+            raise ReleaseError("%s: bad engine report for %s: %r" % (channel, game, spec))
+        sim, cpu, memory = spec
+        if not valid_engine_size(cpu, memory):
+            raise ReleaseError("%s: %s asks for cpu %r / memory %r, not a Fargate size within %s / %s"
+                               % (channel, game, cpu, memory, ENGINE_TEMPLATE["maxCpu"], ENGINE_TEMPLATE["maxMemory"]))
+        tag = "%s_%s-%s" % (game, sim, commit[:12])
+        out[game] = {"tag": tag, "simVersion": sim, "digest": image_digest(where["repository"], tag),
+                     "repositoryUrl": where["repositoryUrl"], "cpu": cpu, "memory": memory}
+    return out
+
+
+def legacy_built_images(channel, commit, exported):
+    """A build by the driver from before games were dynamic (in flight while Terraform switched
+    over): GAMES_MP_IMAGES {"<prefix><game>-engine": "<simVersion>-<sha12>"}, released only for
+    the games that had their own repositories, at the old default size."""
     try:
         images = json.loads(exported.get("GAMES_MP_IMAGES") or "")
     except ValueError:
-        raise ReleaseError("the build exported no GAMES_MP_IMAGES") from None
+        raise ReleaseError("the build exported neither GAMES_MP_ENGINES nor GAMES_MP_IMAGES") from None
     if not isinstance(images, dict):
         raise ReleaseError("GAMES_MP_IMAGES is not an object")
     out = {}
-    for game, template in sorted(ENGINE_TEMPLATES.items()):
-        repo = template[channel]["repository"]
-        tag = images.get(repo)
+    for game, repos in sorted((ENGINE_TEMPLATE.get("legacy") or {}).items()):
+        where = repos[channel]
+        tag = images.get(where["repository"])
+        if tag is None:
+            continue
         m = re.fullmatch(r"(.+)-([0-9a-f]{12})", tag) if isinstance(tag, str) else None
         if not m or m.group(2) != commit[:12] or not SIM_VERSION.fullmatch(m.group(1)):
             raise ReleaseError("%s: no image for %s at %s (got %r)" % (channel, game, commit[:12], tag))
-        out[game] = (tag, m.group(1), image_digest(repo, tag))
+        out[game] = {"tag": tag, "simVersion": m.group(1), "digest": image_digest(where["repository"], tag),
+                     "repositoryUrl": where["repositoryUrl"], "cpu": DEFAULT_ENGINE_SIZE[0],
+                     "memory": DEFAULT_ENGINE_SIZE[1]}
+    if not out:
+        raise ReleaseError("the build reports no engine")
     return out
 
 
@@ -215,22 +286,26 @@ def image_digest(repo, tag):
     return found["imageDetails"][0]["imageDigest"]
 
 
-def register(channel, commit, game, tag):
-    """One engine revision for `game` running `<repository>:<tag>`; returns its ARN."""
-    t = ENGINE_TEMPLATES[game]
-    where = t[channel]
+def register(channel, commit, game, image):
+    """One engine revision for `game` running `<image repositoryUrl>:<image tag>` at the image's
+    size; returns its ARN. Only the image and the size come from the build (checked by
+    built_images); everything else is ENGINE_TEMPLATE's."""
+    t = ENGINE_TEMPLATE
+    if not valid_game_id(game) or not valid_engine_size(image["cpu"], image["memory"]):
+        raise ReleaseError("refusing to register %r at %r / %r" % (game, image.get("cpu"), image.get("memory")))
+    tag = image["tag"]
     out = _client("ecs").register_task_definition(
-        family=where["family"],
+        family=t[channel]["familyPrefix"] + game,
         requiresCompatibilities=["FARGATE"],
         networkMode="awsvpc",
-        cpu=str(t["cpu"]),
-        memory=str(t["memory"]),
+        cpu=str(image["cpu"]),
+        memory=str(image["memory"]),
         executionRoleArn=t["executionRoleArn"],
         taskRoleArn=t["taskRoleArn"],
         runtimePlatform={"operatingSystemFamily": "LINUX", "cpuArchitecture": "ARM64"},
         containerDefinitions=[{
             "name": "engine",
-            "image": "%s:%s" % (where["repositoryUrl"], tag),
+            "image": "%s:%s" % (image["repositoryUrl"], tag),
             "essential": True,
             "portMappings": [{"containerPort": ENGINE_PORT, "protocol": "tcp"}],
             "environment": [
@@ -255,12 +330,12 @@ def register(channel, commit, game, tag):
 def register_all(channel, commit, record, images):
     """The build record's revisions, registering those it does not have yet (idempotent)."""
     games = dict(record.get("games") or {})
-    for game, (tag, sim, digest) in images.items():
+    for game, image in images.items():
         have = games.get(game) or {}
-        if have.get("tag") == tag and have.get("taskDefinition"):
+        if have.get("tag") == image["tag"] and have.get("taskDefinition"):
             continue
-        games[game] = {"taskDefinition": register(channel, commit, game, tag), "simVersion": sim,
-                       "tag": tag, "digest": digest}
+        games[game] = {"taskDefinition": register(channel, commit, game, image), "simVersion": image["simVersion"],
+                       "tag": image["tag"], "digest": image["digest"], "cpu": image["cpu"], "memory": image["memory"]}
     return games
 
 

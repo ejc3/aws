@@ -238,23 +238,23 @@ def repack_zipball(raw, ref, driver_source, extra=None):
 # --------------------------------------------------------------------------------------
 
 
-def missing_tags(expect, region, refresh_before=None):
-    """{repo: tag} entries of `expect` that ECR does not have yet. With `refresh_before` (a UTC
+def missing_images(expect, region, refresh_before=None):
+    """The (repo, tag) pairs of `expect` that ECR does not have yet. With `refresh_before` (a UTC
     datetime), an image pushed before it is deleted and counted as missing, so it is pushed
     again (see PREVIEW_REFRESH_DAYS)."""
-    missing = {}
-    for repo, tag in sorted(expect.items()):
+    missing = set()
+    for repo, tag in sorted(expect):
         found = aws("ecr", "describe-images", "--region", region, "--repository-name", repo,
                     "--image-ids", "imageTag=%s" % tag, check=False)
         if not found or not found.get("imageDetails"):
-            missing[repo] = tag
+            missing.add((repo, tag))
             continue
         pushed = found["imageDetails"][0].get("imagePushedAt")
         if refresh_before is not None and pushed and _when(pushed) < refresh_before:
             log("%s:%s was pushed %s: pushing it again, so it outlives its new release record" % (repo, tag, pushed))
             aws("ecr", "batch-delete-image", "--region", region, "--repository-name", repo,
                 "--image-ids", "imageTag=%s" % tag)
-            missing[repo] = tag
+            missing.add((repo, tag))
     return missing
 
 
@@ -353,15 +353,84 @@ def source_commit():
     return commit
 
 
+# --------------------------------------------------------------------------------------
+# Engines: which games a commit defines, and their sizes
+# --------------------------------------------------------------------------------------
+#
+# GAMES ARE DYNAMIC. No list of games lives in Terraform: a commit's own scripts/mp-images.mjs
+# defines its engines (`games/<game>-engine:<simVersion>-<sha12>`, the contract's names), and an
+# optional mp-engine.json beside an engine's Dockerfile sizes it:
+#     {"cpu": 2048, "memory": 4096}
+# (absent: 2048 / 4096, the contract's 2 vCPU / 4 GB). Every engine image lands in ONE repository
+# per channel (games/engines, games-preview/engines) as `<game>_<simVersion>-<sha12>`: a game id
+# never contains `_`, so the tag names its game unambiguously. games-mp-release checks all of
+# it again (a preview build runs untrusted code) and registers `games-<game>` /
+# `games-preview-<game>` revisions with everything but the image and the size fixed.
+#
+# The rules below are shared with release.py and launch.py (scripts/test-games-mp-deploy.py
+# checks the three copies agree).
+GAME_ID = re.compile(r"[a-z][a-z0-9-]{0,30}[a-z0-9]")
+# `mp-router` would name the router's family (games-mp-router); `preview-*` would name another
+# game's preview family (games-preview-<game>); `engines` is the repositories' own name.
+RESERVED_GAME_IDS = {"mp-router", "engines"}
+SIM_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+DEFAULT_ENGINE_SIZE = (2048, 4096)
+# Fargate's valid memory (MiB) per CPU unit; Terraform's maximums bound both further.
+FARGATE_MEMORY = {
+    256: (512, 1024, 2048),
+    512: tuple(range(1024, 4097, 1024)),
+    1024: tuple(range(2048, 8193, 1024)),
+    2048: tuple(range(4096, 16385, 1024)),
+    4096: tuple(range(8192, 30721, 1024)),
+    8192: tuple(range(16384, 61441, 4096)),
+    16384: tuple(range(32768, 122881, 8192)),
+}
+
+
+def valid_game_id(game):
+    return (isinstance(game, str) and GAME_ID.fullmatch(game) is not None
+            and not game.startswith("preview-") and game not in RESERVED_GAME_IDS)
+
+
+def valid_engine_size(cpu, memory, max_cpu, max_memory):
+    return (type(cpu) is int and type(memory) is int and cpu <= max_cpu and memory <= max_memory
+            and memory in FARGATE_MEMORY.get(cpu, ()))
+
+
+def engine_size(dockerfile, max_cpu, max_memory):
+    """(cpu, memory) from mp-engine.json beside the engine's Dockerfile, or the default."""
+    path = os.path.join(os.path.dirname(dockerfile), "mp-engine.json")
+    if not os.path.exists(path):
+        cpu, memory = DEFAULT_ENGINE_SIZE
+    else:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except ValueError:
+            raise StepError("%s is not JSON" % path) from None
+        if not isinstance(data, dict) or set(data) - {"cpu", "memory"}:
+            raise StepError('%s must be {"cpu": <int>, "memory": <int>}' % path)
+        cpu, memory = data.get("cpu", DEFAULT_ENGINE_SIZE[0]), data.get("memory", DEFAULT_ENGINE_SIZE[1])
+    if not valid_engine_size(cpu, memory, max_cpu, max_memory):
+        raise StepError("%s: cpu %r / memory %r is not a Fargate size within %d / %d"
+                        % (path, cpu, memory, max_cpu, max_memory))
+    return cpu, memory
+
+
 def cmd_codebuild_images(args):
     """Builds and pushes one commit's images. The channel is the project's own setting:
-    main     every image scripts/mp-images.mjs defines, into games/* (router included);
-    preview  engines only, into games-preview/<game>-engine: a preview never ships a router.
-    Tags are the repo's own (`<sha12>`, `<simVersion>-<sha12>`); a tag ECR already has is not
-    rebuilt (tags are immutable: it is already pushed)."""
+    main     every image scripts/mp-images.mjs defines: engines into games/engines, the router
+             into games/mp-router;
+    preview  engines only, into games-preview/engines: a preview never ships a router.
+    A tag ECR already has is not rebuilt (tags are immutable: it is already pushed)."""
     channel = os.environ.get("GAMES_MP_CHANNEL")
     if channel not in ("main", "preview"):
         raise StepError("GAMES_MP_CHANNEL must be main or preview")
+    engine_repo = os.environ.get("GAMES_MP_ENGINE_REPOSITORY", "")
+    if engine_repo != ("games/engines" if channel == "main" else "games-preview/engines"):
+        raise StepError("GAMES_MP_ENGINE_REPOSITORY %r is not the %s engine repository" % (engine_repo, channel))
+    max_cpu = int(os.environ.get("GAMES_MP_MAX_CPU", "4096"))
+    max_memory = int(os.environ.get("GAMES_MP_MAX_MEMORY", "8192"))
     commit = source_commit()
     sha12 = commit[:12]
     account, region = os.environ["ACCOUNT_ID"], os.environ.get("AWS_REGION", "us-west-1")
@@ -371,25 +440,36 @@ def cmd_codebuild_images(args):
               capture_output=True, text=True)
     if dry.returncode != 0:
         raise StepError("mp-images.mjs --dry-run failed: %s" % dry.stderr.strip()[-500:])
-    targets = {}
+    targets, engines = {}, {}
     for name, (repo, tag, dockerfile) in sorted(parse_dry_run(dry.stdout).items()):
-        source = repo
+        local = "%s:%s" % (repo, tag)
         engine = re.fullmatch(r"games/([a-z0-9-]+)-engine", repo)
-        if tag != sha12 and not (engine and tag.endswith("-" + sha12)):
-            raise StepError("mp-images.mjs tags %s %s:%s, not with commit %s" % (name, repo, tag, sha12))
-        if channel == "preview":
-            if not engine:
-                continue
-            repo = "games-preview/%s-engine" % engine.group(1)
-        targets[name] = (repo, tag, dockerfile, "%s:%s" % (source, tag))
-    if not targets:
-        raise StepError("mp-images.mjs defines no images to build")
-    images = {repo: tag for repo, tag, _, _ in targets.values()}
+        if engine:
+            game = engine.group(1)
+            m = re.fullmatch(r"(.+)-([0-9a-f]{12})", tag)
+            if not valid_game_id(game):
+                raise StepError("%s: %r is not a valid game id (%s, not preview-*, not %s)"
+                                % (name, game, GAME_ID.pattern, "/".join(sorted(RESERVED_GAME_IDS))))
+            if not m or m.group(2) != sha12 or not SIM_VERSION.fullmatch(m.group(1)):
+                raise StepError("mp-images.mjs tags %s %s, not <simVersion>-%s" % (name, local, sha12))
+            if game in engines:
+                raise StepError("mp-images.mjs defines two engines for %s" % game)
+            cpu, memory = engine_size(dockerfile, max_cpu, max_memory)
+            engines[game] = [m.group(1), cpu, memory]
+            targets[name] = (engine_repo, "%s_%s" % (game, tag), dockerfile, local)
+        elif repo == "games/mp-router" and tag == sha12:
+            if channel == "main":
+                targets[name] = (repo, tag, dockerfile, local)
+        else:
+            raise StepError("mp-images.mjs defines %s as %s, which is neither an engine nor the router" % (name, local))
+    if not engines:
+        raise StepError("mp-images.mjs defines no engine")
+    images = {(repo, tag) for repo, tag, _, _ in targets.values()}
     refresh = None
     if channel == "preview":
         refresh = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=PREVIEW_REFRESH_DAYS)
-    todo = missing_tags(images, region, refresh)
-    names = [name for name, (repo, _, _, _) in sorted(targets.items()) if repo in todo]
+    todo = missing_images(images, region, refresh)
+    names = [name for name, (repo, tag, _, _) in sorted(targets.items()) if (repo, tag) in todo]
     if names:
         password = aws("ecr", "get-login-password", "--region", region, parse=False)
         if RUN(["docker", "login", "--username", "AWS", "--password-stdin", registry],
@@ -413,10 +493,11 @@ def cmd_codebuild_images(args):
         for cmd in (["docker", "tag", local, remote], ["docker", "push", remote]):
             if RUN(cmd).returncode != 0:
                 raise StepError("%s failed" % " ".join(cmd[:2]))
-    still = missing_tags(images, region)
+    still = missing_images(images, region)
     if still:
-        raise StepError("pushed, but ECR still lacks %s" % still)
-    exports = {"GAMES_MP_IMAGES": json.dumps(images, sort_keys=True)}
+        raise StepError("pushed, but ECR still lacks %s" % sorted("%s:%s" % i for i in still))
+    # {game: [simVersion, cpu, memory]}: compact, as CodeBuild bounds an exported value's size.
+    exports = {"GAMES_MP_ENGINES": json.dumps(engines, sort_keys=True, separators=(",", ":"))}
     if channel == "main":
         router = [df for repo, _, df, _ in targets.values() if repo == "games/mp-router"]
         if len(router) != 1:
@@ -425,8 +506,7 @@ def cmd_codebuild_images(args):
         migrations = mp_migrations(".")
         exports["GAMES_MP_SCHEMA_REVISION"] = str(migrations[-1][0] if migrations else 0)
     write_exports(exports)
-    log("built %s (%s): %s" % (commit, channel, json.dumps(images, sort_keys=True)))
-
+    log("built %s (%s): %s" % (commit, channel, exports["GAMES_MP_ENGINES"]))
 
 # --------------------------------------------------------------------------------------
 # Vercel

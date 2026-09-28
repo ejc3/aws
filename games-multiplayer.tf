@@ -126,14 +126,25 @@ variable "mp_router_envs" {
 }
 
 locals {
-  # ADDING A GAME IS ONE ENTRY HERE plus its SIM_VERSION in var.games_mp_sim_versions (and
-  # an image in the games repo's scripts/mp-images.mjs). The key is the contract's game
-  # id: it names the ECR repository `games/<id>-engine`, the task definition `games-<id>`,
-  # and the log stream prefix.
-  # Sizes are the contract's 2 vCPU / 4 GB; a game may override them if it needs to.
-  mp_games = {
-    mptest = { cpu = 2048, memory = 4096 }
-  }
+  # GAMES ARE DYNAMIC: adding a game is a change to the games repo only. A commit's own
+  # scripts/mp-images.mjs defines its engines (`games/<game>-engine:<simVersion>-<sha12>`) and
+  # an optional mp-engine.json beside each engine's Dockerfile sizes it; the build pushes them to
+  # one repository per channel (games/engines, games-preview/engines) as
+  # `<game>_<simVersion>-<sha12>`, games-mp-release registers `games-<game>` /
+  # `games-preview-<game>` revisions with everything but the image and the size fixed here, and
+  # games-mp-launch launches whatever has been released. Nothing here lists games.
+  #
+  # Terraform bounds what a commit may ask for (bringup.py codebuild-images and release.py both
+  # enforce it; a size must also be one Fargate accepts). 4 vCPU / 8 GB is twice the contract's
+  # 2 vCPU / 4 GB: room for a heavier game without letting one commit take the engine budget.
+  mp_engine_max_cpu    = 4096
+  mp_engine_max_memory = 8192
+
+  # DEPRECATED SEED, never extended: games whose images predate dynamic games, in their own
+  # repositories (games/<game>-engine, games-preview/<game>-engine). Revisions released from
+  # those still launch (older simVersions keep their revision), so the repositories stay; new
+  # builds push only to the shared engine repositories.
+  mp_legacy_engine_games = ["mptest"]
 
   mp_cluster_name = "games"
   # The router's task definition family. The sweeper and games-mp-launch exempt exactly this
@@ -189,8 +200,8 @@ locals {
   # preview CodeBuild role pushes to games-preview/*, and only the preview launch function may
   # run games-preview-<game>.
   mp_engine_channels = {
-    main    = { family_prefix = "games-", repository_prefix = "games/" }
-    preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/" }
+    main    = { family_prefix = "games-", repository_prefix = "games/", repository = "games/engines" }
+    preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/", repository = "games-preview/engines" }
   }
 
   # Vercel team slug and project. The OIDC issuer, audience and subject all embed these
@@ -199,15 +210,6 @@ locals {
   vercel_team_slug    = "coltons-projects-7f9a4e8b"
   vercel_project_name = "colton-games"
   vercel_oidc_host    = "oidc.vercel.com/${local.vercel_team_slug}"
-}
-
-# A game id beginning "preview-" would name the same family as another game's preview engines
-# (games-preview-<game>), so none may.
-check "games_mp_game_ids_do_not_collide_with_preview_families" {
-  assert {
-    condition     = alltrue([for id in keys(local.mp_games) : !startswith(id, "preview-") && can(regex("^[a-z0-9][a-z0-9-]*$", id))])
-    error_message = "A local.mp_games id must be lowercase [a-z0-9-] and must not begin with \"preview-\"."
-  }
 }
 
 # -------------------------------------------------------------------------------------
@@ -219,7 +221,8 @@ check "games_mp_game_ids_do_not_collide_with_preview_families" {
 # tag that could be re-pushed would let two matches of the "same" version run different
 # code, and a running match's image could change under a reconnect. For the router, the
 # tag is the commit it was built from, and a rollback to a previous commit must mean the
-# previous bytes. Every tag carries the commit (`<sha12>`, `<simVersion>-<sha12>`), so a fix
+# previous bytes. Every tag carries the commit (router `<sha12>`, engine
+# `<game>_<simVersion>-<sha12>`; a legacy per-game repository's `<simVersion>-<sha12>`), so a fix
 # is always a new tag, and the build treats "tag already exists" as "already pushed".
 #
 # The one exception is the router's `live` tag (local.mp_router_live_tag), which
@@ -234,10 +237,17 @@ check "games_mp_game_ids_do_not_collide_with_preview_families" {
 # pull request's head after that), so no preview revision still selectable ever lacks its
 # image. Scan on push is the free basic scan.
 
+# ONE ENGINE REPOSITORY PER CHANNEL (games/engines, games-preview/engines), every game's
+# images in it as `<game>_<simVersion>-<sha12>`, so a new game needs no Terraform: no repository
+# to create, and no build role that could create one (the alternative, ECR create-on-push,
+# would give every branch's untrusted preview build ecr:CreateRepository). The lifecycle rules
+# are per channel anyway (above). ECR's images-per-repository quota (adjustable) is then shared
+# by the games of a channel: production keeps every tagged image, one per game per main commit.
 resource "aws_ecr_repository" "games_mp" {
   for_each = toset(concat(
-    [for id in keys(local.mp_games) : "games/${id}-engine"],
-    [for id in keys(local.mp_games) : "games-preview/${id}-engine"],
+    [for c in values(local.mp_engine_channels) : c.repository],
+    [for id in local.mp_legacy_engine_games : "games/${id}-engine"],
+    [for id in local.mp_legacy_engine_games : "games-preview/${id}-engine"],
     ["games/mp-router"],
   ))
 
@@ -697,18 +707,24 @@ resource "aws_iam_role_policy" "games_mp_launch" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = concat(
-      # Any revision of exactly this environment's engine families (production games-<game>,
-      # preview games-preview-<game>), only on this cluster. The function picks the revision
-      # (launch.py SIM VERSIONS AND COMMITS); `:*` after a family matches only its revisions,
-      # as a family name has no colon. A revision naming any role but the two engine roles
-      # fails at PassRole below. (No statement without a game: IAM rejects an empty Resource.)
-      length(local.mp_games) == 0 ? [] : [{
+      # Any revision of this environment's engine families (production games-<game>, preview
+      # games-preview-<game>, for any game: games are dynamic), only on this cluster. The
+      # function picks the revision (launch.py SIM VERSIONS AND COMMITS). A revision naming any
+      # role but the two engine roles fails at PassRole below. Production's prefix games-*
+      # also covers games-preview-* and games-mp-router, so both are denied below.
+      [{
         Sid       = "RunOwnEngineFamilyRevisions"
         Effect    = "Allow"
         Action    = "ecs:RunTask"
-        Resource  = [for id in keys(local.mp_games) : "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_engine_channels[each.value.channel].family_prefix}${id}:*"]
+        Resource  = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_engine_channels[each.value.channel].family_prefix}*:*"
         Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.games.arn } }
       }],
+      each.value.channel == "main" ? [{
+        Sid      = "NeverRunPreviewEngines"
+        Effect   = "Deny"
+        Action   = "ecs:RunTask"
+        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.mp_engine_channels.preview.family_prefix}*:*"
+      }] : [],
       [
         {
           # Which revision is current: production reads current#main and sim#<game>#<sim>,
@@ -724,8 +740,8 @@ resource "aws_iam_role_policy" "games_mp_launch" {
           }
         },
         {
-          # The Allow above never names the router; this keeps it so even if a game id ever
-          # collided with its family name.
+          # Production's Allow (games-*) covers the router's family; this Deny keeps it out, and
+          # launch.py refuses the game id `mp-router` besides.
           Sid      = "NeverRunTheRouter"
           Effect   = "Deny"
           Action   = "ecs:RunTask"
@@ -866,11 +882,13 @@ resource "aws_lambda_function" "games_mp_launch" {
       SETTLE_SEC      = "120"
       # Which revision to launch: games-mp-release's table (launch.py SIM VERSIONS AND COMMITS).
       RELEASES_TABLE = aws_dynamodb_table.games_mp_releases.name
-      # Per game: this environment's family and the ECR repository its images must come from.
-      GAMES = jsonencode({ for id, _ in local.mp_games : id => {
-        family     = "${local.mp_engine_channels[each.value.channel].family_prefix}${id}"
-        repository = aws_ecr_repository.games_mp["${local.mp_engine_channels[each.value.channel].repository_prefix}${id}-engine"].repository_url
-      } })
+      # Games are dynamic: a game's family is this prefix + its id, and its images come from
+      # this environment's engine repository (or, for a pre-dynamic game, its old one).
+      ENGINE_FAMILY_PREFIX = local.mp_engine_channels[each.value.channel].family_prefix
+      ENGINE_REPOSITORY    = aws_ecr_repository.games_mp[local.mp_engine_channels[each.value.channel].repository].repository_url
+      LEGACY_REPOSITORIES = jsonencode({ for id in local.mp_legacy_engine_games : id =>
+        aws_ecr_repository.games_mp["${local.mp_engine_channels[each.value.channel].repository_prefix}${id}-engine"].repository_url
+      })
     }
   }
 
@@ -1564,9 +1582,9 @@ resource "aws_ecs_service" "games_mp_router" {
 # Engine task definitions: games-<game> and games-preview-<game>
 # -------------------------------------------------------------------------------------
 #
-# Registered by games-mp-release for every built commit (games-multiplayer-deploy.tf,
-# ENGINE_TEMPLATES there holds their shape: size, roles, logs, MP_TOKEN_VERIFIER), never by
-# Terraform. No revision is ever deregistered: a production revision stays selectable for its
+# Registered by games-mp-release for every game a built commit defines (games are dynamic;
+# games-multiplayer-deploy.tf's ENGINE_TEMPLATE holds their fixed shape: roles, logs, network,
+# arm64, port, MP_TOKEN_VERIFIER, and the size maximums), never by Terraform. No revision is ever deregistered: a production revision stays selectable for its
 # simVersion, and a running task never depends on its revision anyway. Never register a
 # revision in these families by hand: only revisions games-mp-release recorded are launched,
 # but a stray one is confusing.

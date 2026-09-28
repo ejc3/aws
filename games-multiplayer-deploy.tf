@@ -46,28 +46,46 @@ locals {
   games_mp_migrate_project = "games-mp-migrate"
   games_mp_db_url_secret   = "games/mp-db-url"
 
-  # The shape of every engine revision games-mp-release registers (release.py register()).
-  games_mp_engine_templates = { for id, cfg in local.mp_games : id => {
-    cpu              = cfg.cpu
-    memory           = cfg.memory
+  # The one shape of every engine revision games-mp-release registers (release.py register()),
+  # for any game: only the image and the size (within the maximums) come from a commit.
+  games_mp_engine_template = {
     executionRoleArn = aws_iam_role.games_engine_execution.arn
     taskRoleArn      = aws_iam_role.games_engine_task.arn
     logGroup         = aws_cloudwatch_log_group.games_engines.name
     region           = var.aws_region
+    maxCpu           = local.mp_engine_max_cpu
+    maxMemory        = local.mp_engine_max_memory
     main = {
-      family        = "${local.mp_engine_channels.main.family_prefix}${id}"
-      repository    = "${local.mp_engine_channels.main.repository_prefix}${id}-engine"
-      repositoryUrl = aws_ecr_repository.games_mp["${local.mp_engine_channels.main.repository_prefix}${id}-engine"].repository_url
+      familyPrefix  = local.mp_engine_channels.main.family_prefix
+      repository    = local.mp_engine_channels.main.repository
+      repositoryUrl = aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].repository_url
     }
     preview = {
-      family        = "${local.mp_engine_channels.preview.family_prefix}${id}"
-      repository    = "${local.mp_engine_channels.preview.repository_prefix}${id}-engine"
-      repositoryUrl = aws_ecr_repository.games_mp["${local.mp_engine_channels.preview.repository_prefix}${id}-engine"].repository_url
+      familyPrefix  = local.mp_engine_channels.preview.family_prefix
+      repository    = local.mp_engine_channels.preview.repository
+      repositoryUrl = aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].repository_url
     }
-  } }
+    # Builds in flight while Terraform switched to dynamic games still report these.
+    legacy = { for id in local.mp_legacy_engine_games : id => { for ch, c in local.mp_engine_channels : ch => {
+      repository    = "${c.repository_prefix}${id}-engine"
+      repositoryUrl = aws_ecr_repository.games_mp["${c.repository_prefix}${id}-engine"].repository_url
+    } } }
+  }
 
-  games_mp_production_repo_arns = [for name, repo in aws_ecr_repository.games_mp : repo.arn if startswith(name, "games/")]
-  games_mp_preview_repo_arns    = [for name, repo in aws_ecr_repository.games_mp : repo.arn if startswith(name, "games-preview/")]
+  # What each build role pushes to: its channel's engine repository (and main's router), plus,
+  # FOR THE SWITCH ONLY, the legacy per-game repositories of that channel. A build already
+  # running when this is applied carries the previous driver, which pushes there; revoking the
+  # access mid-build would fail it, and a failed commit is never rebuilt. New builds never push
+  # there. Drop the legacy entries in a later change, once no build from before the switch can
+  # still be running (a build lasts minutes).
+  games_mp_production_repo_arns = concat(
+    [aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].arn, aws_ecr_repository.games_mp["games/mp-router"].arn],
+    [for id in local.mp_legacy_engine_games : aws_ecr_repository.games_mp["${local.mp_engine_channels.main.repository_prefix}${id}-engine"].arn],
+  )
+  games_mp_preview_repo_arns = concat(
+    [aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn],
+    [for id in local.mp_legacy_engine_games : aws_ecr_repository.games_mp["${local.mp_engine_channels.preview.repository_prefix}${id}-engine"].arn],
+  )
 }
 
 # -------------------------------------------------------------------------------------
@@ -120,7 +138,10 @@ resource "terraform_data" "games_mp_current_bootstrap" {
   provisioner "local-exec" {
     command = "python3 ${local.games_mp_bringup} releases-bootstrap --region ${var.aws_region} --table ${aws_dynamodb_table.games_mp_releases.name} --games \"$GAMES_MP_GAMES\""
     environment = {
-      GAMES_MP_GAMES = jsonencode({ for id, t in local.games_mp_engine_templates : id => t.main })
+      GAMES_MP_GAMES = jsonencode({ for id in local.mp_legacy_engine_games : id => {
+        family        = "${local.mp_engine_channels.main.family_prefix}${id}"
+        repositoryUrl = local.games_mp_engine_template.legacy[id].main.repositoryUrl
+      } })
     }
   }
 }
@@ -226,6 +247,21 @@ resource "aws_codebuild_project" "games_mp_images_preview" {
     environment_variable {
       name  = "GAMES_MP_CHANNEL"
       value = "preview"
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_ENGINE_REPOSITORY"
+      value = local.mp_engine_channels.preview.repository
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_MAX_CPU"
+      value = tostring(local.mp_engine_max_cpu)
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_MAX_MEMORY"
+      value = tostring(local.mp_engine_max_memory)
     }
   }
 
@@ -728,7 +764,7 @@ resource "aws_lambda_function" "games_mp_release" {
       PREVIEW_PROJECT   = aws_codebuild_project.games_mp_images_preview.name
       MIGRATE_PROJECT   = aws_codebuild_project.games_mp_migrate.name
       BUCKET            = aws_s3_bucket.games_mp_build.bucket
-      ENGINE_TEMPLATES  = jsonencode(local.games_mp_engine_templates)
+      ENGINE_TEMPLATE   = jsonencode(local.games_mp_engine_template)
       ROUTER_REPOSITORY = aws_ecr_repository.games_mp["games/mp-router"].name
       ROUTER_LIVE_TAG   = local.mp_router_live_tag
       CLUSTER           = aws_ecs_cluster.games.name
