@@ -63,9 +63,10 @@ by hand or by Terraform, and it records which is which in the releases table (RE
     `engine-build-failed` if its build failed. Production ignores `commit`: a preview's code
     never reaches a production engine.
 Whatever the table says, the revision must be of this function's own family for the game
-(GAMES: `games-<game>` on production, `games-preview-<game>` on preview; IAM lets each function
-run only its own families) and run exactly `<its repository>:<simVersion>-<12 hex>` (a preview's:
-its commit's 12 hex), or nothing is launched (`unknown-sim-version`).
+(`games-<game>` on production, `games-preview-<game>` on preview; IAM lets each function run
+only its own families) and run exactly `<engine repository>:<game>_<simVersion>-<12 hex>` (a
+preview's: its commit's 12 hex; a pre-dynamic game's old repository without the `<game>_`), or
+nothing is launched (`unknown-sim-version`). A game no release has is refused the same way.
 
 TOKEN VERIFIER. Engines built before engines verified join tokens themselves trust the
 router's X-MP-* identity headers, so launching one would let a compromised router claim any of
@@ -95,10 +96,28 @@ import time
 CLUSTER = os.environ.get("CLUSTER", "games")
 SUBNETS = [s for s in os.environ.get("SUBNETS", "").split(",") if s]
 SECURITY_GROUP = os.environ.get("SECURITY_GROUP", "")
-# Game id -> {"family": this environment's task definition family for it, "repository": the ECR
-# repository URL its images must come from}. Production: games-<game> and games/<game>-engine;
-# preview: games-preview-<game> and games-preview/<game>-engine (Terraform).
-GAMES = json.loads(os.environ.get("GAMES", "{}"))
+# GAMES ARE DYNAMIC: no list of games is configured here. A game exists for this function when
+# games-mp-release has released a revision for it (the releases table); a game id is only
+# checked for shape, the same rules as bringup.py and release.py (scripts/test-games-mp-deploy.py
+# checks the three agree), which keep its family off the router's and, on production, off the
+# preview families. This environment's engine family is ENGINE_FAMILY_PREFIX + game
+# (games-<game> / games-preview-<game>), and its engine images come from ENGINE_REPOSITORY
+# (games/engines / games-preview/engines, tagged `<game>_<simVersion>-<sha12>`) or, for a game
+# from before games were dynamic, its own old repository in LEGACY_REPOSITORIES
+# (`<simVersion>-<sha12>`), so its revisions released earlier keep launching.
+ENGINE_FAMILY_PREFIX = os.environ.get("ENGINE_FAMILY_PREFIX", "")
+ENGINE_REPOSITORY = os.environ.get("ENGINE_REPOSITORY", "")
+LEGACY_REPOSITORIES = json.loads(os.environ.get("LEGACY_REPOSITORIES", "{}"))
+GAME_ID = re.compile(r"[a-z][a-z0-9-]{0,30}[a-z0-9]")
+RESERVED_GAME_IDS = {"mp-router", "engines"}
+
+
+def valid_game_id(game):
+    return (isinstance(game, str) and GAME_ID.fullmatch(game) is not None
+            and not game.startswith("preview-") and game not in RESERVED_GAME_IDS)
+
+
+
 # games-mp-release's table: which revision is current, per simVersion, and per preview commit.
 RELEASES_TABLE = os.environ.get("RELEASES_TABLE", "")
 ROUTER_FAMILY = os.environ.get("ROUTER_FAMILY", "games-mp-router")
@@ -202,7 +221,7 @@ def validate_start(event, env):
         raise Refused("bad-request", "unknown-field")
     match = _match_id(event)
     game = event.get("game")
-    if not isinstance(game, str) or game not in GAMES:
+    if not valid_game_id(game):
         raise Refused("bad-request", "game")
     sim = event.get("simVersion")
     if not isinstance(sim, str) or not SIM_VERSION.fullmatch(sim):
@@ -308,18 +327,26 @@ def task_definition_for(ecs, env, req):
 
 def _runs(ecs, game, arn, sim, suffix):
     """Whether `arn` is a revision of this function's family for `game` whose engine image is
-    exactly <its repository>:<sim>-<12 hex> (the given 12 hex, if any) and verifies tokens."""
-    family, repository = GAMES[game]["family"], GAMES[game]["repository"]
-    # This account and region are the game's repository's: <account>.dkr.ecr.<region>.amazonaws.com/...
-    where = re.match(r"([0-9]{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/", repository)
+    exactly <ENGINE_REPOSITORY>:<game>_<sim>-<12 hex> (or, for a game from before games were
+    dynamic, <its old repository>:<sim>-<12 hex>), the given 12 hex if any, and verifies tokens."""
+    family = ENGINE_FAMILY_PREFIX + game
+    if not ENGINE_FAMILY_PREFIX or family == ROUTER_FAMILY:
+        return False
+    # This account and region are the engine repository's: <account>.dkr.ecr.<region>.amazonaws.com/...
+    where = re.match(r"([0-9]{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/", ENGINE_REPOSITORY)
     revision = arn.rsplit(":", 1)[1] if ":" in arn else ""
     if not where or arn != "arn:aws:ecs:%s:%s:task-definition/%s:%s" % (where.group(2), where.group(1), family, revision) \
             or not (revision.isdigit() and revision.isascii()):
         return False
     image = _engine_image(ecs, arn)
+    if not isinstance(image, str):
+        return False
     tail = re.escape(suffix) if suffix else "[0-9a-f]{12}"
-    return isinstance(image, str) and re.fullmatch(
-        re.escape(repository) + ":" + re.escape(sim) + "-" + tail, image) is not None
+    allowed = [re.escape(ENGINE_REPOSITORY) + ":" + re.escape(game) + "_" + re.escape(sim) + "-" + tail]
+    legacy = LEGACY_REPOSITORIES.get(game)
+    if isinstance(legacy, str) and legacy:
+        allowed.append(re.escape(legacy) + ":" + re.escape(sim) + "-" + tail)
+    return any(re.fullmatch(pattern, image) for pattern in allowed)
 
 
 def engine_token_keys(env):

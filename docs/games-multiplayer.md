@@ -183,7 +183,8 @@ CodeBuild finished  --EventBridge-->  games-mp-release
   requests would need a wider token. A fork's branches are never built.
 - **What changed is what is built.** A main build pushes only the tags ECR lacks (tags are
   immutable, so an existing tag is already pushed), but every commit gets its own tags and
-  revisions: `games/<game>-engine:<simVersion>-<sha12>`, `games/mp-router:<sha12>`. The router
+  revisions: engines `games/engines:<game>_<simVersion>-<sha12>` (previews
+  `games-preview/engines:...`), the router `games/mp-router:<sha12>`. The router
   rolls only when its inputs changed: the Dockerfile and every file it copies, hashed by the
   build (`bringup.py dockerfile_inputs`). Previews build engines only.
 - **Watching it.** `aws dynamodb get-item --region us-west-1 --table-name games-mp-releases
@@ -262,11 +263,63 @@ CodeBuild finished  --EventBridge-->  games-mp-release
   get only their environment's public keys, and carry the token-verifier marker (the release
   registers every revision with it). The router rolls only from `main`.
 
-**Adding a game** takes three entries:
+### Adding a game: the games repo only
 
-- one in `local.mp_games` (an id that does not begin with `preview-`);
-- its image in the games repo's `scripts/mp-images.mjs`;
-- nothing else: its repositories, families and releases follow from the first.
+Games are dynamic, and nothing in this repo lists them. A commit's own
+`scripts/mp-images.mjs` defines its engines. For each engine, the games repo provides:
+
+1. **An image entry in `scripts/mp-images.mjs`.** It is named `games/<game>-engine`, tagged
+   `<simVersion>-<sha12>`, and built from its own Dockerfile, as mptest's is. The `--dry-run`
+   output must show its `docker build ... -f <Dockerfile>` line and its
+   `<name>: <registry>/games/<game>-engine:<tag>` line. Do not change that format; the build
+   reads it.
+2. **A game id** following the rules below.
+3. **Optionally, `mp-engine.json` beside that Dockerfile.** Its only keys are `cpu` and
+   `memory`, for example `{"cpu": 2048, "memory": 4096}`. Without the file the engine gets
+   2 vCPU / 4 GB.
+4. **The engine itself.** It must meet the contract: it listens on 8080, calls back
+   `MP_API`, and verifies join tokens with `MP_TOKEN_PUBLIC_KEYS`, as mptest does.
+
+The game id must:
+
+- be 2 to 32 characters of `a-z0-9-`, starting with a letter and not ending with `-`;
+- not begin with `preview-`;
+- not be `mp-router` or `engines`.
+
+The size must be one Fargate accepts, within this repo's maximums of 4 vCPU (`4096`) and
+8 GB (`8192`).
+
+The first build of a commit that lists the engine then does the rest:
+
+- pushes `games/engines:<game>_<simVersion>-<sha12>`, or `games-preview/engines:...` for a
+  preview;
+- `games-mp-release` registers `games-<game>` or `games-preview-<game>` revisions;
+- `games-mp-launch` launches the game once a release has it. Before that it answers
+  `unknown-sim-version`.
+
+A build that breaks any of these rules fails before pushing anything. The release checks the
+rules again, because a preview build runs untrusted code.
+
+**What a commit cannot change.** Everything in a revision except the image and the size is
+fixed here:
+
+- the task and execution roles (no AWS permissions);
+- the log group, `awsvpc` networking, arm64 and port 8080;
+- the token-verifier marker.
+
+The image can only come from the channel's engine repository, tagged with the game's own
+name and the commit's own 12 hex. Production's launch function may run any `games-*`
+family except `games-preview-*` and `games-mp-router`, both explicitly denied. The preview
+function may run only `games-preview-*` families.
+
+**mptest's images from before games were dynamic** stay in its old repositories,
+`games/mptest-engine` and `games-preview/mptest-engine`. Revisions released from them keep
+launching (`LEGACY_REPOSITORIES`) and are never expired. New builds push only to
+`games/engines`.
+
+**ECR quota.** A channel's games share one repository's images-per-repository quota. That
+quota is adjustable in Service Quotas. Production keeps every tagged image: one per game per
+main commit.
 
 ## Rotating secrets
 
@@ -446,7 +499,7 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
 - **Request.** `{"action":"start","matchId","game","simVersion","secret","hardCapSec","apiBase"}`,
   plus `"apiBypass"` and `"commit"` from a preview. Any other field (`overrides`, `tags`,
   `taskDefinition`, `env`, a size, a role) is refused, not dropped. `matchId` is a lowercase UUID,
-  `game` must be in `local.mp_games`, `simVersion` is the match's (the lobby's shape, 1 to 64 of
+  `game` must be a valid game id (Adding a game), `simVersion` is the match's (the lobby's shape, 1 to 64 of
   `A-Za-z0-9._-`, matched in full), `commit` is 40 lowercase hex (required on preview, ignored
   on production), `hardCapSec` is 60 to 3,600 (no match may outlive a draining router, see
   Automatic deploys), `apiBase` must be
@@ -463,16 +516,19 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   production takes `current#main` for the game's current simVersion and `sim#<game>#<simVersion>`
   for an older one; preview takes `build#preview#<commit>` (`engine-building` until it is
   released, `engine-build-failed` if its build failed). Whatever the table says, the revision
-  must be of the function's own family (`GAMES`: `games-<game>` on production,
-  `games-preview-<game>` on preview) in this account and region, its only container `engine`
-  running exactly `<the game's repository for that environment>:<simVersion>-<12 hex>` (a
+  must be of the function's own family (`ENGINE_FAMILY_PREFIX` + game: `games-<game>` on
+  production, `games-preview-<game>` on preview) in this account and region, its only container
+  `engine` running exactly `<the environment's engine repository>:<game>_<simVersion>-<12 hex>`
+  (or, for mptest's pre-dynamic revisions, `<its old repository>:<simVersion>-<12 hex>`; a
   preview's: its commit's 12 hex), with `MP_TOKEN_VERIFIER=ed25519-v2` in its environment (read
   once per revision with `DescribeTaskDefinition`, then cached). Otherwise
-  `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched. Revisions registered
+  `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched; a game no release has
+  gets the same answer. Revisions registered
   before engines verified tokens have no marker and are never launched.
 - **What it runs.** That revision (IAM allows each function's own role `RunTask` on its own
-  families only, `games-<game>:*` or `games-preview-<game>:*` for exactly the games in
-  `local.mp_games`, only on cluster `games`, and denies the router's family;
+  family prefix only, `games-*:*` or `games-preview-*:*`, as games are dynamic, only on
+  cluster `games`; production's role also denies `games-preview-*`, and both deny the router's
+  family;
   `ecs:DescribeTaskDefinition` is read-only and takes no resource, so it is on `*`; the table
   reads are `GetItem` on its own items only), `launchType FARGATE`, the engine
   subnets and security group with `assignPublicIp=ENABLED`, `clientToken` = `<env>-<match id>`
@@ -649,8 +705,9 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    launch function, `games-mp-launch-<environment>`: no ECS, no PassRole, no EC2, no secrets.
 6. **Launch functions → ECS.** `games-mp-launch-<environment>` (above) validates the request,
    counts its environment's engines and refuses at its share of the ceiling, then runs a revision of the game's own engine family whose image
-   is in the game's own ECR repository with the match's simVersion, in cluster `games` only
-   (router **explicitly denied**). It can pass only the two
+   is in the environment's engine repository under the game's own name with the match's
+   simVersion, in cluster `games` only (router and, from production, preview families
+   **explicitly denied**). It can pass only the two
    engine roles (to ECS tasks only), tag only at launch, and stop only `match`-tagged tasks
    (router tasks explicitly denied). Reserved concurrency 1 per function.
 7. **Engines.** The task role has **no policies** (live: 0 attached, 0 inline). Engines run in

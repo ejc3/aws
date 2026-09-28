@@ -11,7 +11,7 @@ version: 0.2
 env:
   shell: bash
   exported-variables:
-    - GAMES_MP_IMAGES
+    - GAMES_MP_ENGINES
     - GAMES_MP_ROUTER_INPUTS
     - GAMES_MP_SCHEMA_REVISION
 
@@ -23,4 +23,4 @@ phases:
   build:
     commands:
       - python3 .games-mp/bringup.py codebuild-images
-      - . .games-mp/exports.sh && export GAMES_MP_IMAGES GAMES_MP_ROUTER_INPUTS GAMES_MP_SCHEMA_REVISION
+      - . .games-mp/exports.sh && export GAMES_MP_ENGINES GAMES_MP_ROUTER_INPUTS GAMES_MP_SCHEMA_REVISION

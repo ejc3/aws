@@ -410,7 +410,7 @@ resource "aws_iam_role_policy" "games_mp_codebuild" {
           "ecr:DescribeImages", "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload",
           "ecr:PutImage", "ecr:UploadLayerPart",
         ]
-        Resource = [for name, repo in aws_ecr_repository.games_mp : repo.arn if startswith(name, "games/")]
+        Resource = local.games_mp_production_repo_arns
       },
     ]
   })
@@ -445,6 +445,21 @@ resource "aws_codebuild_project" "games_mp_images" {
     environment_variable {
       name  = "GAMES_MP_CHANNEL"
       value = "main"
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_ENGINE_REPOSITORY"
+      value = local.mp_engine_channels.main.repository
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_MAX_CPU"
+      value = tostring(local.mp_engine_max_cpu)
+    }
+
+    environment_variable {
+      name  = "GAMES_MP_MAX_MEMORY"
+      value = tostring(local.mp_engine_max_memory)
     }
   }
 

@@ -39,16 +39,25 @@ BRANCH = "c" * 40
 TOKEN = "github_pat_DO_NOT_PRINT"
 TD_PREFIX = "arn:aws:ecs:us-west-1:%s:task-definition/" % ACCOUNT
 
-TEMPLATES = {"mptest": {
-    "cpu": 2048, "memory": 4096,
+# games-multiplayer-deploy.tf's games_mp_engine_template: one shape for every game.
+TEMPLATE = {
     "executionRoleArn": "arn:aws:iam::%s:role/games-engine-execution" % ACCOUNT,
     "taskRoleArn": "arn:aws:iam::%s:role/games-engine-task" % ACCOUNT,
-    "logGroup": "/games/engines", "region": "us-west-1",
-    "main": {"family": "games-mptest", "repository": "games/mptest-engine",
-             "repositoryUrl": REGISTRY + "/games/mptest-engine"},
-    "preview": {"family": "games-preview-mptest", "repository": "games-preview/mptest-engine",
-                "repositoryUrl": REGISTRY + "/games-preview/mptest-engine"},
-}}
+    "logGroup": "/games/engines", "region": "us-west-1", "maxCpu": 4096, "maxMemory": 8192,
+    "main": {"familyPrefix": "games-", "repository": "games/engines",
+             "repositoryUrl": REGISTRY + "/games/engines"},
+    "preview": {"familyPrefix": "games-preview-", "repository": "games-preview/engines",
+                "repositoryUrl": REGISTRY + "/games-preview/engines"},
+    "legacy": {"mptest": {
+        "main": {"repository": "games/mptest-engine", "repositoryUrl": REGISTRY + "/games/mptest-engine"},
+        "preview": {"repository": "games-preview/mptest-engine",
+                    "repositoryUrl": REGISTRY + "/games-preview/mptest-engine"}}},
+}
+
+
+def engines_report(sim="mptest-1", **more):
+    """GAMES_MP_ENGINES as bringup.py codebuild-images exports it: {game: [sim, cpu, memory]}."""
+    return json.dumps(dict({"mptest": [sim, 2048, 4096]}, **more), separators=(",", ":"))
 
 
 def load(name, env):
@@ -477,7 +486,7 @@ class PollerTests(unittest.TestCase):
 
 RELEASE_ENV = {"RELEASES_TABLE": "games-mp-releases", "MAIN_PROJECT": "games-mp-images",
                "PREVIEW_PROJECT": "games-mp-images-preview", "MIGRATE_PROJECT": "games-mp-migrate",
-               "BUCKET": "games-mp-build-1", "ENGINE_TEMPLATES": json.dumps(TEMPLATES),
+               "BUCKET": "games-mp-build-1", "ENGINE_TEMPLATE": json.dumps(TEMPLATE),
                "ROUTER_REPOSITORY": "games/mp-router", "ROUTER_LIVE_TAG": "live", "CLUSTER": "games",
                "ROUTER_SERVICE": "mp-router", "TARGET_GROUP_ARN": "arn:tg", "SNS_TOPIC_ARN": "arn:sns",
                "ROLL_TIMEOUT_SEC": "600", "POLL_SEC": "15"}
@@ -511,20 +520,19 @@ class ReleaseTests(unittest.TestCase):
         with contextlib.redirect_stdout(self.log):
             return self.r.lambda_handler(event, None)
 
-    def main_built(self, commit=MAIN, seq=1, inputs=INPUTS_A, schema="1", sim="mptest-1"):
+    def main_built(self, commit=MAIN, seq=1, inputs=INPUTS_A, schema="1", sim="mptest-1", engines=None):
         self.ddb.put("build#main#" + commit, status="building", seq=seq, channel="main", commit=commit)
-        self.ecr.add("games/mptest-engine", "%s-%s" % (sim, commit[:12]))
+        self.ecr.add("games/engines", "mptest_%s-%s" % (sim, commit[:12]))
         self.ecr.add("games/mp-router", commit[:12], "sha256:router-" + commit[:4])
         return self.cb.finish("games-mp-images:%s" % commit[:4], "games-mp-images", commit, {
-            "GAMES_MP_IMAGES": json.dumps({"games/mp-router": commit[:12],
-                                           "games/mptest-engine": "%s-%s" % (sim, commit[:12])}),
+            "GAMES_MP_ENGINES": engines or engines_report(sim),
             "GAMES_MP_ROUTER_INPUTS": inputs, "GAMES_MP_SCHEMA_REVISION": schema})
 
-    def preview_built(self, commit=BRANCH, images=None):
+    def preview_built(self, commit=BRANCH, engines=None, exported=None):
         self.ddb.put("build#preview#" + commit, status="building", channel="preview", commit=commit)
-        self.ecr.add("games-preview/mptest-engine", "mptest-1-" + commit[:12])
-        return self.cb.finish("games-mp-images-preview:1", "games-mp-images-preview", commit, {
-            "GAMES_MP_IMAGES": json.dumps(images or {"games-preview/mptest-engine": "mptest-1-" + commit[:12]})})
+        self.ecr.add("games-preview/engines", "mptest_mptest-1-" + commit[:12])
+        return self.cb.finish("games-mp-images-preview:1", "games-mp-images-preview", commit,
+                              exported or {"GAMES_MP_ENGINES": engines or engines_report()})
 
     # -- preview ------------------------------------------------------------------------------
 
@@ -533,7 +541,7 @@ class ReleaseTests(unittest.TestCase):
         [td] = self.ecs.registered
         self.assertEqual(td["family"], "games-preview-mptest")
         container = td["containerDefinitions"][0]
-        self.assertEqual(container["image"], REGISTRY + "/games-preview/mptest-engine:mptest-1-" + BRANCH[:12])
+        self.assertEqual(container["image"], REGISTRY + "/games-preview/engines:mptest_mptest-1-" + BRANCH[:12])
         self.assertIn({"name": "MP_ENV", "value": "preview"}, container["environment"])
         record = self.ddb.get("build#preview#" + BRANCH)
         self.assertEqual(record["status"], "released")
@@ -543,19 +551,92 @@ class ReleaseTests(unittest.TestCase):
 
     def test_a_preview_build_cannot_claim_a_production_or_another_commits_image(self):
         other = "d" * 40
-        self.ecr.add("games/mptest-engine", "mptest-1-" + BRANCH[:12])
-        self.ecr.add("games-preview/mptest-engine", "mptest-1-" + other[:12])
-        for images in ({"games/mptest-engine": "mptest-1-" + BRANCH[:12]},
-                       {"games-preview/mptest-engine": "mptest-1-" + other[:12]},
-                       {"games-preview/mptest-engine": ".x-" + BRANCH[:12]},
-                       {"games-preview/mptest-engine": "mptest-9-" + BRANCH[:12]}):   # not in ECR
-            with self.subTest(images=images):
-                event = self.preview_built(images=images)
-                self.ecr.images.pop(("games-preview/mptest-engine", "mptest-1-" + BRANCH[:12]))
+        self.ecr.add("games/engines", "mptest_mptest-1-" + BRANCH[:12])            # production's repository
+        self.ecr.add("games-preview/engines", "mptest_mptest-1-" + other[:12])     # another commit's
+        self.ecr.add("games-preview/engines", "starfall_mptest-1-" + BRANCH[:12])  # another game's name
+        for why, engines in (("its image is not in ECR", engines_report("mptest-9")),
+                             ("a bad simVersion", engines_report(".x")),
+                             ("not a report", json.dumps(["mptest"])),
+                             ("nothing", "{}")):
+            with self.subTest(why):
+                event = self.preview_built(engines=engines)
+                self.ecr.images.pop(("games-preview/engines", "mptest_mptest-1-" + BRANCH[:12]))
                 with self.assertRaises(self.r.ReleaseError):
                     self.invoke(event)
                 self.assertEqual(self.ecs.registered, [])
                 self.assertNotEqual(self.ddb.get("build#preview#" + BRANCH)["status"], "released")
+
+    def test_a_build_cannot_escape_the_fixed_shape_or_the_size_bounds(self):
+        # Whatever a (preview: untrusted) build reports, a revision's family is the channel's prefix
+        # plus a valid game id, its image is the channel's engine repository, and its size is a
+        # Fargate size within Terraform's maximums. Refused before anything is registered.
+        bad = {
+            "cpu above the maximum": {"mptest": ["mptest-1", 8192, 16384]},
+            "memory above the maximum": {"mptest": ["mptest-1", 4096, 16384]},
+            "not a Fargate size": {"mptest": ["mptest-1", 2048, 3072]},
+            "a string size": {"mptest": ["mptest-1", "2048", 4096]},
+            "a boolean size": {"mptest": ["mptest-1", True, 4096]},
+            "the router's family": {"mp-router": ["mptest-1", 2048, 4096]},
+            "another game's preview family": {"preview-mptest": ["mptest-1", 2048, 4096]},
+            "not a game id": {"../x": ["mptest-1", 2048, 4096]},
+            "an extra field": {"mptest": ["mptest-1", 2048, 4096, "arn:aws:iam::1:role/admin"]},
+        }
+        for why, engines in bad.items():
+            with self.subTest(why):
+                event = self.preview_built(engines=json.dumps(engines))
+                with self.assertRaises(self.r.ReleaseError):
+                    self.invoke(event)
+                self.assertEqual(self.ecs.registered, [])
+        # Within the bounds, the commit's own size is used; everything else is the template's.
+        self.ecr.add("games-preview/engines", "arena_a-2-" + BRANCH[:12])
+        self.invoke(self.preview_built(engines=engines_report(arena=["a-2", 4096, 8192])))
+        by_family = {td["family"]: td for td in self.ecs.registered}
+        arena = by_family["games-preview-arena"]
+        self.assertEqual((arena["cpu"], arena["memory"]), ("4096", "8192"))
+        self.assertEqual(arena["containerDefinitions"][0]["image"], REGISTRY + "/games-preview/engines:arena_a-2-" + BRANCH[:12])
+        self.assertEqual((arena["executionRoleArn"], arena["taskRoleArn"]), (TEMPLATE["executionRoleArn"], TEMPLATE["taskRoleArn"]))
+        self.assertEqual(arena["networkMode"], "awsvpc")
+        self.assertEqual(arena["runtimePlatform"], {"operatingSystemFamily": "LINUX", "cpuArchitecture": "ARM64"})
+
+    def test_a_new_game_is_released_with_no_terraform_change(self):
+        self.ecr.add("games/engines", "starfall-arena_arena-1-" + MAIN[:12])
+        self.invoke(self.main_built(engines=engines_report(**{"starfall-arena": ["arena-1", 2048, 4096]})))
+        current = self.ddb.get("current#main")
+        self.assertEqual(sorted(current["games"]), ["mptest", "starfall-arena"])
+        self.assertEqual(current["games"]["starfall-arena"]["taskDefinition"], TD_PREFIX + "games-starfall-arena:1")
+        self.assertEqual(self.ddb.get("sim#starfall-arena#arena-1")["commit"], MAIN)
+
+    def test_a_build_by_the_previous_driver_still_releases_mptest(self):
+        # In flight while Terraform switched to dynamic games: GAMES_MP_IMAGES, legacy repository.
+        self.ddb.put("build#main#" + MAIN, status="building", seq=1, channel="main", commit=MAIN)
+        self.ecr.add("games/mptest-engine", "mptest-1-" + MAIN[:12])
+        self.ecr.add("games/mp-router", MAIN[:12], "sha256:router-" + MAIN[:4])
+        self.invoke(self.cb.finish("games-mp-images:old", "games-mp-images", MAIN, {
+            "GAMES_MP_IMAGES": json.dumps({"games/mp-router": MAIN[:12], "games/mptest-engine": "mptest-1-" + MAIN[:12]}),
+            "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+        [td] = self.ecs.registered
+        self.assertEqual(td["containerDefinitions"][0]["image"], REGISTRY + "/games/mptest-engine:mptest-1-" + MAIN[:12])
+        self.assertEqual((td["cpu"], td["memory"]), ("2048", "4096"))
+        self.assertEqual(self.ddb.get("current#main")["commit"], MAIN)
+        # Only games that had their own repository: nothing else is taken from that shape.
+        self.ecr.add("games/starfall-engine", "hl-1-" + MAIN2[:12])
+        self.ddb.put("build#main#" + MAIN2, status="building", seq=2, channel="main", commit=MAIN2)
+        with self.assertRaises(self.r.ReleaseError):
+            self.invoke(self.cb.finish("games-mp-images:old2", "games-mp-images", MAIN2, {
+                "GAMES_MP_IMAGES": json.dumps({"games/starfall-engine": "hl-1-" + MAIN2[:12]}),
+                "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+
+    def test_the_game_id_and_size_rules_agree_in_all_three_files(self):
+        bu = load("bringup", {})
+        la = load("launch", {})
+        for mod in (bu, la):
+            self.assertEqual(mod.GAME_ID.pattern, self.r.GAME_ID.pattern)
+            self.assertEqual(mod.RESERVED_GAME_IDS, self.r.RESERVED_GAME_IDS)
+        self.assertEqual(bu.FARGATE_MEMORY, self.r.FARGATE_MEMORY)
+        self.assertEqual(bu.DEFAULT_ENGINE_SIZE, self.r.DEFAULT_ENGINE_SIZE)
+        self.assertEqual(bu.SIM_VERSION.pattern, self.r.SIM_VERSION.pattern)
+        for game in ("mptest", "starfall", "starfall-arena", "mp-router", "engines", "preview-x", "x_y", "A", "ab"):
+            self.assertEqual({bu.valid_game_id(game), la.valid_game_id(game)}, {self.r.valid_game_id(game)}, game)
 
     # -- main ---------------------------------------------------------------------------------
 
@@ -565,11 +646,11 @@ class ReleaseTests(unittest.TestCase):
         [td] = self.ecs.registered
         self.assertEqual(td["family"], "games-mptest")
         c = td["containerDefinitions"][0]
-        self.assertEqual(c["image"], REGISTRY + "/games/mptest-engine:mptest-1-" + MAIN[:12])
+        self.assertEqual(c["image"], REGISTRY + "/games/engines:mptest_mptest-1-" + MAIN[:12])
         self.assertEqual([e["name"] for e in c["environment"]], ["GAME_ID", "PORT", "MP_ENV", "MP_TOKEN_VERIFIER"])
         self.assertIn({"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}, c["environment"])
         self.assertEqual((td["executionRoleArn"], td["taskRoleArn"]),
-                         (TEMPLATES["mptest"]["executionRoleArn"], TEMPLATES["mptest"]["taskRoleArn"]))
+                         (TEMPLATE["executionRoleArn"], TEMPLATE["taskRoleArn"]))
         self.assertIn({"key": "Project", "value": "games-multiplayer"}, td["tags"])
         self.assertEqual(set(td) - {"arn"}, {"family", "requiresCompatibilities", "networkMode", "cpu", "memory",
                                              "executionRoleArn", "taskRoleArn", "runtimePlatform",
@@ -711,7 +792,12 @@ class TerraformTests(unittest.TestCase):
     def test_preview_builds_can_push_only_preview_images(self):
         policy = block(DEPLOY, "aws_iam_role_policy", "games_mp_codebuild_preview")
         self.assertIn("Resource = local.games_mp_preview_repo_arns", statement(policy, "PushPreviewImages"))
-        self.assertIn('if startswith(name, "games-preview/")', DEPLOY)
+        # Exactly the shared preview engine repository: not the legacy per-game ones, never games/*.
+        self.assertIn("games_mp_preview_repo_arns    = [aws_ecr_repository.games_mp[local.mp_engine_channels.preview.repository].arn]", DEPLOY)
+        self.assertIn('games_mp_production_repo_arns = [aws_ecr_repository.games_mp[local.mp_engine_channels.main.repository].arn, aws_ecr_repository.games_mp["games/mp-router"].arn]', DEPLOY)
+        for name in ("GAMES_MP_ENGINE_REPOSITORY", "GAMES_MP_MAX_CPU", "GAMES_MP_MAX_MEMORY"):
+            self.assertIn(name, block(DEPLOY, "aws_codebuild_project", "games_mp_images_preview"))
+            self.assertIn(name, block(BRINGUP_TF, "aws_codebuild_project", "games_mp_images"))
         self.assertEqual(len(re.findall(r"ecr:BatchDeleteImage", DEPLOY)), 1, "the preview role only")
         self.assertIn('"${aws_s3_bucket.games_mp_build.arn}/sources/preview/*"', policy)
         for forbidden in ("secretsmanager", "ecs:", "iam:", "games_mp_production_repo_arns", "sources/*", "sources/main"):
@@ -721,8 +807,11 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('buildspec = file("${path.module}/games-multiplayer/buildspec.yml")', project)
 
     def test_the_preview_launch_function_is_the_only_one_that_runs_preview_revisions(self):
-        self.assertIn('preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/" }', GAMES_TF)
-        self.assertIn('check "games_mp_game_ids_do_not_collide_with_preview_families"', GAMES_TF)
+        self.assertIn('preview = { family_prefix = "games-preview-", repository_prefix = "games-preview/", repository = "games-preview/engines" }', GAMES_TF)
+        # Game ids are checked in code now (no list of games in Terraform): a preview-* id, which
+        # would name another game's preview family, is refused by the build, the release and the
+        # launch function alike (test_the_game_id_and_size_rules_agree_in_all_three_files).
+        self.assertNotIn("local.mp_games", GAMES_TF + DEPLOY + BRINGUP_TF)
 
     def test_the_poller_reads_the_token_writes_claims_and_starts_image_builds_only(self):
         policy = block(DEPLOY, "aws_iam_role_policy", "games_mp_poller")

@@ -27,8 +27,10 @@ ROOT = Path(__file__).resolve().parent.parent
 GM = ROOT / "games-multiplayer"
 REF = "c76e5bdf083fe32628b5c8fee9e6ab867e291369"
 SHA12 = REF[:12]
-EXPECT = {"games/mp-router": SHA12, "games/mptest-engine": "mptest-1-" + SHA12}
-PREVIEW_EXPECT = {"games-preview/mptest-engine": "mptest-1-" + SHA12}
+# Where a main / preview build pushes: engines to the channel's one engine repository as
+# <game>_<simVersion>-<sha12> (games are dynamic), the router (main only) to games/mp-router.
+EXPECT = {("games/mp-router", SHA12), ("games/engines", "mptest_mptest-1-" + SHA12)}
+PREVIEW_EXPECT = {("games-preview/engines", "mptest_mptest-1-" + SHA12)}
 DB_PASSWORD = "s3cr3t-p@ss/word"
 DB_URL = "postgres://postgres.kmfdnctkbdpcagukwqro:%s@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require" % (
     "s3cr3t-p%40ss%2Fword")
@@ -181,7 +183,7 @@ class World:
         if argv[:3] == ["aws", "codebuild", "batch-get-builds"]:
             status = self.builds.pop(0) if len(self.builds) > 1 else self.builds[0]
             if status == "SUCCEEDED":
-                self.ecr.update(EXPECT.items())
+                self.ecr.update(EXPECT)
             return done(json.dumps({"builds": [{"buildStatus": status, "logs": {"deepLink": "https://logs/x"}}]}))
         if argv[:3] == ["aws", "ecs", "describe-services"]:
             return done(json.dumps(self.services.pop(0) if len(self.services) > 1 else self.services[0]))
@@ -350,7 +352,8 @@ class CodeBuildImagesTests(Base):
     def setUp(self):
         super().setUp()
         os.environ.update(GAMES_MP_COMMIT=REF, GAMES_MP_CHANNEL="main", ACCOUNT_ID="928413605543",
-                          AWS_REGION="us-west-1")
+                          AWS_REGION="us-west-1", GAMES_MP_ENGINE_REPOSITORY="games/engines",
+                          GAMES_MP_MAX_CPU="4096", GAMES_MP_MAX_MEMORY="8192")
         self.cwd = os.getcwd()
         os.chdir(self.tmp.name)
         for d, text in (("server/mp-router", "FROM node:24-alpine\nCOPY lib/multiplayer/token.mjs lib/x.mjs ./lib/\n"
@@ -385,61 +388,114 @@ class CodeBuildImagesTests(Base):
         self.w.ecr.add(("games/mp-router", SHA12))
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(self.w.built, ["mptest"])
-        self.assertEqual(self.w.pushed, ["games/mptest-engine:mptest-1-" + SHA12])
+        self.assertEqual(self.w.pushed, ["games/engines:mptest_mptest-1-" + SHA12])
         pulls = [c for c in self.w.calls if c[:2] == ["docker", "pull"]]
         self.assertEqual(pulls[0][-1], "public.ecr.aws/docker/library/node:24-alpine")
         ex = self.exports()
-        self.assertEqual(json.loads(ex["GAMES_MP_IMAGES"].strip("'")), EXPECT)
+        # No mp-engine.json: the contract's 2 vCPU / 4 GB.
+        self.assertEqual(json.loads(ex["GAMES_MP_ENGINES"].strip("'")), {"mptest": ["mptest-1", 2048, 4096]})
+        self.assertNotIn("GAMES_MP_IMAGES", ex)
         self.assertRegex(ex["GAMES_MP_ROUTER_INPUTS"], r"^[0-9a-f]{64}$")
         self.assertEqual(ex["GAMES_MP_SCHEMA_REVISION"], "1")
         self.assertNoSecretsLeaked()
 
     def test_preview_pushes_engines_only_to_the_preview_repositories(self):
-        os.environ["GAMES_MP_CHANNEL"] = "preview"
+        os.environ.update(GAMES_MP_CHANNEL="preview", GAMES_MP_ENGINE_REPOSITORY="games-preview/engines")
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(self.w.built, ["mptest"], "never the router")
-        self.assertEqual(self.w.pushed, ["games-preview/mptest-engine:mptest-1-" + SHA12])
+        self.assertEqual(self.w.pushed, ["games-preview/engines:mptest_mptest-1-" + SHA12])
         self.assertFalse(any(r.startswith("games/") for r, _ in self.w.ecr))
         tags = [c for c in self.w.calls if c[:2] == ["docker", "tag"] and "games-preview" in c[-1]]
         self.assertEqual(tags[0][2], "games/mptest-engine:mptest-1-" + SHA12)
         ex = self.exports()
-        self.assertEqual(json.loads(ex["GAMES_MP_IMAGES"].strip("'")), PREVIEW_EXPECT)
+        self.assertEqual(json.loads(ex["GAMES_MP_ENGINES"].strip("'")), {"mptest": ["mptest-1", 2048, 4096]})
         self.assertNotIn("GAMES_MP_ROUTER_INPUTS", ex)
+        # The project's repository setting must be its own channel's.
+        os.environ["GAMES_MP_ENGINE_REPOSITORY"] = "games/engines"
+        with self.assertRaisesRegex(self.bu.StepError, "not the preview engine repository"):
+            self.bu.cmd_codebuild_images(None)
 
     def test_a_stale_preview_image_is_pushed_again_a_fresh_one_or_main_is_not(self):
-        os.environ["GAMES_MP_CHANNEL"] = "preview"
-        key = ("games-preview/mptest-engine", "mptest-1-" + SHA12)
+        os.environ.update(GAMES_MP_CHANNEL="preview", GAMES_MP_ENGINE_REPOSITORY="games-preview/engines")
+        key = ("games-preview/engines", "mptest_mptest-1-" + SHA12)
         self.w.ecr.add(key)
         self.w.pushed_at[key] = "2020-01-01T00:00:00+00:00"
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(self.w.deleted, [key])
-        self.assertEqual(self.w.pushed, ["games-preview/mptest-engine:mptest-1-" + SHA12])
+        self.assertEqual(self.w.pushed, ["games-preview/engines:mptest_mptest-1-" + SHA12])
         # Pushed just now: left alone.
         import datetime as _dt
         self.w.pushed_at[key] = _dt.datetime.now(_dt.timezone.utc).isoformat()
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(len(self.w.deleted), 1)
         # Production images are never deleted, however old.
-        os.environ["GAMES_MP_CHANNEL"] = "main"
-        for repo, tag in EXPECT.items():
+        os.environ.update(GAMES_MP_CHANNEL="main", GAMES_MP_ENGINE_REPOSITORY="games/engines")
+        for repo, tag in EXPECT:
             self.w.ecr.add((repo, tag))
             self.w.pushed_at[(repo, tag)] = "2020-01-01T00:00:00+00:00"
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(len(self.w.deleted), 1)
 
     def test_everything_present_builds_nothing(self):
-        self.w.ecr.update(EXPECT.items())
+        self.w.ecr.update(EXPECT)
         self.bu.cmd_codebuild_images(None)
         self.assertEqual(getattr(self.w, "built", []), [])
         self.assertFalse(any(c[:2] == ["docker", "login"] for c in self.w.calls))
 
     def test_a_tag_without_this_commit_or_another_source_fails_before_building(self):
         self.w.dry_run = DRY_RUN.replace("mptest-1-" + SHA12, "mptest-1-0123456789ab")
-        with self.assertRaisesRegex(self.bu.StepError, "not with commit"):
+        with self.assertRaisesRegex(self.bu.StepError, "not <simVersion>-" + SHA12):
             self.bu.cmd_codebuild_images(None)
         self.assertFalse(any("--only" in c for c in self.w.calls))
         Path(".games-mp/SOURCE_REF").write_text("0" * 40 + "\n")
         with self.assertRaisesRegex(self.bu.StepError, "not commit"):
+            self.bu.cmd_codebuild_images(None)
+
+    def test_a_new_game_needs_only_the_games_repo(self):
+        # A second engine in mp-images.mjs, sized by its own mp-engine.json: no Terraform list.
+        os.makedirs("server/starfall-arena")
+        Path("server/starfall-arena/Dockerfile").write_text("FROM node:24-alpine\n")
+        Path("server/starfall-arena/mp-engine.json").write_text('{"cpu": 4096, "memory": 8192}')
+        self.w.dry_run = DRY_RUN + (
+            "[starfall-arena] $ docker build --platform linux/arm64 -f server/starfall-arena/Dockerfile "
+            "-t games/starfall-arena-engine:arena-3-{s} .\n"
+            "starfall-arena: 928413605543.dkr.ecr.us-west-1.amazonaws.com/games/starfall-arena-engine:arena-3-{s}\n"
+        ).format(s=SHA12)
+        self.bu.cmd_codebuild_images(None)
+        self.assertIn("games/engines:starfall-arena_arena-3-" + SHA12, self.w.pushed)
+        self.assertEqual(json.loads(self.exports()["GAMES_MP_ENGINES"].strip("'")),
+                         {"mptest": ["mptest-1", 2048, 4096], "starfall-arena": ["arena-3", 4096, 8192]})
+
+    def test_a_commit_cannot_escape_the_bounds_or_name_another_family(self):
+        os.makedirs("server/big")
+        Path("server/big/Dockerfile").write_text("FROM node:24-alpine\n")
+        line = ("[{n}] $ docker build --platform linux/arm64 -f server/big/Dockerfile -t games/{n}-engine:v-{s} .\n"
+                "{n}: 928413605543.dkr.ecr.us-west-1.amazonaws.com/games/{n}-engine:v-{s}\n")
+        cases = {
+            "cpu above the maximum": ("big", '{"cpu": 8192, "memory": 16384}', "not a Fargate size within"),
+            "memory above the maximum": ("big", '{"cpu": 4096, "memory": 16384}', "not a Fargate size within"),
+            "not a Fargate size": ("big", '{"cpu": 2048, "memory": 3000}', "not a Fargate size within"),
+            "a string": ("big", '{"cpu": "2048"}', "not a Fargate size within"),
+            "another setting": ("big", '{"cpu": 2048, "memory": 4096, "taskRoleArn": "x"}', "must be"),
+            "not JSON": ("big", "{", "not JSON"),
+            "the router's family": ("mp-router", None, "not a valid game id"),
+            "another game's preview family": ("preview-mptest", None, "not a valid game id"),
+            "the repositories' own name": ("engines", None, "not a valid game id"),
+        }
+        for why, (name, size, message) in cases.items():
+            with self.subTest(why):
+                if size is None:
+                    Path("server/big/mp-engine.json").unlink(missing_ok=True)
+                else:
+                    Path("server/big/mp-engine.json").write_text(size)
+                self.w.dry_run = DRY_RUN + line.format(n=name, s=SHA12)
+                self.w.pushed.clear()
+                with self.assertRaisesRegex(self.bu.StepError, message):
+                    self.bu.cmd_codebuild_images(None)
+                self.assertEqual(self.w.pushed, [], "refused before any push")
+        # Anything that is neither an engine nor the router is refused too.
+        self.w.dry_run = DRY_RUN + "x: 928413605543.dkr.ecr.us-west-1.amazonaws.com/games/other:v-%s\n" % SHA12
+        with self.assertRaisesRegex(self.bu.StepError, "neither an engine nor the router"):
             self.bu.cmd_codebuild_images(None)
 
     def test_router_inputs_follow_exactly_the_files_its_dockerfile_copies(self):
@@ -873,8 +929,9 @@ class TerraformWiringTests(unittest.TestCase):
         policy = self.block(self.bu, "aws_iam_role_policy", "games_mp_codebuild")
         for forbidden in ("secretsmanager", "iam:", "ecs:", "sts:"):
             self.assertNotIn(forbidden, policy)
-        # Main's code, pushing only production repositories; never the preview ones.
-        self.assertIn('if startswith(name, "games/")', policy)
+        # Main's code, pushing only production repositories (the engine repository and the
+        # router's); never the preview ones.
+        self.assertIn("Resource = local.games_mp_production_repo_arns", policy)
         self.assertIn('"${aws_s3_bucket.games_mp_build.arn}/sources/main/*"', policy)
         project = self.block(self.bu, "aws_codebuild_project", "games_mp_images")
         self.assertIn('type      = "S3"', project)
@@ -997,7 +1054,7 @@ class JoinTokenKeyTests(unittest.TestCase):
             self.assertNotIn("private", token)
             self.assertNotIn("signing", token)
         # Nor any engine revision: they get only their environment's public keys, at launch.
-        templates = local_expr((ROOT / "games-multiplayer-deploy.tf").read_text(), "games_mp_engine_templates")
+        templates = local_expr((ROOT / "games-multiplayer-deploy.tf").read_text(), "games_mp_engine_template")
         self.assertNotIn("games_mp_token", templates)
 
     def test_private_keys_reach_only_the_vercel_lobby(self):
