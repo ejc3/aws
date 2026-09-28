@@ -351,6 +351,16 @@ chgrp adm /var/log/setup-sync.log
 bash "$NEXT" >/var/log/setup-sync.log 2>&1
 RC=$?
 echo "setup-sync: finished rc=$RC"
+# 75 means setup stopped on purpose before finishing (it could not take the ndev lock).
+# Other codes keep their old meaning: health below decides.
+if [ "$RC" = 75 ]; then
+  echo "setup-sync: setup stopped early; NOT recording this etag, so the next run retries"
+  exit 1
+fi
+
+# A deleted checkout is not a failed unit: unpublish it before judging health, so one
+# removed worktree cannot hold every future setup run in a retry loop.
+[ ! -x /usr/local/bin/ndev-prune ] || /usr/local/bin/ndev-prune || echo "setup-sync: WARNING ndev-prune failed"
 
 FAILED=""
 for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
@@ -836,6 +846,13 @@ case "$DIR" in "/home/$WHO"|"/home/$WHO"/*) ;; *) echo "refusing: $DIR is outsid
 # One registry and one cloudflared config PER ZONE. A single shared registry would mean
 # rewriting both tunnels' ingress on every publish, so a malformed entry from one project
 # could break the other -- the exact coupling the separate tunnels exist to avoid.
+# Shared with ndev-prune and setup and held to exit (write -> rebuild -> enable), so a prune
+# cannot classify this label mid-publish or delete what this publish just wrote. fd 9 is
+# reused only when it already is this lock file, and flock runs either way: it returns at
+# once only when that open file really holds the lock. No environment variable is consulted;
+# the users' `NOPASSWD: ALL` sudo rule implies SETENV, so one would be trivially spoofed.
+[ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$(readlink -f /var/lib/ndev/.lock)" ] || exec 9>/var/lib/ndev/.lock
+flock -w 300 9 || { echo "refusing: another ndev publish or prune is still running; try again" >&2; exit 1; }
 REGISTRY=/var/lib/ndev/registry-$ZONE
 grep -v -P "^\Q$HOST\E\t" "$REGISTRY" > "$REGISTRY.new" 2>/dev/null || true
 printf '%s\t%s\t%s\t%s\n' "$HOST" "$PORT" "$WHO" "$DIR" >> "$REGISTRY.new"
@@ -880,6 +897,263 @@ echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$LABEL, enabled at boot)"
 REG
 chmod 755 /usr/local/bin/ndev-register
 
+# Deleting a checkout does not unpublish it. Its ndev@<label> unit, env file, drop-in,
+# registry row and ingress route all outlived the directory: in September 2026 two deleted
+# worktrees under ~skevh/worktrees each restarted 2,859 times, and setup-sync reported
+# failure every ten minutes because enabled units were not active. ndev@.service's
+# ExecCondition now stops the loop; this removes the leftovers.
+cat > /usr/local/bin/ndev-prune <<'PRUNE'
+#!/bin/bash
+# ndev-prune -- retire every published project whose directory no longer exists.
+#
+# A label is dead only when EVERY env file recorded for it (instances/<label>.env and, for
+# a user's base label, the legacy /var/lib/ndev/<label>.env) names a DIR that is not a
+# directory. For a dead label it stops and disables ndev@<label>, removes that label's
+# registry rows, rebuilds the affected zones' ingress with ndev-rebuild (the same code
+# ndev-register and boot use) and restarts only a tunnel whose config changed, then removes
+# the env files and the drop-in. A label with a live DIR is never touched, and a second run
+# finds nothing to do. DNS needs nothing: each zone has one wildcard record.
+set -euo pipefail
+NDEV=/var/lib/ndev
+
+# Shared with ndev-register and setup and held to exit, so a publish can never land between
+# deciding a label is dead and deleting its records, and the two never edit a registry at
+# once. When setup already holds it, it passes the locked file down as fd 9; flock on that
+# same open file returns at once, where opening the file again would wait on setup forever.
+[ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$(readlink -f "$NDEV/.lock")" ] || exec 9>"$NDEV/.lock"
+flock -w 600 9 || { echo "ndev-prune: timed out waiting for $NDEV/.lock" >&2; exit 1; }
+rm -f "$NDEV"/.prune.*        # left by a run that was killed; only prune makes them, under this lock
+TMP=$(mktemp "$NDEV/.prune.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
+field() { sed -n "s/^$1=//p" "$2" | head -n 1; }
+is_user() { case " ${join(" ", local.nextjs_users)} " in *" $1 "*) return 0 ;; esac; return 1; }
+# The env files that describe a label; the legacy one counts only for a real user's base label.
+records() {
+  local f
+  for f in "$NDEV/instances/$1.env" "$NDEV/$1.env"; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$NDEV/$1.env" ] && ! is_user "$1"; then continue; fi
+    echo "$f"
+  done
+}
+# dead <label>: true only when it has records and every one names a missing dir under /home.
+dead() {
+  local f dir found=1
+  for f in $(records "$1"); do
+    dir=$(field DIR "$f")
+    case "$dir" in
+      /home/?*) ;;
+      *) echo "ndev-prune: leaving $1 alone: $f has DIR='$dir'" >&2; return 1 ;;
+    esac
+    [ ! -d "$dir" ] || return 1
+    found=0
+  done
+  return "$found"
+}
+hosts_of() { local f; for f in $(records "$1"); do field HOST "$f"; done; }
+dirs_of() { local f; for f in $(records "$1"); do field DIR "$f"; done | sort -u; }
+
+# Two kinds of state outlive a run that could not finish, and both are retried here:
+#   .retry-<zone>      that zone's rebuild or tunnel restart failed. By the next run its
+#                      registry may already be clean (a cross-zone alias row leaves no other
+#                      trace), so the marker is what brings the zone back for a rebuild, and it
+#                      forces the restart even when ndev-rebuild reports no change.
+#   .retained-<label>  prune disabled the label but kept its records for that retry. If its
+#                      directory is back by now, it is re-published rather than left disabled.
+ZONES="" RZ="" RESTORE_FAILED=""
+for m in "$NDEV"/.retry-*; do [ -f "$m" ] && ZONES="$ZONES $${m#"$NDEV"/.retry-}"; done
+
+# restore <label>: put back the label's own registry row (as ndev-register writes it), queue
+# its zone for a rebuild, and re-enable its unit.
+restore() {
+  local f host port who dir zone reg
+  f=$(records "$1" | head -n 1)
+  host=$(field HOST "$f"); port=$(field PORT "$f"); who=$(field WHO "$f"); dir=$(field DIR "$f")
+  zone=$(/usr/local/bin/ndev-zone "$who" 2>/dev/null || true)
+  case "$host" in
+    ?*".$zone")
+      reg="$NDEV/registry-$zone"
+      touch "$reg"
+      { grep -v -P "^\Q$host\E\t" "$reg" || true; printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir"; } | sort -u > "$TMP"
+      cmp -s "$TMP" "$reg" || cat "$TMP" > "$reg"
+      RZ="$RZ $zone" ;;
+    *) echo "ndev-prune: WARNING $1: cannot tell the zone of '$host'; run ndev there to restore its route" ;;
+  esac
+  # The marker is the only thing that brings a live-again label back to this function, so
+  # it goes only once the unit is really enabled; a failure keeps (or creates) it.
+  if systemctl enable --now "ndev@$1.service" >/dev/null 2>&1; then
+    rm -f "$NDEV/.retained-$1"
+  else
+    echo "ndev-prune: WARNING could not re-enable ndev@$1; the next run retries"
+    touch "$NDEV/.retained-$1"
+    RESTORE_FAILED=1
+  fi
+}
+
+for m in "$NDEV"/.retained-*; do
+  [ -f "$m" ] || continue
+  label="$${m#"$NDEV"/.retained-}"
+  case "$label" in *[!a-z0-9-]*|"") rm -f "$m"; continue ;; esac
+  if [ -z "$(records "$label")" ]; then
+    rm -f "$m"
+  elif ! dead "$label"; then
+    echo "ndev-prune: $label's project dir is back; re-publishing it"
+    restore "$label"
+  fi
+done
+ZONES="$ZONES $RZ" RZ=""
+
+LABELS=$(
+  for f in "$NDEV"/instances/*.env; do [ -f "$f" ] && basename "$f" .env; done
+  for f in "$NDEV"/*.env; do [ -f "$f" ] && is_user "$(basename "$f" .env)" && basename "$f" .env; done
+  true
+)
+DEAD=""
+for label in $(printf '%s\n' "$LABELS" | sort -u); do
+  case "$label" in *[!a-z0-9-]*|"") echo "ndev-prune: skipping odd label '$label'"; continue ;; esac
+  dead "$label" || continue
+  echo "ndev-prune: $label is dead ($(dirs_of "$label" | tr '\n' ' ')gone); unpublishing"
+  DEAD="$DEAD $label"
+  systemctl disable --now "ndev@$label.service" >/dev/null 2>&1 || echo "ndev-prune: WARNING could not disable ndev@$label"
+  systemctl reset-failed "ndev@$label.service" >/dev/null 2>&1 || true
+done
+[ -n "$DEAD$${ZONES// /}" ] || exit 0
+
+# Registry rows: a row belongs to a dead label when it carries one of the label's hostnames
+# OR its recorded project dir. The dir match is what catches an alias in another zone, such
+# as a pinned route (local.nextjs_pinned_routes) to the same checkout. A row is dropped only
+# when its own recorded dir is empty or gone too, so a row pointing at a live checkout survives.
+LZ=""      # label@zone pairs: which zones each dead label's cleanup depends on
+for reg in "$NDEV"/registry-*; do
+  [ -f "$reg" ] || continue
+  zone="$${reg#"$NDEV"/registry-}"
+  case "$zone" in *.new) continue ;; esac
+  hosts="" dirs="" touched=""
+  for label in $DEAD; do
+    mine=""
+    for h in $(hosts_of "$label"); do
+      case "$h" in *".$zone") hosts="$hosts $h"; mine=1 ;; esac
+    done
+    for d in $(dirs_of "$label"); do
+      dirs="$dirs $d"
+      if awk -F'\t' -v d="$d" '$4 == d { found = 1 } END { exit !found }' "$reg"; then mine=1; fi
+    done
+    [ -z "$mine" ] || { LZ="$LZ $label@$zone"; touched=1; }
+  done
+  [ -n "$touched" ] || continue
+  ZONES="$ZONES $zone"
+  while IFS= read -r line || [ -n "$line" ]; do
+    IFS=$'\t' read -r h _ _ d _ <<<"$line"
+    drop=""
+    case " $hosts " in *" $h "*) drop=1 ;; esac
+    if [ -n "$d" ]; then case " $dirs " in *" $d "*) drop=1 ;; esac; fi
+    if [ -n "$drop" ] && { [ -z "$d" ] || [ ! -d "$d" ]; }; then
+      echo "ndev-prune: removed $h from $zone" >&2
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$reg" > "$TMP"
+  # The marker goes down BEFORE the rows do: a cross-zone alias row is this zone's only link
+  # to the dead project, so a run killed between here and rebuild_zones would otherwise
+  # leave nothing that tells the next run this zone's ingress is stale.
+  if ! cmp -s "$TMP" "$reg"; then
+    touch "$NDEV/.retry-$zone"
+    cat "$TMP" > "$reg"
+  fi
+done
+
+# A zone is rebuilt whenever a dead label's host or dir belongs to it, not only when its
+# registry changed in this run, so a run interrupted after the registry edit still fixes the
+# ingress next time. Only a zone whose config changed (or that is owed a retry) is restarted.
+FAILED=""
+rebuild_zones() {
+  local zone changed owed
+  for zone in $(printf '%s\n' "$@" | sort -u); do
+    owed=""
+    [ ! -f "$NDEV/.retry-$zone" ] || owed=1
+    # Marked before anything is attempted and cleared only on success, so a failed rebuild,
+    # a failed restart or a killed run all leave the zone owed to the next run -- including
+    # a restart that failed after the config was already written, which the next rebuild
+    # would otherwise report as unchanged.
+    touch "$NDEV/.retry-$zone"
+    changed=0
+    /usr/local/bin/ndev-rebuild "$zone" || changed=$?
+    if [ "$changed" = 0 ] && [ -n "$owed" ]; then changed=10; fi
+    case "$changed" in
+      10)
+        if systemctl restart "cloudflared@$zone"; then
+          rm -f "$NDEV/.retry-$zone"
+        else
+          echo "ndev-prune: WARNING cloudflared@$zone did not restart"
+          FAILED="$FAILED $zone"
+        fi ;;
+      0) rm -f "$NDEV/.retry-$zone" ;;
+      *)
+        echo "ndev-prune: WARNING ndev-rebuild $zone failed ($changed)"
+        FAILED="$FAILED $zone" ;;
+    esac
+  done
+}
+rebuild_zones $ZONES
+
+# Last, so an interrupted run leaves the env files and the next run finishes the job. A
+# label whose zone failed keeps its records, marked .retained-<label>, because they are the
+# only state the next run can find it by. Each label is re-checked before anything goes.
+RC=0
+for label in $DEAD; do
+  keep=""
+  for pair in $LZ; do
+    [ "$${pair%@*}" = "$label" ] || continue
+    case " $FAILED " in *" $${pair#*@} "*) keep="$${pair#*@}" ;; esac
+  done
+  if [ -n "$keep" ]; then
+    echo "ndev-prune: keeping $label's records so the next run retries $keep"
+    touch "$NDEV/.retained-$label"
+    RC=1
+    continue
+  fi
+  if ! dead "$label"; then
+    if [ -n "$(records "$label")" ]; then
+      echo "ndev-prune: $label's project dir is back; re-publishing it"
+      restore "$label"
+    fi
+    continue
+  fi
+  rm -f "$NDEV/instances/$label.env" "$NDEV/.retained-$label"
+  if is_user "$label"; then rm -f "$NDEV/$label.env"; fi
+  rm -rf "/etc/systemd/system/ndev@$label.service.d"
+done
+[ -z "$${RZ// /}" ] || rebuild_zones $RZ
+[ -z "$FAILED$RESTORE_FAILED" ] || RC=1
+systemctl daemon-reload
+exit "$RC"
+PRUNE
+chmod 755 /usr/local/bin/ndev-prune
+
+# Daily, at night, as well as on every setup run: with ExecCondition a dead project no
+# longer loops, but its hostname would keep a route to a closed port until setup next ran.
+# Nightly because a prune restarts the zone's cloudflared, briefly dropping its connections.
+cat > /etc/systemd/system/ndev-prune.service <<'UNIT'
+[Unit]
+Description=Unpublish ndev projects whose directory has been deleted
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ndev-prune
+UNIT
+cat > /etc/systemd/system/ndev-prune.timer <<'UNIT'
+[Unit]
+Description=Nightly ndev-prune
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 # ---------------------------------------------------------------- durability
 # WHY THESE UNITS EXIST: this box is a spot instance, so AWS reclaims it and restarts it
 # without warning -- twice in one hour on 2026-07-25. cloudflared came back on its own
@@ -895,15 +1169,34 @@ cat > /usr/local/bin/ndev-run <<'RUN'
 #!/bin/bash
 # Started by ndev@<label>.service. Reads what ndev-register recorded and serves it.
 # %i is the hostname left-label (ejc3 or ejc3-<slug>), not necessarily a unix user.
+#
+# `ndev-run --check <label>` is the unit's ExecCondition. Exit 1 there means "skip this
+# start": systemd leaves the unit inactive rather than failed, and Restart=always does not
+# apply to a skipped condition. Without it a deleted checkout made `cd` fail, and the unit
+# restarted every 10 seconds forever.
 set -euo pipefail
+CHECK=""
+if [ "$${1:-}" = "--check" ]; then CHECK=1; shift; fi
 LABEL="$1"
 ENVF="/var/lib/ndev/instances/$LABEL.env"
 # Legacy single-file layout (pre multi-instance): /var/lib/ndev/$USER.env
 if [ ! -f "$ENVF" ] && [ -f "/var/lib/ndev/$LABEL.env" ]; then
   ENVF="/var/lib/ndev/$LABEL.env"
 fi
-[ -f "$ENVF" ] || { echo "$LABEL has not published a project yet" >&2; exit 0; }
-. "$ENVF"
+DIR=""
+[ ! -f "$ENVF" ] || . "$ENVF"
+WHY=""
+if [ ! -f "$ENVF" ]; then
+  WHY="$LABEL has not published a project yet"
+elif [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
+  WHY="ndev@$LABEL: project dir $DIR is gone; run 'sudo ndev-prune' or re-publish with ndev"
+fi
+if [ -n "$WHY" ]; then
+  echo "$WHY" >&2
+  [ -z "$CHECK" ] || exit 1
+  exit 0    # removed while starting: one restart, then the condition skips it
+fi
+[ -z "$CHECK" ] || exit 0
 cd "$DIR"
 # node_modules lives on the root volume and survives reboots, but a fresh volume (or a
 # dependency change) would otherwise leave the service crash-looping on a missing module.
@@ -932,6 +1225,8 @@ User=%i
 WorkingDirectory=/home/%i
 Environment=HOME=/home/%i
 Environment=NODE_ENV=development
+# Skip (inactive, not failed, no restart) when nothing is published or its dir is gone.
+ExecCondition=/usr/local/bin/ndev-run --check %i
 ExecStart=/usr/local/bin/ndev-run %i
 Restart=always
 RestartSec=10
@@ -1229,6 +1524,21 @@ UNIT
 
 systemctl daemon-reload
 
+# Everything that writes /var/lib/ndev (registries, env files, drop-ins) holds the lock that
+# ndev-register and ndev-prune take, so a user publishing during a setup run cannot interleave
+# with it. The helpers called inside inherit the held lock as fd 9 and reuse it (see
+# ndev-prune) instead of waiting on this script. Released between the two stretches, so a
+# publish is not held up by the user setup in between.
+ndev_lock() {
+  exec 9>/var/lib/ndev/.lock
+  # Never go on without it: that is exactly the interleaving the lock exists to prevent.
+  # Exit 75 (EX_TEMPFAIL) is the one code setup-sync treats as "not applied": it leaves the
+  # etag unrecorded, so the whole script runs again in 10 minutes.
+  flock -w 900 9 || { echo "ERROR: /var/lib/ndev/.lock still held after 15 min; stopping setup, setup-sync will retry"; exit 75; }
+}
+ndev_unlock() { flock -u 9; exec 9>&-; }
+ndev_lock
+
 # Split the old single shared registry into one per zone. Without this the per-zone config
 # is rebuilt from a registry that does not exist yet, so every already-published hostname
 # silently drops to the 404 catch-all: the site stays reachable through Access and then
@@ -1271,6 +1581,12 @@ Environment=HOME=/home/$u
 EOF
 done
 
+# Unpublish projects whose directory was deleted, before the ingress rebuild below and
+# before the re-enable loop further down, so neither brings a dead one back. The timer
+# repeats it nightly between setup runs.
+/usr/local/bin/ndev-prune || echo "WARNING: ndev-prune did not finish cleanly"
+systemctl enable --now ndev-prune.timer >/dev/null 2>&1 || echo "WARNING: ndev-prune.timer not enabled"
+
 # Build each zone's ingress from its registry. Also the reason a fresh box has a working
 # tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
 # Pinned routes (local.nextjs_pinned_routes). Appended to the zone's registry before the
@@ -1281,12 +1597,19 @@ pin_route() {
   case "$host" in *".$zone") ;; *) echo "pin: $host is not under $zone, skipping"; return 0 ;; esac
   touch "$reg"
   grep -v -P "^\Q$host\E\t" "$reg" > "$reg.new" || true
-  printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir" >> "$reg.new"
+  # A pinned route follows its checkout: once the directory is gone, drop the row instead of
+  # routing the alias to a port nothing listens on (ndev-prune removes it the same way).
+  if [ -d "$dir" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$who" "$dir" >> "$reg.new"
+  else
+    echo "pin: not routing $host, $dir is gone"
+  fi
   sort -u "$reg.new" > "$reg" && rm -f "$reg.new"
 }
 ${local.nextjs_pinned_rows}
 
 ${local.nextjs_zone_rebuild}
+ndev_unlock
 
 # Templated per zone: cloudflared serves ONE tunnel per process, so two zones means two
 # services. cloudflared@cc-games.dev and cloudflared@dolphin-labs.dev fail and restart
@@ -1586,11 +1909,15 @@ AGENTSMD
   chown "$u:$u" "$CFG" 2>/dev/null || true
   { [ -s "/home/$u/.codex/auth.json" ] && [ -x "$CODEX_STANDALONE" ]; } && systemctl enable --now "codex-rc@$u.service" 2>/dev/null || true
   # Re-enable previously published projects (per-instance env files).
+  ndev_lock
   for envf in /var/lib/ndev/instances/*.env; do
     [ -s "$envf" ] || continue
     # shellcheck disable=SC1090
     WHO_LINE=$(grep -E '^WHO=' "$envf" | head -1 | cut -d= -f2- || true)
     [ "$WHO_LINE" = "$u" ] || continue
+    # ndev-prune ran above and removed dead projects; never re-enable one it missed.
+    DIR_LINE=$(sed -n 's/^DIR=//p' "$envf" | head -1)
+    [ -n "$DIR_LINE" ] && [ -d "$DIR_LINE" ] || { echo "not re-enabling $envf: DIR '$DIR_LINE' is gone"; continue; }
     label=$(basename "$envf" .env)
     DROP_DIR="/etc/systemd/system/ndev@$label.service.d"
     mkdir -p "$DROP_DIR"
@@ -1604,9 +1931,11 @@ EOF
     systemctl enable --now "ndev@$label.service" 2>/dev/null || true
   done
   # Legacy single-file layout until migrated below.
-  if [ -s "/var/lib/ndev/$u.env" ] && [ ! -s "/var/lib/ndev/instances/$u.env" ]; then
+  if [ -s "/var/lib/ndev/$u.env" ] && [ ! -s "/var/lib/ndev/instances/$u.env" ] &&
+     [ -d "$(sed -n 's/^DIR=//p' "/var/lib/ndev/$u.env" | head -1)" ]; then
     systemctl enable --now "ndev@$u.service" 2>/dev/null || true
   fi
+  ndev_unlock
 done
 
 # ---------------------------------------------------------------- nightly agent update
