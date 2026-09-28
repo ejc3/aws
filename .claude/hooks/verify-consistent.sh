@@ -50,8 +50,17 @@ else
   problems+=("Branch '$branch' has no upstream. Push it: git push -u origin $branch")
 fi
 
-# 3. Terraform drift -- live AWS must match config
-if command -v terraform >/dev/null 2>&1; then
+# 3. Terraform drift -- live AWS must match config. Only origin/main is ever applied, so only
+# a checkout of origin/main is compared with live AWS. Any other branch predates or differs
+# from what is applied, and planning it reports the difference as "drift" that must not be
+# "fixed" (a review branch built on an old base did exactly that).
+git fetch -q origin main 2>/dev/null || true
+at_main=0
+[ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && at_main=1
+if [ "$branch" = main ] && [ "$at_main" = 0 ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)" -gt 0 ]; then
+  problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
+fi
+if [ "$at_main" = 1 ] && command -v terraform >/dev/null 2>&1; then
   tflog="/tmp/stop-hook-tfplan.log"
   terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
   rc=$?
