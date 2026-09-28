@@ -344,6 +344,8 @@ def broker(instance_id, token, expires):
         Tags=[
             # Role=github-runner so fcvm's cleanup also sweeps this parameter once it expires.
             {'Key': 'Role', 'Value': 'github-runner'},
+            # Fleet: the only parameters this controller may delete (runner-app.tf), never fcvm's.
+            {'Key': 'Fleet', 'Value': 'github-app-runner'},
             {'Key': 'InstanceArn', 'Value': f'arn:aws:ec2:{REGION}:{account}:instance/{instance_id}'},
             {'Key': 'CredentialExpiresAt', 'Value': expires.astimezone(timezone.utc).isoformat()},
         ])

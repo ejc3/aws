@@ -29,6 +29,16 @@ class FreshnessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 freshness.pinned_version("  runner_user_data = <<-EOF\n" + body + "\nEOF")
 
+    def test_app_runner_pin_is_watched_and_matches_fcvm(self):
+        app = freshness.pinned_app_version((ROOT / "runner-app" / "bootstrap.sh").read_text())
+        fcvm = freshness.pinned_version((ROOT / "runner-autoscale.tf").read_text())
+        self.assertEqual(app, fcvm, "both fleets must pin one runner version: the check watches it for both")
+        self.assertEqual(freshness.pinned_versions(), fcvm)
+        for body in ("RUNNER_VERSION=$(curl example)", "RUNNER_VERSION='latest'",
+                     "RUNNER_VERSION='2.337.0'\nRUNNER_VERSION='2.338.0'", ""):
+            with self.assertRaises(ValueError):
+                freshness.pinned_app_version(body)
+
     def test_current_stable_passes_despite_newer_draft_and_prerelease(self):
         self.assertEqual(freshness.assess("2.337.0", [release(),
             release("v2.338.0", draft=True), release("v2.338.0-rc1", prerelease=True)])[0], 0)

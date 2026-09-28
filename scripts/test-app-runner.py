@@ -271,6 +271,7 @@ class LaunchTests(unittest.TestCase):
         (put,) = ssm.put
         self.assertEqual(put["Name"], f"/github-runner/bootstrap/{ec2.instances[0]['InstanceId']}")
         self.assertIn({"Key": "InstanceArn", "Value": f"arn:aws:ec2:us-west-1:123456789012:instance/{ec2.instances[0]['InstanceId']}"}, put["Tags"])
+        self.assertIn({"Key": "Fleet", "Value": "github-app-runner"}, put["Tags"])
         self.assertIn(f"REPO='{COLTON}'", kw["UserData"])
         self.assertIn("LABELS='cc-games,xl'", kw["UserData"])
         self.assertNotIn("REGTOKEN", kw["UserData"], "the registration token must never be in user data")
@@ -1033,6 +1034,11 @@ class WiringTests(unittest.TestCase):
         self.assertIn('"ec2:Owner" = [local.runner_app_ami_owner, "amazon"]', policy)
         self.assertNotRegex(policy, r'Action\s*=\s*"ec2:\*"')
         self.assertIn("aws_secretsmanager_secret.github_runner_repo_pat[repo].arn", policy)
+        # fcvm's bootstrap credentials share the path and Role tag: only Fleet tells them apart.
+        for sid, key in (("DeleteBrokeredCredentialOnly", "aws:ResourceTag/Fleet"),
+                         ("BrokerInstanceBoundBootstrapCredential", "aws:RequestTag/Fleet")):
+            block = policy.split('Sid      = "%s"' % sid, 1)[1].split("},\n      {", 1)[0]
+            self.assertIn('"%s" = "github-app-runner"' % key, block, sid)
 
     def test_app_hosts_get_their_own_role_that_reads_only_their_own_credential(self):
         """App runners run outside code; fcvm's github-runner-role can write security records

@@ -321,7 +321,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Action   = ["ssm:PutParameter", "ssm:AddTagsToResource"]
         Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
         Condition = {
-          StringEquals = { "aws:RequestTag/Role" = "github-runner" }
+          StringEquals = { "aws:RequestTag/Role" = "github-runner", "aws:RequestTag/Fleet" = "github-app-runner" }
           StringLike   = { "aws:RequestTag/InstanceArn" = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/i-*" }
         }
       },
@@ -341,12 +341,13 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Condition = { StringEquals = { "cloudwatch:namespace" = "GitHubAppRunner" } }
       },
       {
+        # Only this fleet's credentials: fcvm's share the path and the Role tag, not Fleet.
         Sid      = "DeleteBrokeredCredentialOnly"
         Effect   = "Allow"
         Action   = "ssm:DeleteParameter"
         Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
         Condition = {
-          StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
+          StringEquals = { "aws:ResourceTag/Role" = "github-runner", "aws:ResourceTag/Fleet" = "github-app-runner" }
         }
       },
     ]
