@@ -76,11 +76,16 @@ FUNCTIONS = {
     "production": {"LAUNCH_ENV": "production", "ENV_CEILING": "4",
                    "API_BASE": r"^https://cc-games\.app$", "ALLOW_BYPASS": "false",
                    "TOKEN_PUBLIC_KEYS": PROD_KEYS,
-                   "GAMES": json.dumps({"mptest": {"family": "games-mptest", "repository": REPO}})},
+                   "GAMES": json.dumps({"mptest": {"family": "games-mptest", "repository": REPO},
+                                        # A game Terraform knows whose image no release has yet.
+                                        "starfall-arena": {"family": "games-starfall-arena",
+                                                           "repository": REPO.replace("mptest", "starfall-arena")}})},
     "preview": {"LAUNCH_ENV": "preview", "ENV_CEILING": "2",
                 "API_BASE": r"^https://colton-games-[a-z0-9-]+-coltons-projects-7f9a4e8b\.vercel\.app$",
                 "ALLOW_BYPASS": "true", "TOKEN_PUBLIC_KEYS": PREVIEW_KEYS,
-                "GAMES": json.dumps({"mptest": {"family": "games-preview-mptest", "repository": PREVIEW_REPO}})},
+                "GAMES": json.dumps({"mptest": {"family": "games-preview-mptest", "repository": PREVIEW_REPO},
+                                     "starfall-arena": {"family": "games-preview-starfall-arena",
+                                                        "repository": PREVIEW_REPO.replace("mptest", "starfall-arena")}})},
 }
 
 
@@ -603,6 +608,18 @@ class LaunchTests(unittest.TestCase):
         ecs = FakeECS()
         self.assertEqual(self.invoke(ecs, start_event()), {"ok": False, "error": "unknown-sim-version"})
         self.assertEqual(ecs.run, [])
+
+    def test_a_known_game_with_no_released_revision_is_refused_cleanly(self):
+        # local.mp_games gains a game before any commit builds its image: every release lacks
+        # it, so both functions refuse it without touching ECS, and mptest still launches.
+        for env, event in (("production", start_event(game="starfall-arena", simVersion="starfall-arena-1")),
+                           ("preview", preview_event(game="starfall-arena", simVersion="starfall-arena-1"))):
+            with self.subTest(env=env):
+                ecs = FakeECS()
+                self.assertEqual(self.invoke(ecs, event, env), {"ok": False, "error": "unknown-sim-version"})
+                self.assertEqual(ecs.run, [])
+        ecs = FakeECS()
+        self.assertTrue(self.invoke(ecs, start_event())["ok"])
 
     # -- which revision: preview --------------------------------------------------------------
 

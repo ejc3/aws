@@ -17,9 +17,12 @@ WHICH CHANNEL is decided by the project that built it, never by anything the bui
   games-mp-migrate         main    the mp Supabase migrations of a main commit, then promote it
 
 A MAIN BUILD (SUCCEEDED):
-  1. registers one engine task definition revision per game in `games-<game>` (the shape
-     Terraform gives it in ENGINE_TEMPLATES, including MP_TOKEN_VERIFIER), for the image
-     `<simVersion>-<sha12>` the build pushed;
+  1. registers one engine task definition revision in `games-<game>` (the shape Terraform
+     gives it in ENGINE_TEMPLATES, including MP_TOKEN_VERIFIER) for each game the commit built,
+     for the image `<simVersion>-<sha12>` the build pushed. A game Terraform knows but the
+     commit's scripts/mp-images.mjs does not list yet is simply not in this release (a game is
+     added to Terraform before its image; games-mp-launch refuses it with
+     `unknown-sim-version` until a release has it);
   2. if the commit's mp schema revision is not the database's (`schema#main`), starts
      games-mp-migrate on the same source and stops here; that build's success continues at 3;
   3. PROMOTES: `current#main` becomes this commit's revisions, unless a newer main commit (a
@@ -184,10 +187,12 @@ def build_info(build_id):
 
 
 def built_images(channel, commit, exported):
-    """{game: (tag, simVersion, digest)} for every game, checked against ECR.
+    """{game: (tag, simVersion, digest)} for every game the build reports, checked against ECR.
 
     A preview build runs untrusted code, so its report is only a hint: each tag must be
-    `<simVersion>-<its commit's 12 hex>` and exist in that game's repository for the channel."""
+    `<simVersion>-<its commit's 12 hex>` and exist in that game's repository for the channel.
+    A game with no image in the report is left out (its image may not exist yet); a build that
+    reports no engine at all is an error."""
     try:
         images = json.loads(exported.get("GAMES_MP_IMAGES") or "")
     except ValueError:
@@ -197,11 +202,15 @@ def built_images(channel, commit, exported):
     out = {}
     for game, template in sorted(ENGINE_TEMPLATES.items()):
         repo = template[channel]["repository"]
+        if repo not in images:
+            continue
         tag = images.get(repo)
         m = re.fullmatch(r"(.+)-([0-9a-f]{12})", tag) if isinstance(tag, str) else None
         if not m or m.group(2) != commit[:12] or not SIM_VERSION.fullmatch(m.group(1)):
             raise ReleaseError("%s: no image for %s at %s (got %r)" % (channel, game, commit[:12], tag))
         out[game] = (tag, m.group(1), image_digest(repo, tag))
+    if not out:
+        raise ReleaseError("%s build of %s reports no engine image for any known game" % (channel, commit[:12]))
     return out
 
 

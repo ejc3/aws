@@ -692,8 +692,9 @@ def cmd_releases_bootstrap(args):
     automatic one, so production launches never pause for it. For each game, the newest ACTIVE
     revision of its production family whose engine image is <its repository>:<sim>-<sha12> and
     that carries MP_TOKEN_VERIFIER (what Terraform registered). Written only if the item is
-    missing; with no such revision (a platform built from nothing) nothing is written, and the
-    first main release creates it."""
+    missing, with the games that have such a revision (a game added before its first image has
+    none, and games-mp-launch refuses it until a release has it); with none at all (a platform
+    built from nothing) nothing is written, and the first main release creates it."""
     games = json.loads(args.games)
     found = aws("dynamodb", "get-item", "--region", args.region, "--table-name", args.table,
                 "--key", json.dumps({"id": {"S": "current#main"}}), "--consistent-read")
@@ -715,10 +716,13 @@ def cmd_releases_bootstrap(args):
                 current[game] = {"M": {"taskDefinition": {"S": arn}, "simVersion": {"S": m.group(1)}}}
                 commits.add(m.group(2))
                 break
-    if set(current) != set(games):
-        log("no registered revision for %s: the first main release will create current#main"
-            % ", ".join(sorted(set(games) - set(current))))
+    missing = sorted(set(games) - set(current))
+    if not current:
+        log("no registered revision for any game: the first main release will create current#main")
         return
+    if missing:
+        log("no registered revision for %s yet: left out of current#main until a release has it"
+            % ", ".join(missing))
     item = {"id": {"S": "current#main"}, "seq": {"N": "0"}, "games": {"M": current},
             "commit": {"S": ",".join(sorted(commits))}, "bootstrap": {"BOOL": True}}
     aws("dynamodb", "put-item", "--region", args.region, "--table-name", args.table, "--item", json.dumps(item),

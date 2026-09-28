@@ -262,11 +262,18 @@ CodeBuild finished  --EventBridge-->  games-mp-release
   get only their environment's public keys, and carry the token-verifier marker (the release
   registers every revision with it). The router rolls only from `main`.
 
-**Adding a game** takes three entries:
+**Adding a game** takes two entries, made in this order:
 
-- one in `local.mp_games` (an id that does not begin with `preview-`);
-- its image in the games repo's `scripts/mp-images.mjs`;
-- nothing else: its repositories, families and releases follow from the first.
+1. One in `local.mp_games`, with an id that does not begin with `preview-`. Apply it before
+   any branch builds the image. Its repositories and families follow from this entry.
+2. Its image in the games repo's `scripts/mp-images.mjs`.
+
+The order matters because a commit builds only the images its own `mp-images.mjs` lists.
+
+- **Entry first:** until a commit builds the image, every release simply leaves the game
+  out, and `games-mp-launch` refuses it with `unknown-sim-version`.
+- **Image first:** a branch that lists an image with no entry has no repository to push to,
+  and its build fails.
 
 ## Rotating secrets
 

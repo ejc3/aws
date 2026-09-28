@@ -126,13 +126,24 @@ variable "mp_router_envs" {
 }
 
 locals {
-  # ADDING A GAME IS ONE ENTRY HERE plus its SIM_VERSION in var.games_mp_sim_versions (and
-  # an image in the games repo's scripts/mp-images.mjs). The key is the contract's game
-  # id: it names the ECR repository `games/<id>-engine`, the task definition `games-<id>`,
-  # and the log stream prefix.
+  # ADDING A GAME IS ONE ENTRY HERE, plus its image in the games repo's scripts/mp-images.mjs
+  # (which sets its simVersion; Terraform no longer pins one). The key is the contract's game
+  # id: it names the ECR repositories `games/<id>-engine` and `games-preview/<id>-engine`, the
+  # task definition families `games-<id>` and `games-preview-<id>` (registered by
+  # games-mp-release, never by Terraform), and the log stream prefix.
+  #
+  # ADD THE ENTRY FIRST, then the image. A commit builds only the images its own
+  # mp-images.mjs lists, so an entry with no image yet builds nothing, and games-mp-release
+  # releases the games a commit did build (a game it did not build keeps no revision in that
+  # release); games-mp-launch answers `unknown-sim-version` for a game with no released
+  # revision. The other order fails: a branch listing an image with no entry here has no
+  # repository to push to, so its build fails.
+  #
   # Sizes are the contract's 2 vCPU / 4 GB; a game may override them if it needs to.
   mp_games = {
-    mptest = { cpu = 2048, memory = 4096 }
+    mptest           = { cpu = 2048, memory = 4096 }
+    starfall         = { cpu = 2048, memory = 4096 } # Starfall: Hero League (colton-games #72/#74)
+    "starfall-arena" = { cpu = 2048, memory = 4096 } # Starfall Arena
   }
 
   mp_cluster_name = "games"

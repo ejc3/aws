@@ -49,6 +49,9 @@ TEMPLATES = {"mptest": {
     "preview": {"family": "games-preview-mptest", "repository": "games-preview/mptest-engine",
                 "repositoryUrl": REGISTRY + "/games-preview/mptest-engine"},
 }}
+# A game Terraform knows before any commit builds its image (games-multiplayer.tf mp_games): every
+# release test below runs with it present and unbuilt.
+TEMPLATES["starfall-arena"] = json.loads(json.dumps(TEMPLATES["mptest"]).replace("mptest", "starfall-arena"))
 
 
 def load(name, env):
@@ -556,6 +559,33 @@ class ReleaseTests(unittest.TestCase):
                     self.invoke(event)
                 self.assertEqual(self.ecs.registered, [])
                 self.assertNotEqual(self.ddb.get("build#preview#" + BRANCH)["status"], "released")
+
+    def test_a_game_with_no_image_yet_is_left_out_and_one_with_an_image_is_released(self):
+        # Terraform lists starfall-arena; this commit's mp-images.mjs does not build it yet.
+        self.invoke(self.main_built())
+        current = self.ddb.get("current#main")
+        self.assertEqual(sorted(current["games"]), ["mptest"])
+        self.assertEqual([td["family"] for td in self.ecs.registered], ["games-mptest"])
+        # A later commit that builds it releases both.
+        self.ecr.add("games/starfall-arena-engine", "starfall-arena-1-" + MAIN2[:12])
+        self.ddb.put("build#main#" + MAIN2, status="building", seq=2, channel="main", commit=MAIN2)
+        self.ecr.add("games/mptest-engine", "mptest-1-" + MAIN2[:12])
+        self.ecr.add("games/mp-router", MAIN2[:12], "sha256:router-" + MAIN2[:4])
+        self.invoke(self.cb.finish("games-mp-images:x", "games-mp-images", MAIN2, {
+            "GAMES_MP_IMAGES": json.dumps({"games/mp-router": MAIN2[:12],
+                                           "games/mptest-engine": "mptest-1-" + MAIN2[:12],
+                                           "games/starfall-arena-engine": "starfall-arena-1-" + MAIN2[:12]}),
+            "GAMES_MP_ROUTER_INPUTS": INPUTS_A, "GAMES_MP_SCHEMA_REVISION": "1"}))
+        current = self.ddb.get("current#main")
+        self.assertEqual(current["commit"], MAIN2)
+        self.assertEqual(current["games"]["starfall-arena"]["simVersion"], "starfall-arena-1")
+        self.assertEqual(self.ddb.get("sim#starfall-arena#starfall-arena-1")["commit"], MAIN2)
+
+    def test_a_build_reporting_no_engine_at_all_is_an_error(self):
+        event = self.preview_built(images={"games-preview/unknown-engine": "x-1-" + BRANCH[:12]})
+        with self.assertRaisesRegex(self.r.ReleaseError, "no engine image"):
+            self.invoke(event)
+        self.assertEqual(self.ecs.registered, [])
 
     # -- main ---------------------------------------------------------------------------------
 

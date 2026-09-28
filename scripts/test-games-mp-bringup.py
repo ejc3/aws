@@ -662,6 +662,13 @@ class BootstrapTests(Base):
         self.bu.cmd_releases_bootstrap(rb)
         self.assertEqual(self.w.ddb["current#main"]["commit"]["S"], "later")
 
+    def test_a_game_with_no_revision_yet_is_left_out(self):
+        self.td(3, "%s:mptest-1-%s" % (self.REPO_URL, SHA12))
+        games = dict(self.GAMES, **{"starfall-arena": {"family": "games-starfall-arena",
+                                                       "repositoryUrl": self.REPO_URL.replace("mptest", "starfall-arena")}})
+        self.bu.cmd_releases_bootstrap(args(table="games-mp-releases", games=json.dumps(games)))
+        self.assertEqual(sorted(self.w.ddb["current#main"]["games"]["M"]), ["mptest"])
+
     def test_nothing_registered_writes_nothing(self):
         self.bu.cmd_releases_bootstrap(args(table="games-mp-releases", games=json.dumps(self.GAMES)))
         self.assertEqual(self.w.ddb, {})
