@@ -71,8 +71,8 @@ scripts/test-games-mp-launch.py against fake ECS clients.
 import json
 import os
 import re
+import hashlib
 import time
-import uuid
 
 CLUSTER = os.environ.get("CLUSTER", "games")
 SUBNETS = [s for s in os.environ.get("SUBNETS", "").split(",") if s]
@@ -384,19 +384,36 @@ def start(env, event):
     return {"ok": True, "taskArn": arn, "taskDefinition": task_definition, "engines": total + 1}
 
 
+# How many engines of one match may die and be replaced within one launch call.
+MAX_GENERATIONS = 5
+
+
 def _run_task(ecs, params, env, match):
-    """RunTask with clientToken = <env>-<match id>, so a retry after a lost response cannot start a
-    second engine. ECS answers a reused token with that token's ORIGINAL task, which after a
-    failed or stopped engine is a terminal one, or, if the parameters changed, with
-    ConflictException naming the task(s) already tied to the token. Only when that original
-    task is confirmed terminal does the match get a new engine, under a token of its own; a live
-    one, or one ECS cannot show yet (a cold start can see neither the listing nor the task), is
-    returned as the match's engine instead."""
+    """RunTask idempotently across retries, through every replacement of a dead engine.
+
+    The first launch uses clientToken <env>-<match id>. ECS answers a reused token with that
+    token's ORIGINAL task, or, if the parameters changed, with ConflictException naming it. A
+    live original (or one ECS cannot show yet: a cold start can see neither the listing nor the
+    task) IS the match's engine. A confirmed-terminal one is replaced under a token DERIVED from
+    it, <env>-<match id>-<12 hex of its ARN>: a retry after the replacement's own response was
+    lost derives the same token and so resolves to the same replacement, never a second one."""
+    token = "%s-%s" % (env, match)
+    for _ in range(MAX_GENERATIONS):
+        state, found = _launch_or_resolve(ecs, dict(params, clientToken=token), env, match)
+        if state == "live":
+            return found
+        token = "%s-%s-%s" % (env, match, hashlib.sha256(found.encode()).hexdigest()[:12])
+    raise RuntimeError("match %s/%s: %d engines in a row were already dead" % (env, match, MAX_GENERATIONS))
+
+
+def _launch_or_resolve(ecs, params, env, match):
+    """("live", RunTask-shaped reply) for the token's live task, or ("dead", its terminal ARN)."""
     try:
         out = ecs.run_task(**params)
         task = (out.get("tasks") or [{}])[0]
         if not _terminal(task):
-            return out
+            return "live", out
+        return "dead", task["taskArn"]
     except Exception as error:  # botocore ClientError; the code is what matters
         response = getattr(error, "response", None) or {}
         if response.get("Error", {}).get("Code") != "ConflictException":
@@ -407,15 +424,15 @@ def _run_task(ecs, params, env, match):
         seen = _describe(ecs, originals)
         for arn in originals:
             if arn not in seen:
-                return {"tasks": [{"taskArn": arn}], "failures": []}   # ours, not listed yet
+                return "live", {"tasks": [{"taskArn": arn}], "failures": []}   # ours, not listed yet
             task = seen[arn]
             if _terminal(task):
                 continue
             if _tag(task, "env") != env or _tag(task, "match") != match:
                 # Never adopt another environment's or match's engine as this one's.
                 raise RuntimeError("clientToken for %s/%s is tied to a foreign task %s" % (env, match, arn))
-            return {"tasks": [{"taskArn": arn}], "failures": []}
-    return ecs.run_task(**dict(params, clientToken="%s-%s-%s" % (env, match, uuid.uuid4().hex[:12])))
+            return "live", {"tasks": [{"taskArn": arn}], "failures": []}
+        return "dead", sorted(originals)[-1]
 
 
 def _terminal(task):

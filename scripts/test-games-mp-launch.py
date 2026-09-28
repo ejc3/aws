@@ -527,6 +527,33 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.invoke(ecs, start_event(50))
 
+    def test_a_lost_replacement_response_never_starts_a_second_replacement(self):
+        # Engine 1 dies; a warm retry replaces it (engine 2). Engine 2's reply is lost and the
+        # next retry lands in a fresh environment where ECS shows neither task yet.
+        ecs = FakeECS([])
+        first = self.invoke(ecs, start_event(50))
+        for t in ecs.tasks.values():
+            t["lastStatus"] = "STOPPED"; t["desiredStatus"] = "STOPPED"
+        replacement = self.invoke(ecs, start_event(50))
+        self.lf._recent.clear()
+        ecs.visible = False
+        retry = self.invoke(ecs, start_event(50))
+        self.assertEqual(retry["taskArn"], replacement["taskArn"])
+        live = [a for a, t in ecs.tasks.items() if t["desiredStatus"] != "STOPPED"]
+        self.assertEqual(live, [replacement["taskArn"]], "exactly one live engine for the match")
+
+    def test_each_dead_generation_gets_its_own_deterministic_token(self):
+        ecs = FakeECS([])
+        seen = []
+        for _ in range(3):
+            out = self.invoke(ecs, start_event(50))
+            seen.append(out["taskArn"])
+            for t in ecs.tasks.values():
+                t["lastStatus"] = "STOPPED"; t["desiredStatus"] = "STOPPED"
+        self.assertEqual(len(set(seen)), 3, "each replacement is a new engine")
+        tokens = [c["clientToken"] for c in ecs.run]
+        self.assertEqual(len(tokens), len(set(tokens)) + 3, "each retry re-sends earlier tokens, then one new one")
+
     def test_a_replacement_with_changed_parameters_survives_the_token_conflict(self):
         ecs = FakeECS([])
         first = self.invoke(ecs, start_event(50))
