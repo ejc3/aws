@@ -27,11 +27,13 @@ data "aws_iam_policy_document" "games_mp_observe" {
   statement {
     sid     = "ReadGamesBuilds"
     actions = ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"]
-    resources = [
-      aws_codebuild_project.games_mp_images.arn,
-      aws_codebuild_project.games_mp_images_preview.arn,
-      aws_codebuild_project.games_mp_migrate.arn,
-    ]
+    # ListBuildsForProject is authorized on the project, BatchGetBuilds on its builds
+    # (build/<project>:<id>).
+    resources = flatten([for p in [
+      aws_codebuild_project.games_mp_images,
+      aws_codebuild_project.games_mp_images_preview,
+      aws_codebuild_project.games_mp_migrate,
+    ] : [p.arn, "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:build/${p.name}:*"]])
   }
 
   statement {
@@ -99,7 +101,9 @@ data "aws_iam_policy_document" "games_mp_observe" {
   }
 
   statement {
-    # The one secret: MP_TEST_KEY, for the live smoke. Its exact ARN, nothing wider.
+    # The one secret: MP_TEST_KEY, for the live smoke. Its exact ARN, nothing wider. Its
+    # resource policy (games_mp_admin_only in games-multiplayer-bringup.tf) names these two
+    # roles too; without that its Deny would override this.
     sid       = "ReadMpTestKey"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.games_mp_test_key.arn]

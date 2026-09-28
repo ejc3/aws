@@ -186,12 +186,15 @@ resource "aws_secretsmanager_secret_version" "games_mp_cron_secret" {
   secret_string = random_password.games_mp_cron_secret.result
 }
 
+# The test key is also readable by the dev roles, for the live smoke from a dev box
+# (games-multiplayer-observe.tf grants them GetSecretValue on it; this Deny would otherwise
+# override that). The cron secret stays administration-only.
 resource "aws_secretsmanager_secret_policy" "games_mp_admin_only" {
   for_each = {
-    test_key    = aws_secretsmanager_secret.games_mp_test_key.arn
-    cron_secret = aws_secretsmanager_secret.games_mp_cron_secret.arn
+    test_key    = { arn = aws_secretsmanager_secret.games_mp_test_key.arn, readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn] }
+    cron_secret = { arn = aws_secretsmanager_secret.games_mp_cron_secret.arn, readers = [] }
   }
-  secret_arn = each.value
+  secret_arn = each.value.arn
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -199,8 +202,8 @@ resource "aws_secretsmanager_secret_policy" "games_mp_admin_only" {
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
-      Resource  = each.value
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+      Resource  = each.value.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, each.value.readers) } }
     }]
   })
 }
