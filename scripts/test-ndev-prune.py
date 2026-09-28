@@ -83,7 +83,8 @@ printf '%s\\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
 if [ -n "${TEST_REVIVE_LABEL:-}" ] && [ "$*" = "disable --now ndev@$TEST_REVIVE_LABEL.service" ]; then
   mkdir -p "$TEST_REVIVE_DIR"
 fi
-if [ "$1" = restart ] && [ -e "${TEST_FAIL_RESTART:-/nonexistent}" ]; then exit 1; fi
+if [ "$1" = restart ] && [ -e "${TEST_FAIL_RESTART:-/nonexistent}" ] &&
+   { [ -z "${TEST_FAIL_ZONE:-}" ] || [ "$2" = "cloudflared@$TEST_FAIL_ZONE" ]; }; then exit 1; fi
 exit 0
 """)
         self.install("id", "#!/bin/bash\nexit 0\n")
@@ -95,7 +96,8 @@ exit 0
         # The real ndev-rebuild, failing while a flag file exists.
         (self.bin / "ndev-rebuild").rename(self.bin / "ndev-rebuild.real")
         self.install("ndev-rebuild", f"""#!/bin/bash
-[ ! -e "${{TEST_FAIL_REBUILD:-/nonexistent}}" ] || exit 1
+if [ -e "${{TEST_FAIL_REBUILD:-/nonexistent}}" ] &&
+   {{ [ -z "${{TEST_FAIL_ZONE:-}}" ] || [ "$1" = "$TEST_FAIL_ZONE" ]; }}; then exit 1; fi
 exec bash {self.bin}/ndev-rebuild.real "$@"
 """)
 
@@ -416,7 +418,7 @@ exec bash {self.bin}/ndev-rebuild.real "$@"
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn(f"restart cloudflared@{DOLPHIN}", self.calls_list())
         self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
-        self.assertFalse((self.ndev / f".restart-{DOLPHIN}").exists())
+        self.assertFalse((self.ndev / f".retry-{DOLPHIN}").exists())
         self.calls.write_text("")
         self.assertEqual(self.run_tool("ndev-prune").returncode, 0)
         self.assertEqual(self.calls_list(), [])
@@ -432,6 +434,269 @@ exec bash {self.bin}/ndev-rebuild.real "$@"
         self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
         self.assertFalse((self.ndev / "instances" / "connor-old.env").exists())
         self.assertNotIn(dead_game, (self.config / f"config-{GAMES}.yml").read_text())
+
+    # ------------------------------------------- aliases and retained labels
+    def family_with_alias(self, live):
+        """ejc3-family on dolphin plus its pinned cc-games alias to the same checkout."""
+        host, d = self.publish("ejc3-family", "ejc3", DOLPHIN, 3722, live=live, subdir="family")
+        self.colton, _ = self.publish("colton", "colton", GAMES, 3729, subdir="game")
+        reg = self.ndev / f"registry-{GAMES}"
+        reg.write_text("".join(sorted([reg.read_text(), f"family.{GAMES}\t3722\tejc3\t{d}\n"])))
+        self.rebuild_all()
+        self.calls.write_text("")
+        return host, d
+
+    def test_cross_zone_alias_of_a_dead_project_is_removed(self):
+        host, _ = self.family_with_alias(live=False)
+        self.assertIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for zone, gone in ((DOLPHIN, host), (GAMES, f"family.{GAMES}")):
+            self.assertNotIn(gone, (self.ndev / f"registry-{zone}").read_text())
+            self.assertNotIn(gone, (self.config / f"config-{zone}.yml").read_text())
+            self.assertIn(f"restart cloudflared@{zone}", self.calls_list())
+        self.assertIn(self.colton, (self.config / f"config-{GAMES}.yml").read_text())
+        # Setup's pin_route must not bring the alias back while the checkout is gone.
+        self.run_setup_stretch()
+        self.assertNotIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+        self.assertNotIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+
+    def test_alias_to_a_live_checkout_is_kept(self):
+        self.family_with_alias(live=True)
+        before = self.snapshot()
+        self.run_tool("ndev-prune")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.calls_list(), [])
+
+    def test_pin_route_drops_a_stale_alias_even_without_an_env(self):
+        (self.ndev / f"registry-{GAMES}").write_text(f"family.{GAMES}\t3722\tejc3\t{self.homes}/ejc3/family\n")
+        self.run_setup_stretch()
+        self.assertNotIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+
+    def test_retained_label_is_republished_when_its_dir_returns(self):
+        # Only one dead label, so the retry run has nothing dead and must not exit early.
+        host, d = self.publish("skevh-back", "skevh", DOLPHIN, 3310, live=False)
+        self.publish("skevh", "skevh", DOLPHIN, 3300, subdir="web")
+        self.rebuild_all()
+        flag = self.root / "fail-rebuild"
+        flag.write_text("")
+        self.env["TEST_FAIL_REBUILD"] = str(flag)
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertTrue((self.ndev / ".retained-skevh-back").exists())
+        self.assertNotIn(host, (self.ndev / f"registry-{DOLPHIN}").read_text())
+        flag.unlink()
+        d.mkdir(parents=True)
+        (d / "package.json").write_text("{}\n")
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("enable --now ndev@skevh-back.service", self.calls_list())
+        self.assertIn(f"{host}\t3310\tskevh\t{d}", (self.ndev / f"registry-{DOLPHIN}").read_text())
+        self.assertIn(f"  - hostname: {host}\n    service: http://127.0.0.1:3310\n",
+                      (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertTrue((self.ndev / "instances" / "skevh-back.env").exists())
+        self.assertFalse((self.ndev / ".retained-skevh-back").exists())
+        self.assertFalse((self.ndev / f".retry-{DOLPHIN}").exists())
+        self.calls.write_text("")
+        self.assertEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertEqual(self.calls_list(), [])
+
+    def test_alias_zone_rebuild_failure_is_retried_after_its_row_is_gone(self):
+        self.family_with_alias(live=False)
+        flag = self.root / "fail-rebuild"
+        flag.write_text("")
+        self.env.update(TEST_FAIL_REBUILD=str(flag), TEST_FAIL_ZONE=GAMES)
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertNotIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+        self.assertIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+        flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+        self.assertIn(f"restart cloudflared@{GAMES}", self.calls_list())
+        self.assertFalse((self.ndev / f".retry-{GAMES}").exists())
+        self.assertFalse((self.ndev / "instances" / "ejc3-family.env").exists())
+
+    def test_old_two_field_row_is_removed_by_hostname(self):
+        host, _ = self.publish("skevh-old", "skevh", DOLPHIN, 3311, live=False)
+        reg = self.ndev / f"registry-{DOLPHIN}"
+        reg.write_text(f"{host}\t3311\n")
+        self.rebuild_all()
+        self.run_tool("ndev-prune")
+        self.assertNotIn(host, reg.read_text())
+        self.assertNotIn(host, (self.config / f"config-{DOLPHIN}.yml").read_text())
+
+    def test_restored_route_is_rebuilt_even_when_its_own_zone_succeeded(self):
+        # Kept only because the alias zone failed; its own zone was rebuilt and restarted
+        # cleanly, so it has no retry marker. When the dir returns, its route must come back.
+        host, d = self.family_with_alias(live=False)
+        flag = self.root / "fail-restart"
+        flag.write_text("")
+        self.env.update(TEST_FAIL_RESTART=str(flag), TEST_FAIL_ZONE=GAMES)
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertFalse((self.ndev / f".retry-{DOLPHIN}").exists())
+        self.assertNotIn(host, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        flag.unlink()
+        d.mkdir(parents=True)
+        (d / "package.json").write_text("{}\n")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"  - hostname: {host}\n    service: http://127.0.0.1:3722\n",
+                      (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assertIn("enable --now ndev@ejc3-family.service", self.calls_list())
+        # The pinned alias is setup's to restore, and it does once the checkout is back.
+        self.run_setup_stretch()
+        self.assertIn(f"family.{GAMES}", (self.config / f"config-{GAMES}.yml").read_text())
+
+    def test_alias_zone_failure_is_retried_after_its_row_is_gone(self):
+        # The cc-games restart fails; by the retry the alias row is already gone, so only the
+        # zone's retry marker can bring cc-games back for the restart it still needs.
+        host, _ = self.family_with_alias(live=False)
+        flag = self.root / "fail-restart"
+        flag.write_text("")
+        self.env.update(TEST_FAIL_RESTART=str(flag), TEST_FAIL_ZONE=GAMES)
+        self.assertNotEqual(self.run_tool("ndev-prune").returncode, 0)
+        self.assertTrue((self.ndev / "instances" / "ejc3-family.env").exists())
+        self.assertTrue((self.ndev / f".retry-{GAMES}").exists())
+        self.assertFalse((self.ndev / f".retry-{DOLPHIN}").exists())
+        flag.unlink()
+        self.calls.write_text("")
+        r = self.run_tool("ndev-prune")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"restart cloudflared@{GAMES}", self.calls_list())
+        self.assertFalse((self.ndev / f".retry-{GAMES}").exists())
+        self.assertFalse((self.ndev / "instances" / "ejc3-family.env").exists())
+        self.assertFalse((self.ndev / ".retained-ejc3-family").exists())
+
+    # ------------------------------------------------- setup under the same lock
+    def setup_stretch(self):
+        """The real setup lines from taking the ndev lock to releasing it after the rebuild."""
+        start = SOURCE.index("ndev_lock() {")
+        end = SOURCE.index("\n${local.nextjs_zone_rebuild}\nndev_unlock\n") + len("\n${local.nextjs_zone_rebuild}\nndev_unlock\n")
+        body = SOURCE[start:end]
+        template = re.search(r'nextjs_zone_rebuild = join\("\\n", \[\n\s+for z, t in local\.nextjs_zone_tunnel :\n\s+"(.*)"\n',
+                             SOURCE).group(1).replace("\\n", "\n").replace('\\"', '"')
+        rebuild = "\n".join(template.replace("${z}", z) for z in (GAMES, DOLPHIN))
+        pinned = f"pin_route {GAMES} family.{GAMES} 3722 ejc3 /home/ejc3/family"
+        body = (body.replace("${local.nextjs_zone_rebuild}", rebuild)
+                .replace("${local.nextjs_pinned_rows}", pinned))
+        body = self.localize(render(body))
+        self.assertNotRegex(body, r"\$\{(local|var|join)")
+        path = self.root / "setup-stretch.sh"
+        path.write_text("#!/bin/bash\nset -uo pipefail\n" + body)
+        return path
+
+    def run_setup_stretch(self, held=None):
+        proc = self.start_setup_stretch()
+        try:
+            if held is not None:
+                time.sleep(0.7)
+                self.assertIsNone(proc.poll(), "setup wrote /var/lib/ndev while the lock was held")
+                self.assertEqual(self.calls_list(), [])
+                self.assertTrue((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+                self.assertNotIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+                os.close(held)
+                held = None
+            out, err = proc.communicate(timeout=30)
+        finally:
+            self.stop(proc, held)
+        self.assertEqual(proc.returncode, 0, out + err)
+        return out + err
+
+    def start_setup_stretch(self):
+        # Own process group, so a failed test can kill a helper blocked on the lock too.
+        return subprocess.Popen(["bash", str(self.setup_stretch())], env=self.env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+
+    def stop(self, proc, held=None):
+        if held is not None:
+            os.close(held)
+        if proc.poll() is None:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+
+    def assert_lock_free(self):
+        fd = os.open(self.ndev / ".lock", os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def test_setup_registry_stretch_waits_for_the_lock(self):
+        self.fleet()
+        # The first write in the stretch, before any helper that locks on its own.
+        shared = self.ndev / "registry"
+        shared.write_text(f"connor.{GAMES}\t3641\tconnor\t{self.homes}/connor/game\n")
+        held = self.hold_lock()
+        proc = self.start_setup_stretch()
+        try:
+            time.sleep(0.7)
+            self.assertTrue(shared.exists(), "setup migrated the shared registry without the lock")
+            self.assertFalse((self.ndev / "registry.migrated").exists())
+            os.close(held)
+            held = None
+            out, err = proc.communicate(timeout=30)
+        finally:
+            self.stop(proc, held)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertTrue((self.ndev / "registry.migrated").exists())
+        self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertIn(f"family.{GAMES}", (self.ndev / f"registry-{GAMES}").read_text())
+        self.assert_lock_free()
+
+    def test_prune_under_setup_reuses_its_lock_instead_of_deadlocking(self):
+        self.fleet()
+        began = time.monotonic()
+        self.run_setup_stretch()
+        self.assertLess(time.monotonic() - began, 20)
+        self.assertIn("disable --now ndev@skevh-comeback-panel.service", self.calls_list())
+        self.assertFalse((self.ndev / "instances" / "skevh-comeback-panel.env").exists())
+        self.assertNotIn(self.dead1, (self.config / f"config-{DOLPHIN}.yml").read_text())
+        self.assert_lock_free()
+
+    def test_reenable_stretch_holds_the_lock(self):
+        start = SOURCE.index("# Re-enable previously published projects")
+        loop = SOURCE[start:SOURCE.index("\ndone\n", start)]
+        self.assertLess(loop.index("\n  ndev_lock\n"), loop.index("for envf in /var/lib/ndev/instances/*.env"))
+        self.assertGreater(loop.index("\n  ndev_unlock"), loop.index('systemctl enable --now "ndev@$u.service"'))
+
+    def register_with(self, fd9_source, extra_env):
+        project = self.homes / "ejc3" / "worktrees" / "new"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text("{}\n")
+        env = dict(self.env, SUDO_USER="ejc3", **extra_env)
+        return subprocess.Popen(
+            ["bash", "-c", 'exec 9<"$1"; shift; exec bash "$@"', "_", fd9_source,
+             str(self.bin / "ndev-register"), f"ejc3-new.{DOLPHIN}", "3400", "ejc3", str(project)],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_caller_cannot_talk_register_out_of_the_lock(self):
+        # Neither an environment flag (sudo passes it under NOPASSWD: ALL) nor a fd 9 that is
+        # not a held lock may let ndev-register write while someone else holds the lock.
+        (self.ndev / ".lock").touch()
+        for label, source, extra in (("env flag", "/dev/null", {"NDEV_LOCK_HELD": "1"}),
+                                     ("fd 9 elsewhere", str(self.root / "decoy"), {}),
+                                     ("fd 9 on the unheld lock", str(self.ndev / ".lock"), {})):
+            with self.subTest(label):
+                (self.root / "decoy").touch()
+                held = self.hold_lock()
+                proc = self.register_with(source, extra)
+                try:
+                    time.sleep(0.7)
+                    self.assertIsNone(proc.poll(), "ndev-register skipped the lock")
+                    self.assertFalse((self.ndev / "instances" / "ejc3-new.env").exists())
+                finally:
+                    os.close(held)
+                    out, err = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, out + err)
+                self.assertTrue((self.ndev / "instances" / "ejc3-new.env").exists())
+                (self.ndev / "instances" / "ejc3-new.env").unlink()
+
+    def test_no_environment_switch_for_the_lock(self):
+        self.assertNotIn("NDEV_LOCK_HELD", SOURCE)
+        self.assertNotIn("closefrom_override", SOURCE)
 
     # ------------------------------------------------------------------ ndev-run
     def test_run_check_skips_a_deleted_project(self):

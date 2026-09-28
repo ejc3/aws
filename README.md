@@ -643,14 +643,18 @@ ndev
 remains bound to `127.0.0.1`.
 
 **Deleting a checkout unpublishes it.** `ndev@<label>` has an `ExecCondition` that skips
-the start, leaving the unit inactive rather than restarting it, when the published directory is gone.
-`ndev-prune` (root) then removes every project whose directory no longer exists: it
-disables the unit and deletes its env file, drop-in and registry row, then rebuilds that
-zone's ingress, restarting the tunnel only if the config changed. A project whose directory
-still exists is never touched. It holds the same lock as `ndev-register`, and if a zone's
-rebuild or tunnel restart fails it keeps that zone's records so the next run retries. It runs on every setup run, in `setup-sync` before the health
-check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it immediately. DNS
-needs nothing because each zone has a single wildcard record.
+the start when the published directory is gone, leaving the unit inactive instead of
+restarting it. `ndev-prune` (root) then removes every project whose directory no longer
+exists: it disables the unit, deletes its env file and drop-in, and drops every registry row
+that carries its hostname or its directory (so a pinned alias in the other zone goes too),
+then rebuilds each affected zone, restarting a tunnel only if its config changed. A project
+whose directory still exists is never touched, and a pinned route whose directory is gone is
+not re-added at boot. `ndev-register`, `ndev-prune` and the setup script's registry writes
+share one lock (`/var/lib/ndev/.lock`). If a zone's rebuild or restart fails, prune keeps
+that project's records and retries the zone on its next run; if the directory has come back
+by then, the project is published again. It runs on every setup run, in `setup-sync` before
+the health check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it
+immediately. DNS needs nothing because each zone has a single wildcard record.
 
 **The zone follows the account, not a flag.** `colton` and `connor` publish to
 `https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.
