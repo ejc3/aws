@@ -82,7 +82,7 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 
 | Step | What it does |
 | --- | --- |
-| **Secrets** | The random provider generates the token key (`kid1:<base64 32 bytes>`), `MP_TEST_KEY`, `CRON_SECRET`, `MP_COOKIE_SECRET` (one per environment), Preview's `SKYHOOK_LEADERBOARD_SECRET` and the automation-bypass secret. The token key, test key and cron secret also go to Secrets Manager (`games/mp-token-keys`, `games/mp-test-key`, `games/mp-cron-secret`). The router's task definition names the exact version of its key, so a new key version is a new task definition that the health step verifies. |
+| **Secrets** | The tls provider generates the join-token keys: one Ed25519 key pair per lobby environment (Production, Preview) and per entry of `games_mp_token_kids`, key id `<env>-<kid>` (`production-kid1`, `preview-kid1`). Each environment's private keys go only to its own Vercel `MP_TOKEN_SIGNING_KEYS`; the public keys go to the router's task definition as the plain variable `MP_TOKEN_PUBLIC_KEYS` (`<env>:<env>-<kid>:<base64 SPKI>`), so a key change is a new task definition that the health step verifies, and to each environment's launch function (`games-mp-launch-<environment>`, setting `TOKEN_PUBLIC_KEYS`: that environment's keys only), which gives each engine it starts those public keys. The random provider generates `MP_TEST_KEY`, `CRON_SECRET`, `MP_COOKIE_SECRET` (one per environment), Preview's `SKYHOOK_LEADERBOARD_SECRET` and the automation-bypass secret; the test key and cron secret also go to Secrets Manager (`games/mp-test-key`, `games/mp-cron-secret`). No private token key is in Secrets Manager: nothing on AWS needs one. |
 | **Images** (`terraform_data.games_mp_build`) | Skips everything if ECR already has both tags. Otherwise the jumpbox downloads the pinned commit (`games_mp_source_ref`) with the `games/colton-games-read` token and uploads it to `s3://games-mp-build-<account>/sources/`. It then runs the CodeBuild project `games-mp-images` (ARM, 2 vCPU) and waits for SUCCEEDED. The build checks that the repo's `scripts/mp-images.mjs` produces exactly the tags Terraform expects, then builds and pushes only the missing ones. Tags are router `<sha12>` and engine `<simVersion>-<sha12>`. The build role has no GitHub or Secrets Manager access. |
 | **Task definitions and router** | `games-mp-router`, `games-mptest` and the `mp-router` service are created only after the images exist. The service rolls with no downtime: the new task is started before the old one drains. |
 | **Vercel env** | Terraform owns the multiplayer set on the colton-games project (see below), and only that set. |
@@ -102,7 +102,8 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 | `MP_LAUNCHER=ecs`, `MP_PUBLIC_ENTRY=wss://play.cc-games.app` | yes | yes |
 | `MP_ENV` | `production` | `preview` |
 | `MP_API` | `https://cc-games.app` | not set: the lobby uses `https://$VERCEL_URL` for each deployment |
-| `MP_TOKEN_KEYS`, `MP_TEST_KEY`, `CRON_SECRET` (sensitive) | yes | same values |
+| `MP_TOKEN_SIGNING_KEYS` (sensitive): Ed25519 private keys, `<env>-<kid>:<base64 PKCS#8>`, first signs | Production's own | Preview's own |
+| `MP_TEST_KEY`, `CRON_SECRET` (sensitive) | yes | same values |
 | `MP_COOKIE_SECRET` (sensitive) | its own value | its own value |
 | `SKYHOOK_LEADERBOARD_ENVIRONMENT=preview`, `SKYHOOK_LEADERBOARD_SECRET` (sensitive, preview's own) | no | yes |
 | `SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SECRET_KEY` | the integration's own variables | copied by the Preview Supabase step |
@@ -119,7 +120,10 @@ Production with its next deployment, and Preview with each new preview.
 
 The generated secrets are stored in state. That is the encrypted, versioned S3 backend
 that only administration can read, the same boundary as the Secrets Manager copies.
-Terraform is pinned to 1.10.3, which has no write-only arguments.
+Terraform is pinned to 1.10.3, which has no write-only arguments. The join-token private keys
+(`tls_private_key.games_mp_token`) are in state exactly as the shared HMAC key they replaced
+was; their only other copies are the two Vercel environments. The router's public keys are
+not secret.
 
 Some values are never written to state or to disk:
 
@@ -159,18 +163,91 @@ repository's last-20 lifecycle rule keeps it; a launch whose image has expired f
 
 ## Rotating secrets
 
-- **Token key.** Deployments keep the `MP_TOKEN_KEYS` they were built with, and every
-  Production and Preview deployment shares the one router, so:
-  1. Set `games_mp_token_kids = ["kid2", "kid1"]` and apply. The router rolls onto a new
-     task definition that accepts both keys.
-  2. Redeploy Production, and redeploy or retire every Preview deployment still in use.
-     Until then they keep signing with `kid1`, which the router still accepts.
-  3. Wait at least two minutes, so every token signed with `kid1` has expired.
-  4. Set `["kid2"]` and apply.
+- **Join-token keys.** Each entry of `games_mp_token_kids` is one Ed25519 key pair per
+  environment; the first entry signs, every entry verifies. Deployments keep the
+  `MP_TOKEN_SIGNING_KEYS` they were built with, and every Production and Preview deployment
+  shares the one router, so add the new key to the router before any lobby signs with it:
+  1. **Add.** Set `games_mp_token_kids = ["kid1", "kid2"]` (new id LAST) and apply. Terraform
+     creates `production-kid2` and `preview-kid2`; the router rolls onto a task definition whose
+     `MP_TOKEN_PUBLIC_KEYS` lists both generations, and the health step waits for it. Lobbies
+     still sign with `kid1`; Vercel now holds both private keys per environment, but only
+     new builds see that, and they too sign with `kid1`.
+  2. **Switch.** Set `["kid2", "kid1"]` and apply (only the order changes, so no key is
+     replaced). Then redeploy Production, and redeploy or retire every Preview deployment still
+     in use: from their next build they sign with `kid2`. The router accepts both meanwhile.
+     Engines keep the keys they were launched with, so before this step wait until every engine
+     launched before step 1 has exited: at most its `hardcap` + 10 minutes (4 h 10 min for the
+     longest allowed), or check that `aws ecs list-tasks --cluster games` shows none that
+     started earlier (the router's family aside). Otherwise a player of such a match gets
+     `401 token` from its engine on reconnect.
+  3. **Retire.** Once no deployment built before step 2 serves traffic, wait two minutes (every
+     `kid1` token has expired) and set `["kid2"]` and apply. The router and new engines stop
+     accepting `kid1` and Terraform destroys both `kid1` pairs.
+
+  Id length is at most 20 characters, because the key id on the wire is `<env>-<kid>`.
+  **A leaked private key** (one environment's) cannot wait for that: run
+  `terraform apply -replace='tls_private_key.games_mp_token["<env>-<kid>"]'`. The router
+  rolls onto the new public key and refuses everything the old one signed as soon as the
+  health step passes; that environment's deployments answer `401 token` from the router until
+  they are rebuilt, and its engines already running keep only the old key, so their players
+  cannot reconnect (stop them, see Emergency switches). The other environment is untouched:
+  its keys are separate.
 - **Any other generated secret.** Run `terraform apply -replace=random_password.<name>`,
   then redeploy the site. Replacing `games_mp_cookie_secret` resets every guest identity.
 - **Preview Supabase values.** If the integration rotates its keys, bump
   `games_mp_preview_supabase_sync` and apply.
+
+### Cutover from the shared HMAC key to Ed25519 (once)
+
+Before this, the lobby and the router shared one HMAC key (`MP_TOKEN_KEYS`, Secrets Manager
+`games/mp-token-keys`), so the router could mint. There is deliberately no dual-accepting
+router: accepting both schemes would keep the HMAC key on the router, the exact capability
+being removed. Instead both sides switch in one apply, and every mismatch fails closed (a
+`401 token` from the router or `503 multiplayer-not-configured` from the lobby), never open.
+Tokens live two minutes and Production does not serve multiplayer yet.
+
+1. **Games repo.** Push the Ed25519 change (colton-games `mp-asymmetric-tokens`, `1eb83917`) and
+   stack it under anything that ships multiplayer, so no build that reads `MP_TOKEN_KEYS` ever
+   reaches Production. Do not deploy it to Production. A preview built from it before step 2
+   answers `503 multiplayer-not-configured` (no `MP_TOKEN_SIGNING_KEYS` yet): expected.
+2. **Pin.** `games_mp_source_ref` must be a commit with the Ed25519 router and the
+   token-verifying engine kit (this change pins `1eb83917`; re-pin to the merged commit if it is
+   rebased or squashed). An older router image with this task definition refuses to boot (no
+   `MP_TOKEN_KEYS`), so the health step would fail the apply rather than serve.
+3. **Plan and apply** from a fresh worktree. The plan must show: `random_bytes.games_mp_token_key`
+   destroyed; `tls_private_key.games_mp_token["production-kid1"]` and `["preview-kid1"]` created;
+   the Vercel `MP_TOKEN_KEYS` variable destroyed and `MP_TOKEN_SIGNING_KEYS` created once per
+   environment (targets `["production"]` and `["preview"]`, sensitive); the router task definition
+   replaced with `MP_TOKEN_PUBLIC_KEYS` in `environment` and no `secrets`; the router execution
+   role's inline policy `pull-log-and-token-key` updated in place to drop
+   `secretsmanager:GetSecretValue` (the name is kept so it is never replaced); and
+   `games/mp-token-keys`, its version and its policy destroyed; both launch functions,
+   `games-mp-launch-production` and `games-mp-launch-preview`, updated in place (new code, and
+   `TOKEN_PUBLIC_KEYS`: each its own environment's public keys). New router and engine images
+   for the new commit; the new engine revisions carry `MP_TOKEN_VERIFIER=ed25519-v2`, and the
+   pre-cutover ones stay ACTIVE but are never launched again (a client still on an older
+   simVersion gets `unknown-sim-version` until it updates; `mptest` keeps `mptest-1`, so
+   nothing is stranded). Nothing else. In the apply, the router rolls with no downtime (new tasks
+   healthy before old ones drain) and the health step waits for the new task definition. The
+   launch functions depend on that health step, so they start launching new engines (which accept only the
+   `X-MP-Token` a new router forwards) only once every router task forwards it. Engines already
+   running from the old image keep trusting the `X-MP-*` hints, which the new router still
+   sends, until their matches end.
+   During those minutes a request may reach an old task (HMAC only) or a new one (Ed25519
+   only): neither accepts a token it did not before, and a token that meets the other kind is
+   refused. Running old tasks keep their already-injected key, so deleting the secret
+   (7-day recovery window, administrators only) does not disturb them.
+4. **Redeploy** only after the apply (and its health step) succeeded: rebuild the previews that
+   should keep working from the new code; Production gets the change when the games PRs merge.
+   Vercel applies env only at build, so only builds after step 3 have `MP_TOKEN_SIGNING_KEYS`.
+   Previews built before step 3 still hold the old HMAC key, which nothing accepts any more.
+5. **Check.** The router's `listening` log line lists `keys` as `production:production-kid1`,
+   `preview:preview-kid1`, and a new engine's `boot` line lists only its own environment's key;
+   a match started on a rebuilt preview connects; a token from a
+   pre-cutover preview gets `401 token`; `aws secretsmanager describe-secret --secret-id
+   games/mp-token-keys` shows a `DeletedDate`; and
+   `aws iam simulate-principal-policy --policy-source-arn <games-mp-router-execution role arn>
+   --action-names secretsmanager:GetSecretValue` answers `implicitDeny`.
 
 ## Emergency switches
 
@@ -274,11 +351,16 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   its own environment's function ARN. A function deployed without a usable environment refuses
   every call (`forbidden`). The functions publish no versions or aliases.
 - **Which revision: the simVersion.** For the game's current simVersion (Terraform passes it
-  per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`),
-  with no ECS read. For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
+  per game in `ENGINE_IMAGES`), the exact revision Terraform registered (`TASK_DEFINITIONS`).
+  For any other, the newest ACTIVE revision of `games-<game>` (Terraform's
   `skip_destroy` keeps old ones ACTIVE) whose only container is `engine` with image exactly
   `<the game's ECR repository>:<simVersion>-<12 hex>`; the repository is the one Terraform
   created for the game, so a revision pointing at any other image is never run whatever its tag.
+  Either way the revision's container environment must carry `MP_TOKEN_VERIFIER=ed25519-v2`,
+  which Terraform puts on every engine revision whose kit verifies join tokens itself (read
+  once per revision with `DescribeTaskDefinition`, then cached). Revisions registered before
+  that trust the router's `X-MP-*` headers, so they are never launched, even for the older
+  simVersion they carry: a compromised router could otherwise claim any seat on them.
   None: `{"ok":false,"error":"unknown-sim-version"}` and nothing is launched. A lookup (a miss
   too) is cached for a minute per game and simVersion in the warm function.
 - **What it runs.** That revision (IAM allows `RunTask` on `games-<game>:*` for exactly the
@@ -287,6 +369,9 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   so they are on `*`), `launchType FARGATE`, the engine
   subnets and security group with `assignPublicIp=ENABLED`, `clientToken` = `<env>-<match id>`
   and `startedBy` = the match id. Container `engine` gets `MATCH_ID`, `MATCH_SECRET`, `MP_API`, `GAME_ID`, `MP_ENV`,
+  `MP_TOKEN_PUBLIC_KEYS` (the function's own environment's Ed25519 public keys, its
+  `TOKEN_PUBLIC_KEYS` setting, checked to be exactly that before any launch: a private key, a raw
+  HMAC key or another environment's key makes the launch fail with nothing started),
   `PORT=8080` and, on preview, `MP_API_BYPASS`; tags `game`, `match`, `env`, `hardcap`. Nothing
   else: no command, role, size or capacity provider.
 - **Retries.** Before admission it looks the match up by `startedBy`: if this environment's live
@@ -393,9 +478,11 @@ plays.
 ## Environments and the router
 
 One router serves Production and Preview. It accepts a join token whose `n` is in
-`MP_ENVS`, which is `production,preview`. That check is a correctness guard, not a security
-boundary: the real boundary is which Vercel environments hold `MP_TOKEN_KEYS`, and those
-are Production and Preview only. Preview origins
+`MP_ENVS` (`production,preview`) AND is the environment of the Ed25519 key that signed it:
+every entry of `MP_TOKEN_PUBLIC_KEYS` is bound to one environment, and each Vercel
+environment holds only its own private keys. So this is a security boundary: a Preview
+build, which every writer on the games repo controls, cannot mint a token the router
+honours as Production. Development holds no key at all. Preview origins
 (`https://colton-games-<hash>-coltons-projects-7f9a4e8b.vercel.app` and the
 `colton-games-git-<branch>-...` aliases) match the router's `MP_ALLOWED_ORIGINS` entry
 `https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app`, where `*` is one DNS label.
@@ -426,17 +513,27 @@ against the code and live state on 2026-09-27 unless marked otherwise.
    unset), and limits each client to 20 open connections and 50 requests/s (burst 100). The
    client address is the one the ALB appended to `X-Forwarded-For` (`MP_TRUSTED_HOPS=1`), so
    a client cannot spoof it; IPv6 clients are limited per /64.
-3. **Join token.** HMAC-SHA256 with the keys in `games/mp-token-keys`, bound to one match,
-   one environment and one seat, and valid for two minutes. The key is symmetric, so everything
-   that verifies a token can also mint one: the Vercel lobby (`MP_TOKEN_KEYS` on Production and
-   Preview) and the router, which gets the key as `MP_TOKEN_KEYS` to check tokens. The router's
-   execution role and administrators are the only AWS readers (secret policy,
-   `games-multiplayer.tf`).
+3. **Join token.** Ed25519 (`v2.<kid>.<payload>.<signature>`), bound to one match, one
+   environment and one seat, and valid for two minutes. Only the Vercel lobby can mint one:
+   each environment holds its own private keys (`MP_TOKEN_SIGNING_KEYS`, sensitive, per
+   target). The router holds public keys only (`MP_TOKEN_PUBLIC_KEYS`, a plain task-definition
+   variable), each bound to its environment, and refuses to boot if a signing key is ever in
+   its environment; its execution role reads no secret at all. It accepts `v2` only, so an
+   HMAC or other-algorithm token is refused before a key is chosen. Nothing on AWS holds a
+   private key; administrators can read them from Terraform state.
 4. **Router → engine.** The router runs in its own subnets (`10.0.66.0/24`, `10.0.67.0/24`) and
    forwards only to addresses inside `MP_TARGET_CIDRS` (the two engine subnets,
    `10.0.64.0/24` and `10.0.65.0/24`); its security group's egress reaches only the engine
-   group on 8080 plus HTTPS. The engine group admits only the router, which is why an engine may
-   trust the router's `X-MP-*` identity headers.
+   group on 8080 plus HTTPS. The engine group admits only the router. The router forwards the
+   verified token in `X-MP-Token`, and the engine verifies it again (games repo
+   `server/mp-kit/`) with `MP_TOKEN_PUBLIC_KEYS`, its own environment's public keys only, given
+   by its environment's `games-mp-launch-<environment>`, which refuses to launch with anything
+   but that environment's Ed25519 public keys: signature, key environment, match = its
+   `MATCH_ID`, environment = its `MP_ENV`, expiry, and a seat and player of its spec. The engine
+   takes the seat from the token alone; the router's `X-MP-Match/Player/Seat` headers are
+   ignored. A WebSocket's token is checked when it opens, every HTTP request's each time, so a
+   reconnect needs a fresh token. An engine refuses to start without keys or with any signing
+   key.
 5. **Lobby → AWS.** Vercel functions exchange a Vercel OIDC token for a launcher role; no AWS
    key is stored. Production assumes `games-mp-launcher`, Preview `games-mp-launcher-preview`;
    each trust is exactly project `colton-games` in team `coltons-projects-7f9a4e8b` and that one
@@ -469,7 +566,7 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
 | Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of the registered engine images (the preview share), each for up to its `hardCapSec` (at most 4 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data | Run a command, image, role or size of its choosing; launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
 | A compromised production deployment | The same through `games-mp-launch-production`, up to production's share of 22 engines | Everything in the row above, with production and preview swapped: it cannot launch preview engines or take preview's 8 |
-| A compromised router (it parses internet input) | Mint valid join tokens for any match (it holds the HMAC key), so join any match as any seat; see and drop every player's traffic; reach every engine | Launch or stop tasks; read other secrets (its execution role reads only its key); connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
+| A compromised router task (it parses internet input) | While the compromise lasts, only for connections that pass through it: see their tokens and bytes, and drop or rewrite that traffic (TLS ends at the ALB; router to engine is plain HTTP inside the VPC); replay a token it saw, for that same match and seat, until it expires (two minutes) | Mint a join token: it holds only public keys (it refuses to boot with a signing key), its execution role reads no secret, its task role has no policies. So nothing it can read or leak (env, logs, a memory disclosure) lets anyone mint tokens later, through another router task or from anywhere else, and a Preview-side key cannot pass for Production. Claim a seat it holds no fresh token for: engines verify the token themselves and ignore the router's identity headers. Launch or stop tasks; connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
 | A compromised engine | Reach any internet host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach any host in the VPC, on any port, over IPv4 or IPv6 (its own subnets, security group and `games-engine` ACL); route to the I/O box or its NFS export (no peer route, and NFS admits only the dev-fleet and parallel-box subnets); reach SSH, databases or any non-443 service on the internet |
 
 **Cost-abuse limits, and what happens at each**
@@ -510,7 +607,12 @@ retention); and the all-traffic VPC flow log (`aws_flow_log.security_main`, arch
 `vpc-flow/` in the security-audit bucket), which records every connection by address and port. The ALB appends to `X-Forwarded-For` (live: mode `append`), which the router's
 client-address logic relies on.
 
-**Closed** (2026-09-27): the AWS-side engine ceiling (detective: a sweep every minute) and its alarm, the ECS budget, the WAF,
+**Closed** (2026-09-27): join tokens are Ed25519 (ejc3/aws#173): the router, which holds the
+verifying keys, could mint a valid HMAC token for any match and seat; it now holds public keys
+only and cannot, and each lobby environment has its own key pair, so a Preview build cannot
+mint a Production token. Engines verify the join token themselves (games repo mp-kit, keys
+from each environment's `games-mp-launch-<environment>`) instead of trusting the router's identity headers, so a compromised
+router can no longer claim any seat of any running match. The AWS-side engine ceiling (detective: a sweep every minute) and its alarm, the ECS budget, the WAF,
 two-plus autoscaled routers, ALB access logs, router health and 5xx alarms, HTTPS-only engine
 egress, and the lobby's limits pinned in Terraform. Admission control on launches: the lobby
 holds no ECS permission, and a launch function per environment builds every `RunTask` from
@@ -530,10 +632,7 @@ whole VPCs to its clients' subnets.
    protection-bypass secret. Fix: a non-root read-only container, callbacks without the bypass.
    (Their subnets are closed: engines no longer share the dev fleet's subnets and cannot route
    to the I/O box's NFS export; see chain item 7.)
-3. The router can mint join tokens, because the token key is symmetric. Fix: sign with a
-   private key only the lobby holds and verify with its public key in the router (Ed25519),
-   so a compromised router can no longer mint tokens.
-4. Billing alerts are off account-wide, so no `EstimatedCharges` alarm can fire. Turning them on
+3. Billing alerts are off account-wide, so no `EstimatedCharges` alarm can fire. Turning them on
    is an account setting outside Terraform (Billing preferences, "Receive Billing Alerts").
 
 ## Monthly cost (us-west-1 list prices, checked 2026-09-26/27)
@@ -549,7 +648,7 @@ CodeBuild ARM small costs $0.00425 per build minute.
 | `mp-router`, 2 tasks (autoscaling's minimum) at 0.25 vCPU / 0.5 GB: compute about $16.60, plus public IPv4 $7.30 | about $24 |
 | WAF `games-play`: $5 per web ACL plus $1 per rule (4), plus $0.60 per million requests; the three AWS managed groups carry no extra fee | about $9–10 |
 | WAF logs (blocks and counts only) and ALB access logs, 30 days each | under $1 |
-| Secrets Manager, 3 secrets at $0.40 | $1.20 |
+| Secrets Manager, 2 secrets at $0.40 (`games/mp-test-key`, `games/mp-cron-secret`) | $0.80 |
 | ECR storage, 14-day logs, sweeper Lambda (now every minute) and Scheduler, the two launch Lambdas (one call per match start or stop; reserved concurrency costs nothing), the build bucket | under $2 |
 | **Always on** | **about $64** |
 | Per build: about 5 minutes of CodeBuild | about $0.02 |

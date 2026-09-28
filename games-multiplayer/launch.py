@@ -53,21 +53,36 @@ A stop in a fresh execution environment has no such record and can still find no
 engine runs until it exits or the sweeper's hard cap stops it.
 
 SIM VERSIONS. A match is launched on the engine image of its players' simVersion. The current
-one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS), used
-without any ECS read. Terraform keeps older revisions ACTIVE (skip_destroy), so clients still
+one's revision is the exact family:revision Terraform registered (TASK_DEFINITIONS). Terraform keeps older revisions ACTIVE (skip_destroy), so clients still
 on an older simVersion can be matched while a new site rolls out; for those the function lists
 the ACTIVE revisions of `games-<game>` and takes the newest whose only container is `engine`
 with image exactly `<the game's ECR repository>:<simVersion>-<12 hex>`. The repository is the
 one Terraform created for the game (ENGINE_IMAGES), so a revision pointing anywhere else is
 never run whatever its tag. No such revision: refused with `unknown-sim-version`, nothing
-launched. Lookups are cached for LOOKUP_TTL_SEC per (game, simVersion), a miss included, so a
+launched.
+
+TOKEN VERIFIER. Engines built before engines verified join tokens themselves trust the
+router's X-MP-* identity headers, so launching one would let a compromised router claim any of
+its seats. Terraform marks every revision whose kit verifies tokens with the container
+environment entry MP_TOKEN_VERIFIER=ed25519-v2 (TOKEN_VERIFIER), and the function launches no
+revision without it, the current one included (read once per revision, cached): an older
+simVersion whose only revisions predate the marker is refused as `unknown-sim-version`, and a
+current revision without it fails every launch the same way. Lookups are cached for LOOKUP_TTL_SEC per (game, simVersion), a miss included, so a
 caller cycling versions costs one ListTaskDefinitions per version per minute; a revision's
 container definitions never change, so its image is cached for the environment's life.
+
+JOIN-TOKEN KEYS. Every engine verifies players' join tokens itself (colton-games mp-kit), so it
+gets MP_TOKEN_PUBLIC_KEYS: the Ed25519 public keys of this function's environment only
+(TOKEN_PUBLIC_KEYS, from Terraform), checked here to be exactly that before
+any launch: `<env>:<kid>:<base64 of a 44-byte Ed25519 SubjectPublicKeyInfo>` entries, every one
+for this environment. A private key, a raw HMAC key or another environment's key is never
+passed on (the function refuses to launch with a RuntimeError instead).
 
 No dependency beyond boto3 (bundled in the Lambda runtime). Tested offline by
 scripts/test-games-mp-launch.py against fake ECS clients.
 """
 
+import base64
 import json
 import os
 import re
@@ -93,6 +108,9 @@ ENV_CEILING = int(os.environ.get("ENV_CEILING", "0"))
 API_BASE = os.environ.get("API_BASE", "")
 # Whether a Vercel protection-bypass secret may be passed (previews only).
 ALLOW_BYPASS = os.environ.get("ALLOW_BYPASS", "false") == "true"
+# This environment's Ed25519 join-token public keys, handed to every engine it starts (checked
+# by engine_token_keys before each launch).
+TOKEN_PUBLIC_KEYS = os.environ.get("TOKEN_PUBLIC_KEYS", "")
 MIN_HARDCAP_SEC = int(os.environ.get("MIN_HARDCAP_SEC", "60"))
 MAX_HARDCAP_SEC = int(os.environ.get("MAX_HARDCAP_SEC", "14400"))
 SETTLE_SEC = int(os.environ.get("SETTLE_SEC", "120"))
@@ -102,6 +120,14 @@ STOP_RETRY_SEC = float(os.environ.get("STOP_RETRY_SEC", "0.5"))
 
 ENGINE_CONTAINER = "engine"
 ENGINE_PORT = "8080"
+
+# RFC 8410: SEQUENCE { SEQUENCE { OID 1.3.101.112 (Ed25519) } BIT STRING (32-byte key) }.
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+_TOKEN_PUBLIC_KEY = re.compile(r"([a-z][a-z0-9-]{0,31}):([A-Za-z0-9_-]{1,32}):([A-Za-z0-9+/]{59}=)")
+
+# The container environment entry marking an engine revision whose kit verifies join tokens
+# itself (games-multiplayer.tf, aws_ecs_task_definition.games_engine). No marker, no launch.
+TOKEN_VERIFIER = ("MP_TOKEN_VERIFIER", "ed25519-v2")
 
 _STOPPING = {"DEACTIVATING", "STOPPING", "DEPROVISIONING", "STOPPED", "DELETED"}
 # What StopTask answers for a task ECS does not know yet: not found (InvalidParameterException,
@@ -193,11 +219,15 @@ def validate_start(event, env):
 
 
 def _engine_image(ecs, arn):
+    """The revision's engine image, or None unless it is a one-container engine that verifies
+    join tokens itself (TOKEN_VERIFIER in its environment)."""
     if arn not in _images:
         td = ecs.describe_task_definition(taskDefinition=arn).get("taskDefinition") or {}
         containers = td.get("containerDefinitions") or []
         ok = (td.get("taskDefinitionArn") == arn and len(containers) == 1
-              and containers[0].get("name") == ENGINE_CONTAINER)
+              and containers[0].get("name") == ENGINE_CONTAINER
+              and TOKEN_VERIFIER in [(e.get("name"), e.get("value"))
+                                     for e in containers[0].get("environment") or [] if isinstance(e, dict)])
         _images[arn] = containers[0].get("image") if ok else None
     return _images[arn]
 
@@ -233,6 +263,9 @@ def _newest_revision(ecs, game, sim):
 def task_definition_for(ecs, game, sim, now):
     """The revision to launch for a game's simVersion. See SIM VERSIONS above."""
     if sim == ENGINE_IMAGES[game]["simVersion"]:
+        # Terraform's own revision, still read once: it must verify tokens like any other.
+        if _engine_image(ecs, TASK_DEFINITIONS[game]) is None:
+            raise Refused("unknown-sim-version")
         return TASK_DEFINITIONS[game]
     for key, (_, at) in list(_revisions.items()):
         if now - at >= LOOKUP_TTL_SEC:
@@ -246,6 +279,21 @@ def task_definition_for(ecs, game, sim, now):
     return arn
 
 
+def engine_token_keys(env):
+    """MP_TOKEN_PUBLIC_KEYS for an engine of `env`: that environment's Ed25519 public keys only."""
+    value = TOKEN_PUBLIC_KEYS
+    entries = value.split(",") if value else []
+    if not entries:
+        raise RuntimeError("no token public keys for %s" % env)
+    for entry in entries:
+        m = _TOKEN_PUBLIC_KEY.fullmatch(entry)
+        der = base64.b64decode(m.group(3), validate=True) if m else b""
+        if not m or m.group(1) != env or len(der) != 44 or not der.startswith(_ED25519_SPKI_PREFIX):
+            # Never echoes the value: it is meant to be public, but a misplaced private key is not.
+            raise RuntimeError("token_public_keys for %s: an entry is not one of its Ed25519 public keys" % env)
+    return value
+
+
 def run_task_input(env, req, task_definition):
     """The one RunTask this function ever sends."""
     environment = [
@@ -254,6 +302,7 @@ def run_task_input(env, req, task_definition):
         {"name": "MP_API", "value": req["apiBase"]},
         {"name": "GAME_ID", "value": req["game"]},
         {"name": "MP_ENV", "value": env},
+        {"name": "MP_TOKEN_PUBLIC_KEYS", "value": engine_token_keys(env)},
         {"name": "PORT", "value": ENGINE_PORT},
     ]
     if req.get("apiBypass"):
