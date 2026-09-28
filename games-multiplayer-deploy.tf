@@ -191,6 +191,9 @@ resource "aws_iam_role_policy" "games_mp_codebuild_preview" {
           "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
           "ecr:DescribeImages", "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload",
           "ecr:PutImage", "ecr:UploadLayerPart",
+          # A preview image older than two weeks is deleted and pushed again when its commit is
+          # built again (bringup.py PREVIEW_REFRESH_DAYS), so it outlives its release record.
+          "ecr:BatchDeleteImage",
         ]
         Resource = local.games_mp_preview_repo_arns
       },

@@ -621,6 +621,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.ecr.images[("games/mp-router", "live")], "sha256:old")
         self.assertEqual(self.ddb.get("router#main")["inputs"], INPUTS_A, "the next release tries again")
         self.assertTrue(any("release failed" in s for s, _ in self.sns.sent))
+        # Nothing promoted: new matches never run this commit's engines behind the old router.
+        self.assertIsNone(self.ddb.get("current#main"))
+        self.assertIsNone(self.ddb.get("sim#mptest#mptest-1"))
+
+    def test_a_retry_after_live_moved_but_the_rollout_never_ran_still_rolls(self):
+        event = self.main_built(inputs=INPUTS_B)
+        self.ecr.images[("games/mp-router", "live")] = "sha256:router-" + MAIN[:4]   # moved, then it failed
+        out = self.invoke(event)
+        self.assertEqual(out, {"promoted": MAIN, "router": True})
+        self.assertEqual(self.ecs.updates, 1, "the service still ran the old image")
+        self.assertEqual(self.ecs.running_digest, "sha256:router-" + MAIN[:4])
 
     def test_a_first_release_at_the_running_router_only_records_it(self):
         self.ddb.items.pop("router#main")
@@ -701,6 +712,7 @@ class TerraformTests(unittest.TestCase):
         policy = block(DEPLOY, "aws_iam_role_policy", "games_mp_codebuild_preview")
         self.assertIn("Resource = local.games_mp_preview_repo_arns", statement(policy, "PushPreviewImages"))
         self.assertIn('if startswith(name, "games-preview/")', DEPLOY)
+        self.assertEqual(len(re.findall(r"ecr:BatchDeleteImage", DEPLOY)), 1, "the preview role only")
         self.assertIn('"${aws_s3_bucket.games_mp_build.arn}/sources/preview/*"', policy)
         for forbidden in ("secretsmanager", "ecs:", "iam:", "games_mp_production_repo_arns", "sources/*", "sources/main"):
             self.assertNotIn(forbidden, policy)

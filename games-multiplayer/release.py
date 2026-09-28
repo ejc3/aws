@@ -317,9 +317,14 @@ def on_migrated(commit, exported):
 
 
 def promote(commit, manual=False):
-    """Makes a built main commit production's current release, and rolls the router if its
+    """Makes a built main commit production's current release, rolling the router first if its
     inputs changed. A newer current release (higher sequence number) wins, except for an
-    administrator's explicit promote (a rollback), which takes a fresh sequence number."""
+    administrator's explicit promote (a rollback), which takes a fresh sequence number.
+
+    The router goes first: if its rollout fails, nothing is promoted, so new matches never run
+    this commit's engines behind the previous router. (One function runs at a time, reserved
+    concurrency 1, so nothing moves current#main between the check and the write; the write is
+    conditional anyway.)"""
     record = get("build#main#%s" % commit)
     if not record or not record.get("games") or record.get("status") not in ("built", "migrating", "released", "superseded"):
         raise ReleaseError("main commit %s has no built release to promote" % commit)
@@ -328,23 +333,30 @@ def promote(commit, manual=False):
         seq = int(_client("dynamodb").update_item(
             TableName=TABLE, Key={"id": {"S": "seq#main"}}, UpdateExpression="ADD seq :one",
             ExpressionAttributeValues={":one": {"N": "1"}}, ReturnValues="UPDATED_NEW")["Attributes"]["seq"]["N"])
+    existing = get("current#main") or {}
+    if isinstance(existing.get("seq"), int) and existing["seq"] >= seq:
+        return _superseded(commit, seq)
+    rolled = roll_router_if_changed(record)
     current = {"commit": commit, "seq": seq, "games": {g: {"taskDefinition": v["taskDefinition"],
                                                              "simVersion": v["simVersion"]}
                                                          for g, v in record["games"].items()}}
     old = update("current#main", current, condition="attribute_not_exists(seq) OR seq < :seq",
                  values={":seq": seq})
     if old is None:
-        log(event="superseded", commit=commit, seq=seq)
-        update("build#main#%s" % commit, {"status": "superseded"})
-        return {"superseded": commit}
+        return _superseded(commit, seq)
     for game, v in current["games"].items():
         update("sim#%s#%s" % (game, v["simVersion"]),
                {"taskDefinition": v["taskDefinition"], "commit": commit, "seq": seq},
                condition="attribute_not_exists(seq) OR seq < :seq", values={":seq": seq})
     log(event="promoted", commit=commit, seq=seq, previous=old.get("commit"), games=current["games"])
-    rolled = roll_router_if_changed(record)
     update("build#main#%s" % commit, {"status": "released"})
     return {"promoted": commit, "router": rolled}
+
+
+def _superseded(commit, seq):
+    log(event="superseded", commit=commit, seq=seq)
+    update("build#main#%s" % commit, {"status": "superseded"})
+    return {"superseded": commit}
 
 
 # --------------------------------------------------------------------------------------
@@ -358,6 +370,10 @@ def service_exists():
 
 
 def roll_router_if_changed(record):
+    """Rolls the router to this commit's image when its inputs differ from the last rolled
+    one's. `live` and the running tasks are each checked on their own, so a retry after a
+    failure half-way (live moved, the rollout never ran) still deploys; a failed rollout puts
+    `live` back on the last router that rolled successfully."""
     last = get("router#main") or {}
     if last.get("inputs") == record["routerInputs"]:
         log(event="router-unchanged", inputs=record["routerInputs"])
@@ -368,21 +384,21 @@ def roll_router_if_changed(record):
     previous = live[0] if live else None
     if previous is None or previous["imageId"]["imageDigest"] != record["routerDigest"]:
         _retag(record["routerTag"])
-        if not service_exists():
-            # A platform built from nothing: the apply creates the service on `live` next.
-            log(event="router-live-before-service", tag=record["routerTag"])
-        elif deployed_digest() == record["routerDigest"]:
-            # Nothing but the tag moved (a first release at the commit already running).
-            pass
-        else:
-            try:
-                roll()
-            except ReleaseError:
-                if previous is not None:
-                    ecr.put_image(repositoryName=ROUTER_REPOSITORY, imageTag=ROUTER_LIVE_TAG,
-                                  imageManifest=previous["imageManifest"],
-                                  imageManifestMediaType=previous.get("imageManifestMediaType"))
-                raise
+    if not service_exists():
+        # A platform built from nothing: the apply creates the service on `live` next.
+        log(event="router-live-before-service", tag=record["routerTag"])
+    elif deployed_digest() != record["routerDigest"]:
+        try:
+            roll()
+        except ReleaseError:
+            good = last.get("tag")
+            if good:
+                _retag(good)
+            elif previous is not None and previous["imageId"]["imageDigest"] != record["routerDigest"]:
+                ecr.put_image(repositoryName=ROUTER_REPOSITORY, imageTag=ROUTER_LIVE_TAG,
+                              imageManifest=previous["imageManifest"],
+                              imageManifestMediaType=previous.get("imageManifestMediaType"))
+            raise
     update("router#main", {"inputs": record["routerInputs"], "tag": record["routerTag"],
                            "digest": record["routerDigest"]})
     log(event="router-live", tag=record["routerTag"])

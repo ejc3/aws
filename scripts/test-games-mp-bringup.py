@@ -80,6 +80,8 @@ class World:
         self.token_meta = (200, {"token": {"scopes": [{"type": "team", "teamId": "team_x", "createdAt": 1}]}})
         self.github_commit = 200
         self.pushed = []           # remote refs pushed
+        self.pushed_at = {}        # (repo, tag) -> imagePushedAt
+        self.deleted = []
         self.tasks = {}            # deployment id -> [ip]
         self.target_health = {}    # ip -> state
         self.manifests = {}        # (repo, tag) -> manifest
@@ -111,6 +113,12 @@ class World:
             assert argv[argv.index("--secret-string") + 1] == "file:///dev/stdin"
             self.secrets[argv[argv.index("--secret-id") + 1]] = input
             return done("v1")
+        if argv[:3] == ["aws", "ecr", "batch-delete-image"]:
+            repo = argv[argv.index("--repository-name") + 1]
+            tag = argv[argv.index("--image-ids") + 1].split("=", 1)[1]
+            self.deleted.append((repo, tag))
+            self.ecr.discard((repo, tag))
+            return done("{}")
         if argv[:3] == ["aws", "ecr", "get-login-password"]:
             return done("ecr-password")
         if argv[:2] == ["docker", "login"]:
@@ -158,7 +166,8 @@ class World:
             repo = argv[argv.index("--repository-name") + 1]
             tag = argv[argv.index("--image-ids") + 1].split("=", 1)[1]
             if (repo, tag) in self.ecr:
-                return done(json.dumps({"imageDetails": [{"imageTags": [tag]}]}))
+                pushed = self.pushed_at.get((repo, tag), "2026-09-27T07:00:00.000000+00:00")
+                return done(json.dumps({"imageDetails": [{"imageTags": [tag], "imagePushedAt": pushed}]}))
             return done("", 254, "ImageNotFoundException")
         if argv[:3] == ["aws", "s3", "cp"]:
             return done("")
@@ -396,6 +405,27 @@ class CodeBuildImagesTests(Base):
         ex = self.exports()
         self.assertEqual(json.loads(ex["GAMES_MP_IMAGES"].strip("'")), PREVIEW_EXPECT)
         self.assertNotIn("GAMES_MP_ROUTER_INPUTS", ex)
+
+    def test_a_stale_preview_image_is_pushed_again_a_fresh_one_or_main_is_not(self):
+        os.environ["GAMES_MP_CHANNEL"] = "preview"
+        key = ("games-preview/mptest-engine", "mptest-1-" + SHA12)
+        self.w.ecr.add(key)
+        self.w.pushed_at[key] = "2020-01-01T00:00:00+00:00"
+        self.bu.cmd_codebuild_images(None)
+        self.assertEqual(self.w.deleted, [key])
+        self.assertEqual(self.w.pushed, ["games-preview/mptest-engine:mptest-1-" + SHA12])
+        # Pushed just now: left alone.
+        import datetime as _dt
+        self.w.pushed_at[key] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        self.bu.cmd_codebuild_images(None)
+        self.assertEqual(len(self.w.deleted), 1)
+        # Production images are never deleted, however old.
+        os.environ["GAMES_MP_CHANNEL"] = "main"
+        for repo, tag in EXPECT.items():
+            self.w.ecr.add((repo, tag))
+            self.w.pushed_at[(repo, tag)] = "2020-01-01T00:00:00+00:00"
+        self.bu.cmd_codebuild_images(None)
+        self.assertEqual(len(self.w.deleted), 1)
 
     def test_everything_present_builds_nothing(self):
         self.w.ecr.update(EXPECT.items())

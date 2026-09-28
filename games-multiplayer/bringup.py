@@ -34,6 +34,7 @@ Offline tests: scripts/test-games-mp-bringup.py.
 
 import argparse
 import base64
+import datetime
 import glob
 import hashlib
 import io
@@ -237,15 +238,37 @@ def repack_zipball(raw, ref, driver_source, extra=None):
 # --------------------------------------------------------------------------------------
 
 
-def missing_tags(expect, region):
-    """{repo: tag} entries of `expect` that ECR does not have yet."""
+def missing_tags(expect, region, refresh_before=None):
+    """{repo: tag} entries of `expect` that ECR does not have yet. With `refresh_before` (a UTC
+    datetime), an image pushed before it is deleted and counted as missing, so it is pushed
+    again (see PREVIEW_REFRESH_DAYS)."""
     missing = {}
     for repo, tag in sorted(expect.items()):
         found = aws("ecr", "describe-images", "--region", region, "--repository-name", repo,
                     "--image-ids", "imageTag=%s" % tag, check=False)
         if not found or not found.get("imageDetails"):
             missing[repo] = tag
+            continue
+        pushed = found["imageDetails"][0].get("imagePushedAt")
+        if refresh_before is not None and pushed and _when(pushed) < refresh_before:
+            log("%s:%s was pushed %s: pushing it again, so it outlives its new release record" % (repo, tag, pushed))
+            aws("ecr", "batch-delete-image", "--region", region, "--repository-name", repo,
+                "--image-ids", "imageTag=%s" % tag)
+            missing[repo] = tag
     return missing
+
+
+def _when(value):
+    """The AWS CLI's timestamp (ISO 8601, or epoch seconds) as an aware UTC datetime."""
+    if isinstance(value, (int, float)):
+        return datetime.datetime.fromtimestamp(value, datetime.timezone.utc)
+    return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+# A preview image older than this is pushed again when its commit is built again. The poller
+# builds a branch's head again when its release record expires (30 days) and ECR expires preview
+# images 45 days after the push, so a record never outlives its image.
+PREVIEW_REFRESH_DAYS = 14
 
 
 # Base images named without a registry come from Docker Hub, whose anonymous pull limit
@@ -362,7 +385,10 @@ def cmd_codebuild_images(args):
     if not targets:
         raise StepError("mp-images.mjs defines no images to build")
     images = {repo: tag for repo, tag, _, _ in targets.values()}
-    todo = missing_tags(images, region)
+    refresh = None
+    if channel == "preview":
+        refresh = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=PREVIEW_REFRESH_DAYS)
+    todo = missing_tags(images, region, refresh)
     names = [name for name, (repo, _, _, _) in sorted(targets.items()) if repo in todo]
     if names:
         password = aws("ecr", "get-login-password", "--region", region, parse=False)
