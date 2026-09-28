@@ -280,6 +280,20 @@ its *test* while the real fix sat unapplied and the repo stayed drifted. Per PR:
 6. **After about three review rounds,** stop and tell the owner what is left and whether it
    matters.
 
+**Mutation checks: bounded.** Breaking the code to show a new test fails is worth doing, but only
+for what changed. On 2026-09-28 an agent spent 15+ minutes re-running a full 48-mutation set
+(each a whole timing-sensitive test file) after a three-line fix.
+
+- Check only the mutations for the tests you added or changed in this commit, typically 1 to 5.
+  Never re-run the whole historical set.
+- Confirm each mutant really **fails**. A crash, a mutation that did not apply, or a skipped test
+  is not "caught". Check that the file actually changed and that the test output shows a
+  failure, and report a survivor as a survivor.
+- Keep a mutation run to a few minutes. If it would take longer, run the few mutations that
+  matter and say so.
+- Mutation checks are a local, per-change check. There is no CI mutation job, and none is
+  needed per PR.
+
 ### Common Pitfalls
 
 **Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on
