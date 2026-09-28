@@ -346,7 +346,8 @@ aws ecs describe-tasks --cluster games --tasks <id> --query 'tasks[].[stopCode,s
 
 Name the cluster on every task call: without `--cluster games` the CLI asks about the
 `default` cluster, and IAM denies `task/default/<id>` (the grant covers `task/games/*`).
-ECS forgets a stopped task after about an hour; its output stays in `/games/engines`.
+ECS forgets a stopped task after about an hour; its output stays in the logs: an engine's in
+`/games/engines`, the router's in `/games/mp-router`.
 
 The live smoke reads the key into the environment, never onto a command line:
 `export MP_TEST_KEY=$(aws secretsmanager get-secret-value --secret-id games/mp-test-key --query SecretString --output text)`,
