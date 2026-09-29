@@ -35,7 +35,22 @@ class WboxTests(unittest.TestCase):
 
     def test_the_game_disk_survives_and_is_formatted_only_when_blank(self):
         self.assertRegex(block("aws_ebs_volume", "wbox_games"), r"prevent_destroy = true")
-        self.assertIn("Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Initialize-Disk", TF)
+        # The game disk is found by its EBS volume id, never "any RAW disk" (the instance store is
+        # RAW too, and wiped at every stop), and only a RAW one is ever formatted.
+        self.assertIn('wbox_games_serial = replace(aws_ebs_volume.wbox_games.id, "-", "")', TF)
+        self.assertIn('$disk = Get-Disk | Where-Object { $_.SerialNumber -like "$serial*" }', TF)
+        self.assertNotIn("Get-Disk | Where-Object PartitionStyle -eq 'RAW'", TF)
+        self.assertIn("if ($disk.PartitionStyle -eq 'RAW') {", TF)
+
+    def test_setup_retries_until_it_completes_and_waits_for_its_inputs(self):
+        self.assertIn("<persist>true</persist>", TF)
+        body = TF.split("wbox_user_data = <<-PS", 1)[1]
+        self.assertLess(body.index("Install-WindowsFeature"), body.index("New-Item 'C:\\wbox-setup.done'"),
+                        "the marker is written only after every step")
+        self.assertIn("catch {", body)
+        instance = block("aws_instance", "wbox")
+        for dep in ("aws_secretsmanager_secret_version.wbox_admin", "aws_iam_role_policy.wbox"):
+            self.assertIn(dep, instance)
         self.assertIn("ignore_changes = [ami, user_data]", block("aws_instance", "wbox"))
 
     def test_the_dev_boxes_may_only_start_stop_reboot_and_read_the_password(self):

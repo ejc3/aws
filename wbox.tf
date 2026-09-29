@@ -19,10 +19,11 @@
 # whose route table has the internet and nothing else -- no I/O-box peer route -- so a
 # Windows desktop that runs downloaded games cannot reach the fleet's NFS scratch.
 #
-# FIRST BOOT (user_data, once): sets the Administrator password from Secrets Manager
-# (wbox/administrator-password, generated here; the dev roles may read it), formats D: only
-# if it is RAW, installs the NVIDIA GRID driver from AWS's bucket, Amazon DCV and Media
-# Foundation, then reboots. The store and game installs are the player's.
+# FIRST BOOT (user_data, retried at each boot until it completes once): sets the Administrator
+# password from Secrets Manager (wbox/administrator-password, generated here; the dev roles may
+# read it), finds the game disk by its EBS volume id and formats it only if RAW, installs the
+# NVIDIA GRID driver from AWS's bucket, Amazon DCV and Media Foundation, then reboots. The
+# store and game installs are the player's.
 
 variable "enable_wbox" {
   description = "Create the Windows playtest box (wbox.tf). The game disk has prevent_destroy either way."
@@ -188,31 +189,77 @@ resource "aws_iam_instance_profile" "wbox" {
 }
 
 locals {
+  # EBS volumes show up in Windows with the volume id, minus its hyphen, as the disk serial.
+  wbox_games_serial = replace(aws_ebs_volume.wbox_games.id, "-", "")
+
+  # Runs at every boot (persist) until one run completes every step; only then is the marker
+  # written, so a failure (the password or its grant still propagating, the game disk not yet
+  # attached) is retried at the next boot instead of being recorded as done.
   wbox_user_data = <<-PS
 <powershell>
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 Start-Transcript -Path 'C:\wbox-setup.log' -Append
-if (-not (Test-Path 'C:\wbox-setup.done')) {
-  $pw = (Get-SECSecretValue -SecretId '${aws_secretsmanager_secret.wbox_admin.name}' -Region '${var.aws_region}').SecretString
+if (Test-Path 'C:\wbox-setup.done') { Stop-Transcript; exit 0 }
+try {
+  $pw = $null
+  for ($i = 0; $i -lt 30 -and -not $pw; $i++) {
+    try { $pw = (Get-SECSecretValue -SecretId '${aws_secretsmanager_secret.wbox_admin.name}' -Region '${var.aws_region}').SecretString }
+    catch { Start-Sleep -Seconds 10 }
+  }
+  if (-not $pw) { throw 'could not read the Administrator password' }
   net user Administrator $pw | Out-Null
-  # D: is the persistent game disk. Only a RAW disk is initialized: never a formatted one.
-  Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Initialize-Disk -PartitionStyle GPT -PassThru |
-    New-Partition -DriveLetter D -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel 'Games' -Confirm:$false
+
+  # D: is the 100 GB EBS game disk, found by its serial -- never the instance-store NVMe disk,
+  # which is wiped at every stop. Its attachment may land after boot: wait for it.
+  $serial = '${local.wbox_games_serial}'
+  $disk = $null
+  for ($i = 0; $i -lt 60 -and -not $disk; $i++) {
+    $disk = Get-Disk | Where-Object { $_.SerialNumber -like "$serial*" }
+    if (-not $disk) { Start-Sleep -Seconds 10 }
+  }
+  if (-not $disk) { throw "game disk $serial is not attached" }
+  if ($disk.IsOffline) { $disk | Set-Disk -IsOffline $false }
+  # Free D: if another volume (the instance store, a DVD) took it.
+  $other = Get-Partition -DriveLetter D -ErrorAction SilentlyContinue | Where-Object DiskNumber -ne $disk.Number
+  if ($other) {
+    $free = [char[]]('EFGHIJKLMNOPQRSTUVWXYZ') | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } | Select-Object -First 1
+    $other | Set-Partition -NewDriveLetter $free
+  }
+  if ($disk.PartitionStyle -eq 'RAW') {
+    $disk | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -DriveLetter D -UseMaximumSize |
+      Format-Volume -FileSystem NTFS -NewFileSystemLabel 'Games' -Confirm:$false | Out-Null
+  } else {
+    # Already formatted (a replaced instance): never reformat, only make sure it is D:.
+    $part = $disk | Get-Partition | Where-Object Type -eq 'Basic' | Select-Object -First 1
+    if ($part -and $part.DriveLetter -ne 'D') { $part | Set-Partition -NewDriveLetter D }
+  }
+
   $d = 'C:\nvidia'; New-Item -ItemType Directory -Force $d | Out-Null
   Get-S3Object -BucketName 'ec2-windows-nvidia-drivers' -KeyPrefix 'latest/' -Region 'us-east-1' |
     Where-Object Key -like '*.exe' |
-    ForEach-Object { Read-S3Object -BucketName $_.BucketName -Key $_.Key -File (Join-Path $d (Split-Path $_.Key -Leaf)) -Region 'us-east-1' }
-  Get-ChildItem $d -Filter *.exe | ForEach-Object { Start-Process $_.FullName -ArgumentList '-s', '-noreboot', '-clean' -Wait }
+    ForEach-Object { Read-S3Object -BucketName $_.BucketName -Key $_.Key -File (Join-Path $d (Split-Path $_.Key -Leaf)) -Region 'us-east-1' | Out-Null }
+  $exe = Get-ChildItem $d -Filter *.exe | Select-Object -First 1
+  if (-not $exe) { throw 'no NVIDIA driver downloaded' }
+  $p = Start-Process $exe.FullName -ArgumentList '-s', '-noreboot', '-clean' -Wait -PassThru
+  Write-Output "NVIDIA installer exit code $($p.ExitCode)"
   New-Item -Path 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\GridLicensing' -Force | Out-Null
   New-ItemProperty -Path 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\GridLicensing' -Name 'NvCplDisableManageLicensePage' -PropertyType DWord -Value 1 -Force | Out-Null
+
   Invoke-WebRequest 'https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-server-x64-Release.msi' -OutFile 'C:\dcv.msi'
-  Start-Process msiexec -ArgumentList '/i', 'C:\dcv.msi', 'ADDLOCAL=ALL', 'AUTOMATIC_SESSION_OWNER=Administrator', '/quiet', '/norestart' -Wait
+  $p = Start-Process msiexec -ArgumentList '/i', 'C:\dcv.msi', 'ADDLOCAL=ALL', 'AUTOMATIC_SESSION_OWNER=Administrator', '/quiet', '/norestart' -Wait -PassThru
+  if ($p.ExitCode -notin 0, 3010) { throw "DCV install failed: $($p.ExitCode)" }
+
   Install-WindowsFeature Server-Media-Foundation | Out-Null
+
   New-Item 'C:\wbox-setup.done' -ItemType File | Out-Null
   Stop-Transcript
   Restart-Computer -Force
+} catch {
+  Write-Output "wbox setup failed: $_ -- it runs again at the next boot"
+  Stop-Transcript
 }
 </powershell>
+<persist>true</persist>
 PS
 }
 
@@ -241,6 +288,14 @@ resource "aws_instance" "wbox" {
   lifecycle {
     ignore_changes = [ami, user_data]
   }
+
+  # First boot reads the password with this role: both must exist before Windows starts.
+  depends_on = [
+    aws_secretsmanager_secret_version.wbox_admin,
+    aws_secretsmanager_secret_policy.wbox_admin,
+    aws_iam_role_policy.wbox,
+    aws_iam_role_policy_attachment.wbox_ssm,
+  ]
 
   tags = { Name = local.wbox_name, Purpose = "windows-playtest" }
 }
