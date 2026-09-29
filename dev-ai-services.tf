@@ -76,3 +76,33 @@ resource "vercel_project_environment_variable" "elevenlabs_api_key" {
   sensitive  = true
   comment    = "ElevenLabs; managed by ejc3/aws dev-ai-services.tf from Secrets Manager games/elevenlabs-api-key"
 }
+
+# AWS Price List API for the dev boxes (metal and nextjs-dev, the "dolphin" box): public list
+# prices only, so agents can price an instance, a volume or a model call themselves. Nothing
+# here reads the account's own spend (no Cost Explorer, no billing): that stays with admins.
+# The Price List API has no resource-level permissions, hence "*".
+data "aws_iam_policy_document" "dev_pricing_read" {
+  statement {
+    sid = "ReadPublicPriceLists"
+    actions = [
+      "pricing:DescribeServices",
+      "pricing:GetAttributeValues",
+      "pricing:GetProducts",
+      "pricing:ListPriceLists",
+      "pricing:GetPriceListFileUrl",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "dev_pricing_read" {
+  name        = "dev-pricing-read"
+  description = "Dev boxes: read AWS public list prices (Price List API); no account spend"
+  policy      = data.aws_iam_policy_document.dev_pricing_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "dev_pricing_read" {
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
+  policy_arn = aws_iam_policy.dev_pricing_read.arn
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The ElevenLabs API key (dev-ai-services.tf): readable only by the administration set and the
+"""dev-ai-services.tf: the ElevenLabs key readable only by the administration set and the
 two dev roles, and the dev roles may read that one secret and nothing else. Offline."""
 import re
 import unittest
@@ -41,6 +41,13 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertIn("resources = [aws_secretsmanager_secret.elevenlabs_api_key.arn]", doc)
         attach = block("aws_iam_role_policy_attachment", "elevenlabs_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
+
+    def test_pricing_is_public_price_lists_only(self):
+        doc = block("aws_iam_policy_document", "dev_pricing_read")
+        actions = set(re.findall(r'"(pricing:[A-Za-z]+)"', doc))
+        self.assertEqual(actions, {"pricing:DescribeServices", "pricing:GetAttributeValues", "pricing:GetProducts",
+                                   "pricing:ListPriceLists", "pricing:GetPriceListFileUrl"})
+        self.assertNotRegex(TF, r'"(ce|cur|billing|budgets|aws-portal|account):', "no account spend or billing")
 
     def test_no_bedrock_here(self):
         # DeepSeek stays on the metal boxes (dev-instance-common.tf); the kids' box does not get it.
