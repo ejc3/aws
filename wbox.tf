@@ -349,19 +349,17 @@ data "aws_iam_policy_document" "wbox_control" {
     ]
   }
 
-  # Reading results has no resource-level permission; it returns only command output.
-  statement {
-    sid       = "ReadCommandResults"
-    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:ListCommands"]
-    resources = ["*"]
-  }
+  # Deliberately NO ssm:GetCommandInvocation / ListCommands / ListCommandInvocations: they have no
+  # resource-level authorization, so they would expose the jumpboxes' command output to a dev box,
+  # and dev-instance-common.tf denies them on purpose (NeverReadAccountWideCommandOutput). Commands
+  # here are send-only; see the result on the desktop.
 }
 
 resource "aws_iam_policy" "wbox_control" {
   count = var.enable_wbox ? 1 : 0
 
   name        = "wbox-control"
-  description = "Dev boxes: start, stop, reboot and run PowerShell (SSM) on the Windows playtest box, and read its password"
+  description = "Dev boxes: start, stop, reboot and send PowerShell (SSM, no output back) to the Windows playtest box, and read its password"
   policy      = data.aws_iam_policy_document.wbox_control[0].json
 }
 

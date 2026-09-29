@@ -59,12 +59,14 @@ class WboxTests(unittest.TestCase):
         self.assertIn("resources = [aws_instance.wbox[0].arn]", doc)
         self.assertEqual(set(re.findall(r'"(\w+:\w+)"', doc)),
                          {"ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances", "secretsmanager:GetSecretValue",
-                          "ssm:SendCommand", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:ListCommands"})
+                          "ssm:SendCommand"})
         # SendCommand only to this instance, with only the PowerShell document.
         send = doc.split('sid     = "RunPowerShellOnTheWindowsBox"', 1)[1].split("statement {", 1)[0]
         self.assertEqual(re.findall(r"^\s+(aws_instance\.\S+|\"arn:aws:ssm:[^\"]+\")", send, re.M),
                          ["aws_instance.wbox[0].arn,", '"arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript"'])
         self.assertNotIn("StartSession", doc)
+        # Result reads have no resource scope and would expose the jumpboxes' command output.
+        self.assertNotRegex(re.sub(r"#.*", "", doc), r"GetCommandInvocation|ListCommand")
 
     def test_the_script_runs_powershell_and_launches_on_the_desktop(self):
         sh = (ROOT / "scripts" / "wbox.sh").read_text()
