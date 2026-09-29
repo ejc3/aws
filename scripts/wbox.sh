@@ -7,10 +7,13 @@
 #   wbox status     state, private IP, and how to connect
 #   wbox ip         its private IP
 #   wbox password   the Administrator password (for the DCV or RDP login)
+#   wbox run <powershell>      send PowerShell to the box through SSM (send-only, no output back)
+#   wbox launch <exe> [args]   start a program on the desktop of the logged-in Administrator
+#                              (needs a DCV or RDP session open: SSM itself has no desktop)
 #
 # THIS SCRIPT DOES NOT RUN TERRAFORM. Terraform owns the instance and its disks; the dev
-# boxes' grant (wbox-control) allows only start, stop and reboot of this one instance and
-# reading its password. It stops itself after one idle hour (wbox-auto-stop).
+# boxes' grant (wbox-control) allows only start, stop and reboot of this one instance, sending
+# PowerShell to it through SSM (no output back), and reading its password. It stops itself after one idle hour (wbox-auto-stop).
 #
 # Reaching it: only from the dev boxes. Open https://<ip>:8443 in a dev box browser (DCV's
 # web client; accept the self-signed certificate), or tunnel it to your own machine over the
@@ -41,6 +44,20 @@ connect_hint() {
   say "User Administrator; password: wbox password"
 }
 
+# Send PowerShell ($1) to the box through SSM and print the command id. Send-only: reading a
+# command's output (ssm:GetCommandInvocation) is denied to the dev roles on purpose, because that
+# API has no resource scope and would expose the jumpboxes' command output. Look at the desktop.
+run_ps() {
+  local params cid
+  params=$(mktemp) || return 1
+  PS_SCRIPT="$1" python3 -c 'import json,os; print(json.dumps({"commands":[os.environ["PS_SCRIPT"]]}))' > "$params"
+  cid=$(aws ssm send-command --region "$REGION" --instance-ids "$ID" --document-name AWS-RunPowerShellScript \
+    --parameters "file://$params" --query Command.CommandId --output text)
+  rm -f "$params"
+  [ -n "$cid" ] || { say "wbox: SendCommand failed (is the box running and SSM Online?)"; return 1; }
+  say "Sent (command $cid). Output is not returned; check the box's desktop."
+}
+
 case "${1:-status}" in
   up)
     if [ "$STATE" != "running" ]; then
@@ -69,8 +86,27 @@ case "${1:-status}" in
   password)
     aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET" --query SecretString --output text
     ;;
+  run)
+    [ "$STATE" = "running" ] || { say "wbox is $STATE; run: wbox up"; exit 1; }
+    [ $# -ge 2 ] || { say "usage: wbox run <powershell>"; exit 2; }
+    shift
+    run_ps "$*"
+    ;;
+  launch)
+    [ "$STATE" = "running" ] || { say "wbox is $STATE; run: wbox up"; exit 1; }
+    [ $# -ge 2 ] || { say "usage: wbox launch <exe> [args...]"; exit 2; }
+    shift
+    # A SSM command runs in session 0, which has no desktop. A scheduled task with /IT runs in
+    # the interactive session of the logged-in Administrator, so the game window appears in DCV.
+    exe=$1; shift
+    tr_cmd="\"$exe\" $*"
+    run_ps "\$tr = '${tr_cmd//\'/\'\'}'
+schtasks /Create /TN wbox-launch /TR \$tr /SC ONCE /ST 00:00 /RU Administrator /IT /F
+if (\$LASTEXITCODE -eq 0) { schtasks /Run /TN wbox-launch }
+exit \$LASTEXITCODE"
+    ;;
   *)
-    say "usage: wbox up | down | status | ip | password"
+    say "usage: wbox up | down | status | ip | password | run <powershell> | launch <exe> [args]"
     exit 2
     ;;
 esac
