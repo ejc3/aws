@@ -688,8 +688,8 @@ honours as Production. Development holds no key at all. Preview origins
 `colton-games-git-<branch>-...` aliases) match the router's `MP_ALLOWED_ORIGINS` entry
 `https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app`, where `*` is one DNS label.
 
-**Two production names.** `cc-games.net` serves the same site as `cc-games.app`, with no
-redirect, for networks (a school) that block `.app`. It has its own multiplayer entry,
+**Production domain.** `cc-games.net` is canonical (a school network blocks `.app`); every other
+name, `cc-games.app` included, 308-redirects to it. It has its own multiplayer entry,
 `play.cc-games.net`: a second certificate on the same ALB and the same router, which accepts
 the origin `https://cc-games.net`. Production's `MP_PUBLIC_ENTRY` lists both,
 `wss://play.cc-games.net` first, and the lobby (CoderColton/colton-games#83) gives each player

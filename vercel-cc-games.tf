@@ -1,4 +1,4 @@
-# Colton Games production on Vercel, with cc-games.app as its primary domain.
+# Colton Games production on Vercel, with cc-games.net as its canonical domain.
 #
 # The project lives in the Vercel team `coltons-projects-7f9a4e8b`. This file manages its
 # DOMAINS. The project's settings and env vars stay in Vercel: several env values are database
@@ -10,14 +10,16 @@
 #   stage 2 (this file): cc-games.app becomes a project domain, ccgames.app redirects to it,
 #                        the existing colton-games.com pair is imported AS IT IS.
 #   stage 3 (done):      colton-games.com and www.colton-games.com redirect to cc-games.app.
+#   stage 4 (2026-09-29): cc-games.net is canonical; every other name redirects to it.
 # Only production is redirected. The dev URLs under cc-games.dev are a separate Cloudflare
 # tunnel and are not touched.
 #
-# cc-games.net (registered 2026-09-28) SERVES the same production site, deliberately without
-# a redirect: some school networks block cc-games.app, and a redirect to it would be blocked
-# too. Its www redirects to cc-games.net, never to .app. Multiplayer has a matching entry,
-# play.cc-games.net (games-multiplayer.tf), and the lobby hands each player the entry on the
-# domain its page came from.
+# cc-games.net (registered 2026-09-28) is canonical since 2026-09-29: cc-games.app is blocked on
+# a school network, so every other name -- cc-games.app included -- 308-redirects to
+# cc-games.net, and nothing ever redirects to .app. Multiplayer: play.cc-games.net
+# (games-multiplayer.tf) is production's first entry and MP_API is https://cc-games.net, which
+# had to move BEFORE cc-games.app redirected (an engine's callbacks lose their Authorization
+# header across a redirect; docs/games-multiplayer.md). play.cc-games.app keeps serving.
 #
 # DNS stays at Cloudflare (both .app domains are registered there, and Cloudflare Registrar
 # does not allow other nameservers). The apex records must NOT be proxied: an orange cloud
@@ -68,13 +70,25 @@ locals {
   colton_games_vercel_project_id = "prj_dYI19Kk20cSBR2JirdbGNz5J91KF"
 }
 
+# Redirects to cc-games.net only after every other name points at cc-games.net directly, so no
+# name ever chains through a domain that is itself a redirect.
 resource "vercel_project_domain" "cc_games_app" {
-  team_id    = var.vercel_team_id
-  project_id = data.vercel_project.colton_games.id
-  domain     = "cc-games.app"
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "cc-games.app"
+  redirect             = vercel_project_domain.cc_games_net.domain
+  redirect_status_code = 308
+
+  depends_on = [
+    vercel_project_domain.ccgames_app,
+    vercel_project_domain.colton_games_com,
+    vercel_project_domain.colton_games_com_www,
+    vercel_project_domain.www_cc_games_app,
+    vercel_project_domain.www_ccgames_app,
+  ]
 }
 
-# A second production name, serving directly (see the header): no redirect.
+# The canonical production name (see the header): it serves, it never redirects.
 resource "vercel_project_domain" "cc_games_net" {
   team_id    = var.vercel_team_id
   project_id = data.vercel_project.colton_games.id
@@ -93,19 +107,18 @@ resource "vercel_project_domain" "ccgames_app" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "ccgames.app"
-  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect             = vercel_project_domain.cc_games_net.domain
   redirect_status_code = 308
 }
 
-# The old production domains now redirect to cc-games.app (308). cc-games.app was confirmed
-# serving over HTTPS before this change, so production never redirects to a domain that is
-# not live. colton-games.vercel.app is Vercel's own hostname and is left alone. (Both
+# The old production domains redirect to cc-games.net (308; they pointed at cc-games.app until
+# 2026-09-29). colton-games.vercel.app is Vercel's own hostname and is left alone. (Both
 # domains were imported into state in stage 2.)
 resource "vercel_project_domain" "colton_games_com" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "colton-games.com"
-  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect             = vercel_project_domain.cc_games_net.domain
   redirect_status_code = 308
 }
 
@@ -113,17 +126,17 @@ resource "vercel_project_domain" "colton_games_com_www" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "www.colton-games.com"
-  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect             = vercel_project_domain.cc_games_net.domain
   redirect_status_code = 308
 }
 
-# www variants. Every hostname a person might type ends up on https://cc-games.app: the
+# www variants. Every hostname a person might type ends up on https://cc-games.net: the
 # apex and www of both spellings redirect to it, and http:// is upgraded by Vercel.
 resource "vercel_project_domain" "www_cc_games_app" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "www.cc-games.app"
-  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect             = vercel_project_domain.cc_games_net.domain
   redirect_status_code = 308
 }
 
@@ -131,7 +144,7 @@ resource "vercel_project_domain" "www_ccgames_app" {
   team_id              = var.vercel_team_id
   project_id           = data.vercel_project.colton_games.id
   domain               = "www.ccgames.app"
-  redirect             = vercel_project_domain.cc_games_app.domain
+  redirect             = vercel_project_domain.cc_games_net.domain
   redirect_status_code = 308
 }
 
@@ -142,7 +155,7 @@ resource "cloudflare_dns_record" "cc_games_app_apex" {
   content = "76.76.21.21"
   proxied = false # see the header: proxying breaks Vercel cert issuance
   ttl     = 300
-  comment = "vercel apex; Colton Games production"
+  comment = "vercel apex; redirects to cc-games.net"
 }
 
 resource "cloudflare_dns_record" "cc_games_net_apex" {
@@ -152,7 +165,7 @@ resource "cloudflare_dns_record" "cc_games_net_apex" {
   content = "76.76.21.21"
   proxied = false # see the header: proxying breaks Vercel cert issuance
   ttl     = 300
-  comment = "vercel apex; Colton Games production (second name, no redirect)"
+  comment = "vercel apex; Colton Games production (canonical)"
 }
 
 resource "cloudflare_dns_record" "cc_games_net_www" {
@@ -172,7 +185,7 @@ resource "cloudflare_dns_record" "ccgames_app_apex" {
   content = "76.76.21.21"
   proxied = false
   ttl     = 300
-  comment = "vercel apex; redirects to cc-games.app"
+  comment = "vercel apex; redirects to cc-games.net"
 }
 
 resource "cloudflare_dns_record" "cc_games_app_www" {
@@ -182,7 +195,7 @@ resource "cloudflare_dns_record" "cc_games_app_www" {
   content = "cname.vercel-dns.com"
   proxied = false
   ttl     = 300
-  comment = "vercel www; redirects to cc-games.app"
+  comment = "vercel www; redirects to cc-games.net"
 }
 
 resource "cloudflare_dns_record" "ccgames_app_www" {
@@ -192,5 +205,5 @@ resource "cloudflare_dns_record" "ccgames_app_www" {
   content = "cname.vercel-dns.com"
   proxied = false
   ttl     = 300
-  comment = "vercel www; redirects to cc-games.app"
+  comment = "vercel www; redirects to cc-games.net"
 }

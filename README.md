@@ -1493,9 +1493,9 @@ not trusted: multiplayer players get no shell anywhere, while a runner job gets 
 disposable VM (the `runner` account has passwordless sudo), so the boundary there is the VM,
 its instance role and its network, not the account:
 
-- **Games multiplayer.** The public lobby at `cc-games.app` (and `cc-games.net`, the same site
-  for networks that block `.app`) launches Fargate match engines, and anyone on the internet
-  can connect to `play.cc-games.app` or `play.cc-games.net`, one internet-facing ALB.
+- **Games multiplayer.** The public lobby at `cc-games.net` (canonical; `cc-games.app`, blocked
+  on a school network, redirects to it) launches Fargate match engines, and anyone on the
+  internet can connect to `play.cc-games.net` or `play.cc-games.app`, one internet-facing ALB.
   A WAF (per-IP rate limit, AWS managed rules), join tokens, an origin allowlist, per-IP
   limits in the router and router-only engine ingress protect it. The engines' task role has
   no permissions and their egress is HTTPS-only. Their images deploy automatically: a push
@@ -1983,7 +1983,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
-| Colton Games' production domains on Vercel (`cc-games.app`; `cc-games.net` serving the same site without a redirect; `ccgames.app` and `colton-games.com` redirecting) | `vercel.tf`, `vercel-cc-games.tf` |
+| Colton Games' production domains on Vercel (`cc-games.net`, canonical; `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.app` and `play.cc-games.net`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
