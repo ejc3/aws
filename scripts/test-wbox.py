@@ -57,21 +57,39 @@ class WboxTests(unittest.TestCase):
         doc = block("aws_iam_policy_document", "wbox_control")
         self.assertIn('actions   = ["ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances"]', doc)
         self.assertIn("resources = [aws_instance.wbox[0].arn]", doc)
-        self.assertEqual(set(re.findall(r'"(\w+:\w+)"', doc)),
+        actions = set(re.findall(r'"(\w+:\w+)"', doc)) - {"s3:prefix"}  # a condition key, not an action
+        self.assertEqual(actions,
                          {"ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances", "secretsmanager:GetSecretValue",
-                          "ssm:SendCommand"})
+                          "ssm:SendCommand", "s3:GetObject", "s3:ListBucket"})
         # SendCommand only to this instance, with only the PowerShell document.
         send = doc.split('sid     = "RunPowerShellOnTheWindowsBox"', 1)[1].split("statement {", 1)[0]
         self.assertEqual(re.findall(r"^\s+(aws_instance\.\S+|\"arn:aws:ssm:[^\"]+\")", send, re.M),
                          ["aws_instance.wbox[0].arn,", '"arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript"'])
+        # ...and the output may go to no bucket but ours (SendCommand authorizes the bucket).
+        self.assertIn("aws_s3_bucket.wbox_output.arn,", send)
+        # Reads: only that bucket's wbox/ prefix.
+        self.assertIn('resources = ["${aws_s3_bucket.wbox_output.arn}/${local.wbox_output_prefix}/*"]', doc)
+        self.assertIn('values   = ["${local.wbox_output_prefix}/*"]', doc)
         self.assertNotIn("StartSession", doc)
         # Result reads have no resource scope and would expose the jumpboxes' command output.
-        self.assertNotRegex(re.sub(r"#.*", "", doc), r"GetCommandInvocation|ListCommand")
+        self.assertNotRegex(re.sub(r"#.*", "", doc), r"ssm:(Get|List|Cancel)")
+
+    def test_only_the_windows_box_writes_the_output_bucket(self):
+        role = block("aws_iam_role_policy", "wbox")
+        self.assertIn('Action   = "s3:PutObject"', role)
+        self.assertIn('"arn:aws:s3:::${local.wbox_output_bucket}/${local.wbox_output_prefix}/*"', role)
+        bucket = block("aws_s3_bucket_public_access_block", "wbox_output")
+        for flag in ("block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"):
+            self.assertIn("%s       = true" % flag if flag == "block_public_acls" else flag, bucket)
+        self.assertIn("expiration { days = 7 }", block("aws_s3_bucket_lifecycle_configuration", "wbox_output"))
+        self.assertIn("AES256", block("aws_s3_bucket_server_side_encryption_configuration", "wbox_output"))
 
     def test_the_script_runs_powershell_and_launches_on_the_desktop(self):
         sh = (ROOT / "scripts" / "wbox.sh").read_text()
         self.assertIn("--document-name AWS-RunPowerShellScript", sh)
         self.assertNotIn("start-session", sh)
+        self.assertIn("--output-s3-bucket-name", sh)
+        self.assertNotIn("get-command-invocation", sh)
         # SSM runs in session 0 (no desktop); a /IT scheduled task shows the game in the DCV session.
         self.assertIn("/RU Administrator /IT", sh)
 
