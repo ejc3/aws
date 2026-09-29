@@ -363,7 +363,7 @@ The long-lived development and administration instances are:
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
-| wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down` | wbox.tf |
+| wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request

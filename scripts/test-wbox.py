@@ -66,6 +66,13 @@ class WboxTests(unittest.TestCase):
                          ["aws_instance.wbox[0].arn,", '"arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript"'])
         self.assertNotIn("StartSession", doc)
 
+    def test_the_script_runs_powershell_and_launches_on_the_desktop(self):
+        sh = (ROOT / "scripts" / "wbox.sh").read_text()
+        self.assertIn("--document-name AWS-RunPowerShellScript", sh)
+        self.assertNotIn("start-session", sh)
+        # SSM runs in session 0 (no desktop); a /IT scheduled task shows the game in the DCV session.
+        self.assertIn("/RU Administrator /IT", sh)
+
     def test_the_password_has_exactly_its_readers(self):
         policy = block("aws_secretsmanager_secret_policy", "wbox_admin")
         self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.wbox_password_readers)', policy)
