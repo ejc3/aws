@@ -640,6 +640,23 @@ GH_TOKEN=$(aws secretsmanager get-secret-value \
   --output text)
 ```
 
+### AI services on the dev boxes
+
+Available if a task needs them; neither needs a key on disk.
+
+- **DeepSeek (opencode), metal boxes only.** `opencode` on fcvm-metal-arm/x86 runs DeepSeek on
+  Amazon Bedrock (`deepseek.v3.2`, us-west-2; `deepseek.r1-v1:0` also granted) through the
+  instance role. The managed `~/.zshrc` wraps `opencode` so it names the `[default]` profile when
+  nothing else supplies credentials: opencode does not use an instance role on its own, and
+  asked for a key. The pinned release is `local.opencode_version` in `dev-user-data.tf`. Not on
+  nextjs-dev: the kids' box has no Bedrock access, on purpose.
+- **ElevenLabs** (voice and sound for the games). The key is in Secrets Manager,
+  `games/elevenlabs-api-key` (us-west-1), readable by dev-server-role and nextjs-dev-role only
+  (`dev-ai-services.tf`). Fetch it into the environment when needed, never onto a command line
+  or into a file or a commit:
+  `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
+  The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+
 ### Claude Code Sync
 
 All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:
