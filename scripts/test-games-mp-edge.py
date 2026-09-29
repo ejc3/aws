@@ -296,53 +296,68 @@ class CostTests(unittest.TestCase):
         self.assertIn('"Amazon Elastic Container Service"', budget)
 
 
-class SecondDomainTests(unittest.TestCase):
-    """cc-games.net is canonical (cc-games.app is blocked on a school network): it SERVES, and
-    every other production name redirects straight to it, never to .app."""
+class ProductionDomainTests(unittest.TestCase):
+    """cc-games.app is blocked on a school network, so production is on other names. The serving
+    names never redirect, every other name redirects straight to CANONICAL (never to .app), and
+    each serving name has its own multiplayer entry on the same router."""
     VERCEL = (ROOT / "vercel-cc-games.tf").read_text()
+    # While cc-games.org takes over: both serve, and the rest still points at cc-games.net.
+    SERVING = {"cc_games_net": "cc-games.net", "cc_games_org": "cc-games.org"}
+    CANONICAL = "cc_games_net"
+    OWN_WWW = {"www_cc_games_net": "cc_games_net", "www_cc_games_org": "cc_games_org"}
 
-    def test_cc_games_net_serves_and_its_www_stays_on_net(self):
-        apex = block(self.VERCEL, "vercel_project_domain", "cc_games_net")
-        self.assertIn('domain     = "cc-games.net"', apex)
-        self.assertNotIn("redirect", apex, "cc-games.net must serve the site, not redirect to .app")
-        www = block(self.VERCEL, "vercel_project_domain", "www_cc_games_net")
-        self.assertIn("redirect             = vercel_project_domain.cc_games_net.domain", www)
-        for name in ("cc_games_net_apex", "cc_games_net_www"):
-            record = block(self.VERCEL, "cloudflare_dns_record", name)
-            self.assertIn("zone_id = var.cc_games_net_zone_id", record)
-            self.assertIn("proxied = false", record)
+    def test_the_serving_names_serve_with_dns_only_records(self):
+        for name, domain in self.SERVING.items():
+            apex = block(self.VERCEL, "vercel_project_domain", name)
+            self.assertIn('domain     = "%s"' % domain, apex)
+            self.assertNotIn("redirect", apex, "%s must serve the site" % domain)
+            zone = "var.%s_zone_id" % name
+            for record in ("%s_apex" % name, "%s_www" % name):
+                body = block(self.VERCEL, "cloudflare_dns_record", record)
+                self.assertIn("zone_id = %s" % zone, body)
+                self.assertIn("proxied = false", body)
 
-    def test_every_other_name_redirects_straight_to_cc_games_net(self):
+    def test_every_other_name_redirects_straight_to_a_serving_name(self):
         names = re.findall(r'^resource "vercel_project_domain" "(\w+)"', self.VERCEL, re.M)
         self.assertIn("cc_games_app", names)
-        for name in names:
+        for name in set(names) - set(self.SERVING):
             body = block(self.VERCEL, "vercel_project_domain", name)
-            if name == "cc_games_net":
-                continue
-            self.assertIn("redirect             = vercel_project_domain.cc_games_net.domain", body, name)
+            target = self.OWN_WWW.get(name, self.CANONICAL)
+            self.assertIn("redirect             = vercel_project_domain.%s.domain" % target, body, name)
             self.assertIn("redirect_status_code = 308", body, name)
         self.assertNotIn("vercel_project_domain.cc_games_app.domain", self.VERCEL, "nothing may redirect to .app")
         # cc-games.app redirects last, so no name chains through a redirecting domain.
         app = block(self.VERCEL, "vercel_project_domain", "cc_games_app")
-        for other in set(names) - {"cc_games_app", "cc_games_net", "www_cc_games_net"}:
+        for other in set(names) - {"cc_games_app"} - set(self.SERVING) - set(self.OWN_WWW):
             self.assertIn("vercel_project_domain.%s," % other, app)
 
-    def test_play_cc_games_net_reaches_the_same_router_with_its_own_certificate(self):
-        self.assertIn('mp_play_domain_net = "play.cc-games.net"', GAMES)
-        self.assertIn('"https://cc-games.net",', GAMES, "the router must accept the .net page's origin")
-        listener_cert = block(GAMES, "aws_lb_listener_certificate", "games_play_net")
+    def test_each_serving_name_has_its_own_entry_on_the_same_router(self):
+        self.assertIn('net = { domain = "play.cc-games.net", zone_id = var.cc_games_net_zone_id }', GAMES)
+        self.assertIn('org = { domain = "play.cc-games.org", zone_id = var.cc_games_org_zone_id }', GAMES)
+        for origin in ("https://cc-games.net", "https://cc-games.org"):
+            self.assertIn('"%s",' % origin, GAMES, "the router must accept %s pages" % origin)
+        for kind in ("aws_acm_certificate", "aws_acm_certificate_validation", "aws_lb_listener_certificate",
+                     "cloudflare_dns_record"):
+            self.assertIn("for_each = local.mp_play_extra" if kind != "cloudflare_dns_record" else
+                          'setproduct(keys(local.mp_play_extra), ["play", "*.play"])',
+                          block(GAMES, kind, "games_play_extra"), kind)
+        listener_cert = block(GAMES, "aws_lb_listener_certificate", "games_play_extra")
         self.assertIn("listener_arn    = aws_lb_listener.games_play_https.arn", listener_cert)
-        self.assertIn("aws_acm_certificate_validation.games_play_net.certificate_arn", listener_cert)
-        # Production hands .net pages the .net entry (first) and calls engines back on .net;
-        # previews set no entry of their own.
-        self.assertIn('"MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, '
-                      'value = "wss://${local.mp_play_domain_net},wss://${local.mp_play_domain}" }', BRINGUP)
-        self.assertIn('"MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.net" }', BRINGUP)
-        dns = block(GAMES, "cloudflare_dns_record", "games_play_net")
-        self.assertIn("zone_id = var.cc_games_net_zone_id", dns)
+        dns = block(GAMES, "cloudflare_dns_record", "games_play_extra")
         self.assertIn("content = aws_lb.games_play.dns_name", dns)
         self.assertIn("proxied = false", dns)
+        # The live .net resources moved into the map rather than being replaced.
+        for old, new in (("aws_acm_certificate.games_play_net", 'aws_acm_certificate.games_play_extra["net"]'),
+                         ('cloudflare_dns_record.games_play_net["play"]', 'cloudflare_dns_record.games_play_extra["net/play"]')):
+            self.assertIn("from = %s\n  to   = %s" % (old, new), GAMES)
 
+    def test_production_hands_out_the_canonical_entry_first_and_calls_back_canonical(self):
+        # Previews set no entry of their own (the lobby's default).
+        self.assertIn('"MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, value = '
+                      '"wss://${local.mp_play_extra.org.domain},wss://${local.mp_play_extra.net.domain},'
+                      'wss://${local.mp_play_domain}" }', BRINGUP)
+        self.assertIn('"MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.org" }', BRINGUP)
+        self.assertIn('api_base = "^https://cc-games\\\\.(org|net|app)$"', GAMES)
 
 if __name__ == "__main__":
     unittest.main()

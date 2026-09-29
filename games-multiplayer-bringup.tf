@@ -526,12 +526,12 @@ locals {
     {
       "MP_ENV/production" = { targets = ["production"], sensitive = false, value = "production" }
       "MP_ENV/preview"    = { targets = ["preview"], sensitive = false, value = "preview" }
-      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.net" }
-      # Production serves cc-games.net (canonical) and cc-games.app: the lobby gives each player
+      "MP_API/production" = { targets = ["production"], sensitive = false, value = "https://cc-games.org" }
+      # Production serves cc-games.org (canonical), .net and .app: the lobby gives each player
       # the entry on its page's domain, the first by default. Production only: a preview has no
       # entry of its own and uses the lobby's default (play.cc-games.app), so a preview built
       # from a branch older than the lobby that reads a list is never handed one.
-      "MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, value = "wss://${local.mp_play_domain_net},wss://${local.mp_play_domain}" }
+      "MP_PUBLIC_ENTRY" = { targets = ["production"], sensitive = false, value = "wss://${local.mp_play_extra.org.domain},wss://${local.mp_play_extra.net.domain},wss://${local.mp_play_domain}" }
       # New key names rather than per-environment copies of MP_ROLE_ARN: Terraform may create
       # the per-environment variables before it deletes the shared one, and Vercel refuses two
       # variables with one key on the same target.

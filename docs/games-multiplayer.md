@@ -688,13 +688,14 @@ honours as Production. Development holds no key at all. Preview origins
 `colton-games-git-<branch>-...` aliases) match the router's `MP_ALLOWED_ORIGINS` entry
 `https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app`, where `*` is one DNS label.
 
-**Production domain.** `cc-games.net` is canonical (a school network blocks `.app`); every other
-name, `cc-games.app` included, 308-redirects to it. It has its own multiplayer entry,
-`play.cc-games.net`: a second certificate on the same ALB and the same router, which accepts
-the origin `https://cc-games.net`. Production's `MP_PUBLIC_ENTRY` lists both,
-`wss://play.cc-games.net` first, and the lobby (CoderColton/colton-games#83) gives each player
-the entry on its page's domain, so a player on `.net` never touches `.app`. Engines call back
-`MP_API=https://cc-games.net`. Previews set no entry and use the lobby's default,
+**Production domain.** `cc-games.org` is becoming canonical (a school network blocks `.app`);
+`cc-games.net` serves too until it redirects, and every other name 308-redirects. Each serving
+name has its own multiplayer entry (`play.cc-games.org`, `play.cc-games.net`;
+`local.mp_play_extra`): a certificate each on the same ALB and the same router, which accepts
+those origins. Production's `MP_PUBLIC_ENTRY` lists `wss://play.cc-games.org`,
+`wss://play.cc-games.net` and `wss://play.cc-games.app`, and the lobby
+(CoderColton/colton-games#83) gives each player the entry on its page's domain, so no player
+touches `.app`. Engines call back `MP_API=https://cc-games.org`. Previews set no entry and use the lobby's default,
 `play.cc-games.app`. Do not redirect a domain that `MP_API` names or that running engines were
 launched with: `fetch` drops the engine's `Authorization` header on a cross-origin redirect,
 its heartbeats then fail, and the lobby fails its match.

@@ -44,6 +44,12 @@ variable "cc_games_net_zone_id" {
   default     = "7ecab81e3d2db28b0aeabb2f8e04c1e6"
 }
 
+variable "cc_games_org_zone_id" {
+  description = "Cloudflare zone id for cc-games.org (registered through Cloudflare Registrar 2026-09-29)"
+  type        = string
+  default     = "7efede9790c3944c5d8b3a1fb3747fdf"
+}
+
 variable "ccgames_app_zone_id" {
   description = "Cloudflare zone id for ccgames.app (registered through Cloudflare Registrar 2026-09-25)"
   type        = string
@@ -93,6 +99,21 @@ resource "vercel_project_domain" "cc_games_net" {
   team_id    = var.vercel_team_id
   project_id = data.vercel_project.colton_games.id
   domain     = "cc-games.net"
+}
+
+# cc-games.org: serves (it becomes canonical once nothing calls back cc-games.net).
+resource "vercel_project_domain" "cc_games_org" {
+  team_id    = var.vercel_team_id
+  project_id = data.vercel_project.colton_games.id
+  domain     = "cc-games.org"
+}
+
+resource "vercel_project_domain" "www_cc_games_org" {
+  team_id              = var.vercel_team_id
+  project_id           = data.vercel_project.colton_games.id
+  domain               = "www.cc-games.org"
+  redirect             = vercel_project_domain.cc_games_org.domain
+  redirect_status_code = 308
 }
 
 resource "vercel_project_domain" "www_cc_games_net" {
@@ -166,6 +187,26 @@ resource "cloudflare_dns_record" "cc_games_net_apex" {
   proxied = false # see the header: proxying breaks Vercel cert issuance
   ttl     = 300
   comment = "vercel apex; Colton Games production (canonical)"
+}
+
+resource "cloudflare_dns_record" "cc_games_org_apex" {
+  zone_id = var.cc_games_org_zone_id
+  name    = "cc-games.org"
+  type    = "A"
+  content = "76.76.21.21"
+  proxied = false # see the header: proxying breaks Vercel cert issuance
+  ttl     = 300
+  comment = "vercel apex; Colton Games production (canonical)"
+}
+
+resource "cloudflare_dns_record" "cc_games_org_www" {
+  zone_id = var.cc_games_org_zone_id
+  name    = "www"
+  type    = "CNAME"
+  content = "cname.vercel-dns.com"
+  proxied = false
+  ttl     = 300
+  comment = "vercel www; redirects to cc-games.org"
 }
 
 resource "cloudflare_dns_record" "cc_games_net_www" {

@@ -170,9 +170,13 @@ locals {
   mp_alb_subnets = local.dev_fleet_subnets
 
   mp_play_domain = "play.cc-games.app"
-  # The same entry under cc-games.net, for networks that block cc-games.app: its own
-  # certificate on the same ALB (SNI) and its own DNS; the router behind it is the same.
-  mp_play_domain_net = "play.cc-games.net"
+  # The same entry under the other production names (cc-games.app is blocked on a school
+  # network): each its own certificate on the same ALB (SNI) and its own DNS; the router
+  # behind them is the same. cc-games.org is canonical (vercel-cc-games.tf).
+  mp_play_extra = {
+    net = { domain = "play.cc-games.net", zone_id = var.cc_games_net_zone_id }
+    org = { domain = "play.cc-games.org", zone_id = var.cc_games_org_zone_id }
+  }
 
   # Browser origins the router accepts (MP_ALLOWED_ORIGINS, comma-separated). The three
   # production spellings, then Vercel preview deployments of the colton-games project,
@@ -184,6 +188,7 @@ locals {
   mp_allowed_origins = [
     "https://cc-games.app",
     "https://cc-games.net",
+    "https://cc-games.org",
     "https://ccgames.app",
     "https://colton-games.vercel.app",
     "https://colton-games-*-coltons-projects-7f9a4e8b.vercel.app",
@@ -624,12 +629,12 @@ locals {
   # plus room for engines still exiting after their match.
   games_mp_preview_ceiling = min(8, var.games_mp_engine_ceiling)
   games_mp_launch_environments = {
-    # api_base: cc-games.net is production's MP_API; cc-games.app stays accepted so a lobby
-    # deployment built before the switch (and any engine it launched) works through the cutover.
+    # api_base: cc-games.org is production's MP_API; the older names stay accepted so a lobby
+    # deployment built before a switch (and any engine it launched) works through the cutover.
     production = {
       channel  = "main"
       ceiling  = var.games_mp_engine_ceiling - local.games_mp_preview_ceiling
-      api_base = "^https://cc-games\\.(net|app)$"
+      api_base = "^https://cc-games\\.(org|net|app)$"
       bypass   = false
       # Engines verify join tokens themselves: this environment's PUBLIC keys only.
       token_public_keys = local.games_mp_token_public_keys_by_env["production"]
@@ -1360,14 +1365,16 @@ resource "aws_acm_certificate_validation" "games_play" {
   depends_on              = [cloudflare_dns_record.games_play_acm_validation]
 }
 
-# play.cc-games.net: a second certificate on the same listener (SNI picks it for that name),
-# validated through the cc-games.net zone the same way.
-resource "aws_acm_certificate" "games_play_net" {
-  domain_name               = local.mp_play_domain_net
-  subject_alternative_names = ["*.${local.mp_play_domain_net}"]
+# The other production names' entries (local.mp_play_extra): a certificate each on the same
+# listener (SNI picks it for that name), validated through that name's zone the same way.
+resource "aws_acm_certificate" "games_play_extra" {
+  for_each = local.mp_play_extra
+
+  domain_name               = each.value.domain
+  subject_alternative_names = ["*.${each.value.domain}"]
   validation_method         = "DNS"
 
-  tags = { Name = local.mp_play_domain_net, Project = "games-multiplayer" }
+  tags = { Name = each.value.domain, Project = "games-multiplayer" }
 
   lifecycle {
     create_before_destroy = true
@@ -1375,26 +1382,58 @@ resource "aws_acm_certificate" "games_play_net" {
 }
 
 locals {
-  games_play_net_validation = one([
-    for dvo in aws_acm_certificate.games_play_net.domain_validation_options : dvo
-    if dvo.domain_name == local.mp_play_domain_net
-  ])
+  games_play_extra_validation = {
+    for k, cert in aws_acm_certificate.games_play_extra : k => one([
+      for dvo in cert.domain_validation_options : dvo if dvo.domain_name == local.mp_play_extra[k].domain
+    ])
+  }
 }
 
-resource "cloudflare_dns_record" "games_play_net_acm_validation" {
-  zone_id = var.cc_games_net_zone_id
-  name    = trimsuffix(local.games_play_net_validation.resource_record_name, ".")
-  type    = local.games_play_net_validation.resource_record_type
-  content = trimsuffix(local.games_play_net_validation.resource_record_value, ".")
+resource "cloudflare_dns_record" "games_play_extra_acm_validation" {
+  for_each = local.mp_play_extra
+
+  zone_id = each.value.zone_id
+  name    = trimsuffix(local.games_play_extra_validation[each.key].resource_record_name, ".")
+  type    = local.games_play_extra_validation[each.key].resource_record_type
+  content = trimsuffix(local.games_play_extra_validation[each.key].resource_record_value, ".")
   proxied = false
   ttl     = 300
-  comment = "ACM DNS validation for play.cc-games.net and *.play.cc-games.net (games-multiplayer.tf)"
+  comment = "ACM DNS validation for ${each.value.domain} and *.${each.value.domain} (games-multiplayer.tf)"
 }
 
-resource "aws_acm_certificate_validation" "games_play_net" {
-  certificate_arn         = aws_acm_certificate.games_play_net.arn
-  validation_record_fqdns = [trimsuffix(local.games_play_net_validation.resource_record_name, ".")]
-  depends_on              = [cloudflare_dns_record.games_play_net_acm_validation]
+resource "aws_acm_certificate_validation" "games_play_extra" {
+  for_each = local.mp_play_extra
+
+  certificate_arn         = aws_acm_certificate.games_play_extra[each.key].arn
+  validation_record_fqdns = [trimsuffix(local.games_play_extra_validation[each.key].resource_record_name, ".")]
+  depends_on              = [cloudflare_dns_record.games_play_extra_acm_validation]
+}
+
+# These were single .net resources until cc-games.org arrived; the moves keep the live .net
+# certificate, its validation and its DNS in place.
+moved {
+  from = aws_acm_certificate.games_play_net
+  to   = aws_acm_certificate.games_play_extra["net"]
+}
+moved {
+  from = cloudflare_dns_record.games_play_net_acm_validation
+  to   = cloudflare_dns_record.games_play_extra_acm_validation["net"]
+}
+moved {
+  from = aws_acm_certificate_validation.games_play_net
+  to   = aws_acm_certificate_validation.games_play_extra["net"]
+}
+moved {
+  from = aws_lb_listener_certificate.games_play_net
+  to   = aws_lb_listener_certificate.games_play_extra["net"]
+}
+moved {
+  from = cloudflare_dns_record.games_play_net["play"]
+  to   = cloudflare_dns_record.games_play_extra["net/play"]
+}
+moved {
+  from = cloudflare_dns_record.games_play_net["*.play"]
+  to   = cloudflare_dns_record.games_play_extra["net/*.play"]
 }
 
 # Dualstack: both subnets carry an IPv6 /64 and the public route table has ::/0 to the
@@ -1491,9 +1530,11 @@ resource "aws_lb_listener" "games_play_https" {
   }
 }
 
-resource "aws_lb_listener_certificate" "games_play_net" {
+resource "aws_lb_listener_certificate" "games_play_extra" {
+  for_each = local.mp_play_extra
+
   listener_arn    = aws_lb_listener.games_play_https.arn
-  certificate_arn = aws_acm_certificate_validation.games_play_net.certificate_arn
+  certificate_arn = aws_acm_certificate_validation.games_play_extra[each.key].certificate_arn
 }
 
 # DNS-only (grey cloud), like the apex records in vercel-cc-games.tf. Proxying through
@@ -1512,16 +1553,19 @@ resource "cloudflare_dns_record" "games_play" {
   comment = "games multiplayer entry -> ALB games-play (us-west-1); DNS-only for direct WebSockets"
 }
 
-resource "cloudflare_dns_record" "games_play_net" {
-  for_each = toset(["play", "*.play"])
+resource "cloudflare_dns_record" "games_play_extra" {
+  for_each = {
+    for pair in setproduct(keys(local.mp_play_extra), ["play", "*.play"]) :
+    "${pair[0]}/${pair[1]}" => { zone_id = local.mp_play_extra[pair[0]].zone_id, name = pair[1] }
+  }
 
-  zone_id = var.cc_games_net_zone_id
-  name    = each.key
+  zone_id = each.value.zone_id
+  name    = each.value.name
   type    = "CNAME"
   content = aws_lb.games_play.dns_name
   proxied = false
   ttl     = 300
-  comment = "games multiplayer entry (cc-games.net) -> ALB games-play (us-west-1); DNS-only for direct WebSockets"
+  comment = "games multiplayer entry (${each.key}) -> ALB games-play (us-west-1); DNS-only for direct WebSockets"
 }
 
 # -------------------------------------------------------------------------------------
