@@ -17,8 +17,17 @@ def block(kind, name):
 
 class ElevenLabsSecretTests(unittest.TestCase):
     def test_the_value_is_never_in_terraform(self):
-        self.assertNotIn("aws_secretsmanager_secret_version", TF)
+        # It reaches Vercel through state (a data source), never through the configuration.
+        self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
         self.assertNotRegex(TF, r"sk_[0-9a-f]{20,}")
+
+    def test_the_games_get_it_server_side(self):
+        env = block("vercel_project_environment_variable", "elevenlabs_api_key")
+        self.assertIn('key        = "ELEVENLABS_API_KEY"', env)
+        self.assertIn("value      = data.aws_secretsmanager_secret_version.elevenlabs_api_key.secret_string", env)
+        self.assertIn("sensitive  = true", env)
+        self.assertIn('target     = ["production", "preview"]', env)
+        self.assertNotIn("NEXT_PUBLIC", env)
 
     def test_the_resource_policy_denies_everyone_but_admins_and_the_two_dev_roles(self):
         policy = block("aws_secretsmanager_secret_policy", "elevenlabs_api_key")
