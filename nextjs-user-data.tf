@@ -2192,6 +2192,8 @@ ${local.pbox_setup}
 # own hard lifetime. It uses the hop key below, as pbox does.
 ${local.gbox_setup}
 
+${local.wbox_setup}
+
 # ejc3's copy of the hop key. dev_hop_setup above installs it for `ubuntu` only, and
 # /home/ubuntu is 0700 -- but `pbox up` ends by SSHing to the new box as the invoking
 # user, so without this ejc3 could launch a box and then not reach it.

@@ -122,6 +122,9 @@ jobs:
       - name: Dev-box AI services and price lists (ElevenLabs key readers, public prices only)
         run: python3 -S -B scripts/test-dev-ai-services.py
 
+      - name: Windows playtest box (dev-box-only access, no peer route, kept game disk, 1h idle stop)
+        run: python3 -S -B scripts/test-wbox.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 

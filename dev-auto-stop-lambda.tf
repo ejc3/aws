@@ -228,7 +228,7 @@ resource "aws_iam_role_policy" "dev_auto_stop" {
         ]
         Condition = {
           StringLike = {
-            "ec2:ResourceTag/Name" = ["fcvm-metal-*", "x86-*", "io-box"]
+            "ec2:ResourceTag/Name" = ["fcvm-metal-*", "x86-*", "io-box", "wbox"]
           }
         }
       },
