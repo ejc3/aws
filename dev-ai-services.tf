@@ -56,3 +56,23 @@ resource "aws_iam_role_policy_attachment" "elevenlabs_read" {
   role       = each.value
   policy_arn = aws_iam_policy.elevenlabs_read.arn
 }
+
+# The deployed games: ELEVENLABS_API_KEY for the colton-games project, server-side (sensitive:
+# Vercel never shows it again, and it reaches no browser unless code prefixes it NEXT_PUBLIC_,
+# which it must not). Production and Preview; a preview is any branch of the games repo, whose
+# writers are the owner's family. The value passes through Terraform state, like the other
+# games secrets (games-multiplayer-bringup.tf): state already holds credentials and is guarded
+# for that. (value_wo would keep it out, but needs Terraform 1.11; this repo pins 1.10.3.)
+data "aws_secretsmanager_secret_version" "elevenlabs_api_key" {
+  secret_id = aws_secretsmanager_secret.elevenlabs_api_key.id
+}
+
+resource "vercel_project_environment_variable" "elevenlabs_api_key" {
+  team_id    = var.vercel_team_id
+  project_id = local.colton_games_vercel_project_id
+  key        = "ELEVENLABS_API_KEY"
+  value      = data.aws_secretsmanager_secret_version.elevenlabs_api_key.secret_string
+  target     = ["production", "preview"]
+  sensitive  = true
+  comment    = "ElevenLabs; managed by ejc3/aws dev-ai-services.tf from Secrets Manager games/elevenlabs-api-key"
+}
