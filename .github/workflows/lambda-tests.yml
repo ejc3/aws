@@ -116,6 +116,9 @@ jobs:
       - name: Games pipeline read-only view for the dev boxes
         run: python3 -S -B scripts/test-games-mp-observe.py
 
+      - name: opencode reaches DeepSeek on Bedrock through the instance role
+        run: python3 -S -B scripts/test-opencode-setup.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
