@@ -90,6 +90,11 @@ class WboxTests(unittest.TestCase):
         self.assertNotIn("start-session", sh)
         self.assertIn("--output-s3-bucket-name", sh)
         self.assertNotIn("get-command-invocation", sh)
+        # An output-less command writes no object; the marker makes stdout (and completion) certain,
+        # and stderr must reach stderr, not /dev/null (`2>/dev/null >&2` in that order discards it).
+        self.assertIn("} finally { Write-Output '__wbox_done__' }", sh)
+        self.assertIn("(stdout|stderr)", sh)
+        self.assertNotIn("2>/dev/null >&2", sh)
         # SSM runs in session 0 (no desktop); a /IT scheduled task shows the game in the DCV session.
         self.assertIn("/RU Administrator /IT", sh)
 
