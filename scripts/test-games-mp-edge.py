@@ -297,7 +297,8 @@ class CostTests(unittest.TestCase):
 
 
 class SecondDomainTests(unittest.TestCase):
-    """cc-games.net is for networks that block cc-games.app: it must SERVE, never redirect there."""
+    """cc-games.net is canonical (cc-games.app is blocked on a school network): it SERVES, and
+    every other production name redirects straight to it, never to .app."""
     VERCEL = (ROOT / "vercel-cc-games.tf").read_text()
 
     def test_cc_games_net_serves_and_its_www_stays_on_net(self):
@@ -310,6 +311,21 @@ class SecondDomainTests(unittest.TestCase):
             record = block(self.VERCEL, "cloudflare_dns_record", name)
             self.assertIn("zone_id = var.cc_games_net_zone_id", record)
             self.assertIn("proxied = false", record)
+
+    def test_every_other_name_redirects_straight_to_cc_games_net(self):
+        names = re.findall(r'^resource "vercel_project_domain" "(\w+)"', self.VERCEL, re.M)
+        self.assertIn("cc_games_app", names)
+        for name in names:
+            body = block(self.VERCEL, "vercel_project_domain", name)
+            if name == "cc_games_net":
+                continue
+            self.assertIn("redirect             = vercel_project_domain.cc_games_net.domain", body, name)
+            self.assertIn("redirect_status_code = 308", body, name)
+        self.assertNotIn("vercel_project_domain.cc_games_app.domain", self.VERCEL, "nothing may redirect to .app")
+        # cc-games.app redirects last, so no name chains through a redirecting domain.
+        app = block(self.VERCEL, "vercel_project_domain", "cc_games_app")
+        for other in set(names) - {"cc_games_app", "cc_games_net", "www_cc_games_net"}:
+            self.assertIn("vercel_project_domain.%s," % other, app)
 
     def test_play_cc_games_net_reaches_the_same_router_with_its_own_certificate(self):
         self.assertIn('mp_play_domain_net = "play.cc-games.net"', GAMES)
