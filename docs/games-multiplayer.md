@@ -105,9 +105,10 @@ fails the apply. With nothing changed, a second apply is an empty plan.
 | `MP_LAUNCH_ROLE_ARN` | `games-mp-launcher` | `games-mp-launcher-preview` |
 | `MP_LAUNCH_FUNCTION` | `games-mp-launch-production` (its ARN) | `games-mp-launch-preview` (its ARN) |
 | `MP_REGION`, `AWS_REGION=us-west-1` | yes | yes |
-| `MP_LAUNCHER=ecs`, `MP_PUBLIC_ENTRY=wss://play.cc-games.app` | yes | yes |
+| `MP_LAUNCHER=ecs` | yes | yes |
+| `MP_PUBLIC_ENTRY` | `wss://play.cc-games.org,wss://play.cc-games.net,wss://play.cc-games.app` (each page gets its own domain's entry) | not set: the lobby's default, `wss://play.cc-games.app` |
 | `MP_ENV` | `production` | `preview` |
-| `MP_API` | `https://cc-games.app` | not set: the lobby uses `https://$VERCEL_URL` for each deployment |
+| `MP_API` | `https://cc-games.org` | not set: the lobby uses `https://$VERCEL_URL` for each deployment |
 | `MP_TOKEN_SIGNING_KEYS` (sensitive): Ed25519 private keys, `<env>-<kid>:<base64 PKCS#8>`, first signs | Production's own | Preview's own |
 | `MP_TEST_KEY`, `CRON_SECRET` (sensitive) | yes | same values |
 | `MP_COOKIE_SECRET` (sensitive) | its own value | its own value |
@@ -540,7 +541,8 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   `A-Za-z0-9._-`, matched in full), `commit` is 40 lowercase hex (required on preview, ignored
   on production), `hardCapSec` is 60 to 3,600 (no match may outlive a draining router, see
   Automatic deploys), `apiBase` must be
-  `https://cc-games.app` on production or this project's own `*.vercel.app` deployment URL on
+  `https://cc-games.org` (or `.net`/`.app`, for a lobby built before a switch) on production or
+  this project's own `*.vercel.app` deployment URL on
   preview, and only preview may pass a bypass secret. `{"action":"stop","matchId"}` stops that
   match's engine of the caller's own environment, never another environment's or the router.
 - **Environment from the function.** Each function's environment is its own configuration
