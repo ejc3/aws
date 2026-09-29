@@ -301,10 +301,11 @@ class ProductionDomainTests(unittest.TestCase):
     names never redirect, every other name redirects straight to CANONICAL (never to .app), and
     each serving name has its own multiplayer entry on the same router."""
     VERCEL = (ROOT / "vercel-cc-games.tf").read_text()
-    # While cc-games.org takes over: both serve, and the rest still points at cc-games.net.
-    SERVING = {"cc_games_net": "cc-games.net", "cc_games_org": "cc-games.org"}
-    CANONICAL = "cc_games_net"
-    OWN_WWW = {"www_cc_games_net": "cc_games_net", "www_cc_games_org": "cc_games_org"}
+    SERVING = {"cc_games_org": "cc-games.org"}
+    CANONICAL = "cc_games_org"
+    OWN_WWW = {"www_cc_games_org": "cc_games_org"}
+    # The previous canonical name turns into a redirect last, once nothing points at it.
+    LAST = "cc_games_net"
 
     def test_the_serving_names_serve_with_dns_only_records(self):
         for name, domain in self.SERVING.items():
@@ -326,10 +327,10 @@ class ProductionDomainTests(unittest.TestCase):
             self.assertIn("redirect             = vercel_project_domain.%s.domain" % target, body, name)
             self.assertIn("redirect_status_code = 308", body, name)
         self.assertNotIn("vercel_project_domain.cc_games_app.domain", self.VERCEL, "nothing may redirect to .app")
-        # cc-games.app redirects last, so no name chains through a redirecting domain.
-        app = block(self.VERCEL, "vercel_project_domain", "cc_games_app")
-        for other in set(names) - {"cc_games_app"} - set(self.SERVING) - set(self.OWN_WWW):
-            self.assertIn("vercel_project_domain.%s," % other, app)
+        # The previous canonical name redirects last, so no name chains through a redirect.
+        last = block(self.VERCEL, "vercel_project_domain", self.LAST)
+        for other in set(names) - {self.LAST} - set(self.SERVING) - set(self.OWN_WWW):
+            self.assertIn("vercel_project_domain.%s," % other, last)
 
     def test_each_serving_name_has_its_own_entry_on_the_same_router(self):
         self.assertIn('net = { domain = "play.cc-games.net", zone_id = var.cc_games_net_zone_id }', GAMES)
