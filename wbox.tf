@@ -37,6 +37,11 @@ locals {
   # us-west-1a: g4dn.xlarge is offered in 1a and 1c; the game disk is AZ-locked to this one.
   wbox_az          = aws_subnet.subnet_a.availability_zone
   wbox_client_cidr = [for s in local.dev_fleet_subnets : s.cidr_block]
+  # Where SSM writes the output of the PowerShell the dev boxes send. The dev roles cannot call
+  # ssm:GetCommandInvocation (it has no resource scope and would expose the jumpboxes' command
+  # output), so they read the result from here instead: one bucket, one prefix, only wbox writes.
+  wbox_output_bucket = "wbox-output-${data.aws_caller_identity.current.account_id}"
+  wbox_output_prefix = "wbox"
 }
 
 data "aws_ssm_parameter" "wbox_ami" {
@@ -178,6 +183,13 @@ resource "aws_iam_role_policy" "wbox" {
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
         Resource = aws_secretsmanager_secret.wbox_admin.arn
+      },
+      {
+        # Run Command uploads its output with the instance's own credentials.
+        Sid      = "WriteCommandOutput"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::${local.wbox_output_bucket}/${local.wbox_output_prefix}/*"
       },
     ]
   })
@@ -321,7 +333,40 @@ resource "aws_volume_attachment" "wbox_games" {
   stop_instance_before_detaching = true
 }
 
-# The dev boxes: start, stop and reboot this one instance, and read its password.
+# Output of the PowerShell the dev boxes send (see wbox_output_bucket above): private, encrypted, a week.
+resource "aws_s3_bucket" "wbox_output" {
+  bucket        = local.wbox_output_bucket
+  force_destroy = true # scratch: command output only, expired after a week
+  tags          = { Name = local.wbox_output_bucket }
+}
+
+resource "aws_s3_bucket_public_access_block" "wbox_output" {
+  bucket                  = aws_s3_bucket.wbox_output.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "wbox_output" {
+  bucket = aws_s3_bucket.wbox_output.id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "wbox_output" {
+  bucket = aws_s3_bucket.wbox_output.id
+  rule {
+    id     = "expire-command-output"
+    status = "Enabled"
+    filter {}
+    expiration { days = 7 }
+  }
+}
+
+# The dev boxes: start, stop and reboot this one instance, send it PowerShell, and read its password
+# and the output.
 data "aws_iam_policy_document" "wbox_control" {
   count = var.enable_wbox ? 1 : 0
 
@@ -338,28 +383,47 @@ data "aws_iam_policy_document" "wbox_control" {
   }
 
   # Run PowerShell on this one box through Systems Manager (install a store, check a game),
-  # the way an admin does: the instance and the one AWS document, nothing else. The target is
-  # the Windows box, never a jumpbox (AGENTS.md: dev -> jumpbox is not permitted).
+  # the way an admin does: the instance, the one AWS document and the one output bucket, nothing
+  # else. SendCommand authorizes the output bucket as a resource, so a caller cannot send the
+  # output anywhere but here. The target is the Windows box, never a jumpbox (AGENTS.md: dev ->
+  # jumpbox is not permitted).
   statement {
     sid     = "RunPowerShellOnTheWindowsBox"
     actions = ["ssm:SendCommand"]
     resources = [
       aws_instance.wbox[0].arn,
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript",
+      aws_s3_bucket.wbox_output.arn,
     ]
   }
 
   # Deliberately NO ssm:GetCommandInvocation / ListCommands / ListCommandInvocations: they have no
   # resource-level authorization, so they would expose the jumpboxes' command output to a dev box,
-  # and dev-instance-common.tf denies them on purpose (NeverReadAccountWideCommandOutput). Commands
-  # here are send-only; see the result on the desktop.
+  # and dev-instance-common.tf denies them on purpose (NeverReadAccountWideCommandOutput). The
+  # result is read from the output bucket instead.
+  statement {
+    sid       = "ReadCommandOutput"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.wbox_output.arn}/${local.wbox_output_prefix}/*"]
+  }
+
+  statement {
+    sid       = "ListCommandOutput"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.wbox_output.arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${local.wbox_output_prefix}/*"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "wbox_control" {
   count = var.enable_wbox ? 1 : 0
 
   name        = "wbox-control"
-  description = "Dev boxes: start, stop, reboot and send PowerShell (SSM, no output back) to the Windows playtest box, and read its password"
+  description = "Dev boxes: start, stop, reboot and run PowerShell (SSM, output via S3) on the Windows playtest box, and read its password"
   policy      = data.aws_iam_policy_document.wbox_control[0].json
 }
 
