@@ -241,6 +241,37 @@ PODMANSYS
   # the script's docstring). Tested offline by scripts/test-atuin-agent-hooks.py.
   atuin_agent_hooks_py = file("${path.module}/scripts/atuin-agent-hooks.py")
 
+  # opencode with DeepSeek on Amazon Bedrock, for ubuntu on the metal boxes. dev-server-role grants
+  # exactly deepseek.v3.2 and deepseek.r1-v1:0 (dev-instance-common.tf); the opencode() function
+  # in ~/.zshrc (user_shell_env) points opencode at the instance role. Installs the pinned
+  # release only when no opencode is on PATH (ARM has a pnpm-managed one), and writes a default
+  # config only where none exists: an existing one may carry other settings (remote-claw's).
+  opencode_version = "1.18.33"
+  opencode_setup   = <<-OPENCODE
+sudo -u ubuntu -H bash <<'OPENCODESETUP' || echo "WARNING: opencode setup failed"
+set -e
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/pnpm:$PATH"
+command -v opencode >/dev/null || curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} --no-modify-path
+mkdir -p ~/.aws
+grep -qs '^\[default\]' ~/.aws/config || printf '[default]\nregion = us-west-1\n' >> ~/.aws/config
+if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/opencode.json ]; then
+  mkdir -p ~/.config/opencode
+  cat > ~/.config/opencode/opencode.jsonc <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  // DeepSeek on Amazon Bedrock through this box's instance role (ejc3/aws dev-instance-common.tf
+  // grants deepseek.v3.2 and deepseek.r1-v1:0). deepseek.v3.2 invokes in us-west-2. The opencode()
+  // function in ~/.zshrc supplies the AWS profile that makes opencode use the instance role.
+  "provider": { "amazon-bedrock": { "options": { "region": "us-west-2" } } },
+  "model": "amazon-bedrock/deepseek.v3.2",
+  "small_model": "amazon-bedrock/deepseek.v3.2",
+  "autoupdate": false
+}
+JSON
+fi
+OPENCODESETUP
+OPENCODE
+
   # Per-user interactive shell environment: starship, fzf, atuin, zsh plugins, .zshrc,
   # .tmux.conf and t-claude. Deliberately user-AGNOSTIC -- every path is ~-relative, so
   # the same body sets up whichever account runs it. dev boxes run it for ubuntu; the
@@ -272,7 +303,7 @@ ATUINHOOKS
 [ -d ~/.zsh/zsh-autosuggestions ] || git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
 [ -d ~/.zsh/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'
-export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/.opencode/bin:$PATH"
 # Use NVMe for cargo builds if available
 [ -d /mnt/fcvm-btrfs/cargo-target ] && export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target
 HISTFILE=~/.zsh_history; HISTSIZE=100000; SAVEHIST=100000
@@ -292,6 +323,20 @@ alias ll="ls -la" gs="git status" gd="git diff"
 # launch and explicit arguments win, so agents-start does not end up passing it twice.
 export TCLAUDE_ARGS="--remote-control"
 [ -f ~/.config/t-claude.zsh ] && source ~/.config/t-claude.zsh
+# opencode on Bedrock (DeepSeek on the metal boxes) with an EC2 instance role: opencode walks the
+# AWS credential chain only when it sees a profile, keys, a bearer token, a web identity or
+# container credentials -- never for an instance role -- so it asked for a key. Naming the
+# [default] profile makes the chain reach the instance role. Only when nothing else supplies
+# credentials (exported keys still win), only when [default] exists (the aws CLI refuses a
+# missing one), and only for opencode: nothing else gets AWS_PROFILE.
+opencode() {
+  if [[ -z "$AWS_PROFILE$AWS_ACCESS_KEY_ID$AWS_BEARER_TOKEN_BEDROCK$AWS_WEB_IDENTITY_TOKEN_FILE$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI$AWS_CONTAINER_CREDENTIALS_FULL_URI" ]] &&
+    grep -qs '^\[default\]' ~/.aws/config; then
+    AWS_PROFILE=default command opencode "$@"
+  else
+    command opencode "$@"
+  fi
+}
 ZSH
 cat > ~/.tmux.conf << 'TMUXCONF'
 # Native (swipe/wheel) scrollback in Panic Prompt on iOS -- smcup@/rmcup@, status off,
@@ -473,6 +518,8 @@ else
   echo "WARNING: native claude missing -- keeping the npm copy rather than leaving no claude"
 fi
 
+${local.opencode_setup}
+
 ${local.gh_and_claude_sync_script}
 
 ${local.metal_claude_remote_control}
@@ -567,6 +614,8 @@ if sudo -u ubuntu -H test -x /home/ubuntu/.local/bin/claude; then
 else
   echo "WARNING: native claude missing -- keeping the npm copy rather than leaving no claude"
 fi
+
+${local.opencode_setup}
 
 ${local.gh_and_claude_sync_script}
 

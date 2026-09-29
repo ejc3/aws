@@ -14,7 +14,8 @@ the isolated staging/recovery account, Cloudflare, and several regions. The plat
 - backups, cross-region/cross-account recovery, and cost alerts;
 - credential-free Terraform validation in GitHub, with live plans confined to admin hosts;
 - scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access
-  (Claude models, plus two named DeepSeek models for opencode on the metal boxes).
+  (Claude models, plus two named DeepSeek models for opencode on the metal boxes, which the
+  setup installs and points at the instance role: `opencode` there needs no key).
 
 ## Start here
 
