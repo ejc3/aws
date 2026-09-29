@@ -656,6 +656,9 @@ Available if a task needs them; neither needs a key on disk.
   or into a file or a commit:
   `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+- **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
+  get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
+  spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
 
 ### Claude Code Sync
 

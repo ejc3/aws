@@ -119,8 +119,8 @@ jobs:
       - name: opencode reaches DeepSeek on Bedrock through the instance role
         run: python3 -S -B scripts/test-opencode-setup.py
 
-      - name: ElevenLabs key readable only by admins and the two dev roles
-        run: python3 -S -B scripts/test-elevenlabs-secret.py
+      - name: Dev-box AI services and price lists (ElevenLabs key readers, public prices only)
+        run: python3 -S -B scripts/test-dev-ai-services.py
 
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
