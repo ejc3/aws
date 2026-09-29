@@ -167,7 +167,8 @@ terraform apply -var enable_runner_app_webhooks=false \
   -target='aws_ssm_parameter.github_runner_pat[0]' \
   -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["CoderColton/colton-games"]' \
-  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]'
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]' \
+  -target=aws_secretsmanager_secret.elevenlabs_api_key
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
@@ -184,6 +185,16 @@ org admin for `dolphin-labs`. Put each value without echoing it:
 ```bash
 read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
   --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin; unset T
+```
+
+The ElevenLabs key for the games, `games/elevenlabs-api-key` (us-west-1, from
+`dev-ai-services.tf`), is populated the same way. Until it has a value the dev boxes get
+`ResourceNotFoundException` for it, and the colton-games Vercel env `ELEVENLABS_API_KEY`, which
+Terraform reads from it, cannot be planned, so populate it before the full apply:
+
+```bash
+read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+  --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
