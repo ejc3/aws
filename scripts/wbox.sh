@@ -53,8 +53,10 @@ run_ps() {
   params=$(mktemp) || return 1
   # SSM writes no object for a command with no output, so end with a marker: stdout always exists,
   # and its arrival means the command finished.
-  PS_SCRIPT="$1
-Write-Output '__wbox_done__'" python3 -c 'import json,os; print(json.dumps({"commands":[os.environ["PS_SCRIPT"]]}))' > "$params"
+  # try/finally also runs on 'exit' and 'return'; a parse error runs nothing but writes stderr.
+  PS_SCRIPT="try {
+$1
+} finally { Write-Output '__wbox_done__' }" python3 -c 'import json,os; print(json.dumps({"commands":[os.environ["PS_SCRIPT"]]}))' > "$params"
   cid=$(aws ssm send-command --region "$REGION" --instance-ids "$ID" --document-name AWS-RunPowerShellScript \
     --parameters "file://$params" --output-s3-bucket-name "$bucket" --output-s3-key-prefix wbox \
     --query Command.CommandId --output text)
@@ -63,10 +65,10 @@ Write-Output '__wbox_done__'" python3 -c 'import json,os; print(json.dumps({"com
   prefix="wbox/$cid/"
   for _ in $(seq 1 60); do
     key=$(aws s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix" --query 'Contents[].Key' --output text 2>/dev/null |
-          tr '\t' '\n' | grep '/stdout$' | head -1)
+          tr '\t' '\n' | grep -E '/(stdout|stderr)$' | head -1)
     if [ -n "$key" ]; then
-      sleep 2   # stderr is uploaded alongside stdout
-      out=${key%stdout}
+      sleep 2   # stdout and stderr are uploaded together
+      out=${key%std*}
       aws s3 cp "s3://$bucket/${out}stdout" - 2>/dev/null | tr -d '\r' | grep -vx '__wbox_done__' || true
       aws s3 cp "s3://$bucket/${out}stderr" - >&2 2>/dev/null || true
       return 0
