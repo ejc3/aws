@@ -531,6 +531,8 @@ ${local.metal_claude_remote_control}
 
 ${local.pbox_setup}
 
+${local.wbox_setup}
+
 ${local.selfupdate_setup}
 
 echo "ARM dev instance ready!"
@@ -627,6 +629,8 @@ ${local.gh_and_claude_sync_script}
 ${local.metal_claude_remote_control}
 
 ${local.pbox_setup}
+
+${local.wbox_setup}
 
 ${local.selfupdate_setup}
 

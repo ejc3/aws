@@ -239,6 +239,14 @@ GBOXB64
 chmod 755 /usr/local/bin/gbox
   EOT
 
+  # `wbox` -- start/stop for the Windows playtest box (wbox.tf). Same embedding as pbox.
+  wbox_setup = <<-EOT
+base64 -d > /usr/local/bin/wbox <<'WBOXB64'
+${base64encode(file("${path.module}/scripts/wbox.sh"))}
+WBOXB64
+chmod 755 /usr/local/bin/wbox
+  EOT
+
   # ---------------------------------------------------------------------------
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------
