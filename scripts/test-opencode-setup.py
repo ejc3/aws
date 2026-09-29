@@ -66,15 +66,21 @@ class OpencodeSetupTests(unittest.TestCase):
             body = USER_DATA.split("  %s = <<-SCRIPT" % name, 1)[1].split("\nSCRIPT\n", 1)[0]
             self.assertEqual(body.count("${local.opencode_setup}"), 1, name)
 
-    def test_install_is_pinned_and_only_when_absent(self):
+    def test_the_pinned_install_is_the_one_on_path(self):
         setup = USER_DATA.split("opencode_setup   = <<-OPENCODE", 1)[1].split("\nOPENCODE\n", 1)[0]
         self.assertRegex(USER_DATA, r'opencode_version = "\d+\.\d+\.\d+"')
-        self.assertIn("command -v opencode >/dev/null || curl -fsSL https://opencode.ai/install | bash -s -- "
-                      "--version ${local.opencode_version} --no-modify-path", setup)
+        # Installed (or kept) at exactly the pinned version in ~/.opencode/bin...
+        self.assertIn('[ "$(~/.opencode/bin/opencode --version 2>/dev/null || true)" = "${local.opencode_version}" ] ||\n'
+                      "  curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} "
+                      "--no-modify-path", setup)
+        self.assertNotIn("command -v opencode", setup, "another copy on PATH must not stand in for the pinned one")
+        # ...and that directory precedes every other copy on the managed PATH.
+        zshrc = USER_DATA.split("cat > ~/.zshrc << 'ZSH'", 1)[1].split("\nZSH\n", 1)[0]
+        path_line = zshrc.strip().splitlines()[0]
+        self.assertRegex(path_line, r'^export PATH=".*\$HOME/\.opencode/bin:\$PATH"$')
         self.assertIn("grep -qs '^\\[default\\]' ~/.aws/config || printf '[default]", setup)
         self.assertIn("if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/opencode.json ]",
                       setup, "an existing config must never be overwritten")
-        self.assertIn('$HOME/.opencode/bin', USER_DATA.split("cat > ~/.zshrc << 'ZSH'", 1)[1].split("\nZSH\n", 1)[0])
 
     def test_the_default_model_is_one_the_role_may_invoke(self):
         setup = USER_DATA.split("opencode_setup   = <<-OPENCODE", 1)[1].split("\nOPENCODE\n", 1)[0]

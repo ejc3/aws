@@ -243,15 +243,20 @@ PODMANSYS
 
   # opencode with DeepSeek on Amazon Bedrock, for ubuntu on the metal boxes. dev-server-role grants
   # exactly deepseek.v3.2 and deepseek.r1-v1:0 (dev-instance-common.tf); the opencode() function
-  # in ~/.zshrc (user_shell_env) points opencode at the instance role. Installs the pinned
-  # release only when no opencode is on PATH (ARM has a pnpm-managed one), and writes a default
-  # config only where none exists: an existing one may carry other settings (remote-claw's).
+  # in ~/.zshrc (user_shell_env) points opencode at the instance role. The pinned release goes to
+  # ~/.opencode/bin, which the managed PATH puts ahead of any other copy (ARM also has a
+  # pnpm-managed one, on PATH only through its hand-written ~/.zshenv), so every metal box runs
+  # this version. A default config is written only where none exists: an existing one may carry
+  # other settings (remote-claw's).
   opencode_version = "1.18.33"
   opencode_setup   = <<-OPENCODE
 sudo -u ubuntu -H bash <<'OPENCODESETUP' || echo "WARNING: opencode setup failed"
 set -e
-export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/pnpm:$PATH"
-command -v opencode >/dev/null || curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} --no-modify-path
+# Only ~/.opencode/bin ahead of the system dirs, so the installer's own version check looks at
+# the copy it manages, never at another one elsewhere on PATH.
+export PATH="$HOME/.opencode/bin:/usr/local/bin:/usr/bin:/bin"
+[ "$(~/.opencode/bin/opencode --version 2>/dev/null || true)" = "${local.opencode_version}" ] ||
+  curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} --no-modify-path
 mkdir -p ~/.aws
 grep -qs '^\[default\]' ~/.aws/config || printf '[default]\nregion = us-west-1\n' >> ~/.aws/config
 if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/opencode.json ]; then
