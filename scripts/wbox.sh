@@ -51,7 +51,10 @@ run_ps() {
   local params cid bucket prefix key out
   bucket="wbox-output-$(aws sts get-caller-identity --query Account --output text)" || return 1
   params=$(mktemp) || return 1
-  PS_SCRIPT="$1" python3 -c 'import json,os; print(json.dumps({"commands":[os.environ["PS_SCRIPT"]]}))' > "$params"
+  # SSM writes no object for a command with no output, so end with a marker: stdout always exists,
+  # and its arrival means the command finished.
+  PS_SCRIPT="$1
+Write-Output '__wbox_done__'" python3 -c 'import json,os; print(json.dumps({"commands":[os.environ["PS_SCRIPT"]]}))' > "$params"
   cid=$(aws ssm send-command --region "$REGION" --instance-ids "$ID" --document-name AWS-RunPowerShellScript \
     --parameters "file://$params" --output-s3-bucket-name "$bucket" --output-s3-key-prefix wbox \
     --query Command.CommandId --output text)
@@ -64,8 +67,8 @@ run_ps() {
     if [ -n "$key" ]; then
       sleep 2   # stderr is uploaded alongside stdout
       out=${key%stdout}
-      aws s3 cp "s3://$bucket/${out}stdout" - 2>/dev/null
-      aws s3 cp "s3://$bucket/${out}stderr" - 2>/dev/null >&2 || true
+      aws s3 cp "s3://$bucket/${out}stdout" - 2>/dev/null | tr -d '\r' | grep -vx '__wbox_done__' || true
+      aws s3 cp "s3://$bucket/${out}stderr" - >&2 2>/dev/null || true
       return 0
     fi
     sleep 2
