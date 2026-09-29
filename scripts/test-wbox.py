@@ -58,7 +58,13 @@ class WboxTests(unittest.TestCase):
         self.assertIn('actions   = ["ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances"]', doc)
         self.assertIn("resources = [aws_instance.wbox[0].arn]", doc)
         self.assertEqual(set(re.findall(r'"(\w+:\w+)"', doc)),
-                         {"ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances", "secretsmanager:GetSecretValue"})
+                         {"ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances", "secretsmanager:GetSecretValue",
+                          "ssm:SendCommand", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:ListCommands"})
+        # SendCommand only to this instance, with only the PowerShell document.
+        send = doc.split('sid     = "RunPowerShellOnTheWindowsBox"', 1)[1].split("statement {", 1)[0]
+        self.assertEqual(re.findall(r"^\s+(aws_instance\.\S+|\"arn:aws:ssm:[^\"]+\")", send, re.M),
+                         ["aws_instance.wbox[0].arn,", '"arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript"'])
+        self.assertNotIn("StartSession", doc)
 
     def test_the_password_has_exactly_its_readers(self):
         policy = block("aws_secretsmanager_secret_policy", "wbox_admin")

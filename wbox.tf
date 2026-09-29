@@ -336,13 +336,32 @@ data "aws_iam_policy_document" "wbox_control" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.wbox_admin.arn]
   }
+
+  # Run PowerShell on this one box through Systems Manager (install a store, check a game),
+  # the way an admin does: the instance and the one AWS document, nothing else. The target is
+  # the Windows box, never a jumpbox (AGENTS.md: dev -> jumpbox is not permitted).
+  statement {
+    sid     = "RunPowerShellOnTheWindowsBox"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      aws_instance.wbox[0].arn,
+      "arn:aws:ssm:${var.aws_region}::document/AWS-RunPowerShellScript",
+    ]
+  }
+
+  # Reading results has no resource-level permission; it returns only command output.
+  statement {
+    sid       = "ReadCommandResults"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:ListCommands"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_policy" "wbox_control" {
   count = var.enable_wbox ? 1 : 0
 
   name        = "wbox-control"
-  description = "Dev boxes: start, stop and reboot the Windows playtest box and read its password"
+  description = "Dev boxes: start, stop, reboot and run PowerShell (SSM) on the Windows playtest box, and read its password"
   policy      = data.aws_iam_policy_document.wbox_control[0].json
 }
 
