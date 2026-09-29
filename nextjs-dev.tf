@@ -16,7 +16,9 @@
 # can send SSM commands to runners, stop/start EC2, read the GitHub PAT, publish to
 # CodeArtifact and call Bedrock. A box serving web content to other people should not hold
 # any of that. It gets its own role below with exactly two permissions: read its own setup
-# script from S3, and read the one Cloudflare tunnel secret.
+# script from S3, and read the one Cloudflare tunnel secret. Later, narrow additions, each in its
+# own file: the games pipeline view (games-multiplayer-observe.tf), temporary EBS volumes
+# (dev-ebs.tf) and the ElevenLabs key for the games (dev-ai-services.tf). No Bedrock.
 
 # RUNS PERSISTENTLY. Deliberately absent from dev-auto-stop-lambda.tf's INSTANCE_IDS
 # (which reaps only the two metal boxes after 12h idle) -- these URLs are meant to keep
