@@ -532,6 +532,7 @@ ${local.metal_claude_remote_control}
 ${local.pbox_setup}
 
 ${local.wbox_setup}
+${local.codex_restart_setup}
 
 ${local.selfupdate_setup}
 
@@ -631,6 +632,7 @@ ${local.metal_claude_remote_control}
 ${local.pbox_setup}
 
 ${local.wbox_setup}
+${local.codex_restart_setup}
 
 ${local.selfupdate_setup}
 

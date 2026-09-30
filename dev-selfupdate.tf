@@ -239,6 +239,15 @@ GBOXB64
 chmod 755 /usr/local/bin/gbox
   EOT
 
+  # `codex-restart` -- see and deliberately apply a Codex update (scripts/codex-restart.sh). Same
+  # embedding as pbox. The jumpboxes get the same file from codex-update.tf.
+  codex_restart_setup = <<-EOT
+base64 -d > /usr/local/bin/codex-restart <<'CODEXRESTARTB64'
+${base64encode(file("${path.module}/scripts/codex-restart.sh"))}
+CODEXRESTARTB64
+chmod 755 /usr/local/bin/codex-restart
+  EOT
+
   # `wbox` -- start/stop for the Windows playtest box (wbox.tf). Same embedding as pbox.
   wbox_setup = <<-EOT
 base64 -d > /usr/local/bin/wbox <<'WBOXB64'

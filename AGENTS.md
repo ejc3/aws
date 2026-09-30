@@ -529,6 +529,24 @@ restarting the aggregate can kill every managed and interactive t-claude session
 shared server. The Next.js box is different: Colton and Connor are separate Unix users,
 so their `claude-rc@` units own separate tmux servers.
 
+### Codex updates and restarts
+
+Updating Codex and running the update are two steps on purpose. A daemon keeps the binary it started
+with, so after `current` moves to a new release nothing changes until the daemon restarts, and a
+restart interrupts the turns it is running. On 2026-09-30 fcvm-arm's daemon (started Sep 28) still ran
+0.154.0 with 0.159.2 installed, and the model list a client gets is filtered by its version.
+
+- **Refresh is automatic.** `codex-update.tf`: a weekly SSM association re-runs the installer as
+  `ubuntu` on both jumpboxes and both metal boxes (a stopped spot box catches up at its next run).
+  nextjs-dev refreshes every account daily in its own updater and restarts them there.
+- **Restart is a decision.** `codex-restart` (installed on every box; `scripts/codex-restart.sh`)
+  prints, per account, the version its daemon RUNS vs the one INSTALLED, the connected app clients
+  and the commands running under it. `codex-restart --restart` restarts only the stale daemons,
+  through the `codex-rc@<user>` unit where there is one, and refuses while commands are running
+  unless `--force`. It never signals a process itself and records each restart in
+  `~/.local/state/codex-restart/restart.txt`. To see another account's daemon, run it with `sudo`.
+- Claude has the same shape: `t-claude --restart`. Neither touches the other.
+
 ### Diagnosing a wedged dev box
 
 When an instance fails its status check, the reason is in the EC2 serial console ring

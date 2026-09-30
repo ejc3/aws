@@ -2193,6 +2193,7 @@ ${local.pbox_setup}
 ${local.gbox_setup}
 
 ${local.wbox_setup}
+${local.codex_restart_setup}
 
 # ejc3's copy of the hop key. dev_hop_setup above installs it for `ubuntu` only, and
 # /home/ubuntu is 0700 -- but `pbox up` ends by SSHing to the new box as the invoking
