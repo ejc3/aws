@@ -106,3 +106,55 @@ resource "aws_iam_role_policy_attachment" "dev_pricing_read" {
   role       = each.value
   policy_arn = aws_iam_policy.dev_pricing_read.arn
 }
+
+# Browserbase (hosted headless browsers, for fetching pages that block plain requests). One JSON
+# secret holds BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID, so an agent can export both:
+#   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id browserbase/credentials \
+#     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
+# Terraform owns the container and who may read it; the value is set out of band and never enters
+# git (put-secret-value with a 0600 file). Readers: the administration set and dev-server-role, the
+# metal boxes. NOT the kids' box: nextjs-dev has full-sudo child accounts and no use for it.
+resource "aws_secretsmanager_secret" "browserbase" {
+  name                    = "browserbase/credentials"
+  description             = "Browserbase API key and project id (JSON: BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "browserbase/credentials", Project = "dev" }
+}
+
+locals {
+  browserbase_readers = [aws_iam_role.dev_server.arn]
+}
+
+resource "aws_secretsmanager_secret_policy" "browserbase" {
+  secret_arn = aws_secretsmanager_secret.browserbase.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheMetalBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.browserbase.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.browserbase_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "browserbase_read" {
+  statement {
+    sid       = "ReadTheBrowserbaseCredentials"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.browserbase.arn]
+  }
+}
+
+resource "aws_iam_policy" "browserbase_read" {
+  name        = "dev-browserbase-read"
+  description = "Metal dev boxes: read the Browserbase credentials (browserbase/credentials) and nothing else"
+  policy      = data.aws_iam_policy_document.browserbase_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "browserbase_read" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.browserbase_read.arn
+}

@@ -657,6 +657,12 @@ Available if a task needs them; neither needs a key on disk.
   or into a file or a commit:
   `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+- **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes
+  only. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
+  `BROWSERBASE_PROJECT_ID`; only dev-server-role and admins may read it (`dev-ai-services.tf`), not
+  the kids' box. Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
+  --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
+  "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
