@@ -162,6 +162,12 @@ locals {
   }
 }
 
+variable "parallel_box_spot" {
+  description = "Launch the parallel boxes as spot (default). false = on-demand, for long serial jobs that cannot tolerate reclaims; costs ~3x, flip back after."
+  type        = bool
+  default     = true
+}
+
 # ---------------------------------------------------------------------------------
 # The launch configuration, moved verbatim from the aws_instance resources that used to
 # live in parallel-box.tf / parallel-box2.tf.
@@ -183,14 +189,21 @@ resource "aws_launch_template" "parallel_box_ohio" {
     name = aws_iam_instance_profile.dev_ebs_only.name
   }
 
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      # Interruption is survivable: all work lives on the persistent volume, which is
-      # detached rather than destroyed. Terminate (not stop) keeps this simple -- there
-      # is no state on the root disk worth preserving.
-      spot_instance_type             = "one-time"
-      instance_interruption_behavior = "terminate"
+  # Spot by default. Set parallel_box_spot=false temporarily when a long serial job
+  # cannot tolerate reclaim roulette (e.g. multi-hour benchmark sweeps that lose an
+  # hour per interruption): on-demand c8g.48xlarge is ~$7.25/hr vs ~$2.4 spot, so
+  # flip it back when the job finishes. The idle watchdog still reaps either kind.
+  dynamic "instance_market_options" {
+    for_each = var.parallel_box_spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        # Interruption is survivable: all work lives on the persistent volume, which is
+        # detached rather than destroyed. Terminate (not stop) keeps this simple -- there
+        # is no state on the root disk worth preserving.
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
     }
   }
 
