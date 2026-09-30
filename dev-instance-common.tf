@@ -489,61 +489,14 @@ AUTOUPGRADE
     systemctl enable unattended-upgrades
     systemctl start unattended-upgrades
   SCRIPT
-  # Claude Code Sync cron job (every 5 minutes, email on failure)
+  # RETIRED: the every-5-minutes claude-code-sync pull/push. It had been failing on every run since
+  # claude-code-sync began asking for a TTY ("Onboarding cancelled or failed"), and each failure
+  # published to the cost-alerts SNS topic. The history repo has not received a push since
+  # 2026-07-27. This only removes the job and its script from a box that still has them.
   claude_sync_cron_script = <<-SCRIPT
-    # ============================================
-    # Claude Code Sync cron job
-    # ============================================
-
-    # Create sync script
-    cat > /home/ubuntu/.local/bin/claude-sync-cron.sh << 'SYNCSCRIPT'
-#!/bin/bash
-set -euo pipefail
-
-LOGFILE="/tmp/claude-sync-cron.log"
-HOSTNAME=$(hostname)
-SNS_TOPIC="arn:aws:sns:us-west-1:928413605543:cost-alerts"
-
-log() {
-    echo "[$(date -Iseconds)] $1" >> "$LOGFILE"
-}
-
-notify_failure() {
-    local msg="$1"
-    log "FAILURE: $msg"
-    aws sns publish \
-        --topic-arn "$SNS_TOPIC" \
-        --subject "claude-code-sync FAILED on $HOSTNAME" \
-        --message "$msg" \
-        --region us-west-1 || true
-}
-
-# Rotate log if > 1MB
-if [ -f "$LOGFILE" ] && [ $(stat -f%z "$LOGFILE" 2>/dev/null || stat -c%s "$LOGFILE") -gt 1048576 ]; then
-    mv "$LOGFILE" "$LOGFILE.old"
-fi
-
-log "Starting sync"
-
-# Pull first
-if ! /home/ubuntu/.cargo/bin/claude-code-sync pull >> "$LOGFILE" 2>&1; then
-    notify_failure "Pull failed on $HOSTNAME. Check $LOGFILE for details."
-    exit 1
-fi
-
-# Then push
-if ! /home/ubuntu/.cargo/bin/claude-code-sync push >> "$LOGFILE" 2>&1; then
-    notify_failure "Push failed on $HOSTNAME. Check $LOGFILE for details."
-    exit 1
-fi
-
-log "Sync completed successfully"
-SYNCSCRIPT
-    chmod +x /home/ubuntu/.local/bin/claude-sync-cron.sh
-    chown ubuntu:ubuntu /home/ubuntu/.local/bin/claude-sync-cron.sh
-
-    # Install crontab for ubuntu user (every 5 minutes)
-    sudo -u ubuntu bash -c 'crontab -l 2>/dev/null | grep -v claude-sync-cron || true; echo "*/5 * * * * /home/ubuntu/.local/bin/claude-sync-cron.sh"' | sudo -u ubuntu crontab -
+    # Retired claude-code-sync cron job: remove it if present
+    sudo -u ubuntu bash -c 'crontab -l 2>/dev/null | grep -v claude-sync-cron | crontab - || true'
+    rm -f /home/ubuntu/.local/bin/claude-sync-cron.sh
   SCRIPT
 
   # Console logging for EC2 get-console-output debugging
