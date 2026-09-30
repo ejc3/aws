@@ -112,8 +112,9 @@ resource "aws_iam_role_policy_attachment" "dev_pricing_read" {
 #   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id browserbase/credentials \
 #     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
 # Terraform owns the container and who may read it; the value is set out of band and never enters
-# git (put-secret-value with a 0600 file). Readers: the administration set and dev-server-role, the
-# metal boxes. NOT the kids' box: nextjs-dev has full-sudo child accounts and no use for it.
+# git (put-secret-value with a 0600 file). Readers: the administration set, dev-server-role (the
+# metal boxes) and nextjs-dev-role (the dolphin box). Every account on nextjs-dev has full sudo, so
+# the grant is box-wide, as with the ElevenLabs key.
 resource "aws_secretsmanager_secret" "browserbase" {
   name                    = "browserbase/credentials"
   description             = "Browserbase API key and project id (JSON: BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID). Value set out of band; see dev-ai-services.tf."
@@ -122,7 +123,7 @@ resource "aws_secretsmanager_secret" "browserbase" {
 }
 
 locals {
-  browserbase_readers = [aws_iam_role.dev_server.arn]
+  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "browserbase" {
@@ -130,7 +131,7 @@ resource "aws_secretsmanager_secret_policy" "browserbase" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationAndTheMetalBoxesCanRead"
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
@@ -150,11 +151,12 @@ data "aws_iam_policy_document" "browserbase_read" {
 
 resource "aws_iam_policy" "browserbase_read" {
   name        = "dev-browserbase-read"
-  description = "Metal dev boxes: read the Browserbase credentials (browserbase/credentials) and nothing else"
+  description = "Dev boxes: read the Browserbase credentials (browserbase/credentials) and nothing else"
   policy      = data.aws_iam_policy_document.browserbase_read.json
 }
 
 resource "aws_iam_role_policy_attachment" "browserbase_read" {
-  role       = aws_iam_role.dev_server.name
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
