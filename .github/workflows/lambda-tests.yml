@@ -124,6 +124,10 @@ jobs:
 
       - name: Windows playtest box (dev-box-only access, no peer route, kept game disk, 1h idle stop)
         run: python3 -S -B scripts/test-wbox.py
+      - name: codex-restart (running vs installed, refuses over running commands, restarts only stale daemons)
+        run: python3 -S -B scripts/test-codex-restart.py
+      - name: Codex refresh on the ubuntu boxes (weekly SSM association)
+        run: python3 -S -B scripts/test-codex-update.py
 
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
