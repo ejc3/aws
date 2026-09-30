@@ -674,6 +674,10 @@ All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sy
 - Config: `~/.claude-code-sync-init.toml`
 - Repo: `~/claude-history-sync`
 - Remote: `https://github.com/ejc3/claude-code-history.git`
+- **No cron.** The every-5-minutes sync job was retired: it failed on every run (the tool asks for a
+  TTY) and alerted `cost-alerts` each time, and the private history repo has had no push since
+  2026-07-27. Nothing syncs history automatically now; the setup script removes the job if a box
+  still has it.
 
 To sync manually:
 ```bash
