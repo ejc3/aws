@@ -31,12 +31,27 @@ CM_TAG=claude-master-e8704e4
 CM_SHA256_DARWIN_ARM64=2584c0f24e9e2aab346d7b02bc1ebca46d7848daf6477f5ba53606fdb8ec72a9
 CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
+# The executable inside that tarball: an installed cloudflared is judged by this, not by its version string.
+CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
 ALIAS=${1:-}
 [[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claude-master-mac-setup.sh ALIAS   (mac or macbook: an ssh alias on fcvm-arm)" >&2; exit 2; }
 
 # Run something on the Mac: jumpbox -> fcvm -> (reverse tunnel) -> Mac. stdin is passed through.
 on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "ssh -o BatchMode=yes -o ConnectTimeout=10 $ALIAS $*"; }
+
+echo "0/6 the server must be serving the open listener (the tunnel leads nowhere otherwise)"
+SERVER_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=claude-master-server Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+[ -n "$SERVER_ID" ] && [ "$SERVER_ID" != None ] || { echo "the claude-master server is not running" >&2; exit 1; }
+CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript --parameters 'commands=["cat /var/lib/claude-master/state/ca.pem 2>/dev/null; echo ===STATUS===; claude-master-status 2>&1"]' --query Command.CommandId --output text)
+aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID"
+READY=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
+CA=${READY%%===STATUS===*}
+printf '%s\n' "$READY" | grep -q '^open listener: listening' || {
+  echo "the server is not listening on its open port yet. Finish the three logins (scripts/claude-master-login.sh --server), start claude-master-server, check claude-master-status, then re-run this." >&2
+  exit 1
+}
+printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE' || { echo "the server has no CA certificate yet" >&2; exit 1; }
 
 echo "1/6 reaching $ALIAS through fcvm"
 on_mac "'echo \$(hostname) \$(uname -sm)'" || { echo "$ALIAS is not connected: its reverse tunnel to fcvm is down (the Mac must be online and running its tunnel)" >&2; exit 1; }
@@ -54,10 +69,14 @@ if [ "\$(sum "\$HOME/.local/bin/claude-master" 2>/dev/null || true)" != "$CM_SHA
   [ "\$(sum "\$tmp/cm")" = "$CM_SHA256_DARWIN_ARM64" ] || { echo "claude-master did not match its pinned sha256" >&2; exit 1; }
   chmod 755 "\$tmp/cm" && mv -f "\$tmp/cm" "\$HOME/.local/bin/claude-master"
 fi
-if ! "\$HOME/.local/bin/cloudflared" --version 2>/dev/null | grep -q "version $CFD_VERSION"; then
+# Judged by the hash of the installed EXECUTABLE, never by the version it reports (a substituted binary can
+# say anything, and this one is handed the long-lived Access token).
+if [ "\$(sum "\$HOME/.local/bin/cloudflared" 2>/dev/null || true)" != "$CFD_SHA256_DARWIN_ARM64_BIN" ]; then
   curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/$CFD_VERSION/cloudflared-darwin-arm64.tgz" -o "\$tmp/cfd.tgz"
   [ "\$(sum "\$tmp/cfd.tgz")" = "$CFD_SHA256_DARWIN_ARM64_TGZ" ] || { echo "cloudflared did not match its pinned sha256" >&2; exit 1; }
-  tar -xzf "\$tmp/cfd.tgz" -C "\$tmp" cloudflared && chmod 755 "\$tmp/cloudflared" && mv -f "\$tmp/cloudflared" "\$HOME/.local/bin/cloudflared"
+  tar -xzf "\$tmp/cfd.tgz" -C "\$tmp" cloudflared && chmod 755 "\$tmp/cloudflared"
+  [ "\$(sum "\$tmp/cloudflared")" = "$CFD_SHA256_DARWIN_ARM64_BIN" ] || { echo "the cloudflared executable did not match its pinned sha256" >&2; exit 1; }
+  mv -f "\$tmp/cloudflared" "\$HOME/.local/bin/cloudflared"
 fi
 "\$HOME/.local/bin/cloudflared" --version | head -1
 shasum -a 256 "\$HOME/.local/bin/claude-master" | cut -c1-16
@@ -78,17 +97,9 @@ print("CLAUDE_MASTER_TUNNEL_PORT=%s" % d["local_port"])' |
   on_mac "'umask 077; cat > \$HOME/.config/claude-master/cloudflare.env.new && mv -f \$HOME/.config/claude-master/cloudflare.env.new \$HOME/.config/claude-master/cloudflare.env && chmod 600 \$HOME/.config/claude-master/cloudflare.env'"
 unset SECRET
 
-echo "4/6 the server's public CA certificate (only exists once the server has started)"
-SERVER_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=claude-master-server Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
-CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript --parameters 'commands=["cat /var/lib/claude-master/state/ca.pem 2>/dev/null; true"]' --query Command.CommandId --output text)
-aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID"
-CA=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
-if printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE'; then
-  printf '%s\n' "$CA" | on_mac "'cat > \$HOME/.config/claude-master/ca.pem && chmod 644 \$HOME/.config/claude-master/ca.pem'"
-  echo "   installed ca.pem"
-else
-  echo "   the server has not created its CA yet (it does that on its first start, after the three logins); re-run this script then"
-fi
+echo "4/6 the server's public CA certificate (fetched by the readiness check above)"
+printf '%s\n' "$CA" | on_mac "'cat > \$HOME/.config/claude-master/ca.pem && chmod 644 \$HOME/.config/claude-master/ca.pem'"
+echo "   installed ca.pem"
 
 echo "5/6 the claude-pool command and the tunnel LaunchAgent"
 on_mac bash -s <<REMOTE

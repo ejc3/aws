@@ -301,17 +301,38 @@ class MacSetupTests(unittest.TestCase):
     def test_the_pinned_tag_matches_the_servers(self):
         server_tag = re.search(r'claude_master_tag\s+=\s+"([^"]+)"', TF).group(1)
         self.assertEqual(self.pin("CM_TAG"), server_tag, "bump both together")
-        for name in ("CM_SHA256_DARWIN_ARM64", "CFD_SHA256_DARWIN_ARM64_TGZ"):
+        for name in ("CM_SHA256_DARWIN_ARM64", "CFD_SHA256_DARWIN_ARM64_TGZ", "CFD_SHA256_DARWIN_ARM64_BIN"):
             self.assertRegex(self.pin(name), r"^[0-9a-f]{64}$")
         cfd = re.search(r'cloudflared_version\s+=\s+"([^"]+)"', TUN).group(1)
         self.assertEqual(self.pin("CFD_VERSION"), cfd)
 
     def test_binaries_are_verified_on_the_mac_before_they_are_installed(self):
         text = code(MACSETUP)
-        for needle in ("did not match its pinned sha256",):
-            self.assertEqual(text.count(needle), 2)
+        # claude-master, the cloudflared tarball, and the cloudflared executable inside it
+        self.assertEqual(text.count("did not match its pinned sha256"), 3)
         self.assertLess(text.index("claude-master did not match"), text.index('mv -f "\\$tmp/cm"'))
         self.assertLess(text.index("cloudflared did not match"), text.index('mv -f "\\$tmp/cloudflared"'))
+        self.assertLess(text.index("the cloudflared executable did not match"), text.index('mv -f "\\$tmp/cloudflared"'))
+
+    def test_an_installed_cloudflared_is_judged_by_its_hash_never_by_what_it_reports(self):
+        # It receives the long-lived Access token. A substituted executable can print any version, and an
+        # unanchored version match let a prefix of the pinned version skip the check entirely.
+        text = code(MACSETUP)
+        self.assertNotRegex(text, r"cloudflared[^\n]*--version[^\n]*grep")
+        self.assertIn('"\\$(sum "\\$HOME/.local/bin/cloudflared" 2>/dev/null || true)" != "$CFD_SHA256_DARWIN_ARM64_BIN"', text)
+
+    def test_nothing_is_installed_until_the_server_is_serving_its_open_port(self):
+        # A CA certificate exists from the server's first start, but a server still running the pre-tunnel
+        # configuration listens on no open port, so a Mac set up then reports success and cannot connect.
+        text = code(MACSETUP)
+        gate = text.index("0/6")
+        self.assertIn("claude-master-status", text[gate:text.index("1/6")])
+        self.assertIn("grep -q '^open listener: listening'", text[gate:text.index("1/6")])
+        self.assertIn("exit 1", text[gate:text.index("1/6")])
+        for step in ("1/6", "2/6", "3/6", "5/6"):
+            self.assertLess(gate, text.index(step))
+        self.assertLess(gate, text.index("curl -fsSL"))
+        self.assertLess(gate, text.index("TUNNEL_SERVICE_TOKEN_SECRET"))
 
     def test_the_token_goes_through_stdin_only(self):
         text = code(MACSETUP)
