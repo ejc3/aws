@@ -551,9 +551,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   The key is made on the client; only the request goes up. Signing runs on the server over SSM, so
   it is an AWS-authenticated action. Re-run before the certificate expires; it swaps only after the
   new certificate is in place.
-- **Reaching it.** Dev boxes: the private address. A Mac with AWS access: an SSM port forward to
-  the server (`AWS-StartPortForwardingSession`, port 8443), then `claude-master connect --server
-  127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
+- **Reaching it.** Dev boxes: the private address. A Mac with AWS access: `scripts/claude-master-tunnel.sh`
+  (an SSM port forward, session type `AWS-StartPortForwardingSessionToRemoteHost` aimed at 10.0.1.50: the
+  plain forwarding session reaches the instance's loopback, where nothing listens), then `claude-master
+  connect --server 127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
   internet; a Cloudflare tunnel with Access is the path for machines without AWS access, and would
   be a new ingress in `cloudflare.tf`, not a new open port.
 - **Size.** t4g.nano with a 1GB swapfile. Move to t4g.micro if it pages.

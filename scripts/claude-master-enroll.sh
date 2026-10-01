@@ -48,7 +48,8 @@ SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
 NEW="$DIR.new"
 echo "1/4 making a key and a certificate request on ${HOST:-this machine}"
 on_target "set -e; cd \"\$HOME\"; command -v claude-master >/dev/null || { echo 'claude-master is not installed here' >&2; exit 1; }; rm -rf '$NEW'; claude-master client-init --dir '$NEW' --name '$NAME' >/dev/null"
-CSR=$(on_target "base64 -w0 \"\$HOME/$NEW/client.csr\"")
+# `tr`, not `base64 -w0`: the BSD base64 on a Mac has no -w.
+CSR=$(on_target "base64 < \"\$HOME/$NEW/client.csr\" | tr -d '\n'")
 
 echo "2/4 asking the server ($SERVER_ID) to sign it for $DAYS days"
 CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript \

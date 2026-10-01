@@ -10,6 +10,12 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "claude-master-server.tf").read_text()
 ENROLL = (ROOT / "scripts" / "claude-master-enroll.sh").read_text()
 LOGIN = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+TUNNEL = (ROOT / "scripts" / "claude-master-tunnel.sh").read_text()
+
+
+def code(text):
+    """The script without its comment lines: assertions are about what runs, not what is explained."""
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
 
 
 def block(kind, name):
@@ -134,8 +140,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("!= active", LOGIN)
         self.assertNotRegex(LOGIN, r"systemctl restart")
 
+    def test_enrollment_runs_on_a_mac(self):
+        # BSD base64 (macOS) has no -w, so the request is encoded with plain base64 and tr.
+        self.assertNotRegex(code(ENROLL), r"base64 -w")
+        self.assertIn("tr -d '\\n'", code(ENROLL))
+
+    def test_the_tunnel_uses_the_remote_host_session_to_the_private_address(self):
+        # The plain forwarding session reaches the instance's loopback, where nothing listens.
+        self.assertIn("AWS-StartPortForwardingSessionToRemoteHost", code(TUNNEL))
+        self.assertNotRegex(code(TUNNEL), r"AWS-StartPortForwardingSession[^T]")
+        self.assertIn("host=$REMOTE_HOST", TUNNEL)
+        self.assertRegex(TUNNEL, r'CLAUDE_MASTER_SERVER_HOST:-10\.0\.1\.50')
+
     def test_the_scripts_parse(self):
-        for path in ("claude-master-enroll.sh", "claude-master-login.sh"):
+        for path in ("claude-master-enroll.sh", "claude-master-login.sh", "claude-master-tunnel.sh"):
             r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / path)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
