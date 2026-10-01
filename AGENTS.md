@@ -557,6 +557,19 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   connect --server 127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
   internet; a Cloudflare tunnel with Access is the path for machines without AWS access, and would
   be a new ingress in `cloudflare.tf`, not a new open port.
+- **Macs outside the VPC (the kids' laptops).** A long-lived Cloudflare tunnel (`claude-master-tunnel.tf`,
+  hostname `inference.cc-games.dev`): cloudflared on the server dials OUT and forwards to claude-master's
+  OPEN listener, which is bound to loopback only (`--open-loopback 127.0.0.1:8444`) and asks for no
+  client certificate; the trust is the tunnel. Cloudflare Access on that exact hostname admits one
+  thing, a service token (no person, no wildcard; a year long). The Mac runs `cloudflared access tcp`
+  and `claude-master connect --open 127.0.0.1:8444 --ca ca.pem`. Hand a Mac its one private file with
+  `scripts/claude-master-mac-bundle.sh OUTDIR` (an administrator action; it contains the token). The
+  certificate listener on the private address is unchanged: dev boxes keep per-box certificates. Never
+  put the open port in a security group or bind it to anything but loopback.
+- **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
+  re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
+  a running server; `claude-master-status` shows running versus pinned and a new binary takes effect when
+  the owner restarts the service.
 - **Size.** t4g.micro with a 1GB swapfile. t4g.nano was tried first and was OOM-killed during its own first boot.
 
 ### Codex updates and restarts
