@@ -27,8 +27,8 @@ KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins. Keep CM_TAG equal to claude_master_tag in claude-master-server.tf (a test enforces it) and
 # bump the sha256 values together with it.
-CM_TAG=claude-master-a4c2810
-CM_SHA256_DARWIN_ARM64=e6e430eb1570ab89ba709d85b294b96ed2ab5564fbe1b59ada2859a43cce8ed7
+CM_TAG=claude-master-e8704e4
+CM_SHA256_DARWIN_ARM64=2584c0f24e9e2aab346d7b02bc1ebca46d7848daf6477f5ba53606fdb8ec72a9
 CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 
