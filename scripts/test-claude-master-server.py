@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "claude-master-server.tf").read_text()
 ENROLL = (ROOT / "scripts" / "claude-master-enroll.sh").read_text()
+CONVERGE = (ROOT / "scripts" / "ssm-claude-master-server.sh").read_text()
 LOGIN = (ROOT / "scripts" / "claude-master-login.sh").read_text()
 TUNNEL = (ROOT / "scripts" / "claude-master-tunnel.sh").read_text()
 
@@ -113,6 +114,28 @@ class ServiceTests(unittest.TestCase):
         text = text.replace("$${", "${")
         out = subprocess.run(["bash", "-n"], input=text, text=True, capture_output=True)
         self.assertEqual(out.returncode, 0, out.stderr)
+
+
+class ConvergenceTests(unittest.TestCase):
+    """The instance ignores user_data, so Terraform itself must re-run the bootstrap."""
+
+    def test_a_script_or_pin_or_resize_change_re_runs_the_bootstrap(self):
+        res = block("terraform_data", "claude_master_server_converge")
+        for trigger in ("aws_instance.claude_master_server[0].id", "aws_instance.claude_master_server[0].instance_type",
+                        "sha256(local.claude_master_server_user_data)", 'filesha256("${path.module}/scripts/ssm-claude-master-server.sh")'):
+            self.assertIn(trigger, res)
+        self.assertIn("scripts/ssm-claude-master-server.sh", res)
+        self.assertIn("aws_s3_object.claude_master_server_user_data", res)
+
+    def test_the_convergence_waits_for_ssm_and_cloud_init_and_fails_loudly(self):
+        text = code(CONVERGE)
+        self.assertIn("cloud-init status --wait", text)
+        self.assertIn("PingStatus", text)
+        self.assertIn('[ "$status" != Success ]', text)
+        self.assertIn("exit 1", text)
+
+    def test_the_convergence_never_restarts_the_server(self):
+        self.assertNotRegex(code(CONVERGE), r"systemctl\s+(restart|stop|start)")
 
 
 class IamTests(unittest.TestCase):
