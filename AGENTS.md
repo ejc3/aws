@@ -364,6 +364,7 @@ The long-lived development and administration instances are:
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
+| claude-master-server | t4g.nano | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claude-master-server.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
@@ -528,6 +529,34 @@ aggregate systemd service and one cgroup; do not create per-repository units. St
 restarting the aggregate can kill every managed and interactive t-claude session in that
 shared server. The Next.js box is different: Colton and Connor are separate Unix users,
 so their `claude-rc@` units own separate tmux servers.
+
+### The shared claude-master server
+
+Subscription logins rotate on every refresh and the previous access token stops working at once,
+so a login copied to several boxes destroys itself within hours (measured: refresh, then the old
+access token returns 401). One box therefore owns each login: `claude-master-server`
+(`claude-master-server.tf`, 10.0.1.50:8443). Everything else is a client; none holds a login.
+
+- **No password anywhere.** The proxy is TLS and requires a client certificate signed by the
+  server's own CA. The CA key lives only in `/var/lib/claude-master/state` on that box. Client
+  certificates last 30 days (at most 90), so a lost box expires on its own.
+- **claude-master has no AWS in it.** It is a generic binary (`ejc3/CLIProxyAPI`, `docs/claude-master.md`):
+  `serve`, `issue`, `client-init`, `connect`. All AWS glue is in this repo. The pinned release is
+  `local.claude_master_tag` plus its sha256 in `claude-master-server.tf`; bump both together.
+- **Logins are interactive and belong to the server.** `scripts/claude-master-login.sh --server`
+  drives the three paste-a-code logins; the service stays idle until all exist. Never copy a login
+  from another box. A running server is never restarted by a bootstrap (`claude-master-status`
+  shows running versus pinned); restarting it interrupts every connected session, so ask first.
+- **Adding a client** (a new dev box, a Mac): `scripts/claude-master-enroll.sh NAME [--ssh HOST]`.
+  The key is made on the client; only the request goes up. Signing runs on the server over SSM, so
+  it is an AWS-authenticated action. Re-run before the certificate expires; it swaps only after the
+  new certificate is in place.
+- **Reaching it.** Dev boxes: the private address. A Mac with AWS access: an SSM port forward to
+  the server (`AWS-StartPortForwardingSession`, port 8443), then `claude-master connect --server
+  127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
+  internet; a Cloudflare tunnel with Access is the path for machines without AWS access, and would
+  be a new ingress in `cloudflare.tf`, not a new open port.
+- **Size.** t4g.nano with a 1GB swapfile. Move to t4g.micro if it pages.
 
 ### Codex updates and restarts
 

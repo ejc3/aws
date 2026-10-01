@@ -2,8 +2,10 @@
 #
 # claude-master-login -- log the Claude subscriptions into claude-master on fcvm-metal-arm.
 #
-#   scripts/claude-master-login.sh                        the three: connor, ejc3, colton
+#   scripts/claude-master-login.sh                        the three: connor, ejc3, colton (on fcvm-metal-arm)
 #   scripts/claude-master-login.sh claude-ejc3 ...        only those profiles
+#   scripts/claude-master-login.sh --server [PROFILE...]  the same, on the shared claude-master server
+#                                                         (claude-master-server.tf), then starts its service
 #
 # One profile at a time: it prints a claude.ai link, you open it in a browser signed in to THAT
 # subscription's account (incognito if you are signed in to another), approve, and paste the
@@ -15,12 +17,28 @@ set -euo pipefail
 
 HOST=${FCVM_HOST:-184.72.40.255}   # fcvm-metal-arm's Elastic IP
 KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
+SERVER=0
+if [ "${1:-}" = "--server" ]; then
+  SERVER=1; shift
+  HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claude-master-server.tf: a fixed private address
+fi
 
 profiles=("$@")
 [ ${#profiles[@]} -gt 0 ] || profiles=(claude-connor claude-ejc3 claude-colton)
 
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }
+  if [ "$SERVER" = 1 ]; then
+    # The server's logins belong to its own service account; `claude-master-login` runs as it.
+    ssh -t -i "$KEY" "ubuntu@$HOST" "
+      if sudo claude-master-status | grep -qx 'login $p: present'; then
+        echo '$p: already has a login (skipped)'
+      else
+        printf '\n== $p: sign in to THAT subscription account, approve, paste the code ==\n'
+        sudo claude-master-login $p
+      fi"
+    continue
+  fi
   ssh -t -i "$KEY" "ubuntu@$HOST" "
     export PATH=\$HOME/.local/bin:\$PATH
     tmux -L cmlogin kill-server 2>/dev/null
@@ -31,4 +49,8 @@ for p in "${profiles[@]}"; do
       claude-master login $p
     fi"
 done
+if [ "$SERVER" = 1 ]; then
+  # Starting a server that is not running is safe; restarting a running one is the owner's call.
+  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claude-master-status; if [ \"\$(systemctl is-active claude-master-server)\" != active ] && ! sudo claude-master-status | grep -q MISSING; then sudo systemctl start claude-master-server && sleep 2 && systemctl is-active claude-master-server; fi"
+fi
 echo "done: $(printf '%s ' "${profiles[@]}")"
