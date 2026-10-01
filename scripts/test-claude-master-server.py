@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "claude-master-server.tf").read_text()
 TUN = (ROOT / "claude-master-tunnel.tf").read_text()
 BUNDLE = (ROOT / "scripts" / "claude-master-mac-bundle.sh").read_text()
+MACSETUP = (ROOT / "scripts" / "claude-master-mac-setup.sh").read_text()
 ENROLL = (ROOT / "scripts" / "claude-master-enroll.sh").read_text()
 CONVERGE = (ROOT / "scripts" / "ssm-claude-master-server.sh").read_text()
 LOGIN = (ROOT / "scripts" / "claude-master-login.sh").read_text()
@@ -291,6 +292,54 @@ class TunnelTests(unittest.TestCase):
         self.assertIn("cloudflared access tcp", BUNDLE)
 
 
+class MacSetupTests(unittest.TestCase):
+    """Setting a Mac up over its reverse tunnel: additive, pinned, token through stdin only."""
+
+    def pin(self, name):
+        return re.search(r"^%s=(\S+)$" % name, MACSETUP, re.M).group(1)
+
+    def test_the_pinned_tag_matches_the_servers(self):
+        server_tag = re.search(r'claude_master_tag\s+=\s+"([^"]+)"', TF).group(1)
+        self.assertEqual(self.pin("CM_TAG"), server_tag, "bump both together")
+        for name in ("CM_SHA256_DARWIN_ARM64", "CFD_SHA256_DARWIN_ARM64_TGZ"):
+            self.assertRegex(self.pin(name), r"^[0-9a-f]{64}$")
+        cfd = re.search(r'cloudflared_version\s+=\s+"([^"]+)"', TUN).group(1)
+        self.assertEqual(self.pin("CFD_VERSION"), cfd)
+
+    def test_binaries_are_verified_on_the_mac_before_they_are_installed(self):
+        text = code(MACSETUP)
+        for needle in ("did not match its pinned sha256",):
+            self.assertEqual(text.count(needle), 2)
+        self.assertLess(text.index("claude-master did not match"), text.index('mv -f "\\$tmp/cm"'))
+        self.assertLess(text.index("cloudflared did not match"), text.index('mv -f "\\$tmp/cloudflared"'))
+
+    def test_the_token_goes_through_stdin_only(self):
+        text = code(MACSETUP)
+        self.assertIn("{ set +x; } 2>/dev/null", text)
+        # The secret is produced by python from the variable and piped straight into the ssh `cat >`.
+        seg = text[text.index("TUNNEL_SERVICE_TOKEN_SECRET"):text.index("unset SECRET")]
+        self.assertIn("|\n  on_mac", seg)
+        self.assertIn("cat > \\$HOME/.config/claude-master/cloudflare.env.new", seg)
+        # nothing that carries the secret appears in an ssh command line
+        self.assertNotRegex(text, r"ssh[^\n]*client_secret")
+        self.assertNotRegex(text, r"echo[^\n]*\$SECRET")
+        self.assertIn("unset SECRET", text)
+        self.assertIn("chmod 600", text)
+
+    def test_it_changes_nothing_about_the_macs_own_claude(self):
+        text = code(MACSETUP)
+        for forbidden in ("~/.claude", "$HOME/.claude", "settings.json", "alias claude", ".zshrc", ".zprofile", "/usr/local/bin/claude"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("claude-pool", text)
+
+    def test_the_tunnel_log_rotates_and_the_token_is_not_in_the_plist(self):
+        self.assertIn("5242880", MACSETUP)
+        self.assertIn('cp "\\$LOG" "\\$LOG.1" && : > "\\$LOG"', MACSETUP)
+        plist = MACSETUP[MACSETUP.index("<?xml"):MACSETUP.index("</dict></plist>")]
+        self.assertNotRegex(plist, r"TUNNEL_SERVICE_TOKEN|client_secret")
+        self.assertIn("<key>KeepAlive</key><true/>", plist)
+
+
 class IamTests(unittest.TestCase):
     def test_the_role_reads_only_its_own_bootstrap_script(self):
         policy = block("aws_iam_role_policy", "claude_master_server_bootstrap")
@@ -336,7 +385,7 @@ class ScriptTests(unittest.TestCase):
         self.assertRegex(TUNNEL, r'CLAUDE_MASTER_SERVER_HOST:-10\.0\.1\.50')
 
     def test_the_scripts_parse(self):
-        for path in ("claude-master-enroll.sh", "claude-master-login.sh", "claude-master-tunnel.sh", "claude-master-mac-bundle.sh"):
+        for path in ("claude-master-enroll.sh", "claude-master-login.sh", "claude-master-tunnel.sh", "claude-master-mac-bundle.sh", "claude-master-mac-setup.sh"):
             r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / path)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
