@@ -305,6 +305,14 @@ after every plan of a clean origin/main.
 to one Unix user. Never seed them from Terraform, copy them between users, or overwrite a
 working personal login with a bootstrap token.
 
+**Terraform worktrees fill the jumpbox root**: each fresh worktree's `terraform init` downloads about 1 GB of
+providers into its own `.terraform`. They were never cleaned up, and on 2026-10-01 28 of them took the
+40 GB root volume to 100% (`terraform init` then failed with "no space left on device"; a full root is the
+same failure that hung ssh on 2026-07-25). Remove the worktree when the apply and its empty follow-up plan
+are done: `git worktree remove --force /tmp/tf-<stamp>`. If one is left behind, `rm -rf <worktree>/.terraform`
+frees the space and `terraform init` regenerates it; the source and any saved plan stay. Check
+`df -h /` before an init.
+
 **Stale plans**: `terraform plan` refreshes state against AWS, so a plan from before someone else's change is not safe to apply. Re-plan if the apply is not immediate.
 
 **Cold-bootstrap inputs**: Some secrets, backend resources, and device logins necessarily
