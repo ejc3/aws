@@ -44,8 +44,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-66b3cee"
-  claude_master_sha256_aarch64 = "d5459e55b54ebd6bc1b09e0858f19e493fb8f4d87be3347b415b0fe44aee0943"
+  claude_master_tag            = "claude-master-a4c2810"
+  claude_master_sha256_aarch64 = "59514267a0567879b5046a868b3e08cfc69ee0a4a7cfe81141ee1b8759e4dc6c"
 
   claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
   claude_master_server_port = 8443
@@ -194,7 +194,8 @@ key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id
 if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
 exec /usr/local/bin/claude-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
-  --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} --state-dir /var/lib/claude-master/state
+  --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} \\
+  --open-loopback 127.0.0.1:${local.claude_master_open_port} --state-dir /var/lib/claude-master/state
 EOF
 chmod 0755 /usr/local/bin/claude-master-serve
 
@@ -225,6 +226,61 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable claude-master-server.service >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------- cloudflared (the tunnel for the Macs)
+# Pinned by version and sha256. It dials OUT to Cloudflare and forwards to claude-master's open
+# listener on loopback (claude-master-tunnel.tf); no inbound port is opened for it.
+CFD_VERSION='${local.cloudflared_version}'
+CFD_SHA='${local.cloudflared_sha256_linux_arm}'
+current=$(sha256sum /usr/local/bin/cloudflared 2>/dev/null | cut -d' ' -f1)
+if [ "$current" != "$CFD_SHA" ]; then
+  if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/$CFD_VERSION/cloudflared-linux-arm64" -o /tmp/cloudflared.new \
+     && echo "$CFD_SHA  /tmp/cloudflared.new" | sha256sum -c - ; then
+    install -m 0755 /tmp/cloudflared.new /usr/local/bin/cloudflared.new && mv -f /usr/local/bin/cloudflared.new /usr/local/bin/cloudflared
+  else
+    echo "ERROR: cloudflared $CFD_VERSION did not download or did not match its sha256; leaving the installed binary alone" >&2
+  fi
+  rm -f /tmp/cloudflared.new
+fi
+
+# The connector token comes from Secrets Manager into the environment (TUNNEL_TOKEN), never argv.
+cat > /usr/local/bin/cloudflared-claude-master <<'EOF'
+#!/bin/bash
+set -u
+{ set +x; } 2>/dev/null   # the token below must never reach a trace
+TUNNEL_TOKEN=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/tunnel-token --query SecretString --output text 2>/dev/null) || TUNNEL_TOKEN=""
+[ -n "$TUNNEL_TOKEN" ] && [ "$TUNNEL_TOKEN" != "None" ] || { echo "cloudflared-claude-master: no tunnel token yet" >&2; exit 1; }
+export TUNNEL_TOKEN
+exec /usr/local/bin/cloudflared tunnel --no-autoupdate run
+EOF
+chmod 0755 /usr/local/bin/cloudflared-claude-master
+
+cat > /etc/systemd/system/cloudflared-claude-master.service <<'EOF'
+[Unit]
+Description=Cloudflare tunnel for the claude-master open listener (Macs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=claude-master
+Group=claude-master
+Environment=HOME=/var/lib/claude-master
+ExecStart=/usr/local/bin/cloudflared-claude-master
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claude-master
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable cloudflared-claude-master.service >/dev/null 2>&1 || true
+# The tunnel is harmless to run before the server is: it leads to a loopback port nothing listens on
+# yet. Starting it (not restarting a running one) is therefore safe on every convergence.
+systemctl is-active --quiet cloudflared-claude-master.service || systemctl start cloudflared-claude-master.service || true
 
 # ---------------------------------------------------------------- operator helpers
 # A login is interactive (paste a code); run it as the service account so the profile is its own.
