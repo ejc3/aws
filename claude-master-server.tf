@@ -373,7 +373,7 @@ fi
 if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
   cat > /tmp/cwagent.json <<'CWACONF'
 {
-  "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+  "agent": { "metrics_collection_interval": 60, "run_as_user": "root", "omit_hostname": true },
   "metrics": {
     "namespace": "${local.claude_master_metrics_namespace}",
     "metrics_collected": {
@@ -564,6 +564,9 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_status" {
 }
 
 # Memory and swap (the CloudWatch agent publishes them). The box ran out of memory at its first size.
+# The agent adds a `host` dimension to host metrics unless told not to; the config sets omit_hostname so these
+# two series have NO dimensions, which is what the alarms select. An alarm that selects dimensions the series
+# does not have sees no data and, with notBreaching, stays green forever.
 resource "aws_cloudwatch_metric_alarm" "claude_master_server_memory" {
   count               = var.enable_claude_master_server ? 1 : 0
   alarm_name          = "claude-master-server-memory-pressure"

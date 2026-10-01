@@ -158,6 +158,16 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("SystemMaxUse=200M", TF)
         self.assertIn("journalctl --vacuum-size=200M", TF)
 
+    def test_host_metric_alarms_select_exactly_the_dimensions_the_agent_publishes(self):
+        # The agent adds a `host` dimension unless omit_hostname is set. The alarms select no dimensions, so the
+        # series must have none; otherwise they see no data and (notBreaching) never fire.
+        self.assertIn('"omit_hostname": true', TF)
+        self.assertNotIn("append_dimensions", TF)
+        for name in ("claude_master_server_memory", "claude_master_server_swap"):
+            alarm = block("aws_cloudwatch_metric_alarm", name)
+            self.assertNotIn("dimensions", alarm)
+            self.assertIn("namespace           = local.claude_master_metrics_namespace", alarm)
+
     def test_the_agent_ships_the_exact_log_file_not_its_rotations(self):
         self.assertIn('"file_path": "/var/log/claude-master/server.log"', TF)
         self.assertNotIn("server.log*", TF)
