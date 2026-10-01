@@ -188,6 +188,15 @@ class TunnelTests(unittest.TestCase):
         self.assertNotRegex(script, r"cloudflared[^\n]*--token")
         self.assertIn("{ set +x; } 2>/dev/null", script[script.index("cloudflared-claude-master <<"):])
 
+    def test_a_dead_tunnel_is_never_handed_out(self):
+        # A running server keeps its old configuration; the tunnel can be live with nothing behind it.
+        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        self.assertIn("open listener: listening", script)
+        self.assertIn("open listener: NOT listening", script)
+        self.assertIn("grep -qx 'open listener: listening'", code(BUNDLE))
+        self.assertLess(code(BUNDLE).index("open listener: listening"), code(BUNDLE).index("ca.pem"))
+        self.assertNotRegex(code(BUNDLE), r"systemctl\s+(restart|stop|start)")  # the owner decides that
+
     def test_the_macs_get_one_file_and_no_certificate_or_aws_access(self):
         self.assertIn("claude-master/mac-access", BUNDLE)
         self.assertIn("chmod 0600", BUNDLE)

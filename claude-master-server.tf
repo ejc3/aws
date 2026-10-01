@@ -311,6 +311,11 @@ for p in ${join(" ", local.claude_master_profiles)}; do
   if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
 done
 echo "server: $(systemctl is-active claude-master-server)"
+if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claude_master_open_port} "; then
+  echo "open listener: listening"
+else
+  echo "open listener: NOT listening (the server is stopped, or still running from before the tunnel existed; restart claude-master-server when its sessions can be interrupted)"
+fi
 echo "installed: $(sha256sum /usr/local/bin/claude-master | cut -c1-16)  pinned: ${substr(local.claude_master_sha256_aarch64, 0, 16)}  ($TAG)"
 EOF
 sed -i "s/\$TAG/$TAG/" /usr/local/bin/claude-master-status

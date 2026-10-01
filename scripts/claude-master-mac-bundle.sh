@@ -25,6 +25,19 @@ SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
   --query 'Reservations[0].Instances[0].InstanceId' --output text)
 [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != None ] || { echo "no running claude-master-server instance" >&2; exit 1; }
 
+# READINESS GATE. The tunnel can be live while the server is stopped, or still running from before
+# the open listener existed (a running server keeps its old configuration, and nothing restarts it
+# for you). A bundle made then would be dead on arrival, so refuse until the listener is up.
+READY_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript \
+  --parameters 'commands=["claude-master-status"]' --query Command.CommandId --output text)
+aws ssm wait command-executed --region "$REGION" --command-id "$READY_ID" --instance-id "$SERVER_ID"
+STATUS_OUT=$(aws ssm get-command-invocation --region "$REGION" --command-id "$READY_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
+if ! printf '%s\n' "$STATUS_OUT" | grep -qx 'open listener: listening'; then
+  echo "refusing to make a bundle: the server's open listener is not up." >&2
+  printf '%s\n' "$STATUS_OUT" >&2
+  exit 1
+fi
+
 # The CA certificate is public; fetch it from the server over SSM.
 CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript \
   --parameters 'commands=["cat /var/lib/claude-master/state/ca.pem"]' --query Command.CommandId --output text)
