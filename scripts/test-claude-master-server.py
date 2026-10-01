@@ -274,6 +274,22 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('SELECT MIN(\\"claude_master.quota.used_fraction\\")', alarm)
         self.assertIn("threshold           = each.value", alarm)
 
+    def test_the_error_alarm_judges_one_ten_minute_datapoint_not_two_five_minute_ones(self):
+        # With a 300 s period and two evaluation periods, each five minutes would have to pass the threshold on
+        # its own: 15 errors in each never fired a "20 errors in 10 minutes" alarm.
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claude_master_pool")
+        self.assertIn('evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1', alarm)
+        self.assertIn('period = each.key == "pool_exhausted" ? 300 : 600', alarm)
+        self.assertIn("More than 20 Anthropic error responses in 10 minutes", alarm)
+
+    def test_a_panel_titled_hours_divides_the_seconds_the_proxy_publishes(self):
+        self.assertIn("divide  = 3600", DASH)
+        self.assertIn('expression = "q${i}_${n}/${p.divide}"', DASH)
+        panel = DASH[DASH.index('title   = "Hours until each weekly allowance resets"'):]
+        panel = panel[:panel.index("},\n")]
+        self.assertIn("divide", panel)
+        self.assertIn("quota.resets_in_seconds", panel)
+
     def test_the_dashboard_exists_once_and_shows_the_alarms(self):
         self.assertEqual(DASH.count('resource "aws_cloudwatch_dashboard"'), 1)
         self.assertIn('type = "alarm"', DASH)

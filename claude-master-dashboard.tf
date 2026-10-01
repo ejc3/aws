@@ -91,6 +91,7 @@ locals {
     {
       title   = "Hours until each weekly allowance resets"
       stacked = false
+      divide  = 3600 # the proxy publishes seconds; Metrics Insights cannot divide, metric math can
       queries = [{ label = "", q = "SELECT MAX(\"claude_master.quota.resets_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
@@ -176,8 +177,13 @@ locals {
         stacked = p.stacked
         period  = 300
         stat    = "Average"
-        metrics = [for n, q in p.queries : [{ expression = q.q, label = q.label, id = "q${i}_${n}", region = var.aws_region }]]
-        yAxis   = { left = { min = 0 } }
+        metrics = concat([for n, q in p.queries : (lookup(p, "divide", 0) > 0 ? [
+          [{ expression = q.q, label = "", id = "q${i}_${n}", region = var.aws_region, visible = false }],
+          [{ expression = "q${i}_${n}/${p.divide}", label = q.label, id = "e${i}_${n}", region = var.aws_region, visible = true }],
+          ] : [
+          [{ expression = q.q, label = q.label, id = "q${i}_${n}", region = var.aws_region, visible = true }],
+        ])]...)
+        yAxis = { left = { min = 0 } }
       }
     }],
   )
@@ -195,7 +201,7 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_pool" {
   for_each            = var.enable_claude_master_server ? { pool_exhausted = 0.9, upstream_errors = 20 } : {}
   alarm_name          = each.key == "pool_exhausted" ? "claude-master-pool-nearly-exhausted" : "claude-master-upstream-errors"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = each.key == "pool_exhausted" ? 3 : 2
+  evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1
   threshold           = each.value
   alarm_description   = each.key == "pool_exhausted" ? "Every claude-master subscription is past 90% of its weekly allowance: the paid API-key backup is about to carry everything or clients will be refused." : "More than 20 Anthropic error responses in 10 minutes through claude-master: an Anthropic incident, a rejected login, or a bug."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
@@ -207,6 +213,8 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_pool" {
     label       = each.key
     return_data = true
     expression  = each.key == "pool_exhausted" ? "SELECT MIN(\"claude_master.quota.used_fraction\") FROM \"${local.cm_ns}\"" : "SELECT SUM(\"claude_master.inference.errors\") FROM \"${local.cm_ns}\""
-    period      = 300
+    # One ten-minute datapoint for the error count (two consecutive five-minute ones would each have to pass
+    # 20 on their own); the allowance is judged over three five-minute points.
+    period = each.key == "pool_exhausted" ? 300 : 600
   }
 }
