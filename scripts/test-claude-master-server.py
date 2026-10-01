@@ -134,6 +134,9 @@ class ConvergenceTests(unittest.TestCase):
             self.assertIn(trigger, res)
         self.assertIn("scripts/ssm-claude-master-server.sh", res)
         self.assertIn("aws_s3_object.claude_master_server_user_data", res)
+        # cloudflared reads its token at start: the secret and the role's grant must exist first.
+        self.assertIn("aws_secretsmanager_secret_version.claude_master_tunnel_token", res)
+        self.assertIn("aws_iam_role_policy.claude_master_server_tunnel_token", res)
 
     def test_the_convergence_waits_for_ssm_and_cloud_init_and_fails_loudly(self):
         text = code(CONVERGE)

@@ -413,7 +413,13 @@ resource "terraform_data" "claude_master_server_converge" {
     command = "bash ${path.module}/scripts/ssm-claude-master-server.sh ${aws_instance.claude_master_server[0].id} ${var.aws_region}"
   }
 
-  depends_on = [aws_s3_object.claude_master_server_user_data]
+  # The bootstrap starts cloudflared, which reads the connector token with the server's role: both
+  # must exist first (claude-master-tunnel.tf), or its first start fails and waits for a retry.
+  depends_on = [
+    aws_s3_object.claude_master_server_user_data,
+    aws_secretsmanager_secret_version.claude_master_tunnel_token,
+    aws_iam_role_policy.claude_master_server_tunnel_token,
+  ]
 }
 
 output "claude_master_server_address" {
