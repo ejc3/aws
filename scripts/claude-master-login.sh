@@ -8,7 +8,8 @@
 # One profile at a time: it prints a claude.ai link, you open it in a browser signed in to THAT
 # subscription's account (incognito if you are signed in to another), approve, and paste the
 # CODE#STATE string Claude shows. A profile that already has a login is skipped, so it is safe to
-# re-run after a failure. Each profile is its own OAuth login on this box; nothing is copied from
+# re-run after a failure. It checks that a login EXISTS, not that it is still valid; claude-master
+# refreshes tokens itself, and `claude-master probe NAME --model MODEL` is the live check. Each profile is its own OAuth login on this box; nothing is copied from
 # the native Claude login or between profiles.
 set -euo pipefail
 
@@ -24,7 +25,7 @@ for p in "${profiles[@]}"; do
     export PATH=\$HOME/.local/bin:\$PATH
     tmux -L cmlogin kill-server 2>/dev/null
     if [ -d \$HOME/.local/share/claude-master/profiles/$p/current ]; then
-      echo '$p: already logged in'
+      echo '$p: already has a login (skipped). To replace a revoked one, log in under a NEW name; claude-master login refuses an existing profile.'
     else
       printf '\n== $p: sign in to THAT subscription account, approve, paste the code ==\n'
       claude-master login $p
