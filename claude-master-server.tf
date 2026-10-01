@@ -187,6 +187,7 @@ fi
 cat > /usr/local/bin/claude-master-serve <<'EOF'
 #!/bin/bash
 set -u
+{ set +x; } 2>/dev/null   # the value below must never reach a trace
 key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/backup-api-key --query SecretString --output text 2>/dev/null) || key=""
 if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
