@@ -492,5 +492,146 @@ class UpdateWiringTests(unittest.TestCase):
         self.assertIn("||", guard, "either login is enough")
 
 
+class CodexSeedTests(Base):
+    """A seed turn takes minutes and its child can fail: starting it is not success, its exit status is."""
+
+    def setUp(self):
+        super().setUp()
+        bindir = self.home / ".local" / "bin"
+        bindir.mkdir(parents=True)
+        (bindir / "codex").write_text("#!/bin/sh\nexit 0\n")        # `codex login status`: logged in
+        (bindir / "codex").chmod(0o755)
+        self.counter = Path(self.tmp) / "attempts"
+        self.seed = Path(self.tmp) / "seed"
+        self.seed.write_text('#!/bin/sh\necho x >> %s\n[ "$(wc -l < %s)" -ge 2 ]\n' % (self.counter, self.counter))
+        self.seed.chmod(0o755)                                            # fails the first time, succeeds the second
+        self.cfg.update({"codex_seed": str(self.seed), "state_dir": str(Path(self.tmp) / "state")})
+        self.launcher = ass.Launcher(self.cfg)
+
+    def wait_for(self, path, want):
+        import time as _time
+        deadline = _time.time() + 10
+        while _time.time() < deadline:
+            got = self.launcher.start_codex(path)
+            if got is not None:
+                return got
+            _time.sleep(0.05)
+        self.fail("the seed never finished")
+
+    def test_starting_the_seed_is_not_success_and_a_failed_child_is_retried(self):
+        self.assertIsNone(self.launcher.start_codex("/r"), "just started: not done, not failed")
+        self.assertFalse(self.wait_for("/r", False), "the child exited nonzero: a failure, to be retried")
+        self.assertIsNone(self.launcher.start_codex("/r"), "a retry starts a new child")
+        self.assertTrue(self.wait_for("/r", True), "exit 0 is the only success")
+        self.assertEqual(len(self.counter.read_text().split()), 2)
+
+    def test_the_scan_marks_codex_done_only_when_the_child_succeeded_and_polls_while_it_runs(self):
+        self.scan()
+        r = make_repo(self.home, "fresh")
+        self.launcher = FakeLauncher()
+        results = iter([None, None, False, None, True])
+        self.launcher.start = lambda kind, path: True if kind == "claude" else next(results)
+        self.scan(now=1005)
+        self.assertFalse(self.state.known[str(r)]["codex"], "running: not done")
+        self.scan(now=1006)                                                # polled again at once, not after 60 s
+        self.scan(now=1007)                                                # the child failed
+        self.assertFalse(self.state.known[str(r)]["codex"])
+        self.scan(now=1008)                                                # a failure waits RETRY_SECONDS
+        self.assertFalse(self.state.known[str(r)]["codex"])
+        self.scan(now=1007 + ass.RETRY_SECONDS + 1)                        # retried: started again
+        self.scan(now=1007 + ass.RETRY_SECONDS + 2)                        # and succeeded
+        self.assertTrue(self.state.known[str(r)]["codex"])
+
+
+class OwnerRefreshTests(Base):
+    """gh login or the owners file changes while the watcher runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.update({"owners_extra": [], "owners": ass.allowed_owners(str(self.home), []),
+                         "owners_sig": ass.owners_signature(str(self.home))})
+
+    def login(self, user):
+        (self.home / ".config" / "gh").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    user: %s\n" % user)
+
+    def test_logging_in_to_gh_after_the_watcher_started_makes_later_clones_count(self):
+        self.scan()
+        self.login("acme")
+        self.scan(now=1005)                                                # picks the owner up
+        r = make_repo(self.home, "later", origin="https://github.com/acme/later")
+        self.scan(now=1010)
+        self.assertEqual(self.started(), [str(r)])
+
+    def test_an_edit_of_the_owners_file_is_picked_up_too(self):
+        self.scan()
+        (self.home / ".config" / "agent-session-sync").mkdir(parents=True)
+        (self.home / ".config" / "agent-session-sync" / "owners").write_text("acme\n")
+        self.scan(now=1005)
+        r = make_repo(self.home, "later", origin="https://github.com/acme/later")
+        self.scan(now=1010)
+        self.assertEqual(self.started(), [str(r)])
+
+    def test_a_clone_from_before_the_owner_was_allowed_is_launched_when_it_is_allowed_if_it_came_after_the_first_run(self):
+        self.scan()
+        r = make_repo(self.home, "early", origin="https://github.com/acme/early")
+        self.scan(now=1005)
+        self.assertEqual(self.started(), [], "not this account's yet")
+        self.login("acme")
+        self.scan(now=1010)
+        self.assertEqual(self.started(), [str(r)])
+
+    def test_adding_an_owner_never_launches_the_old_clones_that_were_there_at_the_first_run(self):
+        old = [make_repo(self.home, "old%d" % i, origin="https://github.com/acme/old%d" % i) for i in range(3)]
+        self.scan()                                                        # the first run: recorded, ignored
+        self.login("acme")
+        self.scan(now=1005)
+        self.scan(now=1010)
+        self.assertEqual(self.started(), [], "an old clone the boot launcher skipped stays skipped: %s" % old)
+
+    def test_nothing_is_reread_when_nothing_changed(self):
+        self.scan()
+        calls = []
+        real = ass.allowed_owners
+        ass.allowed_owners = lambda *a: calls.append(a) or real(*a)
+        self.addCleanup(setattr, ass, "allowed_owners", real)
+        for tick in range(5):
+            self.scan(now=1005 + tick)
+        self.assertEqual(calls, [])
+
+
+class ReplacementCloneTests(Base):
+    """The same pathname is not the same checkout."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan()
+        self.repo = make_repo(self.home, "fresh")
+        self.scan(now=1005)
+        self.launcher.calls.clear()
+
+    def test_a_checkout_whose_identity_changed_at_the_same_path_is_new(self):
+        entry = self.state.known[str(self.repo)]
+        self.assertIsNotNone(entry.get("id"), "the identity is recorded when the repo is first seen")
+        entry["id"] = [entry["id"][0], entry["id"][1] + 7]                # what a replacement clone would look like
+        self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(self.repo)), ("codex", str(self.repo))])
+
+    def test_ordinary_git_activity_does_not_make_a_checkout_new(self):
+        for n in range(3):
+            (self.repo / "f").write_text("change %d" % n)
+            git(self.repo, "commit", "-q", "-am", "c%d" % n)
+            git(self.repo, "checkout", "-q", "-b", "b%d" % n)
+            git(self.repo, "config", "user.name", "x%d" % n)
+            self.scan(now=1010 + n)
+        self.assertEqual(self.launcher.calls, [], "HEAD and config are replaced by git all the time; .git itself is not")
+
+    def test_state_from_an_older_version_gets_an_identity_without_relaunching(self):
+        self.state.known[str(self.repo)].pop("id")
+        self.scan(now=1010)
+        self.assertEqual(self.launcher.calls, [])
+        self.assertIsNotNone(self.state.known[str(self.repo)]["id"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

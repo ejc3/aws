@@ -625,6 +625,16 @@ scan plus about a second.
   cached copy and drops a trust entry added meanwhile (the same reason `claude-remote-control.tf` trusts every
   repo before starting any session), so the watcher keeps trust for what it launched: one stat per tick, a
   re-add only when the file changed and an entry is missing.
+- **What it judges by outcome, not by intent.** A Codex seed turn takes minutes and its child can fail (the
+  daemon starting or refusing), so starting it is not success: the thread is marked done only when the child
+  exits 0, polled each tick while it runs, retried after a minute if it failed. The allowed owners are
+  re-read when gh's `hosts.yml` or the owners file changes (two stats per tick), so `gh auth login` or an edit
+  after the watcher started takes effect; a repo from a not-yet-allowed owner is remembered, launched if it
+  appeared after the first run once its owner is allowed, and never if it was there at the first run (adding
+  an owner must not start every old clone). A checkout is identified by the inode of its `.git` directory (git
+  replaces HEAD and config constantly, never that directory), so a clone deleted and replaced between two
+  ticks is new again; a filesystem that hands the same inode to the replacement within one tick would be
+  missed.
 - **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
   same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
   no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,

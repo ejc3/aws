@@ -161,6 +161,47 @@ def allowed_owners(home, extra):
     return owners
 
 
+def owners_signature(home):
+    """What the allowed owners are derived from: gh's hosts.yml and the owners file."""
+    sig = []
+    for p in (os.path.join(home, ".config", "gh", "hosts.yml"), os.path.join(home, ".config", "agent-session-sync", "owners")):
+        try:
+            st = os.stat(p)
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
+def refresh_owners(cfg):
+    """The account logs in to gh, or someone edits the owners file, while the watcher runs: pick it up. Two
+    stats per tick. Returns True when the allowed owners changed."""
+    if "owners_extra" not in cfg:
+        return False
+    sig = owners_signature(cfg["home"])
+    if cfg.get("owners_sig") == sig:
+        return False
+    owners = allowed_owners(cfg["home"], cfg["owners_extra"])
+    first = "owners_sig" not in cfg
+    cfg["owners_sig"] = sig
+    if owners == cfg.get("owners"):
+        return False
+    cfg["owners"] = owners
+    if not first:
+        log("allowed owners are now %s" % sorted(owners))
+    return not first
+
+
+def repo_identity(path):
+    """[device, inode] of the checkout's .git directory: stable while the checkout lives (git never replaces
+    the directory itself), different for a replacement clone at the same path."""
+    try:
+        st = os.stat(os.path.join(path, ".git"))
+    except OSError:
+        return None
+    return [st.st_dev, st.st_ino]
+
+
 # ------------------------------------------------------------------ state
 
 def current_boot_id():
@@ -210,7 +251,6 @@ class State:
 def scan_once(cfg, state, launcher, now=None):
     """One pass. Returns the repos a launch was attempted for."""
     now = time.time() if now is None else now
-    owners, repos = cfg["owners"], cfg["repos"]
     found = list(candidates(cfg["roots"]))
     present = set(found)
     attempted = []
@@ -224,7 +264,7 @@ def scan_once(cfg, state, launcher, now=None):
     # the boot launcher owns those. Codex threads persist in Codex itself, so they are left alone.) Done
     # once; a window the user closes afterwards stays closed.
     if state.rebooted:
-        again = [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")]
+        again = [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded") and not e.get("ignored")]
         for p in again:
             state.known[p]["claude"] = False
             state.known[p].setdefault("tried", {}).pop("claude", None)
@@ -232,15 +272,40 @@ def scan_once(cfg, state, launcher, now=None):
             log("host rebooted: starting Claude again in %d repositories" % len(again))
         state.rebooted = False
 
+    owners_changed = refresh_owners(cfg)
+    owners, repos = cfg["owners"], cfg["repos"]
+
     for path in found:
         entry = state.known.get(path)
-        if entry is None:
-            if not is_allowed(path, owners, repos) or not is_finished(path):
-                continue                      # not (yet) a repo this account's sessions are for
-            if state.first_run:
-                state.known[path] = {"claude": True, "codex": True, "seeded": True}
+        ident = None
+        if entry is not None:
+            # The same PATH is not the same checkout: a clone deleted and replaced between two ticks keeps its
+            # pathname. Compare the identity recorded when it was first seen.
+            ident = repo_identity(path)
+            if entry.get("id") is None:
+                entry["id"] = ident           # recorded by an older version
+            elif ident is not None and entry["id"] != ident:
+                log("checkout replaced at %s; treating it as new" % path)
+                del state.known[path]
+                entry = None
+        if entry is not None and entry.get("ignored"):
+            # Not this account's: remembered, so adding an owner later does not launch every old clone. A repo
+            # that appeared AFTER the first run is looked at again when the allowed owners change.
+            if not (owners_changed and not entry.get("seeded") and is_allowed(path, owners, repos) and is_finished(path)):
                 continue
-            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}}
+            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}, "id": entry.get("id")}
+            log("new repository (its owner is allowed now): %s" % path)
+        if entry is None:
+            ident = repo_identity(path)
+            if not is_allowed(path, owners, repos):
+                state.known[path] = {"ignored": True, "seeded": state.first_run, "id": ident}
+                continue
+            if not is_finished(path):
+                continue                      # a clone still running: looked at again next tick
+            if state.first_run:
+                state.known[path] = {"claude": True, "codex": True, "seeded": True, "id": ident}
+                continue
+            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}, "id": ident}
             log("new repository: %s" % path)
         if entry.get("claude") and entry.get("codex"):
             continue
@@ -252,6 +317,9 @@ def scan_once(cfg, state, launcher, now=None):
                 continue
             tried[kind] = now
             ok = launcher.start(kind, path)
+            if ok is None:
+                tried.pop(kind, None)         # still running (a Codex seed turn takes minutes): ask again next tick
+                continue
             attempted.append((path, kind, ok))
             if ok:
                 entry[kind] = True
@@ -327,6 +395,7 @@ def keep_trust(home, repos, state):
 class Launcher:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.children = {}                    # path -> the running codex seed
         self.cheap_retry = {"claude": True}   # no tmux server yet: look again next tick
 
     def tmux_up(self):
@@ -376,19 +445,33 @@ class Launcher:
         return False
 
     def start_codex(self, path):
+        """True when the seed finished successfully, None while it is running, False when it failed (retried
+        after RETRY_SECONDS). A seed turn can take minutes and the child can fail (the Codex daemon starting or
+        refusing), so starting it is not success: only its exit status is."""
         seed = self.cfg.get("codex_seed")
         if not seed or not os.access(seed, os.X_OK):
             return True                       # no Codex seeding on this account
+        child = self.children.get(path)
+        if child is not None:
+            rc = child.poll()
+            if rc is None:
+                return None
+            del self.children[path]
+            if rc == 0:
+                log("codex thread seeded for %s" % path)
+                return True
+            log("codex seeding for %s exited %d" % (path, rc))
+            return False
         codex = os.path.join(self.cfg["home"], ".local", "bin", "codex")
         if subprocess.run([codex, "login", "status"], capture_output=True, timeout=30).returncode != 0:
             return False                      # not logged in yet: retried later, Claude is not held up
         logdir = os.path.join(self.cfg["state_dir"])
         os.makedirs(logdir, exist_ok=True)
         with open(os.path.join(logdir, "codex-seed.log"), "ab") as fh:
-            subprocess.Popen([seed, path], stdin=subprocess.DEVNULL, stdout=fh, stderr=fh, start_new_session=True,
-                             env=dict(os.environ, HOME=self.cfg["home"]))
+            self.children[path] = subprocess.Popen([seed, path], stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+                                                   start_new_session=True, env=dict(os.environ, HOME=self.cfg["home"]))
         log("codex seeding started for %s" % path)
-        return True
+        return None
 
 
 # ------------------------------------------------------------------ main
@@ -409,7 +492,8 @@ def build_config(args):
     state_dir = args.state_dir or os.path.join(home, ".local", "state", "agent-session-sync")
     return {
         "home": home, "roots": roots, "state_dir": state_dir,
-        "owners": allowed_owners(home, args.owner or []), "repos": set(args.repo or []),
+        "owners": allowed_owners(home, args.owner or []), "owners_extra": list(args.owner or []),
+        "owners_sig": owners_signature(home), "repos": set(args.repo or []),
         "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
     }
 
