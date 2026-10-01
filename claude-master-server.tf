@@ -59,6 +59,13 @@ locals {
   )
 }
 
+locals {
+  # The root volume holds the three subscription logins and the CA key that signs every client
+  # certificate: the two things that are painful to recreate (three interactive logins; reissuing
+  # every client). It joins the backup pool, and the DR copy, with the other persistent roots.
+  claude_master_server_volume_arn = var.enable_claude_master_server ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.claude_master_server[0].root_block_device[0].volume_id}" : ""
+}
+
 resource "aws_security_group" "claude_master_server" {
   count       = var.enable_claude_master_server ? 1 : 0
   name_prefix = "claude-master-server-"
@@ -425,4 +432,24 @@ resource "terraform_data" "claude_master_server_converge" {
 output "claude_master_server_address" {
   description = "Where client boxes point `claude-master connect --server`"
   value       = "${local.claude_master_server_ip}:${local.claude_master_server_port}"
+}
+
+# Alarms to the shared alert topic, like every other box: the instance itself, and the two signals that
+# took nextjs-dev down (memory and swap; the CloudWatch agent publishes them, see below).
+resource "aws_cloudwatch_metric_alarm" "claude_master_server_status" {
+  count               = var.enable_claude_master_server ? 1 : 0
+  alarm_name          = "claude-master-server-status-check"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "The claude-master server's instance status check failed: every box that uses the shared Claude subscriptions loses inference until it is back."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = { InstanceId = aws_instance.claude_master_server[0].id }
 }

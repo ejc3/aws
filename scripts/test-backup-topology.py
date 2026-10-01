@@ -102,11 +102,12 @@ class BackupTopologyTests(unittest.TestCase):
             self.assertIn("!local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled", selection)
             self.assertRegex(selection, r"create_before_destroy\s*=\s*true")
 
-    def test_controller_and_selections_protect_the_same_five_volumes(self):
+    def test_controller_and_selections_protect_the_same_six_volumes(self):
         protected = compact_list(SECURITY, "backup_protected_volume_arns")
         dev = compact_list(resource("aws_backup_selection", "dev_servers", DEV), "resources")
         jumpbox = compact_list(resource("aws_backup_selection", "jumpbox", JUMPBOX), "resources")
-        for name in ("arm_persistent_volume_arn", "x86_persistent_volume_arn", "nextjs_root_volume_arn"):
+        for name in ("arm_persistent_volume_arn", "x86_persistent_volume_arn", "nextjs_root_volume_arn",
+                     "claude_master_server_volume_arn"):
             self.assertIn("local." + name, protected)
             self.assertIn("local." + name, dev)
         for fragment in ("var.enable_jumpbox ? aws_ebs_volume.jumpbox_home[0].arn",
@@ -123,7 +124,8 @@ class BackupTopologyTests(unittest.TestCase):
         hop = compact_list(SECURITY, "backup_cmk_hop_volume_arns")
         for wanted in ("local.nextjs_root_volume_arn",
                        "aws_instance.jumpbox_2[0].root_block_device[0].volume_id",
-                       "local.arm_persistent_volume_arn"):
+                       "local.arm_persistent_volume_arn",
+                       "local.claude_master_server_volume_arn"):
             self.assertIn(wanted, hop)
         for unwanted in ("x86_persistent_volume_arn", "jumpbox_home"):
             self.assertNotIn(unwanted, hop)
