@@ -113,6 +113,26 @@ resource "aws_iam_instance_profile" "nextjs_dev" {
   role = aws_iam_role.nextjs_dev.name
 }
 
+# The CloudWatch agent on this box (nextjs-user-data.tf) publishes mem_used_percent and swap_used_percent. The role
+# was never allowed to, so for the box's whole life the CWAgent namespace stayed empty, and the memory and swap
+# alarms (nextjs-alarms.tf) evaluated no data and stayed green on notBreaching. On 2026-10-01 two Node processes
+# of about 11.6 GB each ran the box out of memory and it fell over with the alarm that exists for exactly that
+# showing OK. One namespace, one action: nothing else, and no logs.
+resource "aws_iam_role_policy" "nextjs_dev_metrics" {
+  name = "publish-agent-metrics"
+  role = aws_iam_role.nextjs_dev.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "PublishAgentMetricsInOneNamespace"
+      Effect    = "Allow"
+      Action    = "cloudwatch:PutMetricData"
+      Resource  = "*"
+      Condition = { StringEquals = { "cloudwatch:namespace" = "CWAgent" } }
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "nextjs_dev" {
   name = "nextjs-dev-policy"
   role = aws_iam_role.nextjs_dev.id

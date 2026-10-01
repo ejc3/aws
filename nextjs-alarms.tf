@@ -111,10 +111,14 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_memory" {
   period              = 300
   statistic           = "Average"
   threshold           = 85
-  alarm_description   = "nextjs-dev memory above 85%. Four accounts share 4GB; the next step is swapping, and swap-in saturates the disk and takes ssh and the tunnels with it."
+  alarm_description   = "nextjs-dev memory above 85%. Four accounts share 16GB; the next step is swapping, and swap-in saturates the disk and takes ssh and the tunnels with it."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # NO DATA IS NOT HEALTHY. With notBreaching this alarm sat green from August to October with no datapoint
+  # ever received (the role could not publish): it reports INSUFFICIENT_DATA now and says so on the topic.
+  # (While the box is down it says so too, on top of the status-check alarm, which is acceptable.)
+  treat_missing_data        = "missing"
+  insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 
   dimensions = {
     InstanceId = aws_instance.nextjs_dev[0].id
@@ -135,7 +139,11 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_swap" {
   threshold           = 25
   alarm_description   = "nextjs-dev is paging to /swapfile, which sits on the root volume. This is the start of the failure that took both tunnels down."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # NO DATA IS NOT HEALTHY. With notBreaching this alarm sat green from August to October with no datapoint
+  # ever received (the role could not publish): it reports INSUFFICIENT_DATA now and says so on the topic.
+  # (While the box is down it says so too, on top of the status-check alarm, which is acceptable.)
+  treat_missing_data        = "missing"
+  insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 
   dimensions = {
     InstanceId = aws_instance.nextjs_dev[0].id

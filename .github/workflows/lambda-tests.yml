@@ -133,6 +133,9 @@ jobs:
       - name: New repositories get Claude and Codex sessions within seconds (agent-session-sync)
         run: python3 -S -B scripts/test-agent-session-sync.py
 
+      - name: Memory and swap alarms can see data and never read no data as healthy (nextjs-dev, claude-master)
+        run: python3 -S -B scripts/test-nextjs-observability.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
