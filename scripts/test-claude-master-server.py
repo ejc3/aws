@@ -173,7 +173,11 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("server.log*", TF)
 
     def test_the_agent_is_reloaded_only_when_its_config_changed_and_the_server_is_never_touched(self):
-        self.assertIn("cmp -s /tmp/cwagent.json", TF)
+        # Compared with the copy we keep: the agent moves the file it is given, so its own path never holds it.
+        self.assertIn("cmp -s /tmp/cwagent.json /etc/claude-master/cwagent.json", TF)
+        self.assertIn("install -m 0644 /tmp/cwagent.json /etc/claude-master/cwagent.json", TF)
+        self.assertIn("-c file:/etc/claude-master/cwagent.json", TF)
+        self.assertNotIn("etc/amazon-cloudwatch-agent.json", TF)
         script = TF[TF.index("# ---------------------------------------------------------------- cloudwatch agent"):TF.index("# ---------------------------------------------------------------- operator helpers")]
         self.assertNotIn("claude-master-server", script)
         self.assertNotRegex(script, r"systemctl (restart|stop)")

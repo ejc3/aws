@@ -388,10 +388,12 @@ if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
 }
 CWACONF
   # Reload only when the configuration changed (or the agent is not running): a no-op convergence touches nothing.
-  if ! cmp -s /tmp/cwagent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || ! systemctl is-active --quiet amazon-cloudwatch-agent; then
-    install -m 0644 /tmp/cwagent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  # Compared with OUR copy: the agent moves the file it is given into its own amazon-cloudwatch-agent.d/, so
+  # its original path never holds the config again.
+  if ! cmp -s /tmp/cwagent.json /etc/claude-master/cwagent.json || ! systemctl is-active --quiet amazon-cloudwatch-agent; then
+    install -m 0644 /tmp/cwagent.json /etc/claude-master/cwagent.json
     /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 \
-      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s >/dev/null 2>&1 \
+      -c file:/etc/claude-master/cwagent.json -s >/dev/null 2>&1 \
       || echo "WARNING: cloudwatch agent installed but did not start" >&2
   fi
   rm -f /tmp/cwagent.json
