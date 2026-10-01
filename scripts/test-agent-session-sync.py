@@ -451,6 +451,17 @@ class UpdateWiringTests(unittest.TestCase):
         self.assertIn('install -m "\\$3" "\\$1" "\\$2.new" && mv -f "\\$2.new" "\\$2"', sh)
         self.assertNotIn("> /usr/local/bin/agent-session-sync", sh, "never write the live script in place")
 
+    def test_the_jumpboxes_get_the_codex_seeder_the_watcher_calls(self):
+        sh = self.read("scripts/ssm-agent-session-sync.sh")
+        self.assertIn('seeder=$(base64 -w0 "$here/codex-seed-thread.py")', sh)
+        self.assertIn('put "\\$t/seeder" /usr/local/bin/codex-seed-thread 755 || true', sh)
+        self.assertNotRegex(sh, r'seeder" /usr/local/bin/codex-seed-thread 755 && restart=1')
+        self.assertIn("codex-seed-thread.py", self.read("agent-session-sync.tf"), "a changed seeder re-runs the step")
+        self.assertIn("${local.codex_seed_thread_install}", self.read("jumpbox2-user-data.tf"))
+        self.assertIn("/usr/local/bin/codex-seed-thread", self.read("codex-remote-control.tf"))
+        default = (ROOT / "scripts" / "agent-session-sync.py").read_text()
+        self.assertIn('"--codex-seed", default="/usr/local/bin/codex-seed-thread"', default, "the path the installers write")
+
     def test_the_box_installers_replace_the_script_atomically_too(self):
         tf = self.read("agent-session-sync.tf")
         self.assertIn("cat > /usr/local/bin/agent-session-sync.new <<'AGENTSYNC'", tf)
@@ -540,6 +551,34 @@ class CodexSeedTests(Base):
         self.assertFalse(self.state.known[str(r)]["codex"])
         self.scan(now=1007 + ass.RETRY_SECONDS + 1)                        # retried: started again
         self.scan(now=1007 + ass.RETRY_SECONDS + 2)                        # and succeeded
+        self.assertTrue(self.state.known[str(r)]["codex"])
+
+
+    def test_a_missing_seeder_is_a_retry_never_a_silent_success(self):
+        self.cfg["codex_seed"] = str(Path(self.tmp) / "not-installed")
+        self.assertFalse(self.launcher.start_codex("/r"))
+        self.cfg["codex_seed"] = None
+        self.assertFalse(self.launcher.start_codex("/r"))
+
+    def test_the_scan_leaves_codex_unfinished_while_the_seeder_is_missing_and_finishes_it_when_it_appears(self):
+        self.cfg["codex_seed"] = str(Path(self.tmp) / "later")
+        self.cfg["t_claude_arg"] = "auto"
+        self.launcher = ass.Launcher(self.cfg)
+        self.launcher.start_claude = lambda path: True
+        self.scan()
+        r = make_repo(self.home, "fresh")
+        self.scan(now=1005)
+        self.assertFalse(self.state.known[str(r)]["codex"])
+        later = Path(self.tmp) / "later"
+        later.write_text("#!/bin/sh\nexit 0\n")
+        later.chmod(0o755)
+        self.scan(now=1005 + ass.RETRY_SECONDS + 1)
+        for tick in range(100):                                            # the child runs, then is polled
+            self.scan(now=1100 + tick)
+            if self.state.known[str(r)]["codex"]:
+                break
+            import time as _time
+            _time.sleep(0.05)
         self.assertTrue(self.state.known[str(r)]["codex"])
 
 

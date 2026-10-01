@@ -188,6 +188,7 @@ ${local.codex_remote_control}
 # A cheap 5-second watch (agent-session-sync.tf): a repository cloned later gets a Claude session and a
 # Codex thread without a person or a reboot. It runs as ubuntu, starts nothing when there is no tmux
 # server, and downloads nothing: the script is this file's own copy.
+${local.codex_seed_thread_install}
 ${local.agent_session_sync_install}
 ${local.agent_session_sync_enable_ubuntu}
 

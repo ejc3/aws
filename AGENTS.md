@@ -635,6 +635,11 @@ scan plus about a second.
   replaces HEAD and config constantly, never that directory), so a clone deleted and replaced between two
   ticks is new again; a filesystem that hands the same inode to the replacement within one tick would be
   missed.
+- **Known gap: the jumpboxes have no boot-time owner of the tmux server.** The watcher never starts one (it
+  would own the user's sessions), and neither jumpbox has `claude-rc@ubuntu` or `fcvm-claude-rc`. After a
+  reboot there is no tmux until someone connects; the watcher retries every tick and starts the sessions
+  (including the post-reboot ones) the moment a server exists. A boot launcher that owns the server is a
+  design decision of its own (what owns the cgroup, what a restart kills), not part of this watcher.
 - **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
   same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
   no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,

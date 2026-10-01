@@ -450,7 +450,10 @@ class Launcher:
         refusing), so starting it is not success: only its exit status is."""
         seed = self.cfg.get("codex_seed")
         if not seed or not os.access(seed, os.X_OK):
-            return True                       # no Codex seeding on this account
+            # Not installed (yet): a retry, never success. Returning True here once left every new checkout on
+            # a box without the helper permanently recorded as having a Codex thread it never got.
+            log_rarely("no-codex-seeder", "%s is not installed; no Codex thread can be made yet" % (seed or "the Codex seeder"))
+            return False
         child = self.children.get(path)
         if child is not None:
             rc = child.poll()

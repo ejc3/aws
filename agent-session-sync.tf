@@ -52,6 +52,7 @@ resource "terraform_data" "admin_agent_session_sync" {
   triggers_replace = {
     instance = each.value
     script   = filesha256("${path.module}/scripts/agent-session-sync.py")
+    seeder   = filesha256("${path.module}/scripts/codex-seed-thread.py")
     unit     = filesha256("${path.module}/scripts/agent-session-sync@.service")
     helper   = filesha256("${path.module}/scripts/ssm-agent-session-sync.sh")
     args     = local.agent_session_sync_ubuntu_args

@@ -1,7 +1,8 @@
 #!/bin/bash
 # ssm-agent-session-sync.sh <instance-id> <region>
 #
-# Installs the new-repo watcher (scripts/agent-session-sync.py and its template unit) on a RUNNING admin
+# Installs the new-repo watcher (scripts/agent-session-sync.py, its template unit, and the Codex seeder
+# scripts/codex-seed-thread.py it calls) on a RUNNING admin
 # box through SSM Run Command, enables agent-session-sync@ubuntu and starts it if it is not running.
 # Called by terraform_data.admin_agent_session_sync (agent-session-sync.tf) with ASS_ARGS in the
 # environment (the ubuntu account's policy; none of it is a secret).
@@ -24,6 +25,7 @@ done
 [ "$ping" = Online ] || { echo "ssm-agent-session-sync: $iid is not registered with SSM after 10 minutes" >&2; exit 1; }
 
 script=$(base64 -w0 "$here/agent-session-sync.py")
+seeder=$(base64 -w0 "$here/codex-seed-thread.py")
 unit=$(base64 -w0 "$here/agent-session-sync@.service")
 # Files are replaced ATOMICALLY (a half-written script must never be what a running watcher re-executes), and
 # only when they differ. A changed SCRIPT needs no restart: the watcher re-executes itself when its own file
@@ -34,11 +36,13 @@ read -r -d '' remote <<REMOTE || true
 set -e
 t=\$(mktemp -d); trap 'rm -rf "\$t"' EXIT
 echo $script | base64 -d > "\$t/script"
+echo $seeder | base64 -d > "\$t/seeder"
 echo $unit | base64 -d > "\$t/unit"
 printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '$ASS_ARGS' > "\$t/policy"
 restart=0
 put() { cmp -s "\$1" "\$2" && return 1; install -m "\$3" "\$1" "\$2.new" && mv -f "\$2.new" "\$2"; }
 put "\$t/script" /usr/local/bin/agent-session-sync 755 || true
+put "\$t/seeder" /usr/local/bin/codex-seed-thread 755 || true      # the watcher seeds Codex threads through it
 put "\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1
 install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
 put "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf 644 && restart=1
