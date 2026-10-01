@@ -1,0 +1,23 @@
+[Unit]
+Description=Start Claude Code and Codex sessions for new repositories of %i within seconds
+# After the boot launchers, so the user's tmux server (which this never starts or owns) exists first.
+After=network-online.target claude-rc@%i.service fcvm-claude-rc.service
+Wants=network-online.target
+
+[Service]
+User=%i
+Environment=HOME=/home/%i
+Environment=TERM=xterm-256color
+Environment=PATH=/home/%i/.local/bin:/home/%i/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# Policy per box or account: a drop-in sets ASS_ARGS (an extra --owner, an exact --repo).
+Environment=ASS_ARGS=
+WorkingDirectory=/home/%i
+ExecStart=/usr/bin/python3 /usr/local/bin/agent-session-sync --home /home/%i $ASS_ARGS
+Restart=always
+RestartSec=5
+# Stopping or restarting the watcher must never take a session with it.
+KillMode=process
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

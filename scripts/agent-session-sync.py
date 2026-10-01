@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""agent-session-sync -- make a NEW repository show up in Claude Code and Codex within seconds.
+
+Installed as /usr/local/bin/agent-session-sync and run as a small service (agent-session-sync.service,
+or agent-session-sync@<user>.service on nextjs-dev) on every box that keeps remote-control sessions.
+It replaces "the boot launcher looked once, at boot" with a cheap watch loop (default every 5 s).
+
+WHAT COUNTS AS NEW. A top-level checkout, directly under one of the roots (default ~/* and ~/src/*),
+that appeared after the watcher first looked:
+  * a MAIN checkout only: `.git` is a DIRECTORY. A linked `git worktree` has `.git` as a FILE, so a
+    random worktree is never new, and nothing nested below a root is ever scanned;
+  * finished: HEAD resolves, no *.lock in .git (a clone, fetch or checkout is still running) and the
+    index exists (a clone writes it last), so a half-cloned repo is not launched;
+  * allowed: its origin is owned by an allowed owner (the account's own GitHub login, plus
+    ~/.config/agent-session-sync/owners and --owner) or is an exact --repo, and it is not claude-code-sync.
+The FIRST run only records what already exists and launches nothing: the boot launcher decided about
+those (a clone idle for 30 days was skipped on purpose and must stay skipped).
+
+WHAT IT DOES for a new repo: pre-accept Claude's per-folder trust prompt (only for a repo that passed
+the gates above), start `t-claude --auto --remote-control` there (a window in the user's EXISTING tmux
+server; with no server yet it waits rather than own one), and seed a Codex thread (detached: a seed
+turn can take minutes, the thread itself exists at once). Claude and Codex are tracked separately, so
+a Codex that is not logged in yet does not hold up Claude and is retried.
+
+COST. Per tick: one listing and one stat per entry in the roots. Anything already handled is skipped
+before any deeper check, so an idle box does almost nothing.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ORIGIN_FORMS = [
+    re.compile(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$"),
+    re.compile(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$"),
+    re.compile(r"^ssh://git@github\.com/([^/]+)/([^/]+?)(?:\.git)?$"),
+]
+NEVER_REPOS = {"claude-code-history", "claude-code-sync"}
+RETRY_SECONDS = 60
+
+
+def log(msg):
+    print("agent-session-sync: " + msg, flush=True)
+
+
+# ------------------------------------------------------------------ discovery
+
+def parse_origin(url):
+    """(owner, repo) for a github.com origin in any of the three forms, else None."""
+    url = (url or "").strip()
+    for form in ORIGIN_FORMS:
+        m = form.match(url)
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def read_origin(git_dir):
+    """The origin url from .git/config, read as text (no subprocess)."""
+    try:
+        text = open(os.path.join(git_dir, "config"), encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    in_origin = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_origin = re.match(r'^\[remote\s+"origin"\]$', line) is not None
+        elif in_origin:
+            m = re.match(r"^url\s*=\s*(.+)$", line)
+            if m:
+                return m.group(1).strip()
+    return None
+
+
+def is_main_checkout(path):
+    """`.git` is a directory. A linked worktree (or a submodule) has a `.git` FILE."""
+    git = os.path.join(path, ".git")
+    return os.path.isdir(git) and not os.path.islink(git)
+
+
+def is_finished(path):
+    git = os.path.join(path, ".git")
+    try:
+        names = os.listdir(git)
+    except OSError:
+        return False
+    if "HEAD" not in names or "index" not in names:
+        return False
+    if any(n.endswith(".lock") for n in names):
+        return False
+    r = subprocess.run(["git", "-C", path, "rev-parse", "-q", "--verify", "HEAD"],
+                       capture_output=True, text=True, timeout=20)
+    return r.returncode == 0
+
+
+def is_allowed(path, owners, repos):
+    origin = parse_origin(read_origin(os.path.join(path, ".git")))
+    if not origin:
+        return False
+    owner, repo = origin
+    if repo in NEVER_REPOS:
+        return False
+    return owner.lower() in owners or "%s/%s" % (owner, repo) in repos
+
+
+def candidates(roots):
+    """Directories directly under the roots whose .git is a directory."""
+    seen = set()
+    for pattern in roots:
+        for p in glob.glob(pattern):
+            name = os.path.basename(p)
+            if name.startswith("."):
+                continue
+            real = os.path.realpath(p)
+            if real in seen or not is_main_checkout(real):
+                continue
+            seen.add(real)
+            yield real
+
+
+def github_login(home):
+    """The account's own GitHub login, from gh's hosts.yml (no network)."""
+    try:
+        text = open(os.path.join(home, ".config", "gh", "hosts.yml"), encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r"^\s+user:\s*(\S+)\s*$", text, re.M)
+    return m.group(1) if m else None
+
+
+def allowed_owners(home, extra):
+    owners = {o.lower() for o in extra}
+    login = github_login(home)
+    if login:
+        owners.add(login.lower())
+    try:
+        with open(os.path.join(home, ".config", "agent-session-sync", "owners"), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    owners.add(line.lower())
+    except OSError:
+        pass
+    return owners
+
+
+# ------------------------------------------------------------------ state
+
+class State:
+    """known: path -> {"claude": bool, "codex": bool, "tried": {"claude": ts, "codex": ts}}"""
+
+    def __init__(self, path):
+        self.path = path
+        self.first_run = not os.path.exists(path)
+        self.known = {}
+        if not self.first_run:
+            try:
+                with open(path) as fh:
+                    self.known = json.load(fh).get("known", {})
+            except (OSError, ValueError):
+                self.known = {}
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".known.")
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"known": self.known}, fh, indent=1, sort_keys=True)
+        os.replace(tmp, self.path)
+
+
+# ------------------------------------------------------------------ the scan
+
+def scan_once(cfg, state, launcher, now=None):
+    """One pass. Returns the repos a launch was attempted for."""
+    now = time.time() if now is None else now
+    owners, repos = cfg["owners"], cfg["repos"]
+    found = list(candidates(cfg["roots"]))
+    present = set(found)
+    attempted = []
+
+    # A path that is no longer a main checkout is forgotten, so deleting and re-cloning is new again.
+    for path in [p for p in state.known if p not in present]:
+        del state.known[path]
+
+    for path in found:
+        entry = state.known.get(path)
+        if entry is None:
+            if not is_allowed(path, owners, repos) or not is_finished(path):
+                continue                      # not (yet) a repo this account's sessions are for
+            if state.first_run:
+                state.known[path] = {"claude": True, "codex": True, "seeded": True}
+                continue
+            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}}
+            log("new repository: %s" % path)
+        if entry.get("claude") and entry.get("codex"):
+            continue
+        for kind in ("claude", "codex"):
+            if entry.get(kind):
+                continue
+            tried = entry.setdefault("tried", {})
+            if now - tried.get(kind, 0) < RETRY_SECONDS and kind in tried:
+                continue
+            tried[kind] = now
+            ok = launcher.start(kind, path)
+            attempted.append((path, kind, ok))
+            if ok:
+                entry[kind] = True
+            else:
+                log("%s for %s is not ready; will retry" % (kind, path))
+                # a failed attempt waits RETRY_SECONDS, except "no tmux server yet" (cheap to poll)
+                if getattr(launcher, "cheap_retry", {}).get(kind):
+                    tried.pop(kind, None)
+    state.first_run = False
+    state.save()
+    return attempted
+
+
+# ------------------------------------------------------------------ the real launcher
+
+def cksum(text):
+    out = subprocess.run(["cksum"], input=text.encode(), capture_output=True, check=True).stdout.split()
+    return out[0].decode()
+
+
+def trust_repo(home, repo):
+    """Pre-accept Claude Code's per-directory trust prompt for a repo that passed the gates above."""
+    path = os.path.join(home, ".claude.json")
+    try:
+        with open(path) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return
+    entry = cfg.setdefault("projects", {}).setdefault(repo, {})
+    if entry.get("hasTrustDialogAccepted") is True:
+        return
+    entry["hasTrustDialogAccepted"] = True
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+class Launcher:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.cheap_retry = {"claude": True}   # no tmux server yet: look again next tick
+
+    def tmux_up(self):
+        r = subprocess.run([self.cfg["tmux"], "list-sessions"], capture_output=True, text=True)
+        return r.returncode == 0
+
+    def start(self, kind, path):
+        return self.start_claude(path) if kind == "claude" else self.start_codex(path)
+
+    def claude_logged_in(self):
+        claude = os.path.join(self.cfg["home"], ".local", "bin", "claude")
+        r = subprocess.run([claude, "auth", "status"], capture_output=True, timeout=30,
+                           env=dict(os.environ, HOME=self.cfg["home"]))
+        return r.returncode == 0
+
+    def start_claude(self, path):
+        if not self.cfg.get("t_claude"):
+            return True                       # this account has no Claude sessions to start
+        if not self.tmux_up():
+            return False                      # never own the user's tmux server from here
+        if not self.claude_logged_in():
+            return False                      # a window with no login only sits at the login screen
+        trust_repo(self.cfg["home"], path)
+        script = 'source "$TCLAUDE" || exit 1; cd -- "$1" || exit 1; t-claude --auto --remote-control'
+        env = dict(os.environ, HOME=self.cfg["home"], TCLAUDE=self.cfg["t_claude"], TERM="xterm-256color")
+        subprocess.run(["zsh", "-c", script, "agent-session-sync", path], env=env, timeout=120,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        key = "%s_%s" % (cksum(path), cksum(""))
+        for _ in range(40):                   # up to ~10 s for the --remote-control child to appear
+            out = subprocess.run([self.cfg["tmux"], "list-windows", "-a", "-F", "#{window_id} #{@tclaude_key}"],
+                                 capture_output=True, text=True).stdout
+            win = next((l.split()[0] for l in out.splitlines() if l.split()[1:] == [key]), None)
+            if win:
+                pane = subprocess.run([self.cfg["tmux"], "display-message", "-p", "-t", win, "#{pane_pid}"],
+                                      capture_output=True, text=True).stdout.strip()
+                kids = subprocess.run(["ps", "-o", "args=", "--ppid", pane], capture_output=True, text=True).stdout
+                if "--remote-control" in kids and re.search(r"claude|nosync-wrap", kids):
+                    log("claude live in %s" % path)
+                    return True
+            time.sleep(0.25)
+        log("no live --remote-control process in %s" % path)
+        return False
+
+    def start_codex(self, path):
+        seed = self.cfg.get("codex_seed")
+        if not seed or not os.access(seed, os.X_OK):
+            return True                       # no Codex seeding on this account
+        codex = os.path.join(self.cfg["home"], ".local", "bin", "codex")
+        if subprocess.run([codex, "login", "status"], capture_output=True, timeout=30).returncode != 0:
+            return False                      # not logged in yet: retried later, Claude is not held up
+        logdir = os.path.join(self.cfg["state_dir"])
+        os.makedirs(logdir, exist_ok=True)
+        with open(os.path.join(logdir, "codex-seed.log"), "ab") as fh:
+            subprocess.Popen([seed, path], stdin=subprocess.DEVNULL, stdout=fh, stderr=fh, start_new_session=True,
+                             env=dict(os.environ, HOME=self.cfg["home"]))
+        log("codex seeding started for %s" % path)
+        return True
+
+
+# ------------------------------------------------------------------ main
+
+def find_t_claude(home, given):
+    """--t-claude PATH, or auto: the system copy (the metal boxes) else the user's own, else none."""
+    if given and given != "auto":
+        return given
+    for path in ("/usr/local/lib/fcvm/t-claude.zsh", os.path.join(home, ".config", "t-claude.zsh")):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def build_config(args):
+    home = args.home or os.path.expanduser("~")
+    roots = args.root or [os.path.join(home, "*"), os.path.join(home, "src", "*")]
+    state_dir = args.state_dir or os.path.join(home, ".local", "state", "agent-session-sync")
+    return {
+        "home": home, "roots": roots, "state_dir": state_dir,
+        "owners": allowed_owners(home, args.owner or []), "repos": set(args.repo or []),
+        "tmux": args.tmux, "t_claude": find_t_claude(home, args.t_claude), "codex_seed": args.codex_seed,
+    }
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--home")
+    ap.add_argument("--root", action="append", help="glob of checkout directories (default ~/* and ~/src/*)")
+    ap.add_argument("--owner", action="append", help="allowed GitHub owner (also: the account's own gh login)")
+    ap.add_argument("--repo", action="append", help="one allowed OWNER/REPO, exactly")
+    ap.add_argument("--t-claude", default="auto", help="t-claude.zsh to source (default: the system copy, else ~/.config/t-claude.zsh)")
+    ap.add_argument("--codex-seed", default="/usr/local/bin/codex-seed-thread")
+    ap.add_argument("--tmux", default="tmux")
+    ap.add_argument("--state-dir")
+    ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args(argv)
+    cfg = build_config(args)
+    state = State(os.path.join(cfg["state_dir"], "known.json"))
+    launcher = Launcher(cfg)
+    log("watching %s as %s; owners=%s repos=%s first_run=%s" % (
+        cfg["roots"], cfg["home"], sorted(cfg["owners"]), sorted(cfg["repos"]), state.first_run))
+    while True:
+        try:
+            scan_once(cfg, state, launcher)
+        except Exception as exc:              # a bad tick must never end the watch
+            log("scan failed: %s" % exc)
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

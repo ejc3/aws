@@ -366,6 +366,12 @@ systemctl daemon-reload
 # auth is absent/expired, and a later boot retries without another provisioning pass.
 systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
 
+# ------------------------------------------------------------- new repos within seconds
+# The launcher above looks once, at boot. This watches every 5 seconds and starts a session (and a
+# Codex thread) for a repository that appears later. See agent-session-sync.tf.
+${local.agent_session_sync_install}
+${local.agent_session_sync_enable_ubuntu}
+
 # ------------------------------------------------------------- Codex thread per window
 # Every folder that got a tmux window above also gets a Codex thread, so it shows up in the
 # Codex app. Runs after the launcher (which writes the list) and the Codex daemon; a folder

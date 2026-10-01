@@ -644,6 +644,12 @@ for u in ${join(" ", local.nextjs_users)}; do
       systemctl is-active --quiet "codex-seed@$u.service" || systemctl start --no-block "codex-seed@$u.service" >/dev/null 2>&1 || true
       ;;
     esac
+    # The new-repo watch for the same accounts; a running one is left alone.
+    case " ${join(" ", local.nextjs_codex_seed_users)} " in *" $u "*)
+      systemctl enable "agent-session-sync@$u.service" >/dev/null 2>&1 || true
+      systemctl is-active --quiet "agent-session-sync@$u.service" || systemctl start --no-block "agent-session-sync@$u.service" >/dev/null 2>&1 || true
+      ;;
+    esac
   fi
 done
 AGENTSENABLE
@@ -1469,6 +1475,10 @@ UNIT
 # Uses the standalone binary explicitly: `codex remote-control` refuses to run against the
 # npm/system install, and $PATH is not dependable inside a unit.
 ${local.codex_seed_thread_install}
+# New repositories within seconds, per account (agent-session-sync.tf). The account's own GitHub login
+# is the allowed owner; ~/.config/agent-session-sync/owners adds more. The watcher never starts the
+# user's tmux server: it waits for claude-rc@<user> to have made it.
+${local.agent_session_sync_install}
 # A Codex thread in every folder agents-start opened a window for (its list:
 # ~/.local/state/agents-start/dirs), so each shows up in the Codex app. Enabled by
 # agents-enable for local.nextjs_codex_seed_users only. Folders that already have a thread are

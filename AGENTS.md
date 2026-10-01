@@ -596,6 +596,30 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Backup.** The root volume (the three logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
+### New repositories appear in Claude Code and Codex within seconds
+
+`agent-session-sync` (`scripts/agent-session-sync.py`, `agent-session-sync.tf`) is a 5-second watch on every
+box that keeps remote-control sessions: both metal boxes, nextjs-dev's accounts and both jumpboxes. Before
+it, the metal boxes looked once at boot (`fcvm-claude-rc`), nextjs-dev started only each user's one working
+folder every 5 minutes (`agents-enable`) and the jumpboxes looked nowhere. Measured on fcvm with a real
+launcher: a live `--remote-control` session existed 0.9 s after a clone finished; worst case is the 5 s
+scan plus about a second.
+
+- **What is new.** A top-level checkout directly under `~/*` or `~/src/*`, appearing after the watcher first
+  looked. A MAIN checkout only: `.git` must be a directory, so a linked `git worktree` (its `.git` is a
+  file) is never new, and nothing nested is scanned. The clone must be finished (no `*.lock`, the index
+  exists). The first run only records what exists and launches nothing, so an old clone the boot launcher
+  skipped stays skipped.
+- **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
+  `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
+  also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.
+- **What it never does.** Own the user's tmux server (it waits for `claude-rc@<user>` or the boot launcher
+  to have made it), start a window for an account that is not logged in, or take a session down when it is
+  restarted (`KillMode=process`). Claude and Codex are tracked separately, so Codex not being logged in
+  yet does not hold up Claude.
+- **Rollout.** One script and one template unit (`agent-session-sync@.service`) installed by the same
+  snippet everywhere. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`.
+
 ### Codex updates and restarts
 
 Updating Codex and running the update are two steps on purpose. A daemon keeps the binary it started
