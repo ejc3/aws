@@ -42,8 +42,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-b0bf69b"
-  claude_master_sha256_aarch64 = "1595ee7fea61878b55f17d3b526f600d6aa99c930f491ae02e5400d2024de4ce"
+  claude_master_tag            = "claude-master-66b3cee"
+  claude_master_sha256_aarch64 = "d5459e55b54ebd6bc1b09e0858f19e493fb8f4d87be3347b415b0fe44aee0943"
 
   claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
   claude_master_server_port = 8443
