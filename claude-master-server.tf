@@ -588,7 +588,9 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_memory" {
   alarm_description   = "claude-master server memory above 85% on 1 GB. The proxy, cloudflared and the CloudWatch agent share it; the next step is swapping."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # No data is not healthy: a dead agent must say so rather than leave the alarm green.
+  treat_missing_data        = "missing"
+  insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
@@ -603,7 +605,9 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
   threshold           = 50
   alarm_description   = "claude-master server is paging heavily; swap lives on the root volume."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # No data is not healthy: a dead agent must say so rather than leave the alarm green.
+  treat_missing_data        = "missing"
+  insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 }
 
 # Two things only a person can fix, found in the proxy's own log. The wording is the program's fixed text.
