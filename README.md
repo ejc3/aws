@@ -197,6 +197,16 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
+The claude-master backup API key, `claude-master/backup-api-key` (us-west-1, from
+`dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
+creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
+and claude-master has no fallback. Populate it from the key file (read from the file, never on the command line), then remove the file:
+
+```bash
+aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/backup-api-key \
+  --secret-string file://$HOME/claude_api.txt && shred -u ~/claude_api.txt
+```
+
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
 

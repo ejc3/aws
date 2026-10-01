@@ -681,6 +681,11 @@ Available if a task needs them; neither needs a key on disk.
   (`dev-ai-services.tf`). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **claude-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
+  the paid Anthropic API key that claude-master uses only after every subscription profile is out of
+  quota (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
+  grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
+  `get-secret-value`; never into a file in a repo, a command line or a commit.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
