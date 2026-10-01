@@ -364,7 +364,7 @@ The long-lived development and administration instances are:
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
-| claude-master-server | t4g.nano | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claude-master-server.tf |
+| claude-master-server | t4g.micro | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claude-master-server.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
@@ -557,7 +557,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   connect --server 127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
   internet; a Cloudflare tunnel with Access is the path for machines without AWS access, and would
   be a new ingress in `cloudflare.tf`, not a new open port.
-- **Size.** t4g.nano with a 1GB swapfile. Move to t4g.micro if it pages.
+- **Size.** t4g.micro with a 1GB swapfile. t4g.nano was tried first and was OOM-killed during its own first boot.
 
 ### Codex updates and restarts
 

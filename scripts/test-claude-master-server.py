@@ -51,6 +51,13 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("delete_on_termination = false", inst)
         self.assertRegex(TF, r'claude_master_server_ip\s+=\s+"10\.0\.1\.50"')
 
+    def test_it_is_big_enough_to_survive_its_first_boot(self):
+        # t4g.nano was OOM-killed during apt on first boot; swap exists before any apt run.
+        inst = block("aws_instance", "claude_master_server")
+        self.assertIn('instance_type               = "t4g.micro"', inst)
+        bootstrap = inst[inst.index("user_data"):]
+        self.assertLess(bootstrap.index("fallocate -l 1G"), bootstrap.index("apt-get update"))
+
     def test_the_server_listens_on_its_private_address_never_everywhere(self):
         self.assertIn("--listen ${local.claude_master_server_ip}:${local.claude_master_server_port}", TF)
         self.assertNotRegex(TF, r"--listen\s+(0\.0\.0\.0|\[::\]|:)")
