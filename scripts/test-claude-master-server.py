@@ -333,7 +333,7 @@ class MacSetupTests(unittest.TestCase):
         self.assertIn("claude-pool", text)
 
     def test_the_tunnel_log_rotates_and_the_token_is_not_in_the_plist(self):
-        self.assertIn("5242880", MACSETUP)
+        self.assertRegex(MACSETUP, r"-gt 5242880 \]")  # exactly 5 MB, not merely containing the digits
         self.assertIn('cp "\\$LOG" "\\$LOG.1" && : > "\\$LOG"', MACSETUP)
         plist = MACSETUP[MACSETUP.index("<?xml"):MACSETUP.index("</dict></plist>")]
         self.assertNotRegex(plist, r"TUNNEL_SERVICE_TOKEN|client_secret")
