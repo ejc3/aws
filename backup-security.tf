@@ -19,6 +19,7 @@ locals {
     local.nextjs_root_volume_arn,
     var.enable_jumpbox ? aws_ebs_volume.jumpbox_home[0].arn : "",
     var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
+    local.claude_master_server_volume_arn,
   ])
   backup_cmk_hop_volume_arns = compact([
     local.nextjs_root_volume_arn,
@@ -28,6 +29,9 @@ locals {
     # it had before, and that key can't be shared cross-account directly. Same fix as
     # nextjs/jumpbox_2: re-encrypt through the DR vault's customer key before copying out.
     local.arm_persistent_volume_arn,
+    # The claude-master server's root is encrypted with the account's default alias/aws/ebs key
+    # (claude-master-server.tf), so it takes the same hop.
+    local.claude_master_server_volume_arn,
   ])
   backup_snapshot_arns = [
     "arn:aws:ec2:${var.aws_region}::snapshot/*",
@@ -911,7 +915,8 @@ resource "aws_backup_restore_testing_selection" "fleet_ebs_dr" {
   name                      = "fleet_ebs"
   restore_testing_plan_name = aws_backup_restore_testing_plan.fleet_dr.name
   protected_resource_type   = "EBS"
-  # The dedicated vault receives only the five configured fleet volume sources.
+  # The dedicated vault receives only the configured fleet volume sources (the controller's
+  # `volumes` list, backup_protected_volume_arns).
   protected_resource_arns = ["*"]
   iam_role_arn            = aws_iam_role.backup_restore_test.arn
   # More than one hourly reconciliation interval leaves room to validate when the

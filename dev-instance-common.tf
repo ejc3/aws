@@ -656,6 +656,7 @@ resource "aws_backup_selection" "dev_servers" {
     local.arm_persistent_volume_arn,
     local.x86_persistent_volume_arn,
     local.nextjs_root_volume_arn,
+    local.claude_master_server_volume_arn,
   ])
   lifecycle {
     create_before_destroy = true
