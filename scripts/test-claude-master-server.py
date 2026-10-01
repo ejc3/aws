@@ -15,6 +15,7 @@ ENROLL = (ROOT / "scripts" / "claude-master-enroll.sh").read_text()
 CONVERGE = (ROOT / "scripts" / "ssm-claude-master-server.sh").read_text()
 LOGIN = (ROOT / "scripts" / "claude-master-login.sh").read_text()
 TUNNEL = (ROOT / "scripts" / "claude-master-tunnel.sh").read_text()
+DASH = (ROOT / "claude-master-dashboard.tf").read_text()
 
 
 def code(text):
@@ -206,6 +207,99 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn(message, TF)
         for name in ("claude_master_server_status", "claude_master_server_memory", "claude_master_server_swap", "claude_master_server_log"):
             self.assertIn("aws_sns_topic.cost_alerts.arn", block("aws_cloudwatch_metric_alarm", name))
+
+
+class DashboardTests(unittest.TestCase):
+    """The dashboard and its alarms read what the proxy publishes. Every query here was checked against the live
+    CloudWatch API; these tests keep them valid and cheap."""
+
+    # The metrics the proxy emits (docs/claude-master.md in ejc3/CLIProxyAPI) and the host metrics of the agent.
+    METRICS = {
+        "claude_master.inference.requests", "claude_master.inference.requests.by_model",
+        "claude_master.inference.requests.by_client", "claude_master.inference.errors",
+        "claude_master.inference.duration", "claude_master.inference.duration.by_model",
+        "claude_master.inference.ttfb", "claude_master.inference.ttfb.by_model",
+        "claude_master.inference.upstream_ttfb", "claude_master.inference.duration_quantile",
+        "claude_master.proxy.overhead", "claude_master.proxy.connections", "claude_master.proxy.tls_handshake_errors",
+        "claude_master.quota.used_fraction", "claude_master.quota.resets_in_seconds", "claude_master.quota.rate_limited",
+        "claude_master.anthropic.ratelimit", "claude_master.routing.switches", "claude_master.routing.backup_requests",
+        "claude_master.auth.token_expires_in_seconds", "claude_master.auth.refresh", "claude_master.usage.polls",
+        "claude_master.process.heap_bytes", "claude_master.process.goroutines",
+        "mem_used_percent", "swap_used_percent", "CredentialRejected", "NoAccountAvailable",
+    }
+    # Names CloudWatch accepted unquoted in GROUP BY / WHERE. Anything else (window and result are reserved
+    # words, which the API rejected) must be double quoted.
+    SAFE = {"profile", "client_account", "client", "model", "status_class", "status", "route", "reason", "quantile", "measure"}
+
+    def queries(self):
+        found = re.findall(r'"(SELECT (?:[^"\\]|\\.)*)"', DASH)
+        return [q.replace('\\"', '"').replace("${local.cm_ns}", "ClaudeMaster") for q in found]
+
+    def test_there_are_queries_and_every_one_reads_the_agents_namespace_and_a_known_metric(self):
+        queries = self.queries()
+        self.assertGreaterEqual(len(queries), 30)
+        for q in queries:
+            self.assertRegex(q, r'^SELECT (SUM|AVG|MIN|MAX)\(.+\) FROM "ClaudeMaster(/Logs)?"')
+            metric = re.match(r'SELECT \w+\("?([^")]+)"?\)', q).group(1)
+            self.assertIn(metric, self.METRICS, q)
+
+    def test_a_dimension_is_quoted_unless_it_is_known_to_be_safe(self):
+        checked = 0
+        for q in self.queries():
+            tail = re.split(r'FROM "[^"]+"', q, maxsplit=1)[1]
+            idents = []
+            group = re.search(r"GROUP BY (.+)$", tail)
+            if group:
+                idents += [x.strip() for x in group.group(1).split(",")]
+            idents += re.findall(r'(?:WHERE|AND)\s+("?\w+"?)\s*=', tail)
+            for ident in idents:
+                checked += 1
+                self.assertTrue(ident.startswith('"') or ident in self.SAFE, "%s: dimension %s must be double quoted" % (q, ident))
+        self.assertGreaterEqual(checked, 15, "the check looked at the queries' dimensions")
+
+    def test_the_reserved_words_that_cloudwatch_rejected_are_quoted(self):
+        for q in self.queries():
+            self.assertNotRegex(q, r'(GROUP BY|,|WHERE)\s+(result|window)\b', q)
+        self.assertIn('GROUP BY \\"result\\"', DASH)
+        self.assertIn('\\"window\\"', DASH)
+
+    def test_no_panel_names_a_dimension_list_so_a_renamed_dimension_cannot_blank_it(self):
+        self.assertNotRegex(DASH, r"Name=|dimensions\s*=", "Metrics Insights queries aggregate across dimensions")
+
+    def test_the_alarms_are_dimensionless_query_alarms_on_the_shared_topic(self):
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claude_master_pool")
+        self.assertIn("metric_query", alarm)
+        self.assertNotIn("dimensions", alarm)
+        self.assertIn("aws_sns_topic.cost_alerts.arn", alarm)
+        self.assertIn('SELECT MIN(\\"claude_master.quota.used_fraction\\")', alarm)
+        self.assertIn("threshold           = each.value", alarm)
+
+    def test_the_error_alarm_judges_one_ten_minute_datapoint_not_two_five_minute_ones(self):
+        # With a 300 s period and two evaluation periods, each five minutes would have to pass the threshold on
+        # its own: 15 errors in each never fired a "20 errors in 10 minutes" alarm.
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claude_master_pool")
+        self.assertIn('evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1', alarm)
+        self.assertIn('period = each.key == "pool_exhausted" ? 300 : 600', alarm)
+        self.assertIn("More than 20 Anthropic error responses in 10 minutes", alarm)
+
+    def test_a_panel_titled_hours_divides_the_seconds_the_proxy_publishes(self):
+        self.assertIn("divide  = 3600", DASH)
+        self.assertIn('expression = "q${i}_${n}/${p.divide}"', DASH)
+        panel = DASH[DASH.index('title   = "Hours until each weekly allowance resets"'):]
+        panel = panel[:panel.index("},\n")]
+        self.assertIn("divide", panel)
+        self.assertIn("quota.resets_in_seconds", panel)
+
+    def test_the_dashboard_exists_once_and_shows_the_alarms(self):
+        self.assertEqual(DASH.count('resource "aws_cloudwatch_dashboard"'), 1)
+        self.assertIn('type = "alarm"', DASH)
+        self.assertIn("aws_cloudwatch_metric_alarm.claude_master_pool", DASH)
+
+
+def block_in(text, kind, name):
+    m = re.search(r'^resource "%s" "%s" \{\n.*?^\}' % (kind, name), text, re.S | re.M)
+    assert m, "%s.%s missing" % (kind, name)
+    return m.group()
 
 
 class ConvergenceTests(unittest.TestCase):
