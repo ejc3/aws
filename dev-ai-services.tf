@@ -164,8 +164,9 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 # Anthropic API key, the final paid backup for claude-master (`--backup-api-key env:CLAUDE_MASTER_BACKUP_API_KEY`),
 # used only after every subscription profile is out of quota. It lived in ~/claude_api.txt on fcvm;
 # the value is set out of band (put-secret-value from a 0600 file) and never enters git. Readers: the
-# administration set and dev-server-role (the metal boxes) ONLY. Not nextjs-dev-role: every account
-# there has full sudo, so a grant would be box-wide, and this key is billed per token.
+# administration set, dev-server-role (the metal boxes) and the shared claude-master server's role.
+# Not nextjs-dev-role: every account there has full sudo, so a grant would be box-wide, and this key
+# is billed per token.
 #   export CLAUDE_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id claude-master/backup-api-key --query SecretString --output text)
 resource "aws_secretsmanager_secret" "claude_master_backup_key" {
@@ -176,7 +177,7 @@ resource "aws_secretsmanager_secret" "claude_master_backup_key" {
 }
 
 locals {
-  claude_master_backup_key_readers = [aws_iam_role.dev_server.arn]
+  claude_master_backup_key_readers = concat([aws_iam_role.dev_server.arn], aws_iam_role.claude_master_server[*].arn)
 }
 
 resource "aws_secretsmanager_secret_policy" "claude_master_backup_key" {
@@ -210,5 +211,12 @@ resource "aws_iam_policy" "claude_master_backup_key_read" {
 
 resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read" {
   role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
+}
+
+# The shared claude-master server is the one box that actually uses the backup key.
+resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read_server" {
+  count      = var.enable_claude_master_server ? 1 : 0
+  role       = aws_iam_role.claude_master_server[0].name
   policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
 }

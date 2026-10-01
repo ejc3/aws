@@ -128,6 +128,8 @@ jobs:
         run: python3 -S -B scripts/test-codex-restart.py
       - name: Codex refresh on the ubuntu boxes (weekly SSM association)
         run: python3 -S -B scripts/test-codex-update.py
+      - name: Shared claude-master server (private, pinned, idle until its logins exist)
+        run: python3 -S -B scripts/test-claude-master-server.py
 
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
