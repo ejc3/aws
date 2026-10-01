@@ -124,6 +124,70 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
 
 
+class ObservabilityTests(unittest.TestCase):
+    """Logs and metrics: info level, rotated, redacted at the source, shipped by a pinned agent that
+    listens on loopback only, with an IAM grant that can publish to one namespace and write one log group."""
+
+    def test_the_agent_is_pinned_and_checked_before_it_is_installed(self):
+        self.assertRegex(TF, r'claude_master_cwagent_version\s+=\s+"[0-9.]+b[0-9a-f]+"')
+        self.assertRegex(TF, r'claude_master_cwagent_sha256_arm64\s+=\s+"[0-9a-f]{64}"')
+        self.assertIn("amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/$CWA_VERSION/", TF)
+        self.assertNotIn("/latest/", TF)
+        check = 'echo "$CWA_SHA  /tmp/cwagent.deb" | sha256sum -c -'
+        self.assertIn(check, TF)
+        self.assertIn("dpkg -i /tmp/cwagent.deb", TF)
+        self.assertLess(TF.index(check), TF.index("dpkg -i /tmp/cwagent.deb"))
+
+    def test_otlp_stays_on_loopback_both_ends(self):
+        self.assertIn('"otlp": { "http_endpoint": "127.0.0.1:4318" }', TF)
+        self.assertIn("--otlp-endpoint http://127.0.0.1:4318", TF)
+        self.assertNotIn("0.0.0.0:4318", TF)
+        self.assertNotIn("4317", TF)
+        self.assertNotIn("4318", block("aws_security_group", "claude_master_server"))
+
+    def test_the_server_always_logs_at_info_to_a_rotated_file_it_may_write(self):
+        wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        for flag in ("--log-level info", "--log-file /var/log/claude-master/server.log", "--log-max-mb 20", "--log-keep 5",
+                     "--quota-log-interval 5m", "--account-labels-file /etc/claude-master/account-labels"):
+            self.assertIn(flag, wrapper)
+        self.assertNotIn("--log-level debug", wrapper)
+        self.assertIn("LogsDirectory=claude-master", TF)
+        self.assertIn("ProtectSystem=strict", TF)
+
+    def test_the_journal_is_capped(self):
+        self.assertIn("SystemMaxUse=200M", TF)
+        self.assertIn("journalctl --vacuum-size=200M", TF)
+
+    def test_the_agent_ships_the_exact_log_file_not_its_rotations(self):
+        self.assertIn('"file_path": "/var/log/claude-master/server.log"', TF)
+        self.assertNotIn("server.log*", TF)
+
+    def test_the_agent_is_reloaded_only_when_its_config_changed_and_the_server_is_never_touched(self):
+        self.assertIn("cmp -s /tmp/cwagent.json", TF)
+        script = TF[TF.index("# ---------------------------------------------------------------- cloudwatch agent"):TF.index("# ---------------------------------------------------------------- operator helpers")]
+        self.assertNotIn("claude-master-server", script)
+        self.assertNotRegex(script, r"systemctl (restart|stop)")
+
+    def test_the_grant_publishes_to_one_namespace_and_writes_one_log_group(self):
+        policy = block("aws_iam_role_policy", "claude_master_server_telemetry")
+        self.assertRegex(policy, r'"cloudwatch:PutMetricData"')
+        self.assertIn('"cloudwatch:namespace" = local.claude_master_metrics_namespace', policy)
+        self.assertIn("aws_cloudwatch_log_group.claude_master_server.arn", policy)
+        self.assertNotRegex(policy, r"logs:CreateLogGroup|logs:DeleteLogGroup|logs:\*|cloudwatch:\*")
+        # The only wildcard resource is PutMetricData, which has no resource-level scope: the condition holds it.
+        self.assertEqual(policy.count('Resource = "*"'), 1)
+        self.assertLess(policy.index('Resource = "*"'), policy.index("WriteItsOwnLogGroup"))
+
+    def test_the_log_group_is_kept_and_two_log_alarms_exist(self):
+        self.assertIn("retention_in_days = 90", block("aws_cloudwatch_log_group", "claude_master_server"))
+        for key in ("CredentialRejected", "NoAccountAvailable"):
+            self.assertIn(key + " = {", TF)
+        for message in ("profile credential rejected by Anthropic", "no inference account could be chosen"):
+            self.assertIn(message, TF)
+        for name in ("claude_master_server_status", "claude_master_server_memory", "claude_master_server_swap", "claude_master_server_log"):
+            self.assertIn("aws_sns_topic.cost_alerts.arn", block("aws_cloudwatch_metric_alarm", name))
+
+
 class ConvergenceTests(unittest.TestCase):
     """The instance ignores user_data, so Terraform itself must re-run the bootstrap."""
 

@@ -44,8 +44,16 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-a4c2810"
-  claude_master_sha256_aarch64 = "59514267a0567879b5046a868b3e08cfc69ee0a4a7cfe81141ee1b8759e4dc6c"
+  claude_master_tag            = "claude-master-e8704e4"
+  claude_master_sha256_aarch64 = "8f7c1ed91787ec1a66f67cac0c20425caa09f5c73dd687e3045ce7ec312c5df5"
+
+  # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
+  # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
+  # `latest` at the time of pinning (verified byte for byte).
+  claude_master_cwagent_version      = "1.300073.2b1889"
+  claude_master_cwagent_sha256_arm64 = "0d04b62f688f257aa35604f89b48f259cea5ed412985831d8d56838f43332169"
+  claude_master_metrics_namespace    = "ClaudeMaster"
+  claude_master_log_group            = "/claude-master/server"
 
   claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
   claude_master_server_port = 8443
@@ -142,6 +150,45 @@ resource "aws_iam_role_policy" "claude_master_server_bootstrap" {
   })
 }
 
+# What the CloudWatch agent on the box may do, and nothing else: publish metrics in ONE namespace, and write
+# to ONE log group that Terraform owns (so it needs no CreateLogGroup). No read access to anything.
+resource "aws_iam_role_policy" "claude_master_server_telemetry" {
+  count = var.enable_claude_master_server ? 1 : 0
+  name  = "telemetry"
+  role  = aws_iam_role.claude_master_server[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "PublishMetricsInOneNamespace"
+        Effect   = "Allow"
+        Action   = "cloudwatch:PutMetricData"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = local.claude_master_metrics_namespace }
+        }
+      },
+      {
+        Sid    = "WriteItsOwnLogGroup"
+        Effect = "Allow"
+        Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+        Resource = [
+          aws_cloudwatch_log_group.claude_master_server.arn,
+          "${aws_cloudwatch_log_group.claude_master_server.arn}:*",
+        ]
+      },
+    ]
+  })
+}
+
+# The proxy's own log (info level: what changed, plus a quota snapshot every five minutes). Redacted at the
+# source; kept 90 days.
+resource "aws_cloudwatch_log_group" "claude_master_server" {
+  name              = local.claude_master_log_group
+  retention_in_days = 90
+  tags              = { Name = "claude-master-server" }
+}
+
 resource "aws_iam_instance_profile" "claude_master_server" {
   count = var.enable_claude_master_server ? 1 : 0
   name  = "claude-master-server-profile"
@@ -202,9 +249,25 @@ if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_K
 unset key
 exec /usr/local/bin/claude-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
   --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} \\
-  --open-loopback 127.0.0.1:${local.claude_master_open_port} --state-dir /var/lib/claude-master/state
+  --open-loopback 127.0.0.1:${local.claude_master_open_port} --state-dir /var/lib/claude-master/state \
+  --log-level info --log-file /var/log/claude-master/server.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
+  --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels
 EOF
 chmod 0755 /usr/local/bin/claude-master-serve
+
+# Names for the incoming users' Anthropic accounts in the dashboards, one `ACCOUNT_UUID=NAME` per line
+# (`claude-master account-key UUID` shows the key an unnamed account gets). Kept if it already exists.
+mkdir -p /etc/claude-master
+if [ ! -e /etc/claude-master/account-labels ]; then
+  printf '%s\n' '# ACCOUNT_UUID=NAME, one per line. The UUID is oauthAccount.accountUuid in a user'"'"'s ~/.claude.json.' '# Without a line an account shows as acct-<8 hex of a hash>; the id itself is never exported.' > /etc/claude-master/account-labels
+  chmod 0644 /etc/claude-master/account-labels
+fi
+
+# The journal is small on this box: cap it, and trim what is there now. (No service is restarted: the cap
+# applies the next time journald starts.)
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=30day\n' > /etc/systemd/journald.conf.d/claude-master.conf
+journalctl --vacuum-size=200M >/dev/null 2>&1 || true
 
 cat > /etc/systemd/system/claude-master-server.service <<'EOF'
 [Unit]
@@ -218,6 +281,9 @@ ${join("\n", [for p in local.claude_master_profiles : "ConditionPathExists=/var/
 User=claude-master
 Group=claude-master
 Environment=HOME=/var/lib/claude-master
+# /var/log/claude-master, owned by the service account; the program rotates the file itself.
+LogsDirectory=claude-master
+LogsDirectoryMode=0750
 ExecStart=/usr/local/bin/claude-master-serve
 Restart=on-failure
 RestartSec=10
@@ -289,6 +355,48 @@ systemctl enable cloudflared-claude-master.service >/dev/null 2>&1 || true
 # yet. Starting it (not restarting a running one) is therefore safe on every convergence.
 systemctl is-active --quiet cloudflared-claude-master.service || systemctl start cloudflared-claude-master.service || true
 
+# ---------------------------------------------------------------- cloudwatch agent
+# Receives the proxy's OTLP metrics on 127.0.0.1:4318 (the agent turns cumulative counters into deltas),
+# publishes them in the ${local.claude_master_metrics_namespace} namespace, adds memory and swap (this box ran out of memory
+# at its first size), and ships the proxy's log file to ${local.claude_master_log_group}.
+CWA_VERSION='${local.claude_master_cwagent_version}'
+CWA_SHA='${local.claude_master_cwagent_sha256_arm64}'
+if ! dpkg-query -W -f='$${Version}' amazon-cloudwatch-agent 2>/dev/null | grep -q "^$CWA_VERSION"; then
+  if curl -fsSL --retry 3 "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/$CWA_VERSION/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb \
+     && echo "$CWA_SHA  /tmp/cwagent.deb" | sha256sum -c - >/dev/null; then
+    dpkg -i /tmp/cwagent.deb >/dev/null 2>&1 || apt-get install -y -f >/dev/null 2>&1
+  else
+    echo "ERROR: cloudwatch agent $CWA_VERSION did not download or did not match its sha256; metrics and logs will not ship" >&2
+  fi
+  rm -f /tmp/cwagent.deb
+fi
+if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
+  cat > /tmp/cwagent.json <<'CWACONF'
+{
+  "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+  "metrics": {
+    "namespace": "${local.claude_master_metrics_namespace}",
+    "metrics_collected": {
+      "otlp": { "http_endpoint": "127.0.0.1:4318" },
+      "mem": { "measurement": ["mem_used_percent"] },
+      "swap": { "measurement": ["swap_used_percent"] }
+    }
+  },
+  "logs": { "logs_collected": { "files": { "collect_list": [
+    { "file_path": "/var/log/claude-master/server.log", "log_group_name": "${local.claude_master_log_group}", "log_stream_name": "{instance_id}" }
+  ] } } }
+}
+CWACONF
+  # Reload only when the configuration changed (or the agent is not running): a no-op convergence touches nothing.
+  if ! cmp -s /tmp/cwagent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || ! systemctl is-active --quiet amazon-cloudwatch-agent; then
+    install -m 0644 /tmp/cwagent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s >/dev/null 2>&1 \
+      || echo "WARNING: cloudwatch agent installed but did not start" >&2
+  fi
+  rm -f /tmp/cwagent.json
+fi
+
 # ---------------------------------------------------------------- operator helpers
 # A login is interactive (paste a code); run it as the service account so the profile is its own.
 cat > /usr/local/bin/claude-master-login <<'EOF'
@@ -318,6 +426,7 @@ for p in ${join(" ", local.claude_master_profiles)}; do
   if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
 done
 echo "server: $(systemctl is-active claude-master-server)"
+echo "cloudwatch agent: $(systemctl is-active amazon-cloudwatch-agent)   log: $(ls -1 /var/log/claude-master 2>/dev/null | head -1) $(stat -c %s /var/log/claude-master/server.log 2>/dev/null) bytes"
 if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claude_master_open_port} "; then
   echo "open listener: listening"
 else
@@ -452,4 +561,80 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_status" {
   treat_missing_data  = "notBreaching"
 
   dimensions = { InstanceId = aws_instance.claude_master_server[0].id }
+}
+
+# Memory and swap (the CloudWatch agent publishes them). The box ran out of memory at its first size.
+resource "aws_cloudwatch_metric_alarm" "claude_master_server_memory" {
+  count               = var.enable_claude_master_server ? 1 : 0
+  alarm_name          = "claude-master-server-memory-pressure"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "mem_used_percent"
+  namespace           = local.claude_master_metrics_namespace
+  period              = 300
+  statistic           = "Average"
+  threshold           = 85
+  alarm_description   = "claude-master server memory above 85% on 1 GB. The proxy, cloudflared and the CloudWatch agent share it; the next step is swapping."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
+  count               = var.enable_claude_master_server ? 1 : 0
+  alarm_name          = "claude-master-server-swapping"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "swap_used_percent"
+  namespace           = local.claude_master_metrics_namespace
+  period              = 300
+  statistic           = "Average"
+  threshold           = 50
+  alarm_description   = "claude-master server is paging heavily; swap lives on the root volume."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+# Two things only a person can fix, found in the proxy's own log. The wording is the program's fixed text.
+locals {
+  claude_master_log_alarms = {
+    CredentialRejected = {
+      pattern     = "\"profile credential rejected by Anthropic\""
+      description = "Anthropic rejected a subscription's login (401/403): it expired or was revoked. Redo it: scripts/claude-master-login.sh --server (the other subscriptions keep serving)."
+    }
+    NoAccountAvailable = {
+      pattern     = "\"no inference account could be chosen\""
+      description = "No subscription (and no API-key backup) could take a request: every one is rate limited, exhausted or its login failed. Clients are being refused."
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "claude_master_server" {
+  for_each       = var.enable_claude_master_server ? local.claude_master_log_alarms : {}
+  name           = "claude-master-${each.key}"
+  log_group_name = aws_cloudwatch_log_group.claude_master_server.name
+  pattern        = each.value.pattern
+  metric_transformation {
+    name          = each.key
+    namespace     = "${local.claude_master_metrics_namespace}/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "claude_master_server_log" {
+  for_each            = var.enable_claude_master_server ? local.claude_master_log_alarms : {}
+  alarm_name          = "claude-master-${each.key}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = each.key
+  namespace           = "${local.claude_master_metrics_namespace}/Logs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = each.value.description
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+  depends_on          = [aws_cloudwatch_log_metric_filter.claude_master_server]
 }

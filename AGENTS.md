@@ -571,6 +571,30 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   a running server; `claude-master-status` shows running versus pinned and a new binary takes effect when
   the owner restarts the service.
 - **Size.** t4g.micro with a 1GB swapfile. t4g.nano was tried first and was OOM-killed during its own first boot.
+- **Logs.** The proxy writes its own log (`/var/log/claude-master/server.log`, always `info`, rotated by
+  the program at 20 MiB x 5, 0600) and the CloudWatch agent ships it to log group `/claude-master/server`
+  (90 days). `info` says when something CHANGES: a conversation moved to another subscription (from, to,
+  reason, both quotas), a profile rate limited or available again, a quota band crossed (ok / reserve at
+  90% / exhausted), the paid API-key backup used, a login rejected or refreshed, a client's first
+  connection, refused handshakes; plus a per-profile quota snapshot and routing summary every 5 minutes.
+  It never contains tokens, bodies, URLs, account ids or upstream text. For `debug` (every routing
+  decision) run `claude-master serve` by hand with `--log-level debug`; do not change the unit to it. The
+  journal is capped at 200M.
+- **Metrics.** The proxy exports OpenTelemetry metrics (`--otlp-endpoint`) to the CloudWatch agent on
+  `127.0.0.1:4318`, which publishes them in namespace `ClaudeMaster` (the agent turns cumulative counters
+  into deltas) along with `mem_used_percent` and `swap_used_percent`. Every inference request carries
+  `profile`, `client` (the box's certificate name), `model`, `status_class` and `client_account`, the
+  incoming user's Anthropic account: a name from `/etc/claude-master/account-labels`
+  (`ACCOUNT_UUID=NAME`, UUID = `oauthAccount.accountUuid` in that user's `~/.claude.json`), else
+  `acct-<8 hex of a hash>`; the account id is never exported (`claude-master account-key UUID` prints a key).
+  Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
+  query: `SELECT SUM(...) FROM "ClaudeMaster" GROUP BY client_account`.
+- **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and two taken from
+  the log: `claude-master-CredentialRejected` (a subscription's login expired or was revoked: redo it with
+  `scripts/claude-master-login.sh --server`) and `claude-master-NoAccountAvailable` (clients are being
+  refused). The agent's IAM grant can publish to the one namespace and write the one log group.
+- **Backup.** The root volume (the three logins and the CA key) is in the dev backup selection and the
+  recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
 ### Codex updates and restarts
 
