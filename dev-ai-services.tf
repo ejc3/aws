@@ -160,3 +160,55 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
   role       = each.value
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
+
+# Anthropic API key, the final paid backup for claude-master (`--backup-api-key env:CLAUDE_MASTER_BACKUP_API_KEY`),
+# used only after every subscription profile is out of quota. It lived in ~/claude_api.txt on fcvm;
+# the value is set out of band (put-secret-value from a 0600 file) and never enters git. Readers: the
+# administration set and dev-server-role (the metal boxes) ONLY. Not nextjs-dev-role: every account
+# there has full sudo, so a grant would be box-wide, and this key is billed per token.
+#   export CLAUDE_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
+#     --secret-id claude-master/backup-api-key --query SecretString --output text)
+resource "aws_secretsmanager_secret" "claude_master_backup_key" {
+  name                    = "claude-master/backup-api-key"
+  description             = "Anthropic API key, final paid backup for claude-master (raw key string). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "claude-master/backup-api-key", Project = "dev" }
+}
+
+locals {
+  claude_master_backup_key_readers = [aws_iam_role.dev_server.arn]
+}
+
+resource "aws_secretsmanager_secret_policy" "claude_master_backup_key" {
+  secret_arn = aws_secretsmanager_secret.claude_master_backup_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheMetalBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claude_master_backup_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.claude_master_backup_key_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "claude_master_backup_key_read" {
+  statement {
+    sid       = "ReadTheClaudeMasterBackupKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.claude_master_backup_key.arn]
+  }
+}
+
+resource "aws_iam_policy" "claude_master_backup_key_read" {
+  name        = "dev-claude-master-backup-key-read"
+  description = "Metal dev boxes: read the claude-master backup API key (claude-master/backup-api-key) and nothing else"
+  policy      = data.aws_iam_policy_document.claude_master_backup_key_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
+}

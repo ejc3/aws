@@ -55,6 +55,19 @@ class ElevenLabsSecretTests(unittest.TestCase):
         attach = block("aws_iam_role_policy_attachment", "browserbase_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
 
+    def test_claude_master_backup_key_is_for_the_metal_role_only(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "claude_master_backup_key"', TF)
+        self.assertNotRegex(TF, r"sk-ant-[A-Za-z0-9_-]{6,}")
+        policy = block("aws_secretsmanager_secret_policy", "claude_master_backup_key")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('concat(local.games_mp_admin_principals, local.claude_master_backup_key_readers)', policy)
+        self.assertIn("claude_master_backup_key_readers = [aws_iam_role.dev_server.arn]", TF)
+        doc = block("aws_iam_policy_document", "claude_master_backup_key_read")
+        self.assertIn("resources = [aws_secretsmanager_secret.claude_master_backup_key.arn]", doc)
+        attach = block("aws_iam_role_policy_attachment", "claude_master_backup_key_read")
+        self.assertIn("aws_iam_role.dev_server.name", attach)
+        self.assertNotIn("nextjs_dev", attach)
+
     def test_pricing_is_public_price_lists_only(self):
         doc = block("aws_iam_policy_document", "dev_pricing_read")
         actions = set(re.findall(r'"(pricing:[A-Za-z]+)"', doc))
