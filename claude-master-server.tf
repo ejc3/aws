@@ -13,9 +13,10 @@
 # once, so copies of it on several boxes destroy each other within hours. One process owns each
 # login; the rest talk to it.
 #
-# SIZE. t4g.nano (0.5GB) is enough for a Go proxy that holds three small credentials and forwards
-# streams; jumpbox-2's header explains why nano is NOT enough for terraform, which this box never
-# runs. A 1GB swapfile covers a burst. Move to t4g.micro if `free` ever shows it paging.
+# SIZE. t4g.micro (1GB). The Go proxy itself is small, but t4g.nano (0.5GB) was tried first and
+# did not survive its own first boot: apt's post-install hooks (appstreamcli) were OOM-killed,
+# cloud-final failed, and the SSM agent starved so no command was delivered. The swapfile is also
+# created at the very top of the inline bootstrap, before any apt run, for the same reason.
 #
 # NETWORK. A fixed private address, because client certificates name it. The security group admits
 # the proxy port from the dev fleet subnets alone and SSH from the two admin boxes alone. The box
@@ -156,7 +157,7 @@ HOME_DIR=/var/lib/claude-master
 apt-get update -y || true
 apt-get install -y curl jq unzip || echo "WARNING: some base packages failed"
 
-# ---------------------------------------------------------------- swap (0.5GB box)
+# ---------------------------------------------------------------- swap (also made earlier, inline)
 if ! swapon --show=NAME --noheadings | grep -q .; then
   fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -272,7 +273,7 @@ resource "aws_s3_object" "claude_master_server_user_data" {
 resource "aws_instance" "claude_master_server" {
   count                       = var.enable_claude_master_server ? 1 : 0
   ami                         = var.firecracker_ami # the same Ubuntu 24.04 ARM64 image as the fleet
-  instance_type               = "t4g.nano"
+  instance_type               = "t4g.micro"
   key_name                    = var.firecracker_key_name
   subnet_id                   = aws_subnet.subnet_a.id
   private_ip                  = local.claude_master_server_ip
@@ -296,6 +297,11 @@ resource "aws_instance" "claude_master_server" {
   user_data = base64encode(<<-BOOTSTRAP
     #!/bin/bash
     export DEBIAN_FRONTEND=noninteractive
+    # Swap BEFORE any apt run: a small box's first boot is the memory peak.
+    if ! swapon --show=NAME --noheadings | grep -q .; then
+      fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
     apt-get update -y || true
     apt-get install -y unzip curl || true
     if ! command -v aws >/dev/null 2>&1; then
