@@ -601,6 +601,20 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   the log: `claude-master-CredentialRejected` (a subscription's login expired or was revoked: redo it with
   `scripts/claude-master-login.sh --server`) and `claude-master-NoAccountAvailable` (clients are being
   refused). The agent's IAM grant can publish to the one namespace and write the one log group.
+- **Dashboard** `claude-master` (`claude-master-dashboard.tf`): requests by user, subscription, box, model and
+  outcome; latency percentiles, Anthropic's first-byte time against claude-master's own overhead; each
+  subscription's allowance, resets and Anthropic's own utilization; switches, rate limits, API-backup use;
+  login health; connections; host memory; the log-derived alarms. Two Metrics Insights QUERY alarms with no
+  dimension names (so a renamed dimension cannot turn one silently green): every subscription past 90% of its
+  weekly allowance, and more than 20 Anthropic errors in 10 minutes. Every query was checked against the live
+  API (`window` and `result` are reserved words and must be quoted); `scripts/test-claude-master-server.py`
+  keeps them valid.
+- **Cost shape.** CloudWatch bills every distinct combination of a metric's dimensions as its own custom metric
+  (about $0.30 a month each) and every OTLP attribute becomes a dimension, so the proxy never crosses its axes:
+  each metric carries at most three attributes and each axis (profile, user, box, model) has its own
+  projection. Measured through the live agent: counters arrive as deltas, histograms as approximate statistic
+  sets (no percentiles; the proxy publishes its own p50/p95/p99 gauges), and `service.name` is an extra
+  dimension. Do not add an attribute to a request metric without checking how many series it multiplies.
 - **Backup.** The root volume (the three logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
