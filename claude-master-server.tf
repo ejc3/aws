@@ -33,8 +33,9 @@
 # (an admin action) and installs the certificate. Certificates last 30 days.
 #
 # TO ROLL THE BINARY FORWARD: publish a release of ejc3/CLIProxyAPI, change the tag and the sha256,
-# apply, then re-run the bootstrap. The binary is swapped atomically but a running server keeps the
-# old one until it is restarted -- a deliberate decision, like codex-restart.
+# apply. terraform_data.claude_master_server_converge re-runs the bootstrap, which swaps the binary
+# atomically; a running server keeps the old one until it is restarted -- a deliberate decision,
+# like codex-restart.
 
 variable "enable_claude_master_server" {
   description = "Enable the shared claude-master server box"
@@ -329,6 +330,29 @@ resource "aws_instance" "claude_master_server" {
     Name    = "claude-master-server"
     Purpose = "Shared Claude subscription pool; clients authenticate with certificates"
   }
+}
+
+# CONVERGENCE. The instance ignores user_data changes, and cloud-init does not run per-instance
+# user data again after a resize or a stop/start, so a script edit, a pin bump or a box whose first
+# boot failed would change nothing on the running machine. This re-runs the bootstrap through SSM
+# whenever the script, the helper or the instance changes. The bootstrap is idempotent and never
+# restarts a running server: a new binary is installed atomically and a running server keeps the old
+# one until the owner restarts it (`claude-master-status` shows running versus pinned).
+resource "terraform_data" "claude_master_server_converge" {
+  count = var.enable_claude_master_server ? 1 : 0
+
+  triggers_replace = {
+    instance = aws_instance.claude_master_server[0].id
+    type     = aws_instance.claude_master_server[0].instance_type
+    script   = sha256(local.claude_master_server_user_data)
+    helper   = filesha256("${path.module}/scripts/ssm-claude-master-server.sh")
+  }
+
+  provisioner "local-exec" {
+    command = "bash ${path.module}/scripts/ssm-claude-master-server.sh ${aws_instance.claude_master_server[0].id} ${var.aws_region}"
+  }
+
+  depends_on = [aws_s3_object.claude_master_server_user_data]
 }
 
 output "claude_master_server_address" {
