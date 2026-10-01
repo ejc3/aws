@@ -276,5 +276,221 @@ class WiringTests(unittest.TestCase):
         self.assertLessEqual(interval, 5.0, "scan + ~1s launch must stay well under 15s")
 
 
+class RebootTests(Base):
+    """tmux windows do not survive a reboot but known.json does: what the watcher launched is launched again."""
+
+    def state_for(self, boot):
+        return ass.State(os.path.join(self.cfg["state_dir"], "known.json"), boot_id=boot)
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.state_for("boot-A")
+        self.scan()
+        self.fresh = make_repo(self.home, "fresh")
+        self.scan(now=1005, state=self.state)          # launched by the watcher: claude and codex done
+        self.launcher.calls.clear()
+
+    def test_a_restart_of_the_watcher_on_the_same_boot_relaunches_nothing(self):
+        state = self.state_for("boot-A")
+        self.assertFalse(state.rebooted)
+        self.scan(now=2000, state=state)
+        self.assertEqual(self.launcher.calls, [])
+
+    def test_after_a_reboot_claude_is_started_again_for_what_the_watcher_launched_and_codex_is_not(self):
+        state = self.state_for("boot-B")
+        self.assertTrue(state.rebooted)
+        self.scan(now=2000, state=state)
+        self.assertEqual(self.launcher.calls, [("claude", str(self.fresh))], "Codex threads live in Codex, not tmux")
+
+    def test_it_is_done_once_a_window_closed_afterwards_stays_closed(self):
+        state = self.state_for("boot-B")
+        self.scan(now=2000, state=state)
+        self.launcher.calls.clear()
+        self.scan(now=2100, state=state)
+        self.assertEqual(self.launcher.calls, [])
+        self.assertEqual(self.state_for("boot-B").rebooted, False, "the new boot id was saved")
+
+    def test_repos_recorded_at_the_first_run_belong_to_the_boot_launcher_not_to_this(self):
+        old = self.home / "old"
+        # the first run was before `fresh` existed in setUp; add an entry as the first run would have
+        self.state.known[str(old)] = {"claude": True, "codex": True, "seeded": True}
+        old.mkdir()
+        state = self.state_for("boot-B")
+        state.known[str(old)] = {"claude": True, "codex": True, "seeded": True}
+        self.scan(now=2000, state=state)
+        self.assertNotIn(str(old), [p for _, p in self.launcher.calls])
+
+    def test_an_older_state_file_without_a_boot_id_is_not_taken_for_a_reboot(self):
+        path = os.path.join(self.cfg["state_dir"], "known.json")
+        import json as _json
+        data = _json.load(open(path))
+        data.pop("boot_id")
+        _json.dump(data, open(path, "w"))
+        self.assertFalse(self.state_for("boot-Z").rebooted)
+
+
+class TrustKeeperTests(Base):
+    """A running Claude rewrites ~/.claude.json from its cached copy and drops a trust entry added meanwhile."""
+
+    def write(self, projects):
+        import json as _json
+        (self.home / ".claude.json").write_text(_json.dumps({"projects": projects, "other": {"keep": 1}}))
+
+    def read(self):
+        import json as _json
+        return _json.loads((self.home / ".claude.json").read_text())
+
+    def test_a_trust_entry_another_session_overwrote_is_put_back(self):
+        repo = str(self.home / "fresh")
+        self.write({repo: {"hasTrustDialogAccepted": True}})
+        state = ass.State(os.path.join(self.cfg["state_dir"], "known.json"))
+        ass.keep_trust(str(self.home), [repo], state)                    # first look: all present, nothing written
+        self.write({})                                                   # a running Claude drops it
+        os.utime(self.home / ".claude.json", ns=(1, 2_000_000_000))      # (and its mtime moves)
+        ass.keep_trust(str(self.home), [repo], state)
+        self.assertIn(repo, self.read()["projects"], "the dropped entry was not put back")
+        self.assertIs(self.read()["projects"][repo]["hasTrustDialogAccepted"], True)
+        self.assertEqual(self.read()["other"], {"keep": 1}, "everything else in the file is preserved")
+
+    def test_an_idle_tick_is_one_stat_and_writes_nothing(self):
+        repo = str(self.home / "fresh")
+        self.write({repo: {"hasTrustDialogAccepted": True}})
+        state = ass.State(os.path.join(self.cfg["state_dir"], "known.json"))
+        ass.keep_trust(str(self.home), [repo], state)
+        before = (self.home / ".claude.json").stat().st_mtime_ns
+        for _ in range(5):
+            ass.keep_trust(str(self.home), [repo], state)
+        self.assertEqual((self.home / ".claude.json").stat().st_mtime_ns, before)
+        calls = []
+        real = ass.trust_repos
+        ass.trust_repos = lambda *a: calls.append(a) or 0
+        self.addCleanup(setattr, ass, "trust_repos", real)
+        ass.keep_trust(str(self.home), [repo], state)
+        self.assertEqual(calls, [], "an unchanged file is not even read")
+
+    def test_the_scan_keeps_trust_for_repos_it_launched_but_not_for_ones_it_never_launched(self):
+        old = self.home / "old"
+        self.scan()
+        fresh = make_repo(self.home, "fresh")
+        self.write({})
+        self.scan(now=1005)
+        self.assertIn(str(fresh), self.read()["projects"])
+        self.assertNotIn(str(old), self.read()["projects"])
+        self.write({})
+        os.utime(self.home / ".claude.json", ns=(1, 3_000_000_000))
+        self.scan(now=1010)
+        self.assertIs(self.read()["projects"][str(fresh)]["hasTrustDialogAccepted"], True)
+
+
+class ClaudeLauncherTests(Base):
+    """t-claude is found on EVERY attempt: not being installed yet must never read as 'nothing to do'."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.update({"t_claude_arg": "auto", "tmux": "tmux"})
+        self.launcher = ass.Launcher(self.cfg)
+        self.launcher.tmux_up = lambda: True
+        self.launcher.claude_logged_in = lambda: True
+        self.looked = []
+        real = ass.find_t_claude
+        ass.find_t_claude = lambda home, given: self.looked.append(home) or None
+        self.addCleanup(setattr, ass, "find_t_claude", real)
+
+    def test_a_missing_t_claude_is_a_retry_not_a_completion(self):
+        self.assertFalse(self.launcher.start_claude(str(self.home / "x")))
+        self.assertEqual(len(self.looked), 1)
+
+    def test_the_scan_keeps_asking_until_it_is_installed(self):
+        self.scan()
+        make_repo(self.home, "fresh")
+        for tick in range(3):
+            self.scan(now=1005 + tick)                    # claude retries every tick while no tmux/launcher
+        entry = self.state.known[str(self.home / "fresh")]
+        self.assertFalse(entry["claude"], "a missing launcher must not be recorded as done")
+        self.assertGreaterEqual(len(self.looked), 1)
+        self.assertNotIn("t_claude", self.cfg, "the path is never cached in the config")
+
+
+class SelfUpdateTests(unittest.TestCase):
+    """A box's installer replaces the file; the running watcher must pick it up without anyone restarting it."""
+
+    def test_the_watcher_runs_new_code_in_the_same_process_when_its_file_is_replaced(self):
+        import time as _time
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        copy = tmp / "agent-session-sync.py"
+        shutil.copy(ROOT / "scripts" / "agent-session-sync.py", copy)
+        home = tmp / "home"
+        home.mkdir()
+        log = tmp / "log"
+        with open(log, "w") as fh:
+            proc = subprocess.Popen(["python3", str(copy), "--home", str(home), "--interval", "0.2",
+                                     "--state-dir", str(tmp / "state"), "--codex-seed", "/nonexistent"], stdout=fh, stderr=fh)
+        self.addCleanup(proc.kill)
+        _time.sleep(1.0)
+        new = copy.read_text() + "\n# a newer version\n"
+        tmp_new = tmp / "new"
+        tmp_new.write_text(new)
+        os.replace(tmp_new, copy)                         # atomic, like the installer
+        deadline = _time.time() + 10
+        while _time.time() < deadline and "my code changed" not in log.read_text():
+            _time.sleep(0.2)
+        self.assertIn("my code changed", log.read_text())
+        _time.sleep(1.0)
+        self.assertIsNone(proc.poll(), "the process is still running: it re-executed, it did not exit")
+        self.assertGreaterEqual(log.read_text().count("watching "), 2, "the new code started watching again")
+
+
+class UpdateWiringTests(unittest.TestCase):
+    def read(self, name):
+        return (ROOT / name).read_text()
+
+    def test_the_ssm_step_replaces_files_atomically_and_only_when_they_differ(self):
+        sh = self.read("scripts/ssm-agent-session-sync.sh")
+        self.assertIn('cmp -s "\\$1" "\\$2"', sh)
+        self.assertIn('install -m "\\$3" "\\$1" "\\$2.new" && mv -f "\\$2.new" "\\$2"', sh)
+        self.assertNotIn("> /usr/local/bin/agent-session-sync", sh, "never write the live script in place")
+
+    def test_the_box_installers_replace_the_script_atomically_too(self):
+        tf = self.read("agent-session-sync.tf")
+        self.assertIn("cat > /usr/local/bin/agent-session-sync.new <<'AGENTSYNC'", tf)
+        self.assertIn("mv -f /usr/local/bin/agent-session-sync.new /usr/local/bin/agent-session-sync", tf)
+        self.assertNotIn("cat > /usr/local/bin/agent-session-sync <<", tf, "never write the live script in place")
+
+    def test_a_running_watcher_is_restarted_only_when_its_unit_or_policy_changed(self):
+        sh = self.read("scripts/ssm-agent-session-sync.sh")
+        self.assertIn('put "\\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1', sh)
+        self.assertIn('policy.conf 644 && restart=1', sh)
+        self.assertNotRegex(sh, r'script"? /usr/local/bin/agent-session-sync 755 && restart=1')
+        self.assertIn('[ "\\$restart" = 1 ] && systemctl restart agent-session-sync@ubuntu.service', sh)
+
+    def test_put_replaces_atomically_reports_a_change_and_leaves_an_identical_file_alone(self):
+        sh = self.read("scripts/ssm-agent-session-sync.sh")
+        line = next(l for l in sh.splitlines() if l.startswith("put() {"))
+        func = line.replace("\\$", "$")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "src").write_text("new")
+        run = lambda: subprocess.run(["bash", "-c", func + '; put "%s" "%s" 644' % (tmp / "src", tmp / "dst")]).returncode
+        self.assertEqual(run(), 0)                         # installed: success means "changed"
+        self.assertEqual((tmp / "dst").read_text(), "new")
+        mtime = (tmp / "dst").stat().st_mtime_ns
+        self.assertEqual(run(), 1)                         # identical: nothing done
+        self.assertEqual((tmp / "dst").stat().st_mtime_ns, mtime)
+        self.assertFalse((tmp / "dst.new").exists())
+
+    def test_the_watcher_on_nextjs_does_not_depend_on_a_codex_login(self):
+        tf = self.read("nextjs-user-data.tf")
+        block = tf[tf.index("cat > /usr/local/bin/agents-enable"):tf.index("AGENTSENABLE\nchmod 755")]
+        codex_guard = block.index('if [ -s "/home/$u/.codex/auth.json" ]; then')
+        end_of_codex = block.index("\n  fi\n", codex_guard)
+        watch = block.index('systemctl enable "agent-session-sync@$u.service"')
+        self.assertGreater(watch, end_of_codex, "the watcher is enabled after the Codex block closes, not inside it")
+        guard = block[block.rindex("if [", 0, watch):watch]
+        self.assertIn('/home/$u/.claude/.credentials.json', guard)
+        self.assertIn('/home/$u/.codex/auth.json', guard)
+        self.assertIn("||", guard, "either login is enough")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

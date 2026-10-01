@@ -12,10 +12,13 @@
 # drift apart the way three bespoke launchers did. Per-box policy is a drop-in setting ASS_ARGS.
 locals {
   agent_session_sync_install = <<-INSTALL
-cat > /usr/local/bin/agent-session-sync <<'AGENTSYNC'
+# Replaced atomically: a running watcher re-executes itself when this file changes (it needs no restart),
+# and must never find it half written.
+cat > /usr/local/bin/agent-session-sync.new <<'AGENTSYNC'
 ${file("${path.module}/scripts/agent-session-sync.py")}
 AGENTSYNC
-chmod 755 /usr/local/bin/agent-session-sync
+chmod 755 /usr/local/bin/agent-session-sync.new
+mv -f /usr/local/bin/agent-session-sync.new /usr/local/bin/agent-session-sync
 cat > /etc/systemd/system/agent-session-sync@.service <<'AGENTSYNCUNIT'
 ${file("${path.module}/scripts/agent-session-sync@.service")}
 AGENTSYNCUNIT

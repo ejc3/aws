@@ -617,8 +617,19 @@ scan plus about a second.
   to have made it), start a window for an account that is not logged in, or take a session down when it is
   restarted (`KillMode=process`). Claude and Codex are tracked separately, so Codex not being logged in
   yet does not hold up Claude.
-- **Rollout.** One script and one template unit (`agent-session-sync@.service`) installed by the same
-  snippet everywhere. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`.
+- **Surviving the things that happen to a box.** t-claude is looked for on every attempt, so a watcher that
+  starts before the installer has put it in place retries instead of recording "done". tmux windows do not
+  survive a reboot but `known.json` does, so it keeps the boot id: after a reboot, Claude is started again
+  once for every repository THIS watcher launched (Codex threads live in Codex and are left alone; repos
+  recorded at the first run belong to the boot launcher). A running Claude rewrites `~/.claude.json` from its
+  cached copy and drops a trust entry added meanwhile (the same reason `claude-remote-control.tf` trusts every
+  repo before starting any session), so the watcher keeps trust for what it launched: one stat per tick, a
+  re-add only when the file changed and an entry is missing.
+- **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
+  same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
+  no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,
+  which restarts the watcher only when its unit or policy changed (harmless to sessions: `KillMode=process`,
+  state on disk). On nextjs-dev the watcher is enabled for an account logged in to Claude OR Codex.
 
 ### Codex updates and restarts
 

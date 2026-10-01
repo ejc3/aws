@@ -8,8 +8,8 @@
 #
 # Why a step and not user_data: the jumpboxes ignore user_data changes and take no downloaded script as
 # root, so a running one converges only through an explicit, reviewed step like this. The files travel
-# base64-encoded from this repository, so nothing is fetched on the box. A running watcher is never
-# restarted (a restart is harmless to sessions, KillMode=process, but a re-run must not reset it).
+# base64-encoded from this repository, so nothing is fetched on the box. A running watcher is restarted only
+# when its unit or policy changed; a new script is picked up by the watcher itself (it re-executes).
 set -euo pipefail
 iid=$1 region=$2
 : "${ASS_ARGS:?}"
@@ -25,13 +25,34 @@ done
 
 script=$(base64 -w0 "$here/agent-session-sync.py")
 unit=$(base64 -w0 "$here/agent-session-sync@.service")
-remote="echo $script | base64 -d > /usr/local/bin/agent-session-sync && chmod 755 /usr/local/bin/agent-session-sync && \
-echo $unit | base64 -d > /etc/systemd/system/agent-session-sync@.service && \
-install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d && \
-printf '[Service]\nEnvironment=\"ASS_ARGS=%s\"\n' '$ASS_ARGS' > /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf && \
-systemctl daemon-reload && systemctl enable agent-session-sync@ubuntu.service >/dev/null 2>&1 && \
-{ systemctl is-active --quiet agent-session-sync@ubuntu.service || systemctl start agent-session-sync@ubuntu.service; } && \
-sleep 3 && systemctl is-active agent-session-sync@ubuntu.service && journalctl -u agent-session-sync@ubuntu.service --no-pager -n 3 | cut -c1-200"
+# Files are replaced ATOMICALLY (a half-written script must never be what a running watcher re-executes), and
+# only when they differ. A changed SCRIPT needs no restart: the watcher re-executes itself when its own file
+# is replaced. A changed UNIT or POLICY (the environment of a running process) does, so the watcher is
+# restarted then and only then: harmless to sessions (KillMode=process, state on disk), and a re-run with
+# nothing new leaves it untouched.
+read -r -d '' remote <<REMOTE || true
+set -e
+t=\$(mktemp -d); trap 'rm -rf "\$t"' EXIT
+echo $script | base64 -d > "\$t/script"
+echo $unit | base64 -d > "\$t/unit"
+printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '$ASS_ARGS' > "\$t/policy"
+restart=0
+put() { cmp -s "\$1" "\$2" && return 1; install -m "\$3" "\$1" "\$2.new" && mv -f "\$2.new" "\$2"; }
+put "\$t/script" /usr/local/bin/agent-session-sync 755 || true
+put "\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1
+install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
+put "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf 644 && restart=1
+systemctl daemon-reload
+systemctl enable agent-session-sync@ubuntu.service >/dev/null 2>&1
+if systemctl is-active --quiet agent-session-sync@ubuntu.service; then
+  [ "\$restart" = 1 ] && systemctl restart agent-session-sync@ubuntu.service
+else
+  systemctl start agent-session-sync@ubuntu.service
+fi
+sleep 3
+systemctl is-active agent-session-sync@ubuntu.service
+journalctl -u agent-session-sync@ubuntu.service --no-pager -n 3 | cut -c1-200
+REMOTE
 
 params=$(python3 -c 'import json, sys; print(json.dumps({"commands": [sys.argv[1]], "executionTimeout": ["300"]}))' "$remote")
 cid=$(aws ssm send-command --region "$region" --instance-ids "$iid" --document-name AWS-RunShellScript \

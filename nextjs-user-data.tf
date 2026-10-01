@@ -644,7 +644,11 @@ for u in ${join(" ", local.nextjs_users)}; do
       systemctl is-active --quiet "codex-seed@$u.service" || systemctl start --no-block "codex-seed@$u.service" >/dev/null 2>&1 || true
       ;;
     esac
-    # The new-repo watch for the same accounts; a running one is left alone.
+  fi
+  # The new-repo watch for the same accounts. It is independent of the Codex login above: an account that has
+  # logged in to Claude only (or Codex only) still gets it, and it starts what is logged in and retries the
+  # rest. A running one is left alone; it re-executes itself when its own file is replaced.
+  if [ -s "/home/$u/.claude/.credentials.json" ] || [ -s "/home/$u/.codex/auth.json" ]; then
     case " ${join(" ", local.nextjs_codex_seed_users)} " in *" $u "*)
       systemctl enable "agent-session-sync@$u.service" >/dev/null 2>&1 || true
       systemctl is-active --quiet "agent-session-sync@$u.service" || systemctl start --no-block "agent-session-sync@$u.service" >/dev/null 2>&1 || true

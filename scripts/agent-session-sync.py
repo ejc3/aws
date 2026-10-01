@@ -48,6 +48,17 @@ def log(msg):
     print("agent-session-sync: " + msg, flush=True)
 
 
+_LOGGED = {}
+
+
+def log_rarely(key, msg, gap=600, now=None):
+    """A retry that cannot succeed yet (t-claude not installed, not logged in) is one line per gap, not one per tick."""
+    now = time.time() if now is None else now
+    if now - _LOGGED.get(key, -gap) >= gap:
+        _LOGGED[key] = now
+        log(msg)
+
+
 # ------------------------------------------------------------------ discovery
 
 def parse_origin(url):
@@ -152,25 +163,45 @@ def allowed_owners(home, extra):
 
 # ------------------------------------------------------------------ state
 
-class State:
-    """known: path -> {"claude": bool, "codex": bool, "tried": {"claude": ts, "codex": ts}}"""
+def current_boot_id():
+    """Changes on every boot of the host, never on a restart of this process."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
-    def __init__(self, path):
+
+class State:
+    """known: path -> {"claude": bool, "codex": bool, "tried": {"claude": ts, "codex": ts}}
+
+    The boot id is kept too. tmux windows do not survive a reboot but this file does, so a Claude session
+    this watcher launched is marked done for a host that no longer has it; `rebooted` says the host has
+    booted since the state was written.
+    """
+
+    def __init__(self, path, boot_id=None):
         self.path = path
         self.first_run = not os.path.exists(path)
         self.known = {}
+        self.boot_id = current_boot_id() if boot_id is None else boot_id
+        saved = None
         if not self.first_run:
             try:
                 with open(path) as fh:
-                    self.known = json.load(fh).get("known", {})
+                    data = json.load(fh)
+                self.known = data.get("known", {})
+                saved = data.get("boot_id")
             except (OSError, ValueError):
                 self.known = {}
+        # An older state file has no boot id: not evidence of a reboot.
+        self.rebooted = bool(saved) and bool(self.boot_id) and saved != self.boot_id
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".known.")
         with os.fdopen(fd, "w") as fh:
-            json.dump({"known": self.known}, fh, indent=1, sort_keys=True)
+            json.dump({"known": self.known, "boot_id": self.boot_id}, fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
 
@@ -187,6 +218,19 @@ def scan_once(cfg, state, launcher, now=None):
     # A path that is no longer a main checkout is forgotten, so deleting and re-cloning is new again.
     for path in [p for p in state.known if p not in present]:
         del state.known[path]
+
+    # The host rebooted since the state was written: its tmux windows are gone, so every Claude session THIS
+    # WATCHER launched is to be launched again. (Repos recorded at the first run were never ours to launch:
+    # the boot launcher owns those. Codex threads persist in Codex itself, so they are left alone.) Done
+    # once; a window the user closes afterwards stays closed.
+    if state.rebooted:
+        again = [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")]
+        for p in again:
+            state.known[p]["claude"] = False
+            state.known[p].setdefault("tried", {}).pop("claude", None)
+        if again:
+            log("host rebooted: starting Claude again in %d repositories" % len(again))
+        state.rebooted = False
 
     for path in found:
         entry = state.known.get(path)
@@ -217,6 +261,7 @@ def scan_once(cfg, state, launcher, now=None):
                 if getattr(launcher, "cheap_retry", {}).get(kind):
                     tried.pop(kind, None)
     state.first_run = False
+    keep_trust(cfg["home"], [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")], state)
     state.save()
     return attempted
 
@@ -228,23 +273,55 @@ def cksum(text):
     return out[0].decode()
 
 
-def trust_repo(home, repo):
-    """Pre-accept Claude Code's per-directory trust prompt for a repo that passed the gates above."""
+def trust_repos(home, repos):
+    """Pre-accept Claude Code's per-directory trust prompt for repos that passed the gates above, in ONE
+    read and at most one write. Returns how many were added."""
     path = os.path.join(home, ".claude.json")
     try:
         with open(path) as fh:
             cfg = json.load(fh)
     except (OSError, ValueError):
-        return
-    entry = cfg.setdefault("projects", {}).setdefault(repo, {})
-    if entry.get("hasTrustDialogAccepted") is True:
-        return
-    entry["hasTrustDialogAccepted"] = True
+        return 0
+    added = 0
+    for repo in repos:
+        entry = cfg.setdefault("projects", {}).setdefault(repo, {})
+        if entry.get("hasTrustDialogAccepted") is not True:
+            entry["hasTrustDialogAccepted"] = True
+            added += 1
+    if not added:
+        return 0
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
     with os.fdopen(fd, "w") as fh:
         json.dump(cfg, fh, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    return added
+
+
+def trust_repo(home, repo):
+    trust_repos(home, [repo])
+
+
+def keep_trust(home, repos, state):
+    """A running Claude rewrites ~/.claude.json from its own cached copy, which silently drops a trust entry
+    added meanwhile (the boot launcher documents this: claude-remote-control.tf). The watcher necessarily adds
+    trust while sessions are live, so it also keeps it: when the file has changed it checks every repo it has
+    launched and puts back any entry that went missing. The common tick is one stat."""
+    if not repos:
+        return
+    path = os.path.join(home, ".claude.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    sig = (st.st_mtime_ns, st.st_size, tuple(sorted(repos)))
+    if getattr(state, "trust_sig", None) == sig:
+        return
+    added = trust_repos(home, repos)
+    if added:
+        log("restored Claude trust for %d repositories (another Claude session overwrote ~/.claude.json)" % added)
+        st = os.stat(path)
+    state.trust_sig = (st.st_mtime_ns, st.st_size, tuple(sorted(repos)))
 
 
 class Launcher:
@@ -266,15 +343,20 @@ class Launcher:
         return r.returncode == 0
 
     def start_claude(self, path):
-        if not self.cfg.get("t_claude"):
-            return True                       # this account has no Claude sessions to start
+        # Looked for on EVERY attempt, never cached: on a rebuilt box this watcher can start before the
+        # installer has put t-claude in place, and "not there yet" must never read as "nothing to do".
+        t_claude = find_t_claude(self.cfg["home"], self.cfg.get("t_claude_arg"))
+        if not t_claude:
+            log_rarely("no-t-claude", "t-claude is not installed yet; will keep looking")
+            return False
         if not self.tmux_up():
             return False                      # never own the user's tmux server from here
         if not self.claude_logged_in():
+            log_rarely("no-claude-login", "claude is not logged in yet; will keep looking")
             return False                      # a window with no login only sits at the login screen
         trust_repo(self.cfg["home"], path)
         script = 'source "$TCLAUDE" || exit 1; cd -- "$1" || exit 1; t-claude --auto --remote-control'
-        env = dict(os.environ, HOME=self.cfg["home"], TCLAUDE=self.cfg["t_claude"], TERM="xterm-256color")
+        env = dict(os.environ, HOME=self.cfg["home"], TCLAUDE=t_claude, TERM="xterm-256color")
         subprocess.run(["zsh", "-c", script, "agent-session-sync", path], env=env, timeout=120,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key = "%s_%s" % (cksum(path), cksum(""))
@@ -328,8 +410,16 @@ def build_config(args):
     return {
         "home": home, "roots": roots, "state_dir": state_dir,
         "owners": allowed_owners(home, args.owner or []), "repos": set(args.repo or []),
-        "tmux": args.tmux, "t_claude": find_t_claude(home, args.t_claude), "codex_seed": args.codex_seed,
+        "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
     }
+
+
+def file_version(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
 
 def main(argv):
@@ -350,6 +440,8 @@ def main(argv):
     launcher = Launcher(cfg)
     log("watching %s as %s; owners=%s repos=%s first_run=%s" % (
         cfg["roots"], cfg["home"], sorted(cfg["owners"]), sorted(cfg["repos"]), state.first_run))
+    me = os.path.abspath(__file__)
+    version = file_version(me)
     while True:
         try:
             scan_once(cfg, state, launcher)
@@ -358,6 +450,11 @@ def main(argv):
         if args.once:
             return 0
         time.sleep(args.interval)
+        if version is not None and file_version(me) not in (None, version):
+            # An update replaced this file. Run the new code, in this same process and unit: nothing of the
+            # sessions is touched, and the state is on disk. (A box's installer never has to restart it.)
+            log("my code changed; running the new version")
+            os.execv(sys.executable, [sys.executable, me] + list(argv))
 
 
 if __name__ == "__main__":
