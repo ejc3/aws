@@ -596,6 +596,56 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Backup.** The root volume (the three logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
+### New repositories appear in Claude Code and Codex within seconds
+
+`agent-session-sync` (`scripts/agent-session-sync.py`, `agent-session-sync.tf`) is a 5-second watch on every
+box that keeps remote-control sessions: both metal boxes, nextjs-dev's accounts and both jumpboxes. Before
+it, the metal boxes looked once at boot (`fcvm-claude-rc`), nextjs-dev started only each user's one working
+folder every 5 minutes (`agents-enable`) and the jumpboxes looked nowhere. Measured on fcvm with a real
+launcher: a live `--remote-control` session existed 0.9 s after a clone finished; worst case is the 5 s
+scan plus about a second.
+
+- **What is new.** A top-level checkout directly under `~/*` or `~/src/*`, appearing after the watcher first
+  looked. A MAIN checkout only: `.git` must be a directory, so a linked `git worktree` (its `.git` is a
+  file) is never new, and nothing nested is scanned. The clone must be finished (no `*.lock`, the index
+  exists). The first run only records what exists and launches nothing, so an old clone the boot launcher
+  skipped stays skipped.
+- **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
+  `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
+  also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.
+- **What it never does.** Own the user's tmux server (it waits for `claude-rc@<user>` or the boot launcher
+  to have made it), start a window for an account that is not logged in, or take a session down when it is
+  restarted (`KillMode=process`). Claude and Codex are tracked separately, so Codex not being logged in
+  yet does not hold up Claude.
+- **Surviving the things that happen to a box.** t-claude is looked for on every attempt, so a watcher that
+  starts before the installer has put it in place retries instead of recording "done". tmux windows do not
+  survive a reboot but `known.json` does, so it keeps the boot id: after a reboot, Claude is started again
+  once for every repository THIS watcher launched (Codex threads live in Codex and are left alone; repos
+  recorded at the first run belong to the boot launcher). A running Claude rewrites `~/.claude.json` from its
+  cached copy and drops a trust entry added meanwhile (the same reason `claude-remote-control.tf` trusts every
+  repo before starting any session), so the watcher keeps trust for what it launched: one stat per tick, a
+  re-add only when the file changed and an entry is missing.
+- **What it judges by outcome, not by intent.** A Codex seed turn takes minutes and its child can fail (the
+  daemon starting or refusing), so starting it is not success: the thread is marked done only when the child
+  exits 0, polled each tick while it runs, retried after a minute if it failed. The allowed owners are
+  re-read when gh's `hosts.yml` or the owners file changes (two stats per tick), so `gh auth login` or an edit
+  after the watcher started takes effect; a repo from a not-yet-allowed owner is remembered, launched if it
+  appeared after the first run once its owner is allowed, and never if it was there at the first run (adding
+  an owner must not start every old clone). A checkout is identified by the inode of its `.git` directory (git
+  replaces HEAD and config constantly, never that directory), so a clone deleted and replaced between two
+  ticks is new again; a filesystem that hands the same inode to the replacement within one tick would be
+  missed.
+- **Known gap: the jumpboxes have no boot-time owner of the tmux server.** The watcher never starts one (it
+  would own the user's sessions), and neither jumpbox has `claude-rc@ubuntu` or `fcvm-claude-rc`. After a
+  reboot there is no tmux until someone connects; the watcher retries every tick and starts the sessions
+  (including the post-reboot ones) the moment a server exists. A boot launcher that owns the server is a
+  design decision of its own (what owns the cgroup, what a restart kills), not part of this watcher.
+- **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
+  same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
+  no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,
+  which restarts the watcher only when its unit or policy changed (harmless to sessions: `KillMode=process`,
+  state on disk). On nextjs-dev the watcher is enabled for an account logged in to Claude OR Codex.
+
 ### Codex updates and restarts
 
 Updating Codex and running the update are two steps on purpose. A daemon keeps the binary it started
