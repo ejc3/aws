@@ -390,10 +390,24 @@ class TerraformTests(unittest.TestCase):
     def names(self):
         return re.findall(r'"([a-z0-9-]+)"', re.search(r"auto_reboot_names\s*=\s*\[(.*?)\]", TF, re.S).group(1))
 
-    def test_the_list_is_the_persistent_boxes_and_no_ephemeral_one(self):
-        self.assertEqual(sorted(self.names()), sorted(["jumpbox", "jumpbox-2", "fcvm-metal-arm", "fcvm-metal-x86", "nextjs-dev", "claude-master-server", "io-box"]))
-        for ephemeral in ("parallel", "gpu", "wbox", "runner", "mac"):
-            self.assertFalse(any(ephemeral in n for n in self.names()), ephemeral)
+    def test_the_list_is_the_on_demand_boxes_and_no_spot_or_ephemeral_one(self):
+        self.assertEqual(sorted(self.names()), sorted(["jumpbox", "jumpbox-2", "nextjs-dev", "claude-master-server"]))
+        for spot_or_ephemeral in ("metal", "io-box", "parallel", "gpu", "wbox", "runner", "mac"):
+            self.assertFalse(any(spot_or_ephemeral in n for n in self.names()), spot_or_ephemeral)
+
+    def test_no_listed_box_is_a_spot_instance(self):
+        # The owner wants automatic restarts for on-demand boxes only. Find each listed box's instance resource by
+        # its Name tag and require that it has no spot market options.
+        for name in self.names():
+            for path in ROOT.glob("*.tf"):
+                text = path.read_text()
+                for m in re.finditer(r'^resource "aws_instance" "[a-z0-9_]+" \{\n.*?^\}', text, re.S | re.M):
+                    body = m.group()
+                    if re.search(r'Name\s*=\s*"%s"' % re.escape(name), body):
+                        self.assertNotIn("instance_market_options", body, "%s is a spot instance" % name)
+
+    def test_only_the_home_region_is_searched(self):
+        self.assertEqual(re.search(r"auto_reboot_regions\s*=\s*(\[[^\]]*\])", TF).group(1), '["us-west-1"]')
 
     def test_every_name_is_a_real_name_tag_in_the_repo(self):
         text = "".join(p.read_text() for p in ROOT.glob("*.tf"))

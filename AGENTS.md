@@ -715,19 +715,20 @@ turns an oops into a reboot (the cmdline carries `panic=-1`) instead of an indef
 hang, hung-task detection logs D-state pileups, sysrq is available on the console, and
 journald is persistent so the last pre-death log survives the reboot.
 
-### A wedged persistent box is rebooted automatically
+### A wedged on-demand box is rebooted automatically
 
 `auto-reboot.tf` and `scripts/auto-reboot.py`: a Lambda every five minutes. The owner asked for it after
 nextjs-dev sat dead for 20 hours on 2026-10-01 (it is a standing authorization: this is the one automated
-restart, and it is narrow). For each RUNNING instance named `jumpbox`, `jumpbox-2`, `fcvm-metal-arm`,
-`fcvm-metal-x86`, `nextjs-dev`, `claude-master-server` or `io-box` it asks CloudWatch whether the instance status
+restart, and it is narrow). It is for ON-DEMAND boxes only: for each RUNNING instance named `jumpbox`,
+`jumpbox-2`, `nextjs-dev` or `claude-master-server` it asks CloudWatch whether the instance status
 check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20 (the second catches the
 wedges where the status check still reads ok: 2026-07-25, 2026-08-16, 2026-10-01). Wedged means: console
 snapshotted first through the existing redacting capture Lambda, then an OS reboot, then a message on the alert
 topic.
 
 - **Never stop/start** (a reboot keeps the console buffer and instance-store disks), never a box that is not
-  running (a deliberate stop stays a stop), never an ephemeral box (parallel, GPU, wbox, runners, mac).
+  running (a deliberate stop stays a stop), never a SPOT box (`fcvm-metal-arm`, `fcvm-metal-x86`, `io-box`: the
+  owner does not want those restarted automatically) and never an ephemeral one (parallel, GPU, wbox, runners, mac).
 - **Brakes:** one reboot per 3 hours and 3 per 24 per box, kept in the `auto-reboot-state` table; after that it
   alerts once every 3 hours and leaves the box for a person. A box that wedges again straight after a reboot
   has a cause worth reading, not a loop to run.
@@ -741,8 +742,7 @@ topic.
   Lambda `Errors` alarm fires; AWS does not retry a failed run.
 - **Its only EC2 write is `ec2:RebootInstances`, by Name tag.** A new persistent box joins by adding its Name
   to `local.auto_reboot_names`.
-- **Limits.** The capture Lambda reads us-west-1 only, so io-box (us-west-2) is rebooted without a console
-  snapshot, and the message says so. Rebooting does not cure what caused the wedge: after one, read the capture
+- **Limits.** Rebooting does not cure what caused the wedge: after one, read the capture
   (`/dev-servers/console-capture`), as for any wedge. `aws lambda invoke --function-name auto-reboot --payload
   '{"dry_run": true}' --cli-binary-format raw-in-base64-out /dev/stdout` shows what it would do.
 - It is watched: alarms fire if it errors or has not run for 15 minutes (a missing datapoint is breaching).
