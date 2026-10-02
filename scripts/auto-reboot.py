@@ -41,19 +41,28 @@ HOME_REGION = os.environ.get("AWS_REGION", "us-west-1")
 
 # ------------------------------------------------------------------ decisions (pure)
 
-def failing_for(points, minutes, period_seconds):
-    """True when the last `minutes` of a 0/1 or sum series are ALL bad. `points` is a list of values in time
-    order, one per period. A missing period is not evidence: fewer points than needed means no."""
+def failing_for(points, minutes, period_seconds, now):
+    """True when the last `minutes` of a series are ALL bad, in CONSECUTIVE buckets that END RECENTLY.
+    points: [(bucket_start_epoch, bad)] in time order. Fewer buckets than the window, a gap, or a newest bucket
+    that is old (CloudWatch stopped delivering, or the box was healthy since) is not evidence: old zeros must never
+    reboot a box that is fine now."""
     need = max(1, (minutes * 60) // period_seconds)
-    return len(points) >= need and all(points[-need:])
+    if len(points) < need:
+        return False
+    tail = points[-need:]
+    if now - tail[-1][0] > 3 * period_seconds:
+        return False
+    if any(b[0] - a[0] != period_seconds for a, b in zip(tail, tail[1:])):
+        return False
+    return all(bad for _, bad in tail)
 
 
-def wedged(status_failed, network_out):
-    """(reason or None). status_failed: StatusCheckFailed_Instance per minute (1 failed). network_out: bytes
-    sent per five minutes."""
-    if failing_for([v >= 1 for v in status_failed], STATUS_MINUTES, 60):
+def wedged(status_failed, network_out, now):
+    """(reason or None). status_failed: [(ts, StatusCheckFailed_Instance)] per minute (1 failed). network_out:
+    [(ts, bytes sent)] per five minutes."""
+    if failing_for([(t, v >= 1) for t, v in status_failed], STATUS_MINUTES, 60, now):
         return "the instance status check has failed for %d minutes" % STATUS_MINUTES
-    if failing_for([v == 0 for v in network_out], NETWORK_MINUTES, 300):
+    if failing_for([(t, v == 0) for t, v in network_out], NETWORK_MINUTES, 300, now):
         return "no network traffic out for %d minutes" % NETWORK_MINUTES
     return None
 
@@ -76,7 +85,7 @@ def series(cw, instance_id, metric, stat, period, minutes, now):
         Namespace="AWS/EC2", MetricName=metric, Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
         StartTime=start, EndTime=now + 60, Period=period, Statistics=[stat])
     points = sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
-    return [p[stat] for p in points]
+    return [(int(p["Timestamp"].timestamp()) if hasattr(p["Timestamp"], "timestamp") else int(p["Timestamp"]), p[stat]) for p in points]
 
 
 def load_history(ddb, instance_id):
@@ -84,12 +93,26 @@ def load_history(ddb, instance_id):
     return ([int(x["N"]) for x in item.get("reboots", {}).get("L", [])], int(item.get("last_alert", {}).get("N", "0")))
 
 
-def save_history(ddb, instance_id, reboots, last_alert):
-    ddb.put_item(TableName=TABLE, Item={
+def save_history(ddb, instance_id, reboots, last_alert, reserve_after=None):
+    """Writes the item. With reserve_after it is CONDITIONAL: it succeeds only if no reboot was recorded since that
+    time, so two overlapping runs cannot both reboot a box. Returns False when the condition failed."""
+    item = {
         "instance_id": {"S": instance_id},
         "reboots": {"L": [{"N": str(t)} for t in reboots[-10:]]},
         "last_alert": {"N": str(last_alert)},
-    })
+        "last_reboot": {"N": str(max(reboots) if reboots else 0)},
+    }
+    kwargs = {}
+    if reserve_after is not None:
+        kwargs = {"ConditionExpression": "attribute_not_exists(last_reboot) OR last_reboot < :cutoff",
+                  "ExpressionAttributeValues": {":cutoff": {"N": str(reserve_after)}}}
+    try:
+        ddb.put_item(TableName=TABLE, Item=item, **kwargs)
+    except Exception as exc:
+        if exc.__class__.__name__ == "ConditionalCheckFailedException":
+            return False
+        raise
+    return True
 
 
 def notify(sns, subject, body):
@@ -99,8 +122,9 @@ def notify(sns, subject, body):
 
 
 def capture_console(lam, instance_id, region):
-    """The existing capture Lambda reads the live console, redacts private keys and archives it. It is
-    in the home region and reads only its own region's instances."""
+    """The existing capture Lambda reads the live console, redacts private keys and archives it. It is in the home
+    region and reads only its own region's instances. It reports a failed read or an empty buffer in its RESULT,
+    not as a function error, so the result is read before anything is claimed."""
     if not CAPTURE_FUNCTION or region != HOME_REGION:
         return "not captured (the capture function reads %s only)" % HOME_REGION
     event = {"Records": [{"Sns": {"Message": json.dumps({
@@ -110,7 +134,13 @@ def capture_console(lam, instance_id, region):
         resp = lam.invoke(FunctionName=CAPTURE_FUNCTION, InvocationType="RequestResponse", Payload=json.dumps(event).encode())
         if resp.get("FunctionError"):
             return "capture function failed"
-        return "console archived to /dev-servers/console-capture"
+        body = resp.get("Payload")
+        result = json.loads(body.read() if hasattr(body, "read") else (body or "{}"))
+        entries = [e for e in result.get("captured", []) if e.get("instance") == instance_id]
+        if entries and entries[0].get("stream"):
+            return "console archived to /dev-servers/console-capture (%s)" % entries[0]["stream"]
+        detail = entries[0].get("error") or entries[0].get("note") if entries else "no result for this instance"
+        return "NOT archived: %s" % detail
     except Exception as exc:  # never let a failed snapshot keep a wedged box down
         return "capture failed: %s" % exc
 
@@ -123,23 +153,25 @@ def handle_instance(inst, region, clients, now, dry_run):
     if age < MIN_AGE_SECONDS:
         return dict(out, action="skip", why="started %d minutes ago" % (age // 60))
     cw = clients["cw"][region]
+    history, last_alert = load_history(clients["ddb"], iid)
+
+    # A HOST problem first, and as a veto: a reboot does not fix AWS hardware, and a dead host also zeroes the
+    # network, which would otherwise read as a guest wedge.
+    system = series(cw, iid, "StatusCheckFailed_System", "Maximum", 60, STATUS_MINUTES, now)
+    if failing_for([(t, v >= 1) for t, v in system], STATUS_MINUTES, 60, now):
+        if now - last_alert >= ALERT_EVERY_SECONDS and not dry_run:
+            notify(clients["sns"], "%s: AWS host problem" % name,
+                   "%s (%s) has failed its SYSTEM status check for %d minutes. A reboot does not fix a host "
+                   "problem; stop/start moves it to new hardware, which is a decision for you (it clears "
+                   "instance-store disks)." % (name, iid, STATUS_MINUTES))
+            save_history(clients["ddb"], iid, history, now)
+        return dict(out, action="alert", why="system status check failing")
+
     status = series(cw, iid, "StatusCheckFailed_Instance", "Maximum", 60, STATUS_MINUTES, now)
     network = series(cw, iid, "NetworkOut", "Sum", 300, NETWORK_MINUTES, now)
-    reason = wedged(status, network)
+    reason = wedged(status, network, now)
     if not reason:
-        system = series(cw, iid, "StatusCheckFailed_System", "Maximum", 60, STATUS_MINUTES, now)
-        if failing_for([v >= 1 for v in system], STATUS_MINUTES, 60):
-            reason = None
-            history, last_alert = load_history(clients["ddb"], iid)
-            if now - last_alert >= ALERT_EVERY_SECONDS and not dry_run:
-                notify(clients["sns"], "%s: AWS host problem" % name,
-                       "%s (%s) has failed its SYSTEM status check for %d minutes. A reboot does not fix a host "
-                       "problem; stop/start moves it to new hardware, which is a decision for you (it clears "
-                       "instance-store disks)." % (name, iid, STATUS_MINUTES))
-                save_history(clients["ddb"], iid, history, now)
-            return dict(out, action="alert", why="system status check failing")
         return dict(out, action="none")
-    history, last_alert = load_history(clients["ddb"], iid)
     ok, why_not = may_reboot(history, now)
     if not ok:
         if now - last_alert >= ALERT_EVERY_SECONDS and not dry_run:
@@ -149,9 +181,18 @@ def handle_instance(inst, region, clients, now, dry_run):
         return dict(out, action="blocked", reason=reason, why=why_not)
     if dry_run:
         return dict(out, action="would-reboot", reason=reason)
+
+    # RESERVE the reboot durably before doing it. If the write fails, nothing is rebooted (the error is raised);
+    # if another run got there first, the conditional write fails and this one stands down. Otherwise a reboot
+    # followed by a failed bookkeeping write would be repeated every five minutes, past both brakes.
+    if not save_history(clients["ddb"], iid, history + [now], last_alert, reserve_after=now - COOLDOWN_SECONDS):
+        return dict(out, action="blocked", reason=reason, why="another run has just rebooted it")
     snapshot = capture_console(clients["lambda"], iid, region)
-    clients["ec2"][region].reboot_instances(InstanceIds=[iid])
-    save_history(clients["ddb"], iid, history + [now], last_alert)
+    try:
+        clients["ec2"][region].reboot_instances(InstanceIds=[iid])
+    except Exception:
+        save_history(clients["ddb"], iid, history, last_alert)       # it was not rebooted: give the reservation back
+        raise
     notify(clients["sns"], "%s wedged: rebooting it" % name,
            "%s (%s) in %s: %s.\n\nConsole: %s.\nAction: OS reboot (not stop/start: the console buffer and any "
            "instance-store disks survive). It will not be rebooted again for %d hours; at most %d times a day."
@@ -185,4 +226,11 @@ def lambda_handler(event, context, clients=None, now=None):
                     results.append({"instance": inst.get("InstanceId"), "action": "error", "why": str(exc)})
                     print("error on %s: %s" % (inst.get("InstanceId"), exc))
     print(json.dumps(results, default=str))
+    errors = [r for r in results if r.get("action") == "error"]
+    if errors and not dry_run:
+        # Every box has been looked at; NOW fail, so AWS/Lambda Errors counts it and the alarm fires. Without this a
+        # permission or API fault would disable the watch for a box while the invocation reported success.
+        notify(clients["sns"], "auto-reboot: %d instance check(s) failed" % len(errors),
+               "\n".join("%s: %s" % (e.get("instance"), e.get("why")) for e in errors))
+        raise RuntimeError("%d instance check(s) failed: %s" % (len(errors), "; ".join(str(e.get("why")) for e in errors)))
     return {"dry_run": dry_run, "results": results}

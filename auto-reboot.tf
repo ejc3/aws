@@ -148,6 +148,13 @@ resource "aws_cloudwatch_event_target" "auto_reboot" {
   arn  = aws_lambda_function.auto_reboot.arn
 }
 
+# No automatic retry of a failed run: it runs again in five minutes anyway, and a retry of a half-finished run is
+# the thing the reservation in the state table exists to make harmless.
+resource "aws_lambda_function_event_invoke_config" "auto_reboot" {
+  function_name          = aws_lambda_function.auto_reboot.function_name
+  maximum_retry_attempts = 0
+}
+
 resource "aws_lambda_permission" "auto_reboot" {
   statement_id  = "AllowEventBridge"
   action        = "lambda:InvokeFunction"

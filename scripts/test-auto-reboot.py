@@ -45,24 +45,43 @@ class FakeEC2:
 
 
 class FakeCW:
-    def __init__(self, series):
-        self.series = series                      # metric name -> list of values
+    """series: metric -> list of values (placed in consecutive buckets ending one period before now, like fresh
+    CloudWatch data) or a list of (timestamp, value) pairs for stale and gappy data."""
 
-    def get_metric_statistics(self, MetricName, Statistics, **kw):
-        stat = Statistics[0]
-        return {"Datapoints": [{"Timestamp": i, stat: v} for i, v in enumerate(self.series.get(MetricName, []))]}
+    def __init__(self, series):
+        self.series = series
+
+    def get_metric_statistics(self, MetricName, Statistics, Period, **kw):
+        stat, values = Statistics[0], self.series.get(MetricName, [])
+        if values and isinstance(values[0], tuple):
+            pts = values
+        else:
+            pts = [(NOW - Period * (len(values) - i), v) for i, v in enumerate(values)]
+        return {"Datapoints": [{"Timestamp": t, stat: v} for t, v in pts]}
+
+
+class ConditionalCheckFailedException(Exception):
+    pass
 
 
 class FakeDDB:
-    def __init__(self, calls, items=None):
-        self.calls, self.items = calls, items or {}
+    def __init__(self, calls, items=None, fail=False):
+        self.calls, self.items, self.fail = calls, items or {}, fail
 
     def get_item(self, TableName, Key):
         return {"Item": self.items[Key["instance_id"]["S"]]} if Key["instance_id"]["S"] in self.items else {}
 
-    def put_item(self, TableName, Item):
-        self.items[Item["instance_id"]["S"]] = Item
-        self.calls.log.append(("save", Item["instance_id"]["S"]))
+    def put_item(self, TableName, Item, ConditionExpression=None, ExpressionAttributeValues=None):
+        if self.fail:
+            raise RuntimeError("dynamodb unavailable")
+        iid = Item["instance_id"]["S"]
+        if ConditionExpression:
+            cutoff = int(ExpressionAttributeValues[":cutoff"]["N"])
+            current = self.items.get(iid, {}).get("last_reboot")
+            if current is not None and int(current["N"]) >= cutoff:
+                raise ConditionalCheckFailedException("condition failed")
+        self.items[iid] = Item
+        self.calls.log.append(("save", iid))
 
 
 class FakeSNS:
@@ -73,15 +92,39 @@ class FakeSNS:
         self.calls.log.append(("sns", Subject))
 
 
+class _Body:
+    def __init__(self, text):
+        self.text = text
+
+    def read(self):
+        return self.text.encode()
+
+
 class FakeLambda:
-    def __init__(self, calls, fail=False):
-        self.calls, self.fail = calls, fail
+    """result: what the real capture Lambda returns. It reports a failed read or an empty buffer INSIDE a
+    successful invocation, not as a FunctionError."""
+
+    def __init__(self, calls, fail=False, result=None):
+        self.calls, self.fail, self.result = calls, fail, result
 
     def invoke(self, FunctionName, InvocationType, Payload):
-        self.calls.log.append(("capture", json.loads(json.loads(Payload)["Records"][0]["Sns"]["Message"])["Trigger"]["Dimensions"][0]["value"]))
+        iid = json.loads(json.loads(Payload)["Records"][0]["Sns"]["Message"])["Trigger"]["Dimensions"][0]["value"]
+        self.calls.log.append(("capture", iid))
         if self.fail:
             raise RuntimeError("throttled")
-        return {}
+        result = self.result if self.result is not None else {"captured": [{"instance": iid, "stream": "%s/2026" % iid, "signatures": 0}]}
+        return {"Payload": _Body(json.dumps(result))}
+
+
+class FakeEC2Reboot(FakeEC2):
+    def __init__(self, calls, instances, fail=False):
+        super().__init__(calls, instances)
+        self.fail = fail
+
+    def reboot_instances(self, InstanceIds):
+        if self.fail:
+            raise RuntimeError("UnauthorizedOperation")
+        super().reboot_instances(InstanceIds)
 
 
 def inst(iid="i-1", name="nextjs-dev", launched=OLD):
@@ -92,16 +135,17 @@ def history_item(times, last_alert=0):
     return {"reboots": {"L": [{"N": str(t)} for t in times]}, "last_alert": {"N": str(last_alert)}}
 
 
-def world(series=None, instances=None, items=None, fail_capture=False, regions=None):
+def world(series=None, instances=None, items=None, fail_capture=False, regions=None, capture_result=None,
+          ddb_fail=False, reboot_fail=False):
     calls = Calls()
     series = series if series is not None else {"StatusCheckFailed_Instance": HEALTHY_STATUS, "NetworkOut": HEALTHY_NET,
                                                   "StatusCheckFailed_System": HEALTHY_STATUS}
     instances = instances if instances is not None else [inst()]
-    ec2 = {r: FakeEC2(calls, instances if i == 0 else []) for i, r in enumerate(["us-west-1", "us-west-2"])}
+    ec2 = {r: FakeEC2Reboot(calls, instances if i == 0 else [], reboot_fail) for i, r in enumerate(["us-west-1", "us-west-2"])}
     if regions:
-        ec2 = {r: FakeEC2(calls, instances if r == regions else []) for r in ["us-west-1", "us-west-2"]}
-    clients = {"ec2": ec2, "cw": {r: FakeCW(series) for r in ec2}, "ddb": FakeDDB(calls, items), "sns": FakeSNS(calls),
-               "lambda": FakeLambda(calls, fail_capture)}
+        ec2 = {r: FakeEC2Reboot(calls, instances if r == regions else [], reboot_fail) for r in ["us-west-1", "us-west-2"]}
+    clients = {"ec2": ec2, "cw": {r: FakeCW(series) for r in ec2}, "ddb": FakeDDB(calls, items, ddb_fail), "sns": FakeSNS(calls),
+               "lambda": FakeLambda(calls, fail_capture, capture_result)}
     return calls, clients
 
 
@@ -109,19 +153,32 @@ def run(clients, dry_run=False):
     return ar.lambda_handler({"dry_run": dry_run}, None, clients=clients, now=NOW)["results"]
 
 
+def fresh(values, period):
+    return [(NOW - period * (len(values) - i), v) for i, v in enumerate(values)]
+
+
 class DecisionTests(unittest.TestCase):
-    def test_only_a_full_unbroken_run_of_bad_minutes_counts(self):
-        self.assertTrue(ar.failing_for([True] * 15, 15, 60))
-        self.assertFalse(ar.failing_for([True] * 14, 15, 60), "fewer points than the window is not evidence")
-        self.assertFalse(ar.failing_for([True] * 7 + [False] + [True] * 7, 15, 60), "one good minute breaks it")
-        self.assertTrue(ar.failing_for([False] * 5 + [True] * 15, 15, 60), "only the last window matters")
-        self.assertFalse(ar.failing_for([], 15, 60))
+    def test_only_a_full_unbroken_FRESH_run_of_bad_buckets_counts(self):
+        bad = lambda n: fresh([True] * n, 60)
+        self.assertTrue(ar.failing_for(bad(15), 15, 60, NOW))
+        self.assertFalse(ar.failing_for(bad(14), 15, 60, NOW), "fewer buckets than the window is not evidence")
+        gap = fresh([True] * 15, 60)
+        gap[7] = (gap[7][0] - 60, True)                       # a bucket missing in the middle: not consecutive
+        self.assertFalse(ar.failing_for(gap, 15, 60, NOW))
+        self.assertFalse(ar.failing_for(fresh([True] * 7 + [False] + [True] * 7, 60), 15, 60, NOW), "one good minute breaks it")
+        self.assertFalse(ar.failing_for([], 15, 60, NOW))
+
+    def test_old_bad_buckets_never_reboot_a_box_that_is_fine_now(self):
+        old = [(t - 7200, True) for t, _ in fresh([True] * 15, 60)]
+        self.assertFalse(ar.failing_for(old, 15, 60, NOW), "the failures ended two hours ago")
+        stale = [(t - 1200, True) for t, _ in fresh([True] * 15, 60)]
+        self.assertFalse(ar.failing_for(stale, 15, 60, NOW), "the newest bucket is twenty minutes old")
 
     def test_the_two_signals(self):
-        self.assertIn("status check", ar.wedged([1] * 15, HEALTHY_NET))
-        self.assertIn("no network traffic", ar.wedged(HEALTHY_STATUS, [0, 0, 0, 0]))
-        self.assertIsNone(ar.wedged(HEALTHY_STATUS, [0, 0, 0, 5]), "any traffic in the window is a live box")
-        self.assertIsNone(ar.wedged(HEALTHY_STATUS, [0, 0, 0]), "fifteen minutes of silence is not twenty")
+        self.assertIn("status check", ar.wedged(fresh([1] * 15, 60), fresh([5e6] * 4, 300), NOW))
+        self.assertIn("no network traffic", ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, 0], 300), NOW))
+        self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, 5], 300), NOW), "any traffic in the window is a live box")
+        self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0], 300), NOW), "fifteen minutes of silence is not twenty")
 
     def test_the_brakes(self):
         self.assertEqual(ar.may_reboot([], NOW), (True, ""))
@@ -149,8 +206,9 @@ class BehaviourTests(unittest.TestCase):
         calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": HEALTHY_NET})
         r = run(clients)[0]
         self.assertEqual(r["action"], "rebooted")
-        self.assertEqual([c[0] for c in calls.log], ["capture", "reboot", "save", "sns"], "the evidence is taken BEFORE the reboot")
-        self.assertEqual(calls.log[1], ("reboot", ("i-1",)))
+        self.assertEqual([c[0] for c in calls.log], ["save", "capture", "reboot", "sns"],
+                         "reserve it, take the evidence, THEN reboot")
+        self.assertEqual(calls.log[2], ("reboot", ("i-1",)))
         self.assertIn(NOW, [int(x["N"]) for x in clients["ddb"].items["i-1"]["reboots"]["L"]])
 
     def test_a_dead_network_with_an_ok_status_check_is_a_wedge_too(self):
@@ -199,6 +257,75 @@ class BehaviourTests(unittest.TestCase):
         self.assertIn("capture failed", r["console"])
         self.assertIn("reboot", [c[0] for c in calls.log])
 
+    def test_an_empty_or_failed_capture_is_reported_honestly_not_as_archived(self):
+        for result, word in (({"captured": [{"instance": "i-1", "note": "console buffer empty"}]}, "buffer empty"),
+                             ({"captured": [{"instance": "i-1", "error": "console read failed: x"}]}, "console read failed"),
+                             ({"captured": []}, "no result")):
+            calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5}, capture_result=result)
+            r = run(clients)[0]
+            self.assertEqual(r["action"], "rebooted", "the box still comes back")
+            self.assertTrue(r["console"].startswith("NOT archived"), r["console"])
+            self.assertIn(word, r["console"])
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5})
+        self.assertIn("console archived", run(clients)[0]["console"])
+
+    def test_old_data_does_not_reboot_a_box_that_is_healthy_now(self):
+        old = {"StatusCheckFailed_Instance": [(NOW - 7200 - 60 * i, 1) for i in range(25)][::-1],
+               "NetworkOut": [(NOW - 7200 - 300 * i, 0) for i in range(6)][::-1]}
+        calls, clients = world(old)
+        self.assertEqual(run(clients)[0]["action"], "none")
+        self.assertEqual(calls.log, [])
+
+    def test_a_gap_in_the_data_is_not_a_wedge(self):
+        gappy = [(NOW - 300 * i, 0) for i in (1, 2, 4, 5)][::-1]       # a bucket missing
+        calls, clients = world({"StatusCheckFailed_Instance": [0] * 25, "NetworkOut": gappy})
+        self.assertEqual(run(clients)[0]["action"], "none")
+
+    def test_a_host_problem_vetoes_a_reboot_even_when_the_guest_looks_dead_too(self):
+        # A dead host also zeroes the network and fails the instance check: it must still be alert-only.
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5, "StatusCheckFailed_System": [1] * 25})
+        self.assertEqual(run(clients)[0]["action"], "alert")
+        self.assertNotIn("reboot", [c[0] for c in calls.log])
+        self.assertNotIn("capture", [c[0] for c in calls.log])
+
+    def test_if_the_reservation_cannot_be_written_nothing_is_rebooted(self):
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5}, ddb_fail=True)
+        with self.assertRaises(RuntimeError):
+            run(clients)
+        self.assertNotIn("reboot", [c[0] for c in calls.log], "no bookkeeping, no reboot: it would otherwise repeat every five minutes")
+
+    def test_two_overlapping_runs_cannot_both_reboot_the_box(self):
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5})
+        self.assertEqual(run(clients)[0]["action"], "rebooted")
+        # a second run that read the table BEFORE the first one wrote it: the conditional write refuses
+        clients["ddb"].get_item = lambda TableName, Key: {}
+        again = run(clients)[0]
+        self.assertEqual(again["action"], "blocked")
+        self.assertIn("another run", again["why"])
+        self.assertEqual([c[0] for c in calls.log].count("reboot"), 1)
+
+    def test_a_reboot_that_fails_gives_the_reservation_back_and_is_an_error(self):
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5}, reboot_fail=True)
+        with self.assertRaises(RuntimeError):
+            run(clients)
+        item = clients["ddb"].items["i-1"]
+        self.assertEqual(item["reboots"]["L"], [], "it was not rebooted, so it is not on cooldown")
+
+    def test_a_failure_on_one_box_fails_the_invocation_after_the_others_were_handled(self):
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5},
+                               instances=[inst("i-bad"), inst("i-ok", "jumpbox")])
+        real = clients["cw"]["us-west-1"].get_metric_statistics
+        def flaky(**kw):
+            if {"Name": "InstanceId", "Value": "i-bad"} in kw["Dimensions"]:
+                raise RuntimeError("AccessDenied")
+            return real(**kw)
+        clients["cw"]["us-west-1"].get_metric_statistics = flaky
+        with self.assertRaises(RuntimeError) as ctx:
+            run(clients)
+        self.assertIn("AccessDenied", str(ctx.exception), "so AWS/Lambda Errors counts it and the alarm fires")
+        self.assertIn(("reboot", ("i-ok",)), calls.log, "the other box was still looked after")
+        self.assertIn("sns", [c[0] for c in calls.log])
+
     def test_a_box_in_another_region_is_rebooted_but_its_console_is_not_claimed_captured(self):
         calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5},
                                instances=[inst("i-2", "io-box")], regions="us-west-2")
@@ -212,18 +339,6 @@ class BehaviourTests(unittest.TestCase):
         self.assertEqual(run(clients)[0]["action"], "alert")
         self.assertNotIn("reboot", [c[0] for c in calls.log])
         self.assertIn("sns", [c[0] for c in calls.log])
-
-    def test_one_box_failing_to_check_does_not_stop_the_others_being_checked(self):
-        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5},
-                               instances=[inst("i-bad"), inst("i-ok", "jumpbox")])
-        real = clients["cw"]["us-west-1"].get_metric_statistics
-        def flaky(**kw):
-            if {"Name": "InstanceId", "Value": "i-bad"} in kw["Dimensions"]:
-                raise RuntimeError("throttled")
-            return real(**kw)
-        clients["cw"]["us-west-1"].get_metric_statistics = flaky
-        by = {r["instance"]: r["action"] for r in run(clients)}
-        self.assertEqual(by, {"i-bad": "error", "i-ok": "rebooted"})
 
 
 class TerraformTests(unittest.TestCase):
@@ -264,6 +379,10 @@ class TerraformTests(unittest.TestCase):
         self.assertEqual((ar.STATUS_MINUTES, ar.NETWORK_MINUTES, ar.COOLDOWN_SECONDS, ar.MAX_PER_DAY), (15, 20, 10800, 3))
         for words in ("15 minutes in a row", "exactly zero for 20", "3 hours or 3 times in 24"):
             self.assertIn(words, TF)
+
+    def test_a_failed_run_is_not_retried_by_aws(self):
+        self.assertIn("maximum_retry_attempts = 0", TF)
+        self.assertIn('aws_lambda_function_event_invoke_config" "auto_reboot"', TF)
 
     def test_the_capture_function_is_the_existing_one(self):
         self.assertIn("aws_lambda_function.console_capture", TF)

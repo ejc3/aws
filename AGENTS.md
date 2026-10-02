@@ -731,7 +731,14 @@ topic.
 - **Brakes:** one reboot per 3 hours and 3 per 24 per box, kept in the `auto-reboot-state` table; after that it
   alerts once every 3 hours and leaves the box for a person. A box that wedges again straight after a reboot
   has a cause worth reading, not a loop to run.
-- **Host problems are alert-only.** A failing SYSTEM status check is AWS hardware: a reboot does not fix it.
+- **Host problems are a veto.** A failing SYSTEM status check is AWS hardware: a reboot does not fix it, and a
+  dead host also zeroes the network, so it is checked FIRST and only ever alerts.
+- **Evidence must be fresh.** Only a full window of consecutive buckets ending recently counts: old zeros, a gap
+  or missing data never reboot a box that is fine now.
+- **The reboot is reserved before it is done.** A conditional write to the state table comes first, so a failed
+  write means no reboot and two overlapping runs cannot both reboot; if the reboot call itself fails the
+  reservation is given back. A failure on any box fails the invocation (after the others are handled) so the
+  Lambda `Errors` alarm fires; AWS does not retry a failed run.
 - **Its only EC2 write is `ec2:RebootInstances`, by Name tag.** A new persistent box joins by adding its Name
   to `local.auto_reboot_names`.
 - **Limits.** The capture Lambda reads us-west-1 only, so io-box (us-west-2) is rebooted without a console
