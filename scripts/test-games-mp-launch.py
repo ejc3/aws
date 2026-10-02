@@ -324,6 +324,16 @@ class LaunchTests(unittest.TestCase):
         [call] = ecs.run
         self.check_run_task(call, TD)
 
+    def test_a_match_longer_than_the_router_drain_is_launched_up_to_the_cap(self):
+        # A game that reconnects its clients may ask for more than the drain's hour, up to the
+        # sweeper's clamp (MAX_HARDCAP_SEC); the tag the sweeper reads carries what was asked.
+        for n, cap in enumerate((3601, 11100, 14400), start=70):
+            ecs = FakeECS()
+            reply = self.invoke(ecs, start_event(n, hardCapSec=cap))   # a match of its own each
+            self.assertEqual(reply["ok"], True, cap)
+            [call] = ecs.run
+            self.assertIn({"key": "hardcap", "value": str(cap)}, call["tags"])
+
     def check_run_task(self, call, task_definition):
         """Everything but the task definition is the same whatever the simVersion."""
         self.assertEqual(call["cluster"], "games")
@@ -1104,7 +1114,7 @@ class TerraformTests(unittest.TestCase):
                      # never the dev fleet's subnet_a/subnet_b.
                      'SUBNETS          = join(",", [for s in local.mp_engine_subnets : s.id])',
                      "ROUTER_FAMILY    = local.mp_router_family",
-                     "MAX_HARDCAP_SEC = tostring(local.mp_router_drain_sec)"):
+                     "MAX_HARDCAP_SEC = tostring(local.mp_max_hardcap_sec)"):
             # Compared with runs of spaces collapsed: terraform fmt realigns the `=` column.
             self.assertIn(" ".join(line.split()), " ".join(self.fn.split()))
         # Production runs main's families and repositories, preview its own, never the other's.
@@ -1114,8 +1124,13 @@ class TerraformTests(unittest.TestCase):
         self.assertNotIn("mp_games", GAMES, "no list of games in Terraform")
         self.assertEqual(re.findall(r'channel\s*=\s*"(\w+)"', envs_block := re.search(
             r"games_mp_launch_environments = \{.*?\n  \}\n", GAMES, re.S).group()), ["main", "preview"])
-        # No match outlives a draining router (the target group's delay is the same local).
+        # A match of up to an hour never outlives a draining router (the target group's delay
+        # is the same local). A longer one may be asked for, up to the sweeper's clamp, by a
+        # game that reconnects its clients; both functions read the one number.
         self.assertIn("mp_router_drain_sec = 3600", GAMES)
+        self.assertRegex(GAMES, r"mp_max_hardcap_sec\s*=\s*14400\b")
+        self.assertEqual(len(re.findall(r"MAX_HARDCAP_SEC\s*=\s*tostring\(local\.mp_max_hardcap_sec\)", GAMES)), 2,
+                         "the launch functions and the sweeper share the cap")
         self.assertIn("deregistration_delay = local.mp_router_drain_sec", GAMES)
         self.assertIn("mp_engine_subnets = values(aws_subnet.games_engine)", GAMES)
         self.assertNotRegex(self.fn, r"aws_subnet\.subnet_[ab]|dev_fleet_subnets")

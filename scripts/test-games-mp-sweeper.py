@@ -275,8 +275,11 @@ class TerraformWiringTests(unittest.TestCase):
         self.assertRegex(self.tf, r'handler\s*=\s*"sweeper\.lambda_handler"')
 
     def test_env_limits_match_the_documented_rule(self):
-        for key, value in [("GRACE_SEC", "600"), ("DEFAULT_LIMIT_SEC", "7200"), ("MAX_HARDCAP_SEC", "14400")]:
+        for key, value in [("GRACE_SEC", "600"), ("DEFAULT_LIMIT_SEC", "7200")]:
             self.assertRegex(self.tf, r'%s\s*=\s*"%s"' % (key, value))
+        # The clamp is the launch functions' maximum: one local for both.
+        self.assertRegex(self.tf, r"MAX_HARDCAP_SEC\s*=\s*tostring\(local\.mp_max_hardcap_sec\)")
+        self.assertRegex(self.tf, r"mp_max_hardcap_sec\s*=\s*14400\b")
 
     def launch_statement(self, sid, resource="games_mp_launch"):
         """One statement of the launch function's policy (the only RunTask grant), or another
