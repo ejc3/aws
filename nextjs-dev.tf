@@ -56,11 +56,14 @@ variable "nextjs_dolphin_gdocs_access_enabled" {
 }
 
 variable "nextjs_volume_size" {
-  # Extended from 100 to 200 on 2026-09-11 when the shared root filled again. Dolphin and
-  # the other users keep their projects, node_modules, browser downloads, and caches here.
+  # Extended from 100 to 200 on 2026-09-11 when the shared root filled again, and from 200 to 400 on
+  # 2026-10-02 when it was 99% full (190 of 193 GB; /home/ejc3 104 GB, colton 31, connor 25, skevh 8.6) the day the
+  # box wedged: the swapfile lives on this same disk, so a full root makes a memory incident worse. Dolphin and
+  # the other users keep their projects, node_modules, browser downloads, and caches here. EBS grows online;
+  # the filesystem is grown on the box afterwards (growpart + resize2fs). It cannot be shrunk.
   description = "Root volume GB. Holds the projects and their node_modules."
   type        = number
-  default     = 200
+  default     = 400
 }
 
 # ---------------------------------------------------------------------------------
