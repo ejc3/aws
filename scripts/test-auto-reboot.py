@@ -177,11 +177,15 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(ar.failing_for([], 15, 60, NOW))
 
     def test_the_bucket_still_filling_is_not_a_completed_period(self):
-        # four five-minute buckets whose newest started two minutes ago cover three completed periods and a bit
-        in_progress = [(NOW - 1500 + 300 * i, True) for i in range(4)]
-        in_progress[-1] = (NOW - 120, True)
-        self.assertEqual(in_progress[-1][0] + 300 > NOW, True)
-        self.assertFalse(ar.failing_for(in_progress, 20, 300, NOW), "fifteen minutes of silence plus a partial bucket is not twenty")
+        # Evenly spaced five-minute buckets (so contiguity is satisfied), the newest of which started two minutes
+        # ago and is still being filled: three COMPLETED periods plus a partial one, i.e. fifteen minutes, not twenty.
+        started = [NOW - 120 - 300 * k for k in (3, 2, 1, 0)]
+        partial = [(t, True) for t in started]
+        self.assertTrue(partial[-1][0] + 300 > NOW, "the newest bucket is still filling")
+        self.assertFalse(ar.failing_for(partial, 20, 300, NOW), "fifteen minutes of silence plus a partial bucket is not twenty")
+        self.assertIsNone(ar.wedged([(NOW - 60 * k, 0) for k in range(25, 0, -1)], partial, NOW))
+        # one more period later the same four buckets are all complete, and then it IS twenty minutes
+        self.assertTrue(ar.failing_for(partial, 20, 300, NOW + 180))
         self.assertTrue(ar.failing_for(fresh([True] * 4, 300), 20, 300, NOW), "four completed buckets are")
 
     def test_any_current_host_failure_is_a_veto_however_young(self):
