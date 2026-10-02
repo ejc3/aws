@@ -84,6 +84,14 @@ class FakeDDB:
         self.calls.log.append(("save", iid))
 
 
+    def update_item(self, TableName, Key, UpdateExpression, ExpressionAttributeValues):
+        iid = Key["instance_id"]["S"]
+        item = dict(self.items.get(iid, {"instance_id": {"S": iid}}))
+        item["last_alert"] = ExpressionAttributeValues[":a"]
+        self.items[iid] = item
+        self.calls.log.append(("alert-note", iid))
+
+
 class FakeSNS:
     def __init__(self, calls):
         self.calls = calls
@@ -167,6 +175,20 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(ar.failing_for(gap, 15, 60, NOW))
         self.assertFalse(ar.failing_for(fresh([True] * 7 + [False] + [True] * 7, 60), 15, 60, NOW), "one good minute breaks it")
         self.assertFalse(ar.failing_for([], 15, 60, NOW))
+
+    def test_the_bucket_still_filling_is_not_a_completed_period(self):
+        # four five-minute buckets whose newest started two minutes ago cover three completed periods and a bit
+        in_progress = [(NOW - 1500 + 300 * i, True) for i in range(4)]
+        in_progress[-1] = (NOW - 120, True)
+        self.assertEqual(in_progress[-1][0] + 300 > NOW, True)
+        self.assertFalse(ar.failing_for(in_progress, 20, 300, NOW), "fifteen minutes of silence plus a partial bucket is not twenty")
+        self.assertTrue(ar.failing_for(fresh([True] * 4, 300), 20, 300, NOW), "four completed buckets are")
+
+    def test_any_current_host_failure_is_a_veto_however_young(self):
+        self.assertTrue(ar.host_failing_now(fresh([0] * 10 + [1], 60), NOW), "one failing minute is already a host fault")
+        self.assertFalse(ar.host_failing_now(fresh([1] * 5 + [0], 60), NOW), "recovered")
+        self.assertFalse(ar.host_failing_now([(t - 3600, 1) for t, _ in fresh([1] * 5, 60)], NOW), "an old failure is not current")
+        self.assertFalse(ar.host_failing_now([], NOW))
 
     def test_old_bad_buckets_never_reboot_a_box_that_is_fine_now(self):
         old = [(t - 7200, True) for t, _ in fresh([True] * 15, 60)]
@@ -287,6 +309,25 @@ class BehaviourTests(unittest.TestCase):
         self.assertEqual(run(clients)[0]["action"], "alert")
         self.assertNotIn("reboot", [c[0] for c in calls.log])
         self.assertNotIn("capture", [c[0] for c in calls.log])
+
+    def test_a_young_host_fault_with_a_dead_network_is_still_not_rebooted(self):
+        calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5,
+                                "StatusCheckFailed_System": [0] * 20 + [1] * 2})
+        self.assertEqual(run(clients)[0]["action"], "alert")
+        self.assertNotIn("reboot", [c[0] for c in calls.log])
+
+    def test_recording_an_alert_never_overwrites_a_reservation_another_run_just_made(self):
+        calls, clients = world({"StatusCheckFailed_Instance": HEALTHY_STATUS, "NetworkOut": HEALTHY_NET,
+                                "StatusCheckFailed_System": [1] * 5},
+                               items={"i-1": history_item([NOW - 10], 0)})
+        before = dict(clients["ddb"].items["i-1"])
+        # this run read the table BEFORE the other run reserved; it must still leave the reservation alone
+        stale = {"reboots": {"L": []}, "last_alert": {"N": "0"}}
+        clients["ddb"].get_item = lambda TableName, Key: {"Item": stale}
+        self.assertEqual(run(clients)[0]["action"], "alert")
+        self.assertEqual(clients["ddb"].items["i-1"]["reboots"], before["reboots"], "the reservation survives")
+        self.assertNotIn(("save", "i-1"), calls.log, "the alert path never rewrites the whole item")
+        self.assertIn(("alert-note", "i-1"), calls.log)
 
     def test_if_the_reservation_cannot_be_written_nothing_is_rebooted(self):
         calls, clients = world({"StatusCheckFailed_Instance": [1] * 25, "NetworkOut": [0] * 5}, ddb_fail=True)

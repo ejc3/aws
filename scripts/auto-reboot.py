@@ -47,14 +47,24 @@ def failing_for(points, minutes, period_seconds, now):
     that is old (CloudWatch stopped delivering, or the box was healthy since) is not evidence: old zeros must never
     reboot a box that is fine now."""
     need = max(1, (minutes * 60) // period_seconds)
+    # Only COMPLETED buckets count: the bucket CloudWatch is still filling is partial, and counting it would
+    # fire the 20-minute rule after fifteen.
+    points = [p for p in points if p[0] + period_seconds <= now]
     if len(points) < need:
         return False
     tail = points[-need:]
-    if now - tail[-1][0] > 3 * period_seconds:
+    if now - (tail[-1][0] + period_seconds) > 2 * period_seconds:
         return False
     if any(b[0] - a[0] != period_seconds for a, b in zip(tail, tail[1:])):
         return False
     return all(bad for _, bad in tail)
+
+
+def host_failing_now(system_failed, now):
+    """The newest COMPLETED system-status bucket is failing and recent: any current host fault, however young.
+    It vetoes the guest recovery path, which cannot fix AWS hardware."""
+    done = [p for p in system_failed if p[0] + 60 <= now]
+    return bool(done) and now - (done[-1][0] + 60) <= 3 * 60 and done[-1][1] >= 1
 
 
 def wedged(status_failed, network_out, now):
@@ -115,6 +125,13 @@ def save_history(ddb, instance_id, reboots, last_alert, reserve_after=None):
     return True
 
 
+def record_alert(ddb, instance_id, when):
+    """Notes that a box was just mentioned, touching ONLY last_alert: rewriting the whole item from state read
+    earlier could erase a reboot reservation another run has just made."""
+    ddb.update_item(TableName=TABLE, Key={"instance_id": {"S": instance_id}},
+                    UpdateExpression="SET last_alert = :a", ExpressionAttributeValues={":a": {"N": str(when)}})
+
+
 def notify(sns, subject, body):
     print(subject + " | " + body.replace("\n", " "))
     if TOPIC:
@@ -158,13 +175,12 @@ def handle_instance(inst, region, clients, now, dry_run):
     # A HOST problem first, and as a veto: a reboot does not fix AWS hardware, and a dead host also zeroes the
     # network, which would otherwise read as a guest wedge.
     system = series(cw, iid, "StatusCheckFailed_System", "Maximum", 60, STATUS_MINUTES, now)
-    if failing_for([(t, v >= 1) for t, v in system], STATUS_MINUTES, 60, now):
+    if host_failing_now(system, now):
         if now - last_alert >= ALERT_EVERY_SECONDS and not dry_run:
             notify(clients["sns"], "%s: AWS host problem" % name,
-                   "%s (%s) has failed its SYSTEM status check for %d minutes. A reboot does not fix a host "
-                   "problem; stop/start moves it to new hardware, which is a decision for you (it clears "
-                   "instance-store disks)." % (name, iid, STATUS_MINUTES))
-            save_history(clients["ddb"], iid, history, now)
+                   "%s (%s) is failing its SYSTEM status check. A reboot does not fix a host problem; stop/start "
+                   "moves it to new hardware, which is a decision for you (it clears instance-store disks)." % (name, iid))
+            record_alert(clients["ddb"], iid, now)
         return dict(out, action="alert", why="system status check failing")
 
     status = series(cw, iid, "StatusCheckFailed_Instance", "Maximum", 60, STATUS_MINUTES, now)
@@ -177,7 +193,7 @@ def handle_instance(inst, region, clients, now, dry_run):
         if now - last_alert >= ALERT_EVERY_SECONDS and not dry_run:
             notify(clients["sns"], "%s is still wedged; NOT rebooting it again" % name,
                    "%s (%s): %s, and I will not reboot it again: %s. It needs a person." % (name, iid, reason, why_not))
-            save_history(clients["ddb"], iid, history, now)
+            record_alert(clients["ddb"], iid, now)
         return dict(out, action="blocked", reason=reason, why=why_not)
     if dry_run:
         return dict(out, action="would-reboot", reason=reason)
