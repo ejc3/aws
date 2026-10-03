@@ -33,14 +33,19 @@ def newest_per_arch(images, keep):
     return chosen
 
 
+def _source_of(image):
+    return next((t["Value"] for t in image.get("Tags", []) if t["Key"] == "SourceImageId"), None)
+
+
 def already_copied(target_images):
-    """Source image ids that already have a copy in the target, whatever state the copy is in."""
-    done = set()
-    for image in target_images:
-        for tag in image.get("Tags", []):
-            if tag["Key"] == "SourceImageId":
-                done.add(tag["Value"])
-    return done
+    """Source image ids with a copy that is done or on its way (pending or available). A copy is asynchronous: the
+    call returns while the image is pending and it can still end up failed, and a FAILED copy is not a copy."""
+    return {_source_of(i) for i in target_images if _source_of(i) and i.get("State") in ("pending", "available")}
+
+
+def failed_copies(target_images):
+    """(source id, target id) of copies that ended failed."""
+    return [(_source_of(i), i["ImageId"]) for i in target_images if _source_of(i) and i.get("State") in ("failed", "error")]
 
 
 def plan(source_images, target_images, keep=KEEP_PER_ARCH):
@@ -57,6 +62,12 @@ def lambda_handler(event, context, clients=None):
     target_images = dst.describe_images(Owners=["self"], Filters=[PURPOSE])["Images"]
     todo = plan(source_images, target_images)
     results, errors = [], []
+    wanted = {i["ImageId"] for i in todo}
+    for source_id, target_id in failed_copies(target_images):
+        if source_id in wanted:
+            # It will be copied again below; but say so, and fail the run, so a copy that keeps failing is seen
+            # (the invocation used to succeed and the error alarm never fired).
+            errors.append("an earlier copy of %s (%s) FAILED; copying it again" % (source_id, target_id))
     for image in todo:
         entry = {"source": image["ImageId"], "name": image["Name"], "arch": image["Architecture"]}
         if dry_run:

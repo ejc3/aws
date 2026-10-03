@@ -210,6 +210,17 @@ resource "aws_iam_role_policy" "ami_replicator" {
         }
       },
       {
+        # CopyImage is also authorized against the SOURCE image and snapshot (AWS: copy-ami-permissions); without these
+        # every copy is denied. Read-side only, and still only for a request made to Ohio.
+        Sid      = "NameTheSourceImagesTheCopyReads"
+        Effect   = "Allow"
+        Action   = "ec2:CopyImage"
+        Resource = ["arn:aws:ec2:${var.aws_region}::image/*", "arn:aws:ec2:${var.aws_region}::snapshot/*"]
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = "us-east-2" }
+        }
+      },
+      {
         Sid      = "SayWhenACopyFails"
         Effect   = "Allow"
         Action   = "sns:Publish"

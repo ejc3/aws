@@ -69,6 +69,16 @@ class ReplicatorTests(unittest.TestCase):
         out, _, d, _ = self.run_it(src, [img("o1", tags=[("SourceImageId", "a3")]), img("o2", state="pending", tags=[("SourceImageId", "a4")])])
         self.assertEqual(d.copies, [], "a copy still pending counts: no second copy")
 
+    def test_a_copy_that_FAILED_after_the_call_returned_is_not_a_copy_and_is_retried_and_reported(self):
+        src = [img("a3")]
+        out, _, d, sns = self.run_it(src, [img("o1", state="failed", tags=[("SourceImageId", "a3")])])
+        self.assertIsInstance(out, RuntimeError, "the run fails so the error alarm fires")
+        self.assertIn("FAILED", str(out))
+        self.assertEqual([c["SourceImageId"] for c in d.copies], ["a3"], "and it is copied again")
+        for state in ("pending", "available"):
+            out, _, d, _ = self.run_it(src, [img("o1", state=state, tags=[("SourceImageId", "a3")])])
+            self.assertEqual(d.copies, [], "%s counts as copied" % state)
+
     def test_an_unavailable_image_is_never_copied(self):
         _, _, d, _ = self.run_it([img("a1", state="pending"), img("a2", state="failed")], [])
         self.assertEqual(d.copies, [])
@@ -137,9 +147,18 @@ class TerraformTests(unittest.TestCase):
     def test_the_replicators_only_ec2_writes_are_copy_and_tag_into_ohio(self):
         role = re.search(r'resource "aws_iam_role_policy" "ami_replicator" \{.*?^\}', TF, re.S | re.M).group()
         actions = re.findall(r'"(ec2:[A-Za-z]+)"', role)
-        self.assertEqual(sorted(actions), ["ec2:CopyImage", "ec2:CreateTags", "ec2:DescribeImages"])
+        self.assertEqual(sorted(set(actions)), ["ec2:CopyImage", "ec2:CreateTags", "ec2:DescribeImages"])
         self.assertIn('"aws:RequestedRegion" = "us-east-2"', role)
         self.assertNotRegex(role, r'"\*"\s*\n\s*Condition')
+
+    def test_copy_image_is_authorized_against_the_source_images_too_else_every_copy_is_denied(self):
+        role = re.search(r'resource "aws_iam_role_policy" "ami_replicator" \{.*?^\}', TF, re.S | re.M).group()
+        self.assertIn('"arn:aws:ec2:${var.aws_region}::image/*"', role)
+        self.assertIn('"arn:aws:ec2:${var.aws_region}::snapshot/*"', role)
+        block = role[role.index("NameTheSourceImagesTheCopyReads"):]
+        self.assertIn('Action   = "ec2:CopyImage"', block)
+        self.assertNotIn("CreateTags", block.split("}")[0], "the source statement grants only the read side of the copy")
+        self.assertIn('"aws:RequestedRegion" = "us-east-2"', block)
 
     def test_it_runs_hourly_and_fails_loudly(self):
         self.assertIn('schedule_expression = "rate(1 hour)"', TF)
