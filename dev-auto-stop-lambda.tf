@@ -10,6 +10,10 @@ import os
 SNS_TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
 SNS_REGION = os.environ.get('SNS_REGION', os.environ.get('AWS_REGION', 'us-west-1'))
 IDLE_HOURS = int(os.environ.get('IDLE_HOURS', '8'))
+# A five-minute window with CPU at or above this keeps the instance alive. 5 suits the metal boxes (a short compile is
+# a real burst). An instance with a high IDLE floor needs more: an idle Windows desktop with its streaming agent sits
+# at about 6% and peaks near 12%, so at 5 it can never be called idle (wbox ran 4 days).
+CPU_THRESHOLD = float(os.environ.get('CPU_THRESHOLD', '5.0'))
 CHECK_IO = os.environ.get('CHECK_IO', 'false').lower() == 'true'
 # Instance-store activity is direct evidence that the scratch disk is in use, so a
 # single MiB in any five-minute period is meaningful. Network needs a higher bar:
@@ -97,11 +101,11 @@ def check_and_stop_instance(instance_id):
             return {'instance': instance_id, 'name': name, 'status': 'insufficient_data',
                     'datapoints': len(datapoints)}
 
-        # Check if ANY 5-min window had CPU >= 5%
+        # Check if ANY 5-min window had CPU >= CPU_THRESHOLD
         max_per_period = [d['Maximum'] for d in datapoints]
         peak_cpu = max(max_per_period)
 
-        if peak_cpu >= 5.0:
+        if peak_cpu >= CPU_THRESHOLD:
             return {'instance': instance_id, 'name': name, 'status': 'active',
                     'peak_cpu': peak_cpu}
 
