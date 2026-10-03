@@ -298,7 +298,17 @@ resource "aws_instance" "wbox" {
 
   # A new Windows AMI or setup script must not replace a box with a game installed on it.
   lifecycle {
-    ignore_changes = [ami, user_data]
+    ignore_changes = [
+      ami,
+      user_data,
+      # A STOPPED instance with no Elastic IP reports associate_public_ip_address as false, because AWS releases the
+      # auto-assigned address on stop. That field forces replacement, and "stopped" is this box's normal resting
+      # state (the idle stop is its whole cost model), so any routine apply while it was stopped planned to REPLACE
+      # it and its game-disk attachment. Found 2026-10-03, the first time it was stopped since the plan was last read
+      # (the stop hook's drift check). The same trap io-box.tf documents. It is a launch-time property: changing it in
+      # config is a deliberate rebuild, not something an unrelated apply should do.
+      associate_public_ip_address,
+    ]
   }
 
   # First boot reads the password with this role: both must exist before Windows starts.
