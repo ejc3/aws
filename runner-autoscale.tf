@@ -739,7 +739,7 @@ data "archive_file" "runner_webhook" {
           """Runner subnets, most preferred first, as (subnet_id, availability_zone).
 
           LAUNCH_SUBNETS is the JSON list Terraform renders from
-          local.runner_launch_subnets. SUBNET_ID, the single subnet the previous
+          local.runner_fcvm_launch_subnets. SUBNET_ID, the single subnet the previous
           controller was given, is still honoured as one subnet with no known AZ,
           for an environment that predates LAUNCH_SUBNETS. A malformed list raises
           before anything is fetched, minted or launched.
@@ -1416,7 +1416,7 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
-      # Ordered [{subnet_id, availability_zone}] from local.runner_launch_subnets.
+      # Ordered [{subnet_id, availability_zone}] from local.runner_fcvm_launch_subnets (the PRIMARY region's).
       # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
       LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_fcvm_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.

@@ -237,6 +237,21 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(TF.count('--region "$${CONTROL_REGION:-$REGION}"'), 4)
         self.assertIn("CONTROL_REGION=%s", TF)
 
+    def test_the_controller_may_tag_a_bootstrap_credential_with_an_instance_arn_from_any_listed_region(self):
+        # Denied after every Ohio RunInstances otherwise: the host is terminated and no Ohio runner can register.
+        boot = (ROOT / "runner-bootstrap.tf").read_text()
+        self.assertIn('[for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:instance/i-*"]', boot)
+        self.assertNotIn('"aws:RequestTag/InstanceArn" = "arn:aws:ec2:us-west-1', boot)
+
+    def test_no_fcvm_runner_policy_pins_a_literal_us_west_1_ec2_arn_except_the_ami_builder_reaper(self):
+        # The class of bug that would have broken the first Ohio launch: an EC2 ARN (or tag condition) left on one region.
+        for name in ("runner-bootstrap.tf", "runner-vpc.tf", "runner-autoscale.tf"):
+            text = (ROOT / name).read_text()
+            lines = [l for l in text.splitlines() if "arn:aws:ec2:us-west-1" in l and not l.lstrip().startswith("#")]
+            allowed = [l for l in lines if "builders only ever run in us-west-1a" in l]
+            self.assertEqual(sorted(set(lines) - set(allowed)), [], "%s pins an EC2 ARN to us-west-1" % name)
+        self.assertEqual(sum("builders only ever run in us-west-1a" in l for l in TF.splitlines()), 1)
+
     def test_ohio_has_the_key_pair_the_launcher_names_on_every_launch(self):
         self.assertIn("KeyName='fcvm-ec2'", TF)
         kp = re.search(r'resource "aws_key_pair" "ohio_runner" \{.*?\n\}', OHIO, re.S).group()
