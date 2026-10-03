@@ -75,22 +75,21 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertEqual(actions(ipv6), {'ec2:AssignIpv6Addresses'})
         self.assertIn(':network-interface/*', ipv6)
         self.assertIn('"aws:ResourceTag/Role" = "github-runner"', ipv6)
-        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', ipv6)
+        self.assertIn('"ec2:Subnet" = local.runner_fcvm_subnet_arns', ipv6)
         self.assertNotIn(':subnet/*', ipv6)
 
     def test_launch_pins_ami_owner_purpose_and_exact_network_inputs(self):
         image = statement(self.controller, 'LaunchApprovedRunnerImages')
-        self.assertIn('arn:aws:ec2:us-west-1::image/*', image)
+        self.assertIn('[for r in local.runner_regions : "arn:aws:ec2:${r}::image/*"]', image)
         self.assertRegex(image, r'"ec2:Owner"\s*=\s*data.aws_caller_identity.current.account_id')
         self.assertIn('"aws:ResourceTag/Purpose" = "github-runner"', image)
         network = statement(self.controller, 'LaunchExactRunnerNetwork')
-        for reference in ['local.runner_launch_subnet_arns', 'aws_security_group.runner[0].arn',
-                          ':key-pair/fcvm-ec2']:
+        for reference in ['local.runner_fcvm_subnet_arns', 'local.runner_fcvm_sg_arns', ':key-pair/fcvm-ec2']:
             self.assertIn(reference, network)
         self.assertNotIn(':subnet/*', network)
         self.assertNotIn(':security-group/*', network)
         eni = statement(self.controller, 'LaunchTaggedRunnerENI')
-        self.assertIn('"ec2:Subnet" = local.runner_launch_subnet_arns', eni)
+        self.assertIn('"ec2:Subnet" = local.runner_fcvm_subnet_arns', eni)
         self.assertNotIn(':subnet/*', eni)
 
     def test_launch_subnets_are_exactly_the_two_runner_subnets(self):

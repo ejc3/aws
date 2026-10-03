@@ -54,7 +54,9 @@ resource "aws_iam_role_policy" "runner_bootstrap_controller" {
         Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner" }
-          StringLike   = { "aws:RequestTag/InstanceArn" = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/i-*" }
+          # One pattern per runner region (a list is OR'd): the controller tags the credential with the ARN of the instance it
+          # just launched, which names that instance's region. The SSM parameter itself stays in us-west-1.
+          StringLike = { "aws:RequestTag/InstanceArn" = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:instance/i-*"] }
         }
       },
       {

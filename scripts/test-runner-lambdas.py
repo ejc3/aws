@@ -1291,7 +1291,8 @@ def case_every_type_is_tried_in_us_west_1c_before_us_west_1a():
 def case_terraform_hands_the_launcher_us_west_1c_first():
     """The order the Lambda walks is Terraform's, so check it at the source."""
     vpc = (TF_FILE.parent / "runner-vpc.tf").read_text()
-    refs = re.search(r"\n  runner_launch_subnets\s*=\s*concat\(([^)]*)\)\n", vpc).group(1)
+    # The us-west-1 network inside the region map keeps the 1c-then-1a order the launcher walks.
+    refs = re.search(r'"us-west-1" = \{ subnets = concat\(([^)]*)\), security_group', vpc).group(1)
     zones = []
     for ref in refs.split(","):
         name = ref.strip().split(".", 1)[1]
@@ -1300,12 +1301,15 @@ def case_terraform_hands_the_launcher_us_west_1c_first():
         zones.append(re.search(r'\n  availability_zone\s*=\s*"([^"]+)"', body).group(1))
     assert zones == ["us-west-1c", "us-west-1a"], zones
     source = TF_FILE.read_text()
-    assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_launch_subnets : "
+    assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_fcvm_launch_subnets : "
                      r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
-                     source), "LAUNCH_SUBNETS is not rendered from local.runner_launch_subnets"
-    # Kept for the previous controller code during the apply; it must stay the us-west-1a subnet.
-    assert re.search(r"\n      SUBNET_ID\s*=\s*aws_subnet\.runner\[0\]\.id\n", source), \
-        "SUBNET_ID is not the us-west-1a subnet"
+                     source), "LAUNCH_SUBNETS is not rendered from the PRIMARY region's subnets"
+    # The primary region today is us-west-1, so the launch network is the 1c-then-1a list asserted above.
+    assert re.search(r'\n  runner_regions\s*=\s*\["us-west-1"\]\n', vpc), "the runner regions are no longer exactly us-west-1"
+    assert re.search(r"\n  runner_fcvm_launch_subnets\s*=\s*var\.enable_github_runner \? local\.runner_networks\[local\.runner_primary_region\]\.subnets", vpc)
+    # Kept for the previous controller code during the apply; the first launch subnet, 1c today.
+    assert re.search(r"\n      SUBNET_ID\s*=\s*local\.runner_fcvm_launch_subnets\[0\]\.id\n", source), \
+        "SUBNET_ID is not the primary region's first launch subnet"
 
 
 def case_capacity_exhausted_in_us_west_1c_falls_through_to_us_west_1a():
