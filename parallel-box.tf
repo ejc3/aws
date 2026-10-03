@@ -1,7 +1,7 @@
 # parallel-box.tf
 #
 # On-demand 192-core Graviton spot box for embarrassingly parallel work, with a
-# persistent 100GB data disk that OUTLIVES the instance.
+# persistent 300GB data disk that OUTLIVES the instance.
 #
 # WHY c8g.48xlarge: 192 vCPU is the ceiling for Graviton across every family (c8g/m8g/
 # r8g/x8g all cap at 48xlarge), and c8g is the compute-optimized one, so it is the
@@ -17,7 +17,7 @@
 # 512 vCPU of both spot and on-demand quota. EBS is AZ-locked, so the volume pins the
 # AZ -- deliberately, since AZ-roaming would require a slow snapshot restore on boot.
 #
-# LIFECYCLE: this file holds only what is DURABLE -- the volume (cheap: 100GB gp3 ~=
+# LIFECYCLE: this file holds only what is DURABLE -- the volume (cheap: 300GB gp3 ~=
 # $8/month), the security group and the key pair. The INSTANCE is not terraform's; it is
 # launched from the launch template in parallel-box-launch.tf by scripts/parallel-box.sh
 # and terminated either by that script or by the idle watchdog. Read the header of
@@ -65,7 +65,7 @@ resource "aws_key_pair" "parallel_box" {
 resource "aws_ebs_volume" "parallel_work" {
   provider          = aws.west2
   availability_zone = var.parallel_box_az
-  size              = 100
+  size              = 300 # was 100; 69G was in use. EBS grows online but never shrinks
   type              = "gp3"
   encrypted         = true
 
@@ -116,6 +116,6 @@ resource "aws_security_group" "parallel_box" {
 }
 
 output "parallel_box_work_volume" {
-  description = "Persistent 100GB work volume (survives the instance)"
+  description = "Persistent 300GB work volume (survives the instance)"
   value       = aws_ebs_volume.parallel_work.id
 }

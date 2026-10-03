@@ -252,7 +252,7 @@ case "$CMD" in
       say "$NAME is already down."
       exit 0
     fi
-    say "Terminating $NAME ($ID). Its 100GB work volume is kept."
+    say "Terminating $NAME ($ID). Its work volume is kept."
     # Terminate detaches the work volume on its own; delete_on_termination is false for
     # it (it is not part of the launch template's block device mappings at all), so the
     # disk survives. Only the 30GB root goes away, which is what it is for.

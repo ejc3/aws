@@ -19,7 +19,7 @@
 #             ID                                so a baked-in ID goes stale immediately)
 #   checked: hourly      checked: every 5 min
 #
-# Terminating is safe precisely because all work lives on the persistent 100GB volume,
+# Terminating is safe precisely because all work lives on the persistent work volume,
 # which is a separate resource with prevent_destroy. Losing the instance loses nothing.
 
 variable "parallel_box_idle_minutes" {
@@ -133,7 +133,7 @@ def lambda_handler(event, context):
             kept = "Nothing on it persists"
         else:
             up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
-            kept = "Its 100GB work volume is untouched"
+            kept = "Its work volume is untouched"
         print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
