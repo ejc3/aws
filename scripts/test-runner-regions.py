@@ -200,8 +200,9 @@ class FacadeTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
-    def test_today_the_runners_run_in_exactly_us_west_1(self):
-        self.assertRegex(VPC, r'\n  runner_regions\s*=\s*\["us-west-1"\]\n')
+    def test_the_runner_regions_are_one_of_the_three_states_of_the_ohio_move(self):
+        # [us-west-1] before, [us-east-2, us-west-1] while the old hosts drain (new runners in Ohio), [us-east-2] after.
+        self.assertRegex(VPC, r'\n  runner_regions\s*=\s*(\["us-west-1"\]|\["us-east-2", "us-west-1"\]|\["us-east-2"\])\n')
         self.assertIn("runner_primary_region = local.runner_regions[0]", VPC)
 
     def test_all_three_lambdas_are_told_the_regions(self):
