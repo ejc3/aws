@@ -181,8 +181,10 @@ class FacadeTests(unittest.TestCase):
         body = CLEANUP[CLEANUP.index("def bootstrap_instance_arns"):]
         body = body[:body.index("\n\n")]
         for regions, expected in ((["us-west-1"], {"arn:aws:ec2:us-west-1:111:instance/i-1"}),
-                                  (["us-east-2", "us-west-1"], {"arn:aws:ec2:us-east-2:111:instance/i-1", "arn:aws:ec2:us-west-1:111:instance/i-1"})):
-            ns = {"RUNNER_REGIONS": regions}
+                                  (["us-east-2", "us-west-1"], {"arn:aws:ec2:us-east-2:111:instance/i-1", "arn:aws:ec2:us-west-1:111:instance/i-1"}),
+                                  # the FINAL state of the move: the app runners' credentials are still swept
+                                  (["us-east-2"], {"arn:aws:ec2:us-east-2:111:instance/i-1", "arn:aws:ec2:us-west-1:111:instance/i-1"})):
+            ns = {"RUNNER_REGIONS": regions, "APP_RUNNER_REGION": "us-west-1"}
             exec(compile(textwrap.dedent(body), "arns", "exec"), ns)
             self.assertEqual(ns["bootstrap_instance_arns"]("i-1", "111"), expected)
         self.assertNotIn("arn:aws:ec2:eu-west-1:111:instance/i-1", expected, "a region we do not run in is never authority")

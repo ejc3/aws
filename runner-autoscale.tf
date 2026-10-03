@@ -2457,6 +2457,8 @@ data "archive_file" "runner_cleanup" {
       # The temporary AMI builders (github-ami-builder.tf) only ever run in us-west-1a, whichever regions the runners are in,
       # so their sweep keeps its own region: after the runners have left us-west-1 it must still find and reap them.
       BUILDER_REGION = 'us-west-1'
+      # The app runners (runner-app.tf) have not moved and stay in us-west-1 whichever regions the fcvm runners are in.
+      APP_RUNNER_REGION = 'us-west-1'
       ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION])
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
@@ -2473,8 +2475,10 @@ data "archive_file" "runner_cleanup" {
           return ec2.region_of(instance_id)
 
       def bootstrap_instance_arns(instance_id, account):
-          """Every ARN an instance's bootstrap credential may legitimately name: one per configured runner region."""
-          return {f'arn:aws:ec2:{region}:{account}:instance/{instance_id}' for region in RUNNER_REGIONS}
+          """Every ARN an instance's bootstrap credential may legitimately name: one per configured fcvm runner region, and
+          the app runners' fixed region (runner-app.tf, not moving; their credentials are swept here too)."""
+          return {f'arn:aws:ec2:{region}:{account}:instance/{instance_id}'
+                  for region in list(RUNNER_REGIONS) + [APP_RUNNER_REGION]}
       # The launcher tags every instance with the registration handshake its
       # user data runs. Only this value has a DynamoDB row to read.
       PROTOCOL_TAG = 'RunnerRegistrationProtocol'
