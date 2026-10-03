@@ -80,10 +80,12 @@ data "archive_file" "runner_webhook" {
           """
           NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
 
-          def __init__(self, regions):
+          def __init__(self, regions, also=()):
               self.regions = list(regions)
               self.primary = self.regions[0]
-              self.clients = {region: boto3.client('ec2', region_name=region) for region in self.regions}
+              # `also` are regions that are never READ as part of the fleet but may still be written to: the AMI
+              # builders always run in us-west-1, whichever regions the runners are in.
+              self.clients = {region: boto3.client('ec2', region_name=region) for region in dict.fromkeys(self.regions + list(also))}
               self.owner = {}
 
           def region_of(self, instance_id):
@@ -2378,10 +2380,12 @@ data "archive_file" "runner_cleanup" {
           """
           NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
 
-          def __init__(self, regions):
+          def __init__(self, regions, also=()):
               self.regions = list(regions)
               self.primary = self.regions[0]
-              self.clients = {region: boto3.client('ec2', region_name=region) for region in self.regions}
+              # `also` are regions that are never READ as part of the fleet but may still be written to: the AMI
+              # builders always run in us-west-1, whichever regions the runners are in.
+              self.clients = {region: boto3.client('ec2', region_name=region) for region in dict.fromkeys(self.regions + list(also))}
               self.owner = {}
 
           def region_of(self, instance_id):
@@ -2450,7 +2454,10 @@ data "archive_file" "runner_cleanup" {
           def __getattr__(self, name):
               return getattr(self.clients[self.primary], name)
 
-      ec2 = RegionalEC2(RUNNER_REGIONS)
+      # The temporary AMI builders (github-ami-builder.tf) only ever run in us-west-1a, whichever regions the runners are in,
+      # so their sweep keeps its own region: after the runners have left us-west-1 it must still find and reap them.
+      BUILDER_REGION = 'us-west-1'
+      ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION])
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
@@ -2464,6 +2471,10 @@ data "archive_file" "runner_cleanup" {
       # (SSM, DynamoDB, Lambda) stays in CONTROL_REGION.
       def instance_region(instance_id):
           return ec2.region_of(instance_id)
+
+      def bootstrap_instance_arns(instance_id, account):
+          """Every ARN an instance's bootstrap credential may legitimately name: one per configured runner region."""
+          return {f'arn:aws:ec2:{region}:{account}:instance/{instance_id}' for region in RUNNER_REGIONS}
       # The launcher tags every instance with the registration handshake its
       # user data runs. Only this value has a DynamoDB row to read.
       PROTOCOL_TAG = 'RunnerRegistrationProtocol'
@@ -3432,12 +3443,15 @@ data "archive_file" "runner_cleanup" {
                   match = re.fullmatch(r'/github-runner/bootstrap/(i-[0-9a-f]{8}(?:[0-9a-f]{9})?)', name)
                   if not match or metadata.get('Type') != 'SecureString':
                       continue
-                  expected_arn = f'arn:aws:ec2:{instance_region(match.group(1))}:{account}:instance/{match.group(1)}'
+                  # The parameter's own InstanceArn tag names the region its runner lived in, and a runner that died
+                  # before it was ever read is not in the instance reads: judge the tag against every region the
+                  # runners may be in, never against "the primary".
+                  expected_arns = bootstrap_instance_arns(match.group(1), account)
                   try:
                       tags = {tag['Key']: tag['Value'] for tag in bootstrap_ssm.list_tags_for_resource(
                           ResourceType='Parameter', ResourceId=name)['TagList']}
                       expires = datetime.fromisoformat(tags.get('CredentialExpiresAt', '').replace('Z', '+00:00'))
-                      if tags.get('Role') != 'github-runner' or tags.get('InstanceArn') != expected_arn:
+                      if tags.get('Role') != 'github-runner' or tags.get('InstanceArn') not in expected_arns:
                           continue
                       # Naive/malformed times, absent provenance and live tokens
                       # never provide authority to delete a parameter.
@@ -4032,7 +4046,7 @@ data "archive_file" "runner_cleanup" {
 
           # Phase 4: Clean up stale AMI builder instances (> 2 hours old)
           ami_builder_terminated = []
-          ami_response = ec2.describe_instances(
+          ami_response = ec2.clients[BUILDER_REGION].describe_instances(
               Filters=[
                   {'Name': 'tag:Name', 'Values': ['ami-builder-temp']},
                   {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
@@ -4041,6 +4055,7 @@ data "archive_file" "runner_cleanup" {
           for reservation in ami_response['Reservations']:
               for instance in reservation['Instances']:
                   instance_id = instance['InstanceId']
+                  ec2.owner[instance_id] = BUILDER_REGION      # so terminate() goes to the builder's region
                   launch_time = instance['LaunchTime']
                   age_hours = (now - launch_time).total_seconds() / 3600
                   if age_hours > 2:

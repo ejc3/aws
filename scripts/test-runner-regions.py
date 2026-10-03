@@ -150,6 +150,46 @@ class FacadeTests(unittest.TestCase):
         ec2.describe_instances()
         self.assertEqual(ec2.owner, {})
 
+    def test_after_the_runners_have_left_us_west_1_a_builder_there_can_still_be_found_and_reaped(self):
+        log = []
+        clients = {"us-east-2": FakeRegionEC2("us-east-2", [inst("i-ohio")], log),
+                   "us-west-1": FakeRegionEC2("us-west-1", [inst("i-builder")], log)}
+        boto3 = types.ModuleType("boto3")
+        boto3.client = lambda name, region_name=None, **kw: clients[region_name]
+        ns = {"json": json, "os": os, "boto3": boto3}
+        os.environ["RUNNER_REGIONS"] = json.dumps(["us-east-2"])               # the FINAL state of a move
+        exec(compile(facade_source(CLEANUP), "facade", "exec"), ns)
+        ec2 = ns["RegionalEC2"](ns["RUNNER_REGIONS"], also=["us-west-1"])
+        fleet = [i["InstanceId"] for r in ec2.describe_instances()["Reservations"] for i in r["Instances"]]
+        self.assertEqual(fleet, ["i-ohio"], "the extra region is never part of the fleet read")
+        found = ec2.clients["us-west-1"].describe_instances()["Reservations"]
+        self.assertEqual(len(found), 1)
+        ec2.owner["i-builder"] = "us-west-1"
+        ec2.terminate_instances(InstanceIds=["i-builder"])
+        self.assertEqual(log, [("us-west-1", "terminate", ("i-builder",))])
+
+    def test_the_builder_sweep_reads_its_own_fixed_region_not_the_runner_regions(self):
+        self.assertIn("BUILDER_REGION = 'us-west-1'", CLEANUP)
+        self.assertIn("ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION])", CLEANUP)
+        sweep = CLEANUP[CLEANUP.index("# Phase 4: Clean up stale AMI builder"):CLEANUP.index("# Phase 5")]
+        self.assertIn("ec2.clients[BUILDER_REGION].describe_instances(", sweep)
+        self.assertNotIn("ec2.describe_instances(", sweep)
+        self.assertIn("ec2.owner[instance_id] = BUILDER_REGION", sweep)
+
+    def test_a_bootstrap_credential_is_judged_against_every_configured_region_not_just_the_primary(self):
+        src = CLEANUP[CLEANUP.index("def bootstrap_instance_arns"):CLEANUP.index('"""', CLEANUP.index("def bootstrap_instance_arns")) + 3]
+        body = CLEANUP[CLEANUP.index("def bootstrap_instance_arns"):]
+        body = body[:body.index("\n\n")]
+        for regions, expected in ((["us-west-1"], {"arn:aws:ec2:us-west-1:111:instance/i-1"}),
+                                  (["us-east-2", "us-west-1"], {"arn:aws:ec2:us-east-2:111:instance/i-1", "arn:aws:ec2:us-west-1:111:instance/i-1"})):
+            ns = {"RUNNER_REGIONS": regions}
+            exec(compile(textwrap.dedent(body), "arns", "exec"), ns)
+            self.assertEqual(ns["bootstrap_instance_arns"]("i-1", "111"), expected)
+        self.assertNotIn("arn:aws:ec2:eu-west-1:111:instance/i-1", expected, "a region we do not run in is never authority")
+        sweep = CLEANUP[CLEANUP.index("expected_arns = bootstrap_instance_arns"):]
+        self.assertIn("tags.get('InstanceArn') not in expected_arns", sweep[:900])
+        self.assertNotIn("instance_region(match.group(1))", CLEANUP, "the sweep must not guess the primary for a dead host")
+
     def test_the_control_plane_clients_stay_in_us_west_1_whatever_the_runner_regions(self):
         for name, code in (("webhook", WEBHOOK), ("cleanup", CLEANUP)):
             for service in ("ssm", "dynamodb", "lambda"):
