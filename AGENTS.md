@@ -211,6 +211,17 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - There is no application database. DynamoDB is limited to Terraform locking and runner
   registration claims. Older notes about Aurora Serverless auto-pause no longer apply
 
+### Ohio (us-east-2) is being prepared, not yet used
+
+The 2026-10-03 cost review found us-west-1 is the most expensive US region (on-demand and EBS 17-20% over the
+others) and that the spot metal we run is 15-65% cheaper in Ohio with no worse placement scores. `ohio.tf` builds the
+runner side next to what runs today, switched on NOTHING: an isolated VPC (10.11.0.0/16, IPv6, three AZs), the two
+runner security groups, VPC flow logs to the audit bucket, and `ami-replicator`, which copies the newest two runner
+AMIs of each architecture to Ohio every hour (the launcher picks its AMI by tag in its own region, and fcvm publishes
+only in us-west-1). Nothing there bills while idle: no Elastic IP, NAT, instance or endpoint (a test enforces it). The
+cutover is a separate act the owner schedules. Known region pins to lift when each move is wired up:
+`runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).
+
 ### File Structure
 
 ```
