@@ -8,7 +8,7 @@
 #   pbox up [2] kvm   same box, METAL pools only: /dev/kvm for hypervisor
 #                     workloads (fcvm/firecracker). Boots in many minutes.
 #   pbox down [2]     terminate it. Its work volume is KEPT.
-#   pbox status       both boxes: running? cost? disk?
+#   pbox status       both boxes: running? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
 #   pbox status 2     just box 2
 #   pbox ssh [2]      connect
 #   pbox ip [2]       print the IP
@@ -110,6 +110,20 @@ set_box() {
 }
 set_box "${BOX:-1}"
 
+# How the NEXT launch will be bought, read from the launch template itself ($Latest, which is what `up` launches).
+# It is a Terraform choice (var.parallel_box_spot) that nothing else shows, so it is looked up rather than
+# assumed: "spot", "on-demand", or "unknown" when the template cannot be read.
+launch_mode() {
+  local m
+  m=$(aws ec2 describe-launch-template-versions --region "$REGION" --launch-template-name "$LT" --versions '$Latest' \
+    --query 'LaunchTemplateVersions[0].LaunchTemplateData.InstanceMarketOptions.MarketType' --output text 2>/dev/null)
+  case "$m" in
+    spot) echo spot ;;
+    None) echo on-demand ;;   # no market options at all
+    *) echo unknown ;;
+  esac
+}
+
 box_ip() {
   aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
@@ -136,7 +150,11 @@ status_one() {
     T=$(aws ec2 describe-instances --region "$REGION" \
       --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
       --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)
-    echo "  state:  RUNNING at $IP ($T)"
+    L=$(aws ec2 describe-instances --region "$REGION" \
+      --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
+    case "$L" in spot) BOUGHT="spot" ;; None|"") BOUGHT="ON-DEMAND (about 3x spot)" ;; *) BOUGHT="$L" ;; esac
+    echo "  state:  RUNNING at $IP ($T, $BOUGHT)"
     ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
       "ubuntu@$IP" 'echo "  cores:  $(nproc)"; echo "  load:   $(uptime | sed "s/.*load average: //")"; echo "  work:   $(df -h /mnt/work | awk "NR==2{print \$3\" used of \"\$2}")"' 2>/dev/null \
       || echo "  (running, but SSH not answering yet)"
@@ -146,6 +164,11 @@ status_one() {
   echo "  volume: $(aws ec2 describe-volumes --region "$REGION" \
     --filters "Name=tag:Name,Values=$VOLTAG" \
     --query 'Volumes[0].[VolumeId,Size,State]' --output text 2>/dev/null) (persistent)"
+  NEXT=$(launch_mode)
+  case "$NEXT" in
+    on-demand) echo "  next launch: ON-DEMAND, about 3x the spot price (launch template: parallel_box_spot=false). Apply parallel_box_spot=true to go back to spot." ;;
+    *) echo "  next launch: $NEXT (launch template)" ;;
+  esac
 }
 
 case "$CMD" in
@@ -160,7 +183,16 @@ case "$CMD" in
     AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
       --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
     say "Work volume $VOL is in $AZ -- the box launches there (EBS is AZ-locked)."
-    say "Spot capacity for 192-core instances is scarce; trying each type in turn."
+    MODE_NOW=$(launch_mode)
+    case "$MODE_NOW" in
+      on-demand)
+        say "PURCHASE MODE: ON-DEMAND (the launch template says parallel_box_spot=false)."
+        say "  This costs about 3x spot, and the \"spot\" figure shown per type below is for reference only, NOT what you pay."
+        say "  To go back to spot, an admin applies parallel_box_spot=true; a later apply without the variable also does."
+        ;;
+      spot) say "PURCHASE MODE: spot. Spot capacity for 192-core instances is scarce; trying each type in turn." ;;
+      *) say "PURCHASE MODE: unknown (could not read the launch template). Trying each type in turn." ;;
+    esac
     say ""
 
     ID=""
@@ -172,7 +204,11 @@ case "$CMD" in
       PRICE=$(aws ec2 describe-spot-price-history --region "$REGION" --instance-types "$T" \
         --product-descriptions "Linux/UNIX" --availability-zone "$AZ" --max-items 1 \
         --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
-      say "--> trying $T (${CORES:-?} cores, \$${PRICE:-?}/hr) in $AZ ..."
+      if [ "$MODE_NOW" = "on-demand" ]; then
+        say "--> trying $T (${CORES:-?} cores, on-demand; spot reference \$${PRICE:-?}/hr) in $AZ ..."
+      else
+        say "--> trying $T (${CORES:-?} cores, \$${PRICE:-?}/hr) in $AZ ..."
+      fi
 
       # Everything except the instance type comes from the launch template, so a typo
       # here cannot land the box in the wrong subnet, on the wrong AMI, or without the
@@ -202,9 +238,9 @@ case "$CMD" in
 
     if [ -z "$ID" ]; then
       say ""
-      say "FAILED: no spot capacity in $AZ for any of: $TYPES"
+      say "FAILED: no ${MODE_NOW} capacity in $AZ for any of: $TYPES"
       say "Options:"
-      say "  - retry later; spot capacity fluctuates hour to hour"
+      say "  - retry later; capacity fluctuates hour to hour"
       say "  - override the list:  PARALLEL_BOX_TYPES='c8g.16xlarge' $SELF up $BOX"
       say "  - move the volume to another AZ via snapshot (ask Claude for the roaming setup)"
       exit 1

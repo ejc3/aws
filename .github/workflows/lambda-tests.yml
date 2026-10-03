@@ -183,6 +183,9 @@ jobs:
       - name: Ohio is prepared and idle; runner AMIs are replicated (ohio.tf, ami-replicator)
         run: python3 -S -B scripts/test-ohio-runner-prep.py
 
+      - name: pbox shows whether a parallel box is bought spot or on-demand
+        run: python3 -S -B scripts/test-parallel-box-mode.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
