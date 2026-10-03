@@ -224,20 +224,28 @@ CodeBuild finished  --EventBridge-->  games-mp-release
   new tasks, waits until they are healthy, then deregisters the old ones. The ALB sends a
   deregistered task no new connection but keeps every open one, a player's WebSocket
   included, for the target group's deregistration delay, 3600 s, its maximum; only then does
-  ECS stop the task. The launch functions refuse a match hardcap above 3600 s, and an engine
-  ends its match at its hardcap after boot, so every match connected through an old router
-  ends before that router's drain does. The mp-test client does not reconnect by itself (a
-  reconnect is its "reconnect" button, which fetches a fresh token), so the drain is what keeps
-  a match alive; a game that wants matches longer than an hour must first reconnect its
-  clients automatically on a dropped socket, and then `mp_router_drain_sec` can stay at the
-  ALB's maximum while `MAX_HARDCAP_SEC` rises. The price: an old router task runs up to an hour
-  after each rollout, a few cents.
+  ECS stop the task. An engine ends its match at its hardcap after boot, so every match of up
+  to an hour that was connected through an old router ends before that router's drain does.
+  The mp-test client does not reconnect by itself (a reconnect is its "reconnect" button,
+  which fetches a fresh token), so for such a game the drain is what keeps a match alive. The
+  price: an old router task runs up to an hour after each rollout, a few cents.
+- **Matches longer than an hour.** The launch functions accept a hardcap up to 14,400 s
+  (`mp_max_hardcap_sec`, the same number the sweeper clamps to); `mp_router_drain_sec` stays
+  at the ALB's maximum. A match longer than the drain can outlive it: when the old router task
+  stops, the sockets still on it close. So a game whose lobby adapter asks for more than
+  3,600 s must reconnect its clients automatically on a dropped socket, with a fresh join
+  token; they come back through a current router task, and the engine, which never restarts,
+  carries on. History Through the Ages is the first such game (its engine holds a disconnect
+  pause while a seat is away). A game that keeps its hardcap at or under an hour is unaffected.
+  A 2 vCPU / 4 GB engine for four hours costs about $0.40.
 - **Migrations run before the release that needs them, and must be backward compatible.**
   The lobby is on Vercel, which deploys `main` on its own, minutes before this release, and
   the engines and lobbies already running keep their code. So an mp migration must work with
   both the previous and the new lobby and engines: add (a column, a function, a new RPC
   version) in one merge, and remove what the old code used only in a later merge, after
-  every match on the old code has ended (at most an hour and a half). A migration that is not
+  every match on the old code has ended (the longest hardcap in use plus its ready
+  window: an hour and a half while every game keeps to an hour, about four and a half hours
+  once a game uses the long cap). A migration that is not
   backward compatible must be gated: ship the new code first without depending on it, then
   the migration. `games-mp-migrate` applies the mp migrations only: the files under
   `supabase/migrations` that set `mp_private.schema_revision` (the first inserts revision 1,
@@ -539,8 +547,8 @@ environment's function. They have no ECS, IAM or EC2 permission at all.
   `taskDefinition`, `env`, a size, a role) is refused, not dropped. `matchId` is a lowercase UUID,
   `game` must be a valid game id (Adding a game), `simVersion` is the match's (the lobby's shape, 1 to 64 of
   `A-Za-z0-9._-`, matched in full), `commit` is 40 lowercase hex (required on preview, ignored
-  on production), `hardCapSec` is 60 to 3,600 (no match may outlive a draining router, see
-  Automatic deploys), `apiBase` must be
+  on production), `hardCapSec` is 60 to 14,400 (above 3,600 the game must reconnect its clients
+  itself, see Automatic deploys), `apiBase` must be
   `https://cc-games.org` (or `.net`/`.app`, for a lobby built before a switch) on production or
   this project's own `*.vercel.app` deployment URL on
   preview, and only preview may pass a bypass secret. `{"action":"stop","matchId"}` stops that

@@ -884,12 +884,13 @@ resource "aws_lambda_function" "games_mp_launch" {
       SECURITY_GROUP  = aws_security_group.games_engine.id
       ROUTER_FAMILY   = local.mp_router_family
       MIN_HARDCAP_SEC = "60"
-      # No match may outlive a draining router: a router rollout keeps each old task's
-      # connections for the target group's deregistration delay (3600 s) before stopping it,
-      # and an engine exits at its hardcap after boot. So a hardcap above the delay is refused.
-      # (The sweeper clamps at 14400 as before; a game that needs longer matches must first
-      # reconnect its clients automatically, then this can rise.)
-      MAX_HARDCAP_SEC = tostring(local.mp_router_drain_sec)
+      # The longest match any game may ask for: the sweeper's own clamp (one number,
+      # local.mp_max_hardcap_sec). A match at or under the router's drain (3600 s) never sees a
+      # router rollout. A LONGER match can: when an old router task stops after its drain, the
+      # sockets still on it close, so a game whose lobby adapter asks for more than the drain
+      # MUST reconnect its clients automatically with a fresh join token (they come back
+      # through a current router task; the engine and the match are untouched).
+      MAX_HARDCAP_SEC = tostring(local.mp_max_hardcap_sec)
       SETTLE_SEC      = "120"
       # Which revision to launch: games-mp-release's table (launch.py SIM VERSIONS AND COMMITS).
       RELEASES_TABLE = aws_dynamodb_table.games_mp_releases.name
@@ -1470,15 +1471,23 @@ resource "aws_lb" "games_play" {
   depends_on = [aws_s3_bucket_policy.games_play_alb_logs]
 }
 
-# Router targets. A ROUTER ROLLOUT NEVER KICKS A LIVE MATCH: when ECS replaces a router task
-# (a release, a key rotation, a scale-in), it first deregisters it and the ALB sends it no new
-# connection but keeps every open one (a player's WebSocket) for deregistration_delay; only
-# then does ECS stop the task. 3600 s is the ALB's maximum, and the launch functions refuse a
-# match hardcap above it (MAX_HARDCAP_SEC), so every match connected through an old task ends
-# before its drain does. The mp-test client does not reconnect by itself, so the drain, not a
-# reconnect, is what keeps a match alive; the cost is an old task running up to an hour.
+# Router targets. A ROUTER ROLLOUT NEVER KICKS A LIVE MATCH OF UP TO AN HOUR: when ECS replaces
+# a router task (a release, a key rotation, a scale-in), it first deregisters it and the ALB
+# sends it no new connection but keeps every open one (a player's WebSocket) for
+# deregistration_delay; only then does ECS stop the task. 3600 s is the ALB's maximum, so every
+# match whose hardcap is at or under it and that was connected through an old task ends before
+# that task's drain does. The mp-test client does not reconnect by itself, so for such a game
+# the drain, not a reconnect, is what keeps a match alive; the cost is an old task running up
+# to an hour.
+#
+# A game may ask for a longer match, up to mp_max_hardcap_sec (the sweeper's clamp; the launch
+# functions refuse more). Such a match can outlive a drain: when the old task stops, its
+# sockets close, and the game's clients must reconnect by themselves with a fresh join token.
+# They land on a current router task; the engine never restarts. That is the game's side of
+# the contract (colton-games docs/MULTIPLAYER-CONTRACT.md), not something AWS can check.
 locals {
   mp_router_drain_sec = 3600
+  mp_max_hardcap_sec  = 14400
 }
 
 resource "aws_lb_target_group" "games_mp_router" {
@@ -1815,7 +1824,7 @@ resource "aws_lambda_function" "games_mp_sweeper" {
       CLUSTER           = aws_ecs_cluster.games.name
       GRACE_SEC         = "600"
       DEFAULT_LIMIT_SEC = "7200"
-      MAX_HARDCAP_SEC   = "14400"
+      MAX_HARDCAP_SEC   = tostring(local.mp_max_hardcap_sec)
       # The ONLY exemption: the router's family, which games-mp-launch is denied RunTask on
       # (NeverRunTheRouter).
       ROUTER_FAMILY = local.mp_router_family
