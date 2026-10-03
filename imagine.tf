@@ -56,10 +56,12 @@ locals {
   imagine_awake_count = 2
 }
 
+# imagine-pink.vercel.app is the project's production domain (Vercel assigned it); the
+# other is the alias Vercel gives every production deployment of a team project.
 variable "imagine_allowed_origins" {
   description = "Browser origins the imagine backend accepts sockets from: the Vercel project's production domains."
   type        = list(string)
-  default     = ["https://imagine-ejc3-7031s-projects.vercel.app"]
+  default     = ["https://imagine-pink.vercel.app", "https://imagine-ejc3-7031s-projects.vercel.app"]
 }
 
 variable "imagine_token_public_keys" {
