@@ -912,6 +912,8 @@ to the two metal servers.
 - More control over logic (peak CPU vs average)
 
 **Configuration:**
+- `CPU_THRESHOLD` (default 5) - a five-minute window at or above this CPU % keeps the box alive. wbox sets 15: idle Windows with
+  its DCV agent measured 6.4% average and 11.7% peak, so at 5 it ran 4+ days (about $20/day) before this existed
 - `IDLE_HOURS = 12` - Hours of idle before auto-stop
 - `INSTANCE_IDS` - Comma-separated list of instances to monitor
 - `SNS_TOPIC_ARN` - For notifications

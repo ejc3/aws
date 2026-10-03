@@ -460,6 +460,10 @@ resource "aws_lambda_function" "wbox_auto_stop" {
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
       SNS_REGION    = var.aws_region
       IDLE_HOURS    = "1"
+      # Idle Windows plus the DCV agent measured 6.4% average and 11.7% peak for 30 hours straight (2026-10-03), so the
+      # default 5% could never see it as idle and it ran 4+ days at about $20/day. A real session (a game streaming)
+      # sits far above 15.
+      CPU_THRESHOLD = "15"
     }
   }
 

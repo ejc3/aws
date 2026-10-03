@@ -2,6 +2,7 @@
 """The Windows playtest box (wbox.tf): reachable only from the dev boxes, kept off the fleet's
 peers, its game disk never destroyed or reformatted, the dev boxes limited to start/stop, and
 stopped after one idle hour. Offline; reads the Terraform source."""
+import json
 import re
 import unittest
 from pathlib import Path
@@ -109,6 +110,85 @@ class WboxTests(unittest.TestCase):
         self.assertIn("INSTANCE_IDS  = aws_instance.wbox[0].id", fn)
         self.assertIn('schedule_expression = "rate(10 minutes)"', block("aws_cloudwatch_event_rule", "wbox_auto_stop"))
         self.assertRegex(AUTOSTOP, r'"ec2:ResourceTag/Name" = \[[^\]]*"wbox"')
+
+
+class WboxIdleThresholdTests(unittest.TestCase):
+    """2026-10-03: wbox ran 4+ days (about $20/day) because the shared auto-stop calls a box active at any five-minute
+    window of 5% CPU, and idle Windows with the DCV agent sits at 6.4% average and 11.7% peak. The threshold is now an
+    environment variable (default 5, so the metal boxes are unchanged) and wbox sets 15. These run the REAL Lambda
+    code from the Terraform against fake AWS clients."""
+
+    @staticmethod
+    def run_lambda(peaks, threshold=None):
+        import datetime
+        import os
+        import types
+        code = re.search(r"auto_stop_lambda_code = <<-PYTHON\n(.*?)\nPYTHON", AUTOSTOP, re.S).group(1)
+        calls = []
+        launch = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=10)
+
+        class EC2:
+            def describe_instances(self, InstanceIds):
+                return {"Reservations": [{"Instances": [{"State": {"Name": "running"}, "LaunchTime": launch, "Tags": [{"Key": "Name", "Value": "wbox"}]}]}]}
+
+            def stop_instances(self, InstanceIds):
+                calls.append("stop")
+
+        class CW:
+            def get_metric_statistics(self, **kw):
+                return {"Datapoints": [{"Timestamp": i, "Maximum": v} for i, v in enumerate(peaks)]}
+
+        class SNS:
+            def publish(self, **kw):
+                pass
+
+        fake = types.ModuleType("boto3")
+        fake.client = lambda name, **kw: {"ec2": EC2(), "cloudwatch": CW(), "sns": SNS()}[name]
+        import sys
+        old = sys.modules.get("boto3")
+        sys.modules["boto3"] = fake
+        env = {"INSTANCE_IDS": "i-1", "IDLE_HOURS": "1", "SNS_TOPIC_ARN": "arn:x"}
+        if threshold is not None:
+            env["CPU_THRESHOLD"] = str(threshold)
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            ns = {}
+            exec(compile(code, "auto_stop", "exec"), ns)
+            result = ns["lambda_handler"]({}, None)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            sys.modules.pop("boto3", None) if old is None else sys.modules.__setitem__("boto3", old)
+        return json.loads(result["body"])[0], calls
+
+    IDLE_WINDOWS_DESKTOP = [6.2, 6.4, 6.5, 11.7, 6.3, 6.4, 6.1, 11.2, 6.4, 6.3, 6.5, 6.4]
+
+    def test_idle_windows_at_the_default_threshold_is_never_idle_which_was_the_bug(self):
+        result, calls = self.run_lambda(self.IDLE_WINDOWS_DESKTOP)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(calls, [])
+
+    def test_wbox_threshold_lets_an_idle_desktop_stop(self):
+        result, calls = self.run_lambda(self.IDLE_WINDOWS_DESKTOP, threshold=15)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(calls, ["stop"])
+
+    def test_a_real_session_still_keeps_it_alive_at_that_threshold(self):
+        result, calls = self.run_lambda(self.IDLE_WINDOWS_DESKTOP[:6] + [38.0] + self.IDLE_WINDOWS_DESKTOP[7:], threshold=15)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(calls, [])
+
+    def test_the_metal_boxes_keep_the_five_percent_rule(self):
+        self.assertIn("os.environ.get('CPU_THRESHOLD', '5.0')", AUTOSTOP)
+        result, _ = self.run_lambda([0.0] * 11 + [5.0])
+        self.assertEqual(result["status"], "active", "a 5% window is still activity by default")
+        result, calls = self.run_lambda([4.9] * 12)
+        self.assertEqual(result["status"], "stopped")
+
+    def test_only_wbox_raises_it(self):
+        self.assertIn('CPU_THRESHOLD = "15"', TF)
+        self.assertEqual(len(re.findall(r"CPU_THRESHOLD\s*=", TF)), 1)
 
 
 if __name__ == "__main__":
