@@ -255,7 +255,8 @@ The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer
 the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
 fleet's subnets (`10.0.1.0/24`, `10.0.2.0/24`) route to the peer. The games router and match
 engines have their own subnets in the same VPC (`10.0.64.0/22`) with no peer route
-(`docs/games-multiplayer.md`).
+(`docs/games-multiplayer.md`). The Imagine backend's subnets (`10.0.70.0/24`,
+`10.0.71.0/24`) use the same route table.
 
 ```text
 GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> disposable Spot runners
@@ -2012,6 +2013,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Shared claude-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claude-master-server.tf`, `claude-master-tunnel.tf`, `scripts/claude-master-login.sh --server`, `scripts/claude-master-enroll.sh`, `scripts/claude-master-mac-bundle.sh` |
 | Codex refresh (weekly SSM association on the jumpboxes and metal boxes) and `codex-restart` (see running vs installed, restart deliberately) | `codex-update.tf`, `scripts/codex-restart.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
+| Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,
