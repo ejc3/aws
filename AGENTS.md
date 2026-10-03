@@ -220,7 +220,7 @@ runner security groups, VPC flow logs to the audit bucket, and `ami-replicator`,
 AMIs of each architecture to Ohio every hour (the launcher picks its AMI by tag in its own region, and fcvm publishes
 only in us-west-1). Nothing there bills while idle: no Elastic IP, NAT, instance or endpoint (a test enforces it). The
 cutover is a separate act the owner schedules. The fcvm metal runners are region-aware: `local.runner_regions` in
-`runner-vpc.tf` (primary first; today `["us-west-1"]`) drives the launcher, reuse and cleanup Lambdas, the IAM ARNs and the
+`runner-vpc.tf` (primary first; now `["us-east-2", "us-west-1"]`: new runners launch in Ohio while the us-west-1 ones drain) drives the launcher, reuse and cleanup Lambdas, the IAM ARNs and the
 subnet and security-group choice. A move is two applies: `["us-east-2", "us-west-1"]` (new runners in Ohio, old ones still
 counted, reused and reaped while they drain), then `["us-east-2"]`. The control plane (SSM, DynamoDB, the Lambdas) stays in
 us-west-1; an instance uses `CONTROL_REGION` for those and its own region for EC2. The app runners (runner-app.tf) have not

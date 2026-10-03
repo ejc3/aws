@@ -1304,8 +1304,9 @@ def case_terraform_hands_the_launcher_us_west_1c_first():
     assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_fcvm_launch_subnets : "
                      r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
                      source), "LAUNCH_SUBNETS is not rendered from the PRIMARY region's subnets"
-    # The primary region today is us-west-1, so the launch network is the 1c-then-1a list asserted above.
-    assert re.search(r'\n  runner_regions\s*=\s*\["us-west-1"\]\n', vpc), "the runner regions are no longer exactly us-west-1"
+    # The move to Ohio is two applies; the list must be one of its three states, never an arbitrary region.
+    assert re.search(r'\n  runner_regions\s*=\s*(\["us-west-1"\]|\["us-east-2", "us-west-1"\]|\["us-east-2"\])\n', vpc), \
+        "runner_regions is not one of the permitted states of the Ohio move"
     assert re.search(r"\n  runner_fcvm_launch_subnets\s*=\s*var\.enable_github_runner \? local\.runner_networks\[local\.runner_primary_region\]\.subnets", vpc)
     # Kept for the previous controller code during the apply; the first launch subnet, 1c today.
     assert re.search(r"\n      SUBNET_ID\s*=\s*local\.runner_fcvm_launch_subnets\[0\]\.id\n", source), \
