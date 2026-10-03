@@ -52,7 +52,11 @@ class WboxTests(unittest.TestCase):
         instance = block("aws_instance", "wbox")
         for dep in ("aws_secretsmanager_secret_version.wbox_admin", "aws_iam_role_policy.wbox"):
             self.assertIn(dep, instance)
-        self.assertIn("ignore_changes = [ami, user_data]", block("aws_instance", "wbox"))
+        # ami and user_data stay ignored (a rebuild is deliberate); see WboxStoppedStateTests for the third field
+        ignored = re.search(r"ignore_changes\s*=\s*\[(.*?)\]", block("aws_instance", "wbox"), re.S).group(1)
+        names = [w for w in re.sub(r"#[^\n]*", "", ignored).replace(",", " ").split() if w]
+        self.assertIn("ami", names)
+        self.assertIn("user_data", names)
 
     def test_the_dev_boxes_may_only_start_stop_reboot_and_read_the_password(self):
         doc = block("aws_iam_policy_document", "wbox_control")
@@ -110,6 +114,17 @@ class WboxTests(unittest.TestCase):
         self.assertIn("INSTANCE_IDS  = aws_instance.wbox[0].id", fn)
         self.assertIn('schedule_expression = "rate(10 minutes)"', block("aws_cloudwatch_event_rule", "wbox_auto_stop"))
         self.assertRegex(AUTOSTOP, r'"ec2:ResourceTag/Name" = \[[^\]]*"wbox"')
+
+
+class WboxStoppedStateTests(unittest.TestCase):
+    def test_a_stopped_wbox_is_never_planned_for_replacement(self):
+        # associate_public_ip_address reads false while stopped (no Elastic IP) and forces replacement; the idle stop
+        # makes "stopped" the normal state, so the field must be ignored (as io-box.tf does).
+        inst = block("aws_instance", "wbox")
+        ignored = re.search(r"ignore_changes\s*=\s*\[(.*?)\]", inst[inst.index("lifecycle"):], re.S).group(1)
+        names = [w for w in re.sub(r"#[^\n]*", "", ignored).replace(",", " ").split() if w]   # comments do not count
+        self.assertIn("associate_public_ip_address", names)
+        self.assertNotIn("aws_eip", TF, "an address held for a box that sleeps is a permanent charge")
 
 
 class WboxIdleThresholdTests(unittest.TestCase):
