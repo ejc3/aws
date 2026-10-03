@@ -14,8 +14,8 @@
 #           each open document on one node; snapshots and ownership leases in S3
 #   EventBridge Scheduler (1 min) --> imagine-scale {"action":"sweep"}: no socket for 5 min
 #       --> desired count 0
-#   GitHub Actions on ejc3/imagine main --OIDC--> role imagine-deploy --> ECR push (commit
-#       tag + `live`) --> imagine-scale {"action":"deploy"}
+#   GitHub Actions on ejc3/imagine main, after its checks pass --OIDC--> role imagine-deploy
+#       --> ECR push (commit tag + `live`) --> imagine-scale {"action":"deploy"}
 #
 # WHAT IT SHARES WITH THE GAMES PLATFORM, and nothing else: the games-play load balancer
 # (one host rule, its wildcard certificate and wildcard DNS record, its WAF and access
@@ -30,8 +30,8 @@
 #
 # BRING-UP, once, in this order (README of ejc3/imagine, "Deployment"):
 #   1. Apply this. The service is created at 0 tasks, so no image need exist yet.
-#   2. In ejc3/imagine set the Actions variables from the imagine_deploy output and run the
-#      deploy workflow: it pushes the first `live` image.
+#   2. In ejc3/imagine set the Actions variables from the imagine_deploy output and run its
+#      CI workflow by hand on main: the deploy job pushes the first `live` image.
 #   3. In the Vercel project set the environment from the imagine_vercel_env output, plus
 #      the secrets Terraform does not hold (the token signing key, AUTH_SECRET, the Google
 #      OAuth client).
@@ -827,7 +827,7 @@ resource "aws_iam_role_policy" "imagine_waker" {
   })
 }
 
-# The image build: GitHub Actions on ejc3/imagine, main branch only. It can push to the one
+# The image build: the deploy job of ejc3/imagine's CI, main branch only. It can push to the one
 # repository and invoke the one function. It cannot change a task definition, a role or
 # the task count, so the most a bad build can do is ship a bad image, which the service's
 # circuit breaker rolls back.
