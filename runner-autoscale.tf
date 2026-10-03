@@ -62,7 +62,97 @@ data "archive_file" "runner_webhook" {
       from botocore.config import Config
       from datetime import datetime, timezone, timedelta
 
-      ec2 = boto3.client('ec2', region_name='us-west-1')
+      # ------------------------------------------------------------------ runner regions
+      # The control plane (SSM, DynamoDB, these Lambdas) never moves. The RUNNERS can: RUNNER_REGIONS is the ordered list
+      # of regions they may run in, the PRIMARY first (where new ones launch). During a move it lists both, so hosts in
+      # the old region are still counted, reused and reaped until they drain. One region (the default) behaves exactly
+      # as before: every call passes straight through to that region's client.
+      CONTROL_REGION = 'us-west-1'
+      RUNNER_REGIONS = json.loads(os.environ.get('RUNNER_REGIONS') or '["us-west-1"]')
+      PRIMARY_REGION = RUNNER_REGIONS[0]
+
+      class RegionalEC2:
+          """EC2 across the runner regions behind the client calls the rest of this file already makes.
+
+          Reads fan out to every region. A call about one instance goes to the region that owns it, learned from any
+          read or launch and remembered; an instance never seen is looked for before it is written. Image lookups
+          use the primary region.
+          """
+          NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
+
+          def __init__(self, regions):
+              self.regions = list(regions)
+              self.primary = self.regions[0]
+              self.clients = {region: boto3.client('ec2', region_name=region) for region in self.regions}
+              self.owner = {}
+
+          def region_of(self, instance_id):
+              return self.owner.get(instance_id, self.primary)
+
+          def _learn(self, region, response):
+              for reservation in response.get('Reservations', []):
+                  for instance in reservation.get('Instances', []):
+                      # a malformed record (no id) is the caller's to reject, never a crash here
+                      if isinstance(instance, dict) and instance.get('InstanceId'):
+                          self.owner[instance['InstanceId']] = region
+
+          @staticmethod
+          def _code(error):
+              response = getattr(error, 'response', None)
+              return response.get('Error', {}).get('Code') if isinstance(response, dict) else None
+
+          def describe_instances(self, **kwargs):
+              if len(self.regions) == 1:
+                  response = self.clients[self.primary].describe_instances(**kwargs)
+                  self._learn(self.primary, response)
+                  return response
+              reservations, missing = [], None
+              for region in self.regions:
+                  try:
+                      response = self.clients[region].describe_instances(**kwargs)
+                  except Exception as error:
+                      # asking for an id that lives in the other region is not an error, unless NO region has it
+                      if kwargs.get('InstanceIds') and self._code(error) in self.NOT_FOUND:
+                          missing = error
+                          continue
+                      raise
+                  self._learn(region, response)
+                  reservations.extend(response.get('Reservations', []))
+              if not reservations and missing is not None:
+                  raise missing
+              return {'Reservations': reservations}
+
+          def _by_region(self, instance_ids):
+              groups = {}
+              for instance_id in instance_ids:
+                  groups.setdefault(self.region_of(instance_id), []).append(instance_id)
+              return groups
+
+          def _locate(self, instance_ids):
+              if len(self.regions) > 1 and any(i not in self.owner for i in instance_ids):
+                  try:
+                      self.describe_instances(InstanceIds=[i for i in instance_ids if i not in self.owner])
+                  except Exception:
+                      pass
+
+          def create_tags(self, Resources, Tags, **kwargs):
+              self._locate(Resources)
+              response = None
+              for region, ids in self._by_region(Resources).items():
+                  response = self.clients[region].create_tags(Resources=ids, Tags=Tags, **kwargs)
+              return response
+
+          def terminate_instances(self, InstanceIds, **kwargs):
+              self._locate(InstanceIds)
+              response = None
+              for region, ids in self._by_region(InstanceIds).items():
+                  response = self.clients[region].terminate_instances(InstanceIds=ids, **kwargs)
+              return response
+
+          def __getattr__(self, name):
+              return getattr(self.clients[self.primary], name)
+
+      ec2 = RegionalEC2(RUNNER_REGIONS)
       # RunInstances only, with botocore's own retries off. A spot pool with no
       # capacity answers InsufficientInstanceCapacity, and the default client
       # retried that same pool four times with backoff ("reached max retries: 4"):
@@ -70,7 +160,7 @@ data "archive_file" "runner_webhook" {
       # them ran invocations into the 30-second timeout while this function's one
       # execution was held and the deliveries arriving meanwhile were throttled.
       # The launcher moves on to the next pool itself.
-      launch_ec2 = boto3.client('ec2', region_name='us-west-1',
+      launch_ec2 = boto3.client('ec2', region_name=PRIMARY_REGION,
                                 config=Config(retries={'total_max_attempts': 1}))
       ssm = boto3.client('ssm', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
@@ -259,7 +349,7 @@ data "archive_file" "runner_webhook" {
               Type='SecureString', Value=token, Overwrite=False,
               Tags=[
                   {'Key': 'Role', 'Value': 'github-runner'},
-                  {'Key': 'InstanceArn', 'Value': f'arn:aws:ec2:us-west-1:{account}:instance/{instance_id}'},
+                  {'Key': 'InstanceArn', 'Value': f'arn:aws:ec2:{ec2.region_of(instance_id)}:{account}:instance/{instance_id}'},
                   {'Key': 'CredentialExpiresAt', 'Value': expires.isoformat()},
               ])
 
@@ -802,6 +892,7 @@ data "archive_file" "runner_webhook" {
               # Do not put this in the capacity-fallback try. Once EC2 accepted
               # a launch, a broker error must never launch another instance type.
               instance_id = response['Instances'][0]['InstanceId']
+              ec2.owner[instance_id] = PRIMARY_REGION
               print(f'Launched {instance_id} ({instance_type}) in {subnet_id} ({az or "unknown AZ"})')
               if not broker:
                   # Only the transitional, already-deployed script uses its old
@@ -838,7 +929,7 @@ data "archive_file" "runner_webhook" {
           account = os.environ.get('RUNNER_ACCOUNT_ID', '')
           if not re.fullmatch(r'[0-9]{12}', account):
               return None
-          return {'InstanceArn': {'S': f'arn:aws:ec2:us-west-1:{account}:instance/{instance_id}'}}
+          return {'InstanceArn': {'S': f'arn:aws:ec2:{ec2.region_of(instance_id)}:{account}:instance/{instance_id}'}}
 
       def error_code(error):
           response = getattr(error, 'response', None)
@@ -1325,10 +1416,11 @@ resource "aws_lambda_function" "runner_webhook" {
     variables = {
       # Ordered [{subnet_id, availability_zone}] from local.runner_launch_subnets.
       # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
-      LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
+      LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_fcvm_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.
-      SUBNET_ID         = aws_subnet.runner[0].id
-      SECURITY_GROUP_ID = aws_security_group.runner[0].id
+      SUBNET_ID         = local.runner_fcvm_launch_subnets[0].id
+      SECURITY_GROUP_ID = local.runner_fcvm_security_group.id
+      RUNNER_REGIONS    = jsonencode(local.runner_regions)
       # Completed jobs are checked for reuse there; the runner_reuse resource says why.
       REUSE_FUNCTION = aws_lambda_function.runner_reuse[0].function_name
       # Warm-host reuse reads and claims hosts through their registration rows.
@@ -1406,7 +1498,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "LaunchApprovedRunnerImages"
         Effect   = "Allow"
         Action   = "ec2:RunInstances"
-        Resource = "arn:aws:ec2:us-west-1::image/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}::image/*"]
         Condition = {
           StringEquals = {
             "ec2:Owner"               = data.aws_caller_identity.current.account_id
@@ -1418,16 +1510,14 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid    = "LaunchExactRunnerNetwork"
         Effect = "Allow"
         Action = "ec2:RunInstances"
-        Resource = concat(local.runner_launch_subnet_arns, [
-          aws_security_group.runner[0].arn,
-          "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:key-pair/fcvm-ec2",
-        ])
+        Resource = concat(local.runner_fcvm_subnet_arns, local.runner_fcvm_sg_arns,
+        [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:key-pair/fcvm-ec2"])
       },
       {
         Sid      = "LaunchTaggedRunnerInstance"
         Effect   = "Allow"
         Action   = "ec2:RunInstances"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:instance/*"]
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner", "ec2:MetadataHttpTokens" = "required" }
           ArnEquals    = { "ec2:InstanceProfile" = aws_iam_instance_profile.runner[0].arn }
@@ -1437,17 +1527,17 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "LaunchTaggedRunnerENI"
         Effect   = "Allow"
         Action   = "ec2:RunInstances"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:network-interface/*"]
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner" }
-          ArnEquals    = { "ec2:Subnet" = local.runner_launch_subnet_arns }
+          ArnEquals    = { "ec2:Subnet" = local.runner_fcvm_subnet_arns }
         }
       },
       {
         Sid      = "LaunchEncryptedRunnerVolume"
         Effect   = "Allow"
         Action   = "ec2:RunInstances"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:volume/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:volume/*"]
         Condition = {
           StringEquals = { "aws:RequestTag/Role" = "github-runner" }
           Bool         = { "ec2:Encrypted" = "true" }
@@ -1457,7 +1547,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "TagOnlyDuringRunnerLaunch"
         Effect   = "Allow"
         Action   = "ec2:CreateTags"
-        Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
+        Resource = flatten([for r in local.runner_regions : [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:${kind}/*"]])
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
           "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
@@ -1467,7 +1557,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "UpdateRunnerLeaseOnly"
         Effect   = "Allow"
         Action   = "ec2:CreateTags"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:instance/*"]
         Condition = {
           StringEquals                = { "aws:ResourceTag/Role" = "github-runner" }
           "ForAllValues:StringEquals" = { "aws:TagKeys" = ["LeaseExpires", "RunnerSeenAt", "CapacityFailedAt"] }
@@ -1490,7 +1580,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "TerminateRunnerOnly"
         Effect   = "Allow"
         Action   = "ec2:TerminateInstances"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:instance/*"]
         Condition = {
           StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
         }
@@ -1501,7 +1591,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "ReapExistingTemporaryAMIBuilder"
         Effect   = "Allow"
         Action   = "ec2:TerminateInstances"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*" # builders only ever run in us-west-1a
         Condition = {
           StringEquals = { "aws:ResourceTag/Name" = "ami-builder-temp" }
         }
@@ -1983,7 +2073,10 @@ set +x
 # `next` after a job whose runner exited cleanly, and `after`, the runner
 # service's ExecStopPost, picks between `next` and poweroff. Any failure, or no
 # credential inside the wait, powers the host off, which terminates it.
-printf 'INSTANCE_ID=%s\nREGION=%s\nRUNNER_LABEL=%s\n' "$INSTANCE_ID" "$REGION" "$RUNNER_LABEL" > /etc/fcvm-runner.env
+# REGION (from IMDS above) is where THIS host is: EC2 calls about its own network and its ARN. The control plane (the SSM
+# bootstrap credential, the DynamoDB registration table) does not move with the runners: CONTROL_REGION stays put.
+CONTROL_REGION="${local.runner_control_region}"
+printf 'INSTANCE_ID=%s\nREGION=%s\nCONTROL_REGION=%s\nRUNNER_LABEL=%s\n' "$INSTANCE_ID" "$REGION" "$CONTROL_REGION" "$RUNNER_LABEL" > /etc/fcvm-runner.env
 cat > /etc/systemd/system/fcvm-runner-next.service <<'NEXT_JOB_SERVICE'
 [Unit]
 Description=Register this runner host for its next job, or power it off
@@ -2011,7 +2104,7 @@ REG_TOKEN=""
 bootstrap_ssm() {
   # Bound credential operations, including SDK credential discovery and retry.
   AWS_MAX_ATTEMPTS=1 timeout --kill-after=2 12 aws ssm "$@" \
-    --region "$REGION" --cli-connect-timeout 3 --cli-read-timeout 5
+    --region "$${CONTROL_REGION:-$REGION}" --cli-connect-timeout 3 --cli-read-timeout 5
 }
 runner_bootstrap_exit() {
   local status=$?
@@ -2062,7 +2155,7 @@ if [ "$MODE" = next ]; then
   # refuses to configure over the local files that registration left.
   rm -f .runner .credentials .credentials_rsaparams
   if ! PREVIOUS_RUNNER_ID=$(aws dynamodb get-item --table-name "$REGISTRATION_TABLE" \
-      --key "$REGISTRATION_KEY" --consistent-read --region "$REGION" --output json \
+      --key "$REGISTRATION_KEY" --consistent-read --region "$${CONTROL_REGION:-$REGION}" --output json \
       | jq -er --arg arn "$INSTANCE_ARN" --arg instance_id "$INSTANCE_ID" \
         --arg runner_name "$RUNNER_NAME" '.Item | select(.InstanceArn.S == $arn
         and .State.S == "registered" and .InstanceId.S == $instance_id
@@ -2134,12 +2227,12 @@ if ! aws dynamodb put-item \
     --table-name "$REGISTRATION_TABLE" \
     --item "$REGISTRATION_ITEM" \
     "$${CLAIM[@]}" \
-    --region "$REGION"; then
+    --region "$${CONTROL_REGION:-$REGION}"; then
   REGISTRATION_ROW=$(aws dynamodb get-item \
     --table-name "$REGISTRATION_TABLE" \
     --key "$REGISTRATION_KEY" \
     --consistent-read \
-    --region "$REGION" \
+    --region "$${CONTROL_REGION:-$REGION}" \
     --output json 2>/dev/null || true)
   if ! printf '%s' "$REGISTRATION_ROW" | jq -e \
       --arg arn "$INSTANCE_ARN" \
@@ -2186,7 +2279,7 @@ fi
 trap - EXIT
 RUNNER_JOB
 chmod 755 /usr/local/sbin/fcvm-runner-job
-INSTANCE_ID="$INSTANCE_ID" REGION="$REGION" RUNNER_LABEL="$RUNNER_LABEL" /usr/local/sbin/fcvm-runner-job first
+INSTANCE_ID="$INSTANCE_ID" REGION="$REGION" CONTROL_REGION="$CONTROL_REGION" RUNNER_LABEL="$RUNNER_LABEL" /usr/local/sbin/fcvm-runner-job first
 EOF
 
   # EC2 receives the script above without its whole-line comments. They stay here for
@@ -2267,7 +2360,97 @@ data "archive_file" "runner_cleanup" {
       from botocore.config import Config
       from datetime import datetime, timezone, timedelta
 
-      ec2 = boto3.client('ec2', region_name='us-west-1')
+      # ------------------------------------------------------------------ runner regions
+      # The control plane (SSM, DynamoDB, these Lambdas) never moves. The RUNNERS can: RUNNER_REGIONS is the ordered list
+      # of regions they may run in, the PRIMARY first (where new ones launch). During a move it lists both, so hosts in
+      # the old region are still counted, reused and reaped until they drain. One region (the default) behaves exactly
+      # as before: every call passes straight through to that region's client.
+      CONTROL_REGION = 'us-west-1'
+      RUNNER_REGIONS = json.loads(os.environ.get('RUNNER_REGIONS') or '["us-west-1"]')
+      PRIMARY_REGION = RUNNER_REGIONS[0]
+
+      class RegionalEC2:
+          """EC2 across the runner regions behind the client calls the rest of this file already makes.
+
+          Reads fan out to every region. A call about one instance goes to the region that owns it, learned from any
+          read or launch and remembered; an instance never seen is looked for before it is written. Image lookups
+          use the primary region.
+          """
+          NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
+
+          def __init__(self, regions):
+              self.regions = list(regions)
+              self.primary = self.regions[0]
+              self.clients = {region: boto3.client('ec2', region_name=region) for region in self.regions}
+              self.owner = {}
+
+          def region_of(self, instance_id):
+              return self.owner.get(instance_id, self.primary)
+
+          def _learn(self, region, response):
+              for reservation in response.get('Reservations', []):
+                  for instance in reservation.get('Instances', []):
+                      # a malformed record (no id) is the caller's to reject, never a crash here
+                      if isinstance(instance, dict) and instance.get('InstanceId'):
+                          self.owner[instance['InstanceId']] = region
+
+          @staticmethod
+          def _code(error):
+              response = getattr(error, 'response', None)
+              return response.get('Error', {}).get('Code') if isinstance(response, dict) else None
+
+          def describe_instances(self, **kwargs):
+              if len(self.regions) == 1:
+                  response = self.clients[self.primary].describe_instances(**kwargs)
+                  self._learn(self.primary, response)
+                  return response
+              reservations, missing = [], None
+              for region in self.regions:
+                  try:
+                      response = self.clients[region].describe_instances(**kwargs)
+                  except Exception as error:
+                      # asking for an id that lives in the other region is not an error, unless NO region has it
+                      if kwargs.get('InstanceIds') and self._code(error) in self.NOT_FOUND:
+                          missing = error
+                          continue
+                      raise
+                  self._learn(region, response)
+                  reservations.extend(response.get('Reservations', []))
+              if not reservations and missing is not None:
+                  raise missing
+              return {'Reservations': reservations}
+
+          def _by_region(self, instance_ids):
+              groups = {}
+              for instance_id in instance_ids:
+                  groups.setdefault(self.region_of(instance_id), []).append(instance_id)
+              return groups
+
+          def _locate(self, instance_ids):
+              if len(self.regions) > 1 and any(i not in self.owner for i in instance_ids):
+                  try:
+                      self.describe_instances(InstanceIds=[i for i in instance_ids if i not in self.owner])
+                  except Exception:
+                      pass
+
+          def create_tags(self, Resources, Tags, **kwargs):
+              self._locate(Resources)
+              response = None
+              for region, ids in self._by_region(Resources).items():
+                  response = self.clients[region].create_tags(Resources=ids, Tags=Tags, **kwargs)
+              return response
+
+          def terminate_instances(self, InstanceIds, **kwargs):
+              self._locate(InstanceIds)
+              response = None
+              for region, ids in self._by_region(InstanceIds).items():
+                  response = self.clients[region].terminate_instances(InstanceIds=ids, **kwargs)
+              return response
+
+          def __getattr__(self, name):
+              return getattr(self.clients[self.primary], name)
+
+      ec2 = RegionalEC2(RUNNER_REGIONS)
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
@@ -2277,7 +2460,10 @@ data "archive_file" "runner_cleanup" {
           connect_timeout=2, read_timeout=2, retries={'total_max_attempts': 1}))
 
       REPO = 'ejc3/fcvm'
-      REGION = 'us-west-1'
+      # A runner's region: the one that owns it (learned from the instance reads), else the primary. The control plane
+      # (SSM, DynamoDB, Lambda) stays in CONTROL_REGION.
+      def instance_region(instance_id):
+          return ec2.region_of(instance_id)
       # The launcher tags every instance with the registration handshake its
       # user data runs. Only this value has a DynamoDB row to read.
       PROTOCOL_TAG = 'RunnerRegistrationProtocol'
@@ -2743,7 +2929,7 @@ data "archive_file" "runner_cleanup" {
           account_id = os.environ.get('RUNNER_ACCOUNT_ID', '')
           if not account_id.isdigit() or len(account_id) != 12:
               return None
-          return f'arn:aws:ec2:{REGION}:{account_id}:instance/{instance_id}'
+          return f'arn:aws:ec2:{instance_region(instance_id)}:{account_id}:instance/{instance_id}'
 
       def parse_registration(instance_id, item):
           """Validate one registration row and return its typed identity."""
@@ -3246,7 +3432,7 @@ data "archive_file" "runner_cleanup" {
                   match = re.fullmatch(r'/github-runner/bootstrap/(i-[0-9a-f]{8}(?:[0-9a-f]{9})?)', name)
                   if not match or metadata.get('Type') != 'SecureString':
                       continue
-                  expected_arn = f'arn:aws:ec2:{REGION}:{account}:instance/{match.group(1)}'
+                  expected_arn = f'arn:aws:ec2:{instance_region(match.group(1))}:{account}:instance/{match.group(1)}'
                   try:
                       tags = {tag['Key']: tag['Value'] for tag in bootstrap_ssm.list_tags_for_resource(
                           ResourceType='Parameter', ResourceId=name)['TagList']}
@@ -4015,6 +4201,7 @@ resource "aws_lambda_function" "runner_cleanup" {
       MAX_RUNNERS        = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
       REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
       RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
+      RUNNER_REGIONS     = jsonencode(local.runner_regions)
     }
   }
 
@@ -4073,6 +4260,7 @@ resource "aws_lambda_function" "runner_reuse" {
       REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
       RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
       MAX_RUNNERS        = tostring(local.runner_max_per_arch)
+      RUNNER_REGIONS     = jsonencode(local.runner_regions)
     }
   }
 

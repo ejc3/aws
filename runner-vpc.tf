@@ -94,6 +94,26 @@ resource "aws_route_table_association" "runner_us_west_1c" {
 }
 
 locals {
+  # Where the fcvm metal runners may run, PRIMARY FIRST. New runners launch in the primary; every region listed is
+  # counted, reused, reaped and allowed by IAM. One entry is today. A move to Ohio (ohio.tf, prepared and idle) is two
+  # applies: ["us-east-2", "us-west-1"] (new runners in Ohio while the us-west-1 ones drain and are still reaped), then
+  # ["us-east-2"] once the old region is empty. The control plane (SSM, DynamoDB, the Lambdas) stays in us-west-1.
+  runner_regions        = ["us-west-1"]
+  runner_primary_region = local.runner_regions[0]
+  runner_networks = var.enable_github_runner ? {
+    "us-west-1" = { subnets = concat(aws_subnet.runner_us_west_1c, aws_subnet.runner), security_group = aws_security_group.runner[0] }
+    "us-east-2" = { subnets = aws_subnet.ohio_runner, security_group = aws_security_group.ohio_runner[0] }
+  } : {}
+  runner_fcvm_launch_subnets = var.enable_github_runner ? local.runner_networks[local.runner_primary_region].subnets : []
+  runner_fcvm_security_group = var.enable_github_runner ? local.runner_networks[local.runner_primary_region].security_group : null
+  # Every subnet and security group in any listed region, for IAM (a host in the old region must stay manageable).
+  runner_fcvm_subnet_arns = var.enable_github_runner ? flatten([for r in local.runner_regions : local.runner_networks[r].subnets[*].arn]) : []
+  runner_fcvm_sg_arns     = var.enable_github_runner ? [for r in local.runner_regions : local.runner_networks[r].security_group.arn] : []
+  # Where the control plane lives: SSM bootstrap credentials, the registration table, the Lambdas.
+  runner_control_region = var.aws_region
+}
+
+locals {
   # Every subnet a runner may launch into, most preferred first. The webhook Lambda
   # tries every instance type in one subnet before the next (LAUNCH_SUBNETS), and the
   # launch and IPv6 IAM grants are pinned to exactly this list, so a subnet the
@@ -202,10 +222,10 @@ resource "aws_iam_role_policy" "runner" {
         Sid      = "AssignRunnerIpv6"
         Effect   = "Allow"
         Action   = "ec2:AssignIpv6Addresses"
-        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:network-interface/*"
+        Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:network-interface/*"]
         Condition = {
           StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
-          ArnEquals    = { "ec2:Subnet" = local.runner_launch_subnet_arns }
+          ArnEquals    = { "ec2:Subnet" = local.runner_fcvm_subnet_arns }
         }
       }
     ]

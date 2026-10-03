@@ -152,6 +152,16 @@ resource "aws_flow_log" "security_ohio_runner" {
   depends_on               = [aws_s3_bucket_policy.security_audit]
 }
 
+# The runner launcher says KeyName='fcvm-ec2' on every launch, and a key pair is regional. The SAME public key as the one in
+# us-west-1 and the parallel box's (fingerprint 5V+NL76VshPSFc9AHLAwWeVQ3qVUQv7M5CSzncf6k2Y= in all three).
+resource "aws_key_pair" "ohio_runner" {
+  provider   = aws.ohio
+  count      = var.enable_github_runner ? 1 : 0
+  key_name   = "fcvm-ec2"
+  public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2"
+  tags       = { Name = "fcvm-ec2" }
+}
+
 # ============================================================ runner AMIs
 # fcvm's pipeline publishes the runner AMIs in us-west-1 only, and the launcher picks its AMI by tag in its own region.
 # This keeps the newest two of each architecture copied to Ohio, tags included, so the launcher finds the current image
