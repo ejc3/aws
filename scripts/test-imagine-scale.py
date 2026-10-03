@@ -379,7 +379,9 @@ class WiringTest(unittest.TestCase):
         self.assertIn("project:${local.imagine_vercel_project}:environment:production", waker)
         self.assertNotIn("StringLike", waker)
         deploy = self.block('resource "aws_iam_role" "imagine_deploy"')
-        self.assertIn('"repo:ejc3/imagine:ref:refs/heads/main"', deploy)
+        # The form GitHub issues for this repository: owner and repository by ID and name.
+        self.assertIn('"repo:ejc3@1694850/imagine@1403409773:ref:refs/heads/main"', deploy)
+        self.assertNotIn('"repo:ejc3/imagine:', deploy)
         self.assertNotIn("StringLike", deploy)
 
     def test_every_setting_the_function_reads_is_set(self):

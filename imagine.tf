@@ -827,6 +827,12 @@ resource "aws_iam_role_policy" "imagine_waker" {
   })
 }
 
+# GitHub names this repository in its tokens by owner and repository ID as well as by name
+# (ejc3@1694850/imagine@1403409773): the "immutable subject" form, which is what a
+# repository created now gets. A trust on the plain name never matches such a token, and a
+# trust on the IDs cannot be met by a different repository that later takes the same name.
+# Confirmed from a token issued to a workflow run in the repository on 2026-10-03.
+#
 # The image build: the deploy job of ejc3/imagine's CI, main branch only. It can push to the one
 # repository and invoke the one function. It cannot change a task definition, a role or
 # the task count, so the most a bad build can do is ship a bad image, which the service's
@@ -844,7 +850,7 @@ resource "aws_iam_role" "imagine_deploy" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:ejc3/imagine:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub" = "repo:ejc3@1694850/imagine@1403409773:ref:refs/heads/main"
         }
       }
     }]
