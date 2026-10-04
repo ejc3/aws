@@ -1021,6 +1021,33 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(sorted(served), sorted(tokens))
         self.assertIn("APP_REPOS           = jsonencode(keys(local.runner_app_repos))", FRONT_TF)
 
+    def test_repos_that_share_a_label_still_get_their_own_alarm(self):
+        # CloudWatch alarm names are unique per region: two repos named after one label would be
+        # one alarm that each apply rewrites for the other repo, so one cap would go unwatched.
+        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
+        served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
+        self.assertEqual([repo for repo, _, _ in rows], served, "every served repo's row must parse")
+        names = [alarm or label for _, label, alarm in rows]
+        self.assertEqual(len(names), len(set(names)), names)
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('alarm_name          = "too-many-app-runners-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"', alarm)
+
+    def test_every_served_repo_has_a_hook_made_with_its_own_token(self):
+        # A controller token is limited to one repo, so a hook made through another repo's
+        # provider alias fails at apply, and without a hook the repo waits for the reconcile.
+        served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
+        hooks = re.findall(r'resource "github_repository_webhook" "\w+" \{.*?\n\}', APP_TF, re.S)
+        self.assertEqual(len(hooks), len(served))
+        for repo in served:
+            owner, name = repo.split("/")
+            hook = [h for h in hooks if 'repository = "%s"' % name in h]
+            self.assertEqual(len(hook), 1, repo)
+            alias = re.search(r"provider   = github\.(\w+)", hook[0]).group(1)
+            provider = re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, APP_TF, re.S).group()
+            self.assertIn('owner = "%s"' % owner, provider, repo)
+            self.assertIn('runner_repo_pat["%s"].secret_string' % repo, provider, repo)
+            self.assertIn('events     = ["workflow_job"]', hook[0])
+
     def test_security_group_has_no_inbound_and_the_controller_is_serialized(self):
         sg = re.search(r'resource "aws_security_group" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
         self.assertNotIn("ingress", sg)

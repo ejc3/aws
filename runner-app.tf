@@ -29,9 +29,16 @@ locals {
 
   # One entry per served repo. `max` bounds that repo's concurrent hosts; it is separate from
   # fcvm's four per architecture, so these repos can never take fcvm's metal.
+  #
+  # dolphin-films (a downstream of dolphin-labs, dolphin-films.tf) asks for the same `dolphin`
+  # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
+  # so sharing the label shares nothing else: its cap of 2 is its own and it can never take one
+  # of dolphin-labs' 8. `alarm` names its per-repo alarm, which would otherwise collide with
+  # dolphin-labs' (both are named after the label).
   runner_app_repos = {
-    "CoderColton/colton-games"     = { label = "cc-games", max = 8 }
-    "dolphin-labs-hq/dolphin-labs" = { label = "dolphin", max = 8 }
+    "CoderColton/colton-games"      = { label = "cc-games", max = 8 }
+    "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
+    "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
   }
 
   runner_app_config = {
@@ -495,11 +502,12 @@ resource "aws_cloudwatch_metric_alarm" "app_runner_reconcile_silent" {
   treat_missing_data  = "breaching"
 }
 
-# Per repo: the combined alarm above fires only when BOTH repos are saturated together, so one
+# Per repo: the combined alarm above fires only when EVERY repo is saturated together, so one
 # repo over-launching on its own would go unseen. Each repo's LiveRunners above its own cap.
+# Named after the repo's label, or its `alarm` where two repos share a label.
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   for_each            = var.enable_github_runner ? local.runner_app_config : {}
-  alarm_name          = "too-many-app-runners-${each.value.label}"
+  alarm_name          = "too-many-app-runners-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 15 minutes
   threshold           = each.value.max
@@ -536,7 +544,7 @@ resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {
 # One workflow_job hook per repo, through the same API Gateway URL and with the same HMAC secret
 # as fcvm's hook; the front tells them apart by repository.full_name. Each hook is created with
 # that repo's own controller token (Webhooks RW, runner-repos.tf), read ephemerally so it never
-# enters state. A provider cannot for_each, hence one alias per owner.
+# enters state. A provider cannot for_each, hence one alias per repo (one per token).
 #
 # Gated separately because the tokens are put into their secrets by hand: until then there is
 # no secret version to read. A cold start creates the containers with this set false (README,
@@ -568,6 +576,14 @@ provider "github" {
   token = local.runner_app_webhooks ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-labs"].secret_string : null
 }
 
+# The same owner as dolphin_labs, but another token: each controller token is limited to one
+# repo, so dolphin-labs' cannot create a hook on dolphin-films.
+provider "github" {
+  alias = "dolphin_films"
+  owner = "dolphin-labs-hq"
+  token = local.runner_app_webhooks ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-films"].secret_string : null
+}
+
 resource "github_repository_webhook" "runner_app_colton_games" {
   count      = local.runner_app_webhooks ? 1 : 0
   provider   = github.colton_games
@@ -589,6 +605,23 @@ resource "github_repository_webhook" "runner_app_dolphin_labs" {
   count      = local.runner_app_webhooks ? 1 : 0
   provider   = github.dolphin_labs
   repository = "dolphin-labs"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+resource "github_repository_webhook" "runner_app_dolphin_films" {
+  count      = local.runner_app_webhooks ? 1 : 0
+  provider   = github.dolphin_films
+  repository = "dolphin-films"
   events     = ["workflow_job"]
   active     = true
 

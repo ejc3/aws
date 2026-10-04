@@ -933,6 +933,28 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   `colton_games_accounts_ready` names a secret. Do not set these names by hand in the Vercel project: Vercel
   refuses a second variable with the same key on a target, and the next apply would fail.
 
+### dolphin-films credentials
+
+`dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
+on Vercel, Google sign-in, a Supabase store) as four JSON secrets in us-west-1, split by environment so
+that production and non-production share nothing:
+
+- `dolphin-films/nonprod/auth` (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
+  `dolphin-films/nonprod/supabase` (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`): local development and Vercel
+  previews. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
+  without printing it:
+  `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth
+  --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
+  Never onto a command line, into a file in a repo or a commit.
+- `dolphin-films/prod/auth` and `dolphin-films/prod/supabase`: production. Admins only; a dev box gets
+  `AccessDeniedException`, on purpose. The Vercel project's Production environment is set from them by hand.
+- The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
+  `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
+  (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.
+- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`. Terraform never
+  reads these secrets, so no value reaches state.
+- CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
+
 ### Claude Code Sync
 
 All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:

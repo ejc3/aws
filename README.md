@@ -155,7 +155,7 @@ state or a different account is not a supported bootstrap and can collide with o
 live infrastructure. Recover the backend state first, or inventory and import every
 pre-existing resource before any full apply.
 
-The alert address, runner PAT, SSH-key backup and the two app-runner controller tokens use
+The alert address, runner PAT, SSH-key backup and the three app-runner controller tokens use
 Terraform-managed containers whose payloads are intentionally kept out of Terraform state.
 For a true cold start, create those containers only after state/import reconciliation is
 complete. `enable_runner_app_webhooks=false` keeps this apply from reading the controller
@@ -168,19 +168,22 @@ terraform apply -var enable_runner_app_webhooks=false \
   -target=aws_secretsmanager_secret.fcvm_ec2_ssh_key \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["CoderColton/colton-games"]' \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]' \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-films"]' \
   -target=aws_secretsmanager_secret.elevenlabs_api_key
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
 console or AWS CLI without printing their values.
 
-The runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` also need one
-controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
+The runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and
+`dolphin-labs-hq/dolphin-films` also need one controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
 containers created above, from `runner-repos.tf`; Terraform never holds the value). The full
-apply reads both to create the repos' webhooks, so populate them before it. Each is a
+apply reads them all to create the repos' webhooks, so populate them before it. That holds
+for a repo added later too: apply only its container (the same command with that one `-target`;
+nothing untargeted changes, so the existing hooks stay), put its token, then run the full apply. Each is a
 fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
-org admin for `dolphin-labs`. Put each value without echoing it:
+org admin for `dolphin-labs` and for `dolphin-films`. Put each value without echoing it:
 
 ```bash
 read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
@@ -206,6 +209,29 @@ and claude-master has no fallback. Populate it from the key file (read from the 
 aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/backup-api-key \
   --secret-string file://$HOME/claude_api.txt && shred -u ~/claude_api.txt
 ```
+
+The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
+kind. Terraform never reads them, so an apply does not wait for them; the site and the builders do. Production
+and non-production get different values throughout: a Google OAuth client each, an `AUTH_SECRET` each, a
+Supabase key each.
+
+| Secret | JSON keys | Readers besides administration |
+|---|---|---|
+| `dolphin-films/prod/auth` | `AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` | none |
+| `dolphin-films/prod/supabase` | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | none |
+| `dolphin-films/nonprod/auth` | as `prod/auth` | dev-server-role (the metal boxes) |
+| `dolphin-films/nonprod/supabase` | as `prod/supabase` | dev-server-role |
+
+Write each as a JSON file readable only by you, put it, and remove the file:
+
+```bash
+aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-films/<env>/<kind> \
+  --secret-string file://<a 0600 JSON file> && shred -u <that file>
+```
+
+The Vercel project is set by hand from these (`terraform output dolphin_films_vercel_env` lists the names):
+Production from `prod/*`, Preview from `nonprod/*`, each variable marked sensitive. The bring-up order is in
+the header of `dolphin-films.tf`.
 
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
@@ -2118,6 +2144,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Starter user-level agent instructions (`~/.codex/AGENTS.md` with `~/.claude/CLAUDE.md` linked to it), created only for an account that has neither | `user-agents.tf`, `scripts/user-agents.md` (the text), `scripts/user-agents-seed.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
+| dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site on Vercel with Google sign-in and a Supabase store; its credentials per environment, and its CI runners) | `dolphin-films.tf` (secret containers and readers; bring-up order in its header), `runner-repos.tf` and `runner-app.tf` (served under the `dolphin` label) |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,
