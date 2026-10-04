@@ -910,6 +910,29 @@ Available if a task needs them; neither needs a key on disk.
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
 
+### Colton Games accounts credentials
+
+`colton-games-accounts.tf` holds what the colton-games site needs for Google sign-in, site admins and browser
+push as four JSON secrets in us-west-1, split by environment so that production and non-production share
+nothing. `README.md` ("Colton Games accounts") has the owner's steps.
+
+- `colton-games/nonprod/auth` (`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `SITE_ADMIN_EMAILS`) and
+  `colton-games/nonprod/push` (`NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`): the dev
+  boxes and Vercel previews. Readable by dev-server-role, nextjs-dev-role and admins. Export one without
+  printing it:
+  `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id colton-games/nonprod/auth
+  --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
+  Never onto a command line, into a file in a repo or a commit. `AUTH_SECRET` is not in it: a dev box makes
+  its own (`openssl rand -base64 33`).
+- `colton-games/prod/auth` and `colton-games/prod/push`: production. Admins only; a dev box gets
+  `AccessDeniedException`, on purpose.
+- The site admins' addresses exist only as the value of `SITE_ADMIN_EMAILS` (the secret, Terraform state and
+  Vercel). Never write one into a file, a test, a commit or a pull request, in this repository or the games
+  one; use a made-up address.
+- Terraform writes the Vercel variables (Production from `prod/*`, Preview from `nonprod/*`) once
+  `colton_games_accounts_ready` names a secret. Do not set these names by hand in the Vercel project: Vercel
+  refuses a second variable with the same key on a target, and the next apply would fail.
+
 ### Claude Code Sync
 
 All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:
