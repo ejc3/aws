@@ -305,3 +305,14 @@ resource "aws_cloudwatch_metric_alarm" "ami_replicator_errors" {
   treat_missing_data  = "notBreaching"
   dimensions          = { FunctionName = aws_lambda_function.ami_replicator[0].function_name }
 }
+
+# Spot vCPU quota. Ohio's default (640) was exactly full with 8 metal runners on 2026-10-04, and the launcher
+# (which has no fallback to another region) logged 18 MaxSpotInstanceCountExceeded errors an hour. us-west-1's is 1148,
+# which is what the runners alone needed there; the parallel boxes (2 x 192 vCPU, moving here) add 384.
+# L-34B43A08 = "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests".
+resource "aws_servicequotas_service_quota" "ohio_spot_standard" {
+  provider     = aws.ohio
+  service_code = "ec2"
+  quota_code   = "L-34B43A08"
+  value        = 1536
+}
