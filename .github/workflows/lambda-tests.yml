@@ -128,6 +128,9 @@ jobs:
       - name: Dev-box AI services and price lists (ElevenLabs key readers, public prices only)
         run: python3 -S -B scripts/test-dev-ai-services.py
 
+      - name: Colton Games accounts (production for administration only, nothing read or written until the gate names a secret)
+        run: python3 -S -B scripts/test-colton-games-accounts.py
+
       - name: Windows playtest box (dev-box-only access, no peer route, kept game disk, 1h idle stop)
         run: python3 -S -B scripts/test-wbox.py
       - name: codex-restart (running vs installed, refuses over running commands, restarts only stale daemons)

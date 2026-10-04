@@ -910,6 +910,96 @@ Roll this out in order; do not collapse the safety gates into one apply:
 Every gate change is a reviewed, committed Terraform change. Do not disable either gate
 after its protected resources exist; `prevent_destroy` is intended to stop that rollback.
 
+### Colton Games accounts: sign-in, site admins and push
+
+`colton-games-accounts.tf` holds what the site's accounts features need outside the games
+repository. Sign-in is optional and stays off in an environment until that environment has
+`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` and `AUTH_SECRET`. Production and non-production share
+no credential, so a session, an admin grant or a push subscription made in one means nothing
+in the other.
+
+Four JSON secrets in us-west-1 hold the values that come from outside. Terraform creates the
+containers; the owner puts the values.
+
+| Secret | JSON keys (all strings) | Readers besides administration | Written to Vercel |
+|---|---|---|---|
+| `colton-games/prod/auth` | `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `SITE_ADMIN_EMAILS` | none | Production |
+| `colton-games/prod/push` | `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | none | Production |
+| `colton-games/nonprod/auth` | as `prod/auth` | dev-server-role, nextjs-dev-role | Preview |
+| `colton-games/nonprod/push` | as `prod/push` | dev-server-role, nextjs-dev-role | Preview |
+
+`AUTH_SECRET` is in none of them: Terraform generates one per environment and writes it to
+Vercel only, as it does for `MP_COOKIE_SECRET`. `SITE_ADMIN_EMAILS` is the comma-separated
+list of the site admins' Google addresses. No repository holds that list: it exists in the
+secret, in Terraform state and in Vercel. Every variable is sensitive in Vercel, each has
+exactly one target, and nothing goes to Development. `NEXT_PUBLIC_VAPID_PUBLIC_KEY` is the one name the browser sees, because a push
+subscription needs the public key in the page.
+
+`colton_games_accounts_ready` in the same file is the gate. Reading a secret that has no
+value fails every plan of this repository, so Terraform reads only the secrets the gate
+names and writes only their variables. It starts empty. Change its default in a commit, not
+with `-var`: a later plan without the flag would propose deleting the variables.
+
+The owner's steps, in order:
+
+1. Merge with the gate empty, then plan and apply on a jumpbox. Expect 13 to add (four
+   secrets, four secret policies, one IAM policy with two attachments, two generated
+   `AUTH_SECRET`s), none in Vercel, and an empty follow-up plan.
+2. Create two Google OAuth clients of type "Web application", one per environment. Give
+   each the redirect URI `https://<hostname>/api/auth/callback/google` for every hostname
+   that serves its environment:
+   - production: `cc-games.org`, and `colton-games.vercel.app` because Vercel's own name also
+     serves. The other production names redirect to `cc-games.org` before sign-in starts.
+   - non-production: each dev-box site (`<name>.cc-games.dev`), `http://localhost:<port>`
+     for a local run, and each preview hostname that should offer sign-in. Google accepts no
+     wildcard, and a preview's per-deploy address is new every time, so only a stable
+     address can be registered. On any other preview the sign-in button ends at Google's
+     `redirect_uri_mismatch` page.
+
+   A Google Cloud project whose consent screen is in testing admits only its listed test
+   users, so production's must be published.
+3. Put each value from a JSON file only you can read, then remove the file:
+
+   ```bash
+   aws secretsmanager put-secret-value --region us-west-1 --secret-id colton-games/<env>/auth \
+     --secret-string file://<a 0600 JSON file> && shred -u <that file>
+   ```
+
+4. Set the gate's default to `["prod/auth", "nonprod/auth"]` in a commit, then plan and apply.
+   Expect eight `vercel_project_environment_variable.colton_games_accounts` to add
+   (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` and `SITE_ADMIN_EMAILS`, once for
+   `production` and once for `preview`) and nothing else. The plan refuses, naming the
+   secret and key and never the value, when a key is missing, a value is in the wrong key,
+   or both environments were given the same OAuth client.
+5. Redeploy production. A deployment reads its environment when it is built; previews get
+   theirs on their next build.
+6. Verify:
+   - `terraform output colton_games_accounts_vercel_env` lists the four names under each target,
+     and a new plan is empty.
+   - `curl -s -o /dev/null -w '%{http_code}\n' https://cc-games.org/api/auth/providers` prints
+     `200`. It prints `404` while sign-in is off.
+   - Signing in on production works. An account on the list is a site admin there, and any
+     other account is not.
+   - On a dev box, `aws secretsmanager get-secret-value --region us-west-1 --secret-id
+     colton-games/prod/auth --query Name --output text` fails with `AccessDeniedException`,
+     and the same command for `colton-games/nonprod/auth` prints the name.
+7. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
+   put `colton-games/prod/push` and `colton-games/nonprod/push` (`VAPID_SUBJECT` is an
+   `https://` address of the site), add both names to the gate and repeat steps 4 to 6.
+
+Later changes: a new admin list or OAuth client is one `put-secret-value` of the whole JSON,
+one apply and a redeploy. `terraform apply
+-replace='random_password.colton_games_auth_secret["production"]'` makes a new `AUTH_SECRET`
+and signs everyone out of that environment. The values pass through Terraform state, which
+only administration can read, like the other games secrets.
+
+Not managed here: the Google OAuth clients (Google has no API for them), a stable hostname
+for preview sign-in, and the database. The Supabase project came from the Vercel
+integration; Production and Preview already hold its URL, its server key and
+`SKYHOOK_LEADERBOARD_ENVIRONMENT`, and the accounts migrations in the games repository are
+applied by hand, because `games-mp-migrate` runs only the multiplayer ones. A dev box reads
+`colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
+
 ## GitHub Actions and package infrastructure
 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
@@ -2020,6 +2110,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
+| Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Windows playtest box (g4dn.xlarge, Server 2025, persistent D: game disk, reachable from the dev boxes only, `wbox up` / `wbox down` / `wbox run` / `wbox launch`, stops after 1 idle hour) | `wbox.tf`, `scripts/wbox.sh` |
 | Shared claude-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claude-master-server.tf`, `claude-master-tunnel.tf`, `scripts/claude-master-login.sh --server`, `scripts/claude-master-enroll.sh`, `scripts/claude-master-mac-bundle.sh` |
