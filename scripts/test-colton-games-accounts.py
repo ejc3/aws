@@ -3,7 +3,8 @@
 environment. Production's secrets are readable by the administration set only, non-production's
 also by the two dev roles. Terraform reads a secret and writes its variables to Vercel only
 once the checked-in gate names it; Production is written from prod and Preview from nonprod,
-never one variable for both. Offline."""
+never one variable for both. The account-saves switch (ACCOUNT_SAVES=on, not a secret) is
+written only to the targets its own gate names. Offline."""
 import re
 import unittest
 from pathlib import Path
@@ -138,7 +139,8 @@ class GateTests(unittest.TestCase):
             'for key in concat(local.colton_games_accounts_secrets[name].keys, endswith(name, "/auth") ? ["AUTH_SECRET"] : []) :',
             env)
         self.assertIn(']) : "${entry.key}/${entry.target}" => entry', env)
-        self.assertEqual(re.findall(r'^resource "vercel_\w+" "(\w+)"', TF, re.M), ["colton_games_accounts"])
+        self.assertEqual(re.findall(r'^resource "vercel_\w+" "(\w+)"', TF, re.M),
+                         ["colton_games_accounts", "colton_games_account_saves"])
         self.assertIn("for_each = local.colton_games_accounts_vercel_env",
                       block("vercel_project_environment_variable", "colton_games_accounts"))
 
@@ -161,7 +163,11 @@ class VercelTests(unittest.TestCase):
     def test_every_variable_is_sensitive(self):
         variable = block("vercel_project_environment_variable", "colton_games_accounts")
         self.assertIn("sensitive  = true", variable)
-        self.assertNotRegex(CODE, r"sensitive\s*=\s*false")
+        self.assertNotRegex(variable, r"sensitive\s*=\s*false")
+        # The one variable that is not: the account-saves switch, which holds no value from a secret.
+        self.assertEqual(len(re.findall(r"sensitive\s*=\s*false", CODE)), 1)
+        self.assertRegex(block("vercel_project_environment_variable", "colton_games_account_saves"),
+                         r"sensitive\s*=\s*false")
 
     def test_only_the_push_public_key_reaches_the_browser(self):
         self.assertEqual(set(re.findall(r"NEXT_PUBLIC_\w+", CODE)), {"NEXT_PUBLIC_VAPID_PUBLIC_KEY"})
@@ -223,6 +229,59 @@ class VercelTests(unittest.TestCase):
             self.assertNotIn("random_password", out)
             self.assertNotIn("sensitive", out)
         self.assertEqual(len(re.findall(r"^output ", TF, re.M)), 2)
+
+
+class AccountSavesTests(unittest.TestCase):
+    """ACCOUNT_SAVES=on is the site's own switch for account saves. Unset means off, so the
+    switch is a variable that exists only on the targets the owner has named."""
+
+    def test_the_switch_is_off_everywhere_until_a_target_is_named(self):
+        gate = block("", "colton_games_account_saves_targets")
+        self.assertIn("type        = set(string)", gate)
+        self.assertRegex(gate, r"(?m)^  default     = \[\]$")
+        switch = block("vercel_project_environment_variable", "colton_games_account_saves")
+        self.assertIn("for_each = var.colton_games_account_saves_targets", switch)
+        self.assertIn("project_id = local.colton_games_vercel_project_id", switch)
+
+    def test_the_site_reads_exactly_this_name_and_value(self):
+        # lib/saves/origins.ts in the games repository: environment.ACCOUNT_SAVES === 'on',
+        # and "ON", "true" or "1" are off.
+        switch = block("vercel_project_environment_variable", "colton_games_account_saves")
+        self.assertIn('key        = "ACCOUNT_SAVES"', switch)
+        self.assertIn('value      = "on"', switch)
+        self.assertEqual(len(re.findall(r'^\s+key\s*=\s*"ACCOUNT_SAVES"$', CODE, re.M)), 1)
+
+    def test_each_target_is_switched_on_its_own_and_development_never(self):
+        gate = block("", "colton_games_account_saves_targets")
+        # Only the two targets the accounts variables go to: production and preview.
+        self.assertIn(
+            "alltrue([for target in var.colton_games_account_saves_targets : "
+            "contains(values(local.colton_games_accounts_vercel_target), target)])", gate)
+        switch = block("vercel_project_environment_variable", "colton_games_account_saves")
+        self.assertIn("target     = [each.key]", switch)
+        self.assertNotIn("development", CODE)
+
+    def test_the_switch_is_not_a_secret_and_reads_none(self):
+        switch = block("vercel_project_environment_variable", "colton_games_account_saves")
+        for source in ("secretsmanager", "random_password", "vercel_values", "payload"):
+            self.assertNotIn(source, switch)
+        # No fifth container and no second secret read for it.
+        self.assertEqual(sorted(secrets()), NAMES)
+        self.assertEqual(len(re.findall(r'^(?:data|ephemeral) "aws_secretsmanager_secret_version"', TF, re.M)), 1)
+
+    def test_saves_cannot_be_switched_on_before_that_targets_sign_in(self):
+        self.assertIn(
+            "colton_games_accounts_target_env    = { for env, target in local.colton_games_accounts_vercel_target : target => env }",
+            TF)
+        switch = block("vercel_project_environment_variable", "colton_games_account_saves")
+        self.assertEqual(len(re.findall(r"^\s+precondition \{", switch, re.M)), 1)
+        self.assertIn(
+            'condition     = contains(var.colton_games_accounts_ready, '
+            '"${local.colton_games_accounts_target_env[each.key]}/auth")', switch)
+
+    def test_the_output_names_the_switch_where_it_is_on(self):
+        env = block("", "colton_games_accounts_vercel_env")
+        self.assertIn('contains(var.colton_games_account_saves_targets, target) ? ["ACCOUNT_SAVES"] : []', env)
 
 
 if __name__ == "__main__":

@@ -64,9 +64,17 @@
 #      adds four variables per environment and changes nothing else.
 #   5. Redeploy: a deployment reads its environment when it is built.
 #   Push is the same later: make a key pair per environment, put */push, add both names.
+#   Account saves come after sign-in works: apply the games repository's saves migration by
+#   hand, then name the target in var.colton_games_account_saves_targets (below).
 # A value changed later is one put-secret-value, one apply and a redeploy. A value that is
 # missing, is in the wrong key, or is the same in both environments fails the plan with the
 # secret's name.
+#
+# ACCOUNT SAVES. The site keeps a signed-in player's saved games in their account only where
+# ACCOUNT_SAVES is exactly `on` (lib/saves in the games repository); unset is off. It is a
+# switch, not a secret, so it has no container: var.colton_games_account_saves_targets names
+# the Vercel targets that get the variable, and it starts empty. Production is the one to
+# name. The site trusts no preview address for saves, so the switch does nothing on Preview.
 #
 # WHAT IS NOT HERE, because it cannot be or already exists:
 #   Google OAuth clients   Google has no API for Web application clients (cloudflare.tf).
@@ -190,6 +198,7 @@ data "aws_secretsmanager_secret_version" "colton_games_accounts" {
 locals {
   colton_games_accounts_vercel_target = { prod = "production", nonprod = "preview" }
   colton_games_accounts_other_target  = { production = "preview", preview = "production" }
+  colton_games_accounts_target_env    = { for env, target in local.colton_games_accounts_vercel_target : target => env }
 
   # "<KEY>/<target>" => the secret and JSON key its value comes from. Built from the gate and
   # the table above only, never from a value: for_each keys must not be sensitive. An auth
@@ -270,6 +279,43 @@ resource "vercel_project_environment_variable" "colton_games_accounts" {
 }
 
 # -------------------------------------------------------------------------------------
+# Account saves: the site's own switch, per target
+# -------------------------------------------------------------------------------------
+
+variable "colton_games_account_saves_targets" {
+  description = "Vercel targets of the colton-games project where account saves are switched on (ACCOUNT_SAVES=on): production, preview, or both. Starts empty, which is off everywhere. Add a target to this default, in a commit, after that target's sign-in works and the saves migration is applied (colton-games-accounts.tf)."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for target in var.colton_games_account_saves_targets : contains(values(local.colton_games_accounts_vercel_target), target)])
+    error_message = "colton_games_account_saves_targets may name only production and preview."
+  }
+}
+
+# Not sensitive: the value is the word `on`, and anyone can see whether the site offers saves.
+# One variable per target, so each is switched on by itself. Saves belong to a signed-in
+# account, so a target cannot be named before its auth secret is in the gate above.
+resource "vercel_project_environment_variable" "colton_games_account_saves" {
+  for_each = var.colton_games_account_saves_targets
+
+  team_id    = var.vercel_team_id
+  project_id = local.colton_games_vercel_project_id
+  key        = "ACCOUNT_SAVES"
+  value      = "on"
+  target     = [each.key]
+  sensitive  = false
+  comment    = "colton-games account saves switch; managed by ejc3/aws colton-games-accounts.tf"
+
+  lifecycle {
+    precondition {
+      condition     = contains(var.colton_games_accounts_ready, "${local.colton_games_accounts_target_env[each.key]}/auth")
+      error_message = "Account saves need sign-in: add ${local.colton_games_accounts_target_env[each.key]}/auth to colton_games_accounts_ready before naming ${each.key} in colton_games_account_saves_targets."
+    }
+  }
+}
+
+# -------------------------------------------------------------------------------------
 # Outputs
 # -------------------------------------------------------------------------------------
 
@@ -280,9 +326,12 @@ output "colton_games_accounts_secrets" {
 
 # Names only.
 output "colton_games_accounts_vercel_env" {
-  description = "The accounts variables Terraform writes to the colton-games Vercel project now, per target (names only). A target is empty until var.colton_games_accounts_ready names its secrets."
+  description = "The accounts variables Terraform writes to the colton-games Vercel project now, per target (names only). A target is empty until var.colton_games_accounts_ready names its secrets or var.colton_games_account_saves_targets names it."
   value = {
     for target in values(local.colton_games_accounts_vercel_target) :
-    target => sort([for entry in local.colton_games_accounts_vercel_env : entry.key if entry.target == target])
+    target => sort(concat(
+      [for entry in local.colton_games_accounts_vercel_env : entry.key if entry.target == target],
+      contains(var.colton_games_account_saves_targets, target) ? ["ACCOUNT_SAVES"] : [],
+    ))
   }
 }

@@ -940,6 +940,13 @@ value fails every plan of this repository, so Terraform reads only the secrets t
 names and writes only their variables. It starts empty. Change its default in a commit, not
 with `-var`: a later plan without the flag would propose deleting the variables.
 
+`ACCOUNT_SAVES` is the site's switch for keeping a signed-in player's saved games in their
+account. The site reads exactly `on`; unset is off. It is not a secret, so it has no
+container and is not sensitive. A second gate, `colton_games_account_saves_targets`, names
+the Vercel targets that get it, each on its own, and also starts empty. Production is the
+one to name: the site trusts no preview address for saves, so the switch does nothing on
+Preview. A target cannot be named before its `auth` secret is in the first gate.
+
 The owner's steps, in order:
 
 1. Merge with the gate empty, then plan and apply on a jumpbox. Expect 13 to add (four
@@ -983,7 +990,22 @@ The owner's steps, in order:
    - On a dev box, `aws secretsmanager get-secret-value --region us-west-1 --secret-id
      colton-games/prod/auth --query Name --output text` fails with `AccessDeniedException`,
      and the same command for `colton-games/nonprod/auth` prints the name.
-7. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
+7. Account saves, when the site has them and only after step 6 passes for production:
+   - Apply the games repository's `supabase/migrations/20261004000000_account_saves.sql`
+     once, by hand, in the Supabase SQL editor. Nothing here applies it: `games-mp-migrate`
+     runs only the multiplayer migrations. Do this before the switch, or the site offers
+     saves with no tables behind them.
+   - Set the default of `colton_games_account_saves_targets` to `["production"]` in a
+     commit, then plan and apply. Expect one to add,
+     `vercel_project_environment_variable.colton_games_account_saves["production"]`, and
+     nothing else.
+   - Redeploy production.
+   - Verify: `terraform output colton_games_accounts_vercel_env` now lists `ACCOUNT_SAVES`
+     under `production` only, and `curl -s -o /dev/null -w '%{http_code}\n'
+     https://cc-games.org/storage-bridge` prints `200`. It prints `404` while saves are off.
+
+   To switch saves off again, take the target out of the default and apply, then redeploy.
+8. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
    put `colton-games/prod/push` and `colton-games/nonprod/push` (`VAPID_SUBJECT` is an
    `https://` address of the site), add both names to the gate and repeat steps 4 to 6.
 
