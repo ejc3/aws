@@ -144,6 +144,11 @@ class NetworkTests(unittest.TestCase):
         back = block(OHIO, 'resource "aws_route" "west2_to_ohio_pbox"')
         self.assertIn("aws_vpc.ohio_pbox.cidr_block", back)
 
+    def test_the_route_table_does_not_fight_its_separate_peering_route(self):
+        table = block(OHIO, 'resource "aws_route_table" "ohio_pbox"')
+        self.assertIn("ignore_changes = [route]", table)
+        self.assertNotIn("vpc_peering_connection_id", table)
+
     def test_peering_is_accepted_before_a_route_uses_it(self):
         for name in ("ohio_pbox_to_io_box", "west2_to_ohio_pbox"):
             self.assertIn("depends_on = [aws_vpc_peering_connection_accepter.ohio_pbox_io]",

@@ -72,6 +72,12 @@ resource "aws_route_table" "ohio_pbox" {
   }
 
   tags = { Name = "parallel-box-rt-ohio" }
+
+  # The route to the I/O box is its own resource (aws_route.ohio_pbox_to_io_box). Inline routes and aws_route on one table
+  # fight: without this each plan proposed stripping the peering route and putting the two defaults back.
+  lifecycle {
+    ignore_changes = [route]
+  }
 }
 
 resource "aws_subnet" "ohio_pbox" {
