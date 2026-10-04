@@ -32,6 +32,10 @@ resource "aws_ebs_volume" "parallel_work_2" {
   tags = {
     Name    = "parallel-box-2-work"
     Purpose = "persistent scratch for the second on-demand parallel box"
+    # Which copy is the real disk. The Ohio volumes are COPIES made when ohio-pbox.tf was applied, so exactly one of the two
+    # is live: the one in local.parallel_box_region. scripts/parallel-box.sh refuses to start a box on a volume that is not
+    # live, so a flip back to the other region cannot silently fork the work disk onto stale data.
+    Live = local.parallel_box_region == "us-west-2" ? "true" : "false"
   }
 
   lifecycle {

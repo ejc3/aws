@@ -9,7 +9,9 @@
 # watchdog, and the private path to the shared NFS scratch on the I/O box, which stays in us-west-2.
 #
 # WHICH REGION A `pbox` COMMAND USES is local.parallel_box_region, published as /infra/parallel-box for the dev boxes.
-# Both sites are fully wired and IAM covers both, so the move is that one value, and so is going back.
+# Both sites are fully wired and IAM covers both, so the move is that one value. The volumes are COPIES, though, so only
+# the region's own is live (tag Live) and `pbox up` refuses the other: going back means copying the Ohio disks to
+# us-west-2 first, never just flipping the value.
 #
 # EBS is AZ-bound, so the volumes pin the box to local.ohio_pbox_az. 2c is the cheapest pool and scores 3; 2a scores 3
 # and costs $2.48; 2b scores 1.
@@ -17,7 +19,8 @@
 locals {
   ohio_pbox_az = "us-east-2c"
 
-  # Where `pbox` launches. us-west-2 until the owner moves it; the old volumes, template and watchdog stay in place.
+  # Where `pbox` launches. Flip it only with the boxes down and the volume snapshots taken just before (apply this file,
+  # then flip, in quick succession): work written to the old region's disks after the snapshot is not in the copy.
   parallel_box_region = "us-west-2"
 
   # The two persistent volumes being copied, by box number: the us-west-2 volume, its size and its Name tag.
@@ -231,6 +234,9 @@ resource "aws_ebs_volume" "ohio_parallel_work" {
   tags = {
     Name    = each.value.name
     Purpose = "persistent scratch for the on-demand 192-core box"
+    # A COPY until local.parallel_box_region is us-east-2; then this is the live disk and the us-west-2 one is the stale
+    # copy. `pbox up` refuses a volume whose Live tag is false (scripts/parallel-box.sh).
+    Live = local.parallel_box_region == "us-east-2" ? "true" : "false"
   }
 
   lifecycle {

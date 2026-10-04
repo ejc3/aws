@@ -112,6 +112,28 @@ class DataTests(unittest.TestCase):
             self.assertIn("prevent_destroy = true", (ROOT / f).read_text(), f)
 
 
+class LiveCopyTests(unittest.TestCase):
+    """The Ohio volumes are copies: only one region's is live, and the script refuses the other (a flip back must not
+    silently fork the work disk onto stale data)."""
+
+    def test_each_volume_carries_a_live_tag_that_follows_the_pointer(self):
+        west1 = block((ROOT / "parallel-box.tf").read_text(), 'resource "aws_ebs_volume" "parallel_work"')
+        west2 = block((ROOT / "parallel-box2.tf").read_text(), 'resource "aws_ebs_volume" "parallel_work_2"')
+        for west in (west1, west2):
+            self.assertIn('Live = local.parallel_box_region == "us-west-2" ? "true" : "false"', west)
+        ohio = block(OHIO, 'resource "aws_ebs_volume" "ohio_parallel_work"')
+        self.assertIn('Live = local.parallel_box_region == "us-east-2" ? "true" : "false"', ohio)
+
+    def test_pbox_up_refuses_a_stale_volume_unless_told_otherwise(self):
+        up = SCRIPT[SCRIPT.index("  up)"):SCRIPT.index("  down)")]
+        self.assertIn("Key==`Live`", up)
+        self.assertIn('[ "$LIVE" = "false" ] && [ "${PARALLEL_BOX_ALLOW_STALE:-}" != "1" ]', up)
+        refuse = up[up.index('[ "$LIVE" = "false" ]'):]
+        self.assertLess(refuse.index("exit 1"), refuse.index("Spot capacity"))
+        # the check happens before any instance is launched
+        self.assertLess(up.index("Key==`Live`"), up.index("run-instances"))
+
+
 class NetworkTests(unittest.TestCase):
     def test_the_nfs_path_is_one_subnet_never_a_vpc(self):
         route = block(OHIO, 'resource "aws_route" "ohio_pbox_to_io_box"')
