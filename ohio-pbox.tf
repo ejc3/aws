@@ -192,6 +192,8 @@ resource "aws_route" "west2_to_ohio_pbox" {
 # A snapshot of each us-west-2 volume, copied here and restored as the Ohio volume, so the data moves with the box. The
 # snapshot is taken when this is applied: apply it while the boxes are down (`pbox down`) for a copy that is exactly
 # the disk. Once the move is done and checked, the two snapshots (and the old volumes) can be deleted.
+# A snapshot of a volume that was itself restored from a snapshot reads its blocks lazily and is slow: the 300 GB one took
+# about 2.5 hours, which is why the create timeouts here (and on the copy) are 6h, not the 2h that failed it.
 resource "aws_ebs_snapshot" "pbox_move" {
   provider    = aws.west2
   for_each    = local.pbox_move_volumes
@@ -199,7 +201,7 @@ resource "aws_ebs_snapshot" "pbox_move" {
   description = "${each.value.name} for the move to us-east-2"
 
   timeouts {
-    create = "2h"
+    create = "6h"
   }
 
   tags = { Name = "${each.value.name}-move" }
@@ -214,7 +216,7 @@ resource "aws_ebs_snapshot_copy" "pbox_move" {
   description        = "${each.value.name} for the move to us-east-2"
 
   timeouts {
-    create = "2h"
+    create = "6h"
   }
 
   tags = { Name = "${each.value.name}-move" }
