@@ -658,19 +658,22 @@ whenever the pool had room. A single delivery is one job and is never cut this w
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 
-`CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` run on ordinary x86 spot VMs, not
-metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and `dolphin-labs-hq/dolphin-films`
+run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
 nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
 controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
 `runner-app/`).
 
 - **Routing.** The same front (`github-runner-webhook-front`) routes by `repository.full_name`
   after the signature check. `ejc3/fcvm`, and deliveries naming no repository, take Pattern B's
-  path unchanged. The two served repos go to Lambda `github-app-runner`, `queued` only.
+  path unchanged. The served repos go to Lambda `github-app-runner`, `queued` only.
   Anything else is answered and dropped.
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
+  `dolphin-films` (a downstream of `dolphin-labs`) uses the `dolphin` label too. Runners
+  register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
+  runner, cap or token.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
@@ -688,7 +691,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
   failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
-  with its `JobId`. Each repo has its own cap (8), counted as the hosts `DescribeInstances` lists
+  with its `JobId`. Each repo has its own cap (8; `dolphin-films` 2), counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
@@ -702,7 +705,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
   zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
-  `too-many-app-runners-<label>` above one repo's own cap, so a single repo running away is
+  `too-many-app-runners-<label>` (`-dolphin-films` for that repo, which shares a label) above one repo's own cap, so a single repo running away is
   visible even while the total is under the combined cap; `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a
@@ -918,14 +921,15 @@ reviewed Terraform removal plan after both acceptance stages pass.
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
 
-**Six GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
+**Seven GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
 clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners,
 `github-webhook-admin-pat` owns the webhook, `games/colton-games-read` (owned by
 CoderColton, Contents read-only on `colton-games`, readable only by administration and the
 `games-mp-poller` Lambda) lets games multiplayer read branch heads and download each new commit
-to build, and the two
+to build, and the three
 `github-runner/repo-pat/*` tokens (one per repo, each owned by that repo's owner) register
-runners and own the hook for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs`. The dev PAT is read by machines that run
+runners and own the hook for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and
+`dolphin-labs-hq/dolphin-films`. The dev PAT is read by machines that run
 other people's code; before the cutoff, the runner PAT was too. Neither may hold
 webhook-write: that would let a compromised dev host or a leaked legacy runner token
 repoint the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by
@@ -1045,7 +1049,8 @@ Still open (accepted for now):
 
 ## Threat model: runners for other repos
 
-Runners for `CoderColton/colton-games` and `dolphin-labs-hq/dolphin-labs` (Pattern C,
+Runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and its downstream
+`dolphin-labs-hq/dolphin-films` (Pattern C,
 `runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
 second place people outside the owner run code on AWS resources we manage. Every writer on
 those repos, and every bot that opens pull requests there (for example
@@ -1101,23 +1106,24 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
    ```
 3. Remove the hooks while Terraform can still read the tokens it deletes them with:
    `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
-   -target='github_repository_webhook.runner_app_dolphin_labs[0]'`, then commit
+   -target='github_repository_webhook.runner_app_dolphin_labs[0]'
+   -target='github_repository_webhook.runner_app_dolphin_films[0]'`, then commit
    `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
    does not work: it also drops the token reads, so the providers have no credentials to
    delete with. The repo's owner can instead revoke its controller token in GitHub, which
    stops registration outright; plans then fail at that repo's provider until its hook is
-   gone from GitHub and from state, and the gate is off. The gate covers both repos, so:
+   gone from GitHub and from state, and the gate is off. The gate covers every served repo, so:
 
    1. An administrator, on a jumpbox, reads the hook URL and gives it to the repo's owner:
       `terraform output -raw runner_webhook_url` (not a secret; GitHub shows it to the repo's
       admins).
    2. The owner deletes the hook with their own `gh` login on their own account (CoderColton
       for `colton-games`, where `ejc3` has write but not admin; `ejc3` as org admin for
-      `dolphin-labs`), and confirms it is gone. Their login never leaves their account:
+      `dolphin-labs` and `dolphin-films`), and confirms it is gone. Their login never leaves their account:
 
       ```bash
       set -euo pipefail
-      R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs
+      R=CoderColton/colton-games   # or dolphin-labs-hq/dolphin-labs, dolphin-labs-hq/dolphin-films
       URL='<from step 1>'
       ID=$(gh api "repos/$R/hooks" --jq ".[] | select(.config.url == \"$URL\") | .id")
       [ -n "$ID" ] || { echo "no hook with that URL" >&2; exit 1; }
@@ -1127,10 +1133,11 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
 
    3. Only after the owner reports `0`, the administrator drops it from state on the jumpbox:
       `terraform state rm 'github_repository_webhook.runner_app_colton_games[0]'` (or
-      `_dolphin_labs`). Dropping it before then would leave a live hook unmanaged.
-   4. Remove the other repo's hook while its token still works:
-      `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'` (or
-      `_colton_games`). No other resource then uses the revoked repo's provider.
+      `_dolphin_labs`, `_dolphin_films`). Dropping it before then would leave a live hook unmanaged.
+   4. Remove the other repos' hooks while their tokens still work:
+      `terraform destroy -target='github_repository_webhook.runner_app_dolphin_labs[0]'
+      -target='github_repository_webhook.runner_app_dolphin_films[0]'` (each repo but the revoked
+      one). No other resource then uses the revoked repo's provider.
    5. Commit `enable_runner_app_webhooks` defaulting to `false` and apply. Leaving it `true`
       would read the revoked token again and try to recreate the deleted hook.
 
@@ -1154,7 +1161,8 @@ operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
 **Open gaps, most severe first**
 
 1. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
-   `dolphin-labs` 2027-09-28. That repo's runners stop registering when its token expires;
+   `dolphin-labs` 2027-09-28, `dolphin-films` a year after it is minted (record the date here).
+   That repo's runners stop registering when its token expires;
    renew each before then (Regenerate in GitHub keeps its permissions).
 
 ## Operating it
