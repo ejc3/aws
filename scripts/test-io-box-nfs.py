@@ -52,9 +52,12 @@ class NfsRuleTests(unittest.TestCase):
     def test_client_cidrs_are_the_dev_fleet_and_the_parallel_box_subnet(self):
         m = re.search(r"io_box_nfs_client_cidrs = concat\(\n(.*?)\n  \)", IO, re.S)
         self.assertIsNotNone(m)
-        self.assertEqual([line.strip() for line in m.group(1).splitlines()],
+        # Comments dropped: the Ohio line carries one.
+        self.assertEqual([line.split("#")[0].strip() for line in m.group(1).splitlines()],
                          ["[for s in local.dev_fleet_subnets : s.cidr_block],",
-                          "[data.aws_subnet.io_box.cidr_block],"])
+                          "[data.aws_subnet.io_box.cidr_block],",
+                          # the parallel boxes in us-east-2 (ohio-pbox.tf): their one SUBNET, never the VPC
+                          "[aws_subnet.ohio_pbox.cidr_block],"])
         self.assertIn("dev_fleet_subnets = [aws_subnet.subnet_a, aws_subnet.subnet_b]", MAIN)
         # The dev fleet list must never pick up a games subnet.
         fleet = re.search(r"dev_fleet_subnets = \[(.*?)\]", MAIN).group(1)

@@ -30,10 +30,12 @@ locals {
   #     var.firecracker_availability_zone), fcvm-metal-x86 and nextjs-dev (subnet_a)
   #   this box's own us-west-2d subnet: the parallel boxes (parallel-box-launch.tf launches
   #     into subnet-095349c0fcef8c47f, the same subnet as data.aws_subnet.io_box)
+  #   the parallel boxes' us-east-2c subnet (ohio-pbox.tf), over a peering connection
   # Adding a client in another subnet means adding that subnet here.
   io_box_nfs_client_cidrs = concat(
     [for s in local.dev_fleet_subnets : s.cidr_block],
     [data.aws_subnet.io_box.cidr_block],
+    [aws_subnet.ohio_pbox.cidr_block], # the parallel boxes in us-east-2 (ohio-pbox.tf), over a peering connection
   )
 }
 

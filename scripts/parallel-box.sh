@@ -37,9 +37,8 @@
 # has always reaped these boxes with tag-scoped ec2:TerminateInstances.
 set -uo pipefail
 
-REGION="us-west-2"
 
-# Candidate pools, all offered in us-west-2d and all Graviton (incl. gen-5 c9g/m9g). The floor is "better
+# Candidate pools, all Graviton (incl. gen-5 c9g/m9g). The floor is "better
 # than the dev box" (c7gd.metal, 64 cores / 128GB Graviton3), so nothing here is under
 # 96 cores.
 #
@@ -47,12 +46,12 @@ REGION="us-west-2"
 #   1. 192-core virtualized, cheapest family first (c8g < c8gn < m8g < r8g < r8gd)
 #   2. 96-core virtualized -- half the cores but a much likelier pool
 # Metal is excluded from the DEFAULT list: it boots in many minutes, which defeats fast
-# startup, and us-west-2d has enough virtualized pools that we should never need it.
+# startup, and there are enough virtualized pools that we should never need it.
 # KVM MODE ("up N kvm") is the deliberate exception: virtualized Graviton has no
 # /dev/kvm (AWS exposes KVM only on *.metal ARM instances), so KVM workloads -- fcvm,
 # firecracker, anything that IS a hypervisor -- get a metal-only pool list and accept
 # the slow boot as the price of admission. Same ordering rules, same >=96-core floor
-# (metal-24xl = 96 cores); all verified offered in us-west-2d.
+# (metal-24xl = 96 cores); all offered where the boxes live (a type a region lacks is skipped as unsupported).
 TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xlarge c9g.48xlarge c9gd.48xlarge m8g.48xlarge m8gd.48xlarge m9g.48xlarge m9gd.48xlarge i8g.48xlarge i8ge.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gb.24xlarge c8gd.24xlarge c8gn.24xlarge c9g.24xlarge c9gd.24xlarge m8g.24xlarge m8gd.24xlarge m9g.24xlarge m9gd.24xlarge i8g.24xlarge i8ge.24xlarge r8g.24xlarge r8gd.24xlarge}"
 # Deliberately a SEPARATE override var: reusing PARALLEL_BOX_TYPES here would let a
 # virtualized-list override silently poison kvm mode with non-metal types, which
@@ -73,6 +72,19 @@ fi
 
 SELF="$(basename "${BASH_SOURCE[0]}")"
 say() { printf '%s\n' "$*" >&2; }
+
+# Which region the boxes live in. Terraform publishes it (ohio-pbox.tf, /infra/parallel-box, in us-west-1), so moving them is
+# one apply and never a script edit on every dev box. PARALLEL_BOX_REGION overrides it for a one-off.
+REGION="${PARALLEL_BOX_REGION:-}"
+if [ -z "$REGION" ]; then
+  REGION="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["region"])' 2>/dev/null)"
+fi
+if [ -z "$REGION" ]; then
+  say "FATAL: cannot read which region the parallel boxes are in (SSM /infra/parallel-box in us-west-1)."
+  say "Retry, or name it yourself:  PARALLEL_BOX_REGION=us-east-2 $SELF $*"
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------------
 # Box selection. Box 1 keeps the original, unnumbered names (tag "parallel-box",
@@ -147,6 +159,14 @@ case "$CMD" in
     [ -n "$VOL" ] || { say "FATAL: no work volume tagged $VOLTAG in $REGION"; exit 1; }
     AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
       --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
+    # The volumes in the other region are stale copies (ohio-pbox.tf): starting a box on one forks the work disk.
+    LIVE=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
+      --query 'Volumes[0].Tags[?Key==`Live`]|[0].Value' --output text 2>/dev/null)
+    if [ "$LIVE" = "false" ] && [ "${PARALLEL_BOX_ALLOW_STALE:-}" != "1" ]; then
+      say "FATAL: $VOL in $REGION is a stale copy (tag Live=false); the live work disk is in the other region."
+      say "Starting a box on it would fork /mnt/work. If you mean it:  PARALLEL_BOX_ALLOW_STALE=1 $SELF $*"
+      exit 1
+    fi
     say "Work volume $VOL is in $AZ -- the box launches there (EBS is AZ-locked)."
     say "Spot capacity for 192-core instances is scarce; trying each type in turn."
     say ""
