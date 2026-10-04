@@ -957,11 +957,11 @@ The owner's steps, in order:
    that serves its environment:
    - production: `cc-games.org`, and `colton-games.vercel.app` because Vercel's own name also
      serves. The other production names redirect to `cc-games.org` before sign-in starts.
-   - non-production: each dev-box site (`<name>.cc-games.dev`), `http://localhost:<port>`
-     for a local run, and each preview hostname that should offer sign-in. Google accepts no
-     wildcard, and a preview's per-deploy address is new every time, so only a stable
-     address can be registered. On any other preview the sign-in button ends at Google's
-     `redirect_uri_mismatch` page.
+   - non-production: each dev-box site (`<name>.cc-games.dev`) and `http://localhost:<port>`
+     for a local run. A preview needs none. Google accepts no wildcard and a preview's
+     address is new with every deploy, so on a Vercel deployment the site offers sign-in
+     only at its registered hostnames (the two production ones above): a preview shows no
+     sign-in button and its `/api/auth/*` routes answer `404`.
 
    A Google Cloud project whose consent screen is in testing admits only its listed test
    users, so production's must be published.
@@ -991,10 +991,12 @@ The owner's steps, in order:
      colton-games/prod/auth --query Name --output text` fails with `AccessDeniedException`,
      and the same command for `colton-games/nonprod/auth` prints the name.
 7. Account saves, when the site has them and only after step 6 passes for production:
-   - Apply the games repository's `supabase/migrations/20261004000000_account_saves.sql`
-     once, by hand, in the Supabase SQL editor. Nothing here applies it: `games-mp-migrate`
-     runs only the multiplayer migrations. Do this before the switch, or the site offers
-     saves with no tables behind them.
+   - Nothing is applied by hand. The saves migration
+     (`supabase/migrations/20261004000000_account_saves.sql` in the games repository) is
+     applied by `games-mp-migrate` when the games change merges to `main`. Before the
+     switch, check it arrived, or the site offers saves with no tables behind them:
+     `aws dynamodb get-item --region us-west-1 --table-name games-mp-releases --key
+     '{"id":{"S":"schema#main"}}'` shows `siteNewest` at that file or a later one.
    - Set the default of `colton_games_account_saves_targets` to `["production"]` in a
      commit, then plan and apply. Expect one to add,
      `vercel_project_environment_variable.colton_games_account_saves["production"]`, and

@@ -64,8 +64,9 @@
 #      adds four variables per environment and changes nothing else.
 #   5. Redeploy: a deployment reads its environment when it is built.
 #   Push is the same later: make a key pair per environment, put */push, add both names.
-#   Account saves come after sign-in works: apply the games repository's saves migration by
-#   hand, then name the target in var.colton_games_account_saves_targets (below).
+#   Account saves come after sign-in works and after the games repository's saves migration
+#   has arrived (games-mp-migrate applies it when it merges to main): then name the target in
+#   var.colton_games_account_saves_targets (below).
 # A value changed later is one put-secret-value, one apply and a redeploy. A value that is
 # missing, is in the wrong key, or is the same in both environments fails the plan with the
 # secret's name.
@@ -78,11 +79,14 @@
 #
 # WHAT IS NOT HERE, because it cannot be or already exists:
 #   Google OAuth clients   Google has no API for Web application clients (cloudflare.tf).
-#   Preview sign-in        Google accepts no wildcard redirect URI, and most preview addresses
-#                          are new with every deploy. Sign-in works on a preview only at a
-#                          hostname registered on the non-production client.
-#                          TODO(owner): a stable non-production hostname, if previews should
-#                          offer sign-in, is a vercel_project_domain with a git_branch here.
+#   Preview sign-in        Google accepts no wildcard redirect URI, and a preview's address is
+#                          new with every deploy. So on a Vercel deployment the site offers
+#                          sign-in only at its registered hostnames (production's): a preview
+#                          shows no sign-in button and its auth routes answer 404, whatever
+#                          Preview's variables hold.
+#                          TODO(owner): if previews should offer sign-in, they need a stable
+#                          hostname (a vercel_project_domain with a git_branch here) that the
+#                          site also lists.
 #   Supabase               the project came from the Vercel integration and is not managed in
 #                          this repo. Production and Preview already hold its URL and server key
 #                          and SKYHOOK_LEADERBOARD_ENVIRONMENT, so the accounts features add no
