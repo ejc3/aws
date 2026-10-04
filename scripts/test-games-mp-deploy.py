@@ -491,6 +491,9 @@ RELEASE_ENV = {"RELEASES_TABLE": "games-mp-releases", "MAIN_PROJECT": "games-mp-
                "ROUTER_SERVICE": "mp-router", "TARGET_GROUP_ARN": "arn:tg", "SNS_TOPIC_ARN": "arn:sns",
                "ROLL_TIMEOUT_SEC": "600", "POLL_SEC": "15"}
 INPUTS_A = "1" * 64
+# Two sets of site migrations as bringup.py site_state reports them: <count>:<sha256>.
+SITE_A = "4:" + "a" * 64
+SITE_B = "5:" + "b" * 64
 INPUTS_B = "2" * 64
 
 
@@ -520,13 +523,21 @@ class ReleaseTests(unittest.TestCase):
         with contextlib.redirect_stdout(self.log):
             return self.r.lambda_handler(event, None)
 
-    def main_built(self, commit=MAIN, seq=1, inputs=INPUTS_A, schema="1", sim="mptest-1", engines=None):
+    def main_built(self, commit=MAIN, seq=1, inputs=INPUTS_A, schema="1", sim="mptest-1", engines=None, site=None):
         self.ddb.put("build#main#" + commit, status="building", seq=seq, channel="main", commit=commit)
         self.ecr.add("games/engines", "mptest_%s-%s" % (sim, commit[:12]))
         self.ecr.add("games/mp-router", commit[:12], "sha256:router-" + commit[:4])
-        return self.cb.finish("games-mp-images:%s" % commit[:4], "games-mp-images", commit, {
-            "GAMES_MP_ENGINES": engines or engines_report(sim),
-            "GAMES_MP_ROUTER_INPUTS": inputs, "GAMES_MP_SCHEMA_REVISION": schema})
+        exported = {"GAMES_MP_ENGINES": engines or engines_report(sim),
+                    "GAMES_MP_ROUTER_INPUTS": inputs, "GAMES_MP_SCHEMA_REVISION": schema}
+        if site is not None:
+            exported["GAMES_SITE_MIGRATIONS"] = site
+        return self.cb.finish("games-mp-images:%s" % commit[:4], "games-mp-images", commit, exported)
+
+    def migrated(self, revision="1", site=None, newest="20261004000000_account_saves.sql", commit=MAIN):
+        exported = {"GAMES_MP_DB_REVISION": revision}
+        if site is not None:
+            exported.update(GAMES_SITE_DB_MIGRATIONS=site, GAMES_SITE_DB_NEWEST=newest)
+        return self.cb.finish("games-mp-migrate:1", "games-mp-migrate", commit, exported)
 
     def preview_built(self, commit=BRANCH, engines=None, exported=None):
         self.ddb.put("build#preview#" + commit, status="building", channel="preview", commit=commit)
@@ -754,6 +765,58 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(self.r.ReleaseError, "revision 1"):
             self.invoke(self.cb.finish("games-mp-migrate:1", "games-mp-migrate", MAIN, {"GAMES_MP_DB_REVISION": "1"}))
         self.assertIsNone(self.ddb.get("current#main"))
+
+    # -- site migrations: the files that are not mp ones, compared as one value ----------------
+
+    def test_new_site_migrations_migrate_first_then_promote(self):
+        self.ddb.put("schema#main", revision=1, site=SITE_A)
+        out = self.invoke(self.main_built(site=SITE_B))
+        self.assertEqual(out, {"migrating": MAIN}, "the mp revision is the database's; the site files are not")
+        self.assertIsNone(self.ddb.get("current#main"), "not promoted before its migration")
+        self.assertEqual([m["project"] for m in self.cb.started], ["games-mp-migrate"])
+        self.assertEqual(self.ddb.get("build#main#" + MAIN)["siteMigrations"], SITE_B)
+        out = self.invoke(self.migrated(site=SITE_B))
+        self.assertEqual(out["promoted"], MAIN)
+        schema = self.ddb.get("schema#main")
+        self.assertEqual((schema["revision"], schema["site"], schema["siteNewest"], schema["commit"]),
+                         (1, SITE_B, "20261004000000_account_saves.sql", MAIN))
+
+    def test_the_first_build_that_reports_site_migrations_runs_the_migration(self):
+        # schema#main has never held a site value: the ledger may not exist yet.
+        self.assertEqual(self.invoke(self.main_built(site=SITE_A)), {"migrating": MAIN})
+
+    def test_unchanged_migrations_of_both_kinds_promote_without_a_migration_run(self):
+        self.ddb.put("schema#main", revision=1, site=SITE_A)
+        self.assertEqual(self.invoke(self.main_built(site=SITE_A))["promoted"], MAIN)
+        self.assertEqual(self.cb.started, [])
+
+    def test_site_migrations_that_end_elsewhere_promote_nothing(self):
+        for report in (SITE_A, None):
+            with self.subTest(report=report):
+                self.ddb.put("schema#main", revision=1, site=SITE_A)
+                self.invoke(self.main_built(site=SITE_B))
+                with self.assertRaisesRegex(self.r.ReleaseError, "site migrations"):
+                    self.invoke(self.migrated(site=report))
+                self.assertIsNone(self.ddb.get("current#main"))
+        self.assertEqual(len(self.sns.sent), 2, "each one alerts")
+
+    def test_a_malformed_site_report_is_an_error_not_a_skip(self):
+        for build in (lambda: self.main_built(site="lots"),):
+            with self.assertRaisesRegex(self.r.ReleaseError, "site migrations"):
+                self.invoke(build())
+        self.ddb.put("schema#main", revision=1, site=SITE_A)
+        self.invoke(self.main_built(site=SITE_B))
+        with self.assertRaisesRegex(self.r.ReleaseError, "site migrations"):
+            self.invoke(self.migrated(site=SITE_B, newest="../etc"))
+        self.assertIsNone(self.ddb.get("current#main"))
+
+    def test_a_source_packaged_before_site_migrations_existed_releases_as_before(self):
+        # Its driver reports no site value at all: release it the old way, and say so.
+        self.ddb.put("schema#main", revision=1, site=SITE_A)
+        self.assertEqual(self.invoke(self.main_built())["promoted"], MAIN)
+        self.assertEqual(self.cb.started, [])
+        self.assertEqual(self.ddb.get("schema#main")["site"], SITE_A)
+        self.assertIn("site-migrations-not-reported", self.log.getvalue())
 
     def test_failed_builds_are_recorded_and_only_main_alerts(self):
         self.ddb.put("build#preview#" + BRANCH, status="building")

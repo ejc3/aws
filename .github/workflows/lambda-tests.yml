@@ -113,6 +113,11 @@ jobs:
       - name: Games multiplayer bring-up steps (offline)
         run: python3 -S -B scripts/test-games-mp-bringup.py
 
+      # Starts its own PostgreSQL in a temporary directory, on a Unix socket only; the runner
+      # image ships the server binaries under /usr/lib/postgresql.
+      - name: Games site migrations against a temporary PostgreSQL (ledger, baseline, refusals)
+        run: python3 -S -B scripts/test-games-site-migrations.py
+
       - name: Games multiplayer automatic deploys (offline)
         run: python3 -S -B scripts/test-games-mp-deploy.py
 
