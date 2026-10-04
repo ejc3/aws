@@ -192,6 +192,11 @@ ${local.codex_seed_thread_install}
 ${local.agent_session_sync_install}
 ${local.agent_session_sync_enable_ubuntu}
 
+# ---------------------------------------------------------------- user-level agent instructions
+# A starter ~/.codex/AGENTS.md with ~/.claude/CLAUDE.md linked to it, only when ubuntu has
+# neither (user-agents.tf). The files are this script's own copy; nothing is downloaded.
+${local.user_agents_seed_ubuntu}
+
 # ---------------------------------------------------------------- fcvm-ec2 key
 # The key every box in this fleet trusts for inbound SSH, restored from the Secrets
 # Manager backup (fcvm-ec2-key-backup.tf) so this box can reach the rest of the fleet

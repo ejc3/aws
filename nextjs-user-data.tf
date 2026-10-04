@@ -2320,6 +2320,13 @@ done
 # Atuin agent hooks (one absolute-path hook per event for Claude Code and Codex) are
 # normalized inside local.user_shell_env above, for every account on every box.
 
+# ---------------------------------------------------------------- user-level agent instructions
+# A starter ~/.codex/AGENTS.md with ~/.claude/CLAUDE.md linked to it, for each account that has
+# NEITHER (user-agents.tf). An account with either file is left exactly as it is, so a re-run
+# changes nothing and an edit someone made is kept. Each account is seeded as itself.
+${local.user_agents_seed_install}
+/usr/local/bin/user-agents-seed ${join(" ", local.nextjs_users)} ubuntu || echo "WARNING: user-agents-seed failed for an account"
+
 # ---------------------------------------------------------------- git identity
 # Derived from `gh api user`, never hardcoded, so it cannot drift from the account that is
 # actually logged in.

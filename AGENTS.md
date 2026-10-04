@@ -702,6 +702,23 @@ restart interrupts the turns it is running. On 2026-09-30 fcvm-arm's daemon (sta
   `~/.local/state/codex-restart/restart.txt`. To see another account's daemon, run it with `sudo`.
 - Claude has the same shape: `t-claude --restart`. Neither touches the other.
 
+### Starter user-level agent instructions
+
+`user-agents.tf`: every setup script that provisions homes (metal boxes, nextjs-dev's accounts, admin boxes)
+runs `user-agents-seed`, which gives an account with no user-level instructions `~/.codex/AGENTS.md` (the real
+file) and `~/.claude/CLAUDE.md` (a symlink to it), so Codex and Claude Code read one file.
+
+- **One source.** The text is `scripts/user-agents.md`. Terraform embeds that file; never paste its text into a
+  `.tf` file or another script (`scripts/test-user-agents.py` fails if a copy appears).
+- **Create only.** If either path exists (a file, a symlink, a dangling one) the account is left as it is:
+  nothing is overwritten, appended to or re-linked. The file is seeded once, not managed, so editing
+  `scripts/user-agents.md` reaches new accounts only; an existing account is changed by its owner.
+- **As the account, never as root.** Root only dispatches (`runuser`); the files are created by the account
+  that owns them.
+- **No box is replaced or rebooted for it.** It is published inside the S3 setup scripts, and every instance
+  that fetches one ignores user_data changes. nextjs-dev takes it through `setup-sync`, a metal box at its next
+  boot (`dev-selfupdate`), an admin box only when its setup script is re-run by hand.
+
 ### Diagnosing a wedged dev box
 
 When an instance fails its status check, the reason is in the EC2 serial console ring

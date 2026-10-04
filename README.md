@@ -1089,6 +1089,18 @@ Next.js users authenticate independently. Jumpboxes intentionally leave interact
 Claude/Codex login to the operator rather than storing those device credentials in
 Terraform.
 
+Every setup script also gives an account that has no user-level agent instructions a
+starting file (`user-agents.tf`): `~/.codex/AGENTS.md`, which Codex reads, with
+`~/.claude/CLAUDE.md`, which Claude Code reads, as a symlink to it. The text is
+`scripts/user-agents.md` and nowhere else. `user-agents-seed` only creates: an account that
+already has either file is left exactly as it is, so a re-run changes nothing and an edit
+made on the box is kept. Changing `scripts/user-agents.md` therefore reaches new accounts
+only. It applies to `ubuntu` on the metal boxes and admin boxes and to every account on
+`nextjs-dev`, and arrives with the setup script: at first boot on a fresh box, through
+`setup-sync` on `nextjs-dev`, at the next boot on a metal box, and on an admin box only when
+its setup script is re-run. Once a box has the script, an account can also seed itself by
+running `user-agents-seed`.
+
 ## Backups, safety, and cost controls
 
 - AWS Backup covers the ARM and x86 roots, the Next.js root, the original jumpbox home
@@ -2012,6 +2024,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Windows playtest box (g4dn.xlarge, Server 2025, persistent D: game disk, reachable from the dev boxes only, `wbox up` / `wbox down` / `wbox run` / `wbox launch`, stops after 1 idle hour) | `wbox.tf`, `scripts/wbox.sh` |
 | Shared claude-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claude-master-server.tf`, `claude-master-tunnel.tf`, `scripts/claude-master-login.sh --server`, `scripts/claude-master-enroll.sh`, `scripts/claude-master-mac-bundle.sh` |
 | Codex refresh (weekly SSM association on the jumpboxes and metal boxes) and `codex-restart` (see running vs installed, restart deliberately) | `codex-update.tf`, `scripts/codex-restart.sh` |
+| Starter user-level agent instructions (`~/.codex/AGENTS.md` with `~/.claude/CLAUDE.md` linked to it), created only for an account that has neither | `user-agents.tf`, `scripts/user-agents.md` (the text), `scripts/user-agents-seed.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |

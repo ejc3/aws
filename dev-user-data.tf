@@ -410,6 +410,9 @@ ${local.dev_hop_setup}
 ${local.io_box_client_setup}
 
 ${local.codex_remote_control}
+
+# Starter user-level agent instructions, only for an account that has none (user-agents.tf).
+${local.user_agents_seed_ubuntu}
 SHELLSETUP
 
   # ARM dev server (c7gd.metal) full setup script
