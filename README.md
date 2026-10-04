@@ -183,7 +183,10 @@ for a repo added later too: apply only its container (the same command with that
 nothing untargeted changes, so the existing hooks stay), put its token, then run the full apply. Each is a
 fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
-org admin for `dolphin-labs` and for `dolphin-films`. Put each value without echoing it:
+org admin for `dolphin-labs` and for `dolphin-films`. `dolphin-films` is behind its own gate,
+`dolphin_films_token_ready` in `runner-app.tf` (default false): until its token has a value its hook and token read are
+not planned, so every plan passes. Put the token, then set that default to true in a commit and apply. Put each value
+without echoing it:
 
 ```bash
 read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \

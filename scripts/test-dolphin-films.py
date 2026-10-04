@@ -104,6 +104,34 @@ class SecretTests(unittest.TestCase):
             self.assertNotIn("sensitive", out)
 
 
+RUNNER_APP = (ROOT / "runner-app.tf").read_text()
+
+
+class WebhookGateTests(unittest.TestCase):
+    """The controller token is minted by the org owner and put by hand. Reading a secret without a value fails EVERY plan of
+    the repository, so dolphin-films' token read and webhook sit behind a gate that starts false."""
+
+    def test_the_gate_starts_false_and_is_a_commit_not_a_flag(self):
+        gate = re.search(r'variable "dolphin_films_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
+        self.assertIn("default     = false", gate)
+        self.assertIn("never with -var", RUNNER_APP)
+
+    def test_nothing_about_dolphin_films_is_read_or_planned_while_the_gate_is_false(self):
+        self.assertIn("dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready", RUNNER_APP)
+        # the token read skips the repo, the provider reads no token and the webhook has no count
+        self.assertIn("if r != \"dolphin-labs-hq/dolphin-films\" || var.dolphin_films_token_ready", RUNNER_APP)
+        self.assertIn("for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])", RUNNER_APP)
+        provider = re.search(r'alias = "dolphin_films".*?\n\}', RUNNER_APP, re.S).group()
+        self.assertIn("token = local.dolphin_films_webhook ?", provider)
+        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
+        self.assertEqual(hook.group(1), "local.dolphin_films_webhook ? 1 : 0")
+
+    def test_the_other_repos_keep_the_global_gate_only(self):
+        self.assertIn("count      = local.runner_app_webhooks ? 1 : 0", RUNNER_APP)
+        for repo in ("CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"):
+            self.assertIn('runner_repo_pat["%s"]' % repo, RUNNER_APP)
+
+
 class BuilderTests(unittest.TestCase):
     """The offline builders need nothing new: they run as dev-server-role, which already has these."""
 
