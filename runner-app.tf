@@ -555,12 +555,30 @@ variable "enable_runner_app_webhooks" {
   default     = true
 }
 
+# A per-repo gate for dolphin-films, whose controller token has to be minted by the org owner (a fine-grained token cannot be
+# created by API) and put by hand. Reading a secret that has no value fails EVERY plan of this repository, so until the value
+# exists this stays false and the repo's webhook is neither planned nor its token read. Set the default to true in a commit
+# once the token is stored, never with -var: a later plan without it would propose deleting the webhook.
+variable "dolphin_films_token_ready" {
+  description = "dolphin-labs-hq/dolphin-films' controller token has a value in Secrets Manager, so its webhook can be created"
+  type        = bool
+  default     = false
+}
+
 locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
+
+  # dolphin-films' webhook and token read need its gate as well as the global one.
+  dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready
+
+  runner_app_webhook_repos = [
+    for r in local.runner_extra_repos : r
+    if r != "dolphin-labs-hq/dolphin-films" || var.dolphin_films_token_ready
+  ]
 }
 
 ephemeral "aws_secretsmanager_secret_version" "runner_repo_pat" {
-  for_each  = local.runner_app_webhooks ? toset(local.runner_extra_repos) : toset([])
+  for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])
   secret_id = aws_secretsmanager_secret.github_runner_repo_pat[each.value].id
 }
 
@@ -581,7 +599,7 @@ provider "github" {
 provider "github" {
   alias = "dolphin_films"
   owner = "dolphin-labs-hq"
-  token = local.runner_app_webhooks ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-films"].secret_string : null
+  token = local.dolphin_films_webhook ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-films"].secret_string : null
 }
 
 resource "github_repository_webhook" "runner_app_colton_games" {
@@ -619,7 +637,7 @@ resource "github_repository_webhook" "runner_app_dolphin_labs" {
 }
 
 resource "github_repository_webhook" "runner_app_dolphin_films" {
-  count      = local.runner_app_webhooks ? 1 : 0
+  count      = local.dolphin_films_webhook ? 1 : 0
   provider   = github.dolphin_films
   repository = "dolphin-films"
   events     = ["workflow_job"]
