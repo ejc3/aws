@@ -145,6 +145,9 @@ jobs:
       - name: A wedged persistent box is rebooted and nothing else is (auto-reboot Lambda)
         run: python3 -S -B scripts/test-auto-reboot.py
 
+      - name: The parallel boxes can run in us-east-2 (ohio-pbox.tf); pbox reads its region from Terraform
+        run: python3 -S -B scripts/test-pbox-ohio.py
+
       - name: Runner launcher and cleanup are region-aware; control plane stays in us-west-1
         run: python3 -S -B scripts/test-runner-regions.py
 

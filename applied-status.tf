@@ -44,6 +44,13 @@ locals {
       Resource = [aws_ssm_parameter.applied_status.arn]
     },
     {
+      # Which region `pbox` launches in (ohio-pbox.tf): a region name, no secret.
+      Sid      = "ReadParallelBoxRegion"
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter"]
+      Resource = [aws_ssm_parameter.parallel_box_region.arn]
+    },
+    {
       # Alarm definitions and states, e.g. fleet-backup-copies-missing. No resource scope.
       Sid      = "ReadAlarmStates"
       Effect   = "Allow"
