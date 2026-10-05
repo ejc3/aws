@@ -102,11 +102,13 @@ class MounterTests(unittest.TestCase):
         self.assertIn("subnet_id              = aws_subnet.subnet_a.id",
                       block(source("nextjs-dev.tf"), "aws_instance", "nextjs_dev"))
 
-    def test_parallel_boxes_launch_in_the_io_box_subnet(self):
-        io_subnet = re.search(r'data "aws_subnet" "io_box" \{[^}]*id\s*=\s*"(subnet-[0-9a-f]+)"', IO).group(1)
-        launch = re.findall(r'subnet_id\s*=\s*"(subnet-[0-9a-f]+)"', source("parallel-box-launch.tf"))
-        self.assertTrue(launch)
-        self.assertEqual(set(launch), {io_subnet})
+    def test_parallel_boxes_launch_in_the_subnet_the_nfs_rules_admit(self):
+        # The boxes moved to us-east-2 (ohio-pbox.tf): they launch in that VPC's one subnet, which is a client of the export
+        # (a subnet, never the VPC) and reaches the I/O box over a peering route to ITS subnet only.
+        launch = source("parallel-box-launch.tf")
+        self.assertIn("subnet_id                   = aws_subnet.ohio_pbox.id", launch)
+        self.assertNotRegex(launch, r'subnet_id\s*=\s*"subnet-[0-9a-f]+"')
+        self.assertIn("[aws_subnet.ohio_pbox.cidr_block]", IO)
 
 
 if __name__ == "__main__":

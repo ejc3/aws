@@ -20,8 +20,9 @@ def block(text, header):
 
 
 class PointerTests(unittest.TestCase):
-    def test_the_region_is_one_of_the_two_sites(self):
-        self.assertRegex(OHIO, r'\n  parallel_box_region = "(us-west-2|us-east-2)"\n')
+    def test_the_region_is_the_one_site(self):
+        # us-west-2's site is retired: the pointer can only name the region that still has volumes and templates.
+        self.assertRegex(OHIO, r'\n  parallel_box_region = "us-east-2"\n')
 
     def test_the_pointer_is_published_for_the_dev_boxes_and_they_may_read_it(self):
         self.assertIn('name        = "/infra/parallel-box"', OHIO)
@@ -41,12 +42,11 @@ class PointerTests(unittest.TestCase):
 
 
 class SiteTests(unittest.TestCase):
-    def test_both_sites_carry_everything_regional(self):
+    def test_there_is_one_site_us_east_2_with_everything_regional(self):
         sites = re.search(r"parallel_box_sites = \{.*?\n  \}\n", LAUNCH, re.S).group(0)
-        for region in ("us-west-2", "us-east-2"):
-            self.assertIn('"%s" = {' % region, sites)
+        self.assertEqual(re.findall(r'^    "(us-[a-z]+-\d)" = \{', sites, re.M), ["us-east-2"])
         for field in ("ami", "subnet_id", "security_group_id", "key_name", "volumes"):
-            self.assertEqual(sites.count(field + " "), 2, field)
+            self.assertEqual(sites.count(field + " "), 1, field)
 
     def test_no_launch_policy_pins_a_literal_region(self):
         policy = re.search(r'data "aws_iam_policy_document" "parallel_box_control" \{.*?\n\}\n', LAUNCH, re.S).group(0)
@@ -56,61 +56,55 @@ class SiteTests(unittest.TestCase):
                       "parallel_box_referenced_arns", "parallel_box_template_arns", "parallel_box_volume_arns"):
             self.assertIn("local." + local, policy, local)
 
-    def test_both_regions_templates_are_pinned_in_the_policy(self):
-        m = re.search(r"parallel_box_template_arns = concat\((.*?)\n  \)", LAUNCH, re.S).group(1)
-        self.assertIn("aws_launch_template.parallel_box :", m)
-        self.assertIn("aws_launch_template.parallel_box_ohio :", m)
+    def test_the_one_template_per_box_is_pinned_in_the_policy(self):
+        self.assertIn("parallel_box_template_arns = [for lt in aws_launch_template.parallel_box_ohio : lt.arn]", LAUNCH)
         self.assertEqual(LAUNCH.count("values   = local.parallel_box_template_arns"), 2)
+        self.assertEqual(re.findall(r'resource "aws_launch_template" "(\w+)"', LAUNCH), ["parallel_box_ohio"])
 
-    def test_the_ohio_template_is_the_west_one_with_only_regional_values_changed(self):
-        west = block(LAUNCH, 'resource "aws_launch_template" "parallel_box"')
-        ohio = block(LAUNCH, 'resource "aws_launch_template" "parallel_box_ohio"')
-        norm = [
-            ('"parallel_box_ohio"', '"parallel_box"'),
-            ("provider = aws.ohio", "provider = aws.west2"),
-            ("var.parallel_box_ami_ohio", "var.parallel_box_ami"),
-            ("aws_key_pair.ohio_pbox.key_name", "aws_key_pair.parallel_box.key_name"),
-            ("aws_security_group.ohio_pbox.id", "aws_security_group.parallel_box.id"),
-            ('us-east-2/', "us-west-2/"),
-        ]
-        for a, b in norm:
-            ohio = ohio.replace(a, b)
-        ohio = re.sub(r"subnet_id\s+= aws_subnet\.ohio_pbox\.id[^\n]*", "SUBNET", ohio)
-        west = re.sub(r'subnet_id\s+= "subnet-[0-9a-f]+"[^\n]*', "SUBNET", west)
-        ohio = re.sub(r"# Ubuntu 24.04 arm64, us-east-2", "# Ubuntu 24.04 arm64, us-west-2", ohio)
-        self.assertEqual(west, ohio)
-
-    def test_one_boot_script_serves_both_regions_and_never_formats_a_disk_with_data(self):
+    def test_one_boot_script_never_formats_a_disk_with_data(self):
         self.assertEqual(LAUNCH.count("mkfs.ext4"), 1)
         self.assertIn("mkfs.ext4 -L parallel-work", LAUNCH)
-        self.assertIn('user_data = local.parallel_box_user_data["us-west-2/${each.key}"]', LAUNCH)
         self.assertIn('user_data = local.parallel_box_user_data["us-east-2/${each.key}"]', LAUNCH)
+        self.assertNotIn("us-west-2/", LAUNCH)
         self.assertNotIn("each.value.volume_id", LAUNCH)
 
 
-class DataTests(unittest.TestCase):
-    def test_each_volume_is_restored_from_a_copied_snapshot_and_protected(self):
+class RetiredSiteTests(unittest.TestCase):
+    """us-west-2's pbox site is gone: its volumes, the snapshots each move took, the launch templates and the security group.
+    The data lives on the Ohio volumes."""
+
+    ALL_TF = {p.name: p.read_text() for p in ROOT.glob("*.tf")}
+
+    def test_nothing_declares_the_old_volumes_snapshots_templates_or_security_group(self):
+        joined = "\n".join(self.ALL_TF.values())
+        for gone in ('resource "aws_ebs_volume" "parallel_work"', 'resource "aws_ebs_volume" "parallel_work_2"',
+                     'resource "aws_ebs_snapshot"', 'resource "aws_ebs_snapshot_copy"',
+                     'resource "aws_security_group" "parallel_box"', 'resource "aws_launch_template" "parallel_box"',
+                     "var.parallel_box_ami\n", "var.parallel_box_az"):
+            self.assertNotIn(gone, joined, gone)
+        self.assertNotIn('variable "parallel_box_az"', joined)
+        self.assertNotIn('variable "parallel_box_ami"', joined)
+
+    def test_the_us_west_2_key_pair_stays_because_the_io_box_launches_with_it(self):
+        self.assertIn('resource "aws_key_pair" "parallel_box"', (ROOT / "parallel-box.tf").read_text())
+        self.assertIn("aws_key_pair.parallel_box.key_name", IO)
+
+    def test_the_ohio_volumes_are_the_only_copy_and_cannot_be_deleted_by_accident(self):
         vol = block(OHIO, 'resource "aws_ebs_volume" "ohio_parallel_work"')
-        self.assertIn("snapshot_id       = aws_ebs_snapshot_copy.pbox_move[each.key].id", vol)
         self.assertIn("prevent_destroy = true", vol)
         self.assertIn("ignore_changes  = [snapshot_id]", vol)
+        self.assertNotRegex(vol, r"(?m)^\s*snapshot_id\s*=")
         self.assertIn("encrypted         = true", vol)
         self.assertIn("availability_zone = local.ohio_pbox_az", vol)
-        copy = block(OHIO, 'resource "aws_ebs_snapshot_copy" "pbox_move"')
-        self.assertIn("ignore_changes = [kms_key_id]", copy)
-        self.assertIn('source_region      = "us-west-2"', copy)
-        self.assertIn("encrypted          = true", copy)
+        self.assertNotIn("Live", vol)
 
-    def test_names_and_sizes_match_the_originals_so_the_script_finds_them_by_tag(self):
-        self.assertIn('size = 300, name = "parallel-box-work"', OHIO)
-        self.assertIn('size = 100, name = "parallel-box-2-work"', OHIO)
-        self.assertIn("size              = 300", (ROOT / "parallel-box.tf").read_text())
-        self.assertIn("size              = 100", (ROOT / "parallel-box2.tf").read_text())
-        self.assertIn('Name    = "parallel-box-work"', (ROOT / "parallel-box.tf").read_text())
+    def test_names_and_sizes_are_what_the_script_finds_them_by(self):
+        self.assertIn('"1" = { size = 300, name = "parallel-box-work" }', OHIO)
+        self.assertIn('"2" = { size = 100, name = "parallel-box-2-work" }', OHIO)
 
-    def test_the_old_volumes_keep_their_protection(self):
-        for f in ("parallel-box.tf", "parallel-box2.tf"):
-            self.assertIn("prevent_destroy = true", (ROOT / f).read_text(), f)
+    def test_the_script_has_no_stale_copy_check_left(self):
+        self.assertNotIn("Live", SCRIPT)
+        self.assertNotIn("PARALLEL_BOX_ALLOW_STALE", SCRIPT)
 
 
 class ControlPolicyTests(unittest.TestCase):
@@ -127,28 +121,6 @@ class ControlPolicyTests(unittest.TestCase):
             self.assertIn("aws_iam_policy.parallel_box_control.arn", att)
         self.assertNotIn('resource "aws_iam_role_policy" "dev_server_parallel_box"', LAUNCH)
         self.assertNotIn('resource "aws_iam_role_policy" "nextjs_dev_parallel_box"', LAUNCH)
-
-
-class LiveCopyTests(unittest.TestCase):
-    """The Ohio volumes are copies: only one region's is live, and the script refuses the other (a flip back must not
-    silently fork the work disk onto stale data)."""
-
-    def test_each_volume_carries_a_live_tag_that_follows_the_pointer(self):
-        west1 = block((ROOT / "parallel-box.tf").read_text(), 'resource "aws_ebs_volume" "parallel_work"')
-        west2 = block((ROOT / "parallel-box2.tf").read_text(), 'resource "aws_ebs_volume" "parallel_work_2"')
-        for west in (west1, west2):
-            self.assertIn('Live = local.parallel_box_region == "us-west-2" ? "true" : "false"', west)
-        ohio = block(OHIO, 'resource "aws_ebs_volume" "ohio_parallel_work"')
-        self.assertIn('Live = local.parallel_box_region == "us-east-2" ? "true" : "false"', ohio)
-
-    def test_pbox_up_refuses_a_stale_volume_unless_told_otherwise(self):
-        up = SCRIPT[SCRIPT.index("  up)"):SCRIPT.index("  down)")]
-        self.assertIn("Key==`Live`", up)
-        self.assertIn('[ "$LIVE" = "false" ] && [ "${PARALLEL_BOX_ALLOW_STALE:-}" != "1" ]', up)
-        refuse = up[up.index('[ "$LIVE" = "false" ]'):]
-        self.assertLess(refuse.index("exit 1"), refuse.index("Spot capacity"))
-        # the check happens before any instance is launched
-        self.assertLess(up.index("Key==`Live`"), up.index("run-instances"))
 
 
 class NetworkTests(unittest.TestCase):

@@ -229,13 +229,12 @@ cutover is a separate act the owner schedules. The fcvm metal runners are region
 subnet and security-group choice. A move is two applies: `["us-east-2", "us-west-1"]` (new runners in Ohio, old ones still
 counted, reused and reaped while they drain), then `["us-east-2"]`. The control plane (SSM, DynamoDB, the Lambdas) stays in
 us-west-1; an instance uses `CONTROL_REGION` for those and its own region for EC2. The app runners (runner-app.tf) have not
-moved. **The parallel boxes** (`ohio-pbox.tf`) are wired in Ohio too: their own VPC, security group, key pair, launch
-templates and idle watchdog, a snapshot-copied restore of each persistent work volume (taken when it is applied, so
-apply with the boxes down), and a peering route to the I/O box's one subnet for the NFS scratch. `scripts/parallel-box.sh`
-reads the region from `/infra/parallel-box`, which Terraform publishes from `local.parallel_box_region`: the move is that
-one value, flipped with the boxes down right after the apply that took the snapshots. The Ohio volumes are COPIES, so
-only the region's own volume is live (tag `Live`) and `pbox up` refuses the other (`PARALLEL_BOX_ALLOW_STALE=1`
-overrides): going back means copying the disks first. IAM covers both regions. One step is not Terraform: the I/O box ignores `user_data`, so
+moved. **The parallel boxes** live in Ohio (`ohio-pbox.tf`): their own VPC, security group, key pair, launch templates and
+idle watchdog, and a peering route to the I/O box's one subnet for the NFS scratch. They moved from us-west-2 on 2026-10-05
+from a snapshot copy of each work volume (no fresh snapshot, as the owner accepted), and the us-west-2 site was retired:
+the old volumes, the move snapshots, the launch templates and the security group are deleted, so the Ohio volumes are the
+only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `/infra/parallel-box`, published from
+`local.parallel_box_region`. One step is not Terraform: the I/O box ignores `user_data`, so
 add the Ohio subnet to its `/etc/exports.d/io-box.exports` (the comment in `ohio-pbox.tf` has the line). Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).

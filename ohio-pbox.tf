@@ -1,7 +1,7 @@
 # ohio-pbox.tf
 #
-# The parallel boxes (parallel-box.tf, parallel-box2.tf, launched by scripts/parallel-box.sh) move from us-west-2 to
-# us-east-2. The 192-core Graviton spot pool is about 30% cheaper there (us-east-2c $1.71/h against us-west-2d $2.49/h
+# The parallel boxes (parallel-box.tf, parallel-box2.tf, launched by scripts/parallel-box.sh) moved from us-west-2 to
+# us-east-2 on 2026-10-05, and the us-west-2 site was retired afterwards. The 192-core Graviton spot pool is about 30% cheaper there (us-east-2c $1.71/h against us-west-2d $2.49/h
 # on 2026-10-04), and the 2c / 2a pools score the same 3/10 for placement as any other region does for that size.
 #
 # This file is the Ohio half: its own VPC, security group and key pair, copies of the two persistent work volumes (made
@@ -26,10 +26,10 @@ locals {
   # only copy of that data until they are deleted.
   parallel_box_region = "us-east-2"
 
-  # The two persistent volumes being copied, by box number: the us-west-2 volume, its size and its Name tag.
-  pbox_move_volumes = {
-    "1" = { west_volume_id = aws_ebs_volume.parallel_work.id, size = 300, name = "parallel-box-work" }
-    "2" = { west_volume_id = aws_ebs_volume.parallel_work_2.id, size = 100, name = "parallel-box-2-work" }
+  # The two persistent volumes, by box number: size and Name tag (scripts/parallel-box.sh finds a volume by its Name tag).
+  ohio_pbox_volumes = {
+    "1" = { size = 300, name = "parallel-box-work" }
+    "2" = { size = 100, name = "parallel-box-2-work" }
   }
 }
 
@@ -198,52 +198,12 @@ resource "aws_route" "west2_to_ohio_pbox" {
 }
 
 # ============================================================ the work volumes
-# A snapshot of each us-west-2 volume, copied here and restored as the Ohio volume, so the data moves with the box. The
-# snapshot is taken when this is applied: apply it while the boxes are down (`pbox down`) for a copy that is exactly
-# the disk. Once the move is done and checked, the two snapshots (and the old volumes) can be deleted.
-# A snapshot of a volume that was itself restored from a snapshot reads its blocks lazily and is slow: the 300 GB one took
-# about 2.5 hours, which is why the create timeouts here (and on the copy) are 6h, not the 2h that failed it.
-resource "aws_ebs_snapshot" "pbox_move" {
-  provider    = aws.west2
-  for_each    = local.pbox_move_volumes
-  volume_id   = each.value.west_volume_id
-  description = "${each.value.name} for the move to us-east-2"
-
-  timeouts {
-    create = "6h"
-  }
-
-  tags = { Name = "${each.value.name}-move" }
-}
-
-resource "aws_ebs_snapshot_copy" "pbox_move" {
-  provider           = aws.ohio
-  for_each           = local.pbox_move_volumes
-  source_snapshot_id = aws_ebs_snapshot.pbox_move[each.key].id
-  source_region      = "us-west-2"
-  encrypted          = true
-  description        = "${each.value.name} for the move to us-east-2"
-
-  timeouts {
-    create = "6h"
-  }
-
-  tags = { Name = "${each.value.name}-move" }
-
-  # AWS records its default EBS key here after the copy; the config names none, and a null against that key forces replacement
-  # (a second 8 minute copy, then a destroyed one the volumes were restored from).
-  lifecycle {
-    ignore_changes = [kms_key_id]
-  }
-}
-
-# The same protection as the originals: losing one loses real work. snapshot_id is ignored after creation so deleting the
-# move snapshot later never replaces the volume.
+# They were made from a snapshot of each us-west-2 volume, copied across; both snapshots, the copies and the us-west-2 volumes
+# are gone, so snapshot_id is ignored (it is not in the config) and these are the only copy of the data.
 resource "aws_ebs_volume" "ohio_parallel_work" {
   provider          = aws.ohio
-  for_each          = local.pbox_move_volumes
+  for_each          = local.ohio_pbox_volumes
   availability_zone = local.ohio_pbox_az
-  snapshot_id       = aws_ebs_snapshot_copy.pbox_move[each.key].id
   size              = each.value.size
   type              = "gp3"
   encrypted         = true
@@ -251,11 +211,10 @@ resource "aws_ebs_volume" "ohio_parallel_work" {
   tags = {
     Name    = each.value.name
     Purpose = "persistent scratch for the on-demand 192-core box"
-    # A COPY until local.parallel_box_region is us-east-2; then this is the live disk and the us-west-2 one is the stale
-    # copy. `pbox up` refuses a volume whose Live tag is false (scripts/parallel-box.sh).
-    Live = local.parallel_box_region == "us-east-2" ? "true" : "false"
   }
 
+  # Losing one loses real work: nothing but an edit of this block can delete them. snapshot_id is ignored because the
+  # volumes were restored from a snapshot that no longer exists.
   lifecycle {
     prevent_destroy = true
     ignore_changes  = [snapshot_id]
