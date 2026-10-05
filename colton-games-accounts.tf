@@ -9,7 +9,7 @@
 # push subscription made in one means nothing in the other:
 #
 #   Secrets Manager containers, one per environment and kind (JSON, values set out of band):
-#     colton-games/prod/auth       AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET, SITE_ADMIN_EMAILS
+#     colton-games/prod/auth       AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET
 #     colton-games/prod/push       NEXT_PUBLIC_VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
 #     colton-games/nonprod/auth    the same names, for previews and the dev boxes
 #     colton-games/nonprod/push
@@ -23,8 +23,6 @@
 #
 # The value of each secret is one JSON object with those keys, every one a string:
 #   AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET   that environment's own Google OAuth client
-#   SITE_ADMIN_EMAILS                    <comma-separated addresses of the site admins>; no
-#                                        repository holds the list
 #   NEXT_PUBLIC_VAPID_PUBLIC_KEY,
 #   VAPID_PRIVATE_KEY                    that environment's own pair from
 #                                        `npx web-push generate-vapid-keys`
@@ -43,9 +41,20 @@
 # never one spanning both. Nothing goes to Development. The values pass through Terraform
 # state, like the other games secrets (dev-ai-services.tf, games-multiplayer-bringup.tf):
 # state is readable by administration only, the same boundary as the secrets, and Terraform
-# is pinned to 1.10.3, so write-only arguments (1.11) are not available. That includes the
-# admin address list. NEXT_PUBLIC_VAPID_PUBLIC_KEY is the one name the browser sees: a push
-# subscription needs the public key in the page, and it is public by design.
+# is pinned to 1.10.3, so write-only arguments (1.11) are not available.
+# NEXT_PUBLIC_VAPID_PUBLIC_KEY is the one name the browser sees: a push subscription needs
+# the public key in the page, and it is public by design.
+#
+# SITE ADMINS. SITE_ADMIN_EMAILS, the Google addresses of the site's admins, is not in a
+# secret: it is the input var.colton_games_site_admin_emails, one list per environment. This
+# file holds only placeholders. The real addresses go in the ignored terraform.tfvars on the
+# machine that applies, and from there exist in Terraform state and in Vercel, never in a
+# repository and no longer in a secret's JSON (a JSON that still has the key is refused, by
+# name). The list is written with its environment's auth secret, under the same gate. An
+# empty list means no site admins and writes no variable. A placeholder is refused where it
+# would be written: on the site a non-empty list switches off the admin panel's password, so
+# a list nobody owns would leave nobody able to open the panel. That refusal is also what
+# stops a machine without the terraform.tfvars entry from replacing the real list.
 #
 # FIRST APPLY. Reading a secret that has no value yet fails the whole plan, for every file in
 # this repo. So var.colton_games_accounts_ready is a checked-in gate that starts empty:
@@ -60,16 +69,18 @@
 #      are https://<hostname>/api/auth/callback/google for every hostname that serves the
 #      site: production's on one client, the non-production ones on the other.
 #   3. Put prod/auth and nonprod/auth (above).
-#   4. Add "prod/auth" and "nonprod/auth" to the gate's default, commit, plan, apply. The plan
-#      adds four variables per environment and changes nothing else.
-#   5. Redeploy: a deployment reads its environment when it is built.
+#   4. Set colton_games_site_admin_emails in terraform.tfvars (README.md has the snippet).
+#   5. Add "prod/auth" and "nonprod/auth" to the gate's default, commit, plan, apply. The plan
+#      adds four variables per environment (three for one whose list is empty) and changes
+#      nothing else.
+#   6. Redeploy: a deployment reads its environment when it is built.
 #   Push is the same later: make a key pair per environment, put */push, add both names.
 #   Account saves come after sign-in works and after the games repository's saves migration
 #   has arrived (games-mp-migrate applies it when it merges to main): then name the target in
 #   var.colton_games_account_saves_targets (below).
-# A value changed later is one put-secret-value, one apply and a redeploy. A value that is
-# missing, is in the wrong key, or is the same in both environments fails the plan with the
-# secret's name.
+# A value changed later is one put-secret-value (or one edit of terraform.tfvars for the
+# admin list), one apply and a redeploy. A value that is missing, is in the wrong key, or is
+# the same in both environments fails the plan with the secret's name.
 #
 # ACCOUNT SAVES. The site keeps a signed-in player's saved games in their account only where
 # ACCOUNT_SAVES is exactly `on` (lib/saves in the games repository); unset is off. It is a
@@ -97,7 +108,7 @@
 #                          (`openssl rand -base64 33`); Preview's never leaves Vercel and state.
 
 locals {
-  colton_games_accounts_auth_keys = ["AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET", "SITE_ADMIN_EMAILS"]
+  colton_games_accounts_auth_keys = ["AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
   colton_games_accounts_push_keys = ["NEXT_PUBLIC_VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "VAPID_SUBJECT"]
 
   # Who may read a non-production secret besides the administration set.
@@ -181,6 +192,33 @@ resource "random_password" "colton_games_auth_secret" {
 }
 
 # -------------------------------------------------------------------------------------
+# The site admins' addresses
+# -------------------------------------------------------------------------------------
+
+# The site splits SITE_ADMIN_EMAILS on commas, trims and lower-cases each entry and keeps the
+# ones shaped like an address, at most 254 characters (lib/auth/config.ts in the games
+# repository), dropping the rest without a word. So an entry here must already be exactly
+# what the site would keep: nothing is written that the site would then ignore. Printable
+# ASCII only, which is what makes "lower-case" and "space" mean the same on both sides.
+# These defaults are placeholders at a reserved example domain. Set the real lists in the
+# ignored terraform.tfvars, never here; [] means that environment has no site admins.
+#
+# The rules are preconditions of the colton_games_accounts_vercel_env output, at the end of
+# this file, and deliberately not `validation` blocks here: a failed validation prints the
+# lines of terraform.tfvars that set the variable, addresses included, even though the
+# variable is sensitive. An output is evaluated on every plan, so the lists are checked
+# whatever the gate says, and a failed precondition prints only its own source.
+variable "colton_games_site_admin_emails" {
+  description = "Google addresses of the colton-games site's admins, per environment: prod is written to Vercel Production and nonprod to Preview as SITE_ADMIN_EMAILS, with that environment's auth secret. The defaults are placeholders; set the real lists in the ignored terraform.tfvars, never in this repository. An empty list means no site admins (colton-games-accounts.tf)."
+  type        = object({ prod = list(string), nonprod = list(string) })
+  sensitive   = true
+  default = {
+    prod    = ["admin@example.com"]
+    nonprod = ["admin@example.com"]
+  }
+}
+
+# -------------------------------------------------------------------------------------
 # Vercel: each ready secret's variables, Production from prod and Preview from nonprod
 # -------------------------------------------------------------------------------------
 
@@ -205,14 +243,24 @@ locals {
   colton_games_accounts_other_target  = { production = "preview", preview = "production" }
   colton_games_accounts_target_env    = { for env, target in local.colton_games_accounts_vercel_target : target => env }
 
-  # "<KEY>/<target>" => the secret and JSON key its value comes from. Built from the gate and
-  # the table above only, never from a value: for_each keys must not be sensitive. An auth
-  # secret brings its environment's AUTH_SECRET with it, so the three variables that turn
-  # sign-in on arrive together.
+  # What an auth secret brings besides its own keys: its environment's AUTH_SECRET, so the
+  # three variables that turn sign-in on arrive together, and SITE_ADMIN_EMAILS when that
+  # environment has site admins. An empty list writes no variable: Vercel refuses an empty
+  # value, and the site reads an unset one as "no admins". Only whether the list is empty
+  # leaves the sensitive input here; for_each keys must not be sensitive.
+  colton_games_accounts_auth_extras = {
+    for env in keys(local.colton_games_accounts_vercel_target) : env => concat(
+      ["AUTH_SECRET"],
+      nonsensitive(length(var.colton_games_site_admin_emails[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],
+    )
+  }
+
+  # "<KEY>/<target>" => the secret and JSON key its value comes from. Built from the gate, the
+  # table above and the extras only, never from a value.
   colton_games_accounts_vercel_env = {
     for entry in flatten([
       for name in var.colton_games_accounts_ready : [
-        for key in concat(local.colton_games_accounts_secrets[name].keys, endswith(name, "/auth") ? ["AUTH_SECRET"] : []) :
+        for key in concat(local.colton_games_accounts_secrets[name].keys, endswith(name, "/auth") ? local.colton_games_accounts_auth_extras[split("/", name)[0]] : []) :
         { secret = name, key = key, target = local.colton_games_accounts_vercel_target[split("/", name)[0]] }
       ]
     ]) : "${entry.key}/${entry.target}" => entry
@@ -229,8 +277,18 @@ locals {
     for id, entry in local.colton_games_accounts_vercel_env : id => (
       entry.key == "AUTH_SECRET"
       ? random_password.colton_games_auth_secret[entry.target].result
+      : entry.key == "SITE_ADMIN_EMAILS"
+      ? join(",", var.colton_games_site_admin_emails[split("/", entry.secret)[0]])
       : trimspace(try(tostring(local.colton_games_accounts_payload[entry.secret][entry.key]), ""))
     )
+  }
+
+  # Addresses nobody can own: the reserved example domains and test names (RFC 2606, RFC 6761).
+  colton_games_site_admin_reserved = "(?i)(^|[@.])example\\.(com|net|org)$|\\.(example|test|invalid|localhost)$"
+
+  # Sensitive. Whether an environment's list still holds one of those.
+  colton_games_site_admin_placeholder = {
+    for env, addresses in var.colton_games_site_admin_emails : env => anytrue([for address in addresses : can(regex(local.colton_games_site_admin_reserved, address))])
   }
 
   # What a value must look like, by variable name; any other must only be non-empty.
@@ -279,6 +337,20 @@ resource "vercel_project_environment_variable" "colton_games_accounts" {
         )
       )
       error_message = "${each.value.key} is the same in production and non-production. Each environment has its own Google OAuth client and its own push key pair (colton-games-accounts.tf)."
+    }
+
+    # Failing, not a warning: on the site a non-empty list switches off the admin panel's
+    # password, and nobody owns a placeholder, so nobody could open the panel.
+    precondition {
+      condition     = each.value.key != "SITE_ADMIN_EMAILS" || !local.colton_games_site_admin_placeholder[split("/", each.value.secret)[0]]
+      error_message = "colton_games_site_admin_emails.${split("/", each.value.secret)[0]} still holds a placeholder (an address at a reserved example domain) and ${each.value.secret} is in the gate. Set the real addresses in terraform.tfvars, or [] for no site admins (colton-games-accounts.tf)."
+    }
+
+    # The list used to be a key of the auth secret. One left there would look effective and
+    # is not, so it is refused by name. (Asked once per auth secret, on its client id.)
+    precondition {
+      condition     = each.value.key != "AUTH_GOOGLE_ID" || !can(local.colton_games_accounts_payload[each.value.secret]["SITE_ADMIN_EMAILS"])
+      error_message = "Secret colton-games/${each.value.secret} still has a SITE_ADMIN_EMAILS key. The site admins are the input colton_games_site_admin_emails now: put the JSON again with AUTH_GOOGLE_ID and AUTH_GOOGLE_SECRET only (colton-games-accounts.tf)."
     }
   }
 }
@@ -338,5 +410,21 @@ output "colton_games_accounts_vercel_env" {
       [for entry in local.colton_games_accounts_vercel_env : entry.key if entry.target == target],
       contains(var.colton_games_account_saves_targets, target) ? ["ACCOUNT_SAVES"] : [],
     ))
+  }
+
+  # The rules for var.colton_games_site_admin_emails (see the variable for why they are here).
+  precondition {
+    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : alltrue([for address in addresses : can(regex("^[^\\s@,]+@[^\\s@,]+\\.[^\\s@,]+$", address)) && can(regex("^[!-~]+$", address)) && length(address) <= 254])])
+    error_message = "colton_games_site_admin_emails: every entry must be one address such as admin@example.com, in printable ASCII with no space or comma, at most 254 characters."
+  }
+
+  precondition {
+    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : alltrue([for address in addresses : address == lower(trimspace(address))])])
+    error_message = "colton_games_site_admin_emails: write every address in lower case with no surrounding space, which is how the site compares it."
+  }
+
+  precondition {
+    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : length(distinct(addresses)) == length(addresses) && length(addresses) <= 20])
+    error_message = "colton_games_site_admin_emails: an environment's list has no duplicate and at most 20 addresses."
   }
 }

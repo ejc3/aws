@@ -925,7 +925,7 @@ Available if a task needs them; neither needs a key on disk.
 push as four JSON secrets in us-west-1, split by environment so that production and non-production share
 nothing. `README.md` ("Colton Games accounts") has the owner's steps.
 
-- `colton-games/nonprod/auth` (`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `SITE_ADMIN_EMAILS`) and
+- `colton-games/nonprod/auth` (`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
   `colton-games/nonprod/push` (`NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`): the dev
   boxes and Vercel previews. Readable by dev-server-role, nextjs-dev-role and admins. Export one without
   printing it:
@@ -935,9 +935,16 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   its own (`openssl rand -base64 33`).
 - `colton-games/prod/auth` and `colton-games/prod/push`: production. Admins only; a dev box gets
   `AccessDeniedException`, on purpose.
-- The site admins' addresses exist only as the value of `SITE_ADMIN_EMAILS` (the secret, Terraform state and
-  Vercel). Never write one into a file, a test, a commit or a pull request, in this repository or the games
-  one; use a made-up address.
+- The site admins' addresses are the sensitive input `colton_games_site_admin_emails` (lists `prod` and
+  `nonprod`). The repository holds placeholders at a reserved example domain. The real ones live in the
+  ignored `terraform.tfvars` on the machine that applies, in Terraform state and in Vercel
+  (`SITE_ADMIN_EMAILS`): never in a repository, and no longer in a secret's JSON. Never write one into a
+  file, a test, a commit or a pull request, in this repository or the games one; use an address at
+  `example.com`. Do not read `terraform.tfvars` to learn them. A dev box that wants site admins locally
+  sets `SITE_ADMIN_EMAILS` in its own environment.
+- The rules for those lists are preconditions on an output, not variable `validation` blocks, on purpose:
+  a failed validation prints the `terraform.tfvars` lines that set the variable, addresses included. Do
+  not move them back.
 - Terraform writes the Vercel variables (Production from `prod/*`, Preview from `nonprod/*`) once
   `colton_games_accounts_ready` names a secret. Do not set these names by hand in the Vercel project: Vercel
   refuses a second variable with the same key on a target, and the next apply would fail.
