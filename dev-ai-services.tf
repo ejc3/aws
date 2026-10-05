@@ -220,3 +220,54 @@ resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read_server"
   role       = aws_iam_role.claude_master_server[0].name
   policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
 }
+
+# Turso platform API token (create and delete databases and groups, mint database tokens), for the metal dev boxes.
+# The value is set out of band (put-secret-value from stdin) and never enters git or Terraform state. Readers: the
+# administration set and dev-server-role (the metal boxes). Not nextjs-dev-role: every account there has full sudo, so a grant
+# would be box-wide, and this token can create and delete databases.
+#   export TURSO_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 \
+#     --secret-id turso/api-token --query SecretString --output text)
+resource "aws_secretsmanager_secret" "turso_api_token" {
+  name                    = "turso/api-token"
+  description             = "Turso platform API token (raw string). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "turso/api-token", Project = "dev" }
+}
+
+locals {
+  turso_api_token_readers = [aws_iam_role.dev_server.arn]
+}
+
+resource "aws_secretsmanager_secret_policy" "turso_api_token" {
+  secret_arn = aws_secretsmanager_secret.turso_api_token.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheMetalBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.turso_api_token.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.turso_api_token_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "turso_api_token_read" {
+  statement {
+    sid       = "ReadTheTursoApiToken"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.turso_api_token.arn]
+  }
+}
+
+resource "aws_iam_policy" "turso_api_token_read" {
+  name        = "dev-turso-api-token-read"
+  description = "Metal dev boxes: read the Turso API token (turso/api-token) and nothing else"
+  policy      = data.aws_iam_policy_document.turso_api_token_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "turso_api_token_read" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.turso_api_token_read.arn
+}
