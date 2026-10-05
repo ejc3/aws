@@ -46,7 +46,7 @@
 # the public key in the page, and it is public by design.
 #
 # SITE ADMINS. SITE_ADMIN_EMAILS, the Google addresses of the site's admins, is not in a
-# secret: it is the input var.colton_games_site_admin_emails, one list per environment. This
+# secret: it is the input local.colton_games_site_admin_emails, one list per environment. This
 # file holds only placeholders. The real addresses go in the ignored terraform.tfvars on the
 # machine that applies, and from there exist in Terraform state and in Vercel, never in a
 # repository and no longer in a secret's JSON (a JSON that still has the key is refused, by
@@ -69,7 +69,7 @@
 #      are https://<hostname>/api/auth/callback/google for every hostname that serves the
 #      site: production's on one client, the non-production ones on the other.
 #   3. Put prod/auth and nonprod/auth (above).
-#   4. Set colton_games_site_admin_emails in terraform.tfvars (README.md has the snippet).
+#   4. The site admins are already in the people/addresses secret (key colton_games_site_admins); change them there.
 #   5. Add "prod/auth" and "nonprod/auth" to the gate's default, commit, plan, apply. The plan
 #      adds four variables per environment (three for one whose list is empty) and changes
 #      nothing else.
@@ -200,22 +200,15 @@ resource "random_password" "colton_games_auth_secret" {
 # repository), dropping the rest without a word. So an entry here must already be exactly
 # what the site would keep: nothing is written that the site would then ignore. Printable
 # ASCII only, which is what makes "lower-case" and "space" mean the same on both sides.
-# These defaults are placeholders at a reserved example domain. Set the real lists in the
-# ignored terraform.tfvars, never here; [] means that environment has no site admins.
+# The lists are not in this repository: they are the `colton_games_site_admins` key of the people/addresses secret (people.tf), one
+# list per environment; [] means that environment has no site admins.
 #
 # The rules are preconditions of the colton_games_accounts_vercel_env output, at the end of
-# this file, and deliberately not `validation` blocks here: a failed validation prints the
-# lines of terraform.tfvars that set the variable, addresses included, even though the
-# variable is sensitive. An output is evaluated on every plan, so the lists are checked
-# whatever the gate says, and a failed precondition prints only its own source.
-variable "colton_games_site_admin_emails" {
-  description = "Google addresses of the colton-games site's admins, per environment: prod is written to Vercel Production and nonprod to Preview as SITE_ADMIN_EMAILS, with that environment's auth secret. The defaults are placeholders; set the real lists in the ignored terraform.tfvars, never in this repository. An empty list means no site admins (colton-games-accounts.tf)."
-  type        = object({ prod = list(string), nonprod = list(string) })
-  sensitive   = true
-  default = {
-    prod    = ["admin@example.com"]
-    nonprod = ["admin@example.com"]
-  }
+# this file: an output is evaluated on every plan, so the lists are checked whatever the gate
+# says, and a failed precondition prints only its own source, never an address.
+locals {
+  # Sensitive on purpose (it is written to Vercel as a sensitive variable): only whether a list is empty leaves it.
+  colton_games_site_admin_emails = local.people.colton_games_site_admins
 }
 
 # -------------------------------------------------------------------------------------
@@ -251,7 +244,7 @@ locals {
   colton_games_accounts_auth_extras = {
     for env in keys(local.colton_games_accounts_vercel_target) : env => concat(
       ["AUTH_SECRET"],
-      nonsensitive(length(var.colton_games_site_admin_emails[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],
+      nonsensitive(length(local.colton_games_site_admin_emails[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],
     )
   }
 
@@ -278,7 +271,7 @@ locals {
       entry.key == "AUTH_SECRET"
       ? random_password.colton_games_auth_secret[entry.target].result
       : entry.key == "SITE_ADMIN_EMAILS"
-      ? join(",", var.colton_games_site_admin_emails[split("/", entry.secret)[0]])
+      ? join(",", local.colton_games_site_admin_emails[split("/", entry.secret)[0]])
       : trimspace(try(tostring(local.colton_games_accounts_payload[entry.secret][entry.key]), ""))
     )
   }
@@ -288,7 +281,7 @@ locals {
 
   # Sensitive. Whether an environment's list still holds one of those.
   colton_games_site_admin_placeholder = {
-    for env, addresses in var.colton_games_site_admin_emails : env => anytrue([for address in addresses : can(regex(local.colton_games_site_admin_reserved, address))])
+    for env, addresses in local.colton_games_site_admin_emails : env => anytrue([for address in addresses : can(regex(local.colton_games_site_admin_reserved, address))])
   }
 
   # What a value must look like, by variable name; any other must only be non-empty.
@@ -412,19 +405,19 @@ output "colton_games_accounts_vercel_env" {
     ))
   }
 
-  # The rules for var.colton_games_site_admin_emails (see the variable for why they are here).
+  # The rules for local.colton_games_site_admin_emails (see the variable for why they are here).
   precondition {
-    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : alltrue([for address in addresses : can(regex("^[^\\s@,]+@[^\\s@,]+\\.[^\\s@,]+$", address)) && can(regex("^[!-~]+$", address)) && length(address) <= 254])])
+    condition     = alltrue([for addresses in values(local.colton_games_site_admin_emails) : alltrue([for address in addresses : can(regex("^[^\\s@,]+@[^\\s@,]+\\.[^\\s@,]+$", address)) && can(regex("^[!-~]+$", address)) && length(address) <= 254])])
     error_message = "colton_games_site_admin_emails: every entry must be one address such as admin@example.com, in printable ASCII with no space or comma, at most 254 characters."
   }
 
   precondition {
-    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : alltrue([for address in addresses : address == lower(trimspace(address))])])
+    condition     = alltrue([for addresses in values(local.colton_games_site_admin_emails) : alltrue([for address in addresses : address == lower(trimspace(address))])])
     error_message = "colton_games_site_admin_emails: write every address in lower case with no surrounding space, which is how the site compares it."
   }
 
   precondition {
-    condition     = alltrue([for addresses in values(var.colton_games_site_admin_emails) : length(distinct(addresses)) == length(addresses) && length(addresses) <= 20])
+    condition     = alltrue([for addresses in values(local.colton_games_site_admin_emails) : length(distinct(addresses)) == length(addresses) && length(addresses) <= 20])
     error_message = "colton_games_site_admin_emails: an environment's list has no duplicate and at most 20 addresses."
   }
 }

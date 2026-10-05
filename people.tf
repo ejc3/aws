@@ -7,7 +7,7 @@
 #
 #   read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id people/addresses --secret-string file:///dev/stdin; unset T
-#   {"owner": "...", "family": ["...", "..."], "staging_account": "..."}
+#   {"owner": "...", "family": ["...", "..."], "staging_account": "...", "colton_games_site_admins": {"prod": [...], "nonprod": [...]}}
 #
 # Terraform reads it into locals (local.people, and the names the configuration already used) wherever an address is needed.
 # Every machine that plans (both jumpboxes, the Stop hook) has the administration role and can read it; a dev box cannot plan
@@ -61,8 +61,8 @@ resource "terraform_data" "people_shape" {
 
   lifecycle {
     precondition {
-      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account)
-      error_message = "The people/addresses secret must be JSON with the keys owner, family and staging_account (see people.tf)."
+      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account) && can(local.people.colton_games_site_admins.prod) && can(local.people.colton_games_site_admins.nonprod)
+      error_message = "The people/addresses secret must be JSON with the keys owner, family, staging_account and colton_games_site_admins {prod, nonprod} (see people.tf)."
     }
     precondition {
       condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account))

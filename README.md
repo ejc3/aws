@@ -979,22 +979,14 @@ value fails every plan of this repository, so Terraform reads only the secrets t
 names and writes only their variables. It starts empty. Change its default in a commit, not
 with `-var`: a later plan without the flag would propose deleting the variables.
 
-**Site admins.** `SITE_ADMIN_EMAILS`, the Google addresses of the site's admins, is the
-Terraform input `colton_games_site_admin_emails`: one list for `prod` (written to
-Production) and one for `nonprod` (written to Preview), with that environment's `auth`
-secret and under the same gate. The repository holds only placeholders. The real addresses
-go in the ignored `terraform.tfvars` on the machine that applies:
-
-```hcl
-# terraform.tfvars (ignored by git; never commit a real address)
-colton_games_site_admin_emails = {
-  prod    = ["admin@example.com", "second.admin@example.com"]
-  nonprod = ["admin@example.com"]
-}
-```
-
-From there the addresses exist in Terraform state and in Vercel, and nowhere else: not in
-a repository, and no longer in a secret's JSON. The rules:
+**Site admins.** `SITE_ADMIN_EMAILS`, the Google addresses of the site's admins, comes from the
+`colton_games_site_admins` key of the `people/addresses` secret (`people.tf`): one list for `prod`
+(written to Production) and one for `nonprod` (written to Preview), with that environment's `auth`
+secret and under the same gate. The repository holds no address. To change them, put the secret's
+JSON again with the new lists under that key (the same `put-secret-value` command as for `people/addresses`
+above); a plan on any jumpbox reads it, so there is no per-machine file. From there the addresses exist
+in Terraform state and in Vercel, and nowhere else: not in a repository, and not in a colton-games
+secret's JSON. The rules:
 
 - Write each address in lower case, one per entry, with no space. That is how the site
   compares them, and it silently drops an entry it cannot read; here the plan refuses it.
@@ -1042,8 +1034,8 @@ The owner's steps, in order:
      --secret-string file://<a 0600 JSON file> && shred -u <that file>
    ```
 
-4. Set `colton_games_site_admin_emails` in `terraform.tfvars` (the snippet above), with the
-   real addresses for `prod` and for `nonprod`, or `[]` for an environment without admins.
+4. Check the `colton_games_site_admins` key of the `people/addresses` secret holds the real addresses for
+   `prod` and for `nonprod`, or `[]` for an environment without admins.
 5. Set the gate's default to `["prod/auth", "nonprod/auth"]` in a commit, then plan and apply.
    Expect eight `vercel_project_environment_variable.colton_games_accounts` to add
    (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` and `SITE_ADMIN_EMAILS`, once for
