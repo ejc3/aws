@@ -156,7 +156,7 @@ jobs:
       - name: A wedged persistent box is rebooted and nothing else is (auto-reboot Lambda)
         run: python3 -S -B scripts/test-auto-reboot.py
 
-      - name: yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone
+      - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
       - name: Turso API token is readable by the metal boxes and administration only
