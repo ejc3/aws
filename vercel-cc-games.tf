@@ -6,7 +6,8 @@
 # sets Terraform creates and owns: the multiplayer one (MP_*, CRON_SECRET,
 # AWS_ROLE_ARN/AWS_REGION, Preview's Skyhook pair and the automation bypass) in
 # games-multiplayer-bringup.tf, ELEVENLABS_API_KEY in dev-ai-services.tf, and the accounts one
-# (AUTH_*, SITE_ADMIN_EMAILS and the push keys) in colton-games-accounts.tf.
+# (AUTH_*, SITE_ADMIN_EMAILS, the push keys and the ACCOUNT_SAVES switch) in
+# colton-games-accounts.tf.
 #
 # Rollout is staged so production never redirects to a domain that is not serving yet:
 #   stage 2 (this file): cc-games.app becomes a project domain, ccgames.app redirects to it,

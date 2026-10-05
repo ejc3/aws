@@ -969,6 +969,13 @@ value fails every plan of this repository, so Terraform reads only the secrets t
 names and writes only their variables. It starts empty. Change its default in a commit, not
 with `-var`: a later plan without the flag would propose deleting the variables.
 
+`ACCOUNT_SAVES` is the site's switch for keeping a signed-in player's saved games in their
+account. The site reads exactly `on`; unset is off. It is not a secret, so it has no
+container and is not sensitive. A second gate, `colton_games_account_saves_targets`, names
+the Vercel targets that get it, each on its own, and also starts empty. Production is the
+one to name: the site trusts no preview address for saves, so the switch does nothing on
+Preview. A target cannot be named before its `auth` secret is in the first gate.
+
 The owner's steps, in order:
 
 1. Merge with the gate empty, then plan and apply on a jumpbox. Expect 13 to add (four
@@ -979,11 +986,11 @@ The owner's steps, in order:
    that serves its environment:
    - production: `cc-games.org`, and `colton-games.vercel.app` because Vercel's own name also
      serves. The other production names redirect to `cc-games.org` before sign-in starts.
-   - non-production: each dev-box site (`<name>.cc-games.dev`), `http://localhost:<port>`
-     for a local run, and each preview hostname that should offer sign-in. Google accepts no
-     wildcard, and a preview's per-deploy address is new every time, so only a stable
-     address can be registered. On any other preview the sign-in button ends at Google's
-     `redirect_uri_mismatch` page.
+   - non-production: each dev-box site (`<name>.cc-games.dev`) and `http://localhost:<port>`
+     for a local run. A preview needs none. Google accepts no wildcard and a preview's
+     address is new with every deploy, so on a Vercel deployment the site offers sign-in
+     only at its registered hostnames (the two production ones above): a preview shows no
+     sign-in button and its `/api/auth/*` routes answer `404`.
 
    A Google Cloud project whose consent screen is in testing admits only its listed test
    users, so production's must be published.
@@ -1012,7 +1019,24 @@ The owner's steps, in order:
    - On a dev box, `aws secretsmanager get-secret-value --region us-west-1 --secret-id
      colton-games/prod/auth --query Name --output text` fails with `AccessDeniedException`,
      and the same command for `colton-games/nonprod/auth` prints the name.
-7. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
+7. Account saves, when the site has them and only after step 6 passes for production:
+   - Nothing is applied by hand. The saves migration
+     (`supabase/migrations/20261004000000_account_saves.sql` in the games repository) is
+     applied by `games-mp-migrate` when the games change merges to `main`. Before the
+     switch, check it arrived, or the site offers saves with no tables behind them:
+     `aws dynamodb get-item --region us-west-1 --table-name games-mp-releases --key
+     '{"id":{"S":"schema#main"}}'` shows `siteNewest` at that file or a later one.
+   - Set the default of `colton_games_account_saves_targets` to `["production"]` in a
+     commit, then plan and apply. Expect one to add,
+     `vercel_project_environment_variable.colton_games_account_saves["production"]`, and
+     nothing else.
+   - Redeploy production.
+   - Verify: `terraform output colton_games_accounts_vercel_env` now lists `ACCOUNT_SAVES`
+     under `production` only, and `curl -s -o /dev/null -w '%{http_code}\n'
+     https://cc-games.org/storage-bridge` prints `200`. It prints `404` while saves are off.
+
+   To switch saves off again, take the target out of the default and apply, then redeploy.
+8. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
    put `colton-games/prod/push` and `colton-games/nonprod/push` (`VAPID_SUBJECT` is an
    `https://` address of the site), add both names to the gate and repeat steps 4 to 6.
 
