@@ -943,10 +943,10 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   its own (`openssl rand -base64 33`).
 - `colton-games/prod/auth` and `colton-games/prod/push`: production. Admins only; a dev box gets
   `AccessDeniedException`, on purpose.
-- The site admins' addresses are the sensitive input `colton_games_site_admin_emails` (lists `prod` and
-  `nonprod`). The repository holds placeholders at a reserved example domain. The real ones live in the
-  ignored `terraform.tfvars` on the machine that applies, in Terraform state and in Vercel
-  (`SITE_ADMIN_EMAILS`): never in a repository, and no longer in a secret's JSON. Never write one into a
+- The site admins' addresses are the `colton_games_site_admins` key (lists `prod` and `nonprod`) of the
+  `people/addresses` secret (`people.tf`), read by every jumpbox that plans, so no machine needs a local file. They
+  live there, in Terraform state and in Vercel (`SITE_ADMIN_EMAILS`): never in a repository, and not in a
+  colton-games secret's JSON. Never write one into a
   file, a test, a commit or a pull request, in this repository or the games one; use an address at
   `example.com`. Do not read `terraform.tfvars` to learn them. A dev box that wants site admins locally
   sets `SITE_ADMIN_EMAILS` in its own environment.

@@ -250,8 +250,8 @@ def hcl_pattern(text):
 
 
 class SiteAdminTests(unittest.TestCase):
-    """The site admins' addresses: a Terraform input, placeholders in the repository, the real
-    ones in the ignored terraform.tfvars. The site reads SITE_ADMIN_EMAILS by splitting on
+    """The site admins' addresses: read from the people/addresses secret (people.tf), never held in the
+    repository. The site reads SITE_ADMIN_EMAILS by splitting on
     commas, trimming, lower-casing and keeping what matches its address shape, at most 254
     characters (lib/auth/config.ts in the games repository)."""
 
@@ -261,20 +261,18 @@ class SiteAdminTests(unittest.TestCase):
         """The rules for the lists: preconditions of an output, which is evaluated on every plan."""
         return preconditions(block("", "colton_games_accounts_vercel_env"))
 
-    def test_the_rules_are_not_variable_validation_which_would_print_the_addresses(self):
-        # A failed `validation` prints the lines of terraform.tfvars that set the variable,
-        # addresses included, even for a sensitive variable. A failed precondition prints its
-        # own source instead.
-        self.assertNotIn("validation {", block("", self.VAR))
+    def test_the_rules_are_preconditions_of_the_output_and_there_is_no_variable(self):
+        # A failed precondition prints its own source, never an address. And there is no variable (and so no tfvars line) to leak:
+        # the lists come from the people/addresses secret.
+        self.assertNotIn('variable "%s"' % self.VAR, TF)
         self.assertEqual(len(self.checks()), 3)
 
-    def test_the_addresses_are_a_sensitive_input_per_environment_with_placeholder_defaults(self):
-        variable = block("", self.VAR)
-        self.assertIn("type        = object({ prod = list(string), nonprod = list(string) })", variable)
-        self.assertIn("sensitive   = true", variable)
-        default = re.search(r"^  default = \{\n(.*?)^  \}", variable, re.S | re.M).group(1)
-        self.assertEqual(re.findall(r'^\s+(\w+)\s+= \[(.*)\]$', default, re.M),
-                         [("prod", '"admin@example.com"'), ("nonprod", '"admin@example.com"')])
+    def test_the_lists_come_from_the_people_secret_per_environment_and_nothing_is_held_here(self):
+        self.assertEqual(local("colton_games_site_admin_emails").strip(), "local.people.colton_games_site_admins")
+        people = (ROOT / "people.tf").read_text()
+        self.assertIn("can(local.people.colton_games_site_admins.prod)", people)
+        self.assertIn("can(local.people.colton_games_site_admins.nonprod)", people)
+        self.assertNotRegex(TF, r"(?m)^\s*(prod|nonprod)\s*=\s*\[")  # no list literal of addresses in this file
 
     def test_an_entry_must_be_exactly_what_the_site_would_keep(self):
         checks = self.checks()
@@ -302,7 +300,7 @@ class SiteAdminTests(unittest.TestCase):
         self.assertIn("length(distinct(addresses)) == length(addresses)", conditions)
         self.assertRegex(conditions, r"length\(addresses\) <= 20\b")
         # Every rule covers both environments, whatever the gate says.
-        self.assertEqual(conditions.count("for addresses in values(var.%s)" % self.VAR), 3)
+        self.assertEqual(conditions.count("for addresses in values(local.%s)" % self.VAR), 3)
         self.assertNotIn("colton_games_accounts_ready", conditions)
 
     def test_the_list_is_written_under_the_auth_gate_from_its_own_environment(self):
@@ -311,7 +309,7 @@ class SiteAdminTests(unittest.TestCase):
         values = local("colton_games_accounts_vercel_values")
         self.assertIn('entry.key == "SITE_ADMIN_EMAILS"', values)
         # Comma-joined, as the site splits it; prod's list for production, nonprod's for preview.
-        self.assertIn('join(",", var.%s[split("/", entry.secret)[0]])' % self.VAR, values)
+        self.assertIn('join(",", local.%s[split("/", entry.secret)[0]])' % self.VAR, values)
         # No resource of its own: the one that exists only for secrets the gate names.
         self.assertEqual(re.findall(r'^resource "vercel_\w+" "(\w+)"', TF, re.M),
                          ["colton_games_accounts", "colton_games_account_saves"])
@@ -320,7 +318,7 @@ class SiteAdminTests(unittest.TestCase):
     def test_an_empty_list_means_no_site_admins_and_writes_no_variable(self):
         # Vercel refuses an empty value, and the site reads "unset" as "no admins".
         self.assertIn(
-            'nonsensitive(length(var.%s[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],' % self.VAR,
+            'nonsensitive(length(local.%s[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],' % self.VAR,
             local("colton_games_accounts_auth_extras"))
 
     def test_a_placeholder_is_refused_where_it_would_be_written(self):
@@ -336,7 +334,7 @@ class SiteAdminTests(unittest.TestCase):
         for real in ("notexample.com", "example.com.au", "example.co", "examples.org", "contest", "latest.dev"):
             self.assertFalse(pattern.search("@" + real), real)
         self.assertIn(
-            "for env, addresses in var.%s : env => anytrue([for address in addresses : "
+            "for env, addresses in local.%s : env => anytrue([for address in addresses : "
             "can(regex(local.colton_games_site_admin_reserved, address))])" % self.VAR,
             local("colton_games_site_admin_placeholder"))
         variable = block("vercel_project_environment_variable", "colton_games_accounts")
