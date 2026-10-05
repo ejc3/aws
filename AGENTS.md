@@ -337,8 +337,8 @@ working personal login with a bootstrap token.
 **Email addresses stay out of the repository**: never write a person's email address into a file, a comment, a
 test, a default value, a commit message, or a pull request title, description or review comment, however the
 configuration needs it (an Access allowlist, an owner, an account's root address, a site admin). Those are read from
-outside git: `/infra/people` in SSM (`people.tf`) for the infrastructure, the secret or the ignored `terraform.tfvars` where a
-feature's own rules say so. In text, code and tests use a made-up address at `example.com`, `example.net` or `example.org`.
+outside git: the `people/addresses` secret in Secrets Manager (`people.tf`) for the infrastructure, the feature's own
+secret or the ignored `terraform.tfvars` where its rules say so. In text, code and tests use a made-up address at `example.com`, `example.net` or `example.org`.
 `scripts/test-people.py` fails on a personal mailbox in any tracked file, so a leaked one fails CI. Git history keeps what it
 already holds; do not rewrite it for this.
 

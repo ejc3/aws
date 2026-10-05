@@ -159,7 +159,7 @@ jobs:
       - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
-      - name: "People's addresses live in /infra/people, not in git (people.tf)"
+      - name: "People's addresses live in the people/addresses secret, not in git (people.tf)"
         run: python3 -S -B scripts/test-people.py
 
       - name: Turso API token is readable by the metal boxes and administration only
