@@ -21,7 +21,10 @@ locals {
 
   # Where `pbox` launches. Flip it only with the boxes down and the volume snapshots taken just before (apply this file,
   # then flip, in quick succession): work written to the old region's disks after the snapshot is not in the copy.
-  parallel_box_region = "us-west-2"
+  # Moved to us-east-2 on 2026-10-05 from the snapshot copied earlier, not a fresh one: anything written to the us-west-2
+  # disks after that snapshot was left behind, which the owner accepted. Those volumes are now Live=false and kept as the
+  # only copy of that data until they are deleted.
+  parallel_box_region = "us-east-2"
 
   # The two persistent volumes being copied, by box number: the us-west-2 volume, its size and its Name tag.
   pbox_move_volumes = {
