@@ -4,7 +4,9 @@ environment. Production's secrets are readable by the administration set only, n
 also by the two dev roles. Terraform reads a secret and writes its variables to Vercel only
 once the checked-in gate names it; Production is written from prod and Preview from nonprod,
 never one variable for both. The account-saves switch (ACCOUNT_SAVES=on, not a secret) is
-written only to the targets its own gate names. Offline."""
+written only to the targets its own gate names. The site admins' addresses are a sensitive
+input with placeholder defaults, written under the auth gate, and a placeholder is refused
+where it would be written. Offline."""
 import re
 import unittest
 from pathlib import Path
@@ -13,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "colton-games-accounts.tf").read_text()
 CODE = "\n".join(line for line in TF.splitlines() if not line.lstrip().startswith("#"))
 
-AUTH = ["AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET", "SITE_ADMIN_EMAILS"]
+AUTH = ["AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
 PUSH = ["NEXT_PUBLIC_VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "VAPID_SUBJECT"]
 NAMES = ["nonprod/auth", "nonprod/push", "prod/auth", "prod/push"]
 
@@ -68,7 +70,9 @@ class SecretTests(unittest.TestCase):
         # Terraform reads a value (a data source); it never holds one in a .tf file.
         self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
         self.assertNotRegex(TF, r"GOCSPX-[A-Za-z0-9_-]{6,}|\d+-[a-z0-9]{20,}\.apps\.googleusercontent\.com")
-        self.assertNotRegex(TF, r"[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}", "no address, not even an example")
+        # The only addresses in the file are placeholders at the reserved example domains.
+        domains = set(re.findall(r"[A-Za-z0-9._+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", TF))
+        self.assertLessEqual(domains, {"example.com", "example.net", "example.org"})
         self.assertNotRegex(TF, r"\bB[A-Za-z0-9_-]{86}\b|mailto:[A-Za-z0-9]")
 
     def test_production_is_for_the_administration_set_only(self):
@@ -136,7 +140,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual(re.findall(r"for name in ([\w.]+) :", env), ["var.colton_games_accounts_ready"])
         self.assertEqual(len(re.findall(r"\bfor \w+(?:, \w+)? in ", env)), 3)
         self.assertIn(
-            'for key in concat(local.colton_games_accounts_secrets[name].keys, endswith(name, "/auth") ? ["AUTH_SECRET"] : []) :',
+            'for key in concat(local.colton_games_accounts_secrets[name].keys, '
+            'endswith(name, "/auth") ? local.colton_games_accounts_auth_extras[split("/", name)[0]] : []) :',
             env)
         self.assertIn(']) : "${entry.key}/${entry.target}" => entry', env)
         self.assertEqual(re.findall(r'^resource "vercel_\w+" "(\w+)"', TF, re.M),
@@ -182,6 +187,8 @@ class VercelTests(unittest.TestCase):
         self.assertNotIn("AUTH_SECRET", local("colton_games_accounts_auth_keys"))
         self.assertIn("random_password.colton_games_auth_secret[entry.target].result",
                       local("colton_games_accounts_vercel_values"))
+        # It comes with every auth secret, whether or not that environment has site admins.
+        self.assertRegex(local("colton_games_accounts_auth_extras"), r'concat\(\s*\["AUTH_SECRET"\],')
 
     def test_a_missing_or_misplaced_value_fails_the_plan(self):
         variable = block("vercel_project_environment_variable", "colton_games_accounts")
@@ -209,7 +216,7 @@ class VercelTests(unittest.TestCase):
         self.assertEqual(sorted(strings(local("colton_games_accounts_distinct_keys"))),
                          ["AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET", "NEXT_PUBLIC_VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"])
         variable = block("vercel_project_environment_variable", "colton_games_accounts")
-        self.assertEqual(len(re.findall(r"^\s+precondition \{", variable, re.M)), 2)
+        self.assertEqual(len(re.findall(r"^\s+precondition \{", variable, re.M)), 4)
         self.assertIn("!contains(local.colton_games_accounts_distinct_keys, each.value.key)", variable)
         self.assertIn("local.colton_games_accounts_vercel_values[each.key] != lookup(", variable)
         self.assertIn(
@@ -229,6 +236,139 @@ class VercelTests(unittest.TestCase):
             self.assertNotIn("random_password", out)
             self.assertNotIn("sensitive", out)
         self.assertEqual(len(re.findall(r"^output ", TF, re.M)), 2)
+
+
+def preconditions(text):
+    """[(condition, error message)] of the precondition blocks in one block's text."""
+    return re.findall(r'precondition \{\n\s+condition\s+= (.*?)\n\s+error_message = "(.*?)"\n\s+\}', text, re.S)
+
+
+def hcl_pattern(text):
+    """The regular expression inside the one regex("...", ...) call of `text`, unescaped."""
+    [pattern] = re.findall(r'regex\("((?:[^"\\]|\\.)*)"', text)
+    return pattern.replace("\\\\", "\\")
+
+
+class SiteAdminTests(unittest.TestCase):
+    """The site admins' addresses: a Terraform input, placeholders in the repository, the real
+    ones in the ignored terraform.tfvars. The site reads SITE_ADMIN_EMAILS by splitting on
+    commas, trimming, lower-casing and keeping what matches its address shape, at most 254
+    characters (lib/auth/config.ts in the games repository)."""
+
+    VAR = "colton_games_site_admin_emails"
+
+    def checks(self):
+        """The rules for the lists: preconditions of an output, which is evaluated on every plan."""
+        return preconditions(block("", "colton_games_accounts_vercel_env"))
+
+    def test_the_rules_are_not_variable_validation_which_would_print_the_addresses(self):
+        # A failed `validation` prints the lines of terraform.tfvars that set the variable,
+        # addresses included, even for a sensitive variable. A failed precondition prints its
+        # own source instead.
+        self.assertNotIn("validation {", block("", self.VAR))
+        self.assertEqual(len(self.checks()), 3)
+
+    def test_the_addresses_are_a_sensitive_input_per_environment_with_placeholder_defaults(self):
+        variable = block("", self.VAR)
+        self.assertIn("type        = object({ prod = list(string), nonprod = list(string) })", variable)
+        self.assertIn("sensitive   = true", variable)
+        default = re.search(r"^  default = \{\n(.*?)^  \}", variable, re.S | re.M).group(1)
+        self.assertEqual(re.findall(r'^\s+(\w+)\s+= \[(.*)\]$', default, re.M),
+                         [("prod", '"admin@example.com"'), ("nonprod", '"admin@example.com"')])
+
+    def test_an_entry_must_be_exactly_what_the_site_would_keep(self):
+        checks = self.checks()
+        conditions = " ".join(condition for condition, _ in checks)
+        # Already trimmed and lower-cased, so what is written is what the site compares.
+        self.assertIn("address == lower(trimspace(address))", conditions)
+        self.assertIn("length(address) <= 254", conditions)
+        shape = [condition for condition, _ in checks if "regex(" in condition]
+        self.assertEqual(len(shape), 1)
+        # The site's own EMAIL_SHAPE, limited to printable ASCII so \\s means the same in both.
+        self.assertEqual(hcl_pattern(shape[0].split("&&")[0]), r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+        self.assertIn('can(regex("^[!-~]+$", address))', shape[0])
+        site_shape = re.compile(hcl_pattern(shape[0].split("&&")[0]))
+        for good in ("admin@example.com", "first.last+games@mail.example.org"):
+            self.assertTrue(site_shape.search(good), good)
+        for bad in ("admin@example", "ad min@example.com", "a,b@example.com", "@example.com", "admin@@example.com",
+                    "admin@example.com,second@example.com", ""):
+            self.assertFalse(site_shape.search(bad), bad)
+        for _, message in checks:
+            self.assertIn(self.VAR, message)
+            self.assertNotIn("${", message, "a message never interpolates a value")
+
+    def test_no_duplicates_and_a_bounded_count(self):
+        conditions = " ".join(condition for condition, _ in self.checks())
+        self.assertIn("length(distinct(addresses)) == length(addresses)", conditions)
+        self.assertRegex(conditions, r"length\(addresses\) <= 20\b")
+        # Every rule covers both environments, whatever the gate says.
+        self.assertEqual(conditions.count("for addresses in values(var.%s)" % self.VAR), 3)
+        self.assertNotIn("colton_games_accounts_ready", conditions)
+
+    def test_the_list_is_written_under_the_auth_gate_from_its_own_environment(self):
+        extras = local("colton_games_accounts_auth_extras")
+        self.assertIn("for env in keys(local.colton_games_accounts_vercel_target) : env => concat(", extras)
+        values = local("colton_games_accounts_vercel_values")
+        self.assertIn('entry.key == "SITE_ADMIN_EMAILS"', values)
+        # Comma-joined, as the site splits it; prod's list for production, nonprod's for preview.
+        self.assertIn('join(",", var.%s[split("/", entry.secret)[0]])' % self.VAR, values)
+        # No resource of its own: the one that exists only for secrets the gate names.
+        self.assertEqual(re.findall(r'^resource "vercel_\w+" "(\w+)"', TF, re.M),
+                         ["colton_games_accounts", "colton_games_account_saves"])
+        self.assertNotIn('"SITE_ADMIN_EMAILS"', local("colton_games_accounts_vercel_env"))
+
+    def test_an_empty_list_means_no_site_admins_and_writes_no_variable(self):
+        # Vercel refuses an empty value, and the site reads "unset" as "no admins".
+        self.assertIn(
+            'nonsensitive(length(var.%s[env]) > 0) ? ["SITE_ADMIN_EMAILS"] : [],' % self.VAR,
+            local("colton_games_accounts_auth_extras"))
+
+    def test_a_placeholder_is_refused_where_it_would_be_written(self):
+        reserved = local("colton_games_site_admin_reserved")
+        pattern = re.compile(hcl_pattern("regex(%s" % reserved.strip()))
+        for placeholder in ("admin@example.com", "someone@mail.example.org", "a@example.net", "a@EXAMPLE.com"):
+            self.assertTrue(pattern.search(placeholder), placeholder)
+        # The reserved test names too. (Bare domains from here on: the only addresses in this
+        # file are at the example domains.)
+        for reserved_name in ("family.test", "something.example", "nowhere.invalid", "box.localhost"):
+            self.assertTrue(pattern.search("someone@" + reserved_name), reserved_name)
+        # Domains that only look like one.
+        for real in ("notexample.com", "example.com.au", "example.co", "examples.org", "contest", "latest.dev"):
+            self.assertFalse(pattern.search("@" + real), real)
+        self.assertIn(
+            "for env, addresses in var.%s : env => anytrue([for address in addresses : "
+            "can(regex(local.colton_games_site_admin_reserved, address))])" % self.VAR,
+            local("colton_games_site_admin_placeholder"))
+        variable = block("vercel_project_environment_variable", "colton_games_accounts")
+        # A failing precondition, not a warning: a non-empty list switches off the admin panel's
+        # password, so a placeholder in production would leave nobody able to open it.
+        self.assertIn(
+            'condition     = each.value.key != "SITE_ADMIN_EMAILS" || '
+            '!local.colton_games_site_admin_placeholder[split("/", each.value.secret)[0]]', variable)
+        self.assertNotRegex(TF, r'(?m)^check "')
+
+    def test_the_secret_no_longer_carries_the_list_and_one_that_does_is_refused(self):
+        self.assertNotIn("SITE_ADMIN_EMAILS", local("colton_games_accounts_auth_keys"))
+        self.assertNotIn("SITE_ADMIN_EMAILS", block("aws_secretsmanager_secret", "colton_games_accounts"))
+        variable = block("vercel_project_environment_variable", "colton_games_accounts")
+        # Asked once per auth secret (on its client id), and the message names the key.
+        self.assertIn(
+            'condition     = each.value.key != "AUTH_GOOGLE_ID" || '
+            '!can(local.colton_games_accounts_payload[each.value.secret]["SITE_ADMIN_EMAILS"])', variable)
+        messages = re.findall(r'error_message = "(.*?)"\n', variable)
+        self.assertEqual(len(messages), 4)
+        self.assertTrue(any("still has a SITE_ADMIN_EMAILS key" in message for message in messages))
+        for message in messages:
+            self.assertNotIn("vercel_values", message)
+            self.assertNotIn("var.", message)
+
+    def test_the_list_stays_sensitive_in_vercel_and_out_of_the_outputs(self):
+        self.assertIn("sensitive  = true", block("vercel_project_environment_variable", "colton_games_accounts"))
+        self.assertNotIn(self.VAR, block("", "colton_games_accounts_secrets"))
+        env = block("", "colton_games_accounts_vercel_env")
+        value = "\n".join(line for line in env[env.index("  value = {"):env.index("  precondition {")].splitlines()
+                          if not line.lstrip().startswith("#"))
+        self.assertNotIn(self.VAR, value, "the output's value is names only; the lists are only checked beside it")
 
 
 class AccountSavesTests(unittest.TestCase):

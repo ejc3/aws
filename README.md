@@ -952,15 +952,14 @@ containers; the owner puts the values.
 
 | Secret | JSON keys (all strings) | Readers besides administration | Written to Vercel |
 |---|---|---|---|
-| `colton-games/prod/auth` | `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `SITE_ADMIN_EMAILS` | none | Production |
+| `colton-games/prod/auth` | `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` | none | Production |
 | `colton-games/prod/push` | `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | none | Production |
 | `colton-games/nonprod/auth` | as `prod/auth` | dev-server-role, nextjs-dev-role | Preview |
 | `colton-games/nonprod/push` | as `prod/push` | dev-server-role, nextjs-dev-role | Preview |
 
 `AUTH_SECRET` is in none of them: Terraform generates one per environment and writes it to
-Vercel only, as it does for `MP_COOKIE_SECRET`. `SITE_ADMIN_EMAILS` is the comma-separated
-list of the site admins' Google addresses. No repository holds that list: it exists in the
-secret, in Terraform state and in Vercel. Every variable is sensitive in Vercel, each has
+Vercel only, as it does for `MP_COOKIE_SECRET`. `SITE_ADMIN_EMAILS` is in none of them
+either (see "Site admins" below). Every variable is sensitive in Vercel, each has
 exactly one target, and nothing goes to Development. `NEXT_PUBLIC_VAPID_PUBLIC_KEY` is the one name the browser sees, because a push
 subscription needs the public key in the page.
 
@@ -968,6 +967,35 @@ subscription needs the public key in the page.
 value fails every plan of this repository, so Terraform reads only the secrets the gate
 names and writes only their variables. It starts empty. Change its default in a commit, not
 with `-var`: a later plan without the flag would propose deleting the variables.
+
+**Site admins.** `SITE_ADMIN_EMAILS`, the Google addresses of the site's admins, is the
+Terraform input `colton_games_site_admin_emails`: one list for `prod` (written to
+Production) and one for `nonprod` (written to Preview), with that environment's `auth`
+secret and under the same gate. The repository holds only placeholders. The real addresses
+go in the ignored `terraform.tfvars` on the machine that applies:
+
+```hcl
+# terraform.tfvars (ignored by git; never commit a real address)
+colton_games_site_admin_emails = {
+  prod    = ["admin@example.com", "second.admin@example.com"]
+  nonprod = ["admin@example.com"]
+}
+```
+
+From there the addresses exist in Terraform state and in Vercel, and nowhere else: not in
+a repository, and no longer in a secret's JSON. The rules:
+
+- Write each address in lower case, one per entry, with no space. That is how the site
+  compares them, and it silently drops an entry it cannot read; here the plan refuses it.
+- No duplicates, at most 20 per environment.
+- `[]` means that environment has no site admins. No variable is written for it.
+- A placeholder is refused where it would be written. If an environment's `auth` secret is
+  in the gate and its list still holds an address at a reserved example domain, the plan
+  fails. On the site a non-empty list switches off the admin panel's password, so a list
+  nobody owns would leave nobody able to open the panel.
+- Every machine that plans needs the same entry. One without it sees the placeholders and
+  is refused by the rule above, so it cannot replace the real list by accident.
+- A refusal names the variable and never an address.
 
 `ACCOUNT_SAVES` is the site's switch for keeping a signed-in player's saved games in their
 account. The site reads exactly `on`; unset is off. It is not a secret, so it has no
@@ -994,22 +1022,27 @@ The owner's steps, in order:
 
    A Google Cloud project whose consent screen is in testing admits only its listed test
    users, so production's must be published.
-3. Put each value from a JSON file only you can read, then remove the file:
+3. Put each `auth` value from a JSON file only you can read, then remove the file. The JSON
+   has exactly two keys, `AUTH_GOOGLE_ID` and `AUTH_GOOGLE_SECRET`; one that still has a
+   `SITE_ADMIN_EMAILS` key is refused by name at step 5.
 
    ```bash
    aws secretsmanager put-secret-value --region us-west-1 --secret-id colton-games/<env>/auth \
      --secret-string file://<a 0600 JSON file> && shred -u <that file>
    ```
 
-4. Set the gate's default to `["prod/auth", "nonprod/auth"]` in a commit, then plan and apply.
+4. Set `colton_games_site_admin_emails` in `terraform.tfvars` (the snippet above), with the
+   real addresses for `prod` and for `nonprod`, or `[]` for an environment without admins.
+5. Set the gate's default to `["prod/auth", "nonprod/auth"]` in a commit, then plan and apply.
    Expect eight `vercel_project_environment_variable.colton_games_accounts` to add
    (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` and `SITE_ADMIN_EMAILS`, once for
-   `production` and once for `preview`) and nothing else. The plan refuses, naming the
-   secret and key and never the value, when a key is missing, a value is in the wrong key,
-   or both environments were given the same OAuth client.
-5. Redeploy production. A deployment reads its environment when it is built; previews get
+   `production` and once for `preview`; one fewer for an environment whose list is `[]`)
+   and nothing else. The plan refuses, naming the secret and key or the variable and never
+   the value, when a key is missing, a value is in the wrong key, both environments were
+   given the same OAuth client, or an admin list is malformed or still a placeholder.
+6. Redeploy production. A deployment reads its environment when it is built; previews get
    theirs on their next build.
-6. Verify:
+7. Verify:
    - `terraform output colton_games_accounts_vercel_env` lists the four names under each target,
      and a new plan is empty.
    - `curl -s -o /dev/null -w '%{http_code}\n' https://cc-games.org/api/auth/providers` prints
@@ -1019,7 +1052,7 @@ The owner's steps, in order:
    - On a dev box, `aws secretsmanager get-secret-value --region us-west-1 --secret-id
      colton-games/prod/auth --query Name --output text` fails with `AccessDeniedException`,
      and the same command for `colton-games/nonprod/auth` prints the name.
-7. Account saves, when the site has them and only after step 6 passes for production:
+8. Account saves, when the site has them and only after step 7 passes for production:
    - Nothing is applied by hand. The saves migration
      (`supabase/migrations/20261004000000_account_saves.sql` in the games repository) is
      applied by `games-mp-migrate` when the games change merges to `main`. Before the
@@ -1036,12 +1069,12 @@ The owner's steps, in order:
      https://cc-games.org/storage-bridge` prints `200`. It prints `404` while saves are off.
 
    To switch saves off again, take the target out of the default and apply, then redeploy.
-8. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
+9. Push, when the site has it: run `npx web-push generate-vapid-keys` once per environment,
    put `colton-games/prod/push` and `colton-games/nonprod/push` (`VAPID_SUBJECT` is an
-   `https://` address of the site), add both names to the gate and repeat steps 4 to 6.
+   `https://` address of the site), add both names to the gate and repeat steps 5 to 7.
 
-Later changes: a new admin list or OAuth client is one `put-secret-value` of the whole JSON,
-one apply and a redeploy. `terraform apply
+Later changes: a new admin list is an edit of `terraform.tfvars`, one apply and a redeploy.
+A new OAuth client is one `put-secret-value` of the whole JSON, one apply and a redeploy. `terraform apply
 -replace='random_password.colton_games_auth_secret["production"]'` makes a new `AUTH_SECRET`
 and signs everyone out of that environment. The values pass through Terraform state, which
 only administration can read, like the other games secrets.
