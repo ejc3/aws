@@ -118,10 +118,14 @@ class SecretTests(unittest.TestCase):
 class GateTests(unittest.TestCase):
     """A secret with no value yet must not be read: reading it fails every plan of the repo."""
 
-    def test_the_gate_starts_empty_and_names_only_the_four_secrets(self):
+    def test_the_gate_names_only_secrets_that_have_a_value_and_only_the_four_known_ones(self):
         gate = block("", "colton_games_accounts_ready")
         self.assertIn("type        = set(string)", gate)
-        self.assertRegex(gate, r"(?m)^  default     = \[\]$")
+        # A committed default, never -var. It started empty; today both auth secrets have a value and push has none, so reading
+        # a push secret (no version) would fail every plan.
+        default = re.search(r"(?m)^  default     = (\[.*?\])", gate).group(1)
+        self.assertEqual(sorted(strings(default)), ["nonprod/auth", "prod/auth"])
+        self.assertNotIn("push", default)
         self.assertIn(
             "alltrue([for name in var.colton_games_accounts_ready : contains(keys(local.colton_games_accounts_secrets), name)])",
             gate)

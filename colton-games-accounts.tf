@@ -218,7 +218,7 @@ locals {
 variable "colton_games_accounts_ready" {
   description = "The colton-games accounts secrets that have a value, as <env>/<kind> (prod/auth, prod/push, nonprod/auth, nonprod/push). Terraform reads only these and writes only their variables to Vercel. Starts empty; add a name to this default, in a commit, once its value is put (colton-games-accounts.tf)."
   type        = set(string)
-  default     = []
+  default     = ["prod/auth", "nonprod/auth"] # sign-in is on: both auth secrets have a value (push has none yet)
 
   validation {
     condition     = alltrue([for name in var.colton_games_accounts_ready : contains(keys(local.colton_games_accounts_secrets), name)])
