@@ -10,7 +10,8 @@
 #         other branch -> games-mp-images-preview  engines only      -> games-preview/*
 #   CodeBuild state change --> EventBridge --> games-mp-release
 #       main:    registers games-<game> revisions; runs games-mp-migrate first when the commit's
-#                mp schema revision is not the database's; makes the commit production's current
+#                migrations are not the database's (the mp schema revision, or the set of every
+#                other file under supabase/migrations); makes the commit production's current
 #                release (releases table `current#main`, which games-mp-launch-production reads on
 #                every launch); moves games/mp-router:live and rolls the router when the
 #                router's files changed
@@ -22,11 +23,12 @@
 # launch runs; no revision is ever deregistered, and production images are never expired).
 # A router rollout drains each old task at the ALB for up to an hour and no match lasts
 # longer (games-multiplayer.tf, the target group). Migrations must be backward compatible
-# with the lobby and engines still running (docs/games-multiplayer.md "Shipping").
+# with the site, lobby and engines still running (docs/games-multiplayer.md "Shipping").
 #
 # TRUST THIS ADDS (docs/games-multiplayer.md): a push to colton-games main deploys production
-# engines, the router and mp migrations with no human step; any branch's code runs in preview
-# engines (preview families, repositories, launch role and ceiling only).
+# engines, the router and every migration under supabase/migrations with no human step; any
+# branch's code runs in preview engines (preview families, repositories, launch role and
+# ceiling only).
 #
 # Terraform owns everything here and in the other two files: roles, network, ceilings, alarms,
 # the functions and the router service. It owns no image commit and never fights a release:
@@ -281,8 +283,16 @@ resource "aws_codebuild_project" "games_mp_images_preview" {
 }
 
 # -------------------------------------------------------------------------------------
-# Migrations: a main commit's mp Supabase migrations
+# Migrations: a main commit's Supabase migrations, the mp ones and the site's
 # -------------------------------------------------------------------------------------
+#
+# One run applies both kinds of file in the games repo's supabase/migrations: the mp ones by
+# revision (the files that set mp_private.schema_revision), then every other file by name, each
+# in one transaction with its row in a ledger the job keeps in the database
+# (migrations_private.applied; games-multiplayer/bringup.py has the rules and the four files
+# that were applied by hand before it existed). The site's migrations needed nothing new here:
+# the same project, role, secret and database login (the integration's `postgres`, which already
+# creates schemas for the mp migrations).
 #
 # Its own project and role, because it holds the database URL: it runs only this repo's driver
 # and psql with main's .sql files (buildspec-migrate.yml), never the games repo's code. The URL
@@ -388,7 +398,7 @@ resource "aws_iam_role_policy" "games_mp_migrate" {
 
 resource "aws_codebuild_project" "games_mp_migrate" {
   name          = local.games_mp_migrate_project
-  description   = "Applies a colton-games main commit's mp Supabase migrations (games-mp-release starts it)"
+  description   = "Applies a colton-games main commit's Supabase migrations, mp and site (games-mp-release starts it)"
   service_role  = aws_iam_role.games_mp_migrate.arn
   build_timeout = 15
 

@@ -906,6 +906,10 @@ Available if a task needs them; neither needs a key on disk.
   quota (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
   grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
   `get-secret-value`; never into a file in a repo, a command line or a commit.
+- **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
+  and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide grant
+  on a box where every account has sudo). Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
+  repo, a command line or a commit.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
@@ -938,6 +942,28 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   `true` or `1`. Sign-in for that target comes first, then the games repository's saves migration
   (`games-mp-migrate` applies it when it merges to `main`; nobody runs SQL by hand), then the target. A
   dev box sets `ACCOUNT_SAVES=on` in its own environment.
+
+### dolphin-films credentials
+
+`dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
+on Vercel, Google sign-in, a Supabase store) as four JSON secrets in us-west-1, split by environment so
+that production and non-production share nothing:
+
+- `dolphin-films/nonprod/auth` (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
+  `dolphin-films/nonprod/supabase` (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`): local development and Vercel
+  previews. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
+  without printing it:
+  `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth
+  --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
+  Never onto a command line, into a file in a repo or a commit.
+- `dolphin-films/prod/auth` and `dolphin-films/prod/supabase`: production. Admins only; a dev box gets
+  `AccessDeniedException`, on purpose. The Vercel project's Production environment is set from them by hand.
+- The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
+  `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
+  (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.
+- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`. Terraform never
+  reads these secrets, so no value reaches state.
+- CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
 ### Claude Code Sync
 

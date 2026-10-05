@@ -17,6 +17,8 @@ env:
     - GAMES_MP_IMAGES
     - GAMES_MP_ROUTER_INPUTS
     - GAMES_MP_SCHEMA_REVISION
+    # Main only: the commit's site migrations as one value (bringup.py site_state).
+    - GAMES_SITE_MIGRATIONS
 
 phases:
   install:
@@ -26,4 +28,4 @@ phases:
   build:
     commands:
       - python3 .games-mp/bringup.py codebuild-images
-      - . .games-mp/exports.sh && export GAMES_MP_ENGINES GAMES_MP_IMAGES GAMES_MP_ROUTER_INPUTS GAMES_MP_SCHEMA_REVISION
+      - . .games-mp/exports.sh && export GAMES_MP_ENGINES GAMES_MP_IMAGES GAMES_MP_ROUTER_INPUTS GAMES_MP_SCHEMA_REVISION GAMES_SITE_MIGRATIONS

@@ -90,8 +90,9 @@
 #   Supabase               the project came from the Vercel integration and is not managed in
 #                          this repo. Production and Preview already hold its URL and server key
 #                          and SKYHOOK_LEADERBOARD_ENVIRONMENT, so the accounts features add no
-#                          database variable. Their migrations are applied by hand: games-mp-migrate
-#                          runs only the multiplayer ones (games-multiplayer/bringup.py).
+#                          database variable. Their migrations need no step: games-mp-migrate
+#                          applies every file of the games repo's supabase/migrations when it
+#                          merges to main (docs/games-multiplayer.md, "Site migrations").
 #   The dev boxes          read nonprod/* themselves and make their own AUTH_SECRET
 #                          (`openssl rand -base64 33`); Preview's never leaves Vercel and state.
 
