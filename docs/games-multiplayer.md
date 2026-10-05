@@ -162,7 +162,7 @@ EventBridge Scheduler, every minute
                          any other      games-mp-images-preview  engines only     -> games-preview/*
 CodeBuild finished  --EventBridge-->  games-mp-release
   main       registers games-<game> engine revisions for the commit; runs games-mp-migrate
-             first when the commit's mp schema revision is not the database's; makes the
+             first when the commit's migrations (mp or site) are not the database's; makes the
              commit production's current release; moves games/mp-router:live and rolls the
              router when the router's own files changed
   preview    registers games-preview-<game> revisions for exactly that commit
@@ -247,19 +247,103 @@ CodeBuild finished  --EventBridge-->  games-mp-release
   window: an hour and a half while every game keeps to an hour, about four and a half hours
   once a game uses the long cap). A migration that is not
   backward compatible must be gated: ship the new code first without depending on it, then
-  the migration. `games-mp-migrate` applies the mp migrations only: the files under
+  the migration. `games-mp-migrate` applies the mp migrations first: the files under
   `supabase/migrations` that set `mp_private.schema_revision` (the first inserts revision 1,
   each later one `UPDATE mp_private.schema_revision SET revision = <n> WHERE id = 1`), in
   file-name order, which must be revisions 1..n. It refuses a database newer than the commit
   (a rollback never runs against a newer schema) and a partial state, and the release is not
-  promoted when it fails. The site's and Skyhook's migrations there are still applied by hand.
+  promoted when it fails. Every other file there is a site migration, applied by the same run
+  right after them: [Site migrations](#site-migrations-every-other-file).
+
+### Site migrations: every other file
+
+Nobody applies a migration by hand. Every `.sql` file under `supabase/migrations` in the games
+repo that is not an mp migration (the site's own tables, Skyhook, account saves, clubs and
+whatever comes next) is applied by `games-mp-migrate` on the merge to `main` that brings it,
+before that commit is promoted. A failure stops the promotion and mails cost-alerts, exactly
+as an mp migration failure does, and production keeps its current release.
+
+The job keeps a ledger in the database, `migrations_private.applied`: one row per applied
+file with its name, the SHA-256 of its bytes, the commit that applied it and when. No site
+role can reach it. On each run it:
+
+1. reads the commit's files and the ledger, and decides everything before it writes anything;
+2. applies the mp migrations, by revision, as before;
+3. applies each site file the ledger lacks, in file-name order, **each in one transaction
+   with its ledger row**: a file either happened and is recorded, or did not happen.
+
+The mp files go first because they keep their own mechanism and a site file may use what
+they made, never the other way round (an mp file refuses the site's schemas). A run with
+nothing new changes nothing.
+
+It refuses, before the first write, so nothing is changed (not the ledger, not a site file,
+not an mp migration):
+
+- an applied file whose content changed;
+- a database with ledger rows the commit does not have (a rollback never runs against a
+  newer schema);
+- a new file whose name sorts before the newest applied one. A fresh database applies files
+  by name, so allowing it would give production an order no test database ever sees, and two
+  files touching one object could leave production different with nothing to show it;
+- a file with a transaction statement inside it, a psql `\` command, or a quote that never
+  closes; a site file that mentions `mp_private`; a file not named
+  `<14 digits>_<lower_case_words>.sql`.
+
+The main images build checks the files too and reports them as one value
+(`GAMES_SITE_MIGRATIONS`, a count and a hash); `games-mp-release` runs the migration when
+that value or the mp revision is not what `schema#main` holds, and promotes only when the
+database ends at exactly the commit's files.
+
+**The four files applied by hand before the ledger existed** (`20260921000000_skyhook_leaderboard`,
+`20260921010000_skyhook_environments`, `20260922000000_site_community`,
+`20260922100000_site_ratings_poll`) are never run again blindly. On the first run, when
+there is no ledger, each is probed read-only: every table, column and function it creates,
+and the revision marker it sets. All there: it is recorded as applied and not run. None
+there: it is an ordinary new file, which is how a fresh database gets everything. Some
+there: the run stops and names what is missing, having changed nothing. The list, with each
+file's SHA-256, lives in `games-multiplayer/bringup.py` (`SITE_BASELINE`) and not in the
+games repo: the job runs no code from that repo, and a marker there would let any merge
+declare a file already applied. There is no first-run switch: before any migration runs the
+first run writes only the ledger itself, in one transaction, after every probe passed.
+
+**What a migration author in the games repo must follow:**
+
+1. One change, one new file under `supabase/migrations`, named
+   `<YYYYMMDDHHMMSS>_<lower_case_words>.sql`.
+2. Its name sorts after every migration already on `main`. If another one merged first,
+   rename yours before merging.
+3. A file on `main` is never edited, renamed or deleted. A correction is a new file, and a
+   revert of a merge keeps its migration file: the job refuses a commit that lacks a file
+   the database has applied, for either kind. (A file the job refused and never applied may
+   still be renamed by a later commit.)
+4. One file is one transaction. Write either no transaction statement, or `BEGIN;` as the
+   first statement and `COMMIT;` as the last; the job supplies the transaction and puts the
+   ledger row inside it. No other `BEGIN`, `COMMIT`, `ROLLBACK` or `SAVEPOINT`, nothing that
+   cannot run in a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`), no psql `\`
+   commands, and function bodies in dollar quotes (not `BEGIN ATOMIC`).
+5. It is backward compatible with the code already running, as the mp rule above says: add
+   in one merge, remove what old code used in a later one. Vercel deploys the site within
+   minutes of the merge, on its own, and may be ahead of the migration or behind it, so new
+   code must also work until its migration has run (keep the feature behind its switch or
+   its readiness check) or ship the migration in an earlier merge. Previews of other
+   branches run against the same database.
+6. It works on a fresh database after every earlier file in name order, and it fails rather
+   than adopt something that already exists.
+7. A site file does not mention `mp_private`. An mp file sets `mp_private.schema_revision`
+   exactly once and mentions neither `skyhook_private` nor `site_private`.
+
+When a migration is refused or fails, the mail names the file and the reason, and the fix is
+a commit on `main` (a renamed or new file); nothing needs the SQL editor. To see what the
+database holds: `schema#main` in `games-mp-releases` has `siteNewest` (the newest applied
+file), `site` (the count and hash) and the commit that last migrated, and the log of the
+run is `/aws/codebuild/games-mp-migrate`.
 
 ### The trust this adds
 
 - **A push to `main` deploys production.** Whoever can merge to colton-games `main` changes the
-  code production engines and the router run, and the mp database schema (as the Supabase
-  integration's `postgres` role), with no further review. That is the owner's choice: `main`
-  already deploys the production lobby on Vercel.
+  code production engines and the router run, and the database schema, the site's as well as
+  mp's (as the Supabase integration's `postgres` role), with no further review. That is the
+  owner's choice: `main` already deploys the production lobby on Vercel.
 - **Any branch's code runs in preview engines.** Every writer on the repo, and every
   dependency a build pulls in, can run code in `games-mp-images-preview` (privileged Docker,
   up to 20 minutes, at most 3 at once and 2 new per minute) and in preview engines. Neither
@@ -531,7 +615,7 @@ Other switches:
 
 - **Merging the games PRs to production**, which is EJ's "push to prod". A merge to `main`
   then deploys everything by itself: Vercel the lobby, and `games-mp-release` the engines, the
-  router and the mp migrations.
+  router and every migration, mp and site.
 - **Fixing whatever a failed preflight names**, for example storing a new Vercel token. The
   plan fails with the exact fix, and nothing has changed.
 
@@ -789,7 +873,7 @@ against the code and live state on 2026-09-27 unless marked otherwise.
 | Anyone on the internet | Reach the ALB and router, up to 6,000 requests per IP per minute; hold connections open (idle timeout 3600 s); push a *distributed* flood that stays under the per-IP limit against 2–6 autoscaled routers | Reach an engine without a token; spoof its IP past the ALB; talk to any other port or host; get past the WAF from a known-bad IP |
 | A lobby user | Ask for matches, within the lobby's admission limits (below) | Launch a task directly; see other players' tokens |
 | Code in any Preview build (every writer on `CoderColton/colton-games`, and every dependency such a build pulls in) | Invoke `games-mp-launch-preview`: start up to 8 preview engines of its own branch's engine image (the preview share), each for up to its `hardCapSec` (at most 1 h) plus 10 minutes, calling back only a `colton-games-*` preview URL; stop preview engines; keep the preview function's own slot busy, which slows only preview launches; read the lobby's Supabase data. In `games-mp-images-preview`: run as root in a privileged build for up to 20 minutes (3 at once) and push `games-preview/*` images | Run a command, role or size of its choosing in production; push or register anything production runs (no push to `games/*`, no production family); launch production engines or more than 8 of its own; take production's share or its launch slot; stop production engines or the router; reach ECS, EC2, IAM or secrets directly |
-| A merge to colton-games `main` | Deploy production engines, the router and mp migrations within minutes, with no further review (by design: `main` is production) | Change anything Terraform owns: roles, network, ceilings, keys, the functions |
+| A merge to colton-games `main` | Deploy production engines, the router and every migration (mp and site) within minutes, with no further review (by design: `main` is production) | Change anything Terraform owns: roles, network, ceilings, keys, the functions |
 | A compromised production deployment | The same through `games-mp-launch-production`, up to production's share of 22 engines | Everything in the row above, with production and preview swapped: it cannot launch preview engines or take preview's 8 |
 | A compromised router task (it parses internet input) | While the compromise lasts, only for connections that pass through it: see their tokens and bytes, and drop or rewrite that traffic (TLS ends at the ALB; router to engine is plain HTTP inside the VPC); replay a token it saw, for that same match and seat, until it expires (two minutes) | Mint a join token: it holds only public keys (it refuses to boot with a signing key), its execution role reads no secret, its task role has no policies. So nothing it can read or leak (env, logs, a memory disclosure) lets anyone mint tokens later, through another router task or from anywhere else, and a Preview-side key cannot pass for Production. Claim a seat it holds no fresh token for: engines verify the token themselves and ignore the router's identity headers. Launch or stop tasks; connect anywhere but the engines on 8080 and HTTPS on 443 (its security group's only egress), so not the admin fleet's SSH or ET either |
 | A compromised engine | Reach any internet host on TCP 443; use the Vercel protection-bypass secret it is given as `MP_API_BYPASS` | Call AWS (empty task role); reach another engine (router-only ingress); reach any host in the VPC, on any port, over IPv4 or IPv6 (its own subnets, security group and `games-engine` ACL); route to the I/O box or its NFS export (no peer route, and NFS admits only the dev-fleet and parallel-box subnets); reach SSH, databases or any non-443 service on the internet |

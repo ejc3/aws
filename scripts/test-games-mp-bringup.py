@@ -10,6 +10,7 @@ Vercel variable outside Preview, never puts a secret in argv or output, and fail
 Run from the repo root:  python3 -S -B scripts/test-games-mp-bringup.py
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -74,6 +75,8 @@ class World:
         self.oidc_patch_effective = True
         self.db_revision = 0
         self.psql_files = []
+        self.site_ledger = None    # {name: sha256} once the site migration ledger exists
+        self.site_scripts = []     # the ledger and the site files psql was given
         self.clock = 0.0
         self.services = None
         self.target_states = ["healthy"]
@@ -203,10 +206,24 @@ class World:
             # db_revision: 0 = fresh, -1 = schema without marker table, -2 = empty marker.
             if "-f" in argv:
                 sql = Path(argv[argv.index("-f") + 1]).read_text()
+                if "migrations_private" in sql:
+                    # The site ledger, or one site file with its row. Only the bookkeeping is
+                    # faked here; scripts/test-games-site-migrations.py runs these for real.
+                    self.site_scripts.append(sql)
+                    self.site_ledger = dict(self.site_ledger or {}, **dict(re.findall(
+                        r"INSERT INTO migrations_private\.applied \([a-z0-9, ]+\) VALUES \('([^']+)', '([0-9a-f]{64})'", sql)))
+                    return done("")
                 self.psql_files.append(sql)
                 self.db_revision = self.bu.migration_revision(sql)
                 return done("")
             sql = argv[argv.index("-c") + 1]
+            if sql == "BEGIN TRANSACTION READ ONLY":
+                sql = argv[argv.index("-c", argv.index("-c") + 1) + 1]
+                if "to_regclass('migrations_private.applied')" in sql:
+                    return done("%d\n" % (self.site_ledger is not None))
+                if "FROM migrations_private.applied" in sql:
+                    return done("".join("%s|%s\n" % row for row in sorted(self.site_ledger.items())))
+                raise AssertionError("unexpected read %r" % sql)
             table = self.db_revision not in (0, -1)
             if "mp_private.schema_revision WHERE" in sql or "FROM mp_private.schema_revision" in sql:
                 if not table:
@@ -397,7 +414,19 @@ class CodeBuildImagesTests(Base):
         self.assertNotIn("GAMES_MP_IMAGES", ex)
         self.assertRegex(ex["GAMES_MP_ROUTER_INPUTS"], r"^[0-9a-f]{64}$")
         self.assertEqual(ex["GAMES_MP_SCHEMA_REVISION"], "1")
+        # The commit's other migrations, as one value: the file that is not an mp one.
+        skyhook = hashlib.sha256(b"CREATE SCHEMA skyhook_private;").hexdigest()
+        self.assertIn("GAMES_SITE_MIGRATIONS", ex)
+        self.assertEqual(ex["GAMES_SITE_MIGRATIONS"].strip("'"),
+                         self.bu.site_state([("20260921000000_skyhook.sql", skyhook)]))
+        self.assertRegex(ex["GAMES_SITE_MIGRATIONS"].strip("'"), r"^1:[0-9a-f]{64}$")
         self.assertNoSecretsLeaked()
+
+    def test_a_site_migration_that_breaks_a_rule_fails_the_main_build(self):
+        Path("supabase/migrations/20261005000000_clubs.sql").write_text("CREATE TABLE a (id integer);\nCOMMIT;\n")
+        with self.assertRaisesRegex(self.bu.StepError, r"20261005000000_clubs\.sql: line 2 is `COMMIT`"):
+            self.bu.cmd_codebuild_images(None)
+        self.assertFalse(Path(".games-mp/exports.sh").exists())
 
     def test_preview_pushes_engines_only_to_the_preview_repositories(self):
         os.environ.update(GAMES_MP_CHANNEL="preview", GAMES_MP_ENGINE_REPOSITORY="games-preview/engines")
@@ -410,6 +439,7 @@ class CodeBuildImagesTests(Base):
         ex = self.exports()
         self.assertEqual(json.loads(ex["GAMES_MP_ENGINES"].strip("'")), {"mptest": ["mptest-1", 2048, 4096]})
         self.assertNotIn("GAMES_MP_ROUTER_INPUTS", ex)
+        self.assertNotIn("GAMES_SITE_MIGRATIONS", ex, "a preview build reports no migrations: only main's run")
         # The project's repository setting must be its own channel's.
         os.environ["GAMES_MP_ENGINE_REPOSITORY"] = "games/engines"
         with self.assertRaisesRegex(self.bu.StepError, "not the preview engine repository"):
@@ -662,6 +692,41 @@ class MigrateTests(Base):
         # A second run finds it applied and runs nothing.
         self.assertEqual(self.migrate()["GAMES_MP_DB_REVISION"], "2")
         self.assertEqual(len(self.w.psql_files), 2)
+
+    def test_the_other_files_are_site_migrations_applied_after_the_mp_ones_and_exported(self):
+        skyhook = hashlib.sha256(b"CREATE SCHEMA skyhook_private;").hexdigest()
+        exports = self.migrate()
+        self.assertEqual(self.w.psql_files, [MIGRATION], "the mp file reaches psql as it is, as before")
+        # Then the ledger, then the one site file with its row, in the job's own transaction.
+        self.assertEqual(len(self.w.site_scripts), 2)
+        self.assertIn("CREATE TABLE migrations_private.applied", self.w.site_scripts[0])
+        self.assertTrue(self.w.site_scripts[1].startswith("BEGIN;\n"))
+        self.assertIn("CREATE SCHEMA skyhook_private;", self.w.site_scripts[1])
+        self.assertTrue(self.w.site_scripts[1].endswith(
+            "INSERT INTO migrations_private.applied (name, sha256, commit) VALUES "
+            "('20260921000000_skyhook.sql', '%s', '%s');\nCOMMIT;\n" % (skyhook, REF)))
+        mp_done = self.w.calls.index(next(c for c in self.w.calls if "-f" in c))
+        first_site_write = [i for i, c in enumerate(self.w.calls) if "-f" in c][1]
+        self.assertLess(mp_done, first_site_write)
+        state = self.bu.site_state([("20260921000000_skyhook.sql", skyhook)])
+        self.assertEqual(exports["GAMES_SITE_DB_MIGRATIONS"].strip("'"), state)
+        self.assertEqual(exports["GAMES_SITE_DB_NEWEST"], "20260921000000_skyhook.sql")
+        self.assertIn("20260921000000_skyhook.sql applied and recorded (verified)", self.out.getvalue())
+        self.assertNoSecretsLeaked()
+        # Again: nothing of either kind runs, and the same values are exported.
+        again = self.migrate()
+        self.assertEqual((again, len(self.w.psql_files), len(self.w.site_scripts)), (exports, 1, 2))
+
+    def test_the_buildspecs_export_what_the_release_function_reads(self):
+        for spec, names in (("buildspec.yml", ["GAMES_MP_SCHEMA_REVISION", "GAMES_SITE_MIGRATIONS"]),
+                            ("buildspec-migrate.yml", ["GAMES_MP_DB_REVISION", "GAMES_SITE_DB_MIGRATIONS",
+                                                       "GAMES_SITE_DB_NEWEST"])):
+            text = (GM / spec).read_text()
+            listed = text.split("exported-variables:", 1)[1].split("\n\n", 1)[0]
+            export_line = [line for line in text.splitlines() if "exports.sh && export" in line][0]
+            for name in names:
+                self.assertIn("- " + name, listed, spec)
+                self.assertIn(" " + name, export_line.split("&& export", 1)[1] + " ", spec)
 
     def test_a_database_one_behind_gets_only_the_new_one(self):
         self.w.db_revision = 1

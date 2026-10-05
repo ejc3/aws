@@ -14,7 +14,8 @@ WHICH CHANNEL is decided by the project that built it, never by anything the bui
                                    reach production: its role cannot push to games/*, and its
                                    revisions are registered only in the games-preview-<game>
                                    families, which the production launch function cannot run
-  games-mp-migrate         main    the mp Supabase migrations of a main commit, then promote it
+  games-mp-migrate         main    the Supabase migrations of a main commit (the mp ones, then
+                                   every other file: the site's), then promote it
 
 A MAIN BUILD (SUCCEEDED):
   1. registers one engine task definition revision in `games-<game>` for EACH GAME THE COMMIT
@@ -24,8 +25,10 @@ A MAIN BUILD (SUCCEEDED):
      MP_TOKEN_VERIFIER); the size is the commit's own (mp-engine.json), checked against Fargate's
      sizes and Terraform's maximums (MAX_CPU, MAX_MEMORY), and the game id against the rules
      that keep its family off the router's and off the preview families;
-  2. if the commit's mp schema revision is not the database's (`schema#main`), starts
-     games-mp-migrate on the same source and stops here; that build's success continues at 3;
+  2. if the commit's mp schema revision or its site migrations (the other files under
+     supabase/migrations, reported as one value) are not the database's (`schema#main`),
+     starts games-mp-migrate on the same source and stops here; that build's success, with the
+     database at exactly this commit's migrations of both kinds, continues at 3;
   3. PROMOTES: `current#main` becomes this commit's revisions, unless a newer main commit (a
      higher poller sequence number) is already current, and `sim#<game>#<simVersion>` points
      at them (production launches older simVersions from these);
@@ -104,6 +107,9 @@ TOKEN_VERIFIER = {"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SIM_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
 HASH = re.compile(r"[0-9a-f]{64}")
+# A set of site migrations as bringup.py site_state reports it, and one of their file names.
+SITE_STATE = re.compile(r"[0-9]{1,6}:[0-9a-f]{64}")
+SITE_FILE = re.compile(r"[0-9]{14}_[a-z0-9_]+\.sql")
 
 # Seams the offline test replaces.
 SLEEP = time.sleep
@@ -358,12 +364,22 @@ def on_images_built(channel, commit, exported):
     schema = exported.get("GAMES_MP_SCHEMA_REVISION") or ""
     if not HASH.fullmatch(router_inputs) or not schema.isdigit():
         raise ReleaseError("main build of %s exported no router inputs or schema revision" % commit)
+    # The commit's site migrations as one value (bringup.py site_state). A source archive
+    # packaged before the driver reported them carries none: it is released as before.
+    site = exported.get("GAMES_SITE_MIGRATIONS") or ""
+    if site and not SITE_STATE.fullmatch(site):
+        raise ReleaseError("main build of %s exported malformed site migrations" % commit)
+    if not site:
+        log(event="site-migrations-not-reported", commit=commit)
     router_tag = commit[:12]
     router_digest = image_digest(ROUTER_REPOSITORY, router_tag)
-    update(key, {"status": "built", "games": games, "routerTag": router_tag, "routerDigest": router_digest,
-                 "routerInputs": router_inputs, "schemaRevision": int(schema)})
+    built = {"status": "built", "games": games, "routerTag": router_tag, "routerDigest": router_digest,
+             "routerInputs": router_inputs, "schemaRevision": int(schema)}
+    if site:
+        built["siteMigrations"] = site
+    update(key, built)
     db = get("schema#main")
-    if db is None or db.get("revision") != int(schema):
+    if db is None or db.get("revision") != int(schema) or (site and db.get("site") != site):
         start_migration(commit)
         update(key, {"status": "migrating"})
         return {"migrating": commit}
@@ -383,11 +399,22 @@ def on_migrated(commit, exported):
     revision = exported.get("GAMES_MP_DB_REVISION") or ""
     if not revision.isdigit():
         raise ReleaseError("games-mp-migrate for %s exported no GAMES_MP_DB_REVISION" % commit)
-    update("schema#main", {"revision": int(revision), "commit": commit})
+    site = exported.get("GAMES_SITE_DB_MIGRATIONS") or ""
+    newest = exported.get("GAMES_SITE_DB_NEWEST") or ""
+    if (site and not SITE_STATE.fullmatch(site)) or (newest and not SITE_FILE.fullmatch(newest)):
+        raise ReleaseError("games-mp-migrate for %s exported malformed site migrations" % commit)
+    database = {"revision": int(revision), "commit": commit}
+    if site:
+        # siteNewest is for whoever looks: the newest file the database has applied.
+        database.update(site=site, siteNewest=newest or "none")
+    update("schema#main", database)
     record = get("build#main#%s" % commit) or {}
     if record.get("schemaRevision") != int(revision):
         raise ReleaseError("database is at mp revision %s after migrating %s, which needs %s"
                            % (revision, commit, record.get("schemaRevision")))
+    if record.get("siteMigrations") and record["siteMigrations"] != site:
+        raise ReleaseError("database's site migrations are %s after migrating %s, which has %s"
+                           % (site or "not reported", commit, record["siteMigrations"]))
     return promote(commit)
 
 

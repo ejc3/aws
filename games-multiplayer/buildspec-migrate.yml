@@ -1,8 +1,10 @@
 # CodeBuild project games-mp-migrate (games-multiplayer-deploy.tf).
 #
-# Applies a main commit's mp Supabase migrations: the .sql files under supabase/migrations that
-# set mp_private.schema_revision, in order, over verify-full TLS against the pinned Supabase
-# CA. It runs this repo's driver and psql only, no code of the games repo. The database URL
+# Applies a main commit's Supabase migrations, every .sql file under supabase/migrations, over
+# verify-full TLS against the pinned Supabase CA: first the mp ones (the files that set
+# mp_private.schema_revision) by revision, then every other file by name, each in one
+# transaction with its row in the ledger migrations_private.applied (bringup.py has the
+# rules). It runs this repo's driver and psql only, no code of the games repo. The database URL
 # comes from secret games/mp-db-url straight into the environment (CodeBuild masks it in logs).
 version: 0.2
 
@@ -12,6 +14,8 @@ env:
     GAMES_MP_DB_URL: games/mp-db-url
   exported-variables:
     - GAMES_MP_DB_REVISION
+    - GAMES_SITE_DB_MIGRATIONS
+    - GAMES_SITE_DB_NEWEST
 
 phases:
   install:
@@ -23,4 +27,4 @@ phases:
   build:
     commands:
       - python3 .games-mp/bringup.py codebuild-migrate
-      - . .games-mp/exports.sh && export GAMES_MP_DB_REVISION
+      - . .games-mp/exports.sh && export GAMES_MP_DB_REVISION GAMES_SITE_DB_MIGRATIONS GAMES_SITE_DB_NEWEST

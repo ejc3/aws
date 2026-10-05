@@ -21,7 +21,8 @@ and inside CodeBuild, from the source zip games-mp-poller made (it adds this fil
 
     codebuild-images   (games-mp-images, games-mp-images-preview) build and push one commit's
                        images, only the tags that are missing, and export what was built
-    codebuild-migrate  (games-mp-migrate) apply a main commit's mp migrations over verify-full TLS
+    codebuild-migrate  (games-mp-migrate) apply a main commit's migrations over verify-full TLS: the
+                       mp ones by revision, then every other file by name, with a ledger
 
 SECRETS NEVER LEAVE MEMORY. Tokens and database credentials are read from Secrets Manager or
 the Vercel API into this process, sent only in HTTP headers, request bodies or a child's
@@ -29,7 +30,8 @@ environment (never argv, which every local user can read in /proc/<pid>/cmdline)
 printed. Python standard library only, plus the `aws`, `psql` (migrate), `node` and `docker`
 (codebuild-images) executables.
 
-Offline tests: scripts/test-games-mp-bringup.py.
+Offline tests: scripts/test-games-mp-bringup.py, and scripts/test-games-site-migrations.py
+for the site migrations (it starts its own temporary PostgreSQL).
 """
 
 import argparse
@@ -505,6 +507,10 @@ def cmd_codebuild_images(args):
         exports["GAMES_MP_ROUTER_INPUTS"] = dockerfile_inputs(router[0])
         migrations = mp_migrations(".")
         exports["GAMES_MP_SCHEMA_REVISION"] = str(migrations[-1][0] if migrations else 0)
+        # The commit's site migrations, as the value games-mp-migrate reports for the database:
+        # games-mp-release runs the migration when the two differ. A file that breaks a rule
+        # fails the build here, before any image is released.
+        exports["GAMES_SITE_MIGRATIONS"] = site_state([(name, digest) for name, digest, _ in site_migrations(".")])
     write_exports(exports)
     log("built %s (%s): %s" % (commit, channel, exports["GAMES_MP_ENGINES"]))
 
@@ -620,7 +626,7 @@ def migration_revision(sql):
 def mp_migrations(root="."):
     """[(revision, path, sql)]: the repo's mp migrations (the files under supabase/migrations
     that set mp_private.schema_revision), in file-name order, which must be revisions 1..n.
-    The other migrations there (the site's, Skyhook's) are applied by hand and never here."""
+    The other migrations there (the site's, Skyhook's, ...) are site_migrations, below."""
     folder = os.path.join(root, MIGRATIONS_DIR)
     out = []
     for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
@@ -693,19 +699,376 @@ def apply_mp_migrations(env, migrations):
     return want
 
 
+# --------------------------------------------------------------------------------------
+# migrate: the site's migrations (every file that is not an mp one)
+# --------------------------------------------------------------------------------------
+#
+# The games repo keeps ALL its migrations in supabase/migrations. The mp ones are applied by
+# revision, above. Every other file is a "site" migration (the site's own tables, Skyhook,
+# account saves, clubs, ...) and is applied here by NAME, with a ledger in the database:
+#
+#   migrations_private.applied   one row per applied file: name, sha256 of its bytes, the
+#                                commit that applied it, when, and whether it was only
+#                                recorded (baseline) because it had been applied by hand
+#
+# RULES, all checked before the first write of a run, so a refusal changes nothing (not the
+# ledger, not a site file, not an mp migration):
+#   - files apply in file-name order (byte order), each exactly once;
+#   - one file is one transaction, and its ledger row is written inside it: a file either
+#     happened and is recorded, or did not happen. A file may hold `BEGIN;` as its first
+#     statement and `COMMIT;` as its last (they are removed, the job supplies the
+#     transaction); any other transaction statement or psql \command is refused, because a
+#     COMMIT inside the file would split it from its row;
+#   - an applied file never changes: its bytes must still hash to the recorded sha256;
+#   - a database never runs under a commit older than itself: every recorded file must be
+#     in the commit (the same rule as "database newer than this commit" for mp);
+#   - a new file never sorts before the newest applied one. Allowing that would let
+#     production apply files in an order no fresh database ever sees (a fresh one applies
+#     them by name), so two files that touch the same object could leave production different
+#     from every test database with nothing to show it. The fix is a rename before merging,
+#     or a commit that renames the not-yet-applied file;
+#   - a site file never mentions mp_private: that schema changes only by an mp migration.
+#
+# BASELINE. Four files were applied by hand in production before this ledger existed
+# (SITE_BASELINE). They must never be run again blindly, so on the first run, when the ledger
+# does not exist, each is PROBED read-only: every object it creates, and the revision marker
+# it sets. All there: it is recorded as applied (baseline), not run. None there: it is an
+# ordinary new file (a fresh database gets every file). Some there: the run stops and names
+# what is missing. The list lives here and not in the games repo on purpose: this job runs
+# no code from that repo, and a marker there would let any merge declare a file "already
+# applied". Each entry pins the file's sha256, so the content recorded is the content probed.
+#
+# NO FIRST-RUN SWITCH. Before any migration runs, the only thing the first run writes is the
+# ledger's own schema and rows, in one transaction, after every probe passed; a migration
+# after that is its own transaction and rolls back whole if it fails.
+
+SITE_FILE = re.compile(r"[0-9]{14}_[a-z0-9_]+\.sql")
+# What each hand-applied file creates, as (kind, object) probes: table "schema.table", column
+# "schema.table.column", function "schema.name", and ("revision", "schema.table", n) for the
+# marker row `id = 1` holding at least n. sha256 is of the file on colton-games main.
+SITE_BASELINE = {
+    "20260921000000_skyhook_leaderboard.sql": {
+        "sha256": "0ea9dfa5768f964833ec79f001d0a72fafe81a5ecaaba1fcc19ff1607c1436f6",
+        "creates": [
+            ("table", "skyhook_private.schema_revision"), ("table", "skyhook_private.scores"),
+            ("table", "skyhook_private.runs"), ("table", "skyhook_private.rate_limits"),
+            ("function", "public.skyhook_leaderboard_ready"), ("function", "public.skyhook_board"),
+            ("function", "public.skyhook_start_run"), ("function", "public.skyhook_submit_run"),
+            ("revision", "skyhook_private.schema_revision", 3),
+        ],
+    },
+    "20260921010000_skyhook_environments.sql": {
+        "sha256": "c887c5d601a5f09808c1f3239b7b1a950ead881e6c4a098de7ae3661089dee2e",
+        "creates": [
+            ("column", "skyhook_private.scores.environment"), ("column", "skyhook_private.runs.environment"),
+            ("column", "skyhook_private.rate_limits.environment"),
+            ("function", "public.skyhook_leaderboard_ready_scoped"), ("function", "public.skyhook_board_scoped"),
+            ("function", "public.skyhook_start_run_scoped"), ("function", "public.skyhook_submit_run_scoped"),
+            ("revision", "skyhook_private.schema_revision", 4),
+        ],
+    },
+    "20260922000000_site_community.sql": {
+        "sha256": "a15066fbbe46f05a3b2c8cca9d67a6978189a4cf7d082bfd4801dafea40189a3",
+        "creates": [
+            ("table", "site_private.schema_revision"), ("table", "site_private.game_stats"),
+            ("table", "site_private.likes"), ("table", "site_private.feedback"), ("table", "site_private.rate_limits"),
+            ("function", "public.site_ready_scoped"), ("function", "public.site_stats_scoped"),
+            ("function", "public.site_add_playtime_scoped"), ("function", "public.site_set_like_scoped"),
+            ("function", "public.site_add_feedback_scoped"), ("function", "public.site_feedback_recent"),
+            ("revision", "site_private.schema_revision", 1),
+        ],
+    },
+    "20260922100000_site_ratings_poll.sql": {
+        "sha256": "f11519d534d4b38c48de579fc17cad041f3417355d71b144af9d739ee0179aeb",
+        "creates": [
+            ("table", "site_private.ratings"), ("table", "site_private.poll_options"), ("table", "site_private.poll_votes"),
+            ("function", "public.site_set_rating_scoped"), ("function", "public.site_poll_scoped"),
+            ("function", "public.site_poll_vote_scoped"), ("function", "public.site_poll_add_option"),
+            ("function", "public.site_poll_set_active"), ("function", "public.site_poll_options_all"),
+            ("function", "public.site_reviews_recent"),
+            ("revision", "site_private.schema_revision", 2),
+        ],
+    },
+}
+
+# The ledger. Its own schema, with nothing granted: PostgREST does not expose it, and the
+# site's roles (when the database has them) are refused by name as well.
+SITE_LEDGER_SQL = """CREATE SCHEMA migrations_private;
+REVOKE ALL ON SCHEMA migrations_private FROM PUBLIC;
+CREATE TABLE migrations_private.applied (
+  name text PRIMARY KEY CHECK (name ~ '^[0-9]{14}_[a-z0-9_]+[.]sql$'),
+  sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  commit text NOT NULL CHECK (commit ~ '^[0-9a-f]{40}$'),
+  baseline boolean NOT NULL DEFAULT false,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE migrations_private.applied ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE migrations_private.applied FROM PUBLIC;
+DO $games_site_ledger$
+DECLARE site_role text;
+BEGIN
+  FOREACH site_role IN ARRAY ARRAY['anon', 'authenticated', 'service_role'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = site_role) THEN
+      EXECUTE format('REVOKE ALL ON SCHEMA migrations_private FROM %I', site_role);
+      EXECUTE format('REVOKE ALL ON TABLE migrations_private.applied FROM %I', site_role);
+    END IF;
+  END LOOP;
+END
+$games_site_ledger$;
+"""
+
+# Everything in a .sql file that is not statement text: comments, strings, quoted identifiers
+# and dollar-quoted bodies (where plpgsql keeps its own BEGIN and END).
+_SQL_OPAQUE = re.compile(
+    r"--[^\n]*"
+    r"|/\*.*?\*/"
+    r"|(?<![A-Za-z0-9_$])[eE]'(?:[^'\\]|\\.|'')*'"
+    r"|'(?:[^']|'')*'"
+    r'|"(?:[^"]|"")*"'
+    r"|\$(?P<tag>(?:[A-Za-z_][A-Za-z0-9_]*)?)\$.*?\$(?P=tag)\$",
+    re.S)
+_SQL_UNCLOSED = re.compile(r"""['"]|/\*|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$""")
+_SQL_TRANSACTION = {"BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE"}
+
+
+def site_body(name, sql):
+    """The statements of one site migration, without the `BEGIN;` and `COMMIT;` it may open
+    and close with. Refuses anything that could end the job's transaction early or leave psql:
+    another transaction statement, a psql \\command, an unclosed quote or comment."""
+    # Same length as `sql`, line for line, so a position in one is a position in the other.
+    outline = _SQL_OPAQUE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), sql)
+    unclosed = _SQL_UNCLOSED.search(outline)
+    if unclosed:
+        raise StepError("%s: line %d has a string, comment or dollar quote that never closes"
+                        % (name, outline.count("\n", 0, unclosed.start()) + 1))
+    if "\\" in outline:
+        raise StepError("%s: line %d has a psql \\command; a migration is SQL only"
+                        % (name, outline.count("\n", 0, outline.index("\\")) + 1))
+    statements, start = [], 0  # (first character, start, end past its `;`, its words in upper case)
+    for piece in outline.split(";"):
+        end = start + len(piece) + 1
+        if piece.split():
+            statements.append((start + len(piece) - len(piece.lstrip()), start, min(end, len(sql)), piece.upper().split()))
+        start = end
+    control = [st for st in statements if st[3][0] in _SQL_TRANSACTION or st[3][:2] == ["PREPARE", "TRANSACTION"]]
+    if not control:
+        return sql
+    first, last = statements[0], statements[-1]
+    wrapped = first is not last and first[3] == ["BEGIN"] and last[3] == ["COMMIT"]
+    inner = [st for st in control if not (wrapped and (st is first or st is last))]
+    if inner:
+        raise StepError("%s: line %d is `%s`. A migration is one transaction: it may start with `BEGIN;` and end "
+                        "with `COMMIT;` and holds no other transaction statement (the job supplies the "
+                        "transaction, with the ledger row inside it)"
+                        % (name, outline.count("\n", 0, inner[0][0]) + 1, " ".join(inner[0][3][:2])))
+    return (sql[:first[0]] + " " * (first[2] - first[0]) + sql[first[2]:last[0]]
+            + " " * (last[2] - last[0]) + sql[last[2]:])
+
+
+def site_migrations(root="."):
+    """[(name, sha256, body)]: the commit's site migrations, every .sql file under
+    supabase/migrations that is not an mp one, in file-name order. Reads no database."""
+    folder = os.path.join(root, MIGRATIONS_DIR)
+    out = []
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        if not name.endswith(".sql"):
+            continue
+        with open(os.path.join(folder, name), "rb") as f:
+            raw = f.read()
+        try:
+            sql = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise StepError("%s is not UTF-8 text" % name)
+        if "mp_private.schema_revision" in sql and _REVISION.search(sql):
+            continue  # an mp migration: mp_migrations
+        if not SITE_FILE.fullmatch(name):
+            raise StepError("%s: a migration file is named <14 digits>_<lower_case_words>.sql" % name)
+        if "mp_private" in sql:
+            raise StepError("%s mentions mp_private but is not an mp migration (it does not set "
+                            "mp_private.schema_revision); that schema changes only by one" % name)
+        out.append((name, hashlib.sha256(raw).hexdigest(), site_body(name, sql)))
+    return out
+
+
+def site_state(rows):
+    """A set of site migrations as one short value, '<count>:<sha256 over its "name sha256"
+    lines>': what the images build reports for a commit and the migration for the database."""
+    text = "".join("%s %s\n" % (name, digest) for name, digest in rows)
+    return "%d:%s" % (len(rows), hashlib.sha256(text.encode()).hexdigest())
+
+
+def psql_read(env, sql):
+    """The rows of one SELECT, run in a READ ONLY transaction: all a plan may do."""
+    out = psql(env, "-A", "-t", "-c", "BEGIN TRANSACTION READ ONLY", "-c", sql, "-c", "COMMIT")
+    return [line for line in out.splitlines() if line]
+
+
+def psql_script(env, script):
+    with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        psql(env, "-f", path)
+    finally:
+        os.unlink(path)
+
+
+def site_ledger(env):
+    """[(name, sha256)] in name order, or None when the ledger does not exist yet."""
+    if psql_read(env, "SELECT (to_regclass('migrations_private.applied') IS NOT NULL)::int") != ["1"]:
+        return None
+    return [tuple(row.split("|")) for row in psql_read(
+        env, 'SELECT name, sha256 FROM migrations_private.applied ORDER BY name COLLATE "C"')]
+
+
+def _probe_sql(kind, target):
+    schema, _, rest = target.partition(".")
+    if kind == "table":
+        return "to_regclass('%s') IS NOT NULL" % target
+    if kind == "column":
+        table, _, column = rest.partition(".")
+        return ("EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('%s.%s') AND attname = '%s' "
+                "AND NOT attisdropped)" % (schema, table, column))
+    if kind == "function":
+        return ("EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = '%s' AND p.proname = '%s')" % (schema, rest))
+    raise StepError("unknown probe kind %r" % kind)
+
+
+def site_baseline_probes(env, names):
+    """{name: [what is missing]} for the hand-applied files `names`, read-only. A revision
+    marker is read only when its table exists (PostgreSQL resolves a relation when it parses)."""
+    probes = [(name, probe) for name in names for probe in SITE_BASELINE[name]["creates"]]
+    if not probes:
+        return {}
+    catalog = [(name, probe) if probe[0] != "revision" else (name, ("table", probe[1])) for name, probe in probes]
+    found = psql_read(env, " UNION ALL ".join(
+        "SELECT %d, (%s)::int" % (i, _probe_sql(*probe)) for i, (_, probe) in enumerate(catalog)) + " ORDER BY 1")
+    there = [row.split("|")[1] == "1" for row in found]
+    if len(there) != len(probes):
+        raise StepError("the baseline probes returned %d rows for %d probes" % (len(there), len(probes)))
+    missing = {name: [] for name in names}
+    for i, (name, probe) in enumerate(probes):
+        if probe[0] == "revision" and there[i]:
+            there[i] = psql_read(env, "SELECT (coalesce(max(revision), 0) >= %d)::int FROM %s WHERE id = 1"
+                                 % (probe[2], probe[1])) == ["1"]
+        if not there[i]:
+            missing[name].append("%s %s%s" % (probe[0], probe[1], " at %d or later" % probe[2] if probe[0] == "revision" else ""))
+    return missing
+
+
+def plan_site_migrations(env, files):
+    """What a run will do, decided by reading only: {create, baseline, pending, files}. Raises
+    for every state the rules above refuse, so nothing is written unless all of it can be."""
+    commit_files = {name: digest for name, digest, _ in files}
+    applied = site_ledger(env)
+    create, baseline, absent = applied is None, [], {}
+    if create:
+        names = [name for name in sorted(SITE_BASELINE) if name in commit_files]
+        for name in names:
+            if commit_files[name] != SITE_BASELINE[name]["sha256"]:
+                raise StepError("%s was applied by hand before the ledger existed, and its content has changed "
+                                "since it was recorded here: an applied file is never edited" % name)
+        for name, missing in site_baseline_probes(env, names).items():
+            if not missing:
+                baseline.append((name, commit_files[name]))
+            elif len(missing) == len(SITE_BASELINE[name]["creates"]):
+                absent[name] = missing
+            else:
+                raise StepError("%s is only partly in the database, missing: %s. Nothing was changed; it is "
+                                "neither recorded as applied nor run" % (name, ", ".join(missing)))
+        applied = baseline
+    for name, digest in applied:
+        if name not in commit_files:
+            raise StepError("the database has applied %s, which this commit does not have: this commit is older "
+                            "than the database and must not run against it" % name)
+        if commit_files[name] != digest:
+            raise StepError("%s is applied and its content has changed since: an applied file is never edited; "
+                            "put the change in a new file" % name)
+    done = {name for name, _ in applied}
+    newest = max(done) if done else ""
+    pending = [f for f in files if f[0] not in done]
+    for name, _, _ in pending:
+        if name < newest:
+            raise StepError("%s sorts before %s, which is already applied%s. Files apply in name order: rename it "
+                            "to sort after the newest applied file"
+                            % (name, newest, "; missing: %s" % ", ".join(absent[name]) if name in absent else ""))
+    return {"create": create, "baseline": baseline, "pending": pending,
+            "files": [(name, digest) for name, digest, _ in files]}
+
+
+def site_apply_script(name, digest, body, commit, nonce):
+    """One file and its ledger row as ONE transaction. The setting is local to the transaction,
+    so if it is gone at the end the file ended that transaction itself, and the row is not written."""
+    return "\n".join([
+        "BEGIN;",
+        "SET LOCAL migrations_private.run = '%s';" % nonce,
+        body,
+        ";",
+        "DO $games_site_ledger$ BEGIN",
+        "  IF current_setting('migrations_private.run', true) IS DISTINCT FROM '%s' THEN" % nonce,
+        "    RAISE EXCEPTION 'the migration ended its own transaction';",
+        "  END IF;",
+        "END $games_site_ledger$;",
+        "INSERT INTO migrations_private.applied (name, sha256, commit) VALUES ('%s', '%s', '%s');" % (name, digest, commit),
+        "COMMIT;",
+        "",
+    ])
+
+
+def apply_site_migrations(env, plan, commit):
+    """Carries out a plan: the ledger (with the baseline rows) if it is new, then each pending
+    file with its row, each verified. Returns the ledger, which must be exactly the commit's files."""
+    check_ref(commit)
+    if plan["create"]:
+        rows = "".join("INSERT INTO migrations_private.applied (name, sha256, commit, baseline) VALUES ('%s', '%s', '%s', true);\n"
+                       % (name, digest, commit) for name, digest in plan["baseline"])
+        psql_script(env, "BEGIN;\n%s%sCOMMIT;\n" % (SITE_LEDGER_SQL, rows))
+        for name, _ in plan["baseline"]:
+            log("%s recorded as applied by hand (every object it creates is there; not run)" % name)
+        log("site migration ledger created (migrations_private.applied)")
+    for name, digest, body in plan["pending"]:
+        psql_script(env, site_apply_script(name, digest, body, commit, hashlib.sha256(os.urandom(32)).hexdigest()))
+        if (name, digest) not in site_ledger(env):
+            raise StepError("%s ran but the ledger has no row for it" % name)
+        log("%s applied and recorded (verified)" % name)
+    ledger = site_ledger(env)
+    if ledger != plan["files"]:
+        raise StepError("the ledger does not hold exactly this commit's site migrations after the run")
+    return ledger
+
+
+def migrate(env, commit, root="."):
+    """A commit's migrations of both kinds against `env`; what games-mp-migrate exports. Both
+    kinds are read and checked, and the site plan made, before anything is written. The mp
+    files go first: they keep their own mechanism, and a site file may then rely on what this
+    commit's mp files made, never the other way round (an mp file refuses the site's schemas)."""
+    mp = mp_migrations(root)
+    site = site_migrations(root)
+    plan = plan_site_migrations(env, site)
+    revision = apply_mp_migrations(env, mp)
+    ledger = apply_site_migrations(env, plan, commit)
+    return {"GAMES_MP_DB_REVISION": str(revision), "GAMES_SITE_DB_MIGRATIONS": site_state(ledger),
+            "GAMES_SITE_DB_NEWEST": ledger[-1][0] if ledger else ""}
+
+
 def cmd_codebuild_migrate(args):
-    """games-mp-migrate: a main commit's mp migrations, from its source zip, against the
-    Supabase database in games/mp-db-url (injected by the buildspec, never on a command line).
-    Runs no code of the repo's: only psql with its .sql files. Exports GAMES_MP_DB_REVISION."""
+    """games-mp-migrate: a main commit's migrations, from its source zip, against the Supabase
+    database in games/mp-db-url (injected by the buildspec, never on a command line). Runs no
+    code of the repo's: only psql with its .sql files. Exports GAMES_MP_DB_REVISION, and for
+    the site migrations GAMES_SITE_DB_MIGRATIONS (site_state of the ledger) and
+    GAMES_SITE_DB_NEWEST (the newest applied file)."""
     commit = source_commit()
     url = os.environ.pop("GAMES_MP_DB_URL", "")
     if not url:
         raise StepError("GAMES_MP_DB_URL is empty (secret games/mp-db-url)")
     check_ca(CA_PATH)
     env = pg_env(url, os.path.abspath(CA_PATH))
-    revision = apply_mp_migrations(env, mp_migrations("."))
-    write_exports({"GAMES_MP_DB_REVISION": str(revision)})
-    log("commit %s: mp_private at revision %d" % (commit, revision))
+    exports = migrate(env, commit)
+    write_exports(exports)
+    log("commit %s: mp_private at revision %s; site migrations %s, newest %s"
+        % (commit, exports["GAMES_MP_DB_REVISION"], exports["GAMES_SITE_DB_MIGRATIONS"].split(":")[0],
+           exports["GAMES_SITE_DB_NEWEST"] or "none"))
 
 
 def cmd_sync_db_url(args):

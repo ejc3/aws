@@ -1025,9 +1025,10 @@ only administration can read, like the other games secrets.
 Not managed here: the Google OAuth clients (Google has no API for them), a stable hostname
 for preview sign-in, and the database. The Supabase project came from the Vercel
 integration; Production and Preview already hold its URL, its server key and
-`SKYHOOK_LEADERBOARD_ENVIRONMENT`, and the accounts migrations in the games repository are
-applied by hand, because `games-mp-migrate` runs only the multiplayer ones. A dev box reads
-`colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
+`SKYHOOK_LEADERBOARD_ENVIRONMENT`. The accounts migrations in the games repository need no
+step here: `games-mp-migrate` applies every file under its `supabase/migrations` when it
+merges to `main`, before that release is promoted (`docs/games-multiplayer.md`, "Site
+migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
 
 ## GitHub Actions and package infrastructure
 
@@ -1654,7 +1655,7 @@ its instance role and its network, not the account:
   A WAF (per-IP rate limit, AWS managed rules), join tokens, an origin allowlist, per-IP
   limits in the router and router-only engine ingress protect it. The engines' task role has
   no permissions and their egress is HTTPS-only. Their images deploy automatically: a push
-  to colton-games `main` reaches production engines (and the router, and mp migrations) with
+  to colton-games `main` reaches production engines (and the router, and every migration) with
   no human step, and any branch's code runs in preview engines only. The lobby's launch limits are pinned by
   Terraform. The lobby holds no ECS permission: it can only invoke a launch function that
   builds every `RunTask` from fixed settings and refuses above AWS's own ceiling on concurrent
