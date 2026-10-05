@@ -529,11 +529,19 @@ data "aws_iam_policy_document" "parallel_box_control" {
   }
 }
 
-# The metal boxes (fcvm-metal-arm, fcvm-metal-x86).
-resource "aws_iam_role_policy" "dev_server_parallel_box" {
+# ONE managed policy for both roles, not an inline policy on each. dev-server-role's inline policies total about 10,060 of the
+# 10,240 characters IAM allows per role, so the policy that grew to cover two regions (about 4,100 characters) could not be
+# put inline there: PutRolePolicy failed with LimitExceeded. A managed policy has its own 6,144 limit and does not count
+# against the role's inline total.
+resource "aws_iam_policy" "parallel_box_control" {
   name   = "parallel-box-control"
-  role   = aws_iam_role.dev_server.id
   policy = data.aws_iam_policy_document.parallel_box_control.json
+}
+
+# The metal boxes (fcvm-metal-arm, fcvm-metal-x86).
+resource "aws_iam_role_policy_attachment" "dev_server_parallel_box" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.parallel_box_control.arn
 }
 
 # The shared Next.js box. It is a four-human box, so this is worth being explicit about:
@@ -541,10 +549,9 @@ resource "aws_iam_role_policy" "dev_server_parallel_box" {
 # The worst a compromised account there can do with it is cost money on a box the
 # watchdog kills after 30 minutes idle -- it cannot reach any other instance, cannot pass
 # any other role, and cannot delete the work volumes.
-resource "aws_iam_role_policy" "nextjs_dev_parallel_box" {
-  name   = "parallel-box-control"
-  role   = aws_iam_role.nextjs_dev.id
-  policy = data.aws_iam_policy_document.parallel_box_control.json
+resource "aws_iam_role_policy_attachment" "nextjs_dev_parallel_box" {
+  role       = aws_iam_role.nextjs_dev.name
+  policy_arn = aws_iam_policy.parallel_box_control.arn
 }
 
 output "parallel_box_launch_templates" {

@@ -226,6 +226,12 @@ resource "aws_ebs_snapshot_copy" "pbox_move" {
   }
 
   tags = { Name = "${each.value.name}-move" }
+
+  # AWS records its default EBS key here after the copy; the config names none, and a null against that key forces replacement
+  # (a second 8 minute copy, then a destroyed one the volumes were restored from).
+  lifecycle {
+    ignore_changes = [kms_key_id]
+  }
 }
 
 # The same protection as the originals: losing one loses real work. snapshot_id is ignored after creation so deleting the

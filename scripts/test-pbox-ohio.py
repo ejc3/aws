@@ -97,6 +97,7 @@ class DataTests(unittest.TestCase):
         self.assertIn("encrypted         = true", vol)
         self.assertIn("availability_zone = local.ohio_pbox_az", vol)
         copy = block(OHIO, 'resource "aws_ebs_snapshot_copy" "pbox_move"')
+        self.assertIn("ignore_changes = [kms_key_id]", copy)
         self.assertIn('source_region      = "us-west-2"', copy)
         self.assertIn("encrypted          = true", copy)
 
@@ -110,6 +111,22 @@ class DataTests(unittest.TestCase):
     def test_the_old_volumes_keep_their_protection(self):
         for f in ("parallel-box.tf", "parallel-box2.tf"):
             self.assertIn("prevent_destroy = true", (ROOT / f).read_text(), f)
+
+
+class ControlPolicyTests(unittest.TestCase):
+    """dev-server-role's inline policies total about 10,060 of IAM's 10,240 characters per role, so the two-region control
+    policy (about 4,100) could not be inline there: PutRolePolicy failed LimitExceeded. It is one managed policy."""
+
+    def test_it_is_a_managed_policy_attached_to_both_roles_and_not_inline(self):
+        self.assertIn('resource "aws_iam_policy" "parallel_box_control"', LAUNCH)
+        self.assertIn("policy = data.aws_iam_policy_document.parallel_box_control.json", LAUNCH)
+        for name, role in (("dev_server_parallel_box", "aws_iam_role.dev_server.name"),
+                           ("nextjs_dev_parallel_box", "aws_iam_role.nextjs_dev.name")):
+            att = block(LAUNCH, 'resource "aws_iam_role_policy_attachment" "%s"' % name)
+            self.assertIn(role, att)
+            self.assertIn("aws_iam_policy.parallel_box_control.arn", att)
+        self.assertNotIn('resource "aws_iam_role_policy" "dev_server_parallel_box"', LAUNCH)
+        self.assertNotIn('resource "aws_iam_role_policy" "nextjs_dev_parallel_box"', LAUNCH)
 
 
 class LiveCopyTests(unittest.TestCase):
