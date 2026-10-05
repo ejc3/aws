@@ -9,7 +9,7 @@ export function readConfig(env = process.env) {
   const issuer = new URL(env.BM_ACCESS_ISSUER || 'https://ejc3.cloudflareaccess.com');
   const audience = env.BM_ACCESS_AUD || '';
   const serviceTokenId = env.BM_ACCESS_SERVICE_TOKEN_ID || '';
-  const owner = (env.BM_OWNER_EMAIL || 'ej.campbell@gmail.com').toLowerCase();
+  const owner = (env.BM_OWNER_EMAIL || '').toLowerCase();
   const port = Number(env.BM_PORT || 3210);
   if (baseUrl.protocol !== 'https:' || baseUrl.pathname !== '/' || baseUrl.search ||
       baseUrl.hash || baseUrl.username || baseUrl.password ||

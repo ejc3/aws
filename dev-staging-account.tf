@@ -11,12 +11,6 @@ variable "enable_dev_staging" {
   default     = true
 }
 
-variable "dev_staging_email" {
-  description = "Unique root email for the dev-staging member account (gmail +alias is fine)"
-  type        = string
-  default     = "ej.campbell+dev-staging@gmail.com"
-}
-
 # Existing organization (management account is the only member today).
 data "aws_organizations_organization" "current" {}
 
@@ -31,7 +25,7 @@ resource "aws_organizations_organizational_unit" "sandbox" {
 resource "aws_organizations_account" "dev_staging" {
   count     = var.enable_dev_staging ? 1 : 0
   name      = "dev-staging"
-  email     = var.dev_staging_email
+  email     = local.dev_staging_email
   parent_id = aws_organizations_organizational_unit.sandbox[0].id
   role_name = "OrganizationAccountAccessRole" # role in the member account this (mgmt) account can assume
 
