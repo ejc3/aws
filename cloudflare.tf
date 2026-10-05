@@ -61,7 +61,7 @@ provider "cloudflare" {
 }
 
 variable "cloudflare_account_id" {
-  description = "Cloudflare account (Ej.campbell@gmail.com's Account)"
+  description = "Cloudflare account that owns the zones, tunnels and Access applications"
   type        = string
   default     = "12ea67fb7ced068de03f35c22688e436"
 }
@@ -70,16 +70,6 @@ variable "cc_games_zone_id" {
   description = "Zone id for cc-games.dev (registered through Cloudflare Registrar, so the zone was created automatically)"
   type        = string
   default     = "5a7a8d961d72744d2e7fd155dcdeb42b"
-}
-
-variable "dev_allowed_emails" {
-  description = "Google accounts allowed through Cloudflare Access to every *.cc-games.dev host. Adding someone is a one-line change here."
-  type        = list(string)
-  default = [
-    "thecoltonc2014@gmail.com",
-    "theconnorc2014@gmail.com",
-    "ej.campbell@gmail.com",
-  ]
 }
 
 # ---------------------------------------------------------------------------------
@@ -163,7 +153,7 @@ resource "cloudflare_zero_trust_access_identity_provider" "onetimepin" {
 #   the URI is unregistered. Google also takes 5 minutes to a few hours to propagate
 #   console changes, so a fresh edit can read as mismatched for a while.
 #
-#   The consent screen is "External" with var.dev_allowed_emails as test users. Google
+#   The consent screen is "External" with local.dev_allowed_emails as test users. Google
 #   only demands app verification once an app serves users beyond that list, so a named
 #   handful stays unverified and works -- with a one-time "unverified app" interstitial.
 #
@@ -301,7 +291,7 @@ resource "cloudflare_zero_trust_access_policy" "warp_enrollment" {
   session_duration = "24h"
 
   include = [
-    for email in var.dev_allowed_emails : { email = { email = email } }
+    for email in local.dev_allowed_emails : { email = { email = email } }
   ]
 }
 
@@ -345,7 +335,7 @@ resource "cloudflare_zero_trust_access_policy" "family_wall_screens_warp" {
   session_duration = "24h"
 
   include = [
-    for email in var.dev_allowed_emails : { email = { email = email } }
+    for email in local.dev_allowed_emails : { email = { email = email } }
   ]
   require = [{
     device_posture = { integration_uid = cloudflare_zero_trust_device_posture_rule.warp_enrolled.id }
@@ -527,7 +517,7 @@ resource "cloudflare_zero_trust_access_policy" "cc_games_allowed" {
   session_duration = "24h"
 
   include = [
-    for email in var.dev_allowed_emails : { email = { email = email } }
+    for email in local.dev_allowed_emails : { email = { email = email } }
   ]
 }
 

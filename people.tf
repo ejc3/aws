@@ -35,3 +35,42 @@ resource "aws_secretsmanager_secret_policy" "people" {
     }]
   })
 }
+
+data "aws_secretsmanager_secret_version" "people" {
+  secret_id = aws_secretsmanager_secret.people.id
+}
+
+locals {
+  people = jsondecode(data.aws_secretsmanager_secret_version.people.secret_string)
+
+  # The names the configuration used before the addresses left git (variables or locals), so call sites change only their prefix.
+  #
+  # nonsensitive() on purpose. These were plain literals, and the secret's value arrives marked sensitive; consumers then plan an
+  # in-place "update" for the mark alone, and the dev-staging account's update makes every value that depends on its id unknown
+  # (one such plan wanted to replace the security modules' IAM roles). Unmarked, an unchanged address plans no change at all.
+  # The cost: if an address DOES change, the plan prints it. Plans stay on the jumpbox and in the Stop hook's log.
+  dev_allowed_emails    = nonsensitive(local.people.family)          # Cloudflare Access: who may reach every *.cc-games.dev host
+  browser_manager_owner = nonsensitive(local.people.owner)           # the browser manager's single owner
+  dev_staging_email     = nonsensitive(local.people.staging_account) # root email of the dev-staging member account
+}
+
+# Fail the plan, naming the key and never the value, if the secret is missing, empty, or still lacks a key. An empty Access
+# allowlist or a blank account email must not reach an apply.
+resource "terraform_data" "people_shape" {
+  input = sha256(data.aws_secretsmanager_secret_version.people.secret_string)
+
+  lifecycle {
+    precondition {
+      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account)
+      error_message = "The people/addresses secret must be JSON with the keys owner, family and staging_account (see people.tf)."
+    }
+    precondition {
+      condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account))
+      error_message = "people/addresses: owner and staging_account must each be one email address."
+    }
+    precondition {
+      condition     = length(local.people.family) > 0 && alltrue([for e in local.people.family : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", e))])
+      error_message = "people/addresses: family must be a non-empty list of email addresses (it is the Cloudflare Access allowlist)."
+    }
+  }
+}

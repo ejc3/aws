@@ -2,7 +2,6 @@
 # or the Dolphin GitHub organization policy. An exact hostname wins over *.cc-games.dev.
 locals {
   browser_manager_hostname = "browsers.cc-games.dev"
-  browser_manager_owner    = "ej.campbell@gmail.com"
   browser_manager_issuer   = "https://ejc3.cloudflareaccess.com"
 }
 

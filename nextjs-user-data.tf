@@ -151,11 +151,10 @@ locals {
   # leaves the old one authorized forever. Anything retired therefore has to be named here
   # so it can be removed explicitly.
   #
-  # skevh@yahoo.com: generated for Steve with a passphrase that was then lost, so nobody
-  # can use it. Retired 2026-08-17.
-  nextjs_retired_user_keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3GGQEbA+7pChjnXMBagHA1G26vH8BQJj9Bgva21eVH skevh@yahoo.com",
-  ]
+  # Empty: the one key that was here (generated for Steve with a passphrase that was then lost, so nobody could use it,
+  # retired 2026-08-17) is gone from every account on the box, so its entry was dropped. A key retired from now on is
+  # listed here as its exact authorized_keys line.
+  nextjs_retired_user_keys = []
 
   # Repositories to lay down for a user on first setup, so the box is useful the moment
   # they log in instead of starting at an empty home directory. Cloned only when that

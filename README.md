@@ -193,6 +193,17 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin; unset T
 ```
 
+People's email addresses are not in this repository. `people/addresses` (us-west-1, from `people.tf`) holds them as JSON:
+`owner` (the browser manager's owner), `family` (the Cloudflare Access allowlist for every `*.cc-games.dev` host) and
+`staging_account` (the dev-staging account's root email). To add someone to the allowlist, put the whole JSON again with the
+new address in `family` (a plan on a jumpbox then shows the Access policies changing; apply it). Terraform fails a plan,
+naming the key, if the secret is missing a key or `family` is empty. Put it without echoing:
+
+```bash
+read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+  --secret-id people/addresses --secret-string file:///dev/stdin; unset T
+```
+
 The ElevenLabs key for the games, `games/elevenlabs-api-key` (us-west-1, from
 `dev-ai-services.tf`), is populated the same way. Until it has a value the dev boxes get
 `ResourceNotFoundException` for it, and the colton-games Vercel env `ELEVENLABS_API_KEY`, which
