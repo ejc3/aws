@@ -138,6 +138,11 @@ permissions, which is exactly why it was useless for this.
 
 Account id: `12ea67fb7ced068de03f35c22688e436`.
 
+**Domains registered here so far** (all Cloudflare Registrar, auto-renew off unless stated): `cc-games.dev`, `cc-games.app`,
+`cc-games.net`, `cc-games.org`, `ccgames.app`, `dolphin-labs.dev`, and `yourfantasymovie.com` (2026-10-05, $10.46, the Fantasy
+Films site; DNS in `yourfantasymovie.tf`). Registration via API needs a short-lived Registrar Domains Admin token, a `domain-check`
+immediately before, exactly one `registrations` call, and revoking the token after.
+
 **September 8, 2026 check:** `/home/ubuntu/aws/.env` was absent, and Secrets Manager
 `cloudflare-account-token` had an `AWSCURRENT` version. Keep this account-level token-minting
 credential in Secrets Manager only; do not recreate a plaintext `.env` copy. This checked

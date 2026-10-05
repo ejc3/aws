@@ -34,9 +34,8 @@
 #                  (colton-games' came from the Vercel integration).
 #   Vercel         the project and its environment are set by hand, as for imagine. The Vercel
 #                  provider's token here (vercel.tf) reaches the colton-games team only.
-#   DNS            none. The site answers on its Vercel-assigned domain.
-#                  TODO(owner): if it gets a hostname of its own, add a vercel_project_domain
-#                  and a cloudflare_dns_record the way vercel-cc-games.tf does.
+#   DNS            yourfantasymovie.com (yourfantasymovie.tf): DNS records here, the Vercel project
+#                  `dolphin-films` (team dolphin-labs) and its domains made with the Vercel CLI as the owner.
 #
 # BRING-UP, once, in this order:
 #   1. Apply. The four containers exist and are empty.
