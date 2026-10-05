@@ -157,10 +157,9 @@ resource "aws_key_pair" "ohio_pbox" {
 # the Ohio subnet is added to local.io_box_nfs_client_cidrs. About 50 ms away, so bulk data and caches only; and the box's
 # automount means a stopped I/O box never blocks a boot.
 #
-# ONE STEP NOT IN TERRAFORM: the I/O box ignores user_data after creation, so its /etc/exports.d/io-box.exports does not
-# list this subnet until the box is rebuilt. Until then the mount is refused by the server (the security group admits it).
-# To enable it on the running box, add the subnet to that file and `exportfs -ra`:
-#   echo '/srv/io 10.12.1.0/24(rw,async,no_subtree_check,root_squash,fsid=0)' | sudo tee -a /etc/exports.d/io-box.exports
+# The I/O box ignores user_data after creation, so its /etc/exports.d/io-box.exports does not list this subnet from the box's
+# build. aws_ssm_association.io_box_exports (io-box.tf) rewrites that file from local.io_box_nfs_client_cidrs whenever the box is
+# up, so the server admits exactly what the security group does and nothing is edited by hand.
 resource "aws_vpc_peering_connection" "ohio_pbox_io" {
   provider    = aws.ohio
   vpc_id      = aws_vpc.ohio_pbox.id

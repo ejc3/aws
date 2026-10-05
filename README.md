@@ -623,8 +623,8 @@ and the parallel boxes' `172.31.48.0/20` in us-west-2d. It is never a whole VPC:
 group cannot be referenced across the inter-region peer, so the source CIDR is the only
 filter. A new NFS client in another subnet needs that subnet added there
 (`scripts/test-io-box-nfs.py` fails until it is). The export line in `/etc/exports.d` is
-rendered from the same list, but only when the box is rebuilt: `user_data` is ignored after
-creation, so until then the security group is what enforces it.
+rendered from the same list by an SSM association (`io_box_exports`) that runs whenever the box is up, because
+`user_data` is ignored after creation: the server and the security group cannot disagree.
 
 The I/O watchdog queries CPU, disk bytes, and network bytes over the same intended 12-hour
 window. A returned five-minute point with CPU at least 5%, disk I/O at least 1 MiB, or
