@@ -91,6 +91,18 @@ class CISecurityTests(unittest.TestCase):
         self.assertNotIn('GitHubActionsPublish', source('codeartifact.tf'))
         self.assertNotIn('aws_iam_role.github_actions_terraform.arn', source('codeartifact.tf'))
 
+    def test_every_workflow_step_name_is_valid_yaml(self):
+        # A plain (unquoted) name containing ": " is a YAML mapping error, and GitHub then runs
+        # none of that workflow: every offline test in lambda-tests.yml stops, with only a
+        # failed run named after the file to show it. This workflow is the one that still runs.
+        for workflow in sorted((ROOT / '.github' / 'workflows').glob('*.yml')):
+            for number, line in enumerate(workflow.read_text().splitlines(), 1):
+                match = re.match(r'\s*(?:- )?name: (.*)$', line)
+                if match is None or match.group(1)[:1] in ('"', "'"):
+                    continue
+                value = match.group(1).split(' #', 1)[0].rstrip()
+                self.assertNotRegex(value, r': |:$', f'{workflow.name} line {number}: quote this name')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
