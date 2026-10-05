@@ -159,14 +159,6 @@ case "$CMD" in
     [ -n "$VOL" ] || { say "FATAL: no work volume tagged $VOLTAG in $REGION"; exit 1; }
     AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
       --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
-    # The volumes in the other region are stale copies (ohio-pbox.tf): starting a box on one forks the work disk.
-    LIVE=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
-      --query 'Volumes[0].Tags[?Key==`Live`]|[0].Value' --output text 2>/dev/null)
-    if [ "$LIVE" = "false" ] && [ "${PARALLEL_BOX_ALLOW_STALE:-}" != "1" ]; then
-      say "FATAL: $VOL in $REGION is a stale copy (tag Live=false); the live work disk is in the other region."
-      say "Starting a box on it would fork /mnt/work. If you mean it:  PARALLEL_BOX_ALLOW_STALE=1 $SELF $*"
-      exit 1
-    fi
     say "Work volume $VOL is in $AZ -- the box launches there (EBS is AZ-locked)."
     say "Spot capacity for 192-core instances is scarce; trying each type in turn."
     say ""

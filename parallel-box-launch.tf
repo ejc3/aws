@@ -38,12 +38,10 @@ locals {
   # the point: a second box exists so two jobs can run without sharing one work disk.
   parallel_boxes = {
     "1" = {
-      name      = "parallel-box"
-      volume_id = aws_ebs_volume.parallel_work.id
+      name = "parallel-box"
     }
     "2" = {
-      name      = "parallel-box-2"
-      volume_id = aws_ebs_volume.parallel_work_2.id
+      name = "parallel-box-2"
     }
   }
 
@@ -51,18 +49,11 @@ locals {
 }
 
 locals {
-  # Where a box can live. The persistent work volume pins the AZ and therefore the region, so a site is everything that
-  # is regional: AMI, subnet, security group, key pair and the volume of each box. us-west-2 is where they lived;
-  # us-east-2 (ohio-pbox.tf) is where they are moving, 30% cheaper for the 192-core spot pool. IAM covers every site
-  # so the move is a pointer flip (local.parallel_box_region -> /infra/parallel-box), not a permissions change.
+  # Where a box lives. The persistent work volume pins the AZ and therefore the region, so a site is everything that is
+  # regional: AMI, subnet, security group, key pair and the volume of each box. There is one, us-east-2 (ohio-pbox.tf), where
+  # the boxes moved from us-west-2 on 2026-10-05 (30% cheaper for the 192-core spot pool); the us-west-2 site, its volumes and
+  # its templates are retired. The map form stays so a second site is an entry here, not a rewrite of the IAM below.
   parallel_box_sites = {
-    "us-west-2" = {
-      ami               = var.parallel_box_ami
-      subnet_id         = "subnet-095349c0fcef8c47f" # default VPC, us-west-2d
-      security_group_id = aws_security_group.parallel_box.id
-      key_name          = aws_key_pair.parallel_box.key_name
-      volumes           = { "1" = aws_ebs_volume.parallel_work.id, "2" = aws_ebs_volume.parallel_work_2.id }
-    }
     "us-east-2" = {
       ami               = var.parallel_box_ami_ohio
       subnet_id         = aws_subnet.ohio_pbox.id
@@ -89,10 +80,7 @@ locals {
     ]
   ])
 
-  parallel_box_template_arns = concat(
-    [for lt in aws_launch_template.parallel_box : lt.arn],
-    [for lt in aws_launch_template.parallel_box_ohio : lt.arn],
-  )
+  parallel_box_template_arns = [for lt in aws_launch_template.parallel_box_ohio : lt.arn]
 
   # The boot script of one box: authorize the dev hop key, find the work volume by its EBS serial and mount it
   # without ever formatting a disk that has a filesystem, then the shared NFS scratch. Keyed "<region>/<box>" because
@@ -181,103 +169,6 @@ locals {
 # instance_type is deliberately ABSENT. It is the one field the caller supplies, because
 # capacity is the hard part: a 192-core spot request pinned to one type scores 1/10 for
 # fulfilment, so scripts/parallel-box.sh walks a list of pools until one answers.
-# ---------------------------------------------------------------------------------
-resource "aws_launch_template" "parallel_box" {
-  provider = aws.west2
-  for_each = local.parallel_boxes
-
-  name                   = each.value.name
-  image_id               = var.parallel_box_ami # Ubuntu 24.04 arm64, us-west-2
-  key_name               = aws_key_pair.parallel_box.key_name
-  update_default_version = true
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.dev_ebs_only.name
-  }
-
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      # Interruption is survivable: all work lives on the persistent volume, which is
-      # detached rather than destroyed. Terminate (not stop) keeps this simple -- there
-      # is no state on the root disk worth preserving.
-      spot_instance_type             = "one-time"
-      instance_interruption_behavior = "terminate"
-    }
-  }
-
-  # Root is DISPOSABLE and recreated on every launch. Anything you care about belongs
-  # on /mnt/work, which is the persistent volume.
-  block_device_mappings {
-    device_name = "/dev/sda1"
-    ebs {
-      volume_size           = 30
-      volume_type           = "gp3"
-      delete_on_termination = true
-    }
-  }
-
-  # The subnet pins the AZ, and the AZ is pinned by the work volume: EBS is AZ-locked, so
-  # the box must launch where its disk already is. Set here rather than passed by the
-  # caller so a mistyped --subnet-id cannot strand an instance away from its disk.
-  network_interfaces {
-    subnet_id                   = "subnet-095349c0fcef8c47f" # default VPC, us-west-2d
-    security_groups             = [aws_security_group.parallel_box.id]
-    associate_public_ip_address = true
-    delete_on_termination       = true
-  }
-
-  # Tags must be applied AT LAUNCH, not afterwards: the IAM policy below authorizes
-  # RunInstances only when the instance is born with the right Name, and the watchdog
-  # finds its targets by that same tag. An untagged box would be both unauthorized and
-  # invisible to the thing that stops it costing money.
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name    = each.value.name
-      Purpose = "on-demand embarrassingly-parallel compute"
-      DevEBS  = "true"
-    }
-  }
-
-  # The root volume carries the BOX's name, not "<name>-root". The IAM condition below
-  # tests aws:RequestTag/Name against exactly the two box names, so any other value --
-  # however sensible it reads -- is an unsatisfiable condition and a denied launch. It is
-  # distinguishable from the work volume by tag Role, which nothing gates on.
-  #
-  # Deliberately no DevEBS=true here: that tag is what local.dev_ebs_policy keys on for
-  # ec2:DeleteVolume, and there is no reason to hand out a delete grant for a disk that
-  # already dies with the instance.
-  tag_specifications {
-    resource_type = "volume"
-    tags = {
-      Name = each.value.name
-      Role = "root"
-    }
-  }
-
-  # The ENI must be tagged too, and this is not cosmetic. RunInstances authorizes every
-  # resource it creates, the IAM policy below gates instance/volume/network-interface on
-  # aws:RequestTag/Name, and a condition on an untagged resource can never be satisfied.
-  # Without this the launch fails with UnauthorizedOperation on network-interface/* --
-  # observed live, and it fails for EVERY instance type, so it reads like a capacity
-  # drought rather than a policy bug.
-  tag_specifications {
-    resource_type = "network-interface"
-    tags = {
-      Name = each.value.name
-    }
-  }
-
-  tags = { Name = each.value.name }
-
-  user_data = local.parallel_box_user_data["us-west-2/${each.key}"]
-}
-
-# ---------------------------------------------------------------------------------
-# The same launch template in us-east-2, where the boxes are moving (ohio-pbox.tf). Identical to the one above except
-# for what is regional: AMI, key pair, subnet, security group and the boot script's work-volume ID. The two are kept as
-# two resources, not a provider-parameterized one, because a Terraform resource has exactly one provider.
 # ---------------------------------------------------------------------------------
 resource "aws_launch_template" "parallel_box_ohio" {
   provider = aws.ohio
@@ -556,5 +447,5 @@ resource "aws_iam_role_policy_attachment" "nextjs_dev_parallel_box" {
 
 output "parallel_box_launch_templates" {
   description = "Launch templates pbox runs instances from (terraform owns the config; pbox picks the instance type)"
-  value       = { for k, lt in aws_launch_template.parallel_box : k => lt.name }
+  value       = { for k, lt in aws_launch_template.parallel_box_ohio : k => lt.name }
 }
