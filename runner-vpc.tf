@@ -98,7 +98,7 @@ locals {
   # counted, reused, reaped and allowed by IAM. One entry is today. A move to Ohio (ohio.tf, prepared and idle) is two
   # applies: ["us-east-2", "us-west-1"] (new runners in Ohio while the us-west-1 ones drain and are still reaped), then
   # ["us-east-2"] once the old region is empty. The control plane (SSM, DynamoDB, the Lambdas) stays in us-west-1.
-  runner_regions        = ["us-east-2", "us-west-1"]
+  runner_regions        = ["us-east-2"]
   runner_primary_region = local.runner_regions[0]
   runner_networks = var.enable_github_runner ? {
     "us-west-1" = { subnets = concat(aws_subnet.runner_us_west_1c, aws_subnet.runner), security_group = aws_security_group.runner[0] }
