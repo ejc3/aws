@@ -234,8 +234,8 @@ idle watchdog, and a peering route to the I/O box's one subnet for the NFS scrat
 from a snapshot copy of each work volume (no fresh snapshot, as the owner accepted), and the us-west-2 site was retired:
 the old volumes, the move snapshots, the launch templates and the security group are deleted, so the Ohio volumes are the
 only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `/infra/parallel-box`, published from
-`local.parallel_box_region`. One step is not Terraform: the I/O box ignores `user_data`, so
-add the Ohio subnet to its `/etc/exports.d/io-box.exports` (the comment in `ohio-pbox.tf` has the line). Known region
+`local.parallel_box_region`. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).
 

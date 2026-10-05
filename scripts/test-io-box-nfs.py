@@ -111,5 +111,29 @@ class MounterTests(unittest.TestCase):
         self.assertIn("[aws_subnet.ohio_pbox.cidr_block]", IO)
 
 
+class ExportsAssociationTests(unittest.TestCase):
+    """The server's export file follows the security group on every start: user_data is ignored after creation, so an SSM
+    association rewrites it from the same list (a client added later was admitted by the security group and refused by the server)."""
+
+    ASSOC = re.search(r'resource "aws_ssm_association" "io_box_exports" \{.*?\n\}\n', IO, re.S).group(0)
+
+    def test_it_targets_only_the_io_box_in_us_west_2(self):
+        self.assertIn("provider            = aws.west2", self.ASSOC)
+        self.assertIn('name                = "AWS-RunShellScript"', self.ASSOC)
+        self.assertRegex(self.ASSOC, r'targets \{\s+key\s+= "tag:Name"\s+values = \["io-box"\]')
+
+    def test_it_renders_the_same_line_from_the_same_list_as_the_boot_script(self):
+        line = '/srv/io ${join(" ", [for c in local.io_box_nfs_client_cidrs : "${c}(rw,async,no_subtree_check,root_squash,fsid=0)"])}'
+        self.assertEqual(IO.count(line), 2, "the boot script and the association must render the identical export line")
+        for whole in ("data.aws_vpc", "0.0.0.0/0", "172.31.0.0/16", "10.0.0.0/16"):
+            self.assertNotIn(whole, self.ASSOC)
+
+    def test_it_replaces_the_file_only_when_it_differs_and_then_reloads(self):
+        self.assertIn('if cmp -s "$new" "$f"; then', self.ASSOC)
+        self.assertIn('install -m 644 "$new" "$f"', self.ASSOC)
+        self.assertLess(self.ASSOC.index('install -m 644'), self.ASSOC.index("exportfs -ra"))
+        self.assertIn('rate(1 day)', self.ASSOC)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

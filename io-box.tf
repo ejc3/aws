@@ -416,3 +416,44 @@ output "io_box_mount" {
   description = "Shared ephemeral scratch mount installed on every dev server"
   value       = "/mnt/io -> ${aws_instance.io_box.private_ip}:/ (NFSv4; data is erased whenever the box stops)"
 }
+
+# The export file follows the security group, on every start.
+#
+# The box ignores user_data after creation (lifecycle above), so /etc/exports.d/io-box.exports holds the client list as it was when
+# the box was built, and a client added later (the parallel boxes' Ohio subnet) was admitted by the security group and then refused
+# by the server. This State Manager association runs when the box registers with SSM after a start and every day while it is up: it
+# renders the same line the boot script writes, from the same local.io_box_nfs_client_cidrs, replaces the file only if it differs,
+# and reloads the exports. The security group and the exports can no longer disagree, and no one has to edit the box by hand.
+# A stopped box is simply not targeted; it converges the moment it is up.
+resource "aws_ssm_association" "io_box_exports" {
+  provider            = aws.west2
+  name                = "AWS-RunShellScript"
+  association_name    = "io-box-exports"
+  schedule_expression = "rate(1 day)"
+
+  targets {
+    key    = "tag:Name"
+    values = ["io-box"]
+  }
+
+  parameters = {
+    commands = <<-SCRIPT
+      set -eu
+      f=/etc/exports.d/io-box.exports
+      mkdir -p /etc/exports.d
+      new=$(mktemp)
+      cat > "$new" <<'EXPORTS'
+      /srv/io ${join(" ", [for c in local.io_box_nfs_client_cidrs : "${c}(rw,async,no_subtree_check,root_squash,fsid=0)"])}
+      EXPORTS
+      if cmp -s "$new" "$f"; then
+        echo "io-box exports already current"
+      else
+        install -m 644 "$new" "$f"
+        exportfs -ra
+        echo "io-box exports updated"
+      fi
+      rm -f "$new"
+      exportfs -v | head -5
+    SCRIPT
+  }
+}
