@@ -9,8 +9,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "people.tf").read_text()
 ADDRESS = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-# A mailbox at a public provider is a person; the rest are placeholders, hosts, or unix user@unit names.
-PERSONAL = re.compile(r"@(gmail|googlemail|yahoo|icloud|me|hotmail|outlook|proton|protonmail|aol)\.[a-z.]+$", re.I)
+
+# Every address-shaped string in a tracked file is a failure unless it is a known NON-mailbox form. The allowlist is the point:
+# a personal mailbox at any provider, employer or school fails, and so does one at a domain we own (a mailbox there is a person).
+NOT_A_MAILBOX = (
+    re.compile(r"(^|\.)(example\.(com|net|org)|[a-z0-9-]+\.example|[a-z0-9-]+\.test|[a-z0-9-]+\.invalid|localhost)$"),  # placeholders
+    re.compile(r"\.(service|timer|socket|mount|target|slice|path)$"),  # systemd units: agent-session-sync@ubuntu.service
+    re.compile(r"^github\.com$"),  # git@github.com (a clone URL), checked with the user below
+    re.compile(r"^([a-z0-9-]+\.)+cc-games\.dev$|^ssh\.dolphin-labs\.dev$"),  # ssh login hosts (user@host), never an apex mailbox
+    re.compile(r"\.local$"),  # mDNS hostnames in ssh key comments: user@Host.local
+    re.compile(r"^pooler\.supabase\.com$|\.pooler\.supabase\.com$"),  # a database URL: user:password@host
+)
+
+
+# systemd template instances: `cloudflared@cc-games.dev` is the unit cloudflared@ instantiated for a hostname, not a mailbox
+SYSTEMD_TEMPLATES = {"cloudflared"}
+
+
+def is_mailbox(address):
+    user, domain = address.rsplit("@", 1)
+    domain = domain.lower()
+    if user in SYSTEMD_TEMPLATES or domain == "users.noreply.github.com":  # unit instances; GitHub's noreply placeholder
+        return False
+    if domain == "github.com":
+        return user.lower() != "git"
+    return not any(rule.search(domain) for rule in NOT_A_MAILBOX)
 
 
 def block(header):
@@ -57,7 +80,7 @@ class PeopleTests(unittest.TestCase):
         auth = (ROOT / "browser-manager" / "lib" / "auth.mjs").read_text()
         self.assertIn("env.BM_OWNER_EMAIL || ''", auth)  # no built-in owner: the Terraform output is required
 
-    def test_no_tracked_file_holds_a_personal_mailbox(self):
+    def test_no_tracked_file_holds_a_mailbox_except_known_non_mailbox_forms(self):
         files = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True, check=True).stdout.split("\n")
         hits = []
         for name in files:
@@ -69,9 +92,20 @@ class PeopleTests(unittest.TestCase):
                 continue
             for n, line in enumerate(text.splitlines(), 1):
                 for m in ADDRESS.finditer(line):
-                    if PERSONAL.search(m.group()):
+                    if is_mailbox(m.group()):
                         hits.append("%s:%d" % (name, n))
-        self.assertEqual(hits, [], "personal addresses in tracked files (use the people/addresses secret, see people.tf)")
+        self.assertEqual(hits, [], "email addresses in tracked files (use the people/addresses secret, see people.tf)")
+
+    def test_the_scan_flags_any_provider_and_our_own_domains_but_not_the_known_forms(self):
+        at = "@"  # the examples are assembled, so this file holds no address literal itself
+        for bad in ("a.b" + at + "gmail.com", "x" + at + "acme-corp.com", "y" + at + "school.k12.ca.us", "z" + at + "dolphin-labs.dev",
+                    "w" + at + "cc-games.dev", "n" + at + "github.com", "q" + at + "mail.yahoo.co.uk"):
+            self.assertTrue(is_mailbox(bad), bad)
+        for ok in ("admin" + at + "example.com", "o" + at + "owner.example.test", "agent-session-sync" + at + "ubuntu.service",
+                   "git" + at + "github.com", "admin" + at + "skevh-mac-ssh.cc-games.dev", "ejc3" + at + "ssh.dolphin-labs.dev",
+                   "u" + at + "Some-Mac.local", "%s" + at + "aws-0-us-east-1.pooler.supabase.com", "cloudflared" + at + "cc-games.dev",
+                   "GH_LOGIN" + at + "users.noreply.github.com"):
+            self.assertFalse(is_mailbox(ok), ok)
 
 
 if __name__ == "__main__":
