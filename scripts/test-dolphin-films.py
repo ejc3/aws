@@ -111,12 +111,14 @@ class WebhookGateTests(unittest.TestCase):
     """The controller token is minted by the org owner and put by hand. Reading a secret without a value fails EVERY plan of
     the repository, so dolphin-films' token read and webhook sit behind a gate that starts false."""
 
-    def test_the_gate_starts_false_and_is_a_commit_not_a_flag(self):
+    def test_the_gate_is_a_committed_default_never_a_flag(self):
+        # It started false (no token had a value, and reading an empty secret fails every plan); it is true once the token
+        # is stored. Either way it lives in the file: a -var would make a later plan propose deleting the webhook.
         gate = re.search(r'variable "dolphin_films_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
-        self.assertIn("default     = false", gate)
+        self.assertRegex(gate, r"default\s+= (true|false)")
         self.assertIn("never with -var", RUNNER_APP)
 
-    def test_nothing_about_dolphin_films_is_read_or_planned_while_the_gate_is_false(self):
+    def test_nothing_about_dolphin_films_is_read_or_planned_unless_the_gate_is_true(self):
         self.assertIn("dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready", RUNNER_APP)
         # the token read skips the repo, the provider reads no token and the webhook has no count
         self.assertIn("if r != \"dolphin-labs-hq/dolphin-films\" || var.dolphin_films_token_ready", RUNNER_APP)

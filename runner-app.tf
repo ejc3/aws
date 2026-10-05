@@ -562,7 +562,7 @@ variable "enable_runner_app_webhooks" {
 variable "dolphin_films_token_ready" {
   description = "dolphin-labs-hq/dolphin-films' controller token has a value in Secrets Manager, so its webhook can be created"
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {
