@@ -86,21 +86,14 @@ resource "aws_secretsmanager_secret_version" "cloudflare_workers_deploy_token" {
   secret_string = cloudflare_account_token.workers_deploy.value
 }
 
-# The token the first version of this file minted with curl (scripts/workers-deploy-token.sh, since removed). Adopted so
-# a follow-up change can revoke it through Terraform instead of by hand. Its value is unknown to state; nothing reads it.
-import {
-  to = cloudflare_account_token.workers_deploy_legacy
-  id = "${var.cloudflare_account_id}/1fab0b6a37d726771b3314ee40bd89b8"
-}
-
-resource "cloudflare_account_token" "workers_deploy_legacy" {
-  provider   = cloudflare.token_minter
-  account_id = var.cloudflare_account_id
-  name       = "workers-deploy"
-  policies   = local.workers_deploy_policies
+# The token the first version of this file minted with curl (a script, since removed) was adopted so Terraform could
+# revoke it. Every site repo now holds the Terraform-minted token, so this destroys the old one. Delete this block
+# after the apply.
+removed {
+  from = cloudflare_account_token.workers_deploy_legacy
 
   lifecycle {
-    ignore_changes = all
+    destroy = true
   }
 }
 
