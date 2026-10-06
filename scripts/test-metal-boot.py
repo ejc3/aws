@@ -198,6 +198,8 @@ class ArmNetworkInterfaceTests(unittest.TestCase):
         block = re.search(r'resource "terraform_data" "firecracker_dev_host_ipv6" \{(.*?)\n\}\n', self.FC, re.S).group(1)
         self.assertIn("triggers_replace = aws_network_interface.firecracker_dev[0].id", block)
         self.assertIn("assign-ipv6-addresses", block)
+        # local-exec defaults to /bin/sh (dash), where `set -o pipefail` is an error (the 2026-10-06 apply failed on it)
+        self.assertIn('interpreter = ["/bin/bash", "-c"]', block)
         self.assertIn('if [ "$N" = "0" ]', block)
 
     def test_the_instance_waits_for_the_host_address(self):
