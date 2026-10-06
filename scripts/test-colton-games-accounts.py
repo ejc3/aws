@@ -377,10 +377,13 @@ class AccountSavesTests(unittest.TestCase):
     """ACCOUNT_SAVES=on is the site's own switch for account saves. Unset means off, so the
     switch is a variable that exists only on the targets the owner has named."""
 
-    def test_the_switch_is_off_everywhere_until_a_target_is_named(self):
+    def test_the_switch_is_on_only_for_the_targets_the_owner_named(self):
         gate = block("", "colton_games_account_saves_targets")
         self.assertIn("type        = set(string)", gate)
-        self.assertRegex(gate, r"(?m)^  default     = \[\]$")
+        # A committed default, never -var. It started empty; today saves are on for production only: the site trusts no
+        # preview address for saves, so naming preview would do nothing there.
+        default = re.search(r"(?m)^  default     = (\[.*?\])", gate).group(1)
+        self.assertEqual(strings(default), ["production"])
         switch = block("vercel_project_environment_variable", "colton_games_account_saves")
         self.assertIn("for_each = var.colton_games_account_saves_targets", switch)
         self.assertIn("project_id = local.colton_games_vercel_project_id", switch)

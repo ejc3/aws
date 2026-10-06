@@ -355,7 +355,7 @@ resource "vercel_project_environment_variable" "colton_games_accounts" {
 variable "colton_games_account_saves_targets" {
   description = "Vercel targets of the colton-games project where account saves are switched on (ACCOUNT_SAVES=on): production, preview, or both. Starts empty, which is off everywhere. Add a target to this default, in a commit, after that target's sign-in works and the saves migration is applied (colton-games-accounts.tf)."
   type        = set(string)
-  default     = []
+  default     = ["production"] # saves are on for production: sign-in works there and the saves migration is applied
 
   validation {
     condition     = alltrue([for target in var.colton_games_account_saves_targets : contains(values(local.colton_games_accounts_vercel_target), target)])
