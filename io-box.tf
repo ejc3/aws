@@ -380,8 +380,15 @@ MOUNTUNIT
 cat > /etc/systemd/system/mnt-io.automount <<'AUTOMOUNT'
 [Unit]
 Description=Automount shared ephemeral I/O scratch
-After=network-online.target
-Wants=network-online.target
+# An automount is lazy: it needs no network until something opens /mnt/io, and the mount unit above carries
+# that ordering. The default dependencies put an automount Before=local-fs.target, and After=network-online.target
+# on top made a cycle (local-fs -> automount -> network-online -> networkd -> cloud-init-local -> local-fs).
+# systemd breaks a cycle by deleting start jobs and WHICH ones is random per boot: one boot dropped this
+# automount (harmless), the next dropped systemd-networkd, resolved and cloud-init, and the box came up with
+# no network at all (2026-10-06, the new fcvm-metal-arm).
+DefaultDependencies=no
+Before=umount.target
+Conflicts=umount.target
 
 [Automount]
 Where=/mnt/io
