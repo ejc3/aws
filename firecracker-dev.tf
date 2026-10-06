@@ -14,7 +14,7 @@ variable "enable_firecracker_instance" {
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "c7gd.metal" # ARM64 Graviton3 metal + NVMe for nested virt
+  default     = "r8gd.metal-24xl" # ARM64 Graviton4 metal, 96 vCPU / 768 GB / 5.7 TB NVMe; was c7gd.metal (Graviton3, 64 / 128 GB / 3.8 TB)
 }
 
 variable "firecracker_volume_size" {
@@ -63,7 +63,7 @@ variable "firecracker_ami" {
 variable "firecracker_availability_zone" {
   description = "AZ for fcvm-metal-arm; must be a key of local.subnet_ids_by_az"
   type        = string
-  default     = "us-west-1c"
+  default     = "us-west-1a"
 
   validation {
     condition     = contains(["us-west-1a", "us-west-1c"], var.firecracker_availability_zone)
@@ -74,7 +74,7 @@ variable "firecracker_availability_zone" {
 variable "firecracker_move_from_instance_id" {
   description = "Instance whose root disk the box is built from after a move; empty boots var.firecracker_ami"
   type        = string
-  default     = "" # set only for a move; see steps 2 and 4 above
+  default     = "i-0a51afaaa2e6cc460" # set only for a move; see steps 2 and 4 above. Moving from the stopped c7gd.metal in 1c (no spot capacity for it since 2026-10-06 02:11 UTC) to an r8gd.metal-24xl in 1a
 }
 
 # Security group for Firecracker dev instance

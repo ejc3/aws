@@ -411,7 +411,7 @@ The long-lived development and administration instances are:
 |----------|------|----------|---------|-----------|
 | jumpbox | t4g.large (2 vCPU / 8GB) | on-demand | Remote management, admin AWS access | jumpbox.tf |
 | jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
-| fcvm-metal-arm | c7gd.metal (64 vCPU) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
+| fcvm-metal-arm | r8gd.metal-24xl (96 vCPU / 768GB, Graviton4) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
@@ -829,7 +829,7 @@ The home volume is backed up daily/weekly via AWS Backup.
 
 ### ARM Dev Server Storage (fcvm-metal-arm)
 
-The ARM dev server (c7gd.metal) has a persistent 400GB EBS root and two ephemeral local
+The ARM dev server (r8gd.metal-24xl) has a persistent 400GB EBS root and three ephemeral local
 NVMe disks. `/home/ubuntu`, including `~/.codex`, lives on that backed-up root; there is
 no separate ARM home volume. `nvme-btrfs.service` positively identifies instance-store
 devices and creates a Btrfs RAID0 across all of them at `/mnt/fcvm-btrfs`.
