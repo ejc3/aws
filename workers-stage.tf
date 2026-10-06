@@ -3,7 +3,7 @@
 # The Cloudflare side of the sites that also deploy to Workers (see workers-deploy.tf and
 # AGENTS.md, "Sites also deploying to Cloudflare Workers"). Each site's own GitHub Actions
 # deploys the application with Wrangler, which creates the Worker `<site>-stage`; this file
-# owns what the application deploy must not: the Access gate and the Worker's URL switches,
+# owns what the application deploy must not: the Access gate and each Worker's URL switches,
 # so an apply can never replace an application bundle and a deploy can never open a URL.
 # It is the same split as colton-games-stage (cloudflare.tf, #16): Terraform for the
 # envelope, Wrangler for the code.
@@ -63,35 +63,39 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
   ]
 }
 
-# Adopt each Worker the first deploy created. Wrangler keeps owning code, bindings and versions.
+# Terraform owns only each Worker's two URL switches, through the narrow script-subdomain resource,
+# not the whole Worker: cloudflare_worker sends the adopted object back on every update, including
+# the observability defaults Cloudflare fills in (traces.propagation_policy), and the API refuses
+# that PUT ("propagation_policy requires the trace propagation feature", 2026-10-06). Wrangler keeps
+# owning code, bindings, observability and versions.
 import {
   for_each = local.workers_stage
-  to       = cloudflare_worker.stage[each.key]
-  id       = "${var.cloudflare_account_id}/${each.value.id}"
+  to       = cloudflare_workers_script_subdomain.stage[each.key]
+  id       = "${var.cloudflare_account_id}/${each.key}"
 }
 
-resource "cloudflare_worker" "stage" {
-  for_each   = local.workers_stage
-  account_id = var.cloudflare_account_id
-  name       = each.key
+# The first version of this file adopted whole Workers as cloudflare_worker.stage. Forget them
+# without touching the Workers.
+removed {
+  from = cloudflare_worker.stage
 
-  subdomain = {
-    enabled          = each.value.urls
-    previews_enabled = each.value.urls
+  lifecycle {
+    destroy = false
   }
+}
+
+resource "cloudflare_workers_script_subdomain" "stage" {
+  for_each         = local.workers_stage
+  account_id       = var.cloudflare_account_id
+  script_name      = each.key
+  enabled          = each.value.urls
+  previews_enabled = each.value.urls
 
   # Both protections exist before a later one-line change can enable a URL surface.
   depends_on = [
     cloudflare_workers_subdomain.cc_games,
     cloudflare_zero_trust_access_application.workers_stage,
   ]
-
-  lifecycle {
-    prevent_destroy = true
-
-    # Wrangler owns observability alongside the deployed bundle; the provider would default it off.
-    ignore_changes = [observability]
-  }
 }
 
 output "workers_stage_urls" {

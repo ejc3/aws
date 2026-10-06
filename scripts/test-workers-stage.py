@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The staging Workers' Cloudflare envelope (workers-stage.tf): one Worker-native Access application covering every Worker, each
-Worker adopted so its URL switches belong to Terraform, and no URL ever on for a Worker the Access application does not cover."""
+Worker's URL switches owned by Terraform, and no URL ever on for a Worker the Access application does not cover."""
 import re
 import unittest
 from pathlib import Path
@@ -61,26 +61,32 @@ class AccessTests(unittest.TestCase):
         self.assertIn("prevent_destroy = true", self.ACCESS)
 
 
-class WorkerEnvelopeTests(unittest.TestCase):
-    WORKER = block("resource", "cloudflare_worker", "stage")
+class UrlSwitchTests(unittest.TestCase):
+    SUB = block("resource", "cloudflare_workers_script_subdomain", "stage")
 
     def test_both_url_switches_follow_one_flag(self):
-        self.assertIn("enabled          = each.value.urls", self.WORKER)
-        self.assertIn("previews_enabled = each.value.urls", self.WORKER)
+        self.assertIn("enabled          = each.value.urls", self.SUB)
+        self.assertIn("previews_enabled = each.value.urls", self.SUB)
 
     def test_access_exists_before_any_url_can_be_enabled(self):
-        self.assertRegex(self.WORKER, r"depends_on\s*=\s*\[[^\]]*cloudflare_zero_trust_access_application\.workers_stage")
-        self.assertIn("cloudflare_workers_subdomain.cc_games", self.WORKER)
+        self.assertRegex(self.SUB, r"depends_on\s*=\s*\[[^\]]*cloudflare_zero_trust_access_application\.workers_stage")
+        self.assertIn("cloudflare_workers_subdomain.cc_games", self.SUB)
 
-    def test_the_worker_cannot_be_destroyed_and_wrangler_keeps_its_observability(self):
-        self.assertIn("prevent_destroy = true", self.WORKER)
-        self.assertIn("ignore_changes = [observability]", self.WORKER)
+    def test_only_the_url_switches_are_managed_never_the_whole_worker(self):
+        # A whole-Worker update sends back Cloudflare's own observability defaults and the API refuses it.
+        self.assertNotRegex(code(TF), r'resource\s+"cloudflare_worker"')
+        self.assertIn("script_name      = each.key", self.SUB)
 
     def test_every_worker_is_adopted_not_created(self):
         imp = re.search(r"import \{(.*?)\n\}", code(TF), re.S).group(1)
         self.assertIn("for_each = local.workers_stage", imp)
-        self.assertIn("to       = cloudflare_worker.stage[each.key]", imp)
-        self.assertIn('id       = "${var.cloudflare_account_id}/${each.value.id}"', imp)
+        self.assertIn("to       = cloudflare_workers_script_subdomain.stage[each.key]", imp)
+        self.assertIn('id       = "${var.cloudflare_account_id}/${each.key}"', imp)
+
+    def test_the_earlier_whole_worker_resources_are_forgotten_without_destroying_a_worker(self):
+        rm = re.search(r"removed \{(.*?)\n\}", code(TF), re.S).group(1)
+        self.assertIn("from = cloudflare_worker.stage", rm)
+        self.assertIn("destroy = false", rm)
 
     def test_nothing_in_the_file_shells_out_or_calls_the_api_directly(self):
         self.assertNotRegex(code(TF), r"local-exec|provisioner|curl|api\.cloudflare\.com")

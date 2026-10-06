@@ -1007,7 +1007,11 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
   `pull_request_target` or a fork's pull request.
 - **Terraform owns the envelope, Wrangler owns the code.** `workers-stage.tf` holds the one Worker-native Access application
   (a `worker` destination per Worker, the family allowlist and the service-token policy, as colton-games-stage in
-  `cloudflare.tf`) and adopts each Worker with an `import` block so its `workers.dev` and preview switches are Terraform's. The
+  `cloudflare.tf`) and, through `cloudflare_workers_script_subdomain`, each Worker's `workers.dev` and preview switches. It
+  deliberately does not manage the whole Worker: `cloudflare_worker` sends the adopted object back on every update with Cloudflare's
+  own observability defaults and the API refuses it ("propagation_policy requires the trace propagation feature"). Note
+  `cloudflare_worker.colton_games_stage` in `cloudflare.tf` is adopted the same way and has never been updated, so expect that error
+  there when its URL gate is first turned on. The
   rule from #16 holds here: Cloudflare infrastructure is created by `terraform apply` with the typed provider, never by `curl`,
   `local-exec` or the dashboard. (The deploy token is the one documented exception: a credential, minted by script as the
   registrar token is.)
