@@ -77,10 +77,8 @@ class TokenResourceTests(unittest.TestCase):
         self.assertIn("secret_string = cloudflare_account_token.workers_deploy.value", r)
         self.assertIn("aws_secretsmanager_secret.cloudflare_workers_deploy_token.id", r)
 
-    def test_the_curl_minted_token_is_revoked_through_terraform_not_by_hand(self):
-        rm = re.search(r"removed \{\s*from = cloudflare_account_token\.workers_deploy_legacy(.*?)\n\}", TF, re.S).group(1)
-        self.assertIn("destroy = true", rm)
-        self.assertNotRegex(code(TF), r'resource\s+"cloudflare_account_token"\s+"workers_deploy_legacy"')
+    def test_no_trace_of_the_curl_minted_token_remains(self):
+        self.assertNotIn("workers_deploy_legacy", code(TF))
 
 
 class InstallScriptTests(unittest.TestCase):
