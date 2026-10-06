@@ -129,10 +129,10 @@ resource "aws_network_interface" "firecracker_dev" {
   security_groups   = [aws_security_group.firecracker_dev[0].id]
   ipv6_prefix_count = 1
 
-  # The host always gets its own IPv6 address too, not just the /80 its VMs route. The ENI
-  # created by the 2026-09-13 move came up without one, and cloud-init only turns on DHCPv6
-  # for an interface that has an address when the box boots.
-  ipv6_address_count = 1
+  # The host also gets its own IPv6 address, not just the /80 its VMs route, but CreateNetworkInterface
+  # takes only one of the four IPv6 parameters (address count, addresses, prefix count, prefixes), so
+  # ipv6_address_count here fails every create (2026-10-06, the move to r8gd). The address is assigned
+  # right after the ENI exists by terraform_data.firecracker_dev_host_ipv6 below.
 
   tags = {
     Name = "fcvm-metal-arm-eni"
@@ -140,6 +140,25 @@ resource "aws_network_interface" "firecracker_dev" {
 
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+# The host's own IPv6 address (see the ENI above). cloud-init only turns on DHCPv6 for an interface that
+# had an address at the first boot, so the instance waits for this. Idempotent: it assigns one only when
+# the ENI has none, and runs again only for a new ENI.
+resource "terraform_data" "firecracker_dev_host_ipv6" {
+  count            = var.enable_firecracker_instance ? 1 : 0
+  triggers_replace = aws_network_interface.firecracker_dev[0].id
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -euo pipefail
+      ENI="${aws_network_interface.firecracker_dev[0].id}"
+      N=$(aws ec2 describe-network-interfaces --region us-west-1 --network-interface-ids "$ENI" --query 'length(NetworkInterfaces[0].Ipv6Addresses)' --output text)
+      if [ "$N" = "0" ]; then
+        aws ec2 assign-ipv6-addresses --region us-west-1 --network-interface-id "$ENI" --ipv6-address-count 1 > /dev/null
+      fi
+    EOT
   }
 }
 
@@ -240,6 +259,8 @@ resource "aws_instance" "firecracker_dev" {
     Name   = "fcvm-metal-arm"
     DevEBS = "true"
   }
+
+  depends_on = [terraform_data.firecracker_dev_host_ipv6]
 
   lifecycle {
     # Build the replacement before destroying the old box, so a move refused for spot
