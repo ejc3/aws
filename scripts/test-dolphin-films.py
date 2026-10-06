@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""dolphin-films.tf: credentials split by environment. Production's secrets are readable by
-the administration set only; non-production's also by dev-server-role, which may read those
-and nothing else here. No value is in Terraform, and the builders bring no new AI grant. Offline."""
+"""dolphin-films.tf: credentials split by environment, sign-in and the Turso database each
+environment has. Production's secrets are readable by the administration set only;
+non-production's also by dev-server-role, which may read those and nothing else here. No
+value is in Terraform, and the builders bring no new AI grant. Offline."""
 import re
 import unittest
 from pathlib import Path
@@ -12,7 +13,8 @@ COMMON = (ROOT / "dev-instance-common.tf").read_text()
 AI = (ROOT / "dev-ai-services.tf").read_text()
 
 AUTH = ["AUTH_SECRET", "AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
-SUPABASE = ["SUPABASE_URL", "SUPABASE_SECRET_KEY"]
+TURSO = ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"]
+CODE = "\n".join(line for line in TF.splitlines() if not line.lstrip().startswith("#"))
 
 
 def block(kind, name):
@@ -36,12 +38,12 @@ def secrets():
 
 
 class SecretTests(unittest.TestCase):
-    def test_each_environment_has_its_own_auth_and_supabase_secret(self):
-        self.assertEqual(sorted(secrets()), ["nonprod/auth", "nonprod/supabase", "prod/auth", "prod/supabase"])
+    def test_each_environment_has_its_own_auth_and_turso_secret(self):
+        self.assertEqual(sorted(secrets()), ["nonprod/auth", "nonprod/turso", "prod/auth", "prod/turso"])
         for name, (keys, _) in secrets().items():
             self.assertEqual(keys, "dolphin_films_%s_keys" % name.split("/")[1], name)
         self.assertEqual(key_list("dolphin_films_auth_keys"), AUTH)
-        self.assertEqual(key_list("dolphin_films_supabase_keys"), SUPABASE)
+        self.assertEqual(key_list("dolphin_films_turso_keys"), TURSO)
         secret = block("aws_secretsmanager_secret", "dolphin_films")
         self.assertIn("for_each = local.dolphin_films_secrets", secret)
         self.assertIn('name                    = "dolphin-films/${each.key}"', secret)
@@ -52,8 +54,18 @@ class SecretTests(unittest.TestCase):
         self.assertNotIn("aws_secretsmanager_secret_version", TF)
         self.assertNotIn("vercel_project_environment_variable", TF)
         self.assertNotRegex(TF, r"eyJ[A-Za-z0-9_-]{10,}|sb_secret_[A-Za-z0-9_]{6,}|GOCSPX-[A-Za-z0-9_-]{6,}")
-        self.assertNotRegex(TF, r"[a-z0-9]{20}\.supabase\.co|\d+-[a-z0-9]{20,}\.apps\.googleusercontent\.com")
-        self.assertNotIn("NEXT_PUBLIC", TF, "the browser never talks to Supabase")
+        self.assertNotRegex(TF, r"libsql://[a-z0-9]|[a-z0-9-]+\.turso\.io|\d+-[a-z0-9]{20,}\.apps\.googleusercontent\.com")
+        self.assertNotRegex(TF, r"[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}", "no address, the list variables included")
+        self.assertNotIn("NEXT_PUBLIC", TF, "the browser never talks to the database")
+
+    def test_the_store_is_turso_and_nothing_of_supabase_is_left(self):
+        self.assertNotRegex(TF, r"(?i)supabase")
+
+    def test_the_app_never_gets_the_platform_token(self):
+        # turso/api-token (dev-ai-services.tf) creates and deletes databases and mints their
+        # tokens. It is not one of the site's variables and this file grants nothing on it.
+        self.assertNotRegex(CODE, r"TURSO_API_TOKEN|turso_api_token|turso/api-token")
+        self.assertIn("turso/api-token", TF, "the header says how it differs from the per-database values")
 
     def test_production_is_for_the_administration_set_only(self):
         for name, (_, readers) in secrets().items():
@@ -99,6 +111,11 @@ class SecretTests(unittest.TestCase):
         env = block("", "dolphin_films_vercel_env")
         self.assertIn('{ production = "prod", preview = "nonprod" }', env)
         self.assertIn('=> secret.keys if startswith(key, "${env}/")', env)
+        # The two lists the site reads are set by the owner in the hosting project: named for
+        # every target, held nowhere here.
+        self.assertEqual(key_list("dolphin_films_owner_env"), ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"])
+        self.assertIn('{ "set by the owner in the hosting project" = local.dolphin_films_owner_env },', env)
+        self.assertEqual(len(re.findall(r"FILMS_(?:SEED|ADMIN)_EMAILS", CODE)), 2, "named once each, never given a value")
         for out in (names, env):
             self.assertNotIn("secret_string", out)
             self.assertNotIn("sensitive", out)

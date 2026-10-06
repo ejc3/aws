@@ -227,14 +227,26 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
 kind. Terraform never reads them, so an apply does not wait for them; the site and the builders do. Production
 and non-production get different values throughout: a Google OAuth client each, an `AUTH_SECRET` each, a
-Supabase key each.
+Turso database each with its own token.
 
 | Secret | JSON keys | Readers besides administration |
 |---|---|---|
 | `dolphin-films/prod/auth` | `AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` | none |
-| `dolphin-films/prod/supabase` | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | none |
+| `dolphin-films/prod/turso` | `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | none |
 | `dolphin-films/nonprod/auth` | as `prod/auth` | dev-server-role (the metal boxes) |
-| `dolphin-films/nonprod/supabase` | as `prod/supabase` | dev-server-role |
+| `dolphin-films/nonprod/turso` | as `prod/turso` | dev-server-role |
+
+The site's data is in Turso (libSQL), one database per environment. Two kinds of credential are involved, and
+the site only ever gets the second:
+
+- The **platform token** (`turso/api-token`, readable by administration and the metal dev boxes) belongs to the
+  account. It creates and deletes databases and mints their tokens. It is never one of the site's variables.
+- The **per-database values**, `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`: one database's address and a token
+  for that database alone. These are what the two `turso` secrets hold.
+
+The databases are made once, with the platform token, from a metal dev box, which writes each pair to a private
+file. An administrator puts them: a dev box cannot write a container, and cannot read production's. The site
+applies its own migrations when it deploys, so nothing here runs one.
 
 Write each as a JSON file readable only by you, put it, and remove the file:
 
@@ -244,8 +256,10 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-films
 ```
 
 The Vercel project is set by hand from these (`terraform output dolphin_films_vercel_env` lists the names):
-Production from `prod/*`, Preview from `nonprod/*`, each variable marked sensitive. The bring-up order is in
-the header of `dolphin-films.tf`.
+Production from `prod/*`, Preview from `nonprod/*`, each variable marked sensitive. The same output names two
+variables that are in no secret and that the owner sets in the hosting project for each target:
+`FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads. No address belongs in this
+repository. The bring-up order is in the header of `dolphin-films.tf`.
 
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
@@ -2209,7 +2223,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Starter user-level agent instructions (`~/.codex/AGENTS.md` with `~/.claude/CLAUDE.md` linked to it), created only for an account that has neither | `user-agents.tf`, `scripts/user-agents.md` (the text), `scripts/user-agents-seed.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
-| dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site on Vercel with Google sign-in and a Supabase store; its credentials per environment, and its CI runners) | `dolphin-films.tf` (secret containers and readers; bring-up order in its header), `runner-repos.tf` and `runner-app.tf` (served under the `dolphin` label) |
+| dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site on Vercel with Google sign-in and a Turso store; its credentials per environment, and its CI runners) | `dolphin-films.tf` (secret containers and readers; bring-up order in its header), `runner-repos.tf` and `runner-app.tf` (served under the `dolphin` label) |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,
