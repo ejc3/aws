@@ -183,5 +183,27 @@ class HardeningTests(unittest.TestCase):
             self.assertNotIn("metal_boot_hardening", (ROOT / name).read_text(), name)
 
 
+class ArmNetworkInterfaceTests(unittest.TestCase):
+    """CreateNetworkInterface accepts only ONE of ipv6 address count / addresses / prefix count / prefixes. Asking for the
+    prefix AND an address count failed every create (the 2026-10-06 move to r8gd), so the host address is assigned afterwards."""
+
+    FC = (ROOT / "firecracker-dev.tf").read_text()
+    ENI = re.search(r'resource "aws_network_interface" "firecracker_dev" \{(.*?)\n\}\n', FC, re.S).group(1)
+
+    def test_the_eni_asks_for_the_prefix_only(self):
+        self.assertRegex(self.ENI, r"(?m)^\s*ipv6_prefix_count\s*=\s*1")
+        self.assertNotRegex(self.ENI, r"(?m)^\s*(ipv6_address_count|ipv6_addresses|ipv6_prefixes)\s*=")
+
+    def test_the_host_address_is_assigned_after_the_eni_and_only_when_it_has_none(self):
+        block = re.search(r'resource "terraform_data" "firecracker_dev_host_ipv6" \{(.*?)\n\}\n', self.FC, re.S).group(1)
+        self.assertIn("triggers_replace = aws_network_interface.firecracker_dev[0].id", block)
+        self.assertIn("assign-ipv6-addresses", block)
+        self.assertIn('if [ "$N" = "0" ]', block)
+
+    def test_the_instance_waits_for_the_host_address(self):
+        inst = re.search(r'resource "aws_instance" "firecracker_dev" \{(.*?)\n\}\n', self.FC, re.S).group(1)
+        self.assertIn("depends_on = [terraform_data.firecracker_dev_host_ipv6]", inst)
+
+
 if __name__ == "__main__":
     unittest.main()
