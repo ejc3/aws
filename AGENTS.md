@@ -834,7 +834,12 @@ NVMe disks. `/home/ubuntu`, including `~/.codex`, lives on that backed-up root; 
 no separate ARM home volume. `nvme-btrfs.service` positively identifies instance-store
 devices and creates a Btrfs RAID0 across all of them at `/mnt/fcvm-btrfs`.
 
-**IMPORTANT**: The NVMe drives are ephemeral - data is lost on stop/start. Use for:
+**IMPORTANT**: The NVMe drives are ephemeral - data is lost on stop/start (and when AWS reclaims the spot box).
+A plain **reboot keeps them**: `nvme-btrfs-setup.sh` reuses a filesystem both disks already carry (same UUID, all devices
+present) and formats only blank disks, so a reboot, the usual way back from a wedged box, loses nothing. (Until 2026-10-06
+it ran `mkfs` on every boot and a reboot wiped them.) `earlyoom` kills a runaway process at 4% available memory before the
+box wedges (the ARM box has no swap), and the system `dnsmasq` service is masked because it races `systemd-resolved` for
+port 53 (fcvm does not use it). All three come from `metal_boot_hardening` and the NVMe script in `dev-user-data.tf`. Use for:
 - VM images and caches (`/mnt/fcvm-btrfs/image-cache`)
 - Build artifacts and temp files
 - Firecracker VM storage

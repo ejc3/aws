@@ -3,7 +3,8 @@
 
 locals {
   # NVMe btrfs setup - runs on every boot via systemd
-  # Formats NVMe as btrfs and mounts at /mnt/fcvm-btrfs (for CoW reflinks)
+  # Mounts the NVMe instance store as btrfs at /mnt/fcvm-btrfs (for CoW reflinks): an existing filesystem on the same disks
+  # (a reboot) is reused with its data; blank disks (a stop/start) are formatted.
   nvme_btrfs_setup = <<-NVME
 # Install btrfs-progs
 apt-get install -y btrfs-progs
@@ -78,7 +79,28 @@ if mountpoint -q /mnt/fcvm-btrfs; then
     exit 0
 fi
 
-if [ "$NVME_COUNT" -ge 2 ]; then
+# A REBOOT KEEPS THE INSTANCE STORE. This script used to run mkfs on every boot, so a plain reboot (the only way back from a
+# wedged box) threw away the whole scratch disk. If every selected disk already carries the SAME btrfs filesystem and that
+# filesystem lists exactly this many devices, mount it instead. A stop/start gives blank disks (no filesystem), a replaced or
+# partial set fails one of these checks, and a filesystem that will not mount falls through: all three are formatted as before.
+reuse_existing_btrfs() {
+    local d uuid_list
+    for d in $NVME_DEVS; do
+        [ "$(blkid -s TYPE -o value "/dev/$d" 2>/dev/null)" = "btrfs" ] || return 1
+    done
+    uuid_list=$(for d in $NVME_DEVS; do blkid -s UUID -o value "/dev/$d" 2>/dev/null; done | sort -u)
+    [ "$(echo "$uuid_list" | wc -w)" -eq 1 ] || return 1
+    btrfs device scan >/dev/null 2>&1 || true
+    [ "$(btrfs filesystem show "$uuid_list" 2>/dev/null | grep -c 'devid')" -eq "$NVME_COUNT" ] || return 1
+    if btrfs filesystem show "$uuid_list" 2>/dev/null | grep -qi 'missing'; then return 1; fi
+    mkdir -p /mnt/fcvm-btrfs
+    mount "/dev/$(echo "$NVME_DEVS" | head -1)" /mnt/fcvm-btrfs || return 1
+    echo "Reusing the existing btrfs filesystem $uuid_list across $NVME_COUNT NVMe drives (data kept)"
+}
+
+if reuse_existing_btrfs; then
+    :
+elif [ "$NVME_COUNT" -ge 2 ]; then
     # RAID0 multiple NVMe drives for maximum throughput
     NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
     echo "Setting up btrfs RAID0 across $NVME_COUNT NVMe drives: $NVME_PATHS"
@@ -97,7 +119,8 @@ chmod 1777 /mnt/fcvm-btrfs
 # Create directory structure for fcvm
 mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache}
 mkdir -p /mnt/fcvm-btrfs/{containers,cargo-target}
-chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
+# Not -R: on a reused filesystem the tree is large, and a recursive chown at boot would walk all of it. Only the top level is ours.
+chown ubuntu:ubuntu /mnt/fcvm-btrfs /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache,containers,cargo-target}
 
 # Symlink podman containers to NVMe
 CONTAINERS_DIR="/home/ubuntu/.local/share/containers"
@@ -131,6 +154,31 @@ for UNIT in \
     fi
 done
 NVME
+
+  # Boot-time defences for the metal boxes (ARM and x86), included by both scripts after the NVMe setup.
+  #
+  # 1. A runaway process must be killed, not wedge the box. On 2026-10-05 a background job took the ARM box from 8% to 97% of its
+  #    125 GB in about 15 minutes; the box has no swap, the kernel never OOM-killed anything, and it thrashed its page cache
+  #    (root volume pinned at its 125 MB/s read cap, load average 240) until the status check failed and ssh stopped answering.
+  #    earlyoom watches available memory and kills the biggest offender (SIGTERM at 4% available, SIGKILL at 2%) before that.
+  #    The infrastructure that keeps the box reachable and the agents alive is never a candidate.
+  # 2. The system dnsmasq service must not race systemd-resolved for port 53. The apt package enables a wildcard listener on :53;
+  #    whichever of the two starts first wins, and when dnsmasq wins resolved turns its 127.0.0.53 stub off and every name lookup
+  #    on the box fails (seen on the x86 box: codex could not start). fcvm does not use it (its VMs take the host's resolvers
+  #    directly, src/network/veth.rs), so the service is masked and only dnsmasq-base is installed.
+  metal_boot_hardening = <<-HARDEN
+apt-get install -y earlyoom
+cat > /etc/default/earlyoom << 'EARLYOOM'
+# Managed by terraform (dev-user-data.tf, metal_boot_hardening): do not edit by hand.
+EARLYOOM_ARGS="-r 3600 -m 4,2 -p --avoid '(^|/)(systemd|systemd-journald|sshd|dbus-daemon|cloudflared|tmux|tmux-scroll|amazon-ssm-agent|ssm-agent-worker|snapd|containerd|earlyoom)$' --prefer '(^|/)(chrome|chromium|vitest|cargo|rustc|cc1|cc1plus)$'"
+EARLYOOM
+systemctl enable earlyoom.service
+systemctl restart earlyoom.service || echo "WARNING: earlyoom did not start"
+
+systemctl disable --now dnsmasq.service 2>/dev/null || true
+systemctl mask dnsmasq.service 2>/dev/null || true
+systemctl restart systemd-resolved.service 2>/dev/null || true
+HARDEN
 
   # Eternal Terminal (pinned tag, built from source = single source of truth).
   # The cleanup lines below remove a *manually* apt/PPA-installed et: nothing in
@@ -430,7 +478,7 @@ apt-get upgrade -y || { echo "WARNING: apt upgrade failed (likely a stale mirror
 apt-get install -y \
   zsh curl wget git jq build-essential software-properties-common \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
-  nftables iproute2 dnsmasq cmake ninja-build pkg-config autoconf libtool \
+  nftables iproute2 dnsmasq-base cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev unzip zip flex bison libssl-dev \
   libelf-dev bc dwarves nfs-kernel-server
@@ -444,6 +492,8 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 
 # NVMe btrfs setup (scratch space for builds, VMs, containers)
 ${local.nvme_btrfs_setup}
+
+${local.metal_boot_hardening}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
 ${local.bin_update}
@@ -557,7 +607,7 @@ apt-get upgrade -y || { echo "WARNING: apt upgrade failed (likely a stale mirror
 apt-get install -y \
   zsh curl wget git jq build-essential software-properties-common \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
-  nftables iproute2 dnsmasq cmake ninja-build pkg-config autoconf libtool \
+  nftables iproute2 dnsmasq-base cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev libssl-dev unzip zip nfs-kernel-server
 
@@ -570,6 +620,8 @@ sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 
 # NVMe btrfs setup (scratch space for builds, VMs, containers)
 ${local.nvme_btrfs_setup}
+
+${local.metal_boot_hardening}
 
 # Eternal Terminal (isolated so a build failure can't abort the rest of setup; SSH :22 remains)
 ${local.bin_update}

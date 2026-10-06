@@ -159,6 +159,9 @@ jobs:
       - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
+      - name: "Metal boot scripts: a reboot keeps the NVMe, earlyoom guards memory, dnsmasq cannot race resolved"
+        run: python3 -S -B scripts/test-metal-boot.py
+
       - name: "People's addresses live in the people/addresses secret, not in git (people.tf)"
         run: python3 -S -B scripts/test-people.py
 
