@@ -996,11 +996,17 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
-- **One deploy credential.** `workers-deploy.tf` owns the container `cloudflare-workers-deploy-token` (administration read
-  only; Terraform never reads the value). `scripts/workers-deploy-token.sh` mints it from `cloudflare-account-token` with
-  Workers Scripts Write and Account Settings Read on the one account and revokes the token it replaces, so a rotation is
-  one command. `scripts/workers-deploy-secret.sh OWNER/REPO [account]` installs it as the repo's `CLOUDFLARE_API_TOKEN`
-  Actions secret (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied).
+- **One deploy credential, a typed Terraform resource.** `workers-deploy.tf` owns the container `cloudflare-workers-deploy-token`
+  (administration read only) and `cloudflare_account_token.workers_deploy`, minted through the `token_minter` provider alias that
+  reads `cloudflare-account-token` ephemerally; Terraform writes its value into the container (value in state, as the Workers
+  Builds deploy token's is; dev boxes cannot read state). Permissions: Workers Scripts Write and Account Settings Read on the one
+  account. There is deliberately no mint script (issue #16: no curl or local-exec for Cloudflare resources). Rotate with
+  `terraform apply -replace=cloudflare_account_token.workers_deploy`, then `scripts/workers-deploy-secret.sh OWNER/REPO [account]`
+  for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied).
+- **The account token is pinned to the jumpboxes' addresses, IPv6 included.** `cloudflare-account-token` allows only
+  `52.9.31.202/32`, `13.56.106.229/32` and the two jumpboxes' IPv6 `/128`s. Terraform's HTTP client prefers IPv6, so an IPv4-only
+  pin fails every plan with `9109 Cannot use the access token from location: 2600:...`. If a jumpbox is replaced or gains a new
+  address, add it to that token's `request_ip` list (one PUT with the token's own definition) before planning there.
 - **This is a deploy-capable credential in GitHub**, chosen by the owner on 2026-10-06 over Workers Builds (a browser
   authorization per repository owner; colton-games' version of that path is still gated off). Its reach is Workers scripts in
   one account: no DNS, Access or tunnels. Workflows must deploy only on `push` to `main` or `workflow_dispatch`, never on

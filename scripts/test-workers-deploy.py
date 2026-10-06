@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The Cloudflare Workers deploy token (workers-deploy.tf and the two scripts that mint and install it): a narrow token,
-an administrators-only container Terraform never reads, and no secret ever on a command line."""
+"""The Cloudflare Workers deploy token (workers-deploy.tf and the script that installs it): a narrow typed token resource,
+an administrators-only container, and no secret ever on a command line."""
 import re
 import subprocess
 import unittest
@@ -8,7 +8,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "workers-deploy.tf").read_text()
-MINT = (ROOT / "scripts" / "workers-deploy-token.sh").read_text()
 INSTALL = (ROOT / "scripts" / "workers-deploy-secret.sh").read_text()
 ALL_TF = "\n".join(p.read_text() for p in ROOT.glob("*.tf"))
 
@@ -31,51 +30,57 @@ class ContainerTests(unittest.TestCase):
         self.assertNotIn("dev_server", code(TF))
         self.assertNotIn("nextjs_dev", code(TF))
 
-    def test_terraform_never_reads_the_value_so_it_is_not_in_state(self):
+    def test_nothing_reads_the_stored_value_back_into_terraform(self):
         self.assertNotRegex(ALL_TF, r'data\s+"aws_secretsmanager_secret_version"\s+"[^"]*workers_deploy')
         self.assertNotRegex(ALL_TF, r'ephemeral\s+"aws_secretsmanager_secret_version"\s+"[^"]*workers_deploy')
-        self.assertNotIn("secret_string", code(TF))
 
 
-class MintScriptTests(unittest.TestCase):
-    def test_both_scripts_are_valid_bash(self):
-        for name in ("workers-deploy-token.sh", "workers-deploy-secret.sh"):
-            r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / name)], capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
+class TokenResourceTests(unittest.TestCase):
+    """The deploy token is a typed Terraform resource (issue #16: no curl or local-exec for Cloudflare resources)."""
+
+    def resource(self, kind, name):
+        start = code(TF).index('%s "%s" "%s" {' % ("resource", kind, name))
+        body = code(TF)[start:]
+        depth, seen = 0, False
+        for i, ch in enumerate(body):
+            depth += ch == "{"
+            depth -= ch == "}"
+            seen = seen or depth > 0
+            if seen and depth == 0:
+                return body[:i + 1]
+
+    def test_there_is_no_mint_script_and_nothing_shells_out_or_calls_the_api(self):
+        self.assertFalse((ROOT / "scripts" / "workers-deploy-token.sh").exists())
+        self.assertNotRegex(code(TF), r"local-exec|provisioner|curl|api\.cloudflare\.com")
+
+    def test_the_account_token_is_read_ephemerally_and_trimmed_for_the_minting_provider(self):
+        self.assertIn('ephemeral "aws_secretsmanager_secret_version" "cloudflare_account_token"', TF)
+        self.assertIn('secret_id = "cloudflare-account-token"', TF)
+        self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.cloudflare_account_token.secret_string)", TF)
+        self.assertIn('alias = "token_minter"', TF)
 
     def test_the_token_has_exactly_two_permissions_on_one_account(self):
-        groups = re.findall(r'^([A-Z_]+)=([0-9a-f]{32})\s*$', MINT, re.M)
-        perms = {name: value for name, value in groups if name != "ACCOUNT_ID"}
-        self.assertEqual(perms, {"WORKERS_SCRIPTS_WRITE": WORKERS_SCRIPTS_WRITE, "ACCOUNT_SETTINGS_READ": ACCOUNT_SETTINGS_READ})
-        # and the request names exactly those two, nothing more
-        self.assertEqual(MINT.count('{"id":"%s"}'), 2)
-        self.assertIn('"com.cloudflare.api.account.%s":"*"', MINT)
-        self.assertNotRegex(code(MINT), r'com\.cloudflare\.api\.(user|zone|account\.[^%])')
+        self.assertIn('workers_scripts_write = "%s"' % WORKERS_SCRIPTS_WRITE, TF)
+        self.assertIn('account_settings_read = "%s"' % ACCOUNT_SETTINGS_READ, TF)
+        self.assertIn("permission_groups = [{ id = local.workers_scripts_write }, { id = local.account_settings_read }]", TF)
+        self.assertEqual(code(TF).count("permission_groups"), 1)
+        self.assertIn('resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', TF)
 
-    def test_no_secret_is_ever_on_a_command_line(self):
-        body = code(MINT) + code(INSTALL)
-        # The bearer header is built only by printf into curl's stdin (-H @-), never as -H "Authorization: ...".
-        self.assertNotRegex(body, r'-H\s+["\']Authorization')
-        self.assertNotRegex(body, r'--secret-string\s+["\']?\$')
-        self.assertNotRegex(body, r'--secret-string\s+["\']?[A-Za-z0-9]{20,}')
-        self.assertIn("-H @-", MINT)
-        self.assertIn("--secret-string file:///dev/stdin", MINT)
-        self.assertNotRegex(code(INSTALL), r'gh secret set[^\n]*(--body|-b\s)')
-        self.assertIn("printf '%s' \"$TOKEN\" | gh secret set CLOUDFLARE_API_TOKEN", INSTALL)
+    def test_the_new_token_uses_the_minting_provider_and_is_not_ip_pinned_for_github_runners(self):
+        r = self.resource("cloudflare_account_token", "workers_deploy")
+        self.assertIn("provider   = cloudflare.token_minter", r)
+        self.assertIn("policies   = local.workers_deploy_policies", r)
+        self.assertNotIn("condition", r)
 
-    def test_curl_uses_ipv4_because_the_account_token_is_pinned(self):
-        self.assertIn("curl -4", MINT)
+    def test_terraform_writes_the_token_into_the_container(self):
+        r = self.resource("aws_secretsmanager_secret_version", "cloudflare_workers_deploy_token")
+        self.assertIn("secret_string = cloudflare_account_token.workers_deploy.value", r)
+        self.assertIn("aws_secretsmanager_secret.cloudflare_workers_deploy_token.id", r)
 
-    def test_the_old_token_is_revoked_only_after_the_new_one_is_stored_and_verified(self):
-        c = code(MINT)
-        stored, verified, revoked = c.index("put-secret-value"), c.index("/tokens/verify"), c.index("DELETE")
-        self.assertLess(stored, verified)
-        self.assertLess(verified, revoked)
-        self.assertIn('t["id"] != new', c)  # never revokes the token it just minted
-
-    def test_the_token_is_not_ip_pinned_for_github_runners(self):
-        self.assertNotIn('"condition"', MINT)
-        self.assertNotIn("request.ip", MINT)
+    def test_the_curl_minted_token_is_adopted_so_terraform_can_revoke_it(self):
+        self.assertIn('id = "${var.cloudflare_account_id}/1fab0b6a37d726771b3314ee40bd89b8"', TF)
+        r = self.resource("cloudflare_account_token", "workers_deploy_legacy")
+        self.assertIn("ignore_changes = all", r)
 
 
 class InstallScriptTests(unittest.TestCase):
