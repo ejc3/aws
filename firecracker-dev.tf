@@ -151,7 +151,8 @@ resource "terraform_data" "firecracker_dev_host_ipv6" {
   triggers_replace = aws_network_interface.firecracker_dev[0].id
 
   provisioner "local-exec" {
-    command = <<-EOT
+    interpreter = ["/bin/bash", "-c"] # the default /bin/sh is dash, which has no pipefail
+    command     = <<-EOT
       set -euo pipefail
       ENI="${aws_network_interface.firecracker_dev[0].id}"
       N=$(aws ec2 describe-network-interfaces --region us-west-1 --network-interface-ids "$ENI" --query 'length(NetworkInterfaces[0].Ipv6Addresses)' --output text)
