@@ -92,5 +92,28 @@ class UrlSwitchTests(unittest.TestCase):
         self.assertNotRegex(code(TF), r"local-exec|provisioner|curl|api\.cloudflare\.com")
 
 
+class ColtonGamesStageTests(unittest.TestCase):
+    """colton-games-stage (cloudflare.tf) follows the same rule: only its URL switches are managed, never the whole Worker."""
+
+    CF = (ROOT / "cloudflare.tf").read_text()
+
+    def test_it_manages_only_the_url_switches_and_waits_for_access(self):
+        self.assertNotRegex(self.CF, r'resource\s+"cloudflare_worker"\s+"colton_games_stage"')
+        self.assertIn('resource "cloudflare_workers_script_subdomain" "colton_games_stage"', self.CF)
+        body = self.CF[self.CF.index('resource "cloudflare_workers_script_subdomain" "colton_games_stage"'):][:900]
+        self.assertIn("enabled          = local.colton_games_worker_urls_enabled", body)
+        self.assertIn("previews_enabled = local.colton_games_worker_urls_enabled", body)
+        self.assertIn("cloudflare_zero_trust_access_application.colton_games_stage", body)
+        self.assertIn("prevent_destroy = true", body)
+
+    def test_the_old_whole_worker_object_is_forgotten_not_destroyed(self):
+        rm = re.search(r"removed \{\s*from = cloudflare_worker\.colton_games_stage(.*?)\n\}", self.CF, re.S).group(1)
+        self.assertIn("destroy = false", rm)
+
+    def test_the_gated_workers_builds_resources_wait_on_the_new_resource(self):
+        self.assertNotIn("cloudflare_worker.colton_games_stage]", self.CF)
+        self.assertGreaterEqual(self.CF.count("depends_on = [cloudflare_workers_script_subdomain.colton_games_stage]"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

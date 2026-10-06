@@ -16,7 +16,7 @@ AS=${2:-}
 [[ -z "$AS" || "$AS" =~ ^[a-z][a-z0-9_-]*$ ]] || { echo "not an account name: $AS" >&2; exit 2; }
 
 TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-workers-deploy-token --query SecretString --output text)
-[ "${#TOKEN}" -ge 30 ] || { echo "the stored token looks empty; run scripts/workers-deploy-token.sh first" >&2; exit 1; }
+[ "${#TOKEN}" -ge 30 ] || { echo "the stored token looks empty; apply workers-deploy.tf first" >&2; exit 1; }
 
 if [ -z "$AS" ]; then
   printf '%s' "$TOKEN" | gh secret set CLOUDFLARE_API_TOKEN --repo "$REPO"
