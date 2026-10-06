@@ -989,6 +989,26 @@ that production and non-production share nothing:
   reads these secrets, so no value reaches state.
 - CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
+### Sites also deploying to Cloudflare Workers (staging copies)
+
+The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, next-step) also deploy a second copy
+to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Production stays on Vercel; the Worker is a
+**staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
+(`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
+
+- **One deploy credential.** `workers-deploy.tf` owns the container `cloudflare-workers-deploy-token` (administration read
+  only; Terraform never reads the value). `scripts/workers-deploy-token.sh` mints it from `cloudflare-account-token` with
+  Workers Scripts Write and Account Settings Read on the one account and revokes the token it replaces, so a rotation is
+  one command. `scripts/workers-deploy-secret.sh OWNER/REPO [account]` installs it as the repo's `CLOUDFLARE_API_TOKEN`
+  Actions secret (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied).
+- **This is a deploy-capable credential in GitHub**, chosen by the owner on 2026-10-06 over Workers Builds (a browser
+  authorization per repository owner; colton-games' version of that path is still gated off). Its reach is Workers scripts in
+  one account: no DNS, Access or tunnels. Workflows must deploy only on `push` to `main` or `workflow_dispatch`, never on
+  `pull_request_target` or a fork's pull request.
+- **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
+  deploy:** first deploy with `workers_dev` and `preview_urls` false (no public URL), then add the Worker id to the shared
+  Access application, then turn `workers_dev` on.
+
 ### Claude Code Sync
 
 All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:
