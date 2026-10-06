@@ -547,7 +547,7 @@ locals {
   colton_games_github_owner_id        = "250920182"
   colton_games_github_repository_id   = "1120877379"
   colton_games_workers_builds_enabled = false
-  colton_games_worker_urls_enabled    = false
+  colton_games_worker_urls_enabled    = true
 
   # The repository's Wrangler configuration enables workers.dev and preview URLs. Do not
   # create an automatic trigger until Terraform has enabled those surfaces behind Access.

@@ -86,17 +86,6 @@ resource "aws_secretsmanager_secret_version" "cloudflare_workers_deploy_token" {
   secret_string = cloudflare_account_token.workers_deploy.value
 }
 
-# The token the first version of this file minted with curl (a script, since removed) was adopted so Terraform could
-# revoke it. Every site repo now holds the Terraform-minted token, so this destroys the old one. Delete this block
-# after the apply.
-removed {
-  from = cloudflare_account_token.workers_deploy_legacy
-
-  lifecycle {
-    destroy = true
-  }
-}
-
 output "cloudflare_workers_deploy_token_secret" {
   description = "Secrets Manager name of the Workers deploy token (us-west-1). Written by Terraform from cloudflare_account_token.workers_deploy."
   value       = aws_secretsmanager_secret.cloudflare_workers_deploy_token.name
