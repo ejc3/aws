@@ -1005,9 +1005,16 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
   authorization per repository owner; colton-games' version of that path is still gated off). Its reach is Workers scripts in
   one account: no DNS, Access or tunnels. Workflows must deploy only on `push` to `main` or `workflow_dispatch`, never on
   `pull_request_target` or a fork's pull request.
+- **Terraform owns the envelope, Wrangler owns the code.** `workers-stage.tf` holds the one Worker-native Access application
+  (a `worker` destination per Worker, the family allowlist and the service-token policy, as colton-games-stage in
+  `cloudflare.tf`) and adopts each Worker with an `import` block so its `workers.dev` and preview switches are Terraform's. The
+  rule from #16 holds here: Cloudflare infrastructure is created by `terraform apply` with the typed provider, never by `curl`,
+  `local-exec` or the dashboard. (The deploy token is the one documented exception: a credential, minted by script as the
+  registrar token is.)
 - **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
-  deploy:** first deploy with `workers_dev` and `preview_urls` false (no public URL), then add the Worker id to the shared
-  Access application, then turn `workers_dev` on.
+  deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
+  with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
+  Access, still unreachable); (3) set `urls = true` and, in the repo, `workers_dev`/`preview_urls` true. Never reverse 2 and 3.
 
 ### Claude Code Sync
 
