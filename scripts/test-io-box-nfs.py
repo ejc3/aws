@@ -76,6 +76,34 @@ class NfsRuleTests(unittest.TestCase):
         self.assertNotIn("2049", rule)
 
 
+class AutomountOrderingTests(unittest.TestCase):
+    """The /mnt/io automount must not sit in an ordering cycle with the network. On 2026-10-06 systemd broke such a cycle
+    by deleting the start jobs of systemd-networkd, systemd-resolved and cloud-init, and a new fcvm-metal-arm booted with
+    no network at all; a boot before it had happened to drop the automount instead. The victim is random per boot."""
+
+    SETUP = re.search(r"io_box_client_setup = <<-CLIENT\n(.*?)\n  CLIENT\n", IO, re.S).group(1)
+
+    def unit(self, name, tag):
+        return re.search(r"cat > /etc/systemd/system/%s <<'%s'\n(.*?)\n%s\n" % (re.escape(name), tag, tag), self.SETUP, re.S).group(1)
+
+    def test_the_automount_has_no_default_dependencies_and_no_network_ordering(self):
+        unit = self.unit("mnt-io.automount", "AUTOMOUNT")
+        directives = [l for l in unit.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        self.assertIn("DefaultDependencies=no", directives)
+        self.assertEqual([l for l in directives if "network" in l or l.startswith(("After=", "Requires=", "Wants="))], [])
+
+    def test_the_automount_still_unmounts_cleanly_at_shutdown(self):
+        unit = self.unit("mnt-io.automount", "AUTOMOUNT")
+        self.assertIn("Before=umount.target", unit)
+        self.assertIn("Conflicts=umount.target", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+
+    def test_the_network_ordering_lives_on_the_mount_unit_the_automount_triggers(self):
+        unit = self.unit("mnt-io.mount", "MOUNTUNIT")
+        self.assertIn("After=network-online.target", unit)
+        self.assertIn("Wants=network-online.target", unit)
+
+
 class MounterTests(unittest.TestCase):
     """Every host that installs the /mnt/io automount sits in an admitted subnet."""
 
