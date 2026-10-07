@@ -30,7 +30,7 @@ elif "describe-instances" in a and "InstanceType" in a:
 elif "describe-instances" in a:
     print("None")
 elif "describe-volumes" in a and "AvailabilityZone" in a:
-    print("us-west-2d")
+    print("us-east-2c")
 elif "describe-volumes" in a:
     print("vol-1\t500\tavailable")
 elif "describe-instance-types" in a:
@@ -56,7 +56,7 @@ class PboxMode(unittest.TestCase):
     def pbox(self, *args, market="spot", running=False, lifecycle="None"):
         env = dict(os.environ, PATH=self.tmp + ":" + os.environ["PATH"], FAKE_MARKET=market,
                    FAKE_RUNNING="1" if running else "0", FAKE_LIFECYCLE=lifecycle, PARALLEL_BOX_TYPES="c8g.48xlarge",
-                   HOME=self.tmp)
+                   PARALLEL_BOX_REGION="us-east-2", HOME=self.tmp)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=60)
         return r.stdout + r.stderr
 
@@ -98,6 +98,21 @@ class PboxMode(unittest.TestCase):
     def test_status_of_both_boxes_labels_each(self):
         out = self.pbox("status", market="none")
         self.assertEqual(out.count("next launch: ON-DEMAND"), 2)
+
+
+class LaunchTemplateSwitch(unittest.TestCase):
+    """The Terraform side: parallel_box_spot defaults to spot, and only false removes the spot options."""
+
+    TF = (Path(__file__).resolve().parent.parent / "parallel-box-launch.tf").read_text()
+
+    def test_the_default_is_spot_so_nothing_changes_until_someone_flips_it(self):
+        self.assertRegex(self.TF, r'variable "parallel_box_spot" \{[^}]*default\s*=\s*true')
+
+    def test_only_the_switch_decides_whether_the_template_carries_spot_options(self):
+        self.assertIn('dynamic "instance_market_options"', self.TF)
+        self.assertIn("for_each = var.parallel_box_spot ? [1] : []", self.TF)
+        self.assertIn('market_type = "spot"', self.TF)
+        self.assertIn('spot_instance_type             = "one-time"', self.TF)  # a reclaimed box is not restarted
 
 
 if __name__ == "__main__":
