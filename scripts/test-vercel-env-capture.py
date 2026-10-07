@@ -103,7 +103,12 @@ class SafeguardTests(unittest.TestCase):
     def test_a_production_capture_is_staged_and_never_promoted(self):
         self.assertIn('["--prod", "--skip-domain"]', SRC)
         self.assertNotRegex(SRC, r'"--prod"\]')   # --prod is never used without --skip-domain
-        self.assertIn('dep.get("aliasAssigned") or dep.get("alias")', SRC)
+        self.assertIn('if not a.endswith(".vercel.app")', SRC)
+
+    def test_the_default_aliases_a_staged_deploy_steals_are_given_back_after_the_delete(self):
+        self.assertLess(SRC.index('"remove", deployment'), SRC.index('"alias", "set", previous[0], alias'))
+        self.assertIn('previous = (prod.get("url"), list(prod.get("alias") or []))', SRC)
+        self.assertIn("cannot tell which deployment serves production now; not deploying", SRC)
 
     def test_nothing_is_read_until_an_unauthenticated_request_has_been_refused(self):
         anon = SRC.index('anon != "401"')
