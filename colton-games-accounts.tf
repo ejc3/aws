@@ -85,8 +85,9 @@
 # ACCOUNT SAVES. The site keeps a signed-in player's saved games in their account only where
 # ACCOUNT_SAVES is exactly `on` (lib/saves in the games repository); unset is off. It is a
 # switch, not a secret, so it has no container: var.colton_games_account_saves_targets names
-# the Vercel targets that get the variable, and it starts empty. Production is the one to
-# name. The site trusts no preview address for saves, so the switch does nothing on Preview.
+# the Vercel targets that get the variable. It started empty; its default now names
+# production, the one to name: the site trusts no preview address for saves, so the switch
+# does nothing on Preview.
 #
 # WHAT IS NOT HERE, because it cannot be or already exists:
 #   Google OAuth clients   Google has no API for Web application clients (cloudflare.tf).
@@ -353,9 +354,9 @@ resource "vercel_project_environment_variable" "colton_games_accounts" {
 # -------------------------------------------------------------------------------------
 
 variable "colton_games_account_saves_targets" {
-  description = "Vercel targets of the colton-games project where account saves are switched on (ACCOUNT_SAVES=on): production, preview, or both. Starts empty, which is off everywhere. Add a target to this default, in a commit, after that target's sign-in works and the saves migration is applied (colton-games-accounts.tf)."
+  description = "Vercel targets of the colton-games project where account saves are switched on (ACCOUNT_SAVES=on): production, preview, or both. An empty set is off everywhere. The default names production: its sign-in works and the saves migration is applied. Change this default in a commit (colton-games-accounts.tf)."
   type        = set(string)
-  default     = []
+  default     = ["production"] # saves are on for production: sign-in works there and the saves migration is applied
 
   validation {
     condition     = alltrue([for target in var.colton_games_account_saves_targets : contains(values(local.colton_games_accounts_vercel_target), target)])
