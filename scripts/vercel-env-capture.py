@@ -155,6 +155,15 @@ def api(path, scope):
     return json.loads(r.stdout[r.stdout.find("{"):])
 
 
+def api_call(method, path, scope, body, check=True):
+    r = subprocess.run(["vercel", "api", path, "--scope", scope, "-X", method, "--input", "-", "--raw"],
+                       input=json.dumps(body), stdin=None, capture_output=True, text=True, timeout=120)
+    if check and r.returncode:
+        raise SystemExit("vercel api %s %s failed: %s" % (method, path, (r.stderr or r.stdout)[-200:]))
+    out = r.stdout
+    return json.loads(out[out.find("{"):]) if "{" in out else {}
+
+
 def log(message):
     print(message, file=sys.stderr, flush=True)
 
@@ -166,6 +175,7 @@ def remote(scope, project, target, root):
     names = variable_names(envs, target)
     if not names:
         raise SystemExit("no variables for %s on %s" % (project, target))
+    temp_bypass = None  # a protection-bypass secret this run created because the project had none; always revoked
     previous = None  # (deployment url, aliases) serving production before a staged deploy: --skip-domain keeps the custom
     #                  domains but Vercel still moves the project's default *.vercel.app aliases to the new deployment
     work = tempfile.mkdtemp(dir="/dev/shm", prefix="vercel-env.")
@@ -219,19 +229,41 @@ def remote(scope, project, target, root):
         if not is_protected(anon[0], anon[1]):
             raise SystemExit("an unauthenticated request got %s: the deployment is NOT protected; deleting it" % anon[0])
         log("unauthenticated request: %s (protected)" % anon[0])
+        if not info.get("protectionBypass"):
+            # `vercel curl` gets through protection only with an automation-bypass secret, and this project has none: make one
+            # for this run, mark it temporary, and revoke it in the finally below. Existing secrets are never touched.
+            made = api_call("PATCH", "/v1/projects/%s/protection-bypass" % info["id"], scope, {"generate": {"note": "temporary: vercel-env-capture, revoked at the end of the run"}})
+            keys = list((made.get("protectionBypass") or {}).keys())
+            if len(keys) != 1:
+                raise SystemExit("could not create a temporary bypass secret")
+            temp_bypass = keys[0]
+            log("created a temporary protection-bypass secret (revoked at the end)")
         for _ in range(6):
-            r = vercel(["curl", "/api/dump", "--deployment", url, "--scope", scope, "--yes", "--", "-s", "--max-time", "60",
-                        "-H", "x-dump-token: " + token], check=False, timeout=180)
+            if temp_bypass:
+                # secret and token go to curl on stdin, never argv
+                r = subprocess.run(["curl", "-s", "--max-time", "60", "-H", "@-", url + "/api/dump"], capture_output=True, text=True, timeout=180,
+                                   input="x-vercel-protection-bypass: %s\nx-dump-token: %s\n" % (temp_bypass, token))
+            else:
+                r = vercel(["curl", "/api/dump", "--deployment", url, "--scope", scope, "--yes", "--", "-s", "--max-time", "60",
+                            "-H", "x-dump-token: " + token], check=False, timeout=180)
             body = r.stdout[r.stdout.find("{"):] if "{" in r.stdout else ""
             try:
                 values = json.loads(body)
                 break
             except ValueError:
+                last = r
                 time.sleep(5)
         else:
-            raise SystemExit("could not read the route's answer")
+            # A reply that is not JSON cannot hold the variables, so a short look at it is safe; a reply that starts like JSON is never shown.
+            seen = (last.stdout or last.stderr or "").strip()
+            hint = "" if seen[:1] == "{" else " (exit %s, %d bytes, begins %r)" % (last.returncode, len(seen), seen[:60])
+            raise SystemExit("could not read the route's answer" + hint)
         json.dump(values, sys.stdout)
     finally:
+        if temp_bypass:
+            api_call("PATCH", "/v1/projects/%s/protection-bypass" % info["id"], scope, {"revoke": {"secret": temp_bypass, "regenerate": False}}, check=False)
+            left = (api("/v9/projects/%s" % project, scope).get("protectionBypass") or {})
+            log("temporary protection-bypass secret %s" % ("STILL EXISTS: revoke it by hand in the project's Deployment Protection settings" if temp_bypass in left else "revoked"))
         if deployment:
             vercel(["remove", deployment, "--yes", "--scope", scope], check=False)
             gone = subprocess.run(["vercel", "api", "/v13/deployments/%s" % deployment, "--scope", scope], stdin=subprocess.DEVNULL,

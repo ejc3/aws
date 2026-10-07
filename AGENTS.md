@@ -1051,7 +1051,8 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
   Deployment Protection, answering only a one-time token, deleted by its `dpl_` id afterwards. It requests the URL without
   credentials first and goes no further unless Vercel answers 401, and it needs the project's `ssoProtection` set. A target with no
   sensitive variable is read with `vercel env pull` instead. Never run `vercel remove <project name>`: it deletes every
-  deployment of the project. `--skip-domain` keeps the custom domains off the throwaway but Vercel still moves the project's
+  deployment of the project. A project with no automation-bypass secret (imagine) gets a temporary one for the run, passed to curl on
+  stdin and revoked and verified gone afterwards; an existing secret is never touched. `--skip-domain` keeps the custom domains off the throwaway but Vercel still moves the project's
   default `*.vercel.app` aliases to it (found on dolphin-labs 2026-10-07, which left that alias dangling for a few minutes), so the tool
   records the aliases first and sets them back after the delete. Re-run the tool for a site when its Vercel environment changes.
 - **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
