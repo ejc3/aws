@@ -133,6 +133,18 @@ class SafeguardTests(unittest.TestCase):
         self.assertNotRegex(SRC, r'\["remove", (project|name)\b')
         self.assertIn("STILL EXISTS", SRC)  # it confirms the deletion
 
+    def test_a_temporary_bypass_secret_is_only_made_when_none_exists_never_on_argv_and_always_revoked(self):
+        self.assertIn('if not info.get("protectionBypass"):', SRC)          # an existing secret is never replaced or touched
+        self.assertIn('input="x-vercel-protection-bypass: %s', SRC)          # reaches curl on stdin
+        self.assertNotRegex(SRC, r'"x-vercel-protection-bypass: "\s*\+')    # never built into an argument
+        fin = SRC.index("    finally:\n        if temp_bypass:")
+        self.assertLess(fin, SRC.index('"revoke": {"secret": temp_bypass'))
+        self.assertLess(SRC.index('"revoke": {"secret": temp_bypass'), SRC.index("STILL EXISTS: revoke it by hand"))
+        self.assertLess(SRC.index('"remove", deployment'), len(SRC))
+
+    def test_a_reply_that_looks_like_json_is_never_shown_in_the_failure_message(self):
+        self.assertIn('hint = "" if seen[:1] == "{"', SRC)
+
     def test_values_are_only_ever_printed_as_names(self):
         printed = re.findall(r'print\((.*?)\)\n', SRC)
         self.assertTrue(all("record[" not in p and "values[" not in p for p in printed), printed)
