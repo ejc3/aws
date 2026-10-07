@@ -12,9 +12,8 @@
 #     dolphin-films/nonprod/auth       the same names, for preview deployments and local dev
 #     dolphin-films/nonprod/turso
 #   and who may read them:
-#     prod/*      the administration set only. Production's values live in the Vercel project;
-#                 these are the record they are set from, since Vercel never shows a sensitive
-#                 value again.
+#     prod/*      the administration set only. Terraform writes production's values from these
+#                 into the Vercel project (dolphin-films-vercel.tf).
 #     nonprod/*   the administration set and dev-server-role (the metal boxes, where the app is
 #                 developed and the builders run). Not nextjs-dev-role: every account on that
 #                 box has sudo, so a grant there is box-wide.
@@ -42,11 +41,10 @@
 #                  key and no new Bedrock statement.
 #   Turso          the two databases (one per environment) are created with the platform
 #                  token, not by Terraform: no Turso resource is managed in this repo.
-#   Vercel         the project and its environment are set by hand, as for imagine. The Vercel
-#                  provider's token here (vercel.tf) reaches the colton-games team only. Two
-#                  more variables are the owner's to set there and are in no container:
-#                  FILMS_SEED_EMAILS and FILMS_ADMIN_EMAILS, the lists of addresses the site
-#                  reads. No address is written in this repository.
+#   Vercel         the project was made by hand; its environment is written by Terraform from
+#                  these containers and the people secret, with a token of its own for the
+#                  dolphin-labs team (dolphin-films-vercel.tf). No address is written in this
+#                  repository.
 #   DNS            yourfantasymovie.com (yourfantasymovie.tf): DNS records here, the Vercel project
 #                  `dolphin-films` (team dolphin-labs) and its domains made with the Vercel CLI as the owner.
 #
@@ -62,9 +60,8 @@
 #        aws secretsmanager put-secret-value --region us-west-1 \
 #          --secret-id dolphin-films/<env>/<kind> --secret-string file://<a 0600 JSON file>
 #      then delete the file. `openssl rand -base64 33` makes an AUTH_SECRET.
-#   5. Set the Vercel project's environment from the dolphin_films_vercel_env output:
-#      Production from prod/*, Preview from nonprod/*, every variable marked sensitive, and
-#      the owner's two lists on each. The next deploy applies the site's migrations.
+#   5. Bring up dolphin-films-vercel.tf (its header lists the steps): Terraform writes Production
+#      from prod/* and Preview from nonprod/*. The next deploy applies the site's migrations.
 #
 # On a metal box, an agent exports one secret's variables without printing them:
 #   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth \
@@ -73,10 +70,6 @@
 locals {
   dolphin_films_auth_keys  = ["AUTH_SECRET", "AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
   dolphin_films_turso_keys = ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"]
-
-  # Set by the owner in the hosting project, per target, and held in no container: the lists
-  # of addresses the site reads. Named here so the output below is the whole list to set.
-  dolphin_films_owner_env = ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"]
 
   # Who may read a non-production secret besides the administration set.
   dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn]
@@ -148,13 +141,5 @@ output "dolphin_films_secrets" {
   value       = { for key, secret in aws_secretsmanager_secret.dolphin_films : key => secret.name }
 }
 
-# Names only. Terraform holds none of these values and sets nothing in Vercel.
-output "dolphin_films_vercel_env" {
-  description = "What to set by hand in the dolphin-films Vercel project: per Vercel environment, each secret and the variable names its JSON holds, and the variables the owner sets there directly"
-  value = {
-    for target, env in { production = "prod", preview = "nonprod" } : target => merge(
-      { for key, secret in local.dolphin_films_secrets : aws_secretsmanager_secret.dolphin_films[key].name => secret.keys if startswith(key, "${env}/") },
-      { "set by the owner in the hosting project" = local.dolphin_films_owner_env },
-    )
-  }
-}
+# What Terraform writes to the Vercel project: output dolphin_films_vercel_written
+# (dolphin-films-vercel.tf).

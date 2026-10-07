@@ -225,7 +225,8 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
 ```
 
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
-kind. Terraform never reads them, so an apply does not wait for them; the site and the builders do. Production
+kind. Terraform reads only the ones its gate names (`dolphin_films_vercel_ready` in `dolphin-films-vercel.tf`), to
+write them into the Vercel project. Production
 and non-production get different values throughout: a Google OAuth client each, an `AUTH_SECRET` each, a
 Turso database each with its own token.
 
@@ -255,11 +256,14 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-films
   --secret-string file://<a 0600 JSON file> && shred -u <that file>
 ```
 
-The Vercel project is set by hand from these (`terraform output dolphin_films_vercel_env` lists the names):
-Production from `prod/*`, Preview from `nonprod/*`, each variable marked sensitive. The same output names two
-variables that are in no secret and that the owner sets in the hosting project for each target:
-`FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads. No address belongs in this
-repository. The bring-up order is in the header of `dolphin-films.tf`.
+Terraform writes the Vercel project's environment from these (`dolphin-films-vercel.tf`): Production from
+`prod/*`, Preview from `nonprod/*`, each variable sensitive, through a provider with its own token for the
+dolphin-labs team (`vercel-api-token-dolphin-labs`, administration only). `FILMS_SEED_EMAILS` and
+`FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, come from the `dolphin_films` key of the
+`people/addresses` secret (`{"prod": {"seeds": [...], "admins": [...]}, "nonprod": {...}}`). No address
+belongs in this repository. A gate, `dolphin_films_vercel_ready`, names the containers that have a value and
+starts empty; `terraform output dolphin_films_vercel_written` lists what is written. The bring-up order is in
+the header of `dolphin-films-vercel.tf`.
 
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.

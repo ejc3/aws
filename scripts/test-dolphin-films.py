@@ -108,17 +108,12 @@ class SecretTests(unittest.TestCase):
     def test_outputs_carry_names_only(self):
         names = block("", "dolphin_films_secrets")
         self.assertIn("value       = { for key, secret in aws_secretsmanager_secret.dolphin_films : key => secret.name }", names)
-        env = block("", "dolphin_films_vercel_env")
-        self.assertIn('{ production = "prod", preview = "nonprod" }', env)
-        self.assertIn('=> secret.keys if startswith(key, "${env}/")', env)
-        # The two lists the site reads are set by the owner in the hosting project: named for
-        # every target, held nowhere here.
-        self.assertEqual(key_list("dolphin_films_owner_env"), ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"])
-        self.assertIn('{ "set by the owner in the hosting project" = local.dolphin_films_owner_env },', env)
-        self.assertEqual(len(re.findall(r"FILMS_(?:SEED|ADMIN)_EMAILS", CODE)), 2, "named once each, never given a value")
-        for out in (names, env):
-            self.assertNotIn("secret_string", out)
-            self.assertNotIn("sensitive", out)
+        self.assertNotIn("secret_string", names)
+        self.assertNotIn("sensitive", names)
+        # What Vercel gets is written by dolphin-films-vercel.tf, from these containers: this file names no variable
+        # of its own and reads no value.
+        self.assertNotRegex(CODE, r"FILMS_(?:SEED|ADMIN)_EMAILS")
+        self.assertIn("dolphin-films-vercel.tf", TF)
 
 
 RUNNER_APP = (ROOT / "runner-app.tf").read_text()
