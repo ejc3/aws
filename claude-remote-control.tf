@@ -366,6 +366,23 @@ systemctl daemon-reload
 # auth is absent/expired, and a later boot retries without another provisioning pass.
 systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
 
+# Nothing automatic restarts this box's sessions. After unattended-upgrades updates a library,
+# needrestart restarts every service that still maps the old copy. This unit holds ubuntu's
+# tmux server, so restarting it kills every session in it: on 2026-10-07 a libfreetype6
+# security update did exactly that. needrestart now lists the unit as deferred instead. The
+# same goes for unattended-upgrades' 03:00 reboot (dev-instance-common.tf), which stays on for
+# the on-demand boxes. The metal boxes are spot: they stop and start on their own terms (see
+# auto-reboot.tf), and that start loads the new library and kernel.
+install -d -m 755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/fcvm-claude-rc.conf <<'NEEDRESTART'
+# fcvm-claude-rc holds ubuntu's tmux server: list it as deferred, never restart it.
+$nrconf{override_rc}{qr(^fcvm-claude-rc\.service$)} = 0;
+NEEDRESTART
+cat > /etc/apt/apt.conf.d/52unattended-upgrades-no-reboot <<'NOREBOOT'
+// Read after 50unattended-upgrades: this spot box is not rebooted automatically.
+Unattended-Upgrade::Automatic-Reboot "false";
+NOREBOOT
+
 # ------------------------------------------------------------- new repos within seconds
 # The launcher above looks once, at boot. This watches every 5 seconds and starts a session (and a
 # Codex thread) for a repository that appears later. See agent-session-sync.tf.

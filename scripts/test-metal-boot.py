@@ -4,6 +4,7 @@ disks, earlyoom guards memory, and the system dnsmasq service never races system
 Terraform renders it and RUN against stub blkid/btrfs/mount/mkfs, so the decision is tested, not just the text."""
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -181,6 +182,77 @@ class HardeningTests(unittest.TestCase):
     def test_it_changes_nothing_on_the_nextjs_or_jumpbox_scripts(self):
         for name in ("nextjs-user-data.tf", "jumpbox2-user-data.tf"):
             self.assertNotIn("metal_boot_hardening", (ROOT / name).read_text(), name)
+
+
+def heredoc(text, opener, terminator):
+    start = text.index(opener) + len(opener)
+    return text[start:text.index("\n%s\n" % terminator, start)] + "\n"
+
+
+class NoAutomaticRestartTests(unittest.TestCase):
+    """The metal boxes' tmux server lives in fcvm-claude-rc.service, so restarting that unit kills every session. On
+    2026-10-07 needrestart did, after unattended-upgrades updated libfreetype6. The snippets are evaluated by the tools
+    that read them: needrestart's own matching rule in perl, and apt-config over the real unattended-upgrades file."""
+
+    CRC = (ROOT / "claude-remote-control.tf").read_text()
+    COMMON = (ROOT / "dev-instance-common.tf").read_text()
+
+    def needrestart_decision(self, unit):
+        """What needrestart decides for a unit: its default (restart), then the first override_rc regex that matches,
+        as in /usr/sbin/needrestart; the snippet is eval'd after the stock overrides, as needrestart.conf does."""
+        snippet = heredoc(self.CRC, "cat > /etc/needrestart/conf.d/fcvm-claude-rc.conf <<'NEEDRESTART'\n", "NEEDRESTART")
+        perl = r'''
+our %nrconf = (override_rc => { qr(^dbus) => 0, qr(^gdm) => 0, qr(^systemd-logind) => 0 });
+local $/; my $snippet = <STDIN>; eval $snippet; die "snippet: $@" if $@;
+my $rc = $ARGV[0]; my $restart = 1;
+foreach my $re (keys %{$nrconf{override_rc}}) { next unless ($rc =~ /$re/); $restart = $nrconf{override_rc}->{$re}; last; }
+print $restart ? "restart" : "defer";
+'''
+        r = subprocess.run(["perl", "-e", perl, unit], input=snippet, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_needrestart_defers_the_unit_that_holds_the_tmux_server(self):
+        self.assertEqual(self.needrestart_decision("fcvm-claude-rc.service"), "defer")
+
+    def test_needrestart_still_restarts_every_other_service(self):
+        for unit in ("remote-claw-claude-browser.service", "agent-session-sync@ubuntu.service",
+                     "fcvm-claude-rc-other.service", "x-fcvm-claude-rc.service"):
+            self.assertEqual(self.needrestart_decision(unit), "restart", unit)
+
+    def automatic_reboot(self, with_override):
+        """The value apt (and so unattended-upgrades) reads, from the real 50unattended-upgrades and the override."""
+        self.assertTrue(shutil.which("apt-config"), "apt-config is needed for this test")
+        with tempfile.TemporaryDirectory() as d:
+            parts = Path(d) / "apt.conf.d"
+            parts.mkdir()
+            (parts / "50unattended-upgrades").write_text(
+                heredoc(self.COMMON, "cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UNATTENDED'\n", "UNATTENDED")
+                .replace("$${", "${"))
+            if with_override:
+                (parts / "52unattended-upgrades-no-reboot").write_text(
+                    heredoc(self.CRC, "cat > /etc/apt/apt.conf.d/52unattended-upgrades-no-reboot <<'NOREBOOT'\n", "NOREBOOT"))
+            # APT_CONFIG is read before the parts directory is chosen; `-o Dir::Etc::Parts=` comes too late and
+            # would read the machine's own /etc/apt/apt.conf.d instead.
+            (Path(d) / "apt.conf").write_text('Dir::Etc::Parts "%s";\nDir::Etc::main "/dev/null";\n' % parts)
+            r = subprocess.run(["apt-config", "shell", "V", "Unattended-Upgrade::Automatic-Reboot"],
+                               capture_output=True, text=True, env=dict(os.environ, APT_CONFIG=str(Path(d) / "apt.conf")))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+    def test_the_metal_boxes_are_not_rebooted_by_unattended_upgrades(self):
+        self.assertEqual(self.automatic_reboot(with_override=True), "V='false'")
+
+    def test_without_the_override_unattended_upgrades_would_reboot(self):
+        self.assertEqual(self.automatic_reboot(with_override=False), "V='true'")
+
+    def test_only_the_metal_boxes_get_it(self):
+        self.assertEqual(TF.count("${local.metal_claude_remote_control}\n"), 2)
+        for name in ("nextjs-user-data.tf", "jumpbox2-user-data.tf", "dev-instance-common.tf"):
+            text = (ROOT / name).read_text()
+            self.assertNotIn("metal_claude_remote_control", text, name)
+            self.assertNotIn("needrestart/conf.d", text, name)
+            self.assertNotIn("52unattended-upgrades-no-reboot", text, name)
 
 
 class ArmNetworkInterfaceTests(unittest.TestCase):
