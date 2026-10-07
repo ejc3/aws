@@ -547,7 +547,7 @@ locals {
   colton_games_github_owner_id        = "250920182"
   colton_games_github_repository_id   = "1120877379"
   colton_games_workers_builds_enabled = false
-  colton_games_worker_urls_enabled    = false
+  colton_games_worker_urls_enabled    = true
 
   # The repository's Wrangler configuration enables workers.dev and preview URLs. Do not
   # create an automatic trigger until Terraform has enabled those surfaces behind Access.
@@ -568,32 +568,27 @@ resource "cloudflare_workers_subdomain" "cc_games" {
   }
 }
 
-resource "cloudflare_worker" "colton_games_stage" {
-  account_id = var.cloudflare_account_id
-  name       = local.colton_games_worker_name
+# Terraform owns only the two URL switches, through the narrow script-subdomain resource, not the whole Worker:
+# cloudflare_worker sends the adopted object back on every update including the observability defaults
+# Cloudflare fills in, and the API refuses that PUT ("propagation_policy requires the trace propagation
+# feature"). Found when the staging Workers in workers-stage.tf were first updated, 2026-10-06; this Worker had
+# been adopted the same way and never updated. Wrangler keeps owning code, bindings and observability.
+resource "cloudflare_workers_script_subdomain" "colton_games_stage" {
+  account_id       = var.cloudflare_account_id
+  script_name      = local.colton_games_worker_name
+  enabled          = local.colton_games_worker_urls_enabled
+  previews_enabled = local.colton_games_worker_urls_enabled
 
-  subdomain = {
-    enabled          = local.colton_games_worker_urls_enabled
-    previews_enabled = local.colton_games_worker_urls_enabled
-  }
-
-  # The destination uses the immutable Worker tag below, rather than this resource ID,
-  # to avoid an Access <-> Worker graph cycle. This ordering guarantees both protections
-  # exist before a later one-line rollout enables either public URL surface.
+  # The destination uses the immutable Worker tag, rather than a Worker resource, to avoid an
+  # Access <-> Worker graph cycle. This ordering guarantees both protections exist before a later
+  # one-line rollout enables either public URL surface.
   depends_on = [
     cloudflare_workers_subdomain.cc_games,
     cloudflare_zero_trust_access_application.colton_games_stage,
   ]
 
-  # The Worker already exists and carries an OpenNext deployment. It must be adopted by
-  # the import block below; replacement or destruction would sever the staging service.
   lifecycle {
     prevent_destroy = true
-
-    # Wrangler owns application observability alongside the deployed bundle. The provider
-    # defaults this nested object to disabled when it is omitted, which must not overwrite
-    # the live Worker setting during import or fight later application deployments.
-    ignore_changes = [observability]
   }
 }
 
@@ -628,8 +623,18 @@ resource "cloudflare_zero_trust_access_application" "colton_games_stage" {
 }
 
 import {
-  to = cloudflare_worker.colton_games_stage
-  id = "${var.cloudflare_account_id}/${local.colton_games_worker_id}"
+  to = cloudflare_workers_script_subdomain.colton_games_stage
+  id = "${var.cloudflare_account_id}/${local.colton_games_worker_name}"
+}
+
+# The Worker was first adopted whole as cloudflare_worker.colton_games_stage. Forget that object without
+# touching the Worker.
+removed {
+  from = cloudflare_worker.colton_games_stage
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 # ---------------------------------------------------------------------------------
@@ -720,7 +725,7 @@ resource "cloudflare_workers_build_trigger" "colton_games_staging" {
   path_excludes              = []
   build_caching_enabled      = true
 
-  depends_on = [cloudflare_worker.colton_games_stage]
+  depends_on = [cloudflare_workers_script_subdomain.colton_games_stage]
 
   lifecycle {
     prevent_destroy = true
@@ -745,7 +750,7 @@ resource "cloudflare_workers_build_trigger" "colton_games_preview" {
   path_excludes              = []
   build_caching_enabled      = true
 
-  depends_on = [cloudflare_worker.colton_games_stage]
+  depends_on = [cloudflare_workers_script_subdomain.colton_games_stage]
 
   lifecycle {
     prevent_destroy = true

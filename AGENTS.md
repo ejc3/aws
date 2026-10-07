@@ -989,6 +989,43 @@ that production and non-production share nothing:
   reads these secrets, so no value reaches state.
 - CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
+### Sites also deploying to Cloudflare Workers (staging copies)
+
+The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, next-step) also deploy a second copy
+to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Production stays on Vercel; the Worker is a
+**staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
+(`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
+
+- **One deploy credential, a typed Terraform resource.** `workers-deploy.tf` owns the container `cloudflare-workers-deploy-token`
+  (administration read only) and `cloudflare_account_token.workers_deploy`, minted through the `token_minter` provider alias that
+  reads `cloudflare-account-token` ephemerally; Terraform writes its value into the container (value in state, as the Workers
+  Builds deploy token's is; dev boxes cannot read state). Permissions: Workers Scripts Write and Account Settings Read on the one
+  account. There is deliberately no mint script (issue #16: no curl or local-exec for Cloudflare resources). Rotate with
+  `terraform apply -replace=cloudflare_account_token.workers_deploy`, then `scripts/workers-deploy-secret.sh OWNER/REPO [account]`
+  for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied).
+- **The account token is pinned to the jumpboxes' addresses, IPv6 included.** `cloudflare-account-token` allows only
+  `52.9.31.202/32`, `13.56.106.229/32` and the two jumpboxes' IPv6 `/128`s. Terraform's HTTP client prefers IPv6, so an IPv4-only
+  pin fails every plan with `9109 Cannot use the access token from location: 2600:...`. If a jumpbox is replaced or gains a new
+  address, add it to that token's `request_ip` list (one PUT with the token's own definition) before planning there.
+- **This is a deploy-capable credential in GitHub**, chosen by the owner on 2026-10-06 over Workers Builds (a browser
+  authorization per repository owner; colton-games' version of that path is still gated off). Its reach is Workers scripts in
+  one account: no DNS, Access or tunnels. Workflows must deploy only on `push` to `main` or `workflow_dispatch`, never on
+  `pull_request_target` or a fork's pull request.
+- **Terraform owns the envelope, Wrangler owns the code.** `workers-stage.tf` holds the one Worker-native Access application
+  (a `worker` destination per Worker, the family allowlist and the service-token policy, as colton-games-stage in
+  `cloudflare.tf`) and, through `cloudflare_workers_script_subdomain`, each Worker's `workers.dev` and preview switches. It
+  deliberately does not manage the whole Worker: `cloudflare_worker` sends the adopted object back on every update with Cloudflare's
+  own observability defaults and the API refuses it ("propagation_policy requires the trace propagation feature"). Note
+  `cloudflare_worker.colton_games_stage` in `cloudflare.tf` is adopted the same way and has never been updated, so expect that error
+  there when its URL gate is first turned on. The
+  rule from #16 holds here: Cloudflare infrastructure is created by `terraform apply` with the typed provider, never by `curl`,
+  `local-exec` or the dashboard. (The deploy token is the one documented exception: a credential, minted by script as the
+  registrar token is.)
+- **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
+  deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
+  with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
+  Access, still unreachable); (3) set `urls = true` and, in the repo, `workers_dev`/`preview_urls` true. Never reverse 2 and 3.
+
 ### Claude Code Sync
 
 All dev instances have [claude-code-sync](https://github.com/ejc3/claude-code-sync) installed:
