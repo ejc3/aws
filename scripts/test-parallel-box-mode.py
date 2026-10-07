@@ -81,6 +81,10 @@ class PboxMode(unittest.TestCase):
         out = self.pbox("up", market="broken")
         self.assertIn("PURCHASE MODE: unknown", out)
         self.assertNotIn("PURCHASE MODE: spot", out)
+        # the spot history figure is never presented as the price when the mode is not known to be spot
+        self.assertIn("spot reference", out)
+        self.assertIn("NOT necessarily what you pay", out)
+        self.assertNotIn("no unknown capacity", out)
 
     def test_status_of_a_running_box_says_how_it_was_bought(self):
         self.assertIn("(c8g.48xlarge, spot)", self.pbox("status", "1", running=True, lifecycle="spot"))

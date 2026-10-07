@@ -204,10 +204,11 @@ case "$CMD" in
       PRICE=$(aws ec2 describe-spot-price-history --region "$REGION" --instance-types "$T" \
         --product-descriptions "Linux/UNIX" --availability-zone "$AZ" --max-items 1 \
         --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
-      if [ "$MODE_NOW" = "on-demand" ]; then
-        say "--> trying $T (${CORES:-?} cores, on-demand; spot reference \$${PRICE:-?}/hr) in $AZ ..."
-      else
+      if [ "$MODE_NOW" = "spot" ]; then
         say "--> trying $T (${CORES:-?} cores, \$${PRICE:-?}/hr) in $AZ ..."
+      else
+        # on-demand, or unknown because the template could not be read: the spot figure is a reference, never the price
+        say "--> trying $T (${CORES:-?} cores, $MODE_NOW; spot reference \$${PRICE:-?}/hr, NOT necessarily what you pay) in $AZ ..."
       fi
 
       # Everything except the instance type comes from the launch template, so a typo
@@ -238,7 +239,10 @@ case "$CMD" in
 
     if [ -z "$ID" ]; then
       say ""
-      say "FAILED: no ${MODE_NOW} capacity in $AZ for any of: $TYPES"
+      case "$MODE_NOW" in
+        spot|on-demand) say "FAILED: no ${MODE_NOW} capacity in $AZ for any of: $TYPES" ;;
+        *) say "FAILED: no capacity in $AZ for any of: $TYPES (purchase mode unknown)" ;;
+      esac
       say "Options:"
       say "  - retry later; capacity fluctuates hour to hour"
       say "  - override the list:  PARALLEL_BOX_TYPES='c8g.16xlarge' $SELF up $BOX"
