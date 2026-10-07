@@ -111,11 +111,18 @@ class SafeguardTests(unittest.TestCase):
         self.assertIn("cannot tell which deployment serves production now; not deploying", SRC)
 
     def test_nothing_is_read_until_an_unauthenticated_request_has_been_refused(self):
-        anon = SRC.index('anon != "401"')
+        anon = SRC.index('not is_protected(anon[0], anon[1])')
         read = SRC.index('"/api/dump", "--deployment"')
         self.assertLess(anon, read)
         self.assertIn("is NOT protected; deleting it", SRC)
         self.assertIn('sso.get("deploymentType") not in ("all", "prod_deployment_urls_and_all_previews")', SRC)
+
+    def test_only_a_401_or_vercels_own_login_redirect_counts_as_protected(self):
+        self.assertTrue(cap.is_protected("401", ""))
+        self.assertTrue(cap.is_protected("302", "https://vercel.com/sso-api?url=https%3A%2F%2Fx.vercel.app%2Fapi%2Fdump&nonce=1"))
+        for status, loc in (("200", ""), ("404", ""), ("302", "https://example.com/login"), ("302", ""),
+                            ("302", "https://vercel.com.evil.example/sso-api?x=1"), ("500", ""), ("", "")):
+            self.assertFalse(cap.is_protected(status, loc), (status, loc))
 
     def test_the_deployment_is_deleted_by_its_id_never_by_project_name(self):
         self.assertIn('assert deployment.startswith("dpl_")', SRC)
