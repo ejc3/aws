@@ -1044,6 +1044,14 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
   it activates). Take values from the real source, never from Vercel: a variable of type `sensitive` is never returned by any
   Vercel API, and `vercel env pull` writes the text `[SENSITIVE]` in its place. Use the site's non-production values where it
   has them (its own OAuth client, the non-production database) and fresh random ones where a value only has to be unguessable.
+- **AWS holds a record of every site's Vercel environment, too** (`vercel-env-secrets.tf`): `vercel-env/<site>/<target>`, one
+  administration-only container per project per target (JSON name to value), so Vercel is not the only holder of a site's
+  credentials. Vercel never returns a `sensitive` variable after it is saved, so `scripts/vercel-env-capture.py SITE TARGET` reads
+  them from inside a deployment: a throwaway route deployed as a staged production build (`--skip-domain`) or a preview, behind
+  Deployment Protection, answering only a one-time token, deleted by its `dpl_` id afterwards. It requests the URL without
+  credentials first and goes no further unless Vercel answers 401, and it needs the project's `ssoProtection` set. A target with no
+  sensitive variable is read with `vercel env pull` instead. Never run `vercel remove <project name>`: it deletes every
+  deployment of the project. Re-run the tool for a site when its Vercel environment changes.
 - **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
   deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
