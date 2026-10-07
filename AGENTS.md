@@ -563,6 +563,12 @@ is guarded by an integrity check (`zsh -n` on the installed file) rather than a 
 and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
 copies them.
 
+The unit holds ubuntu's tmux server, so restarting it kills every session. Nothing automatic
+does: needrestart lists it as deferred after a library update
+(`/etc/needrestart/conf.d/fcvm-claude-rc.conf`), and unattended-upgrades does not reboot the
+metal boxes (`/etc/apt/apt.conf.d/52unattended-upgrades-no-reboot`). They are spot boxes and
+stop and start on their own terms; the on-demand boxes keep the 03:00 reboot.
+
 Every folder that gets a window at boot also gets a Codex thread, so it shows up in the Codex
 app: `fcvm-codex-seed.service` reads the launcher's list (`~/.local/state/fcvm-claude/repos`)
 and seeds one message per folder through the running Codex daemon, and a timer retries until
