@@ -1003,8 +1003,12 @@ that production and non-production share nothing:
 - The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
   `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
   (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.
-- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`. Terraform never
-  reads these secrets, so no value reaches state.
+- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`.
+- State: once `dolphin_films_vercel_ready` names a container, Terraform reads it and writes its values into
+  Vercel, so those values, the address lists and the dolphin-labs token's use are in Terraform state, as
+  colton-games' accounts are (`colton-games-accounts.tf`). State is readable by administration only, the same
+  boundary as the containers. Terraform is pinned to 1.10.3, so write-only arguments (1.11) are not
+  available. While the gate is empty nothing is read and nothing reaches state.
 - CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
 ### Sites also deploying to Cloudflare Workers (staging copies)
