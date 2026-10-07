@@ -1036,6 +1036,14 @@ to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Pro
   rule from #16 holds here: Cloudflare infrastructure is created by `terraform apply` with the typed provider, never by `curl`,
   `local-exec` or the dashboard. (The deploy token is the one documented exception: a credential, minted by script as the
   registrar token is.)
+- **The Workers' runtime secrets are kept in AWS, not in Cloudflare.** A Worker's secrets are write-only (nothing can read one
+  back), so `workers-stage-secrets.tf` owns one administration-only container per site, `workers-stage/<site>` (JSON of variable
+  name to value), and `scripts/workers-stage-secrets.sh SITE` loads it into `<site>-stage` through `wrangler secret bulk`
+  (stdin, names printed only; it refuses an empty value or a bracketed placeholder). Change a value by editing the container and
+  re-running the script, after the site's own deploy has finished (a secret change made while a deploy uploads can be lost when
+  it activates). Take values from the real source, never from Vercel: a variable of type `sensitive` is never returned by any
+  Vercel API, and `vercel env pull` writes the text `[SENSITIVE]` in its place. Use the site's non-production values where it
+  has them (its own OAuth client, the non-production database) and fresh random ones where a value only has to be unguessable.
 - **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
   deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
