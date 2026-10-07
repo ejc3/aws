@@ -961,7 +961,7 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   `colton_games_accounts_ready` names a secret. Do not set these names by hand in the Vercel project: Vercel
   refuses a second variable with the same key on a target, and the next apply would fail.
 - `ACCOUNT_SAVES=on` switches account saves on. It is not a secret and comes from no container: Terraform
-  writes it, not sensitive, to the targets `colton_games_account_saves_targets` names (default none), and
+  writes it, not sensitive, to the targets `colton_games_account_saves_targets` names (default: production), and
   the same rule applies: never set it by hand in Vercel. The site reads exactly `on`, so do not write
   `true` or `1`. Sign-in for that target comes first, then the games repository's saves migration
   (`games-mp-migrate` applies it when it merges to `main`; nobody runs SQL by hand), then the target. A

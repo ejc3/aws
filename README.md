@@ -1003,8 +1003,8 @@ secret's JSON. The rules:
 `ACCOUNT_SAVES` is the site's switch for keeping a signed-in player's saved games in their
 account. The site reads exactly `on`; unset is off. It is not a secret, so it has no
 container and is not sensitive. A second gate, `colton_games_account_saves_targets`, names
-the Vercel targets that get it, each on its own, and also starts empty. Production is the
-one to name: the site trusts no preview address for saves, so the switch does nothing on
+the Vercel targets that get it, each on its own. It started empty and its default now names
+production, the one to name: the site trusts no preview address for saves, so the switch does nothing on
 Preview. A target cannot be named before its `auth` secret is in the first gate.
 
 The owner's steps, in order:
@@ -1062,8 +1062,9 @@ The owner's steps, in order:
      switch, check it arrived, or the site offers saves with no tables behind them:
      `aws dynamodb get-item --region us-west-1 --table-name games-mp-releases --key
      '{"id":{"S":"schema#main"}}'` shows `siteNewest` at that file or a later one.
-   - Set the default of `colton_games_account_saves_targets` to `["production"]` in a
-     commit, then plan and apply. Expect one to add,
+   - The default of `colton_games_account_saves_targets` is `["production"]` (set in a
+     commit, as any later change to it is). Plan and apply. Until it has been applied,
+     expect one to add,
      `vercel_project_environment_variable.colton_games_account_saves["production"]`, and
      nothing else.
    - Redeploy production.
