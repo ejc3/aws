@@ -159,6 +159,8 @@ def remote(scope, project, target, root):
     names = variable_names(envs, target)
     if not names:
         raise SystemExit("no variables for %s on %s" % (project, target))
+    previous = None  # (deployment url, aliases) serving production before a staged deploy: --skip-domain keeps the custom
+    #                  domains but Vercel still moves the project's default *.vercel.app aliases to the new deployment
     work = tempfile.mkdtemp(dir="/dev/shm", prefix="vercel-env.")
     os.chmod(work, 0o700)
     deployment = None
@@ -176,6 +178,11 @@ def remote(scope, project, target, root):
             raise SystemExit("%s: Vercel Authentication does not cover all deployments (%r); not deploying" % (project, sso))
         log("%s %s: %d names, %d sensitive: using a protected throwaway deployment" % (
             project, target, len(names), sum(1 for e in envs if target in e["target"] and e.get("type") == "sensitive")))
+        if target == "production":
+            prod = (info.get("targets") or {}).get("production") or {}
+            previous = (prod.get("url"), list(prod.get("alias") or []))
+            if not previous[0]:
+                raise SystemExit("cannot tell which deployment serves production now; not deploying")
         token = secrets.token_urlsafe(32)
         app = os.path.join(work, root) if root != "." else work
         os.makedirs(os.path.join(app, "app", "api", "dump"), exist_ok=True)
@@ -194,8 +201,9 @@ def remote(scope, project, target, root):
         deployment = dep["id"]
         assert deployment.startswith("dpl_"), deployment
         log("deployed %s (%s, target %s)" % (host, deployment, dep.get("target")))
-        if target == "production" and (dep.get("aliasAssigned") or dep.get("alias")):
-            raise SystemExit("the staged production deployment has aliases %r; refusing to go on" % dep.get("alias"))
+        custom = [a for a in dep.get("alias") or [] if not a.endswith(".vercel.app")]
+        if target == "production" and custom:
+            raise SystemExit("the staged production deployment has custom domains %r; refusing to go on" % custom)
         # No credentials: Vercel must refuse. This is the whole point of the protection.
         anon = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", url + "/api/dump"],
                               capture_output=True, text=True).stdout.strip()
@@ -220,6 +228,12 @@ def remote(scope, project, target, root):
             gone = subprocess.run(["vercel", "api", "/v13/deployments/%s" % deployment, "--scope", scope], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True).stdout
             log("deployment %s %s" % (deployment, "STILL EXISTS: delete it by hand" if '"id"' in gone and deployment in gone else "deleted"))
+            if previous:
+                # Deleting the deployment leaves the default aliases dangling: point each back at what served production.
+                for alias in previous[1]:
+                    if alias.endswith(".vercel.app"):
+                        r = vercel(["alias", "set", previous[0], alias, "--scope", scope], check=False)
+                        log("alias %s -> %s: %s" % (alias, previous[0], "restored" if r.returncode == 0 else "FAILED, set it by hand"))
         shutil.rmtree(work, ignore_errors=True)
 
 
