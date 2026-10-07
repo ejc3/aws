@@ -5,10 +5,12 @@
 # for the sites that have variables:
 #
 #   colton-games   development preview production      dolphin-labs   development preview production
+#   dolphin-films  preview production
 #   nest-step      development preview production      imagine        preview production
 #   remote-claw    preview production                  ts-api         preview production
 #
-# (dolphin-films has no Vercel environment today: its credentials are dolphin-films/{prod,nonprod}/* in dolphin-films.tf.)
+# (dolphin-films' variables are written by Terraform from dolphin-films/{prod,nonprod}/* and people/addresses,
+# dolphin-films-vercel.tf: those stay the source and its records here are mirrors, as for colton-games' accounts.)
 #
 # Terraform owns only the containers and who may read them (administration only); it never reads a value. Vercel never
 # returns a variable of type `sensitive` once saved, so the values are captured by `scripts/vercel-env-capture.py`, which
@@ -19,12 +21,13 @@
 
 locals {
   vercel_env_targets = {
-    "colton-games" = ["development", "preview", "production"]
-    "dolphin-labs" = ["development", "preview", "production"]
-    "imagine"      = ["preview", "production"]
-    "nest-step"    = ["development", "preview", "production"]
-    "remote-claw"  = ["preview", "production"]
-    "ts-api"       = ["preview", "production"]
+    "colton-games"  = ["development", "preview", "production"]
+    "dolphin-films" = ["preview", "production"]
+    "dolphin-labs"  = ["development", "preview", "production"]
+    "imagine"       = ["preview", "production"]
+    "nest-step"     = ["development", "preview", "production"]
+    "remote-claw"   = ["preview", "production"]
+    "ts-api"        = ["preview", "production"]
   }
   vercel_env_records = toset(flatten([for site, targets in local.vercel_env_targets : [for t in targets : "${site}/${t}"]]))
 }

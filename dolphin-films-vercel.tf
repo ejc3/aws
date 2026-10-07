@@ -118,10 +118,12 @@ locals {
   }
 
   # What an auth container brings besides its own keys: the lists of its environment that are
-  # not empty. Only whether a list is empty leaves the sensitive input; for_each keys must not
-  # be sensitive.
+  # not empty. Built from static names and one declassified boolean per list, so no sensitive
+  # mark reaches the for_each keys below.
   dolphin_films_auth_extras = {
-    for env, lists in local.dolphin_films_people : env => [for name, addresses in lists : name if nonsensitive(length(addresses) > 0)]
+    for env in keys(local.dolphin_films_vercel_target) : env => [
+      for name in ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"] : name if nonsensitive(length(local.dolphin_films_people[env][name]) > 0)
+    ]
   }
 
   # "<KEY>/<target>" => the container and key its value comes from. Built from the gate and the
