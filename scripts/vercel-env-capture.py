@@ -112,6 +112,12 @@ def render_vercel_json():
     return json.dumps({"framework": "nextjs", "installCommand": "npm install --no-audit --no-fund", "buildCommand": "npm run build"}) + "\n"
 
 
+def is_protected(status, location):
+    """Deployment Protection answers an anonymous request with a 401 or a redirect to Vercel's own login (vercel.com/sso-api).
+    Anything else (a 200, a 404, a redirect elsewhere) is not proof of protection."""
+    return status == "401" or (status[:1] == "3" and re.match(r"https://vercel\.com/sso-api[?/]", location or "") is not None)
+
+
 def parse_dotenv(text):
     values = {}
     for line in text.splitlines():
@@ -205,11 +211,11 @@ def remote(scope, project, target, root):
         if target == "production" and custom:
             raise SystemExit("the staged production deployment has custom domains %r; refusing to go on" % custom)
         # No credentials: Vercel must refuse. This is the whole point of the protection.
-        anon = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", url + "/api/dump"],
-                              capture_output=True, text=True).stdout.strip()
-        if anon != "401":
-            raise SystemExit("an unauthenticated request got %s, not 401: the deployment is NOT protected; deleting it" % anon)
-        log("unauthenticated request: 401 (protected)")
+        anon = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", "--max-time", "30", url + "/api/dump"],
+                              capture_output=True, text=True).stdout.strip().split(" ", 1) + [""]
+        if not is_protected(anon[0], anon[1]):
+            raise SystemExit("an unauthenticated request got %s: the deployment is NOT protected; deleting it" % anon[0])
+        log("unauthenticated request: %s (protected)" % anon[0])
         for _ in range(6):
             r = vercel(["curl", "/api/dump", "--deployment", url, "--scope", scope, "--yes", "--", "-s", "--max-time", "60",
                         "-H", "x-dump-token: " + token], check=False, timeout=180)
