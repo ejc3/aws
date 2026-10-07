@@ -159,6 +159,9 @@ jobs:
       - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
+      - name: "Vercel environment record: the capture tool only ever deploys staged and protected, reads after a 401, and deletes by deployment id"
+        run: python3 -S -B scripts/test-vercel-env-capture.py
+
       - name: "Staging Workers' secrets kept in AWS: one administrators-only container per site and a loader that never prints a value"
         run: python3 -S -B scripts/test-workers-stage-secrets.py
 
