@@ -976,18 +976,27 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
-on Vercel, Google sign-in, a Supabase store) as four JSON secrets in us-west-1, split by environment so
+on Vercel, Google sign-in, a Turso store) as four JSON secrets in us-west-1, split by environment so
 that production and non-production share nothing:
 
 - `dolphin-films/nonprod/auth` (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
-  `dolphin-films/nonprod/supabase` (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`): local development and Vercel
+  `dolphin-films/nonprod/turso` (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`): local development and Vercel
   previews. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
   without printing it:
   `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth
   --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
   Never onto a command line, into a file in a repo or a commit.
-- `dolphin-films/prod/auth` and `dolphin-films/prod/supabase`: production. Admins only; a dev box gets
+- `dolphin-films/prod/auth` and `dolphin-films/prod/turso`: production. Admins only; a dev box gets
   `AccessDeniedException`, on purpose. The Vercel project's Production environment is set from them by hand.
+- Turso has two kinds of credential. `turso/api-token` (above) is the account's platform token: it makes and
+  deletes databases and mints their tokens, and the site never gets it. `TURSO_DATABASE_URL` and
+  `TURSO_AUTH_TOKEN` are one database's address and a token for that database alone; those are the site's.
+  One database per environment, made once with the platform token from a metal box. When you mint a pair,
+  write it to a 0600 JSON file for an administrator to put and never print it: a dev box cannot write a
+  container. The site applies its own migrations when it deploys.
+- `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, are in no secret. The
+  owner sets them in the hosting project. Never write an address into a file, a test, a commit or a pull
+  request here.
 - The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
   `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
   (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.

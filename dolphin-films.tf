@@ -1,16 +1,16 @@
 # dolphin-films.tf
 #
 # AWS half of dolphin-films (dolphin-labs-hq/dolphin-films, private): a Next.js app at
-# films/web on Vercel, Google sign-in through Auth.js, a per-user store in Supabase Postgres,
+# films/web on Vercel, Google sign-in through Auth.js, a per-user store in Turso (libSQL),
 # and offline asset builders that run on the metal dev boxes. The app reads nothing from AWS
 # at run time, so there is no Vercel OIDC role here (imagine.tf has one because its web app
 # invokes a Lambda). What this file owns:
 #
 #   Secrets Manager containers, one per environment and kind (JSON, values set out of band):
 #     dolphin-films/prod/auth          AUTH_SECRET, AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET
-#     dolphin-films/prod/supabase      SUPABASE_URL, SUPABASE_SECRET_KEY
+#     dolphin-films/prod/turso         TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
 #     dolphin-films/nonprod/auth       the same names, for preview deployments and local dev
-#     dolphin-films/nonprod/supabase
+#     dolphin-films/nonprod/turso
 #   and who may read them:
 #     prod/*      the administration set only. Production's values live in the Vercel project;
 #                 these are the record they are set from, since Vercel never shows a sensitive
@@ -20,8 +20,18 @@
 #                 box has sudo, so a grant there is box-wide.
 #
 # Production and non-production never share a credential: separate containers, a separate
-# Google OAuth client, a separate AUTH_SECRET and a separate Supabase key, and no dev box can
-# read a production value whatever an identity policy elsewhere says.
+# Google OAuth client, a separate AUTH_SECRET and a separate database with its own token, and
+# no dev box can read a production value whatever an identity policy elsewhere says.
+#
+# TURSO: TWO KINDS OF CREDENTIAL. The platform token (turso/api-token, dev-ai-services.tf)
+# belongs to the account: it creates and deletes databases and mints their tokens. The site
+# never sees it; it is not one of its variables and nothing here grants it. What the site
+# gets is per database: that database's URL and a token for that database alone
+# (TURSO_DATABASE_URL, TURSO_AUTH_TOKEN), one pair per environment, in the two turso
+# containers. The databases are made once with the platform token from a metal dev box
+# (which may read it); an administrator puts each pair, since no dev box may write a
+# container or read production's. The site applies its own migrations when it deploys, so
+# nothing here runs one.
 #
 # WHAT IS NOT HERE, because it already exists or is not managed from this repo:
 #   CI runners     runner-repos.tf and runner-app.tf serve the repo (label `dolphin`).
@@ -30,10 +40,13 @@
 #                  Bedrock through the same role (dev-instance-common.tf, BedrockRuntimeInvoke:
 #                  anthropic.* and the account's inference profiles). So there is no LLM API
 #                  key and no new Bedrock statement.
-#   Supabase       projects are created by hand; no Supabase project is managed in this repo
-#                  (colton-games' came from the Vercel integration).
+#   Turso          the two databases (one per environment) are created with the platform
+#                  token, not by Terraform: no Turso resource is managed in this repo.
 #   Vercel         the project and its environment are set by hand, as for imagine. The Vercel
-#                  provider's token here (vercel.tf) reaches the colton-games team only.
+#                  provider's token here (vercel.tf) reaches the colton-games team only. Two
+#                  more variables are the owner's to set there and are in no container:
+#                  FILMS_SEED_EMAILS and FILMS_ADMIN_EMAILS, the lists of addresses the site
+#                  reads. No address is written in this repository.
 #   DNS            yourfantasymovie.com (yourfantasymovie.tf): DNS records here, the Vercel project
 #                  `dolphin-films` (team dolphin-labs) and its domains made with the Vercel CLI as the owner.
 #
@@ -42,31 +55,38 @@
 #   2. Create two Google OAuth clients (Web application), one per environment. Redirect URI:
 #      https://<the environment's domain>/api/auth/callback/google (for non-production also
 #      http://localhost:<port>/api/auth/callback/google).
-#   3. Create the Supabase project or projects and take each one's URL and secret key.
-#   4. Put each value, never on a command line, in a repo file or a commit:
+#   3. On a metal dev box, with the platform token: make sure each environment's database
+#      exists, and mint a token for each. Write each pair (TURSO_DATABASE_URL,
+#      TURSO_AUTH_TOKEN) to a 0600 JSON file for an administrator; never print it.
+#   4. An administrator puts each value, never on a command line, in a repo file or a commit:
 #        aws secretsmanager put-secret-value --region us-west-1 \
 #          --secret-id dolphin-films/<env>/<kind> --secret-string file://<a 0600 JSON file>
 #      then delete the file. `openssl rand -base64 33` makes an AUTH_SECRET.
 #   5. Set the Vercel project's environment from the dolphin_films_vercel_env output:
-#      Production from prod/*, Preview from nonprod/*, every variable marked sensitive.
+#      Production from prod/*, Preview from nonprod/*, every variable marked sensitive, and
+#      the owner's two lists on each. The next deploy applies the site's migrations.
 #
 # On a metal box, an agent exports one secret's variables without printing them:
 #   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth \
 #     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
 
 locals {
-  dolphin_films_auth_keys     = ["AUTH_SECRET", "AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
-  dolphin_films_supabase_keys = ["SUPABASE_URL", "SUPABASE_SECRET_KEY"]
+  dolphin_films_auth_keys  = ["AUTH_SECRET", "AUTH_GOOGLE_ID", "AUTH_GOOGLE_SECRET"]
+  dolphin_films_turso_keys = ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"]
+
+  # Set by the owner in the hosting project, per target, and held in no container: the lists
+  # of addresses the site reads. Named here so the output below is the whole list to set.
+  dolphin_films_owner_env = ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"]
 
   # Who may read a non-production secret besides the administration set.
   dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn]
 
   # <environment>/<kind> => the variable names its JSON holds and who else may read it.
   dolphin_films_secrets = {
-    "prod/auth"        = { keys = local.dolphin_films_auth_keys, readers = [] }
-    "prod/supabase"    = { keys = local.dolphin_films_supabase_keys, readers = [] }
-    "nonprod/auth"     = { keys = local.dolphin_films_auth_keys, readers = local.dolphin_films_nonprod_readers }
-    "nonprod/supabase" = { keys = local.dolphin_films_supabase_keys, readers = local.dolphin_films_nonprod_readers }
+    "prod/auth"     = { keys = local.dolphin_films_auth_keys, readers = [] }
+    "prod/turso"    = { keys = local.dolphin_films_turso_keys, readers = [] }
+    "nonprod/auth"  = { keys = local.dolphin_films_auth_keys, readers = local.dolphin_films_nonprod_readers }
+    "nonprod/turso" = { keys = local.dolphin_films_turso_keys, readers = local.dolphin_films_nonprod_readers }
   }
 }
 
@@ -130,10 +150,11 @@ output "dolphin_films_secrets" {
 
 # Names only. Terraform holds none of these values and sets nothing in Vercel.
 output "dolphin_films_vercel_env" {
-  description = "What to set by hand in the dolphin-films Vercel project: per Vercel environment, each secret and the variable names its JSON holds"
+  description = "What to set by hand in the dolphin-films Vercel project: per Vercel environment, each secret and the variable names its JSON holds, and the variables the owner sets there directly"
   value = {
-    for target, env in { production = "prod", preview = "nonprod" } : target => {
-      for key, secret in local.dolphin_films_secrets : aws_secretsmanager_secret.dolphin_films[key].name => secret.keys if startswith(key, "${env}/")
-    }
+    for target, env in { production = "prod", preview = "nonprod" } : target => merge(
+      { for key, secret in local.dolphin_films_secrets : aws_secretsmanager_secret.dolphin_films[key].name => secret.keys if startswith(key, "${env}/") },
+      { "set by the owner in the hosting project" = local.dolphin_films_owner_env },
+    )
   }
 }
