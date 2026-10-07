@@ -226,7 +226,8 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
 
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
 kind. Terraform reads only the ones its gate names (`dolphin_films_vercel_ready` in `dolphin-films-vercel.tf`), to
-write them into the Vercel project. Production
+write them into the Vercel project; from then on their values are in Terraform state (administration only), as
+colton-games' accounts are. Production
 and non-production get different values throughout: a Google OAuth client each, an `AUTH_SECRET` each, a
 Turso database each with its own token.
 

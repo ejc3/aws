@@ -6,7 +6,8 @@
 # at run time, so there is no Vercel OIDC role here (imagine.tf has one because its web app
 # invokes a Lambda). What this file owns:
 #
-#   Secrets Manager containers, one per environment and kind (JSON, values set out of band):
+#   Secrets Manager containers, one per environment and kind (JSON, values set out of band; read
+#   by Terraform, and so in state, once dolphin-films-vercel.tf's gate names them):
 #     dolphin-films/prod/auth          AUTH_SECRET, AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET
 #     dolphin-films/prod/turso         TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
 #     dolphin-films/nonprod/auth       the same names, for preview deployments and local dev

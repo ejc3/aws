@@ -35,6 +35,14 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"aws_secretsmanager_secret_version", CODE)), 4, "two reads and their two uses")
 
 
+class StateTests(unittest.TestCase):
+    def test_the_docs_say_the_values_reach_state_once_the_gate_names_them(self):
+        agents = (ROOT / "AGENTS.md").read_text()
+        self.assertNotIn("reads these secrets, so no value reaches state", agents)
+        self.assertIn("are in Terraform state, as\n  colton-games' accounts are", agents)
+        self.assertIn("pass through Terraform state", TF)
+
+
 class TokenTests(unittest.TestCase):
     def test_a_token_of_its_own_for_administration_only(self):
         secret = block('resource "aws_secretsmanager_secret" "dolphin_films_vercel_api_token"')
