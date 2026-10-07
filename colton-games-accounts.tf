@@ -422,12 +422,3 @@ output "colton_games_accounts_vercel_env" {
     error_message = "colton_games_site_admin_emails: an environment's list has no duplicate and at most 20 addresses."
   }
 }
-
-# ACCOUNT_SAVES was first set on production by hand (a sensitive variable, 2026-10-06), so creating the declared one
-# failed with ENV_CONFLICT. This adopts that variable; Vercel cannot turn a sensitive variable into a non-sensitive
-# one in place, so the plan replaces it with the declared variable (value `on`). One-time: delete this block after
-# the apply.
-import {
-  to = vercel_project_environment_variable.colton_games_account_saves["production"]
-  id = "${var.vercel_team_id}/${local.colton_games_vercel_project_id}/0Qch8032VE3IlyGW"
-}
