@@ -115,7 +115,10 @@ class SafeguardTests(unittest.TestCase):
         read = SRC.index('"/api/dump", "--deployment"')
         self.assertLess(anon, read)
         self.assertIn("is NOT protected; deleting it", SRC)
-        self.assertIn('sso.get("deploymentType") not in ("all", "prod_deployment_urls_and_all_previews")', SRC)
+        self.assertIn('sso.get("deploymentType") not in PROTECTED_MODES', SRC)
+        self.assertEqual(cap.PROTECTED_MODES, ("all", "prod_deployment_urls_and_all_previews", "all_except_custom_domains"))
+        for weak in ("preview", "standard_protection_new", None, "none"):
+            self.assertNotIn(weak, cap.PROTECTED_MODES)
 
     def test_only_a_401_or_vercels_own_login_redirect_counts_as_protected(self):
         self.assertTrue(cap.is_protected("401", ""))
