@@ -46,6 +46,7 @@ SITES = {
     "ts-api": ("ejc3", "ejc3-7031s-projects", "ts-api", "."),
 }
 TARGETS = ("development", "preview", "production")
+PROTECTED_MODES = ("all", "prod_deployment_urls_and_all_previews", "all_except_custom_domains")
 SKIP_NAME = re.compile(r"^(VERCEL_|TURBO_|NX_)")
 PLACEHOLDER = re.compile(r"\[[A-Za-z _]{4,14}\]")
 NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
@@ -180,7 +181,9 @@ def remote(scope, project, target, root):
             return
         # The Deployment Protection setting is checked first; a project without it is never deployed to.
         sso = info.get("ssoProtection")
-        if not sso or sso.get("deploymentType") not in ("all", "prod_deployment_urls_and_all_previews"):
+        # all_except_custom_domains still covers every *.vercel.app URL, which is all the throwaway ever has (a custom domain on
+        # it is refused below); "preview" alone would leave a production deployment's own URL open.
+        if not sso or sso.get("deploymentType") not in PROTECTED_MODES:
             raise SystemExit("%s: Vercel Authentication does not cover all deployments (%r); not deploying" % (project, sso))
         log("%s %s: %d names, %d sensitive: using a protected throwaway deployment" % (
             project, target, len(names), sum(1 for e in envs if target in e["target"] and e.get("type") == "sensitive")))
