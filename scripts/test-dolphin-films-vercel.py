@@ -79,7 +79,9 @@ class VariableTests(unittest.TestCase):
     def test_the_address_lists_come_from_the_people_secret(self):
         self.assertIn("try(tolist(local.people.dolphin_films[env].seeds), [])", TF)
         self.assertIn("try(tolist(local.people.dolphin_films[env].admins), [])", TF)
-        self.assertIn("nonsensitive(length(addresses) > 0)", TF)
+        # Static names and a declassified boolean: no sensitive mark reaches a for_each key.
+        self.assertIn('for name in ["FILMS_SEED_EMAILS", "FILMS_ADMIN_EMAILS"] : name if nonsensitive(length(local.dolphin_films_people[env][name]) > 0)', TF)
+        self.assertNotRegex(TF, r"for \w+, \w+ in local\.dolphin_films_people")
 
     def test_no_value_or_address_is_in_the_repository(self):
         for text in (TF, FILMS):

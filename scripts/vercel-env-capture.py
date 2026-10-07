@@ -39,6 +39,7 @@ import time
 # site -> (unix account on nextjs-dev holding the Vercel login, Vercel scope, project name, the project's root directory)
 SITES = {
     "colton-games": ("colton", "coltons-projects-7f9a4e8b", "colton-games", "."),
+    "dolphin-films": ("ejc3", "dolphin-labs", "dolphin-films", "films/web"),
     "dolphin-labs": ("ejc3", "dolphin-labs", "dolphin-labs", "web"),
     "imagine": ("ejc3", "ejc3-7031s-projects", "imagine", "web"),
     "nest-step": ("colton", "coltons-projects-7f9a4e8b", "v0-immigrant-children-website", "."),
