@@ -59,7 +59,7 @@ locals {
   claude_master_server_port = 8443
 
   # Order is the fallback order. The first login is the one a fresh session prefers when quotas tie.
-  claude_master_profiles = ["claude-connor", "claude-ejc3", "claude-colton"]
+  claude_master_profiles = ["claude-connor", "claude-colton", "claude-ejc3"]
 
   claude_master_admin_cidrs = concat(
     var.enable_jumpbox ? ["${aws_instance.jumpbox[0].private_ip}/32"] : [],

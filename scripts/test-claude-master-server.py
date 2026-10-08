@@ -147,6 +147,14 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("4317", TF)
         self.assertNotIn("4318", block("aws_security_group", "claude_master_server"))
 
+    def test_ejc3_is_the_last_profile_and_the_login_script_uses_the_same_order(self):
+        # Fallback order: the first is preferred when quotas tie, so the owner's own subscription is the last resort.
+        tf_order = re.search(r'claude_master_profiles = \[([^\]]*)\]', TF).group(1)
+        names = re.findall(r'"([a-z0-9-]+)"', tf_order)
+        self.assertEqual(names, ["claude-connor", "claude-colton", "claude-ejc3"])
+        login = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+        self.assertIn("profiles=(" + " ".join(names) + ")", login)
+
     def test_the_serve_command_is_one_command_with_every_flag_not_cut_short_by_a_doubled_backslash(self):
         # #226 wrote a line continuation as two backslashes: the shell ends the command there, so --state-dir and the open
         # listener ran as a separate command and the service died with "serve requires --listen ... and --state-dir".
