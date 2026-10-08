@@ -555,8 +555,9 @@ class ScriptTests(unittest.TestCase):
             text = open(ze).read()
             self.assertEqual(text.count(">>> claude-master"), 1, "the block is rewritten, not repeated")
             self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"), "the rest of the file is untouched")
+            # The block is plain POSIX shell (zsh reads it unchanged), so bash is enough to run it: the CI runner has no zsh.
             def server_for(home):
-                out = subprocess.run(["zsh", "-c", f'HOME={home}; source {ze}; print -r -- "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                out = subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
                                      capture_output=True, text=True, timeout=30)
                 return out.stdout.strip()
             enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
