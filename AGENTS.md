@@ -624,6 +624,15 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `scripts/claude-master-mac-bundle.sh OUTDIR` (an administrator action; it contains the token). The
   certificate listener on the private address is unchanged: dev boxes keep per-box certificates. Never
   put the open port in a security group or bind it to anything but loopback.
+- **nextjs-dev accounts use the pool through t-claude.** The setup script installs the pinned `claude-master` (the server's tag and
+  sha256, one pin) and writes a marker block into `/etc/zsh/zshenv`: for an account whose own client certificate
+  (`~/.config/claude-master/client.pem`) is readable it exports `TCLAUDE_INFERENCE_SERVER`, and t-claude (`--inference-server`,
+  ejc3/t-claude) then runs `claude-master connect` in place of plain claude, keeping `--continue`, `--remote-control` and the hooks.
+  An account with no certificate is unchanged, so **enrolling is the switch**: `scripts/claude-master-enroll.sh nextjs-USER --ssh HOST
+  --as USER` (one certificate per account, so the `client` metric shows who). The account keeps its own native login for Remote
+  Control; only inference goes to the pool. There is no fallback to a login on the box: a server that is down or out of quota is an
+  error in the session, not a quiet switch. Certificates last 30 days: re-run the enrol before they expire. A window running when an
+  account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
   re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
   a running server; `claude-master-status` shows running versus pinned and a new binary takes effect when

@@ -4,6 +4,8 @@
 #
 #   scripts/claude-master-enroll.sh NAME                 enroll THIS machine (a Mac, a jumpbox)
 #   scripts/claude-master-enroll.sh NAME --ssh HOST      enroll another box over SSH (ubuntu@HOST)
+#   ... --as USER                                        with --ssh: enroll that Unix account (its own home and its own
+#                                                        key), not ubuntu -- for a box several people share (nextjs-dev)
 #   ... --days N                                         certificate lifetime, 1-90 (default 30)
 #
 # NAME is the identity the server sees: lowercase letters, digits and hyphens, e.g. box-fcvm-arm,
@@ -25,19 +27,28 @@ DIR=${CLAUDE_MASTER_CLIENT_DIR:-.config/claude-master}   # relative to the enrol
 DAYS=30
 NAME=${1:-}; shift || true
 HOST=""
+AS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --ssh) HOST=${2:-}; shift 2 ;;
     --days) DAYS=${2:-}; shift 2 ;;
-    *) echo "usage: claude-master-enroll.sh NAME [--ssh HOST] [--days N]" >&2; exit 2 ;;
+    --as) AS=${2:-}; shift 2 ;;
+    *) echo "usage: claude-master-enroll.sh NAME [--ssh HOST [--as USER]] [--days N]" >&2; exit 2 ;;
   esac
 done
 [[ $NAME =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "NAME must be 1-63 lowercase letters, digits or hyphens" >&2; exit 2; }
 [[ $DAYS =~ ^[0-9]+$ ]] && [ "$DAYS" -ge 1 ] && [ "$DAYS" -le 90 ] || { echo "--days must be 1-90" >&2; exit 2; }
 
-# Run a command on the machine being enrolled.
+[ -z "$AS" ] || [ -n "$HOST" ] || { echo "--as needs --ssh HOST" >&2; exit 2; }
+[ -z "$AS" ] || [[ $AS =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "--as must be a Unix account name" >&2; exit 2; }
+
+# Run a command on the machine being enrolled (as the --as account when one is given: sudo -H sets its HOME). The command
+# travels base64-encoded so no layer of quoting can change it; stdin still reaches it.
 on_target() {
-  if [ -n "$HOST" ]; then ssh -o BatchMode=yes -i "${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}" "ubuntu@$HOST" "$@"; else bash -c "$*"; fi
+  if [ -n "$HOST" ] && [ -n "$AS" ]; then
+    ssh -o BatchMode=yes -i "${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}" "ubuntu@$HOST" "sudo -n -H -u $AS bash -c \"\$(echo $(printf '%s' "$*" | base64 | tr -d '\n') | base64 -d)\""
+  elif [ -n "$HOST" ]; then ssh -o BatchMode=yes -i "${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}" "ubuntu@$HOST" "$@"
+  else bash -c "$*"; fi
 }
 
 SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
@@ -46,7 +57,7 @@ SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
 [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != None ] || { echo "no running claude-master-server instance" >&2; exit 1; }
 
 NEW="$DIR.new"
-echo "1/4 making a key and a certificate request on ${HOST:-this machine}"
+echo "1/4 making a key and a certificate request on ${HOST:-this machine}${AS:+ as $AS}"
 on_target "set -e; cd \"\$HOME\"; command -v claude-master >/dev/null || { echo 'claude-master is not installed here' >&2; exit 1; }; rm -rf '$NEW'; claude-master client-init --dir '$NEW' --name '$NAME' >/dev/null"
 # `tr`, not `base64 -w0`: the BSD base64 on a Mac has no -w.
 CSR=$(on_target "base64 < \"\$HOME/$NEW/client.csr\" | tr -d '\n'")

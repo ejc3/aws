@@ -514,6 +514,62 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("!= active", LOGIN)
         self.assertNotRegex(LOGIN, r"systemctl restart")
 
+    def test_enrollment_as_an_account_carries_awkward_commands_and_stdin_through_ssh_and_sudo_intact(self):
+        # Runs the real on_target function with ssh and sudo stubbed: ssh executes its last argument (the remote command
+        # line) in a shell, sudo drops its options and runs the rest as the same user but records who it was asked for.
+        import os, subprocess, tempfile
+        fn = ENROLL[ENROLL.index("on_target() {"):ENROLL.index("\n}\n", ENROLL.index("on_target() {")) + 3]
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin"); os.mkdir(bindir)
+            open(os.path.join(bindir, "ssh"), "w").write('#!/bin/bash\nfor a; do last="$a"; done\nexec bash -c "$last"\n')
+            open(os.path.join(bindir, "sudo"), "w").write(
+                '#!/bin/bash\nwhile [ "${1:-}" != bash ]; do case "$1" in -u) echo "asked-for:$2" >> "$SUDO_LOG"; shift 2;; *) shift;; esac; done\nexec "$@"\n')
+            for f in ("ssh", "sudo"): os.chmod(os.path.join(bindir, f), 0o755)
+            log = os.path.join(d, "sudo.log")
+            script = ('HOST=h; AS=colton; ' + fn + '\n'
+                      'on_target "set -e; cd \\"\\$HOME\\"; printf \'%s|%s\\\\n\' \\"it\'s \\$(echo q)\\" \'a b\'"\n'
+                      'printf "%s\\n" PEM-LINE-1 PEM-LINE-2 | on_target "cat"\n')
+            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"], SUDO_LOG=log)
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.splitlines(), ["it's q|a b", "PEM-LINE-1", "PEM-LINE-2"])
+            self.assertEqual(open(log).read().split(), ["asked-for:colton", "asked-for:colton"])
+
+    def test_nextjs_dev_installs_the_pinned_client_and_routes_only_enrolled_accounts(self):
+        import os, re, subprocess, tempfile
+        nx = (ROOT / "nextjs-user-data.tf").read_text()
+        # one pin with the server, checksum-verified, installed under a temporary name then renamed
+        self.assertIn('CM_TAG="${local.claude_master_tag}"', nx)
+        self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', nx)
+        self.assertIn('echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet -', nx)
+        self.assertIn("/usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master", nx)
+        # the zshenv block: run it for real, twice, against a copy of the stock file
+        start = nx.index('ZE=/etc/zsh/zshenv'); end = nx.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
+        block = nx[start:end].replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
+        with tempfile.TemporaryDirectory() as d:
+            ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
+            script = block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze)
+            for _ in range(2):
+                r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            text = open(ze).read()
+            self.assertEqual(text.count(">>> claude-master"), 1, "the block is rewritten, not repeated")
+            self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"), "the rest of the file is untouched")
+            # The block is plain POSIX shell (zsh reads it unchanged), so bash is enough to run it: the CI runner has no zsh.
+            def server_for(home):
+                out = subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                                     capture_output=True, text=True, timeout=30)
+                return out.stdout.strip()
+            enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
+            open(enrolled + "/.config/claude-master/client.pem", "w").write("x")
+            plain = os.path.join(d, "plain"); os.makedirs(plain)
+            self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
+            self.assertEqual(server_for(plain), "unset", "an account without a certificate is not routed")
+
+    def test_enrollment_refuses_as_without_ssh_and_a_bad_account_name(self):
+        self.assertIn('[ -z "$AS" ] || [ -n "$HOST" ]', ENROLL)
+        self.assertIn('^[a-z_][a-z0-9_-]{0,31}$', ENROLL)
+
     def test_enrollment_runs_on_a_mac(self):
         # BSD base64 (macOS) has no -w, so the request is encoded with plain base64 and tr.
         self.assertNotRegex(code(ENROLL), r"base64 -w")
