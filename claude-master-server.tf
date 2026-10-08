@@ -248,7 +248,7 @@ key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id
 if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
 exec /usr/local/bin/claude-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
-  --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} \\
+  --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} \
   --open-loopback 127.0.0.1:${local.claude_master_open_port} --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
   --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels

@@ -147,6 +147,25 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("4317", TF)
         self.assertNotIn("4318", block("aws_security_group", "claude_master_server"))
 
+    def test_the_serve_command_is_one_command_with_every_flag_not_cut_short_by_a_doubled_backslash(self):
+        # #226 wrote a line continuation as two backslashes: the shell ends the command there, so --state-dir and the open
+        # listener ran as a separate command and the service died with "serve requires --listen ... and --state-dir".
+        # It went unseen because the service stays idle until all three logins exist.
+        wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        lines = wrapper.splitlines()
+        self.assertEqual([n for n, l in enumerate(lines) if l.rstrip().endswith("\\\\")], [], "a doubled backslash ends the command")
+        start = next(n for n, l in enumerate(lines) if l.startswith("exec /usr/local/bin/claude-master serve"))
+        logical = []
+        for l in lines[start:]:
+            logical.append(l.rstrip().rstrip("\\"))
+            if not l.rstrip().endswith("\\"):
+                break
+        command = " ".join(logical)
+        for flag in ("--listen ${local.claude_master_server_ip}:${local.claude_master_server_port}", "--open-loopback 127.0.0.1:",
+                     "--state-dir /var/lib/claude-master/state", "--log-file /var/log/claude-master/server.log",
+                     "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels"):
+            self.assertIn(flag, command)
+
     def test_the_server_always_logs_at_info_to_a_rotated_file_it_may_write(self):
         wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
         for flag in ("--log-level info", "--log-file /var/log/claude-master/server.log", "--log-max-mb 20", "--log-keep 5",
