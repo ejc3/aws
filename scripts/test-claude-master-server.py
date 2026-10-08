@@ -544,7 +544,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet -', nx)
         self.assertIn("/usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master", nx)
         # the zshenv block: run it for real, twice, against a copy of the stock file
-        start = nx.index('ZE=/etc/zsh/zshenv'); end = nx.index("# Claude Code -- the NATIVE installer")
+        start = nx.index('ZE=/etc/zsh/zshenv'); end = nx.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
         block = nx[start:end].replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
         with tempfile.TemporaryDirectory() as d:
             ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
