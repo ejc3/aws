@@ -2120,6 +2120,7 @@ if [ -f "$ZE" ]; then
 # >>> claude-master (managed by nextjs-user-data.tf) >>>
 if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
   export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
+  export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
 fi
 # <<< claude-master <<<
 CMZSHENV

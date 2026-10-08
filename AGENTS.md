@@ -638,6 +638,8 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
+  The block also exports `TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master` (here and on nextjs-dev): this box has a personal build in
+  `~/.local/bin` ahead of the shared one on PATH, an older build that refuses t-claude's flags, and the route must use the pinned one.
   The `ubuntu` account's sessions share one tmux server, so a running session keeps plain claude; a window launched afterwards goes
   through the pool and saves the server. Enrolling is the switch: `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST`. Mind the
   capacity: one heavy account on a pool of three subscriptions drains it for everyone (see `claude-master-status` quotas).
