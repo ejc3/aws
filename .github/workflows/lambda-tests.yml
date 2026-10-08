@@ -159,6 +159,9 @@ jobs:
       - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
+      - name: "claude-master certificates renew themselves: the four SSM scripts run for real, the Lambda against fake AWS, the role can send nothing else"
+        run: python3 -S -B scripts/test-claude-master-cert-renew.py
+
       - name: "Vercel environment record: the capture tool only ever deploys staged and protected, reads after a 401, and deletes by deployment id"
         run: python3 -S -B scripts/test-vercel-env-capture.py
 
