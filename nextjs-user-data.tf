@@ -2110,7 +2110,7 @@ fi
 # TCLAUDE_INFERENCE_SERVER at launch and runs `claude-master connect` instead of plain claude (keeping
 # --continue, --remote-control and the hooks). /etc/zsh/zshenv is read by every zsh, including the `zsh -c`
 # inside agents-start, so the unattended launchers and a person's terminal behave the same. The variable is
-# set ONLY when the account's own client certificate is readable: no certificate, no change, and enrolling an
+# set ONLY when the client binary is installed and the account's own client certificate is readable: no certificate (or no binary), no change, and enrolling an
 # account (scripts/claude-master-enroll.sh NAME --ssh HOST --as USER) is what switches it. The block between
 # the markers is rewritten on every run and nothing else in the file is touched.
 ZE=/etc/zsh/zshenv
@@ -2118,7 +2118,7 @@ if [ -f "$ZE" ]; then
   sed -i '/^# >>> claude-master (managed by nextjs-user-data.tf) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
   cat >> "$ZE" <<'CMZSHENV'
 # >>> claude-master (managed by nextjs-user-data.tf) >>>
-if [ -r "$HOME/.config/claude-master/client.pem" ]; then
+if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
   export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
 fi
 # <<< claude-master <<<

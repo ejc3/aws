@@ -14,8 +14,8 @@
 # a window launched afterwards (a new t-claude, the boot launcher after the next reboot) goes through the pool, and the
 # window saves the server so a relaunch (/clear, /cd) stays there.
 #
-# THE SWITCH IS THE CERTIFICATE. The block exports TCLAUDE_INFERENCE_SERVER only when the account's own client certificate
-# is readable, so nothing is routed until `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST` has run. t-claude reads it at
+# THE SWITCH IS THE CERTIFICATE. The block exports TCLAUDE_INFERENCE_SERVER only when the client binary is installed AND the
+# account's own client certificate is readable, so nothing is routed until `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST` has run. t-claude reads it at
 # launch (`--inference-server`, ejc3/t-claude) and runs `claude-master connect` in place of plain claude.
 
 locals {
@@ -30,12 +30,15 @@ locals {
       echo "claude-master $CM_TAG already installed"
     else
       CMTMP=$(mktemp -d)
+      # Every step is part of the condition: a failed install or rename (full or read-only disk) must fail the association,
+      # not fall through to an echo that reports success.
       if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claude-master-linux-arm64" -o "$CMTMP/claude-master" \
-         && echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet - ; then
-        install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master
+         && echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet - \
+         && install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new \
+         && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master; then
         echo "claude-master $CM_TAG installed"
       else
-        echo "claude-master client FAILED: download or sha256 mismatch (kept any installed copy)"; rm -rf "$CMTMP"; exit 1
+        echo "claude-master client FAILED: download, sha256 or install (kept any installed copy)"; rm -f /usr/local/bin/claude-master.new; rm -rf "$CMTMP"; exit 1
       fi
       rm -rf "$CMTMP"
     fi
@@ -44,7 +47,7 @@ locals {
       sed -i '/^# >>> claude-master (managed by claude-master-client.tf) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
       cat >> "$ZE" <<'CMZSHENV'
     # >>> claude-master (managed by claude-master-client.tf) >>>
-    if [ -r "$HOME/.config/claude-master/client.pem" ]; then
+    if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
       export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
     fi
     # <<< claude-master <<<
