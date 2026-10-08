@@ -3,13 +3,20 @@
 Runs every five minutes. For each RUNNING instance whose Name is on the list it asks CloudWatch three questions:
 
   * has the instance status check been failing for STATUS_MINUTES in a row?  (the guest OS is unreachable)
-  * has NetworkOut been exactly zero for NETWORK_MINUTES in a row?           (the guest is alive to EC2 and
-    dead to everyone else: 2026-10-01 nextjs-dev sat like this for 20 hours; 2026-07-25 and 2026-08-16 were
+  * has NetworkOut stayed under NETWORK_FLOOR_BYTES for NETWORK_MINUTES in a row?  (the guest is alive to EC2
+    and dead to everyone else: 2026-10-01 nextjs-dev sat like this for 20 hours; 2026-07-25 and 2026-08-16 were
     the same with the status check still "ok")
   * has the box been PAGING for THRASH_MINUTES in a row: EBS reads at the volume's cap with writes near zero?
     (2026-10-10 nextjs-dev: SSH timed out and both tunnels were down for 20+ minutes while the status check
-    read ok and NetworkOut fell to 27 KB per five minutes, never zero, so neither rule above fired. A 14-day
+    read ok and NetworkOut fell to 27 KB per five minutes, above even the floor, so neither rule above fired. A 14-day
     backtest on every box here found this signature only in that wedge and in 2026-10-01's, never in real work)
+
+A FLOOR, not exactly zero, because of 2026-10-08: the jumpbox took an RCU stall (`rcu_sched detected stalls`),
+which starves userspace while leaving the kernel's TCP stack answering. Both vCPUs pinned at 99%, SSH accepted
+the connection and never sent a banner, SSM went Delayed then ConnectionLost -- and NetworkOut fell to 11,468
+bytes per five minutes but NEVER to zero, because bare ARP and SYN-ACK still go out. The status check stayed
+"ok" the whole time, so neither signal fired and the box would have sat wedged indefinitely. A trickle is not
+life; measure against the floor.
 
 Any one makes it wedged. A wedged box gets its console snapshotted FIRST (the existing redacting capture
 Lambda), then an OS reboot, then a notification. Never stop/start: a reboot keeps the console buffer and the
@@ -33,6 +40,13 @@ NETWORK_MINUTES = 20
 THRASH_MINUTES = 20
 THRASH_READ_BYTES = 30 * 1024 ** 3  # per five minutes: about 107 MB/s, 86% of a gp3 volume's default 125 MB/s
 THRASH_WRITE_SHARE = 0.1           # paging reads pages back and writes almost nothing; a build or a copy writes
+# Below this many bytes of NetworkOut per five-minute bucket the box is "silent". Measured over the four days to
+# 2026-10-08, the quietest HEALTHY bucket of any box on the list was jumpbox-2 at 34,909 bytes (jumpbox 68,259,
+# claude-master-server 152,048, nextjs-dev 684,878), while the jumpbox's RCU-stall wedge sat at 11,468. 20 KiB is
+# the geometric midpoint of that gap: ~1.8x above the wedge, ~1.7x below the quietest healthy bucket. Re-measure
+# before trusting it on a box quieter than jumpbox-2; the 20-minute window and the brakes below are what keep a
+# mis-set floor from becoming a reboot loop.
+NETWORK_FLOOR_BYTES = 20 * 1024
 MIN_AGE_SECONDS = 30 * 60        # a box still booting fails its checks; so does one that was just started
 COOLDOWN_SECONDS = 3 * 3600
 MAX_PER_DAY = 3
@@ -87,7 +101,7 @@ def wedged(status_failed, network_out, now, ebs_read=(), ebs_write=()):
     ebs_read, ebs_write: [(ts, bytes)] per five minutes."""
     if failing_for([(t, v >= 1) for t, v in status_failed], STATUS_MINUTES, 60, now):
         return "the instance status check has failed for %d minutes" % STATUS_MINUTES
-    if failing_for([(t, v == 0) for t, v in network_out], NETWORK_MINUTES, 300, now):
+    if failing_for([(t, v < NETWORK_FLOOR_BYTES) for t, v in network_out], NETWORK_MINUTES, 300, now):
         return "no network traffic out for %d minutes" % NETWORK_MINUTES
     if failing_for(paging(ebs_read, ebs_write), THRASH_MINUTES, 300, now):
         return "paging for %d minutes (disk reads at the volume's cap, writes near zero)" % THRASH_MINUTES

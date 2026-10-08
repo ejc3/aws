@@ -895,11 +895,13 @@ journald is persistent so the last pre-death log survives the reboot.
 nextjs-dev sat dead for 20 hours on 2026-10-01 (it is a standing authorization: this is the one automated
 restart, and it is narrow). It is for ON-DEMAND boxes only: for each RUNNING instance named `jumpbox`,
 `jumpbox-2`, `nextjs-dev` or `claude-master-server` it asks CloudWatch whether the instance status
-check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20 (the second catches the
-wedges where the status check still reads ok: 2026-07-25, 2026-08-16, 2026-10-01), or the box has been paging for 20
+check has failed for 15 minutes in a row, or NetworkOut has stayed under a 20 KiB-per-five-minutes floor for 20
+(the second catches the wedges where the status check still reads ok: 2026-07-25, 2026-08-16, 2026-10-01,
+2026-10-08's RCU stall, whose trickle of 11,468 bytes never reached zero), or the box has been paging for 20
 (EBS reads of 30 GiB or more per five minutes, the gp3 cap, with writes under a tenth of that: 2026-10-10 nextjs-dev
-paged until SSH and both tunnels were dead while its status check read ok and NetworkOut never quite reached zero; a
-14-day backtest on these boxes found the signature only in that wedge and 2026-10-01's, never in real work). Wedged means: console
+paged until SSH and both tunnels were dead while its status check read ok and NetworkOut bottomed out at 27,394
+bytes, above even the floor; a 14-day backtest on these boxes found the signature only in that wedge and
+2026-10-01's, never in real work). Wedged means: console
 snapshotted first through the existing redacting capture Lambda, then an OS reboot, then a message on the alert
 topic.
 
@@ -919,6 +921,16 @@ topic.
   Lambda `Errors` alarm fires; AWS does not retry a failed run.
 - **Its only EC2 write is `ec2:RebootInstances`, by Name tag.** A new persistent box joins by adding its Name
   to `local.auto_reboot_names`.
+- **A floor, not exactly zero, because a trickle is not life.** On 2026-10-08 the jumpbox took an RCU stall
+  (`rcu: INFO: rcu_sched detected stalls on CPUs/tasks:`): both vCPUs pinned at 99%, journald stopped
+  mid-stream, SSH accepted the TCP connection and never sent a banner, SSM went `Delayed` then
+  `ConnectionLost`. The kernel's TCP stack kept answering, so NetworkOut fell to 11,468 bytes per five
+  minutes and never to zero, and the instance, system and EBS status checks all stayed `ok` throughout --
+  so the exactly-zero rule could not fire and neither could the status-check one. The box would have sat
+  there indefinitely. The floor is 20 KiB per five-minute bucket, the geometric midpoint between that
+  11,468 and the quietest healthy bucket measured on any listed box (jumpbox-2, 34,909; jumpbox 68,259;
+  claude-master-server 152,048; nextjs-dev 684,878). Re-measure before adding a box quieter than jumpbox-2.
+  Note an RCU stall is NOT an oops, so `panic_on_oops` and `panic=-1` do not catch it either.
 - **Limits.** Rebooting does not cure what caused the wedge: after one, read the capture
   (`/dev-servers/console-capture`), as for any wedge. `aws lambda invoke --function-name auto-reboot --payload
   '{"dry_run": true}' --cli-binary-format raw-in-base64-out /dev/stdout` shows what it would do.
