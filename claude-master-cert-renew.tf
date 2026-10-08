@@ -38,8 +38,10 @@ locals {
   # Every parameter a document accepts, and the only shape it accepts it in.
   cert_account_pattern = "^[a-z_][a-z0-9_-]{0,31}$"
   cert_name_pattern    = "^[a-z0-9][a-z0-9-]{0,62}$"
-  cert_b64_csr_pattern = "^[A-Za-z0-9+/=]{100,4096}$"
-  cert_b64_pem_pattern = "^[A-Za-z0-9+/=]{100,8192}$"
+  # SSM's regex engine (RE2) refuses a repeat count over 1000, so a length bound cannot live here: the pattern pins the ALPHABET
+  # (base64, nothing a shell could act on) and the scripts bound the size (a request at most 4096 characters, a certificate or CA at most 8192).
+  cert_b64_csr_pattern = "^[A-Za-z0-9+/=]+$"
+  cert_b64_pem_pattern = "^[A-Za-z0-9+/=]+$"
   cert_days_pattern    = "^[0-9]{1,2}$"
 
   claude_master_cert_documents = {

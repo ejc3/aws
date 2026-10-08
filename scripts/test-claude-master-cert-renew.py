@@ -187,6 +187,35 @@ class ScriptTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0, why)
         self.assertFalse(sentinel.exists())
 
+    def test_sizes_are_bounded_by_the_scripts_because_the_ssm_pattern_cannot_do_it(self):
+        # Inputs that are valid in every OTHER way (a real request / certificate, harmless trailing text that OpenSSL ignores),
+        # so the size limit is the only thing that can refuse them.
+        env, sentinel = self.sign_env()
+        d = Path(tempfile.mkdtemp(dir=self.tmp))
+        openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(d / "k"))
+        openssl("req", "-new", "-key", str(d / "k"), "-subj", "/CN=nextjs-colton", "-out", str(d / "r"))
+        small = base64.b64encode(((d / "r").read_text()).encode()).decode()
+        big = base64.b64encode(((d / "r").read_text() + "\n# " + "x" * 4000 + "\n").encode()).decode()
+        self.assertLess(len(small), 4096)
+        self.assertGreater(len(big), 4096)
+        ok = run_script(SCRIPTS["sign"], env, Name="nextjs-colton", Csr=small, Days="30")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        sentinel.unlink()
+        too_big = run_script(SCRIPTS["sign"], env, Name="nextjs-colton", Csr=big, Days="30")
+        self.assertNotEqual(too_big.returncode, 0)
+        self.assertIn("bad-request-size", too_big.stderr)
+        self.assertFalse(sentinel.exists(), "an oversized request must never reach the signer")
+        home = self.home(days=20)
+        _, cert = self.pending(home, days=30)
+        padded = base64.b64encode((cert.read_text() + "\n# " + "x" * 9000 + "\n").encode()).decode()
+        self.assertGreater(len(padded), 8192)
+        for c, a in ((padded, b64(self.pki.pem)), (b64(cert), base64.b64encode((self.pki.pem.read_text() + "\n# " + "x" * 9000 + "\n").encode()).decode())):
+            r = run_script(SCRIPTS["install"], {"CM_HOME_OVERRIDE": str(home)}, Account="colton", Name="nextjs-colton", Cert=c, Ca=a, MinDays=20)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertEqual(kv(r.stdout).get("INSTALL"), "bad-size")
+        good = run_script(SCRIPTS["install"], {"CM_HOME_OVERRIDE": str(home)}, Account="colton", Name="nextjs-colton", Cert=b64(cert), Ca=b64(self.pki.pem), MinDays=20)
+        self.assertEqual(kv(good.stdout).get("INSTALL"), "ok", "the same certificate, un-padded, installs: only the size stopped it")
+
     # install -----------------------------------------------------------------------------------------------------
     def pending(self, home, name="nextjs-colton", days=30, pki=None):
         """A pending ~/.config/claude-master.new with a key and request, and a certificate for it signed with DAYS left."""
@@ -458,16 +487,31 @@ class TerraformTests(unittest.TestCase):
         self.assertTrue(all("allowedPattern = local.cert_" in p for p in params), [p for p in params if "allowedPattern" not in p])
 
     def test_the_patterns_reject_what_could_become_a_command(self):
-        pat = {k: re.compile(v) for k, v in re.findall(r'(cert_\w+_pattern)\s+= "([^"]+)"', TF)}
+        # SSM anchors strictly (RE2: `$` is the end of the text, not "before a final newline" as in Python), so test with fullmatch
+        # on the pattern without its ^ and $.
+        class Strict:
+            def __init__(self, v):
+                self.rx = re.compile(v[1:-1])
+
+            def match(self, s):
+                return self.rx.fullmatch(s)
+        pat = {k: Strict(v) for k, v in re.findall(r'(cert_\w+_pattern)\s+= "([^"]+)"', TF)}
         for bad in ("a;b", "a b", "a$(id)", "../x", "A", "", "-x" * 40):
             self.assertIsNone(pat["cert_account_pattern"].match(bad), bad)
         for bad in ("a;b", "a b", "NAME", "-x", "a" * 64, ""):
             self.assertIsNone(pat["cert_name_pattern"].match(bad), bad)
-        for bad in ("x" * 99, "a b" * 40, "a;b" + "x" * 100, "$(id)" + "x" * 100, "x" * 4097):
+        for bad in ("a b" * 40, "a;b" + "x" * 100, "$(id)" + "x" * 100, "x" * 100 + "\n", "", "x`id`"):
             self.assertIsNone(pat["cert_b64_csr_pattern"].match(bad), bad[:20])
+            self.assertIsNone(pat["cert_b64_pem_pattern"].match(bad), bad[:20])
         for bad in ("", "100", "1 2", "9;", "-1", "ab"):
             self.assertIsNone(pat["cert_days_pattern"].match(bad), bad)
         self.assertTrue(pat["cert_name_pattern"].match("nextjs-colton") and pat["cert_account_pattern"].match("ubuntu"))
+
+    def test_every_pattern_fits_the_ssm_regex_engine(self):
+        # SSM rejects the whole document ("invalid repeat count") for a quantifier above 1000: Python's re accepts it, so say it here.
+        for name, pattern in re.findall(r'(cert_\w+_pattern)\s+= "([^"]+)"', TF):
+            for low, high in re.findall(r"\{(\d+)(?:,(\d*))?\}", pattern):
+                self.assertLessEqual(int(high or low), 1000, "%s: %s" % (name, pattern))
 
     def test_the_role_can_send_only_the_four_documents_to_only_the_named_boxes(self):
         policy = TF.split('resource "aws_iam_role_policy" "claude_master_cert_renew"', 1)[1].split("\nresource ", 1)[0]

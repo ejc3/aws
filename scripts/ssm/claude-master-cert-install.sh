@@ -14,6 +14,7 @@ HOME_DIR=${CM_HOME_OVERRIDE:-$(getent passwd "$ACCOUNT" | cut -d: -f6)}
 DIR="$HOME_DIR/.config/claude-master"; NEW="$DIR.new"; OLD="$DIR.old"
 [ -s "$NEW/client.key" ] && [ -s "$NEW/client.csr" ] || { echo "INSTALL=no-pending-request"; exit 1; }
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+[ "${#CERT_B64}" -le 8192 ] && [ "${#CA_B64}" -le 8192 ] || { echo "INSTALL=bad-size"; exit 1; }
 printf '%s' "$CERT_B64" | base64 -d > "$WORK/client.pem" 2>/dev/null && printf '%s' "$CA_B64" | base64 -d > "$WORK/ca.pem" 2>/dev/null \
   || { echo "INSTALL=bad-encoding"; exit 1; }
 openssl verify -CAfile "$WORK/ca.pem" "$WORK/client.pem" >/dev/null 2>&1 || { echo "INSTALL=not-signed-by-the-ca"; exit 1; }
