@@ -2,7 +2,7 @@
 #
 # claude-master-login -- log the Claude subscriptions into claude-master on fcvm-metal-arm.
 #
-#   scripts/claude-master-login.sh                        the three: connor, ejc3, colton (on fcvm-metal-arm)
+#   scripts/claude-master-login.sh                        the three: connor, colton, ejc3 (on fcvm-metal-arm)
 #   scripts/claude-master-login.sh claude-ejc3 ...        only those profiles
 #   scripts/claude-master-login.sh --server [PROFILE...]  the same, on the shared claude-master server
 #                                                         (claude-master-server.tf), then starts its service
@@ -24,7 +24,7 @@ if [ "${1:-}" = "--server" ]; then
 fi
 
 profiles=("$@")
-[ ${#profiles[@]} -gt 0 ] || profiles=(claude-connor claude-ejc3 claude-colton)
+[ ${#profiles[@]} -gt 0 ] || profiles=(claude-connor claude-colton claude-ejc3)
 
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }
