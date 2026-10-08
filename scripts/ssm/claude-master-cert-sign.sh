@@ -9,6 +9,7 @@ DAYS='{{ Days }}'
 CM_SIGN=${CM_SIGN:-/usr/local/bin/claude-master-sign}
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 [ "$DAYS" -ge 1 ] 2>/dev/null && [ "$DAYS" -le 90 ] || { echo "SIGN=bad-days" >&2; exit 1; }
+[ "${#CSR}" -le 4096 ] || { echo "SIGN=bad-request-size" >&2; exit 1; }
 printf '%s' "$CSR" | base64 -d > "$TMP/request.csr" 2>/dev/null || { echo "SIGN=bad-request-encoding" >&2; exit 1; }
 openssl req -in "$TMP/request.csr" -noout -verify >/dev/null 2>&1 || { echo "SIGN=request-signature-invalid" >&2; exit 1; }
 CN=$(openssl req -in "$TMP/request.csr" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=//p' | sed -n 's/^CN=\([^,]*\)$/\1/p')
