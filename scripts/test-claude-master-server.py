@@ -566,6 +566,42 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
             self.assertEqual(server_for(plain), "unset", "an account without a certificate is not routed")
 
+    def test_the_metal_box_gets_the_pinned_client_and_routing_through_an_ssm_association(self):
+        import os, subprocess, tempfile, textwrap
+        cf = (ROOT / "claude-master-client.tf").read_text()
+        # the association: no key, no service, nothing restarted, one pin shared with the server
+        self.assertIn('name                = "AWS-RunShellScript"', cf)
+        self.assertIn('CM_TAG="${local.claude_master_tag}"', cf)
+        self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', cf)
+        self.assertIn('sha256sum -c --quiet -', cf)
+        self.assertIn("install -m 0755 \"$CMTMP/claude-master\" /usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master", cf)
+        self.assertNotRegex(cf, r"systemctl\s+(restart|stop|kill)|tmux[- ]?(scroll)?\s+kill|kill-server|pkill")
+        # render the heredoc as Terraform does (<<- strips the common indent), then run the zshenv part for real, twice
+        body = cf.split("<<-CMD\n", 1)[1].split("\n  CMD\n", 1)[0]
+        script = (textwrap.dedent(body) + "\n").replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
+        start = script.index("ZE=/etc/zsh/zshenv"); end = script.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
+        block = script[start:end]
+        self.assertIn("\nCMZSHENV\n", block, "the heredoc terminator must be at column 0 after the indent is stripped")
+        with tempfile.TemporaryDirectory() as d:
+            ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
+            for _ in range(2):
+                r = subprocess.run(["bash", "-c", block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            text = open(ze).read()
+            self.assertEqual(text.count(">>> claude-master"), 1)
+            self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"))
+            def server_for(home):
+                return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                                      capture_output=True, text=True, timeout=30).stdout.strip()
+            enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
+            with open(enrolled + "/.config/claude-master/client.pem", "w") as f: f.write("x")
+            plain = os.path.join(d, "plain"); os.makedirs(plain)
+            self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
+            self.assertEqual(server_for(plain), "unset")
+        # the whole rendered command parses as shell
+        r = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_enrollment_refuses_as_without_ssh_and_a_bad_account_name(self):
         self.assertIn('[ -z "$AS" ] || [ -n "$HOST" ]', ENROLL)
         self.assertIn('^[a-z_][a-z0-9_-]{0,31}$', ENROLL)
