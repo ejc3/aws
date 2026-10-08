@@ -636,6 +636,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   "launcher flags cannot override master identity or provider routing"). There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days: re-run the enrol before they expire. A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
+- **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
+  server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
+  The `ubuntu` account's sessions share one tmux server, so a running session keeps plain claude; a window launched afterwards goes
+  through the pool and saves the server. Enrolling is the switch: `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST`. Mind the
+  capacity: one heavy account on a pool of three subscriptions drains it for everyone (see `claude-master-status` quotas).
 - **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
   re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
   a running server; `claude-master-status` shows running versus pinned and a new binary takes effect when

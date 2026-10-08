@@ -548,7 +548,8 @@ class ScriptTests(unittest.TestCase):
         block = nx[start:end].replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
         with tempfile.TemporaryDirectory() as d:
             ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
-            script = block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze)
+            fake = os.path.join(d, "claude-master"); open(fake, "w").write("#!/bin/sh\n"); os.chmod(fake, 0o755)
+            script = block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze).replace("[ -x /usr/local/bin/claude-master ]", "[ -x %s ]" % fake)
             for _ in range(2):
                 r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
                 self.assertEqual(r.returncode, 0, r.stderr)
@@ -565,6 +566,73 @@ class ScriptTests(unittest.TestCase):
             plain = os.path.join(d, "plain"); os.makedirs(plain)
             self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
             self.assertEqual(server_for(plain), "unset", "an account without a certificate is not routed")
+            os.chmod(fake, 0o644)
+            self.assertEqual(server_for(enrolled), "unset", "an enrolled account is not routed when the client binary is not executable")
+
+    def test_the_metal_box_gets_the_pinned_client_and_routing_through_an_ssm_association(self):
+        import os, subprocess, tempfile, textwrap
+        cf = (ROOT / "claude-master-client.tf").read_text()
+        # the association: no key, no service, nothing restarted, one pin shared with the server
+        self.assertIn('name                = "AWS-RunShellScript"', cf)
+        self.assertIn('CM_TAG="${local.claude_master_tag}"', cf)
+        self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', cf)
+        self.assertIn('sha256sum -c --quiet -', cf)
+        # install and rename are PART OF the if condition, so a failure of either fails the run
+        self.assertIn('&& install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new \\', cf)
+        self.assertIn("&& mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master; then", cf)
+        self.assertNotRegex(cf, r"systemctl\s+(restart|stop|kill)|tmux[- ]?(scroll)?\s+kill|kill-server|pkill")
+        # render the heredoc as Terraform does (<<- strips the common indent), then run the zshenv part for real, twice
+        body = cf.split("<<-CMD\n", 1)[1].split("\n  CMD\n", 1)[0]
+        script = (textwrap.dedent(body) + "\n").replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
+        start = script.index("ZE=/etc/zsh/zshenv"); end = script.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
+        block = script[start:end]
+        self.assertIn("\nCMZSHENV\n", block, "the heredoc terminator must be at column 0 after the indent is stripped")
+        with tempfile.TemporaryDirectory() as d:
+            ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
+            fake = os.path.join(d, "claude-master"); open(fake, "w").write("#!/bin/sh\n"); os.chmod(fake, 0o755)
+            for _ in range(2):
+                r = subprocess.run(["bash", "-c", block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze).replace("[ -x /usr/local/bin/claude-master ]", "[ -x %s ]" % fake)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            text = open(ze).read()
+            self.assertEqual(text.count(">>> claude-master"), 1)
+            self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"))
+            def server_for(home):
+                return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                                      capture_output=True, text=True, timeout=30).stdout.strip()
+            enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
+            with open(enrolled + "/.config/claude-master/client.pem", "w") as f: f.write("x")
+            plain = os.path.join(d, "plain"); os.makedirs(plain)
+            self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
+            self.assertEqual(server_for(plain), "unset")
+            os.chmod(fake, 0o644)
+            self.assertEqual(server_for(enrolled), "unset", "not routed when the client binary is not executable")
+        # a failed install or rename must FAIL the association (it once fell through to an echo that reported success)
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin"); os.mkdir(bindir)
+            payload = b"stand-in binary"
+            import hashlib
+            sha = hashlib.sha256(payload).hexdigest()
+            # the section exits early on an architecture with no pinned build; make the test the same on every machine
+            open(os.path.join(bindir, "uname"), "w").write('#!/bin/bash\n[ "${1:-}" = -m ] && { echo aarch64; exit 0; }\nexec /usr/bin/uname "$@"\n')
+            os.chmod(os.path.join(bindir, "uname"), 0o755)
+            open(os.path.join(bindir, "curl"), "w").write('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\nprintf %s \'' + payload.decode() + '\' > "$out"\n')
+            def run_with(install_ok, mv_ok):
+                for name, ok in (("install", install_ok), ("mv", mv_ok)):
+                    open(os.path.join(bindir, name), "w").write("#!/bin/bash\n" + ("exit 0\n" if ok else "echo simulated-failure >&2; exit 1\n"))
+                for name in ("curl", "install", "mv"): os.chmod(os.path.join(bindir, name), 0o755)
+                s = script.replace('CM_SHA="203.0.113.5"', "x")  # no-op guard; the sha comes from the template below
+                s = s.replace("ZE=/etc/zsh/zshenv", "ZE=" + os.path.join(d, "zshenv"))
+                s = s.replace('CM_SHA="${local.claude_master_sha256_aarch64}"', 'CM_SHA="%s"' % sha).replace('CM_TAG="${local.claude_master_tag}"', 'CM_TAG="test-tag"')
+                s = s.replace("/usr/local/bin/claude-master", os.path.join(d, "installed-claude-master"))
+                return subprocess.run(["bash", "-c", s], capture_output=True, text=True, timeout=30, env=dict(os.environ, PATH=bindir + ":" + os.environ["PATH"]))
+            ok = run_with(True, True)
+            self.assertEqual(ok.returncode, 0, ok.stderr); self.assertIn("installed", ok.stdout)
+            for name, r in (("install fails", run_with(False, True)), ("rename fails", run_with(True, False))):
+                self.assertNotEqual(r.returncode, 0, name + " must fail the association")
+                self.assertIn("FAILED", r.stdout, name)
+        # the whole rendered command parses as shell
+        r = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_enrollment_refuses_as_without_ssh_and_a_bad_account_name(self):
         self.assertIn('[ -z "$AS" ] || [ -n "$HOST" ]', ENROLL)
