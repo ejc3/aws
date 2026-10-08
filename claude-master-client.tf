@@ -16,7 +16,9 @@
 #
 # THE SWITCH IS THE CERTIFICATE. The block exports TCLAUDE_INFERENCE_SERVER only when the client binary is installed AND the
 # account's own client certificate is readable, so nothing is routed until `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST` has run. t-claude reads it at
-# launch (`--inference-server`, ejc3/t-claude) and runs `claude-master connect` in place of plain claude.
+# launch (`--inference-server`, ejc3/t-claude) and runs `claude-master connect` in place of plain claude. It also exports
+# TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master: this box has a personal build in ~/.local/bin ahead of the shared one on
+# PATH (an older one that refuses the t-claude flags), and the route must use the pinned build, not whichever comes first.
 
 locals {
   claude_master_client_instances = var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : []
@@ -49,6 +51,7 @@ locals {
     # >>> claude-master (managed by claude-master-client.tf) >>>
     if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
       export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
+      export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
     fi
     # <<< claude-master <<<
     CMZSHENV

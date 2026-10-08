@@ -558,16 +558,16 @@ class ScriptTests(unittest.TestCase):
             self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"), "the rest of the file is untouched")
             # The block is plain POSIX shell (zsh reads it unchanged), so bash is enough to run it: the CI runner has no zsh.
             def server_for(home):
-                out = subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                out = subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s|%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}" "${{TCLAUDE_CLAUDE_MASTER-unset}}"'],
                                      capture_output=True, text=True, timeout=30)
                 return out.stdout.strip()
             enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
             open(enrolled + "/.config/claude-master/client.pem", "w").write("x")
             plain = os.path.join(d, "plain"); os.makedirs(plain)
-            self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
-            self.assertEqual(server_for(plain), "unset", "an account without a certificate is not routed")
+            self.assertEqual(server_for(enrolled), "203.0.113.5:8443|/usr/local/bin/claude-master")
+            self.assertEqual(server_for(plain), "unset|unset", "an account without a certificate is not routed")
             os.chmod(fake, 0o644)
-            self.assertEqual(server_for(enrolled), "unset", "an enrolled account is not routed when the client binary is not executable")
+            self.assertEqual(server_for(enrolled), "unset|unset", "an enrolled account is not routed when the client binary is not executable")
 
     def test_the_metal_box_gets_the_pinned_client_and_routing_through_an_ssm_association(self):
         import os, subprocess, tempfile, textwrap
@@ -597,15 +597,15 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(text.count(">>> claude-master"), 1)
             self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"))
             def server_for(home):
-                return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}"'],
+                return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s|%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}" "${{TCLAUDE_CLAUDE_MASTER-unset}}"'],
                                       capture_output=True, text=True, timeout=30).stdout.strip()
             enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
             with open(enrolled + "/.config/claude-master/client.pem", "w") as f: f.write("x")
             plain = os.path.join(d, "plain"); os.makedirs(plain)
-            self.assertEqual(server_for(enrolled), "203.0.113.5:8443")
-            self.assertEqual(server_for(plain), "unset")
+            self.assertEqual(server_for(enrolled), "203.0.113.5:8443|/usr/local/bin/claude-master")
+            self.assertEqual(server_for(plain), "unset|unset")
             os.chmod(fake, 0o644)
-            self.assertEqual(server_for(enrolled), "unset", "not routed when the client binary is not executable")
+            self.assertEqual(server_for(enrolled), "unset|unset", "not routed when the client binary is not executable")
         # a failed install or rename must FAIL the association (it once fell through to an echo that reported success)
         with tempfile.TemporaryDirectory() as d:
             bindir = os.path.join(d, "bin"); os.mkdir(bindir)
