@@ -2139,6 +2139,48 @@ else
   rm -rf "$TSTMP"
 fi
 
+# claude-master, the CLIENT side. The shared server (claude-master-server.tf) holds the Claude subscription
+# logins; an account here reaches it with `claude-master connect`, authenticating with its own client certificate
+# (scripts/claude-master-enroll.sh NAME --ssh HOST --as USER). This box holds no subscription login for it and
+# the binary needs nothing from AWS. ONE pin with the server (local.claude_master_tag and its sha256), so the
+# client and the server are always the same build. Installing it changes nothing for a running session.
+CM_TAG="${local.claude_master_tag}"
+CM_SHA="${local.claude_master_sha256_aarch64}"
+if [ "$(uname -m)" != aarch64 ]; then
+  echo "WARNING: no pinned claude-master build for $(uname -m); keeping any installed copy"
+elif [ "$(sha256sum /usr/local/bin/claude-master 2>/dev/null | cut -d' ' -f1)" = "$CM_SHA" ]; then
+  : # already the pinned build
+else
+  CMTMP=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claude-master-linux-arm64" -o "$CMTMP/claude-master" \
+     && echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet - ; then
+    # Install under a temporary name, then rename: a running binary cannot be overwritten in place.
+    install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master
+  else
+    echo "WARNING: could not download the pinned claude-master, or it did not match its sha256 (keeping any installed copy)"
+  fi
+  rm -rf "$CMTMP"
+fi
+
+# Route Claude through the shared pool, for an account that has been ENROLLED. t-claude reads
+# TCLAUDE_INFERENCE_SERVER at launch and runs `claude-master connect` instead of plain claude (keeping
+# --continue, --remote-control and the hooks). /etc/zsh/zshenv is read by every zsh, including the `zsh -c`
+# inside agents-start, so the unattended launchers and a person's terminal behave the same. The variable is
+# set ONLY when the account's own client certificate is readable: no certificate, no change, and enrolling an
+# account (scripts/claude-master-enroll.sh NAME --ssh HOST --as USER) is what switches it. The block between
+# the markers is rewritten on every run and nothing else in the file is touched.
+ZE=/etc/zsh/zshenv
+if [ -f "$ZE" ]; then
+  sed -i '/^# >>> claude-master (managed by nextjs-user-data.tf) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
+  cat >> "$ZE" <<'CMZSHENV'
+# >>> claude-master (managed by nextjs-user-data.tf) >>>
+if [ -r "$HOME/.config/claude-master/client.pem" ]; then
+  export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
+fi
+# <<< claude-master <<<
+CMZSHENV
+fi
+
 # Claude Code -- the NATIVE installer, per user. See dev-user-data.tf for the full reasoning:
 # npm's "latest" lagged the native channel (2.1.241 vs 2.1.246), a root-owned global install
 # cannot be updated by a normal user so every start retried and failed, and having both
