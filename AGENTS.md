@@ -607,7 +607,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   shows running versus pinned); restarting it interrupts every connected session, so ask first.
 - **Adding a client** (a new dev box, a Mac): `scripts/claude-master-enroll.sh NAME [--ssh HOST]`.
   The key is made on the client; only the request goes up. Signing runs on the server over SSM, so
-  it is an AWS-authenticated action. Re-run before the certificate expires; it swaps only after the
+  it is an AWS-authenticated action. Renewal is automatic (next bullet); the script swaps only after the
   new certificate is in place.
 - **Reaching it.** Dev boxes: the private address. A Mac with AWS access: `scripts/claude-master-tunnel.sh`
   (an SSM port forward, session type `AWS-StartPortForwardingSessionToRemoteHost` aimed at 10.0.1.50: the
@@ -624,6 +624,18 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `scripts/claude-master-mac-bundle.sh OUTDIR` (an administrator action; it contains the token). The
   certificate listener on the private address is unchanged: dev boxes keep per-box certificates. Never
   put the open port in a security group or bind it to anything but loopback.
+- **Client certificates renew themselves** (`claude-master-cert-renew.tf`, `scripts/claude-master-cert-renew.py`). A Lambda runs daily at
+  08:00 UTC; for each client in `local.claude_master_clients` it reads the certificate's end date over SSM and, with under 14 days
+  left, renews it: the client makes a NEW key and request (the key never leaves the box), the server signs it, the client verifies it
+  (chains to the CA, names this client, matches the pending key, lasts 20+ days) and swaps it in with two renames, so a failure
+  leaves the old identity working. It works on an already-expired certificate, so a stopped spot box catches up when it next runs.
+  The role can send exactly four custom SSM documents (`scripts/ssm/claude-master-cert-{status,request,sign,install}.sh`, every
+  parameter pinned by a regex) to the server and the client boxes, never `AWS-RunShellScript`; the signing document signs only for
+  the exact name asked for. It never enrols (an account with no certificate is skipped: enrolling stays the switch), never touches
+  a stopped box, never restarts anything. Alarms: the job errors, it has not run for two days, or any certificate has under 7 days
+  left (`ClaudeMasterCerts/ClientCertDaysLeft`). A NEW client is added by enrolling it by hand once and adding it to
+  `claude_master_clients`. `aws lambda invoke --function-name claude-master-cert-renew --payload '{"dry_run": true}' ...` shows what it
+  would do; `{"renew_before_days": 60}` forces a renewal. The CA lasts ten years and the proxy renews its own certificate.
 - **nextjs-dev accounts use the pool through t-claude.** The setup script installs the pinned `claude-master` (the server's tag and
   sha256, one pin) and writes a marker block into `/etc/zsh/zshenv`: for an account whose own client certificate
   (`~/.config/claude-master/client.pem`) is readable it exports `TCLAUDE_INFERENCE_SERVER`, and t-claude (`--inference-server`,
@@ -634,7 +646,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   allows `--settings` unless the settings are known to conflict (login/provider keys, or provider/proxy variables in `env`), and names the
   setting it refused (release `claude-master-4d4910f` onward; before it every `--settings` was refused and a pool launch failed with
   "launcher flags cannot override master identity or provider routing"). There is no fallback to a login on the box: a server that is down or out of quota is an
-  error in the session, not a quiet switch. Certificates last 30 days: re-run the enrol before they expire. A window running when an
+  error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
