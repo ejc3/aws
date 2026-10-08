@@ -630,7 +630,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   ejc3/t-claude) then runs `claude-master connect` in place of plain claude, keeping `--continue`, `--remote-control` and the hooks.
   An account with no certificate is unchanged, so **enrolling is the switch**: `scripts/claude-master-enroll.sh nextjs-USER --ssh HOST
   --as USER` (one certificate per account, so the `client` metric shows who). The account keeps its own native login for Remote
-  Control; only inference goes to the pool. There is no fallback to a login on the box: a server that is down or out of quota is an
+  Control; only inference goes to the pool. t-claude hands Claude its session-sync and notification hooks as `--settings FILE`; claude-master
+  allows `--settings` unless the settings are known to conflict (login/provider keys, or provider/proxy variables in `env`), and names the
+  setting it refused (release `claude-master-4d4910f` onward; before it every `--settings` was refused and a pool launch failed with
+  "launcher flags cannot override master identity or provider routing"). There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days: re-run the enrol before they expire. A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
