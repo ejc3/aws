@@ -612,6 +612,9 @@ class ScriptTests(unittest.TestCase):
             payload = b"stand-in binary"
             import hashlib
             sha = hashlib.sha256(payload).hexdigest()
+            # the section exits early on an architecture with no pinned build; make the test the same on every machine
+            open(os.path.join(bindir, "uname"), "w").write('#!/bin/bash\n[ "${1:-}" = -m ] && { echo aarch64; exit 0; }\nexec /usr/bin/uname "$@"\n')
+            os.chmod(os.path.join(bindir, "uname"), 0o755)
             open(os.path.join(bindir, "curl"), "w").write('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\nprintf %s \'' + payload.decode() + '\' > "$out"\n')
             def run_with(install_ok, mv_ok):
                 for name, ok in (("install", install_ok), ("mv", mv_ok)):
