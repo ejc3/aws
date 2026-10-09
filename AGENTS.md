@@ -645,7 +645,12 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   Control; only inference goes to the pool. t-claude hands Claude its session-sync and notification hooks as `--settings FILE`; claude-master
   allows `--settings` unless the settings are known to conflict (login/provider keys, or provider/proxy variables in `env`), and names the
   setting it refused (release `claude-master-4d4910f` onward; before it every `--settings` was refused and a pool launch failed with
-  "launcher flags cannot override master identity or provider routing"). There is no fallback to a login on the box: a server that is down or out of quota is an
+  "launcher flags cannot override master identity or provider routing"). Release `claude-master-f9e4b9e` adds two things learned on
+  2026-10-09: a conversation whose subscription runs out MOVES to another one even though it carries signed thinking (Anthropic binds
+  a thinking signature to the model and the conversation prefix, not the account: checked on the pool's own logins, an Opus 5.5 block
+  replays on another subscription untouched and a Sonnet 5.5 block is dropped by the API with the request still succeeding; only signed
+  compaction, container, file and encrypted server-tool state still pin a conversation); and a `NODE_OPTIONS` that only sizes the V8
+  heap (`--max-old-space-size=N`) is allowed in settings and the environment, where before any `NODE_OPTIONS` refused the launch. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
