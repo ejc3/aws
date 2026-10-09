@@ -50,7 +50,7 @@ variable "dolphin_films_vercel_team_id" {
 variable "dolphin_films_vercel_ready" {
   description = "The dolphin-films containers that have a value, as <env>/<kind> (prod/auth, prod/turso, nonprod/auth, nonprod/turso). Terraform reads only these, and the dolphin-labs Vercel token once any is named, and writes only their variables to Vercel. Starts empty. Change it in a commit, never with -var (dolphin-films-vercel.tf)."
   type        = set(string)
-  default     = []
+  default     = ["prod/auth", "prod/turso", "nonprod/auth", "nonprod/turso"]
 
   validation {
     condition     = alltrue([for name in var.dolphin_films_vercel_ready : contains(keys(local.dolphin_films_secrets), name)])
