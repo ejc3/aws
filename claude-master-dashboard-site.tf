@@ -28,7 +28,7 @@
 # ---------------------------------------------------------------------------------
 
 locals {
-  claude_master_dashboard_worker = { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = false }
+  claude_master_dashboard_worker = { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true }
   # Zero or one entry: empty until the first deploy has created the Worker and its id is set.
   claude_master_dashboard_workers = local.claude_master_dashboard_worker.id == "" ? {} : {
     (local.claude_master_dashboard_worker.name) = local.claude_master_dashboard_worker
