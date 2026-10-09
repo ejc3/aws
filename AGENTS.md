@@ -650,7 +650,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   a thinking signature to the model and the conversation prefix, not the account: checked on the pool's own logins, an Opus 5.5 block
   replays on another subscription untouched and a Sonnet 5.5 block is dropped by the API with the request still succeeding; only signed
   compaction, container, file and encrypted server-tool state still pin a conversation); and a `NODE_OPTIONS` that only sizes the V8
-  heap (`--max-old-space-size=N`) is allowed in settings and the environment, where before any `NODE_OPTIONS` refused the launch. There is no fallback to a login on the box: a server that is down or out of quota is an
+  heap (`--max-old-space-size=N`) is allowed in settings and the environment, where before any `NODE_OPTIONS` refused the launch. From
+  `claude-master-d77d287` a refusal reaches the session in claude-master's own words (`claude-master: subscription NAME does not serve model M
+  (HTTP 404); ... Switch model with /model`) instead of the generic "Configured inference failed": a model only one subscription serves
+  stays with that subscription, and the message says which, so it is not mistaken for an outage. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
