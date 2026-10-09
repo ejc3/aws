@@ -656,8 +656,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   relayed again on later requests; a refusal with nothing upstream behind it is synthesized in Anthropic's shape with the type and status
   Anthropic would use (429 `rate_limit_error` with the unified headers and `retry-after` at the earliest reset when the pool is out of
   weekly quota, 404 `not_found_error` for a model the bound subscription does not serve, 400 for opaque state, 529 for a cooldown), so
-  Claude Code reacts as it would to Anthropic instead of retrying a generic 503. A model only one subscription serves stays with that
-  subscription. There is no fallback to a login on the box: a server that is down or out of quota is an
+  Claude Code reacts as it would to Anthropic instead of retrying a generic 503. From `claude-master-7934205` a failure benches
+  nothing: the scheduler underneath benched a subscription twelve hours for one 404, and two 404s Anthropic did not repeat took the
+  pool down twice on 2026-10-09 ("no auth available" for every Opus request until a restart). Only a used-up weekly quota (429) or a
+  dead login (401) moves work; every other failure is relayed and the next request goes to the same subscription. Each upstream error
+  is in the server log (type and message). A model only one subscription serves stays with that subscription. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
