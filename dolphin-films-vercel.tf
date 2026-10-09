@@ -93,13 +93,13 @@ ephemeral "aws_secretsmanager_secret_version" "dolphin_films_vercel_api_token" {
 
 # `team` is not set on the provider, as in vercel-cc-games.tf: each resource passes team_id.
 # With the gate empty no resource uses this provider, so it is never configured.
+# Terraform configures a provider that any resource block names, even with zero instances, and
+# the Vercel provider refuses to configure without a token ("Unable to find api_token": how
+# #298's first apply failed) or with one that is not shaped like a Vercel token ("Invalid
+# api_token"). A placeholder of that shape stands in until the gate names the container; the
+# provider sends a token only when it calls the API, and nothing calls it while the gate is empty.
 provider "vercel" {
-  alias = "dolphin_labs"
-  # Terraform configures a provider that any resource block names, even with zero instances, and
-  # the Vercel provider refuses to configure without a token ("Unable to find api_token": how
-  # #298's first apply failed) or with one that is not shaped like a Vercel token ("Invalid
-  # api_token"). A placeholder of that shape stands in until the gate names the container; the
-  # provider sends a token only when it calls the API, and nothing calls it while the gate is empty.
+  alias     = "dolphin_labs"
   api_token = coalesce(one(ephemeral.aws_secretsmanager_secret_version.dolphin_films_vercel_api_token[*].secret_string), "unsetunsetunsetunsetunse")
 }
 
