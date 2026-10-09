@@ -1,8 +1,8 @@
 # gpu-box.tf
 #
-# THE ON-DEMAND GPU BOX: one small NVIDIA instance for measuring browser games on real
-# graphics hardware. Every dev box renders WebGL in software (SwiftShader), which says
-# nothing about frame rate on a real GPU -- Colton Games' 36-player Starfall royale runs at
+# THE ON-DEMAND GPU BOXES: up to four small NVIDIA instances (slots 1-4) for measuring
+# browser games on real graphics hardware. Every dev box renders WebGL in software
+# (SwiftShader), which says nothing about frame rate on a real GPU -- Colton Games' 36-player Starfall royale runs at
 # ~0.1 fps there, and that number is useless for deciding whether it is playable.
 #
 # SAME SHAPE AS THE PARALLEL BOXES (parallel-box-launch.tf), deliberately: terraform owns
@@ -11,19 +11,30 @@
 # scripts/gpu-box.sh) with a tag-scoped policy. It is the same documented exception to
 # AGENTS.md rule 5, not a new one: the instance is ephemeral and never in state.
 #
-#   durable  (terraform): security group, launch template, IAM grant, watchdog entry
-#   ephemeral (gbox):     the instance and its disposable root disk
+#   durable  (terraform): security group, launch templates, IAM grant, watchdog entries
+#   ephemeral (gbox):     the instances and their disposable root disks
 #
 # THREE THINGS BOUND WHAT IT CAN COST, because every account on nextjs-dev has sudo and
 # the grant is therefore box-wide:
 #   1. the policy allows only the instance types in local.gpu_box_types (the smallest
-#      NVIDIA sizes, ~$0.5-1/hr on demand), only tagged Name=gpu-box, one template;
-#   2. parallel-box-watchdog.tf terminates it after 30 minutes below 5% CPU;
+#      NVIDIA sizes, ~$0.5-1/hr on demand), only the slot names in local.gpu_box_slots,
+#      only the slots' templates;
+#   2. parallel-box-watchdog.tf terminates each one after 30 minutes below 5% CPU;
 #   3. a hard lifetime of var.gpu_box_max_hours, enforced twice: the watchdog terminates
 #      it by LaunchTime (MAX_AGE_MINUTES), which nothing on the box can disarm, and the box
 #      arms its own shutdown -h timer as a backup, so even a busy runaway test ends.
 #
 # Nothing on it persists. Tests copy their build in over SSH, run, and copy results out.
+#
+# FOUR SLOTS, so several projects' GPU jobs stop queueing behind one box. Each slot is its own
+# box with its own Name tag -- slot 1 keeps the original "gpu-box", slots 2-4 are "gpu-box-2"
+# .. "gpu-box-4" -- and its own launch template of the same name, exactly as the parallel
+# boxes do it (one template per box, the Name baked into the template's tags). gbox therefore
+# never passes a tag at launch: the template writes it, and the grant below accepts exactly
+# these names, so `gbox up 3` needs no wider tagging right than `gbox up` does. Everything
+# that bounds the cost is per box and keyed on the same names: the watchdog finds, idles out
+# and lifetime-caps each one, and `gbox down N` terminates only the instances tagged with
+# slot N's name.
 
 variable "gpu_box_ami" {
   description = "AWS Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04), x86_64, us-west-2. The NVIDIA driver is preinstalled."
@@ -38,7 +49,13 @@ variable "gpu_box_max_hours" {
 }
 
 locals {
-  gpu_box_name = "gpu-box"
+  # Slot 1 keeps the original name, so every existing `gbox` caller and the box already
+  # running are untouched; the others are suffixed, as parallel-box-2 is.
+  gpu_box_name  = "gpu-box"
+  gpu_box_slots = { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" }
+  gpu_box_names = [for k in sort(keys(local.gpu_box_slots)) : local.gpu_box_slots[k]]
+
+  gpu_box_template_arns = [for k in sort(keys(local.gpu_box_slots)) : aws_launch_template.gpu_box[k].arn]
 
   # The tag keys the launch template writes, per created resource. IAM evaluates
   # aws:TagKeys for each resource of a RunInstances call separately (the untagged-ENI trap
@@ -112,12 +129,14 @@ resource "aws_security_group" "gpu_box" {
 
 # The whole launch configuration except two things gbox supplies at launch: the instance
 # type and the subnet, because capacity is the part terraform cannot know. Neither is a
-# free choice -- the IAM policy pins both to the lists above, and requires THIS template.
+# free choice -- the IAM policy pins both to the lists above, and requires one of THESE
+# templates. One template per slot, identical but for the Name it writes.
 # IAM cannot pin the template's user_data, shutdown behaviour or termination protection
 # against a launch-time override; the watchdog's LaunchTime lifetime is what bounds those.
 resource "aws_launch_template" "gpu_box" {
   provider               = aws.west2
-  name                   = local.gpu_box_name
+  for_each               = local.gpu_box_slots
+  name                   = each.value
   image_id               = var.gpu_box_ami
   update_default_version = true
 
@@ -153,7 +172,7 @@ resource "aws_launch_template" "gpu_box" {
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name    = local.gpu_box_name
+      Name    = each.value
       Purpose = "on-demand GPU browser performance tests"
     }
   }
@@ -161,7 +180,7 @@ resource "aws_launch_template" "gpu_box" {
   tag_specifications {
     resource_type = "volume"
     tags = {
-      Name = local.gpu_box_name
+      Name = each.value
       Role = "root"
     }
   }
@@ -169,11 +188,11 @@ resource "aws_launch_template" "gpu_box" {
   tag_specifications {
     resource_type = "network-interface"
     tags = {
-      Name = local.gpu_box_name
+      Name = each.value
     }
   }
 
-  tags = { Name = local.gpu_box_name }
+  tags = { Name = each.value }
 
   user_data = base64encode(<<-INIT
     #!/bin/bash
@@ -183,7 +202,7 @@ resource "aws_launch_template" "gpu_box" {
     # With the template's shutdown behaviour this terminates the instance. It is only a
     # backup: user_data runs once, so a reboot disarms it; the watchdog's LaunchTime check
     # (parallel-box-watchdog.tf MAX_AGE_MINUTES) is the lifetime that always holds.
-    shutdown -h +${var.gpu_box_max_hours * 60} "gpu-box lifetime (${var.gpu_box_max_hours} h) reached"
+    shutdown -h +${var.gpu_box_max_hours * 60} "${each.value} lifetime (${var.gpu_box_max_hours} h) reached"
 
     # Authorize the dev-hop key (dev-hop-key.tf), the only key nextjs-dev holds that
     # reaches another host -- exactly as the parallel boxes do.
@@ -201,22 +220,28 @@ resource "aws_launch_template" "gpu_box" {
   )
 }
 
+# The single template that existed before the slots is slot 1's, under the same name.
+moved {
+  from = aws_launch_template.gpu_box
+  to   = aws_launch_template.gpu_box["1"]
+}
+
 # ---------------------------------------------------------------------------------
-# What nextjs-dev may do: launch this one tagged box from this one template, in one of
-# four subnets, as one of four small GPU types -- and terminate it. The statement split
+# What nextjs-dev may do: launch the four tagged slot boxes from their four templates, in one
+# of four subnets, as one of four small GPU types -- and terminate them. The statement split
 # follows parallel-box-launch.tf and exists for the same reason: a condition only holds
 # for the resources that carry the key it tests, so created resources, the instance's
 # type, and referenced resources each need their own statement.
 # ---------------------------------------------------------------------------------
 data "aws_iam_policy_document" "gpu_box_control" {
-  # EVERY RunInstances statement below requires this template. The role also holds the
-  # parallel boxes' grant (parallel-box-launch.tf), and IAM checks each resource of a call
+  # EVERY RunInstances statement below requires one of these templates. The role also holds
+  # the parallel boxes' grant (parallel-box-launch.tf), and IAM checks each resource of a call
   # against the union of both, so without the pin a template-less call could mix this
   # policy's AMI and subnets with that one's tags, PassRole or security group. The
   # parallel-box statements carry the mirror-image pin.
 
-  # The instance: tagged gpu-box, one of the allowed types, default tenancy, IMDSv2, no
-  # instance profile, only the template's own tag keys. ec2:InstanceType and friends exist
+  # The instance: tagged with a slot's name, one of the allowed types, default tenancy,
+  # IMDSv2, no instance profile, only the template's own tag keys. ec2:InstanceType and friends exist
   # only on the instance resource, so they cannot share a statement with the volume/ENI.
   statement {
     sid       = "RunGpuBoxInstanceOnly"
@@ -227,13 +252,13 @@ data "aws_iam_policy_document" "gpu_box_control" {
     condition {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.gpu_box.arn]
+      values   = local.gpu_box_template_arns
     }
 
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/Name"
-      values   = [local.gpu_box_name]
+      values   = local.gpu_box_names
     }
 
     condition {
@@ -280,13 +305,13 @@ data "aws_iam_policy_document" "gpu_box_control" {
     condition {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.gpu_box.arn]
+      values   = local.gpu_box_template_arns
     }
 
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/Name"
-      values   = [local.gpu_box_name]
+      values   = local.gpu_box_names
     }
 
     condition {
@@ -314,7 +339,7 @@ data "aws_iam_policy_document" "gpu_box_control" {
     }
   }
 
-  # Its ENI: tagged gpu-box.
+  # Its ENI: tagged with a slot's name.
   statement {
     sid       = "RunGpuBoxEni"
     effect    = "Allow"
@@ -324,13 +349,13 @@ data "aws_iam_policy_document" "gpu_box_control" {
     condition {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.gpu_box.arn]
+      values   = local.gpu_box_template_arns
     }
 
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/Name"
-      values   = [local.gpu_box_name]
+      values   = local.gpu_box_names
     }
 
     condition {
@@ -341,7 +366,7 @@ data "aws_iam_policy_document" "gpu_box_control" {
   }
 
   # What the call references, pinned to exact ARNs: this AMI, these subnets, this
-  # security group, this template. No key pair (the key arrives through user_data) and
+  # security group, these templates. No key pair (the key arrives through user_data) and
   # no instance profile.
   statement {
     sid     = "RunGpuBoxReferencedResources"
@@ -351,15 +376,15 @@ data "aws_iam_policy_document" "gpu_box_control" {
       [
         "arn:aws:ec2:us-west-2::image/${var.gpu_box_ami}",
         "arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:security-group/${aws_security_group.gpu_box.id}",
-        aws_launch_template.gpu_box.arn,
       ],
+      local.gpu_box_template_arns,
       [for s in local.gpu_box_subnets : "arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:subnet/${s}"],
     )
 
     condition {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.gpu_box.arn]
+      values   = local.gpu_box_template_arns
     }
   }
 
@@ -392,7 +417,7 @@ data "aws_iam_policy_document" "gpu_box_control" {
     condition {
       test     = "StringEquals"
       variable = "ec2:ResourceTag/Name"
-      values   = [local.gpu_box_name]
+      values   = local.gpu_box_names
     }
   }
 
@@ -414,15 +439,15 @@ data "aws_iam_policy_document" "gpu_box_control" {
 
 # The shared Next.js box, where the games and their browser tests live. As with the
 # parallel boxes, an instance-role grant reaches every account there (they all have
-# sudo); the bounds above -- four types, one tag, the watchdog, the lifetime -- are what
-# make that acceptable.
+# sudo); the bounds above -- four types, four slot tags, the watchdog, the lifetime -- are
+# what make that acceptable.
 #
 # A MANAGED policy, not inline: a role's inline policies share one 10,240-character limit
 # (nextjs-dev-role's use roughly 6.6K of it today), and this grant would take most of what
 # is left. A managed policy has its own 6,144-character budget.
 resource "aws_iam_policy" "gpu_box_control" {
   name        = "gpu-box-control"
-  description = "nextjs-dev: launch and terminate the tagged on-demand GPU test box (gpu-box.tf)"
+  description = "nextjs-dev: launch and terminate the tagged on-demand GPU test boxes (gpu-box.tf)"
   policy      = data.aws_iam_policy_document.gpu_box_control.json
 }
 
@@ -431,7 +456,7 @@ resource "aws_iam_role_policy_attachment" "nextjs_dev_gpu_box" {
   policy_arn = aws_iam_policy.gpu_box_control.arn
 }
 
-output "gpu_box_launch_template" {
-  description = "Launch template gbox runs the GPU test box from (terraform owns the config; gbox picks type and subnet)"
-  value       = aws_launch_template.gpu_box.name
+output "gpu_box_launch_templates" {
+  description = "Launch template per gbox slot (terraform owns the config; gbox picks type and subnet)"
+  value       = { for k, lt in aws_launch_template.gpu_box : k => lt.name }
 }
