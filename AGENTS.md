@@ -651,9 +651,13 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   replays on another subscription untouched and a Sonnet 5.5 block is dropped by the API with the request still succeeding; only signed
   compaction, container, file and encrypted server-tool state still pin a conversation); and a `NODE_OPTIONS` that only sizes the V8
   heap (`--max-old-space-size=N`) is allowed in settings and the environment, where before any `NODE_OPTIONS` refused the launch. From
-  `claude-master-d77d287` a refusal reaches the session in claude-master's own words (`claude-master: subscription NAME does not serve model M
-  (HTTP 404); ... Switch model with /model`) instead of the generic "Configured inference failed": a model only one subscription serves
-  stays with that subscription, and the message says which, so it is not mistaken for an outage. There is no fallback to a login on the box: a server that is down or out of quota is an
+  `claude-master-c366cea` errors reach the session exactly as Anthropic sent them (status, body, `request-id`, `retry-after`,
+  `anthropic-ratelimit-*`), including after a retry and a refusal, and a bound subscription's last upstream error for that model is
+  relayed again on later requests; a refusal with nothing upstream behind it is synthesized in Anthropic's shape with the type and status
+  Anthropic would use (429 `rate_limit_error` with the unified headers and `retry-after` at the earliest reset when the pool is out of
+  weekly quota, 404 `not_found_error` for a model the bound subscription does not serve, 400 for opaque state, 529 for a cooldown), so
+  Claude Code reacts as it would to Anthropic instead of retrying a generic 503. A model only one subscription serves stays with that
+  subscription. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
