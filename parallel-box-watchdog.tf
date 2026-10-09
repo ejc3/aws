@@ -40,8 +40,8 @@ import os, json, datetime, boto3
 
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
-# Comma-separated: both parallel boxes (parallel-box2.tf) and the GPU test box
-# (gpu-box.tf) share this one watchdog.
+# Comma-separated: both parallel boxes (parallel-box2.tf) and the GPU test boxes' four
+# slots (gpu-box.tf) share this one watchdog.
 TAG_NAMES    = os.environ.get("TAG_NAMES", "parallel-box").split(",")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
 # The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
@@ -128,8 +128,9 @@ def lambda_handler(event, context):
             results.append({"id": iid, "action": "busy", "peak_cpu": round(peak, 1)})
             continue
 
-        if name == "gpu-box":
-            up_cmd = "gbox up"
+        if name.startswith("gpu-box"):
+            # gpu-box is slot 1; gpu-box-N is slot N.
+            up_cmd = "gbox up" + ("" if name == "gpu-box" else " " + name.rsplit("-", 1)[1])
             kept = "Nothing on it persists"
         else:
             up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
@@ -155,6 +156,12 @@ def lambda_handler(event, context):
     print(json.dumps(results))
     return {"checked": len(instances), "results": results}
   PY
+}
+
+# Every box this watchdog reaps, by exact Name tag: what it describes (TAG_NAMES) and what its
+# role may terminate are the same list, so a new GPU slot cannot be found but unkillable.
+locals {
+  parallel_watchdog_tag_names = concat(["parallel-box", "parallel-box-2"], local.gpu_box_names)
 }
 
 data "archive_file" "parallel_watchdog" {
@@ -198,14 +205,14 @@ resource "aws_iam_role_policy" "parallel_watchdog" {
         Resource = "*"
       },
       {
-        # Scoped by tag so this role can only ever terminate the parallel boxes, never a
-        # dev box or the jumpbox. Explicit list, not a wildcard, so nothing else that
-        # happens to share the prefix can ever match.
+        # Scoped by tag so this role can only ever terminate the parallel boxes and the GPU
+        # boxes, never a dev box or the jumpbox. Explicit list, not a wildcard, so nothing
+        # else that happens to share a prefix can ever match.
         Effect   = "Allow"
         Action   = "ec2:TerminateInstances"
         Resource = "*"
         Condition = {
-          StringEquals = { "ec2:ResourceTag/Name" = ["parallel-box", "parallel-box-2", "gpu-box"] }
+          StringEquals = { "ec2:ResourceTag/Name" = local.parallel_watchdog_tag_names }
         }
       },
       {
@@ -231,9 +238,10 @@ resource "aws_lambda_function" "parallel_watchdog" {
     variables = {
       IDLE_MINUTES = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT = tostring(var.parallel_box_idle_cpu_pct)
-      TAG_NAMES    = "parallel-box,parallel-box-2,gpu-box"
-      # gpu-box.tf's hard lifetime; the parallel boxes have none (a long job is their point).
-      MAX_AGE_MINUTES = jsonencode({ "gpu-box" = var.gpu_box_max_hours * 60 })
+      TAG_NAMES    = join(",", local.parallel_watchdog_tag_names)
+      # gpu-box.tf's hard lifetime, the same for every slot; the parallel boxes have none (a
+      # long job is their point).
+      MAX_AGE_MINUTES = jsonencode({ for n in local.gpu_box_names : n => var.gpu_box_max_hours * 60 })
       SNS_REGION      = var.aws_region
       SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }

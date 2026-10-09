@@ -306,7 +306,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.xlarge` | 400 GB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d` or `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
-| `gpu-box` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Launched from `nextjs-dev` with `gbox`; terminates after 30 idle minutes or 4 hours, whichever comes first. |
+| `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
@@ -684,26 +684,31 @@ terminating a box in the middle of a live job.
 
 ## On-demand GPU box
 
-One small NVIDIA instance for measuring browser games on real graphics hardware; every dev
-box renders WebGL in software. From `nextjs-dev`:
+Small NVIDIA instances for measuring browser games on real graphics hardware; every dev
+box renders WebGL in software. There are four independent slots, so four GPU jobs can run
+at once. Slot 1 is `gpu-box` and is what every command means without a slot; slot N (2-4) is
+`gpu-box-N`. From `nextjs-dev`:
 
 ```bash
-gbox up        # launch from its launch template: tries g4dn.xlarge, g5.xlarge, g6.xlarge,
-               # g4dn.2xlarge in each us-west-2 AZ until one has capacity
-gbox status    # type, GPU, and its on-box shutdown timer
-gbox ssh
-gbox down      # terminate; nothing on it persists
+gbox up [N]       # launch slot N from its launch template: tries g4dn.xlarge, g5.xlarge,
+                  # g6.xlarge, g4dn.2xlarge in each us-west-2 AZ until one has capacity
+gbox status [N]   # type, GPU, and its on-box shutdown timer
+gbox status all   # every slot
+gbox ssh [N]
+gbox ip [N]
+gbox down [N]     # terminate that slot only; nothing on it persists
 ```
 
-Terraform owns the launch template, the security group (SSH in from `nextjs-dev`'s Elastic
+Each slot has its own launch template of the same name, which writes the slot's `Name` tag, so
+`gbox` never tags anything itself. Terraform owns the four launch templates, the security group (SSH in from `nextjs-dev`'s Elastic
 IP only; out only to web, DNS and NTP, so the box cannot reach the fleet's NFS scratch) and the
 tag-scoped managed policy `gpu-box-control` on `nextjs-dev-role`; the instance is never in
-state. The grant launches only this template, only those four types, only the template's root
-disk shape, and only terminates the tagged box. It costs money only while it runs: the
+state. The grant launches only these templates, only those four types, only the template's root
+disk shape, and only terminates the four tagged slots. Each costs money only while it runs: the
 parallel-box watchdog terminates it after 30 minutes below 5% CPU and at `gpu_box_max_hours`
-(4) from launch, and the box arms its own shutdown timer as a backup. The account needs at least
-8 vCPUs of the us-west-2 "Running On-Demand G and VT instances" quota (`L-DB2E81BA`) for the
-largest type.
+(4) from launch, and the box arms its own shutdown timer as a backup. All slots share the
+us-west-2 "Running On-Demand G and VT instances" quota (`L-DB2E81BA`): four `g4dn.xlarge`
+need 16 vCPUs, and 32 covers four of the largest type (`g4dn.2xlarge`).
 
 ## Temporary EBS for agents
 
