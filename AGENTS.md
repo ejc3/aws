@@ -1030,21 +1030,28 @@ that production and non-production share nothing:
   --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
   Never onto a command line, into a file in a repo or a commit.
 - `dolphin-films/prod/auth` and `dolphin-films/prod/turso`: production. Admins only; a dev box gets
-  `AccessDeniedException`, on purpose. The Vercel project's Production environment is set from them by hand.
+  `AccessDeniedException`, on purpose. Terraform writes the Vercel project's Production environment from them
+  (`dolphin-films-vercel.tf`); never set one of those names by hand in Vercel, or the next apply fails.
 - Turso has two kinds of credential. `turso/api-token` (above) is the account's platform token: it makes and
   deletes databases and mints their tokens, and the site never gets it. `TURSO_DATABASE_URL` and
   `TURSO_AUTH_TOKEN` are one database's address and a token for that database alone; those are the site's.
   One database per environment, made once with the platform token from a metal box. When you mint a pair,
   write it to a 0600 JSON file for an administrator to put and never print it: a dev box cannot write a
   container. The site applies its own migrations when it deploys.
-- `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, are in no secret. The
-  owner sets them in the hosting project. Never write an address into a file, a test, a commit or a pull
-  request here.
+- `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, are the `dolphin_films`
+  key of `people/addresses` (`people.tf`); Terraform writes them with their environment's auth secret. Never
+  write an address into a file, a test, a commit or a pull request here.
+- `dolphin_films_vercel_ready` (`dolphin-films-vercel.tf`) names the containers Terraform reads. It is a
+  committed default, never a `-var`: a plan without the flag would propose deleting every variable.
 - The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
   `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
   (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.
-- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`. Terraform never
-  reads these secrets, so no value reaches state.
+- Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`.
+- State: once `dolphin_films_vercel_ready` names a container, Terraform reads it and writes its values into
+  Vercel, so those values, the address lists and the dolphin-labs token's use are in Terraform state, as
+  colton-games' accounts are (`colton-games-accounts.tf`). State is readable by administration only, the same
+  boundary as the containers. Terraform is pinned to 1.10.3, so write-only arguments (1.11) are not
+  available. While the gate is empty nothing is read and nothing reaches state.
 - CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
 ### Sites also deploying to Cloudflare Workers (staging copies)

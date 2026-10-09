@@ -139,6 +139,9 @@ jobs:
       - name: dolphin-films credentials (production for administration only, non-production for the metal dev role)
         run: python3 -S -B scripts/test-dolphin-films.py
 
+      - name: dolphin-films Vercel environment (written by Terraform, behind a gate, a token of its own)
+        run: python3 -S -B scripts/test-dolphin-films-vercel.py
+
       - name: Windows playtest box (dev-box-only access, no peer route, kept game disk, 1h idle stop)
         run: python3 -S -B scripts/test-wbox.py
       - name: codex-restart (running vs installed, refuses over running commands, restarts only stale daemons)
