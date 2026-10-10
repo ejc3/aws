@@ -745,18 +745,16 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and four taken from
   the log: `claude-master-CredentialRejected` (a subscription's login expired or was revoked: redo it with
   `scripts/claude-master-login.sh --server`), `claude-master-NoAccountAvailable` (clients are being
-  refused), `claude-master-UnlistedRoute` and `claude-master-BlockedRoute`. Since `claude-master-d8d4aed`
-  an Anthropic route claude-master does not list is passed through on the session's own login when
-  it is in Claude Code's control plane (`/v1/code/...`), claude.ai's `/api/...` or the MCP registry, and refused
-  when it may spend tokens (the rest of `/v1`, other versions, anything naming messages, completions,
-  generation, batches or agent proxying). UnlistedRoute is the review queue (nothing broke: list the route in
-  `proxyControlPath`, or block it); BlockedRoute means a session may be failing on a refused route. Each route
-  shape is logged once per server process, so an unreviewed route fires again after a rollout.
-  `claude-master-1910e02` lists every non-inference route Claude Code 2.1.296 carries (reviewed from the binary's
-  own endpoint strings), which also made claude.ai MCP connectors, skills and the rest under `/v1` work for pooled
-  sessions for the first time; `/v1/messages/cache_touch` stays closed until the pool serves it on the
-  conversation's own subscription. To review a new Claude Code release before sessions relaunch on it, diff its
-  `strings` for `"/api/`, `"/v1/` and `"/mcp-registry/` paths against `proxyControlPath`. The agent's IAM grant can publish to the one namespace and write the one log group.
+  refused) and `claude-master-UnlistedRoute`. Routing is compatibility first (owner, 2026-10-10: "our primary goal
+  is compatibility and seamlessness, not pedantry"): from `claude-master-5b83ce9` inference (`POST /v1/messages`,
+  `/v1/messages/count_tokens`) goes to the pool and every other Anthropic route goes to Anthropic unchanged, on the
+  session's own login, exactly as Claude Code sends it without claude-master; only ambiguous or encoded paths (400)
+  and the pool's own routes with the wrong method (405) are refused. Each refusal before this broke sessions
+  (WebFetch's domain check; 2.1.296's `/api/hello`, which stopped every interactive start; claude.ai MCP connectors).
+  UnlistedRoute is a review queue, not an outage: the route already works; list it in `proxyControlPath` once
+  reviewed. Each route shape is logged once per server process, so an unreviewed route fires again after a rollout.
+  To review a new Claude Code release, diff its `strings` for `"/api/`, `"/v1/` and `"/mcp-registry/` paths
+  against `proxyControlPath`. The agent's IAM grant can publish to the one namespace and write the one log group.
 - **Dashboard** `claude-master` (`claude-master-dashboard.tf`): requests by user, subscription, box, model and
   outcome; latency percentiles, Anthropic's first-byte time against claude-master's own overhead; each
   subscription's allowance, resets and Anthropic's own utilization; switches, rate limits, API-backup use;
