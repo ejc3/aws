@@ -831,6 +831,17 @@ class EnvoyTests(unittest.TestCase):
         self.assertLess(stop_legacy, back)
         self.assertLess(back, remove)  # the pre-Envoy unit is kept until Envoy listens
 
+    def test_a_failed_switch_points_envoy_back_at_the_recorded_color(self):
+        # If Envoy does not report the new endpoints, the record and Envoy must agree again before the rollout
+        # fails, or a retry would restart the server that is taking traffic.
+        r = rollout()
+        failed = r[r.index('if [ "$switched" != 1 ]; then'):r.index('echo "$next" > /etc/claude-master/active-color')]
+        back = failed.index('/usr/local/bin/claude-master-envoy-endpoints "$active"')
+        stop = failed.index('systemctl stop "claude-master-server@$next"')
+        self.assertLess(back, stop)
+        self.assertIn('grep -q "^cert::$IP:$(port_of "$active")::"', failed)
+        self.assertIn("exit 1", failed[stop:])
+
     def test_the_endpoint_files_are_replaced_by_a_rename(self):
         e = TF[TF.index("cat > /usr/local/bin/claude-master-envoy-endpoints"):TF.index("chmod 0755 /usr/local/bin/claude-master-envoy-endpoints")]
         self.assertIn("tmp=$(mktemp /etc/envoy/eds/.$1.XXXXXX)", e)
