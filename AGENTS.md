@@ -603,8 +603,22 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `local.claude_master_tag` plus its sha256 in `claude-master-server.tf`; bump both together.
 - **Logins are interactive and belong to the server.** `scripts/claude-master-login.sh --server`
   drives the three paste-a-code logins; the service stays idle until all exist. Never copy a login
-  from another box. A running server is never restarted by a bootstrap (`claude-master-status`
-  shows running versus pinned); restarting it interrupts every connected session, so ask first.
+  from another box. Nothing on the box restarts a server or Envoy on its own; `claude-master-status` shows
+  running versus pinned.
+- **Restarts nobody notices: Envoy and blue/green** (`claude-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
+  version and sha256) listens on the client address and the tunnel's loopback port and passes TCP through,
+  unchanged, to one of two servers on the box, `claude-master-server@blue` or `@green`, each on its own port of
+  the same address (the server certificate names the address clients dial; the color ports are in no security
+  group). `sudo claude-master-rollout` (over SSM) starts the idle color, waits until it listens, points Envoy's
+  NEW connections at it (an endpoint file Envoy watches, replaced by a rename), checks Envoy's admin API reports
+  it, then stops the old color. The old one drains (`serve --balanced`): it keeps serving the connections it has,
+  every response closing its connection, so each client moves over on its next request without an error, and
+  running requests get up to `local.claude_master_drain_seconds` (the unit's stop timeout is a minute longer).
+  That is how a new binary goes live. Each color has its own `--instance` (metrics) and log file
+  (`server-blue.log`, `server-green.log`). Through Envoy, claude-master sees every connection come from the box
+  itself: a handshake failure's `remote=` no longer names the client box. The first rollout on a box from
+  before Envoy stops `claude-master-server.service` (it drains for 60 s), lets Envoy take the client port, and
+  starts the old server again if Envoy does not come up.
 - **Adding a client** (a new dev box, a Mac): `scripts/claude-master-enroll.sh NAME [--ssh HOST]`.
   The key is made on the client; only the request goes up. Signing runs on the server over SSM, so
   it is an AWS-authenticated action. Renewal is automatic (next bullet); the script swaps only after the
@@ -699,10 +713,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   capacity: one heavy account on a pool of three subscriptions drains it for everyone (see `claude-master-status` quotas).
 - **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
   re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
-  a running server; `claude-master-status` shows running versus pinned and a new binary takes effect when
-  the owner restarts the service.
+  a running server or Envoy; `claude-master-status` shows running versus pinned and a new binary takes
+  effect at the next `sudo claude-master-rollout`.
 - **Size.** t4g.micro with a 1GB swapfile. t4g.nano was tried first and was OOM-killed during its own first boot.
-- **Logs.** The proxy writes its own log (`/var/log/claude-master/server.log`, always `info`, rotated by
+- **Logs.** The proxy writes its own log (`/var/log/claude-master/server-<color>.log`, always `info`, rotated by
   the program at 20 MiB x 5, 0600) and the CloudWatch agent ships it to log group `/claude-master/server`
   (90 days). `info` says when something CHANGES: a conversation moved to another subscription (from, to,
   reason, both quotas), a profile rate limited or available again, a quota band crossed (ok / reserve at

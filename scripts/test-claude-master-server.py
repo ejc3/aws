@@ -70,8 +70,11 @@ class NetworkTests(unittest.TestCase):
         self.assertLess(bootstrap.index("fallocate -l 1G"), bootstrap.index("apt-get update"))
 
     def test_the_server_listens_on_its_private_address_never_everywhere(self):
-        self.assertIn("--listen ${local.claude_master_server_ip}:${local.claude_master_server_port}", TF)
+        # Each server listens on the private address (its own port); Envoy takes the client port on the same address.
+        self.assertIn("--listen ${local.claude_master_server_ip}:$port", TF)
+        self.assertIn('cert = "${local.claude_master_server_ip}:${local.claude_master_server_port}"', TF)
         self.assertNotRegex(TF, r"--listen\s+(0\.0\.0\.0|\[::\]|:)")
+        self.assertNotIn("0.0.0.0", envoy_config())
 
 
 class SupplyChainTests(unittest.TestCase):
@@ -83,8 +86,13 @@ class SupplyChainTests(unittest.TestCase):
         self.assertLess(TF.index("sha256sum -c -"), TF.index("mv -f /usr/local/bin/claude-master.new"))
 
     def test_a_running_server_is_never_restarted_by_the_bootstrap(self):
+        # The bootstrap writes claude-master-rollout (an operator tool, checked in EnvoyTests) but never runs it,
+        # never restarts or stops a server or Envoy, and only starts Envoy when it is not running.
         script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        script = script[:script.index("cat > /usr/local/bin/claude-master-rollout")] + script[script.index("chmod 0755 /usr/local/bin/claude-master-rollout"):]
         self.assertNotRegex(script, r"systemctl (restart|stop)")
+        self.assertNotRegex(script, r"\n\s*(sudo )?/usr/local/bin/claude-master-rollout|\n\s*claude-master-rollout")
+        self.assertIn("systemctl is-active --quiet envoy.service || systemctl start envoy.service", script)
         self.assertIn("keeps its old binary until it is restarted", script)
 
     def test_no_secret_is_in_the_source(self):
@@ -181,7 +189,7 @@ class AccountLabelsTests(unittest.TestCase):
             self.assertIn("keeping", out.stderr)
 
     def test_it_runs_as_root_before_each_start_and_can_never_stop_it(self):
-        unit = TF[TF.index("cat > /etc/systemd/system/claude-master-server.service"):]
+        unit = TF[TF.index("cat > /etc/systemd/system/claude-master-server@.service"):]
         unit = unit[:unit.index("\nEOF\n")]
         self.assertIn("ExecStartPre=-+/usr/local/bin/claude-master-account-labels", unit)
         self.assertLess(unit.index("ExecStartPre="), unit.index("ExecStart=/usr/local/bin/claude-master-serve"))
@@ -249,14 +257,15 @@ class ObservabilityTests(unittest.TestCase):
             if not l.rstrip().endswith("\\"):
                 break
         command = " ".join(logical)
-        for flag in ("--listen ${local.claude_master_server_ip}:${local.claude_master_server_port}", "--open-loopback 127.0.0.1:",
-                     "--state-dir /var/lib/claude-master/state", "--log-file /var/log/claude-master/server.log",
-                     "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels"):
+        for flag in ("--listen ${local.claude_master_server_ip}:$port", "--open-loopback 127.0.0.1:$open",
+                     "--state-dir /var/lib/claude-master/state", "--log-file /var/log/claude-master/server-$color.log",
+                     "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels",
+                     "--instance claude-master-$color", "$balancer"):
             self.assertIn(flag, command)
 
     def test_the_server_always_logs_at_info_to_a_rotated_file_it_may_write(self):
         wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
-        for flag in ("--log-level info", "--log-file /var/log/claude-master/server.log", "--log-max-mb 20", "--log-keep 5",
+        for flag in ("--log-level info", "--log-file /var/log/claude-master/server-$color.log", "--log-max-mb 20", "--log-keep 5",
                      "--quota-log-interval 5m", "--account-labels-file /etc/claude-master/account-labels"):
             self.assertIn(flag, wrapper)
         self.assertNotIn("--log-level debug", wrapper)
@@ -278,8 +287,16 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn("namespace           = local.claude_master_metrics_namespace", alarm)
 
     def test_the_agent_ships_the_exact_log_file_not_its_rotations(self):
-        self.assertIn('"file_path": "/var/log/claude-master/server.log"', TF)
+        # Every server's log (server-blue.log, server-green.log, and server-legacy.log before Envoy), never a
+        # rotation (server-blue.log.1): the pattern ends in .log.
+        import fnmatch
+        self.assertIn('"file_path": "/var/log/claude-master/server*.log"', TF)
         self.assertNotIn("server.log*", TF)
+        self.assertNotIn("server*.log*", TF)
+        for name in ("server-blue.log", "server-green.log", "server-legacy.log"):
+            self.assertTrue(fnmatch.fnmatch(name, "server*.log"), name)
+        for name in ("server-blue.log.1", "server-green.log.5"):
+            self.assertFalse(fnmatch.fnmatch(name, "server*.log"), name)
 
     def test_the_agent_is_reloaded_only_when_its_config_changed_and_the_server_is_never_touched(self):
         # Compared with the copy we keep: the agent moves the file it is given, so its own path never holds it.
@@ -438,10 +455,13 @@ class TunnelTests(unittest.TestCase):
     """The Macs' path: an outbound Cloudflare tunnel to a LOOPBACK-only open listener."""
 
     def test_the_open_listener_is_loopback_only_and_never_in_a_security_group(self):
-        self.assertIn("--open-loopback 127.0.0.1:${local.claude_master_open_port}", TF)
+        # Envoy takes the tunnel's port on loopback; each server's open listener is on loopback too.
+        self.assertIn('open = "127.0.0.1:${local.claude_master_open_port}"', TF)
+        self.assertIn("--open-loopback 127.0.0.1:$open", TF)
         self.assertNotRegex(TF, r"--open-loopback\s+(0\.0\.0\.0|\$\{local\.claude_master_server_ip\})")
         sg = block("aws_security_group", "claude_master_server")
         self.assertNotIn("claude_master_open_port", sg)
+        self.assertNotIn("claude_master_colors", sg)
 
     def test_the_tunnel_forwards_to_loopback_over_tcp(self):
         cfg = tblock("cloudflare_zero_trust_tunnel_cloudflared_config", "claude_master")
@@ -591,8 +611,9 @@ class ScriptTests(unittest.TestCase):
     def test_the_login_script_drives_the_server_and_never_restarts_a_running_one(self):
         self.assertIn("--server", LOGIN)
         self.assertIn("sudo claude-master-login", LOGIN)
-        self.assertIn("!= active", LOGIN)
-        self.assertNotRegex(LOGIN, r"systemctl restart")
+        # It starts the pool (through the rollout) only when no server is running; it never restarts one.
+        self.assertIn("! sudo claude-master-status | grep -q '^server: active'; then sudo claude-master-rollout", LOGIN)
+        self.assertNotRegex(LOGIN, r"systemctl (restart|start)")
 
     def test_enrollment_as_an_account_carries_awkward_commands_and_stdin_through_ssh_and_sudo_intact(self):
         # Runs the real on_target function with ssh and sudo stubbed: ssh executes its last argument (the remote command
@@ -735,6 +756,90 @@ class ScriptTests(unittest.TestCase):
             r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / path)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
+
+
+def envoy_config():
+    return TF[TF.index("cat > /etc/envoy/envoy.yaml <<'EOF'"):TF.index("\nEOF\n", TF.index("cat > /etc/envoy/envoy.yaml"))]
+
+
+def rollout():
+    return TF[TF.index("cat > /usr/local/bin/claude-master-rollout"):TF.index("chmod 0755 /usr/local/bin/claude-master-rollout")]
+
+
+class EnvoyTests(unittest.TestCase):
+    """Envoy in front of two servers on the box, so a rollout drains instead of cutting sessions."""
+
+    def test_envoy_is_pinned_and_checked_before_it_is_installed(self):
+        self.assertRegex(TF, r'claude_master_envoy_version\s+=\s+"[0-9]+\.[0-9]+\.[0-9]+"')
+        self.assertRegex(TF, r'claude_master_envoy_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
+        self.assertIn("github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-aarch_64", TF)
+        check = 'echo "$ENVOY_SHA  /tmp/envoy.new" | sha256sum -c -'
+        self.assertIn(check, TF)
+        self.assertLess(TF.index(check), TF.index("mv -f /usr/local/bin/envoy.new /usr/local/bin/envoy"))
+
+    def test_envoy_only_passes_tcp_through_and_its_admin_stays_on_loopback(self):
+        cfg = envoy_config()
+        self.assertIn("envoy.filters.network.tcp_proxy", cfg)
+        for forbidden in ("http_connection_manager", "transport_socket", "tls_context", "0.0.0.0"):
+            self.assertNotIn(forbidden, cfg)
+        self.assertIn("admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }", cfg)
+        self.assertIn("watched_directory: { path: /etc/envoy/eds }", cfg)
+        self.assertIn("max_active_downstream_connections", cfg)
+        unit = TF[TF.index("cat > /etc/systemd/system/envoy.service"):]
+        unit = unit[:unit.index("\nEOF\n")]
+        self.assertIn("User=envoy", unit)
+        self.assertIn("--disable-hot-restart", unit)
+
+    def test_the_color_ports_are_never_in_the_security_group(self):
+        sg = block("aws_security_group", "claude_master_server")
+        colors = re.search(r"claude_master_colors = \{(.*?)\n  \}", TF, re.S).group(1)
+        for port in re.findall(r"port\s*=\s*([0-9]+)", colors):
+            self.assertNotIn(port, sg)
+        self.assertNotIn("claude_master_colors", sg)
+
+    def test_a_server_may_drain_for_the_whole_drain_timeout(self):
+        self.assertIn('balancer="--balanced --drain-timeout ${local.claude_master_drain_seconds}s"', TF)
+        self.assertIn("TimeoutStopSec=${local.claude_master_drain_seconds + 60}", TF)
+        self.assertRegex(TF, r"claude_master_drain_seconds = [0-9]+")
+
+    def test_the_rollout_switches_only_after_the_new_server_listens_and_stops_the_old_only_after_envoy_switched(self):
+        r = rollout()
+        start = r.index('systemctl restart "claude-master-server@$next"')
+        refused = r.index("nothing was switched")
+        switch = r.index('/usr/local/bin/claude-master-envoy-endpoints "$next"')
+        verified = r.index("Envoy did not report")
+        record = r.index('echo "$next" > /etc/claude-master/active-color')
+        stop = r.index('systemctl stop --no-block "claude-master-server@$active"')
+        self.assertLess(start, refused)
+        self.assertLess(refused, switch)
+        self.assertLess(switch, verified)
+        self.assertLess(verified, record)
+        self.assertLess(record, stop)
+        # Envoy is never restarted or reloaded; it is stopped in one place only: when it never came up during the
+        # first rollout, so the pre-Envoy server can have its port back.
+        self.assertNotRegex(r, r"systemctl (restart|reload) envoy")
+        self.assertEqual(r.count("systemctl stop envoy"), 1)
+        self.assertLess(r.index("Envoy did not start listening"), r.index("systemctl stop envoy"))
+
+    def test_the_first_rollout_never_leaves_clients_without_a_listener(self):
+        r = rollout()
+        validate = r.index("/usr/local/bin/envoy --mode validate -c /etc/envoy/envoy.yaml")
+        stop_legacy = r.index("systemctl stop claude-master-server.service")
+        back = r.index("systemctl start claude-master-server.service")
+        remove = r.index("rm -f /etc/systemd/system/claude-master-server.service")
+        self.assertLess(validate, stop_legacy)
+        self.assertLess(stop_legacy, back)
+        self.assertLess(back, remove)  # the pre-Envoy unit is kept until Envoy listens
+
+    def test_the_endpoint_files_are_replaced_by_a_rename(self):
+        e = TF[TF.index("cat > /usr/local/bin/claude-master-envoy-endpoints"):TF.index("chmod 0755 /usr/local/bin/claude-master-envoy-endpoints")]
+        self.assertIn("tmp=$(mktemp /etc/envoy/eds/.$1.XXXXXX)", e)
+        self.assertIn('mv -f "$tmp" "/etc/envoy/eds/$1.yaml"', e)
+
+    def test_without_a_color_the_server_is_the_one_from_before_envoy(self):
+        serve = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        self.assertIn("color=$${1:-legacy}", serve)
+        self.assertIn('legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;', serve)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
