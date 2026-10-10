@@ -52,8 +52,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-82404b3"
-  claude_master_sha256_aarch64 = "00d916c5dd2b4881984f6ad5e2cad384b37c8dc022c37324fcb061b7a29c4193"
+  claude_master_tag            = "claude-master-95551d3"
+  claude_master_sha256_aarch64 = "64fdfcd553585ce58093fb7d0b5e65870ea557acd216b03413c22c147f2a9285"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -218,10 +218,10 @@ resource "aws_cloudwatch_log_group" "claude_master_server" {
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
 #     --secret-string file://labels.txt && shred -u labels.txt
 #
-# then restart the server when its sessions can be interrupted (`sudo systemctl restart claude-master-server`
-# over SSM): claude-master reads the file only when it starts. A value with any other kind of line is refused
-# and the old file kept, because claude-master refuses to start on a bad line. Never write a UUID or a name
-# into this repository.
+# and nothing else: a timer on the box (claude-master-account-labels.timer, every 10 minutes) rewrites the file
+# when the secret changed, and the running server reloads it within a minute, with no restart. A value with any
+# other kind of line is refused and the old file kept, because claude-master refuses to start on a bad line.
+# Never write a UUID or a name into this repository.
 resource "aws_secretsmanager_secret" "claude_master_account_labels" {
   count                   = var.enable_claude_master_server ? 1 : 0
   name                    = "claude-master/account-labels"
@@ -349,9 +349,10 @@ fi
 chown root:claude-master /etc/claude-master/account-labels
 chmod 0640 /etc/claude-master/account-labels
 
-# Run by systemd as root before each start (ExecStartPre=-+ in the unit), because claude-master reads the
-# file only when it starts. It never stops the start: without a value, when the secret cannot be read, or
-# when a line is not `ACCOUNT_UUID=NAME` (on which claude-master would refuse to start), the file is kept.
+# Run by systemd as root before each start (ExecStartPre=-+ in the unit) and every 10 minutes by its timer;
+# the running server reloads the file when it changes. It never stops a start: without a value, when the
+# secret cannot be read, or when a line is not `ACCOUNT_UUID=NAME` (on which claude-master would refuse to
+# start), the file is kept. An unchanged value leaves the file alone, so the server does not reload for nothing.
 cat > /usr/local/bin/claude-master-account-labels <<'EOF'
 #!/bin/bash
 set -u
@@ -368,7 +369,9 @@ if printf '%s\n' "$value" | grep -qvE '^[[:space:]]*(#.*)?$|^[[:space:]]*[0-9A-F
   exit 0
 fi
 tmp=$(mktemp /etc/claude-master/.account-labels.XXXXXX) || { echo "claude-master-account-labels: cannot write in /etc/claude-master; keeping $file" >&2; exit 0; }
-if printf '%s\n' "$value" > "$tmp" && chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$file"; then
+if ! printf '%s\n' "$value" > "$tmp"; then rm -f "$tmp"; echo "claude-master-account-labels: could not write; keeping $file" >&2; exit 0; fi
+if cmp -s "$tmp" "$file"; then rm -f "$tmp"; exit 0; fi
+if chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$file"; then
   echo "claude-master-account-labels: $file written with $(grep -cvE '^[[:space:]]*(#.*)?$' "$file") names" >&2
 else
   rm -f "$tmp"
@@ -419,7 +422,30 @@ ProtectControlGroups=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+# The names follow the secret on their own: the timer rewrites the file when the secret changed, and the
+# running server reloads it. Nothing is restarted.
+cat > /etc/systemd/system/claude-master-account-labels.service <<'EOF'
+[Unit]
+Description=Refresh claude-master's account labels from Secrets Manager (the running server reloads the file)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-master-account-labels
+EOF
+cat > /etc/systemd/system/claude-master-account-labels.timer <<'EOF'
+[Unit]
+Description=Refresh claude-master's account labels every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
 systemctl daemon-reload
+systemctl enable --now claude-master-account-labels.timer >/dev/null 2>&1 || echo "WARNING: claude-master-account-labels.timer not enabled"
 
 # ---------------------------------------------------------------- Envoy (rolling restarts)
 ENVOY_VERSION='${local.claude_master_envoy_version}'
