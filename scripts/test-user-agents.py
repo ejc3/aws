@@ -127,13 +127,19 @@ class SeederTests(unittest.TestCase):
 
 
 class TextTests(unittest.TestCase):
-    def test_the_file_is_a_one_line_title_and_one_paragraph(self):
-        lines = TEXT.read_text().split("\n")
-        self.assertEqual(len(lines), 4, "title, blank line, one paragraph, final newline")
+    def test_the_file_is_a_title_the_session_values_paragraph_and_the_models_section(self):
+        text = TEXT.read_text()
+        lines = text.split("\n")
         self.assertRegex(lines[0], r"^# \S")
         self.assertEqual((lines[1], lines[3]), ("", ""))
         self.assertTrue(lines[2].startswith("Session values stay out of the repository. "))
         self.assertTrue(lines[2].endswith("before every push."))
+        # The owner, 2026-10-10: every account is told which cheaper models exist and when to hand them work.
+        self.assertEqual(lines[4], "## Cheaper models for straightforward work")
+        self.assertEqual([l for l in lines if l.startswith("#")], [lines[0], lines[4]], "one title, one section")
+        for model in ("`haiku`", "`sonnet`", "Opus 5.5"):
+            self.assertIn(model, text)
+        self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
 
     def test_the_text_has_one_source(self):
         # Terraform embeds the file; no .tf or other script carries a copy that could drift.
