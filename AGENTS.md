@@ -993,17 +993,20 @@ Available if a task needs them; neither needs a key on disk.
   nothing else supplies credentials: opencode does not use an instance role on its own, and
   asked for a key. The pinned release is `local.opencode_version` in `dev-user-data.tf`. Not on
   nextjs-dev: DeepSeek and the other Anthropic models stay on the metal boxes.
-- **Claude Haiku 5.5 on Bedrock, nextjs-dev too** (`bedrock-haiku.tf`). The kids' box had no Bedrock
-  until the owner, 2026-10-10: "I am fine if this box has haiku access. All boxes can be." Its role,
-  `nextjs-dev-role`, may invoke Haiku 5.5 and no other model; the metal boxes keep every `anthropic.*`
-  model. Call it on bedrock-runtime, region `us-west-2`, model `us.anthropic.claude-haiku-5-5` (the US
+- **Claude Haiku 5.5 on Bedrock, on every box** (`bedrock-haiku.tf`). The kids' box and the other
+  non-metal boxes had no Bedrock until the owner, 2026-10-10: "I am fine if this box has haiku access. All
+  boxes can be." `nextjs-dev-role`, `dev-ebs-only-role` (I/O and parallel boxes), `wbox-role`,
+  `claude-master-server-role` and, when the Mac is on, `mac-dev-instance` may invoke Haiku 5.5 and no other
+  model; the metal boxes keep every `anthropic.*` model. The GPU boxes have no instance profile and get
+  nothing. A new box role joins through `local.bedrock_haiku_box_roles`.
+  Call it on bedrock-runtime, region `us-west-2`, model `us.anthropic.claude-haiku-5-5` (the US
   inference profile; Haiku 5.5 has no in-Region endpoint and is not on bedrock-mantle outside GovCloud, so
   the Mantle URL Claude Code uses on the metal boxes does not serve it). Credentials come from the
   instance role; there is no key.
 - **Haiku 5.5 for dolphin-labs' news pass** (`bedrock-haiku.tf`). Role `dolphin-labs-news-bedrock`,
   assumed through GitHub OIDC by `refresh-news.yml` on `main` of `dolphin-labs-hq/dolphin-labs` and no
   other workflow, branch or pull request (the trust pins GitHub's immutable `sub` and `job_workflow_ref`).
-  Same grant as nextjs-dev. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
+  Same grant as the boxes. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
   workflow needs.
 - **ElevenLabs** (voice and sound for the games). The key is in Secrets Manager,
   `games/elevenlabs-api-key` (us-west-1), readable by dev-server-role and nextjs-dev-role only

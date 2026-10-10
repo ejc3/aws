@@ -1,11 +1,15 @@
 # bedrock-haiku.tf
 #
-# Claude Haiku 5.5 on Amazon Bedrock, and no other model, for two callers:
+# Claude Haiku 5.5 on Amazon Bedrock, and no other model, for:
 #
-#   - nextjs-dev-role: every account on the kids' box. Until 2026-10-10 that box had no Bedrock at all
-#     (nextjs-dev.tf). The owner, 2026-10-10: "I am fine if this box has haiku access. All boxes can be."
-#     The grant is Haiku 5.5, not every Anthropic model. The metal boxes already have every anthropic.*
-#     model through dev-server-role (BedrockRuntimeInvoke in dev-instance-common.tf); this file leaves them alone.
+#   - every box's instance role that had no Bedrock. The owner, 2026-10-10: "I am fine if this box has
+#     haiku access. All boxes can be." That is nextjs-dev-role (the kids' box, no Bedrock until then:
+#     nextjs-dev.tf), dev-ebs-only-role (the I/O box and the parallel boxes), wbox-role,
+#     claude-master-server-role and, when the Mac is on, mac-dev-instance. The grant is Haiku 5.5, not every
+#     Anthropic model. The metal boxes already have every anthropic.* model through dev-server-role
+#     (BedrockRuntimeInvoke in dev-instance-common.tf); this file leaves them alone. Not here: the GPU boxes
+#     run with no instance profile at all (gpu-box.tf), the jumpboxes are administrators, and runners and
+#     the AMI builder are CI machines, not boxes.
 #   - dolphin-labs-news-bedrock: the hourly news pass of dolphin-labs-hq/dolphin-labs
 #     (.github/workflows/refresh-news.yml on main), through GitHub OIDC. No AWS key is stored in GitHub.
 #
@@ -60,11 +64,33 @@ locals {
   ]
 }
 
-# Its own inline policy, so nextjs-dev.tf's least-privilege policy keeps its shape.
-resource "aws_iam_role_policy" "nextjs_dev_bedrock_haiku" {
-  name   = "invoke-claude-haiku-5-5"
-  role   = aws_iam_role.nextjs_dev.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
+# One inline policy per role, so each role's own least-privilege policy keeps its shape. A new box role
+# joins by adding it here.
+locals {
+  bedrock_haiku_box_roles = merge(
+    {
+      nextjs-dev   = aws_iam_role.nextjs_dev.id
+      dev-ebs-only = aws_iam_role.dev_ebs_only.id
+      wbox         = aws_iam_role.wbox.id
+    },
+    var.enable_claude_master_server ? { claude-master-server = aws_iam_role.claude_master_server[0].id } : {},
+  )
+}
+
+resource "aws_iam_role_policy" "box_bedrock_haiku" {
+  for_each = local.bedrock_haiku_box_roles
+  name     = "invoke-claude-haiku-5-5"
+  role     = each.value
+  policy   = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
+}
+
+# The Mac's role is made through the aws.mac provider, so its policy is too (as mac_dev_ebs in dev-ebs.tf).
+resource "aws_iam_role_policy" "mac_bedrock_haiku" {
+  count    = var.enable_mac_dev ? 1 : 0
+  provider = aws.mac
+  name     = "invoke-claude-haiku-5-5"
+  role     = aws_iam_role.mac_instance[0].id
+  policy   = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
 }
 
 # TRUST: workflow refresh-news.yml, on the main branch of dolphin-labs-hq/dolphin-labs, and nothing else.

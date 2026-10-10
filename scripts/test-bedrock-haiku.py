@@ -41,13 +41,32 @@ class GrantTests(unittest.TestCase):
         self.assertIsNotNone(subscribe)
         self.assertIn('"aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"]', subscribe.group())
 
-    def test_both_roles_get_exactly_the_shared_statements(self):
-        for name in ("nextjs_dev_bedrock_haiku", "dolphin_labs_news_bedrock"):
+    def test_every_role_gets_exactly_the_shared_statements(self):
+        for name in ("box_bedrock_haiku", "mac_bedrock_haiku", "dolphin_labs_news_bedrock"):
             policy = block("aws_iam_role_policy", name)
             self.assertIn("Statement = local.bedrock_haiku_statements", policy)
-        self.assertIn("role   = aws_iam_role.nextjs_dev.id", block("aws_iam_role_policy", "nextjs_dev_bedrock_haiku"))
-        # nextjs-dev's own policy stays without Bedrock; the grant lives here.
-        self.assertNotIn("bedrock:", (ROOT / "nextjs-dev.tf").read_text())
+        self.assertIn("for_each = local.bedrock_haiku_box_roles", block("aws_iam_role_policy", "box_bedrock_haiku"))
+        mac = block("aws_iam_role_policy", "mac_bedrock_haiku")
+        self.assertIn("role     = aws_iam_role.mac_instance[0].id", mac)
+        self.assertIn("count    = var.enable_mac_dev ? 1 : 0", mac)
+        # The roles' own files stay without Bedrock; the grant lives here.
+        for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "claude-master-server.tf", "mac-dev-secrets.tf"):
+            self.assertNotIn("bedrock:", (ROOT / tf).read_text(), tf)
+
+    def test_every_box_role_without_bedrock_is_attached(self):
+        roles = re.search(r"^  bedrock_haiku_box_roles = merge\(\n(.*?)^  \)", TF, re.S | re.M)
+        self.assertIsNotNone(roles)
+        attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?\.id", roles.group(1)))
+        self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "claude_master_server"})
+        # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
+        # is an administrator (jumpbox_admin), is a CI machine, or is the Mac (its own resource above).
+        not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "mac_instance"}
+        profile_roles = set()
+        for tf in ROOT.glob("*.tf"):
+            for m in re.finditer(r'^resource "aws_iam_instance_profile" "\w+" \{\n.*?^\}', tf.read_text(), re.S | re.M):
+                profile_roles.update(re.findall(r"role\s*=\s*aws_iam_role\.(\w+)", m.group()))
+        self.assertTrue(profile_roles, "no instance profiles found")
+        self.assertEqual(profile_roles - not_here, attached)
 
 
 class TrustTests(unittest.TestCase):
