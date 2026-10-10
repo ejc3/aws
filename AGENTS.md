@@ -753,6 +753,8 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   (WebFetch's domain check; 2.1.296's `/api/hello`, which stopped every interactive start; claude.ai MCP connectors).
   UnlistedRoute is a review queue, not an outage: the route already works; list it in `proxyControlPath` once
   reviewed. Each route shape is logged once per server process, so an unreviewed route fires again after a rollout.
+  From `claude-master-e356d0a` a draining color stops keeping idle connections alive, so a client's next request
+  reaches the new color instead of being served by the old one on the configuration it started with.
   To review a new Claude Code release, diff its `strings` for `"/api/`, `"/v1/` and `"/mcp-registry/` paths
   against `proxyControlPath`. The agent's IAM grant can publish to the one namespace and write the one log group.
 - **Dashboard** `claude-master` (`claude-master-dashboard.tf`): requests by user, subscription, box, model and
@@ -1045,7 +1047,12 @@ Available if a task needs them; neither needs a key on disk.
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
 - **claude-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
   the paid Anthropic API key that claude-master uses only after every subscription profile is out of
-  quota (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
+  quota (`dev-ai-services.tf`). From `claude-master-e356d0a` the server checks every 5 minutes that it can pay
+  (a token count with the key, which is free) and skips it while it cannot: on 2026-10-10 its organization had no
+  credit, every request it took failed with `credit balance is too low`, and an exhausted pool sent sessions
+  there anyway. A credit refusal on a real request also marks it unavailable; the next check that succeeds
+  brings it back. The server log says `API-key backup unavailable` / `available`, and the 5-minute routing
+  summary carries `backup=` (none, unchecked, available, unavailable). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
   grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
   `get-secret-value`; never into a file in a repo, a command line or a commit.
 - **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
