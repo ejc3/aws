@@ -895,7 +895,10 @@ nextjs-dev sat dead for 20 hours on 2026-10-01 (it is a standing authorization: 
 restart, and it is narrow). It is for ON-DEMAND boxes only: for each RUNNING instance named `jumpbox`,
 `jumpbox-2`, `nextjs-dev` or `claude-master-server` it asks CloudWatch whether the instance status
 check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20 (the second catches the
-wedges where the status check still reads ok: 2026-07-25, 2026-08-16, 2026-10-01). Wedged means: console
+wedges where the status check still reads ok: 2026-07-25, 2026-08-16, 2026-10-01), or the box has been paging for 20
+(EBS reads of 30 GiB or more per five minutes, the gp3 cap, with writes under a tenth of that: 2026-10-10 nextjs-dev
+paged until SSH and both tunnels were dead while its status check read ok and NetworkOut never quite reached zero; a
+14-day backtest on these boxes found the signature only in that wedge and 2026-10-01's, never in real work). Wedged means: console
 snapshotted first through the existing redacting capture Lambda, then an OS reboot, then a message on the alert
 topic.
 

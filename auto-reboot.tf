@@ -2,16 +2,19 @@
 #
 # WHY: on 2026-10-01 nextjs-dev ran out of memory and sat dead for 20 hours (network out exactly 0, both tunnels down,
 # status check in ALARM) until a person noticed and rebooted it. 2026-07-25 (jumpbox) and 2026-08-16 (nextjs-dev) were
-# the same story with the instance status check still "ok". Nothing here prevents a wedge; it ends one in minutes
-# instead of hours.
+# the same story with the instance status check still "ok". 2026-10-10 (nextjs-dev) paged until SSH and both tunnels were
+# dead while the status check read ok and NetworkOut fell to 27 KB per five minutes but never zero, so neither rule saw
+# it; the third rule below is that signature. Nothing here prevents a wedge; it ends one in minutes instead of hours.
 #
 # WHICH BOXES: the on-demand ones only (jumpbox, jumpbox-2, nextjs-dev, claude-master-server). The owner does not want
 # automatic restarts of the SPOT boxes (fcvm-metal-arm, fcvm-metal-x86, io-box): they are interruptible and stop/start on
 # their own terms, and a person decides about them.
 #
 # WHAT: scripts/auto-reboot.py, every five minutes. For each RUNNING instance on the list below it asks CloudWatch
-# whether the instance status check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20.
-# Either is "wedged". It then snapshots the console (the existing redacting capture Lambda, dev-diagnostics.tf),
+# whether the instance status check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20, or
+# the box has been paging for 20 minutes (EBS reads of 30 GiB or more per five minutes, about the gp3 cap, with writes
+# under a tenth of that; a 14-day backtest on these boxes found it only in the 2026-10-01 and 2026-10-10 wedges).
+# Any one is "wedged". It then snapshots the console (the existing redacting capture Lambda, dev-diagnostics.tf),
 # reboots the OS, and tells the alert topic.
 #
 # WHAT IT NEVER DOES:
