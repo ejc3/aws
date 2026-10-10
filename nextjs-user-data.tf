@@ -2075,7 +2075,7 @@ fi
 # A runaway must be killed, not page the box to death. On 2026-10-10 memory ran out, the kernel never OOM-killed anything
 # (the swapfile kept it "alive"), and the box paged with its root volume pinned at the 125 MB/s gp3 cap until ssh and both
 # tunnels stopped answering for everyone, 25 minutes, until a person rebooted it. earlyoom kills the biggest offender at
-# 4% available memory (SIGKILL at 2%), as on the metal boxes (dev-user-data.tf, metal_boot_hardening). Unlike them this box
+# 4% available memory (SIGKILL at 2%), as on the metal boxes (their boot hardening in dev-user-data.tf). Unlike them this box
 # has swap, and earlyoom acts only when memory AND free swap are both under their minimums, so `-s 100,100` makes memory
 # alone decide: paging is the failure here, not the last resort. A Next dev server is preferred (2026-10-01: two of them
 # grew to ~11.6 GB each), and its ndev@ unit restarts it; what keeps the box reachable is never a candidate.
