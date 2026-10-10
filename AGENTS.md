@@ -1106,8 +1106,23 @@ that production and non-production share nothing:
 
 ### Sites also deploying to Cloudflare Workers (staging copies)
 
-The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, next-step) also deploy a second copy
-to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Production stays on Vercel; the Worker is a
+The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step) also deploy a second copy
+to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions.
+
+**Standing rule (owner, 2026-10-10): every web app supports both clouds, and secrets reach both.** It covers the apps
+deployed as sites (Vercel projects and `<site>-stage` Workers), not host-local tools such as `browser-manager/` (bound to
+loopback on its host, reached through its own tunnel). Each app repository's agent instructions carry the same section
+("Two clouds: Vercel and Cloudflare"): a change is done only when both deploys are green; no platform-only code without a
+path on the other; every secret lives in AWS Secrets Manager and must reach both platforms. Where it lives today:
+Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the containers Terraform
+writes into the project for colton-games (`colton-games-accounts.tf`) and dolphin-films (`dolphin-films-vercel.tf`). For
+the other sites the Vercel environment is still set in Vercel by hand and `vercel-env/<site>/<target>` is a record captured
+from it afterwards (`scripts/vercel-env-capture.py`), not a source: a change there is made in Vercel and re-recorded, and in
+`workers-stage/<site>`. Moving each of them to a Terraform-written Vercel environment (the dolphin-films shape) is what makes
+AWS the one source. A new app joins both clouds before it ships. Two apps do not meet the rule yet: dolphin-maps
+(`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage` Worker) and claude-master-dashboard (Cloudflare only, no
+Vercel project). Bringing each to the other cloud follows the order below for Cloudflare, or a Vercel project with its
+environment written by Terraform. Production stays on Vercel; the Worker is a
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
