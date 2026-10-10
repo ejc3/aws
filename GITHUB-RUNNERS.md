@@ -658,7 +658,7 @@ whenever the pool had room. A single delivery is one job and is never cut this w
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 
-`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and `dolphin-labs-hq/dolphin-films`
+`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films` and `dolphin-labs-hq/dolphin-maps`
 run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
 nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
 controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
@@ -671,7 +671,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
-  `dolphin-films` (a downstream of `dolphin-labs`) uses the `dolphin` label too. Runners
+  `dolphin-films` (a downstream of `dolphin-labs`) and `dolphin-maps` use the `dolphin` label too. Runners
   register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
   runner, cap or token.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
@@ -691,7 +691,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
   failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
-  with its `JobId`. Each repo has its own cap (8; `dolphin-films` 2), counted as the hosts `DescribeInstances` lists
+  with its `JobId`. Each repo has its own cap (8; `dolphin-films` and `dolphin-maps` 2), counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
@@ -705,7 +705,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
   zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
-  `too-many-app-runners-<label>` (`-dolphin-films` for that repo, which shares a label) above one repo's own cap, so a single repo running away is
+  `too-many-app-runners-<label>` (`-dolphin-films` and `-dolphin-maps` for those repos, which share a label) above one repo's own cap, so a single repo running away is
   visible even while the total is under the combined cap; `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a

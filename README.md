@@ -169,23 +169,25 @@ terraform apply -var enable_runner_app_webhooks=false \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["CoderColton/colton-games"]' \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-labs"]' \
   -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-films"]' \
+  -target='aws_secretsmanager_secret.github_runner_repo_pat["dolphin-labs-hq/dolphin-maps"]' \
   -target=aws_secretsmanager_secret.elevenlabs_api_key
 ```
 
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
 console or AWS CLI without printing their values.
 
-The runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and
-`dolphin-labs-hq/dolphin-films` also need one controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
+The runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films` and
+`dolphin-labs-hq/dolphin-maps` also need one controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
 containers created above, from `runner-repos.tf`; Terraform never holds the value). The full
 apply reads them all to create the repos' webhooks, so populate them before it. That holds
 for a repo added later too: apply only its container (the same command with that one `-target`;
 nothing untargeted changes, so the existing hooks stay), put its token, then run the full apply. Each is a
 fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
-org admin for `dolphin-labs` and for `dolphin-films`. `dolphin-films` is behind its own gate,
-`dolphin_films_token_ready` in `runner-app.tf` (default false): until its token has a value its hook and token read are
-not planned, so every plan passes. Put the token, then set that default to true in a commit and apply. Put each value
+org admin for `dolphin-labs`, `dolphin-films` and `dolphin-maps`. `dolphin-films` and `dolphin-maps` are each behind
+their own gate in `runner-app.tf`, `dolphin_films_token_ready` and `dolphin_maps_token_ready` (each starts false): until
+the token has a value, that repo's hook, token read and controller entry are not planned, so every plan passes and the
+controller does not report it as missing a token. Put the token, then set that default to true in a commit and apply. Put each value
 without echoing it:
 
 ```bash
