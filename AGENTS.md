@@ -673,7 +673,16 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   From `claude-master-069ec38` a stopping server drains: new inference requests get Anthropic's retryable 529 and running ones
   get up to 60 seconds to finish before they are cancelled (inside systemd's default 90-second stop timeout; do not lower it), and
   a cancelled request is written as a retryable 529, not the 499 "Configured inference failed" Claude Code does not retry (a
-  restart at 2026-10-10 05:45 failed a running turn that way). A restart still interrupts a stream that runs past the drain. There is no fallback to a login on the box: a server that is down or out of quota is an
+  restart at 2026-10-10 05:45 failed a running turn that way). A restart still interrupts a stream that runs past the drain.
+  `claude-master-09015c6` adds four things. A local forwarder: `connect` gives Claude a plain-HTTP CONNECT proxy on
+  127.0.0.1 with a per-launch token; only `api.anthropic.com` with that token goes through the pool, everything else (git, curl,
+  gh, hooks, MCP servers that inherit `HTTPS_PROXY`) is dialled from the box itself, and Claude no longer holds the client
+  certificate. Before it those tools failed the proxy's certificate handshake: the `client TLS handshake failed` lines from the dev
+  boxes. Token counters read from each response's `usage`: `claude_master.inference.tokens` {profile, type},
+  `.tokens.by_client_account` and `.tokens.by_client`, type input / output / cache_read / cache_creation (about 50 new series).
+  Five-hour window gauges (`claude_master.quota.five_hour.*`). WebFetch's domain check (`GET /api/web/domain_info`) is relayed to
+  Anthropic instead of refused. The next PR in that stack (`service.instance.id` on every metric) is NOT released: it adds a
+  dimension to every series, so it must ship together with every `SCHEMA(...)` query here and in the dashboard repository. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
