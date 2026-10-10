@@ -52,8 +52,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-1910e02"
-  claude_master_sha256_aarch64 = "93519f821fb78dbe99a22b318bb9055e7c6cf17df20118a75ff4dce81da6ef04"
+  claude_master_tag            = "claude-master-5b83ce9"
+  claude_master_sha256_aarch64 = "15392310acf8d01da7eccfb605e50aa801d4c9d411d09b2ff38ec555cb1f0215"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -969,14 +969,11 @@ locals {
       pattern     = "\"no inference account could be chosen\""
       description = "No subscription (and no API-key backup) could take a request: every one is rate limited, exhausted or its login failed. Clients are being refused."
     }
-    # Routes claude-master does not list. The first request of each route shape is logged once per server process.
+    # A route claude-master does not list was relayed to Anthropic on the session's own login (it works; nothing is
+    # refused any more). The first request of each route shape is logged once per server process.
     UnlistedRoute = {
       pattern     = "\"relayed an unlisted Anthropic route\""
-      description = "A session reached an Anthropic route claude-master does not list (usually a new Claude Code release), and it was passed through on the session's own login, so nothing broke. Review the log line's method and route: list it in claude-master's control routes if it is harmless, or block it if it spends tokens."
-    }
-    BlockedRoute = {
-      pattern     = "\"blocked an unlisted route that may spend tokens\""
-      description = "claude-master refused an unlisted route that may spend tokens, and a session may be failing on it. The log line names the method and route: have the pool serve it, or list it if it is harmless."
+      description = "A session used an Anthropic route claude-master does not list (usually a new Claude Code release). It was relayed on the session's own login and works. Review the log line's method and route, then list it in claude-master's proxyControlPath."
     }
   }
 }
