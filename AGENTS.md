@@ -1052,7 +1052,12 @@ Available if a task needs them; neither needs a key on disk.
   credit, every request it took failed with `credit balance is too low`, and an exhausted pool sent sessions
   there anyway. A credit refusal on a real request also marks it unavailable; the next check that succeeds
   brings it back. The server log says `API-key backup unavailable` / `available`, and the 5-minute routing
-  summary carries `backup=` (none, unchecked, available, unavailable). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
+  summary carries `backup=` (none, unchecked, available, unavailable). From `claude-master-82404b3` that check runs on
+  a jittered interval, and the subscription usage poll is skewed: about every 3 minutes (jittered 20% either way), each
+  profile on its own phase after the round starts, and a 429 from the usage endpoint holds that profile back for its
+  `Retry-After` (else one more interval, at most 15 minutes). Polled every minute all at once, about half the polls on
+  every profile were refused with 429 (2026-10-10). Where Claude Code is the caller, a 429 is relayed to it as sent,
+  `retry-after` included, and it backs off itself. Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
   grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
   `get-secret-value`; never into a file in a repo, a command line or a commit.
 - **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
