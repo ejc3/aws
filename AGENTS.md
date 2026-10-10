@@ -1063,6 +1063,13 @@ Available if a task needs them; neither needs a key on disk.
   `retry-after` included, and it backs off itself. Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
   grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
   `get-secret-value`; never into a file in a repo, a command line or a commit.
+- **Cloudflare logs and metrics**, metal boxes and nextjs-dev. `cloudflare-observability-token` (us-west-1) is a
+  long-lived READ-ONLY Cloudflare token (`cloudflare-observability.tf`): Workers Logs and the telemetry query API, live
+  `wrangler tail`, the GraphQL Analytics API, Workers versions and deployments, Logpush jobs and the request tracer for
+  the account, and analytics, logs, observability and health checks on every zone. No Access audit logs (they carry
+  people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
+  --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
+  command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
 - **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide grant
   on a box where every account has sudo). Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
