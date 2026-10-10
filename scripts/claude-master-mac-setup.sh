@@ -27,8 +27,8 @@ KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins. Keep CM_TAG equal to claude_master_tag in claude-master-server.tf (a test enforces it) and
 # bump the sha256 values together with it.
-CM_TAG=claude-master-5c78013
-CM_SHA256_DARWIN_ARM64=2d9e60657857fac8bf571e5b0d174b2aacab2315ae5632f357e4eaca2ad3e8fa
+CM_TAG=claude-master-87f05f5
+CM_SHA256_DARWIN_ARM64=01b5bd6e09b97529d631f67245687934351d983f4ddaa433c71c968a3cd275da
 CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 # The executable inside that tarball: an installed cloudflared is judged by this, not by its version string.
