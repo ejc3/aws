@@ -570,11 +570,11 @@ variable "dolphin_films_token_ready" {
   default     = true
 }
 
-# The same gate for dolphin-maps: false until the org owner has minted and stored its token.
+# The same gate for dolphin-maps: true once the org owner has minted and stored its token.
 variable "dolphin_maps_token_ready" {
   description = "dolphin-labs-hq/dolphin-maps' controller token has a value in Secrets Manager, so its webhook can be created"
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {
