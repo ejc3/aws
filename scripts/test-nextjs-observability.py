@@ -32,6 +32,10 @@ class RunawayIsKilledNotPaged(unittest.TestCase):
         for line in ("apt-get install -y earlyoom", "systemctl enable earlyoom.service", "systemctl restart earlyoom.service"):
             self.assertIn(line, USER_DATA)
 
+    def test_a_failed_install_or_start_is_retried_not_recorded(self):
+        gate = re.search(r"for unit in (cloudflared@cc-games\.dev [^;]*); do", USER_DATA).group(1)
+        self.assertIn("earlyoom", gate.split())
+
     def test_memory_alone_decides_because_this_box_has_swap(self):
         # earlyoom acts only when memory AND swap are both under their minimums; with a 4 GB swapfile the box would page
         # long before swap ran out. -s 100 puts swap always "under", so memory decides.
@@ -45,8 +49,10 @@ class RunawayIsKilledNotPaged(unittest.TestCase):
         # Next sets its title to "next-server (vX.Y.Z)"; the kernel keeps 15 characters of it.
         self.assertRegex("next-server (v1", prefer)
         self.assertNotRegex("claude", prefer)
-        for name in ("sshd", "cloudflared", "amazon-ssm-agent", "tmux", "systemd-journald"):
-            self.assertRegex(name, avoid)
+        # earlyoom matches /proc/PID/comm, which the kernel truncates to 15 characters.
+        for name in ("sshd", "cloudflared", "amazon-ssm-agent", "ssm-agent-worker", "tmux", "systemd-journald",
+                     "amazon-cloudwatch-agent", "earlyoom"):
+            self.assertRegex(name[:15], "^(?:%s)$" % avoid.replace("(^|/)", ""), "%s as the kernel names it" % name)
         self.assertNotRegex("next-server (v1", avoid)
         self.assertNotRegex("node", avoid)
 
