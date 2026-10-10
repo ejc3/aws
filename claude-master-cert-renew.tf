@@ -30,6 +30,7 @@ locals {
   claude_master_clients = {
     "nextjs-colton" = { instance = "nextjs-dev", account = "colton" }
     "nextjs-connor" = { instance = "nextjs-dev", account = "connor" }
+    "nextjs-colin"  = { instance = "nextjs-dev", account = "colin" }
     "nextjs-ejc3"   = { instance = "nextjs-dev", account = "ejc3" }
     "fcvm-arm"      = { instance = "fcvm-metal-arm", account = "ubuntu" }
   }
