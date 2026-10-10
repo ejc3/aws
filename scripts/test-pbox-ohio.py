@@ -100,7 +100,16 @@ class RetiredSiteTests(unittest.TestCase):
 
     def test_names_and_sizes_are_what_the_script_finds_them_by(self):
         self.assertIn('"1" = { size = 300, name = "parallel-box-work" }', OHIO)
-        self.assertIn('"2" = { size = 100, name = "parallel-box-2-work" }', OHIO)
+        for n in (2, 3, 4):
+            self.assertIn(f'"{n}" = {{ size = 100, name = "parallel-box-{n}-work" }}', OHIO)
+
+    def test_four_slots_and_slot_one_keeps_its_name(self):
+        # the slot list, the volume list and the watchdog's tag list are one thing
+        self.assertRegex(LAUNCH, r'parallel_boxes\s*=\s*\{ for n in \[1, 2, 3, 4\] : tostring\(n\) => \{ name = n == 1 \? "parallel-box" : "parallel-box-\$\{n\}" \} \}')
+        self.assertRegex(LAUNCH, r'parallel_box_names\s*=\s*\[for k in sort\(keys\(local\.parallel_boxes\)\) : local\.parallel_boxes\[k\]\.name\]')
+        self.assertIn('case "$BOX" in ""|1|2|3|4) ;;', SCRIPT)
+        self.assertIn('for n in 1 2 3 4; do status_one "$n"; done', SCRIPT)
+        self.assertIn('VOLTAG="$NAME-work"', SCRIPT)
 
     def test_the_script_has_no_stale_copy_check_left(self):
         self.assertNotIn("Live", SCRIPT)
@@ -161,7 +170,7 @@ class WatchdogTests(unittest.TestCase):
         fn = block(OHIO, 'resource "aws_lambda_function" "parallel_watchdog_ohio"')
         self.assertIn("aws_iam_role.parallel_watchdog.arn", fn)
         self.assertIn("data.archive_file.parallel_watchdog.output_path", fn)
-        self.assertIn('TAG_NAMES     = "parallel-box,parallel-box-2"', fn)
+        self.assertIn('TAG_NAMES     = join(",", local.parallel_box_names)', fn)
         self.assertNotIn("gpu-box", fn)
         self.assertIn('schedule_expression = "rate(5 minutes)"', OHIO)
         self.assertIn("aws_lambda_permission", OHIO)

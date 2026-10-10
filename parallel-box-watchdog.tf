@@ -133,7 +133,8 @@ def lambda_handler(event, context):
             up_cmd = "gbox up" + ("" if name == "gpu-box" else " " + name.rsplit("-", 1)[1])
             kept = "Nothing on it persists"
         else:
-            up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
+            # parallel-box is slot 1; parallel-box-N is slot N (the same shape as gbox).
+            up_cmd = "pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1])
             kept = "Its work volume is untouched"
         print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
@@ -161,7 +162,7 @@ def lambda_handler(event, context):
 # Every box this watchdog reaps, by exact Name tag: what it describes (TAG_NAMES) and what its
 # role may terminate are the same list, so a new GPU slot cannot be found but unkillable.
 locals {
-  parallel_watchdog_tag_names = concat(["parallel-box", "parallel-box-2"], local.gpu_box_names)
+  parallel_watchdog_tag_names = concat(local.parallel_box_names, local.gpu_box_names)
 }
 
 data "archive_file" "parallel_watchdog" {
