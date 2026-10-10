@@ -217,7 +217,9 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
 The claude-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
-and claude-master has no fallback. Populate it from the key file (read from the file, never on the command line), then remove the file:
+and claude-master has no fallback. The server checks every 5 minutes that the key can pay and uses it only
+while it can (the server log says `API-key backup unavailable` when its organization is out of credit; adding
+credit brings it back at the next check, no restart). Populate it from the key file (read from the file, never on the command line), then remove the file:
 
 ```bash
 aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/backup-api-key \
