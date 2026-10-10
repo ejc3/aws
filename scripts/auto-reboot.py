@@ -1,13 +1,17 @@
 """auto-reboot: reboot a persistent box that has wedged. See auto-reboot.tf for the why.
 
-Runs every five minutes. For each RUNNING instance whose Name is on the list it asks CloudWatch two questions:
+Runs every five minutes. For each RUNNING instance whose Name is on the list it asks CloudWatch three questions:
 
   * has the instance status check been failing for STATUS_MINUTES in a row?  (the guest OS is unreachable)
   * has NetworkOut been exactly zero for NETWORK_MINUTES in a row?           (the guest is alive to EC2 and
     dead to everyone else: 2026-10-01 nextjs-dev sat like this for 20 hours; 2026-07-25 and 2026-08-16 were
     the same with the status check still "ok")
+  * has the box been PAGING for THRASH_MINUTES in a row: EBS reads at the volume's cap with writes near zero?
+    (2026-10-10 nextjs-dev: SSH timed out and both tunnels were down for 20+ minutes while the status check
+    read ok and NetworkOut fell to 27 KB per five minutes, never zero, so neither rule above fired. A 14-day
+    backtest on every box here found this signature only in that wedge and in 2026-10-01's, never in real work)
 
-Either one makes it wedged. A wedged box gets its console snapshotted FIRST (the existing redacting capture
+Any one makes it wedged. A wedged box gets its console snapshotted FIRST (the existing redacting capture
 Lambda), then an OS reboot, then a notification. Never stop/start: a reboot keeps the console buffer and the
 instance-store disks. A box that is not running is never touched, so a deliberate stop stays a stop.
 
@@ -26,6 +30,9 @@ import boto3
 
 STATUS_MINUTES = 15
 NETWORK_MINUTES = 20
+THRASH_MINUTES = 20
+THRASH_READ_BYTES = 30 * 1024 ** 3  # per five minutes: about 107 MB/s, 86% of a gp3 volume's default 125 MB/s
+THRASH_WRITE_SHARE = 0.1           # paging reads pages back and writes almost nothing; a build or a copy writes
 MIN_AGE_SECONDS = 30 * 60        # a box still booting fails its checks; so does one that was just started
 COOLDOWN_SECONDS = 3 * 3600
 MAX_PER_DAY = 3
@@ -67,13 +74,22 @@ def host_failing_now(system_failed, now):
     return bool(done) and now - (done[-1][0] + 60) <= 3 * 60 and done[-1][1] >= 1
 
 
-def wedged(status_failed, network_out, now):
-    """(reason or None). status_failed: [(ts, StatusCheckFailed_Instance)] per minute (1 failed). network_out:
-    [(ts, bytes sent)] per five minutes."""
+def paging(ebs_read, ebs_write):
+    """[(ts, bad)] per five minutes: bad when that bucket read at least THRASH_READ_BYTES and wrote at most
+    THRASH_WRITE_SHARE of what it read. A missing write bucket counts as no writes."""
+    writes = dict(ebs_write)
+    return [(t, r >= THRASH_READ_BYTES and writes.get(t, 0) <= r * THRASH_WRITE_SHARE) for t, r in ebs_read]
+
+
+def wedged(status_failed, network_out, now, ebs_read=(), ebs_write=()):
+    """(reason or None). status_failed: [(ts, StatusCheckFailed_Instance)] per minute (1 failed). network_out,
+    ebs_read, ebs_write: [(ts, bytes)] per five minutes."""
     if failing_for([(t, v >= 1) for t, v in status_failed], STATUS_MINUTES, 60, now):
         return "the instance status check has failed for %d minutes" % STATUS_MINUTES
     if failing_for([(t, v == 0) for t, v in network_out], NETWORK_MINUTES, 300, now):
         return "no network traffic out for %d minutes" % NETWORK_MINUTES
+    if failing_for(paging(ebs_read, ebs_write), THRASH_MINUTES, 300, now):
+        return "paging for %d minutes (disk reads at the volume's cap, writes near zero)" % THRASH_MINUTES
     return None
 
 
@@ -185,7 +201,9 @@ def handle_instance(inst, region, clients, now, dry_run):
 
     status = series(cw, iid, "StatusCheckFailed_Instance", "Maximum", 60, STATUS_MINUTES, now)
     network = series(cw, iid, "NetworkOut", "Sum", 300, NETWORK_MINUTES, now)
-    reason = wedged(status, network, now)
+    ebs_read = series(cw, iid, "EBSReadBytes", "Sum", 300, THRASH_MINUTES, now)
+    ebs_write = series(cw, iid, "EBSWriteBytes", "Sum", 300, THRASH_MINUTES, now)
+    reason = wedged(status, network, now, ebs_read, ebs_write)
     if not reason:
         return dict(out, action="none")
     ok, why_not = may_reboot(history, now)

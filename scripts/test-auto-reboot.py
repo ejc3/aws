@@ -206,6 +206,20 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, 5], 300), NOW), "any traffic in the window is a live box")
         self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0], 300), NOW), "fifteen minutes of silence is not twenty")
 
+    def test_the_paging_signal(self):
+        healthy = fresh([0] * 25, 60), fresh([12e6] * 4, 300)
+        # 2026-10-10 nextjs-dev, as CloudWatch had it: reads pinned at the gp3 cap, writes all but gone.
+        reads, writes = fresh([35.8e9, 39.35e9, 39.37e9, 36e9], 300), fresh([233e6, 40e6, 3e6, 3e6], 300)
+        self.assertIn("paging for 20 minutes", ar.wedged(*healthy, NOW, reads, writes))
+        self.assertIsNone(ar.wedged(*healthy, NOW, reads[1:], writes[1:]), "fifteen minutes of paging is not twenty")
+        build = fresh([39e9] * 4, 300), fresh([9e9] * 4, 300)
+        self.assertIsNone(ar.wedged(*healthy, NOW, *build), "a box reading hard and writing too is working, not paging")
+        busy = fresh([20e9] * 4, 300), fresh([0] * 4, 300)
+        self.assertIsNone(ar.wedged(*healthy, NOW, *busy), "reads well under the cap are not paging")
+        self.assertIn("paging", ar.wedged(*healthy, NOW, reads, []), "a missing write bucket counts as no writes")
+        recovered = fresh([39e9, 39e9, 39e9, 2e9], 300), fresh([0] * 4, 300)
+        self.assertIsNone(ar.wedged(*healthy, NOW, *recovered), "one normal bucket breaks the run")
+
     def test_the_brakes(self):
         self.assertEqual(ar.may_reboot([], NOW), (True, ""))
         self.assertFalse(ar.may_reboot([NOW - 3600], NOW)[0], "inside the cooldown")
@@ -242,6 +256,14 @@ class BehaviourTests(unittest.TestCase):
         r = run(clients)[0]
         self.assertEqual(r["action"], "rebooted")
         self.assertIn("no network traffic", r["reason"])
+
+    def test_paging_with_an_ok_status_check_and_some_network_is_a_wedge_too(self):
+        calls, clients = world({"StatusCheckFailed_Instance": HEALTHY_STATUS, "NetworkOut": [53e6, 12e6, 27e3, 27e3],
+                                "EBSReadBytes": [35.8e9, 39.35e9, 39.37e9, 36e9], "EBSWriteBytes": [233e6, 40e6, 3e6, 3e6]})
+        r = run(clients)[0]
+        self.assertEqual(r["action"], "rebooted")
+        self.assertIn("paging", r["reason"])
+        self.assertEqual([c[0] for c in calls.log], ["save", "capture", "reboot", "sns"])
 
     def test_missing_data_is_not_a_wedge(self):
         calls, clients = world({"StatusCheckFailed_Instance": [1] * 5, "NetworkOut": [0, 0]})
@@ -436,7 +458,9 @@ class TerraformTests(unittest.TestCase):
 
     def test_the_comment_and_the_code_agree_on_the_thresholds(self):
         self.assertEqual((ar.STATUS_MINUTES, ar.NETWORK_MINUTES, ar.COOLDOWN_SECONDS, ar.MAX_PER_DAY), (15, 20, 10800, 3))
-        for words in ("15 minutes in a row", "exactly zero for 20", "3 hours or 3 times in 24"):
+        self.assertEqual((ar.THRASH_MINUTES, ar.THRASH_READ_BYTES, ar.THRASH_WRITE_SHARE), (20, 30 * 1024 ** 3, 0.1))
+        for words in ("15 minutes in a row", "exactly zero for 20", "3 hours or 3 times in 24", "paging for 20 minutes",
+                      "30 GiB or more per five minutes", "under a tenth"):
             self.assertIn(words, TF)
 
     def test_a_failed_run_is_not_retried_by_aws(self):
