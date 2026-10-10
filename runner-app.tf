@@ -43,13 +43,16 @@ locals {
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
   }
 
+  # A repo whose token gate is false is left out of the controller's REPOS as well: with no token its every reconcile
+  # reports "skipped: no controller token", which withholds the aggregate Repo=ALL metric for every repo and fires
+  # github-app-runner-reconcile-silent.
   runner_app_config = {
     for repo, c in local.runner_app_repos : repo => {
       label      = c.label
       max        = c.max
       pat_secret = "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
-    }
+    } if lookup(local.runner_app_token_gates, repo, true)
   }
   runner_app_max_total = sum([for c in values(local.runner_app_repos) : c.max])
 

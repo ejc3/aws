@@ -141,6 +141,10 @@ class WebhookGateTests(unittest.TestCase):
         hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
         self.assertEqual(hook.group(1), "local.dolphin_films_webhook ? 1 : 0")
 
+    def test_a_gated_repo_is_left_out_of_the_controller_config(self):
+        config = re.search(r"runner_app_config = \{.*?\n  \}", RUNNER_APP, re.S).group()
+        self.assertIn("if lookup(local.runner_app_token_gates, repo, true)", config)
+
     def test_dolphin_maps_has_the_same_gate(self):
         gate = re.search(r'variable "dolphin_maps_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
         self.assertRegex(gate, r"default\s+= (true|false)")
