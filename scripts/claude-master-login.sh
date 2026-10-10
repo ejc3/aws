@@ -51,6 +51,6 @@ for p in "${profiles[@]}"; do
 done
 if [ "$SERVER" = 1 ]; then
   # Starting a server that is not running is safe; restarting a running one is the owner's call.
-  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claude-master-status; if [ \"\$(systemctl is-active claude-master-server)\" != active ] && ! sudo claude-master-status | grep -q MISSING; then sudo systemctl start claude-master-server && sleep 2 && systemctl is-active claude-master-server; fi"
+  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claude-master-status; if ! sudo claude-master-status | grep -q MISSING && ! sudo claude-master-status | grep -q '^server: active'; then sudo claude-master-rollout && sudo claude-master-status; fi"
 fi
 echo "done: $(printf '%s ' "${profiles[@]}")"

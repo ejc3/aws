@@ -26,16 +26,24 @@
 # LOGINS ARE INTERACTIVE and belong to this box: `scripts/claude-master-login.sh --server` walks
 # the three paste-a-code logins here. They are never copied from another box (a rotating login
 # cannot be shared). The service stays idle until every profile below has a login, then
-# `systemctl start claude-master-server`.
+# `sudo claude-master-rollout` starts it (scripts/claude-master-login.sh --server does that).
 #
 # CERTIFICATES. The CA key never leaves /var/lib/claude-master/state. A client box makes its own
 # key and a certificate request; scripts/claude-master-enroll.sh gets the request signed over SSM
 # (an admin action) and installs the certificate. Certificates last 30 days.
 #
+# ROLLING RESTARTS. Envoy listens on the client address (and the tunnel's loopback port) and passes TCP
+# through, unchanged, to one of two claude-master servers on this box, blue or green, each on its own
+# port of the same address (the server certificate names the address clients dial; the ports are not
+# in the security group). `sudo claude-master-rollout` starts the idle color, points Envoy's NEW
+# connections at it (an endpoint file Envoy watches, replaced atomically), and stops the old color,
+# which drains: it serves the connections it already has, each response closing its connection, so
+# every client moves over on its next request without an error, and running requests get up to
+# local.claude_master_drain_seconds. Nothing on the box restarts Envoy or a server on its own.
+#
 # TO ROLL THE BINARY FORWARD: publish a release of ejc3/CLIProxyAPI, change the tag and the sha256,
-# apply. terraform_data.claude_master_server_converge re-runs the bootstrap, which swaps the binary
-# atomically; a running server keeps the old one until it is restarted -- a deliberate decision,
-# like codex-restart.
+# apply (terraform_data.claude_master_server_converge installs the binary atomically), then
+# `sudo claude-master-rollout`.
 
 variable "enable_claude_master_server" {
   description = "Enable the shared claude-master server box"
@@ -44,8 +52,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-dcb7263"
-  claude_master_sha256_aarch64 = "f96ddc03875a31a12b59e4c6987db265f461e69b0a2b5edb1bc84e1577f88413"
+  claude_master_tag            = "claude-master-957ec56"
+  claude_master_sha256_aarch64 = "850334a53ad430ab06325c4fe6636286fa8f04b6ca69e70abfbc9909693ccd75"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -56,7 +64,18 @@ locals {
   claude_master_log_group            = "/claude-master/server"
 
   claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
-  claude_master_server_port = 8443
+  claude_master_server_port = 8443        # Envoy; the servers behind it use the color ports below
+
+  # Envoy in front of the servers. Pinned by version and sha256 (the official linux-aarch_64 binary).
+  claude_master_envoy_version        = "1.39.1"
+  claude_master_envoy_sha256_aarch64 = "8565ad0af4b1d1d3c986e5165c027add3073579182f398dd7f4d728d25e9ec62"
+  # The two servers' ports: the client-facing one on the server address, the open one on loopback.
+  claude_master_colors = {
+    blue  = { port = 18443, open_port = 18444 }
+    green = { port = 28443, open_port = 28444 }
+  }
+  # How long a stopping server lets running requests finish. Its unit's stop timeout is a minute longer.
+  claude_master_drain_seconds = 600
 
   # Order is the fallback order. The first login is the one a fresh session prefers when quotas tie.
   claude_master_profiles = ["claude-connor", "claude-colton", "claude-ejc3"]
@@ -300,11 +319,22 @@ set -u
 key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/backup-api-key --query SecretString --output text 2>/dev/null) || key=""
 if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
+# One of the two servers behind Envoy, by color: its own ports, log file and metrics instance. With no
+# color it is the server from before Envoy (claude-master-server.service, until the first rollout moves
+# it behind Envoy): the client port itself, and no balancer.
+color=$${1:-legacy}
+balancer="--balanced --drain-timeout ${local.claude_master_drain_seconds}s"
+case "$color" in
+${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
+  legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;
+  *) echo "usage: claude-master-serve blue|green" >&2; exit 2 ;;
+esac
 exec /usr/local/bin/claude-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
-  --listen ${local.claude_master_server_ip}:${local.claude_master_server_port} \
-  --open-loopback 127.0.0.1:${local.claude_master_open_port} --state-dir /var/lib/claude-master/state \
-  --log-level info --log-file /var/log/claude-master/server.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
-  --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels
+  --listen ${local.claude_master_server_ip}:$port \
+  --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
+  --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
+  --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels \
+  --instance claude-master-$color $balancer
 EOF
 chmod 0755 /usr/local/bin/claude-master-serve
 
@@ -354,9 +384,12 @@ mkdir -p /etc/systemd/journald.conf.d
 printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=30day\n' > /etc/systemd/journald.conf.d/claude-master.conf
 journalctl --vacuum-size=200M >/dev/null 2>&1 || true
 
-cat > /etc/systemd/system/claude-master-server.service <<'EOF'
+# One unit per color (claude-master-server@blue, @green). The unit of the active color is enabled at boot;
+# claude-master-rollout moves that. A pre-Envoy box still runs claude-master-server.service until the
+# first rollout moves it behind Envoy.
+cat > /etc/systemd/system/claude-master-server@.service <<'EOF'
 [Unit]
-Description=claude-master server (shared Claude subscription pool)
+Description=claude-master server %i (shared Claude subscription pool, behind Envoy)
 After=network-online.target
 Wants=network-online.target
 # Idle until every login exists: `scripts/claude-master-login.sh --server`, then start it.
@@ -371,9 +404,11 @@ LogsDirectory=claude-master
 LogsDirectoryMode=0750
 # As root and outside the sandbox (+), and never fatal (-): the names from Secrets Manager.
 ExecStartPre=-+/usr/local/bin/claude-master-account-labels
-ExecStart=/usr/local/bin/claude-master-serve
+ExecStart=/usr/local/bin/claude-master-serve %i
 Restart=on-failure
 RestartSec=10
+# A stop drains for up to the drain timeout; systemd must not cut it short.
+TimeoutStopSec=${local.claude_master_drain_seconds + 60}
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/claude-master
@@ -385,7 +420,198 @@ ProtectControlGroups=yes
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable claude-master-server.service >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------- Envoy (rolling restarts)
+ENVOY_VERSION='${local.claude_master_envoy_version}'
+ENVOY_SHA='${local.claude_master_envoy_sha256_aarch64}'
+current=$(sha256sum /usr/local/bin/envoy 2>/dev/null | cut -d' ' -f1)
+if [ "$current" != "$ENVOY_SHA" ]; then
+  if curl -fsSL "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-aarch_64" -o /tmp/envoy.new \
+     && echo "$ENVOY_SHA  /tmp/envoy.new" | sha256sum -c - ; then
+    install -m 0755 /tmp/envoy.new /usr/local/bin/envoy.new && mv -f /usr/local/bin/envoy.new /usr/local/bin/envoy
+    echo "envoy $ENVOY_VERSION installed; a running envoy keeps its old binary until it is restarted"
+  else
+    echo "ERROR: envoy $ENVOY_VERSION did not download or did not match its sha256; leaving the installed binary alone" >&2
+  fi
+  rm -f /tmp/envoy.new
+fi
+id envoy >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin envoy
+install -d -m 0755 /etc/envoy /etc/envoy/eds
+
+# TCP passthrough: Envoy never sees inside the TLS; client certificates are still checked by claude-master.
+# The endpoints are files Envoy watches; claude-master-rollout replaces them (a rename, so atomically).
+cat > /etc/envoy/envoy.yaml <<'EOF'
+node: { id: claude-master, cluster: claude-master }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+overload_manager:
+  resource_monitors:
+  - name: envoy.resource_monitors.global_downstream_max_connections
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+      max_active_downstream_connections: 10000
+static_resources:
+  listeners:
+%{for name, addr in { cert = "${local.claude_master_server_ip}:${local.claude_master_server_port}", open = "127.0.0.1:${local.claude_master_open_port}" } ~}
+  - name: ${name}
+    address: { socket_address: { address: ${split(":", addr)[0]}, port_value: ${split(":", addr)[1]} } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: ${name}
+          cluster: ${name}
+          idle_timeout: 3600s
+%{endfor~}
+  clusters:
+%{for name in ["cert", "open"]~}
+  - name: ${name}
+    type: EDS
+    connect_timeout: 2s
+    eds_cluster_config:
+      eds_config:
+        resource_api_version: V3
+        path_config_source:
+          path: /etc/envoy/eds/${name}.yaml
+          watched_directory: { path: /etc/envoy/eds }
+%{endfor~}
+EOF
+
+cat > /usr/local/bin/claude-master-envoy-endpoints <<'EOF'
+#!/bin/bash
+# claude-master-envoy-endpoints COLOR: point Envoy's new connections at that color's two ports.
+set -euo pipefail
+case "$1" in
+${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
+  *) echo "usage: claude-master-envoy-endpoints blue|green" >&2; exit 2 ;;
+esac
+write() { # cluster address port
+  tmp=$(mktemp /etc/envoy/eds/.$1.XXXXXX)
+  printf '%s\n' 'resources:' '- "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment' "  cluster_name: $1" \
+    '  endpoints:' '  - lb_endpoints:' "    - endpoint: { address: { socket_address: { address: $2, port_value: $3 } } }" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "/etc/envoy/eds/$1.yaml"
+}
+write cert ${local.claude_master_server_ip} "$port"
+write open 127.0.0.1 "$open"
+EOF
+chmod 0755 /usr/local/bin/claude-master-envoy-endpoints
+
+mkdir -p /etc/claude-master
+[ -s /etc/claude-master/active-color ] || echo blue > /etc/claude-master/active-color
+[ -e /etc/envoy/eds/cert.yaml ] && [ -e /etc/envoy/eds/open.yaml ] || /usr/local/bin/claude-master-envoy-endpoints "$(cat /etc/claude-master/active-color)"
+
+cat > /etc/systemd/system/envoy.service <<'EOF'
+[Unit]
+Description=Envoy in front of the claude-master servers (TCP passthrough, rolling restarts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=envoy
+Group=envoy
+ExecStart=/usr/local/bin/envoy -c /etc/envoy/envoy.yaml --log-level warn --disable-hot-restart
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+# A box still running the pre-Envoy server keeps it (it holds the client port) until claude-master-rollout
+# moves it behind Envoy. Otherwise Envoy runs; the bootstrap starts it if it is stopped and never restarts it.
+if systemctl is-active --quiet claude-master-server.service; then
+  echo "claude-master-server.service (before Envoy) is running; run claude-master-rollout to move it behind Envoy"
+else
+  systemctl enable envoy.service >/dev/null 2>&1 || true
+  systemctl is-active --quiet envoy.service || systemctl start envoy.service || true
+fi
+
+# Moves the pool to a fresh server process without a session noticing (see ROLLING RESTARTS above).
+cat > /usr/local/bin/claude-master-rollout <<'EOF'
+#!/bin/bash
+set -uo pipefail
+[ "$(id -u)" = 0 ] || { echo "run as root: sudo claude-master-rollout" >&2; exit 2; }
+IP=${local.claude_master_server_ip}
+port_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.port} ;;"])} esac; }
+open_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.open_port} ;;"])} esac; }
+other() { [ "$1" = blue ] && echo green || echo blue; }
+listening() { ss -ltnH | awk '{print $4}' | grep -qx "$1"; }
+
+active=$(cat /etc/claude-master/active-color 2>/dev/null || echo blue)
+legacy=0
+systemctl is-active --quiet claude-master-server.service && legacy=1
+if [ "$legacy" = 0 ] && systemctl is-active --quiet "claude-master-server@$active"; then
+  next=$(other "$active")
+else
+  next=$active; active=none   # nothing behind Envoy is running yet: start the recorded color
+fi
+
+echo "starting claude-master-server@$next"
+systemctl restart "claude-master-server@$next"
+ready=0
+for _ in $(seq 1 90); do
+  if listening "$IP:$(port_of "$next")" && listening "127.0.0.1:$(open_of "$next")"; then ready=1; break; fi
+  systemctl is-active --quiet "claude-master-server@$next" || break
+  sleep 1
+done
+if [ "$ready" != 1 ]; then
+  echo "claude-master-server@$next did not start listening; nothing was switched" >&2
+  journalctl -u "claude-master-server@$next" -n 20 --no-pager >&2
+  systemctl stop "claude-master-server@$next"
+  exit 1
+fi
+
+/usr/local/bin/claude-master-envoy-endpoints "$next"
+if [ "$legacy" = 1 ]; then
+  # The pre-Envoy server holds the client port: it drains and exits, then Envoy takes the port over. If Envoy
+  # does not come up, the pre-Envoy server is started again, so clients are never left with nothing.
+  if ! /usr/local/bin/envoy --mode validate -c /etc/envoy/envoy.yaml >/dev/null 2>&1; then
+    echo "Envoy's configuration does not validate; the pre-Envoy server keeps running" >&2
+    systemctl stop "claude-master-server@$next"
+    exit 1
+  fi
+  echo "stopping the pre-Envoy claude-master-server.service (it drains), then starting Envoy"
+  systemctl stop claude-master-server.service
+  systemctl start envoy.service
+  up=0
+  for _ in $(seq 1 20); do listening "$IP:${local.claude_master_server_port}" && listening "127.0.0.1:${local.claude_master_open_port}" && { up=1; break; }; sleep 0.5; done
+  if [ "$up" != 1 ]; then
+    echo "Envoy did not start listening; starting the pre-Envoy server again" >&2
+    systemctl stop envoy.service
+    systemctl start claude-master-server.service
+    systemctl stop "claude-master-server@$next"
+    exit 1
+  fi
+  systemctl disable claude-master-server.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/claude-master-server.service
+  systemctl daemon-reload
+  systemctl enable envoy.service >/dev/null 2>&1 || true
+fi
+systemctl is-active --quiet envoy.service || systemctl start envoy.service
+
+switched=0
+for _ in $(seq 1 20); do
+  clusters=$(curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null) || clusters=""
+  if grep -q "^cert::$IP:$(port_of "$next")::" <<<"$clusters" && grep -q "^open::127.0.0.1:$(open_of "$next")::" <<<"$clusters"; then switched=1; break; fi
+  sleep 0.5
+done
+[ "$switched" = 1 ] || { echo "Envoy did not report $next's endpoints; leaving $active running" >&2; exit 1; }
+
+echo "$next" > /etc/claude-master/active-color
+systemctl enable "claude-master-server@$next" >/dev/null 2>&1 || true
+echo "new connections go to $next"
+if [ "$active" != none ]; then
+  systemctl disable "claude-master-server@$active" >/dev/null 2>&1 || true
+  systemctl stop --no-block "claude-master-server@$active"
+  echo "claude-master-server@$active is draining (up to ${local.claude_master_drain_seconds}s); claude-master-status shows when it is done"
+fi
+EOF
+chmod 0755 /usr/local/bin/claude-master-rollout
 
 # ---------------------------------------------------------------- cloudflared (the tunnel for the Macs)
 # Pinned by version and sha256. It dials OUT to Cloudflare and forwards to claude-master's open
@@ -470,7 +696,7 @@ if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
     }
   },
   "logs": { "logs_collected": { "files": { "collect_list": [
-    { "file_path": "/var/log/claude-master/server.log", "log_group_name": "${local.claude_master_log_group}", "log_stream_name": "{instance_id}" }
+    { "file_path": "/var/log/claude-master/server*.log", "log_group_name": "${local.claude_master_log_group}", "log_stream_name": "{instance_id}" }
   ] } } }
 }
 CWACONF
@@ -520,12 +746,26 @@ cat > /usr/local/bin/claude-master-status <<'EOF'
 for p in ${join(" ", local.claude_master_profiles)}; do
   if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
 done
-echo "server: $(systemctl is-active claude-master-server)"
-echo "cloudwatch agent: $(systemctl is-active amazon-cloudwatch-agent)   log: $(ls -1 /var/log/claude-master 2>/dev/null | head -1) $(stat -c %s /var/log/claude-master/server.log 2>/dev/null) bytes"
+active=$(cat /etc/claude-master/active-color 2>/dev/null || echo none)
+if systemctl is-active --quiet claude-master-server.service; then
+  echo "server: active (before Envoy; sudo claude-master-rollout moves it behind Envoy)"
+else
+  echo "server: $(systemctl is-active "claude-master-server@$active") ($active)"
+fi
+clusters=$(curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null)
+for c in ${join(" ", keys(local.claude_master_colors))}; do
+  pid=$(systemctl show -p MainPID --value "claude-master-server@$c")
+  running=""; [ "$pid" != 0 ] && running=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -c1-16)
+  port=$(case $c in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.port} ;;"])} esac)
+  conns=$(grep -E "^cert::${local.claude_master_server_ip}:$port::cx_active::" <<<"$clusters" | sed 's/.*:://')
+  echo "  $c: $(systemctl is-active "claude-master-server@$c")$${running:+  running $running}$${conns:+  envoy connections $conns}"
+done
+echo "envoy: $(systemctl is-active envoy)   new connections go to: $(grep -o 'port_value: [0-9]*' /etc/envoy/eds/cert.yaml 2>/dev/null | grep -o '[0-9]*$')"
+echo "cloudwatch agent: $(systemctl is-active amazon-cloudwatch-agent)   logs: $(ls -1 /var/log/claude-master 2>/dev/null | grep -E '^server.*log$' | tr '\n' ' ')"
 if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claude_master_open_port} "; then
   echo "open listener: listening"
 else
-  echo "open listener: NOT listening (the server is stopped, or still running from before the tunnel existed; restart claude-master-server when its sessions can be interrupted)"
+  echo "open listener: NOT listening (Envoy is stopped, or no server is running yet: sudo claude-master-rollout)"
 fi
 echo "installed: $(sha256sum /usr/local/bin/claude-master | cut -c1-16)  pinned: ${substr(local.claude_master_sha256_aarch64, 0, 16)}  ($TAG)"
 EOF
@@ -608,8 +848,8 @@ resource "aws_instance" "claude_master_server" {
 # user data again after a resize or a stop/start, so a script edit, a pin bump or a box whose first
 # boot failed would change nothing on the running machine. This re-runs the bootstrap through SSM
 # whenever the script, the helper or the instance changes. The bootstrap is idempotent and never
-# restarts a running server: a new binary is installed atomically and a running server keeps the old
-# one until the owner restarts it (`claude-master-status` shows running versus pinned).
+# restarts a running server or Envoy: a new binary is installed atomically and the running server keeps
+# the old one until `sudo claude-master-rollout` (`claude-master-status` shows running versus pinned).
 resource "terraform_data" "claude_master_server_converge" {
   count = var.enable_claude_master_server ? 1 : 0
 
