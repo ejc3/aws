@@ -11,9 +11,12 @@
 # their own terms, and a person decides about them.
 #
 # WHAT: scripts/auto-reboot.py, every five minutes. For each RUNNING instance on the list below it asks CloudWatch
-# whether the instance status check has failed for 15 minutes in a row, or NetworkOut has been exactly zero for 20, or
-# the box has been paging for 20 minutes (EBS reads of 30 GiB or more per five minutes, about the gp3 cap, with writes
+# whether the instance status check has failed for 15 minutes in a row, or NetworkOut has been under a 20 KiB floor for 20,
+# or the box has been paging for 20 minutes (EBS reads of 30 GiB or more per five minutes, about the gp3 cap, with writes
 # under a tenth of that; a 14-day backtest on these boxes found it only in the 2026-10-01 and 2026-10-10 wedges).
+# A floor, not exactly zero: an RCU stall (the jumpbox, 2026-10-08) starves userspace while the kernel keeps answering
+# TCP, so NetworkOut falls to a trickle -- 11,468 bytes per five minutes -- and never reaches zero. The paging rule
+# covers a wedge whose trickle stays above the floor (2026-10-10 nextjs-dev bottomed out at 27,394 bytes).
 # Any one is "wedged". It then snapshots the console (the existing redacting capture Lambda, dev-diagnostics.tf),
 # reboots the OS, and tells the alert topic.
 #

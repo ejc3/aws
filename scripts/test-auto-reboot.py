@@ -203,7 +203,8 @@ class DecisionTests(unittest.TestCase):
     def test_the_two_signals(self):
         self.assertIn("status check", ar.wedged(fresh([1] * 15, 60), fresh([5e6] * 4, 300), NOW))
         self.assertIn("no network traffic", ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, 0], 300), NOW))
-        self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, 5], 300), NOW), "any traffic in the window is a live box")
+        live = ar.NETWORK_FLOOR_BYTES
+        self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0, live], 300), NOW), "real traffic in the window is a live box")
         self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([0, 0, 0], 300), NOW), "fifteen minutes of silence is not twenty")
 
     def test_the_paging_signal(self):
@@ -220,6 +221,20 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(ar.wedged(*healthy, NOW, reads, writes[:3]), "one missing write bucket breaks the run")
         recovered = fresh([39e9, 39e9, 39e9, 2e9], 300), fresh([0] * 4, 300)
         self.assertIsNone(ar.wedged(*healthy, NOW, *recovered), "one normal bucket breaks the run")
+
+    def test_a_trickle_is_not_life(self):
+        """2026-10-08: the jumpbox's RCU stall left the kernel answering TCP while userspace starved, so NetworkOut
+        fell to 11,468 bytes per five minutes and never to zero. An exactly-zero rule never fired and the box sat
+        wedged with its status check reading "ok"."""
+        stalled = fresh([11468] * 4, 300)
+        self.assertIn("no network traffic", ar.wedged(fresh([0] * 25, 60), stalled, NOW), "the measured RCU-stall trickle is a wedge")
+        # The floor must clear the quietest HEALTHY bucket measured on any box on the list (jumpbox-2, 34,909 bytes).
+        self.assertLess(ar.NETWORK_FLOOR_BYTES, 34909, "the floor must sit below the quietest healthy box")
+        self.assertGreater(ar.NETWORK_FLOOR_BYTES, 11468, "and above the measured wedge")
+        for healthy in (34909, 68259, 152048, 684878):
+            self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([healthy] * 4, 300), NOW), "%d bytes is a live box" % healthy)
+        # One healthy bucket in the window still breaks the run, exactly as a non-zero one used to.
+        self.assertIsNone(ar.wedged(fresh([0] * 25, 60), fresh([11468, 11468, 68259, 11468], 300), NOW), "one live bucket breaks it")
 
     def test_the_brakes(self):
         self.assertEqual(ar.may_reboot([], NOW), (True, ""))
@@ -460,8 +475,9 @@ class TerraformTests(unittest.TestCase):
     def test_the_comment_and_the_code_agree_on_the_thresholds(self):
         self.assertEqual((ar.STATUS_MINUTES, ar.NETWORK_MINUTES, ar.COOLDOWN_SECONDS, ar.MAX_PER_DAY), (15, 20, 10800, 3))
         self.assertEqual((ar.THRASH_MINUTES, ar.THRASH_READ_BYTES, ar.THRASH_WRITE_SHARE), (20, 30 * 1024 ** 3, 0.1))
-        for words in ("15 minutes in a row", "exactly zero for 20", "3 hours or 3 times in 24", "paging for 20 minutes",
-                      "30 GiB or more per five minutes", "under a tenth"):
+        self.assertEqual(ar.NETWORK_FLOOR_BYTES, 20 * 1024)
+        for words in ("15 minutes in a row", "under a 20 KiB floor for 20", "3 hours or 3 times in 24",
+                      "paging for 20 minutes", "30 GiB or more per five minutes", "under a tenth"):
             self.assertIn(words, TF)
 
     def test_a_failed_run_is_not_retried_by_aws(self):
