@@ -1020,6 +1020,14 @@ interchangeable: `/github-runner/pat` (SSM) registers runners, and
 `github-webhook-admin-pat` (Secrets Manager) is webhook-write only and exists solely for
 the `integrations/github` provider. See `GITHUB-RUNNERS.md` for the full inventory.
 
+`github-admin-token/dolphin-labs-hq` and `github-admin-token/ejc3` (`github-admin-tokens.tf`) are the administration
+agent's own fine-grained tokens, every repository of that owner: repository administration, Actions, secrets,
+variables, environments, webhooks, contents, pull requests, issues and workflows. Only the administration roles can
+read them (a resource policy denies everyone else), so a dev box never holds one. They expire after at most 366
+days, the organization's limit, and are minted again in the owner's browser session; GitHub has no API that creates
+a personal access token. Each runner controller still has its own one-repository token
+(`github-runner/repo-pat/<owner>/<repo>`); never put an admin token there.
+
 Instances fetch the token during user_data bootstrap:
 ```bash
 GH_TOKEN=$(aws secretsmanager get-secret-value \
