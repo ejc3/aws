@@ -690,7 +690,13 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `profile`, `client` (the box's certificate name), `model`, `status_class` and `client_account`, the
   incoming user's Anthropic account: a name from `/etc/claude-master/account-labels`
   (`ACCOUNT_UUID=NAME`, UUID = `oauthAccount.accountUuid` in that user's `~/.claude.json`), else
-  `acct-<8 hex of a hash>`; the account id is never exported (`claude-master account-key UUID` prints a key).
+  `acct-<8 hex of a hash>`; the account id is never exported (`claude-master account-key UUID` prints the
+  key, to tell which `acct-` is whose). The file is written from the Secrets Manager secret
+  `claude-master/account-labels` (administration and the server's role only) by
+  `/usr/local/bin/claude-master-account-labels`, which systemd runs as root before every start; claude-master
+  reads it only when it starts, so a new value takes effect at the next restart. With no value, no access, or
+  a line that is not `ACCOUNT_UUID=NAME` the old file is kept and the server starts anyway. Set the value
+  from a file (README); never put a UUID or a name in this repository.
   Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
   query: `SELECT SUM(...) FROM "ClaudeMaster" GROUP BY client_account`.
 - **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and two taken from
