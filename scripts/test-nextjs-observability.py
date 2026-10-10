@@ -22,6 +22,35 @@ def block(text, kind, name):
     return m.group()
 
 
+class RunawayIsKilledNotPaged(unittest.TestCase):
+    """2026-10-10: the box paged itself unreachable with the kernel never OOM-killing anything."""
+
+    def args(self):
+        return re.search(r'^EARLYOOM_ARGS="(.*)"$', USER_DATA, re.M).group(1)
+
+    def test_earlyoom_is_installed_enabled_and_started(self):
+        for line in ("apt-get install -y earlyoom", "systemctl enable earlyoom.service", "systemctl restart earlyoom.service"):
+            self.assertIn(line, USER_DATA)
+
+    def test_memory_alone_decides_because_this_box_has_swap(self):
+        # earlyoom acts only when memory AND swap are both under their minimums; with a 4 GB swapfile the box would page
+        # long before swap ran out. -s 100 puts swap always "under", so memory decides.
+        self.assertIn("swapon /swapfile", USER_DATA)
+        self.assertIn("-m 4,2 -s 100,100", self.args())
+
+    def test_a_next_dev_server_is_preferred_and_the_access_path_is_never_a_candidate(self):
+        args = self.args()
+        prefer = re.search(r"--prefer '([^']*)'", args).group(1)
+        avoid = re.search(r"--avoid '([^']*)'", args).group(1)
+        # Next sets its title to "next-server (vX.Y.Z)"; the kernel keeps 15 characters of it.
+        self.assertRegex("next-server (v1", prefer)
+        self.assertNotRegex("claude", prefer)
+        for name in ("sshd", "cloudflared", "amazon-ssm-agent", "tmux", "systemd-journald"):
+            self.assertRegex(name, avoid)
+        self.assertNotRegex("next-server (v1", avoid)
+        self.assertNotRegex("node", avoid)
+
+
 class MetricsCanBePublished(unittest.TestCase):
     def test_the_role_may_publish_to_the_agents_namespace_and_nothing_else(self):
         policy = block(NEXTJS, "aws_iam_role_policy", "nextjs_dev_metrics")

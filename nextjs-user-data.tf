@@ -2071,6 +2071,22 @@ if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
+# ---------------------------------------------------------------- earlyoom
+# A runaway must be killed, not page the box to death. On 2026-10-10 memory ran out, the kernel never OOM-killed anything
+# (the swapfile kept it "alive"), and the box paged with its root volume pinned at the 125 MB/s gp3 cap until ssh and both
+# tunnels stopped answering for everyone, 25 minutes, until a person rebooted it. earlyoom kills the biggest offender at
+# 4% available memory (SIGKILL at 2%), as on the metal boxes (dev-user-data.tf, metal_boot_hardening). Unlike them this box
+# has swap, and earlyoom acts only when memory AND free swap are both under their minimums, so `-s 100,100` makes memory
+# alone decide: paging is the failure here, not the last resort. A Next dev server is preferred (2026-10-01: two of them
+# grew to ~11.6 GB each), and its ndev@ unit restarts it; what keeps the box reachable is never a candidate.
+apt-get install -y earlyoom || echo "WARNING: earlyoom did not install"
+cat > /etc/default/earlyoom << 'EARLYOOM'
+# Managed by terraform (nextjs-user-data.tf): do not edit by hand.
+EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100 -p --avoid '(^|/)(systemd|systemd-journald|sshd|dbus-daemon|cloudflared|tmux|tmux-scroll|amazon-ssm-agent|ssm-agent-worker|snapd|earlyoom|amazon-cloudwatch-agent)$' --prefer '^next-server|(^|/)(chrome|chromium|vitest)$'"
+EARLYOOM
+systemctl enable earlyoom.service >/dev/null 2>&1 || echo "WARNING: earlyoom not enabled"
+systemctl restart earlyoom.service || echo "WARNING: earlyoom did not start"
+
 # ---------------------------------------------------------------- per-user shell env
 # t-claude, atuin, starship, fzf, zsh plugins and the native-scrollback tmux.conf --
 # identical for every account. This is local.user_shell_env, the SAME body the other dev
