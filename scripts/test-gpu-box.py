@@ -196,7 +196,7 @@ class WatchdogHarness(unittest.TestCase):
         saved_mod, saved_env = sys.modules.get('boto3'), dict(os.environ)
         sys.modules['boto3'] = fake
         slots = GpuBoxTests.SLOT_NAMES
-        os.environ.update(TAG_NAMES=','.join(['parallel-box', 'parallel-box-2'] + slots), IDLE_MINUTES='30',
+        os.environ.update(TAG_NAMES=','.join(['parallel-box', 'parallel-box-2', 'parallel-box-3', 'parallel-box-4'] + slots), IDLE_MINUTES='30',
                           MAX_AGE_MINUTES=json.dumps({n: 240 for n in slots}), SNS_TOPIC_ARN='arn:aws:sns:test')
         try:
             env = {}
@@ -221,12 +221,16 @@ class WatchdogHarness(unittest.TestCase):
 
     def test_every_slot_is_lifetime_capped_and_idled_out(self):
         actions, calls = self.run_watchdog(
-            [('i-2', 'gpu-box-2', 250), ('i-3', 'gpu-box-3', 45), ('i-4', 'gpu-box-4', 45), ('i-p2', 'parallel-box-2', 45)],
-            {'i-2': 90.0, 'i-3': 1.0, 'i-4': 90.0, 'i-p2': 1.0})
-        self.assertEqual(actions, {'i-2': 'terminated_lifetime', 'i-3': 'terminated', 'i-4': 'busy', 'i-p2': 'terminated'})
+            [('i-2', 'gpu-box-2', 250), ('i-3', 'gpu-box-3', 45), ('i-4', 'gpu-box-4', 45), ('i-p2', 'parallel-box-2', 45),
+             ('i-p3', 'parallel-box-3', 45), ('i-p1', 'parallel-box', 45)],
+            {'i-2': 90.0, 'i-3': 1.0, 'i-4': 90.0, 'i-p2': 1.0, 'i-p3': 1.0, 'i-p1': 1.0})
+        self.assertEqual(actions, {'i-2': 'terminated_lifetime', 'i-3': 'terminated', 'i-4': 'busy', 'i-p2': 'terminated',
+                                   'i-p3': 'terminated', 'i-p1': 'terminated'})
         idle = [b for b in calls['body'] if 'below' in b]
         self.assertTrue(any('gbox up 3\n' in b for b in idle), idle)
-        self.assertTrue(any('pbox up 2\n' in b for b in idle), idle)
+        # each parallel box's alert names ITS slot: the restart command selects that slot's work volume
+        for cmd in ('pbox up 2\n', 'pbox up 3\n', 'pbox up\n'):
+            self.assertTrue(any(cmd in b for b in idle), (cmd, idle))
 
     def test_failed_terminate_alerts(self):
         actions, calls = self.run_watchdog([('i-old', 'gpu-box', 250), ('i-idle', 'gpu-box', 45)],

@@ -133,7 +133,8 @@ def lambda_handler(event, context):
             up_cmd = "gbox up" + ("" if name == "gpu-box" else " " + name.rsplit("-", 1)[1])
             kept = "Nothing on it persists"
         else:
-            up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
+            # parallel-box is slot 1; parallel-box-N is slot N (the same shape as gbox).
+            up_cmd = "pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1])
             kept = "Its work volume is untouched"
         print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
