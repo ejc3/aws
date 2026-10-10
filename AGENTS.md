@@ -682,7 +682,12 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `.tokens.by_client_account` and `.tokens.by_client`, type input / output / cache_read / cache_creation (about 50 new series).
   Five-hour window gauges (`claude_master.quota.five_hour.*`). WebFetch's domain check (`GET /api/web/domain_info`) is relayed to
   Anthropic instead of refused. The next PR in that stack (`service.instance.id` on every metric) is NOT released: it adds a
-  dimension to every series, so it must ship together with every `SCHEMA(...)` query here and in the dashboard repository. There is no fallback to a login on the box: a server that is down or out of quota is an
+  dimension to every series, so it must ship together with every `SCHEMA(...)` query here and in the dashboard repository.
+  `claude-master-dcb7263` fixes two things 09015c6 got wrong in production. No token series appeared in two hours of traffic:
+  Anthropic answers compressed and the scanner read compressed bytes; it now decodes a copy (gzip, deflate, br, zstd) and the
+  client's bytes stay as sent. And the first drained restart "waited 2ms" for 2 running requests: the backend's lifetime was the
+  serve context, which the stop signal cancels, and every request handler stops with it; the backend now outlives the signal and
+  stops at Close, after the drain. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
