@@ -139,6 +139,10 @@ class TextTests(unittest.TestCase):
         self.assertEqual([l for l in lines if l.startswith("#")], [lines[0], lines[4]], "one title, one section")
         for model in ("`haiku`", "`sonnet`", "Opus 5.5"):
             self.assertIn(model, text)
+        # Subagents only ever go down a model: a Sonnet session must not start an Opus subagent (owner, 2026-10-10).
+        self.assertIn("Delegate down, never up.", text)
+        self.assertIn("A Sonnet session never starts an Opus subagent", text)
+        self.assertNotIn("move up a model", text)
         self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
 
     def test_the_text_has_one_source(self):

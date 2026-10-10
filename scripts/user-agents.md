@@ -21,7 +21,10 @@ How to use them:
 
 - Give a subagent its model on the Agent tool (`model: "haiku"` or `model: "sonnet"`); the main session keeps its own.
   For a long run of simple work, `/model sonnet` switches the whole session; switch back when the work gets hard.
+- Delegate down, never up. A subagent runs on the session's own model or a cheaper one: Haiku from a Sonnet session,
+  Haiku or Sonnet from an Opus session. A Sonnet session never starts an Opus subagent; if the work needs Opus, the
+  session itself goes back to Opus (`/model opus`) first.
 - A subagent starts with no context: give it the goal, the files, the constraints and what "done" looks like.
 - One task per subagent. Check what it did yourself (run the tests, read the diff) before relying on it.
-- If a cheaper model gets it wrong once, move up a model; do not retry the same one.
+- If a subagent gets it wrong once, do that piece in the main session instead; do not retry the same model.
 - Never hand a cheaper model an action that cannot be undone: a deploy, a delete, a push to main, a credential.
