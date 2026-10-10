@@ -140,7 +140,8 @@ resource "aws_iam_role_policy" "mac_dev_ebs" {
   policy   = local.dev_ebs_policy
 }
 
-# io-box and parallel-box need no AWS access beyond temporary EBS volume lifecycle.
+# io-box and parallel-box need no AWS access beyond temporary EBS volume lifecycle, plus Claude Haiku 5.5
+# on Bedrock since 2026-10-10 (bedrock-haiku.tf).
 resource "aws_iam_role" "dev_ebs_only" {
   name = "dev-ebs-only-role"
 
