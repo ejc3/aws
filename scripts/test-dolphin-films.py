@@ -133,12 +133,23 @@ class WebhookGateTests(unittest.TestCase):
     def test_nothing_about_dolphin_films_is_read_or_planned_unless_the_gate_is_true(self):
         self.assertIn("dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready", RUNNER_APP)
         # the token read skips the repo, the provider reads no token and the webhook has no count
-        self.assertIn("if r != \"dolphin-labs-hq/dolphin-films\" || var.dolphin_films_token_ready", RUNNER_APP)
+        self.assertIn('"dolphin-labs-hq/dolphin-films" = var.dolphin_films_token_ready', RUNNER_APP)
+        self.assertIn("if lookup(local.runner_app_token_gates, r, true)", RUNNER_APP)
         self.assertIn("for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])", RUNNER_APP)
         provider = re.search(r'alias = "dolphin_films".*?\n\}', RUNNER_APP, re.S).group()
         self.assertIn("token = local.dolphin_films_webhook ?", provider)
         hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
         self.assertEqual(hook.group(1), "local.dolphin_films_webhook ? 1 : 0")
+
+    def test_dolphin_maps_has_the_same_gate(self):
+        gate = re.search(r'variable "dolphin_maps_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
+        self.assertRegex(gate, r"default\s+= (true|false)")
+        self.assertIn("dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready", RUNNER_APP)
+        self.assertIn('"dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready', RUNNER_APP)
+        provider = re.search(r'alias = "dolphin_maps".*?\n\}', RUNNER_APP, re.S).group()
+        self.assertIn("token = local.dolphin_maps_webhook ?", provider)
+        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_maps" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
+        self.assertEqual(hook.group(1), "local.dolphin_maps_webhook ? 1 : 0")
 
     def test_the_other_repos_keep_the_global_gate_only(self):
         self.assertIn("count      = local.runner_app_webhooks ? 1 : 0", RUNNER_APP)

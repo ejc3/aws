@@ -1,8 +1,9 @@
 # runner-repos.tf
 #
 # Self-hosted runners for repos other than ejc3/fcvm. Today the runner system serves exactly
-# one repo on bare metal; CoderColton/colton-games, dolphin-labs-hq/dolphin-labs and
-# dolphin-labs-hq/dolphin-films are on ordinary x86 spot instances (their jobs need no KVM).
+# one repo on bare metal; CoderColton/colton-games, dolphin-labs-hq/dolphin-labs,
+# dolphin-labs-hq/dolphin-films and dolphin-labs-hq/dolphin-maps are on ordinary x86 spot
+# instances (their jobs need no KVM).
 #
 # STEP 1 (this file, for now): each repo's controller token. A runner registration token needs
 # repo ADMIN, so each repo's owner mints a fine-grained token limited to that one repo with
@@ -12,6 +13,7 @@
 #   dolphin-labs-hq/dolphin-labs   minted by ejc3 as org admin
 #   dolphin-labs-hq/dolphin-films  minted by ejc3 as org admin (its own token: each is limited
 #                                  to one repo, so dolphin-labs' cannot register runners here)
+#   dolphin-labs-hq/dolphin-maps   minted by ejc3 as org admin (its own token, likewise)
 #
 # CONTAINER ONLY, deliberately not an SSM parameter. Terraform creates the secret and never a
 # version, so it never reads the value and the token cannot land in state. (An
@@ -24,7 +26,7 @@
 # Only administration and the runner controllers (runner_lambda, runner_app_lambda) may read it. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
-  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films"]
+  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps"]
 }
 
 resource "aws_secretsmanager_secret" "github_runner_repo_pat" {

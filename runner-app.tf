@@ -34,11 +34,13 @@ locals {
   # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
   # so sharing the label shares nothing else: its cap of 2 is its own and it can never take one
   # of dolphin-labs' 8. `alarm` names its per-repo alarm, which would otherwise collide with
-  # dolphin-labs' (both are named after the label).
+  # dolphin-labs' (both are named after the label). dolphin-maps (another dolphin-labs-hq
+  # project) is the same shape: the `dolphin` label, its own cap of 2, its own alarm.
   runner_app_repos = {
     "CoderColton/colton-games"      = { label = "cc-games", max = 8 }
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
+    "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
   }
 
   runner_app_config = {
@@ -565,15 +567,28 @@ variable "dolphin_films_token_ready" {
   default     = true
 }
 
+# The same gate for dolphin-maps: false until the org owner has minted and stored its token.
+variable "dolphin_maps_token_ready" {
+  description = "dolphin-labs-hq/dolphin-maps' controller token has a value in Secrets Manager, so its webhook can be created"
+  type        = bool
+  default     = false
+}
+
 locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
 
-  # dolphin-films' webhook and token read need its gate as well as the global one.
+  # A repo with a hand-minted token: its webhook and token read need its gate as well as the global one. A repo not
+  # listed here needs only the global gate.
+  runner_app_token_gates = {
+    "dolphin-labs-hq/dolphin-films" = var.dolphin_films_token_ready
+    "dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready
+  }
   dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready
+  dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready
 
   runner_app_webhook_repos = [
     for r in local.runner_extra_repos : r
-    if r != "dolphin-labs-hq/dolphin-films" || var.dolphin_films_token_ready
+    if lookup(local.runner_app_token_gates, r, true)
   ]
 }
 
@@ -619,6 +634,13 @@ resource "github_repository_webhook" "runner_app_colton_games" {
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
 }
 
+# dolphin-maps' own token, for the same reason.
+provider "github" {
+  alias = "dolphin_maps"
+  owner = "dolphin-labs-hq"
+  token = local.dolphin_maps_webhook ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-maps"].secret_string : null
+}
+
 resource "github_repository_webhook" "runner_app_dolphin_labs" {
   count      = local.runner_app_webhooks ? 1 : 0
   provider   = github.dolphin_labs
@@ -640,6 +662,23 @@ resource "github_repository_webhook" "runner_app_dolphin_films" {
   count      = local.dolphin_films_webhook ? 1 : 0
   provider   = github.dolphin_films
   repository = "dolphin-films"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+resource "github_repository_webhook" "runner_app_dolphin_maps" {
+  count      = local.dolphin_maps_webhook ? 1 : 0
+  provider   = github.dolphin_maps
+  repository = "dolphin-maps"
   events     = ["workflow_job"]
   active     = true
 
