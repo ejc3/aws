@@ -7,12 +7,16 @@
 #   github-admin-token/dolphin-labs-hq   all of the organization's repositories
 #   github-admin-token/ejc3              all of the user's repositories
 #
-# Readers: the administration set only (the jumpboxes' roles), enforced by a resource policy that denies everyone else
-# whatever an identity policy says. No dev box and no person's account can read them. Terraform owns only the
+# Readers: the jumpboxes' one role (jumpbox-admin-role, shared by jumpbox and jumpbox-2) and nothing else, enforced by
+# a resource policy that denies everyone else whatever an identity policy says. Deliberately NOT the shared
+# administration list (local.games_mp_admin_principals): it also matches a person's Identity Center
+# AdministratorAccess session, and these are the agent's tokens. The account root can still replace the policy (break
+# glass), and Terraform applies from a jumpbox, so the containers stay manageable. Terraform owns only the
 # containers; the values are minted in the owner's browser session and put without being printed (they cannot be
 # created by API). Each expires after at most 366 days, the organization's limit; mint again before then.
 locals {
-  github_admin_token_owners = ["dolphin-labs-hq", "ejc3"]
+  github_admin_token_owners  = ["dolphin-labs-hq", "ejc3"]
+  github_admin_token_readers = [aws_iam_role.jumpbox_admin[0].arn]
 }
 
 resource "aws_secretsmanager_secret" "github_admin_token" {
@@ -29,12 +33,12 @@ resource "aws_secretsmanager_secret_policy" "github_admin_token" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationCanRead"
+      Sid       = "OnlyTheJumpboxRoleCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = each.value.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.github_admin_token_readers } }
     }]
   })
 }
