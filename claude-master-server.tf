@@ -208,6 +208,36 @@ resource "aws_cloudwatch_log_group" "claude_master_server" {
   tags              = { Name = "claude-master-server" }
 }
 
+# The metal boxes may READ this one log group (owner, 2026-10-10: "give fcvm access to logs for the claude master"),
+# so an agent there can see what the pool did (moves, rate limits, upstream errors, reloads) without a person. The log
+# never holds tokens, bodies, URLs, account ids or upstream text (see the Logs bullet in AGENTS.md). Not nextjs-dev:
+# every account there has sudo, and nothing there debugs the pool.
+resource "aws_iam_role_policy" "dev_server_claude_master_logs_read" {
+  name = "claude-master-logs-read"
+  role = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadTheClaudeMasterLogGroup"
+        Effect = "Allow"
+        Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams", "logs:StartQuery", "logs:StopQuery"]
+        Resource = [
+          aws_cloudwatch_log_group.claude_master_server.arn,
+          "${trimsuffix(aws_cloudwatch_log_group.claude_master_server.arn, ":*")}:*",
+        ]
+      },
+      {
+        # Logs Insights results are fetched by query id; the action has no resource to scope to.
+        Sid      = "ReadInsightsResults"
+        Effect   = "Allow"
+        Action   = ["logs:GetQueryResults"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
 # Names for the incoming users' Anthropic accounts in the metrics (the `client_account` dimension), so the
 # dashboards say who instead of acct-<8 hex>. claude-master reads them from /etc/claude-master/account-labels,
 # which the server writes from this secret before every start (claude-master-account-labels below). Terraform
