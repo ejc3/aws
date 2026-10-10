@@ -363,7 +363,7 @@ fi
 [ ! -x /usr/local/bin/ndev-prune ] || /usr/local/bin/ndev-prune || echo "setup-sync: WARNING ndev-prune failed"
 
 FAILED=""
-for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
+for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev earlyoom; do
   systemctl is-active --quiet "$unit" || FAILED="$FAILED $unit"
 done
 # Primary labels plus any user-<slug> preview instances that are enabled.
@@ -2070,6 +2070,25 @@ if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
+
+# ---------------------------------------------------------------- earlyoom
+# A runaway must be killed, not page the box to death. On 2026-10-10 memory ran out, the kernel never OOM-killed anything
+# (the swapfile kept it "alive"), and the box paged with its root volume pinned at the 125 MB/s gp3 cap until ssh and both
+# tunnels stopped answering for everyone, 25 minutes, until a person rebooted it. earlyoom kills the biggest offender at
+# 4% available memory (SIGKILL at 2%), as on the metal boxes (their boot hardening in dev-user-data.tf). Unlike them this box
+# has swap, and earlyoom acts only when memory AND free swap are both under their minimums, so `-s 100,100` makes memory
+# alone decide: paging is the failure here, not the last resort. A Next dev server is preferred (2026-10-01: two of them
+# grew to ~11.6 GB each), and its ndev@ unit restarts it; what keeps the box reachable is never a candidate. earlyoom matches
+# /proc/PID/comm, which the kernel cuts to 15 characters, so a longer name is written as its first 15 (systemd-journal,
+# amazon-ssm-agen, ssm-agent-worke, amazon-cloudwat). A failed install or start is not a success: setup-sync's health gate
+# below checks earlyoom.service, so the etag is not recorded and the next run retries.
+apt-get install -y earlyoom || echo "WARNING: earlyoom did not install; setup-sync will retry"
+cat > /etc/default/earlyoom << 'EARLYOOM'
+# Managed by terraform (nextjs-user-data.tf): do not edit by hand.
+EARLYOOM_ARGS="-r 3600 -m 4,2 -s 100,100 -p --avoid '(^|/)(systemd|systemd-journal|sshd|dbus-daemon|cloudflared|tmux|tmux-scroll|amazon-ssm-agen|ssm-agent-worke|snapd|earlyoom|amazon-cloudwat)$' --prefer '^next-server|(^|/)(chrome|chromium|vitest)$'"
+EARLYOOM
+systemctl enable earlyoom.service >/dev/null 2>&1 || echo "WARNING: earlyoom not enabled; setup-sync will retry"
+systemctl restart earlyoom.service || echo "WARNING: earlyoom did not start; setup-sync will retry"
 
 # ---------------------------------------------------------------- per-user shell env
 # t-claude, atuin, starship, fzf, zsh plugins and the native-scrollback tmux.conf --
