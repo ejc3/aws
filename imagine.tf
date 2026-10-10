@@ -34,7 +34,9 @@
 #      CI workflow by hand on main: the deploy job pushes the first `live` image.
 #   3. In the Vercel project set the environment from the imagine_vercel_env output, plus
 #      the secrets Terraform does not hold (the token signing key, AUTH_SECRET, the Google
-#      OAuth client).
+#      OAuth client), and Preview's picture store from imagine_vercel_preview_env. Copy the
+#      four values of imagine-stage/store (imagine-stage-store.tf) into workers-stage/imagine
+#      and reload the staging Worker.
 # After that a deploy is a merge to main there, and nothing here names an image commit.
 
 locals {
@@ -293,6 +295,14 @@ resource "aws_iam_role_policy" "imagine_task" {
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.imagine_docs.arn}/docs/*"
+      },
+      {
+        # Version history: a version's body is <id>.v-<epoch>-<n>, written once and deleted
+        # when it is evicted or replaced. Delete reaches those keys only: a document id has no
+        # dot, so no snapshot (<id>.json), lease (<id>.lease) or picture (images/...) matches.
+        Effect   = "Allow"
+        Action   = "s3:DeleteObject"
+        Resource = "${aws_s3_bucket.imagine_docs.arn}/docs/*.v-*"
       },
       {
         # Without ListBucket, S3 answers 403 instead of 404 for a document that does not
@@ -827,6 +837,98 @@ resource "aws_iam_role_policy" "imagine_waker" {
   })
 }
 
+# Pictures: the web app keeps the bytes of the images placed in a document itself, after it has
+# decided who may, under images/<file id>/<hash> in the store the backend's documents are in
+# (ejc3/imagine web/src/lib/image-store.ts). Its production deployments assume imagine-store
+# through the same Vercel OIDC trust as the waker; it reaches docs/images/* and nothing else of
+# the bucket's contents (no snapshot, lease, access record or version), and cannot delete.
+# ListBucket is for the reason given at the task role: without it S3 answers 403 for a
+# picture that is not there, and the store must tell "not there" from an error.
+#
+# Preview deployments are not production: they get imagine-store-preview, the same reach on
+# the staging bucket (imagine-stage-store.tf), never on this one.
+resource "aws_iam_role" "imagine_store" {
+  name                 = "imagine-store"
+  description          = "Assumed by the imagine web app's production deployments via Vercel OIDC to read and write pictures under docs/images/"
+  max_session_duration = 3600
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.vercel_imagine.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.imagine_vercel_oidc}:aud" = "https://vercel.com/${local.imagine_vercel_team}"
+          "${local.imagine_vercel_oidc}:sub" = "owner:${local.imagine_vercel_team}:project:${local.imagine_vercel_project}:environment:production"
+        }
+      }
+    }]
+  })
+  tags = { Name = "imagine-store", Project = "imagine" }
+}
+
+resource "aws_iam_role_policy" "imagine_store" {
+  name = "pictures"
+  role = aws_iam_role.imagine_store.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.imagine_docs.arn}/docs/images/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.imagine_docs.arn
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role" "imagine_store_preview" {
+  name                 = "imagine-store-preview"
+  description          = "Assumed by the imagine web app's preview deployments via Vercel OIDC to read and write pictures in the staging bucket"
+  max_session_duration = 3600
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.vercel_imagine.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.imagine_vercel_oidc}:aud" = "https://vercel.com/${local.imagine_vercel_team}"
+          "${local.imagine_vercel_oidc}:sub" = "owner:${local.imagine_vercel_team}:project:${local.imagine_vercel_project}:environment:preview"
+        }
+      }
+    }]
+  })
+  tags = { Name = "imagine-store-preview", Project = "imagine" }
+}
+
+resource "aws_iam_role_policy" "imagine_store_preview" {
+  name = "pictures-staging"
+  role = aws_iam_role.imagine_store_preview.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.imagine_stage.arn}/images/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.imagine_stage.arn
+      },
+    ]
+  })
+}
+
 # GitHub names this repository in its tokens by owner and repository ID as well as by name
 # (ejc3@1694850/imagine@1403409773): the "immutable subject" form, which is what a
 # repository created now gets. A trust on the plain name never matches such a token, and a
@@ -900,6 +1002,18 @@ output "imagine_vercel_env" {
     IMAGINE_WS_URL         = "wss://${local.imagine_host}/socket"
     IMAGINE_SCALE_FUNCTION = aws_lambda_function.imagine_scale.function_name
     IMAGINE_SCALE_ROLE_ARN = aws_iam_role.imagine_waker.arn
+    IMAGINE_AWS_REGION     = var.aws_region
+    IMAGINE_STORE          = "s3:${aws_s3_bucket.imagine_docs.bucket}/docs/"
+    IMAGINE_STORE_ROLE_ARN = aws_iam_role.imagine_store.arn
+  }
+}
+
+# The same, for Preview deployments: pictures go to the staging bucket, never production's.
+output "imagine_vercel_preview_env" {
+  description = "Non-secret picture-store environment for the imagine Vercel project (Preview)"
+  value = {
+    IMAGINE_STORE          = "s3:${aws_s3_bucket.imagine_stage.bucket}/"
+    IMAGINE_STORE_ROLE_ARN = aws_iam_role.imagine_store_preview.arn
     IMAGINE_AWS_REGION     = var.aws_region
   }
 }
