@@ -216,7 +216,8 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(ar.wedged(*healthy, NOW, *build), "a box reading hard and writing too is working, not paging")
         busy = fresh([20e9] * 4, 300), fresh([0] * 4, 300)
         self.assertIsNone(ar.wedged(*healthy, NOW, *busy), "reads well under the cap are not paging")
-        self.assertIn("paging", ar.wedged(*healthy, NOW, reads, []), "a missing write bucket counts as no writes")
+        self.assertIsNone(ar.wedged(*healthy, NOW, reads, []), "no write samples is no evidence of low writes")
+        self.assertIsNone(ar.wedged(*healthy, NOW, reads, writes[:3]), "one missing write bucket breaks the run")
         recovered = fresh([39e9, 39e9, 39e9, 2e9], 300), fresh([0] * 4, 300)
         self.assertIsNone(ar.wedged(*healthy, NOW, *recovered), "one normal bucket breaks the run")
 

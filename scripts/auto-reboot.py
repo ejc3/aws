@@ -76,9 +76,10 @@ def host_failing_now(system_failed, now):
 
 def paging(ebs_read, ebs_write):
     """[(ts, bad)] per five minutes: bad when that bucket read at least THRASH_READ_BYTES and wrote at most
-    THRASH_WRITE_SHARE of what it read. A missing write bucket counts as no writes."""
+    THRASH_WRITE_SHARE of what it read. A bucket with no write sample is not evidence and is never bad: missing data
+    must not reboot a box."""
     writes = dict(ebs_write)
-    return [(t, r >= THRASH_READ_BYTES and writes.get(t, 0) <= r * THRASH_WRITE_SHARE) for t, r in ebs_read]
+    return [(t, t in writes and r >= THRASH_READ_BYTES and writes[t] <= r * THRASH_WRITE_SHARE) for t, r in ebs_read]
 
 
 def wedged(status_failed, network_out, now, ebs_read=(), ebs_write=()):
