@@ -5,8 +5,8 @@ Session values stay out of the repository. A value copied from a working session
 ## Cheaper models for straightforward work
 
 Claude Code here can run three current models. Opus 5.5 is the default. Sonnet 5.5 and Haiku 5.5 are faster and
-much cheaper (list price per million tokens, input/output: Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50),
-so hand them the simple parts and keep Opus for the thinking.
+much cheaper (list price per million tokens, input/output: Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50 for
+prompts up to 100K tokens and $0.50/$2.50 above), so hand them the simple parts and keep Opus for the thinking.
 
 - **Haiku 5.5 (`haiku`)**: mechanical work that is easy to check. Finding and reading files and summarizing them,
   extraction and classification, renames, formatting, lookups, running a command and reporting what it printed, simple
@@ -20,7 +20,8 @@ so hand them the simple parts and keep Opus for the thinking.
 How to use them:
 
 - Give a subagent its model on the Agent tool (`model: "haiku"` or `model: "sonnet"`); the main session keeps its own.
-  For a long run of simple work, `/model sonnet` switches the whole session; switch back when the work gets hard.
+  For a long run of simple work, start a session on Sonnet with `claude --model sonnet` (that session only). `/model
+  sonnet` inside a session also makes Sonnet the default for later sessions, so `/model opus` when the simple work ends.
 - Delegate down, never up. A subagent runs on the session's own model or a cheaper one: Haiku from a Sonnet session,
   Haiku or Sonnet from an Opus session. A Sonnet session never starts an Opus subagent; if the work needs Opus, the
   session itself goes back to Opus (`/model opus`) first.
