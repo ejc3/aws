@@ -44,8 +44,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-87f05f5"
-  claude_master_sha256_aarch64 = "8afa0ba79d663ad12c397c503f64d09cea3145282ee8632436d8b7f370daaf9c"
+  claude_master_tag            = "claude-master-069ec38"
+  claude_master_sha256_aarch64 = "d5a1432d6dde297e4d2af6ba8bab9406d785f3d2c9cc114cea24d28cc49842e7"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
