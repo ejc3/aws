@@ -224,6 +224,20 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
   --secret-string file://$HOME/claude_api.txt && shred -u ~/claude_api.txt
 ```
 
+The claude-master account names, `claude-master/account-labels` (us-west-1, from `claude-master-server.tf`),
+turn the `acct-<8 hex>` keys in the metrics into names: one `ACCOUNT_UUID=NAME` line per account (UUID =
+`oauthAccount.accountUuid` in that user's `~/.claude.json`; `claude-master account-key UUID` shows which key
+it replaces). Terraform creates only the container. Set it from a file, then restart the server when its
+sessions can be interrupted, because claude-master reads the names only when it starts:
+
+```bash
+aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
+  --secret-string file://labels.txt && shred -u labels.txt
+aws ssm send-command --region us-west-1 --document-name AWS-RunShellScript \
+  --targets Key=tag:Name,Values=claude-master-server \
+  --parameters 'commands=["systemctl restart claude-master-server"]'
+```
+
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
 kind. Terraform reads only the ones its gate names (`dolphin_films_vercel_ready` in `dolphin-films-vercel.tf`), to
 write them into the Vercel project; from then on their values are in Terraform state (administration only), as

@@ -126,6 +126,86 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
 
 
+def labels_helper():
+    """The account-labels helper as the server gets it, rendered and pointed at `etc` instead of /etc/claude-master."""
+    script = TF[TF.index("cat > /usr/local/bin/claude-master-account-labels <<'EOF'\n"):]
+    script = script[script.index("\n") + 1:script.index("\nEOF\n")]
+    return script.replace("${var.aws_region}", "us-west-1")
+
+
+class AccountLabelsTests(unittest.TestCase):
+    """Names for the incoming accounts come from Secrets Manager, written before each start, never fatal."""
+
+    def run_helper(self, value, existing="# old\n", aws_fails=False):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            etc = Path(d) / "etc"
+            etc.mkdir()
+            (etc / "account-labels").write_text(existing)
+            bin_ = Path(d) / "bin"
+            bin_.mkdir()
+            (bin_ / "aws").write_text("#!/bin/bash\n" + ("exit 255\n" if aws_fails else "cat \"$AWS_VALUE_FILE\"\n"))
+            (bin_ / "chown").write_text("#!/bin/bash\nexit 0\n")  # the test does not run as root
+            for f in bin_.iterdir():
+                f.chmod(0o755)
+            (Path(d) / "value").write_text(value)
+            script = labels_helper().replace("/etc/claude-master", str(etc))
+            env = dict(os.environ, PATH="%s:%s" % (bin_, os.environ["PATH"]), AWS_VALUE_FILE=str(Path(d) / "value"))
+            out = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+            left = sorted(x.name for x in etc.iterdir())
+            return out, (etc / "account-labels").read_text(), left
+
+    def test_a_good_value_replaces_the_file(self):
+        value = "# who is who\n0a1b2c3d-0000-4000-8000-00000000000a=alice\n\n0a1b2c3d-0000-4000-8000-00000000000b = bob\n"
+        out, text, left = self.run_helper(value)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(text, value)  # aws prints the value; the helper ends it with one newline
+        self.assertEqual(left, ["account-labels"], "no temporary file is left behind")
+        self.assertIn("written with 2 names", out.stderr)
+        self.assertNotIn("alice", out.stderr + out.stdout)
+
+    def test_a_line_claude_master_would_refuse_keeps_the_old_file_and_still_starts(self):
+        for bad in ("alice\n", "not-hex=alice\n", "0a1b2c3d-0000-4000-8000-00000000000a=\n", "0a1b2c3d alice\n"):
+            out, text, left = self.run_helper(bad)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(text, "# old\n", bad)
+            self.assertEqual(left, ["account-labels"])
+            self.assertIn("not ACCOUNT_UUID=NAME", out.stderr)
+
+    def test_no_value_or_no_access_keeps_the_old_file_and_still_starts(self):
+        for kwargs in ({"value": ""}, {"value": "None"}, {"value": "x", "aws_fails": True}):
+            out, text, _ = self.run_helper(**kwargs)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(text, "# old\n")
+            self.assertIn("keeping", out.stderr)
+
+    def test_it_runs_as_root_before_each_start_and_can_never_stop_it(self):
+        unit = TF[TF.index("cat > /etc/systemd/system/claude-master-server.service"):]
+        unit = unit[:unit.index("\nEOF\n")]
+        self.assertIn("ExecStartPre=-+/usr/local/bin/claude-master-account-labels", unit)
+        self.assertLess(unit.index("ExecStartPre="), unit.index("ExecStart=/usr/local/bin/claude-master-serve"))
+        helper = code(labels_helper())
+        self.assertNotRegex(helper, r"exit [1-9]")
+        self.assertIn("{ set +x; } 2>/dev/null", labels_helper())
+        self.assertIn("timeout 20 aws secretsmanager get-secret-value", helper)
+        self.assertIn('mv -f "$tmp" "$file"', helper)
+        self.assertIn("chown root:claude-master", helper)
+        self.assertIn("chmod 0640", helper)
+
+    def test_only_administration_and_the_server_read_the_names(self):
+        secret = block("aws_secretsmanager_secret", "claude_master_account_labels")
+        self.assertIn('name                    = "claude-master/account-labels"', secret)
+        self.assertNotIn("aws_secretsmanager_secret_version", TF[TF.index("claude_master_account_labels"):TF.index('resource "aws_iam_instance_profile"')])
+        policy = block("aws_secretsmanager_secret_policy", "claude_master_account_labels")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.claude_master_server[0].arn])", policy)
+        grant = block("aws_iam_role_policy", "claude_master_server_account_labels")
+        self.assertIn('Action   = "secretsmanager:GetSecretValue"', grant)
+        self.assertIn("Resource = aws_secretsmanager_secret.claude_master_account_labels[0].arn", grant)
+        self.assertNotIn('"*"', grant)
+
+
 class ObservabilityTests(unittest.TestCase):
     """Logs and metrics: info level, rotated, redacted at the source, shipped by a pinned agent that
     listens on loopback only, with an IAM grant that can publish to one namespace and write one log group."""

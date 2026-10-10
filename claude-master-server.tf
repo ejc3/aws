@@ -189,6 +189,59 @@ resource "aws_cloudwatch_log_group" "claude_master_server" {
   tags              = { Name = "claude-master-server" }
 }
 
+# Names for the incoming users' Anthropic accounts in the metrics (the `client_account` dimension), so the
+# dashboards say who instead of acct-<8 hex>. claude-master reads them from /etc/claude-master/account-labels,
+# which the server writes from this secret before every start (claude-master-account-labels below). Terraform
+# creates only the container; the owner sets the value out of band, one `ACCOUNT_UUID=NAME` per line (UUID =
+# oauthAccount.accountUuid in that user's ~/.claude.json; `claude-master account-key UUID` prints the
+# acct-<8 hex> key an account shows as until it has a name). From a file, never on a command line:
+#
+#   aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
+#     --secret-string file://labels.txt && shred -u labels.txt
+#
+# then restart the server when its sessions can be interrupted (`sudo systemctl restart claude-master-server`
+# over SSM): claude-master reads the file only when it starts. A value with any other kind of line is refused
+# and the old file kept, because claude-master refuses to start on a bad line. Never write a UUID or a name
+# into this repository.
+resource "aws_secretsmanager_secret" "claude_master_account_labels" {
+  count                   = var.enable_claude_master_server ? 1 : 0
+  name                    = "claude-master/account-labels"
+  description             = "ACCOUNT_UUID=NAME lines naming claude-master's incoming accounts in its metrics. Value set out of band; see claude-master-server.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "claude-master/account-labels", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_policy" "claude_master_account_labels" {
+  count      = var.enable_claude_master_server ? 1 : 0
+  secret_arn = aws_secretsmanager_secret.claude_master_account_labels[0].arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheServerCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claude_master_account_labels[0].arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.claude_master_server[0].arn]) } }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "claude_master_server_account_labels" {
+  count = var.enable_claude_master_server ? 1 : 0
+  name  = "account-labels"
+  role  = aws_iam_role.claude_master_server[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "ReadTheAccountLabels"
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.claude_master_account_labels[0].arn
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "claude_master_server" {
   count = var.enable_claude_master_server ? 1 : 0
   name  = "claude-master-server-profile"
@@ -256,12 +309,44 @@ EOF
 chmod 0755 /usr/local/bin/claude-master-serve
 
 # Names for the incoming users' Anthropic accounts in the dashboards, one `ACCOUNT_UUID=NAME` per line
-# (`claude-master account-key UUID` shows the key an unnamed account gets). Kept if it already exists.
+# (`claude-master account-key UUID` shows the key an unnamed account gets). The file is written from the
+# secret claude-master/account-labels before every start (below); until the secret has a value it holds
+# only this explanation, and an existing file is kept.
 mkdir -p /etc/claude-master
 if [ ! -e /etc/claude-master/account-labels ]; then
-  printf '%s\n' '# ACCOUNT_UUID=NAME, one per line. The UUID is oauthAccount.accountUuid in a user'"'"'s ~/.claude.json.' '# Without a line an account shows as acct-<8 hex of a hash>; the id itself is never exported.' > /etc/claude-master/account-labels
-  chmod 0644 /etc/claude-master/account-labels
+  printf '%s\n' '# ACCOUNT_UUID=NAME, one per line, from the secret claude-master/account-labels at each start.' '# Without a line an account shows as acct-<8 hex of a hash>; the id itself is never exported.' > /etc/claude-master/account-labels
 fi
+chown root:claude-master /etc/claude-master/account-labels
+chmod 0640 /etc/claude-master/account-labels
+
+# Run by systemd as root before each start (ExecStartPre=-+ in the unit), because claude-master reads the
+# file only when it starts. It never stops the start: without a value, when the secret cannot be read, or
+# when a line is not `ACCOUNT_UUID=NAME` (on which claude-master would refuse to start), the file is kept.
+cat > /usr/local/bin/claude-master-account-labels <<'EOF'
+#!/bin/bash
+set -u
+{ set +x; } 2>/dev/null   # the names below stay out of traces
+file=/etc/claude-master/account-labels
+value=$(HOME=/root timeout 20 aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/account-labels --query SecretString --output text 2>/dev/null) || value=""
+if [ -z "$value" ] || [ "$value" = "None" ]; then
+  echo "claude-master-account-labels: claude-master/account-labels has no value or could not be read; keeping $file" >&2
+  exit 0
+fi
+# claude-master's own rule: a blank line, a # comment, or ACCOUNT_UUID=NAME (8 to 64 hex digits and dashes).
+if printf '%s\n' "$value" | grep -qvE '^[[:space:]]*(#.*)?$|^[[:space:]]*[0-9A-Fa-f-]{8,64}[[:space:]]*=[[:space:]]*[^[:space:]]'; then
+  echo "claude-master-account-labels: claude-master/account-labels has a line that is not ACCOUNT_UUID=NAME; keeping $file" >&2
+  exit 0
+fi
+tmp=$(mktemp /etc/claude-master/.account-labels.XXXXXX) || { echo "claude-master-account-labels: cannot write in /etc/claude-master; keeping $file" >&2; exit 0; }
+if printf '%s\n' "$value" > "$tmp" && chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$file"; then
+  echo "claude-master-account-labels: $file written with $(grep -cvE '^[[:space:]]*(#.*)?$' "$file") names" >&2
+else
+  rm -f "$tmp"
+  echo "claude-master-account-labels: could not replace $file; keeping it" >&2
+fi
+exit 0
+EOF
+chmod 0755 /usr/local/bin/claude-master-account-labels
 
 # The journal is small on this box: cap it, and trim what is there now. (No service is restarted: the cap
 # applies the next time journald starts.)
@@ -284,6 +369,8 @@ Environment=HOME=/var/lib/claude-master
 # /var/log/claude-master, owned by the service account; the program rotates the file itself.
 LogsDirectory=claude-master
 LogsDirectoryMode=0750
+# As root and outside the sandbox (+), and never fatal (-): the names from Secrets Manager.
+ExecStartPre=-+/usr/local/bin/claude-master-account-labels
 ExecStart=/usr/local/bin/claude-master-serve
 Restart=on-failure
 RestartSec=10
