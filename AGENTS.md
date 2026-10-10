@@ -736,8 +736,9 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `acct-<8 hex of a hash>`; the account id is never exported (`claude-master account-key UUID` prints the
   key, to tell which `acct-` is whose). The file is written from the Secrets Manager secret
   `claude-master/account-labels` (administration and the server's role only) by
-  `/usr/local/bin/claude-master-account-labels`, which systemd runs as root before every start; claude-master
-  reads it only when it starts, so a new value takes effect at the next restart. With no value, no access, or
+  `/usr/local/bin/claude-master-account-labels`, which systemd runs as root before every start and every 10 minutes
+  (`claude-master-account-labels.timer`); the running server reloads the file within a minute of a change
+  (`claude-master-95551d3` onward), so a new value takes effect without a restart. With no value, no access, or
   a line that is not `ACCOUNT_UUID=NAME` the old file is kept and the server starts anyway. Set the value
   from a file (README); never put a UUID or a name in this repository.
   Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
