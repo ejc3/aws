@@ -604,7 +604,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `serve`, `issue`, `client-init`, `connect`. All AWS glue is in this repo. The pinned release is
   `local.claude_master_tag` plus its sha256 in `claude-master-server.tf`; bump both together.
 - **Logins are interactive and belong to the server.** `scripts/claude-master-login.sh --server`
-  drives the four paste-a-code logins; the service stays idle until all exist. Never copy a login
+  drives the five paste-a-code logins; the service stays idle until all exist. Never copy a login
   from another box. Nothing on the box restarts a server or Envoy on its own; `claude-master-status` shows
   running versus pinned.
 - **Restarts nobody notices: Envoy and blue/green** (`claude-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
@@ -712,7 +712,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `~/.local/bin` ahead of the shared one on PATH, an older build that refuses t-claude's flags, and the route must use the pinned one.
   The `ubuntu` account's sessions share one tmux server, so a running session keeps plain claude; a window launched afterwards goes
   through the pool and saves the server. Enrolling is the switch: `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST`. Mind the
-  capacity: one heavy account on a pool of four subscriptions drains it for everyone (see `claude-master-status` quotas).
+  capacity: one heavy account on a pool of five subscriptions drains it for everyone (see `claude-master-status` quotas).
 - **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
   re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
   a running server or Envoy; `claude-master-status` shows running versus pinned and a new binary takes
@@ -769,7 +769,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   projection. Measured through the live agent: counters arrive as deltas, histograms as approximate statistic
   sets (no percentiles; the proxy publishes its own p50/p95/p99 gauges), and `service.name` is an extra
   dimension. Do not add an attribute to a request metric without checking how many series it multiplies.
-- **Backup.** The root volume (the four logins and the CA key) is in the dev backup selection and the
+- **Backup.** The root volume (the five logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
 ### New repositories appear in Claude Code and Codex within seconds
