@@ -726,7 +726,9 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   connection, refused handshakes; plus a per-profile quota snapshot and routing summary every 5 minutes.
   It never contains tokens, bodies, URLs, account ids or upstream text. For `debug` (every routing
   decision) run `claude-master serve` by hand with `--log-level debug`; do not change the unit to it. The
-  journal is capped at 200M.
+  journal is capped at 200M. The metal boxes (dev-server-role) may read the log group, and only it:
+  `aws logs filter-log-events --region us-west-1 --log-group-name /claude-master/server --filter-pattern '"rate limited"'`,
+  or a Logs Insights query (`aws logs start-query`).
 - **Metrics.** The proxy exports OpenTelemetry metrics (`--otlp-endpoint`) to the CloudWatch agent on
   `127.0.0.1:4318`, which publishes them in namespace `ClaudeMaster` (the agent turns cumulative counters
   into deltas) along with `mem_used_percent` and `swap_used_percent`. Every inference request carries
