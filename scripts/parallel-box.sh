@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Bring the on-demand many-core Graviton boxes up and down. There are TWO independent
-# boxes (parallel-box.tf, parallel-box2.tf), each with its own persistent work volume,
-# so two parallel jobs can run at once.
+# Bring the on-demand many-core Graviton boxes up and down. There are FOUR independent
+# boxes (slots 1-4; ohio-pbox.tf, parallel-box-launch.tf), each with its own persistent
+# work volume, so four parallel jobs can run at once.
 #
-#   pbox up [2]       launch box 1 (or 2); tries several instance types
-#   pbox up [2] kvm   same box, METAL pools only: /dev/kvm for hypervisor
+#   pbox up [N]       launch box 1 (or N, 1-4); tries several instance types
+#   pbox up [N] kvm   same box, METAL pools only: /dev/kvm for hypervisor
 #                     workloads (fcvm/firecracker). Boots in many minutes.
-#   pbox down [2]     terminate it. Its work volume is KEPT.
-#   pbox status       both boxes: running? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
-#   pbox status 2     just box 2
-#   pbox ssh [2]      connect
-#   pbox ip [2]       print the IP
+#   pbox down [N]     terminate it. Its work volume is KEPT.
+#   pbox status       every box: running? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
+#   pbox status N     just box N
+#   pbox ssh [N]      connect
+#   pbox ip [N]       print the IP
 #
 # CAPACITY IS THE HARD PART. A 192-core spot request pinned to one AZ and one instance
 # type scores 1/10 for fulfilment; allowing several instance types raises that
@@ -32,7 +32,7 @@
 # TEMPLATE that carries the whole launch configuration), and this script supplies the one
 # thing terraform cannot know in advance -- which instance type has capacity right now --
 # via ec2:RunInstances against that template. The IAM policy behind it
-# (parallel-box-launch.tf) allows launching ONLY these two tagged boxes, and passing only
+# (parallel-box-launch.tf) allows launching ONLY these four tagged boxes, and passing only
 # the dev-ebs-only role. Terminating was already non-terraform: parallel-box-watchdog.tf
 # has always reaped these boxes with tag-scoped ec2:TerminateInstances.
 set -uo pipefail
@@ -88,7 +88,7 @@ fi
 
 # ---------------------------------------------------------------------------------
 # Box selection. Box 1 keeps the original, unnumbered names (tag "parallel-box",
-# launch template "parallel-box") so nothing existing moves; box 2 is suffixed.
+# launch template "parallel-box") so nothing existing moves; boxes 2-4 are suffixed.
 # ---------------------------------------------------------------------------------
 CMD="${1:-status}"
 BOX="${2:-}"
@@ -96,16 +96,17 @@ MODE="${3:-}"
 
 # "up kvm" is shorthand for box 1 in kvm mode.
 if [ "$BOX" = "kvm" ]; then MODE="kvm"; BOX=1; fi
-case "$BOX" in ""|1|2) ;; *) say "unknown box '$BOX' (use 1 or 2)"; exit 1 ;; esac
+case "$BOX" in ""|1|2|3|4) ;; *) say "unknown box '$BOX' (use 1-4)"; exit 1 ;; esac
 case "$MODE" in ""|kvm) ;; *) say "unknown mode '$MODE' (only 'kvm')"; exit 1 ;; esac
 [ "$MODE" = "kvm" ] && TYPES="$KVM_TYPES"
 
 set_box() {
-  if [ "$1" = "2" ]; then
-    NAME="parallel-box-2" VOLTAG="parallel-box-2-work"
+  if [ "$1" = "1" ]; then
+    NAME="parallel-box"
   else
-    NAME="parallel-box" VOLTAG="parallel-box-work"
+    NAME="parallel-box-$1"
   fi
+  VOLTAG="$NAME-work" # the volume's Name tag (ohio-pbox.tf)
   LT="$NAME" # launch template name matches the box name (parallel-box-launch.tf)
 }
 set_box "${BOX:-1}"
@@ -316,10 +317,9 @@ case "$CMD" in
     ;;
 
   status)
-    # No explicit box -> show both; a numbered ask shows just that one.
+    # No explicit box -> show every slot; a numbered ask shows just that one.
     if [ -z "$BOX" ]; then
-      status_one 1
-      status_one 2
+      for n in 1 2 3 4; do status_one "$n"; done
     else
       status_one "$BOX"
     fi

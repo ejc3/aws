@@ -31,19 +31,14 @@
 #
 # A drift detector that flags unmanaged instances WILL see a running parallel box. That
 # is correct and expected -- it is unmanaged on purpose, exactly like a watchdog-launched
-# replacement would have been. Allowlist tag Name=parallel-box / parallel-box-2 there.
+# replacement would have been. Allowlist tag Name=parallel-box / parallel-box-2 .. parallel-box-4 there.
 
 locals {
-  # Everything that differs between the two boxes. They are otherwise identical, which is
-  # the point: a second box exists so two jobs can run without sharing one work disk.
-  parallel_boxes = {
-    "1" = {
-      name = "parallel-box"
-    }
-    "2" = {
-      name = "parallel-box-2"
-    }
-  }
+  # Everything that differs between the boxes: the Name tag (slot 1 keeps the original, unsuffixed name, so nothing
+  # existing moves). They are otherwise identical, which is the point: four slots exist so four jobs can run without
+  # sharing one work disk. Each slot needs a work volume of the same key in ohio-pbox.tf.
+  parallel_boxes     = { for n in [1, 2, 3, 4] : tostring(n) => { name = n == 1 ? "parallel-box" : "parallel-box-${n}" } }
+  parallel_box_names = [for k in sort(keys(local.parallel_boxes)) : local.parallel_boxes[k].name]
 
   parallel_box_volume_arns = flatten([for r, site in local.parallel_box_sites : [for id in values(site.volumes) : "arn:aws:ec2:${r}:${local.parallel_box_account}:volume/${id}"]])
 }
@@ -276,7 +271,7 @@ resource "aws_launch_template" "parallel_box_ohio" {
 }
 
 # ---------------------------------------------------------------------------------
-# What a dev box is allowed to do, which is exactly: launch one of these two boxes,
+# What a dev box is allowed to do, which is exactly: launch one of these four boxes,
 # attach its own work disk, and kill it again.
 #
 # The condition structure matters and is easy to get wrong. RunInstances authorizes a
@@ -289,7 +284,7 @@ resource "aws_launch_template" "parallel_box_ohio" {
 # ---------------------------------------------------------------------------------
 data "aws_iam_policy_document" "parallel_box_control" {
   # The instance, its root volume and its ENI: may only be created carrying a Name tag
-  # that is one of the two boxes. This is the condition that makes "launch a 192-core
+  # that is one of the four boxes. This is the condition that makes "launch a 192-core
   # box" fail to generalize into "launch anything".
   statement {
     sid       = "RunTaggedParallelBoxOnly"

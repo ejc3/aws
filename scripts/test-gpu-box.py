@@ -125,7 +125,7 @@ class GpuBoxTests(unittest.TestCase):
     def test_watchdog_reaps_every_slot_and_enforces_its_lifetime(self):
         watchdog = source('parallel-box-watchdog.tf')
         # what it finds and what it may terminate are one list, and that list holds every slot
-        self.assertRegex(watchdog, r'parallel_watchdog_tag_names\s*=\s*concat\(\["parallel-box", "parallel-box-2"\], local\.gpu_box_names\)')
+        self.assertRegex(watchdog, r'parallel_watchdog_tag_names\s*=\s*concat\(local\.parallel_box_names, local\.gpu_box_names\)')
         self.assertRegex(watchdog, r'TAG_NAMES\s*=\s*join\(",", local\.parallel_watchdog_tag_names\)')
         self.assertRegex(watchdog, r'"ec2:ResourceTag/Name"\s*=\s*local\.parallel_watchdog_tag_names\s*\}')
         self.assertRegex(watchdog, r'MAX_AGE_MINUTES\s*=\s*jsonencode\(\{\s*for n in local\.gpu_box_names\s*:\s*n\s*=>\s*var\.gpu_box_max_hours \* 60')

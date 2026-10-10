@@ -161,7 +161,7 @@ def lambda_handler(event, context):
 # Every box this watchdog reaps, by exact Name tag: what it describes (TAG_NAMES) and what its
 # role may terminate are the same list, so a new GPU slot cannot be found but unkillable.
 locals {
-  parallel_watchdog_tag_names = concat(["parallel-box", "parallel-box-2"], local.gpu_box_names)
+  parallel_watchdog_tag_names = concat(local.parallel_box_names, local.gpu_box_names)
 }
 
 data "archive_file" "parallel_watchdog" {

@@ -26,10 +26,13 @@ locals {
   # only copy of that data until they are deleted.
   parallel_box_region = "us-east-2"
 
-  # The two persistent volumes, by box number: size and Name tag (scripts/parallel-box.sh finds a volume by its Name tag).
+  # The persistent volumes, by box number: size and Name tag (scripts/parallel-box.sh finds a volume by its Name tag).
+  # One per slot in local.parallel_boxes (parallel-box-launch.tf); slots 3 and 4 were added on 2026-10-10.
   ohio_pbox_volumes = {
     "1" = { size = 300, name = "parallel-box-work" }
     "2" = { size = 100, name = "parallel-box-2-work" }
+    "3" = { size = 100, name = "parallel-box-3-work" }
+    "4" = { size = 100, name = "parallel-box-4-work" }
   }
 }
 
@@ -223,7 +226,7 @@ resource "aws_ebs_volume" "ohio_parallel_work" {
 # ============================================================ idle watchdog
 # The same function as parallel-box-watchdog.tf's, in this region: CloudWatch metrics and TerminateInstances are
 # regional. It shares that role (IAM is global; the policy already allows terminating the parallel boxes by tag in any
-# region) and watches only the two parallel boxes: the GPU box stays in us-west-2.
+# region) and watches only the parallel boxes: the GPU boxes stay in us-west-2.
 resource "aws_lambda_function" "parallel_watchdog_ohio" {
   provider         = aws.ohio
   function_name    = "parallel-box-watchdog"
@@ -238,7 +241,7 @@ resource "aws_lambda_function" "parallel_watchdog_ohio" {
     variables = {
       IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
-      TAG_NAMES     = "parallel-box,parallel-box-2"
+      TAG_NAMES     = join(",", local.parallel_box_names)
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
