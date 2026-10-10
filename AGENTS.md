@@ -665,7 +665,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   names a model it does not serve with `not_found_error`; a bodiless 404 is a path, an intermediary or a transient: 139 of them in
   26 hours on 2026-10-09/10, across every subscription and the API-key backup, while the same subscriptions served the same
   models), the log line for a non-Anthropic body carries content type, request-id, cf-ray, server and a 120-character body
-  prefix, and the usage-poll warning says what failed. There is no fallback to a login on the box: a server that is down or out of quota is an
+  prefix, and the usage-poll warning says what failed. That evidence line showed what they were: Anthropic's own
+  `not_found_error`, 234 bytes of JSON behind a `Content-Encoding` the native passthrough hands over as sent and the proxy never
+  decoded (the session read it; the log read `type= message=`). From `claude-master-87f05f5` a compressed upstream error is decoded
+  once in the record (gzip, deflate, br, zstd), relayed plain, logged readable, and a `not_found_error` about something in the request
+  other than the model (a file, a container, another account's resource) is named as such instead of "does not serve the model". There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
