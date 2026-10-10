@@ -600,7 +600,28 @@ for _ in $(seq 1 20); do
   if grep -q "^cert::$IP:$(port_of "$next")::" <<<"$clusters" && grep -q "^open::127.0.0.1:$(open_of "$next")::" <<<"$clusters"; then switched=1; break; fi
   sleep 0.5
 done
-[ "$switched" = 1 ] || { echo "Envoy did not report $next's endpoints; leaving $active running" >&2; exit 1; }
+if [ "$switched" != 1 ]; then
+  # Envoy may already be sending some new connections to $next. Point it back at the color that is recorded as
+  # active, so the record and Envoy agree and a retry does not restart the server that is taking traffic.
+  if [ "$active" != none ]; then
+    /usr/local/bin/claude-master-envoy-endpoints "$active"
+    back=0
+    for _ in $(seq 1 20); do
+      clusters=$(curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null) || clusters=""
+      if grep -q "^cert::$IP:$(port_of "$active")::" <<<"$clusters" && grep -q "^open::127.0.0.1:$(open_of "$active")::" <<<"$clusters"; then back=1; break; fi
+      sleep 0.5
+    done
+    if [ "$back" = 1 ]; then
+      systemctl stop "claude-master-server@$next"
+      echo "Envoy did not report $next's endpoints; pointed it back at $active and stopped $next" >&2
+    else
+      echo "Envoy reports neither $next nor $active; both are left running. Check: curl -s 127.0.0.1:9901/clusters" >&2
+    fi
+  else
+    echo "Envoy did not report $next's endpoints; $next keeps running (nothing else is serving)" >&2
+  fi
+  exit 1
+fi
 
 echo "$next" > /etc/claude-master/active-color
 systemctl enable "claude-master-server@$next" >/dev/null 2>&1 || true
