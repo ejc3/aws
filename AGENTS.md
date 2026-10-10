@@ -1106,8 +1106,17 @@ that production and non-production share nothing:
 
 ### Sites also deploying to Cloudflare Workers (staging copies)
 
-The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, next-step) also deploy a second copy
-to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions. Production stays on Vercel; the Worker is a
+The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step) also deploy a second copy
+to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions.
+
+**Standing rule (owner, 2026-10-10): every web app supports both clouds, and secrets are handled across both.** Each app
+repository's agent instructions carry the same section ("Two clouds: Vercel and Cloudflare"): a change is done only when both
+deploys are green; no platform-only code without a path on the other; every secret lives in AWS Secrets Manager first
+(`vercel-env/<site>/<target>`, `workers-stage/<site>`, or the site's Terraform-written containers) and is pushed to both platforms
+from there, never set in only one dashboard. A new app joins both clouds before it ships. Two apps do not meet it yet:
+dolphin-maps (`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage` Worker) and claude-master-dashboard
+(Cloudflare only, no Vercel project). Bringing each to the other cloud follows the order below for Cloudflare, or a Vercel
+project with its environment written by Terraform from the same containers. Production stays on Vercel; the Worker is a
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
