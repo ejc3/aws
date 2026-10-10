@@ -133,6 +133,9 @@ jobs:
       - name: Dev-box AI services and price lists (ElevenLabs key readers, public prices only)
         run: python3 -S -B scripts/test-dev-ai-services.py
 
+      - name: Claude Haiku 5.5 on Bedrock (nextjs-dev and one dolphin-labs workflow on main, no other model)
+        run: python3 -S -B scripts/test-bedrock-haiku.py
+
       - name: Colton Games accounts (production for administration only, nothing read or written until the gate names a secret)
         run: python3 -S -B scripts/test-colton-games-accounts.py
 

@@ -397,7 +397,9 @@ providers with `-backend=false`, runs `validate`, and checks CI boundaries. Neve
 state, secret-payload, Lambda-environment, or log-read access to make a GitHub full plan
 pass. Those reads can convey administrator credentials. Full plans belong on a jumpbox;
 a successful validation is not an empty live plan. The shared main/staging CI roles are
-retired with Deny `*`; only the owner-approved AMI publisher uses GitHub OIDC.
+retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
+(`imagine.tf`) and `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`), each trusted for one repository's `main`
+or environment.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
@@ -990,7 +992,19 @@ Available if a task needs them; neither needs a key on disk.
   instance role. The managed `~/.zshrc` wraps `opencode` so it names the `[default]` profile when
   nothing else supplies credentials: opencode does not use an instance role on its own, and
   asked for a key. The pinned release is `local.opencode_version` in `dev-user-data.tf`. Not on
-  nextjs-dev: the kids' box has no Bedrock access, on purpose.
+  nextjs-dev: DeepSeek and the other Anthropic models stay on the metal boxes.
+- **Claude Haiku 5.5 on Bedrock, nextjs-dev too** (`bedrock-haiku.tf`). The kids' box had no Bedrock
+  until the owner, 2026-10-10: "I am fine if this box has haiku access. All boxes can be." Its role,
+  `nextjs-dev-role`, may invoke Haiku 5.5 and no other model; the metal boxes keep every `anthropic.*`
+  model. Call it on bedrock-runtime, region `us-west-2`, model `us.anthropic.claude-haiku-5-5` (the US
+  inference profile; Haiku 5.5 has no in-Region endpoint and is not on bedrock-mantle outside GovCloud, so
+  the Mantle URL Claude Code uses on the metal boxes does not serve it). Credentials come from the
+  instance role; there is no key.
+- **Haiku 5.5 for dolphin-labs' news pass** (`bedrock-haiku.tf`). Role `dolphin-labs-news-bedrock`,
+  assumed through GitHub OIDC by `refresh-news.yml` on `main` of `dolphin-labs-hq/dolphin-labs` and no
+  other workflow, branch or pull request (the trust pins GitHub's immutable `sub` and `job_workflow_ref`).
+  Same grant as nextjs-dev. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
+  workflow needs.
 - **ElevenLabs** (voice and sound for the games). The key is in Secrets Manager,
   `games/elevenlabs-api-key` (us-west-1), readable by dev-server-role and nextjs-dev-role only
   (`dev-ai-services.tf`). Fetch it into the environment when needed, never onto a command line
