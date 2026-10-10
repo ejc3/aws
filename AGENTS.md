@@ -738,7 +738,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   `claude-master/account-labels` (administration and the server's role only) by
   `/usr/local/bin/claude-master-account-labels`, which systemd runs as root before every start and every 10 minutes
   (`claude-master-account-labels.timer`); the running server reloads the file within a minute of a change
-  (`claude-master-95551d3` onward), so a new value takes effect without a restart. With no value, no access, or
+  (`claude-master-95551d3` onward), so a new value takes effect without a restart. From `claude-master-ba18878`
+  tokens are also counted by project (`claude_master.inference.tokens.by_project` {project, type}): the name of the
+  git repository a launch started in, sent by the launch's local forwarder (never a path), at most 100 per process.
+  A client sends it only once it runs that release, so a running session counts as no project until it relaunches. With no value, no access, or
   a line that is not `ACCOUNT_UUID=NAME` the old file is kept and the server starts anyway. Set the value
   from a file (README); never put a UUID or a name in this repository.
   Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
