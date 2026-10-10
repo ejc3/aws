@@ -180,6 +180,9 @@ jobs:
       - name: "Workers deploy token: a typed Cloudflare token resource, an administrators-only container, no secret on a command line"
         run: python3 -S -B scripts/test-workers-deploy.py
 
+      - name: "Cloudflare observability token: read-only groups, account and zones, no Access logs, dev boxes may read it"
+        run: python3 -S -B scripts/test-cloudflare-observability.py
+
       - name: "Metal boot scripts: a reboot keeps the NVMe, earlyoom guards memory, dnsmasq cannot race resolved"
         run: python3 -S -B scripts/test-metal-boot.py
 
