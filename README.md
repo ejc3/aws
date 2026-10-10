@@ -231,16 +231,17 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
 The claude-master account names, `claude-master/account-labels` (us-west-1, from `claude-master-server.tf`),
 turn the `acct-<8 hex>` keys in the metrics into names: one `ACCOUNT_UUID=NAME` line per account (UUID =
 `oauthAccount.accountUuid` in that user's `~/.claude.json`; `claude-master account-key UUID` shows which key
-it replaces). Terraform creates only the container. Set it from a file, then roll the server (a rolling
-restart through Envoy: no session notices), because claude-master reads the names only when it starts:
+it replaces). Terraform creates only the container. Set it from a file and nothing else: a timer on the
+server (`claude-master-account-labels.timer`) copies a changed secret into the server's labels file within 10
+minutes, and claude-master reloads that file within a minute, with no restart:
 
 ```bash
 aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
   --secret-string file://labels.txt && shred -u labels.txt
-aws ssm send-command --region us-west-1 --document-name AWS-RunShellScript \
-  --targets Key=tag:Name,Values=claude-master-server \
-  --parameters 'commands=["claude-master-rollout"]'
 ```
+
+The server log says `account labels reloaded` with the number of names. A value with a line that is not
+`ACCOUNT_UUID=NAME` is not copied, and the names already in use stay.
 
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
 kind. Terraform reads only the ones its gate names (`dolphin_films_vercel_ready` in `dolphin-films-vercel.tf`), to
