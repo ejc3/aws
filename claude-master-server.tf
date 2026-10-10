@@ -24,7 +24,7 @@
 # connect in. It is reached for administration over SSM, or SSH from the jumpboxes.
 #
 # LOGINS ARE INTERACTIVE and belong to this box: `scripts/claude-master-login.sh --server` walks
-# the three paste-a-code logins here. They are never copied from another box (a rotating login
+# the four paste-a-code logins here. They are never copied from another box (a rotating login
 # cannot be shared). The service stays idle until every profile below has a login, then
 # `sudo claude-master-rollout` starts it (scripts/claude-master-login.sh --server does that).
 #
@@ -78,7 +78,7 @@ locals {
   claude_master_drain_seconds = 600
 
   # Order is the fallback order. The first login is the one a fresh session prefers when quotas tie.
-  claude_master_profiles = ["claude-connor", "claude-colton", "claude-ejc3"]
+  claude_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-ejc3"]
 
   claude_master_admin_cidrs = concat(
     var.enable_jumpbox ? ["${aws_instance.jumpbox[0].private_ip}/32"] : [],
@@ -87,7 +87,7 @@ locals {
 }
 
 locals {
-  # The root volume holds the three subscription logins and the CA key that signs every client
+  # The root volume holds the four subscription logins and the CA key that signs every client
   # certificate: the two things that are painful to recreate (three interactive logins; reissuing
   # every client). It joins the backup pool, and the DR copy, with the other persistent roots.
   claude_master_server_volume_arn = var.enable_claude_master_server ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.claude_master_server[0].root_block_device[0].volume_id}" : ""

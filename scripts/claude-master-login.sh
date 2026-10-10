@@ -24,7 +24,7 @@ if [ "${1:-}" = "--server" ]; then
 fi
 
 profiles=("$@")
-[ ${#profiles[@]} -gt 0 ] || profiles=(claude-connor claude-colton claude-ejc3)
+[ ${#profiles[@]} -gt 0 ] || profiles=(claude-connor claude-colton claude-colin claude-ejc3)
 
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }
