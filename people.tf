@@ -8,8 +8,10 @@
 #   read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id people/addresses --secret-string file:///dev/stdin; unset T
 #   {"owner": "...", "family": ["...", "..."], "staging_account": "...", "colton_games_site_admins": {"prod": [...], "nonprod": [...]},
-#    "dolphin_films": {"prod": {"seeds": [...], "admins": [...]}, "nonprod": {"seeds": [...], "admins": [...]}}}
-#   (dolphin_films is optional until dolphin-films-vercel.tf's gate names prod/auth.)
+#    "dolphin_films": {"prod": {"seeds": [...], "admins": [...]}, "nonprod": {"seeds": [...], "admins": [...]}},
+#    "claude_master_dashboard": ["...", "..."]}
+#   (dolphin_films is optional until dolphin-films-vercel.tf's gate names prod/auth. claude_master_dashboard is optional:
+#   the people besides the owner whom the claude-master dashboard admits, claude-master-dashboard-site.tf.)
 #
 # Terraform reads it into locals (local.people, and the names the configuration already used) wherever an address is needed.
 # Every machine that plans (both jumpboxes, the Stop hook) has the administration role and can read it; a dev box cannot plan

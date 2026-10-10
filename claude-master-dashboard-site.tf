@@ -9,9 +9,11 @@
 #
 #   1. Cloudflare Access on the Worker itself (a worker destination, so workers.dev and preview
 #      URLs alike), reusing this account's Google and one-time PIN identity providers (no new
-#      OAuth client). Its policy admits the owner only: the dashboard names subscription
-#      accounts and the people using them, which is not for the family-wide cc-games allowlist.
-#      The app checks the Access assertion again.
+#      OAuth client). Its policy admits the owner and the people the owner named for it (the
+#      `claude_master_dashboard` list in people/addresses: Colton and Connor, 2026-10-10), never
+#      the family-wide cc-games allowlist as such: the dashboard names subscription accounts and
+#      the people using them. The app checks the Access assertion again, against its own
+#      DASHBOARD_ALLOWED_EMAILS, which must name the same people.
 #   2. The Worker's URL switches, which turn on only after Access covers it.
 #   3. A read-only AWS key for the Worker, which cannot assume an AWS role (Workers have no
 #      OIDC identity AWS accepts). It may only read CloudWatch metrics in this region.
@@ -41,7 +43,10 @@ resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_owner" {
   decision         = "allow"
   session_duration = "24h"
 
-  include = [{ email = { email = nonsensitive(local.people.owner) } }]
+  include = concat(
+    [{ email = { email = nonsensitive(local.people.owner) } }],
+    [for e in try(nonsensitive(local.people.claude_master_dashboard), []) : { email = { email = e } }],
+  )
 }
 
 resource "cloudflare_zero_trust_access_application" "claude_master_dashboard" {
