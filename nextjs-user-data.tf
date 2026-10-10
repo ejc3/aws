@@ -4,7 +4,7 @@
 # pattern as the other dev boxes, so it can be updated without recreating the instance).
 #
 # Three things it sets up:
-#   1. Separate Unix users (colton, connor, ejc3, skevh) so each has their own home, their own
+#   1. Separate Unix users (colton, connor, colin, ejc3, skevh) so each has their own home, their own
 #      `gh auth login`, and their own projects. Nobody shares a GitHub identity.
 #   2. cloudflared, running as a system service, holding the tunnel to Cloudflare.
 #   3. `ndev` -- run it in a Next.js project and it starts `next dev` on a deterministic
@@ -41,6 +41,7 @@ locals {
     for u, z in {
       colton = local.nextjs_domain
       connor = local.nextjs_domain
+      colin  = local.nextjs_domain
       ejc3   = local.dolphin_domain
       skevh  = local.dolphin_domain
     } : u => z if contains(keys(local.nextjs_zone_tunnel), z)
@@ -95,7 +96,7 @@ locals {
   # `skevh` is arriving the same way. A rename would have preserved 363MB and proven
   # nothing. This list only decides which accounts must EXIST; removing a name from it does
   # not delete the account.
-  nextjs_users = ["colton", "connor", "ejc3", "skevh"]
+  nextjs_users = ["colton", "connor", "colin", "ejc3", "skevh"]
   # Accounts whose boot-launched folders also get a Codex thread (codex-seed@<user>), so each
   # folder shows up in their Codex app. Deliberately not everyone: skevh is left out.
   nextjs_codex_seed_users = ["colton", "connor", "ejc3"]
