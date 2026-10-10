@@ -740,10 +740,16 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   from a file (README); never put a UUID or a name in this repository.
   Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
   query: `SELECT SUM(...) FROM "ClaudeMaster" GROUP BY client_account`.
-- **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and two taken from
+- **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and four taken from
   the log: `claude-master-CredentialRejected` (a subscription's login expired or was revoked: redo it with
-  `scripts/claude-master-login.sh --server`) and `claude-master-NoAccountAvailable` (clients are being
-  refused). The agent's IAM grant can publish to the one namespace and write the one log group.
+  `scripts/claude-master-login.sh --server`), `claude-master-NoAccountAvailable` (clients are being
+  refused), `claude-master-UnlistedRoute` and `claude-master-BlockedRoute`. Since `claude-master-d8d4aed`
+  an Anthropic route claude-master does not list is passed through on the session's own login when
+  it is in Claude Code's control plane (`/v1/code/...`), claude.ai's `/api/...` or the MCP registry, and refused
+  when it may spend tokens (the rest of `/v1`, other versions, anything naming messages, completions,
+  generation, batches or agent proxying). UnlistedRoute is the review queue (nothing broke: list the route in
+  `proxyControlPath`, or block it); BlockedRoute means a session may be failing on a refused route. Each route
+  shape is logged once per server process, so an unreviewed route fires again after a rollout. The agent's IAM grant can publish to the one namespace and write the one log group.
 - **Dashboard** `claude-master` (`claude-master-dashboard.tf`): requests by user, subscription, box, model and
   outcome; latency percentiles, Anthropic's first-byte time against claude-master's own overhead; each
   subscription's allowance, resets and Anthropic's own utilization; switches, rate limits, API-backup use;

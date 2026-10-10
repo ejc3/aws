@@ -52,8 +52,8 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-55d298a"
-  claude_master_sha256_aarch64 = "0a5a19b8e7e6181e75bb7f377c937a97818be4270429a1ece5c32a0859a62902"
+  claude_master_tag            = "claude-master-d8d4aed"
+  claude_master_sha256_aarch64 = "cd478a11fc69fb1b6412c0ff75d5016e3a9635419cf82f9f2c940acc95825275"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -958,7 +958,7 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
   insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 }
 
-# Two things only a person can fix, found in the proxy's own log. The wording is the program's fixed text.
+# Things only a person can fix, found in the proxy's own log. The wording is the program's fixed text.
 locals {
   claude_master_log_alarms = {
     CredentialRejected = {
@@ -968,6 +968,15 @@ locals {
     NoAccountAvailable = {
       pattern     = "\"no inference account could be chosen\""
       description = "No subscription (and no API-key backup) could take a request: every one is rate limited, exhausted or its login failed. Clients are being refused."
+    }
+    # Routes claude-master does not list. The first request of each route shape is logged once per server process.
+    UnlistedRoute = {
+      pattern     = "\"relayed an unlisted Anthropic route\""
+      description = "A session reached an Anthropic route claude-master does not list (usually a new Claude Code release), and it was passed through on the session's own login, so nothing broke. Review the log line's method and route: list it in claude-master's control routes if it is harmless, or block it if it spends tokens."
+    }
+    BlockedRoute = {
+      pattern     = "\"blocked an unlisted route that may spend tokens\""
+      description = "claude-master refused an unlisted route that may spend tokens, and a session may be failing on it. The log line names the method and route: have the pool serve it, or list it if it is harmless."
     }
   }
 }
