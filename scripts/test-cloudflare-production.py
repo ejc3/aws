@@ -225,7 +225,8 @@ class LoaderTests(unittest.TestCase):
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=60)
         return r, r.stdout + r.stderr
 
-    OOB = {"SUPABASE_URL": "https://project.example.invalid", "SUPABASE_SECRET_KEY": "sb_secret_oob-VALUE-111"}
+    OOB = {"SUPABASE_URL": "https://project.example.invalid", "SUPABASE_SECRET_KEY": "sb_secret_oob-VALUE-111",
+           "SKYHOOK_LEADERBOARD_SECRET": "skyhook-oob-VALUE-333-abcdefghijklmnopqrstuvwxyz"}
     MANAGED = {"AUTH_SECRET": "managed-VALUE-222-abcdefghijklmnop", "MP_ENV": "production"}
 
     def test_it_loads_the_merge_of_both_into_the_prod_worker(self):
@@ -238,14 +239,14 @@ class LoaderTests(unittest.TestCase):
     def test_it_prints_names_never_values_or_the_token(self):
         r, out = self.run_loader("colton-games", oob=self.OOB, managed=self.MANAGED)
         self.assertIn("SUPABASE_SECRET_KEY", out)
-        for secret in ("sb_secret_oob-VALUE-111", "managed-VALUE-222", "cfat_fake-deploy-token"):
+        for secret in ("sb_secret_oob-VALUE-111", "skyhook-oob-VALUE-333", "managed-VALUE-222", "cfat_fake-deploy-token"):
             self.assertNotIn(secret, out)
             self.assertNotIn(secret, self.log.read_text())
 
     def test_a_name_in_both_containers_is_refused_before_cloudflare(self):
-        r, out = self.run_loader("colton-games", oob={**self.OOB, "MP_ENV": "preview"}, managed=self.MANAGED)
+        r, out = self.run_loader("colton-games", oob=self.OOB, managed={**self.MANAGED, "SUPABASE_URL": "https://other.invalid"})
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("MP_ENV is in both containers", out)
+        self.assertIn("SUPABASE_URL is in both containers", out)
         self.assertFalse(self.log.exists())
 
     def test_placeholders_empties_bad_names_and_missing_containers_are_refused(self):
@@ -254,6 +255,24 @@ class LoaderTests(unittest.TestCase):
                              (None, self.MANAGED), (self.OOB, None)):
             r, out = self.run_loader("colton-games", oob=oob, managed=managed)
             self.assertNotEqual(r.returncode, 0, (oob, managed))
+        self.assertFalse(self.log.exists())
+
+    def test_an_incomplete_or_extra_out_of_band_set_is_refused(self):
+        missing = {k: v for k, v in self.OOB.items() if k != "SKYHOOK_LEADERBOARD_SECRET"}
+        for oob in (missing, {**self.OOB, "EXTRA_NAME": "x"}):
+            r, out = self.run_loader("colton-games", oob=oob, managed=self.MANAGED)
+            self.assertNotEqual(r.returncode, 0, oob)
+            self.assertIn("must hold exactly", out)
+        self.assertFalse(self.log.exists())
+
+    def test_the_loader_and_terraform_agree_on_the_out_of_band_names(self):
+        tf = re.search(r"colton_games_prod_worker_out_of_band = \[(.*?)\]", SECRETS).group(1)
+        sh = re.search(r'colton-games\) OUT_OF_BAND_NAMES="([^"]+)"', SCRIPT.read_text()).group(1)
+        self.assertEqual(sorted(re.findall(r'"([A-Z_]+)"', tf)), sorted(sh.split()))
+
+    def test_a_site_without_production_secrets_is_refused(self):
+        r, out = self.run_loader("imagine", oob=self.OOB, managed=self.MANAGED)
+        self.assertEqual(r.returncode, 2)
         self.assertFalse(self.log.exists())
 
     def test_the_site_argument_is_validated(self):

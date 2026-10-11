@@ -20,6 +20,13 @@ SITE=${1:?usage: workers-prod-secrets.sh SITE}
 WORKER="$SITE-prod"
 ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
+# Exactly what each site's out-of-band container must hold (workers-prod-secrets.tf,
+# local.colton_games_prod_worker_out_of_band), so a missing credential is refused here and not found after the cutover.
+case "$SITE" in
+  colton-games) OUT_OF_BAND_NAMES="SKYHOOK_LEADERBOARD_SECRET SUPABASE_SECRET_KEY SUPABASE_URL" ;;
+  *) echo "no production Worker secrets are defined for $SITE (workers-prod-secrets.tf)" >&2; exit 2 ;;
+esac
+
 read_container() {
   aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null \
     || { echo "$1 has no value yet: put one first (see workers-prod-secrets.tf)" >&2; return 1; }
@@ -28,7 +35,7 @@ OUT_OF_BAND=$(read_container "workers-prod/$SITE") || exit 1
 MANAGED=$(read_container "workers-prod/$SITE/terraform") || exit 1
 
 # Merge and check in one place; the merged object goes to stdout, names and refusals to stderr.
-JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" python3 -c '
+JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" OUT_OF_BAND_NAMES="$OUT_OF_BAND_NAMES" python3 -c '
 import json, os, re, sys
 merged = {}
 for label in ("OUT_OF_BAND", "MANAGED"):
@@ -48,6 +55,8 @@ for label in ("OUT_OF_BAND", "MANAGED"):
         if k in merged:
             sys.exit("%s is in both containers: each name has one owner (workers-prod-secrets.tf)" % k)
         merged[k] = v
+    if label == "OUT_OF_BAND" and sorted(d) != sorted(os.environ["OUT_OF_BAND_NAMES"].split()):
+        sys.exit("workers-prod/%s must hold exactly: %s (it holds: %s)" % (sys.argv[1], os.environ["OUT_OF_BAND_NAMES"], " ".join(sorted(d))))
 print("workers-prod/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")
