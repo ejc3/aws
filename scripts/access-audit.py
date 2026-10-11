@@ -73,6 +73,10 @@ class Layout:
         self.fifo = self.helper_dir + "/events"
         self.log = "/var/log/" + name + ".log"
         self.helper_log = "/var/log/" + name + "-helper.log"
+        # Optional, installed out of band: an executable run on each trigger event, whose
+        # JSON stdout (if any) is delivered as a report. Absent by default; the agent never
+        # installs it. It must be root-owned and not group/world-writable to be run.
+        self.event_handler = self.config_dir + "/event_handler"
 
     @classmethod
     def installed(cls):
@@ -197,7 +201,7 @@ class AwsClient:
 
 # --- Reporting ---------------------------------------------------------------
 
-METRIC_FOR_KIND = {"file-read": "FileRead", "tamper": "Tamper", "test": "Test"}
+METRIC_FOR_KIND = {"file-read": "FileRead", "tamper": "Tamper", "test": "Test", "handler": "Handler"}
 
 
 def subject_for(report):
@@ -206,6 +210,8 @@ def subject_for(report):
         text = "Access audit: " + host + ": " + os.path.basename(report["path"]) + " opened by " + os.path.basename(report.get("exe") or "unknown")
     elif report["kind"] == "tamper":
         text = "Access audit: " + host + ": " + report["reason"]
+    elif report["kind"] == "handler":
+        text = "Access audit: " + host + ": " + str(report.get("summary", "event handler report"))
     else:
         text = "Access audit: " + host + ": TEST alert"
     text = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in text)
@@ -660,6 +666,66 @@ class Integrity:
                     self.remark(path)
 
 
+HANDLER_TRIGGERS = {"file-read", "tamper"}
+HANDLER_TIMEOUT = 15
+HANDLER_MAX_OUTPUT = 64 << 10
+
+
+def handler_is_safe(path):
+    """Run an installed handler only if it is a regular, root-owned, non-writable-by-others file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+class HandlerRunner:
+    """Feeds trigger events to an optional installed handler on a bounded worker thread, so a
+    slow or missing handler never blocks or crashes the sensor. The handler's JSON stdout,
+    if well-formed and small, is delivered as a report through the normal pipeline."""
+
+    def __init__(self, path, emit, run=None, is_safe=handler_is_safe):
+        self.path = path
+        self.emit = emit
+        self.is_safe = is_safe
+        self.run = run or self._run
+        self.queue = queue.Queue(maxsize=50)
+
+    def offer(self, report):
+        if report.get("kind") not in HANDLER_TRIGGERS or not self.is_safe(self.path):
+            return
+        try:
+            self.queue.put_nowait(report)
+        except queue.Full:
+            pass
+
+    def _run(self, payload):
+        completed = subprocess.run([self.path], input=payload, capture_output=True,
+                                   timeout=HANDLER_TIMEOUT)
+        return completed.stdout[:HANDLER_MAX_OUTPUT]
+
+    def handle(self, report):
+        try:
+            output = self.run(json.dumps(report).encode("utf-8"))
+        except Exception as error:
+            self.emit({"kind": "tamper", "reason": "event handler failed", "detail": str(error)[:200]})
+            return
+        if not output:
+            return
+        try:
+            result = json.loads(output)
+        except ValueError:
+            self.emit({"kind": "tamper", "reason": "event handler returned non-JSON"})
+            return
+        if isinstance(result, dict) and result.get("kind") in METRIC_FOR_KIND:
+            self.emit(result)
+
+    def run_loop(self):
+        while True:
+            self.handle(self.queue.get())
+
+
 # --- Install -----------------------------------------------------------------
 
 def render(template, values):
@@ -927,14 +993,21 @@ def command_run():
     client = AwsClient(config["reporter"], config["region"])
     reporter = Reporter(config, client)
     threading.Thread(target=reporter.run, name="reporter", daemon=True).start()
+    handler = HandlerRunner(layout.event_handler, reporter.submit)
+    threading.Thread(target=handler.run_loop, name="handler", daemon=True).start()
+
+    def dispatch(report):
+        reporter.submit(report)
+        handler.offer(report)
+
     watched = sorted(os.path.realpath(path) for path, record in state["files"].items() if record["watch"])
-    sensor, degraded = choose_sensor(platform_name(), watched, reporter.submit, config["ignore_executables"], layout.fifo)
+    sensor, degraded = choose_sensor(platform_name(), watched, dispatch, config["ignore_executables"], layout.fifo)
     if degraded:
         reporter.submit({"kind": "tamper", "reason": "sensor degraded to " + sensor.name, "detail": degraded})
     sensor_thread = threading.Thread(target=sensor.run, name="sensor", daemon=True)
     sensor_thread.start()
     integrity = Integrity({path: record["fingerprint"] for path, record in state["files"].items()},
-                          reporter.submit, getattr(sensor, "mark", lambda path: None))
+                          dispatch, getattr(sensor, "mark", lambda path: None))
     log("running: " + str(len(watched)) + " watched paths, sensor " + sensor.name)
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     while True:

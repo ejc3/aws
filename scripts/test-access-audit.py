@@ -423,6 +423,67 @@ class SensorTest(unittest.TestCase):
         self.assertEqual(remarked, [path, path])
 
 
+class HandlerHookTest(unittest.TestCase):
+    def make(self, safe=True, run=None):
+        self.emitted = []
+        return agent.HandlerRunner("/etc/x/event_handler", self.emitted.append,
+                                   run=run or (lambda payload: b""), is_safe=lambda path: safe)
+
+    def test_absent_or_unsafe_handler_is_never_run(self):
+        ran = []
+        runner = self.make(safe=False, run=lambda payload: ran.append(payload) or b"")
+        runner.offer({"kind": "file-read", "path": "/p"})
+        self.assertTrue(runner.queue.empty())
+        self.assertEqual(ran, [])
+
+    def test_only_trigger_kinds_are_offered(self):
+        runner = self.make()
+        runner.offer({"kind": "heartbeat"})
+        runner.offer({"kind": "test"})
+        self.assertTrue(runner.queue.empty())
+        runner.offer({"kind": "file-read", "path": "/p"})
+        runner.offer({"kind": "tamper", "reason": "x"})
+        self.assertEqual(runner.queue.qsize(), 2)
+
+    def test_handler_receives_event_json_and_its_report_is_delivered(self):
+        seen = {}
+        def run(payload):
+            seen["event"] = json.loads(payload)
+            return json.dumps({"kind": "handler", "summary": "acted", "detail": "z"}).encode()
+        runner = self.make(run=run)
+        runner.handle({"kind": "file-read", "path": "/p", "pid": 7})
+        self.assertEqual(seen["event"]["path"], "/p")
+        self.assertEqual([r["kind"] for r in self.emitted], ["handler"])
+        self.assertEqual(self.emitted[0]["summary"], "acted")
+
+    def test_no_output_delivers_nothing_and_bad_output_is_reported(self):
+        self.make(run=lambda p: b"").handle({"kind": "file-read"})
+        self.assertEqual(self.emitted, [])
+        runner = self.make(run=lambda p: b"not json")
+        runner.handle({"kind": "tamper", "reason": "x"})
+        self.assertEqual(self.emitted[0]["reason"], "event handler returned non-JSON")
+
+    def test_handler_crash_is_reported_not_fatal(self):
+        runner = self.make(run=lambda p: (_ for _ in ()).throw(OSError("boom")))
+        runner.handle({"kind": "file-read"})
+        self.assertEqual(self.emitted[0]["reason"], "event handler failed")
+
+    def test_unknown_kind_from_handler_is_dropped(self):
+        runner = self.make(run=lambda p: json.dumps({"kind": "arbitrary"}).encode())
+        runner.handle({"kind": "file-read"})
+        self.assertEqual(self.emitted, [])
+
+    def test_safety_predicate_requires_root_owned_non_writable(self):
+        import tempfile, pathlib
+        path = tempfile.mkdtemp() + "/h"
+        pathlib.Path(path).write_text("x")
+        os.chmod(path, 0o755)
+        self.assertEqual(agent.handler_is_safe(path), os.stat(path).st_uid == 0)
+        os.chmod(path, 0o777)
+        self.assertFalse(agent.handler_is_safe(path))
+        self.assertFalse(agent.handler_is_safe(path + "-missing"))
+
+
 class TerraformBoundaryTest(unittest.TestCase):
     def test_no_private_layout_in_the_public_repository(self):
         for text in (TERRAFORM, (ROOT / "scripts/access-audit.py").read_text()):
