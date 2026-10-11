@@ -26,6 +26,7 @@
 # Who reaches what:
 #   the function            Bedrock Haiku 5.5; journal/ (write); the two secrets (read); its own logs
 #   deploy-news.yml (main)  code/ (write); UpdateFunctionCode and GetFunction on this function only
+#   refresh-news.yml (main) journal/ (write), through dolphin-labs-news-bedrock, until it is retired
 #   nextjs-dev, dev-ebs-only (the dolphin box and the parallel boxes, where replays run)
 #                           journal/ and local/ (read); local/ (write)
 
@@ -442,6 +443,22 @@ resource "aws_iam_role_policy" "box_dolphin_labs_news_journal" {
         Resource = "${aws_s3_bucket.dolphin_labs_news.arn}/local/*"
       },
     ]
+  })
+}
+
+# The hourly GitHub job (refresh-news.yml, role dolphin-labs-news-bedrock in bedrock-haiku.tf) journals
+# its passes too, until the Lambda replaces it: write only, under journal/.
+resource "aws_iam_role_policy" "dolphin_labs_news_bedrock_journal" {
+  name = "write-news-journal"
+  role = aws_iam_role.dolphin_labs_news_bedrock.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "WriteTheJournal"
+      Effect   = "Allow"
+      Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
+      Resource = "${aws_s3_bucket.dolphin_labs_news.arn}/journal/*"
+    }]
   })
 }
 
