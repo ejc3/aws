@@ -1109,6 +1109,13 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
+- **The claude-master dashboard, as an agent**, metal boxes only. `claude-master-dashboard/agent-access` (us-west-1) holds a
+  Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
+  (`claude-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
+  `curl -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET" <dashboard>/api/claude-master/snapshot`, the two
+  values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role and
+  admins, not nextjs-dev-role. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents`,
+  then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claude_master_dashboard`.
 - **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide grant
   on a box where every account has sudo). Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a

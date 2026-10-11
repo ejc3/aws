@@ -75,10 +75,16 @@ resource "cloudflare_zero_trust_access_application" "claude_master_dashboard" {
 
   # Declared here, not only on the policy: without the attachment an apply would leave the
   # Worker with no Access check at all.
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.claude_master_dashboard_owner.id
-    precedence = 1
-  }]
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.claude_master_dashboard_owner.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.claude_master_dashboard_agents.id
+      precedence = 2
+    },
+  ]
 }
 
 # Terraform owns only the Worker's two URL switches, as for the staging Workers.
@@ -147,6 +153,80 @@ resource "aws_secretsmanager_secret_version" "claude_master_dashboard_reader" {
   })
 }
 
+# ---------------------------------------------------------------------------------
+# Agents on the metal boxes (#374): a service token of their own, so an agent can read what the dashboard shows
+# (`/api/claude-master/snapshot`) and check a deploy, as the owner does in a browser. The token is admitted by a
+# non_identity policy after the owner's; the Worker admits exactly its client id (DASHBOARD_SERVICE_TOKEN_CLIENT_ID,
+# matched against the assertion's common_name) and still checks every person against DASHBOARD_ALLOWED_EMAILS.
+# Readers: dev-server-role only (the metal boxes), which already reads the ClaudeMaster metrics and the
+# /claude-master/server log the dashboard is built from, so the page shows it nothing new. Not nextjs-dev-role:
+# every account there has sudo. Not the cc-games automation token or the Macs' token: revoking this touches nothing else.
+resource "cloudflare_zero_trust_access_service_token" "claude_master_dashboard_agents" {
+  account_id = var.cloudflare_account_id
+  name       = "claude-master-dashboard-agents"
+  duration   = "8760h"
+
+  lifecycle {
+    # A replacement changes the client id the Worker admits: set DASHBOARD_SERVICE_TOKEN_CLIENT_ID again after it.
+    create_before_destroy = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_agents" {
+  account_id       = var.cloudflare_account_id
+  name             = "claude-master dashboard: metal-box agents"
+  decision         = "non_identity"
+  session_duration = "24h"
+
+  include = [{
+    service_token = {
+      token_id = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.id
+    }
+  }]
+}
+
+resource "aws_secretsmanager_secret" "claude_master_dashboard_agent_access" {
+  name        = "claude-master-dashboard/agent-access"
+  description = "Cloudflare Access service token for metal-box agents to read the claude-master dashboard (client_id, client_secret)"
+  tags        = { Name = "claude-master-dashboard/agent-access", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "claude_master_dashboard_agent_access" {
+  secret_id = aws_secretsmanager_secret.claude_master_dashboard_agent_access.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_secret
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "claude_master_dashboard_agent_access" {
+  secret_arn = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndMetalBoxes"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "dev_server_claude_master_dashboard_access" {
+  name = "claude-master-dashboard-agent-access"
+  role = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+    }]
+  })
+}
+
 output "claude_master_dashboard" {
   description = "What the claude-master dashboard Worker's secrets need (docs/deploy.md in ejc3/claude-master-dashboard)"
   value = {
@@ -157,5 +237,8 @@ output "claude_master_dashboard" {
       "not yet: set the Worker id (step 2)",
     )
     aws_reader_secret = aws_secretsmanager_secret.claude_master_dashboard_reader.name
+    # The Worker secret DASHBOARD_SERVICE_TOKEN_CLIENT_ID (not secret: the client secret is the credential).
+    agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_id
+    agent_access_secret           = aws_secretsmanager_secret.claude_master_dashboard_agent_access.name
   }
 }
