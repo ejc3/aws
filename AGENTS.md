@@ -1151,6 +1151,19 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
   (`games-mp-migrate` applies it when it merges to `main`; nobody runs SQL by hand), then the target. A
   dev box sets `ACCOUNT_SAVES=on` in its own environment.
 
+### Colton Games picture moderation
+
+`colton-games-moderation.tf` lets colton-games check pictures for inappropriate content with Amazon Rekognition
+`DetectModerationLabels` (us-west-1). That one action is the whole grant everywhere; the picture travels in the request and
+nothing is stored. About $1 per 1,000 pictures; alarm `colton-games-moderation-volume` fires above 2,000 calls an hour.
+
+- Vercel production and preview assume `colton-games-moderation` / `colton-games-moderation-preview` through the Vercel OIDC
+  provider, each pinned to its own environment. Terraform writes `MODERATION_ROLE_ARN` and `MODERATION_AWS_REGION`.
+- The staging Worker `colton-games-stage` has no OIDC, so IAM user `colton-games-moderation-worker` holds the same single
+  permission. Its key is in `colton-games/moderation-worker-key` (administration only). Copy its three keys into
+  `workers-stage/colton-games` and run `scripts/workers-stage-secrets.sh colton-games`.
+- nextjs-dev's role may call it too, for building the feature on the box.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
