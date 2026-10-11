@@ -442,9 +442,9 @@ state, secret-payload, Lambda-environment, or log-read access to make a GitHub f
 pass. Those reads can convey administrator credentials. Full plans belong on a jumpbox;
 a successful validation is not an empty live plan. The shared main/staging CI roles are
 retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
-(`imagine.tf`), `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`) and `dolphin-labs-news-deploy`
-(`dolphin-labs-news.tf`), each trusted for one repository's `main`
-or environment.
+(`imagine.tf`), `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`), `dolphin-labs-news-deploy`
+(`dolphin-labs-news.tf`) and `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`), each trusted for one
+repository's `main` or environment.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
@@ -1221,6 +1221,14 @@ Available if a task needs them; neither needs a key on disk.
   secret, turn refresh-news.yml's schedule off in dolphin-labs, then `dolphin_labs_news_enabled = true`
   (both running would bill Haiku and Browserbase twice); an Errors alarm and, once enabled, a 'not running'
   alarm watch it. Output `dolphin_labs_news` holds the deploy workflow's variables.
+- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambda `dolphin-maps-loop` on two EventBridge
+  schedules in America/Los_Angeles time (live samples every 5 minutes on weekday mornings, the sweep and
+  refit on Sunday night; both off until `dolphin_maps_loop_enabled`), reading `browserbase/credentials`
+  and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
+  write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
+  text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.
+  The code ships from dolphin-maps `deploy-loop.yml` through `dolphin-maps-loop-deploy` (GitHub OIDC,
+  `main` only). Output `dolphin_maps_loop` holds the deploy workflow's repository variables.
 - **ElevenLabs** (voice and sound for the games). The key is in Secrets Manager,
   `games/elevenlabs-api-key` (us-west-1), readable by dev-server-role and nextjs-dev-role only
   (`dev-ai-services.tf`). Fetch it into the environment when needed, never onto a command line
