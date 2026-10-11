@@ -656,6 +656,14 @@ poll that ran while a job's runner was booting put up a second host for the same
 whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
+**Controller tokens from a GitHub App (2026-10-11).** For the dolphin-labs-hq repos (`local.runner_app_github_app_repos` in
+`runner-app.tf`) the controller mints an installation token from the runners GitHub App (`github-app/runners`: the
+controller and the jumpbox role only) on each run, narrowed to that one repository and to administration:write +
+actions:read, expiring within the hour. The JWT is signed in pure Python (`app_runner.py`, `rs256`), because the Lambda
+runtime has no openssl. Until the secret has a value, or when minting fails (logged), the repo's own PAT
+(`github-runner/repo-pat/<owner>/<repo>`) is used, so the PATs stay until the app is proven. CoderColton's colton-games keeps
+its PAT: the app would have to be installed from Colton's account.
+
 ## Pattern C — ephemeral x86 spot runners for other repos
 
 `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films` and `dolphin-labs-hq/dolphin-maps`

@@ -47,14 +47,19 @@ locals {
   # reports "skipped: no controller token", which withholds the aggregate Repo=ALL metric for every repo and fires
   # github-app-runner-reconcile-silent.
   runner_app_config = {
-    for repo, c in local.runner_app_repos : repo => {
+    for repo, c in local.runner_app_repos : repo => merge({
       label      = c.label
       max        = c.max
       pat_secret = "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
-    } if lookup(local.runner_app_token_gates, repo, true)
+    }, contains(local.runner_app_github_app_repos, repo) ? { app_repo = repo } : {}) if lookup(local.runner_app_token_gates, repo, true)
   }
-  runner_app_max_total = sum([for c in values(local.runner_app_repos) : c.max])
+
+  # Repos whose controller token comes from the runners GitHub App (github-app/runners, below) rather than a year-long PAT:
+  # the app is installed on these. A repo outside an owner the app can be installed on (CoderColton's colton-games: the app
+  # would need Colton's own account) keeps its PAT. The PAT stays the fallback until the app is proven in production.
+  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps"]
+  runner_app_max_total        = sum([for c in values(local.runner_app_repos) : c.max])
 
   # Canonical's own account. Only its images may be launched by this controller.
   runner_app_ami_owner = "099720109477"
@@ -210,7 +215,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Sid      = "ReadServedRepoTokens"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = [for repo in local.runner_extra_repos : aws_secretsmanager_secret.github_runner_repo_pat[repo].arn]
+        Resource = concat([for repo in local.runner_extra_repos : aws_secretsmanager_secret.github_runner_repo_pat[repo].arn], [aws_secretsmanager_secret.github_app_runners[0].arn])
       },
       {
         Sid      = "ResolveUbuntuImage"
@@ -385,6 +390,7 @@ resource "aws_lambda_function" "runner_app" {
   environment {
     variables = {
       REPOS             = jsonencode(local.runner_app_config)
+      RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SECURITY_GROUP_ID = aws_security_group.runner_app[0].id
@@ -693,4 +699,33 @@ resource "github_repository_webhook" "runner_app_dolphin_maps" {
   }
 
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+# The runners GitHub App (ejc3-aws-runners): installation tokens for the controller, narrowed per call to one repository and
+# to administration:write + actions:read, expiring within the hour (app_runner.py, app_token). JSON: app_id, slug,
+# private_key, installations {owner: id}. Terraform owns only the container; the value is stored from GitHub's
+# app-manifest conversion without being printed. Readers: the controller and the jumpboxes' role, nothing else. This
+# replaces the controller's year-long per-repo PATs for the repos in local.runner_app_github_app_repos.
+resource "aws_secretsmanager_secret" "github_app_runners" {
+  count                   = var.enable_github_runner ? 1 : 0
+  name                    = "github-app/runners"
+  description             = "The runners GitHub App's credentials (JSON: app id, private key, installations) for the github-app-runner controller. See runner-app.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "github-app/runners", Project = "github-runners" }
+}
+
+resource "aws_secretsmanager_secret_policy" "github_app_runners" {
+  count      = var.enable_github_runner ? 1 : 0
+  secret_arn = aws_secretsmanager_secret.github_app_runners[0].arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyTheControllerAndTheJumpboxRoleCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.github_app_runners[0].arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat([aws_iam_role.runner_app_lambda[0].arn], local.github_admin_token_readers) } }
+    }]
+  })
 }

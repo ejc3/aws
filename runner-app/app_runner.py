@@ -24,7 +24,9 @@ writes /github-runner/bootstrap/<instance-id> tagged with that instance's ARN, a
 instance role can read and delete only the parameter tagged with its own ARN. The token never
 appears in user data.
 """
+import base64
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -122,12 +124,110 @@ def github(method, path, pat, body=None):
     return json.loads(raw) if raw else {}
 
 
-def repo_pat(cfg):
-    """This repo's controller token, or None while its secret has no value yet.
+# ---------------------------------------------------------------- the runners GitHub App
+# A repo whose config names `app_repo` takes an installation token from the runners GitHub App (Secrets Manager
+# RUNNER_APP_SECRET, JSON: app_id, private_key, installations {owner: id}) instead of a year-long PAT: minted here, narrowed
+# to that one repository and to administration:write + actions:read, and expiring within the hour. The app's JWT is signed
+# in pure Python (RSA PKCS#1 v1.5 over SHA-256, standard library only): the Lambda runtime has no openssl and no
+# `cryptography`. Until the secret has a value, or when minting fails, the repo's own PAT is used and the reason logged.
+RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
+APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
+_APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
+_SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
-    The secret is a Terraform-managed CONTAINER with no Terraform-managed version (runner-repos.tf),
-    so the token never enters state; its owner puts the value in by hand.
+
+def _der(buf, i):
+    """One DER element at buf[i]: (tag, contents, index after it)."""
+    tag, length = buf[i], buf[i + 1]
+    i += 2
+    if length & 0x80:
+        width = length & 0x7f
+        length, i = int.from_bytes(buf[i:i + width], 'big'), i + width
+    return tag, buf[i:i + length], i + length
+
+
+def rsa_private_numbers(pem):
+    """(n, d) from a PEM RSA private key, PKCS#1 ("RSA PRIVATE KEY", what GitHub issues) or PKCS#8 ("PRIVATE KEY")."""
+    der = base64.b64decode(''.join(l for l in pem.strip().splitlines() if not l.startswith('-----')))
+    _, seq, _ = _der(der, 0)
+    if 'BEGIN PRIVATE KEY' in pem:
+        _, _, i = _der(seq, 0)          # version
+        _, _, i = _der(seq, i)          # algorithm
+        _, inner, _ = _der(seq, i)      # OCTET STRING holding the PKCS#1 key
+        _, seq, _ = _der(inner, 0)
+    ints, i = [], 0
+    while len(ints) < 4:
+        _, value, i = _der(seq, i)
+        ints.append(int.from_bytes(value, 'big'))
+    _version, n, _e, d = ints
+    return n, d
+
+
+def rs256(message, pem):
+    n, d = rsa_private_numbers(pem)
+    k = (n.bit_length() + 7) // 8
+    digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
+    em = b'\x00\x01' + b'\xff' * (k - len(digest_info) - 3) + b'\x00' + digest_info
+    return pow(int.from_bytes(em, 'big'), d, n).to_bytes(k, 'big')
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+
+def app_jwt(app_id, pem, at=None):
+    at = int(time.time() if at is None else at)
+    head = _b64url(json.dumps({'alg': 'RS256', 'typ': 'JWT'}, separators=(',', ':')).encode())
+    body = _b64url(json.dumps({'iat': at - 60, 'exp': at + 540, 'iss': str(app_id)}, separators=(',', ':')).encode())
+    return f'{head}.{body}.{_b64url(rs256(f"{head}.{body}".encode(), pem))}'
+
+
+def app_token(repo):
+    """An installation token for `repo` from the runners app, or None when the app is not set up for it."""
+    cached = _APP_TOKENS.get(repo)
+    if cached and cached[1] - time.time() > 600:
+        return cached[0]
+    try:
+        value = secrets.get_secret_value(SecretId=RUNNER_APP_SECRET)['SecretString']
+    except Exception as error:
+        if ((getattr(error, 'response', None) or {}).get('Error', {}).get('Code')) == 'ResourceNotFoundException':
+            return None
+        raise
+    creds = json.loads(value) if value.strip() else {}
+    owner, name = repo.split('/', 1)
+    installation = (creds.get('installations') or {}).get(owner)
+    if not (creds.get('app_id') and creds.get('private_key') and installation):
+        return None
+    out = github('POST', f'/app/installations/{installation}/access_tokens', app_jwt(creds['app_id'], creds['private_key']),
+                 body={'repositories': [name], 'permissions': APP_TOKEN_PERMISSIONS})
+    token = out.get('token')
+    if not isinstance(token, str) or not token.startswith('ghs_'):
+        raise RuntimeError('GitHub returned no installation token')
+    try:
+        expires = datetime.fromisoformat(out['expires_at'].replace('Z', '+00:00')).timestamp()
+    except Exception:
+        expires = time.time() + 3000
+    _APP_TOKENS[repo] = (token, expires)
+    return token
+
+
+def repo_pat(cfg):
+    """This repo's controller token, or None while it has none yet.
+
+    With RUNNER_APP_SECRET set and the repo named in `app_repo`: an installation token from the runners app. Otherwise,
+    or when the app is not set up or minting fails (logged), the repo's own PAT: a Terraform-managed CONTAINER with no
+    Terraform-managed version (runner-repos.tf), so the token never enters state; its owner puts the value in by hand.
     """
+    if RUNNER_APP_SECRET and cfg.get('app_repo'):
+        try:
+            token = app_token(cfg['app_repo'])
+            if token:
+                return token
+            print(f"{cfg['app_repo']}: the runners app is not set up for it yet; using the repo's own token")
+        except OutOfTime:
+            raise
+        except Exception as error:
+            print(f"{cfg['app_repo']}: runners app token failed ({type(error).__name__}: {str(error)[:160]}); using the repo's own token")
     try:
         value = secrets.get_secret_value(SecretId=cfg['pat_secret'])['SecretString']
     except Exception as error:
