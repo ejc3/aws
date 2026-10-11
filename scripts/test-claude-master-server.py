@@ -906,5 +906,17 @@ class EnvoyTests(unittest.TestCase):
         self.assertIn("color=$${1:-legacy}", serve)
         self.assertIn('legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;', serve)
 
+
+class LoginDefaultsTests(unittest.TestCase):
+    """A login refreshed on two boxes revokes the other copy: a server-only subscription stays off fcvm's default."""
+
+    def test_claude_colby_is_in_the_server_default_only(self):
+        script = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+        server = re.search(r'if \[ "\$SERVER" = 1 \]; then profiles=\(([^)]*)\)', script).group(1).split()
+        other = re.search(r'else profiles=\(([^)]*)\); fi', script).group(1).split()
+        self.assertIn("claude-colby", server)
+        self.assertNotIn("claude-colby", other)
+        self.assertEqual(set(server) - set(other), {"claude-colby"})
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
