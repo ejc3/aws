@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# claude-master-tunnel -- reach the shared claude-master server from a machine that is outside
+# claude-master-tunnel -- reach the shared claw-master server from a machine that is outside
 # the VPC but has AWS access (a Mac), through an SSM port forward. Nothing is opened to the internet.
 #
-#   scripts/claude-master-tunnel.sh [LOCAL_PORT]        default 8443; leave it running
+#   scripts/claw-master-tunnel.sh [LOCAL_PORT]        default 8443; leave it running
 #   claw-master connect --server 127.0.0.1:8443 --dir ~/.config/claude-master -- ...
 #
 # The session type matters. The plain AWS-StartPortForwardingSession connects to the INSTANCE'S
@@ -14,7 +14,7 @@ set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
 LOCAL_PORT=${1:-8443}
-REMOTE_HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claude-master-server.tf: a fixed private address
+REMOTE_HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claw-master-server.tf: a fixed private address
 REMOTE_PORT=${CLAUDE_MASTER_SERVER_PORT:-8443}
 [[ $LOCAL_PORT =~ ^[0-9]+$ ]] || { echo "LOCAL_PORT must be a number" >&2; exit 2; }
 

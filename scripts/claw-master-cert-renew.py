@@ -1,13 +1,13 @@
 """claude-master-cert-renew: keep every claude-master client certificate from ever expiring.
 
-Runs daily (claude-master-cert-renew.tf). For each configured client it reads the certificate's end date over SSM Run Command
+Runs daily (claw-master-cert-renew.tf). For each configured client it reads the certificate's end date over SSM Run Command
 (a fixed document, read-only). When fewer than RENEW_BEFORE_DAYS remain it renews: the client box makes a NEW key and request,
 the server signs it (only for that client's own name), and the client box verifies the result and swaps it in atomically
-(scripts/ssm/claude-master-cert-*.sh). A renewal does not need the old certificate to still be valid, so a box that was stopped
+(scripts/ssm/claw-master-cert-*.sh). A renewal does not need the old certificate to still be valid, so a box that was stopped
 for a month catches up on the next run.
 
 What it never does: invent a client (an account with no certificate is "not enrolled" and is skipped: enrolling stays a
-person's decision, scripts/claude-master-enroll.sh), touch a box that is not running, run anything but the four fixed
+person's decision, scripts/claw-master-enroll.sh), touch a box that is not running, run anything but the four fixed
 documents, or restart a service. The key is made on the client and never travels; only the request and the signed certificate do.
 
 Every run publishes ClientCertDaysLeft per client (namespace ClaudeMasterCerts), so an alarm sees a certificate shrinking even

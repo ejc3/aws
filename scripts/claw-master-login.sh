@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# claude-master-login -- log the Claude subscriptions into claude-master on fcvm-metal-arm.
+# claude-master-login -- log the Claude subscriptions into claw-master on fcvm-metal-arm.
 #
-#   scripts/claude-master-login.sh                        the three: connor, colton, ejc3 (on fcvm-metal-arm)
-#   scripts/claude-master-login.sh claude-ejc3 ...        only those profiles
-#   scripts/claude-master-login.sh --server [PROFILE...]  the same, on the shared claude-master server
-#                                                         (claude-master-server.tf), then starts its service
+#   scripts/claw-master-login.sh                        the three: connor, colton, ejc3 (on fcvm-metal-arm)
+#   scripts/claw-master-login.sh claude-ejc3 ...        only those profiles
+#   scripts/claw-master-login.sh --server [PROFILE...]  the same, on the shared claw-master server
+#                                                         (claw-master-server.tf), then starts its service
 #
 # One profile at a time: it prints a claude.ai link, you open it in a browser signed in to THAT
 # subscription's account (incognito if you are signed in to another), approve, and paste the
 # CODE#STATE string Claude shows. A profile that already has a login is skipped, so it is safe to
-# re-run after a failure. It checks that a login EXISTS, not that it is still valid; claude-master
-# refreshes tokens itself, and `claude-master probe NAME --model MODEL` is the live check. Each profile is its own OAuth login on this box; nothing is copied from
+# re-run after a failure. It checks that a login EXISTS, not that it is still valid; claw-master
+# refreshes tokens itself, and `claw-master probe NAME --model MODEL` is the live check. Each profile is its own OAuth login on this box; nothing is copied from
 # the native Claude login or between profiles.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 SERVER=0
 if [ "${1:-}" = "--server" ]; then
   SERVER=1; shift
-  HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claude-master-server.tf: a fixed private address
+  HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claw-master-server.tf: a fixed private address
 fi
 
 profiles=("$@")

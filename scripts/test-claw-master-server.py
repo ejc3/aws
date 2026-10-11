@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-master-server.tf: the shared claude-master server is private, pinned and idle until its
+"""claw-master-server.tf: the shared claude-master server is private, pinned and idle until its
 logins exist. Offline: reads the Terraform source and the two scripts."""
 import re
 import subprocess
@@ -7,15 +7,15 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TF = (ROOT / "claude-master-server.tf").read_text()
-TUN = (ROOT / "claude-master-tunnel.tf").read_text()
-BUNDLE = (ROOT / "scripts" / "claude-master-mac-bundle.sh").read_text()
-MACSETUP = (ROOT / "scripts" / "claude-master-mac-setup.sh").read_text()
-ENROLL = (ROOT / "scripts" / "claude-master-enroll.sh").read_text()
-CONVERGE = (ROOT / "scripts" / "ssm-claude-master-server.sh").read_text()
-LOGIN = (ROOT / "scripts" / "claude-master-login.sh").read_text()
-TUNNEL = (ROOT / "scripts" / "claude-master-tunnel.sh").read_text()
-DASH = (ROOT / "claude-master-dashboard.tf").read_text()
+TF = (ROOT / "claw-master-server.tf").read_text()
+TUN = (ROOT / "claw-master-tunnel.tf").read_text()
+BUNDLE = (ROOT / "scripts" / "claw-master-mac-bundle.sh").read_text()
+MACSETUP = (ROOT / "scripts" / "claw-master-mac-setup.sh").read_text()
+ENROLL = (ROOT / "scripts" / "claw-master-enroll.sh").read_text()
+CONVERGE = (ROOT / "scripts" / "ssm-claw-master-server.sh").read_text()
+LOGIN = (ROOT / "scripts" / "claw-master-login.sh").read_text()
+TUNNEL = (ROOT / "scripts" / "claw-master-tunnel.sh").read_text()
+DASH = (ROOT / "claw-master-dashboard.tf").read_text()
 
 
 def code(text):
@@ -37,50 +37,50 @@ def block(kind, name):
 
 class NetworkTests(unittest.TestCase):
     def test_nothing_inbound_is_open_to_the_internet(self):
-        sg = block("aws_security_group", "claude_master_server")
+        sg = block("aws_security_group", "claw_master_server")
         ingress = re.findall(r"ingress \{.*?\n  \}", sg, re.S)
         self.assertEqual(len(ingress), 2, "only the proxy port and SSH")
         for rule in ingress:
             self.assertNotIn("0.0.0.0/0", rule)
             self.assertNotIn("::/0", rule)
         proxy, ssh = ingress
-        self.assertIn("local.claude_master_server_port", proxy)
+        self.assertIn("local.claw_master_server_port", proxy)
         self.assertIn("[for s in local.dev_fleet_subnets : s.cidr_block]", proxy)
         self.assertIn("from_port   = 22", ssh)
-        self.assertIn("local.claude_master_admin_cidrs", ssh)
+        self.assertIn("local.claw_master_admin_cidrs", ssh)
 
     def test_ssh_comes_from_the_two_admin_boxes_by_address(self):
         self.assertRegex(TF, r'aws_instance\.jumpbox\[0\]\.private_ip\}/32')
         self.assertRegex(TF, r'aws_instance\.jumpbox_2\[0\]\.private_ip\}/32')
 
     def test_the_address_is_fixed_and_public_ip_is_for_outbound_only(self):
-        inst = block("aws_instance", "claude_master_server")
-        self.assertIn("private_ip                  = local.claude_master_server_ip", inst)
+        inst = block("aws_instance", "claw_master_server")
+        self.assertIn("private_ip                  = local.claw_master_server_ip", inst)
         self.assertIn("associate_public_ip_address = true # outbound only", inst)
         self.assertIn('http_tokens = "required"', inst)
         self.assertIn("prevent_destroy = true", inst)
         self.assertIn("delete_on_termination = false", inst)
-        self.assertRegex(TF, r'claude_master_server_ip\s+=\s+"10\.0\.1\.50"')
+        self.assertRegex(TF, r'claw_master_server_ip\s+=\s+"10\.0\.1\.50"')
 
     def test_it_is_big_enough_to_survive_its_first_boot(self):
         # t4g.nano was OOM-killed during apt on first boot; swap exists before any apt run.
-        inst = block("aws_instance", "claude_master_server")
+        inst = block("aws_instance", "claw_master_server")
         self.assertIn('instance_type               = "t4g.micro"', inst)
         bootstrap = inst[inst.index("user_data"):]
         self.assertLess(bootstrap.index("fallocate -l 1G"), bootstrap.index("apt-get update"))
 
     def test_the_server_listens_on_its_private_address_never_everywhere(self):
         # Each server listens on the private address (its own port); Envoy takes the client port on the same address.
-        self.assertIn("--listen ${local.claude_master_server_ip}:$port", TF)
-        self.assertIn('cert = "${local.claude_master_server_ip}:${local.claude_master_server_port}"', TF)
+        self.assertIn("--listen ${local.claw_master_server_ip}:$port", TF)
+        self.assertIn('cert = "${local.claw_master_server_ip}:${local.claw_master_server_port}"', TF)
         self.assertNotRegex(TF, r"--listen\s+(0\.0\.0\.0|\[::\]|:)")
         self.assertNotIn("0.0.0.0", envoy_config())
 
 
 class SupplyChainTests(unittest.TestCase):
     def test_the_binary_is_pinned_by_tag_and_sha256_and_checked_before_install(self):
-        self.assertRegex(TF, r'claude_master_tag\s+=\s+"claw-master-[0-9a-f]{7}"')
-        self.assertRegex(TF, r'claude_master_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
+        self.assertRegex(TF, r'claw_master_tag\s+=\s+"claw-master-[0-9a-f]{7}"')
+        self.assertRegex(TF, r'claw_master_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
         self.assertIn("github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claw-master-linux-arm64", TF)
         self.assertIn('sha256sum -c -', TF)
         self.assertLess(TF.index("sha256sum -c -"), TF.index("mv -f /usr/local/bin/claw-master.new"))
@@ -88,7 +88,7 @@ class SupplyChainTests(unittest.TestCase):
     def test_the_old_names_stay_as_links_swapped_in_by_a_rename(self):
         # claude-master (the binary) and every claude-master-* helper keep working after the rename, as links that replace
         # the old files by a rename, so a running server keeps the file it started from.
-        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        script = TF[TF.index("claw_master_server_user_data"):TF.index('resource "aws_s3_object"')]
         self.assertIn("ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master", script)
         self.assertLess(script.index("mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master"), script.index("ln -sfn claw-master /usr/local/bin/claude-master.new"))
         loop = re.search(r"for h in ([a-z -]+); do\n(.*?)\ndone", script, re.S)
@@ -101,7 +101,7 @@ class SupplyChainTests(unittest.TestCase):
     def test_a_running_server_is_never_restarted_by_the_bootstrap(self):
         # The bootstrap writes claude-master-rollout (an operator tool, checked in EnvoyTests) but never runs it,
         # never restarts or stops a server or Envoy, and only starts Envoy when it is not running.
-        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        script = TF[TF.index("claw_master_server_user_data"):TF.index('resource "aws_s3_object"')]
         script = script[:script.index("cat > /usr/local/bin/claw-master-rollout")] + script[script.index("chmod 0755 /usr/local/bin/claw-master-rollout"):]
         self.assertNotRegex(script, r"systemctl (restart|stop)")
         self.assertNotRegex(script, r"\n\s*(sudo )?(/usr/local/bin/)?cla(ude|w)-master-rollout")
@@ -116,7 +116,7 @@ class SupplyChainTests(unittest.TestCase):
 
 class ServiceTests(unittest.TestCase):
     def test_the_unit_waits_for_every_login_and_is_sandboxed(self):
-        profiles = re.search(r"claude_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)
+        profiles = re.search(r"claw_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', profiles)
         self.assertEqual(len(names), 6)
         self.assertIn("ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current", TF)
@@ -131,18 +131,18 @@ class ServiceTests(unittest.TestCase):
         self.assertNotRegex(TF, r">\s*/(tmp|var|etc)[^\n]*key")
 
     def test_the_rendered_script_is_valid_bash(self):
-        m = re.search(r"claude_master_server_user_data = <<SCRIPT\n(.*?)\nSCRIPT", TF, re.S)
+        m = re.search(r"claw_master_server_user_data = <<SCRIPT\n(.*?)\nSCRIPT", TF, re.S)
         self.assertTrue(m)
         # Render the three interpolations that matter, then let bash parse it.
         text = m.group(1)
-        text = re.sub(r"\$\{local\.claude_master_tag\}", "claw-master-0000000", text)
-        text = re.sub(r"\$\{local\.claude_master_sha256_aarch64\}", "0" * 64, text)
-        text = re.sub(r"\$\{local\.claude_master_server_ip\}", "10.0.1.50", text)
-        text = re.sub(r"\$\{local\.claude_master_server_port\}", "8443", text)
+        text = re.sub(r"\$\{local\.claw_master_tag\}", "claw-master-0000000", text)
+        text = re.sub(r"\$\{local\.claw_master_sha256_aarch64\}", "0" * 64, text)
+        text = re.sub(r"\$\{local\.claw_master_server_ip\}", "10.0.1.50", text)
+        text = re.sub(r"\$\{local\.claw_master_server_port\}", "8443", text)
         text = re.sub(r"\$\{var\.aws_region\}", "us-west-1", text)
         text = re.sub(r"\$\{join\(.*\)\}", "x", text)
         text = re.sub(r"\$\{substr\(.*?\)\}", "0" * 16, text)
-        text = re.sub(r"\$\{local\.claude_master_profiles\[0\]\}", "claude-connor", text)
+        text = re.sub(r"\$\{local\.claw_master_profiles\[0\]\}", "claude-connor", text)
         text = text.replace("$${", "${")
         out = subprocess.run(["bash", "-n"], input=text, text=True, capture_output=True)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -187,7 +187,7 @@ class AccountLabelsTests(unittest.TestCase):
         self.assertIn("written with 2 names", out.stderr)
         self.assertNotIn("alice", out.stderr + out.stdout)
 
-    def test_a_line_claude_master_would_refuse_keeps_the_old_file_and_still_starts(self):
+    def test_a_line_claw_master_would_refuse_keeps_the_old_file_and_still_starts(self):
         for bad in ("alice\n", "not-hex=alice\n", "0a1b2c3d-0000-4000-8000-00000000000a=\n", "0a1b2c3d alice\n"):
             out, text, left = self.run_helper(bad)
             self.assertEqual(out.returncode, 0, out.stderr)
@@ -216,15 +216,15 @@ class AccountLabelsTests(unittest.TestCase):
         self.assertIn("chmod 0640", helper)
 
     def test_only_administration_and_the_server_read_the_names(self):
-        secret = block("aws_secretsmanager_secret", "claude_master_account_labels")
+        secret = block("aws_secretsmanager_secret", "claw_master_account_labels")
         self.assertIn('name                    = "claude-master/account-labels"', secret)
-        self.assertNotIn("aws_secretsmanager_secret_version", TF[TF.index("claude_master_account_labels"):TF.index('resource "aws_iam_instance_profile"')])
-        policy = block("aws_secretsmanager_secret_policy", "claude_master_account_labels")
+        self.assertNotIn("aws_secretsmanager_secret_version", TF[TF.index("claw_master_account_labels"):TF.index('resource "aws_iam_instance_profile"')])
+        policy = block("aws_secretsmanager_secret_policy", "claw_master_account_labels")
         self.assertIn('Effect    = "Deny"', policy)
-        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.claude_master_server[0].arn])", policy)
-        grant = block("aws_iam_role_policy", "claude_master_server_account_labels")
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.claw_master_server[0].arn])", policy)
+        grant = block("aws_iam_role_policy", "claw_master_server_account_labels")
         self.assertIn('Action   = "secretsmanager:GetSecretValue"', grant)
-        self.assertIn("Resource = aws_secretsmanager_secret.claude_master_account_labels[0].arn", grant)
+        self.assertIn("Resource = aws_secretsmanager_secret.claw_master_account_labels[0].arn", grant)
         self.assertNotIn('"*"', grant)
 
 
@@ -233,8 +233,8 @@ class ObservabilityTests(unittest.TestCase):
     listens on loopback only, with an IAM grant that can publish to one namespace and write one log group."""
 
     def test_the_agent_is_pinned_and_checked_before_it_is_installed(self):
-        self.assertRegex(TF, r'claude_master_cwagent_version\s+=\s+"[0-9.]+b[0-9a-f]+"')
-        self.assertRegex(TF, r'claude_master_cwagent_sha256_arm64\s+=\s+"[0-9a-f]{64}"')
+        self.assertRegex(TF, r'claw_master_cwagent_version\s+=\s+"[0-9.]+b[0-9a-f]+"')
+        self.assertRegex(TF, r'claw_master_cwagent_sha256_arm64\s+=\s+"[0-9a-f]{64}"')
         self.assertIn("amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/$CWA_VERSION/", TF)
         self.assertNotIn("/latest/", TF)
         check = 'echo "$CWA_SHA  /tmp/cwagent.deb" | sha256sum -c -'
@@ -247,14 +247,14 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("--otlp-endpoint http://127.0.0.1:4318", TF)
         self.assertNotIn("0.0.0.0:4318", TF)
         self.assertNotIn("4317", TF)
-        self.assertNotIn("4318", block("aws_security_group", "claude_master_server"))
+        self.assertNotIn("4318", block("aws_security_group", "claw_master_server"))
 
     def test_ejc3_is_the_last_profile_and_the_login_script_uses_the_same_order(self):
         # Fallback order: the first is preferred when quotas tie, so the owner's own subscription is the last resort.
-        tf_order = re.search(r'claude_master_profiles = \[([^\]]*)\]', TF).group(1)
+        tf_order = re.search(r'claw_master_profiles = \[([^\]]*)\]', TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', tf_order)
         self.assertEqual(names, ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"])
-        login = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+        login = (ROOT / "scripts" / "claw-master-login.sh").read_text()
         self.assertIn("profiles=(" + " ".join(names) + ")", login)
 
     def test_the_serve_command_is_one_command_with_every_flag_not_cut_short_by_a_doubled_backslash(self):
@@ -271,7 +271,7 @@ class ObservabilityTests(unittest.TestCase):
             if not l.rstrip().endswith("\\"):
                 break
         command = " ".join(logical)
-        for flag in ("--listen ${local.claude_master_server_ip}:$port", "--open-loopback 127.0.0.1:$open",
+        for flag in ("--listen ${local.claw_master_server_ip}:$port", "--open-loopback 127.0.0.1:$open",
                      "--state-dir /var/lib/claude-master/state", "--log-file /var/log/claude-master/server-$color.log",
                      "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels",
                      "--instance claw-master-$color", "$balancer"):
@@ -284,9 +284,9 @@ class ObservabilityTests(unittest.TestCase):
         serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve <<'EOF'\n"):]
         serve = serve[serve.index("\n") + 1:serve.index("\nEOF\n")]
         serve = (serve.replace("${var.aws_region}", "us-west-1").replace("$${", "${")
-                 .replace("${local.claude_master_drain_seconds}", "600").replace("${local.claude_master_server_ip}", "10.0.1.50")
-                 .replace("${local.claude_master_server_port}", "8443").replace("${local.claude_master_open_port}", "8444")
-                 .replace("${local.claude_master_profiles[0]}", "claude-connor"))
+                 .replace("${local.claw_master_drain_seconds}", "600").replace("${local.claw_master_server_ip}", "10.0.1.50")
+                 .replace("${local.claw_master_server_port}", "8443").replace("${local.claw_master_open_port}", "8444")
+                 .replace("${local.claw_master_profiles[0]}", "claude-connor"))
         serve = re.sub(r"\$\{join\(.*\)\}", "", serve)
         with tempfile.TemporaryDirectory() as d:
             bindir = os.path.join(d, "bin"); os.mkdir(bindir)
@@ -323,10 +323,10 @@ class ObservabilityTests(unittest.TestCase):
         # series must have none; otherwise they see no data and (notBreaching) never fire.
         self.assertIn('"omit_hostname": true', TF)
         self.assertNotIn("append_dimensions", TF)
-        for name in ("claude_master_server_memory", "claude_master_server_swap"):
+        for name in ("claw_master_server_memory", "claw_master_server_swap"):
             alarm = block("aws_cloudwatch_metric_alarm", name)
             self.assertNotIn("dimensions", alarm)
-            self.assertIn("namespace           = local.claude_master_metrics_namespace", alarm)
+            self.assertIn("namespace           = local.claw_master_metrics_namespace", alarm)
 
     def test_the_agent_ships_the_exact_log_file_not_its_rotations(self):
         # Every server's log (server-blue.log, server-green.log, and server-legacy.log before Envoy), never a
@@ -356,10 +356,10 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotRegex(script, r"systemctl (restart|stop)")
 
     def test_the_grant_publishes_to_one_namespace_and_writes_one_log_group(self):
-        policy = block("aws_iam_role_policy", "claude_master_server_telemetry")
+        policy = block("aws_iam_role_policy", "claw_master_server_telemetry")
         self.assertRegex(policy, r'"cloudwatch:PutMetricData"')
-        self.assertIn('"cloudwatch:namespace" = local.claude_master_metrics_namespace', policy)
-        self.assertIn("aws_cloudwatch_log_group.claude_master_server.arn", policy)
+        self.assertIn('"cloudwatch:namespace" = local.claw_master_metrics_namespace', policy)
+        self.assertIn("aws_cloudwatch_log_group.claw_master_server.arn", policy)
         self.assertNotRegex(policy, r"logs:CreateLogGroup|logs:DeleteLogGroup|logs:\*|cloudwatch:\*")
         # The only wildcard resource is PutMetricData, which has no resource-level scope: the condition holds it.
         self.assertEqual(policy.count('Resource = "*"'), 1)
@@ -367,17 +367,17 @@ class ObservabilityTests(unittest.TestCase):
 
     def test_the_metrics_namespace_is_the_one_the_dashboards_read(self):
         # Since the rename the agent publishes into ClawMaster (claw_master.* metrics); the log group keeps its name.
-        self.assertRegex(TF, r'claude_master_metrics_namespace\s+=\s+"ClawMaster"')
-        self.assertRegex(TF, r'claude_master_log_group\s+=\s+"/claude-master/server"')
-        self.assertIn('"namespace": "${local.claude_master_metrics_namespace}"', TF)
+        self.assertRegex(TF, r'claw_master_metrics_namespace\s+=\s+"ClawMaster"')
+        self.assertRegex(TF, r'claw_master_log_group\s+=\s+"/claude-master/server"')
+        self.assertIn('"namespace": "${local.claw_master_metrics_namespace}"', TF)
 
     def test_the_log_group_is_kept_and_two_log_alarms_exist(self):
-        self.assertIn("retention_in_days = 90", block("aws_cloudwatch_log_group", "claude_master_server"))
+        self.assertIn("retention_in_days = 90", block("aws_cloudwatch_log_group", "claw_master_server"))
         for key in ("CredentialRejected", "NoAccountAvailable"):
             self.assertIn(key + " = {", TF)
         for message in ("profile credential rejected by Anthropic", "no inference account could be chosen"):
             self.assertIn(message, TF)
-        for name in ("claude_master_server_status", "claude_master_server_memory", "claude_master_server_swap", "claude_master_server_log"):
+        for name in ("claw_master_server_status", "claw_master_server_memory", "claw_master_server_swap", "claw_master_server_log"):
             self.assertIn("aws_sns_topic.cost_alerts.arn", block("aws_cloudwatch_metric_alarm", name))
 
 
@@ -439,7 +439,7 @@ class DashboardTests(unittest.TestCase):
         self.assertNotRegex(DASH, r"Name=|dimensions\s*=", "Metrics Insights queries aggregate across dimensions")
 
     def test_the_alarms_are_dimensionless_query_alarms_on_the_shared_topic(self):
-        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claude_master_pool")
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claw_master_pool")
         self.assertIn("metric_query", alarm)
         self.assertNotIn("dimensions", alarm)
         self.assertIn("aws_sns_topic.cost_alerts.arn", alarm)
@@ -449,7 +449,7 @@ class DashboardTests(unittest.TestCase):
     def test_the_error_alarm_judges_one_ten_minute_datapoint_not_two_five_minute_ones(self):
         # With a 300 s period and two evaluation periods, each five minutes would have to pass the threshold on
         # its own: 15 errors in each never fired a "20 errors in 10 minutes" alarm.
-        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claude_master_pool")
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claw_master_pool")
         self.assertIn('evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1', alarm)
         self.assertIn('period = each.key == "pool_exhausted" ? 300 : 600', alarm)
         self.assertIn("More than 20 Anthropic error responses in 10 minutes", alarm)
@@ -465,7 +465,7 @@ class DashboardTests(unittest.TestCase):
     def test_the_dashboard_exists_once_and_shows_the_alarms(self):
         self.assertEqual(DASH.count('resource "aws_cloudwatch_dashboard"'), 1)
         self.assertIn('type = "alarm"', DASH)
-        self.assertIn("aws_cloudwatch_metric_alarm.claude_master_pool", DASH)
+        self.assertIn("aws_cloudwatch_metric_alarm.claw_master_pool", DASH)
 
 
 def block_in(text, kind, name):
@@ -478,15 +478,15 @@ class ConvergenceTests(unittest.TestCase):
     """The instance ignores user_data, so Terraform itself must re-run the bootstrap."""
 
     def test_a_script_or_pin_or_resize_change_re_runs_the_bootstrap(self):
-        res = block("terraform_data", "claude_master_server_converge")
-        for trigger in ("aws_instance.claude_master_server[0].id", "aws_instance.claude_master_server[0].instance_type",
-                        "sha256(local.claude_master_server_user_data)", 'filesha256("${path.module}/scripts/ssm-claude-master-server.sh")'):
+        res = block("terraform_data", "claw_master_server_converge")
+        for trigger in ("aws_instance.claw_master_server[0].id", "aws_instance.claw_master_server[0].instance_type",
+                        "sha256(local.claw_master_server_user_data)", 'filesha256("${path.module}/scripts/ssm-claw-master-server.sh")'):
             self.assertIn(trigger, res)
-        self.assertIn("scripts/ssm-claude-master-server.sh", res)
-        self.assertIn("aws_s3_object.claude_master_server_user_data", res)
+        self.assertIn("scripts/ssm-claw-master-server.sh", res)
+        self.assertIn("aws_s3_object.claw_master_server_user_data", res)
         # cloudflared reads its token at start: the secret and the role's grant must exist first.
-        self.assertIn("aws_secretsmanager_secret_version.claude_master_tunnel_token", res)
-        self.assertIn("aws_iam_role_policy.claude_master_server_tunnel_token", res)
+        self.assertIn("aws_secretsmanager_secret_version.claw_master_tunnel_token", res)
+        self.assertIn("aws_iam_role_policy.claw_master_server_tunnel_token", res)
 
     def test_the_convergence_waits_for_ssm_and_cloud_init_and_fails_loudly(self):
         text = code(CONVERGE)
@@ -504,34 +504,34 @@ class TunnelTests(unittest.TestCase):
 
     def test_the_open_listener_is_loopback_only_and_never_in_a_security_group(self):
         # Envoy takes the tunnel's port on loopback; each server's open listener is on loopback too.
-        self.assertIn('open = "127.0.0.1:${local.claude_master_open_port}"', TF)
+        self.assertIn('open = "127.0.0.1:${local.claw_master_open_port}"', TF)
         self.assertIn("--open-loopback 127.0.0.1:$open", TF)
-        self.assertNotRegex(TF, r"--open-loopback\s+(0\.0\.0\.0|\$\{local\.claude_master_server_ip\})")
-        sg = block("aws_security_group", "claude_master_server")
-        self.assertNotIn("claude_master_open_port", sg)
-        self.assertNotIn("claude_master_colors", sg)
+        self.assertNotRegex(TF, r"--open-loopback\s+(0\.0\.0\.0|\$\{local\.claw_master_server_ip\})")
+        sg = block("aws_security_group", "claw_master_server")
+        self.assertNotIn("claw_master_open_port", sg)
+        self.assertNotIn("claw_master_colors", sg)
 
     def test_the_tunnel_forwards_to_loopback_over_tcp(self):
-        cfg = tblock("cloudflare_zero_trust_tunnel_cloudflared_config", "claude_master")
-        self.assertIn('service  = "tcp://127.0.0.1:${local.claude_master_open_port}"', cfg)
+        cfg = tblock("cloudflare_zero_trust_tunnel_cloudflared_config", "claw_master")
+        self.assertIn('service  = "tcp://127.0.0.1:${local.claw_master_open_port}"', cfg)
         self.assertIn("http_status:404", cfg)  # anything else gets nothing
-        self.assertIn("cloudflare_zero_trust_access_application.claude_master", cfg)  # no routing before Access
+        self.assertIn("cloudflare_zero_trust_access_application.claw_master", cfg)  # no routing before Access
 
     def test_only_a_service_token_may_reach_it_no_person_and_no_wildcard(self):
-        pol = tblock("cloudflare_zero_trust_access_policy", "claude_master_macs")
+        pol = tblock("cloudflare_zero_trust_access_policy", "claw_master_macs")
         self.assertIn('decision         = "non_identity"', pol)
         self.assertIn("service_token", pol)
         self.assertNotRegex(pol, r"email|everyone|group|login_method")
-        app = tblock("cloudflare_zero_trust_access_application", "claude_master")
-        self.assertIn("domain           = local.claude_master_tunnel_hostname", app)
+        app = tblock("cloudflare_zero_trust_access_application", "claw_master")
+        self.assertIn("domain           = local.claw_master_tunnel_hostname", app)
         self.assertEqual(app.count("id         ="), 1, "exactly one policy")
-        self.assertNotIn("*", re.search(r'claude_master_tunnel_hostname\s+=\s+"([^"]+)"', TUN).group(1))
+        self.assertNotIn("*", re.search(r'claw_master_tunnel_hostname\s+=\s+"([^"]+)"', TUN).group(1))
 
     def test_the_two_secrets_have_different_readers(self):
-        conn = tblock("aws_secretsmanager_secret_policy", "claude_master_tunnel_token")
-        self.assertIn("aws_iam_role.claude_master_server[0].arn", conn)
-        mac = tblock("aws_secretsmanager_secret_policy", "claude_master_mac_access")
-        self.assertNotIn("claude_master_server", mac)  # the server never needs the Macs' credential
+        conn = tblock("aws_secretsmanager_secret_policy", "claw_master_tunnel_token")
+        self.assertIn("aws_iam_role.claw_master_server[0].arn", conn)
+        mac = tblock("aws_secretsmanager_secret_policy", "claw_master_mac_access")
+        self.assertNotIn("claw_master_server", mac)  # the server never needs the Macs' credential
         for p in (conn, mac):
             self.assertIn('Effect    = "Deny"', p)
             self.assertIn("local.games_mp_admin_principals", p)
@@ -539,14 +539,14 @@ class TunnelTests(unittest.TestCase):
     def test_cloudflared_is_pinned_and_gets_its_token_from_the_environment(self):
         self.assertRegex(TUN, r'cloudflared_sha256_linux_arm\s+=\s+"[0-9a-f]{64}"')
         self.assertIn("sha256sum -c -", TF)
-        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        script = TF[TF.index("claw_master_server_user_data"):TF.index('resource "aws_s3_object"')]
         self.assertIn("export TUNNEL_TOKEN", script)
         self.assertNotRegex(script, r"cloudflared[^\n]*--token")
         self.assertIn("{ set +x; } 2>/dev/null", script[script.index("cloudflared-claude-master <<"):])
 
     def test_a_dead_tunnel_is_never_handed_out(self):
         # A running server keeps its old configuration; the tunnel can be live with nothing behind it.
-        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        script = TF[TF.index("claw_master_server_user_data"):TF.index('resource "aws_s3_object"')]
         self.assertIn("open listener: listening", script)
         self.assertIn("open listener: NOT listening", script)
         self.assertIn("grep -qx 'open listener: listening'", code(BUNDLE))
@@ -568,7 +568,7 @@ class MacSetupTests(unittest.TestCase):
         return re.search(r"^%s=(\S+)$" % name, MACSETUP, re.M).group(1)
 
     def test_the_pinned_tag_matches_the_servers(self):
-        server_tag = re.search(r'claude_master_tag\s+=\s+"([^"]+)"', TF).group(1)
+        server_tag = re.search(r'claw_master_tag\s+=\s+"([^"]+)"', TF).group(1)
         self.assertEqual(self.pin("CM_TAG"), server_tag, "bump both together")
         for name in ("CM_SHA256_DARWIN_ARM64", "CFD_SHA256_DARWIN_ARM64_TGZ", "CFD_SHA256_DARWIN_ARM64_BIN"):
             self.assertRegex(self.pin(name), r"^[0-9a-f]{64}$")
@@ -632,12 +632,12 @@ class MacSetupTests(unittest.TestCase):
 
 class IamTests(unittest.TestCase):
     def test_the_role_reads_only_its_own_bootstrap_script(self):
-        policy = block("aws_iam_role_policy", "claude_master_server_bootstrap")
+        policy = block("aws_iam_role_policy", "claw_master_server_bootstrap")
         self.assertIn('"${aws_s3_bucket.dev_scripts.arn}/user-data/claude-master-server.sh"', policy)
         self.assertNotIn('"*"', policy)
 
     def test_it_is_not_given_the_kids_box_or_dev_server_powers(self):
-        role = block("aws_iam_role", "claude_master_server")
+        role = block("aws_iam_role", "claw_master_server")
         self.assertIn("ec2.amazonaws.com", role)
         self.assertNotIn("AdministratorAccess", TF)
 
@@ -688,8 +688,8 @@ class ScriptTests(unittest.TestCase):
         import os, re, subprocess, tempfile
         nx = (ROOT / "nextjs-user-data.tf").read_text()
         # one pin with the server, checksum-verified, installed under a temporary name then renamed
-        self.assertIn('CM_TAG="${local.claude_master_tag}"', nx)
-        self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', nx)
+        self.assertIn('CM_TAG="${local.claw_master_tag}"', nx)
+        self.assertIn('CM_SHA="${local.claw_master_sha256_aarch64}"', nx)
         self.assertIn('echo "$CM_SHA  $CMTMP/claw-master" | sha256sum -c --quiet -', nx)
         self.assertIn("/usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master", nx)
         self.assertIn("releases/download/$CM_TAG/claw-master-linux-arm64", nx)
@@ -698,7 +698,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master", nx)
         # the zshenv block: run it for real, twice, against a copy of the stock file
         start = nx.index('ZE=/etc/zsh/zshenv'); end = nx.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
-        block = nx[start:end].replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
+        block = nx[start:end].replace("${local.claw_master_server_ip}", "203.0.113.5").replace("${local.claw_master_server_port}", "8443")
         with tempfile.TemporaryDirectory() as d:
             ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
             fake = os.path.join(d, "claude-master"); open(fake, "w").write("#!/bin/sh\n"); os.chmod(fake, 0o755)
@@ -724,11 +724,11 @@ class ScriptTests(unittest.TestCase):
 
     def test_the_metal_box_gets_the_pinned_client_and_routing_through_an_ssm_association(self):
         import os, subprocess, tempfile, textwrap
-        cf = (ROOT / "claude-master-client.tf").read_text()
+        cf = (ROOT / "claw-master-client.tf").read_text()
         # the association: no key, no service, nothing restarted, one pin shared with the server
         self.assertIn('name                = "AWS-RunShellScript"', cf)
-        self.assertIn('CM_TAG="${local.claude_master_tag}"', cf)
-        self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', cf)
+        self.assertIn('CM_TAG="${local.claw_master_tag}"', cf)
+        self.assertIn('CM_SHA="${local.claw_master_sha256_aarch64}"', cf)
         self.assertIn('sha256sum -c --quiet -', cf)
         # install and rename are PART OF the if condition, so a failure of either fails the run
         self.assertIn('&& install -m 0755 "$CMTMP/claw-master" /usr/local/bin/claw-master.new \\', cf)
@@ -738,18 +738,21 @@ class ScriptTests(unittest.TestCase):
         self.assertNotRegex(cf, r"systemctl\s+(restart|stop|kill)|tmux[- ]?(scroll)?\s+kill|kill-server|pkill")
         # render the heredoc as Terraform does (<<- strips the common indent), then run the zshenv part for real, twice
         body = cf.split("<<-CMD\n", 1)[1].split("\n  CMD\n", 1)[0]
-        script = (textwrap.dedent(body) + "\n").replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
+        script = (textwrap.dedent(body) + "\n").replace("${local.claw_master_server_ip}", "203.0.113.5").replace("${local.claw_master_server_port}", "8443")
         start = script.index("ZE=/etc/zsh/zshenv"); end = script.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
         block = script[start:end]
         self.assertIn("\nCMZSHENV\n", block, "the heredoc terminator must be at column 0 after the indent is stripped")
         with tempfile.TemporaryDirectory() as d:
-            ze = os.path.join(d, "zshenv"); open(ze, "w").write("# stock\nexport PATH=$PATH\n")
+            ze = os.path.join(d, "zshenv")
+            # a box that still has the block written before the file was renamed (managed by claude-master-client.tf)
+            open(ze, "w").write("# stock\nexport PATH=$PATH\n# >>> claude-master (managed by claude-master-client.tf) >>>\nexport TCLAUDE_OLD=1\n# <<< claude-master <<<\n")
             fake = os.path.join(d, "claude-master"); open(fake, "w").write("#!/bin/sh\n"); os.chmod(fake, 0o755)
             for _ in range(2):
                 r = subprocess.run(["bash", "-c", block.replace("ZE=/etc/zsh/zshenv", "ZE=" + ze).replace("[ -x /usr/local/bin/claude-master ]", "[ -x %s ]" % fake)], capture_output=True, text=True, timeout=30)
                 self.assertEqual(r.returncode, 0, r.stderr)
             text = open(ze).read()
             self.assertEqual(text.count(">>> claude-master"), 1)
+            self.assertNotIn("TCLAUDE_OLD", text, "the block from before the rename is replaced, not kept")
             self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"))
             def server_for(home):
                 return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s|%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}" "${{TCLAUDE_CLAUDE_MASTER-unset}}"'],
@@ -777,7 +780,7 @@ class ScriptTests(unittest.TestCase):
                 for name in ("curl", "install", "mv"): os.chmod(os.path.join(bindir, name), 0o755)
                 s = script.replace('CM_SHA="203.0.113.5"', "x")  # no-op guard; the sha comes from the template below
                 s = s.replace("ZE=/etc/zsh/zshenv", "ZE=" + os.path.join(d, "zshenv"))
-                s = s.replace('CM_SHA="${local.claude_master_sha256_aarch64}"', 'CM_SHA="%s"' % sha).replace('CM_TAG="${local.claude_master_tag}"', 'CM_TAG="test-tag"')
+                s = s.replace('CM_SHA="${local.claw_master_sha256_aarch64}"', 'CM_SHA="%s"' % sha).replace('CM_TAG="${local.claw_master_tag}"', 'CM_TAG="test-tag"')
                 s = s.replace("/usr/local/bin/claw-master", os.path.join(d, "installed-claw-master")).replace("/usr/local/bin/claude-master", os.path.join(d, "installed-claude-master"))
                 return subprocess.run(["bash", "-c", s], capture_output=True, text=True, timeout=30, env=dict(os.environ, PATH=bindir + ":" + os.environ["PATH"]))
             ok = run_with(True, True)
@@ -806,7 +809,7 @@ class ScriptTests(unittest.TestCase):
         self.assertRegex(TUNNEL, r'CLAUDE_MASTER_SERVER_HOST:-10\.0\.1\.50')
 
     def test_the_scripts_parse(self):
-        for path in ("claude-master-enroll.sh", "claude-master-login.sh", "claude-master-tunnel.sh", "claude-master-mac-bundle.sh", "claude-master-mac-setup.sh"):
+        for path in ("claw-master-enroll.sh", "claw-master-login.sh", "claw-master-tunnel.sh", "claw-master-mac-bundle.sh", "claw-master-mac-setup.sh"):
             r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / path)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -824,8 +827,8 @@ class EnvoyTests(unittest.TestCase):
     """Envoy in front of two servers on the box, so a rollout drains instead of cutting sessions."""
 
     def test_envoy_is_pinned_and_checked_before_it_is_installed(self):
-        self.assertRegex(TF, r'claude_master_envoy_version\s+=\s+"[0-9]+\.[0-9]+\.[0-9]+"')
-        self.assertRegex(TF, r'claude_master_envoy_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
+        self.assertRegex(TF, r'claw_master_envoy_version\s+=\s+"[0-9]+\.[0-9]+\.[0-9]+"')
+        self.assertRegex(TF, r'claw_master_envoy_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
         self.assertIn("github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-aarch_64", TF)
         check = 'echo "$ENVOY_SHA  /tmp/envoy.new" | sha256sum -c -'
         self.assertIn(check, TF)
@@ -845,16 +848,16 @@ class EnvoyTests(unittest.TestCase):
         self.assertIn("--disable-hot-restart", unit)
 
     def test_the_color_ports_are_never_in_the_security_group(self):
-        sg = block("aws_security_group", "claude_master_server")
-        colors = re.search(r"claude_master_colors = \{(.*?)\n  \}", TF, re.S).group(1)
+        sg = block("aws_security_group", "claw_master_server")
+        colors = re.search(r"claw_master_colors = \{(.*?)\n  \}", TF, re.S).group(1)
         for port in re.findall(r"port\s*=\s*([0-9]+)", colors):
             self.assertNotIn(port, sg)
-        self.assertNotIn("claude_master_colors", sg)
+        self.assertNotIn("claw_master_colors", sg)
 
     def test_a_server_may_drain_for_the_whole_drain_timeout(self):
-        self.assertIn('balancer="--balanced --drain-timeout ${local.claude_master_drain_seconds}s"', TF)
-        self.assertIn("TimeoutStopSec=${local.claude_master_drain_seconds + 60}", TF)
-        self.assertRegex(TF, r"claude_master_drain_seconds = [0-9]+")
+        self.assertIn('balancer="--balanced --drain-timeout ${local.claw_master_drain_seconds}s"', TF)
+        self.assertIn("TimeoutStopSec=${local.claw_master_drain_seconds + 60}", TF)
+        self.assertRegex(TF, r"claw_master_drain_seconds = [0-9]+")
 
     def test_the_rollout_switches_only_after_the_new_server_listens_and_stops_the_old_only_after_envoy_switched(self):
         r = rollout()
@@ -904,14 +907,14 @@ class EnvoyTests(unittest.TestCase):
     def test_without_a_color_the_server_is_the_one_from_before_envoy(self):
         serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         self.assertIn("color=$${1:-legacy}", serve)
-        self.assertIn('legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;', serve)
+        self.assertIn('legacy) port=${local.claw_master_server_port}; open=${local.claw_master_open_port}; balancer="" ;;', serve)
 
 
 class LoginDefaultsTests(unittest.TestCase):
     """A login refreshed on two boxes revokes the other copy: a server-only subscription stays off fcvm's default."""
 
     def test_claude_colby_is_in_the_server_default_only(self):
-        script = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+        script = (ROOT / "scripts" / "claw-master-login.sh").read_text()
         server = re.search(r'if \[ "\$SERVER" = 1 \]; then profiles=\(([^)]*)\)', script).group(1).split()
         other = re.search(r'else profiles=\(([^)]*)\); fi', script).group(1).split()
         self.assertIn("claude-colby", server)

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# claude-master-mac-bundle -- make the small file a Mac needs to use the shared claude-master server
-# through the Cloudflare tunnel (claude-master-tunnel.tf). Run it as an AWS administrator; hand the
+# claude-master-mac-bundle -- make the small file a Mac needs to use the shared claw-master server
+# through the Cloudflare tunnel (claw-master-tunnel.tf). Run it as an AWS administrator; hand the
 # result to the person whose Mac it is, privately. It holds a long-lived Cloudflare Access service
 # token, so treat it like a password.
 #
-#   scripts/claude-master-mac-bundle.sh OUTDIR
+#   scripts/claw-master-mac-bundle.sh OUTDIR
 #
 # Writes OUTDIR/ (mode 0700): cloudflare.env (the token, 0600), ca.pem (the server's PUBLIC CA
 # certificate) and README.txt with the two commands to run. The Mac needs `cloudflared` (brew install
@@ -15,7 +15,7 @@ set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
 OUT=${1:-}
-[ -n "$OUT" ] || { echo "usage: claude-master-mac-bundle.sh OUTDIR" >&2; exit 2; }
+[ -n "$OUT" ] || { echo "usage: claw-master-mac-bundle.sh OUTDIR" >&2; exit 2; }
 [ ! -e "$OUT" ] || { echo "$OUT already exists; choose a new directory" >&2; exit 1; }
 
 { set +x; } 2>/dev/null   # the service token below must never reach a trace

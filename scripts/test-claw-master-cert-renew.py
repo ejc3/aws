@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""scripts/claude-master-cert-renew.py, scripts/ssm/claude-master-cert-*.sh and claude-master-cert-renew.tf:
+"""scripts/claw-master-cert-renew.py, scripts/ssm/claw-master-cert-*.sh and claw-master-cert-renew.tf:
 no claude-master client certificate expires, and nothing else is possible through the machinery that renews it.
 
 Offline. The four SSM scripts run for real (bash + openssl, a throwaway CA, real keys and certificates, home directories under a
@@ -26,12 +26,12 @@ CLIENTS = [
 os.environ.update({"CLIENTS": json.dumps(CLIENTS), "SERVER_NAME": "claude-master-server", "RENEW_BEFORE_DAYS": "14",
                    "CERT_DAYS": "30", "MIN_DAYS_ON_INSTALL": "20", "SNS_TOPIC_ARN": "arn:topic", "AWS_REGION": "us-west-1"})
 sys.modules.setdefault("boto3", types.ModuleType("boto3"))
-SPEC = importlib.util.spec_from_file_location("cr", ROOT / "scripts" / "claude-master-cert-renew.py")
+SPEC = importlib.util.spec_from_file_location("cr", ROOT / "scripts" / "claw-master-cert-renew.py")
 cr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cr)
-TF = (ROOT / "claude-master-cert-renew.tf").read_text()
+TF = (ROOT / "claw-master-cert-renew.tf").read_text()
 SSM_DIR = ROOT / "scripts" / "ssm"
-SCRIPTS = {n: (SSM_DIR / ("claude-master-cert-%s.sh" % n)).read_text() for n in ("status", "request", "sign", "install")}
+SCRIPTS = {n: (SSM_DIR / ("claw-master-cert-%s.sh" % n)).read_text() for n in ("status", "request", "sign", "install")}
 
 
 def sh(cmd, **kw):
@@ -523,13 +523,13 @@ class TerraformTests(unittest.TestCase):
                 self.assertLessEqual(int(high or low), 1000, "%s: %s" % (name, pattern))
 
     def test_the_role_can_send_only_the_four_documents_to_only_the_named_boxes(self):
-        policy = TF.split('resource "aws_iam_role_policy" "claude_master_cert_renew"', 1)[1].split("\nresource ", 1)[0]
+        policy = TF.split('resource "aws_iam_role_policy" "claw_master_cert_renew"', 1)[1].split("\nresource ", 1)[0]
         policy = "\n".join(re.sub(r"\s+#.*$", "", l) for l in policy.splitlines() if not l.strip().startswith("#"))   # comments grant nothing
         self.assertNotIn("AWS-RunShellScript", policy)
         self.assertNotIn('"ssm:*"', policy)
         self.assertNotRegex(policy, r'Action\s*=\s*"\*"')
-        self.assertIn('for name in keys(local.claude_master_cert_documents) : "arn:aws:ssm:', policy)
-        self.assertIn('"ssm:resourceTag/Name" = local.claude_master_cert_instance_names', policy)
+        self.assertIn('for name in keys(local.claw_master_cert_documents) : "arn:aws:ssm:', policy)
+        self.assertIn('"ssm:resourceTag/Name" = local.claw_master_cert_instance_names', policy)
         self.assertEqual(sorted(re.findall(r'"(claude-master-cert-\w+)" = \{\n\s+script', TF)),
                          ["claude-master-cert-install", "claude-master-cert-request", "claude-master-cert-sign", "claude-master-cert-status"])
         for action in re.findall(r'Action\s*=\s*(\[[^\]]*\]|"[^"]+")', policy):
@@ -542,15 +542,15 @@ class TerraformTests(unittest.TestCase):
                                         ("nextjs-colin", "nextjs-dev", "colin"),
                                         ("nextjs-ejc3", "nextjs-dev", "ejc3"), ("fcvm-arm", "fcvm-metal-arm", "ubuntu")):
             self.assertRegex(TF, r'"%s"\s+= \{ instance = "%s", account = "%s" \}' % (name, instance, account))
-        self.assertIn("CLIENTS             = jsonencode([for name, c in local.claude_master_clients", TF)
+        self.assertIn("CLIENTS             = jsonencode([for name, c in local.claw_master_clients", TF)
 
     def test_it_runs_daily_one_at_a_time_and_is_watched(self):
         self.assertIn('schedule_expression = "cron(0 8 * * ? *)"', TF)
         self.assertIn("reserved_concurrent_executions = 1", TF)
         self.assertIn("maximum_retry_attempts = 0", TF)
-        for alarm in ("claude_master_cert_renew_errors", "claude_master_cert_renew_not_running", "claude_master_cert_expiring"):
+        for alarm in ("claw_master_cert_renew_errors", "claw_master_cert_renew_not_running", "claw_master_cert_expiring"):
             self.assertIn('resource "aws_cloudwatch_metric_alarm" "%s"' % alarm, TF)
-        self.assertIn("for_each = local.claude_master_clients", TF)
+        self.assertIn("for_each = local.claw_master_clients", TF)
         self.assertRegex(TF, r'RENEW_BEFORE_DAYS\s+= "14"')
 
     def test_the_scripts_never_touch_services_or_run_anything_downloaded(self):

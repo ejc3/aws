@@ -1,7 +1,7 @@
-# CloudWatch dashboard and metric alarms for the claude-master server.
+# CloudWatch dashboard and metric alarms for the claw-master server.
 #
 # Data path: claw-master --otlp-endpoint -> the CloudWatch agent on the box (127.0.0.1:4318) -> namespace
-# ClawMaster (claude-master-server.tf). Since the rename (2026-10-11) the metrics are claw_master.* and every measurement
+# ClawMaster (claw-master-server.tf). Since the rename (2026-10-11) the metrics are claw_master.* and every measurement
 # about Claude also carries provider=claude; the queries below aggregate across dimensions, so that extra one changes
 # nothing here. The history from before the switch (ClaudeMaster, claude_master.*) was copied into ClawMaster under the
 # new names by scripts/claw-master-migrate-metrics.py in ejc3/CLIProxyAPI.
@@ -22,10 +22,10 @@
 # alarms had exactly that bug in review). A query alarm cannot.
 
 locals {
-  cm_ns = local.claude_master_metrics_namespace
+  cm_ns = local.claw_master_metrics_namespace
 
   # One panel per entry. queries: label and Metrics Insights query. Grouped queries get one line per group.
-  claude_master_panels = [
+  claw_master_panels = [
     {
       title   = "Requests by user (client_account)"
       stacked = true
@@ -159,21 +159,21 @@ locals {
     },
   ]
 
-  claude_master_dashboard_widgets = concat(
+  claw_master_dashboard_widgets = concat(
     [{
       type = "alarm", x = 0, y = 0, width = 24, height = 3
       properties = {
         title = "claude-master alarms"
         alarms = concat(
-          [for a in aws_cloudwatch_metric_alarm.claude_master_server_status : a.arn],
-          [for a in aws_cloudwatch_metric_alarm.claude_master_server_memory : a.arn],
-          [for a in aws_cloudwatch_metric_alarm.claude_master_server_swap : a.arn],
-          [for a in aws_cloudwatch_metric_alarm.claude_master_server_log : a.arn],
-          [for a in aws_cloudwatch_metric_alarm.claude_master_pool : a.arn],
+          [for a in aws_cloudwatch_metric_alarm.claw_master_server_status : a.arn],
+          [for a in aws_cloudwatch_metric_alarm.claw_master_server_memory : a.arn],
+          [for a in aws_cloudwatch_metric_alarm.claw_master_server_swap : a.arn],
+          [for a in aws_cloudwatch_metric_alarm.claw_master_server_log : a.arn],
+          [for a in aws_cloudwatch_metric_alarm.claw_master_pool : a.arn],
         )
       }
     }],
-    [for i, p in local.claude_master_panels : {
+    [for i, p in local.claw_master_panels : {
       type = "metric", x = (i % 2) * 12, y = 3 + floor(i / 2) * 6, width = 12, height = 6
       properties = {
         title   = p.title
@@ -194,16 +194,16 @@ locals {
   )
 }
 
-resource "aws_cloudwatch_dashboard" "claude_master" {
-  count          = var.enable_claude_master_server ? 1 : 0
+resource "aws_cloudwatch_dashboard" "claw_master" {
+  count          = var.enable_claw_master_server ? 1 : 0
   dashboard_name = "claude-master"
-  dashboard_body = jsonencode({ widgets = local.claude_master_dashboard_widgets })
+  dashboard_body = jsonencode({ widgets = local.claw_master_dashboard_widgets })
 }
 
 # The pool is nearly used up: even the LEAST used subscription is past 90% of its weekly allowance, so the paid
 # API-key backup is about to carry everything (or clients are about to be refused).
-resource "aws_cloudwatch_metric_alarm" "claude_master_pool" {
-  for_each            = var.enable_claude_master_server ? { pool_exhausted = 0.9, upstream_errors = 20 } : {}
+resource "aws_cloudwatch_metric_alarm" "claw_master_pool" {
+  for_each            = var.enable_claw_master_server ? { pool_exhausted = 0.9, upstream_errors = 20 } : {}
   alarm_name          = each.key == "pool_exhausted" ? "claude-master-pool-nearly-exhausted" : "claude-master-upstream-errors"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1

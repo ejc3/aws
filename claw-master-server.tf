@@ -1,12 +1,12 @@
-# claude-master-server.tf
+# claw-master-server.tf
 #
-# The shared claude-master server: ONE small box that holds the Claude subscription logins and
+# The shared claw-master server: ONE small box that holds the Claude subscription logins and
 # routes inference for every other box, so no client box holds a login at all. Clients prove who
 # they are with a client certificate this box issued (no password anywhere); the dev boxes reach it
 # on a private address, a Mac with AWS access reaches it through an SSM port forward, and anything
-# else can later come in over a Cloudflare tunnel. claude-master itself knows nothing of AWS: it is
+# else can later come in over a Cloudflare tunnel. claw-master itself knows nothing of AWS: it is
 # a generic binary driven by flags and files (github.com/ejc3/CLIProxyAPI, docs/claude-master.md).
-# Everything cloud-specific -- this file, the IAM, the bootstrap, scripts/claude-master-enroll.sh --
+# Everything cloud-specific -- this file, the IAM, the bootstrap, scripts/claw-master-enroll.sh --
 # lives here.
 #
 # WHY A BOX AT ALL. A subscription login rotates on every refresh and the old access token dies at
@@ -23,66 +23,66 @@
 # gets a public IPv4 only for OUTBOUND (api.anthropic.com, GitHub release downloads); nothing can
 # connect in. It is reached for administration over SSM, or SSH from the jumpboxes.
 #
-# LOGINS ARE INTERACTIVE and belong to this box: `scripts/claude-master-login.sh --server` walks
+# LOGINS ARE INTERACTIVE and belong to this box: `scripts/claw-master-login.sh --server` walks
 # the six paste-a-code logins here. They are never copied from another box (a rotating login
 # cannot be shared). The service stays idle until every profile below has a login, then
-# `sudo claw-master-rollout` starts it (scripts/claude-master-login.sh --server does that).
+# `sudo claw-master-rollout` starts it (scripts/claw-master-login.sh --server does that).
 #
 # CERTIFICATES. The CA key never leaves /var/lib/claude-master/state. A client box makes its own
-# key and a certificate request; scripts/claude-master-enroll.sh gets the request signed over SSM
+# key and a certificate request; scripts/claw-master-enroll.sh gets the request signed over SSM
 # (an admin action) and installs the certificate. Certificates last 30 days.
 #
 # ROLLING RESTARTS. Envoy listens on the client address (and the tunnel's loopback port) and passes TCP
-# through, unchanged, to one of two claude-master servers on this box, blue or green, each on its own
+# through, unchanged, to one of two claw-master servers on this box, blue or green, each on its own
 # port of the same address (the server certificate names the address clients dial; the ports are not
 # in the security group). `sudo claw-master-rollout` starts the idle color, points Envoy's NEW
 # connections at it (an endpoint file Envoy watches, replaced atomically), and stops the old color,
 # which drains: it serves the connections it already has, each response closing its connection, so
 # every client moves over on its next request without an error, and running requests get up to
-# local.claude_master_drain_seconds. Nothing on the box restarts Envoy or a server on its own.
+# local.claw_master_drain_seconds. Nothing on the box restarts Envoy or a server on its own.
 #
 # TO ROLL THE BINARY FORWARD: publish a release of ejc3/CLIProxyAPI, change the tag and the sha256,
-# apply (terraform_data.claude_master_server_converge installs the binary atomically), then
+# apply (terraform_data.claw_master_server_converge installs the binary atomically), then
 # `sudo claw-master-rollout`.
 
-variable "enable_claude_master_server" {
+variable "enable_claw_master_server" {
   description = "Enable the shared claude-master server box"
   type        = bool
   default     = true
 }
 
 locals {
-  claude_master_tag            = "claw-master-39add35"
-  claude_master_sha256_aarch64 = "46e33444c45da2d24befbe340d39b678c361f6e550bb3c789b1ea799e178ae5f"
+  claw_master_tag            = "claw-master-39add35"
+  claw_master_sha256_aarch64 = "46e33444c45da2d24befbe340d39b678c361f6e550bb3c789b1ea799e178ae5f"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
   # `latest` at the time of pinning (verified byte for byte).
-  claude_master_cwagent_version      = "1.300073.2b1889"
-  claude_master_cwagent_sha256_arm64 = "0d04b62f688f257aa35604f89b48f259cea5ed412985831d8d56838f43332169"
+  claw_master_cwagent_version      = "1.300073.2b1889"
+  claw_master_cwagent_sha256_arm64 = "0d04b62f688f257aa35604f89b48f259cea5ed412985831d8d56838f43332169"
   # ClawMaster since the rename (2026-10-11): the binary's metrics became claw_master.*, and the history before the switch
   # was copied from ClaudeMaster with scripts/claw-master-migrate-metrics.py (ejc3/CLIProxyAPI), so nothing was lost.
-  claude_master_metrics_namespace = "ClawMaster"
-  claude_master_log_group         = "/claude-master/server"
+  claw_master_metrics_namespace = "ClawMaster"
+  claw_master_log_group         = "/claude-master/server"
 
-  claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
-  claude_master_server_port = 8443        # Envoy; the servers behind it use the color ports below
+  claw_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
+  claw_master_server_port = 8443        # Envoy; the servers behind it use the color ports below
 
   # Envoy in front of the servers. Pinned by version and sha256 (the official linux-aarch_64 binary).
-  claude_master_envoy_version        = "1.39.1"
-  claude_master_envoy_sha256_aarch64 = "8565ad0af4b1d1d3c986e5165c027add3073579182f398dd7f4d728d25e9ec62"
+  claw_master_envoy_version        = "1.39.1"
+  claw_master_envoy_sha256_aarch64 = "8565ad0af4b1d1d3c986e5165c027add3073579182f398dd7f4d728d25e9ec62"
   # The two servers' ports: the client-facing one on the server address, the open one on loopback.
-  claude_master_colors = {
+  claw_master_colors = {
     blue  = { port = 18443, open_port = 18444 }
     green = { port = 28443, open_port = 28444 }
   }
   # How long a stopping server lets running requests finish. Its unit's stop timeout is a minute longer.
-  claude_master_drain_seconds = 600
+  claw_master_drain_seconds = 600
 
   # Order is the fallback order. The first login is the one a fresh session prefers when quotas tie.
-  claude_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"]
+  claw_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"]
 
-  claude_master_admin_cidrs = concat(
+  claw_master_admin_cidrs = concat(
     var.enable_jumpbox ? ["${aws_instance.jumpbox[0].private_ip}/32"] : [],
     var.enable_jumpbox_2 ? ["${aws_instance.jumpbox_2[0].private_ip}/32"] : [],
   )
@@ -92,19 +92,19 @@ locals {
   # The root volume holds the six subscription logins and the CA key that signs every client
   # certificate: the two things that are painful to recreate (three interactive logins; reissuing
   # every client). It joins the backup pool, and the DR copy, with the other persistent roots.
-  claude_master_server_volume_arn = var.enable_claude_master_server ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.claude_master_server[0].root_block_device[0].volume_id}" : ""
+  claw_master_server_volume_arn = var.enable_claw_master_server ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.claw_master_server[0].root_block_device[0].volume_id}" : ""
 }
 
-resource "aws_security_group" "claude_master_server" {
-  count       = var.enable_claude_master_server ? 1 : 0
+resource "aws_security_group" "claw_master_server" {
+  count       = var.enable_claw_master_server ? 1 : 0
   name_prefix = "claude-master-server-"
   description = "claude-master server: the proxy port from the dev fleet subnets, SSH from the admin boxes"
   vpc_id      = local.vpc_id
 
   ingress {
     description = "claude-master proxy (TLS, client certificate required)"
-    from_port   = local.claude_master_server_port
-    to_port     = local.claude_master_server_port
+    from_port   = local.claw_master_server_port
+    to_port     = local.claw_master_server_port
     protocol    = "tcp"
     cidr_blocks = [for s in local.dev_fleet_subnets : s.cidr_block]
   }
@@ -114,7 +114,7 @@ resource "aws_security_group" "claude_master_server" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = local.claude_master_admin_cidrs
+    cidr_blocks = local.claw_master_admin_cidrs
   }
 
   # IPv6 egress matters: see jumpbox2.tf. Nothing inbound is open to the internet.
@@ -134,8 +134,8 @@ resource "aws_security_group" "claude_master_server" {
   }
 }
 
-resource "aws_iam_role" "claude_master_server" {
-  count = var.enable_claude_master_server ? 1 : 0
+resource "aws_iam_role" "claw_master_server" {
+  count = var.enable_claw_master_server ? 1 : 0
   name  = "claude-master-server-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -148,18 +148,18 @@ resource "aws_iam_role" "claude_master_server" {
   tags = { Name = "claude-master-server-role" }
 }
 
-resource "aws_iam_role_policy_attachment" "claude_master_server_ssm" {
-  count      = var.enable_claude_master_server ? 1 : 0
-  role       = aws_iam_role.claude_master_server[0].name
+resource "aws_iam_role_policy_attachment" "claw_master_server_ssm" {
+  count      = var.enable_claw_master_server ? 1 : 0
+  role       = aws_iam_role.claw_master_server[0].name
   policy_arn = aws_iam_policy.ssm_managed_instance.arn
 }
 
 # Its bootstrap script and nothing else in the scripts bucket; the backup API key comes through
-# aws_iam_policy.claude_master_backup_key_read (dev-ai-services.tf).
-resource "aws_iam_role_policy" "claude_master_server_bootstrap" {
-  count = var.enable_claude_master_server ? 1 : 0
+# aws_iam_policy.claw_master_backup_key_read (dev-ai-services.tf).
+resource "aws_iam_role_policy" "claw_master_server_bootstrap" {
+  count = var.enable_claw_master_server ? 1 : 0
   name  = "bootstrap-script"
-  role  = aws_iam_role.claude_master_server[0].id
+  role  = aws_iam_role.claw_master_server[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -173,10 +173,10 @@ resource "aws_iam_role_policy" "claude_master_server_bootstrap" {
 
 # What the CloudWatch agent on the box may do, and nothing else: publish metrics in ONE namespace, and write
 # to ONE log group that Terraform owns (so it needs no CreateLogGroup). No read access to anything.
-resource "aws_iam_role_policy" "claude_master_server_telemetry" {
-  count = var.enable_claude_master_server ? 1 : 0
+resource "aws_iam_role_policy" "claw_master_server_telemetry" {
+  count = var.enable_claw_master_server ? 1 : 0
   name  = "telemetry"
-  role  = aws_iam_role.claude_master_server[0].id
+  role  = aws_iam_role.claw_master_server[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -186,7 +186,7 @@ resource "aws_iam_role_policy" "claude_master_server_telemetry" {
         Action   = "cloudwatch:PutMetricData"
         Resource = "*"
         Condition = {
-          StringEquals = { "cloudwatch:namespace" = local.claude_master_metrics_namespace }
+          StringEquals = { "cloudwatch:namespace" = local.claw_master_metrics_namespace }
         }
       },
       {
@@ -194,8 +194,8 @@ resource "aws_iam_role_policy" "claude_master_server_telemetry" {
         Effect = "Allow"
         Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
         Resource = [
-          aws_cloudwatch_log_group.claude_master_server.arn,
-          "${aws_cloudwatch_log_group.claude_master_server.arn}:*",
+          aws_cloudwatch_log_group.claw_master_server.arn,
+          "${aws_cloudwatch_log_group.claw_master_server.arn}:*",
         ]
       },
     ]
@@ -204,8 +204,8 @@ resource "aws_iam_role_policy" "claude_master_server_telemetry" {
 
 # The proxy's own log (info level: what changed, plus a quota snapshot every five minutes). Redacted at the
 # source; kept 90 days.
-resource "aws_cloudwatch_log_group" "claude_master_server" {
-  name              = local.claude_master_log_group
+resource "aws_cloudwatch_log_group" "claw_master_server" {
+  name              = local.claw_master_log_group
   retention_in_days = 90
   tags              = { Name = "claude-master-server" }
 }
@@ -214,7 +214,7 @@ resource "aws_cloudwatch_log_group" "claude_master_server" {
 # so an agent there can see what the pool did (moves, rate limits, upstream errors, reloads) without a person. The log
 # never holds tokens, bodies, URLs, account ids or upstream text (see the Logs bullet in AGENTS.md). Not nextjs-dev:
 # every account there has sudo, and nothing there debugs the pool.
-resource "aws_iam_role_policy" "dev_server_claude_master_logs_read" {
+resource "aws_iam_role_policy" "dev_server_claw_master_logs_read" {
   name = "claude-master-logs-read"
   role = aws_iam_role.dev_server.id
   policy = jsonencode({
@@ -225,8 +225,8 @@ resource "aws_iam_role_policy" "dev_server_claude_master_logs_read" {
         Effect = "Allow"
         Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams", "logs:StartQuery", "logs:StopQuery"]
         Resource = [
-          aws_cloudwatch_log_group.claude_master_server.arn,
-          "${trimsuffix(aws_cloudwatch_log_group.claude_master_server.arn, ":*")}:*",
+          aws_cloudwatch_log_group.claw_master_server.arn,
+          "${trimsuffix(aws_cloudwatch_log_group.claw_master_server.arn, ":*")}:*",
         ]
       },
       {
@@ -241,10 +241,10 @@ resource "aws_iam_role_policy" "dev_server_claude_master_logs_read" {
 }
 
 # Names for the incoming users' Anthropic accounts in the metrics (the `client_account` dimension), so the
-# dashboards say who instead of acct-<8 hex>. claude-master reads them from /etc/claude-master/account-labels,
+# dashboards say who instead of acct-<8 hex>. claw-master reads them from /etc/claude-master/account-labels,
 # which the server writes from this secret before every start (claude-master-account-labels below). Terraform
 # creates only the container; the owner sets the value out of band, one `ACCOUNT_UUID=NAME` per line (UUID =
-# oauthAccount.accountUuid in that user's ~/.claude.json; `claude-master account-key UUID` prints the
+# oauthAccount.accountUuid in that user's ~/.claude.json; `claw-master account-key UUID` prints the
 # acct-<8 hex> key an account shows as until it has a name). From a file, never on a command line:
 #
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
@@ -252,19 +252,19 @@ resource "aws_iam_role_policy" "dev_server_claude_master_logs_read" {
 #
 # and nothing else: a timer on the box (claude-master-account-labels.timer, every 10 minutes) rewrites the file
 # when the secret changed, and the running server reloads it within a minute, with no restart. A value with any
-# other kind of line is refused and the old file kept, because claude-master refuses to start on a bad line.
+# other kind of line is refused and the old file kept, because claw-master refuses to start on a bad line.
 # Never write a UUID or a name into this repository.
-resource "aws_secretsmanager_secret" "claude_master_account_labels" {
-  count                   = var.enable_claude_master_server ? 1 : 0
+resource "aws_secretsmanager_secret" "claw_master_account_labels" {
+  count                   = var.enable_claw_master_server ? 1 : 0
   name                    = "claude-master/account-labels"
-  description             = "ACCOUNT_UUID=NAME lines naming claude-master's incoming accounts in its metrics. Value set out of band; see claude-master-server.tf."
+  description             = "ACCOUNT_UUID=NAME lines naming claude-master's incoming accounts in its metrics. Value set out of band; see claw-master-server.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "claude-master/account-labels", Managed = "terraform" }
 }
 
-resource "aws_secretsmanager_secret_policy" "claude_master_account_labels" {
-  count      = var.enable_claude_master_server ? 1 : 0
-  secret_arn = aws_secretsmanager_secret.claude_master_account_labels[0].arn
+resource "aws_secretsmanager_secret_policy" "claw_master_account_labels" {
+  count      = var.enable_claw_master_server ? 1 : 0
+  secret_arn = aws_secretsmanager_secret.claw_master_account_labels[0].arn
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -272,43 +272,43 @@ resource "aws_secretsmanager_secret_policy" "claude_master_account_labels" {
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.claude_master_account_labels[0].arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.claude_master_server[0].arn]) } }
+      Resource  = aws_secretsmanager_secret.claw_master_account_labels[0].arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.claw_master_server[0].arn]) } }
     }]
   })
 }
 
-resource "aws_iam_role_policy" "claude_master_server_account_labels" {
-  count = var.enable_claude_master_server ? 1 : 0
+resource "aws_iam_role_policy" "claw_master_server_account_labels" {
+  count = var.enable_claw_master_server ? 1 : 0
   name  = "account-labels"
-  role  = aws_iam_role.claude_master_server[0].id
+  role  = aws_iam_role.claw_master_server[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Sid      = "ReadTheAccountLabels"
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.claude_master_account_labels[0].arn
+      Resource = aws_secretsmanager_secret.claw_master_account_labels[0].arn
     }]
   })
 }
 
-resource "aws_iam_instance_profile" "claude_master_server" {
-  count = var.enable_claude_master_server ? 1 : 0
+resource "aws_iam_instance_profile" "claw_master_server" {
+  count = var.enable_claw_master_server ? 1 : 0
   name  = "claude-master-server-profile"
-  role  = aws_iam_role.claude_master_server[0].name
+  role  = aws_iam_role.claw_master_server[0].name
 }
 
 locals {
-  claude_master_server_user_data = <<SCRIPT
+  claw_master_server_user_data = <<SCRIPT
 #!/bin/bash
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-TAG='${local.claude_master_tag}'
-SHA='${local.claude_master_sha256_aarch64}'
-IP='${local.claude_master_server_ip}'
-PORT='${local.claude_master_server_port}'
+TAG='${local.claw_master_tag}'
+SHA='${local.claw_master_sha256_aarch64}'
+IP='${local.claw_master_server_ip}'
+PORT='${local.claw_master_server_port}'
 REGION='${var.aws_region}'
 HOME_DIR=/var/lib/claude-master
 
@@ -329,7 +329,7 @@ id claude-master >/dev/null 2>&1 || useradd --system --create-home --home-dir "$
 install -d -m 0700 -o claude-master -g claude-master "$HOME_DIR" "$HOME_DIR/state"
 
 # ---------------------------------------------------------------- the pinned binary
-# claw-master (renamed from claude-master on 2026-10-11). The release asset is named for the tag's prefix.
+# claw-master (renamed from claw-master on 2026-10-11). The release asset is named for the tag's prefix.
 current=$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)
 if [ "$current" != "$SHA" ]; then
   if curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claw-master-linux-arm64" -o /tmp/claw-master.new \
@@ -365,14 +365,14 @@ unset key
 # color it is the server from before Envoy (claude-master-server.service, until the first rollout moves
 # it behind Envoy): the client port itself, and no balancer.
 color=$${1:-legacy}
-balancer="--balanced --drain-timeout ${local.claude_master_drain_seconds}s"
+balancer="--balanced --drain-timeout ${local.claw_master_drain_seconds}s"
 case "$color" in
-${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
-  legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;
+${join("\n", [for c, v in local.claw_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
+  legacy) port=${local.claw_master_server_port}; open=${local.claw_master_open_port}; balancer="" ;;
   *) echo "usage: claw-master-serve blue|green" >&2; exit 2 ;;
 esac
-exec "$bin" serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
-  --listen ${local.claude_master_server_ip}:$port \
+exec "$bin" serve ${local.claw_master_profiles[0]}${join("", [for p in slice(local.claw_master_profiles, 1, length(local.claw_master_profiles)) : " --next-profile ${p}"])} \
+  --listen ${local.claw_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
   --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels \
@@ -381,7 +381,7 @@ EOF
 chmod 0755 /usr/local/bin/claw-master-serve
 
 # Names for the incoming users' Anthropic accounts in the dashboards, one `ACCOUNT_UUID=NAME` per line
-# (`claude-master account-key UUID` shows the key an unnamed account gets). The file is written from the
+# (`claw-master account-key UUID` shows the key an unnamed account gets). The file is written from the
 # secret claude-master/account-labels before every start (below); until the secret has a value it holds
 # only this explanation, and an existing file is kept.
 mkdir -p /etc/claude-master
@@ -393,7 +393,7 @@ chmod 0640 /etc/claude-master/account-labels
 
 # Run by systemd as root before each start (ExecStartPre=-+ in the unit) and every 10 minutes by its timer;
 # the running server reloads the file when it changes. It never stops a start: without a value, when the
-# secret cannot be read, or when a line is not `ACCOUNT_UUID=NAME` (on which claude-master would refuse to
+# secret cannot be read, or when a line is not `ACCOUNT_UUID=NAME` (on which claw-master would refuse to
 # start), the file is kept. An unchanged value leaves the file alone, so the server does not reload for nothing.
 cat > /usr/local/bin/claw-master-account-labels <<'EOF'
 #!/bin/bash
@@ -405,7 +405,7 @@ if [ -z "$value" ] || [ "$value" = "None" ]; then
   echo "claw-master-account-labels: claude-master/account-labels has no value or could not be read; keeping $file" >&2
   exit 0
 fi
-# claude-master's own rule: a blank line, a # comment, or ACCOUNT_UUID=NAME (8 to 64 hex digits and dashes).
+# claw-master's own rule: a blank line, a # comment, or ACCOUNT_UUID=NAME (8 to 64 hex digits and dashes).
 if printf '%s\n' "$value" | grep -qvE '^[[:space:]]*(#.*)?$|^[[:space:]]*[0-9A-Fa-f-]{8,64}[[:space:]]*=[[:space:]]*[^[:space:]]'; then
   echo "claw-master-account-labels: claude-master/account-labels has a line that is not ACCOUNT_UUID=NAME; keeping $file" >&2
   exit 0
@@ -437,8 +437,8 @@ cat > /etc/systemd/system/claude-master-server@.service <<'EOF'
 Description=claude-master server %i (shared Claude subscription pool, behind Envoy)
 After=network-online.target
 Wants=network-online.target
-# Idle until every login exists: `scripts/claude-master-login.sh --server`, then start it.
-${join("\n", [for p in local.claude_master_profiles : "ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current"])}
+# Idle until every login exists: `scripts/claw-master-login.sh --server`, then start it.
+${join("\n", [for p in local.claw_master_profiles : "ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current"])}
 
 [Service]
 User=claude-master
@@ -453,7 +453,7 @@ ExecStart=/usr/local/bin/claw-master-serve %i
 Restart=on-failure
 RestartSec=10
 # A stop drains for up to the drain timeout; systemd must not cut it short.
-TimeoutStopSec=${local.claude_master_drain_seconds + 60}
+TimeoutStopSec=${local.claw_master_drain_seconds + 60}
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/claude-master
@@ -490,8 +490,8 @@ systemctl daemon-reload
 systemctl enable --now claude-master-account-labels.timer >/dev/null 2>&1 || echo "WARNING: claude-master-account-labels.timer not enabled"
 
 # ---------------------------------------------------------------- Envoy (rolling restarts)
-ENVOY_VERSION='${local.claude_master_envoy_version}'
-ENVOY_SHA='${local.claude_master_envoy_sha256_aarch64}'
+ENVOY_VERSION='${local.claw_master_envoy_version}'
+ENVOY_SHA='${local.claw_master_envoy_sha256_aarch64}'
 current=$(sha256sum /usr/local/bin/envoy 2>/dev/null | cut -d' ' -f1)
 if [ "$current" != "$ENVOY_SHA" ]; then
   if curl -fsSL "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-aarch_64" -o /tmp/envoy.new \
@@ -519,7 +519,7 @@ overload_manager:
       max_active_downstream_connections: 10000
 static_resources:
   listeners:
-%{for name, addr in { cert = "${local.claude_master_server_ip}:${local.claude_master_server_port}", open = "127.0.0.1:${local.claude_master_open_port}" } ~}
+%{for name, addr in { cert = "${local.claw_master_server_ip}:${local.claw_master_server_port}", open = "127.0.0.1:${local.claw_master_open_port}" } ~}
   - name: ${name}
     address: { socket_address: { address: ${split(":", addr)[0]}, port_value: ${split(":", addr)[1]} } }
     filter_chains:
@@ -550,7 +550,7 @@ cat > /usr/local/bin/claw-master-envoy-endpoints <<'EOF'
 # claw-master-envoy-endpoints COLOR: point Envoy's new connections at that color's two ports.
 set -euo pipefail
 case "$1" in
-${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
+${join("\n", [for c, v in local.claw_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
   *) echo "usage: claw-master-envoy-endpoints blue|green" >&2; exit 2 ;;
 esac
 write() { # cluster address port
@@ -560,7 +560,7 @@ write() { # cluster address port
   chmod 0644 "$tmp"
   mv -f "$tmp" "/etc/envoy/eds/$1.yaml"
 }
-write cert ${local.claude_master_server_ip} "$port"
+write cert ${local.claw_master_server_ip} "$port"
 write open 127.0.0.1 "$open"
 EOF
 chmod 0755 /usr/local/bin/claw-master-envoy-endpoints
@@ -604,9 +604,9 @@ cat > /usr/local/bin/claw-master-rollout <<'EOF'
 #!/bin/bash
 set -uo pipefail
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo claw-master-rollout" >&2; exit 2; }
-IP=${local.claude_master_server_ip}
-port_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.port} ;;"])} esac; }
-open_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.open_port} ;;"])} esac; }
+IP=${local.claw_master_server_ip}
+port_of() { case "$1" in ${join(" ", [for c, v in local.claw_master_colors : "${c}) echo ${v.port} ;;"])} esac; }
+open_of() { case "$1" in ${join(" ", [for c, v in local.claw_master_colors : "${c}) echo ${v.open_port} ;;"])} esac; }
 other() { [ "$1" = blue ] && echo green || echo blue; }
 listening() { ss -ltnH | awk '{print $4}' | grep -qx "$1"; }
 
@@ -647,7 +647,7 @@ if [ "$legacy" = 1 ]; then
   systemctl stop claude-master-server.service
   systemctl start envoy.service
   up=0
-  for _ in $(seq 1 20); do listening "$IP:${local.claude_master_server_port}" && listening "127.0.0.1:${local.claude_master_open_port}" && { up=1; break; }; sleep 0.5; done
+  for _ in $(seq 1 20); do listening "$IP:${local.claw_master_server_port}" && listening "127.0.0.1:${local.claw_master_open_port}" && { up=1; break; }; sleep 0.5; done
   if [ "$up" != 1 ]; then
     echo "Envoy did not start listening; starting the pre-Envoy server again" >&2
     systemctl stop envoy.service
@@ -697,14 +697,14 @@ echo "new connections go to $next"
 if [ "$active" != none ]; then
   systemctl disable "claude-master-server@$active" >/dev/null 2>&1 || true
   systemctl stop --no-block "claude-master-server@$active"
-  echo "claude-master-server@$active is draining (up to ${local.claude_master_drain_seconds}s); claw-master-status shows when it is done"
+  echo "claude-master-server@$active is draining (up to ${local.claw_master_drain_seconds}s); claw-master-status shows when it is done"
 fi
 EOF
 chmod 0755 /usr/local/bin/claw-master-rollout
 
 # ---------------------------------------------------------------- cloudflared (the tunnel for the Macs)
-# Pinned by version and sha256. It dials OUT to Cloudflare and forwards to claude-master's open
-# listener on loopback (claude-master-tunnel.tf); no inbound port is opened for it.
+# Pinned by version and sha256. It dials OUT to Cloudflare and forwards to claw-master's open
+# listener on loopback (claw-master-tunnel.tf); no inbound port is opened for it.
 CFD_VERSION='${local.cloudflared_version}'
 CFD_SHA='${local.cloudflared_sha256_linux_arm}'
 current=$(sha256sum /usr/local/bin/cloudflared 2>/dev/null | cut -d' ' -f1)
@@ -759,10 +759,10 @@ systemctl is-active --quiet cloudflared-claude-master.service || systemctl start
 
 # ---------------------------------------------------------------- cloudwatch agent
 # Receives the proxy's OTLP metrics on 127.0.0.1:4318 (the agent turns cumulative counters into deltas),
-# publishes them in the ${local.claude_master_metrics_namespace} namespace, adds memory and swap (this box ran out of memory
-# at its first size), and ships the proxy's log file to ${local.claude_master_log_group}.
-CWA_VERSION='${local.claude_master_cwagent_version}'
-CWA_SHA='${local.claude_master_cwagent_sha256_arm64}'
+# publishes them in the ${local.claw_master_metrics_namespace} namespace, adds memory and swap (this box ran out of memory
+# at its first size), and ships the proxy's log file to ${local.claw_master_log_group}.
+CWA_VERSION='${local.claw_master_cwagent_version}'
+CWA_SHA='${local.claw_master_cwagent_sha256_arm64}'
 if ! dpkg-query -W -f='$${Version}' amazon-cloudwatch-agent 2>/dev/null | grep -q "^$CWA_VERSION"; then
   if curl -fsSL --retry 3 "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/$CWA_VERSION/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb \
      && echo "$CWA_SHA  /tmp/cwagent.deb" | sha256sum -c - >/dev/null; then
@@ -777,7 +777,7 @@ if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
 {
   "agent": { "metrics_collection_interval": 60, "run_as_user": "root", "omit_hostname": true },
   "metrics": {
-    "namespace": "${local.claude_master_metrics_namespace}",
+    "namespace": "${local.claw_master_metrics_namespace}",
     "metrics_collected": {
       "otlp": { "http_endpoint": "127.0.0.1:4318" },
       "mem": { "measurement": ["mem_used_percent"] },
@@ -785,7 +785,7 @@ if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
     }
   },
   "logs": { "logs_collected": { "files": { "collect_list": [
-    { "file_path": "/var/log/claude-master/server*.log", "log_group_name": "${local.claude_master_log_group}", "log_stream_name": "{instance_id}" }
+    { "file_path": "/var/log/claude-master/server*.log", "log_group_name": "${local.claw_master_log_group}", "log_stream_name": "{instance_id}" }
   ] } } }
 }
 CWACONF
@@ -817,7 +817,7 @@ EOF
 chmod 0755 /usr/local/bin/claw-master-login
 
 # Signs a client's certificate request (base64 on stdin) and prints the client certificate and then
-# the CA certificate. scripts/claude-master-enroll.sh calls this over SSM; it is an admin action.
+# the CA certificate. scripts/claw-master-enroll.sh calls this over SSM; it is an admin action.
 cat > /usr/local/bin/claw-master-sign <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -832,7 +832,7 @@ chmod 0755 /usr/local/bin/claw-master-sign
 # Which logins exist, whether the server is up, and the version it runs versus the one installed.
 cat > /usr/local/bin/claw-master-status <<'EOF'
 #!/bin/bash
-for p in ${join(" ", local.claude_master_profiles)}; do
+for p in ${join(" ", local.claw_master_profiles)}; do
   if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
 done
 active=$(cat /etc/claude-master/active-color 2>/dev/null || echo none)
@@ -842,21 +842,21 @@ else
   echo "server: $(systemctl is-active "claude-master-server@$active") ($active)"
 fi
 clusters=$(curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null)
-for c in ${join(" ", keys(local.claude_master_colors))}; do
+for c in ${join(" ", keys(local.claw_master_colors))}; do
   pid=$(systemctl show -p MainPID --value "claude-master-server@$c")
   running=""; [ "$pid" != 0 ] && running=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -c1-16)
-  port=$(case $c in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.port} ;;"])} esac)
-  conns=$(grep -E "^cert::${local.claude_master_server_ip}:$port::cx_active::" <<<"$clusters" | sed 's/.*:://')
+  port=$(case $c in ${join(" ", [for c, v in local.claw_master_colors : "${c}) echo ${v.port} ;;"])} esac)
+  conns=$(grep -E "^cert::${local.claw_master_server_ip}:$port::cx_active::" <<<"$clusters" | sed 's/.*:://')
   echo "  $c: $(systemctl is-active "claude-master-server@$c")$${running:+  running $running}$${conns:+  envoy connections $conns}"
 done
 echo "envoy: $(systemctl is-active envoy)   new connections go to: $(grep -o 'port_value: [0-9]*' /etc/envoy/eds/cert.yaml 2>/dev/null | grep -o '[0-9]*$')"
 echo "cloudwatch agent: $(systemctl is-active amazon-cloudwatch-agent)   logs: $(ls -1 /var/log/claude-master 2>/dev/null | grep -E '^server.*log$' | tr '\n' ' ')"
-if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claude_master_open_port} "; then
+if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claw_master_open_port} "; then
   echo "open listener: listening"
 else
   echo "open listener: NOT listening (Envoy is stopped, or no server is running yet: sudo claw-master-rollout)"
 fi
-echo "installed: $(sha256sum /usr/local/bin/claw-master | cut -c1-16)  pinned: ${substr(local.claude_master_sha256_aarch64, 0, 16)}  ($TAG)"
+echo "installed: $(sha256sum /usr/local/bin/claw-master | cut -c1-16)  pinned: ${substr(local.claw_master_sha256_aarch64, 0, 16)}  ($TAG)"
 EOF
 sed -i "s/\$TAG/$TAG/" /usr/local/bin/claw-master-status
 chmod 0755 /usr/local/bin/claw-master-status
@@ -869,25 +869,25 @@ done
 SCRIPT
 }
 
-resource "aws_s3_object" "claude_master_server_user_data" {
-  count        = var.enable_claude_master_server ? 1 : 0
+resource "aws_s3_object" "claw_master_server_user_data" {
+  count        = var.enable_claw_master_server ? 1 : 0
   bucket       = aws_s3_bucket.dev_scripts.id
   key          = "user-data/claude-master-server.sh"
-  content      = local.claude_master_server_user_data
+  content      = local.claw_master_server_user_data
   content_type = "text/x-shellscript"
   tags         = { Name = "claude-master-server-user-data" }
 }
 
-resource "aws_instance" "claude_master_server" {
-  count                       = var.enable_claude_master_server ? 1 : 0
+resource "aws_instance" "claw_master_server" {
+  count                       = var.enable_claw_master_server ? 1 : 0
   ami                         = var.firecracker_ami # the same Ubuntu 24.04 ARM64 image as the fleet
   instance_type               = "t4g.micro"
   key_name                    = var.firecracker_key_name
   subnet_id                   = aws_subnet.subnet_a.id
-  private_ip                  = local.claude_master_server_ip
+  private_ip                  = local.claw_master_server_ip
   associate_public_ip_address = true # outbound only: the security group admits no one from outside
-  vpc_security_group_ids      = [aws_security_group.claude_master_server[0].id]
-  iam_instance_profile        = aws_iam_instance_profile.claude_master_server[0].name
+  vpc_security_group_ids      = [aws_security_group.claw_master_server[0].id]
+  iam_instance_profile        = aws_iam_instance_profile.claw_master_server[0].name
 
   root_block_device {
     volume_size           = 20
@@ -922,7 +922,7 @@ resource "aws_instance" "claude_master_server" {
   )
 
   # The bootstrap names the S3 object by a literal path, so Terraform needs the edge said aloud.
-  depends_on = [aws_s3_object.claude_master_server_user_data]
+  depends_on = [aws_s3_object.claw_master_server_user_data]
 
   lifecycle {
     prevent_destroy = true
@@ -945,38 +945,38 @@ resource "aws_instance" "claude_master_server" {
 # whenever the script, the helper or the instance changes. The bootstrap is idempotent and never
 # restarts a running server or Envoy: a new binary is installed atomically and the running server keeps
 # the old one until `sudo claw-master-rollout` (`claw-master-status` shows running versus pinned).
-resource "terraform_data" "claude_master_server_converge" {
-  count = var.enable_claude_master_server ? 1 : 0
+resource "terraform_data" "claw_master_server_converge" {
+  count = var.enable_claw_master_server ? 1 : 0
 
   triggers_replace = {
-    instance = aws_instance.claude_master_server[0].id
-    type     = aws_instance.claude_master_server[0].instance_type
-    script   = sha256(local.claude_master_server_user_data)
-    helper   = filesha256("${path.module}/scripts/ssm-claude-master-server.sh")
+    instance = aws_instance.claw_master_server[0].id
+    type     = aws_instance.claw_master_server[0].instance_type
+    script   = sha256(local.claw_master_server_user_data)
+    helper   = filesha256("${path.module}/scripts/ssm-claw-master-server.sh")
   }
 
   provisioner "local-exec" {
-    command = "bash ${path.module}/scripts/ssm-claude-master-server.sh ${aws_instance.claude_master_server[0].id} ${var.aws_region}"
+    command = "bash ${path.module}/scripts/ssm-claw-master-server.sh ${aws_instance.claw_master_server[0].id} ${var.aws_region}"
   }
 
   # The bootstrap starts cloudflared, which reads the connector token with the server's role: both
-  # must exist first (claude-master-tunnel.tf), or its first start fails and waits for a retry.
+  # must exist first (claw-master-tunnel.tf), or its first start fails and waits for a retry.
   depends_on = [
-    aws_s3_object.claude_master_server_user_data,
-    aws_secretsmanager_secret_version.claude_master_tunnel_token,
-    aws_iam_role_policy.claude_master_server_tunnel_token,
+    aws_s3_object.claw_master_server_user_data,
+    aws_secretsmanager_secret_version.claw_master_tunnel_token,
+    aws_iam_role_policy.claw_master_server_tunnel_token,
   ]
 }
 
-output "claude_master_server_address" {
+output "claw_master_server_address" {
   description = "Where client boxes point `claude-master connect --server`"
-  value       = "${local.claude_master_server_ip}:${local.claude_master_server_port}"
+  value       = "${local.claw_master_server_ip}:${local.claw_master_server_port}"
 }
 
 # Alarms to the shared alert topic, like every other box: the instance itself, and the two signals that
 # took nextjs-dev down (memory and swap; the CloudWatch agent publishes them, see below).
-resource "aws_cloudwatch_metric_alarm" "claude_master_server_status" {
-  count               = var.enable_claude_master_server ? 1 : 0
+resource "aws_cloudwatch_metric_alarm" "claw_master_server_status" {
+  count               = var.enable_claw_master_server ? 1 : 0
   alarm_name          = "claude-master-server-status-check"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -990,20 +990,20 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_status" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data  = "notBreaching"
 
-  dimensions = { InstanceId = aws_instance.claude_master_server[0].id }
+  dimensions = { InstanceId = aws_instance.claw_master_server[0].id }
 }
 
 # Memory and swap (the CloudWatch agent publishes them). The box ran out of memory at its first size.
 # The agent adds a `host` dimension to host metrics unless told not to; the config sets omit_hostname so these
 # two series have NO dimensions, which is what the alarms select. An alarm that selects dimensions the series
 # does not have sees no data and, with notBreaching, stays green forever.
-resource "aws_cloudwatch_metric_alarm" "claude_master_server_memory" {
-  count               = var.enable_claude_master_server ? 1 : 0
+resource "aws_cloudwatch_metric_alarm" "claw_master_server_memory" {
+  count               = var.enable_claw_master_server ? 1 : 0
   alarm_name          = "claude-master-server-memory-pressure"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "mem_used_percent"
-  namespace           = local.claude_master_metrics_namespace
+  namespace           = local.claw_master_metrics_namespace
   period              = 300
   statistic           = "Average"
   threshold           = 85
@@ -1015,13 +1015,13 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_memory" {
   insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 }
 
-resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
-  count               = var.enable_claude_master_server ? 1 : 0
+resource "aws_cloudwatch_metric_alarm" "claw_master_server_swap" {
+  count               = var.enable_claw_master_server ? 1 : 0
   alarm_name          = "claude-master-server-swapping"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "swap_used_percent"
-  namespace           = local.claude_master_metrics_namespace
+  namespace           = local.claw_master_metrics_namespace
   period              = 300
   statistic           = "Average"
   threshold           = 50
@@ -1034,16 +1034,16 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_swap" {
 
 # Things only a person can fix, found in the proxy's own log. The wording is the program's fixed text.
 locals {
-  claude_master_log_alarms = {
+  claw_master_log_alarms = {
     CredentialRejected = {
       pattern     = "\"profile credential rejected by Anthropic\""
-      description = "Anthropic rejected a subscription's login (401/403): it expired or was revoked. Redo it: scripts/claude-master-login.sh --server (the other subscriptions keep serving)."
+      description = "Anthropic rejected a subscription's login (401/403): it expired or was revoked. Redo it: scripts/claw-master-login.sh --server (the other subscriptions keep serving)."
     }
     NoAccountAvailable = {
       pattern     = "\"no inference account could be chosen\""
       description = "No subscription (and no API-key backup) could take a request: every one is rate limited, exhausted or its login failed. Clients are being refused."
     }
-    # A route claude-master does not list was relayed to Anthropic on the session's own login (it works; nothing is
+    # A route claw-master does not list was relayed to Anthropic on the session's own login (it works; nothing is
     # refused any more). The first request of each route shape is logged once per server process.
     UnlistedRoute = {
       pattern     = "\"relayed an unlisted Anthropic route\""
@@ -1052,26 +1052,26 @@ locals {
   }
 }
 
-resource "aws_cloudwatch_log_metric_filter" "claude_master_server" {
-  for_each       = var.enable_claude_master_server ? local.claude_master_log_alarms : {}
+resource "aws_cloudwatch_log_metric_filter" "claw_master_server" {
+  for_each       = var.enable_claw_master_server ? local.claw_master_log_alarms : {}
   name           = "claude-master-${each.key}"
-  log_group_name = aws_cloudwatch_log_group.claude_master_server.name
+  log_group_name = aws_cloudwatch_log_group.claw_master_server.name
   pattern        = each.value.pattern
   metric_transformation {
     name          = each.key
-    namespace     = "${local.claude_master_metrics_namespace}/Logs"
+    namespace     = "${local.claw_master_metrics_namespace}/Logs"
     value         = "1"
     default_value = "0"
   }
 }
 
-resource "aws_cloudwatch_metric_alarm" "claude_master_server_log" {
-  for_each            = var.enable_claude_master_server ? local.claude_master_log_alarms : {}
+resource "aws_cloudwatch_metric_alarm" "claw_master_server_log" {
+  for_each            = var.enable_claw_master_server ? local.claw_master_log_alarms : {}
   alarm_name          = "claude-master-${each.key}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = each.key
-  namespace           = "${local.claude_master_metrics_namespace}/Logs"
+  namespace           = "${local.claw_master_metrics_namespace}/Logs"
   period              = 300
   statistic           = "Sum"
   threshold           = 0
@@ -1079,5 +1079,5 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_server_log" {
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data  = "notBreaching"
-  depends_on          = [aws_cloudwatch_log_metric_filter.claude_master_server]
+  depends_on          = [aws_cloudwatch_log_metric_filter.claw_master_server]
 }

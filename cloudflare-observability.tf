@@ -2,7 +2,7 @@
 #
 # A long-lived, READ-ONLY Cloudflare token for logs and metrics, readable from the dev boxes, so an agent debugging a
 # Worker or a site can read what Cloudflare recorded instead of asking a person to open the dashboard (owner,
-# 2026-10-10: the claude-master dashboard's 500s were in Workers Logs and no dev box could see them).
+# 2026-10-10: the claw-master dashboard's 500s were in Workers Logs and no dev box could see them).
 #
 #   cloudflare-observability-token   Secrets Manager (us-west-1), the raw token string. Readers: administration,
 #                                    dev-server-role (the metal boxes) and nextjs-dev-role (every account there has

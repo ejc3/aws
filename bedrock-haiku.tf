@@ -73,7 +73,7 @@ locals {
       dev-ebs-only = aws_iam_role.dev_ebs_only.id
       wbox         = aws_iam_role.wbox.id
     },
-    var.enable_claude_master_server ? { claude-master-server = aws_iam_role.claude_master_server[0].id } : {},
+    var.enable_claw_master_server ? { claude-master-server = aws_iam_role.claw_master_server[0].id } : {},
   )
 }
 

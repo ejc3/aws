@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
 # claude-master-mac-setup -- set a Mac up to use the shared Claude subscriptions through the Cloudflare
-# tunnel (claude-master-tunnel.tf), reaching it over the reverse tunnel the Mac keeps open to
+# tunnel (claw-master-tunnel.tf), reaching it over the reverse tunnel the Mac keeps open to
 # fcvm-metal-arm (mac-reverse-tunnels.tf: `ssh mac` / `ssh macbook` from there).
 #
-#   scripts/claude-master-mac-setup.sh macbook        run on a jumpbox as an AWS administrator
-#   scripts/claude-master-mac-setup.sh mac
+#   scripts/claw-master-mac-setup.sh macbook        run on a jumpbox as an AWS administrator
+#   scripts/claw-master-mac-setup.sh mac
 #
 # ADDITIVE AND OPT-IN. It installs into the user's home only (~/.local/bin, ~/.config/claude-master,
 # ~/Library/LaunchAgents) and leaves the Mac's own `claude`, its login and its settings alone: a
 # plain `claude` still uses that Mac's own subscription. Only the new `claude-pool` command routes
 # inference through the shared pool.
-#   * claw-master (and the link claude-master, its name before the rename) and cloudflared, each pinned by version and
+#   * claw-master (and the link claw-master, its name before the rename) and cloudflared, each pinned by version and
 #     sha256 and verified ON the Mac
 #   * ~/.config/claude-master/cloudflare.env (0600): the Access service token. It travels from
 #     Secrets Manager through ssh STDIN only: never an argument, never written on fcvm or here.
@@ -26,7 +26,7 @@ REGION=${AWS_REGION:-us-west-1}
 FCVM=${FCVM_HOST:-184.72.40.255}                       # fcvm-metal-arm's Elastic IP
 KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
-# Pins. Keep CM_TAG equal to claude_master_tag in claude-master-server.tf (a test enforces it) and
+# Pins. Keep CM_TAG equal to claw_master_tag in claw-master-server.tf (a test enforces it) and
 # bump the sha256 values together with it.
 CM_TAG=claw-master-39add35
 CM_SHA256_DARWIN_ARM64=a37f315347dd188d30839e1097b37592abe9c63611223715185b4689fbdc023b
@@ -36,7 +36,7 @@ CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
 ALIAS=${1:-}
-[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claude-master-mac-setup.sh ALIAS   (mac or macbook: an ssh alias on fcvm-arm)" >&2; exit 2; }
+[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claw-master-mac-setup.sh ALIAS   (mac or macbook: an ssh alias on fcvm-arm)" >&2; exit 2; }
 
 # Run something on the Mac: jumpbox -> fcvm -> (reverse tunnel) -> Mac. stdin is passed through.
 on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "ssh -o BatchMode=yes -o ConnectTimeout=10 $ALIAS $*"; }
@@ -49,7 +49,7 @@ aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instan
 READY=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
 CA=${READY%%===STATUS===*}
 printf '%s\n' "$READY" | grep -q '^open listener: listening' || {
-  echo "the server is not listening on its open port yet. Finish the six logins (scripts/claude-master-login.sh --server), start claude-master-server, check claw-master-status, then re-run this." >&2
+  echo "the server is not listening on its open port yet. Finish the six logins (scripts/claw-master-login.sh --server), start claude-master-server, check claw-master-status, then re-run this." >&2
   exit 1
 }
 printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE' || { echo "the server has no CA certificate yet" >&2; exit 1; }

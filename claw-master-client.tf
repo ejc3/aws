@@ -1,9 +1,9 @@
-# claude-master-client.tf
+# claw-master-client.tf
 #
-# The CLIENT side of the shared claude-master server on fcvm-metal-arm: the pinned `claude-master` binary and the
+# The CLIENT side of the shared claw-master server on fcvm-metal-arm: the pinned `claw-master` binary and the
 # routing that makes t-claude send inference through the pool. (nextjs-dev gets the same two things from its own
-# setup script, nextjs-user-data.tf; the server is claude-master-server.tf.) The pin is the server's: one tag and one
-# sha256 (local.claude_master_tag / claude_master_sha256_aarch64), so client and server are always the same build.
+# setup script, nextjs-user-data.tf; the server is claw-master-server.tf.) The pin is the server's: one tag and one
+# sha256 (local.claw_master_tag / claw_master_sha256_aarch64), so client and server are always the same build.
 #
 # HOW. A State Manager association (the pattern of codex-update.tf): Run Command as root on a schedule, no key on disk,
 # no service on the box, the permitted admin -> box direction. It is idempotent: a box already on the pinned build and
@@ -15,26 +15,26 @@
 # window saves the server so a relaunch (/clear, /cd) stays there.
 #
 # THE SWITCH IS THE CERTIFICATE. The block exports TCLAUDE_INFERENCE_SERVER only when the client binary is installed AND the
-# account's own client certificate is readable, so nothing is routed until `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST` has run. t-claude reads it at
-# launch (`--inference-server`, ejc3/t-claude) and runs `claude-master connect` in place of plain claude. It also exports
+# account's own client certificate is readable, so nothing is routed until `scripts/claw-master-enroll.sh fcvm-arm --ssh HOST` has run. t-claude reads it at
+# launch (`--inference-server`, ejc3/t-claude) and runs `claw-master connect` in place of plain claude. It also exports
 # TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master: this box has a personal build in ~/.local/bin ahead of the shared one on
 # PATH (an older one that refuses the t-claude flags), and the route must use the pinned build, not whichever comes first.
 #
 # THE OLD NAME IS KEPT ON PURPOSE. Since the rename (2026-10-11) the binary is /usr/local/bin/claw-master, and
 # /usr/local/bin/claude-master is a link to it. TCLAUDE_CLAUDE_MASTER names the LINK: t-claude decides whether a window's
-# agent is still running by the process name, and counts a process whose name starts with "claude" (so claude-master
-# matches, claw-master would not). Through the link the process keeps the name claude-master; pointed at claw-master, a
+# agent is still running by the process name, and counts a process whose name starts with "claude" (so claw-master
+# matches, claw-master would not). Through the link the process keeps the name claw-master; pointed at claw-master, a
 # running pool session would look dead and t-claude would type a second launch into it. Switch it once t-claude knows the name.
 # The client directory stays ~/.config/claude-master: t-claude passes it, and the certificate renewal works on it.
 
 locals {
-  claude_master_client_instances = var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : []
+  claw_master_client_instances = var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : []
 
-  claude_master_client_commands = <<-CMD
+  claw_master_client_commands = <<-CMD
     set -u
     if [ "$(uname -m)" != aarch64 ]; then echo "claw-master client: no pinned build for $(uname -m); nothing done"; exit 0; fi
-    CM_TAG="${local.claude_master_tag}"
-    CM_SHA="${local.claude_master_sha256_aarch64}"
+    CM_TAG="${local.claw_master_tag}"
+    CM_SHA="${local.claw_master_sha256_aarch64}"
     if [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" = "$CM_SHA" ]; then
       echo "claw-master $CM_TAG already installed"
     else
@@ -59,11 +59,12 @@ locals {
     fi
     ZE=/etc/zsh/zshenv
     if [ -f "$ZE" ]; then
-      sed -i '/^# >>> claude-master (managed by claude-master-client.tf) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
+      # Also the block from before this file was renamed (managed by claude-master-client.tf).
+      sed -i '/^# >>> claude-master (managed by cla[a-z]*-master-client.tf) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
       cat >> "$ZE" <<'CMZSHENV'
-    # >>> claude-master (managed by claude-master-client.tf) >>>
+    # >>> claude-master (managed by claw-master-client.tf) >>>
     if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
-      export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
+      export TCLAUDE_INFERENCE_SERVER="${local.claw_master_server_ip}:${local.claw_master_server_port}"
       export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
     fi
     # <<< claude-master <<<
@@ -72,8 +73,8 @@ locals {
   CMD
 }
 
-resource "aws_ssm_association" "claude_master_client" {
-  count = length(local.claude_master_client_instances) > 0 ? 1 : 0
+resource "aws_ssm_association" "claw_master_client" {
+  count = length(local.claw_master_client_instances) > 0 ? 1 : 0
 
   name                = "AWS-RunShellScript"
   association_name    = "claude-master-client"
@@ -83,11 +84,11 @@ resource "aws_ssm_association" "claude_master_client" {
 
   targets {
     key    = "InstanceIds"
-    values = local.claude_master_client_instances
+    values = local.claw_master_client_instances
   }
 
   parameters = {
-    commands         = local.claude_master_client_commands
+    commands         = local.claw_master_client_commands
     executionTimeout = "300"
   }
 }

@@ -2104,13 +2104,13 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
     apt-get install -y tmux || true
   fi
 fi
-# claw-master (claude-master until 2026-10-11), the CLIENT side. The shared server (claude-master-server.tf) holds the
+# claw-master (claw-master until 2026-10-11), the CLIENT side. The shared server (claw-master-server.tf) holds the
 # Claude subscription logins; an account here reaches it with `claw-master connect`, authenticating with its own client
-# certificate (scripts/claude-master-enroll.sh NAME --ssh HOST --as USER). This box holds no subscription login for it and
-# the binary needs nothing from AWS. ONE pin with the server (local.claude_master_tag and its sha256), so the
+# certificate (scripts/claw-master-enroll.sh NAME --ssh HOST --as USER). This box holds no subscription login for it and
+# the binary needs nothing from AWS. ONE pin with the server (local.claw_master_tag and its sha256), so the
 # client and the server are always the same build. Installing it changes nothing for a running session.
-CM_TAG="${local.claude_master_tag}"
-CM_SHA="${local.claude_master_sha256_aarch64}"
+CM_TAG="${local.claw_master_tag}"
+CM_SHA="${local.claw_master_sha256_aarch64}"
 if [ "$(uname -m)" != aarch64 ]; then
   echo "WARNING: no pinned claw-master build for $(uname -m); keeping any installed copy"
 elif [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" = "$CM_SHA" ]; then
@@ -2133,11 +2133,11 @@ if [ -x /usr/local/bin/claw-master ] && [ "$(readlink /usr/local/bin/claude-mast
 fi
 
 # Route Claude through the shared pool, for an account that has been ENROLLED. t-claude reads
-# TCLAUDE_INFERENCE_SERVER at launch and runs `claude-master connect` (the link to claw-master) instead of plain claude (keeping
+# TCLAUDE_INFERENCE_SERVER at launch and runs `claw-master connect` (the link to claw-master) instead of plain claude (keeping
 # --continue, --remote-control and the hooks). /etc/zsh/zshenv is read by every zsh, including the `zsh -c`
 # inside agents-start, so the unattended launchers and a person's terminal behave the same. The variable is
 # set ONLY when the client binary is installed and the account's own client certificate is readable: no certificate (or no binary), no change, and enrolling an
-# account (scripts/claude-master-enroll.sh NAME --ssh HOST --as USER) is what switches it. The block between
+# account (scripts/claw-master-enroll.sh NAME --ssh HOST --as USER) is what switches it. The block between
 # the markers is rewritten on every run and nothing else in the file is touched.
 ZE=/etc/zsh/zshenv
 if [ -f "$ZE" ]; then
@@ -2145,7 +2145,7 @@ if [ -f "$ZE" ]; then
   cat >> "$ZE" <<'CMZSHENV'
 # >>> claude-master (managed by nextjs-user-data.tf) >>>
 if [ -x /usr/local/bin/claude-master ] && [ -r "$HOME/.config/claude-master/client.pem" ]; then
-  export TCLAUDE_INFERENCE_SERVER="${local.claude_master_server_ip}:${local.claude_master_server_port}"
+  export TCLAUDE_INFERENCE_SERVER="${local.claw_master_server_ip}:${local.claw_master_server_port}"
   export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
 fi
 # <<< claude-master <<<

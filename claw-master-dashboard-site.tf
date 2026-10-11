@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------------
-# The claude-master dashboard site (ejc3/claude-master-dashboard): a Cloudflare Worker that
-# reads the ClawMaster CloudWatch namespace, ClaudeMaster before the rename (claude-master-dashboard.tf is the console
+# The claw-master dashboard site (ejc3/claude-master-dashboard): a Cloudflare Worker that
+# reads the ClawMaster CloudWatch namespace, ClaudeMaster before the rename (claw-master-dashboard.tf is the console
 # dashboard over the same metrics).
 #
 # The same split as workers-stage.tf: the repository's Deploy workflow (Wrangler, with the shared
@@ -26,18 +26,18 @@
 #      and apply: Access adopts the Worker; nothing becomes reachable.
 #   3. Set urls = true here and workers_dev true in the repository's wrangler.jsonc; apply.
 # Never reverse 2 and 3. After step 2, set the Worker's secrets from output
-# "claude_master_dashboard" (docs/deploy.md in that repository).
+# "claw_master_dashboard" (docs/deploy.md in that repository).
 # ---------------------------------------------------------------------------------
 
 locals {
-  claude_master_dashboard_worker = { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true }
+  claw_master_dashboard_worker = { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true }
   # Zero or one entry: empty until the first deploy has created the Worker and its id is set.
-  claude_master_dashboard_workers = local.claude_master_dashboard_worker.id == "" ? {} : {
-    (local.claude_master_dashboard_worker.name) = local.claude_master_dashboard_worker
+  claw_master_dashboard_workers = local.claw_master_dashboard_worker.id == "" ? {} : {
+    (local.claw_master_dashboard_worker.name) = local.claw_master_dashboard_worker
   }
 }
 
-resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_owner" {
+resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
   account_id       = var.cloudflare_account_id
   name             = "claude-master dashboard: owner"
   decision         = "allow"
@@ -49,8 +49,8 @@ resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_owner" {
   )
 }
 
-resource "cloudflare_zero_trust_access_application" "claude_master_dashboard" {
-  for_each         = local.claude_master_dashboard_workers
+resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
+  for_each         = local.claw_master_dashboard_workers
   account_id       = var.cloudflare_account_id
   name             = "claude-master dashboard"
   type             = "self_hosted"
@@ -77,11 +77,11 @@ resource "cloudflare_zero_trust_access_application" "claude_master_dashboard" {
   # Worker with no Access check at all.
   policies = [
     {
-      id         = cloudflare_zero_trust_access_policy.claude_master_dashboard_owner.id
+      id         = cloudflare_zero_trust_access_policy.claw_master_dashboard_owner.id
       precedence = 1
     },
     {
-      id         = cloudflare_zero_trust_access_policy.claude_master_dashboard_agents.id
+      id         = cloudflare_zero_trust_access_policy.claw_master_dashboard_agents.id
       precedence = 2
     },
   ]
@@ -89,13 +89,13 @@ resource "cloudflare_zero_trust_access_application" "claude_master_dashboard" {
 
 # Terraform owns only the Worker's two URL switches, as for the staging Workers.
 import {
-  for_each = local.claude_master_dashboard_workers
-  to       = cloudflare_workers_script_subdomain.claude_master_dashboard[each.key]
+  for_each = local.claw_master_dashboard_workers
+  to       = cloudflare_workers_script_subdomain.claw_master_dashboard[each.key]
   id       = "${var.cloudflare_account_id}/${each.key}"
 }
 
-resource "cloudflare_workers_script_subdomain" "claude_master_dashboard" {
-  for_each         = local.claude_master_dashboard_workers
+resource "cloudflare_workers_script_subdomain" "claw_master_dashboard" {
+  for_each         = local.claw_master_dashboard_workers
   account_id       = var.cloudflare_account_id
   script_name      = each.key
   enabled          = each.value.urls
@@ -103,21 +103,21 @@ resource "cloudflare_workers_script_subdomain" "claude_master_dashboard" {
 
   depends_on = [
     cloudflare_workers_subdomain.cc_games,
-    cloudflare_zero_trust_access_application.claude_master_dashboard,
+    cloudflare_zero_trust_access_application.claw_master_dashboard,
   ]
 }
 
 # ---------------------------------------------------------------------------------
 # Read-only CloudWatch access for the Worker.
 # ---------------------------------------------------------------------------------
-resource "aws_iam_user" "claude_master_dashboard" {
+resource "aws_iam_user" "claw_master_dashboard" {
   name = "claude-master-dashboard-reader"
   tags = { Name = "claude-master-dashboard-reader", Managed = "terraform" }
 }
 
-resource "aws_iam_user_policy" "claude_master_dashboard" {
+resource "aws_iam_user_policy" "claw_master_dashboard" {
   name = "read-claude-master-metrics"
-  user = aws_iam_user.claude_master_dashboard.name
+  user = aws_iam_user.claw_master_dashboard.name
 
   # CloudWatch has no resource-level permissions for these reads, so they cannot be narrowed
   # to one namespace; the dashboard queries only ClawMaster. The region condition keeps the
@@ -142,21 +142,21 @@ resource "aws_iam_user_policy" "claude_master_dashboard" {
   })
 }
 
-resource "aws_iam_access_key" "claude_master_dashboard" {
-  user = aws_iam_user.claude_master_dashboard.name
+resource "aws_iam_access_key" "claw_master_dashboard" {
+  user = aws_iam_user.claw_master_dashboard.name
 }
 
-resource "aws_secretsmanager_secret" "claude_master_dashboard_reader" {
+resource "aws_secretsmanager_secret" "claw_master_dashboard_reader" {
   name        = "claude-master-dashboard/aws-reader"
   description = "Read-only CloudWatch key for the claude-master dashboard Worker (set as its Worker secrets)"
   tags        = { Name = "claude-master-dashboard/aws-reader", Managed = "terraform" }
 }
 
-resource "aws_secretsmanager_secret_version" "claude_master_dashboard_reader" {
-  secret_id = aws_secretsmanager_secret.claude_master_dashboard_reader.id
+resource "aws_secretsmanager_secret_version" "claw_master_dashboard_reader" {
+  secret_id = aws_secretsmanager_secret.claw_master_dashboard_reader.id
   secret_string = jsonencode({
-    AWS_ACCESS_KEY_ID     = aws_iam_access_key.claude_master_dashboard.id
-    AWS_SECRET_ACCESS_KEY = aws_iam_access_key.claude_master_dashboard.secret
+    AWS_ACCESS_KEY_ID     = aws_iam_access_key.claw_master_dashboard.id
+    AWS_SECRET_ACCESS_KEY = aws_iam_access_key.claw_master_dashboard.secret
     AWS_REGION            = var.aws_region
   })
 }
@@ -169,7 +169,7 @@ resource "aws_secretsmanager_secret_version" "claude_master_dashboard_reader" {
 # Readers: dev-server-role only (the metal boxes), which already reads the ClawMaster metrics and the
 # /claude-master/server log the dashboard is built from, so the page shows it nothing new. Not nextjs-dev-role:
 # every account there has sudo. Not the cc-games automation token or the Macs' token: revoking this touches nothing else.
-resource "cloudflare_zero_trust_access_service_token" "claude_master_dashboard_agents" {
+resource "cloudflare_zero_trust_access_service_token" "claw_master_dashboard_agents" {
   account_id = var.cloudflare_account_id
   name       = "claude-master-dashboard-agents"
   duration   = "8760h"
@@ -180,7 +180,7 @@ resource "cloudflare_zero_trust_access_service_token" "claude_master_dashboard_a
   }
 }
 
-resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_agents" {
+resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_agents" {
   account_id       = var.cloudflare_account_id
   name             = "claude-master dashboard: metal-box agents"
   decision         = "non_identity"
@@ -188,27 +188,27 @@ resource "cloudflare_zero_trust_access_policy" "claude_master_dashboard_agents" 
 
   include = [{
     service_token = {
-      token_id = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.id
+      token_id = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.id
     }
   }]
 }
 
-resource "aws_secretsmanager_secret" "claude_master_dashboard_agent_access" {
+resource "aws_secretsmanager_secret" "claw_master_dashboard_agent_access" {
   name        = "claude-master-dashboard/agent-access"
   description = "Cloudflare Access service token for metal-box agents to read the claude-master dashboard (client_id, client_secret)"
   tags        = { Name = "claude-master-dashboard/agent-access", Managed = "terraform" }
 }
 
-resource "aws_secretsmanager_secret_version" "claude_master_dashboard_agent_access" {
-  secret_id = aws_secretsmanager_secret.claude_master_dashboard_agent_access.id
+resource "aws_secretsmanager_secret_version" "claw_master_dashboard_agent_access" {
+  secret_id = aws_secretsmanager_secret.claw_master_dashboard_agent_access.id
   secret_string = jsonencode({
-    client_id     = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_id
-    client_secret = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_secret
+    client_id     = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_secret
   })
 }
 
-resource "aws_secretsmanager_secret_policy" "claude_master_dashboard_agent_access" {
-  secret_arn = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+resource "aws_secretsmanager_secret_policy" "claw_master_dashboard_agent_access" {
+  secret_arn = aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -216,13 +216,13 @@ resource "aws_secretsmanager_secret_policy" "claude_master_dashboard_agent_acces
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+      Resource  = aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn
       Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
     }]
   })
 }
 
-resource "aws_iam_role_policy" "dev_server_claude_master_dashboard_access" {
+resource "aws_iam_role_policy" "dev_server_claw_master_dashboard_access" {
   name = "claude-master-dashboard-agent-access"
   role = aws_iam_role.dev_server.id
   policy = jsonencode({
@@ -230,23 +230,23 @@ resource "aws_iam_role_policy" "dev_server_claude_master_dashboard_access" {
     Statement = [{
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.claude_master_dashboard_agent_access.arn
+      Resource = aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn
     }]
   })
 }
 
-output "claude_master_dashboard" {
+output "claw_master_dashboard" {
   description = "What the claude-master dashboard Worker's secrets need (docs/deploy.md in ejc3/claude-master-dashboard)"
   value = {
-    url                   = local.claude_master_dashboard_worker.urls ? "https://${local.claude_master_dashboard_worker.name}.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev/claude-master" : "no public URL"
+    url                   = local.claw_master_dashboard_worker.urls ? "https://${local.claw_master_dashboard_worker.name}.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev/claude-master" : "no public URL"
     cf_access_team_domain = trimsuffix(local.cf_access_callback, "/cdn-cgi/access/callback")
     cf_access_aud = try(
-      cloudflare_zero_trust_access_application.claude_master_dashboard[local.claude_master_dashboard_worker.name].aud,
+      cloudflare_zero_trust_access_application.claw_master_dashboard[local.claw_master_dashboard_worker.name].aud,
       "not yet: set the Worker id (step 2)",
     )
-    aws_reader_secret = aws_secretsmanager_secret.claude_master_dashboard_reader.name
+    aws_reader_secret = aws_secretsmanager_secret.claw_master_dashboard_reader.name
     # The Worker secret DASHBOARD_SERVICE_TOKEN_CLIENT_ID (not secret: the client secret is the credential).
-    agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents.client_id
-    agent_access_secret           = aws_secretsmanager_secret.claude_master_dashboard_agent_access.name
+    agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_id
+    agent_access_secret           = aws_secretsmanager_secret.claw_master_dashboard_agent_access.name
   }
 }
