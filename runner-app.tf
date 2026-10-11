@@ -614,18 +614,43 @@ provider "github" {
   token = local.runner_app_webhooks ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["CoderColton/colton-games"].secret_string : null
 }
 
+# The dolphin-labs-hq repos' hooks are managed as the administration agent's GitHub App (github-admin-tokens.tf: installed on
+# the organization with repository_hooks write), not with the repos' controller PATs, so those PATs can be retired: the
+# controller itself takes installation tokens from the runners app (app_runner.py). colton-games keeps its PAT: the app
+# would have to be installed from Colton's own account. Read only while the hooks are managed.
+ephemeral "aws_secretsmanager_secret_version" "github_app_admin" {
+  count     = local.runner_app_webhooks ? 1 : 0
+  secret_id = aws_secretsmanager_secret.github_app_admin.id
+}
+
+locals {
+  github_app_admin = local.runner_app_webhooks ? jsondecode(ephemeral.aws_secretsmanager_secret_version.github_app_admin[0].secret_string) : null
+}
+
 provider "github" {
   alias = "dolphin_labs"
   owner = "dolphin-labs-hq"
-  token = local.runner_app_webhooks ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-labs"].secret_string : null
+  dynamic "app_auth" {
+    for_each = local.runner_app_webhooks ? [1] : []
+    content {
+      id              = tostring(local.github_app_admin.app_id)
+      installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
+      pem_file        = local.github_app_admin.private_key
+    }
+  }
 }
 
-# The same owner as dolphin_labs, but another token: each controller token is limited to one
-# repo, so dolphin-labs' cannot create a hook on dolphin-films.
 provider "github" {
   alias = "dolphin_films"
   owner = "dolphin-labs-hq"
-  token = local.dolphin_films_webhook ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-films"].secret_string : null
+  dynamic "app_auth" {
+    for_each = local.dolphin_films_webhook ? [1] : []
+    content {
+      id              = tostring(local.github_app_admin.app_id)
+      installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
+      pem_file        = local.github_app_admin.private_key
+    }
+  }
 }
 
 resource "github_repository_webhook" "runner_app_colton_games" {
@@ -649,7 +674,14 @@ resource "github_repository_webhook" "runner_app_colton_games" {
 provider "github" {
   alias = "dolphin_maps"
   owner = "dolphin-labs-hq"
-  token = local.dolphin_maps_webhook ? ephemeral.aws_secretsmanager_secret_version.runner_repo_pat["dolphin-labs-hq/dolphin-maps"].secret_string : null
+  dynamic "app_auth" {
+    for_each = local.dolphin_maps_webhook ? [1] : []
+    content {
+      id              = tostring(local.github_app_admin.app_id)
+      installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
+      pem_file        = local.github_app_admin.private_key
+    }
+  }
 }
 
 resource "github_repository_webhook" "runner_app_dolphin_labs" {
