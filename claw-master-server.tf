@@ -79,7 +79,9 @@ locals {
   # How long a stopping server lets running requests finish. Its unit's stop timeout is a minute longer.
   claw_master_drain_seconds = 600
 
-  # Order is the fallback order. The first login is the one a fresh session prefers when quotas tie.
+  # The PREFERRED order (fallback order; the first is the one a fresh session prefers when quotas tie). It is not the
+  # list of what is served: the server serves every login that exists, these first, then any other in name order, so a
+  # new subscription needs no edit here (claw-master-add-start / -finish below, or scripts/claw-master-login.sh --server).
   claw_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"]
 
   claw_master_admin_cidrs = concat(
@@ -371,7 +373,20 @@ ${join("\n", [for c, v in local.claw_master_colors : "  ${c}) port=${v.port}; op
   legacy) port=${local.claw_master_server_port}; open=${local.claw_master_open_port}; balancer="" ;;
   *) echo "usage: claw-master-serve blue|green" >&2; exit 2 ;;
 esac
-exec "$bin" serve ${local.claw_master_profiles[0]}${join("", [for p in slice(local.claw_master_profiles, 1, length(local.claw_master_profiles)) : " --next-profile ${p}"])} \
+# Every login that exists: the preferred order first, then any other in name order. A missing preferred login is skipped
+# and a new one is served without a code change; with no login at all there is nothing to serve.
+profdir=$${CLAW_MASTER_PROFILE_DIR:-/var/lib/claude-master/.local/share/claude-master/profiles}
+found=()
+for p in ${join(" ", local.claw_master_profiles)}; do [ -d "$profdir/$p/current" ] && found+=("$p"); done
+for d in "$profdir"/*/current; do
+  [ -d "$d" ] || continue
+  p=$(basename "$(dirname "$d")")
+  case " $${found[*]} " in *" $p "*) ;; *) found+=("$p") ;; esac
+done
+[ $${#found[@]} -gt 0 ] || { echo "claw-master-serve: no subscription login under $profdir" >&2; exit 1; }
+args=("$${found[0]}")
+for p in "$${found[@]:1}"; do args+=(--next-profile "$p"); done
+exec "$bin" serve "$${args[@]}" \
   --listen ${local.claw_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
@@ -437,8 +452,8 @@ cat > /etc/systemd/system/claude-master-server@.service <<'EOF'
 Description=claude-master server %i (shared Claude subscription pool, behind Envoy)
 After=network-online.target
 Wants=network-online.target
-# Idle until every login exists: `scripts/claw-master-login.sh --server`, then start it.
-${join("\n", [for p in local.claw_master_profiles : "ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current"])}
+# Idle until at least one login exists; it serves every login there is (claw-master-serve).
+ConditionPathExistsGlob=/var/lib/claude-master/.local/share/claude-master/profiles/*/current
 
 [Service]
 User=claude-master
@@ -829,11 +844,64 @@ cat /var/lib/claude-master/state/ca.pem
 EOF
 chmod 0755 /usr/local/bin/claw-master-sign
 
+# Adding a subscription without a terminal (an agent over SSM, or anyone): two steps, no Terraform change.
+#   sudo claw-master-add-start NAME      starts `claw-master login NAME` as the service account, waiting up to two hours,
+#                                        and prints the claude.ai link to open signed in to THAT subscription's account
+#   sudo claw-master-add-finish NAME     reads the CODE#STATE string on stdin, hands it to the waiting login, and when
+#                                        the login is installed runs claw-master-rollout so the new color serves it
+# The code is read from stdin only (never an argument) and is single use. NAME is new: an existing login is refused, as
+# `claw-master login` refuses one (a revoked login is replaced under a new name).
+cat > /usr/local/bin/claw-master-add-start <<'EOF'
+#!/bin/bash
+set -u
+name=$${1:-}
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "usage: claw-master-add-start NAME (letters, digits, - and _)" >&2; exit 2; }
+profdir=/var/lib/claude-master/.local/share/claude-master/profiles
+[ -d "$profdir/$name/current" ] && { echo "$name already has a login; use a new name" >&2; exit 1; }
+run=/run/claw-master-add; install -d -m 0700 -o claude-master -g claude-master "$run"
+pkill -u claude-master -f "^claw-master-add-feed $name -f " 2>/dev/null || true
+rm -f "$run/$name.in" "$run/$name.out"
+runuser -u claude-master -- mkfifo -m 0600 "$run/$name.in"
+runuser -u claude-master -- bash -c "exec -a 'claw-master-add-feed $name' tail -f '$run/$name.in' | HOME=/var/lib/claude-master timeout 7200 /usr/local/bin/claw-master login '$name' > '$run/$name.out' 2>&1" </dev/null >/dev/null 2>&1 &
+disown
+for _ in $(seq 1 30); do grep -q 'https://claude.ai/' "$run/$name.out" 2>/dev/null && break; sleep 1; done
+link=$(grep -oE 'https://claude\.ai/[^[:space:]]+' "$run/$name.out" | head -1)
+[ -n "$link" ] || { echo "no sign-in link from claw-master login:" >&2; cat "$run/$name.out" >&2; exit 1; }
+echo "$link"
+EOF
+chmod 0755 /usr/local/bin/claw-master-add-start
+
+cat > /usr/local/bin/claw-master-add-finish <<'EOF'
+#!/bin/bash
+set -u
+name=$${1:-}
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "usage: claw-master-add-finish NAME < code" >&2; exit 2; }
+run=/run/claw-master-add; profdir=/var/lib/claude-master/.local/share/claude-master/profiles
+[ -p "$run/$name.in" ] || { echo "no login waiting for $name: run claw-master-add-start $name first" >&2; exit 1; }
+IFS= read -r code || true
+[[ $code =~ ^[A-Za-z0-9_-]+#[A-Za-z0-9_-]+$ ]] || { echo "that is not a CODE#STATE string" >&2; exit 2; }
+printf '%s\n' "$code" > "$run/$name.in"; unset code
+for _ in $(seq 1 60); do [ -d "$profdir/$name/current" ] && break; grep -q 'failed' "$run/$name.out" 2>/dev/null && break; sleep 1; done
+pkill -u claude-master -f "^claw-master-add-feed $name -f " 2>/dev/null || true
+if [ ! -d "$profdir/$name/current" ]; then echo "the login did not complete:" >&2; tail -c 400 "$run/$name.out" >&2; rm -f "$run/$name.in"; exit 1; fi
+rm -f "$run/$name.in" "$run/$name.out"
+echo "$name: login installed"
+# The new color starts with every login, this one included; the old color drains its running requests.
+/usr/local/bin/claw-master-rollout && /usr/local/bin/claw-master-status | grep -E "^login $name|^server:|installed"
+EOF
+chmod 0755 /usr/local/bin/claw-master-add-finish
+
 # Which logins exist, whether the server is up, and the version it runs versus the one installed.
 cat > /usr/local/bin/claw-master-status <<'EOF'
 #!/bin/bash
+profdir=/var/lib/claude-master/.local/share/claude-master/profiles
 for p in ${join(" ", local.claw_master_profiles)}; do
-  if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
+  if [ -d "$profdir/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING (preferred, skipped by the server)"; fi
+done
+for d in "$profdir"/*/current; do
+  [ -d "$d" ] || continue
+  p=$(basename "$(dirname "$d")")
+  case " ${join(" ", local.claw_master_profiles)} " in *" $p "*) ;; *) echo "login $p: present (served after the preferred ones)" ;; esac
 done
 active=$(cat /etc/claude-master/active-color 2>/dev/null || echo none)
 if systemctl is-active --quiet claude-master-server.service; then
@@ -862,7 +930,7 @@ sed -i "s/\$TAG/$TAG/" /usr/local/bin/claw-master-status
 chmod 0755 /usr/local/bin/claw-master-status
 
 # The helpers' names before the rename (claude-master-*) stay as links, for anything that still calls them.
-for h in serve account-labels envoy-endpoints rollout login sign status; do
+for h in serve account-labels envoy-endpoints rollout login sign status add-start add-finish; do
   [ "$(readlink /usr/local/bin/claude-master-$h)" = "claw-master-$h" ] && continue
   ln -sfn "claw-master-$h" "/usr/local/bin/claude-master-$h.new" && mv -Tf "/usr/local/bin/claude-master-$h.new" "/usr/local/bin/claude-master-$h"
 done
