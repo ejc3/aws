@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSM document claude-master-cert-status: read-only. Prints how long an account's claude-master client certificate lasts.
+# SSM document claude-master-cert-status: read-only. Prints how long an account's claw-master client certificate lasts.
 # Output (one KEY=value per line): STATUS=ok|missing, NOTAFTER=<epoch seconds>, SUBJECT=<subject>.
 set -u
 ACCOUNT='{{ Account }}'

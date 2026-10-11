@@ -217,10 +217,10 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
-The claude-master backup API key, `claude-master/backup-api-key` (us-west-1, from
+The claw-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
-and claude-master has no fallback. The server checks every 5 minutes that the key can pay and uses it only
+and claw-master has no fallback. The server checks every 5 minutes that the key can pay and uses it only
 while it can (the server log says `API-key backup unavailable` when its organization is out of credit; adding
 credit brings it back at the next check, no restart). Populate it from the key file (read from the file, never on the command line), then remove the file:
 
@@ -229,12 +229,12 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
   --secret-string file://$HOME/claude_api.txt && shred -u ~/claude_api.txt
 ```
 
-The claude-master account names, `claude-master/account-labels` (us-west-1, from `claude-master-server.tf`),
+The claw-master account names, `claude-master/account-labels` (us-west-1, from `claw-master-server.tf`),
 turn the `acct-<8 hex>` keys in the metrics into names: one `ACCOUNT_UUID=NAME` line per account (UUID =
-`oauthAccount.accountUuid` in that user's `~/.claude.json`; `claude-master account-key UUID` shows which key
+`oauthAccount.accountUuid` in that user's `~/.claude.json`; `claw-master account-key UUID` shows which key
 it replaces). Terraform creates only the container. Set it from a file and nothing else: a timer on the
 server (`claude-master-account-labels.timer`) copies a changed secret into the server's labels file within 10
-minutes, and claude-master reloads that file within a minute, with no restart:
+minutes, and claw-master reloads that file within a minute, with no restart:
 
 ```bash
 aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master/account-labels \
@@ -2270,7 +2270,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Windows playtest box (g4dn.xlarge, Server 2025, persistent D: game disk, reachable from the dev boxes only, `wbox up` / `wbox down` / `wbox run` / `wbox launch`, stops after 1 idle hour) | `wbox.tf`, `scripts/wbox.sh` |
-| Shared claude-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claude-master-server.tf`, `claude-master-tunnel.tf`, `scripts/claude-master-login.sh --server`, `scripts/claude-master-enroll.sh`, `scripts/claude-master-mac-bundle.sh` |
+| Shared claw-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claw-master-server.tf`, `claw-master-tunnel.tf`, `scripts/claw-master-login.sh --server`, `scripts/claw-master-enroll.sh`, `scripts/claw-master-mac-bundle.sh` |
 | Codex refresh (weekly SSM association on the jumpboxes and metal boxes) and `codex-restart` (see running vs installed, restart deliberately) | `codex-update.tf`, `scripts/codex-restart.sh` |
 | Starter user-level agent instructions (`~/.codex/AGENTS.md` with `~/.claude/CLAUDE.md` linked to it), created only for an account that has neither | `user-agents.tf`, `scripts/user-agents.md` (the text), `scripts/user-agents-seed.sh` |
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |

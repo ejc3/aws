@@ -13,7 +13,7 @@
 #   (dolphin_account is the root address of the Dolphin member account, dolphin-account.tf. dolphin_steve is optional: Steve's
 #   address, which creates his Identity Center user and read-only assignment, dolphin-identity-center.tf. dolphin_films is
 #   optional until dolphin-films-vercel.tf's gate names prod/auth. claude_master_dashboard is optional: the people besides the
-#   owner whom the claude-master dashboard admits, claude-master-dashboard-site.tf.)
+#   owner whom the claw-master dashboard admits, claw-master-dashboard-site.tf.)
 #
 # Terraform reads it into locals (local.people, and the names the configuration already used) wherever an address is needed.
 # Every machine that plans (both jumpboxes, the Stop hook) has the administration role and can read it; a dev box cannot plan

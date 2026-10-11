@@ -50,14 +50,14 @@ class GrantTests(unittest.TestCase):
         self.assertIn("role     = aws_iam_role.mac_instance[0].id", mac)
         self.assertIn("count    = var.enable_mac_dev ? 1 : 0", mac)
         # The roles' own files stay without Bedrock; the grant lives here.
-        for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "claude-master-server.tf", "mac-dev-secrets.tf"):
+        for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "claw-master-server.tf", "mac-dev-secrets.tf"):
             self.assertNotIn("bedrock:", (ROOT / tf).read_text(), tf)
 
     def test_every_box_role_without_bedrock_is_attached(self):
         roles = re.search(r"^  bedrock_haiku_box_roles = merge\(\n(.*?)^  \)", TF, re.S | re.M)
         self.assertIsNotNone(roles)
         attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?\.id", roles.group(1)))
-        self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "claude_master_server"})
+        self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
         # is an administrator (jumpbox_admin), is a CI machine, or is the Mac (its own resource above).
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "mac_instance"}

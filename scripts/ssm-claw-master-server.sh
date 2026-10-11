@@ -1,9 +1,9 @@
 #!/bin/bash
-# ssm-claude-master-server.sh <instance-id> <region>
+# ssm-claw-master-server.sh <instance-id> <region>
 #
-# Converges the claude-master server box: fetches its bootstrap script from S3 and runs it, through
+# Converges the claw-master server box: fetches its bootstrap script from S3 and runs it, through
 # SSM Run Command, waits for a final status, prints the output and fails unless it succeeded. Called
-# by terraform_data.claude_master_server_converge (claude-master-server.tf).
+# by terraform_data.claw_master_server_converge (claw-master-server.tf).
 #
 # WHY THIS EXISTS. The instance ignores user_data changes and cloud-init does not run per-instance
 # user data again after a resize or a stop/start, so editing the script, bumping the pinned binary
@@ -31,7 +31,7 @@ remote='cloud-init status --wait >/dev/null 2>&1 || true; swapon --show=NAME --n
 
 params=$(python3 -c 'import json, sys; print(json.dumps({"commands": [sys.argv[1]], "executionTimeout": ["900"]}))' "$remote")
 cid=$(aws ssm send-command --region "$region" --instance-ids "$iid" \
-  --document-name AWS-RunShellScript --comment "claude-master server bootstrap (claude-master-server.tf)" \
+  --document-name AWS-RunShellScript --comment "claude-master server bootstrap (claw-master-server.tf)" \
   --parameters "$params" --query Command.CommandId --output text)
 echo "ssm-claude-master-server: $iid command $cid"
 

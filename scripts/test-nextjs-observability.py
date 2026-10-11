@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 NEXTJS = (ROOT / "nextjs-dev.tf").read_text()
 ALARMS = (ROOT / "nextjs-alarms.tf").read_text()
-CM = (ROOT / "claude-master-server.tf").read_text()
+CM = (ROOT / "claw-master-server.tf").read_text()
 USER_DATA = (ROOT / "nextjs-user-data.tf").read_text()
 
 
@@ -75,7 +75,7 @@ class MetricsCanBePublished(unittest.TestCase):
 class NoDataIsNotHealthy(unittest.TestCase):
     def alarms(self):
         return [(ALARMS, "nextjs_memory"), (ALARMS, "nextjs_swap"),
-                (CM, "claude_master_server_memory"), (CM, "claude_master_server_swap")]
+                (CM, "claw_master_server_memory"), (CM, "claw_master_server_swap")]
 
     def test_host_metric_alarms_report_no_data_instead_of_staying_green(self):
         for text, name in self.alarms():

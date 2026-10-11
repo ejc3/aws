@@ -165,12 +165,12 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 # binary still reads CLAUDE_MASTER_BACKUP_API_KEY, its name before the rename), used only after every subscription
 # profile is out of quota. It lived in ~/claude_api.txt on fcvm;
 # the value is set out of band (put-secret-value from a 0600 file) and never enters git. Readers: the
-# administration set, dev-server-role (the metal boxes) and the shared claude-master server's role.
+# administration set, dev-server-role (the metal boxes) and the shared claw-master server's role.
 # Not nextjs-dev-role: every account there has full sudo, so a grant would be box-wide, and this key
 # is billed per token.
 #   export CLAW_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id claude-master/backup-api-key --query SecretString --output text)
-resource "aws_secretsmanager_secret" "claude_master_backup_key" {
+resource "aws_secretsmanager_secret" "claw_master_backup_key" {
   name                    = "claude-master/backup-api-key"
   description             = "Anthropic API key, final paid backup for claude-master (raw key string). Value set out of band; see dev-ai-services.tf."
   recovery_window_in_days = 7
@@ -178,11 +178,11 @@ resource "aws_secretsmanager_secret" "claude_master_backup_key" {
 }
 
 locals {
-  claude_master_backup_key_readers = concat([aws_iam_role.dev_server.arn], aws_iam_role.claude_master_server[*].arn)
+  claw_master_backup_key_readers = concat([aws_iam_role.dev_server.arn], aws_iam_role.claw_master_server[*].arn)
 }
 
-resource "aws_secretsmanager_secret_policy" "claude_master_backup_key" {
-  secret_arn = aws_secretsmanager_secret.claude_master_backup_key.arn
+resource "aws_secretsmanager_secret_policy" "claw_master_backup_key" {
+  secret_arn = aws_secretsmanager_secret.claw_master_backup_key.arn
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -190,36 +190,36 @@ resource "aws_secretsmanager_secret_policy" "claude_master_backup_key" {
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.claude_master_backup_key.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.claude_master_backup_key_readers) } }
+      Resource  = aws_secretsmanager_secret.claw_master_backup_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.claw_master_backup_key_readers) } }
     }]
   })
 }
 
-data "aws_iam_policy_document" "claude_master_backup_key_read" {
+data "aws_iam_policy_document" "claw_master_backup_key_read" {
   statement {
     sid       = "ReadTheClaudeMasterBackupKey"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.claude_master_backup_key.arn]
+    resources = [aws_secretsmanager_secret.claw_master_backup_key.arn]
   }
 }
 
-resource "aws_iam_policy" "claude_master_backup_key_read" {
+resource "aws_iam_policy" "claw_master_backup_key_read" {
   name        = "dev-claude-master-backup-key-read"
   description = "Metal dev boxes: read the claude-master backup API key (claude-master/backup-api-key) and nothing else"
-  policy      = data.aws_iam_policy_document.claude_master_backup_key_read.json
+  policy      = data.aws_iam_policy_document.claw_master_backup_key_read.json
 }
 
-resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read" {
+resource "aws_iam_role_policy_attachment" "claw_master_backup_key_read" {
   role       = aws_iam_role.dev_server.name
-  policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
+  policy_arn = aws_iam_policy.claw_master_backup_key_read.arn
 }
 
-# The shared claude-master server is the one box that actually uses the backup key.
-resource "aws_iam_role_policy_attachment" "claude_master_backup_key_read_server" {
-  count      = var.enable_claude_master_server ? 1 : 0
-  role       = aws_iam_role.claude_master_server[0].name
-  policy_arn = aws_iam_policy.claude_master_backup_key_read.arn
+# The shared claw-master server is the one box that actually uses the backup key.
+resource "aws_iam_role_policy_attachment" "claw_master_backup_key_read_server" {
+  count      = var.enable_claw_master_server ? 1 : 0
+  role       = aws_iam_role.claw_master_server[0].name
+  policy_arn = aws_iam_policy.claw_master_backup_key_read.arn
 }
 
 # Turso platform API token (create and delete databases and groups, mint database tokens), for the metal dev boxes.

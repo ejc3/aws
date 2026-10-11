@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# claude-master-enroll -- give a machine a client certificate for the shared claude-master server.
+# claude-master-enroll -- give a machine a client certificate for the shared claw-master server.
 #
-#   scripts/claude-master-enroll.sh NAME                 enroll THIS machine (a Mac, a jumpbox)
-#   scripts/claude-master-enroll.sh NAME --ssh HOST      enroll another box over SSH (ubuntu@HOST)
+#   scripts/claw-master-enroll.sh NAME                 enroll THIS machine (a Mac, a jumpbox)
+#   scripts/claw-master-enroll.sh NAME --ssh HOST      enroll another box over SSH (ubuntu@HOST)
 #   ... --as USER                                        with --ssh: enroll that Unix account (its own home and its own
 #                                                        key), not ubuntu -- for a box several people share (nextjs-dev)
 #   ... --days N                                         certificate lifetime, 1-90 (default 30)
@@ -15,7 +15,7 @@
 #
 # WHO MAY RUN IT: anyone with AWS access to the server (an administrator). Signing happens on the
 # server box through SSM Run Command, so issuing a certificate is an AWS-authenticated action and
-# the CA key never leaves that box. The machine being enrolled needs the `claw-master` binary (or `claude-master`,
+# the CA key never leaves that box. The machine being enrolled needs the `claw-master` binary (or `claw-master`,
 # its name before the rename; github.com/ejc3/CLIProxyAPI releases) and nothing from AWS.
 #
 # The key is made ON the enrolled machine and never travels; only the certificate request goes up
@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
     --ssh) HOST=${2:-}; shift 2 ;;
     --days) DAYS=${2:-}; shift 2 ;;
     --as) AS=${2:-}; shift 2 ;;
-    *) echo "usage: claude-master-enroll.sh NAME [--ssh HOST [--as USER]] [--days N]" >&2; exit 2 ;;
+    *) echo "usage: claw-master-enroll.sh NAME [--ssh HOST [--as USER]] [--days N]" >&2; exit 2 ;;
   esac
 done
 [[ $NAME =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "NAME must be 1-63 lowercase letters, digits or hyphens" >&2; exit 2; }
@@ -81,4 +81,4 @@ printf '%s\n' "$CA_PEM" | on_target "cat > \"\$HOME/$NEW/ca.pem\" && chmod 644 \
 
 echo "4/4 switching to the new identity"
 on_target "set -e; cd \"\$HOME\"; rm -rf '$DIR.old'; [ -d '$DIR' ] && mv '$DIR' '$DIR.old'; mv '$NEW' '$DIR'; rm -rf '$DIR.old'; openssl x509 -noout -subject -enddate -in '$DIR/client.pem'"
-echo "done. Connect with: claw-master connect --server $(terraform -chdir="$(dirname "$0")/.." output -raw claude_master_server_address 2>/dev/null || echo 10.0.1.50:8443) --dir ~/$DIR -- ..."
+echo "done. Connect with: claw-master connect --server $(terraform -chdir="$(dirname "$0")/.." output -raw claw_master_server_address 2>/dev/null || echo 10.0.1.50:8443) --dir ~/$DIR -- ..."

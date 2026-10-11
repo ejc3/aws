@@ -418,7 +418,7 @@ The long-lived development and administration instances are:
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
-| claude-master-server | t4g.micro | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claude-master-server.tf |
+| claude-master-server | t4g.micro | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claw-master-server.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
@@ -592,12 +592,12 @@ restarting the aggregate can kill every managed and interactive t-claude session
 shared server. The Next.js box is different: Colton and Connor are separate Unix users,
 so their `claude-rc@` units own separate tmux servers.
 
-### The shared claude-master server
+### The shared claw-master server
 
 Subscription logins rotate on every refresh and the previous access token stops working at once,
 so a login copied to several boxes destroys itself within hours (measured: refresh, then the old
 access token returns 401). One box therefore owns each login: `claude-master-server`
-(`claude-master-server.tf`, 10.0.1.50:8443). Everything else is a client; none holds a login.
+(`claw-master-server.tf`, 10.0.1.50:8443). Everything else is a client; none holds a login.
 
 - **Renamed claw-master (owner, 2026-10-11; ejc3/CLIProxyAPI #20).** Releases are `claw-master-<sha7>` with assets
   `claw-master-<os>-<arch>`; the binary is `/usr/local/bin/claw-master` everywhere, and the server's helpers are
@@ -613,11 +613,16 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
     `/etc/claude-master` and `/var/log/claude-master`. The logins are read from `~/.local/share/claude-master` only
     while `~/.local/share/claw-master` does not exist: never create that directory on the server;
   - the clients' certificate directory `~/.config/claude-master` (t-claude passes it; renewal works on it);
+  - the bootstrap's S3 key `user-data/claude-master-server.sh` (the instance's own user data names it) and the
+    `claude_master_dashboard` key of the `people/addresses` secret;
   - every AWS name: the instance's Name tag `claude-master-server`, the log group `/claude-master/server` (90 days of
     history), the `claude-master/*` secrets, the IAM roles, the SSM documents `claude-master-cert-*`, the Lambda
     `claude-master-cert-renew` and its `ClaudeMasterCerts` namespace, the alarm names `claude-master-*` (the dashboard
     Worker lists alarms by that prefix), the console dashboard `claude-master` and the Worker `claude-master-dashboard`.
     Renaming any of them replaces the resource and loses its history or breaks a caller, for no gain.
+  In this repository everything else moved: the files are `claw-master-*.tf`, `scripts/claw-master-*` and
+  `scripts/ssm/claw-master-cert-*.sh`, the Terraform addresses, locals, variable and outputs are `claw_master_*` (the
+  `moved` blocks in `claw-master-moved.tf` carried the state over without replacing anything).
   The METRICS did move, because the binary renamed them: `claw_master.*`, with `provider=claude` on every measurement
   about Claude, in namespace `ClawMaster` (log-derived alarms in `ClawMaster/Logs`). The history from before the switch
   was copied from `ClaudeMaster` with `scripts/claw-master-migrate-metrics.py` (ejc3/CLIProxyAPI), which must run
@@ -626,65 +631,65 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **No password anywhere.** The proxy is TLS and requires a client certificate signed by the
   server's own CA. The CA key lives only in `/var/lib/claude-master/state` on that box. Client
   certificates last 30 days (at most 90), so a lost box expires on its own.
-- **claude-master has no AWS in it.** It is a generic binary (`ejc3/CLIProxyAPI`, `docs/claude-master.md`):
+- **claw-master has no AWS in it.** It is a generic binary (`ejc3/CLIProxyAPI`, `docs/claw-master.md`):
   `serve`, `issue`, `client-init`, `connect`. All AWS glue is in this repo. The pinned release is
-  `local.claude_master_tag` plus its sha256 in `claude-master-server.tf`; bump both together.
-- **Logins are interactive and belong to the server.** `scripts/claude-master-login.sh --server`
+  `local.claw_master_tag` plus its sha256 in `claw-master-server.tf`; bump both together.
+- **Logins are interactive and belong to the server.** `scripts/claw-master-login.sh --server`
   drives the six paste-a-code logins; the service stays idle until all exist. Never copy a login
-  from another box. Nothing on the box restarts a server or Envoy on its own; `claude-master-status` shows
+  from another box. Nothing on the box restarts a server or Envoy on its own; `claw-master-status` shows
   running versus pinned.
-- **Restarts nobody notices: Envoy and blue/green** (`claude-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
+- **Restarts nobody notices: Envoy and blue/green** (`claw-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
   version and sha256) listens on the client address and the tunnel's loopback port and passes TCP through,
   unchanged, to one of two servers on the box, `claude-master-server@blue` or `@green`, each on its own port of
   the same address (the server certificate names the address clients dial; the color ports are in no security
-  group). `sudo claude-master-rollout` (over SSM) starts the idle color, waits until it listens, points Envoy's
+  group). `sudo claw-master-rollout` (over SSM) starts the idle color, waits until it listens, points Envoy's
   NEW connections at it (an endpoint file Envoy watches, replaced by a rename), checks Envoy's admin API reports
   it, then stops the old color. The old one drains (`serve --balanced`): it keeps serving the connections it has,
   every response closing its connection, so each client moves over on its next request without an error, and
-  running requests get up to `local.claude_master_drain_seconds` (the unit's stop timeout is a minute longer).
+  running requests get up to `local.claw_master_drain_seconds` (the unit's stop timeout is a minute longer).
   That is how a new binary goes live. Each color has its own `--instance` (metrics) and log file
-  (`server-blue.log`, `server-green.log`). Through Envoy, claude-master sees every connection come from the box
+  (`server-blue.log`, `server-green.log`). Through Envoy, claw-master sees every connection come from the box
   itself: a handshake failure's `remote=` no longer names the client box. The first rollout on a box from
   before Envoy stops `claude-master-server.service` (it drains for 60 s), lets Envoy take the client port, and
   starts the old server again if Envoy does not come up.
-- **Adding a client** (a new dev box, a Mac): `scripts/claude-master-enroll.sh NAME [--ssh HOST]`.
+- **Adding a client** (a new dev box, a Mac): `scripts/claw-master-enroll.sh NAME [--ssh HOST]`.
   The key is made on the client; only the request goes up. Signing runs on the server over SSM, so
   it is an AWS-authenticated action. Renewal is automatic (next bullet); the script swaps only after the
   new certificate is in place.
-- **Reaching it.** Dev boxes: the private address. A Mac with AWS access: `scripts/claude-master-tunnel.sh`
+- **Reaching it.** Dev boxes: the private address. A Mac with AWS access: `scripts/claw-master-tunnel.sh`
   (an SSM port forward, session type `AWS-StartPortForwardingSessionToRemoteHost` aimed at 10.0.1.50: the
-  plain forwarding session reaches the instance's loopback, where nothing listens), then `claude-master
+  plain forwarding session reaches the instance's loopback, where nothing listens), then `claw-master
   connect --server 127.0.0.1:8443`; the certificate also names loopback for exactly this. Nothing is opened to the
   internet; a Cloudflare tunnel with Access is the path for machines without AWS access, and would
   be a new ingress in `cloudflare.tf`, not a new open port.
-- **Macs outside the VPC (the kids' laptops).** A long-lived Cloudflare tunnel (`claude-master-tunnel.tf`,
-  hostname `inference.cc-games.dev`): cloudflared on the server dials OUT and forwards to claude-master's
+- **Macs outside the VPC (the kids' laptops).** A long-lived Cloudflare tunnel (`claw-master-tunnel.tf`,
+  hostname `inference.cc-games.dev`): cloudflared on the server dials OUT and forwards to claw-master's
   OPEN listener, which is bound to loopback only (`--open-loopback 127.0.0.1:8444`) and asks for no
   client certificate; the trust is the tunnel. Cloudflare Access on that exact hostname admits one
   thing, a service token (no person, no wildcard; a year long). The Mac runs `cloudflared access tcp`
-  and `claude-master connect --open 127.0.0.1:8444 --ca ca.pem`. Hand a Mac its one private file with
-  `scripts/claude-master-mac-bundle.sh OUTDIR` (an administrator action; it contains the token). The
+  and `claw-master connect --open 127.0.0.1:8444 --ca ca.pem`. Hand a Mac its one private file with
+  `scripts/claw-master-mac-bundle.sh OUTDIR` (an administrator action; it contains the token). The
   certificate listener on the private address is unchanged: dev boxes keep per-box certificates. Never
   put the open port in a security group or bind it to anything but loopback.
-- **Client certificates renew themselves** (`claude-master-cert-renew.tf`, `scripts/claude-master-cert-renew.py`). A Lambda runs daily at
-  08:00 UTC; for each client in `local.claude_master_clients` it reads the certificate's end date over SSM and, with under 14 days
+- **Client certificates renew themselves** (`claw-master-cert-renew.tf`, `scripts/claw-master-cert-renew.py`). A Lambda runs daily at
+  08:00 UTC; for each client in `local.claw_master_clients` it reads the certificate's end date over SSM and, with under 14 days
   left, renews it: the client makes a NEW key and request (the key never leaves the box), the server signs it, the client verifies it
   (chains to the CA, names this client, matches the pending key, lasts 20+ days) and swaps it in with two renames, so a failure
   leaves the old identity working. It works on an already-expired certificate, so a stopped spot box catches up when it next runs.
-  The role can send exactly four custom SSM documents (`scripts/ssm/claude-master-cert-{status,request,sign,install}.sh`, every
+  The role can send exactly four custom SSM documents (`scripts/ssm/claw-master-cert-{status,request,sign,install}.sh`, every
   parameter pinned by a regex) to the server and the client boxes, never `AWS-RunShellScript`; the signing document signs only for
   the exact name asked for. It never enrols (an account with no certificate is skipped: enrolling stays the switch), never touches
   a stopped box, never restarts anything. Alarms: the job errors, it has not run for two days, or any certificate has under 7 days
   left (`ClaudeMasterCerts/ClientCertDaysLeft`). A NEW client is added by enrolling it by hand once and adding it to
-  `claude_master_clients`. `aws lambda invoke --function-name claude-master-cert-renew --payload '{"dry_run": true}' ...` shows what it
+  `claw_master_clients`. `aws lambda invoke --function-name claude-master-cert-renew --payload '{"dry_run": true}' ...` shows what it
   would do; `{"renew_before_days": 60}` forces a renewal. The CA lasts ten years and the proxy renews its own certificate.
-- **nextjs-dev accounts use the pool through t-claude.** The setup script installs the pinned `claude-master` (the server's tag and
+- **nextjs-dev accounts use the pool through t-claude.** The setup script installs the pinned `claw-master` (the server's tag and
   sha256, one pin) and writes a marker block into `/etc/zsh/zshenv`: for an account whose own client certificate
   (`~/.config/claude-master/client.pem`) is readable it exports `TCLAUDE_INFERENCE_SERVER`, and t-claude (`--inference-server`,
-  ejc3/t-claude) then runs `claude-master connect` in place of plain claude, keeping `--continue`, `--remote-control` and the hooks.
-  An account with no certificate is unchanged, so **enrolling is the switch**: `scripts/claude-master-enroll.sh nextjs-USER --ssh HOST
+  ejc3/t-claude) then runs `claw-master connect` in place of plain claude, keeping `--continue`, `--remote-control` and the hooks.
+  An account with no certificate is unchanged, so **enrolling is the switch**: `scripts/claw-master-enroll.sh nextjs-USER --ssh HOST
   --as USER` (one certificate per account, so the `client` metric shows who). The account keeps its own native login for Remote
-  Control; only inference goes to the pool. t-claude hands Claude its session-sync and notification hooks as `--settings FILE`; claude-master
+  Control; only inference goes to the pool. t-claude hands Claude its session-sync and notification hooks as `--settings FILE`; claw-master
   allows `--settings` unless the settings are known to conflict (login/provider keys, or provider/proxy variables in `env`), and names the
   setting it refused (release `claude-master-4d4910f` onward; before it every `--settings` was refused and a pool launch failed with
   "launcher flags cannot override master identity or provider routing"). Release `claude-master-f9e4b9e` adds two things learned on
@@ -720,9 +725,9 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   127.0.0.1 with a per-launch token; only `api.anthropic.com` with that token goes through the pool, everything else (git, curl,
   gh, hooks, MCP servers that inherit `HTTPS_PROXY`) is dialled from the box itself, and Claude no longer holds the client
   certificate. Before it those tools failed the proxy's certificate handshake: the `client TLS handshake failed` lines from the dev
-  boxes. Token counters read from each response's `usage`: `claude_master.inference.tokens` {profile, type},
+  boxes. Token counters read from each response's `usage`: `claw_master.inference.tokens` {profile, type},
   `.tokens.by_client_account` and `.tokens.by_client`, type input / output / cache_read / cache_creation (about 50 new series).
-  Five-hour window gauges (`claude_master.quota.five_hour.*`). WebFetch's domain check (`GET /api/web/domain_info`) is relayed to
+  Five-hour window gauges (`claw_master.quota.five_hour.*`). WebFetch's domain check (`GET /api/web/domain_info`) is relayed to
   Anthropic instead of refused. The next PR in that stack (`service.instance.id` on every metric) is NOT released: it adds a
   dimension to every series, so it must ship together with every `SCHEMA(...)` query here and in the dashboard repository.
   `claude-master-dcb7263` fixes two things 09015c6 got wrong in production. No token series appeared in two hours of traffic:
@@ -735,17 +740,17 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   request (429) until its reset, and a success clears it. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
-- **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
+- **fcvm-metal-arm uses the pool the same way** (`claw-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
   The block also exports `TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master` (here and on nextjs-dev): this box has a personal build in
   `~/.local/bin` ahead of the shared one on PATH, an older build that refuses t-claude's flags, and the route must use the pinned one.
   The `ubuntu` account's sessions share one tmux server, so a running session keeps plain claude; a window launched afterwards goes
-  through the pool and saves the server. Enrolling is the switch: `scripts/claude-master-enroll.sh fcvm-arm --ssh HOST`. Mind the
-  capacity: one heavy account on a pool of six subscriptions drains it for everyone (see `claude-master-status` quotas).
-- **Convergence.** The instance ignores user_data, so `terraform_data.claude_master_server_converge`
+  through the pool and saves the server. Enrolling is the switch: `scripts/claw-master-enroll.sh fcvm-arm --ssh HOST`. Mind the
+  capacity: one heavy account on a pool of six subscriptions drains it for everyone (see `claw-master-status` quotas).
+- **Convergence.** The instance ignores user_data, so `terraform_data.claw_master_server_converge`
   re-runs the bootstrap through SSM when the script, the pin or the instance changes. It never restarts
-  a running server or Envoy; `claude-master-status` shows running versus pinned and a new binary takes
-  effect at the next `sudo claude-master-rollout`.
+  a running server or Envoy; `claw-master-status` shows running versus pinned and a new binary takes
+  effect at the next `sudo claw-master-rollout`.
 - **Size.** t4g.micro with a 1GB swapfile. t4g.nano was tried first and was OOM-killed during its own first boot.
 - **Logs.** The proxy writes its own log (`/var/log/claude-master/server-<color>.log`, always `info`, rotated by
   the program at 20 MiB x 5, 0600) and the CloudWatch agent ships it to log group `/claude-master/server`
@@ -754,36 +759,36 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   90% / exhausted), the paid API-key backup used, a login rejected or refreshed, a client's first
   connection, refused handshakes; plus a per-profile quota snapshot and routing summary every 5 minutes.
   It never contains tokens, bodies, URLs, account ids or upstream text. For `debug` (every routing
-  decision) run `claude-master serve` by hand with `--log-level debug`; do not change the unit to it. The
+  decision) run `claw-master serve` by hand with `--log-level debug`; do not change the unit to it. The
   journal is capped at 200M. The metal boxes (dev-server-role) may read the log group, and only it:
   `aws logs filter-log-events --region us-west-1 --log-group-name /claude-master/server --filter-pattern '"rate limited"'`,
   or a Logs Insights query (`aws logs start-query`).
 - **Metrics.** The proxy exports OpenTelemetry metrics (`--otlp-endpoint`) to the CloudWatch agent on
-  `127.0.0.1:4318`, which publishes them in namespace `ClaudeMaster` (the agent turns cumulative counters
+  `127.0.0.1:4318`, which publishes them in namespace `ClawMaster` (`ClaudeMaster` before the rename; the agent turns cumulative counters
   into deltas) along with `mem_used_percent` and `swap_used_percent`. Every inference request carries
   `profile`, `client` (the box's certificate name), `model`, `status_class` and `client_account`, the
   incoming user's Anthropic account: a name from `/etc/claude-master/account-labels`
   (`ACCOUNT_UUID=NAME`, UUID = `oauthAccount.accountUuid` in that user's `~/.claude.json`), else
-  `acct-<8 hex of a hash>`; the account id is never exported (`claude-master account-key UUID` prints the
+  `acct-<8 hex of a hash>`; the account id is never exported (`claw-master account-key UUID` prints the
   key, to tell which `acct-` is whose). The file is written from the Secrets Manager secret
   `claude-master/account-labels` (administration and the server's role only) by
-  `/usr/local/bin/claude-master-account-labels`, which systemd runs as root before every start and every 10 minutes
+  `/usr/local/bin/claw-master-account-labels`, which systemd runs as root before every start and every 10 minutes
   (`claude-master-account-labels.timer`); the running server reloads the file within a minute of a change
   (`claude-master-95551d3` onward), so a new value takes effect without a restart. From `claude-master-ba18878`
-  tokens are also counted by project (`claude_master.inference.tokens.by_project` {project, type}): the name of the
+  tokens are also counted by project (`claw_master.inference.tokens.by_project` {project, type}): the name of the
   git repository a launch started in, sent by the launch's local forwarder (never a path), at most 100 per process.
   A client sends it only once it runs that release, so a running session counts as no project until it relaunches. With no value, no access, or
   a line that is not `ACCOUNT_UUID=NAME` the old file is kept and the server starts anyway. Set the value
   from a file (README); never put a UUID or a name in this repository.
-  Metric names and meanings: `docs/claude-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
-  query: `SELECT SUM(...) FROM "ClaudeMaster" GROUP BY client_account`.
+  Metric names and meanings: `docs/claw-master.md` in `ejc3/CLIProxyAPI`. Split with a Metrics Insights
+  query: `SELECT SUM(...) FROM "ClawMaster" GROUP BY client_account`.
 - **Alarms** (shared alert topic): instance status check, memory above 85%, heavy swap, and four taken from
   the log: `claude-master-CredentialRejected` (a subscription's login expired or was revoked: redo it with
-  `scripts/claude-master-login.sh --server`), `claude-master-NoAccountAvailable` (clients are being
+  `scripts/claw-master-login.sh --server`), `claude-master-NoAccountAvailable` (clients are being
   refused) and `claude-master-UnlistedRoute`. Routing is compatibility first (owner, 2026-10-10: "our primary goal
   is compatibility and seamlessness, not pedantry"): from `claude-master-5b83ce9` inference (`POST /v1/messages`,
   `/v1/messages/count_tokens`) goes to the pool and every other Anthropic route goes to Anthropic unchanged, on the
-  session's own login, exactly as Claude Code sends it without claude-master; only ambiguous or encoded paths (400)
+  session's own login, exactly as Claude Code sends it without claw-master; only ambiguous or encoded paths (400)
   and the pool's own routes with the wrong method (405) are refused. Each refusal before this broke sessions
   (WebFetch's domain check; 2.1.296's `/api/hello`, which stopped every interactive start; claude.ai MCP connectors).
   UnlistedRoute is a review queue, not an outage: the route already works; list it in `proxyControlPath` once
@@ -792,13 +797,13 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   reaches the new color instead of being served by the old one on the configuration it started with.
   To review a new Claude Code release, diff its `strings` for `"/api/`, `"/v1/` and `"/mcp-registry/` paths
   against `proxyControlPath`. The agent's IAM grant can publish to the one namespace and write the one log group.
-- **Dashboard** `claude-master` (`claude-master-dashboard.tf`): requests by user, subscription, box, model and
-  outcome; latency percentiles, Anthropic's first-byte time against claude-master's own overhead; each
+- **Dashboard** `claude-master` (`claw-master-dashboard.tf`): requests by user, subscription, box, model and
+  outcome; latency percentiles, Anthropic's first-byte time against claw-master's own overhead; each
   subscription's allowance, resets and Anthropic's own utilization; switches, rate limits, API-backup use;
   login health; connections; host memory; the log-derived alarms. Two Metrics Insights QUERY alarms with no
   dimension names (so a renamed dimension cannot turn one silently green): every subscription past 90% of its
   weekly allowance, and more than 20 Anthropic errors in 10 minutes. Every query was checked against the live
-  API (`window` and `result` are reserved words and must be quoted); `scripts/test-claude-master-server.py`
+  API (`window` and `result` are reserved words and must be quoted); `scripts/test-claw-master-server.py`
   keeps them valid.
 - **Cost shape.** CloudWatch bills every distinct combination of a metric's dimensions as its own custom metric
   (about $0.30 a month each) and every OTLP attribute becomes a dimension, so the proxy never crosses its axes:
@@ -1114,8 +1119,8 @@ Available if a task needs them; neither needs a key on disk.
   (`dev-ai-services.tf`). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
-- **claude-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
-  the paid Anthropic API key that claude-master uses only after every subscription profile is out of
+- **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
+  the paid Anthropic API key that claw-master uses only after every subscription profile is out of
   quota (`dev-ai-services.tf`). From `claude-master-e356d0a` the server checks every 5 minutes that it can pay
   (a token count with the key, which is free) and skips it while it cannot: on 2026-10-10 its organization had no
   credit, every request it took failed with `credit balance is too low`, and an exhausted pool sent sessions
@@ -1136,13 +1141,13 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
-- **The claude-master dashboard, as an agent**, metal boxes only. `claude-master-dashboard/agent-access` (us-west-1) holds a
+- **The claw-master dashboard, as an agent**, metal boxes only. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
-  (`claude-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
+  (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
   `curl -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET" <dashboard>/api/claude-master/snapshot`, the two
   values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role and
-  admins, not nextjs-dev-role. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claude_master_dashboard_agents`,
-  then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claude_master_dashboard`.
+  admins, not nextjs-dev-role. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
+  then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claw_master_dashboard`.
 - **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide grant
   on a box where every account has sudo). Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
