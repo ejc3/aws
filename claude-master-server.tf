@@ -26,7 +26,7 @@
 # LOGINS ARE INTERACTIVE and belong to this box: `scripts/claude-master-login.sh --server` walks
 # the five paste-a-code logins here. They are never copied from another box (a rotating login
 # cannot be shared). The service stays idle until every profile below has a login, then
-# `sudo claude-master-rollout` starts it (scripts/claude-master-login.sh --server does that).
+# `sudo claw-master-rollout` starts it (scripts/claude-master-login.sh --server does that).
 #
 # CERTIFICATES. The CA key never leaves /var/lib/claude-master/state. A client box makes its own
 # key and a certificate request; scripts/claude-master-enroll.sh gets the request signed over SSM
@@ -35,7 +35,7 @@
 # ROLLING RESTARTS. Envoy listens on the client address (and the tunnel's loopback port) and passes TCP
 # through, unchanged, to one of two claude-master servers on this box, blue or green, each on its own
 # port of the same address (the server certificate names the address clients dial; the ports are not
-# in the security group). `sudo claude-master-rollout` starts the idle color, points Envoy's NEW
+# in the security group). `sudo claw-master-rollout` starts the idle color, points Envoy's NEW
 # connections at it (an endpoint file Envoy watches, replaced atomically), and stops the old color,
 # which drains: it serves the connections it already has, each response closing its connection, so
 # every client moves over on its next request without an error, and running requests get up to
@@ -43,7 +43,7 @@
 #
 # TO ROLL THE BINARY FORWARD: publish a release of ejc3/CLIProxyAPI, change the tag and the sha256,
 # apply (terraform_data.claude_master_server_converge installs the binary atomically), then
-# `sudo claude-master-rollout`.
+# `sudo claw-master-rollout`.
 
 variable "enable_claude_master_server" {
   description = "Enable the shared claude-master server box"
@@ -52,16 +52,18 @@ variable "enable_claude_master_server" {
 }
 
 locals {
-  claude_master_tag            = "claude-master-9ff1e5d"
-  claude_master_sha256_aarch64 = "e9ad108cbd80964eec82d5cafc0b419904926ed381f0e4ee8798dc49b5df5b9b"
+  claude_master_tag            = "claw-master-39add35"
+  claude_master_sha256_aarch64 = "46e33444c45da2d24befbe340d39b678c361f6e550bb3c789b1ea799e178ae5f"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
   # `latest` at the time of pinning (verified byte for byte).
   claude_master_cwagent_version      = "1.300073.2b1889"
   claude_master_cwagent_sha256_arm64 = "0d04b62f688f257aa35604f89b48f259cea5ed412985831d8d56838f43332169"
-  claude_master_metrics_namespace    = "ClaudeMaster"
-  claude_master_log_group            = "/claude-master/server"
+  # ClawMaster since the rename (2026-10-11): the binary's metrics became claw_master.*, and the history before the switch
+  # was copied from ClaudeMaster with scripts/claw-master-migrate-metrics.py (ejc3/CLIProxyAPI), so nothing was lost.
+  claude_master_metrics_namespace = "ClawMaster"
+  claude_master_log_group         = "/claude-master/server"
 
   claude_master_server_ip   = "10.0.1.50" # in subnet_a; client certificates name this address
   claude_master_server_port = 8443        # Envoy; the servers behind it use the color ports below
@@ -327,27 +329,37 @@ id claude-master >/dev/null 2>&1 || useradd --system --create-home --home-dir "$
 install -d -m 0700 -o claude-master -g claude-master "$HOME_DIR" "$HOME_DIR/state"
 
 # ---------------------------------------------------------------- the pinned binary
-current=$(sha256sum /usr/local/bin/claude-master 2>/dev/null | cut -d' ' -f1)
+# claw-master (renamed from claude-master on 2026-10-11). The release asset is named for the tag's prefix.
+current=$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)
 if [ "$current" != "$SHA" ]; then
-  if curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claude-master-linux-arm64" -o /tmp/claude-master.new \
-     && echo "$SHA  /tmp/claude-master.new" | sha256sum -c - ; then
-    install -m 0755 /tmp/claude-master.new /usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master
-    echo "claude-master $TAG installed; a running server keeps its old binary until it is restarted"
+  if curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claw-master-linux-arm64" -o /tmp/claw-master.new \
+     && echo "$SHA  /tmp/claw-master.new" | sha256sum -c - ; then
+    install -m 0755 /tmp/claw-master.new /usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master
+    echo "claw-master $TAG installed; a running server keeps its old binary until it is restarted"
   else
-    echo "ERROR: claude-master $TAG did not download or did not match its sha256; leaving the installed binary alone" >&2
+    echo "ERROR: claw-master $TAG did not download or did not match its sha256; leaving the installed binary alone" >&2
   fi
-  rm -f /tmp/claude-master.new
+  rm -f /tmp/claw-master.new
+fi
+# The name before the rename stays as a link to the same binary, swapped in by a rename (a running server keeps the file
+# it started from).
+if [ -x /usr/local/bin/claw-master ] && [ "$(readlink /usr/local/bin/claude-master)" != claw-master ]; then
+  ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master
 fi
 
 # ---------------------------------------------------------------- how the server starts
 # The final paid backup (claude-master/backup-api-key) is read from Secrets Manager at start and
 # handed over in the environment: never on a command line, never written to disk.
-cat > /usr/local/bin/claude-master-serve <<'EOF'
+cat > /usr/local/bin/claw-master-serve <<'EOF'
 #!/bin/bash
 set -u
 { set +x; } 2>/dev/null   # the value below must never reach a trace
+# The renamed binary; or, when a convergence could not install it, the one from before the rename (then still a file at
+# the old name), with the backup key under the name that binary reads.
+bin=/usr/local/bin/claw-master; keyvar=CLAW_MASTER_BACKUP_API_KEY
+if [ ! -x "$bin" ]; then bin=/usr/local/bin/claude-master; keyvar=CLAUDE_MASTER_BACKUP_API_KEY; fi
 key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/backup-api-key --query SecretString --output text 2>/dev/null) || key=""
-if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
+if [ -n "$key" ] && [ "$key" != "None" ]; then export "$keyvar=$key"; else echo "claw-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
 # One of the two servers behind Envoy, by color: its own ports, log file and metrics instance. With no
 # color it is the server from before Envoy (claude-master-server.service, until the first rollout moves
@@ -357,16 +369,16 @@ balancer="--balanced --drain-timeout ${local.claude_master_drain_seconds}s"
 case "$color" in
 ${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
   legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;
-  *) echo "usage: claude-master-serve blue|green" >&2; exit 2 ;;
+  *) echo "usage: claw-master-serve blue|green" >&2; exit 2 ;;
 esac
-exec /usr/local/bin/claude-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
+exec "$bin" serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
   --listen ${local.claude_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
   --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels \
-  --instance claude-master-$color $balancer
+  --instance claw-master-$color $balancer
 EOF
-chmod 0755 /usr/local/bin/claude-master-serve
+chmod 0755 /usr/local/bin/claw-master-serve
 
 # Names for the incoming users' Anthropic accounts in the dashboards, one `ACCOUNT_UUID=NAME` per line
 # (`claude-master account-key UUID` shows the key an unnamed account gets). The file is written from the
@@ -383,33 +395,33 @@ chmod 0640 /etc/claude-master/account-labels
 # the running server reloads the file when it changes. It never stops a start: without a value, when the
 # secret cannot be read, or when a line is not `ACCOUNT_UUID=NAME` (on which claude-master would refuse to
 # start), the file is kept. An unchanged value leaves the file alone, so the server does not reload for nothing.
-cat > /usr/local/bin/claude-master-account-labels <<'EOF'
+cat > /usr/local/bin/claw-master-account-labels <<'EOF'
 #!/bin/bash
 set -u
 { set +x; } 2>/dev/null   # the names below stay out of traces
 file=/etc/claude-master/account-labels
 value=$(HOME=/root timeout 20 aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/account-labels --query SecretString --output text 2>/dev/null) || value=""
 if [ -z "$value" ] || [ "$value" = "None" ]; then
-  echo "claude-master-account-labels: claude-master/account-labels has no value or could not be read; keeping $file" >&2
+  echo "claw-master-account-labels: claude-master/account-labels has no value or could not be read; keeping $file" >&2
   exit 0
 fi
 # claude-master's own rule: a blank line, a # comment, or ACCOUNT_UUID=NAME (8 to 64 hex digits and dashes).
 if printf '%s\n' "$value" | grep -qvE '^[[:space:]]*(#.*)?$|^[[:space:]]*[0-9A-Fa-f-]{8,64}[[:space:]]*=[[:space:]]*[^[:space:]]'; then
-  echo "claude-master-account-labels: claude-master/account-labels has a line that is not ACCOUNT_UUID=NAME; keeping $file" >&2
+  echo "claw-master-account-labels: claude-master/account-labels has a line that is not ACCOUNT_UUID=NAME; keeping $file" >&2
   exit 0
 fi
-tmp=$(mktemp /etc/claude-master/.account-labels.XXXXXX) || { echo "claude-master-account-labels: cannot write in /etc/claude-master; keeping $file" >&2; exit 0; }
-if ! printf '%s\n' "$value" > "$tmp"; then rm -f "$tmp"; echo "claude-master-account-labels: could not write; keeping $file" >&2; exit 0; fi
+tmp=$(mktemp /etc/claude-master/.account-labels.XXXXXX) || { echo "claw-master-account-labels: cannot write in /etc/claude-master; keeping $file" >&2; exit 0; }
+if ! printf '%s\n' "$value" > "$tmp"; then rm -f "$tmp"; echo "claw-master-account-labels: could not write; keeping $file" >&2; exit 0; fi
 if cmp -s "$tmp" "$file"; then rm -f "$tmp"; exit 0; fi
 if chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$file"; then
-  echo "claude-master-account-labels: $file written with $(grep -cvE '^[[:space:]]*(#.*)?$' "$file") names" >&2
+  echo "claw-master-account-labels: $file written with $(grep -cvE '^[[:space:]]*(#.*)?$' "$file") names" >&2
 else
   rm -f "$tmp"
-  echo "claude-master-account-labels: could not replace $file; keeping it" >&2
+  echo "claw-master-account-labels: could not replace $file; keeping it" >&2
 fi
 exit 0
 EOF
-chmod 0755 /usr/local/bin/claude-master-account-labels
+chmod 0755 /usr/local/bin/claw-master-account-labels
 
 # The journal is small on this box: cap it, and trim what is there now. (No service is restarted: the cap
 # applies the next time journald starts.)
@@ -418,7 +430,7 @@ printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=30day\n' > /etc/systemd/jo
 journalctl --vacuum-size=200M >/dev/null 2>&1 || true
 
 # One unit per color (claude-master-server@blue, @green). The unit of the active color is enabled at boot;
-# claude-master-rollout moves that. A pre-Envoy box still runs claude-master-server.service until the
+# claw-master-rollout moves that. A pre-Envoy box still runs claude-master-server.service until the
 # first rollout moves it behind Envoy.
 cat > /etc/systemd/system/claude-master-server@.service <<'EOF'
 [Unit]
@@ -436,8 +448,8 @@ Environment=HOME=/var/lib/claude-master
 LogsDirectory=claude-master
 LogsDirectoryMode=0750
 # As root and outside the sandbox (+), and never fatal (-): the names from Secrets Manager.
-ExecStartPre=-+/usr/local/bin/claude-master-account-labels
-ExecStart=/usr/local/bin/claude-master-serve %i
+ExecStartPre=-+/usr/local/bin/claw-master-account-labels
+ExecStart=/usr/local/bin/claw-master-serve %i
 Restart=on-failure
 RestartSec=10
 # A stop drains for up to the drain timeout; systemd must not cut it short.
@@ -460,7 +472,7 @@ Description=Refresh claude-master's account labels from Secrets Manager (the run
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/claude-master-account-labels
+ExecStart=/usr/local/bin/claw-master-account-labels
 EOF
 cat > /etc/systemd/system/claude-master-account-labels.timer <<'EOF'
 [Unit]
@@ -495,7 +507,7 @@ id envoy >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/
 install -d -m 0755 /etc/envoy /etc/envoy/eds
 
 # TCP passthrough: Envoy never sees inside the TLS; client certificates are still checked by claude-master.
-# The endpoints are files Envoy watches; claude-master-rollout replaces them (a rename, so atomically).
+# The endpoints are files Envoy watches; claw-master-rollout replaces them (a rename, so atomically).
 cat > /etc/envoy/envoy.yaml <<'EOF'
 node: { id: claude-master, cluster: claude-master }
 admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
@@ -533,13 +545,13 @@ static_resources:
 %{endfor~}
 EOF
 
-cat > /usr/local/bin/claude-master-envoy-endpoints <<'EOF'
+cat > /usr/local/bin/claw-master-envoy-endpoints <<'EOF'
 #!/bin/bash
-# claude-master-envoy-endpoints COLOR: point Envoy's new connections at that color's two ports.
+# claw-master-envoy-endpoints COLOR: point Envoy's new connections at that color's two ports.
 set -euo pipefail
 case "$1" in
 ${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; open=${v.open_port} ;;"])}
-  *) echo "usage: claude-master-envoy-endpoints blue|green" >&2; exit 2 ;;
+  *) echo "usage: claw-master-envoy-endpoints blue|green" >&2; exit 2 ;;
 esac
 write() { # cluster address port
   tmp=$(mktemp /etc/envoy/eds/.$1.XXXXXX)
@@ -551,11 +563,11 @@ write() { # cluster address port
 write cert ${local.claude_master_server_ip} "$port"
 write open 127.0.0.1 "$open"
 EOF
-chmod 0755 /usr/local/bin/claude-master-envoy-endpoints
+chmod 0755 /usr/local/bin/claw-master-envoy-endpoints
 
 mkdir -p /etc/claude-master
 [ -s /etc/claude-master/active-color ] || echo blue > /etc/claude-master/active-color
-[ -e /etc/envoy/eds/cert.yaml ] && [ -e /etc/envoy/eds/open.yaml ] || /usr/local/bin/claude-master-envoy-endpoints "$(cat /etc/claude-master/active-color)"
+[ -e /etc/envoy/eds/cert.yaml ] && [ -e /etc/envoy/eds/open.yaml ] || /usr/local/bin/claw-master-envoy-endpoints "$(cat /etc/claude-master/active-color)"
 
 cat > /etc/systemd/system/envoy.service <<'EOF'
 [Unit]
@@ -578,20 +590,20 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-# A box still running the pre-Envoy server keeps it (it holds the client port) until claude-master-rollout
+# A box still running the pre-Envoy server keeps it (it holds the client port) until claw-master-rollout
 # moves it behind Envoy. Otherwise Envoy runs; the bootstrap starts it if it is stopped and never restarts it.
 if systemctl is-active --quiet claude-master-server.service; then
-  echo "claude-master-server.service (before Envoy) is running; run claude-master-rollout to move it behind Envoy"
+  echo "claude-master-server.service (before Envoy) is running; run claw-master-rollout to move it behind Envoy"
 else
   systemctl enable envoy.service >/dev/null 2>&1 || true
   systemctl is-active --quiet envoy.service || systemctl start envoy.service || true
 fi
 
 # Moves the pool to a fresh server process without a session noticing (see ROLLING RESTARTS above).
-cat > /usr/local/bin/claude-master-rollout <<'EOF'
+cat > /usr/local/bin/claw-master-rollout <<'EOF'
 #!/bin/bash
 set -uo pipefail
-[ "$(id -u)" = 0 ] || { echo "run as root: sudo claude-master-rollout" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "run as root: sudo claw-master-rollout" >&2; exit 2; }
 IP=${local.claude_master_server_ip}
 port_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.port} ;;"])} esac; }
 open_of() { case "$1" in ${join(" ", [for c, v in local.claude_master_colors : "${c}) echo ${v.open_port} ;;"])} esac; }
@@ -622,7 +634,7 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-/usr/local/bin/claude-master-envoy-endpoints "$next"
+/usr/local/bin/claw-master-envoy-endpoints "$next"
 if [ "$legacy" = 1 ]; then
   # The pre-Envoy server holds the client port: it drains and exits, then Envoy takes the port over. If Envoy
   # does not come up, the pre-Envoy server is started again, so clients are never left with nothing.
@@ -660,7 +672,7 @@ if [ "$switched" != 1 ]; then
   # Envoy may already be sending some new connections to $next. Point it back at the color that is recorded as
   # active, so the record and Envoy agree and a retry does not restart the server that is taking traffic.
   if [ "$active" != none ]; then
-    /usr/local/bin/claude-master-envoy-endpoints "$active"
+    /usr/local/bin/claw-master-envoy-endpoints "$active"
     back=0
     for _ in $(seq 1 20); do
       clusters=$(curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null) || clusters=""
@@ -685,10 +697,10 @@ echo "new connections go to $next"
 if [ "$active" != none ]; then
   systemctl disable "claude-master-server@$active" >/dev/null 2>&1 || true
   systemctl stop --no-block "claude-master-server@$active"
-  echo "claude-master-server@$active is draining (up to ${local.claude_master_drain_seconds}s); claude-master-status shows when it is done"
+  echo "claude-master-server@$active is draining (up to ${local.claude_master_drain_seconds}s); claw-master-status shows when it is done"
 fi
 EOF
-chmod 0755 /usr/local/bin/claude-master-rollout
+chmod 0755 /usr/local/bin/claw-master-rollout
 
 # ---------------------------------------------------------------- cloudflared (the tunnel for the Macs)
 # Pinned by version and sha256. It dials OUT to Cloudflare and forwards to claude-master's open
@@ -797,16 +809,16 @@ fi
 
 # ---------------------------------------------------------------- operator helpers
 # A login is interactive (paste a code); run it as the service account so the profile is its own.
-cat > /usr/local/bin/claude-master-login <<'EOF'
+cat > /usr/local/bin/claw-master-login <<'EOF'
 #!/bin/bash
-[ $# -eq 1 ] || { echo "usage: claude-master-login PROFILE" >&2; exit 2; }
+[ $# -eq 1 ] || { echo "usage: claw-master-login PROFILE" >&2; exit 2; }
 exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master login "$1"
 EOF
-chmod 0755 /usr/local/bin/claude-master-login
+chmod 0755 /usr/local/bin/claw-master-login
 
 # Signs a client's certificate request (base64 on stdin) and prints the client certificate and then
 # the CA certificate. scripts/claude-master-enroll.sh calls this over SSM; it is an admin action.
-cat > /usr/local/bin/claude-master-sign <<'EOF'
+cat > /usr/local/bin/claw-master-sign <<'EOF'
 #!/bin/bash
 set -euo pipefail
 days=$${1:-30}
@@ -815,17 +827,17 @@ base64 -d > "$tmp/request.csr"; chmod 644 "$tmp/request.csr"
 runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master issue --state-dir /var/lib/claude-master/state --request "$tmp/request.csr" --days "$days"
 cat /var/lib/claude-master/state/ca.pem
 EOF
-chmod 0755 /usr/local/bin/claude-master-sign
+chmod 0755 /usr/local/bin/claw-master-sign
 
 # Which logins exist, whether the server is up, and the version it runs versus the one installed.
-cat > /usr/local/bin/claude-master-status <<'EOF'
+cat > /usr/local/bin/claw-master-status <<'EOF'
 #!/bin/bash
 for p in ${join(" ", local.claude_master_profiles)}; do
   if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
 done
 active=$(cat /etc/claude-master/active-color 2>/dev/null || echo none)
 if systemctl is-active --quiet claude-master-server.service; then
-  echo "server: active (before Envoy; sudo claude-master-rollout moves it behind Envoy)"
+  echo "server: active (before Envoy; sudo claw-master-rollout moves it behind Envoy)"
 else
   echo "server: $(systemctl is-active "claude-master-server@$active") ($active)"
 fi
@@ -842,12 +854,18 @@ echo "cloudwatch agent: $(systemctl is-active amazon-cloudwatch-agent)   logs: $
 if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${local.claude_master_open_port} "; then
   echo "open listener: listening"
 else
-  echo "open listener: NOT listening (Envoy is stopped, or no server is running yet: sudo claude-master-rollout)"
+  echo "open listener: NOT listening (Envoy is stopped, or no server is running yet: sudo claw-master-rollout)"
 fi
-echo "installed: $(sha256sum /usr/local/bin/claude-master | cut -c1-16)  pinned: ${substr(local.claude_master_sha256_aarch64, 0, 16)}  ($TAG)"
+echo "installed: $(sha256sum /usr/local/bin/claw-master | cut -c1-16)  pinned: ${substr(local.claude_master_sha256_aarch64, 0, 16)}  ($TAG)"
 EOF
-sed -i "s/\$TAG/$TAG/" /usr/local/bin/claude-master-status
-chmod 0755 /usr/local/bin/claude-master-status
+sed -i "s/\$TAG/$TAG/" /usr/local/bin/claw-master-status
+chmod 0755 /usr/local/bin/claw-master-status
+
+# The helpers' names before the rename (claude-master-*) stay as links, for anything that still calls them.
+for h in serve account-labels envoy-endpoints rollout login sign status; do
+  [ "$(readlink /usr/local/bin/claude-master-$h)" = "claw-master-$h" ] && continue
+  ln -sfn "claw-master-$h" "/usr/local/bin/claude-master-$h.new" && mv -Tf "/usr/local/bin/claude-master-$h.new" "/usr/local/bin/claude-master-$h"
+done
 SCRIPT
 }
 
@@ -926,7 +944,7 @@ resource "aws_instance" "claude_master_server" {
 # boot failed would change nothing on the running machine. This re-runs the bootstrap through SSM
 # whenever the script, the helper or the instance changes. The bootstrap is idempotent and never
 # restarts a running server or Envoy: a new binary is installed atomically and the running server keeps
-# the old one until `sudo claude-master-rollout` (`claude-master-status` shows running versus pinned).
+# the old one until `sudo claw-master-rollout` (`claw-master-status` shows running versus pinned).
 resource "terraform_data" "claude_master_server_converge" {
   count = var.enable_claude_master_server ? 1 : 0
 

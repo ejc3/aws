@@ -79,19 +79,32 @@ class NetworkTests(unittest.TestCase):
 
 class SupplyChainTests(unittest.TestCase):
     def test_the_binary_is_pinned_by_tag_and_sha256_and_checked_before_install(self):
-        self.assertRegex(TF, r'claude_master_tag\s+=\s+"claude-master-[0-9a-f]{7}"')
+        self.assertRegex(TF, r'claude_master_tag\s+=\s+"claw-master-[0-9a-f]{7}"')
         self.assertRegex(TF, r'claude_master_sha256_aarch64\s+=\s+"[0-9a-f]{64}"')
-        self.assertIn("github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claude-master-linux-arm64", TF)
+        self.assertIn("github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claw-master-linux-arm64", TF)
         self.assertIn('sha256sum -c -', TF)
-        self.assertLess(TF.index("sha256sum -c -"), TF.index("mv -f /usr/local/bin/claude-master.new"))
+        self.assertLess(TF.index("sha256sum -c -"), TF.index("mv -f /usr/local/bin/claw-master.new"))
+
+    def test_the_old_names_stay_as_links_swapped_in_by_a_rename(self):
+        # claude-master (the binary) and every claude-master-* helper keep working after the rename, as links that replace
+        # the old files by a rename, so a running server keeps the file it started from.
+        script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
+        self.assertIn("ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master", script)
+        self.assertLess(script.index("mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master"), script.index("ln -sfn claw-master /usr/local/bin/claude-master.new"))
+        loop = re.search(r"for h in ([a-z -]+); do\n(.*?)\ndone", script, re.S)
+        self.assertTrue(loop)
+        helpers = set(re.findall(r"cat > /usr/local/bin/claw-master-([a-z-]+) <<", script))
+        self.assertEqual(set(loop.group(1).split()), helpers, "every helper keeps its old name")
+        self.assertIn('mv -Tf "/usr/local/bin/claude-master-$h.new" "/usr/local/bin/claude-master-$h"', loop.group(2))
+        self.assertNotIn("claude-master-", "".join(re.findall(r"cat > /usr/local/bin/(\S+) <<", script)))
 
     def test_a_running_server_is_never_restarted_by_the_bootstrap(self):
         # The bootstrap writes claude-master-rollout (an operator tool, checked in EnvoyTests) but never runs it,
         # never restarts or stops a server or Envoy, and only starts Envoy when it is not running.
         script = TF[TF.index("claude_master_server_user_data"):TF.index('resource "aws_s3_object"')]
-        script = script[:script.index("cat > /usr/local/bin/claude-master-rollout")] + script[script.index("chmod 0755 /usr/local/bin/claude-master-rollout"):]
+        script = script[:script.index("cat > /usr/local/bin/claw-master-rollout")] + script[script.index("chmod 0755 /usr/local/bin/claw-master-rollout"):]
         self.assertNotRegex(script, r"systemctl (restart|stop)")
-        self.assertNotRegex(script, r"\n\s*(sudo )?/usr/local/bin/claude-master-rollout|\n\s*claude-master-rollout")
+        self.assertNotRegex(script, r"\n\s*(sudo )?(/usr/local/bin/)?cla(ude|w)-master-rollout")
         self.assertIn("systemctl is-active --quiet envoy.service || systemctl start envoy.service", script)
         self.assertIn("keeps its old binary until it is restarted", script)
 
@@ -112,7 +125,8 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("User=claude-master", TF)
 
     def test_the_backup_key_is_handed_over_in_the_environment_not_argv_or_disk(self):
-        self.assertIn("export CLAUDE_MASTER_BACKUP_API_KEY=", TF)
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
+        self.assertIn('export "$keyvar=$key"', serve)
         self.assertNotRegex(TF, r"--backup-api-key")
         self.assertNotRegex(TF, r">\s*/(tmp|var|etc)[^\n]*key")
 
@@ -121,7 +135,7 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(m)
         # Render the three interpolations that matter, then let bash parse it.
         text = m.group(1)
-        text = re.sub(r"\$\{local\.claude_master_tag\}", "claude-master-0000000", text)
+        text = re.sub(r"\$\{local\.claude_master_tag\}", "claw-master-0000000", text)
         text = re.sub(r"\$\{local\.claude_master_sha256_aarch64\}", "0" * 64, text)
         text = re.sub(r"\$\{local\.claude_master_server_ip\}", "10.0.1.50", text)
         text = re.sub(r"\$\{local\.claude_master_server_port\}", "8443", text)
@@ -136,7 +150,7 @@ class ServiceTests(unittest.TestCase):
 
 def labels_helper():
     """The account-labels helper as the server gets it, rendered and pointed at `etc` instead of /etc/claude-master."""
-    script = TF[TF.index("cat > /usr/local/bin/claude-master-account-labels <<'EOF'\n"):]
+    script = TF[TF.index("cat > /usr/local/bin/claw-master-account-labels <<'EOF'\n"):]
     script = script[script.index("\n") + 1:script.index("\nEOF\n")]
     return script.replace("${var.aws_region}", "us-west-1")
 
@@ -191,8 +205,8 @@ class AccountLabelsTests(unittest.TestCase):
     def test_it_runs_as_root_before_each_start_and_can_never_stop_it(self):
         unit = TF[TF.index("cat > /etc/systemd/system/claude-master-server@.service"):]
         unit = unit[:unit.index("\nEOF\n")]
-        self.assertIn("ExecStartPre=-+/usr/local/bin/claude-master-account-labels", unit)
-        self.assertLess(unit.index("ExecStartPre="), unit.index("ExecStart=/usr/local/bin/claude-master-serve"))
+        self.assertIn("ExecStartPre=-+/usr/local/bin/claw-master-account-labels", unit)
+        self.assertLess(unit.index("ExecStartPre="), unit.index("ExecStart=/usr/local/bin/claw-master-serve"))
         helper = code(labels_helper())
         self.assertNotRegex(helper, r"exit [1-9]")
         self.assertIn("{ set +x; } 2>/dev/null", labels_helper())
@@ -247,10 +261,10 @@ class ObservabilityTests(unittest.TestCase):
         # #226 wrote a line continuation as two backslashes: the shell ends the command there, so --state-dir and the open
         # listener ran as a separate command and the service died with "serve requires --listen ... and --state-dir".
         # It went unseen because the service stays idle until all three logins exist.
-        wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        wrapper = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         lines = wrapper.splitlines()
         self.assertEqual([n for n, l in enumerate(lines) if l.rstrip().endswith("\\\\")], [], "a doubled backslash ends the command")
-        start = next(n for n, l in enumerate(lines) if l.startswith("exec /usr/local/bin/claude-master serve"))
+        start = next(n for n, l in enumerate(lines) if l.startswith('exec "$bin" serve'))
         logical = []
         for l in lines[start:]:
             logical.append(l.rstrip().rstrip("\\"))
@@ -260,11 +274,39 @@ class ObservabilityTests(unittest.TestCase):
         for flag in ("--listen ${local.claude_master_server_ip}:$port", "--open-loopback 127.0.0.1:$open",
                      "--state-dir /var/lib/claude-master/state", "--log-file /var/log/claude-master/server-$color.log",
                      "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels",
-                     "--instance claude-master-$color", "$balancer"):
+                     "--instance claw-master-$color", "$balancer"):
             self.assertIn(flag, command)
 
+    def test_the_wrapper_falls_back_to_the_old_binary_when_the_new_one_is_not_installed(self):
+        # A convergence that could not download claw-master keeps the old file at /usr/local/bin/claude-master; the next
+        # start must run that one, with the backup key under the name it reads, not fail on a missing claw-master.
+        import os, tempfile
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve <<'EOF'\n"):]
+        serve = serve[serve.index("\n") + 1:serve.index("\nEOF\n")]
+        serve = (serve.replace("${var.aws_region}", "us-west-1").replace("$${", "${")
+                 .replace("${local.claude_master_drain_seconds}", "600").replace("${local.claude_master_server_ip}", "10.0.1.50")
+                 .replace("${local.claude_master_server_port}", "8443").replace("${local.claude_master_open_port}", "8444")
+                 .replace("${local.claude_master_profiles[0]}", "claude-connor"))
+        serve = re.sub(r"\$\{join\(.*\)\}", "", serve)
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin"); os.mkdir(bindir)
+            open(os.path.join(bindir, "aws"), "w").write("#!/bin/bash\necho test-key\n")
+            report = '#!/bin/bash\necho "$0|${CLAW_MASTER_BACKUP_API_KEY-unset}|${CLAUDE_MASTER_BACKUP_API_KEY-unset}"\n'
+            for name in ("aws", "claw-master", "claude-master"):
+                path = os.path.join(bindir, name)
+                if name != "aws":
+                    open(path, "w").write(report)
+                os.chmod(path, 0o755)
+            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"])
+            def run():
+                s = serve.replace("/usr/local/bin/", bindir + "/")
+                return subprocess.run(["bash", "-c", s, "serve", "legacy"], capture_output=True, text=True, env=env, timeout=30).stdout.strip()
+            self.assertEqual(run(), "%s/claw-master|test-key|unset" % bindir)
+            os.chmod(os.path.join(bindir, "claw-master"), 0o644)
+            self.assertEqual(run(), "%s/claude-master|unset|test-key" % bindir)
+
     def test_the_server_always_logs_at_info_to_a_rotated_file_it_may_write(self):
-        wrapper = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        wrapper = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         for flag in ("--log-level info", "--log-file /var/log/claude-master/server-$color.log", "--log-max-mb 20", "--log-keep 5",
                      "--quota-log-interval 5m", "--account-labels-file /etc/claude-master/account-labels"):
             self.assertIn(flag, wrapper)
@@ -323,6 +365,12 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(policy.count('Resource = "*"'), 1)
         self.assertLess(policy.index('Resource = "*"'), policy.index("WriteItsOwnLogGroup"))
 
+    def test_the_metrics_namespace_is_the_one_the_dashboards_read(self):
+        # Since the rename the agent publishes into ClawMaster (claw_master.* metrics); the log group keeps its name.
+        self.assertRegex(TF, r'claude_master_metrics_namespace\s+=\s+"ClawMaster"')
+        self.assertRegex(TF, r'claude_master_log_group\s+=\s+"/claude-master/server"')
+        self.assertIn('"namespace": "${local.claude_master_metrics_namespace}"', TF)
+
     def test_the_log_group_is_kept_and_two_log_alarms_exist(self):
         self.assertIn("retention_in_days = 90", block("aws_cloudwatch_log_group", "claude_master_server"))
         for key in ("CredentialRejected", "NoAccountAvailable"):
@@ -339,16 +387,16 @@ class DashboardTests(unittest.TestCase):
 
     # The metrics the proxy emits (docs/claude-master.md in ejc3/CLIProxyAPI) and the host metrics of the agent.
     METRICS = {
-        "claude_master.inference.requests", "claude_master.inference.requests.by_model",
-        "claude_master.inference.requests.by_client", "claude_master.inference.errors",
-        "claude_master.inference.duration", "claude_master.inference.duration.by_model",
-        "claude_master.inference.ttfb", "claude_master.inference.ttfb.by_model",
-        "claude_master.inference.upstream_ttfb", "claude_master.inference.duration_quantile",
-        "claude_master.proxy.overhead", "claude_master.proxy.connections", "claude_master.proxy.tls_handshake_errors",
-        "claude_master.quota.used_fraction", "claude_master.quota.resets_in_seconds", "claude_master.quota.rate_limited",
-        "claude_master.anthropic.ratelimit", "claude_master.routing.switches", "claude_master.routing.backup_requests",
-        "claude_master.auth.token_expires_in_seconds", "claude_master.auth.refresh", "claude_master.usage.polls",
-        "claude_master.process.heap_bytes", "claude_master.process.goroutines",
+        "claw_master.inference.requests", "claw_master.inference.requests.by_model",
+        "claw_master.inference.requests.by_client", "claw_master.inference.errors",
+        "claw_master.inference.duration", "claw_master.inference.duration.by_model",
+        "claw_master.inference.ttfb", "claw_master.inference.ttfb.by_model",
+        "claw_master.inference.upstream_ttfb", "claw_master.inference.duration_quantile",
+        "claw_master.proxy.overhead", "claw_master.proxy.connections", "claw_master.proxy.tls_handshake_errors",
+        "claw_master.quota.used_fraction", "claw_master.quota.resets_in_seconds", "claw_master.quota.rate_limited",
+        "claw_master.anthropic.ratelimit", "claw_master.routing.switches", "claw_master.routing.backup_requests",
+        "claw_master.auth.token_expires_in_seconds", "claw_master.auth.refresh", "claw_master.usage.polls",
+        "claw_master.process.heap_bytes", "claw_master.process.goroutines",
         "mem_used_percent", "swap_used_percent", "CredentialRejected", "NoAccountAvailable",
     }
     # Names CloudWatch accepted unquoted in GROUP BY / WHERE. Anything else (window and result are reserved
@@ -357,13 +405,13 @@ class DashboardTests(unittest.TestCase):
 
     def queries(self):
         found = re.findall(r'"(SELECT (?:[^"\\]|\\.)*)"', DASH)
-        return [q.replace('\\"', '"').replace("${local.cm_ns}", "ClaudeMaster") for q in found]
+        return [q.replace('\\"', '"').replace("${local.cm_ns}", "ClawMaster") for q in found]
 
     def test_there_are_queries_and_every_one_reads_the_agents_namespace_and_a_known_metric(self):
         queries = self.queries()
         self.assertGreaterEqual(len(queries), 30)
         for q in queries:
-            self.assertRegex(q, r'^SELECT (SUM|AVG|MIN|MAX)\(.+\) FROM "ClaudeMaster(/Logs)?"')
+            self.assertRegex(q, r'^SELECT (SUM|AVG|MIN|MAX)\(.+\) FROM "ClawMaster(/Logs)?"')
             metric = re.match(r'SELECT \w+\("?([^")]+)"?\)', q).group(1)
             self.assertIn(metric, self.METRICS, q)
 
@@ -395,7 +443,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("metric_query", alarm)
         self.assertNotIn("dimensions", alarm)
         self.assertIn("aws_sns_topic.cost_alerts.arn", alarm)
-        self.assertIn('SELECT MIN(\\"claude_master.quota.used_fraction\\")', alarm)
+        self.assertIn('SELECT MIN(\\"claw_master.quota.used_fraction\\")', alarm)
         self.assertIn("threshold           = each.value", alarm)
 
     def test_the_error_alarm_judges_one_ten_minute_datapoint_not_two_five_minute_ones(self):
@@ -508,7 +556,7 @@ class TunnelTests(unittest.TestCase):
     def test_the_macs_get_one_file_and_no_certificate_or_aws_access(self):
         self.assertIn("claude-master/mac-access", BUNDLE)
         self.assertIn("chmod 0600", BUNDLE)
-        self.assertIn("claude-master connect --open 127.0.0.1", BUNDLE)
+        self.assertIn("claw-master connect --open 127.0.0.1", BUNDLE)
         self.assertNotRegex(code(BUNDLE), r"client\.key|client-init")
         self.assertIn("cloudflared access tcp", BUNDLE)
 
@@ -531,7 +579,7 @@ class MacSetupTests(unittest.TestCase):
         text = code(MACSETUP)
         # claude-master, the cloudflared tarball, and the cloudflared executable inside it
         self.assertEqual(text.count("did not match its pinned sha256"), 3)
-        self.assertLess(text.index("claude-master did not match"), text.index('mv -f "\\$tmp/cm"'))
+        self.assertLess(text.index("claw-master did not match"), text.index('mv -f "\\$tmp/cm"'))
         self.assertLess(text.index("cloudflared did not match"), text.index('mv -f "\\$tmp/cloudflared"'))
         self.assertLess(text.index("the cloudflared executable did not match"), text.index('mv -f "\\$tmp/cloudflared"'))
 
@@ -547,7 +595,7 @@ class MacSetupTests(unittest.TestCase):
         # configuration listens on no open port, so a Mac set up then reports success and cannot connect.
         text = code(MACSETUP)
         gate = text.index("0/6")
-        self.assertIn("claude-master-status", text[gate:text.index("1/6")])
+        self.assertIn("claw-master-status", text[gate:text.index("1/6")])
         self.assertIn("grep -q '^open listener: listening'", text[gate:text.index("1/6")])
         self.assertIn("exit 1", text[gate:text.index("1/6")])
         for step in ("1/6", "2/6", "3/6", "5/6"):
@@ -597,7 +645,7 @@ class IamTests(unittest.TestCase):
 class ScriptTests(unittest.TestCase):
     def test_enrollment_signs_over_ssm_and_never_moves_a_key(self):
         self.assertIn("aws ssm send-command", ENROLL)
-        self.assertIn("claude-master-sign", ENROLL)
+        self.assertIn("/usr/local/bin/claw-master-sign", ENROLL)
         # The key is made on the enrolled machine; only the request goes up.
         self.assertIn("client-init", ENROLL)
         self.assertNotRegex(ENROLL, r"client\.key")
@@ -610,9 +658,9 @@ class ScriptTests(unittest.TestCase):
 
     def test_the_login_script_drives_the_server_and_never_restarts_a_running_one(self):
         self.assertIn("--server", LOGIN)
-        self.assertIn("sudo claude-master-login", LOGIN)
+        self.assertIn("sudo claw-master-login", LOGIN)
         # It starts the pool (through the rollout) only when no server is running; it never restarts one.
-        self.assertIn("! sudo claude-master-status | grep -q '^server: active'; then sudo claude-master-rollout", LOGIN)
+        self.assertIn("! sudo claw-master-status | grep -q '^server: active'; then sudo claw-master-rollout", LOGIN)
         self.assertNotRegex(LOGIN, r"systemctl (restart|start)")
 
     def test_enrollment_as_an_account_carries_awkward_commands_and_stdin_through_ssh_and_sudo_intact(self):
@@ -642,8 +690,12 @@ class ScriptTests(unittest.TestCase):
         # one pin with the server, checksum-verified, installed under a temporary name then renamed
         self.assertIn('CM_TAG="${local.claude_master_tag}"', nx)
         self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', nx)
-        self.assertIn('echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet -', nx)
-        self.assertIn("/usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master", nx)
+        self.assertIn('echo "$CM_SHA  $CMTMP/claw-master" | sha256sum -c --quiet -', nx)
+        self.assertIn("/usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master", nx)
+        self.assertIn("releases/download/$CM_TAG/claw-master-linux-arm64", nx)
+        # The old name is a link to the new binary, made only once the new binary is there; it is what t-claude runs.
+        self.assertIn('if [ -x /usr/local/bin/claw-master ] && [ "$(readlink /usr/local/bin/claude-master)" != claw-master ]; then', nx)
+        self.assertIn("ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master", nx)
         # the zshenv block: run it for real, twice, against a copy of the stock file
         start = nx.index('ZE=/etc/zsh/zshenv'); end = nx.index("CMZSHENV\nfi\n", start) + len("CMZSHENV\nfi\n")
         block = nx[start:end].replace("${local.claude_master_server_ip}", "203.0.113.5").replace("${local.claude_master_server_port}", "8443")
@@ -679,8 +731,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('CM_SHA="${local.claude_master_sha256_aarch64}"', cf)
         self.assertIn('sha256sum -c --quiet -', cf)
         # install and rename are PART OF the if condition, so a failure of either fails the run
-        self.assertIn('&& install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new \\', cf)
-        self.assertIn("&& mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master; then", cf)
+        self.assertIn('&& install -m 0755 "$CMTMP/claw-master" /usr/local/bin/claw-master.new \\', cf)
+        self.assertIn("&& mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master; then", cf)
+        self.assertIn("releases/download/$CM_TAG/claw-master-linux-arm64", cf)
+        self.assertIn("ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master", cf)
         self.assertNotRegex(cf, r"systemctl\s+(restart|stop|kill)|tmux[- ]?(scroll)?\s+kill|kill-server|pkill")
         # render the heredoc as Terraform does (<<- strips the common indent), then run the zshenv part for real, twice
         body = cf.split("<<-CMD\n", 1)[1].split("\n  CMD\n", 1)[0]
@@ -724,7 +778,7 @@ class ScriptTests(unittest.TestCase):
                 s = script.replace('CM_SHA="203.0.113.5"', "x")  # no-op guard; the sha comes from the template below
                 s = s.replace("ZE=/etc/zsh/zshenv", "ZE=" + os.path.join(d, "zshenv"))
                 s = s.replace('CM_SHA="${local.claude_master_sha256_aarch64}"', 'CM_SHA="%s"' % sha).replace('CM_TAG="${local.claude_master_tag}"', 'CM_TAG="test-tag"')
-                s = s.replace("/usr/local/bin/claude-master", os.path.join(d, "installed-claude-master"))
+                s = s.replace("/usr/local/bin/claw-master", os.path.join(d, "installed-claw-master")).replace("/usr/local/bin/claude-master", os.path.join(d, "installed-claude-master"))
                 return subprocess.run(["bash", "-c", s], capture_output=True, text=True, timeout=30, env=dict(os.environ, PATH=bindir + ":" + os.environ["PATH"]))
             ok = run_with(True, True)
             self.assertEqual(ok.returncode, 0, ok.stderr); self.assertIn("installed", ok.stdout)
@@ -763,7 +817,7 @@ def envoy_config():
 
 
 def rollout():
-    return TF[TF.index("cat > /usr/local/bin/claude-master-rollout"):TF.index("chmod 0755 /usr/local/bin/claude-master-rollout")]
+    return TF[TF.index("cat > /usr/local/bin/claw-master-rollout"):TF.index("chmod 0755 /usr/local/bin/claw-master-rollout")]
 
 
 class EnvoyTests(unittest.TestCase):
@@ -806,7 +860,7 @@ class EnvoyTests(unittest.TestCase):
         r = rollout()
         start = r.index('systemctl restart "claude-master-server@$next"')
         refused = r.index("nothing was switched")
-        switch = r.index('/usr/local/bin/claude-master-envoy-endpoints "$next"')
+        switch = r.index('/usr/local/bin/claw-master-envoy-endpoints "$next"')
         verified = r.index("Envoy did not report")
         record = r.index('echo "$next" > /etc/claude-master/active-color')
         stop = r.index('systemctl stop --no-block "claude-master-server@$active"')
@@ -836,19 +890,19 @@ class EnvoyTests(unittest.TestCase):
         # fails, or a retry would restart the server that is taking traffic.
         r = rollout()
         failed = r[r.index('if [ "$switched" != 1 ]; then'):r.index('echo "$next" > /etc/claude-master/active-color')]
-        back = failed.index('/usr/local/bin/claude-master-envoy-endpoints "$active"')
+        back = failed.index('/usr/local/bin/claw-master-envoy-endpoints "$active"')
         stop = failed.index('systemctl stop "claude-master-server@$next"')
         self.assertLess(back, stop)
         self.assertIn('grep -q "^cert::$IP:$(port_of "$active")::"', failed)
         self.assertIn("exit 1", failed[stop:])
 
     def test_the_endpoint_files_are_replaced_by_a_rename(self):
-        e = TF[TF.index("cat > /usr/local/bin/claude-master-envoy-endpoints"):TF.index("chmod 0755 /usr/local/bin/claude-master-envoy-endpoints")]
+        e = TF[TF.index("cat > /usr/local/bin/claw-master-envoy-endpoints"):TF.index("chmod 0755 /usr/local/bin/claw-master-envoy-endpoints")]
         self.assertIn("tmp=$(mktemp /etc/envoy/eds/.$1.XXXXXX)", e)
         self.assertIn('mv -f "$tmp" "/etc/envoy/eds/$1.yaml"', e)
 
     def test_without_a_color_the_server_is_the_one_from_before_envoy(self):
-        serve = TF[TF.index("cat > /usr/local/bin/claude-master-serve"):TF.index("chmod 0755 /usr/local/bin/claude-master-serve")]
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         self.assertIn("color=$${1:-legacy}", serve)
         self.assertIn('legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;', serve)
 

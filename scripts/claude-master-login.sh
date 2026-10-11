@@ -29,13 +29,13 @@ profiles=("$@")
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }
   if [ "$SERVER" = 1 ]; then
-    # The server's logins belong to its own service account; `claude-master-login` runs as it.
+    # The server's logins belong to its own service account; `claw-master-login` runs as it.
     ssh -t -i "$KEY" "ubuntu@$HOST" "
-      if sudo claude-master-status | grep -qx 'login $p: present'; then
+      if sudo claw-master-status | grep -qx 'login $p: present'; then
         echo '$p: already has a login (skipped)'
       else
         printf '\n== $p: sign in to THAT subscription account, approve, paste the code ==\n'
-        sudo claude-master-login $p
+        sudo claw-master-login $p
       fi"
     continue
   fi
@@ -51,6 +51,6 @@ for p in "${profiles[@]}"; do
 done
 if [ "$SERVER" = 1 ]; then
   # Starting a server that is not running is safe; restarting a running one is the owner's call.
-  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claude-master-status; if ! sudo claude-master-status | grep -q MISSING && ! sudo claude-master-status | grep -q '^server: active'; then sudo claude-master-rollout && sudo claude-master-status; fi"
+  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claw-master-status; if ! sudo claw-master-status | grep -q MISSING && ! sudo claw-master-status | grep -q '^server: active'; then sudo claw-master-rollout && sudo claw-master-status; fi"
 fi
 echo "done: $(printf '%s ' "${profiles[@]}")"

@@ -27,7 +27,7 @@ if [ "$ping" != Online ]; then
 fi
 
 # `cloud-init status --wait` first, so this never races the first boot's own run of the script.
-remote='cloud-init status --wait >/dev/null 2>&1 || true; swapon --show=NAME --noheadings | grep -q . || { fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile; }; aws s3 cp s3://ejc3-dev-scripts/user-data/claude-master-server.sh /tmp/claude-master-server.sh --region '"$region"' && chmod 755 /tmp/claude-master-server.sh && NEEDRESTART_MODE=a /tmp/claude-master-server.sh; rc=$?; rm -f /tmp/claude-master-server.sh; claude-master-status; exit $rc'
+remote='cloud-init status --wait >/dev/null 2>&1 || true; swapon --show=NAME --noheadings | grep -q . || { fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile; }; aws s3 cp s3://ejc3-dev-scripts/user-data/claude-master-server.sh /tmp/claude-master-server.sh --region '"$region"' && chmod 755 /tmp/claude-master-server.sh && NEEDRESTART_MODE=a /tmp/claude-master-server.sh; rc=$?; rm -f /tmp/claude-master-server.sh; claw-master-status; exit $rc'
 
 params=$(python3 -c 'import json, sys; print(json.dumps({"commands": [sys.argv[1]], "executionTimeout": ["900"]}))' "$remote")
 cid=$(aws ssm send-command --region "$region" --instance-ids "$iid" \

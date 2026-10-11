@@ -151,6 +151,15 @@ class ScriptTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0, why)
             self.assertNotIn("CSR=", r.stdout, why)
 
+    def test_the_documents_prefer_the_claw_master_names_and_fall_back_to_the_old_ones(self):
+        # A box that has not yet received the renamed binary (nextjs-dev syncs its setup on a timer) still renews.
+        for script, new, old in (("request", "/usr/local/bin/claw-master", "/usr/local/bin/claude-master"),
+                                 ("sign", "/usr/local/bin/claw-master-sign", "/usr/local/bin/claude-master-sign")):
+            var = "CM_BIN" if script == "request" else "CM_SIGN"
+            line = 'if [ -z "$%s" ]; then %s=%s; [ -x "$%s" ] || %s=%s; fi' % (var, var, new, var, var, old)
+            self.assertIn(line, SCRIPTS[script], script)
+            self.assertIn("%s=${%s:-}" % (var, var), SCRIPTS[script], "an explicit %s still wins" % var)
+
     # sign --------------------------------------------------------------------------------------------------------
     def sign_env(self):
         sentinel = self.tmp / ("signed-%s" % time.time_ns())

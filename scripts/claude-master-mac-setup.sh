@@ -11,7 +11,8 @@
 # ~/Library/LaunchAgents) and leaves the Mac's own `claude`, its login and its settings alone: a
 # plain `claude` still uses that Mac's own subscription. Only the new `claude-pool` command routes
 # inference through the shared pool.
-#   * claude-master and cloudflared, each pinned by version and sha256 and verified ON the Mac
+#   * claw-master (and the link claude-master, its name before the rename) and cloudflared, each pinned by version and
+#     sha256 and verified ON the Mac
 #   * ~/.config/claude-master/cloudflare.env (0600): the Access service token. It travels from
 #     Secrets Manager through ssh STDIN only: never an argument, never written on fcvm or here.
 #   * ~/.config/claude-master/ca.pem: the server's PUBLIC CA certificate, once the server has one
@@ -27,8 +28,8 @@ KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins. Keep CM_TAG equal to claude_master_tag in claude-master-server.tf (a test enforces it) and
 # bump the sha256 values together with it.
-CM_TAG=claude-master-9ff1e5d
-CM_SHA256_DARWIN_ARM64=d828dbb14e34b5d17e397ca1b272d35be4420083bde984410e19012f6e44f39d
+CM_TAG=claw-master-39add35
+CM_SHA256_DARWIN_ARM64=a37f315347dd188d30839e1097b37592abe9c63611223715185b4689fbdc023b
 CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 # The executable inside that tarball: an installed cloudflared is judged by this, not by its version string.
@@ -43,12 +44,12 @@ on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "s
 echo "0/6 the server must be serving the open listener (the tunnel leads nowhere otherwise)"
 SERVER_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=claude-master-server Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
 [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != None ] || { echo "the claude-master server is not running" >&2; exit 1; }
-CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript --parameters 'commands=["cat /var/lib/claude-master/state/ca.pem 2>/dev/null; echo ===STATUS===; claude-master-status 2>&1"]' --query Command.CommandId --output text)
+CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript --parameters 'commands=["cat /var/lib/claude-master/state/ca.pem 2>/dev/null; echo ===STATUS===; claw-master-status 2>&1"]' --query Command.CommandId --output text)
 aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID"
 READY=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
 CA=${READY%%===STATUS===*}
 printf '%s\n' "$READY" | grep -q '^open listener: listening' || {
-  echo "the server is not listening on its open port yet. Finish the five logins (scripts/claude-master-login.sh --server), start claude-master-server, check claude-master-status, then re-run this." >&2
+  echo "the server is not listening on its open port yet. Finish the five logins (scripts/claude-master-login.sh --server), start claude-master-server, check claw-master-status, then re-run this." >&2
   exit 1
 }
 printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE' || { echo "the server has no CA certificate yet" >&2; exit 1; }
@@ -57,18 +58,20 @@ echo "1/6 reaching $ALIAS through fcvm"
 on_mac "'echo \$(hostname) \$(uname -sm)'" || { echo "$ALIAS is not connected: its reverse tunnel to fcvm is down (the Mac must be online and running its tunnel)" >&2; exit 1; }
 [ "$(on_mac "'uname -sm'")" = "Darwin arm64" ] || { echo "this script installs the macOS arm64 builds" >&2; exit 1; }
 
-echo "2/6 installing claude-master $CM_TAG and cloudflared $CFD_VERSION (verified on the Mac)"
+echo "2/6 installing claw-master $CM_TAG and cloudflared $CFD_VERSION (verified on the Mac)"
 on_mac bash -s <<REMOTE
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 mkdir -p "\$HOME/.local/bin" "\$HOME/.config/claude-master" && chmod 700 "\$HOME/.config/claude-master"
 tmp=\$(mktemp -d) && trap 'rm -rf "\$tmp"' EXIT
 sum() { shasum -a 256 "\$1" | cut -d' ' -f1; }
-if [ "\$(sum "\$HOME/.local/bin/claude-master" 2>/dev/null || true)" != "$CM_SHA256_DARWIN_ARM64" ]; then
-  curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claude-master-darwin-arm64" -o "\$tmp/cm"
-  [ "\$(sum "\$tmp/cm")" = "$CM_SHA256_DARWIN_ARM64" ] || { echo "claude-master did not match its pinned sha256" >&2; exit 1; }
-  chmod 755 "\$tmp/cm" && mv -f "\$tmp/cm" "\$HOME/.local/bin/claude-master"
+if [ "\$(sum "\$HOME/.local/bin/claw-master" 2>/dev/null || true)" != "$CM_SHA256_DARWIN_ARM64" ]; then
+  curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claw-master-darwin-arm64" -o "\$tmp/cm"
+  [ "\$(sum "\$tmp/cm")" = "$CM_SHA256_DARWIN_ARM64" ] || { echo "claw-master did not match its pinned sha256" >&2; exit 1; }
+  chmod 755 "\$tmp/cm" && mv -f "\$tmp/cm" "\$HOME/.local/bin/claw-master"
 fi
+# Its name before the rename, as a link, for anyone who still types it.
+ln -sfn claw-master "\$HOME/.local/bin/claude-master"
 # Judged by the hash of the installed EXECUTABLE, never by the version it reports (a substituted binary can
 # say anything, and this one is handed the long-lived Access token).
 if [ "\$(sum "\$HOME/.local/bin/cloudflared" 2>/dev/null || true)" != "$CFD_SHA256_DARWIN_ARM64_BIN" ]; then
@@ -79,7 +82,7 @@ if [ "\$(sum "\$HOME/.local/bin/cloudflared" 2>/dev/null || true)" != "$CFD_SHA2
   mv -f "\$tmp/cloudflared" "\$HOME/.local/bin/cloudflared"
 fi
 "\$HOME/.local/bin/cloudflared" --version | head -1
-shasum -a 256 "\$HOME/.local/bin/claude-master" | cut -c1-16
+shasum -a 256 "\$HOME/.local/bin/claw-master" | cut -c1-16
 REMOTE
 
 echo "3/6 the Access service token (from Secrets Manager, through ssh stdin only)"
@@ -121,7 +124,7 @@ if ! launchctl print "gui/\$(id -u)/dev.cc-games.claude-master-tunnel" >/dev/nul
   echo "claude-pool: the tunnel agent is not loaded (launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/dev.cc-games.claude-master-tunnel.plist)" >&2
   exit 1
 fi
-exec "\$HOME/.local/bin/claude-master" connect --open "127.0.0.1:\$CLAUDE_MASTER_TUNNEL_PORT" --ca "\$D/ca.pem" -- "\$@"
+exec "\$HOME/.local/bin/claw-master" connect --open "127.0.0.1:\$CLAUDE_MASTER_TUNNEL_PORT" --ca "\$D/ca.pem" -- "\$@"
 POOL
 chmod 755 "\$HOME/.local/bin/claude-pool"
 
