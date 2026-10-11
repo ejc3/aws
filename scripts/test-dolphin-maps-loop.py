@@ -29,11 +29,14 @@ class ScheduleTests(unittest.TestCase):
         schedule = block("aws_scheduler_schedule", "dolphin_maps_loop")
         self.assertIn('schedule_expression_timezone = "America/Los_Angeles"', schedule)
         self.assertIn("input    = jsonencode({ mode = each.key })", schedule)
-        self.assertIn('live  = "cron(*/5 6-8 ? * MON-FRI *)"', TF)
-        self.assertIn('sweep = "cron(0 23 ? * SUN *)"', TF)
+        self.assertIn("schedule_expression          = each.value.schedule", schedule)
+        self.assertIn("arn      = aws_lambda_function.dolphin_maps_loop[each.key].arn", schedule)
+        self.assertIn('live  = { schedule = "cron(*/5 6-8 ? * MON-FRI *)", timeout = 300, memory = 1024 }', TF)
+        self.assertIn('sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }', TF)
 
     def test_a_failed_pass_is_not_retried(self):
         self.assertIn("maximum_retry_attempts       = 0", block("aws_lambda_function_event_invoke_config", "dolphin_maps_loop"))
+        self.assertIn("for_each                     = aws_lambda_function.dolphin_maps_loop", block("aws_lambda_function_event_invoke_config", "dolphin_maps_loop"))
         self.assertIn("maximum_retry_attempts       = 0", block("aws_scheduler_schedule", "dolphin_maps_loop"))
 
 
@@ -59,6 +62,7 @@ class AccessTests(unittest.TestCase):
         self.assertIn('dolphin_maps_loop_sub    = "repo:dolphin-labs-hq@316189183/dolphin-maps@1409029367:ref:refs/heads/main"', TF)
         self.assertNotIn("StringLike", role)
         deploy = block("aws_iam_role_policy", "dolphin_maps_loop_deploy")
+        self.assertIn("Resource = [for f in aws_lambda_function.dolphin_maps_loop : f.arn]", deploy)
         self.assertIn('"${aws_s3_bucket.dolphin_maps_loop.arn}/code/*"', deploy)
         self.assertNotRegex(deploy, r"iam:|PassRole|AddPermission")
 
@@ -75,11 +79,19 @@ class AccessTests(unittest.TestCase):
 
 
 class AlarmTests(unittest.TestCase):
-    def test_a_failed_sweep_alarms_on_the_line_the_function_logs(self):
-        # dolphin-maps pipeline/src/aws/lambda.ts logs "loop <mode> failed: <why>" before it throws.
-        self.assertIn('pattern        = "\\"loop sweep failed\\""', block("aws_cloudwatch_log_metric_filter", "dolphin_maps_loop_sweep_failed"))
-        self.assertIn("evaluation_periods  = 1", block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_sweep_failed"))
+    def test_each_loop_is_its_own_function_so_lambda_counts_every_sweep_failure(self):
+        # A timeout, running out of memory or a failed start logs nothing of the function's own: only Lambda's
+        # Errors metric for the sweep's own function sees every failure, and one failed sweep alarms.
+        fn = block("aws_lambda_function", "dolphin_maps_loop")
+        self.assertIn("for_each      = local.dolphin_maps_loop_modes", fn)
+        self.assertIn('function_name = "${local.dolphin_maps_loop_name}-${each.key}"', fn)
+        sweep = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_sweep_failed")
+        self.assertIn('metric_name         = "Errors"', sweep)
+        self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["sweep"].function_name }', sweep)
+        self.assertIn("evaluation_periods  = 1", sweep)
+        self.assertNotIn("aws_cloudwatch_log_metric_filter", TF)
         live = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_errors")
+        self.assertIn('aws_lambda_function.dolphin_maps_loop["live"].function_name', live)
         self.assertIn("evaluation_periods  = 3", live)
         self.assertIn("datapoints_to_alarm = 3", live)
 

@@ -1221,9 +1221,10 @@ Available if a task needs them; neither needs a key on disk.
   secret, turn refresh-news.yml's schedule off in dolphin-labs, then `dolphin_labs_news_enabled = true`
   (both running would bill Haiku and Browserbase twice); an Errors alarm and, once enabled, a 'not running'
   alarm watch it. Output `dolphin_labs_news` holds the deploy workflow's variables.
-- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambda `dolphin-maps-loop` on two EventBridge
-  schedules in America/Los_Angeles time (live samples every 5 minutes on weekday mornings, the sweep and
-  refit on Sunday night; both off until `dolphin_maps_loop_enabled`), reading `browserbase/credentials`
+- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live` and
+  `dolphin-maps-loop-sweep` (one bundle) on EventBridge schedules in America/Los_Angeles time (live samples
+  every 5 minutes on weekday mornings, the sweep and refit on Sunday night; both off until
+  `dolphin_maps_loop_enabled`; one failed sweep alarms), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.

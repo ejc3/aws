@@ -3,15 +3,17 @@
 # (scrape-live.yml, scrape-weekly.yml and the dev box's crontab trigger), which stand down when that repository's
 # variable LOOPS_RUN_IN_AWS is true.
 #
-#   dolphin-maps-loop             the function. Terraform creates it with a stand-in handler
-#                                 (dolphin-maps-loop/placeholder.mjs) and then leaves its code alone:
-#                                 dolphin-maps deploy-loop.yml (main) uploads a bundle to code/ and calls
-#                                 UpdateFunctionCode through dolphin-maps-loop-deploy.
-#   dolphin-maps-loop (live)      every 5 minutes, 06:00-08:55 America/Los_Angeles, weekdays: {"mode": "live"}.
-#                                 The function samples only the routes inside their own morning window; the
-#                                 rest of the invocations return at once without reading a secret.
-#   dolphin-maps-loop (sweep)     Sunday 23:00 America/Los_Angeles: {"mode": "sweep"}, the coming school week's
+#   dolphin-maps-loop-live        every 5 minutes, 06:00-08:55 America/Los_Angeles, weekdays: {"mode": "live"}.
+#                                 It samples only the routes inside their own morning window; the rest of the
+#                                 invocations return at once without reading a secret.
+#   dolphin-maps-loop-sweep       Sunday 23:00 America/Los_Angeles: {"mode": "sweep"}, the coming school week's
 #                                 "typically" ranges, then each area's calibration refit.
+#                                 One bundle, two functions: each loop has its own limits, and Lambda's own Errors
+#                                 metric (timeouts, running out of memory and failed starts included) is that
+#                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a
+#                                 stand-in handler (dolphin-maps-loop/placeholder.mjs) and then leaves their code
+#                                 alone: dolphin-maps deploy-loop.yml (main) uploads the bundle to code/ and calls
+#                                 UpdateFunctionCode on each through dolphin-maps-loop-deploy.
 #   dolphin-maps-loop-<account>   the bucket:
 #                                   journal/  one gzipped record per pass: each page's text and the rows read
 #                                             from it, and the bundle's sha, so a page Google changed can be
@@ -29,8 +31,8 @@
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
-#   the function               journal/ (write); the two secrets (read); its own logs
-#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode and GetFunction on this function only
+#   the two functions          journal/ (write); the two secrets (read); their own logs
+#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode and GetFunction on these two functions only
 #   dev-server-role            journal/ (read, list): replays on the metal boxes
 
 variable "dolphin_maps_loop_enabled" {
@@ -43,9 +45,11 @@ locals {
   dolphin_maps_loop_name   = "dolphin-maps-loop"
   dolphin_maps_loop_bucket = "dolphin-maps-loop-${data.aws_caller_identity.current.account_id}"
   dolphin_maps_loop_sub    = "repo:dolphin-labs-hq@316189183/dolphin-maps@1409029367:ref:refs/heads/main"
-  dolphin_maps_loop_schedules = {
-    live  = "cron(*/5 6-8 ? * MON-FRI *)"
-    sweep = "cron(0 23 ? * SUN *)"
+  # A live pass is a page or two (minutes at most); a sweep is about six minutes of pages and two of refit,
+  # whose memory is set for its CPU share, not its footprint (about 250 MB).
+  dolphin_maps_loop_modes = {
+    live  = { schedule = "cron(*/5 6-8 ? * MON-FRI *)", timeout = 300, memory = 1024 }
+    sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }
   }
 }
 
@@ -187,7 +191,8 @@ data "archive_file" "dolphin_maps_loop_placeholder" {
 }
 
 resource "aws_cloudwatch_log_group" "dolphin_maps_loop" {
-  name              = "/aws/lambda/${local.dolphin_maps_loop_name}"
+  for_each          = local.dolphin_maps_loop_modes
+  name              = "/aws/lambda/${local.dolphin_maps_loop_name}-${each.key}"
   retention_in_days = 30
 }
 
@@ -226,31 +231,30 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
         Sid      = "WriteOwnLogs"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "${aws_cloudwatch_log_group.dolphin_maps_loop.arn}:*"
+        Resource = [for g in aws_cloudwatch_log_group.dolphin_maps_loop : "${g.arn}:*"]
       },
     ]
   })
 }
 
 resource "aws_lambda_function" "dolphin_maps_loop" {
-  function_name = local.dolphin_maps_loop_name
-  description   = "dolphin-maps loops: live Google Maps samples on school mornings, the weekly sweep and refit; commits to the repository, journal to S3"
+  for_each      = local.dolphin_maps_loop_modes
+  function_name = "${local.dolphin_maps_loop_name}-${each.key}"
+  description   = each.key == "live" ? "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3" : "dolphin-maps weekly loop: the school week's typical ranges and the calibration refit, committed to the repository, journal to S3"
   role          = aws_iam_role.dolphin_maps_loop.arn
   handler       = "placeholder.handler"
   runtime       = "nodejs22.x"
   architectures = ["arm64"]
-  # A sweep (about two minutes of pages) and the refit (about two minutes of CPU on a dev box) fit well
-  # inside the limit; memory is set for the refit's CPU share, not its footprint (about 250 MB).
-  timeout     = 900
-  memory_size = 2048
-  filename    = data.archive_file.dolphin_maps_loop_placeholder.output_path
-  # One pass at a time: two passes' commits would only retry against each other, but a sweep must never
-  # run beside itself.
+  timeout       = each.value.timeout
+  memory_size   = each.value.memory
+  filename      = data.archive_file.dolphin_maps_loop_placeholder.output_path
+  # One pass of each loop at a time: two passes' commits would only retry against each other, but a sweep
+  # must never run beside itself.
   reserved_concurrent_executions = 1
 
   logging_config {
     log_format = "Text"
-    log_group  = aws_cloudwatch_log_group.dolphin_maps_loop.name
+    log_group  = aws_cloudwatch_log_group.dolphin_maps_loop[each.key].name
   }
 
   environment {
@@ -264,7 +268,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
     }
   }
 
-  tags = { Name = local.dolphin_maps_loop_name, Project = "dolphin-maps" }
+  tags = { Name = "${local.dolphin_maps_loop_name}-${each.key}", Project = "dolphin-maps" }
 
   # deploy-loop.yml owns the code and the handler it names; Terraform owns everything else.
   lifecycle {
@@ -275,7 +279,8 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
 # A failed pass is not retried by Lambda: the next live pass is five minutes away, and a failed sweep is
 # better rerun by hand after a look at its journal.
 resource "aws_lambda_function_event_invoke_config" "dolphin_maps_loop" {
-  function_name                = aws_lambda_function.dolphin_maps_loop.function_name
+  for_each                     = aws_lambda_function.dolphin_maps_loop
+  function_name                = each.value.function_name
   maximum_retry_attempts       = 0
   maximum_event_age_in_seconds = 300
 }
@@ -302,25 +307,25 @@ resource "aws_iam_role_policy" "dolphin_maps_loop_scheduler" {
     Statement = [{
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.dolphin_maps_loop.arn
+      Resource = [for f in aws_lambda_function.dolphin_maps_loop : f.arn]
     }]
   })
 }
 
 # In Los Angeles time, as the routes' arrive-by times are: no daylight-saving arithmetic anywhere.
 resource "aws_scheduler_schedule" "dolphin_maps_loop" {
-  for_each   = local.dolphin_maps_loop_schedules
+  for_each   = local.dolphin_maps_loop_modes
   name       = "${local.dolphin_maps_loop_name}-${each.key}"
   group_name = "default"
   state      = var.dolphin_maps_loop_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window { mode = "OFF" }
 
-  schedule_expression          = each.value
+  schedule_expression          = each.value.schedule
   schedule_expression_timezone = "America/Los_Angeles"
 
   target {
-    arn      = aws_lambda_function.dolphin_maps_loop.arn
+    arn      = aws_lambda_function.dolphin_maps_loop[each.key].arn
     role_arn = aws_iam_role.dolphin_maps_loop_scheduler.arn
     input    = jsonencode({ mode = each.key })
 
@@ -335,10 +340,10 @@ resource "aws_scheduler_schedule" "dolphin_maps_loop" {
 # missing secret or a changed page; one failure is a bad page load and the next pass covers it.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_errors" {
   alarm_name          = "dolphin-maps-loop-errors"
-  alarm_description   = "dolphin-maps-loop failed three passes running: the morning's live samples are not being kept. See /aws/lambda/dolphin-maps-loop and the journal in the dolphin-maps-loop bucket."
+  alarm_description   = "dolphin-maps-loop-live failed three passes running: the morning's live samples are not being kept. See /aws/lambda/dolphin-maps-loop-live and journal/live/ in the dolphin-maps-loop bucket."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
-  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop.function_name }
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["live"].function_name }
   statistic           = "Sum"
   period              = 300
   evaluation_periods  = 3
@@ -350,24 +355,14 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_errors" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
-# Sweep: it runs once a week, so one failure is a week without new ranges or a refit. The function logs
-# "loop sweep failed: <why>" before it throws.
-resource "aws_cloudwatch_log_metric_filter" "dolphin_maps_loop_sweep_failed" {
-  name           = "dolphin-maps-loop-sweep-failed"
-  log_group_name = aws_cloudwatch_log_group.dolphin_maps_loop.name
-  pattern        = "\"loop sweep failed\""
-  metric_transformation {
-    name      = "SweepFailures"
-    namespace = "DolphinMapsLoop"
-    value     = "1"
-  }
-}
-
+# Sweep: it runs once a week, so one failure is a week without new ranges or a refit. Lambda's Errors metric for
+# the sweep's own function counts every failure: a thrown error, a timeout, running out of memory, a failed start.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_sweep_failed" {
   alarm_name          = "dolphin-maps-loop-sweep-failed"
-  alarm_description   = "dolphin-maps' weekly sweep failed: no new typical ranges or refit this week. See /aws/lambda/dolphin-maps-loop and journal/sweep/ in the dolphin-maps-loop bucket; rerun with {\"mode\": \"sweep\"}."
-  namespace           = "DolphinMapsLoop"
-  metric_name         = "SweepFailures"
+  alarm_description   = "dolphin-maps' weekly sweep failed: no new typical ranges or refit this week. See /aws/lambda/dolphin-maps-loop-sweep and journal/sweep/ in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"sweep\"}."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["sweep"].function_name }
   statistic           = "Sum"
   period              = 3600
   evaluation_periods  = 1
@@ -423,7 +418,7 @@ resource "aws_iam_role_policy" "dolphin_maps_loop_deploy" {
         # GetFunction to wait for the update to finish; UpdateFunctionConfiguration only to name the bundle's
         # handler. Not its role, environment or permissions: those are Terraform's.
         Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration"]
-        Resource = aws_lambda_function.dolphin_maps_loop.arn
+        Resource = [for f in aws_lambda_function.dolphin_maps_loop : f.arn]
       },
     ]
   })
@@ -461,7 +456,7 @@ output "dolphin_maps_loop" {
   value = {
     AWS_REGION               = var.aws_region
     AWS_LOOP_DEPLOY_ROLE_ARN = aws_iam_role.dolphin_maps_loop_deploy.arn
-    LOOP_LAMBDA_FUNCTION     = aws_lambda_function.dolphin_maps_loop.function_name
+    LOOP_LAMBDA_FUNCTIONS    = join(" ", [for f in aws_lambda_function.dolphin_maps_loop : f.function_name])
     LOOP_BUCKET              = aws_s3_bucket.dolphin_maps_loop.bucket
     LOOP_JOURNAL_PREFIX      = "journal/"
     LOOP_GITHUB_APP_SECRET   = aws_secretsmanager_secret.dolphin_maps_loop_github_app.name
