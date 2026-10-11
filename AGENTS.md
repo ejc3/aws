@@ -1174,6 +1174,8 @@ Every account is opted out of AWS AI services keeping or using what they are sen
   permission. Its key is in `colton-games/moderation-worker-key` (administration only). Copy its three keys into
   `workers-stage/colton-games` and run `scripts/workers-stage-secrets.sh colton-games`.
 - nextjs-dev's role may call it too, for building the feature on the box.
+- The production Worker `colton-games-prod` has its own user, `colton-games-moderation-worker-prod`, whose key Terraform writes
+  into `workers-prod/colton-games/terraform` only ("Colton Games production on Cloudflare").
 
 ### dolphin-films credentials
 
@@ -1241,7 +1243,7 @@ games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing
 get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees
 Cloudflare's addresses instead of players'. Cloudflare's protections reach production when production is served by a Worker
 (the move above), or, for the multiplayer entries, when those records are proxied and the router reads the client address from
-`CF-Connecting-IP` and accepts connections only from Cloudflare. All nine zones are on the Free plan. Production stays on Vercel; the Worker is a
+`CF-Connecting-IP` and accepts connections only from Cloudflare. All nine zones are on the Free plan. Production stays on Vercel (colton-games' move is prepared: "Colton Games production on Cloudflare" below); the Worker is a
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
@@ -1293,6 +1295,48 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
   Access, still unreachable); (3) set `urls = true` and, in the repo, `workers_dev`/`preview_urls` true. Never reverse 2 and 3.
+
+### Colton Games production on Cloudflare (prepared, not switched)
+
+The owner decided on 2026-10-11 to move colton-games production from Vercel to Cloudflare Workers so that the zone's WAF,
+rate limiting and bot rules cover it. Everything is in place; **the switch is one line and has not been flipped**.
+
+- **The Worker.** `colton-games-prod`: the games repo's Cloudflare workflow builds once from `main` and deploys
+  `colton-games-stage`, then `wrangler deploy --env production` (`wrangler.jsonc` `env.production`). Wrangler owns the
+  code. Before the cutover it answers only at `https://colton-games-prod.cc-games.workers.dev`, behind a HOSTNAME Access
+  application (`cloudflare-production.tf`: family allowlist plus the `cc-games-access-service-token`). Never cover it with a
+  Worker-native (`worker`) destination as the staging Workers are: that follows the Worker onto every route and Custom
+  Domain and would put Access in front of production at the cutover.
+- **Its secrets** are production's and never staging's (`workers-prod-secrets.tf`): `workers-prod/colton-games/terraform`
+  is written by Terraform with the same values it writes to Vercel production (AUTH_SECRET, so sessions survive the move;
+  the Google client; site admins; ACCOUNT_SAVES; the MP_* set and its signing keys), plus AUTH_URL, the declared environment
+  and two IAM users' keys, because a Worker cannot present a Vercel OIDC token: `colton-games-moderation-worker-prod`
+  (DetectModerationLabels) and `games-mp-launcher-worker` (invoke `games-mp-launch-production`). `workers-prod/colton-games`
+  holds what Terraform does not: the Supabase URL and secret key (from the Vercel integration) and production's
+  SKYHOOK_LEADERBOARD_SECRET. Load both with `scripts/workers-prod-secrets.sh colton-games` after a deploy has finished,
+  and again after any rotation; it refuses a name in both containers.
+- **cc-games.org zone protection** (Free plan), applied and inert while the records are DNS-only: Always Use HTTPS, TLS 1.2
+  minimum, SSL Full (strict), HSTS as Vercel sends it, Block AI bots, four WAF custom rules (engine callbacks skip the
+  browser checks; scanner paths, unused methods and UA-less API calls blocked) and the one rate-limiting rule (100 requests
+  per address per 10 s on `/api/*` outside `/api/mp/`). **Bot Fight Mode stays off**: on Free it cannot be skipped and
+  would challenge the engines' callbacks and every API client. The provider token (`cloudflare-tunnel-token`) has Zone
+  Settings, Zone WAF, Bot Management and Workers Routes write as a policy scoped to the cc-games.org zone only, added
+  2026-10-11 with one PUT of the token's own definition; another zone needs the same before its protections can be applied.
+- **The cutover is `local.colton_games_production_on_cloudflare = true`** in `cloudflare-production.tf`: the cc-games.org
+  apex record becomes proxied (content unchanged, Vercel's address) and a Workers route sends `cc-games.org/*` to
+  `colton-games-prod`. Either half alone is harmless (a route on a DNS-only record does nothing; a proxied record without
+  the route reaches Vercel over Full strict), so the apply has no unsafe order. `false` is the rollback and is the same
+  shape. A Custom Domain is deliberately not used: it cannot coexist with the record, so the switch would be delete-then-
+  attach with an outage between. `www.cc-games.org` and every old domain stay DNS-only on Vercel's 308 redirects.
+- **Keep the Vercel project after the cutover.** `colton-games.vercel.app` is the saves bridge's primary address
+  (`PRIMARY_SAVE_ORIGIN` in the games repo), the redirects for www and the old domains are Vercel project domains, and a
+  live Vercel production deployment is what makes the rollback instant. Vercel cannot renew cc-games.org's certificate while
+  the record is proxied; a rollback after its expiry re-issues it on demand, which takes minutes.
+- **Before flipping it**, in order: the production Worker deployed from `main` and its secrets loaded; `curl` with the
+  service token at the workers.dev address returns the home page and `/api/health`; a plan of the one-line change shows
+  exactly the record update (proxied, ttl 1, comment) and the route create. **After**: sign-in (the callback is
+  `https://cc-games.org/api/auth/callback/google`, already registered), account saves, a picture upload and its scan, a
+  multiplayer launch (`mptest` with the test key), and the Cloudflare security events for false positives.
 
 ### Claude Code Sync
 
