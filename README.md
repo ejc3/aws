@@ -2276,6 +2276,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
 | dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site on Vercel with Google sign-in and a Turso store; its credentials per environment, and its CI runners) | `dolphin-films.tf` (secret containers and readers; bring-up order in its header), `runner-repos.tf` and `runner-app.tf` (served under the `dolphin` label) |
+| Host access audit (reports opens of registered paths on hosts and any use of registered principals; the registry is private, see the doc) | `access-audit.tf`, `scripts/access-audit.py`, `docs/access-audit.md` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
 `AGENTS.md` contains the deeper operational constraints, nested-virtualization details,
