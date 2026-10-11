@@ -1314,6 +1314,26 @@ Next.js users authenticate independently. Jumpboxes intentionally leave interact
 Claude/Codex login to the operator rather than storing those device credentials in
 Terraform.
 
+The administration agent's own credentials (`github-admin-tokens.tf`) are containers that only the jumpbox role can
+read. Terraform creates them empty and they are filled once by hand, in the owner's browser session, because neither
+GitHub nor Vercel creates the first such credential by API. On a cold start, after the containers exist:
+
+- `github-app/aws-admin`: create the GitHub App from a manifest (GitHub's app-manifest flow: post the manifest to
+  `https://github.com/settings/apps/new`, click Create, exchange the returned code with
+  `POST /app-manifests/{code}/conversions`), store `{app_id, slug, client_id, private_key, webhook_secret,
+  installations}` as JSON, install the app on each owner with all repositories, and record the installation ids
+  (`GET /app/installations` with the app's JWT). `scripts/github-app-token.py OWNER` then mints tokens.
+- `github-admin-token/<owner>`: a fine-grained token per owner, all repositories, with the permissions listed in
+  `AGENTS.md`; the longest expiry the owner allows.
+- `vercel-admin-token`: a full-account token from the owner's Vercel account settings (Tokens, scope Full Account).
+
+Put each value from stdin or a 0600 file, never on a command line:
+
+```bash
+read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \
+  --secret-id vercel-admin-token --secret-string file:///dev/stdin; unset T
+```
+
 Every setup script also gives an account that has no user-level agent instructions a
 starting file (`user-agents.tf`): `~/.codex/AGENTS.md`, which Codex reads, with
 `~/.claude/CLAUDE.md`, which Claude Code reads, as a symlink to it. The text is
