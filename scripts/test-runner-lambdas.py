@@ -2295,9 +2295,42 @@ def case_bootstrap_cleanup_is_bounded_by_pages_and_short_client_timeouts():
     result = module["cleanup_expired_bootstrap_parameters"](NOW)
     assert len(ssm.metadata_calls) == 2 and result["truncated"] is True, result
     assert ssm.metadata_calls[1]["NextToken"] == "more", ssm.metadata_calls
-    options = [kw["config"] for service, kw in module["_test_client_options"] if service == "ssm" and "config" in kw]
-    assert len(options) == 1 and options[0].connect_timeout == 2 and options[0].read_timeout == 2
+    options = [kw["config"] for service, kw in module["_test_client_options"]
+               if service == "ssm" and "config" in kw and kw["config"].connect_timeout == 2]
+    assert len(options) == 1 and options[0].read_timeout == 2
     assert options[0].retries == {"total_max_attempts": 1}, options
+
+
+def case_held_leases_are_emitted_as_a_metric():
+    # Issue #48: the held count and the longest unobserved time reach CloudWatch as EMF every poll, and an alarm reads them.
+    src = CLEANUP_SRC
+    assert "'Name': 'HeldLeases'" in src and "'Name': 'HeldLeaseMaxUnobservedMinutes'" in src
+    body = src.split("def hold(instance, instance_id, github_silent=False):")[1]
+    calls = re.findall(r"hold\(instance, instance_id(?:, github_silent=(?:True|\([^)]*\)))?\)", body)
+    assert len(calls) == 8, calls
+    assert "held.append(instance_id)" not in body.split("held.append(instance_id)", 1)[1].split("return {'terminated'")[0]
+    # Only the two holds that come from GitHub's silence feed the outage timer (a missing row or a failed write must not).
+    silent = [c for c in calls if "github_silent=" in c]
+    assert silent == ["hold(instance, instance_id, github_silent=True)", "hold(instance, instance_id, github_silent=(fresh_verdict == HOLD))"], silent
+    # Emitted right after the lease sweep, before the optional phases.
+    assert src.index("'event': 'runner_lease_holds'") < src.index("# Phase 2: runners whose current job"), "emit before Phase 2"
+    tf = (Path(__file__).resolve().parent.parent / "cost-alerts.tf").read_text()
+    block = tf.split('resource "aws_cloudwatch_metric_alarm" "runner_leases_held"', 1)[1].split("\n}\n", 1)[0]
+    assert 'metric_name         = "HeldLeaseMaxUnobservedMinutes"' in block and "threshold           = 60" in block, block
+
+def case_every_sweep_client_is_bounded():
+    # Issue #47: a stalled call must cost a known few seconds, not the SDK's minute-long defaults.
+    module = cleanup(FakeEC2(), FakeGitHub())
+    seen = {}
+    for service, kw in module["_test_client_options"]:
+        cfg = kw.get("config")
+        seen.setdefault(service, []).append(cfg)
+    for service in ("ec2", "ssm", "lambda", "dynamodb"):
+        assert seen.get(service), f"no {service} client built"
+        for cfg in seen[service]:
+            assert cfg is not None, f"a {service} client has no bounded config"
+            assert cfg.connect_timeout <= 3 and cfg.read_timeout <= 8, (service, vars(cfg))
+            assert cfg.retries.get("total_max_attempts", 99) <= 2, (service, cfg.retries)
 
 
 def case_bootstrap_cleanup_time_budget_prevents_late_deletion():
