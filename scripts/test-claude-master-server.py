@@ -118,7 +118,7 @@ class ServiceTests(unittest.TestCase):
     def test_the_unit_waits_for_every_login_and_is_sandboxed(self):
         profiles = re.search(r"claude_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', profiles)
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         self.assertIn("ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current", TF)
         for flag in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/claude-master", "PrivateTmp=yes"):
             self.assertIn(flag, TF)
@@ -253,7 +253,7 @@ class ObservabilityTests(unittest.TestCase):
         # Fallback order: the first is preferred when quotas tie, so the owner's own subscription is the last resort.
         tf_order = re.search(r'claude_master_profiles = \[([^\]]*)\]', TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', tf_order)
-        self.assertEqual(names, ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-ejc3"])
+        self.assertEqual(names, ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"])
         login = (ROOT / "scripts" / "claude-master-login.sh").read_text()
         self.assertIn("profiles=(" + " ".join(names) + ")", login)
 
