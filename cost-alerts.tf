@@ -306,6 +306,26 @@ resource "aws_cloudwatch_metric_alarm" "runner_cleanup_silent" {
   period              = 300
 }
 
+# A runner whose lease the cleanup Lambda is HOLDING (GitHub said nothing usable about it) for over an hour: GitHub is
+# down or unreachable for the fleet, and held leases are stretching toward the 13h30m ceiling (issue #48). Read the
+# Lambda's HOLDING lines and GitHub's status; nothing is wrong with the runners themselves.
+resource "aws_cloudwatch_metric_alarm" "runner_leases_held" {
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "runner-leases-held"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  threshold           = 60
+  alarm_description   = "github-runner-cleanup has held a runner's lease for 60+ minutes because GitHub says nothing usable about it: a GitHub outage is stretching leases toward the age ceiling"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+  namespace           = "GitHubRunners"
+  metric_name         = "HeldLeaseMaxUnobservedMinutes"
+  statistic           = "Maximum"
+  period              = 300
+}
+
 # Alert if any runner is running for more than 2 hours. Warm reuse (up to 12 hours,
 # runner-autoscale.tf) can keep a host busy that long on a heavy day, so read it as "look",
 # not "broken".

@@ -2380,12 +2380,12 @@ data "archive_file" "runner_cleanup" {
           """
           NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
 
-          def __init__(self, regions, also=()):
+          def __init__(self, regions, also=(), config=None):
               self.regions = list(regions)
               self.primary = self.regions[0]
               # `also` are regions that are never READ as part of the fleet but may still be written to: the AMI
               # builders always run in us-west-1, whichever regions the runners are in.
-              self.clients = {region: boto3.client('ec2', region_name=region) for region in dict.fromkeys(self.regions + list(also))}
+              self.clients = {region: boto3.client('ec2', region_name=region, **({'config': config} if config else {})) for region in dict.fromkeys(self.regions + list(also))}
               self.owner = {}
 
           def region_of(self, instance_id):
@@ -2459,10 +2459,14 @@ data "archive_file" "runner_cleanup" {
       BUILDER_REGION = 'us-west-1'
       # The app runners (runner-app.tf) have not moved and stay in us-west-1 whichever regions the fcvm runners are in.
       APP_RUNNER_REGION = 'us-west-1'
-      ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION])
-      ssm = boto3.client('ssm', region_name='us-west-1')
-      lambda_client = boto3.client('lambda', region_name='us-west-1')
-      dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      # Every client the sweep uses is bounded (issue #47): with the SDK's defaults (60 s connect, 60 s read, legacy retries)
+      # one stalled CreateTags or TerminateInstances could take most of the 240 s budget, and a Lambda timeout cannot be
+      # caught, so every instance after it went unswept that poll. Now one call costs at most about 2 x (3 + 8) seconds.
+      SWEEP_CLIENT = Config(connect_timeout=3, read_timeout=8, retries={'mode': 'standard', 'total_max_attempts': 2})
+      ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION], config=SWEEP_CLIENT)
+      ssm = boto3.client('ssm', region_name='us-west-1', config=SWEEP_CLIENT)
+      lambda_client = boto3.client('lambda', region_name='us-west-1', config=SWEEP_CLIENT)
+      dynamodb = boto3.client('dynamodb', region_name='us-west-1', config=SWEEP_CLIENT)
       # This optional metadata-only sweep must not inherit SDK's minute-long
       # timeouts/retries and consume the lifecycle controller's whole budget.
       bootstrap_ssm = boto3.client('ssm', region_name='us-west-1', config=Config(
@@ -3564,6 +3568,18 @@ data "archive_file" "runner_cleanup" {
           # Instances whose lease was neither renewed nor allowed to expire,
           # because GitHub said nothing usable about them this poll.
           held = []
+          # How long the longest-held of them has gone without a usable answer: its seen stamp, else its launch
+          # (issue #48). Emitted with the held count as EMF at the end of the poll, so a sustained GitHub outage,
+          # which can stretch a lease to the 13h30m ceiling, is an alarm rather than a log line.
+          held_unobserved_minutes = [0.0]
+
+          def hold(instance, instance_id):
+              try:
+                  since = parse_ts(get_tag(instance, SEEN_TAG)) or instance['LaunchTime']
+                  held_unobserved_minutes[0] = max(held_unobserved_minutes[0], (now - since).total_seconds() / 60)
+              except Exception:
+                  pass   # never let the measurement break the sweep
+              held.append(instance_id)
           # Instances EC2 refused to terminate. They are STILL RUNNING, so they must
           # never appear in `terminated`, and the poll must not read as a clean sweep.
           terminate_failed = []
@@ -3769,7 +3785,7 @@ data "archive_file" "runner_cleanup" {
                               or (isinstance(registration, dict)
                                   and registration['state'] == 'reaping')):
                           if lease_expires is None or lease_expires > now:
-                              held.append(instance_id)
+                              hold(instance, instance_id)
                               print(f'{instance_id}: no registration row yet; holding '
                                     f'until the lease at {lease_expires_str or "unset"}')
                               continue
@@ -3791,7 +3807,7 @@ data "archive_file" "runner_cleanup" {
                               or lease_was_renewed(launch_time, lease_expires_str))
                           on_roster = roster is not None and runner_name in roster
                           if registered_before or on_roster:
-                              held.append(instance_id)
+                              hold(instance, instance_id)
                               print(f'{instance_id}: REGISTRATION ROW MISSING for a runner '
                                     f'that did register (roster lists it: {on_roster}, '
                                     f'seen stamp or renewed lease: {registered_before}). '
@@ -3799,7 +3815,7 @@ data "archive_file" "runner_cleanup" {
                                     f'never registered.')
                               continue
                           if registration is None and not claim_reaping(instance_id, now):
-                              held.append(instance_id)
+                              hold(instance, instance_id)
                               print(f'{instance_id}: bootstrap won the registration row, or '
                                     f'the table could not be read; holding')
                               continue
@@ -3889,7 +3905,7 @@ data "archive_file" "runner_cleanup" {
                           seen_at = parse_ts(get_tag(instance, SEEN_TAG))
                           unobserved = (f'{(now - seen_at).total_seconds() / 60:.0f}m'
                                         if seen_at else 'its whole life')
-                          held.append(instance_id)
+                          hold(instance, instance_id)
                           print(f'{instance_id}: HOLDING the lease at '
                                 f'{lease_expires_str or "unset"} - GitHub has said nothing '
                                 f'usable about {runner_name} for {unobserved} '
@@ -3911,10 +3927,10 @@ data "archive_file" "runner_cleanup" {
                                   print(f'{instance_id}: busy, renewed lease until {new_expiry}')
                                   renewed.append(instance_id)
                               else:
-                                  held.append(instance_id)
+                                  hold(instance, instance_id)
                                   print(f'{instance_id}: renewal failed; lease remains unset')
                           elif renew_lease(instance_id, now) is None:
-                              held.append(instance_id)
+                              hold(instance, instance_id)
                           continue
 
                       minutes_until_expiry = (lease_expires - now).total_seconds() / 60
@@ -3929,7 +3945,7 @@ data "archive_file" "runner_cleanup" {
                               print(f'{instance_id}: busy, renewed lease until {new_expiry}')
                               renewed.append(instance_id)
                           else:
-                              held.append(instance_id)
+                              hold(instance, instance_id)
                               print(f'{instance_id}: renewal failed; lease remains '
                                     f'{lease_expires_str}')
                           continue
@@ -3948,7 +3964,7 @@ data "archive_file" "runner_cleanup" {
                               fresh_verdict = lease_verdict(
                                   {runner_name: fresh} if fresh else None, runner_name, True)
                               if fresh_verdict != EXPIRE:
-                                  held.append(instance_id)
+                                  hold(instance, instance_id)
                                   print(f'{instance_id}: lease expired, but the runner did '
                                         f'not read as idle on a fresh read; holding')
                                   continue
@@ -4189,6 +4205,21 @@ data "archive_file" "runner_cleanup" {
                       idle_terminated.append(instance_id)
                   else:
                       terminate_failed.append(instance_id)
+
+          print(json.dumps({
+              '_aws': {
+                  'Timestamp': int(now.timestamp() * 1000),
+                  'CloudWatchMetrics': [{
+                      'Namespace': 'GitHubRunners',
+                      'Dimensions': [[]],
+                      'Metrics': [{'Name': 'HeldLeases', 'Unit': 'Count'},
+                                  {'Name': 'HeldLeaseMaxUnobservedMinutes', 'Unit': 'None'}]
+                  }]
+              },
+              'event': 'runner_lease_holds',
+              'HeldLeases': len(held),
+              'HeldLeaseMaxUnobservedMinutes': round(held_unobserved_minutes[0], 1),
+          }))
 
           return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF
