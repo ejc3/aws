@@ -741,13 +741,13 @@ class TerraformSafetyTests(unittest.TestCase):
     def test_shipped_pattern_map_is_the_single_source_for_rules_and_watchdog(self):
         for name in ("findings",):
             rule = block(REGIONAL, "aws_cloudwatch_event_rule", name)
-            self.assertRegex(rule, r"for_each\s*=\s*local\.security_event_patterns")
+            self.assertRegex(rule, r"for_each\s*=\s*var\.forward_findings \? local\.security_event_patterns : \{\}")
             self.assertRegex(rule, r"event_pattern\s*=\s*each\.value")
             self.assertRegex(rule, r"length\(each\.value\)\s*<=\s*2048")
             self.assertRegex(rule, r'state\s*=\s*each\.key\s*==\s*"security-forward-audit"\s*\?\s*"ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"\s*:\s*"ENABLED"')
             self.assertNotIn("is_enabled", rule)
         target = block(REGIONAL, "aws_cloudwatch_event_target", "central")
-        self.assertRegex(target, r"for_each\s*=\s*local\.security_event_patterns")
+        self.assertRegex(target, r"for_each\s*=\s*var\.forward_findings \? local\.security_event_patterns : \{\}")
         self.assertIn("aws_cloudwatch_event_rule.findings[each.key].name", target)
         self.assertRegex(REGIONAL, r'output "event_patterns"\s*\{\s*value\s*=\s*local\.security_event_patterns')
         function = block(TERRAFORM, "aws_lambda_function", "security_delivery_health")
@@ -761,7 +761,7 @@ class TerraformSafetyTests(unittest.TestCase):
     def test_central_rule_accepts_forwarded_management_reads_without_broadening_pattern(self):
         rule = block(TERRAFORM, "aws_cloudwatch_event_rule", "security_notify")
         self.assertRegex(rule, r'\bstate\s*=\s*"ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"')
-        self.assertRegex(rule, r'event_pattern\s*=\s*jsonencode\(\{ account = local\.security_account_ids \}\)')
+        self.assertRegex(rule, r'event_pattern\s*=\s*jsonencode\(\{ account = concat\(local\.security_account_ids, \[aws_organizations_account\.dolphin\.id\]\) \}\)')
         self.assertNotIn("is_enabled", rule)
 
     @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free semantic fixtures run above")
@@ -1125,7 +1125,7 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertNotRegex(target, r"\bretry_policy\s*\{")
         self.assertRegex(target, r"\barn\s*=\s*var\.central_event_bus_arn\b")
         self.assertRegex(target, r"\brole_arn\s*=\s*var\.forwarding_role_arn\b")
-        self.assertIn("aws_sqs_queue.delivery_failures.arn", target)
+        self.assertIn("aws_sqs_queue.delivery_failures[0].arn", target)
         for name, age, attempts in (("security_notify", 86400, 185), ("security_delivery_health", 300, 2)):
             target = block(TERRAFORM, "aws_cloudwatch_event_target", name)
             self.assertEqual(len(re.findall(r"\bretry_policy\s*\{", target)), 1)
@@ -1175,6 +1175,47 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertRegex(block(TERRAFORM, "aws_cloudwatch_log_group", "security_delivery_health"),
                          r"retention_in_days\s*=\s*30\b")
         self.assertIn('schedule_expression = "rate(5 minutes)"', block(TERRAFORM, "aws_cloudwatch_event_rule", "security_delivery_health"))
+
+
+DOLPHIN = (ROOT / "dolphin-security.tf").read_text()
+
+
+class DolphinSecurityTests(unittest.TestCase):
+    """The Dolphin account is overseen from here and gets no path into this account (dolphin-security.tf)."""
+
+    def test_dolphin_is_not_a_forwarding_account(self):
+        accounts = re.search(r"security_account_ids = \[(.*?)\]", TERRAFORM, re.S).group(1)
+        self.assertNotIn("dolphin", accounts)
+        for name in ("aws_s3_bucket_policy", "aws_cloudwatch_event_bus_policy"):
+            for _, body in re.findall(r'^resource "' + name + r'" "([^"]+)" \{(.*?)^\}', TERRAFORM, re.M | re.S):
+                self.assertNotIn("dolphin", body)
+
+    def test_every_region_is_monitored_without_forwarding_and_joined_by_invitation(self):
+        modules = dict(re.findall(r'^module "dolphin_security_([a-z0-9_]+)" \{(.*?)^\}', DOLPHIN, re.M | re.S))
+        self.assertEqual(set(modules), {region.replace("-", "_") for region in REGIONS})
+        for region, body in modules.items():
+            self.assertRegex(body, r"forward_findings\s*=\s*false")
+            self.assertIn("aws_s3_bucket.dolphin_security_config", body)
+            member = block(DOLPHIN, "aws_guardduty_member", "dolphin_" + region)
+            self.assertIn("module.security_main_" + region + ".guardduty_detector_id", member)
+            accepter = block(DOLPHIN, "aws_guardduty_invite_accepter", "dolphin_" + region)
+            self.assertIn("module.dolphin_security_" + region + ".guardduty_detector_id", accepter)
+            self.assertIsNotNone(re.search(r'^module "security_defaults_dolphin_' + region + r'" \{', DOLPHIN, re.M))
+        posture = {region for region, body in modules.items() if "local.security_posture_enabled" in body}
+        self.assertEqual(posture, {"us_west_1"})
+
+    def test_dolphin_providers_assume_only_the_organization_role(self):
+        for body in re.findall(r'^provider "aws" \{(.*?)^\}', DOLPHIN, re.M | re.S):
+            self.assertIn('alias  = "dolphin_', body)
+            self.assertIn(":role/OrganizationAccountAccessRole", body)
+
+    def test_inspector_rule_is_pinned_to_the_dolphin_account(self):
+        rule = block(DOLPHIN, "aws_cloudwatch_event_rule", "dolphin_security_inspector")
+        self.assertIn("AwsAccountId = [aws_organizations_account.dolphin.id]", rule)
+        self.assertIn(':product/aws/inspector', rule)
+        self.assertIn('"dolphin-security-inspector"', block(TERRAFORM, "aws_iam_role", "security_forward"))
+        self.assertIn("aws_cloudwatch_event_rule.dolphin_security_inspector.arn",
+                      block(TERRAFORM, "aws_sqs_queue_policy", "security_delivery_failures"))
 
 
 if __name__ == "__main__":

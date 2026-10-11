@@ -397,7 +397,8 @@ resource "aws_iam_role" "security_forward" {
       Action    = "sts:AssumeRole"
       Condition = {
         StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
-        ArnLike = { "aws:SourceArn" = [for rule in ["security-forward-findings", "security-forward-audit"] :
+        # dolphin-security-inspector: dolphin-security.tf.
+        ArnLike = { "aws:SourceArn" = [for rule in ["security-forward-findings", "security-forward-audit", "dolphin-security-inspector"] :
           "arn:aws:events:*:${data.aws_caller_identity.current.account_id}:rule/${rule}"
         ] }
       }
@@ -454,7 +455,9 @@ resource "aws_iam_role_policy" "security_forward_staging" {
 resource "aws_cloudwatch_event_rule" "security_notify" {
   name           = "security-alerts-notify"
   event_bus_name = aws_cloudwatch_event_bus.security_alerts.name
-  event_pattern  = jsonencode({ account = local.security_account_ids })
+  # The Dolphin account's id too: it forwards nothing here, but an administrator's copy of a member's GuardDuty or
+  # Security Hub finding may carry the member's account (dolphin-security.tf).
+  event_pattern = jsonencode({ account = concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) })
   # Forwarded CloudTrail reads need this state on the custom-bus rule too.
   state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"
 }
@@ -524,6 +527,7 @@ resource "aws_sqs_queue_policy" "security_delivery_failures" {
         Condition = { ArnEquals = { "aws:SourceArn" = [
           aws_cloudwatch_event_rule.security_notify.arn,
           aws_cloudwatch_event_rule.security_delivery_health.arn,
+          aws_cloudwatch_event_rule.dolphin_security_inspector.arn,
         ] } }
       },
       {

@@ -50,7 +50,10 @@ class DolphinAccountTests(unittest.TestCase):
         ids = re.search(r"  security_account_ids = \[\n(.*?)\n  \]", mon, re.S).group(1)
         self.assertNotIn("dolphin", ids)  # that list admits an account's principals to the Config bucket and key
         self.assertIn('concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) : "arn:aws:cloudtrail:*:${account}:trail/*"', mon)
-        self.assertEqual(mon.count("aws_organizations_account.dolphin"), 1)
+        # The other use: security-alerts-notify matches the Dolphin id in events this account's own rules forward
+        # (an administrator's copy of a member finding). A pattern, not a grant.
+        self.assertIn("event_pattern = jsonencode({ account = concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) })", mon)
+        self.assertEqual(mon.count("aws_organizations_account.dolphin"), 2)
 
 
 class DolphinBootstrapTests(unittest.TestCase):
@@ -106,13 +109,27 @@ class DolphinBootstrapTests(unittest.TestCase):
 
     def test_nothing_in_the_management_account_trusts_the_dolphin_account(self):
         for path in ROOT.glob("*.tf"):
-            if path.name in ("dolphin-bootstrap.tf", "dolphin-account.tf", "dolphin-identity-center.tf"):
+            if path.name in ("dolphin-bootstrap.tf", "dolphin-account.tf", "dolphin-identity-center.tf", "dolphin-security.tf"):
                 continue
             if path.name == "security-monitoring.tf":  # the trail key's encryption context only, pinned above
                 continue
             text = path.read_text()
             self.assertNotIn("aws_organizations_account.dolphin", text, path.name)
             self.assertNotIn("local.dolphin_account_id", text, path.name)
+
+
+class DolphinSecurityTests(unittest.TestCase):
+    def test_monitoring_grants_the_dolphin_account_nothing_here(self):
+        text = (ROOT / "dolphin-security.tf").read_text()
+        # The only resource policy is the Config bucket's, in the Dolphin account, for its own Config service.
+        self.assertEqual(text.count("Principal = "), 3)
+        self.assertEqual(text.count('resource "aws_s3_bucket_policy"'), 1)
+        policy = block(text, 'resource "aws_s3_bucket_policy" "dolphin_security_config"')
+        self.assertIn("provider = aws.dolphin\n", policy)
+        self.assertEqual(policy.count("Principal = "), 3)
+        for forbidden in ("aws_cloudwatch_event_bus_policy", "assume_role_policy", "aws_iam_role", "aws_sns_topic_policy",
+                          "aws_sqs_queue_policy", "aws_kms_key", "aws_lambda_permission"):
+            self.assertNotIn('resource "' + forbidden, text)
 
 
 class DolphinIdentityCenterTests(unittest.TestCase):
