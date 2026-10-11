@@ -9,6 +9,8 @@
 #     provider (games-multiplayer.tf) with the same audience and per-environment subject as the multiplayer launcher, so
 #     no key is stored anywhere. Terraform writes MODERATION_ROLE_ARN (per target) and MODERATION_AWS_REGION into the
 #     project.
+#   Cloudflare colton-games-prod (the production Worker): IAM user colton-games-moderation-worker-prod, the same single
+#     permission; its key is written into workers-prod/colton-games/terraform (workers-prod-secrets.tf).
 #   Cloudflare colton-games-stage: a Worker cannot present a Vercel OIDC token, so an IAM user with the same single
 #     permission. Its key is in `colton-games/moderation-worker-key` (administration only, JSON of the Worker's variable
 #     names), copied into workers-stage/colton-games and loaded with scripts/workers-stage-secrets.sh (AGENTS.md, "Sites
@@ -82,6 +84,26 @@ resource "aws_iam_user_policy" "colton_games_moderation_worker" {
 
 resource "aws_iam_access_key" "colton_games_moderation_worker" {
   user = aws_iam_user.colton_games_moderation_worker.name
+}
+
+# The production Worker's identity (colton-games-prod, cloudflare-production.tf): its own user, so a staging key can never
+# check pictures as production and the two can be rotated apart. Its key goes only into the production Worker's managed
+# secrets (workers-prod-secrets.tf), never into a staging container.
+#   Rotate: terraform apply -replace=aws_iam_access_key.colton_games_moderation_worker_prod, then
+#   scripts/workers-prod-secrets.sh colton-games.
+resource "aws_iam_user" "colton_games_moderation_worker_prod" {
+  name = "colton-games-moderation-worker-prod"
+  tags = { Name = "colton-games-moderation-worker-prod", Project = "colton-games" }
+}
+
+resource "aws_iam_user_policy" "colton_games_moderation_worker_prod" {
+  name   = "detect-moderation-labels"
+  user   = aws_iam_user.colton_games_moderation_worker_prod.name
+  policy = data.aws_iam_policy_document.moderation.json
+}
+
+resource "aws_iam_access_key" "colton_games_moderation_worker_prod" {
+  user = aws_iam_user.colton_games_moderation_worker_prod.name
 }
 
 resource "aws_secretsmanager_secret" "colton_games_moderation_worker_key" {

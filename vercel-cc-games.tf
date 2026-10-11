@@ -206,14 +206,18 @@ resource "cloudflare_dns_record" "cc_games_net_apex" {
   comment = "vercel apex; redirects to cc-games.org"
 }
 
+# DNS-only while Vercel serves production. The ONE exception to "never proxy a Vercel record": the production cutover to
+# the Cloudflare Worker (cloudflare-production.tf) proxies it, and a Workers route then serves cc-games.org/* from
+# colton-games-prod, so Vercel is no longer the origin. The content stays Vercel's address, so turning the switch back
+# returns to Vercel directly. TTL is ignored while proxied (Cloudflare answers with its own addresses).
 resource "cloudflare_dns_record" "cc_games_org_apex" {
   zone_id = var.cc_games_org_zone_id
   name    = "cc-games.org"
   type    = "A"
   content = "76.76.21.21"
-  proxied = false # see the header: proxying breaks Vercel cert issuance
-  ttl     = 300
-  comment = "vercel apex; Colton Games production (canonical)"
+  proxied = local.colton_games_production_on_cloudflare
+  ttl     = local.colton_games_production_on_cloudflare ? 1 : 300
+  comment = local.colton_games_production_on_cloudflare ? "Colton Games production (canonical), served by the colton-games-prod Worker" : "vercel apex; Colton Games production (canonical)"
 }
 
 resource "cloudflare_dns_record" "cc_games_org_www" {

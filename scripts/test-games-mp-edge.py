@@ -316,7 +316,12 @@ class ProductionDomainTests(unittest.TestCase):
             for record in ("%s_apex" % name, "%s_www" % name):
                 body = block(self.VERCEL, "cloudflare_dns_record", record)
                 self.assertIn("zone_id = %s" % zone, body)
-                self.assertIn("proxied = false", body)
+                if record == "cc_games_org_apex":
+                    # The one exception: the production cutover switch (cloudflare-production.tf), which is off until
+                    # the Worker serves cc-games.org (scripts/test-cloudflare-production.py pins it).
+                    self.assertIn("proxied = local.colton_games_production_on_cloudflare", body)
+                else:
+                    self.assertIn("proxied = false", body)
 
     def test_every_other_name_redirects_straight_to_a_serving_name(self):
         names = re.findall(r'^resource "vercel_project_domain" "(\w+)"', self.VERCEL, re.M)
