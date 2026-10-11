@@ -31,7 +31,9 @@ if [ ${#profiles[@]} -eq 0 ]; then
   else profiles=(claude-connor claude-colton claude-colin claude-thao claude-ejc3); fi
 fi
 
-count_logins() { ssh -i "$KEY" "ubuntu@$HOST" "sudo claw-master-status | grep -c ': present'" 2>/dev/null || echo 0; }
+# Exactly one number: grep -c prints 0 AND exits 1 when nothing matches, so the remote side ends in `|| true`; an ssh
+# failure counts as 0.
+count_logins() { local n; n=$(ssh -i "$KEY" "ubuntu@$HOST" "sudo claw-master-status | grep -c ': present' || true" 2>/dev/null) || n=0; echo "${n:-0}"; }
 [ "$SERVER" = 1 ] && before=$(count_logins)
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }

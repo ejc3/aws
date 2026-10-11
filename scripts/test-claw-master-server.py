@@ -978,5 +978,25 @@ class SubscriptionDiscoveryTests(unittest.TestCase):
         self.assertIn('[ ! -d "$profdir/$name/current" ]', finish)  # no rollout unless the login was installed
         self.assertLess(finish.index('[ ! -d "$profdir/$name/current" ]'), finish.index("/usr/local/bin/claw-master-rollout"))
 
+
+class LoginCountTests(unittest.TestCase):
+    """The login script rolls out after a new login; its count must be one number even when there are none."""
+
+    def count(self, status_lines, ssh_ok=True):
+        import os, tempfile
+        fn = LOGIN[LOGIN.index("count_logins() {"):LOGIN.index("\n", LOGIN.index("count_logins() {"))]
+        with tempfile.TemporaryDirectory() as d:
+            status = os.path.join(d, "status"); open(status, "w").write("".join(l + "\n" for l in status_lines))
+            ssh = os.path.join(d, "ssh")
+            open(ssh, "w").write('#!/bin/bash\n%s\nsudo() { shift; cat "%s"; }\nexport -f sudo 2>/dev/null\nbash -c "sudo() { cat %s; }; ${@: -1}"\n' % ("" if ssh_ok else "exit 255", status, status))
+            os.chmod(ssh, 0o755)
+            env = dict(os.environ, PATH=d + ":" + os.environ["PATH"])
+            return subprocess.run(["bash", "-c", fn + '\nKEY=k HOST=h; count_logins'], capture_output=True, text=True, env=env, timeout=30).stdout
+
+    def test_one_number_with_none_some_and_no_ssh(self):
+        self.assertEqual(self.count(["login claude-a: MISSING (preferred, skipped by the server)", "server: inactive (none)"]), "0\n")
+        self.assertEqual(self.count(["login claude-a: present", "login claude-b: present (served after the preferred ones)"]), "2\n")
+        self.assertEqual(self.count([], ssh_ok=False), "0\n")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
