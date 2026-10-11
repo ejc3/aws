@@ -1200,11 +1200,13 @@ loopback on its host, reached through its own tunnel). Each app repository's age
 ("Two clouds: Vercel and Cloudflare"): a change is done only when both deploys are green; no platform-only code without a
 path on the other; every secret lives in AWS Secrets Manager and must reach both platforms. Where it lives today:
 Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the containers Terraform
-writes into the project for colton-games (`colton-games-accounts.tf`) and dolphin-films (`dolphin-films-vercel.tf`). For
-the other sites the Vercel environment is still set in Vercel by hand and `vercel-env/<site>/<target>` is a record captured
-from it afterwards (`scripts/vercel-env-capture.py`), not a source: a change there is made in Vercel and re-recorded, and in
-`workers-stage/<site>`. Moving each of them to a Terraform-written Vercel environment (the dolphin-films shape) is what makes
-AWS the one source. A new app joins both clouds before it ships. Two apps do not meet the rule yet: dolphin-maps
+writes into the project for colton-games (`colton-games-accounts.tf`), dolphin-films (`dolphin-films-vercel.tf`) and, from
+`vercel-env.tf`, dolphin-labs, imagine and remote-claw: for those three `vercel-env/<site>/<target>` is the SOURCE. Change a
+value there and apply, never in the Vercel dashboard; a variable added or removed in Vercel is picked up by re-running
+`scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names, targets, sensitivity, never a value), and
+every existing variable is imported by its id, never recreated. nest-step is next (it needs a token that reaches its project);
+until then its record is still captured from Vercel afterwards (`scripts/vercel-env-capture.py`), not a source. The
+Cloudflare side is `workers-stage/<site>`. A new app joins both clouds before it ships. Two apps do not meet the rule yet: dolphin-maps
 (`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage` Worker) and claude-master-dashboard (Cloudflare only, no
 Vercel project). Bringing each to the other cloud follows the order below for Cloudflare, or a Vercel project with its
 environment written by Terraform. Production stays on Vercel; the Worker is a

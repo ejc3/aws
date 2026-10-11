@@ -1,6 +1,8 @@
 # vercel-env-secrets.tf
 #
-# AWS keeps a record of every Vercel project's environment, so Vercel is not the only holder of a site's credentials.
+# AWS keeps every Vercel project's environment, so Vercel is not the only holder of a site's credentials. For dolphin-labs,
+# imagine and remote-claw these containers are the SOURCE: vercel-env.tf writes the projects from them (change a value
+# here and apply). For the rest they are still records captured from Vercel, as described below.
 # One Secrets Manager container per project per Vercel target, `vercel-env/<site>/<target>` (JSON: variable name -> value),
 # for the sites that have variables:
 #
