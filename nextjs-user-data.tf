@@ -161,9 +161,10 @@ locals {
   # they log in instead of starting at an empty home directory. Cloned only when that
   # user's own `gh` is authenticated -- these are private repos, and cloning them with
   # anyone else's credentials would either fail or, worse, leave a token behind.
+  # dolphin-aws is the Dolphin account's Terraform, applied from this box only (dolphin-bootstrap.tf).
   nextjs_user_repos = {
-    skevh = ["dolphin-labs-hq/dolphin-labs"]
-    ejc3  = ["dolphin-labs-hq/dolphin-labs"]
+    skevh = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-aws"]
+    ejc3  = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-aws"]
   }
 
   nextjs_user_data = <<-SCRIPT

@@ -2263,6 +2263,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
+| The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
