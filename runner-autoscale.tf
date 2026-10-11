@@ -3573,12 +3573,16 @@ data "archive_file" "runner_cleanup" {
           # which can stretch a lease to the 13h30m ceiling, is an alarm rather than a log line.
           held_unobserved_minutes = [0.0]
 
-          def hold(instance, instance_id):
-              try:
-                  since = parse_ts(get_tag(instance, SEEN_TAG)) or instance['LaunchTime']
-                  held_unobserved_minutes[0] = max(held_unobserved_minutes[0], (now - since).total_seconds() / 60)
-              except Exception:
-                  pass   # never let the measurement break the sweep
+          def hold(instance, instance_id, github_silent=False):
+              # Only a hold BECAUSE GitHub said nothing usable feeds the outage timer. Holds for a missing registration
+              # row or a failed lease write are not GitHub's silence, and an old runner held for one of those must not
+              # read as an outage.
+              if github_silent:
+                  try:
+                      since = parse_ts(get_tag(instance, SEEN_TAG)) or instance['LaunchTime']
+                      held_unobserved_minutes[0] = max(held_unobserved_minutes[0], (now - since).total_seconds() / 60)
+                  except Exception:
+                      pass   # never let the measurement break the sweep
               held.append(instance_id)
           # Instances EC2 refused to terminate. They are STILL RUNNING, so they must
           # never appear in `terminated`, and the poll must not read as a clean sweep.
@@ -3905,7 +3909,7 @@ data "archive_file" "runner_cleanup" {
                           seen_at = parse_ts(get_tag(instance, SEEN_TAG))
                           unobserved = (f'{(now - seen_at).total_seconds() / 60:.0f}m'
                                         if seen_at else 'its whole life')
-                          hold(instance, instance_id)
+                          hold(instance, instance_id, github_silent=True)
                           print(f'{instance_id}: HOLDING the lease at '
                                 f'{lease_expires_str or "unset"} - GitHub has said nothing '
                                 f'usable about {runner_name} for {unobserved} '
@@ -3964,7 +3968,7 @@ data "archive_file" "runner_cleanup" {
                               fresh_verdict = lease_verdict(
                                   {runner_name: fresh} if fresh else None, runner_name, True)
                               if fresh_verdict != EXPIRE:
-                                  hold(instance, instance_id)
+                                  hold(instance, instance_id, github_silent=(fresh_verdict == HOLD))
                                   print(f'{instance_id}: lease expired, but the runner did '
                                         f'not read as idle on a fresh read; holding')
                                   continue
@@ -3991,6 +3995,23 @@ data "archive_file" "runner_cleanup" {
                             f'no safe verdict and it is skipped - this instance is NOT covered '
                             f'by the lifetime bound until its record reads cleanly. Every other '
                             f'instance is still swept.')
+
+          # The lease sweep is complete: emit its holds now, before the optional phases below, so a failure or a
+          # timeout in any of them cannot suppress this record (runner-leases-held treats missing data as fine).
+          print(json.dumps({
+              '_aws': {
+                  'Timestamp': int(now.timestamp() * 1000),
+                  'CloudWatchMetrics': [{
+                      'Namespace': 'GitHubRunners',
+                      'Dimensions': [[]],
+                      'Metrics': [{'Name': 'HeldLeases', 'Unit': 'Count'},
+                                  {'Name': 'HeldLeaseMaxUnobservedMinutes', 'Unit': 'None'}]
+                  }]
+              },
+              'event': 'runner_lease_holds',
+              'HeldLeases': len(held),
+              'HeldLeaseMaxUnobservedMinutes': round(held_unobserved_minutes[0], 1),
+          }))
 
           # Phase 2: runners whose current job has run past MAX_JOB_RUNTIME_MINUTES.
           #
@@ -4205,21 +4226,6 @@ data "archive_file" "runner_cleanup" {
                       idle_terminated.append(instance_id)
                   else:
                       terminate_failed.append(instance_id)
-
-          print(json.dumps({
-              '_aws': {
-                  'Timestamp': int(now.timestamp() * 1000),
-                  'CloudWatchMetrics': [{
-                      'Namespace': 'GitHubRunners',
-                      'Dimensions': [[]],
-                      'Metrics': [{'Name': 'HeldLeases', 'Unit': 'Count'},
-                                  {'Name': 'HeldLeaseMaxUnobservedMinutes', 'Unit': 'None'}]
-                  }]
-              },
-              'event': 'runner_lease_holds',
-              'HeldLeases': len(held),
-              'HeldLeaseMaxUnobservedMinutes': round(held_unobserved_minutes[0], 1),
-          }))
 
           return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF

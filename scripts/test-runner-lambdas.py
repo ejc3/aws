@@ -2305,8 +2305,15 @@ def case_held_leases_are_emitted_as_a_metric():
     # Issue #48: the held count and the longest unobserved time reach CloudWatch as EMF every poll, and an alarm reads them.
     src = CLEANUP_SRC
     assert "'Name': 'HeldLeases'" in src and "'Name': 'HeldLeaseMaxUnobservedMinutes'" in src
-    calls = src.count("hold(instance, instance_id)") - src.count("def hold(instance, instance_id)")
-    assert calls == 8 and "held.append(instance_id)" not in src.split("def hold(instance, instance_id):")[1].split("return {'terminated'")[0].split("held.append(instance_id)", 1)[1], calls
+    body = src.split("def hold(instance, instance_id, github_silent=False):")[1]
+    calls = re.findall(r"hold\(instance, instance_id(?:, github_silent=(?:True|\([^)]*\)))?\)", body)
+    assert len(calls) == 8, calls
+    assert "held.append(instance_id)" not in body.split("held.append(instance_id)", 1)[1].split("return {'terminated'")[0]
+    # Only the two holds that come from GitHub's silence feed the outage timer (a missing row or a failed write must not).
+    silent = [c for c in calls if "github_silent=" in c]
+    assert silent == ["hold(instance, instance_id, github_silent=True)", "hold(instance, instance_id, github_silent=(fresh_verdict == HOLD))"], silent
+    # Emitted right after the lease sweep, before the optional phases.
+    assert src.index("'event': 'runner_lease_holds'") < src.index("# Phase 2: runners whose current job"), "emit before Phase 2"
     tf = (Path(__file__).resolve().parent.parent / "cost-alerts.tf").read_text()
     block = tf.split('resource "aws_cloudwatch_metric_alarm" "runner_leases_held"', 1)[1].split("\n}\n", 1)[0]
     assert 'metric_name         = "HeldLeaseMaxUnobservedMinutes"' in block and "threshold           = 60" in block, block
