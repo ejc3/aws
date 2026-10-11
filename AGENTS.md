@@ -1269,13 +1269,14 @@ targets, sensitivity, never a value), and every existing variable is imported by
 Cloudflare. One app is not on Cloudflare yet: dolphin-maps (`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage`
 Worker); bringing it over follows the order below.
 
-**Production is not behind Cloudflare yet (checked 2026-10-11).** Every production hostname (cc-games.org and its old
-domains, yourfantasymovie.com) and the multiplayer `play.cc-games.*` entries are DNS-only records pointing at Vercel or the
-games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
+**Which production is behind Cloudflare (2026-10-11).** cc-games.org itself is served by the `colton-games-prod` Worker since
+the cutover below, so its zone protection applies. Every other production hostname (www.cc-games.org and the old domains,
+which Vercel still redirects; yourfantasymovie.com) and the multiplayer `play.cc-games.*` entries are DNS-only records
+pointing at Vercel or the games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
 get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees
 Cloudflare's addresses instead of players'. Cloudflare's protections reach production when production is served by a Worker
 (the move above), or, for the multiplayer entries, when those records are proxied and the router reads the client address from
-`CF-Connecting-IP` and accepts connections only from Cloudflare. All nine zones are on the Free plan. Production stays on Vercel (colton-games' move is prepared: "Colton Games production on Cloudflare" below); the Worker is a
+`CF-Connecting-IP` and accepts connections only from Cloudflare. All nine zones are on the Free plan. Production stays on Vercel for the other sites (colton-games moved: "Colton Games production on Cloudflare" below); each one's Worker is a
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
@@ -1328,10 +1329,11 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
   Access, still unreachable); (3) set `urls = true` and, in the repo, `workers_dev`/`preview_urls` true. Never reverse 2 and 3.
 
-### Colton Games production on Cloudflare (prepared, not switched)
+### Colton Games production on Cloudflare (switched 2026-10-11)
 
 The owner decided on 2026-10-11 to move colton-games production from Vercel to Cloudflare Workers so that the zone's WAF,
-rate limiting and bot rules cover it. Everything is in place; **the switch is one line and has not been flipped**.
+rate limiting and bot rules cover it. **The switch was flipped on 2026-10-11** (`colton_games_production_on_cloudflare = true`):
+cc-games.org is proxied and served by `colton-games-prod`. Rollback is the same line set to `false`, applied from a jumpbox.
 
 - **The Worker.** `colton-games-prod`: the games repo's Cloudflare workflow builds once from `main` and deploys
   `colton-games-stage`, then `wrangler deploy --env production` (`wrangler.jsonc` `env.production`). Wrangler owns the

@@ -42,7 +42,7 @@ def block(text, kind, *labels):
 class CutoverTests(unittest.TestCase):
     def test_the_switch_exists_once_and_is_off(self):
         self.assertEqual(len(re.findall(r"^\s*colton_games_production_on_cloudflare\s*=", code(ALL_TF), re.M)), 1)
-        self.assertRegex(code(PROD), r"colton_games_production_on_cloudflare\s*=\s*false\b")
+        self.assertRegex(code(PROD), r"colton_games_production_on_cloudflare\s*=\s*true\b")
 
     def test_the_apex_record_follows_the_switch_and_keeps_vercels_address(self):
         rec = block(VERCEL, "resource", "cloudflare_dns_record", "cc_games_org_apex")

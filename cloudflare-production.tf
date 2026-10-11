@@ -34,7 +34,7 @@
 
 locals {
   # THE CUTOVER SWITCH. false: Vercel serves cc-games.org (DNS-only record). true: Cloudflare serves it from the Worker.
-  colton_games_production_on_cloudflare = false
+  colton_games_production_on_cloudflare = true
 
   colton_games_prod_worker_name = "colton-games-prod"
   colton_games_prod_workers_dev = "${local.colton_games_prod_worker_name}.cc-games.workers.dev"
