@@ -120,16 +120,22 @@ resource "aws_iam_user_policy" "claude_master_dashboard" {
   user = aws_iam_user.claude_master_dashboard.name
 
   # CloudWatch has no resource-level permissions for these reads, so they cannot be narrowed
-  # to one namespace; the dashboard queries only ClaudeMaster and alarms named claude-master*. The region condition keeps the
+  # to one namespace; the dashboard queries only ClaudeMaster. The region condition keeps the
   # key to the region the metrics live in.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Sid       = "ReadMetrics"
       Effect    = "Allow"
-      Action    = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "cloudwatch:DescribeAlarms"]
+      Action    = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]
       Resource  = "*"
       Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
+      }, {
+      # The Alarms box reads only alarms named claude-master*; DescribeAlarms is scoped to those ARNs (#384).
+      Sid      = "ReadClaudeMasterAlarms"
+      Effect   = "Allow"
+      Action   = "cloudwatch:DescribeAlarms"
+      Resource = "arn:aws:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:claude-master*"
     }]
   })
 }
