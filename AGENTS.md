@@ -1185,6 +1185,29 @@ Dolphin (the dolphin-labs-hq sites) gets an AWS member account of its own, `dolp
 anywhere. `close_on_deletion = false` and `prevent_destroy`: unlike dev-staging, this account will hold production data and
 Terraform must never close it. Nothing in this account becomes reachable from it: trust runs one way, from here into it.
 
+- **Its Terraform is `dolphin-labs-hq/dolphin-aws`** (private), with the same review gate as dolphin-labs (`review decision`,
+  `review-gate (self-test)`, the `main-pr-required` ruleset). Its state is in the Dolphin account: bucket
+  `dolphin-terraform-state-<account id>` (versioned, encrypted, public access blocked, `prevent_destroy`) with S3 native
+  locking (`use_lockfile`, no DynamoDB). This repository builds that bucket and the apply role (`dolphin-bootstrap.tf`,
+  provider `aws.dolphin` through OrganizationAccountAccessRole); dolphin-aws must never manage either.
+- **Applied from nextjs-dev only, never CI.** Role `dolphin-terraform` in the Dolphin account (AdministratorAccess there,
+  one-hour sessions) trusts exactly `nextjs-dev-role`, which has one inline policy (`assume-dolphin-terraform`) allowing
+  `sts:AssumeRole` on exactly that role. dolphin-aws's provider and backend both `assume_role` it from the instance role, so
+  there is no login step; `scripts/apply.sh` there plans and applies origin/main from a throwaway worktree. GitHub holds no
+  AWS credential for it.
+- **That grant is box-wide.** Every account on nextjs-dev has full sudo and agents run there, so anyone on that box can
+  apply in the Dolphin account. The account boundary is what bounds it: nothing in this account trusts the Dolphin account.
+  Do not grant the Dolphin account any path back into this one.
+- **Sign-in is Identity Center** (`dolphin-identity-center.tf`, portal in output `dolphin_sign_in_url`). The owner's user
+  gets the existing AdministratorAccess permission set (read as data, not managed). Steve gets `DolphinReadOnly` on the
+  Dolphin account only: ReadOnlyAccess, 8-hour sessions, plus a deny on every read that returns a secret value
+  (`GetSecretValue`, `ssm:GetParameter*`, `kms:Decrypt`, state objects); the state bucket's policy refuses him too. His user
+  and assignment exist only while the `dolphin_steve` key of `people/addresses` holds his address (it is also his
+  user name); an API-created user gets no invitation and sets a password with "Forgot password".
+- Security monitoring (`security-monitoring.tf`, `security-regions.tf`) covers this account and dev-staging only. The org
+  CloudTrail (its key's encryption context lists the Dolphin account) and the AI-services opt-out at the root cover it.
+  Do not add it to `security_account_ids`: that list admits an account's principals to this account's Config bucket.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
