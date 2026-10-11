@@ -354,8 +354,12 @@ cat > /usr/local/bin/claw-master-serve <<'EOF'
 #!/bin/bash
 set -u
 { set +x; } 2>/dev/null   # the value below must never reach a trace
+# The renamed binary; or, when a convergence could not install it, the one from before the rename (then still a file at
+# the old name), with the backup key under the name that binary reads.
+bin=/usr/local/bin/claw-master; keyvar=CLAW_MASTER_BACKUP_API_KEY
+if [ ! -x "$bin" ]; then bin=/usr/local/bin/claude-master; keyvar=CLAUDE_MASTER_BACKUP_API_KEY; fi
 key=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id claude-master/backup-api-key --query SecretString --output text 2>/dev/null) || key=""
-if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAW_MASTER_BACKUP_API_KEY="$key"; else echo "claw-master-serve: no backup API key; subscriptions only" >&2; fi
+if [ -n "$key" ] && [ "$key" != "None" ]; then export "$keyvar=$key"; else echo "claw-master-serve: no backup API key; subscriptions only" >&2; fi
 unset key
 # One of the two servers behind Envoy, by color: its own ports, log file and metrics instance. With no
 # color it is the server from before Envoy (claude-master-server.service, until the first rollout moves
@@ -367,7 +371,7 @@ ${join("\n", [for c, v in local.claude_master_colors : "  ${c}) port=${v.port}; 
   legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;
   *) echo "usage: claw-master-serve blue|green" >&2; exit 2 ;;
 esac
-exec /usr/local/bin/claw-master serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
+exec "$bin" serve ${local.claude_master_profiles[0]}${join("", [for p in slice(local.claude_master_profiles, 1, length(local.claude_master_profiles)) : " --next-profile ${p}"])} \
   --listen ${local.claude_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \

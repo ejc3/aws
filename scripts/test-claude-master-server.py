@@ -125,7 +125,8 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("User=claude-master", TF)
 
     def test_the_backup_key_is_handed_over_in_the_environment_not_argv_or_disk(self):
-        self.assertIn("export CLAW_MASTER_BACKUP_API_KEY=", TF)
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
+        self.assertIn('export "$keyvar=$key"', serve)
         self.assertNotRegex(TF, r"--backup-api-key")
         self.assertNotRegex(TF, r">\s*/(tmp|var|etc)[^\n]*key")
 
@@ -263,7 +264,7 @@ class ObservabilityTests(unittest.TestCase):
         wrapper = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         lines = wrapper.splitlines()
         self.assertEqual([n for n, l in enumerate(lines) if l.rstrip().endswith("\\\\")], [], "a doubled backslash ends the command")
-        start = next(n for n, l in enumerate(lines) if l.startswith("exec /usr/local/bin/claw-master serve"))
+        start = next(n for n, l in enumerate(lines) if l.startswith('exec "$bin" serve'))
         logical = []
         for l in lines[start:]:
             logical.append(l.rstrip().rstrip("\\"))
@@ -275,6 +276,34 @@ class ObservabilityTests(unittest.TestCase):
                      "--otlp-endpoint http://127.0.0.1:4318", "--account-labels-file /etc/claude-master/account-labels",
                      "--instance claw-master-$color", "$balancer"):
             self.assertIn(flag, command)
+
+    def test_the_wrapper_falls_back_to_the_old_binary_when_the_new_one_is_not_installed(self):
+        # A convergence that could not download claw-master keeps the old file at /usr/local/bin/claude-master; the next
+        # start must run that one, with the backup key under the name it reads, not fail on a missing claw-master.
+        import os, tempfile
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve <<'EOF'\n"):]
+        serve = serve[serve.index("\n") + 1:serve.index("\nEOF\n")]
+        serve = (serve.replace("${var.aws_region}", "us-west-1").replace("$${", "${")
+                 .replace("${local.claude_master_drain_seconds}", "600").replace("${local.claude_master_server_ip}", "10.0.1.50")
+                 .replace("${local.claude_master_server_port}", "8443").replace("${local.claude_master_open_port}", "8444")
+                 .replace("${local.claude_master_profiles[0]}", "claude-connor"))
+        serve = re.sub(r"\$\{join\(.*\)\}", "", serve)
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin"); os.mkdir(bindir)
+            open(os.path.join(bindir, "aws"), "w").write("#!/bin/bash\necho test-key\n")
+            report = '#!/bin/bash\necho "$0|${CLAW_MASTER_BACKUP_API_KEY-unset}|${CLAUDE_MASTER_BACKUP_API_KEY-unset}"\n'
+            for name in ("aws", "claw-master", "claude-master"):
+                path = os.path.join(bindir, name)
+                if name != "aws":
+                    open(path, "w").write(report)
+                os.chmod(path, 0o755)
+            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"])
+            def run():
+                s = serve.replace("/usr/local/bin/", bindir + "/")
+                return subprocess.run(["bash", "-c", s, "serve", "legacy"], capture_output=True, text=True, env=env, timeout=30).stdout.strip()
+            self.assertEqual(run(), "%s/claw-master|test-key|unset" % bindir)
+            os.chmod(os.path.join(bindir, "claw-master"), 0o644)
+            self.assertEqual(run(), "%s/claude-master|unset|test-key" % bindir)
 
     def test_the_server_always_logs_at_info_to_a_rotated_file_it_may_write(self):
         wrapper = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
