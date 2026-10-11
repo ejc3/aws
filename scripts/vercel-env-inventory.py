@@ -21,6 +21,7 @@ OUT = ROOT / "vercel-env-vars.tf"
 PROJECTS = {
     "dolphin-labs": ("prj_VZaPcYdmfnBhYKtuPK9KxjmMGQmW", "team_4TayirAcbgetrOUgYXghMXJH"),
     "imagine": ("prj_MNp1CoEL7jqd3ufUb0lL98vTMBTV", "team_fYexi4KRmIrq9wtYsiXs9e9H"),
+    "nest-step": ("prj_UEBlk5ovC3cPF0oaXwgZyGuRQtId", "team_luQ5Id7cevXQ5kBbxzV7Jk2B"),
     "remote-claw": ("prj_qUeYYc7P87JmsQUipJG0m0kqmYbM", "team_fYexi4KRmIrq9wtYsiXs9e9H"),
 }
 TARGETS = ("development", "preview", "production")

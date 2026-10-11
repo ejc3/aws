@@ -40,6 +40,23 @@ locals {
     "imagine/Mi1paHwIMOyXaUob"      = { key = "IMAGINE_WS_URL", target = ["production"], sensitive = false }
     "imagine/zsBijtQOs75gEOaM"      = { key = "TURSO_AUTH_TOKEN", target = ["production"], sensitive = false }
     "imagine/9yGkla7PrqprmKlY"      = { key = "TURSO_DATABASE_URL", target = ["production"], sensitive = false }
+    "nest-step/Lb1AWvNW52frqgzK"    = { key = "NEXT_PUBLIC_DEV_SUPABASE_REDIRECT_URL", target = ["development"], sensitive = false }
+    "nest-step/1zsxDNnidpNx5Bh5"    = { key = "NEXT_PUBLIC_SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/5uuIoghAcfVzFFYZ"    = { key = "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/XW3CVP3Nm7vEfp6g"    = { key = "NEXT_PUBLIC_SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/fbe45N3zgMDILfnv"    = { key = "POSTGRES_DATABASE", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/MooNWjyBYiwySliw"    = { key = "POSTGRES_HOST", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/I6zfph2SpSImD5YO"    = { key = "POSTGRES_PASSWORD", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/pY8Kime1nA7mkxFV"    = { key = "POSTGRES_PRISMA_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/tsT0VGR67PLW3zEi"    = { key = "POSTGRES_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/dVHWG2HtJAyTU52c"    = { key = "POSTGRES_URL_NON_POOLING", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/IDKbxRiYY6Cbo4NO"    = { key = "POSTGRES_USER", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/ONFtsJyArMoAebuw"    = { key = "SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/IZgVFtgz7e3aDk4p"    = { key = "SUPABASE_JWT_SECRET", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/w5xnii2KCY9TTHtc"    = { key = "SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/EeW78cX0YOE7L5Fr"    = { key = "SUPABASE_SECRET_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/rzvnMz3SJ0RurhAJ"    = { key = "SUPABASE_SERVICE_ROLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/DFCFMWpkzEoSZzHJ"    = { key = "SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
     "remote-claw/CAI1jCoPYNPLnLZe"  = { key = "BROKER_BACKEND", target = ["production"], sensitive = true }
     "remote-claw/T3XGYlTpOvlLB5Ph"  = { key = "BROKER_BACKEND", target = ["preview"], sensitive = false }
     "remote-claw/TkYmrlQ8pfUyoEqv"  = { key = "CRON_SECRET", target = ["preview", "production"], sensitive = false }

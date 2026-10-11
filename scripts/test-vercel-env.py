@@ -61,7 +61,8 @@ class TerraformTests(unittest.TestCase):
             self.assertIn(f"to       = vercel_project_environment_variable.{name}[each.key]", TF, name)
         self.assertIn("provider   = vercel.dolphin_labs", blocks["vercel_env_dolphin_labs"])
         self.assertIn("provider   = vercel.ejc3", blocks["vercel_env_ejc3"])
-        self.assertNotIn("provider", blocks["vercel_env_coltons"].split("for_each")[0])
+        self.assertIn("provider   = vercel.coltons", blocks["vercel_env_coltons"])
+        self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_coltons.secret_string)", TF)
 
     def test_the_import_id_is_team_project_and_variable(self):
         ids = re.findall(r'id       = "(\$\{.*?\})/(\$\{.*?\})/(\$\{split\("/", each.key\)\[1\]\})"', TF)

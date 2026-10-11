@@ -1,7 +1,7 @@
 # vercel-env.tf
 #
 # Terraform writes the Vercel environments of the sites whose variables were set by hand (dolphin-labs, imagine,
-# remote-claw; nest-step next, once it has a token that reaches its project) from AWS, so AWS is the one source for every site on both clouds (the standing rule in
+# remote-claw, nest-step) from AWS, so AWS is the one source for every site on both clouds (the standing rule in
 # AGENTS.md, "Sites also deploying to Cloudflare Workers"). This first part is the Vercel API token for the owner's
 # personal team (imagine, remote-claw), which no Terraform provider here could reach: an API token scoped to that one
 # team, minted by API with vercel-admin-token (github-admin-tokens.tf), never anyone's CLI login.
@@ -79,11 +79,12 @@ locals {
   vercel_env_projects = {
     "dolphin-labs" = { project_id = "prj_VZaPcYdmfnBhYKtuPK9KxjmMGQmW", team_id = "team_4TayirAcbgetrOUgYXghMXJH" }
     "imagine"      = { project_id = "prj_MNp1CoEL7jqd3ufUb0lL98vTMBTV", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
+    "nest-step"    = { project_id = "prj_UEBlk5ovC3cPF0oaXwgZyGuRQtId", team_id = "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
     "remote-claw"  = { project_id = "prj_qUeYYc7P87JmsQUipJG0m0kqmYbM", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
   }
 
-  # Which provider reaches each team: the dolphin-labs token (dolphin-films-vercel.tf), the colton-games team token (the
-  # default provider, vercel-cc-games.tf) and the personal-team token above.
+  # Which provider reaches each team: the dolphin-labs token (dolphin-films-vercel.tf), the Colton's-team token minted for
+  # this file (vercel_api_token_coltons: the colton-games team's own token cannot see nest-step) and the personal-team token.
   vercel_env_by_team = {
     dolphin_labs = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_4TayirAcbgetrOUgYXghMXJH" }
     coltons      = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
@@ -117,6 +118,15 @@ ephemeral "aws_secretsmanager_secret_version" "vercel_api_token_ejc3" {
   secret_id = aws_secretsmanager_secret.vercel_api_token_ejc3.id
 }
 
+ephemeral "aws_secretsmanager_secret_version" "vercel_api_token_coltons" {
+  secret_id = aws_secretsmanager_secret.vercel_api_token_coltons.id
+}
+
+provider "vercel" {
+  alias     = "coltons"
+  api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_coltons.secret_string)
+}
+
 provider "vercel" {
   alias     = "ejc3"
   api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_ejc3.secret_string)
@@ -146,6 +156,7 @@ resource "vercel_project_environment_variable" "vercel_env_dolphin_labs" {
 }
 
 resource "vercel_project_environment_variable" "vercel_env_coltons" {
+  provider   = vercel.coltons
   for_each   = local.vercel_env_by_team.coltons
   team_id    = local.vercel_env_projects[split("/", each.key)[0]].team_id
   project_id = local.vercel_env_projects[split("/", each.key)[0]].project_id
