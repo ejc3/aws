@@ -4,7 +4,9 @@
 #   scripts/workers-stage-secrets.sh SITE          e.g. imagine -> reads workers-stage/imagine, loads Worker imagine-stage
 #
 # Source of truth: the Secrets Manager container workers-stage/SITE (JSON of variable name -> value; see
-# workers-stage-secrets.tf). It is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this
+# workers-stage-secrets.tf). Dolphin's sites (dolphin-labs, dolphin-films) keep theirs in the Dolphin account
+# (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
+# administration; every other site's container is in this account. It is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this
 # script's output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a
 # deploy is uploading can be lost when that deploy activates.
 set -euo pipefail
@@ -15,8 +17,36 @@ SITE=${1:?usage: workers-stage-secrets.sh SITE}
 WORKER="$SITE-stage"
 ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
-JSON=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text 2>/dev/null) \
-  || { echo "workers-stage/$SITE has no value yet: put one first (see workers-stage-secrets.tf)" >&2; exit 1; }
+DOLPHIN_ACCOUNT_ID=484888470752
+case "$SITE" in
+  dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
+  *) SOURCE_ACCOUNT="" ;;
+esac
+
+read_container() {
+  if [[ -z "$SOURCE_ACCOUNT" ]]; then
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
+    return
+  fi
+  # A one-hour session in the Dolphin account, kept in this subshell's environment (never on a command line or on disk),
+  # used for this one read and gone when the subshell exits.
+  local creds
+  creds=$(aws sts assume-role --role-arn "arn:aws:iam::$SOURCE_ACCOUNT:role/OrganizationAccountAccessRole" \
+    --role-session-name "workers-stage-secrets-$(id -un)" --query Credentials --output json) || return 1
+  (
+    eval "$(printf '%s' "$creds" | python3 -c '
+import json, shlex, sys
+c = json.load(sys.stdin)
+for k, v in (("AWS_ACCESS_KEY_ID", "AccessKeyId"), ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), ("AWS_SESSION_TOKEN", "SessionToken")):
+    print("export %s=%s" % (k, shlex.quote(c[v])))
+')"
+    unset AWS_PROFILE
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
+  )
+}
+
+JSON=$(read_container 2>/dev/null) \
+  || { echo "workers-stage/$SITE has no value yet in account ${SOURCE_ACCOUNT:-this one}: put one first (see workers-stage-secrets.tf)" >&2; exit 1; }
 
 # Refuse anything that is not a plain {NAME: non-empty string} object, or that is Vercel's placeholder for a hidden value.
 printf '%s' "$JSON" | python3 -c '

@@ -5,8 +5,11 @@
 # holds the whole set as JSON (variable name -> value), and `scripts/workers-stage-secrets.sh SITE` loads it into the
 # Worker `<site>-stage`. Rebuilding a Worker, or rotating a value, is: edit the container, run the script.
 #
-#   workers-stage/dolphin-labs   workers-stage/dolphin-films   workers-stage/imagine
-#   workers-stage/remote-claw    workers-stage/nest-step       workers-stage/colton-games
+#   workers-stage/imagine   workers-stage/remote-claw   workers-stage/nest-step   workers-stage/colton-games
+#
+# Dolphin's two sites (dolphin-labs, dolphin-films) keep theirs in the Dolphin account under the same names
+# (dolphin-labs-hq/dolphin-aws, secrets.tf; moved 2026-10-11, step 1 of its docs/secrets-migration.md). The loader reads
+# them there through OrganizationAccountAccessRole; put a value there the same way, never back in this account.
 #
 # Terraform owns only the containers and who may read them (administration only: a dev box has no reason to hold
 # another site's credentials, and nextjs-dev gives every account sudo). It never reads a value, so none is in state.
@@ -20,7 +23,7 @@
 # variable of type `sensitive`, so those cannot be copied from there: take them from the real source, or make new ones.
 
 locals {
-  workers_stage_secret_sites = toset(["colton-games", "dolphin-films", "dolphin-labs", "imagine", "nest-step", "remote-claw"])
+  workers_stage_secret_sites = toset(["colton-games", "imagine", "nest-step", "remote-claw"])
 }
 
 resource "aws_secretsmanager_secret" "workers_stage" {

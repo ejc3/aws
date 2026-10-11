@@ -1249,6 +1249,11 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   configuration reads that return environment variables or user data); the state bucket's policy refuses him too. His user
   and assignment exist only while the `dolphin_steve` key of `people/addresses` holds his address (it is also his
   user name); an API-created user gets no invitation and sets a password with "Forgot password".
+- **Secrets moving here** (dolphin-aws `docs/secrets-migration.md`, one consumer at a time). Moved: `workers-stage/dolphin-labs`
+  and `workers-stage/dolphin-films` (2026-10-11): the containers in the Dolphin account hold them and
+  `scripts/workers-stage-secrets.sh` reads them there through `OrganizationAccountAccessRole`, which dolphin-aws names as
+  administration of its containers (the management account's way in, assumed from here; nothing in the Dolphin account can
+  assume anything here). Put a new value there from a 0600 file or stdin with a session in that role, never in this account.
 - **Security monitoring** is `dolphin-security.tf`, built from here (never dolphin-aws), with nothing written into this
   account: GuardDuty in us-west-1, us-west-2 and us-east-1 (`modules/security-region` with `forward_findings = false`),
   Config, Security Hub (foundational standard) and Inspector in us-west-1, Config records in
@@ -1362,7 +1367,8 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   registrar token is.)
 - **The Workers' runtime secrets are kept in AWS, not in Cloudflare.** A Worker's secrets are write-only (nothing can read one
   back), so `workers-stage-secrets.tf` owns one administration-only container per site, `workers-stage/<site>` (JSON of variable
-  name to value), and `scripts/workers-stage-secrets.sh SITE` loads it into `<site>-stage` through `wrangler secret bulk`
+  name to value; dolphin-labs' and dolphin-films' are in the Dolphin account under the same names, below), and
+  `scripts/workers-stage-secrets.sh SITE` loads it into `<site>-stage` through `wrangler secret bulk`
   (stdin, names printed only; it refuses an empty value or a bracketed placeholder). Change a value by editing the container and
   re-running the script, after the site's own deploy has finished (a secret change made while a deploy uploads can be lost when
   it activates). Take values from the real source, never from Vercel: a variable of type `sensitive` is never returned by any

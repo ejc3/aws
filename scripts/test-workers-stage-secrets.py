@@ -15,7 +15,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "workers-stage-secrets.tf").read_text()
 SCRIPT = ROOT / "scripts" / "workers-stage-secrets.sh"
-SITES = ["colton-games", "dolphin-films", "dolphin-labs", "imagine", "nest-step", "remote-claw"]
+SITES = ["colton-games", "imagine", "nest-step", "remote-claw"]
+# Kept in the Dolphin account (dolphin-labs-hq/dolphin-aws) and read there through OrganizationAccountAccessRole.
+DOLPHIN_SITES = ["dolphin-films", "dolphin-labs"]
+DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
 ALL_TF = "\n".join(p.read_text() for p in ROOT.glob("*.tf"))
 
 
@@ -49,7 +52,14 @@ class ContainerTests(unittest.TestCase):
 FAKE_AWS = r'''#!/usr/bin/env python3
 import os, sys
 a = " ".join(sys.argv[1:])
-if "workers-stage/" in a:
+log = os.environ.get("AWS_LOG")
+if log:
+    open(log, "a").write("ARGV %s KEY=%s PROFILE=%s\n" % (a, os.environ.get("AWS_ACCESS_KEY_ID", "-"), os.environ.get("AWS_PROFILE", "-")))
+if a.startswith("sts assume-role"):
+    if os.environ.get("FAKE_ASSUME_FAILS"):
+        sys.stderr.write("An error occurred (AccessDenied)\n"); sys.exit(254)
+    print('{"AccessKeyId": "ASIAFAKEDOLPHIN", "SecretAccessKey": "fake-secret-key-0123", "SessionToken": "fake-session-token-4567"}')
+elif "workers-stage/" in a:
     p = os.environ.get("FAKE_STAGE_JSON")
     if p is None:
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
@@ -76,10 +86,14 @@ class LoaderTests(unittest.TestCase):
             p.write_text(body)
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         self.log, self.stdin, self.env = self.tmp / "npx.log", self.tmp / "npx.stdin", self.tmp / "npx.env"
+        self.aws_log = self.tmp / "aws.log"
 
-    def run_loader(self, *args, stage_json=None):
+    def run_loader(self, *args, stage_json=None, **extra_env):
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
-                   NPX_STDIN=str(self.stdin), NPX_ENV=str(self.env))
+                   NPX_STDIN=str(self.stdin), NPX_ENV=str(self.env), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile")
+        for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "FAKE_ASSUME_FAILS"):
+            env.pop(k, None)
+        env.update(extra_env)
         if stage_json is not None:
             env["FAKE_STAGE_JSON"] = stage_json
         else:
@@ -125,6 +139,41 @@ class LoaderTests(unittest.TestCase):
         for bad in ("../x", "Imagine", "a b", "x;rm", ""):
             r, out = self.run_loader(bad, stage_json=json.dumps({"A": "b"}))
             self.assertNotEqual(r.returncode, 0, bad)
+        self.assertFalse(self.log.exists())
+
+
+    def aws_calls(self):
+        return self.aws_log.read_text().splitlines() if self.aws_log.exists() else []
+
+    def test_dolphin_sites_are_read_in_the_dolphin_account_with_an_assumed_session(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        for site in DOLPHIN_SITES:
+            self.aws_log.unlink(missing_ok=True)
+            r, out = self.run_loader(site, stage_json=json.dumps(payload))
+            self.assertEqual(r.returncode, 0, out)
+            calls = self.aws_calls()
+            self.assertIn("sts assume-role --role-arn %s" % DOLPHIN_ROLE, calls[0])
+            read = [c for c in calls if "workers-stage/%s" % site in c]
+            self.assertEqual(len(read), 1, calls)
+            self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=-", read[0])  # the read ran as the assumed session, no profile
+            token = [c for c in calls if "cloudflare-workers-deploy-token" in c]
+            self.assertIn("KEY=- PROFILE=example-profile", token[0])  # the deploy token stays in this account
+            self.assertIn("secret bulk --name %s-stage" % site, self.log.read_text())
+            for secret in ("fake-secret-key-0123", "fake-session-token-4567", "dolphin-value-0123456789"):
+                self.assertNotIn(secret, out)
+                self.assertNotIn(secret, "\n".join(calls))  # never on a command line
+
+    def test_other_sites_never_assume_a_role(self):
+        r, out = self.run_loader("imagine", stage_json=json.dumps({"A": "b"}))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertFalse([c for c in self.aws_calls() if "assume-role" in c])
+        self.assertIn("KEY=- PROFILE=example-profile", [c for c in self.aws_calls() if "workers-stage/imagine" in c][0])
+
+    def test_a_failed_assume_role_stops_before_cloudflare(self):
+        r, out = self.run_loader("dolphin-labs", stage_json=json.dumps({"A": "b"}), FAKE_ASSUME_FAILS="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("account 484888470752", out)
+        self.assertFalse([c for c in self.aws_calls() if "workers-stage/" in c])
         self.assertFalse(self.log.exists())
 
 
