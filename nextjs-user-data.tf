@@ -2419,20 +2419,23 @@ for u in ${join(" ", local.nextjs_users)}; do
     # authenticated" branch: these are private, so cloning them as anyone else would
     # either fail outright or leave another account's token in the checkout. Skipped
     # when the directory already exists, so it never clobbers local work.
+    # The template emits only one case arm per user; the cloning is a plain bash loop. A nested template loop here
+    # welded each repository's `fi` onto the next one's `if` (the ~ markers eat the newline), a syntax error that
+    # setup-sync's bash -n guard refuses, which would stop the box converging at all.
+    starter_repos=""
     case "$u" in
 %{~for ru, rl in local.nextjs_user_repos~}
-      ${ru})
-%{~for repo in rl~}
-        if [ ! -d "/home/$u/${basename(repo)}" ]; then
-          echo "cloning ${repo} for $u"
-          sudo -u "$u" -H env HOME="/home/$u" \
-            gh repo clone ${repo} "/home/$u/${basename(repo)}" >/dev/null 2>&1 \
-            || echo "WARNING: could not clone ${repo} for $u (no access?)"
-        fi
-%{~endfor~}
-        ;;
+      ${ru}) starter_repos="${join(" ", rl)}" ;;
 %{~endfor~}
     esac
+    for repo in $starter_repos; do
+      if [ ! -d "/home/$u/$${repo##*/}" ]; then
+        echo "cloning $repo for $u"
+        sudo -u "$u" -H env HOME="/home/$u" \
+          gh repo clone "$repo" "/home/$u/$${repo##*/}" >/dev/null 2>&1 \
+          || echo "WARNING: could not clone $repo for $u (no access?)"
+      fi
+    done
     for r in /home/$u/*/; do
       [ -d "$r/.git" ] || continue
       sudo -u "$u" -H env HOME="/home/$u" git -C "$r" config --unset user.email 2>/dev/null || true
