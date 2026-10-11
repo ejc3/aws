@@ -15,8 +15,8 @@
 #
 # WHO MAY RUN IT: anyone with AWS access to the server (an administrator). Signing happens on the
 # server box through SSM Run Command, so issuing a certificate is an AWS-authenticated action and
-# the CA key never leaves that box. The machine being enrolled needs the `claude-master` binary
-# (github.com/ejc3/CLIProxyAPI releases) and nothing from AWS.
+# the CA key never leaves that box. The machine being enrolled needs the `claw-master` binary (or `claude-master`,
+# its name before the rename; github.com/ejc3/CLIProxyAPI releases) and nothing from AWS.
 #
 # The key is made ON the enrolled machine and never travels; only the certificate request goes up
 # and the signed certificate and the server's public CA certificate come back.
@@ -58,13 +58,13 @@ SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
 
 NEW="$DIR.new"
 echo "1/4 making a key and a certificate request on ${HOST:-this machine}${AS:+ as $AS}"
-on_target "set -e; cd \"\$HOME\"; command -v claude-master >/dev/null || { echo 'claude-master is not installed here' >&2; exit 1; }; rm -rf '$NEW'; claude-master client-init --dir '$NEW' --name '$NAME' >/dev/null"
+on_target "set -e; cd \"\$HOME\"; CM=\$(command -v claw-master || command -v claude-master) || { echo 'claw-master is not installed here' >&2; exit 1; }; rm -rf '$NEW'; \"\$CM\" client-init --dir '$NEW' --name '$NAME' >/dev/null"
 # `tr`, not `base64 -w0`: the BSD base64 on a Mac has no -w.
 CSR=$(on_target "base64 < \"\$HOME/$NEW/client.csr\" | tr -d '\n'")
 
 echo "2/4 asking the server ($SERVER_ID) to sign it for $DAYS days"
 CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript \
-  --parameters "commands=[\"echo $CSR | /usr/local/bin/claude-master-sign $DAYS\"]" --query Command.CommandId --output text)
+  --parameters "commands=[\"echo $CSR | /usr/local/bin/claw-master-sign $DAYS\"]" --query Command.CommandId --output text)
 aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID"
 STATUS=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query Status --output text)
 [ "$STATUS" = Success ] || { echo "signing failed ($STATUS):" >&2; aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardErrorContent --output text >&2; exit 1; }
@@ -81,4 +81,4 @@ printf '%s\n' "$CA_PEM" | on_target "cat > \"\$HOME/$NEW/ca.pem\" && chmod 644 \
 
 echo "4/4 switching to the new identity"
 on_target "set -e; cd \"\$HOME\"; rm -rf '$DIR.old'; [ -d '$DIR' ] && mv '$DIR' '$DIR.old'; mv '$NEW' '$DIR'; rm -rf '$DIR.old'; openssl x509 -noout -subject -enddate -in '$DIR/client.pem'"
-echo "done. Connect with: claude-master connect --server $(terraform -chdir="$(dirname "$0")/.." output -raw claude_master_server_address 2>/dev/null || echo 10.0.1.50:8443) --dir ~/$DIR -- ..."
+echo "done. Connect with: claw-master connect --server $(terraform -chdir="$(dirname "$0")/.." output -raw claude_master_server_address 2>/dev/null || echo 10.0.1.50:8443) --dir ~/$DIR -- ..."

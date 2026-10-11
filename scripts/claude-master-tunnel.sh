@@ -4,7 +4,7 @@
 # the VPC but has AWS access (a Mac), through an SSM port forward. Nothing is opened to the internet.
 #
 #   scripts/claude-master-tunnel.sh [LOCAL_PORT]        default 8443; leave it running
-#   claude-master connect --server 127.0.0.1:8443 --dir ~/.config/claude-master -- ...
+#   claw-master connect --server 127.0.0.1:8443 --dir ~/.config/claude-master -- ...
 #
 # The session type matters. The plain AWS-StartPortForwardingSession connects to the INSTANCE'S
 # loopback, where nothing listens (the server binds its private address only). This uses the

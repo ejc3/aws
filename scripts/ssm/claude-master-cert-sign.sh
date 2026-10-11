@@ -1,12 +1,13 @@
 #!/bin/bash
 # SSM document claude-master-cert-sign: on the SERVER, sign a client's certificate request, but only for the name the caller
 # asked for. The request's own CN must equal Name exactly, so this cannot be used to mint a certificate for any other client.
-# Output: the client certificate PEM, then the CA certificate PEM (what claude-master-sign prints).
+# Output: the client certificate PEM, then the CA certificate PEM (what claw-master-sign prints).
 set -u
 NAME='{{ Name }}'
 CSR='{{ Csr }}'
 DAYS='{{ Days }}'
-CM_SIGN=${CM_SIGN:-/usr/local/bin/claude-master-sign}
+CM_SIGN=${CM_SIGN:-}
+if [ -z "$CM_SIGN" ]; then CM_SIGN=/usr/local/bin/claw-master-sign; [ -x "$CM_SIGN" ] || CM_SIGN=/usr/local/bin/claude-master-sign; fi
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 [ "$DAYS" -ge 1 ] 2>/dev/null && [ "$DAYS" -le 90 ] || { echo "SIGN=bad-days" >&2; exit 1; }
 [ "${#CSR}" -le 4096 ] || { echo "SIGN=bad-request-size" >&2; exit 1; }

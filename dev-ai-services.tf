@@ -161,13 +161,14 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
 
-# Anthropic API key, the final paid backup for claude-master (`--backup-api-key env:CLAUDE_MASTER_BACKUP_API_KEY`),
-# used only after every subscription profile is out of quota. It lived in ~/claude_api.txt on fcvm;
+# Anthropic API key, the final paid backup for claw-master (`--backup-api-key env:CLAW_MASTER_BACKUP_API_KEY`; the
+# binary still reads CLAUDE_MASTER_BACKUP_API_KEY, its name before the rename), used only after every subscription
+# profile is out of quota. It lived in ~/claude_api.txt on fcvm;
 # the value is set out of band (put-secret-value from a 0600 file) and never enters git. Readers: the
 # administration set, dev-server-role (the metal boxes) and the shared claude-master server's role.
 # Not nextjs-dev-role: every account there has full sudo, so a grant would be box-wide, and this key
 # is billed per token.
-#   export CLAUDE_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
+#   export CLAW_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id claude-master/backup-api-key --query SecretString --output text)
 resource "aws_secretsmanager_secret" "claude_master_backup_key" {
   name                    = "claude-master/backup-api-key"

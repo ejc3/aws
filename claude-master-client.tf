@@ -19,30 +19,43 @@
 # launch (`--inference-server`, ejc3/t-claude) and runs `claude-master connect` in place of plain claude. It also exports
 # TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master: this box has a personal build in ~/.local/bin ahead of the shared one on
 # PATH (an older one that refuses the t-claude flags), and the route must use the pinned build, not whichever comes first.
+#
+# THE OLD NAME IS KEPT ON PURPOSE. Since the rename (2026-10-11) the binary is /usr/local/bin/claw-master, and
+# /usr/local/bin/claude-master is a link to it. TCLAUDE_CLAUDE_MASTER names the LINK: t-claude decides whether a window's
+# agent is still running by the process name, and counts a process whose name starts with "claude" (so claude-master
+# matches, claw-master would not). Through the link the process keeps the name claude-master; pointed at claw-master, a
+# running pool session would look dead and t-claude would type a second launch into it. Switch it once t-claude knows the name.
+# The client directory stays ~/.config/claude-master: t-claude passes it, and the certificate renewal works on it.
 
 locals {
   claude_master_client_instances = var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : []
 
   claude_master_client_commands = <<-CMD
     set -u
-    if [ "$(uname -m)" != aarch64 ]; then echo "claude-master client: no pinned build for $(uname -m); nothing done"; exit 0; fi
+    if [ "$(uname -m)" != aarch64 ]; then echo "claw-master client: no pinned build for $(uname -m); nothing done"; exit 0; fi
     CM_TAG="${local.claude_master_tag}"
     CM_SHA="${local.claude_master_sha256_aarch64}"
-    if [ "$(sha256sum /usr/local/bin/claude-master 2>/dev/null | cut -d' ' -f1)" = "$CM_SHA" ]; then
-      echo "claude-master $CM_TAG already installed"
+    if [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" = "$CM_SHA" ]; then
+      echo "claw-master $CM_TAG already installed"
     else
       CMTMP=$(mktemp -d)
       # Every step is part of the condition: a failed install or rename (full or read-only disk) must fail the association,
       # not fall through to an echo that reports success.
-      if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claude-master-linux-arm64" -o "$CMTMP/claude-master" \
-         && echo "$CM_SHA  $CMTMP/claude-master" | sha256sum -c --quiet - \
-         && install -m 0755 "$CMTMP/claude-master" /usr/local/bin/claude-master.new \
-         && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master; then
-        echo "claude-master $CM_TAG installed"
+      if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claw-master-linux-arm64" -o "$CMTMP/claw-master" \
+         && echo "$CM_SHA  $CMTMP/claw-master" | sha256sum -c --quiet - \
+         && install -m 0755 "$CMTMP/claw-master" /usr/local/bin/claw-master.new \
+         && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master; then
+        echo "claw-master $CM_TAG installed"
       else
-        echo "claude-master client FAILED: download, sha256 or install (kept any installed copy)"; rm -f /usr/local/bin/claude-master.new; rm -rf "$CMTMP"; exit 1
+        echo "claw-master client FAILED: download, sha256 or install (kept any installed copy)"; rm -f /usr/local/bin/claw-master.new; rm -rf "$CMTMP"; exit 1
       fi
       rm -rf "$CMTMP"
+    fi
+    # The name before the rename stays as a link to the same binary (see TCLAUDE_CLAUDE_MASTER below). A running session keeps
+    # the file it started from.
+    if [ "$(readlink /usr/local/bin/claude-master)" != claw-master ]; then
+      ln -sfn claw-master /usr/local/bin/claude-master.new && mv -Tf /usr/local/bin/claude-master.new /usr/local/bin/claude-master \
+        || { echo "claw-master client FAILED: could not link /usr/local/bin/claude-master"; rm -f /usr/local/bin/claude-master.new; exit 1; }
     fi
     ZE=/etc/zsh/zshenv
     if [ -f "$ZE" ]; then

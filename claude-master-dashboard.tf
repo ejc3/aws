@@ -1,15 +1,20 @@
 # CloudWatch dashboard and metric alarms for the claude-master server.
 #
-# Data path: claude-master --otlp-endpoint -> the CloudWatch agent on the box (127.0.0.1:4318) -> namespace
-# ClaudeMaster (claude-master-server.tf). What CloudWatch does with it, measured with synthetic OTLP through the
-# live agent on 2026-10-01 (not read from documentation, which does not say):
+# Data path: claw-master --otlp-endpoint -> the CloudWatch agent on the box (127.0.0.1:4318) -> namespace
+# ClawMaster (claude-master-server.tf). Since the rename (2026-10-11) the metrics are claw_master.* and every measurement
+# about Claude also carries provider=claude; the queries below aggregate across dimensions, so that extra one changes
+# nothing here. The history from before the switch (ClaudeMaster, claude_master.*) was copied into ClawMaster under the
+# new names by scripts/claw-master-migrate-metrics.py in ejc3/CLIProxyAPI.
+#
+# What CloudWatch does with it, measured with synthetic OTLP through the live agent on 2026-10-01 (not read from
+# documentation, which does not say):
 #   * every attribute becomes a dimension, plus the resource's service.name, and every distinct combination is
 #     its own billable custom metric. The proxy therefore never crosses its axes: each metric carries at most
-#     three attributes, one projection per axis (docs/claude-master.md in ejc3/CLIProxyAPI);
+#     three attributes, one projection per axis (docs/claw-master.md in ejc3/CLIProxyAPI);
 #   * counters arrive as DELTAS (a Sum is a count);
 #   * histograms arrive as approximate statistic sets (Sum, SampleCount, Min, Max; no percentiles), so latency
 #     percentiles are the proxy's own duration_quantile gauges;
-#   * Metrics Insights queries (SELECT ... FROM "ClaudeMaster" GROUP BY ...) aggregate across all the
+#   * Metrics Insights queries (SELECT ... FROM "ClawMaster" GROUP BY ...) aggregate across all the
 #     dimension combinations, so the panels below need no dimension lists.
 #
 # Alarms here are Metrics Insights QUERY alarms with no dimension names, on purpose: an alarm that selects
@@ -24,108 +29,108 @@ locals {
     {
       title   = "Requests by user (client_account)"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY client_account" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY client_account" }]
     },
     {
       title   = "Requests by subscription (profile)"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Requests by box (client)"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.requests.by_client\") FROM \"${local.cm_ns}\" GROUP BY client" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.requests.by_client\") FROM \"${local.cm_ns}\" GROUP BY client" }]
     },
     {
       title   = "Requests by model"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.requests.by_model\") FROM \"${local.cm_ns}\" GROUP BY model" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.requests.by_model\") FROM \"${local.cm_ns}\" GROUP BY model" }]
     },
     {
       title   = "Outcome (status class)"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY status_class" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.requests\") FROM \"${local.cm_ns}\" GROUP BY status_class" }]
     },
     {
       title   = "Errors from Anthropic by status"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.inference.errors\") FROM \"${local.cm_ns}\" GROUP BY status" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.inference.errors\") FROM \"${local.cm_ns}\" GROUP BY status" }]
     },
     {
       title   = "Latency percentiles, recent requests (ms)"
       stacked = false
       queries = [
-        { label = "p50", q = "SELECT MAX(\"claude_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.5'" },
-        { label = "p95", q = "SELECT MAX(\"claude_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.95'" },
-        { label = "p99", q = "SELECT MAX(\"claude_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.99'" },
+        { label = "p50", q = "SELECT MAX(\"claw_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.5'" },
+        { label = "p95", q = "SELECT MAX(\"claw_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.95'" },
+        { label = "p99", q = "SELECT MAX(\"claw_master.inference.duration_quantile\") FROM \"${local.cm_ns}\" WHERE quantile = '0.99'" },
       ]
     },
     {
       title   = "Average time to first byte by subscription (ms)"
       stacked = false
-      queries = [{ label = "", q = "SELECT AVG(\"claude_master.inference.ttfb\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      queries = [{ label = "", q = "SELECT AVG(\"claw_master.inference.ttfb\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Average duration by model (ms)"
       stacked = false
-      queries = [{ label = "", q = "SELECT AVG(\"claude_master.inference.duration.by_model\") FROM \"${local.cm_ns}\" GROUP BY model" }]
+      queries = [{ label = "", q = "SELECT AVG(\"claw_master.inference.duration.by_model\") FROM \"${local.cm_ns}\" GROUP BY model" }]
     },
     {
-      title   = "Anthropic's own first-byte time vs claude-master's added time (ms)"
+      title   = "Anthropic's own first-byte time vs claw-master's added time (ms)"
       stacked = false
       queries = [
-        { label = "Anthropic first byte", q = "SELECT AVG(\"claude_master.inference.upstream_ttfb\") FROM \"${local.cm_ns}\"" },
-        { label = "claude-master overhead", q = "SELECT AVG(\"claude_master.proxy.overhead\") FROM \"${local.cm_ns}\"" },
+        { label = "Anthropic first byte", q = "SELECT AVG(\"claw_master.inference.upstream_ttfb\") FROM \"${local.cm_ns}\"" },
+        { label = "claw-master overhead", q = "SELECT AVG(\"claw_master.proxy.overhead\") FROM \"${local.cm_ns}\"" },
       ]
     },
     {
       title   = "Weekly allowance used, by subscription (0 to 1; the last tenth is a reserve)"
       stacked = false
-      queries = [{ label = "", q = "SELECT MAX(\"claude_master.quota.used_fraction\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      queries = [{ label = "", q = "SELECT MAX(\"claw_master.quota.used_fraction\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Anthropic's own utilization, by subscription and window"
       stacked = false
-      queries = [{ label = "", q = "SELECT MAX(\"claude_master.anthropic.ratelimit\") FROM \"${local.cm_ns}\" WHERE measure = 'utilization' GROUP BY profile, \"window\"" }]
+      queries = [{ label = "", q = "SELECT MAX(\"claw_master.anthropic.ratelimit\") FROM \"${local.cm_ns}\" WHERE measure = 'utilization' GROUP BY profile, \"window\"" }]
     },
     {
       title   = "Hours until each weekly allowance resets"
       stacked = false
       divide  = 3600 # the proxy publishes seconds; Metrics Insights cannot divide, metric math can
-      queries = [{ label = "", q = "SELECT MAX(\"claude_master.quota.resets_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      queries = [{ label = "", q = "SELECT MAX(\"claw_master.quota.resets_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Conversations moved between subscriptions (by reason)"
       stacked = true
-      queries = [{ label = "", q = "SELECT SUM(\"claude_master.routing.switches\") FROM \"${local.cm_ns}\" GROUP BY reason" }]
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.routing.switches\") FROM \"${local.cm_ns}\" GROUP BY reason" }]
     },
     {
       title   = "Rate limits from Anthropic, API-key backup use"
       stacked = false
       queries = [
-        { label = "rate limited", q = "SELECT SUM(\"claude_master.quota.rate_limited\") FROM \"${local.cm_ns}\"" },
-        { label = "API backup requests", q = "SELECT SUM(\"claude_master.routing.backup_requests\") FROM \"${local.cm_ns}\"" },
+        { label = "rate limited", q = "SELECT SUM(\"claw_master.quota.rate_limited\") FROM \"${local.cm_ns}\"" },
+        { label = "API backup requests", q = "SELECT SUM(\"claw_master.routing.backup_requests\") FROM \"${local.cm_ns}\"" },
       ]
     },
     {
       title   = "Login health: seconds until each token expires"
       stacked = false
-      queries = [{ label = "", q = "SELECT MIN(\"claude_master.auth.token_expires_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      queries = [{ label = "", q = "SELECT MIN(\"claw_master.auth.token_expires_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Login refreshes and usage polls (by result)"
       stacked = true
       queries = [
-        { label = "refresh", q = "SELECT SUM(\"claude_master.auth.refresh\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
-        { label = "usage poll", q = "SELECT SUM(\"claude_master.usage.polls\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
+        { label = "refresh", q = "SELECT SUM(\"claw_master.auth.refresh\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
+        { label = "usage poll", q = "SELECT SUM(\"claw_master.usage.polls\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
       ]
     },
     {
       title   = "Proxy connections (by result) and refused handshakes"
       stacked = true
       queries = [
-        { label = "connections", q = "SELECT SUM(\"claude_master.proxy.connections\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
-        { label = "TLS handshake errors", q = "SELECT SUM(\"claude_master.proxy.tls_handshake_errors\") FROM \"${local.cm_ns}\"" },
+        { label = "connections", q = "SELECT SUM(\"claw_master.proxy.connections\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
+        { label = "TLS handshake errors", q = "SELECT SUM(\"claw_master.proxy.tls_handshake_errors\") FROM \"${local.cm_ns}\"" },
       ]
     },
     {
@@ -140,8 +145,8 @@ locals {
       title   = "Process: heap (bytes) and goroutines"
       stacked = false
       queries = [
-        { label = "heap", q = "SELECT MAX(\"claude_master.process.heap_bytes\") FROM \"${local.cm_ns}\"" },
-        { label = "goroutines", q = "SELECT MAX(\"claude_master.process.goroutines\") FROM \"${local.cm_ns}\"" },
+        { label = "heap", q = "SELECT MAX(\"claw_master.process.heap_bytes\") FROM \"${local.cm_ns}\"" },
+        { label = "goroutines", q = "SELECT MAX(\"claw_master.process.goroutines\") FROM \"${local.cm_ns}\"" },
       ]
     },
     {
@@ -212,7 +217,7 @@ resource "aws_cloudwatch_metric_alarm" "claude_master_pool" {
     id          = "q"
     label       = each.key
     return_data = true
-    expression  = each.key == "pool_exhausted" ? "SELECT MIN(\"claude_master.quota.used_fraction\") FROM \"${local.cm_ns}\"" : "SELECT SUM(\"claude_master.inference.errors\") FROM \"${local.cm_ns}\""
+    expression  = each.key == "pool_exhausted" ? "SELECT MIN(\"claw_master.quota.used_fraction\") FROM \"${local.cm_ns}\"" : "SELECT SUM(\"claw_master.inference.errors\") FROM \"${local.cm_ns}\""
     # One ten-minute datapoint for the error count (two consecutive five-minute ones would each have to pass
     # 20 on their own); the allowance is judged over three five-minute points.
     period = each.key == "pool_exhausted" ? 300 : 600

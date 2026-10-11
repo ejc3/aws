@@ -599,6 +599,30 @@ so a login copied to several boxes destroys itself within hours (measured: refre
 access token returns 401). One box therefore owns each login: `claude-master-server`
 (`claude-master-server.tf`, 10.0.1.50:8443). Everything else is a client; none holds a login.
 
+- **Renamed claw-master (owner, 2026-10-11; ejc3/CLIProxyAPI #20).** Releases are `claw-master-<sha7>` with assets
+  `claw-master-<os>-<arch>`; the binary is `/usr/local/bin/claw-master` everywhere, and the server's helpers are
+  `claw-master-rollout`, `-status`, `-login`, `-sign` (and `-serve`, `-account-labels`, `-envoy-endpoints`). The
+  binary still reads every old name (`CLAUDE_MASTER_*` variables, `~/.local/share/claude-master`, the old probe path
+  and headers), so old clients and new servers mix in either order. What deliberately stayed `claude-master`:
+  - on every box, `/usr/local/bin/claude-master` (a link to claw-master) and each `claude-master-*` helper (links).
+    The clients' `TCLAUDE_CLAUDE_MASTER` names the LINK on purpose: t-claude decides a window's agent is alive by a
+    process name starting with `claude`, so a session run as `claw-master` would look dead and get a second launch
+    typed into it. Switch it only once t-claude knows the new name;
+  - on the server, the systemd units (`claude-master-server@blue|green`, `claude-master-account-labels.timer`,
+    `cloudflared-claude-master`), the service account and its home `/var/lib/claude-master` (the logins and the CA),
+    `/etc/claude-master` and `/var/log/claude-master`. The logins are read from `~/.local/share/claude-master` only
+    while `~/.local/share/claw-master` does not exist: never create that directory on the server;
+  - the clients' certificate directory `~/.config/claude-master` (t-claude passes it; renewal works on it);
+  - every AWS name: the instance's Name tag `claude-master-server`, the log group `/claude-master/server` (90 days of
+    history), the `claude-master/*` secrets, the IAM roles, the SSM documents `claude-master-cert-*`, the Lambda
+    `claude-master-cert-renew` and its `ClaudeMasterCerts` namespace, the alarm names `claude-master-*` (the dashboard
+    Worker lists alarms by that prefix), the console dashboard `claude-master` and the Worker `claude-master-dashboard`.
+    Renaming any of them replaces the resource and loses its history or breaks a caller, for no gain.
+  The METRICS did move, because the binary renamed them: `claw_master.*`, with `provider=claude` on every measurement
+  about Claude, in namespace `ClawMaster` (log-derived alarms in `ClawMaster/Logs`). The history from before the switch
+  was copied from `ClaudeMaster` with `scripts/claw-master-migrate-metrics.py` (ejc3/CLIProxyAPI), which must run
+  within two weeks of the oldest minute it copies.
+
 - **No password anywhere.** The proxy is TLS and requires a client certificate signed by the
   server's own CA. The CA key lives only in `/var/lib/claude-master/state` on that box. Client
   certificates last 30 days (at most 90), so a lost box expires on its own.

@@ -5,7 +5,9 @@
 set -u
 ACCOUNT='{{ Account }}'
 NAME='{{ Name }}'
-CM_BIN=${CM_BIN:-/usr/local/bin/claude-master}
+# claw-master since the rename (2026-10-11); the old name until a box has the new binary.
+CM_BIN=${CM_BIN:-}
+if [ -z "$CM_BIN" ]; then CM_BIN=/usr/local/bin/claw-master; [ -x "$CM_BIN" ] || CM_BIN=/usr/local/bin/claude-master; fi
 HOME_DIR=${CM_HOME_OVERRIDE:-$(getent passwd "$ACCOUNT" | cut -d: -f6)}
 [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || { echo "REQUEST=no-such-account"; exit 1; }
 [ -x "$CM_BIN" ] || { echo "REQUEST=no-client-binary"; exit 1; }

@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------------
 # The claude-master dashboard site (ejc3/claude-master-dashboard): a Cloudflare Worker that
-# reads the ClaudeMaster CloudWatch namespace (claude-master-dashboard.tf is the console
+# reads the ClawMaster CloudWatch namespace, ClaudeMaster before the rename (claude-master-dashboard.tf is the console
 # dashboard over the same metrics).
 #
 # The same split as workers-stage.tf: the repository's Deploy workflow (Wrangler, with the shared
@@ -120,7 +120,7 @@ resource "aws_iam_user_policy" "claude_master_dashboard" {
   user = aws_iam_user.claude_master_dashboard.name
 
   # CloudWatch has no resource-level permissions for these reads, so they cannot be narrowed
-  # to one namespace; the dashboard queries only ClaudeMaster. The region condition keeps the
+  # to one namespace; the dashboard queries only ClawMaster. The region condition keeps the
   # key to the region the metrics live in.
   policy = jsonencode({
     Version = "2012-10-17"
@@ -164,7 +164,7 @@ resource "aws_secretsmanager_secret_version" "claude_master_dashboard_reader" {
 # (`/api/claude-master/snapshot`) and check a deploy, as the owner does in a browser. The token is admitted by a
 # non_identity policy after the owner's; the Worker admits exactly its client id (DASHBOARD_SERVICE_TOKEN_CLIENT_ID,
 # matched against the assertion's common_name) and still checks every person against DASHBOARD_ALLOWED_EMAILS.
-# Readers: dev-server-role only (the metal boxes), which already reads the ClaudeMaster metrics and the
+# Readers: dev-server-role only (the metal boxes), which already reads the ClawMaster metrics and the
 # /claude-master/server log the dashboard is built from, so the page shows it nothing new. Not nextjs-dev-role:
 # every account there has sudo. Not the cc-games automation token or the Macs' token: revoking this touches nothing else.
 resource "cloudflare_zero_trust_access_service_token" "claude_master_dashboard_agents" {

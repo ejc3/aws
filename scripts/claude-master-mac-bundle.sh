@@ -9,7 +9,7 @@
 #
 # Writes OUTDIR/ (mode 0700): cloudflare.env (the token, 0600), ca.pem (the server's PUBLIC CA
 # certificate) and README.txt with the two commands to run. The Mac needs `cloudflared` (brew install
-# cloudflared) and the `claude-master` binary (github.com/ejc3/CLIProxyAPI releases); no AWS access
+# cloudflared) and the `claw-master` binary (github.com/ejc3/CLIProxyAPI releases); no AWS access
 # and no client certificate.
 set -euo pipefail
 
@@ -29,7 +29,7 @@ SERVER_ID=$(aws ec2 describe-instances --region "$REGION" \
 # the open listener existed (a running server keeps its old configuration, and nothing restarts it
 # for you). A bundle made then would be dead on arrival, so refuse until the listener is up.
 READY_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$SERVER_ID" --document-name AWS-RunShellScript \
-  --parameters 'commands=["claude-master-status"]' --query Command.CommandId --output text)
+  --parameters 'commands=["claw-master-status"]' --query Command.CommandId --output text)
 aws ssm wait command-executed --region "$REGION" --command-id "$READY_ID" --instance-id "$SERVER_ID"
 STATUS_OUT=$(aws ssm get-command-invocation --region "$REGION" --command-id "$READY_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
 if ! printf '%s\n' "$STATUS_OUT" | grep -qx 'open listener: listening'; then
@@ -61,7 +61,7 @@ printf '%s\n' "$CA" > "$OUT/ca.pem"; chmod 0644 "$OUT/ca.pem"
 cat > "$OUT/README.txt" <<TXT
 Use the shared Claude subscriptions from this Mac (nothing here is a login).
 
-One-time:  brew install cloudflared      and install claude-master (github.com/ejc3/CLIProxyAPI releases)
+One-time:  brew install cloudflared      and install claw-master (github.com/ejc3/CLIProxyAPI releases)
            mkdir -p ~/.config/claude-master && cp cloudflare.env ca.pem ~/.config/claude-master/ && chmod 600 ~/.config/claude-master/cloudflare.env
 
 Each time, in one terminal (leave it running):
@@ -69,7 +69,7 @@ Each time, in one terminal (leave it running):
   cloudflared access tcp --hostname "\$CLAUDE_MASTER_TUNNEL_HOSTNAME" --url 127.0.0.1:\$CLAUDE_MASTER_TUNNEL_PORT
 
 In another terminal:
-  claude-master connect --open 127.0.0.1:$PORT --ca ~/.config/claude-master/ca.pem -- --remote-control
+  claw-master connect --open 127.0.0.1:$PORT --ca ~/.config/claude-master/ca.pem -- --remote-control
 
 You still sign in to Claude Code with YOUR OWN account as usual; only inference is shared.
 TXT
