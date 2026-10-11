@@ -1029,6 +1029,12 @@ days, the organization's limit, and are minted again in the owner's browser sess
 a personal access token. Each runner controller still has its own one-repository token
 (`github-runner/repo-pat/<owner>/<repo>`); never put an admin token there.
 
+Prefer the administration agent's **GitHub App** over those tokens: `scripts/github-app-token.py OWNER [--repos a,b]`
+prints a one-hour installation token for an account the app is installed on (ejc3, dolphin-labs-hq), from
+`github-app/aws-admin` (app id, private key, installation ids; jumpbox role only). It signs the app's JWT with the
+system `openssl`, retries only GitHub's transient errors, and prints nothing but the token, so use it in a pipe:
+`GH_TOKEN=$(scripts/github-app-token.py dolphin-labs-hq) gh api ...`. Nothing about it expires or needs a browser.
+
 Instances fetch the token during user_data bootstrap:
 ```bash
 GH_TOKEN=$(aws secretsmanager get-secret-value \
