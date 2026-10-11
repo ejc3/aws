@@ -1035,7 +1035,7 @@ prints a one-hour installation token for an account the app is installed on (ejc
 system `openssl`, retries only GitHub's transient errors, and prints nothing but the token, so use it in a pipe:
 `GH_TOKEN=$(scripts/github-app-token.py dolphin-labs-hq) gh api ...`. Nothing about it expires or needs a browser.
 
-`vercel-admin-token` (`github-admin-tokens.tf`, jumpbox role only) is a full-account Vercel token for ejc3-7031: it manages
+`vercel-admin-token` (`github-admin-tokens.tf`, jumpbox role only) is a full-account Vercel token for the owner's account: it manages
 projects and environments across the account's teams and creates narrower Vercel tokens by API (`POST /v3/user/tokens`),
 so it is the one Vercel credential minted by hand.
 

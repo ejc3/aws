@@ -70,12 +70,12 @@ resource "aws_secretsmanager_secret_policy" "github_app_admin" {
 }
 
 # The administration agent's Vercel token (owner, 2026-10-11: "vercel should be headless too"): a full-account token for
-# ejc3-7031, so Vercel tokens, environment variables and projects are managed by API with no browser. A full-account token
+# the owner's Vercel account, so Vercel tokens, environment variables and projects are managed by API with no browser. A full-account token
 # can create further tokens (POST /v3/user/tokens), so this is the one Vercel credential minted by hand. Raw token string;
 # readers: the jumpboxes' role only, as above.
 resource "aws_secretsmanager_secret" "vercel_admin_token" {
   name                    = "vercel-admin-token"
-  description             = "Full-account Vercel token for the administration agent (ejc3-7031). Jumpbox role only. See github-admin-tokens.tf."
+  description             = "Full-account Vercel token for the administration agent (the owner's Vercel account). Jumpbox role only. See github-admin-tokens.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "vercel-admin-token", Project = "dev" }
 }
