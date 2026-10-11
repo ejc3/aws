@@ -139,6 +139,8 @@ jobs:
       - name: Colton Games accounts (production for administration only, nothing read or written until the gate names a secret)
         run: python3 -S -B scripts/test-colton-games-accounts.py
 
+      - name: colton-games picture moderation grant
+        run: python3 -S -B scripts/test-colton-games-moderation.py
       - name: dolphin-films credentials (production for administration only, non-production for the metal dev role)
         run: python3 -S -B scripts/test-dolphin-films.py
 
