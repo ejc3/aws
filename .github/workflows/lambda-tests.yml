@@ -199,6 +199,9 @@ jobs:
       - name: "People's addresses live in the people/addresses secret, not in git (people.tf)"
         run: python3 -S -B scripts/test-people.py
 
+      - name: "The Dolphin account: its own OU, root address from people/addresses, never closed by Terraform"
+        run: python3 -S -B scripts/test-dolphin-account.py
+
       - name: Turso API token is readable by the metal boxes and administration only
         run: python3 -S -B scripts/test-turso-token.py
 

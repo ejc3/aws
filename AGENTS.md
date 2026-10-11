@@ -1175,6 +1175,14 @@ Every account is opted out of AWS AI services keeping or using what they are sen
   `workers-stage/colton-games` and run `scripts/workers-stage-secrets.sh colton-games`.
 - nextjs-dev's role may call it too, for building the feature on the box.
 
+### The Dolphin account
+
+Dolphin (the dolphin-labs-hq sites) gets an AWS member account of its own, `dolphin`, in OU `Dolphin` at the org root
+(`dolphin-account.tf`), so its resources can move out of this account one consumer at a time. Its root address is the
+`dolphin_account` key of `people/addresses` (a plus-address of the owner's, as the staging account's is); never write it
+anywhere. `close_on_deletion = false` and `prevent_destroy`: unlike dev-staging, this account will hold production data and
+Terraform must never close it. Nothing in this account becomes reachable from it: trust runs one way, from here into it.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
