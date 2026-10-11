@@ -240,6 +240,14 @@ print $restart ? "restart" : "defer";
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout.strip()
 
+    def test_a_running_box_gets_the_guards_without_a_reboot(self):
+        # The boot script and a daily SSM association write the same snippet: fcvm-metal-arm never booted after #294.
+        self.assertIn("\n${local.metal_update_guards}\n", self.CRC)
+        assoc = self.CRC[self.CRC.index('resource "aws_ssm_association" "metal_update_guards"'):]
+        self.assertIn("${local.metal_update_guards}", assoc[:assoc.index("\n}\n")])
+        self.assertIn('schedule_expression = "rate(1 day)"', assoc)
+        self.assertNotIn("systemctl", self.CRC[self.CRC.index("metal_update_guards = <<GUARDS"):self.CRC.index("\nGUARDS\n")])
+
     def test_the_metal_boxes_are_not_rebooted_by_unattended_upgrades(self):
         self.assertEqual(self.automatic_reboot(with_override=True), "V='false'")
 

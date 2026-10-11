@@ -568,7 +568,9 @@ copies them.
 The unit holds ubuntu's tmux server, so restarting it kills every session. Nothing automatic
 does: needrestart lists it as deferred after a library update
 (`/etc/needrestart/conf.d/fcvm-claude-rc.conf`), and unattended-upgrades does not reboot the
-metal boxes (`/etc/apt/apt.conf.d/52unattended-upgrades-no-reboot`). They are spot boxes and
+metal boxes (`/etc/apt/apt.conf.d/52unattended-upgrades-no-reboot`). Both files come from the boot script AND a daily SSM
+association (`metal-update-guards`): fcvm-metal-arm had not booted since they were added, so it had neither, and on
+2026-10-11 an apt install restarted the unit and killed every session. They are spot boxes and
 stop and start on their own terms; the on-demand boxes keep the 03:00 reboot.
 
 Every folder that gets a window at boot also gets a Codex thread, so it shows up in the Codex
@@ -1156,6 +1158,8 @@ nothing. `README.md` ("Colton Games accounts") has the owner's steps.
 `colton-games-moderation.tf` lets colton-games check pictures for inappropriate content with Amazon Rekognition
 `DetectModerationLabels` (us-west-1). That one action is the whole grant everywhere; the picture travels in the request and
 nothing is stored. About $1 per 1,000 pictures; alarm `colton-games-moderation-volume` fires above 2,000 calls an hour.
+Every account is opted out of AWS AI services keeping or using what they are sent (`security-organization.tf`, an
+`AISERVICES_OPT_OUT_POLICY` on the organization root): these are kids' photos.
 
 - Vercel production and preview assume `colton-games-moderation` / `colton-games-moderation-preview` through the Vercel OIDC
   provider, each pinned to its own environment. Terraform writes `MODERATION_ROLE_ARN` and `MODERATION_AWS_REGION`.
