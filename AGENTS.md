@@ -1218,20 +1218,30 @@ that production and non-production share nothing:
 The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step) also deploy a second copy
 to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions.
 
-**Standing rule (owner, 2026-10-10): every web app supports both clouds, and secrets reach both.** It covers the apps
-deployed as sites (Vercel projects and `<site>-stage` Workers), not host-local tools such as `browser-manager/` (bound to
-loopback on its host, reached through its own tunnel). Each app repository's agent instructions carry the same section
-("Two clouds: Vercel and Cloudflare"): a change is done only when both deploys are green; no platform-only code without a
-path on the other; every secret lives in AWS Secrets Manager and must reach both platforms. Where it lives today:
-Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the containers Terraform
-writes into the project for colton-games (`colton-games-accounts.tf`), dolphin-films (`dolphin-films-vercel.tf`) and, from
-`vercel-env.tf`, dolphin-labs, imagine, remote-claw and nest-step: for those four `vercel-env/<site>/<target>` is the SOURCE. Change a
-value there and apply, never in the Vercel dashboard; a variable added or removed in Vercel is picked up by re-running
-`scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names, targets, sensitivity, never a value), and
-every existing variable is imported by its id, never recreated. The Cloudflare side is `workers-stage/<site>`. A new app joins both clouds before it ships. Two apps do not meet the rule yet: dolphin-maps
-(`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage` Worker) and claude-master-dashboard (Cloudflare only, no
-Vercel project). Bringing each to the other cloud follows the order below for Cloudflare, or a Vercel project with its
-environment written by Terraform. Production stays on Vercel; the Worker is a
+**Standing rule (owner, 2026-10-11): Cloudflare is where the sites are going, so parity runs one way.** Every web app
+must work on Cloudflare Workers; nothing has to be brought to Vercel. A feature may use what only Cloudflare offers (Workers
+bindings, KV, D1, R2, Durable Objects, Queues, Cron Triggers, the zone's WAF and rate limiting) without a Vercel path, and a
+Cloudflare-only app (claude-master-dashboard) needs no Vercel project. Until a site's production moves, its Vercel production
+deployment must keep working: a change may not break it, but new capability is built for Cloudflare first. This replaces the
+2026-10-10 rule ("every web app supports both clouds"). It covers the apps deployed as sites (Vercel projects and
+`<site>-stage` Workers), not host-local tools such as `browser-manager/` (bound to loopback on its host, reached through its
+own tunnel). Each app repository's agent instructions carry the matching section. Every secret lives in AWS Secrets Manager.
+Where it lives today: Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the
+containers Terraform writes into the project for colton-games (`colton-games-accounts.tf`), dolphin-films
+(`dolphin-films-vercel.tf`) and, from `vercel-env.tf`, dolphin-labs, imagine, remote-claw and nest-step: for those four
+`vercel-env/<site>/<target>` is the SOURCE. Change a value there and apply, never in the Vercel dashboard; a variable added or
+removed in Vercel is picked up by re-running `scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names,
+targets, sensitivity, never a value), and every existing variable is imported by its id, never recreated. A new app ships on
+Cloudflare. One app is not on Cloudflare yet: dolphin-maps (`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage`
+Worker); bringing it over follows the order below.
+
+**Production is not behind Cloudflare yet (checked 2026-10-11).** Every production hostname (cc-games.org and its old
+domains, yourfantasymovie.com) and the multiplayer `play.cc-games.*` entries are DNS-only records pointing at Vercel or the
+games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
+get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees
+Cloudflare's addresses instead of players'. Cloudflare's protections reach production when production is served by a Worker
+(the move above), or, for the multiplayer entries, when those records are proxied and the router reads the client address from
+`CF-Connecting-IP` and accepts connections only from Cloudflare. All nine zones are on the Free plan. Production stays on Vercel; the Worker is a
 **staging** copy named `<site>-stage`, behind Cloudflare Access, running with the site's NON-PRODUCTION credentials.
 (`ts-api` already deploys to Cloudflare from its own workflow and its own Cloudflare account; it is not part of this.)
 
