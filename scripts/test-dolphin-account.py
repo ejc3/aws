@@ -39,6 +39,13 @@ class DolphinAccountTests(unittest.TestCase):
         self.assertIn("local.people.dolphin_account))", shape)  # and it must be one address
         self.assertNotIn("@", ACCOUNT)
 
+    def test_the_org_trail_can_encrypt_its_events_without_the_account_being_trusted(self):
+        mon = (ROOT / "security-monitoring.tf").read_text()
+        ids = re.search(r"  security_account_ids = \[\n(.*?)\n  \]", mon, re.S).group(1)
+        self.assertNotIn("dolphin", ids)  # that list admits an account's principals to the Config bucket and key
+        self.assertIn('concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) : "arn:aws:cloudtrail:*:${account}:trail/*"', mon)
+        self.assertEqual(mon.count("aws_organizations_account.dolphin"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

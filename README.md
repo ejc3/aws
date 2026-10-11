@@ -197,7 +197,8 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
 
 People's email addresses are not in this repository. `people/addresses` (us-west-1, from `people.tf`) holds them as JSON:
 `owner` (the browser manager's owner), `family` (the Cloudflare Access allowlist for every `*.cc-games.dev` host) and
-`staging_account` (the dev-staging account's root email). To add someone to the allowlist, put the whole JSON again with the
+`staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email) and, optionally,
+`dolphin_steve` (Steve's Identity Center sign-in to the Dolphin account). To add someone to the allowlist, put the whole JSON again with the
 new address in `family` (a plan on a jumpbox then shows the Access policies changing; apply it). Terraform fails a plan,
 naming the key, if the secret is missing a key or `family` is empty. Put it without echoing:
 
