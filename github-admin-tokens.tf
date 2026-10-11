@@ -42,3 +42,29 @@ resource "aws_secretsmanager_secret_policy" "github_admin_token" {
     }]
   })
 }
+
+# The administration agent's GitHub App (owner, 2026-10-11: "setup a github app"), so GitHub tokens are minted by API
+# and expire on their own (an hour) instead of living for a year. `github-app/aws-admin` holds JSON: app_id, slug,
+# client_id, private_key (PEM), webhook_secret, and installations {owner: installation_id}. scripts/github-app-token.py
+# turns it into an installation token for one owner. Same readers as the tokens above: the jumpboxes' role only.
+resource "aws_secretsmanager_secret" "github_app_admin" {
+  name                    = "github-app/aws-admin"
+  description             = "The administration agent's GitHub App credentials (JSON: app id, private key, installations). Jumpbox role only. See github-admin-tokens.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "github-app/aws-admin", Project = "dev" }
+}
+
+resource "aws_secretsmanager_secret_policy" "github_app_admin" {
+  secret_arn = aws_secretsmanager_secret.github_app_admin.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyTheJumpboxRoleCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.github_app_admin.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.github_admin_token_readers } }
+    }]
+  })
+}
