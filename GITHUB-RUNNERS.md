@@ -661,7 +661,9 @@ whenever the pool had room. A single delivery is one job and is never cut this w
 controller and the jumpbox role only) on each run, narrowed to that one repository and to administration:write +
 actions:read, expiring within the hour. The JWT is signed in pure Python (`app_runner.py`, `rs256`), because the Lambda
 runtime has no openssl. Until the secret has a value, or when minting fails (logged), the repo's own PAT
-(`github-runner/repo-pat/<owner>/<repo>`) is used, so the PATs stay until the app is proven. CoderColton's colton-games keeps
+(`github-runner/repo-pat/<owner>/<repo>`) is used, so the PATs stay until the app is proven. The dolphin-labs-hq repos'
+webhooks are managed as the administration agent's GitHub App (`app_auth` from `github-app/aws-admin`), not with those PATs,
+so once the controller has run on app tokens the PATs have no remaining user and can be retired. CoderColton's colton-games keeps
 its PAT: the app would have to be installed from Colton's account.
 
 ## Pattern C — ephemeral x86 spot runners for other repos

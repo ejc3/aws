@@ -1049,7 +1049,13 @@ class WiringTests(unittest.TestCase):
             alias = re.search(r"provider   = github\.(\w+)", hook[0]).group(1)
             provider = re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, APP_TF, re.S).group()
             self.assertIn('owner = "%s"' % owner, provider, repo)
-            self.assertIn('runner_repo_pat["%s"].secret_string' % repo, provider, repo)
+            if owner == "dolphin-labs-hq":
+                # Managed as the administration agent's GitHub App, so the repos' controller PATs can be retired.
+                self.assertIn("app_auth", provider, repo)
+                self.assertIn('installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])', provider, repo)
+                self.assertNotIn("runner_repo_pat", provider, repo)
+            else:
+                self.assertIn('runner_repo_pat["%s"].secret_string' % repo, provider, repo)
             self.assertIn('events     = ["workflow_job"]', hook[0])
 
     def test_security_group_has_no_inbound_and_the_controller_is_serialized(self):

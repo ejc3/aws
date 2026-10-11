@@ -137,7 +137,8 @@ class WebhookGateTests(unittest.TestCase):
         self.assertIn("if lookup(local.runner_app_token_gates, r, true)", RUNNER_APP)
         self.assertIn("for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])", RUNNER_APP)
         provider = re.search(r'alias = "dolphin_films".*?\n\}', RUNNER_APP, re.S).group()
-        self.assertIn("token = local.dolphin_films_webhook ?", provider)
+        self.assertIn("for_each = local.dolphin_films_webhook ? [1] : []", provider)
+        self.assertIn("pem_file        = local.github_app_admin.private_key", provider)
         hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
         self.assertEqual(hook.group(1), "local.dolphin_films_webhook ? 1 : 0")
 
@@ -151,14 +152,17 @@ class WebhookGateTests(unittest.TestCase):
         self.assertIn("dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready", RUNNER_APP)
         self.assertIn('"dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready', RUNNER_APP)
         provider = re.search(r'alias = "dolphin_maps".*?\n\}', RUNNER_APP, re.S).group()
-        self.assertIn("token = local.dolphin_maps_webhook ?", provider)
+        self.assertIn("for_each = local.dolphin_maps_webhook ? [1] : []", provider)
+        self.assertIn("pem_file        = local.github_app_admin.private_key", provider)
         hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_maps" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
         self.assertEqual(hook.group(1), "local.dolphin_maps_webhook ? 1 : 0")
 
     def test_the_other_repos_keep_the_global_gate_only(self):
         self.assertIn("count      = local.runner_app_webhooks ? 1 : 0", RUNNER_APP)
-        for repo in ("CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"):
-            self.assertIn('runner_repo_pat["%s"]' % repo, RUNNER_APP)
+        self.assertIn('runner_repo_pat["CoderColton/colton-games"]', RUNNER_APP)
+        # dolphin-labs' hook is managed as the administration GitHub App, under the global gate alone.
+        provider = re.search(r'alias = "dolphin_labs".*?\n\}', RUNNER_APP, re.S).group()
+        self.assertIn("for_each = local.runner_app_webhooks ? [1] : []", provider)
 
 
 class BuilderTests(unittest.TestCase):
