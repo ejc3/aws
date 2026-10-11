@@ -131,11 +131,13 @@ resource "aws_iam_user_policy" "claude_master_dashboard" {
       Resource  = "*"
       Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
       }, {
-      # The Alarms box reads only alarms named claude-master*; DescribeAlarms is scoped to those ARNs (#384).
-      Sid      = "ReadClaudeMasterAlarms"
+      # The Alarms box reads alarms named claude-master* (#384). It cannot be scoped to that prefix: AWS authorizes
+      # DescribeAlarms against arn:...:alarm:* whatever AlarmNamePrefix asks for (checked 2026-10-11, the prefix-scoped
+      # grant was refused with exactly that resource). So: every alarm in this account and region, read only.
+      Sid      = "ReadAlarms"
       Effect   = "Allow"
       Action   = "cloudwatch:DescribeAlarms"
-      Resource = "arn:aws:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:claude-master*"
+      Resource = "arn:aws:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:*"
     }]
   })
 }
