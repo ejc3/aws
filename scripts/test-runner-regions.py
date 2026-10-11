@@ -170,7 +170,7 @@ class FacadeTests(unittest.TestCase):
 
     def test_the_builder_sweep_reads_its_own_fixed_region_not_the_runner_regions(self):
         self.assertIn("BUILDER_REGION = 'us-west-1'", CLEANUP)
-        self.assertIn("ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION])", CLEANUP)
+        self.assertIn("ec2 = RegionalEC2(RUNNER_REGIONS, also=[BUILDER_REGION], config=SWEEP_CLIENT)", CLEANUP)
         sweep = CLEANUP[CLEANUP.index("# Phase 4: Clean up stale AMI builder"):CLEANUP.index("# Phase 5")]
         self.assertIn("ec2.clients[BUILDER_REGION].describe_instances(", sweep)
         self.assertNotIn("ec2.describe_instances(", sweep)

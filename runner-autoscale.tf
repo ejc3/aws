@@ -80,12 +80,12 @@ data "archive_file" "runner_webhook" {
           """
           NOT_FOUND = ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed')
 
-          def __init__(self, regions, also=()):
+          def __init__(self, regions, also=(), config=None):
               self.regions = list(regions)
               self.primary = self.regions[0]
               # `also` are regions that are never READ as part of the fleet but may still be written to: the AMI
               # builders always run in us-west-1, whichever regions the runners are in.
-              self.clients = {region: boto3.client('ec2', region_name=region) for region in dict.fromkeys(self.regions + list(also))}
+              self.clients = {region: boto3.client('ec2', region_name=region, **({'config': config} if config else {})) for region in dict.fromkeys(self.regions + list(also))}
               self.owner = {}
 
           def region_of(self, instance_id):
