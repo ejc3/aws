@@ -1201,7 +1201,8 @@ Terraform must never close it. Nothing in this account becomes reachable from it
 - **Sign-in is Identity Center** (`dolphin-identity-center.tf`, portal in output `dolphin_sign_in_url`). The owner's user
   gets the existing AdministratorAccess permission set (read as data, not managed). Steve gets `DolphinReadOnly` on the
   Dolphin account only: ReadOnlyAccess, 8-hour sessions, plus a deny on every read that returns a secret value
-  (`GetSecretValue`, `ssm:GetParameter*`, `kms:Decrypt`, state objects); the state bucket's policy refuses him too. His user
+  (`GetSecretValue`, `ssm:GetParameter*`, `kms:Decrypt`, state objects, and the Lambda, ECS, CodeBuild and EC2
+  configuration reads that return environment variables or user data); the state bucket's policy refuses him too. His user
   and assignment exist only while the `dolphin_steve` key of `people/addresses` holds his address (it is also his
   user name); an API-created user gets no invitation and sets a password with "Forgot password".
 - Security monitoring (`security-monitoring.tf`, `security-regions.tf`) covers this account and dev-staging only. The org

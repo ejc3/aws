@@ -62,9 +62,11 @@ resource "aws_ssoadmin_managed_policy_attachment" "dolphin_read_only" {
   managed_policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
-# ReadOnlyAccess already leaves out secretsmanager:GetSecretValue. It does include ssm:Get* (SecureString parameters
-# decrypt) and s3:Get* (Terraform state holds secret values), so those are denied here as well; the state bucket's own
-# policy (dolphin-bootstrap.tf) refuses the read too.
+# ReadOnlyAccess already leaves out secretsmanager:GetSecretValue. It does include other reads that hand back a secret,
+# so those are denied here: ssm:Get* (SecureString parameters decrypt), s3:Get* on the state (Terraform state holds
+# secret values; the bucket's own policy refuses it too), and the configuration reads that return environment variables
+# or user data in plain text (Lambda, ECS task definitions, CodeBuild projects, EC2 user data and launch templates),
+# which a kms:Decrypt deny does not stop.
 resource "aws_ssoadmin_permission_set_inline_policy" "dolphin_read_only" {
   instance_arn       = local.sso_instance_arn
   permission_set_arn = aws_ssoadmin_permission_set.dolphin_read_only.arn
@@ -72,9 +74,17 @@ resource "aws_ssoadmin_permission_set_inline_policy" "dolphin_read_only" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "NoSecretValues"
-        Effect   = "Deny"
-        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory", "kms:Decrypt"]
+        Sid    = "NoSecretValues"
+        Effect = "Deny"
+        Action = [
+          "secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue",
+          "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory",
+          "kms:Decrypt",
+          "lambda:GetFunction", "lambda:GetFunctionConfiguration",
+          "ecs:DescribeTaskDefinition",
+          "codebuild:BatchGetProjects",
+          "ec2:DescribeInstanceAttribute", "ec2:DescribeLaunchTemplateVersions", "ec2:GetLaunchTemplateData",
+        ]
         Resource = "*"
       },
       {

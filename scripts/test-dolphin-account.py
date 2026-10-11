@@ -132,7 +132,9 @@ class DolphinIdentityCenterTests(unittest.TestCase):
         self.assertEqual(IDC.count("aws_ssoadmin_managed_policy_attachment"), 1)
         inline = block(IDC, 'resource "aws_ssoadmin_permission_set_inline_policy" "dolphin_read_only"')
         self.assertNotIn('"Allow"', inline)
-        for action in ("secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "ssm:GetParameter", "kms:Decrypt", "s3:GetObject"):
+        for action in ("secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "ssm:GetParameter", "kms:Decrypt", "s3:GetObject",
+                       "lambda:GetFunction", "lambda:GetFunctionConfiguration", "ecs:DescribeTaskDefinition",
+                       "ec2:DescribeInstanceAttribute", "ec2:GetLaunchTemplateData"):
             self.assertIn('"%s"' % action, inline)
         self.assertIn("${local.dolphin_state_bucket}/*", inline)
 
