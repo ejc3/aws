@@ -49,7 +49,7 @@ aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instan
 READY=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$SERVER_ID" --query StandardOutputContent --output text)
 CA=${READY%%===STATUS===*}
 printf '%s\n' "$READY" | grep -q '^open listener: listening' || {
-  echo "the server is not listening on its open port yet. Finish the five logins (scripts/claude-master-login.sh --server), start claude-master-server, check claw-master-status, then re-run this." >&2
+  echo "the server is not listening on its open port yet. Finish the six logins (scripts/claude-master-login.sh --server), start claude-master-server, check claw-master-status, then re-run this." >&2
   exit 1
 }
 printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE' || { echo "the server has no CA certificate yet" >&2; exit 1; }

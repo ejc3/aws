@@ -118,7 +118,7 @@ class ServiceTests(unittest.TestCase):
     def test_the_unit_waits_for_every_login_and_is_sandboxed(self):
         profiles = re.search(r"claude_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', profiles)
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         self.assertIn("ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current", TF)
         for flag in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/claude-master", "PrivateTmp=yes"):
             self.assertIn(flag, TF)
@@ -253,7 +253,7 @@ class ObservabilityTests(unittest.TestCase):
         # Fallback order: the first is preferred when quotas tie, so the owner's own subscription is the last resort.
         tf_order = re.search(r'claude_master_profiles = \[([^\]]*)\]', TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', tf_order)
-        self.assertEqual(names, ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-ejc3"])
+        self.assertEqual(names, ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"])
         login = (ROOT / "scripts" / "claude-master-login.sh").read_text()
         self.assertIn("profiles=(" + " ".join(names) + ")", login)
 
@@ -905,6 +905,18 @@ class EnvoyTests(unittest.TestCase):
         serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         self.assertIn("color=$${1:-legacy}", serve)
         self.assertIn('legacy) port=${local.claude_master_server_port}; open=${local.claude_master_open_port}; balancer="" ;;', serve)
+
+
+class LoginDefaultsTests(unittest.TestCase):
+    """A login refreshed on two boxes revokes the other copy: a server-only subscription stays off fcvm's default."""
+
+    def test_claude_colby_is_in_the_server_default_only(self):
+        script = (ROOT / "scripts" / "claude-master-login.sh").read_text()
+        server = re.search(r'if \[ "\$SERVER" = 1 \]; then profiles=\(([^)]*)\)', script).group(1).split()
+        other = re.search(r'else profiles=\(([^)]*)\); fi', script).group(1).split()
+        self.assertIn("claude-colby", server)
+        self.assertNotIn("claude-colby", other)
+        self.assertEqual(set(server) - set(other), {"claude-colby"})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
