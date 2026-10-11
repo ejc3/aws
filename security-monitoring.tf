@@ -277,7 +277,9 @@ resource "aws_kms_key" "security_cloudtrail" {
         Resource  = "*"
         Condition = {
           StringEquals = { "aws:SourceArn" = local.security_trail_arn }
-          StringLike   = { "kms:EncryptionContext:aws:cloudtrail:arn" = [for account in local.security_account_ids : "arn:aws:cloudtrail:*:${account}:trail/*"] }
+          # The Dolphin account is in the organization trail but deliberately not in security_account_ids: that list also
+          # admits its principals to this account's Config bucket and key, and nothing here may trust the Dolphin account.
+          StringLike = { "kms:EncryptionContext:aws:cloudtrail:arn" = [for account in concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) : "arn:aws:cloudtrail:*:${account}:trail/*"] }
         }
       },
       {
