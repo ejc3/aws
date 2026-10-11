@@ -83,6 +83,15 @@ class AccessTests(unittest.TestCase):
         # A worker destination would follow the Worker onto cc-games.org and put Access in front of production.
         self.assertNotRegex(self.ACCESS, r'type\s*=\s*"(worker|preview_worker)"|worker_id')
 
+    def test_the_url_switches_are_adopted_after_access_with_previews_off(self):
+        sub = block(PROD, "resource", "cloudflare_workers_script_subdomain", "colton_games_prod")
+        self.assertIn("script_name      = local.colton_games_prod_worker_name", sub)
+        self.assertIn("enabled          = true", sub)
+        self.assertIn("previews_enabled = false", sub)
+        self.assertIn("cloudflare_zero_trust_access_application.colton_games_prod_workers_dev", sub)
+        self.assertIn('id = "${var.cloudflare_account_id}/${local.colton_games_prod_worker_name}"', PROD)
+        self.assertNotRegex(code(PROD), r'resource\s+"cloudflare_worker"\s')
+
     def test_the_family_allowlist_and_service_token_and_no_destroy(self):
         self.assertIn("cloudflare_zero_trust_access_policy.cc_games_allowed.id", self.ACCESS)
         self.assertIn("cloudflare_zero_trust_access_policy.cc_games_service.id", self.ACCESS)

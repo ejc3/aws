@@ -1315,6 +1315,10 @@ rate limiting and bot rules cover it. Everything is in place; **the switch is on
   application (`cloudflare-production.tf`: family allowlist plus the `cc-games-access-service-token`). Never cover it with a
   Worker-native (`worker`) destination as the staging Workers are: that follows the Worker onto every route and Custom
   Domain and would put Access in front of production at the cutover.
+  Terraform owns its two URL switches (`cloudflare_workers_script_subdomain.colton_games_prod`: workers.dev on, previews
+  off), the same values `wrangler.jsonc` `env.production` sets on every deploy. A script probing it sets its own
+  User-Agent: Cloudflare's Browser Integrity Check answers `error code: 1010` to `Python-urllib` (seen there 2026-10-11),
+  which is also why the engines' callbacks skip that check on cc-games.org.
 - **Its secrets** are production's and never staging's (`workers-prod-secrets.tf`): `workers-prod/colton-games/terraform`
   is written by Terraform with the same values it writes to Vercel production (AUTH_SECRET, so sessions survive the move;
   the Google client; site admins; ACCOUNT_SAVES; the MP_* set and its signing keys), plus AUTH_URL, the declared environment

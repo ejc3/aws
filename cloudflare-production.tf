@@ -73,6 +73,26 @@ resource "cloudflare_zero_trust_access_application" "colton_games_prod_workers_d
   }
 }
 
+# The Worker's two URL switches, adopted once its first deploy created it: workers.dev on (behind the application above),
+# version previews off. Only the switches, never the whole Worker (workers-stage.tf explains why); wrangler.jsonc
+# env.production sets the same values on every deploy.
+import {
+  to = cloudflare_workers_script_subdomain.colton_games_prod
+  id = "${var.cloudflare_account_id}/${local.colton_games_prod_worker_name}"
+}
+
+resource "cloudflare_workers_script_subdomain" "colton_games_prod" {
+  account_id       = var.cloudflare_account_id
+  script_name      = local.colton_games_prod_worker_name
+  enabled          = true
+  previews_enabled = false
+
+  depends_on = [
+    cloudflare_workers_subdomain.cc_games,
+    cloudflare_zero_trust_access_application.colton_games_prod_workers_dev,
+  ]
+}
+
 # -------------------------------------------------------------------------------------
 # The multiplayer launcher's identity on the Worker
 # -------------------------------------------------------------------------------------
