@@ -373,16 +373,7 @@ systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
 # same goes for unattended-upgrades' 03:00 reboot (dev-instance-common.tf), which stays on for
 # the on-demand boxes. The metal boxes are spot: they stop and start on their own terms (see
 # auto-reboot.tf), and that start loads the new library and kernel.
-install -d -m 755 /etc/needrestart/conf.d
-cat > /etc/needrestart/conf.d/fcvm-claude-rc.conf <<'NEEDRESTART'
-# fcvm-claude-rc holds ubuntu's tmux server: list it as deferred, never restart it.
-$nrconf{override_rc}{qr(^fcvm-claude-rc\.service$)} = 0;
-NEEDRESTART
-cat > /etc/apt/apt.conf.d/52unattended-upgrades-no-reboot <<'NOREBOOT'
-// Read after 50unattended-upgrades: this spot box is not rebooted automatically.
-Unattended-Upgrade::Automatic-Reboot "false";
-NOREBOOT
-
+${local.metal_update_guards}
 # ------------------------------------------------------------- new repos within seconds
 # The launcher above looks once, at boot. This watches every 5 seconds and starts a session (and a
 # Codex thread) for a repository that appears later. See agent-session-sync.tf.
@@ -436,4 +427,47 @@ systemctl enable --now fcvm-codex-seed.timer >/dev/null 2>&1 || true
 # launcher and on model turns.
 systemctl start --no-block fcvm-codex-seed.service >/dev/null 2>&1 || true
   SETUP
+}
+
+# The two update guards above, as one snippet: the boot script writes them, and so does a daily SSM association, because
+# a box that has not booted since a guard was added never ran it. fcvm-metal-arm last booted 2026-10-06, the guards
+# arrived 2026-10-07 (#294), and on 2026-10-11 an apt install's needrestart restarted fcvm-claude-rc and killed every
+# session in ubuntu's tmux server. Writing a file is all it does: nothing is restarted.
+locals {
+  metal_update_guards = <<GUARDS
+install -d -m 755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/fcvm-claude-rc.conf <<'NEEDRESTART'
+# fcvm-claude-rc holds ubuntu's tmux server: list it as deferred, never restart it.
+$nrconf{override_rc}{qr(^fcvm-claude-rc\.service$)} = 0;
+NEEDRESTART
+cat > /etc/apt/apt.conf.d/52unattended-upgrades-no-reboot <<'NOREBOOT'
+// Read after 50unattended-upgrades: this spot box is not rebooted automatically.
+Unattended-Upgrade::Automatic-Reboot "false";
+NOREBOOT
+GUARDS
+
+  metal_update_guard_instances = concat(
+    var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : [],
+    var.enable_x86_dev_instance ? [aws_instance.x86_dev[0].id] : [],
+  )
+}
+
+resource "aws_ssm_association" "metal_update_guards" {
+  count = length(local.metal_update_guard_instances) > 0 ? 1 : 0
+
+  name                = "AWS-RunShellScript"
+  association_name    = "metal-update-guards"
+  schedule_expression = "rate(1 day)"
+  max_concurrency     = "2"
+  max_errors          = "1"
+
+  targets {
+    key    = "InstanceIds"
+    values = local.metal_update_guard_instances
+  }
+
+  parameters = {
+    commands         = "set -eu\n${local.metal_update_guards}echo 'metal update guards written'"
+    executionTimeout = "60"
+  }
 }

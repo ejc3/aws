@@ -57,5 +57,16 @@ class ModerationTests(unittest.TestCase):
         self.assertIn("alarm_actions       = [aws_sns_topic.cost_alerts.arn]", alarm)
 
 
+
+class AiServicesOptOutTests(unittest.TestCase):
+    """Pictures sent to Rekognition are kids' photos: every account is opted out of AWS keeping and using them."""
+
+    ORG = (ROOT / "security-organization.tf").read_text()
+
+    def test_the_root_carries_the_opt_out_policy(self):
+        self.assertIn('enabled_policy_types          = ["AISERVICES_OPT_OUT_POLICY"]', self.ORG)
+        self.assertIn('services = { default = { opt_out_policy = { "@@assign" = "optOut" } } }', self.ORG)
+        self.assertIn("target_id = aws_organizations_organization.security.roots[0].id", self.ORG)
+
 if __name__ == "__main__":
     unittest.main()
