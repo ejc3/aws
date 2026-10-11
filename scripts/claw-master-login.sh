@@ -31,6 +31,8 @@ if [ ${#profiles[@]} -eq 0 ]; then
   else profiles=(claude-connor claude-colton claude-colin claude-thao claude-ejc3); fi
 fi
 
+count_logins() { ssh -i "$KEY" "ubuntu@$HOST" "sudo claw-master-status | grep -c ': present'" 2>/dev/null || echo 0; }
+[ "$SERVER" = 1 ] && before=$(count_logins)
 for p in "${profiles[@]}"; do
   [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { echo "bad profile name: $p" >&2; exit 2; }
   if [ "$SERVER" = 1 ]; then
@@ -55,7 +57,12 @@ for p in "${profiles[@]}"; do
     fi"
 done
 if [ "$SERVER" = 1 ]; then
-  # Starting a server that is not running is safe; restarting a running one is the owner's call.
-  ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claw-master-status; if ! sudo claw-master-status | grep -q MISSING && ! sudo claw-master-status | grep -q '^server: active'; then sudo claw-master-rollout && sudo claw-master-status; fi"
+  # The server serves every login there is, so a new one goes live with a rollout: a new color starts with all of them and
+  # the old one drains its running requests (no session is cut). Asking for a login is asking for it to be used.
+  if [ "$(count_logins)" -gt "$before" ]; then
+    ssh -t -i "$KEY" "ubuntu@$HOST" "sudo claw-master-rollout && sudo claw-master-status"
+  else
+    echo "no new login, so no rollout"
+  fi
 fi
 echo "done: $(printf '%s ' "${profiles[@]}")"

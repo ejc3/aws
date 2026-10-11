@@ -634,10 +634,22 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **claw-master has no AWS in it.** It is a generic binary (`ejc3/CLIProxyAPI`, `docs/claw-master.md`):
   `serve`, `issue`, `client-init`, `connect`. All AWS glue is in this repo. The pinned release is
   `local.claw_master_tag` plus its sha256 in `claw-master-server.tf`; bump both together.
-- **Logins are interactive and belong to the server.** `scripts/claw-master-login.sh --server`
-  drives the six paste-a-code logins; the service stays idle until all exist. Never copy a login
-  from another box. Nothing on the box restarts a server or Envoy on its own; `claw-master-status` shows
-  running versus pinned.
+- **Logins are interactive and belong to the server.** Never copy a login from another box. Nothing on the box restarts a
+  server or Envoy on its own; `claw-master-status` shows running versus pinned, and every login it finds.
+- **Adding a subscription is one login, no Terraform change.** The server serves every login that exists:
+  `local.claw_master_profiles` is only the PREFERRED order (served first; a missing one is skipped), any other login is served
+  after those in name order, and the unit waits for at least one login. A new login goes live with a rollout (a new color
+  starts with all of them; nobody's session is cut). Two ways:
+  - At a terminal on a jumpbox: `scripts/claw-master-login.sh --server claude-NAME`. It prints the claude.ai link, takes the
+    CODE#STATE you paste, and rolls out only if a login was added.
+  - Without a terminal (an agent over SSM): `sudo claw-master-add-start claude-NAME` prints the link and waits up to two
+    hours; give the owner the link (shorten it if they are on a phone; it carries no secret: the PKCE verifier stays on the
+    box and only someone signed in to that account can produce a code); then pipe the code they send to
+    `sudo claw-master-add-finish claude-NAME` on stdin (never as an argument). It installs the login and runs the rollout.
+  Open the link signed in to THAT subscription's Claude account (incognito if the browser is signed in to another). A name
+  is used once: a revoked login is replaced under a new name. Add the name to `local.claw_master_profiles` only to change
+  its place in the order; a login that exists only on the server stays out of fcvm's default list in the login script
+  (refreshing one login on two boxes revokes the other copy).
 - **Restarts nobody notices: Envoy and blue/green** (`claw-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
   version and sha256) listens on the client address and the tunnel's loopback port and passes TCP through,
   unchanged, to one of two servers on the box, `claude-master-server@blue` or `@green`, each on its own port of

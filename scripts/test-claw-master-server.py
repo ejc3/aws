@@ -103,6 +103,8 @@ class SupplyChainTests(unittest.TestCase):
         # never restarts or stops a server or Envoy, and only starts Envoy when it is not running.
         script = TF[TF.index("claw_master_server_user_data"):TF.index('resource "aws_s3_object"')]
         script = script[:script.index("cat > /usr/local/bin/claw-master-rollout")] + script[script.index("chmod 0755 /usr/local/bin/claw-master-rollout"):]
+        # claw-master-add-finish rolls out after a new login; the bootstrap installs it and never runs it.
+        script = script[:script.index("cat > /usr/local/bin/claw-master-add-finish")] + script[script.index("chmod 0755 /usr/local/bin/claw-master-add-finish"):]
         self.assertNotRegex(script, r"systemctl (restart|stop)")
         self.assertNotRegex(script, r"\n\s*(sudo )?(/usr/local/bin/)?cla(ude|w)-master-rollout")
         self.assertIn("systemctl is-active --quiet envoy.service || systemctl start envoy.service", script)
@@ -115,11 +117,14 @@ class SupplyChainTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
-    def test_the_unit_waits_for_every_login_and_is_sandboxed(self):
+    def test_the_unit_waits_for_any_login_and_is_sandboxed(self):
+        # The list is only the preferred order: the unit waits for at least one login, not for each listed one, so a
+        # missing or new login never keeps the server from starting.
         profiles = re.search(r"claw_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)
         names = re.findall(r'"([a-z0-9-]+)"', profiles)
         self.assertEqual(len(names), 6)
-        self.assertIn("ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current", TF)
+        self.assertIn("ConditionPathExistsGlob=/var/lib/claude-master/.local/share/claude-master/profiles/*/current", TF)
+        self.assertNotIn("ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current", TF)
         for flag in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/claude-master", "PrivateTmp=yes"):
             self.assertIn(flag, TF)
         self.assertIn("User=claude-master", TF)
@@ -297,7 +302,8 @@ class ObservabilityTests(unittest.TestCase):
                 if name != "aws":
                     open(path, "w").write(report)
                 os.chmod(path, 0o755)
-            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"])
+            profiles = os.path.join(d, "profiles"); os.makedirs(os.path.join(profiles, "claude-connor", "current"))
+            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"], CLAW_MASTER_PROFILE_DIR=profiles)
             def run():
                 s = serve.replace("/usr/local/bin/", bindir + "/")
                 return subprocess.run(["bash", "-c", s, "serve", "legacy"], capture_output=True, text=True, env=env, timeout=30).stdout.strip()
@@ -659,8 +665,9 @@ class ScriptTests(unittest.TestCase):
     def test_the_login_script_drives_the_server_and_never_restarts_a_running_one(self):
         self.assertIn("--server", LOGIN)
         self.assertIn("sudo claw-master-login", LOGIN)
-        # It starts the pool (through the rollout) only when no server is running; it never restarts one.
-        self.assertIn("! sudo claw-master-status | grep -q '^server: active'; then sudo claw-master-rollout", LOGIN)
+        # A new login goes live through a rollout (no session is cut); no rollout when nothing was added.
+        self.assertIn('if [ "$(count_logins)" -gt "$before" ]; then', LOGIN)
+        self.assertIn("sudo claw-master-rollout && sudo claw-master-status", LOGIN)
         self.assertNotRegex(LOGIN, r"systemctl (restart|start)")
 
     def test_enrollment_as_an_account_carries_awkward_commands_and_stdin_through_ssh_and_sudo_intact(self):
@@ -920,6 +927,56 @@ class LoginDefaultsTests(unittest.TestCase):
         self.assertIn("claude-colby", server)
         self.assertNotIn("claude-colby", other)
         self.assertEqual(set(server) - set(other), {"claude-colby"})
+
+
+class SubscriptionDiscoveryTests(unittest.TestCase):
+    """A subscription is added by logging it in: the server serves every login there is, the preferred ones first."""
+
+    def serve_args(self, present):
+        import os, tempfile
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve <<'EOF'\n"):]
+        serve = serve[serve.index("\n") + 1:serve.index("\nEOF\n")]
+        preferred = " ".join(re.findall(r'"([a-z0-9-]+)"', re.search(r"claw_master_profiles\s*=\s*\[(.*?)\]", TF).group(1)))
+        serve = (serve.replace('${join(" ", local.claw_master_profiles)}', preferred).replace("${var.aws_region}", "us-west-1")
+                 .replace("$${", "${").replace("${local.claw_master_drain_seconds}", "600").replace("${local.claw_master_server_ip}", "10.0.1.50")
+                 .replace("${local.claw_master_server_port}", "8443").replace("${local.claw_master_open_port}", "8444"))
+        serve = re.sub(r"\$\{join\(.*\)\}", "", serve)
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin"); os.mkdir(bindir)
+            open(os.path.join(bindir, "aws"), "w").write("#!/bin/bash\necho\n")
+            open(os.path.join(bindir, "claw-master"), "w").write('#!/bin/bash\nargs=(); while [ $# -gt 0 ] && [ "$1" != --listen ]; do args+=("$1"); shift; done; echo "${args[*]}"\n')
+            for n in ("aws", "claw-master"):
+                os.chmod(os.path.join(bindir, n), 0o755)
+            profiles = os.path.join(d, "profiles")
+            os.makedirs(profiles)
+            for name in present:
+                os.makedirs(os.path.join(profiles, name, "current"))
+            os.makedirs(os.path.join(profiles, "claude-halfway", ".login-123"))  # a login that never finished
+            env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"], CLAW_MASTER_PROFILE_DIR=profiles)
+            r = subprocess.run(["bash", "-c", serve.replace("/usr/local/bin/", bindir + "/"), "serve", "legacy"], capture_output=True, text=True, env=env, timeout=30)
+            return r.returncode, r.stdout.strip(), r.stderr
+
+    def test_preferred_first_missing_skipped_new_ones_after(self):
+        code, out, _ = self.serve_args(["claude-thao", "claude-connor", "claude-zed", "claude-amy"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "serve claude-connor --next-profile claude-thao --next-profile claude-amy --next-profile claude-zed")
+
+    def test_no_login_at_all_refuses_to_start(self):
+        code, out, err = self.serve_args([])
+        self.assertNotEqual(code, 0)
+        self.assertIn("no subscription login", err)
+
+    def test_the_add_helpers_take_the_code_on_stdin_and_go_live_by_rollout(self):
+        start = TF[TF.index("cat > /usr/local/bin/claw-master-add-start"):TF.index("chmod 0755 /usr/local/bin/claw-master-add-start")]
+        finish = TF[TF.index("cat > /usr/local/bin/claw-master-add-finish"):TF.index("chmod 0755 /usr/local/bin/claw-master-add-finish")]
+        for script in (start, finish):
+            self.assertIn("[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]", script)
+        self.assertIn("already has a login; use a new name", start)
+        self.assertIn("timeout 7200 /usr/local/bin/claw-master login", start)
+        self.assertIn("IFS= read -r code", finish)            # stdin, never an argument
+        self.assertNotIn("$2", finish)
+        self.assertIn('[ ! -d "$profdir/$name/current" ]', finish)  # no rollout unless the login was installed
+        self.assertLess(finish.index('[ ! -d "$profdir/$name/current" ]'), finish.index("/usr/local/bin/claw-master-rollout"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
