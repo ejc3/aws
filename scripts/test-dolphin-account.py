@@ -155,5 +155,29 @@ class DolphinIdentityCenterTests(unittest.TestCase):
         self.assertEqual(set(targets), {"aws_organizations_account.dolphin.id"})
 
 
+class StarterCheckoutTests(unittest.TestCase):
+    """nextjs-dev clones dolphin-aws for skevh and ejc3, and the rendered setup script stays valid bash."""
+
+    SETUP = (ROOT / "nextjs-user-data.tf").read_text()
+
+    def test_both_accounts_get_the_dolphin_aws_checkout(self):
+        repos = re.search(r"  nextjs_user_repos = \{\n(.*?)\n  \}\n", self.SETUP, re.S).group(1)
+        for user in ("skevh", "ejc3"):
+            self.assertRegex(repos, r'%s\s+= \[[^\]]*"dolphin-labs-hq/dolphin-aws"' % user)
+
+    def test_the_clone_loop_is_bash_not_a_nested_template_loop(self):
+        # A template for-loop nested in the per-user case arm welds one repository's `fi` onto the next one's `if`
+        # (the ~ markers eat the newline): `fi        if` is a syntax error, and setup-sync refuses the whole script.
+        start = self.SETUP.index('    case "$u" in\n%{~for ru, rl in local.nextjs_user_repos~}')
+        end = self.SETUP.index("    esac\n", start)
+        arm = self.SETUP[start:end]
+        self.assertEqual(arm.count("%{~for"), 1, "only the per-user loop may be a template loop")
+        self.assertIn('${ru}) starter_repos="${join(" ", rl)}" ;;', arm)
+        loop = self.SETUP[end:self.SETUP.index("    done\n", end)]
+        self.assertIn("for repo in $starter_repos; do", loop)
+        self.assertIn('gh repo clone "$repo" "/home/$u/$${repo##*/}"', loop)
+        self.assertIn('    starter_repos=""\n    case "$u" in', self.SETUP)  # set -u: defined for every user
+
+
 if __name__ == "__main__":
     unittest.main()
