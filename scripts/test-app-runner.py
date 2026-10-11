@@ -1221,7 +1221,7 @@ class RunnersAppTerraformTests(unittest.TestCase):
         repos = re.findall(r'"([^"]+)"', m.group(1))
         self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps"])
         self.assertNotIn(COLTON, repos)
-        self.assertIn("contains(local.runner_app_github_app_repos, repo) ? { app_repo = repo } : {}", self.TF)
+        self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
 
     def test_the_controller_reads_the_app_secret_and_only_it_and_the_jumpboxes_can(self):

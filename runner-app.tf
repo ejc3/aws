@@ -47,12 +47,14 @@ locals {
   # reports "skipped: no controller token", which withholds the aggregate Repo=ALL metric for every repo and fires
   # github-app-runner-reconcile-silent.
   runner_app_config = {
-    for repo, c in local.runner_app_repos : repo => merge({
+    for repo, c in local.runner_app_repos : repo => {
       label      = c.label
       max        = c.max
       pat_secret = "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
-    }, contains(local.runner_app_github_app_repos, repo) ? { app_repo = repo } : {}) if lookup(local.runner_app_token_gates, repo, true)
+      # Every entry carries app_repo so the map stays one type; empty means "no app, use the PAT".
+      app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""
+    } if lookup(local.runner_app_token_gates, repo, true)
   }
 
   # Repos whose controller token comes from the runners GitHub App (github-app/runners, below) rather than a year-long PAT:
