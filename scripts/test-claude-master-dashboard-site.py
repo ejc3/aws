@@ -45,5 +45,15 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn("client_secret", out)
 
 
+class ReaderKeyTests(unittest.TestCase):
+    def test_the_worker_key_reads_metrics_and_alarms_in_one_region_only(self):
+        pol = block('resource "aws_iam_user_policy"', "claude_master_dashboard")
+        self.assertIn('Action    = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]', pol)
+        # Alarm reads are scoped to the dashboard's own alarms, not every alarm in the region.
+        self.assertIn('Action   = "cloudwatch:DescribeAlarms"', pol)
+        self.assertIn(':alarm:claude-master*"', pol)
+        self.assertIn('Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }', pol)
+        self.assertNotRegex(pol, r"cloudwatch:(Put|Delete|Set|Enable|Disable)")
+
 if __name__ == "__main__":
     unittest.main()

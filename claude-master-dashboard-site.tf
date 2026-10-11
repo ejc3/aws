@@ -130,6 +130,12 @@ resource "aws_iam_user_policy" "claude_master_dashboard" {
       Action    = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]
       Resource  = "*"
       Condition = { StringEquals = { "aws:RequestedRegion" = var.aws_region } }
+      }, {
+      # The Alarms box reads only alarms named claude-master*; DescribeAlarms is scoped to those ARNs (#384).
+      Sid      = "ReadClaudeMasterAlarms"
+      Effect   = "Allow"
+      Action   = "cloudwatch:DescribeAlarms"
+      Resource = "arn:aws:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:claude-master*"
     }]
   })
 }
