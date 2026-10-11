@@ -196,7 +196,8 @@ class EsloggerScannerTest(unittest.TestCase):
 
     def scanner(self):
         reports = []
-        return agent.EsloggerScanner([self.PATH], reports.append, ["/usr/bin/mdworker"], describe=lambda pid: {"cmdline": "cat"}), reports
+        return agent.EsloggerScanner([self.PATH], reports.append, ["/usr/bin/mdworker"], describe=lambda pid: {"cmdline": "cat"},
+                                     ancestry=lambda pid: [{"pid": pid, "start": "t"}]), reports
 
     def test_escaped_slashes_and_lines_split_across_chunks(self):
         scanner, reports = self.scanner()
@@ -208,6 +209,7 @@ class EsloggerScannerTest(unittest.TestCase):
         self.assertEqual(reports[0]["exe"], "/usr/bin/cat")
         self.assertEqual(reports[0]["pid"], 4242)
         self.assertEqual(reports[0]["cmdline"], "cat")
+        self.assertEqual(reports[0]["ancestry"], [{"pid": 4242, "start": "t"}])
 
     def test_ignored_executables_same_basename_elsewhere_and_garbage(self):
         scanner, reports = self.scanner()
@@ -230,6 +232,7 @@ class EsloggerFifoTest(unittest.TestCase):
         self.sensor = agent.EsloggerSensor([EsloggerScannerTest.PATH], self.reports.append, [], fifo=self.fifo,
                                            silence=100, clock=lambda: self.now[0])
         self.sensor.scanner.describe = lambda pid: {}
+        self.sensor.scanner.ancestry = lambda pid: []
         self.reader = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
         self.addCleanup(os.close, self.reader)
 
@@ -482,6 +485,222 @@ class HandlerHookTest(unittest.TestCase):
         os.chmod(path, 0o777)
         self.assertFalse(agent.handler_is_safe(path))
         self.assertFalse(agent.handler_is_safe(path + "-missing"))
+
+
+class ReviewRegressionTest(unittest.TestCase):
+    """Regressions from the PR review: each fails on the code before its fix."""
+
+    def setUp(self):
+        self.directory = os.path.realpath(tempfile.mkdtemp())
+
+    # Hard links: fanotify marks the inode, so match the opened file by inode, not by name.
+    def test_fanotify_reports_a_read_through_another_name_for_a_registered_file(self):
+        registered, alias = self.directory + "/registered", self.directory + "/alias"
+        Path(registered).write_text("x")
+        os.link(registered, alias)
+        sensor = agent.FanotifySensor.__new__(agent.FanotifySensor)
+        sensor.paths, sensor.emit, sensor.ignore = {registered}, None, set()
+        sensor.inodes = {}
+        sensor.remember(registered)
+        fd = os.open(alias, os.O_RDONLY)
+        try:
+            report = sensor.describe(fd, os.getpid(), -1)
+        finally:
+            os.close(fd)
+        self.assertEqual(report["path"], registered)
+        self.assertEqual(report["opened_path"], alias)
+
+    # Process ancestry, captured while the reader is still held.
+    def test_ancestry_lists_this_process_and_its_parents_with_start_tokens(self):
+        chain = agent.process_ancestry(os.getpid(), "linux")
+        self.assertEqual(chain[0]["pid"], os.getpid())
+        self.assertEqual(chain[1]["pid"], os.getppid())
+        self.assertTrue(all(isinstance(e["start"], str) and e["start"].isdigit() for e in chain))
+        self.assertLessEqual(len(chain), 16)
+        self.assertEqual(agent.process_ancestry(2 ** 22 + 12345, "linux"), [])
+
+    def test_linux_file_read_report_carries_ancestry(self):
+        registered = self.directory + "/registered"
+        Path(registered).write_text("x")
+        sensor = agent.FanotifySensor.__new__(agent.FanotifySensor)
+        sensor.paths, sensor.emit, sensor.ignore, sensor.inodes = {registered}, None, set(), {}
+        sensor.remember(registered)
+        fd = os.open(registered, os.O_RDONLY)
+        try:
+            report = sensor.describe(fd, os.getpid(), -1)
+        finally:
+            os.close(fd)
+        self.assertEqual(report["ancestry"][0]["pid"], os.getpid())
+
+    def test_darwin_ancestry_parses_one_process_table(self):
+        table = ("  4242   900 Sun Oct 11 16:31:49 2026\n"
+                 "   900   800 Sun Oct 11 16:00:00 2026\n"
+                 "   800     1 Sun Oct 11 09:00:00 2026\n")
+        chain = agent.darwin_ancestry(4242, table=table)
+        self.assertEqual([e["pid"] for e in chain], [4242, 900, 800])
+        self.assertEqual(chain[0]["start"], "Sun Oct 11 16:31:49 2026")
+        self.assertEqual(agent.darwin_ancestry(7, table=table), [])
+
+    # macOS: a read by an ignored executable must not come back through the atime fallback.
+    def test_ignored_reader_also_suppresses_the_atime_fallback(self):
+        fifo = tempfile.mkdtemp() + "/open.fifo"
+        os.mkfifo(fifo, 0o600)
+        emitted = []
+        sensor = agent.EsloggerSensor([EsloggerScannerTest.PATH], emitted.append, ["/usr/bin/mdworker"], fifo=fifo)
+        sensor.scanner.describe = lambda pid: {}
+        sensor.scanner.ancestry = lambda pid: []
+        sensor.scanner.feed(EsloggerScannerTest.event(None, EsloggerScannerTest.PATH, exe="/usr/bin/mdworker"))
+        self.assertEqual(emitted, [])
+        mac = agent.MacSensor.__new__(agent.MacSensor)
+        mac.eslogger, mac.emit = sensor, emitted.append
+        original, agent.time.sleep = agent.time.sleep, lambda _: None
+        try:
+            mac.fallback({"kind": "file-read", "path": EsloggerScannerTest.PATH})
+        finally:
+            agent.time.sleep = original
+        self.assertEqual(emitted, [])
+
+    # Event handler: exit status, bounded output, and only handler reports reach the reporter.
+    def handler(self, body):
+        path = self.directory + "/handler"
+        Path(path).write_text("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o700)
+        emitted = []
+        return agent.HandlerRunner(path, emitted.append, is_safe=lambda p: True), emitted
+
+    def test_nonzero_handler_exit_is_reported(self):
+        runner, emitted = self.handler("cat >/dev/null; exit 3")
+        runner.handle({"kind": "file-read", "path": "/p"})
+        self.assertEqual([r.get("reason") for r in emitted], ["event handler failed"])
+        self.assertIn("status 3", emitted[0]["detail"])
+
+    def test_handler_output_is_bounded_while_reading(self):
+        runner, emitted = self.handler("cat >/dev/null; exec head -c 50000000 /dev/zero")
+        started = time.monotonic()
+        runner.handle({"kind": "file-read", "path": "/p"})
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual([r.get("reason") for r in emitted], ["event handler failed"])
+        self.assertIn("output", emitted[0]["detail"])
+
+    def test_handler_timeout_kills_it(self):
+        runner, emitted = self.handler("cat >/dev/null; exec sleep 30")
+        original, agent.HANDLER_TIMEOUT = agent.HANDLER_TIMEOUT, 1
+        try:
+            started = time.monotonic()
+            runner.handle({"kind": "file-read", "path": "/p"})
+        finally:
+            agent.HANDLER_TIMEOUT = original
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("timed out", emitted[0]["detail"])
+
+    def test_only_handler_reports_are_delivered_and_the_thread_survives(self):
+        outputs = [b'{"kind": "file-read"}', b'{"kind": "tamper"}', b'{"kind": "handler", "summary": "ok", "host": "spoofed"}']
+        reporter = agent.Reporter({"host": "example-host"}, FakeClient())
+        runner = agent.HandlerRunner("/h", reporter.submit, run=lambda p: outputs.pop(0), is_safe=lambda p: True)
+        for _ in range(3):
+            runner.offer({"kind": "file-read", "path": "/p"})
+        import threading
+        threading.Thread(target=runner.run_loop, daemon=True).start()
+        deadline = time.time() + 5
+        while outputs and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        delivered = []
+        while not reporter.queue.empty():
+            delivered.append(reporter.queue.get())
+        self.assertEqual([r["kind"] for r in delivered], ["handler"])
+        self.assertEqual(delivered[0]["host"], "example-host")
+        self.assertEqual(outputs, [])
+
+    # Installer: everything is resolved before the first write; a failure mid-way stays recoverable.
+    def test_unknown_owner_fails_before_any_file_is_written(self):
+        files = [{"path": self.directory + "/first", "owner": USER, "content": "a"},
+                 {"path": self.directory + "/second", "owner": "no-such-user-for-test", "content": "b"}]
+        with self.assertRaisesRegex(RuntimeError, "unknown owner"):
+            agent.place_files(bundle(self.directory, files), {}, chown=False)
+        self.assertFalse(os.path.exists(self.directory + "/first"))
+
+    def test_unknown_template_fails_before_any_file_is_written(self):
+        files = [{"path": self.directory + "/first", "owner": USER, "content": "a"},
+                 {"path": self.directory + "/second", "owner": USER, "content": "{{nope}}"}]
+        with self.assertRaises(ValueError):
+            agent.place_files(bundle(self.directory, files), {}, chown=False)
+        self.assertFalse(os.path.exists(self.directory + "/first"))
+
+    def test_failure_mid_install_records_what_was_placed(self):
+        Path(self.directory + "/blocker").write_text("not a directory")
+        files = [{"path": self.directory + "/first", "owner": USER, "content": "a"},
+                 {"path": self.directory + "/blocker/second", "owner": USER, "content": "b"}]
+        saved = []
+        with self.assertRaises(OSError):
+            agent.place_files(bundle(self.directory, files), {}, chown=False, save=saved.append)
+        self.assertIn(self.directory + "/first", saved[-1]["files"])
+        os.unlink(self.directory + "/blocker")
+        state = agent.place_files(bundle(self.directory, files), saved[-1], chown=False)
+        self.assertEqual(Path(self.directory + "/blocker/second").read_text(), "b")
+        self.assertIn(self.directory + "/first", state["files"])
+
+    # Installer: never follow a link the file owner controls.
+    def test_symlinked_directory_in_a_registered_path_is_refused(self):
+        target = os.path.realpath(tempfile.mkdtemp())
+        os.symlink(target, self.directory + "/link")
+        files = [{"path": self.directory + "/link/creds", "owner": USER, "content": "a"}]
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            agent.place_files(bundle(self.directory, files), {}, chown=False)
+        self.assertEqual(os.listdir(target), [])
+
+    def test_placed_file_mode_owner_and_times_are_set_through_the_descriptor(self):
+        source = (ROOT / "scripts/access-audit.py").read_text()
+        body = source[source.index("def write_private"):source.index("def remove_placed")]
+        for by_name in ("os.chown(", "os.chmod(", "os.utime(path", "os.lchown("):
+            self.assertNotIn(by_name, body)
+        self.assertIn("os.fchown(", body)
+        self.assertIn("O_NOFOLLOW", body)
+
+    def test_agent_never_resolves_owners_by_name_after_writing(self):
+        # Swapping a placed file for a link before the owner is applied must not move root's ownership.
+        victim = os.path.realpath(tempfile.mkdtemp()) + "/victim"
+        Path(victim).write_text("root's file")
+        before = os.stat(victim)
+        files = [{"path": self.directory + "/creds", "owner": USER, "content": "a"}]
+        original = agent.os.replace
+
+        def swap_then_replace(src, dst, **kwargs):
+            original(src, dst, **kwargs)
+            dirfd = kwargs.get("dst_dir_fd")
+            os.unlink(dst, dir_fd=dirfd) if dirfd is not None else os.unlink(dst)
+            os.symlink(victim, dst, dir_fd=dirfd) if dirfd is not None else os.symlink(victim, dst)
+        agent.os.replace = swap_then_replace
+        try:
+            with self.assertRaises(RuntimeError):
+                agent.place_files(bundle(self.directory, files), {}, chown=False)
+        finally:
+            agent.os.replace = original
+        after = os.stat(victim)
+        self.assertEqual((before.st_mode, before.st_uid, before.st_mtime_ns), (after.st_mode, after.st_uid, after.st_mtime_ns))
+
+
+class TerraformRegistryTest(unittest.TestCase):
+    def test_registry_instances_are_keyed_by_unmarked_host_names_only(self):
+        self.assertRegex(TERRAFORM, r"access_audit_host_keys\s*=\s*nonsensitive\(toset\(keys\(local\.access_audit_hosts\)\)\)")
+        for line in TERRAFORM.splitlines():
+            if "for_each" in line and "access_audit_hosts" in line:
+                self.fail("for_each over the sensitive registry: " + line.strip())
+        self.assertNotRegex(TERRAFORM, r"length\(local\.access_audit_hosts\)")
+        self.assertNotRegex(TERRAFORM, r"\? jsondecode\([^)]*\)\.hosts : \{\}")
+
+    def test_bundle_carries_the_install_name_only_when_registered(self):
+        bundles = block("aws_secretsmanager_secret_version", "access_audit_bundles")
+        self.assertIn("can(entry.service_name) ? { service_name = entry.service_name } : {}", bundles)
+        self.assertIn("can(entry.launchd_label) ? { launchd_label = entry.launchd_label } : {}", bundles)
+
+
+class DocsTest(unittest.TestCase):
+    def test_runbook_commands_use_the_installed_layout(self):
+        docs = (ROOT / "docs/access-audit.md").read_text()
+        self.assertNotIn("/usr/local/libexec/access-audit/agent.py", docs)
+        self.assertNotIn("com.ejc3", docs)
+        self.assertIn("/usr/local/libexec/hostmetricsd/hostmetricsd", docs)
 
 
 class TerraformBoundaryTest(unittest.TestCase):

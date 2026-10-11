@@ -13,6 +13,15 @@ private operator data: it arrives in the install bundle and never lives here.
 
 Sensors: fanotify on Linux, eslogger on macOS, and an atime arm-and-poll
 fallback on both. Standard library only; Python 3.9 or newer.
+
+Event handler: if <config_dir>/event_handler exists, is a regular root-owned file and is not
+group- or world-writable, each file-read and tamper report is written to it as JSON on stdin.
+A file-read report carries "ancestry": the reader's process chain, reader first, as up to 16
+{"pid": int, "start": str} entries captured when the open was seen ("start" is an opaque
+process-start token: /proc/<pid>/stat starttime on Linux, ps lstart on macOS), so a consumer
+can tell a live process from a reused pid. The handler has 15 seconds; a nonzero exit or more
+than 64 KiB of stdout is reported as a failure, and only a JSON object with "kind": "handler"
+on its stdout is delivered.
 """
 import ctypes
 import datetime
@@ -367,6 +376,48 @@ def darwin_process(pid):
     return info
 
 
+ANCESTRY_DEPTH = 16
+
+
+def linux_ancestry(pid):
+    """[{pid, start}] from the reader up through its parents, start = /proc/<pid>/stat field 22."""
+    chain = []
+    while pid > 1 and len(chain) < ANCESTRY_DEPTH:
+        try:
+            data = _read_bounded("/proc/%d/stat" % pid, 4096)
+            fields = data[data.rindex(b")") + 2:].split()
+            parent, start = int(fields[1]), fields[19].decode("ascii")
+        except (OSError, ValueError, IndexError, UnicodeDecodeError):
+            break
+        chain.append({"pid": pid, "start": start})
+        pid = parent
+    return chain
+
+
+def darwin_ancestry(pid, table=None):
+    """The same chain on macOS from one bounded process table read; start is ps lstart."""
+    if table is None:
+        try:
+            table = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,ppid=,lstart="], capture_output=True, timeout=2,
+                                   check=False).stdout[:1 << 20].decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            return []
+    rows = {}
+    for line in table.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    chain = []
+    while pid > 1 and pid in rows and len(chain) < ANCESTRY_DEPTH:
+        chain.append({"pid": pid, "start": rows[pid][1]})
+        pid = rows[pid][0]
+    return chain
+
+
+def process_ancestry(pid, platform):
+    return linux_ancestry(pid) if platform == "linux" else darwin_ancestry(pid)
+
+
 # --- Sensors -----------------------------------------------------------------
 
 # Permission events hold the opener until the agent answers, so even a reader
@@ -388,6 +439,7 @@ class FanotifySensor:
         self.paths = set(paths)
         self.emit = emit
         self.ignore = set(ignore)
+        self.inodes = {}
         self.libc = ctypes.CDLL(None, use_errno=True)
         self.libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
         self.libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.c_char_p]
@@ -404,7 +456,18 @@ class FanotifySensor:
             if error != 2:  # a missing path is reported by the integrity check
                 log("fanotify_mark failed for a registered path: errno " + str(error))
             return False
+        self.remember(path)
         return True
+
+    def remember(self, path):
+        # The mark is on the inode, so an open through any other name (a hard link, a bind
+        # mount) is reported too: events are matched by inode, then by name.
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        self.inodes = {key: value for key, value in self.inodes.items() if value != path}
+        self.inodes[(st.st_dev, st.st_ino)] = path
 
     def parse(self, data):
         offset, own = 0, os.getpid()
@@ -442,13 +505,21 @@ class FanotifySensor:
             return None
         if path.endswith(" (deleted)"):
             path = path[:-len(" (deleted)")]
-        if path not in self.paths:
+        st = os.fstat(fd)
+        registered = self.inodes.get((st.st_dev, st.st_ino)) or (path if path in self.paths else None)
+        if registered is None:
             return None
         info = linux_process(pid)
         if info.get("exe") in self.ignore:
             return None
-        report = {"kind": "file-read", "path": path, "sensor": self.name}
+        report = {"kind": "file-read", "path": registered, "sensor": self.name}
+        if path != registered:
+            report["opened_path"] = path
         report.update(info)
+        # The reader is still held on the permission event here, so its chain is intact.
+        ancestry = linux_ancestry(pid)
+        if ancestry:
+            report["ancestry"] = ancestry
         return report
 
     def run(self):
@@ -467,12 +538,14 @@ def eslogger_needles(paths):
 class EsloggerScanner:
     """Finds registered-path opens in a stream of eslogger JSON lines without parsing every line."""
 
-    def __init__(self, paths, emit, ignore, describe=darwin_process):
+    def __init__(self, paths, emit, ignore, describe=darwin_process, ancestry=darwin_ancestry, ignored=None):
         self.paths = set(paths)
         self.needles = eslogger_needles(paths)
         self.emit = emit
         self.ignore = set(ignore)
         self.describe = describe
+        self.ancestry = ancestry
+        self.ignored = ignored or (lambda path: None)
         self.buffer = b""
 
     def feed(self, chunk):
@@ -499,6 +572,7 @@ class EsloggerScanner:
             return
         exe = ((process.get("executable") or {}).get("path"))
         if exe in self.ignore:
+            self.ignored(path)  # its read still moves atime; the poll fallback must not report it
             return
         token = process.get("audit_token") or {}
         if token.get("pid") == os.getpid():
@@ -512,6 +586,7 @@ class EsloggerScanner:
             pass
         if isinstance(report["pid"], int):
             report.update(self.describe(report["pid"]))
+            report["ancestry"] = self.ancestry(report["pid"]) or None
         self.emit({k: v for k, v in report.items() if v is not None})
 
 
@@ -523,7 +598,7 @@ class EsloggerSensor:
     def __init__(self, paths, emit, ignore, fifo, silence=ES_SILENCE_SECONDS, clock=time.monotonic):
         if not stat.S_ISFIFO(os.stat(fifo).st_mode):
             raise OSError(fifo + " is not a FIFO")
-        self.scanner = EsloggerScanner(paths, self.seen, ignore)
+        self.scanner = EsloggerScanner(paths, self.seen, ignore, ignored=self.note)
         self.emit = emit
         self.fifo = fifo
         self.silence = silence
@@ -532,8 +607,11 @@ class EsloggerSensor:
         self.last_data = clock()
         self.silent = False
 
+    def note(self, path):
+        self.last_report[path] = self.clock()
+
     def seen(self, report):
-        self.last_report[report["path"]] = self.clock()
+        self.note(report["path"])
         self.emit(report)
 
     def reported_recently(self, path):
@@ -701,9 +779,43 @@ class HandlerRunner:
             pass
 
     def _run(self, payload):
-        completed = subprocess.run([self.path], input=payload, capture_output=True,
-                                   timeout=HANDLER_TIMEOUT)
-        return completed.stdout[:HANDLER_MAX_OUTPUT]
+        """Run the handler with the event on stdin. Its stdout is read only up to the cap, it is
+        killed at the deadline, and a nonzero exit is a failure; stderr is discarded."""
+        deadline = time.monotonic() + HANDLER_TIMEOUT
+        process = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        try:
+            try:
+                process.stdin.write(payload)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            output = b""
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("timed out after " + str(HANDLER_TIMEOUT) + " seconds")
+                ready, _, _ = select.select([process.stdout], [], [], remaining)
+                if not ready:
+                    continue
+                chunk = os.read(process.stdout.fileno(), HANDLER_MAX_OUTPUT + 1 - len(output))
+                if not chunk:
+                    break
+                output += chunk
+                if len(output) > HANDLER_MAX_OUTPUT:
+                    raise RuntimeError("output over " + str(HANDLER_MAX_OUTPUT) + " bytes")
+            try:
+                status = process.wait(max(deadline - time.monotonic(), 0.01))
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("timed out after " + str(HANDLER_TIMEOUT) + " seconds")
+            if status != 0:
+                raise RuntimeError("exited with status " + str(status))
+            return output
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
 
     def handle(self, report):
         try:
@@ -718,12 +830,20 @@ class HandlerRunner:
         except ValueError:
             self.emit({"kind": "tamper", "reason": "event handler returned non-JSON"})
             return
-        if isinstance(result, dict) and result.get("kind") in METRIC_FOR_KIND:
+        # Only the handler's own report kind is delivered: a handler cannot forge sensor
+        # reports, and the agent, not the handler, names the host and the time.
+        if isinstance(result, dict) and result.get("kind") == "handler":
+            result.pop("host", None)
+            result.pop("time", None)
             self.emit(result)
 
     def run_loop(self):
         while True:
-            self.handle(self.queue.get())
+            report = self.queue.get()
+            try:
+                self.handle(report)
+            except Exception as error:  # never let one bad result stop the handler thread
+                log("event handler result dropped: " + str(error)[:200])
 
 
 # --- Install -----------------------------------------------------------------
@@ -795,12 +915,14 @@ def load_json(path, default):
 
 
 def write_private(path, data, mode=0o600):
+    """Atomically write a root-only file in a root-owned directory (config and state)."""
     directory = os.path.dirname(path)
     descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
         with os.fdopen(descriptor, "w") as handle:
             handle.write(data)
-        os.chmod(temporary, mode)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
         os.replace(temporary, path)
     except BaseException:
         if os.path.exists(temporary):
@@ -808,8 +930,78 @@ def write_private(path, data, mode=0o600):
         raise
 
 
-def place_files(bundle, previous, chown=True, keygen=generate_ssh_key):
-    """Place registered files. Never overwrites a file this agent did not place unchanged."""
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+def open_parent(path, owner, chown, created):
+    """Open the directory that will hold `path`, one component at a time from '/', creating
+    missing ones for `owner`. A registered file usually sits in a tree its owner controls, so
+    nothing here is resolved by name after the fact: each step is opened O_NOFOLLOW relative to
+    the last, and a symlink is followed only where it sits in a root-owned directory nobody
+    else can write (e.g. macOS /var -> /private/var)."""
+    fd = os.open("/", DIRECTORY_FLAGS)
+    current = ""
+    try:
+        for name in os.path.dirname(path).split("/")[1:]:
+            current += "/" + name
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(name, 0o700, dir_fd=fd)
+                created.append(current)
+                child = os.open(name, DIRECTORY_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+                if chown:
+                    os.fchown(child, owner.pw_uid, owner.pw_gid)
+            else:
+                if stat.S_ISLNK(st.st_mode):
+                    parent = os.fstat(fd)
+                    if parent.st_uid != 0 or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or st.st_uid != 0:
+                        raise RuntimeError("refusing a symlink in a registered path: " + current)
+                    child = os.open(name, DIRECTORY_FLAGS, dir_fd=fd)
+                else:
+                    child = os.open(name, DIRECTORY_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def write_placed(dirfd, name, data, mode, owner, chown, stamp):
+    """Write one registered file inside `dirfd`. Mode, owner and times are set on the open
+    descriptor before the rename, and the result is checked to be that same file."""
+    temporary = ".tmp-" + secrets.token_hex(8)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        if chown:
+            os.fchown(fd, owner.pw_uid, owner.pw_gid)
+        os.fchmod(fd, mode)
+        os.utime(fd, (stamp, stamp))
+        os.replace(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        written = os.fstat(fd)
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (st.st_dev, st.st_ino) != (written.st_dev, written.st_ino):
+            raise RuntimeError("a registered path changed while it was being placed")
+        return {"ino": written.st_ino, "size": written.st_size, "mtime_ns": written.st_mtime_ns}
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def place_files(bundle, previous, chown=True, keygen=generate_ssh_key, save=None):
+    """Place registered files. Never overwrites a file this agent did not place unchanged.
+
+    Every owner and template is resolved before the first write. `save` is called with the
+    state after each file, so a failure part-way leaves a record that retry and uninstall use."""
     placed = previous.get("files", {})
     for item in bundle["files"]:
         path = item["path"]
@@ -820,26 +1012,26 @@ def place_files(bundle, previous, chown=True, keygen=generate_ssh_key):
               "principal_secret_access_key": bundle["principal"]["secret_access_key"]}
     if any("{{ssh_" in item["content"] for item in bundle["files"]):
         values["ssh_private_key"], values["ssh_public_key"] = keygen()
-    files, created_dirs = {}, list(previous.get("dirs", []))
+    plan = []
     for item in bundle["files"]:
+        try:
+            owner = pwd.getpwnam(item["owner"])
+        except KeyError:
+            raise RuntimeError("unknown owner for a registered path: " + item["owner"]) from None
+        plan.append((item, owner, render(item["content"], values).encode("utf-8")))
+    files, created_dirs = {}, list(previous.get("dirs", []))
+    for item, owner, data in plan:
         path = item["path"]
-        owner = pwd.getpwnam(item["owner"])
-        missing = []
-        parent = os.path.dirname(path)
-        while not os.path.isdir(parent):
-            missing.append(parent)
-            parent = os.path.dirname(parent)
-        for directory in reversed(missing):
-            os.mkdir(directory, 0o700)
-            if chown:
-                os.chown(directory, owner.pw_uid, owner.pw_gid)
-            created_dirs.append(directory)
-        write_private(path, render(item["content"], values), int(item.get("mode", "0600"), 8))
-        if chown:
-            os.chown(path, owner.pw_uid, owner.pw_gid)
-        stamp = time.time() - item.get("age_days", 120) * 86400 - secrets.randbelow(86400)
-        os.utime(path, (stamp, stamp))
-        files[path] = {"sha256": sha256_file(path), "watch": item.get("watch", True), "fingerprint": fingerprint(path)}
+        dirfd = open_parent(path, owner, chown, created_dirs)
+        try:
+            stamp = time.time() - item.get("age_days", 120) * 86400 - secrets.randbelow(86400)
+            stamped = write_placed(dirfd, os.path.basename(path), data, int(item.get("mode", "0600"), 8), owner, chown, stamp)
+        finally:
+            os.close(dirfd)
+        files[path] = {"sha256": hashlib.sha256(data[:MAX_FILE_BYTES + 1]).hexdigest(),
+                       "watch": item.get("watch", True), "fingerprint": stamped}
+        if save:
+            save({"files": dict(placed, **files), "dirs": created_dirs})
     for path in set(placed) - set(files):
         remove_placed(path, placed[path])
     return {"files": files, "dirs": created_dirs}
@@ -930,7 +1122,8 @@ def command_install():
     os.makedirs(layout.config_dir, mode=0o700, exist_ok=True)
     os.chmod(layout.config_dir, 0o700)
     previous = load_json(layout.state, {})
-    state = place_files(bundle, previous)
+    state = place_files(bundle, previous,
+                        save=lambda partial: write_private(layout.state, json.dumps(partial, indent=2, sort_keys=True)))
     platform = platform_name()
     config = {key: bundle[key] for key in ("host", "region", "topic_arn", "log_group", "namespace", "reporter")}
     config["ignore_executables"] = DEFAULT_IGNORE[platform] + list(bundle.get("ignore_executables", []))

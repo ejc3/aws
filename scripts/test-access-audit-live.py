@@ -1,7 +1,8 @@
 """Live Linux sensor test for the host access audit agent. Needs root; makes no AWS calls.
 
-fanotify reports another process opening a registered path, with its executable
-and pid even when the reader exits at once, ignores the agent's own opens and
+fanotify reports another process opening a registered path, with its executable,
+pid and process ancestry even when the reader exits at once, including through a hard
+link under another name, ignores the agent's own opens and
 unregistered paths, and keeps reporting after the file is replaced and re-marked.
 macOS is verified through the installed service instead: eslogger does not report
 processes in its own login session, so a single-process test cannot observe it.
@@ -51,6 +52,17 @@ class LiveSensorTest(unittest.TestCase):
         self.assertEqual(reads[0]["path"], self.path)
         self.assertEqual(reads[0]["pid"], reader.pid)
         self.assertTrue(reads[0]["exe"].endswith("/cat"), reads[0])
+        # Captured while the reader was held: the chain starts at the reader, then this test.
+        self.assertEqual([e["pid"] for e in reads[0]["ancestry"][:2]], [reader.pid, os.getpid()])
+
+    def test_read_through_a_hard_link_is_reported_under_the_registered_path(self):
+        alias = os.path.dirname(self.path) + "/alias"
+        os.link(self.path, alias)
+        subprocess.run(["/bin/cat", alias], stdout=subprocess.DEVNULL, check=True)
+        reads = self.wait_for(1)
+        self.assertEqual(len(reads), 1, reads)
+        self.assertEqual(reads[0]["path"], self.path)
+        self.assertEqual(reads[0]["opened_path"], alias)
 
     def test_replaced_file_is_still_watched_after_remark(self):
         os.unlink(self.path)

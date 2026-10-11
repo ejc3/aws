@@ -4,11 +4,16 @@
 
 - **Registered paths opened on a host.** The agent watches a private list of files and
   reports each open by another process, with the reader's executable, pid, user, command
-  line and, when the reader came in over SSH, its `SSH_CONNECTION`. It also reports when a
+  line, its process ancestry (pid and start time of each parent) and, when the reader's
+  environment carries one, its `SSH_CONNECTION`. That variable is whatever the reader's
+  environment says, so treat it as a lead, not proof of the source. It also reports when a
   registered file is modified, replaced or removed, and when its own sensor degrades.
 - **Registered principals used anywhere.** Each registered host has an IAM principal whose
   policy denies everything. CloudTrail still records every call it makes, and a rule in each
   of the 17 enabled Regions forwards those calls to the `access-audit` bus in us-west-1.
+  This covers every management event and the S3 data events the account trail already
+  selects. Data-plane calls the trail does not record (an S3 object read in another bucket,
+  a Lambda invoke) are not seen.
 
 Everything that says *which* hosts, files and principals are registered is private. It is
 held only in the `access-audit/config` secret and in Terraform state. Nothing in this
@@ -30,14 +35,19 @@ The `access-audit` CloudWatch dashboard shows all of them and the latest host re
 
 - **Linux:** fanotify permission events. The opener is held only while the agent reads its
   `/proc` entry, then always allowed, so even a reader that exits at once is identified.
+  Opens are matched by inode, so a read through a hard link or another mount of the same
+  file is reported under the registered path, with `opened_path` naming the one used.
   Files replaced or recreated are re-marked by the integrity check.
-- **macOS:** `eslogger open` runs as its own launchd job (`com.ejc3.access-audit.es`) and
+- **macOS:** `eslogger open` runs as its own launchd job (`<label>.helper`; the label is
+  `local.<service name>` unless the registry sets `launchd_label`) and
   writes into a root-only FIFO the agent reads, so only `/usr/bin/eslogger` needs Full Disk
   Access. Give it that once: System Settings, Privacy & Security, Full Disk Access, **+**,
   Cmd-Shift-G, `/usr/bin/eslogger`. Until it has it, or whenever it stops, atime polling still
   reports reads (without the reader's identity) and the agent sends one `sensor silent`
   report. eslogger does not report processes in its own login session, which matters only
-  when testing by hand.
+  when testing by hand. eslogger events are matched by path, so a read through a hard link
+  under another name is caught by the atime poll (atime is per inode) without the reader's
+  identity. Executables in `ignore_executables` are ignored by both.
 
 ## Rollout
 
@@ -64,16 +74,20 @@ other private values in this repository.
        {"path": "/home/example/.example/notes", "owner": "example", "watch": false,
         "content": "{{random_hex:32}}\n"}
      ],
-     "ignore_executables": []
+     "ignore_executables": [],
+     "service_name": "example-name"
    }}}
    ```
 
    Templates: `{{principal_access_key_id}}`, `{{principal_secret_access_key}}`,
    `{{ssh_private_key}}` and `{{ssh_public_key}}` (one key pair generated per install), and
-   `{{random_hex:N}}`. `watch: false` places a file without watching opens of it; use it for
+   `{{random_hex:N}}`. `service_name` (optional, default `hostmetricsd`) names the installed
+   service and its paths; `launchd_label` (optional, `local.` prefix) overrides the macOS label.
+   `watch: false` places a file without watching opens of it; use it for
    files that ordinary tools read on every run. `age_days` (default 120) back-dates each file.
    Choose paths no routine job reads: backup agents, indexers and file-sync clients would page
-   you. The installer refuses to overwrite any file it did not place.
+   you. The installer refuses to overwrite any file it did not place, and refuses a path whose
+   directories include a symlink the file's owner could have made.
 3. Set `enable_access_audit` to `true` in a commit, plan, read the plan, apply. Creating the
    principals and their keys trips the existing IAM-change security alerts; that is expected.
 4. Install on each host. On the jumpbox, take that host's bundle from the generated secret and
@@ -88,12 +102,12 @@ other private values in this repository.
    ```
 
 5. Prove the delivery path without touching a registered file:
-   `sudo python3 -I /usr/local/libexec/access-audit/agent.py test-alert` sends one email and log
-   line labelled TEST.
+   `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd test-alert` sends one email and
+   log line labelled TEST. With a `service_name`, the path is `/usr/local/libexec/<name>/<name>`.
 
 Re-running the install replaces only files the agent placed and that are unchanged since.
-`sudo python3 -I /usr/local/libexec/access-audit/agent.py uninstall` stops the service and removes
-only those files. Removing a host from the registry and applying deletes its principal,
+`sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd uninstall` stops the service and
+removes only those files, including any placed by an install that failed part-way. Removing a host from the registry and applying deletes its principal,
 reporter, stream and heartbeat alarm.
 
 ## Tests

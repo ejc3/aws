@@ -13,8 +13,14 @@ variable "enable_access_audit" {
 locals {
   access_audit_namespace = "AccessAudit"
   access_audit_log_group = "/security/access-audit"
-  # { "hosts": { "<host>": { "principal": "<iam user name>", "files": [...], "ignore_executables": [...] } } }
-  access_audit_hosts          = var.enable_access_audit ? jsondecode(data.aws_secretsmanager_secret_version.access_audit_config[0].secret_string).hosts : {}
+  # { "hosts": { "<host>": { "principal": "<iam user name>", "files": [...], "ignore_executables": [...],
+  #                          "service_name": "<optional>", "launchd_label": "<optional>" } } }
+  # Decode first and branch on the string, so hosts with different optional keys never have to
+  # unify with an empty object in a conditional.
+  access_audit_hosts = jsondecode(var.enable_access_audit ? data.aws_secretsmanager_secret_version.access_audit_config[0].secret_string : "{\"hosts\":{}}").hosts
+  # The registry arrives marked sensitive (secret_string), and for_each refuses a sensitive
+  # collection. Only the host names are unmarked, to key instances; every value stays sensitive.
+  access_audit_host_keys      = nonsensitive(toset(keys(local.access_audit_hosts)))
   access_audit_principal_arns = sort([for user in aws_iam_user.access_audit_principal : user.arn])
   access_audit_forward_pattern = jsonencode({
     "detail-type" = ["AWS API Call via CloudTrail", "AWS Console Sign In via CloudTrail"]
@@ -36,12 +42,12 @@ data "aws_secretsmanager_secret_version" "access_audit_config" {
 # Registered principals: real keys that are allowed to do nothing. Every call
 # they make is still recorded by CloudTrail, which is what the rules below need.
 resource "aws_iam_user" "access_audit_principal" {
-  for_each = local.access_audit_hosts
-  name     = each.value.principal
+  for_each = local.access_audit_host_keys
+  name     = local.access_audit_hosts[each.key].principal
 
   lifecycle {
     precondition {
-      condition     = can(regex("^[a-z0-9][a-z0-9-]{0,39}$", each.key)) && can(regex("^[A-Za-z0-9+=,.@_-]{1,64}$", each.value.principal))
+      condition     = can(regex("^[a-z0-9][a-z0-9-]{0,39}$", each.key)) && can(regex("^[A-Za-z0-9+=,.@_-]{1,64}$", local.access_audit_hosts[each.key].principal))
       error_message = "access-audit/config host names must be lowercase DNS labels and principals valid IAM user names."
     }
   }
@@ -69,7 +75,7 @@ resource "aws_iam_access_key" "access_audit_principal" {
 # Reporters: one credential per host, able only to write that host's audit
 # stream, the audit namespace, and the operator topic.
 resource "aws_iam_user" "access_audit_reporter" {
-  for_each = local.access_audit_hosts
+  for_each = local.access_audit_host_keys
   name     = "access-audit-${each.key}"
 }
 
@@ -111,7 +117,7 @@ resource "aws_cloudwatch_log_group" "access_audit" {
 }
 
 resource "aws_cloudwatch_log_stream" "access_audit" {
-  for_each       = local.access_audit_hosts
+  for_each       = local.access_audit_host_keys
   name           = each.key
   log_group_name = aws_cloudwatch_log_group.access_audit.name
 }
@@ -126,7 +132,9 @@ resource "aws_secretsmanager_secret" "access_audit_bundles" {
 resource "aws_secretsmanager_secret_version" "access_audit_bundles" {
   count     = var.enable_access_audit ? 1 : 0
   secret_id = aws_secretsmanager_secret.access_audit_bundles.id
-  secret_string = jsonencode({ for host, entry in local.access_audit_hosts : host => {
+  # service_name and launchd_label name the on-host install; they are sent only when the
+  # registry sets them (the agent rejects a null), so an unset host takes the agent's default.
+  secret_string = jsonencode({ for host, entry in local.access_audit_hosts : host => merge({
     version            = 1
     host               = host
     region             = var.aws_region
@@ -143,7 +151,10 @@ resource "aws_secretsmanager_secret_version" "access_audit_bundles" {
       access_key_id     = aws_iam_access_key.access_audit_principal[host].id
       secret_access_key = aws_iam_access_key.access_audit_principal[host].secret
     }
-  } })
+    },
+    can(entry.service_name) ? { service_name = entry.service_name } : {},
+    can(entry.launchd_label) ? { launchd_label = entry.launchd_label } : {},
+  ) })
 }
 
 # Principal activity: every enabled Region forwards matching CloudTrail events
@@ -183,7 +194,7 @@ resource "aws_iam_role_policy" "access_audit_forward" {
 }
 
 resource "aws_cloudwatch_event_rule" "access_audit_forward" {
-  for_each      = length(local.access_audit_hosts) > 0 ? toset(local.security_delivery_regions) : toset([])
+  for_each      = length(local.access_audit_host_keys) > 0 ? toset(local.security_delivery_regions) : toset([])
   region        = each.key
   name          = "access-audit-forward"
   description   = "Forward registered principal activity to the access-audit bus"
@@ -333,7 +344,7 @@ resource "aws_cloudwatch_metric_alarm" "access_audit_tamper" {
 
 # A silent host is an alarm: stopping the agent must not stop the audit.
 resource "aws_cloudwatch_metric_alarm" "access_audit_heartbeat" {
-  for_each            = local.access_audit_hosts
+  for_each            = local.access_audit_host_keys
   alarm_name          = "access-audit-heartbeat-${each.key}"
   alarm_description   = "The access-audit agent on ${each.key} stopped reporting."
   namespace           = local.access_audit_namespace
@@ -384,14 +395,14 @@ resource "aws_cloudwatch_dashboard" "access_audit" {
           query  = "SOURCE '${local.access_audit_log_group}' | fields @timestamp, @logStream, kind, path, reason, exe, user, ssh_connection | sort @timestamp desc | limit 50"
         }
       },
-      ], length(local.access_audit_hosts) == 0 ? [] : [{
+      ], length(local.access_audit_host_keys) == 0 ? [] : [{
         type = "metric", x = 0, y = 20, width = 24, height = 6
         properties = {
           title   = "Host heartbeats"
           region  = var.aws_region
           stat    = "Sum"
           period  = 300
-          metrics = [for host in sort(keys(local.access_audit_hosts)) : [local.access_audit_namespace, "Heartbeat", "Host", host]]
+          metrics = [for host in sort(local.access_audit_host_keys) : [local.access_audit_namespace, "Heartbeat", "Host", host]]
         }
     }])
   })
