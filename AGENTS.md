@@ -705,7 +705,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   Anthropic answers compressed and the scanner read compressed bytes; it now decodes a copy (gzip, deflate, br, zstd) and the
   client's bytes stay as sent. And the first drained restart "waited 2ms" for 2 running requests: the backend's lifetime was the
   serve context, which the stop signal cancels, and every request handler stops with it; the backend now outlives the signal and
-  stops at Close, after the drain. There is no fallback to a login on the box: a server that is down or out of quota is an
+  stops at Close, after the drain. From `claude-master-9ff1e5d` Anthropic's usage poll only ORDERS subscriptions: a weekly figure of 100% no longer refuses
+  a request. On 2026-10-11 every subscription's poll read 100% and the pool refused everyone while Anthropic still served the
+  same accounts (a native session on one of them kept working); now a subscription is out only after Anthropic rejects a real
+  request (429) until its reset, and a success clears it. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
 - **fcvm-metal-arm uses the pool the same way** (`claude-master-client.tf`): an SSM association installs the pinned client (the
