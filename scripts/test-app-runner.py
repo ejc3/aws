@@ -6,6 +6,10 @@ and the real front function (extracted from runner-webhook-front.tf) against a f
 client. Nothing here touches AWS or GitHub.
 """
 import importlib.util
+import base64
+import contextlib
+import io
+import os
 import json
 import re
 import subprocess
@@ -1104,6 +1108,127 @@ class WiringTests(unittest.TestCase):
         self.assertIn("dimensions          = { Repo = each.key }", alarm)
         self.assertIn("'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text(),
                       "the controller must publish the per-repo series this alarm reads")
+
+
+class RunnersAppTokenTests(unittest.TestCase):
+    """The runners GitHub App: a pure-Python RS256 JWT that openssl verifies, an installation token narrowed to the one repo,
+    reuse while it lasts, and the repo's own PAT whenever the app is not set up or minting fails."""
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess, tempfile
+        cls.dir = tempfile.mkdtemp()
+        cls.pkcs1, cls.pkcs8, cls.pub = (os.path.join(cls.dir, n) for n in ("k1.pem", "k8.pem", "k.pub"))
+        subprocess.run(["openssl", "genrsa", "-traditional", "-out", cls.pkcs1, "2048"], check=True, capture_output=True)
+        subprocess.run(["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", cls.pkcs1, "-out", cls.pkcs8], check=True, capture_output=True)
+        subprocess.run(["openssl", "rsa", "-in", cls.pkcs1, "-pubout", "-out", cls.pub], check=True, capture_output=True)
+
+    def verify(self, message, signature):
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as s:
+            s.write(signature)
+        r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", self.pub, "-signature", s.name], input=message, capture_output=True)
+        os.unlink(s.name)
+        return r.returncode == 0
+
+    def test_rs256_verifies_with_openssl_for_both_key_formats(self):
+        app, *_ = load_app()
+        for path in (self.pkcs1, self.pkcs8):
+            pem = open(path).read()
+            self.assertTrue(self.verify(b"hello", app.rs256(b"hello", pem)), path)
+            self.assertFalse(self.verify(b"hellO", app.rs256(b"hello", pem)), "a different message must not verify")
+        self.assertIn("BEGIN RSA PRIVATE KEY", open(self.pkcs1).read(), "GitHub issues PKCS#1 keys")
+
+    def test_the_jwt_is_signed_and_valid_nine_minutes(self):
+        app, *_ = load_app()
+        jwt = app.app_jwt(4242, open(self.pkcs1).read(), at=1_800_000_000)
+        head, body, sig = jwt.split(".")
+        pad = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+        self.assertEqual(json.loads(pad(body)), {"iat": 1_800_000_000 - 60, "exp": 1_800_000_000 + 540, "iss": "4242"})
+        self.assertTrue(self.verify(f"{head}.{body}".encode(), pad(sig)))
+
+    def app_with(self, secret_value, mint=None):
+        tokens = {f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN", f"github-runner/repo-pat/{COLTON}": "PAT-COLTON"}
+        if secret_value is not None:
+            tokens["github-app/runners"] = secret_value
+        app, ec2, ssm, secrets = load_app(tokens=tokens)
+        app.RUNNER_APP_SECRET = "github-app/runners"
+        app._APP_TOKENS.clear()
+        calls = []
+
+        def github(method, path, pat, body=None):
+            calls.append((method, path, body))
+            if mint is not None:
+                return mint(method, path, pat, body)
+            return {"token": "ghs_minted", "expires_at": "2099-01-01T00:00:00Z"}
+        app.github = github
+        return app, calls, secrets
+
+    def creds(self):
+        return json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(), "installations": {"dolphin-labs-hq": 777}})
+
+    def test_an_app_repo_gets_a_narrowed_installation_token_reused_while_it_lasts(self):
+        app, calls, _ = self.app_with(self.creds())
+        cfg = dict(REPOS[DOLPHIN], app_repo=DOLPHIN)
+        self.assertEqual(app.repo_pat(cfg), "ghs_minted")
+        self.assertEqual(app.repo_pat(cfg), "ghs_minted")
+        self.assertEqual(len(calls), 1, "the token is reused, not minted per call")
+        method, path, body = calls[0]
+        self.assertEqual((method, path), ("POST", "/app/installations/777/access_tokens"))
+        self.assertEqual(body, {"repositories": ["dolphin-labs"], "permissions": {"administration": "write", "actions": "read", "metadata": "read"}})
+
+    def test_without_the_app_secret_value_the_repo_pat_is_used(self):
+        app, calls, _ = self.app_with(None)
+        self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "PAT-DOLPHIN")
+        self.assertEqual(calls, [])
+
+    def test_an_owner_without_an_installation_uses_its_pat(self):
+        app, calls, _ = self.app_with(self.creds())
+        self.assertEqual(app.repo_pat(dict(REPOS[COLTON], app_repo=COLTON)), "PAT-COLTON")
+        self.assertEqual(calls, [])
+
+    def test_a_failed_mint_falls_back_to_the_pat_and_says_why(self):
+        def mint(*a):
+            raise RuntimeError("GitHub 502")
+        app, calls, _ = self.app_with(self.creds(), mint)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "PAT-DOLPHIN")
+        self.assertIn("runners app token failed", out.getvalue())
+
+    def test_a_repo_without_app_repo_never_reads_the_app_secret(self):
+        app, calls, secrets = self.app_with(self.creds())
+        self.assertEqual(app.repo_pat(REPOS[DOLPHIN]), "PAT-DOLPHIN")
+        self.assertNotIn("github-app/runners", secrets.read)
+        self.assertEqual(calls, [])
+
+    def test_running_out_of_time_is_not_swallowed(self):
+        app, *_ = load_app()
+        app.RUNNER_APP_SECRET = "github-app/runners"
+
+        def boom(repo):
+            raise app.OutOfTime("deadline")
+        app.app_token = boom
+        with self.assertRaises(app.OutOfTime):
+            app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN))
+
+
+class RunnersAppTerraformTests(unittest.TestCase):
+    TF = (ROOT / "runner-app.tf").read_text()
+
+    def test_exactly_the_dolphin_repos_take_app_tokens_and_colton_keeps_its_pat(self):
+        m = re.search(r"runner_app_github_app_repos = \[(.*?)\]", self.TF)
+        repos = re.findall(r'"([^"]+)"', m.group(1))
+        self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps"])
+        self.assertNotIn(COLTON, repos)
+        self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
+        self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
+
+    def test_the_controller_reads_the_app_secret_and_only_it_and_the_jumpboxes_can(self):
+        self.assertIn("RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name", self.TF)
+        self.assertIn("[aws_secretsmanager_secret.github_app_runners[0].arn])", self.TF)
+        self.assertIn('"aws:PrincipalArn" = concat([aws_iam_role.runner_app_lambda[0].arn], local.github_admin_token_readers)', self.TF)
+        self.assertIn('count                   = var.enable_github_runner ? 1 : 0\n  name                    = "github-app/runners"', self.TF)
 
 
 if __name__ == "__main__":
