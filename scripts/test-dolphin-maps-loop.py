@@ -92,6 +92,14 @@ class AccessTests(unittest.TestCase):
         self.assertIn("local.games_mp_admin_principals", statement)
 
 
+class ReplayTests(unittest.TestCase):
+    def test_the_metal_boxes_can_read_noncurrent_journal_versions(self):
+        grant = block("aws_iam_role_policy", "dev_server_dolphin_maps_loop_journal")
+        self.assertIn('["s3:GetObject", "s3:GetObjectVersion"]', grant)
+        self.assertIn('["s3:ListBucket", "s3:ListBucketVersions"]', grant)
+        self.assertNotRegex(grant, r"s3:Put|s3:Delete")
+
+
 class AlarmTests(unittest.TestCase):
     def test_each_loop_is_its_own_function_so_lambda_counts_every_sweep_failure(self):
         # A timeout, running out of memory or a failed start logs nothing of the function's own: only Lambda's

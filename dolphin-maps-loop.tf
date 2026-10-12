@@ -493,15 +493,16 @@ resource "aws_iam_role_policy" "dev_server_dolphin_maps_loop_journal" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadJournals"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
+        Sid    = "ReadJournals"
+        Effect = "Allow"
+        # Versions too: an overwritten record survives only as a noncurrent version.
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"
       },
       {
         Sid       = "ListJournals"
         Effect    = "Allow"
-        Action    = "s3:ListBucket"
+        Action    = ["s3:ListBucket", "s3:ListBucketVersions"]
         Resource  = aws_s3_bucket.dolphin_maps_loop.arn
         Condition = { StringLike = { "s3:prefix" = ["journal/*"] } }
       },
