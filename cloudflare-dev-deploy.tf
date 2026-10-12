@@ -22,7 +22,7 @@
 #
 # Same shape as workers-deploy.tf: a typed cloudflare_account_token minted through the token_minter
 # provider alias, its value written to the container by Terraform (so it is in state; dev boxes cannot
-# read state). Each pinned permission group id is checked against its name at plan time. ROTATE with
+# read state). Permission group ids are looked up by name at plan time. ROTATE with
 # `terraform apply -replace=cloudflare_account_token.dev_deploy`, then re-install it in each app repo.
 
 resource "aws_secretsmanager_secret" "cloudflare_dev_deploy_token" {
@@ -35,13 +35,10 @@ resource "aws_secretsmanager_secret" "cloudflare_dev_deploy_token" {
 locals {
   cloudflare_dev_deploy_readers = [aws_iam_role.dev_server.arn]
 
-  # Permission group ids by their exact Cloudflare names (GET /accounts/<id>/tokens/permission_groups),
-  # pinned by scripts/test-cloudflare-dev-deploy.py and checked against the live names at plan time.
-  cloudflare_dev_deploy_groups = {
-    "Workers Scripts Write" = "e086da7e2179491d91ee5f35b3ca210a"
-    "D1 Write"              = "09b2857d1c31407795e75e3fed8617a1"
-    "Account Settings Read" = "c1fde68c7bcc44588cbb6ddbc16d6480"
-  }
+  # Permission groups by their exact Cloudflare names, pinned by scripts/test-cloudflare-dev-deploy.py.
+  # Their ids are looked up by name at plan time (GET /accounts/<id>/tokens/permission_groups, which
+  # the minting token may read), so no id is guessed.
+  cloudflare_dev_deploy_groups = ["Workers Scripts Write", "D1 Write", "Account Settings Read"]
 }
 
 resource "aws_secretsmanager_secret_policy" "cloudflare_dev_deploy_token" {
@@ -59,11 +56,12 @@ resource "aws_secretsmanager_secret_policy" "cloudflare_dev_deploy_token" {
   })
 }
 
-data "cloudflare_account_permission_group" "dev_deploy" {
-  for_each            = local.cloudflare_dev_deploy_groups
-  provider            = cloudflare.token_minter
-  account_id          = var.cloudflare_account_id
-  permission_group_id = each.value
+# The API matches `name` exactly; one() fails the plan unless each name gives exactly one group.
+data "cloudflare_account_api_token_permission_groups_list" "dev_deploy" {
+  for_each   = toset(local.cloudflare_dev_deploy_groups)
+  provider   = cloudflare.token_minter
+  account_id = var.cloudflare_account_id
+  name       = replace(each.key, " ", "%20")
 }
 
 resource "cloudflare_account_token" "dev_deploy" {
@@ -72,16 +70,9 @@ resource "cloudflare_account_token" "dev_deploy" {
   name       = "dev-deploy-terraform"
   policies = [{
     effect            = "allow"
-    permission_groups = [for id in values(local.cloudflare_dev_deploy_groups) : { id = id }]
+    permission_groups = [for name in local.cloudflare_dev_deploy_groups : { id = one(data.cloudflare_account_api_token_permission_groups_list.dev_deploy[name].result).id }]
     resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })
   }]
-
-  lifecycle {
-    precondition {
-      condition     = alltrue([for name, group in data.cloudflare_account_permission_group.dev_deploy : group.name == name])
-      error_message = "A pinned permission group id in local.cloudflare_dev_deploy_groups does not carry the name it is listed under."
-    }
-  }
 }
 
 resource "aws_secretsmanager_secret_version" "cloudflare_dev_deploy_token" {

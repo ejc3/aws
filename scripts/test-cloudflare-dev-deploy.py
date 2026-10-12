@@ -15,20 +15,18 @@ def code(text):
 
 
 class DevDeployTokenTests(unittest.TestCase):
-    def test_exactly_three_permission_groups_pinned_by_name(self):
-        groups = dict(re.findall(r'^\s+"([A-Za-z0-9 ]+)"\s+=\s+"([0-9a-f]{32})"$', code(TF), re.M))
-        self.assertEqual(groups, {
-            "Workers Scripts Write": "e086da7e2179491d91ee5f35b3ca210a",
-            "D1 Write": "09b2857d1c31407795e75e3fed8617a1",
-            "Account Settings Read": "c1fde68c7bcc44588cbb6ddbc16d6480",
-        })
-        self.assertEqual(code(TF).count("permission_groups"), 1)
+    def test_exactly_three_permission_groups_named_on_one_account(self):
+        self.assertIn('cloudflare_dev_deploy_groups = ["Workers Scripts Write", "D1 Write", "Account Settings Read"]', TF)
+        self.assertNotRegex(code(TF), r'"[0-9a-f]{32}"', "no permission group id is pinned or guessed")
+        self.assertEqual(code(TF).count("permission_groups ="), 1)
         self.assertIn('resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', TF)
 
-    def test_each_pinned_id_is_checked_against_its_name_before_the_token_is_made(self):
-        self.assertIn('data "cloudflare_account_permission_group" "dev_deploy"', TF)
-        self.assertIn("permission_group_id = each.value", TF)
-        self.assertIn("group.name == name", TF)
+    def test_ids_come_from_the_token_endpoint_the_minting_token_may_read(self):
+        # /accounts/<id>/tokens/permission_groups (API Tokens Read), not /accounts/<id>/iam/permission_groups.
+        self.assertIn('data "cloudflare_account_api_token_permission_groups_list" "dev_deploy"', TF)
+        self.assertNotIn("cloudflare_account_permission_group", code(TF).replace("cloudflare_account_api_token_permission_groups_list", ""))
+        self.assertIn('name       = replace(each.key, " ", "%20")', TF)
+        self.assertIn("one(data.cloudflare_account_api_token_permission_groups_list.dev_deploy[name].result).id", TF)
 
     def test_minted_through_the_minting_provider_never_by_api_call(self):
         self.assertIn('resource "cloudflare_account_token" "dev_deploy"', TF)
