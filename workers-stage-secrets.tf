@@ -18,14 +18,18 @@
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id workers-stage/<site> \
 #     --secret-string file:///dev/stdin < <a 0600 JSON file, or a pipe>
 #
-# For dolphin-labs and dolphin-films, the same command with a session in the Dolphin account (the credentials only in the
-# environment, never on a command line):
+# For dolphin-labs and dolphin-films, the same command with a session in the Dolphin account, all inside one subshell
+# that stops at the first failure (no session means no write, not a write with this account's credentials) and takes
+# the credentials with it when it ends. They are only ever in the environment, never on a command line:
 #
-#   read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < <(aws sts assume-role \
-#     --role-arn arn:aws:iam::<Dolphin account id>:role/OrganizationAccountAccessRole --role-session-name put-value \
-#     --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
-#   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; unset AWS_PROFILE AWS_DEFAULT_PROFILE
-#   aws secretsmanager put-secret-value ...   # as above, in a subshell you then exit
+#   ( set -e
+#     read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < <(aws sts assume-role \
+#       --role-arn arn:aws:iam::<Dolphin account id>:role/OrganizationAccountAccessRole --role-session-name put-value \
+#       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+#     [ -n "$AWS_SESSION_TOKEN" ] && [ "$AWS_SESSION_TOKEN" != None ]
+#     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; unset AWS_PROFILE AWS_DEFAULT_PROFILE
+#     aws secretsmanager put-secret-value --region us-west-1 --secret-id workers-stage/<site> \
+#       --secret-string file:///dev/stdin < <a 0600 JSON file> )
 #
 # Rolling a Dolphin site back here inside the 7-day recovery window needs the deleted container restored first.
 #
