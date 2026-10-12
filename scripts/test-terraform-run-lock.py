@@ -91,7 +91,7 @@ class WrapperTests(unittest.TestCase):
         a = self.start("apply", FAKE_SLEEP="2")
         self.wait_started("apply")
         for args in (["fmt", "-check"], ["validate"], ["version"], ["output", "-json"], ["show"], ["-help"],
-                     ["-chdir=sub", "providers"]):
+                     ["-chdir=sub", "providers"], ["graph"]):
             t = time.time()
             r = subprocess.run(["bash", str(WRAPPER), *args], env=self.env, capture_output=True, text=True,
                                timeout=10)
@@ -122,6 +122,7 @@ class WrapperTests(unittest.TestCase):
         a = self.start("apply", FAKE_SLEEP="1.5")
         self.wait_started("apply")
         for args, expect in ((["providers", "lock", "-platform=linux_arm64"], 75), (["providers", "mirror", "d"], 75),
+                             (["console"], 75), (["console", "-plan"], 75),
                              (["providers"], 0), (["providers", "schema", "-json"], 0)):
             r = subprocess.run(["bash", str(WRAPPER), *args], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
                                capture_output=True, text=True, timeout=10)
