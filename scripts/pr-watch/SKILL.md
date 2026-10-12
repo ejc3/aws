@@ -87,7 +87,9 @@ to approve if it is safe; we have many code review agents"):
    /tmp/tf-$(date +%s) origin/main`), `umask 002`, `terraform init -input=false -lockfile=readonly`, plan, read the
    plan, apply the saved plan, require an empty follow-up plan. Check `df -h /` before the init (each worktree's
    providers take about 1 GB of the 40 GB root), and `git worktree remove --force` the worktree on every way out, a
-   failed or stopped run included. Remove the PR from `unapplied` only after the empty follow-up plan. One Terraform
+   failed or stopped run included. Remove the PR from `unapplied` only after the empty follow-up plan. A merge that
+   changed `scripts/pr-watch-install.sh` or `scripts/pr-watch/` also re-runs `scripts/pr-watch-install.sh --watcher`
+   from that worktree before it is removed, so the running skill, hook and claim script are the merged ones. One Terraform
    run at a time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions
    (agree on one run owner and tell them when it ends); `-lock-timeout=10m`, never `-lock=false`. A plan that replaces
    or destroys something unexpected stops the run and goes to the owner. (Two backstops: the Stop hook's drift plan and
