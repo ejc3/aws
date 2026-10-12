@@ -9,7 +9,9 @@ import {
 resource "aws_organizations_organization" "security" {
   feature_set                   = "ALL"
   aws_service_access_principals = ["sso.amazonaws.com", "cloudtrail.amazonaws.com", "backup.amazonaws.com"]
-  enabled_policy_types          = ["AISERVICES_OPT_OUT_POLICY"]
+  # SERVICE_CONTROL_POLICY: dolphin-region-scp.tf. Enabling it attaches AWS's FullAWSAccess everywhere, so only the
+  # Dolphin OU's own SCP restricts anything.
+  enabled_policy_types = ["AISERVICES_OPT_OUT_POLICY", "SERVICE_CONTROL_POLICY"]
   lifecycle { prevent_destroy = true }
 }
 

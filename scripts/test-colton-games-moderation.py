@@ -64,7 +64,7 @@ class AiServicesOptOutTests(unittest.TestCase):
     ORG = (ROOT / "security-organization.tf").read_text()
 
     def test_the_root_carries_the_opt_out_policy(self):
-        self.assertIn('enabled_policy_types          = ["AISERVICES_OPT_OUT_POLICY"]', self.ORG)
+        self.assertRegex(self.ORG, r'enabled_policy_types\s*=\s*\["AISERVICES_OPT_OUT_POLICY"')
         self.assertIn('services = { default = { opt_out_policy = { "@@assign" = "optOut" } } }', self.ORG)
         self.assertIn("target_id = aws_organizations_organization.security.roots[0].id", self.ORG)
 
