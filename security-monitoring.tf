@@ -548,8 +548,8 @@ locals {
   # At 2026-09 rates ($0.014/1k in Sao Paulo, $0.01/1k elsewhere here),
   # retrieval is ~$6.36/month; four metrics + five alarms add ~$1.70/month.
   # Lambda, SQS and logs are additional usage charges; no free tier assumed.
-  # Each rule in security_delivery_extra_rules adds two metric queries per run (~$0.17/month each): four with the
-  # access audit off, 38 with it on in all 17 regions.
+  # Each rule in security_delivery_extra_rules adds two metric queries per run (~$0.17/month each): 76 queries per run
+  # with the access audit off (656,640 per 30 days), 110 with it on in all 17 regions.
   security_delivery_regions = [
     "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
     "ap-southeast-1", "ap-southeast-2", "ca-central-1", "eu-central-1",
@@ -578,6 +578,8 @@ locals {
     EXTRA_RULE_KEYS = {"name", "bus", "region", "state", "pattern", "target"}
     EXTRA_TARGET_KEYS = {"Id", "Arn", "RoleArn", "DeadLetterConfig", "RetryPolicy", "InputTransformer"}
     RESERVED_RULES = FORWARD_RULES + ["security-alerts-notify", "security-delivery-health"]
+    # Always deployed (not gated by a feature switch), so a file without them is a packaging fault, not a quiet account.
+    REQUIRED_EXTRA_RULES = {"dolphin-security-inspector", "access-audit-notify"}
 
     def expected_target(rule, account, region, main_account, sns_topic):
         if rule in FORWARD_RULES:
@@ -628,10 +630,15 @@ locals {
                     or rule["state"] not in ("ENABLED", "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
                     or not isinstance(rule["target"], dict) or not set(rule["target"]) <= EXTRA_TARGET_KEYS
                     or not {"Id", "Arn", "DeadLetterConfig"} <= set(rule["target"])
+                    or any(not isinstance(rule["target"][key], str) or not rule["target"][key] for key in ("Id", "Arn"))
+                    or not isinstance(rule["target"]["DeadLetterConfig"], dict) or set(rule["target"]["DeadLetterConfig"]) != {"Arn"}
+                    or not re.fullmatch(r"arn:aws:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,80}", str(rule["target"]["DeadLetterConfig"]["Arn"]))
                     or (rule["name"], rule["bus"], rule["region"]) in seen):
                 raise ValueError("Invalid extra rule")
             seen.add((rule["name"], rule["bus"], rule["region"]))
             checked.append(dict(rule, pattern=parse_pattern(rule["pattern"])))
+        if not REQUIRED_EXTRA_RULES <= {rule["name"] for rule in checked}:
+            raise ValueError("Extra rules lack a required rule")
         return checked
 
     def check_rule(events, rule, bus, expected_arn, expected_state, expected_pattern, expected_targets):

@@ -290,9 +290,12 @@ class DeliveryTests(unittest.TestCase):
         self.module = load(self.factory)
         self.extra_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.extra_dir.cleanup)
-        self.set_extra_rules([])
+        self.set_extra_rules(None)
 
-    def set_extra_rules(self, rules):
+    def set_extra_rules(self, rules, region="us-west-1"):
+        self.default_extra = rules is None
+        if rules is None:  # the two always-deployed rules, as an account without the access audit has
+            rules = [dict(rule, region=region) for rule in extra_rule_fixtures() if rule["name"] != "access-audit-forward"]
         path = os.path.join(self.extra_dir.name, "extra_rules.json")
         with open(path, "w") as handle:
             json.dump(rules, handle)
@@ -301,6 +304,9 @@ class DeliveryTests(unittest.TestCase):
                               if isinstance(rules, list) and isinstance(rule, dict) and {"region", "name"} <= set(rule)}
 
     def run_handler(self, regions=None, extra=None):
+        if getattr(self, "default_extra", False):  # the required rules live in a region this run monitors
+            regs = regions or REGIONS
+            self.set_extra_rules(None, "us-west-1" if "us-west-1" in regs else regs[0])
         env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS), "SNS_TOPIC_ARN": SNS_TOPIC,
                "EVENT_PATTERNS": json.dumps(PATTERNS)}
         env.update(extra or {})
@@ -325,11 +331,12 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual({(account, region) for account, region, _ in self.factory.reads},
                          {(account, region) for account in (MAIN, STAGING) for region in REGIONS})
         requested = sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads)
-        self.assertEqual(requested, 72)
-        self.assertEqual(requested * 288 * 30, 622080)
+        # 72 for the shared rules, plus two for each of the two always-deployed extra rules.
+        self.assertEqual(requested, 76)
+        self.assertEqual(requested * 288 * 30, 656640)
         self.assertEqual(len(self.factory.queue_reads), 35)
-        self.assertEqual(len(self.factory.rule_reads), 70)
-        self.assertEqual(len(self.factory.target_reads), 70)
+        self.assertEqual(len(self.factory.rule_reads), 72)
+        self.assertEqual(len(self.factory.target_reads), 72)
 
     def test_disabled_missing_or_wrong_rule_is_not_a_healthy_quiet_region(self):
         for override in (lambda r: dict(r, State="DISABLED"), lambda r: {},
@@ -469,22 +476,22 @@ class DeliveryTests(unittest.TestCase):
             with self.subTest(offset=offset):
                 self.factory = Factory()
                 self.module = load(self.factory)
-                self.set_extra_rules([])
+                self.set_extra_rules(None)
                 with patch.dict(self.module, datetime=types.SimpleNamespace(datetime=Clock, timedelta=datetime.timedelta, timezone=datetime.timezone)):
                     values, log = self.run_handler()
                 self.assertEqual(values["ObserverErrors"], 0)
                 self.assertEqual(log["checked_regions"], 34)
-                self.assertEqual(len(self.factory.rule_reads), 70)
-                self.assertEqual(len(self.factory.target_reads), 70)
+                self.assertEqual(len(self.factory.rule_reads), 72)
+                self.assertEqual(len(self.factory.target_reads), 72)
                 self.assertEqual(len(self.factory.queue_reads), 35)
-                self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 72)
+                self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 76)
                 expected_sample = REGIONAL_RULES[int(instant.timestamp()) // 300 % 2]
                 for account, region, call in self.factory.reads:
                     queried = [dict((d["Name"], d["Value"]) for d in q["MetricStat"]["Metric"]["Dimensions"])["RuleName"]
                                for q in call["MetricDataQueries"]]
                     self.assertEqual(queried.count(expected_sample), 2)
                     self.assertNotIn(REGIONAL_RULES[1 - REGIONAL_RULES.index(expected_sample)], queried)
-                    self.assertEqual(len(queried), 6 if account == MAIN and region == "us-west-1" else 2)
+                    self.assertEqual(len(queried), 10 if account == MAIN and region == "us-west-1" else 2)
                     self.assertEqual(call["StartTime"], instant - datetime.timedelta(minutes=15))
                     self.assertEqual(call["EndTime"], instant)
 
@@ -821,6 +828,12 @@ class ExtraRuleTests(unittest.TestCase):
             "default bus named": [dict(good[0], bus="default")],
             "bad state": [dict(good[0], state="DISABLED")],
             "not a list": {"rules": good},
+            "empty": [],
+            "a required rule missing": [r for r in good if r["name"] != "access-audit-notify"],
+            "empty dead-letter config": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig={}))],
+            "null dead-letter config": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig=None))],
+            "dead-letter target not a queue": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig={"Arn": "arn:aws:sns:us-west-1:" + MAIN + ":x"}))],
+            "empty target id": [dict(good[0], target=dict(good[0]["target"], Id=""))],
         }
         for label, rules in bad_cases.items():
             with self.subTest(label):
