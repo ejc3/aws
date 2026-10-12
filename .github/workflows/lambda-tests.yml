@@ -40,6 +40,9 @@ jobs:
       - name: Agent instructions distributed from ejc3/agents-md
         run: python3 -S -B scripts/test-agents-md.py
 
+      - name: One Terraform run at a time on the jumpboxes (run-lock wrapper)
+        run: python3 -B scripts/test-terraform-run-lock.py
+
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 
