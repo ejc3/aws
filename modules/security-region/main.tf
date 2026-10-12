@@ -13,6 +13,12 @@ variable "audit_bucket_name" { type = string }
 variable "audit_bucket_arn" { type = string }
 variable "posture_enabled" { type = bool }
 variable "record_global_iam" { type = bool }
+# false: no EventBridge forwarding (no rules, targets or DLQ). The Dolphin account uses it: nothing there may write into
+# the admin account, so its findings reach the admin account as GuardDuty and Security Hub administrator instead.
+variable "forward_findings" {
+  type    = bool
+  default = true
+}
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
@@ -190,7 +196,7 @@ locals {
 output "event_patterns" { value = local.security_event_patterns }
 
 resource "aws_cloudwatch_event_rule" "findings" {
-  for_each      = local.security_event_patterns
+  for_each      = var.forward_findings ? local.security_event_patterns : {}
   name          = each.key
   description   = "Forward security findings and high-risk control-plane changes to the admin account"
   event_pattern = each.value
@@ -205,20 +211,21 @@ resource "aws_cloudwatch_event_rule" "findings" {
 }
 
 resource "aws_cloudwatch_event_target" "central" {
-  for_each  = local.security_event_patterns
+  for_each  = var.forward_findings ? local.security_event_patterns : {}
   rule      = aws_cloudwatch_event_rule.findings[each.key].name
   target_id = "central-security-alerts"
   arn       = var.central_event_bus_arn
   role_arn  = var.forwarding_role_arn
   # Event-bus targets reject RetryPolicy; their role and regional DLQ are supported.
   # https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_events_targets.EventBusProps.html
-  dead_letter_config { arn = aws_sqs_queue.delivery_failures.arn }
+  dead_letter_config { arn = aws_sqs_queue.delivery_failures[0].arn }
   depends_on = [aws_sqs_queue_policy.delivery_failures]
 }
 
 # A DLQ must be in its rule's Region. The central observer reads counts only;
 # failed security events are retained for recovery, never consumed automatically.
 resource "aws_sqs_queue" "delivery_failures" {
+  count                     = var.forward_findings ? 1 : 0
   name                      = "security-findings-delivery-dlq"
   message_retention_seconds = 1209600
   sqs_managed_sse_enabled   = true
@@ -226,7 +233,8 @@ resource "aws_sqs_queue" "delivery_failures" {
 }
 
 resource "aws_sqs_queue_policy" "delivery_failures" {
-  queue_url = aws_sqs_queue.delivery_failures.url
+  count     = var.forward_findings ? 1 : 0
+  queue_url = aws_sqs_queue.delivery_failures[0].url
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -234,18 +242,28 @@ resource "aws_sqs_queue_policy" "delivery_failures" {
         Effect    = "Allow"
         Principal = { Service = "events.amazonaws.com" }
         Action    = "sqs:SendMessage"
-        Resource  = aws_sqs_queue.delivery_failures.arn
+        Resource  = aws_sqs_queue.delivery_failures[0].arn
         Condition = { ArnEquals = { "aws:SourceArn" = [for rule in aws_cloudwatch_event_rule.findings : rule.arn] } }
       },
       {
         Effect    = "Deny"
         Principal = "*"
         Action    = "sqs:*"
-        Resource  = aws_sqs_queue.delivery_failures.arn
+        Resource  = aws_sqs_queue.delivery_failures[0].arn
         Condition = { Bool = { "aws:SecureTransport" = "false", "aws:PrincipalIsAWSService" = "false" } }
       }
     ]
   })
+}
+
+moved {
+  from = aws_sqs_queue.delivery_failures
+  to   = aws_sqs_queue.delivery_failures[0]
+}
+
+moved {
+  from = aws_sqs_queue_policy.delivery_failures
+  to   = aws_sqs_queue_policy.delivery_failures[0]
 }
 
 # Posture checks run where durable workloads/data currently exist. GuardDuty and
@@ -353,3 +371,7 @@ resource "aws_inspector2_enabler" "security" {
   # First-time EC2 onboarding exceeded the provider's five-minute default.
   timeouts { create = "20m" }
 }
+
+# For an administrator relationship (the Dolphin account): the detector the member joins, and Security Hub once enabled.
+output "guardduty_detector_id" { value = aws_cloudcontrolapi_resource.guardduty.id }
+output "securityhub_enabled" { value = length(aws_securityhub_account.security) > 0 ? aws_securityhub_account.security[0].id : null }

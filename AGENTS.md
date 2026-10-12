@@ -1249,9 +1249,20 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   configuration reads that return environment variables or user data); the state bucket's policy refuses him too. His user
   and assignment exist only while the `dolphin_steve` key of `people/addresses` holds his address (it is also his
   user name); an API-created user gets no invitation and sets a password with "Forgot password".
-- Security monitoring (`security-monitoring.tf`, `security-regions.tf`) covers this account and dev-staging only. The org
-  CloudTrail (its key's encryption context lists the Dolphin account) and the AI-services opt-out at the root cover it.
-  Do not add it to `security_account_ids`: that list admits an account's principals to this account's Config bucket.
+- **Security monitoring** is `dolphin-security.tf`, built from here (never dolphin-aws), with nothing written into this
+  account: GuardDuty in us-west-1, us-west-2 and us-east-1 (`modules/security-region` with `forward_findings = false`),
+  Config, Security Hub (foundational standard) and Inspector in us-west-1, Config records in
+  `dolphin-security-records-<id>` in the Dolphin account, and the account defaults (`modules/security-defaults`) in the
+  same three regions. Three, not 17: each region is a provider alias and so another provider process in every plan, and
+  all 17 ran the jumpbox out of memory. This account is the Dolphin account's GuardDuty administrator (those regions) and
+  Security Hub administrator (us-west-1) by invitation, so its findings arrive
+  in this account's own EventBridge and go out through the existing `security-forward-findings` rules and
+  `security-alerts-notify` (whose pattern lists the Dolphin id); one extra rule, `dolphin-security-inspector`, forwards its
+  Inspector findings, which the shared pattern leaves to Inspector's own events. A Config aggregator `dolphin` reads its
+  configuration. Not covered: the Dolphin account's CloudTrail control-plane alerts (`security-forward-audit`); the org
+  CloudTrail (its key's encryption context lists the Dolphin account) still records every call. The AI-services opt-out
+  at the root covers it. Do not add it to `security_account_ids`: that list admits an account's principals to this
+  account's Config bucket and central event bus.
 
 ### dolphin-films credentials
 
