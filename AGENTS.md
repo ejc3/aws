@@ -826,6 +826,25 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Backup.** The root volume (the six logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
+### The PR and issue watch: the jumpbox reviews and merges everything
+
+Owner, 2026-10-12: watch for pull requests and issues from `ejc3`, run the full review loop on each, make sure the
+reviewers sign off, and merge; "this box handles everything", and the dev boxes "can give us PRs but can't touch
+anything". `scripts/pr-watch/SKILL.md` is the procedure (`/pr-watch`): every 30 minutes, every open pull request and
+issue authored by `ejc3` in the `ejc3` and `dolphin-labs-hq` repositories, drafts skipped; review, fix, re-request
+Codex/Greptile/the review gate, resolve threads, merge, then apply (`ejc3/aws` from a fresh worktree here, `dolphin-aws`
+through its `scripts/apply.sh` on nextjs-dev). Steve may merge dolphin-labs-hq pull requests from his own server.
+
+- `scripts/pr-watch-install.sh --watcher` (main jumpbox, `ubuntu`) installs the skill and a SessionStart hook. A
+  `CronCreate` job lives only as long as its session, so the hook makes exactly one live Claude session on the box its
+  owner (`~/.local/state/pr-watch/owner`, a Claude process id) and tells that session to schedule `/pr-watch`; while it
+  is alive, other sessions are told nothing, and when it exits the next new session takes over.
+- `scripts/pr-watch-install.sh --dev-rule --ssh HOST [--as USER]` writes `scripts/pr-watch/dev-box-rule.md` as a marked
+  block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. Agents there open
+  pull requests (draft while working) and issues, and never merge, push to a default branch, apply or deploy. That is
+  an instruction, not a permission boundary: their GitHub login can still merge.
+- Re-run either after changing these files or rebuilding a box; both are idempotent.
+
 ### New repositories appear in Claude Code and Codex within seconds
 
 `agent-session-sync` (`scripts/agent-session-sync.py`, `agent-session-sync.tf`) is a 5-second watch on every
