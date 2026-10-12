@@ -125,7 +125,8 @@ class SkillTextTests(unittest.TestCase):
 class RuleTextTests(unittest.TestCase):
     def test_dev_boxes_propose_only(self):
         rule = (ROOT / "scripts/pr-watch/dev-box-rule.md").read_text()
-        for phrase in ("Never merge", "push to a default branch", "apply Terraform", "draft"):
+        for phrase in ("Never merge", "push to `main`", "apply Terraform", "draft", "for the `ejc3/aws` repository only",
+                       "Every other repository works as it always has"):
             self.assertIn(phrase, rule)
 
 

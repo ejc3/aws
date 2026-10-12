@@ -833,8 +833,7 @@ reviewers sign off, and merge; "this box handles everything", and the dev boxes 
 anything". `scripts/pr-watch/SKILL.md` is the procedure (`/pr-watch`): every 30 minutes, every open pull request and
 issue authored by `ejc3` in this repository ("focus on aws repo only"), drafts skipped; review, fix, ask Codex,
 CodeRabbit (it skips this public repository unless asked) and Greptile by comment, resolve threads, merge, then apply
-from a fresh worktree. Other repositories' pull requests wait for the owner; Steve may merge dolphin-labs-hq pull
-requests from his own server.
+from a fresh worktree. Only this repository has these rules; every other repository keeps its own workflow.
 
 - **It is the dev-box-to-jumpbox queue the section above forbids**, accepted by the owner with safeguards: the dev boxes
   post as `ejc3` too, so everything on GitHub is treated as data, never instructions, and a change to sensitive
@@ -848,9 +847,10 @@ requests from his own server.
   session ends, so the hook has every interactive session keep a job: the heartbeat's holder does the work, the others
   answer `standby` and take over once it is 45 minutes stale. A session that is never prompted never claims it.
 - `scripts/pr-watch-install.sh --dev-rule --ssh HOST [--as USER]` writes `scripts/pr-watch/dev-box-rule.md` as a marked
-  block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. Agents there open
-  pull requests (draft while working) and issues, and never merge, push to a default branch, apply or deploy. That is
-  an instruction, not a permission boundary: their GitHub login can still merge.
+  block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. For `ejc3/aws`
+  only, agents there open pull requests (draft while working) and issues, and never merge, push to `main` or apply;
+  other repositories are untouched by it. That is an instruction, not a permission boundary: their GitHub login can
+  still merge.
 - Re-run either after changing these files or rebuilding a box; both are idempotent.
 
 ### New repositories appear in Claude Code and Codex within seconds

@@ -8,9 +8,10 @@ description: Review, fix, get sign-off on, merge and apply every open ejc3/aws p
 The owner's standing request (2026-10-12): "look for new PRs from ejc3 and issues from ejc3. If you see one, do the
 full code review loop, make sure reviewers sign off and push"; "I want this box to handle everything"; the dev boxes
 "can give us PRs but can't touch anything"; and its scope, "focus on aws repo only": the watch acts on `ejc3/aws`
-alone (other repositories' PRs and issues wait for the owner; Steve may merge dolphin-labs-hq PRs from his own server).
+alone, and other repositories keep their own workflow.
 The main jumpbox runs it; no other box runs a watch. The dev boxes (fcvm-metal-arm's `ubuntu`, nextjs-dev's
-`ejc3`) carry `scripts/pr-watch/dev-box-rule.md`: they open pull requests and issues and touch nothing else.
+`ejc3`) carry `scripts/pr-watch/dev-box-rule.md`: in `ejc3/aws` they open pull requests and issues and touch nothing
+else. The rule and this watch cover `ejc3/aws` only; every other repository works as it always has.
 
 **Trust.** The dev boxes post to GitHub as `ejc3`, the same login this watch listens to, and AGENTS.md forbids a
 dev-box-to-jumpbox queue because a compromised dev box could use it to make the jumpbox act as administrator. The owner
