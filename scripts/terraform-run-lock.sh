@@ -8,10 +8,10 @@
 # (73 provider processes, 2026-10-12) and staled an apply (2026-10-11). Every command that loads providers or touches
 # state takes one host-wide lock and holds it until Terraform exits; the rest pass straight through.
 #
-#   waits for the lock:   init plan apply destroy import refresh state taint untaint force-unlock test console,
+#   waits for the lock:   init plan apply destroy import refresh state taint untaint force-unlock test console validate,
 #                         providers lock, providers mirror (they rewrite .terraform.lock.hcl / download providers;
-#                         console holds the state lock, and console -plan plans)
-#   passes through:       everything else (fmt, validate, version, providers, output, show, graph, get, -help)
+#                         console holds the state lock, and console -plan plans; validate starts provider plugins)
+#   passes through:       everything else (fmt, version, providers, output, show, graph, get, -help)
 #
 #   TF_RUN_LOCK_NOWAIT=1  do not wait: exit 75 at once if another run holds the lock (the Stop hook uses this)
 #   TF_RUN_LOCK_WAIT=N    seconds to wait before giving up with 75 (default 1800)
@@ -55,7 +55,7 @@ done
 
 case "$sub $sub2" in
   "init "* | "plan "* | "apply "* | "destroy "* | "import "* | "refresh "* | "state "* | "taint "* | "untaint "* | \
-    "force-unlock "* | "test "* | "console "* | "providers lock" | "providers mirror") ;;
+    "force-unlock "* | "test "* | "console "* | "validate "* | "providers lock" | "providers mirror") ;;
   *) exec "$real" "$@" ;;
 esac
 

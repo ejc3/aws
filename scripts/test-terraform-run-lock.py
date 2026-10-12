@@ -99,7 +99,7 @@ class WrapperTests(unittest.TestCase):
     def test_cheap_commands_pass_straight_through_while_a_run_holds_the_lock(self):
         a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
-        for args in (["fmt", "-check"], ["validate"], ["version"], ["output", "-json"], ["show"], ["-help"],
+        for args in (["fmt", "-check"], ["version"], ["output", "-json"], ["show"], ["-help"],
                      ["-chdir=sub", "providers"], ["graph"]):
             t = time.time()
             r = subprocess.run(["bash", str(WRAPPER), *args], env=self.env, capture_output=True, text=True,
@@ -151,7 +151,7 @@ class WrapperTests(unittest.TestCase):
         a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
         for args, expect in ((["providers", "lock", "-platform=linux_arm64"], 75), (["providers", "mirror", "d"], 75),
-                             (["console"], 75), (["console", "-plan"], 75),
+                             (["console"], 75), (["console", "-plan"], 75), (["validate"], 75),
                              (["providers"], 0), (["providers", "schema", "-json"], 0)):
             r = subprocess.run(["bash", str(WRAPPER), *args], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
                                capture_output=True, text=True, timeout=10)
