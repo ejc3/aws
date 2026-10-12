@@ -1945,10 +1945,14 @@ it is saved, until the queue is empty; the alarm then returns to OK:
     jq -r '.Messages[].ReceiptHandle' <<<"$batch" | while read -r handle; do
       aws sqs delete-message --region <region> --queue-url "$Q" --receipt-handle "$handle"
     done
-  done )
+  done
+  aws sqs get-queue-attributes --region <region> --queue-url "$Q" --attribute-names \
+    ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible ApproximateNumberOfMessagesDelayed )
 ```
 
-Read `dead-letters.jsonl`, act on it, then shred it.
+It is empty only when all three counts are 0. A message a failed run left in flight stays invisible for
+the 120-second visibility timeout: if any count is not 0, wait two minutes and run it again (the file is
+appended to, so nothing already saved is lost). Read `dead-letters.jsonl`, act on it, then shred it.
 
 This is the same for the other security dead-letter queues.
 

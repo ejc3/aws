@@ -849,7 +849,11 @@ class HandlerRunner:
         if not known:
             return False
         chain = [entry for entry in report.get("ancestry", []) if isinstance(entry, dict)]
-        return any((entry.get("pid"), entry.get("start")) in known for entry in chain)
+        if chain:
+            return any((entry.get("pid"), entry.get("start")) in known for entry in chain)
+        # No chain: the reader was gone before the sensor looked it up (a delayed eslogger record of a
+        # short handler). Fall back to its pid alone, which only matches a handler seen in the grace window.
+        return report.get("pid") is not None and report.get("pid") in {pid for pid, _start in known}
 
     def nearby(self):
         """A handler is running or ran in the last HANDLER_GRACE seconds."""
@@ -871,12 +875,25 @@ class HandlerRunner:
         """Run the handler with the event on stdin. Its stdout is read only up to the cap, it is
         killed at the deadline, and a nonzero exit is a failure; stderr is discarded."""
         deadline = time.monotonic() + HANDLER_TIMEOUT
-        process = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL)
+        # Start gate: the handler is exec'd by a shell that first waits on a pipe, so none of its code runs
+        # until its identity is registered (exec keeps the pid and the start time the sensors report).
+        gate_read, gate_write = os.pipe()
+        try:
+            # No preexec_fn (unsafe in this threaded process): the shell reads the gate at its own fd number.
+            process = subprocess.Popen(["/bin/sh", "-c", 'read -r _ <&%d || exit 1; exec "$0"' % gate_read, self.path],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       pass_fds=(gate_read,), close_fds=True)
+        except BaseException:
+            os.close(gate_write)
+            raise
+        finally:
+            os.close(gate_read)
         chain = process_ancestry(process.pid, platform_name())
         identity = (process.pid, chain[0]["start"] if chain else None)
         self.active.add(identity)
         self.last_activity = self.clock()
+        os.write(gate_write, b"go\n")
+        os.close(gate_write)
         try:
             # Writing the event and reading the result share one deadline, so a handler that
             # never reads its stdin cannot block the writer either.

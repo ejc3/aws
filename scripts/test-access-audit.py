@@ -939,6 +939,35 @@ class FollowUpTest(unittest.TestCase):
         now[0] += agent.HANDLER_GRACE + 1
         self.assertFalse(runner.owns(own))
 
+    def test_a_delayed_report_without_ancestry_matches_a_recent_handler_by_pid(self):
+        now = [1000.0]
+        runner = agent.HandlerRunner("/etc/x/event_handler", lambda report: None, is_safe=lambda path: True)
+        runner.clock = lambda: now[0]
+        runner.recent[(4242, "2")] = runner.last_activity = now[0]
+        self.assertTrue(runner.owns({"kind": "file-read", "path": "/p", "pid": 4242}))
+        self.assertFalse(runner.owns({"kind": "file-read", "path": "/p", "pid": 77}))
+        now[0] += agent.HANDLER_GRACE + 1
+        self.assertFalse(runner.owns({"kind": "file-read", "path": "/p", "pid": 4242}))
+
+    def test_the_handler_does_not_run_until_its_identity_is_registered(self):
+        marker = Path(self.directory) / "ran"
+        script = Path(self.directory) / "handler"
+        script.write_text("#!/bin/sh\necho $$ > " + str(marker) + "\ncat >/dev/null\n")
+        script.chmod(0o700)
+        runner = agent.HandlerRunner(str(script), lambda report: None, is_safe=lambda path: True)
+        seen = {}
+
+        class Spy(set):
+            def add(spy, item):
+                time.sleep(0.3)  # give an ungated handler every chance to run first
+                seen["ran_before_registered"] = marker.exists()
+                seen["identity"] = item
+                set.add(spy, item)
+        runner.active = Spy()
+        runner._run(b"{}")
+        self.assertFalse(seen["ran_before_registered"])
+        self.assertEqual(int(marker.read_text()), seen["identity"][0])  # exec kept the registered pid
+
     def test_an_unattributed_read_is_reported_but_not_handed_back_near_a_handler_run(self):
         now = [1000.0]
         runner = agent.HandlerRunner("/etc/x/event_handler", lambda report: None, is_safe=lambda path: True)
@@ -1044,7 +1073,8 @@ class FollowUpTest(unittest.TestCase):
     def test_runbook_says_to_empty_the_dead_letter_queue_after_a_failure(self):
         text = runbook()
         for phrase in ("access-audit-forward-dlq", "security-central-delivery-dlq", "security-delivery-QueuedEvents",
-                       "aws sqs delete-message", ">> dead-letters.jsonl", "umask 077"):
+                       "aws sqs delete-message", ">> dead-letters.jsonl", "umask 077",
+                       "ApproximateNumberOfMessagesNotVisible", "all three counts are 0"):
             self.assertIn(phrase, text)
         self.assertNotIn("purge-queue", text)  # nothing is deleted before it is saved
 
