@@ -60,12 +60,11 @@ at_main=0
 if [ "$branch" = main ] && [ "$at_main" = 0 ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)" -gt 0 ]; then
   problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
 fi
-# Share a host-local lock across checkouts so simultaneous Stop hooks cannot both
-# start a plan. Also skip while any Terraform or provider process is already alive,
-# including manual runs that do not take this lock. Git checks still apply.
+# One Terraform run at a time (#408): on the jumpboxes `terraform` is the run-lock wrapper (terraform-run-lock.tf),
+# which makes this plan share one host lock with every other plan and apply. TF_RUN_LOCK_NOWAIT makes it give up at
+# once (exit 75) instead of queueing behind a long apply. The process check also skips while a run that bypassed the
+# wrapper (a full path, another box's checkout) is alive. Git checks still apply either way.
 terraform_check_available() {
-  exec 9>"/tmp/aws-stop-hook-tfplan-${UID}.lock" || return 1
-  flock -n 9 || return 1
   if pgrep -x 'terraform|terraform-provi' >/dev/null; then
     printf '%s\n' 'Skipping Terraform drift check: Terraform is already running.' >&2
     return 1
@@ -74,15 +73,19 @@ terraform_check_available() {
 
 if [ "$at_main" = 1 ] && command -v terraform >/dev/null 2>&1 && terraform_check_available; then
   tflog="/tmp/stop-hook-tfplan.log"
-  terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
+  TF_RUN_LOCK_NOWAIT=1 terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
   rc=$?
-  # Dev boxes cannot read state; tell them what this plan found (applied-status.tf).
-  # Publishes only from a clean origin/main checkout and never blocks the stop.
-  bash scripts/publish-applied-status.sh "$rc" "$tflog" >/dev/null 2>&1 || true
-  if [ "$rc" -eq 2 ]; then
-    problems+=("Terraform drift: live AWS does not match config (terraform plan shows changes). Review $tflog and either 'terraform apply' the intended change or reconcile config to match live BEFORE stopping, so nothing is lost.")
-  elif [ "$rc" -ne 0 ]; then
-    problems+=("terraform plan failed (exit $rc). See $tflog -- resolve before stopping.")
+  if [ "$rc" -eq 75 ]; then
+    printf '%s\n' 'Skipping Terraform drift check: another Terraform run holds the run lock.' >&2
+  else
+    # Dev boxes cannot read state; tell them what this plan found (applied-status.tf).
+    # Publishes only from a clean origin/main checkout and never blocks the stop.
+    bash scripts/publish-applied-status.sh "$rc" "$tflog" >/dev/null 2>&1 || true
+    if [ "$rc" -eq 2 ]; then
+      problems+=("Terraform drift: live AWS does not match config (terraform plan shows changes). Review $tflog and either 'terraform apply' the intended change or reconcile config to match live BEFORE stopping, so nothing is lost.")
+    elif [ "$rc" -ne 0 ]; then
+      problems+=("terraform plan failed (exit $rc). See $tflog -- resolve before stopping.")
+    fi
   fi
 fi
 
