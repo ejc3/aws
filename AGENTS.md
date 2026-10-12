@@ -1493,6 +1493,24 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by
   Access, still unreachable); (3) set `urls = true` and, in the repo, `workers_dev`/`preview_urls` true. Never reverse 2 and 3.
 
+### The Dolphin Browser relay (dolphin-relay.tf)
+
+The relay in dolphin-labs-hq/dolphin-browser (`relay/`, a public Worker with a Durable Object and a D1 database) deploys
+from that repository's CI on merge to main (its `deploy-relay.yml` and `relay/scripts/deploy.ts`, which creates the D1
+database `dolphin-relay` on the first deploy, applies migrations, deploys and sets `SIGNUP_TOKEN`). Owner, 2026-10-12:
+no Cloudflare deploy token on the dev boxes, and invite-only signup.
+
+- **The deploy token** (`cloudflare_account_token.dolphin_relay_deploy`: Workers Scripts Write, D1 Write, Account Settings
+  Read on the account) is written to ONE place a workflow can use it: the GitHub environment `relay` in dolphin-browser,
+  whose deployment policy admits only `main`. The deploy job must name `environment: relay`. Workers Scripts Write
+  reaches every Worker in the account (production included) and cannot be scoped to one, so the branch rule is the
+  control. A record of it is in `dolphin-browser/relay-deploy-token` (administration only).
+- **The invite token** (`random_password.dolphin_relay_signup`) is in `dolphin-browser/signup-token`, readable by
+  administration and dev-server-role (the metal boxes run `dolphin init --relay <url>`), and is the environment secret
+  `SIGNUP_TOKEN`, so each deploy sets the Worker secret: no dev box takes part in a deploy.
+- Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_relay_deploy` or
+  `-replace=random_password.dolphin_relay_signup`; the next deploy uses the new values.
+
 ### Colton Games production on Cloudflare (switched 2026-10-11)
 
 The owner decided on 2026-10-11 to move colton-games production from Vercel to Cloudflare Workers so that the zone's WAF,
