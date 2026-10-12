@@ -62,9 +62,8 @@ resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
 
   # A replacement would get a new audience tag, and the Worker would refuse everyone until its
   # CF_ACCESS_AUD secret is set again; URLs must be off before this protection can go.
-  # Lifted for one apply to retire claude-master-dashboard's application (#415); restored after.
   lifecycle {
-    prevent_destroy = false
+    prevent_destroy = true
   }
 
   destinations = [{
