@@ -1,4 +1,4 @@
-# dolphin-maps' scheduled loops, run in AWS: one Lambda on two EventBridge schedules, a journal of every pass
+# dolphin-maps' scheduled loops, run in AWS: two Lambdas from one bundle on two EventBridge schedules, a journal of every pass
 # in S3, and a GitHub App for its commits. It replaces the GitHub Actions loops in dolphin-labs-hq/dolphin-maps
 # (scrape-live.yml, scrape-weekly.yml and the dev box's crontab trigger), which stand down when that repository's
 # variable LOOPS_RUN_IN_AWS is true.
@@ -11,14 +11,15 @@
 #                                 One bundle, two functions: each loop has its own limits, and Lambda's own Errors
 #                                 metric (timeouts, running out of memory and failed starts included) is that
 #                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a
-#                                 stand-in handler (dolphin-maps-loop/placeholder.mjs) and then leaves their code
+#                                 stand-in handler (dolphin-maps-loop/index.mjs, index.handler like the bundle) and then leaves their code
 #                                 alone: dolphin-maps deploy-loop.yml (main) uploads the bundle to code/ and calls
 #                                 UpdateFunctionCode on each through dolphin-maps-loop-deploy.
 #   dolphin-maps-loop-<account>   the bucket:
 #                                   journal/  one gzipped record per pass: each page's text and the rows read
 #                                             from it, and the bundle's sha, so a page Google changed can be
-#                                             replayed through fixed code. Kept 400 days, Infrequent Access
-#                                             after 30.
+#                                             replayed through fixed code. Kept 400 days. The bucket is
+#                                             versioned, so an overwrite keeps the earlier record, and only
+#                                             administration may delete a record or a version.
 #                                   code/     deployed bundles, 30 days (Lambda copies the code at update time).
 #   github-app/dolphin-maps-loop  JSON: app_id, slug, private_key, installations {owner: id}. The loop's GitHub
 #                                 App: contents read and write, installed on dolphin-labs-hq for
@@ -32,7 +33,8 @@
 #
 # Who reaches what:
 #   the two functions          journal/ (write); the two secrets (read); their own logs
-#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode and GetFunction on these two functions only
+#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these two
+#                              functions only (no UpdateFunctionConfiguration: the handler is Terraform's)
 #   dev-server-role            journal/ (read, list): replays on the metal boxes
 
 variable "dolphin_maps_loop_enabled" {
@@ -86,8 +88,16 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "dolphin_maps_loop
   }
 }
 
-# A journal record is written once under a key naming its pass; nothing rewrites one. No principal but the
-# administration set may delete from journal/, so a bad deploy cannot erase the record of what was read.
+resource "aws_s3_bucket_versioning" "dolphin_maps_loop" {
+  bucket = aws_s3_bucket.dolphin_maps_loop.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# A journal record is written once under a key naming its pass. The bucket is versioned, so even a bad deploy that
+# rewrote a key would leave the earlier record as a noncurrent version, and no principal but the administration set
+# may delete from journal/ (a key or a version): the record of what was read cannot be erased from the loop's side.
 resource "aws_s3_bucket_policy" "dolphin_maps_loop" {
   bucket = aws_s3_bucket.dolphin_maps_loop.id
   policy = jsonencode({
@@ -122,12 +132,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_maps_loop" {
     filter {
       prefix = "journal/"
     }
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
     expiration {
       days = 400
+    }
+    noncurrent_version_expiration {
+      noncurrent_days = 400
     }
   }
   rule {
@@ -139,6 +148,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_maps_loop" {
     expiration {
       days = 30
     }
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
   }
   rule {
     id     = "abort-incomplete-uploads"
@@ -148,6 +160,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_maps_loop" {
       days_after_initiation = 2
     }
   }
+  depends_on = [aws_s3_bucket_versioning.dolphin_maps_loop]
 }
 
 # -------------------------------------------------------------------------------------
@@ -186,7 +199,7 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_loop_github_app" {
 
 data "archive_file" "dolphin_maps_loop_placeholder" {
   type        = "zip"
-  source_file = "${path.module}/dolphin-maps-loop/placeholder.mjs"
+  source_file = "${path.module}/dolphin-maps-loop/index.mjs"
   output_path = "${path.module}/.terraform/dolphin-maps-loop-placeholder.zip"
 }
 
@@ -242,14 +255,16 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
   function_name = "${local.dolphin_maps_loop_name}-${each.key}"
   description   = each.key == "live" ? "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3" : "dolphin-maps weekly loop: the school week's typical ranges and the calibration refit, committed to the repository, journal to S3"
   role          = aws_iam_role.dolphin_maps_loop.arn
-  handler       = "placeholder.handler"
+  # The bundle deploy-loop.yml uploads exports index.handler too, so the handler never changes and the deploy
+  # role needs no UpdateFunctionConfiguration (which IAM cannot narrow to the handler).
+  handler       = "index.handler"
   runtime       = "nodejs22.x"
   architectures = ["arm64"]
   timeout       = each.value.timeout
   memory_size   = each.value.memory
   filename      = data.archive_file.dolphin_maps_loop_placeholder.output_path
-  # One pass of each loop at a time: two passes' commits would only retry against each other, but a sweep
-  # must never run beside itself.
+  # One pass of each loop at a time, so a sweep never runs beside itself. A live pass and a sweep (a sweep rerun by
+  # hand on a school morning) can overlap: both commit to main, and the later commit retries against the earlier.
   reserved_concurrent_executions = 1
 
   logging_config {
@@ -270,9 +285,9 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
 
   tags = { Name = "${local.dolphin_maps_loop_name}-${each.key}", Project = "dolphin-maps" }
 
-  # deploy-loop.yml owns the code and the handler it names; Terraform owns everything else.
+  # deploy-loop.yml owns the code; Terraform owns everything else, the handler included.
   lifecycle {
-    ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version, handler]
+    ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version]
   }
 }
 
@@ -336,17 +351,18 @@ resource "aws_scheduler_schedule" "dolphin_maps_loop" {
   }
 }
 
-# Live: three failed passes running (15 minutes of a school morning with no samples) is a broken deploy, a
-# missing secret or a changed page; one failure is a bad page load and the next pass covers it.
+# Live: three failed passes within half an hour of a school morning is a broken deploy, a missing secret or a
+# changed page; one failure is a bad page load and the next pass covers it. Three of six periods, not three in a
+# row, so a scheduler-jittered pass landing in a neighbouring period cannot reset the count.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_errors" {
   alarm_name          = "dolphin-maps-loop-errors"
-  alarm_description   = "dolphin-maps-loop-live failed three passes running: the morning's live samples are not being kept. See /aws/lambda/dolphin-maps-loop-live and journal/live/ in the dolphin-maps-loop bucket."
+  alarm_description   = "dolphin-maps-loop-live failed three passes within half an hour: the morning's live samples are not being kept. See /aws/lambda/dolphin-maps-loop-live and journal/live/ in the dolphin-maps-loop bucket."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
   dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["live"].function_name }
   statistic           = "Sum"
   period              = 300
-  evaluation_periods  = 3
+  evaluation_periods  = 6
   datapoints_to_alarm = 3
   comparison_operator = "GreaterThanThreshold"
   threshold           = 0
@@ -372,12 +388,53 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_sweep_failed" {
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
 }
 
+# A pass that never ran is not an error: with one run at a time, a live pass that takes past the next five
+# minutes throttles the one after it, and a throttled event older than 300 s is dropped without running. Lambda
+# counts those in AsyncEventsDropped, not Errors, so each function gets its own alarm on them.
+resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_dropped" {
+  for_each            = local.dolphin_maps_loop_modes
+  alarm_name          = "dolphin-maps-loop-${each.key}-dropped"
+  alarm_description   = "dolphin-maps-loop-${each.key}: scheduled passes were dropped without running (a pass still running when the next was due, past the 300 s event age). See /aws/lambda/dolphin-maps-loop-${each.key}."
+  namespace           = "AWS/Lambda"
+  metric_name         = "AsyncEventsDropped"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop[each.key].function_name }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+}
+
+# And a loop that stops running at all (a schedule disabled or broken, the scheduler role changed) produces no
+# Errors and no drops. Only while the schedules are on: the live loop is invoked every weekday morning, so four
+# days without an invocation spans any weekend; the sweep runs once a week, so seven daily periods always hold
+# one run. Missing data is a breach: no invocations publish no datapoint.
+resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_not_running" {
+  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7 } : {}
+  alarm_name          = "dolphin-maps-loop-${each.key}-not-running"
+  alarm_description   = "dolphin-maps-loop-${each.key} has not been invoked for ${each.value} days although its schedule is on. Check the scheduler schedule dolphin-maps-loop-${each.key} and the dolphin-maps-loop-scheduler role."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop[each.key].function_name }
+  statistic           = "Sum"
+  period              = 86400
+  evaluation_periods  = each.value
+  datapoints_to_alarm = each.value
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
 # -------------------------------------------------------------------------------------
 # Deploy (GitHub OIDC, deploy-loop.yml on main)
 # -------------------------------------------------------------------------------------
 
 # GitHub's immutable sub for main of dolphin-labs-hq/dolphin-maps, narrowed by job_workflow_ref to the one
-# workflow file, as dolphin-labs-news-deploy is.
+# workflow file.
 resource "aws_iam_role" "dolphin_maps_loop_deploy" {
   name                 = "dolphin-maps-loop-deploy"
   description          = "Assumed by dolphin-labs-hq/dolphin-maps deploy-loop.yml (main) via GitHub OIDC: upload the loop bundle and update the function's code"
@@ -415,9 +472,10 @@ resource "aws_iam_role_policy" "dolphin_maps_loop_deploy" {
       {
         Sid    = "UpdateTheFunctionsCode"
         Effect = "Allow"
-        # GetFunction to wait for the update to finish; UpdateFunctionConfiguration only to name the bundle's
-        # handler. Not its role, environment or permissions: those are Terraform's.
-        Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration"]
+        # GetFunction and GetFunctionConfiguration to wait for the update and check the handler. No
+        # UpdateFunctionConfiguration: it cannot be narrowed to the handler (it would also reach the environment,
+        # layers and runtime), and the handler is Terraform's (index.handler, the same in the stand-in and the bundle).
+        Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration"]
         Resource = [for f in aws_lambda_function.dolphin_maps_loop : f.arn]
       },
     ]

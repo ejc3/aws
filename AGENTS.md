@@ -1239,7 +1239,8 @@ Available if a task needs them; neither needs a key on disk.
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
-  role and admins may read it (`dev-ai-services.tf`; not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
+  role, the dolphin-maps-loop Lambdas' role (`dolphin-maps-loop.tf`) and admins may read it (`dev-ai-services.tf`;
+  not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
 - **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds

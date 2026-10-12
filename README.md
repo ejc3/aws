@@ -1335,6 +1335,21 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id vercel-admin-token --secret-string file:///dev/stdin; unset T
 ```
 
+dolphin-maps' loops in Lambda (`dolphin-maps-loop.tf`) need their own GitHub App before they can run, then a
+switch-over in a fixed order so the loops never run in both places:
+
+1. **The app.** Create `dolphin-maps-loop` from a manifest the same way: no webhook, repository permission
+   `contents: write` only, installed on dolphin-labs-hq with only `dolphin-maps` selected. Put the conversion's
+   JSON plus `installations {"dolphin-labs-hq": <id>}` into `github-app/dolphin-maps-loop` (stdin or a 0600 file).
+   The loops commit straight to dolphin-maps' main, which has no ruleset today; if it ever gets one, add this app
+   as a bypass actor first or every pass fails.
+2. **The first deploy.** Set dolphin-maps' repository variables from output `dolphin_maps_loop` and run its
+   `deploy-loop.yml` on main; it uploads the bundle and updates both functions' code (the handler stays
+   `index.handler`). Invoke each once by hand (`{"mode": "live"}`, `{"mode": "sweep"}`) and read its journal.
+3. **The switch-over, back to back:** set dolphin-maps' repository variable `LOOPS_RUN_IN_AWS` to `true` (its
+   `scrape-live.yml` and `scrape-weekly.yml` then stand down), then set `dolphin_maps_loop_enabled = true` here and
+   apply (the two schedules and the not-running alarms come on). To go back: the variable false and the gate false.
+
 Every setup script also gives an account that has no user-level agent instructions a
 starting file (`user-agents.tf`): `~/.codex/AGENTS.md`, which Codex reads, with
 `~/.claude/CLAUDE.md`, which Claude Code reads, as a symlink to it. The text is

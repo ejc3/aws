@@ -66,10 +66,24 @@ class AccessTests(unittest.TestCase):
         self.assertIn('"${aws_s3_bucket.dolphin_maps_loop.arn}/code/*"', deploy)
         self.assertNotRegex(deploy, r"iam:|PassRole|AddPermission")
 
-    def test_terraform_leaves_the_deployed_code_and_handler_alone(self):
+    def test_terraform_leaves_the_deployed_code_alone_but_owns_the_handler(self):
         fn = block("aws_lambda_function", "dolphin_maps_loop")
-        self.assertIn("ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version, handler]", fn)
+        self.assertIn("ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version]", fn)
+        self.assertRegex(fn, r'handler\s+= "index.handler"')
         self.assertIn("reserved_concurrent_executions = 1", fn)
+        self.assertIn('source_file = "${path.module}/dolphin-maps-loop/index.mjs"', block("archive_file", "dolphin_maps_loop_placeholder"))
+
+    def test_the_deploy_role_cannot_change_the_functions_configuration(self):
+        deploy = block("aws_iam_role_policy", "dolphin_maps_loop_deploy")
+        actions = re.search(r"Action\s+= \[([^\]]*lambda:[^\]]*)\]", deploy).group(1)
+        self.assertNotIn("UpdateFunctionConfiguration", actions)
+        self.assertIn('"lambda:UpdateFunctionCode"', actions)
+
+    def test_the_journal_is_versioned_so_an_overwrite_keeps_the_record(self):
+        self.assertIn('status = "Enabled"', block("aws_s3_bucket_versioning", "dolphin_maps_loop"))
+        lifecycle = block("aws_s3_bucket_lifecycle_configuration", "dolphin_maps_loop")
+        self.assertIn("noncurrent_version_expiration", lifecycle)
+        self.assertIn("depends_on = [aws_s3_bucket_versioning.dolphin_maps_loop]", lifecycle)
 
     def test_only_administration_deletes_the_journal(self):
         policy = block("aws_s3_bucket_policy", "dolphin_maps_loop")
@@ -92,11 +106,24 @@ class AlarmTests(unittest.TestCase):
         self.assertNotIn("aws_cloudwatch_log_metric_filter", TF)
         live = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_errors")
         self.assertIn('aws_lambda_function.dolphin_maps_loop["live"].function_name', live)
-        self.assertIn("evaluation_periods  = 3", live)
+        self.assertIn("evaluation_periods  = 6", live)
         self.assertIn("datapoints_to_alarm = 3", live)
 
+    def test_dropped_passes_alarm_for_each_loop(self):
+        dropped = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_dropped")
+        self.assertIn("for_each            = local.dolphin_maps_loop_modes", dropped)
+        self.assertIn('metric_name         = "AsyncEventsDropped"', dropped)
+
+    def test_a_loop_that_stops_running_alarms_while_its_schedule_is_on(self):
+        idle = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_not_running")
+        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7 } : {}", idle)
+        self.assertIn('metric_name         = "Invocations"', idle)
+        self.assertIn('treat_missing_data  = "breaching"', idle)
+        self.assertIn("datapoints_to_alarm = each.value", idle)
+
     def test_the_placeholder_only_throws(self):
-        text = (ROOT / "dolphin-maps-loop" / "placeholder.mjs").read_text()
+        text = (ROOT / "dolphin-maps-loop" / "index.mjs").read_text()
+        self.assertIn("export const handler", text)
         self.assertIn("throw new Error", text)
         json.dumps(text)
 
