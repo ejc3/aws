@@ -527,6 +527,7 @@ resource "aws_sqs_queue_policy" "security_delivery_failures" {
           aws_cloudwatch_event_rule.security_notify.arn,
           aws_cloudwatch_event_rule.security_delivery_health.arn,
           aws_cloudwatch_event_rule.dolphin_security_inspector.arn,
+          aws_cloudwatch_event_rule.access_audit_notify.arn,
         ] } }
       },
       {
@@ -602,9 +603,12 @@ locals {
         # and scalar types: JSON false is not the numeric value zero.
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
-    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns):
+    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns, extra_queues=()):
         rules = [(name, None) for name in FORWARD_RULES]
         queues = [QUEUE]
+        # Other features' regional DLQs in this account (access-audit.tf): only their depth is read.
+        if account == main_account:
+            queues.extend(extra_queues)
         if account == main_account and region == "us-west-1":
             rules.extend([("security-alerts-notify", "security-alerts"), ("security-delivery-health", None)])
             queues.append("security-central-delivery-dlq")
@@ -693,6 +697,10 @@ locals {
         regions = json.loads(os.environ["REGIONS"])
         sns_topic = os.environ["SNS_TOPIC_ARN"]
         configured_patterns = json.loads(os.environ["EVENT_PATTERNS"])
+        extra_queues = json.loads(os.environ.get("EXTRA_QUEUES", "[]"))
+        if (not isinstance(extra_queues, list) or len(extra_queues) > 4 or len(set(extra_queues)) != len(extra_queues)
+                or any(not isinstance(q, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", q) or q == QUEUE for q in extra_queues)):
+            raise ValueError("Invalid extra queues")
         if not isinstance(configured_patterns, dict) or set(configured_patterns) != set(FORWARD_RULES + ["security-alerts-notify"]):
             raise ValueError("Invalid expected event patterns")
         patterns = {name: parse_pattern(value) for name, value in configured_patterns.items()}
@@ -724,7 +732,8 @@ locals {
                 try:
                     tasks.append((session.client("cloudwatch", region_name=region, config=CONFIG),
                         session.client("sqs", region_name=region, config=CONFIG),
-                        session.client("events", region_name=region, config=CONFIG), account, region, main_account, sns_topic, now, patterns))
+                        session.client("events", region_name=region, config=CONFIG), account, region, main_account, sns_topic, now, patterns,
+                        tuple(extra_queues)))
                 except Exception:
                     errors += 1
         # 34 account/region jobs, six concurrent readers, short SDK timeouts and
@@ -811,8 +820,9 @@ resource "aws_iam_role_policy" "security_delivery_health" {
         Condition = { StringEquals = { "aws:RequestedRegion" = local.security_delivery_regions } }
       },
       {
-        Effect   = "Allow", Action = "sqs:GetQueueAttributes"
-        Resource = concat([aws_sqs_queue.security_delivery_failures.arn], [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${data.aws_caller_identity.current.account_id}:security-findings-delivery-dlq"])
+        Effect = "Allow", Action = "sqs:GetQueueAttributes"
+        Resource = concat([aws_sqs_queue.security_delivery_failures.arn], [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${data.aws_caller_identity.current.account_id}:security-findings-delivery-dlq"],
+        [for queue in aws_sqs_queue.access_audit_forward_dlq : queue.arn])
       },
       {
         Effect = "Allow", Action = ["events:DescribeRule", "events:ListTargetsByRule"]
@@ -863,6 +873,8 @@ resource "aws_lambda_function" "security_delivery_health" {
       STAGING_ACCOUNT = aws_organizations_account.dev_staging[0].id
       REGIONS         = jsonencode(local.security_delivery_regions)
       SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
+      # access-audit.tf's regional forward DLQs, once it registers a host; their depth counts as QueuedEvents.
+      EXTRA_QUEUES = jsonencode(length(aws_sqs_queue.access_audit_forward_dlq) > 0 ? ["access-audit-forward-dlq"] : [])
       EVENT_PATTERNS = jsonencode(merge(module.security_main_us_west_1.event_patterns, {
         security-alerts-notify = aws_cloudwatch_event_rule.security_notify.event_pattern
       }))

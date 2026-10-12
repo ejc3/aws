@@ -85,6 +85,12 @@ jobs:
       - name: Atuin agent hook normalizer (offline)
         run: python3 -S -B scripts/test-atuin-agent-hooks.py
 
+      - name: Host access audit agent and Terraform boundaries (offline)
+        run: python3 -S -B scripts/test-access-audit.py
+
+      - name: Host access audit Linux sensor (live fanotify, root)
+        run: sudo python3 -S -B scripts/test-access-audit-live.py
+
       - name: Admin box setup and Codex host guidance (offline)
         run: python3 -S -B scripts/test-admin-box-setup.py
 
