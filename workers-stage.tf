@@ -23,6 +23,7 @@ locals {
   workers_stage = {
     "dolphin-films-stage" = { id = "46a606b362ff46ffa1dbfc926e4ea7a2", urls = true }
     "dolphin-labs-stage"  = { id = "cec7e26a37314345922f483adc05c1bd", urls = true }
+    "dolphin-maps-stage"  = { id = "2ba16e42744a46c892720dfeafeccfd4", urls = false }
     "imagine-stage"       = { id = "2b8755b7ba1f4845bae8d18ced8fafef", urls = true }
     "nest-step-stage"     = { id = "d31376c75b8247f7b0a8e8a7e0fc7dba", urls = true }
     "remote-claw-stage"   = { id = "54a603228ad24345b518a9c10cfb3e26", urls = true }
