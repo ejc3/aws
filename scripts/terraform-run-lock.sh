@@ -19,9 +19,10 @@
 #   TF_RUN_LOCK_REAL      the real terraform (default /usr/local/lib/terraform-run-lock/terraform, else the first
 #                         terraform on PATH that is not this wrapper)
 #
-# The lock is an flock on fd 9, opened here and inherited by Terraform through exec, so it is held for exactly as long
-# as the run lives and released when it exits or is killed. It never adds -lock=false: Terraform's own state lock is a
-# separate, cross-host guard.
+# The lock is held by util-linux flock(1) with -o: flock takes it, closes its descriptor before starting Terraform, and
+# holds it until Terraform exits, so no descendant of Terraform (a provider plugin that outlives a killed Terraform)
+# ever holds it. Killing flock releases it too. A probe on fd 9 first, only to say who holds a busy lock. It never adds
+# -lock=false: Terraform's own state lock is a separate, cross-host guard.
 set -u
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
@@ -66,6 +67,8 @@ if ! { exec 9<"$lock"; } 2>/dev/null && ! { exec 9>>"$lock"; } 2>/dev/null; then
   exit 1
 fi
 
+wait=${TF_RUN_LOCK_WAIT:-1800}
+mode=(-w "$wait")
 if ! flock -n 9; then
   holder=""
   target=$(readlink -f "$lock")
@@ -81,13 +84,14 @@ if ! flock -n 9; then
     echo "terraform-run-lock: a Terraform run is in progress, by $holder; not waiting (TF_RUN_LOCK_NOWAIT)" >&2
     exit 75
   fi
-  wait=${TF_RUN_LOCK_WAIT:-1800}
   echo "terraform-run-lock: waiting for the Terraform run by $holder (up to ${wait}s)" >&2
-  if ! flock -w "$wait" 9; then
-    echo "terraform-run-lock: still busy after ${wait}s; giving up" >&2
-    exit 75
-  fi
-  echo "terraform-run-lock: lock acquired, running terraform $sub" >&2
 fi
+exec 9<&- # the probe's descriptor (and its lock, if it got one) goes; flock below takes the lock for the run
+[ -n "${TF_RUN_LOCK_NOWAIT:-}" ] && mode=(-n)
 
-exec "$real" "$@"
+flock -o "${mode[@]}" -E 75 "$lock" "$real" "$@"
+rc=$?
+if [ "$rc" -eq 75 ] && ! flock -n "$lock" true 2>/dev/null; then
+  echo "terraform-run-lock: still busy; giving up" >&2
+fi
+exit "$rc"

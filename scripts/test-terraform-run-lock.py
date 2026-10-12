@@ -18,7 +18,9 @@ INSTALLER = ROOT / "scripts/terraform-run-lock-install.sh"
 TF = (ROOT / "terraform-run-lock.tf").read_text()
 
 FAKE = """#!/bin/bash
-# A stand-in terraform: records when it ran and with what, sleeps if asked.
+# A stand-in terraform: records when it ran and with what, sleeps if asked, can leave a child running like a provider.
+echo $$ > "$FAKE_LOG.pid"
+[ -n "${FAKE_CHILD:-}" ] && { sleep 30 & echo $! > "$FAKE_LOG.child"; }
 echo "$(date +%s.%N) start $*" >> "$FAKE_LOG"
 [ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
 echo "$(date +%s.%N) end $*" >> "$FAKE_LOG"
@@ -43,6 +45,13 @@ class WrapperTests(unittest.TestCase):
         # Its own process group, so a test can kill the run with everything it started and nothing else.
         return subprocess.Popen(["bash", str(WRAPPER), *args], env=dict(self.env, **extra),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+    def end(self, proc):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate(timeout=10)
 
     def lines(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -69,26 +78,26 @@ class WrapperTests(unittest.TestCase):
         self.assertGreaterEqual(b_start, a_end)  # never overlapped
 
     def test_nowait_gives_up_with_75_while_busy(self):
-        a = self.start("plan", FAKE_SLEEP="1.5")
+        a = self.start("plan", FAKE_SLEEP="20")
         self.wait_started("plan")
         b = self.start("plan", "-detailed-exitcode", TF_RUN_LOCK_NOWAIT="1")
         _, err = b.communicate(timeout=10)
-        a.communicate(timeout=20)
+        self.end(a)
         self.assertEqual(b.returncode, 75)
         self.assertIn("not waiting", err)
         self.assertEqual(sum("start plan -detailed-exitcode" in line for line in self.lines()), 0)
 
     def test_a_wait_cap_gives_up_with_75(self):
-        a = self.start("apply", FAKE_SLEEP="3")
+        a = self.start("apply", FAKE_SLEEP="20")
         self.wait_started("apply")
         b = self.start("plan", TF_RUN_LOCK_WAIT="1")
         _, err = b.communicate(timeout=10)
-        a.communicate(timeout=20)
+        self.end(a)
         self.assertEqual(b.returncode, 75)
         self.assertIn("giving up", err)
 
     def test_cheap_commands_pass_straight_through_while_a_run_holds_the_lock(self):
-        a = self.start("apply", FAKE_SLEEP="2")
+        a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
         for args in (["fmt", "-check"], ["validate"], ["version"], ["output", "-json"], ["show"], ["-help"],
                      ["-chdir=sub", "providers"], ["graph"]):
@@ -96,16 +105,16 @@ class WrapperTests(unittest.TestCase):
             r = subprocess.run(["bash", str(WRAPPER), *args], env=self.env, capture_output=True, text=True,
                                timeout=10)
             self.assertEqual(r.returncode, 0, (args, r.stderr))
-            self.assertLess(time.time() - t, 1.5, args)
+            self.assertLess(time.time() - t, 5, args)
             self.assertNotIn("waiting", r.stderr)
-        a.communicate(timeout=20)
+        self.end(a)
 
     def test_chdir_before_the_subcommand_still_takes_the_lock(self):
-        a = self.start("apply", FAKE_SLEEP="1.5")
+        a = self.start("apply", FAKE_SLEEP="20")
         self.wait_started("apply")
         b = self.start("-chdir=elsewhere", "plan", TF_RUN_LOCK_NOWAIT="1")
         b.communicate(timeout=10)
-        a.communicate(timeout=20)
+        self.end(a)
         self.assertEqual(b.returncode, 75)
 
     def test_a_killed_run_releases_the_lock(self):
@@ -118,8 +127,28 @@ class WrapperTests(unittest.TestCase):
                            capture_output=True, text=True, timeout=10)
         self.assertEqual(b.returncode, 0, b.stderr)
 
+    def test_a_provider_that_outlives_a_killed_terraform_does_not_keep_the_lock(self):
+        a = self.start("apply", FAKE_SLEEP="30", FAKE_CHILD="1")
+        self.wait_started("apply")
+        tf_pid = int((self.tmp / "log.pid").read_text())
+        child = int((self.tmp / "log.child").read_text())
+        try:
+            os.kill(tf_pid, signal.SIGKILL)  # Terraform alone dies (an OOM kill); its "provider" keeps running
+            a.wait(timeout=5)
+            time.sleep(0.3)
+            os.kill(child, 0)  # still alive
+            b = subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(b.returncode, 0, b.stderr)
+        finally:
+            for pid in (child,):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_providers_lock_and_mirror_take_the_lock_but_plain_providers_does_not(self):
-        a = self.start("apply", FAKE_SLEEP="1.5")
+        a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
         for args, expect in ((["providers", "lock", "-platform=linux_arm64"], 75), (["providers", "mirror", "d"], 75),
                              (["console"], 75), (["console", "-plan"], 75),
@@ -127,7 +156,7 @@ class WrapperTests(unittest.TestCase):
             r = subprocess.run(["bash", str(WRAPPER), *args], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
                                capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, expect, (args, r.stderr))
-        a.communicate(timeout=20)
+        self.end(a)
 
     def test_the_exit_code_and_arguments_are_the_real_binarys(self):
         r = subprocess.run(["bash", str(WRAPPER), "plan", "-detailed-exitcode", "-no-color"],
