@@ -192,8 +192,9 @@ class InstallTests(unittest.TestCase):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.dirs = {k: self.tmp / k for k in ("bin", "lib", "lockdir")}
         self.dirs["bin"].mkdir()
+        # PATH without any real terraform, so nothing can stand in for the binary under test (a clean CI runner).
         self.env = dict(os.environ, BIN_DIR=str(self.dirs["bin"]), LIB_DIR=str(self.dirs["lib"]),
-                        LOCK_DIR=str(self.dirs["lockdir"]))
+                        LOCK_DIR=str(self.dirs["lockdir"]), PATH="/usr/bin:/bin")
         self.script = self.tmp / "association.sh"
         self.script.write_text(render_association_script())
 
@@ -211,25 +212,25 @@ class InstallTests(unittest.TestCase):
         self.assertIn(INSTALLER.read_text(), text)
 
     def test_first_install_moves_the_real_binary_and_puts_the_wrapper_in_its_place(self):
-        self.put_real("1.10.3")
+        self.put_real("9.9.1")
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((self.dirs["bin"] / "terraform").read_text(), WRAPPER.read_text())
-        self.assertIn("v1.10.3", (self.dirs["lib"] / "terraform").read_text())
+        self.assertIn("v9.9.1", (self.dirs["lib"] / "terraform").read_text())
         lock = self.dirs["lockdir"] / "lock"
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o666)
-        self.assertIn("Terraform v1.10.3", r.stdout)  # the wrapper's passthrough reached the moved binary
+        self.assertIn("Terraform v9.9.1", r.stdout)  # the wrapper's passthrough reached the moved binary
 
     def test_a_rerun_changes_nothing_and_an_upgrade_is_repaired(self):
-        self.put_real("1.10.3")
+        self.put_real("9.9.1")
         self.run_install()
         r = self.run_install()
         self.assertNotIn("moved", r.stdout)
         self.assertNotIn("installed the wrapper", r.stdout)
-        self.put_real("1.11.0")  # an upgrade overwrote the wrapper
+        self.put_real("9.9.2")  # an upgrade overwrote the wrapper
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("v1.11.0", (self.dirs["lib"] / "terraform").read_text())
+        self.assertIn("v9.9.2", (self.dirs["lib"] / "terraform").read_text())
         self.assertEqual((self.dirs["bin"] / "terraform").read_text(), WRAPPER.read_text())
 
     def test_no_real_binary_means_no_wrapper(self):

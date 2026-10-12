@@ -31,4 +31,4 @@ if ! cmp -s "$src" "$bin/terraform"; then
   install -m 0755 "$src" "$bin/terraform.new" && mv -f "$bin/terraform.new" "$bin/terraform"
   echo "terraform-run-lock: installed the wrapper at $bin/terraform"
 fi
-"$bin/terraform" version | head -1
+TF_RUN_LOCK_REAL="$lib/terraform" "$bin/terraform" version | head -1
