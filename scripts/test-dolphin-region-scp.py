@@ -52,6 +52,15 @@ class DolphinRegionScpTests(unittest.TestCase):
         self.assertRegex(SCP, r'StringNotEquals\s*=\s*\{ "s3:LocationConstraint" = local\.dolphin_security_regions \}')
         self.assertRegex(SCP, r'Null\s*=\s*\{ "s3:LocationConstraint" = "false" \}')
 
+    def test_cross_region_copies_from_an_allowed_region_are_denied(self):
+        stmt = SCP[SCP.index('"DenyCrossRegionCopies"'):]
+        stmt = stmt[:stmt.index("},")]
+        for action in ("ecr:PutReplicationConfiguration", "s3:PutReplicationConfiguration",
+                       "secretsmanager:ReplicateSecretToRegions", "kms:ReplicateKey", "backup:StartCopyJob",
+                       "cloudformation:CreateStackInstances", "dynamodb:CreateTableReplica"):
+            self.assertIn('"%s"' % action, stmt)
+        self.assertNotIn("Condition", stmt)
+
     def test_no_principal_is_exempt(self):
         # A role-name exemption is a bypass: an administrator in the Dolphin account can rewrite that role's trust.
         self.assertNotIn("aws:PrincipalARN", SCP)

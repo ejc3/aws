@@ -72,6 +72,23 @@ locals {
         }
       },
       {
+        # Actions called in an allowed region that put copies in another one: aws:RequestedRegion sees only the source,
+        # and the copy is often made by a service-linked role, which SCPs never cover. The Dolphin account uses none of
+        # them; allowing one means adding its destination check here first.
+        Sid    = "DenyCrossRegionCopies"
+        Effect = "Deny"
+        Action = [
+          "backup:StartCopyJob",
+          "cloudformation:CreateStackInstances",
+          "dynamodb:CreateTableReplica",
+          "ecr:PutReplicationConfiguration",
+          "kms:ReplicateKey",
+          "s3:PutReplicationConfiguration",
+          "secretsmanager:ReplicateSecretToRegions",
+        ]
+        Resource = "*"
+      },
+      {
         # aws:RequestedRegion is the endpoint called, not where a bucket goes: CreateBucket through an allowed endpoint
         # can name another region in LocationConstraint. Denied only when a constraint is given (Null false) and is not
         # one of the three; no constraint means us-east-1, which is allowed.
