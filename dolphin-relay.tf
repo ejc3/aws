@@ -147,6 +147,8 @@ resource "github_repository_environment" "dolphin_relay" {
   provider    = github.dolphin_relay
   repository  = local.dolphin_relay_repository
   environment = local.dolphin_relay_environment
+  # The provider defaults this to true: a repository administrator could then deploy from any ref and get the token.
+  can_admins_bypass = false
   deployment_branch_policy {
     protected_branches     = false
     custom_branch_policies = true
