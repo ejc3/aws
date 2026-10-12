@@ -548,6 +548,8 @@ locals {
   # At 2026-09 rates ($0.014/1k in Sao Paulo, $0.01/1k elsewhere here),
   # retrieval is ~$6.36/month; four metrics + five alarms add ~$1.70/month.
   # Lambda, SQS and logs are additional usage charges; no free tier assumed.
+  # Each rule in security_delivery_extra_rules adds two metric queries per run (~$0.17/month each): four with the
+  # access audit off, 38 with it on in all 17 regions.
   security_delivery_regions = [
     "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
     "ap-southeast-1", "ap-southeast-2", "ca-central-1", "eu-central-1",
@@ -569,6 +571,13 @@ locals {
     QUEUE = "security-findings-delivery-dlq"
 
     FORWARD_RULES = ["security-forward-findings", "security-forward-audit"]
+    # Other features' rules in the main account, with their exact expected topology: extra_rules.json, written by
+    # Terraform next to this file (security_delivery_extra_rules). A file, not an environment variable: the event
+    # patterns already fill most of Lambda's 4 KB environment.
+    EXTRA_RULES_FILE = os.path.join(os.path.dirname(os.path.abspath(globals().get("__file__") or "lambda_function.py")), "extra_rules.json")
+    EXTRA_RULE_KEYS = {"name", "bus", "region", "state", "pattern", "target"}
+    EXTRA_TARGET_KEYS = {"Id", "Arn", "RoleArn", "DeadLetterConfig", "RetryPolicy", "InputTransformer"}
+    RESERVED_RULES = FORWARD_RULES + ["security-alerts-notify", "security-delivery-health"]
 
     def expected_target(rule, account, region, main_account, sns_topic):
         if rule in FORWARD_RULES:
@@ -603,7 +612,49 @@ locals {
         # and scalar types: JSON false is not the numeric value zero.
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
-    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns, extra_queues=()):
+    def load_extra_rules(regions):
+        with open(EXTRA_RULES_FILE) as handle:
+            rules = json.load(handle)
+        if not isinstance(rules, list) or len(rules) > 40:
+            raise ValueError("Invalid extra rules")
+        checked, seen = [], set()
+        for rule in rules:
+            if (not isinstance(rule, dict) or set(rule) != EXTRA_RULE_KEYS
+                    or not isinstance(rule["name"], str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", rule["name"])
+                    or rule["name"] in RESERVED_RULES
+                    or not (rule["bus"] is None or (isinstance(rule["bus"], str) and rule["bus"] != "default"
+                        and re.fullmatch(r"[A-Za-z0-9._-]{1,256}", rule["bus"])))
+                    or rule["region"] not in regions
+                    or rule["state"] not in ("ENABLED", "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
+                    or not isinstance(rule["target"], dict) or not set(rule["target"]) <= EXTRA_TARGET_KEYS
+                    or not {"Id", "Arn", "DeadLetterConfig"} <= set(rule["target"])
+                    or (rule["name"], rule["bus"], rule["region"]) in seen):
+                raise ValueError("Invalid extra rule")
+            seen.add((rule["name"], rule["bus"], rule["region"]))
+            checked.append(dict(rule, pattern=parse_pattern(rule["pattern"])))
+        return checked
+
+    def check_rule(events, rule, bus, expected_arn, expected_state, expected_pattern, expected_targets):
+        """Count topology errors for one pattern rule: missing, disabled, renamed, changed or retargeted."""
+        errors = 0
+        scope = {"EventBusName": bus} if bus else {}
+        try:
+            state = events.describe_rule(Name=rule, **scope)
+            if state.get("State") != expected_state or state.get("Name") != rule or state.get("Arn") != expected_arn:
+                errors += 1
+            if state.get("ScheduleExpression") or parse_pattern(state.get("EventPattern")) != expected_pattern:
+                errors += 1
+        except Exception:
+            errors += 1
+        try:
+            response = events.list_targets_by_rule(Rule=rule, Limit=2, **scope)
+            if response.get("NextToken") or response.get("Targets") != expected_targets:
+                errors += 1
+        except Exception:
+            errors += 1
+        return errors
+
+    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns, extra_queues=(), extra_rules=()):
         rules = [(name, None) for name in FORWARD_RULES]
         queues = [QUEUE]
         # Other features' regional DLQs in this account (access-audit.tf): only their depth is read.
@@ -619,6 +670,7 @@ locals {
         # the reviewed 72 metrics/run without pretending aggregation is free.
         sampled_rule = FORWARD_RULES[int(now.timestamp()) // 300 % len(FORWARD_RULES)]
         metric_rules = [(name, bus) for name, bus in rules if bus or name == "security-delivery-health" or name == sampled_rule]
+        metric_rules.extend((extra["name"], extra["bus"]) for extra in extra_rules)
         queries = []
         for rule, bus in metric_rules:
             dimensions = [{"Name": "RuleName", "Value": rule}]
@@ -656,6 +708,11 @@ locals {
                     errors += 1
             except Exception:
                 errors += 1
+        for extra in extra_rules:
+            bus = extra["bus"]
+            errors += check_rule(events, extra["name"], bus,
+                "arn:aws:events:"+region+":"+account+":rule/"+(bus+"/" if bus else "")+extra["name"],
+                extra["state"], extra["pattern"], [extra["target"]])
         try:
             response = cloudwatch.get_metric_data(
                 MetricDataQueries=queries, StartTime=now-datetime.timedelta(minutes=15), EndTime=now,
@@ -711,6 +768,7 @@ locals {
                 or main_account == staging_account
                 or not re.fullmatch(r"arn:aws:sns:us-west-1:"+main_account+r":[A-Za-z0-9_-]{1,256}", sns_topic)):
             raise ValueError("Invalid security region coverage")
+        extra_rules = load_extra_rules(regions)
         now = datetime.datetime.now(datetime.timezone.utc)
         main = boto3.Session(region_name="us-west-1")
         sessions = [(main_account, main)]
@@ -733,7 +791,8 @@ locals {
                     tasks.append((session.client("cloudwatch", region_name=region, config=CONFIG),
                         session.client("sqs", region_name=region, config=CONFIG),
                         session.client("events", region_name=region, config=CONFIG), account, region, main_account, sns_topic, now, patterns,
-                        tuple(extra_queues)))
+                        tuple(extra_queues),
+                        tuple(rule for rule in extra_rules if account == main_account and rule["region"] == region)))
                 except Exception:
                     errors += 1
         # 34 account/region jobs, six concurrent readers, short SDK timeouts and
@@ -831,7 +890,7 @@ resource "aws_iam_role_policy" "security_delivery_health" {
           aws_cloudwatch_event_rule.security_delivery_health.arn,
           ], flatten([for region in local.security_delivery_regions : [for rule in ["security-forward-findings", "security-forward-audit"] :
             "arn:aws:events:${region}:${data.aws_caller_identity.current.account_id}:rule/${rule}"
-        ]]))
+        ]]), local.security_delivery_extra_rule_arns)
       },
       {
         Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.security_delivery_observer_staging.arn
@@ -848,12 +907,71 @@ resource "aws_iam_role_policy" "security_delivery_health" {
   })
 }
 
+# Rules of other features that the observer checks like its own (missing, disabled, changed pattern, other target),
+# with their failure metrics: the exact topology each must have, packaged as extra_rules.json. Every one is in this
+# account; the observer refuses an entry that is not in a monitored region or has no dead-letter queue.
+locals {
+  security_delivery_extra_rules = concat(
+    [{
+      # dolphin-security.tf: the Dolphin account's Inspector findings, through this account's Security Hub.
+      name    = aws_cloudwatch_event_rule.dolphin_security_inspector.name
+      bus     = null
+      region  = var.aws_region
+      state   = aws_cloudwatch_event_rule.dolphin_security_inspector.state
+      pattern = aws_cloudwatch_event_rule.dolphin_security_inspector.event_pattern
+      target = {
+        Id               = "central-security-alerts"
+        Arn              = aws_cloudwatch_event_bus.security_alerts.arn
+        RoleArn          = aws_iam_role.dolphin_security_inspector.arn
+        DeadLetterConfig = { Arn = aws_sqs_queue.security_delivery_failures.arn }
+      }
+      }, {
+      # access-audit.tf: registered principals' activity, from the access-audit bus to the operator topic.
+      name    = aws_cloudwatch_event_rule.access_audit_notify.name
+      bus     = aws_cloudwatch_event_bus.access_audit.name
+      region  = var.aws_region
+      state   = aws_cloudwatch_event_rule.access_audit_notify.state
+      pattern = aws_cloudwatch_event_rule.access_audit_notify.event_pattern
+      target = {
+        Id               = "operator-email"
+        Arn              = aws_sns_topic.cost_alerts.arn
+        RoleArn          = aws_iam_role.access_audit_notify.arn
+        RetryPolicy      = { MaximumEventAgeInSeconds = 86400, MaximumRetryAttempts = 185 }
+        DeadLetterConfig = { Arn = aws_sqs_queue.security_delivery_failures.arn }
+        InputTransformer = { InputPathsMap = local.access_audit_notify_input_paths, InputTemplate = local.access_audit_notify_input_template }
+      }
+    }],
+    # access-audit.tf: one forward rule per region once a host is registered (none while the feature is off).
+    [for region, rule in aws_cloudwatch_event_rule.access_audit_forward : {
+      name    = rule.name
+      bus     = null
+      region  = region
+      state   = rule.state
+      pattern = rule.event_pattern
+      target = {
+        Id               = "access-audit-bus"
+        Arn              = aws_cloudwatch_event_bus.access_audit.arn
+        RoleArn          = aws_iam_role.access_audit_forward.arn
+        DeadLetterConfig = { Arn = aws_sqs_queue.access_audit_forward_dlq[region].arn }
+      }
+    }]
+  )
+  security_delivery_extra_rule_arns = concat(
+    [aws_cloudwatch_event_rule.dolphin_security_inspector.arn, aws_cloudwatch_event_rule.access_audit_notify.arn],
+    [for rule in aws_cloudwatch_event_rule.access_audit_forward : rule.arn],
+  )
+}
+
 data "archive_file" "security_delivery_health" {
   type        = "zip"
   output_path = "${path.module}/.terraform/security-delivery-health.zip"
   source {
     filename = "lambda_function.py"
     content  = local.security_delivery_watchdog
+  }
+  source {
+    filename = "extra_rules.json"
+    content  = jsonencode(local.security_delivery_extra_rules)
   }
 }
 
