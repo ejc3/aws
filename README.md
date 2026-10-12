@@ -1339,8 +1339,11 @@ dolphin-maps' loops in Lambda (`dolphin-maps-loop.tf`) need their own GitHub App
 switch-over in a fixed order so the loops never run in both places:
 
 1. **The app.** Create `dolphin-maps-loop` from a manifest the same way: no webhook, repository permission
-   `contents: write` only, installed on dolphin-labs-hq with only `dolphin-maps` selected. Put the conversion's
-   JSON plus `installations {"dolphin-labs-hq": <id>}` into `github-app/dolphin-maps-loop` (stdin or a 0600 file).
+   `contents: write` only, installed on dolphin-labs-hq with only `dolphin-maps` selected. The conversion answers
+   with `id`, `slug` and `pem`; the secret takes them renamed, as `dolphin-maps-loop.tf` documents:
+   `jq '{app_id: .id, slug: .slug, private_key: .pem, installations: {"dolphin-labs-hq": <installation id>}}'`
+   over the 0600 file holding the conversion, piped into `put-secret-value` for `github-app/dolphin-maps-loop`
+   (stdin, never a command line). Stored as returned, the loop cannot mint a token and every pass fails.
    The loops commit straight to dolphin-maps' main, which has no ruleset today; if it ever gets one, add this app
    as a bypass actor first or every pass fails.
 2. **The first deploy.** Set dolphin-maps' repository variables from output `dolphin_maps_loop` and run its
