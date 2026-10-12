@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------------
-# The claw-master dashboard site (ejc3/claude-master-dashboard): a Cloudflare Worker that
+# The claw-master dashboard site (ejc3/claw-master-dashboard): a Cloudflare Worker that
 # reads the ClawMaster CloudWatch namespace, ClaudeMaster before the rename (claw-master-dashboard.tf is the console
 # dashboard over the same metrics).
 #
@@ -31,10 +31,10 @@
 
 locals {
   # Each Worker gets its own Access application and URL switches, and follows the ORDER above on its own.
-  # The rename (#415): claw-master-dashboard serves /claw-master; claude-master-dashboard stays on until
-  # the new address is verified, then is retired (URLs off, then deleted with its application).
+  # The rename (#415) retired claude-master-dashboard (id a3016d88fb32412aa5fff7e271eb17a3): taking it out
+  # here destroys its URL switches first (a delete turns workers.dev and previews off; they depend on
+  # the application), then its Access application. The dashboard repository then deletes the Worker.
   claw_master_dashboard_worker_list = [
-    { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true, path = "/claude-master" },
     { name = "claw-master-dashboard", id = "df3cf048457e4063b4e60ce88d9388f0", urls = true, path = "/claw-master" },
   ]
   # A Worker is left out until the first deploy has created it and its id is set.
@@ -62,8 +62,9 @@ resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
 
   # A replacement would get a new audience tag, and the Worker would refuse everyone until its
   # CF_ACCESS_AUD secret is set again; URLs must be off before this protection can go.
+  # Lifted for one apply to retire claude-master-dashboard's application (#415); restored after.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   destinations = [{
@@ -240,7 +241,7 @@ resource "aws_iam_role_policy" "dev_server_claw_master_dashboard_access" {
 }
 
 output "claw_master_dashboard" {
-  description = "What the claude-master dashboard Worker's secrets need (docs/deploy.md in ejc3/claude-master-dashboard)"
+  description = "What the claude-master dashboard Worker's secrets need (docs/deploy.md in ejc3/claw-master-dashboard)"
   value = {
     # Per Worker: its address, and its own application's audience (its CF_ACCESS_AUD secret).
     workers = { for w in local.claw_master_dashboard_worker_list : w.name => {
