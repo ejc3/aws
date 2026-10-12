@@ -1926,6 +1926,36 @@ repository, its tests or its pull requests names it, and nothing should.
 
 The `access-audit` CloudWatch dashboard shows all of them and the latest host reports.
 
+**After a delivery failure, empty its dead-letter queue.** A forward or notification that fails
+lands in a dead-letter queue (`access-audit-forward-dlq` in the Region of the failed rule, or
+`security-central-delivery-dlq` in us-west-1 for the notification) and is kept 14 days. While it is
+there, the security observer's `security-delivery-QueuedEvents` alarm stays in ALARM, so a later,
+unrelated failure raises no new alarm. Once the cause is fixed, drain the queue into a private file
+(the events carry the call or report that was missed, so keep them), deleting each batch only after
+it is saved, until the queue is empty; the alarm then returns to OK:
+
+```bash
+( umask 077; set -euo pipefail
+  Q=$(aws sqs get-queue-url --region <region> --queue-name <queue> --query QueueUrl --output text)
+  while :; do
+    batch=$(aws sqs receive-message --region <region> --queue-url "$Q" --max-number-of-messages 10 \
+      --wait-time-seconds 5 --visibility-timeout 120 --attribute-names All)
+    [ -n "$batch" ] && [ "$(jq '.Messages | length' <<<"$batch")" -gt 0 ] || break
+    jq -c '.Messages[]' <<<"$batch" >> dead-letters.jsonl
+    jq -r '.Messages[].ReceiptHandle' <<<"$batch" | while read -r handle; do
+      aws sqs delete-message --region <region> --queue-url "$Q" --receipt-handle "$handle"
+    done
+  done
+  aws sqs get-queue-attributes --region <region> --queue-url "$Q" --attribute-names \
+    ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible ApproximateNumberOfMessagesDelayed )
+```
+
+It is empty only when all three counts are 0. A message a failed run left in flight stays invisible for
+the 120-second visibility timeout: if any count is not 0, wait two minutes and run it again (the file is
+appended to, so nothing already saved is lost). Read `dead-letters.jsonl`, act on it, then shred it.
+
+This is the same for the other security dead-letter queues.
+
 ### Sensors
 
 - **Linux:** fanotify permission events. The opener is held only while the agent reads its
@@ -2005,7 +2035,10 @@ other private values in this repository.
    `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd test-alert` sends one email and
    log line labelled TEST, and exits nonzero naming any destination (log, metrics, email) that did not take it. With a `service_name`, the path is `/usr/local/libexec/<name>/<name>`.
 
-Re-running the install replaces only files the agent placed and that are unchanged since.
+Re-running the install replaces only files the agent placed and that are unchanged since. It stops the
+running agent first, so the replaced files do not page as tamper, and starts it again at the end; an install
+that fails in between leaves the agent stopped, which `access-audit-heartbeat-<host>` reports within 15
+minutes, and re-running the install starts it.
 `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd uninstall` stops the service and
 removes only those files. If an install fails part-way, fix the bundle and re-run the install:
 it records each file as it is placed, so the retry takes over the ones already there. Removing a
