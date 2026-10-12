@@ -60,7 +60,19 @@ at_main=0
 if [ "$branch" = main ] && [ "$at_main" = 0 ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)" -gt 0 ]; then
   problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
 fi
-if [ "$at_main" = 1 ] && command -v terraform >/dev/null 2>&1; then
+# Share a host-local lock across checkouts so simultaneous Stop hooks cannot both
+# start a plan. Also skip while any Terraform or provider process is already alive,
+# including manual runs that do not take this lock. Git checks still apply.
+terraform_check_available() {
+  exec 9>"/tmp/aws-stop-hook-tfplan-${UID}.lock" || return 1
+  flock -n 9 || return 1
+  if pgrep -x 'terraform|terraform-provi' >/dev/null; then
+    printf '%s\n' 'Skipping Terraform drift check: Terraform is already running.' >&2
+    return 1
+  fi
+}
+
+if [ "$at_main" = 1 ] && command -v terraform >/dev/null 2>&1 && terraform_check_available; then
   tflog="/tmp/stop-hook-tfplan.log"
   terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
   rc=$?
