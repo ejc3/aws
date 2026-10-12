@@ -301,6 +301,33 @@ class LayoutTest(unittest.TestCase):
             agent.Layout("widgetd", "com.apple.widgetd")  # never impersonate a system label
         self.assertEqual(agent.Layout("widgetd", "local.custom.name").label, "local.custom.name")
 
+    def test_install_refuses_a_directory_it_did_not_make(self):
+        root = self.directory if hasattr(self, "directory") else tempfile.mkdtemp()
+        layout = agent.Layout("widgetd")
+        for attr in ("config_dir", "agent_dir", "helper_dir"):
+            setattr(layout, attr, os.path.join(root, attr))
+        layout.state, layout.config = layout.config_dir + "/state.json", layout.config_dir + "/config.json"
+        layout.agent, layout.fifo = layout.agent_dir + "/widgetd", layout.helper_dir + "/events"
+        agent.refuse_foreign_dirs(layout)  # nothing there yet
+        os.mkdir(layout.config_dir)  # a package's own directory
+        with self.assertRaises(SystemExit):
+            agent.refuse_foreign_dirs(layout)
+        Path(layout.state).write_text("{}")  # ours, from an earlier install
+        agent.refuse_foreign_dirs(layout)
+
+    def test_load_json_without_permission_is_the_default(self):
+        original = agent.open if hasattr(agent, "open") else None
+        def denied(*_args, **_kwargs):
+            raise PermissionError("root only")
+        agent.open = denied
+        try:
+            self.assertEqual(agent.load_json("/etc/x/config.json", {"d": 1}), {"d": 1})
+        finally:
+            if original is None:
+                del agent.open
+            else:
+                agent.open = original
+
     def test_default_name_does_not_reveal_purpose(self):
         for word in ("audit", "honey", "decoy", "canary", "trap", "security", "trip"):
             self.assertNotIn(word, agent.DEFAULT_SERVICE_NAME)
@@ -321,8 +348,8 @@ class ReporterTest(unittest.TestCase):
         self.reporter.submit({"kind": "file-read", "path": "/p", "pid": 1, "exe": "/usr/bin/cat"})
         self.drain()
         kinds = [call[0] for call in self.client.calls]
-        self.assertEqual(kinds, ["log", "metrics", "publish"])
-        self.assertEqual(self.client.calls[1][2], [("FileRead", {}), ("FileRead", {"Host": "example-host"})])
+        self.assertEqual(kinds, ["metrics", "log", "publish"])  # the alarm's metric first
+        self.assertEqual(self.client.calls[0][2], [("FileRead", {}), ("FileRead", {"Host": "example-host"})])
         self.assertEqual(self.client.calls[2][2], "Access audit: example-host: p opened by cat")
 
     def test_heartbeat_is_metric_only(self):
@@ -343,7 +370,8 @@ class ReporterTest(unittest.TestCase):
             self.reporter.submit({"kind": "file-read", "path": "/p", "pid": pid})
         self.assertEqual(self.reporter.dropped, 5)
         self.reporter.deliver(self.reporter.queue.get())
-        self.assertEqual(self.client.calls[0][3]["dropped_before"], 5)
+        log_call = next(call for call in self.client.calls if call[0] == "log")
+        self.assertEqual(log_call[3]["dropped_before"], 5)
 
     def test_email_is_rate_limited_but_logs_and_metrics_are_not(self):
         for pid in range(agent.SNS_WINDOW_LIMIT + 3):
@@ -358,6 +386,32 @@ class ReporterTest(unittest.TestCase):
     def test_deliver_reports_each_destination(self):
         results = self.reporter.deliver({"kind": "test", "host": "example-host"})
         self.assertEqual(results, {"log": True, "metrics": True, "email": True})
+
+    def test_a_permanent_error_is_not_retried(self):
+        calls, sleeps = [], []
+        def denied():
+            calls.append(1)
+            raise agent.PermanentError("sns returned HTTP 403: AuthorizationError")
+        self.assertFalse(agent.Reporter.retry(denied, sleep=sleeps.append))
+        self.assertEqual((len(calls), sleeps), (1, []))
+
+    def test_http_post_sorts_permanent_from_transient(self):
+        import io, urllib.error
+        def raising(code, body):
+            def opener(request, timeout):
+                raise urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(body))
+            return opener
+        cases = [(403, b"<Code>AccessDenied</Code>", agent.PermanentError), (404, b"ResourceNotFound", agent.PermanentError),
+                 (400, b"<Code>Throttling</Code>", RuntimeError), (429, b"", RuntimeError), (503, b"", RuntimeError)]
+        original = agent.urllib.request.urlopen
+        try:
+            for code, body, expected in cases:
+                agent.urllib.request.urlopen = raising(code, body)
+                with self.assertRaises(expected) as raised:
+                    agent.http_post("https://sns.us-west-1.amazonaws.com/", {}, b"")
+                self.assertEqual(type(raised.exception) is agent.PermanentError, expected is agent.PermanentError, code)
+        finally:
+            agent.urllib.request.urlopen = original
 
     def test_test_alert_fails_when_a_destination_does_not_take_it(self):
         class Layout:
@@ -538,6 +592,28 @@ class ReviewRegressionTest(unittest.TestCase):
             os.close(fd)
         self.assertEqual(report["path"], registered)
         self.assertEqual(report["opened_path"], alias)
+
+    # mv f f.x; cp f.x f: the original inode keeps its mark and must still be reported.
+    def test_a_replaced_file_keeps_its_old_inode_registered(self):
+        registered, moved = self.directory + "/registered", self.directory + "/registered.x"
+        Path(registered).write_text("x")
+        sensor = agent.FanotifySensor.__new__(agent.FanotifySensor)
+        sensor.paths, sensor.emit, sensor.ignore, sensor.inodes = {registered}, None, set(), {}
+        sensor.remember(registered)
+        os.rename(registered, moved)
+        Path(registered).write_text("x")
+        sensor.remember(registered)  # the integrity check re-marks the new inode
+        fd = os.open(moved, os.O_RDONLY)
+        try:
+            report = sensor.describe(fd, os.getpid(), -1)
+        finally:
+            os.close(fd)
+        self.assertEqual(report["path"], registered)
+        for _ in range(agent.MAX_INODES_PER_PATH + 3):
+            os.unlink(registered)
+            Path(registered).write_text("x")
+            sensor.remember(registered)
+        self.assertLessEqual(len(sensor.inodes), agent.MAX_INODES_PER_PATH)
 
     # Process ancestry, captured while the reader is still held.
     def test_ancestry_lists_this_process_and_its_parents_with_start_tokens(self):

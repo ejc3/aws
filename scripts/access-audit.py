@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -99,6 +100,7 @@ MAX_BUNDLE_BYTES = 1 << 20
 MAX_FILE_BYTES = 64 << 10
 MAX_QUEUE = 1000
 DEDUPE_SECONDS = 60
+MAX_INODES_PER_PATH = 8
 SNS_WINDOW_SECONDS = 600
 SNS_WINDOW_LIMIT = 20
 HEARTBEAT_SECONDS = 60
@@ -160,10 +162,21 @@ def sign_request(method, url, headers, body, credentials, region, service, now):
     return headers
 
 
+class PermanentError(RuntimeError):
+    """A 4xx that retrying cannot fix (denied, missing resource, bad request); throttling is not one."""
+
+
 def http_post(url, headers, body, timeout=10):
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status, response.read(1 << 16)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read(1 << 16)
+    except urllib.error.HTTPError as error:
+        payload = error.read(1 << 16)
+        text = urllib.parse.urlsplit(url).netloc.split(".")[0] + " returned HTTP " + str(error.code) + ": " + payload[:300].decode("utf-8", "replace")
+        if 400 <= error.code < 500 and error.code not in (408, 429) and b"Throttl" not in payload:
+            raise PermanentError(text)
+        raise RuntimeError(text)
 
 
 class AwsClient:
@@ -283,8 +296,9 @@ class Reporter:
             report["emails_suppressed_before"] = self.suppressed
         message = json.dumps(report, sort_keys=True)
         metric = METRIC_FOR_KIND[report["kind"]]
-        results = {"log": self.retry(lambda: self.client.put_log(config["log_group"], config["host"], message)),
-                   "metrics": self.retry(lambda: self.client.put_metrics(config["namespace"], [(metric, {}), (metric, {"Host": config["host"]})])),
+        # The metric drives the alarm, so it goes first: a failing log or email destination must not delay it.
+        results = {"metrics": self.retry(lambda: self.client.put_metrics(config["namespace"], [(metric, {}), (metric, {"Host": config["host"]})])),
+                   "log": self.retry(lambda: self.client.put_log(config["log_group"], config["host"], message)),
                    "email": None}
         if self.allow_email():
             if "emails_suppressed_before" in report:
@@ -298,6 +312,9 @@ class Reporter:
             try:
                 action()
                 return True
+            except PermanentError as error:  # retrying a denial or a missing resource only delays the next report
+                log("delivery failed (not retried): " + str(error)[:300])
+                return False
             except Exception as error:  # network or AWS error: keep the agent alive
                 log("delivery failed (attempt " + str(attempt + 1) + "): " + str(error)[:300])
                 sleep(min(2 ** attempt, 30))
@@ -472,7 +489,11 @@ class FanotifySensor:
             st = os.stat(real)
         except OSError:
             return
-        self.inodes = {key: value for key, value in self.inodes.items() if value != real}
+        # Keep the inodes this path had before: a replaced file keeps its mark, so `mv f f.x; cp f.x f`
+        # followed by a read of f.x must still be reported as the registered path. Bounded per path.
+        previous = [key for key, value in self.inodes.items() if value == real and key != (st.st_dev, st.st_ino)]
+        for key in previous[:-(MAX_INODES_PER_PATH - 1)] if len(previous) >= MAX_INODES_PER_PATH else []:
+            del self.inodes[key]
         self.inodes[(st.st_dev, st.st_ino)] = real
 
     def parse(self, data):
@@ -931,7 +952,7 @@ def load_json(path, default):
     try:
         with open(path) as handle:
             return json.load(handle)
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return default
 
 
@@ -1132,6 +1153,14 @@ def require_root():
         raise SystemExit("access-audit: run as root")
 
 
+def refuse_foreign_dirs(layout):
+    """A service name may match a real package (/etc/nginx): never chmod or write into a directory this agent did not make."""
+    for directory, marks in ((layout.config_dir, (layout.state, layout.config)), (layout.agent_dir, (layout.agent,)),
+                             (layout.helper_dir, (layout.fifo,))):
+        if os.path.lexists(directory) and not any(os.path.lexists(mark) for mark in marks):
+            raise SystemExit(layout.name + ": " + directory + " exists and was not made by this agent; choose another service_name")
+
+
 def command_install():
     require_root()
     raw = sys.stdin.buffer.read(MAX_BUNDLE_BYTES + 1)
@@ -1141,6 +1170,7 @@ def command_install():
     validate_bundle(bundle)
     layout = Layout(bundle.get("service_name", DEFAULT_SERVICE_NAME), bundle.get("launchd_label"))
     LOG_NAME[0] = layout.name
+    refuse_foreign_dirs(layout)
     os.makedirs(layout.config_dir, mode=0o700, exist_ok=True)
     os.chmod(layout.config_dir, 0o700)
     previous = load_json(layout.state, {})
