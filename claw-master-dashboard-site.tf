@@ -30,11 +30,15 @@
 # ---------------------------------------------------------------------------------
 
 locals {
-  claw_master_dashboard_worker = { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true }
-  # Zero or one entry: empty until the first deploy has created the Worker and its id is set.
-  claw_master_dashboard_workers = local.claw_master_dashboard_worker.id == "" ? {} : {
-    (local.claw_master_dashboard_worker.name) = local.claw_master_dashboard_worker
-  }
+  # Each Worker gets its own Access application and URL switches, and follows the ORDER above on its own.
+  # The rename (#415): claw-master-dashboard serves /claw-master; claude-master-dashboard stays on until
+  # the new address is verified, then is retired (URLs off, then deleted with its application).
+  claw_master_dashboard_worker_list = [
+    { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true, path = "/claude-master" },
+    { name = "claw-master-dashboard", id = "df3cf048457e4063b4e60ce88d9388f0", urls = false, path = "/claw-master" },
+  ]
+  # A Worker is left out until the first deploy has created it and its id is set.
+  claw_master_dashboard_workers = { for w in local.claw_master_dashboard_worker_list : w.name => w if w.id != "" }
 }
 
 resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
@@ -52,7 +56,7 @@ resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
 resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
   for_each         = local.claw_master_dashboard_workers
   account_id       = var.cloudflare_account_id
-  name             = "claude-master dashboard"
+  name             = replace(each.key, "-dashboard", " dashboard")
   type             = "self_hosted"
   session_duration = "24h"
 
@@ -238,13 +242,16 @@ resource "aws_iam_role_policy" "dev_server_claw_master_dashboard_access" {
 output "claw_master_dashboard" {
   description = "What the claude-master dashboard Worker's secrets need (docs/deploy.md in ejc3/claude-master-dashboard)"
   value = {
-    url                   = local.claw_master_dashboard_worker.urls ? "https://${local.claw_master_dashboard_worker.name}.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev/claude-master" : "no public URL"
+    # Per Worker: its address, and its own application's audience (its CF_ACCESS_AUD secret).
+    workers = { for w in local.claw_master_dashboard_worker_list : w.name => {
+      url = w.urls ? "https://${w.name}.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev${w.path}" : "no public URL"
+      cf_access_aud = try(
+        cloudflare_zero_trust_access_application.claw_master_dashboard[w.name].aud,
+        "not yet: set the Worker id (step 2)",
+      )
+    } }
     cf_access_team_domain = trimsuffix(local.cf_access_callback, "/cdn-cgi/access/callback")
-    cf_access_aud = try(
-      cloudflare_zero_trust_access_application.claw_master_dashboard[local.claw_master_dashboard_worker.name].aud,
-      "not yet: set the Worker id (step 2)",
-    )
-    aws_reader_secret = aws_secretsmanager_secret.claw_master_dashboard_reader.name
+    aws_reader_secret     = aws_secretsmanager_secret.claw_master_dashboard_reader.name
     # The Worker secret DASHBOARD_SERVICE_TOKEN_CLIENT_ID (not secret: the client secret is the credential).
     agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_id
     agent_access_secret           = aws_secretsmanager_secret.claw_master_dashboard_agent_access.name
