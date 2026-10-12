@@ -83,6 +83,9 @@ to approve if it is safe; we have many code review agents"):
    on fcvm-metal-arm (see Trust; the jumpbox also has only 2 vCPU), and so does a local `codex review`.
 4. **After a merge: apply.** An `ejc3/agents-md` merge is applied the same way: `agents-md.tf` reads that
    repository's `main` at plan time, so the plan shows the changed object and association, and the apply installs it.
+   Its merge commit lives in that repository, not in ~/aws: check it with `gh api
+   repos/ejc3/agents-md/compare/<merge sha>...main --jq .status` (`identical` or `ahead`), skip the ~/aws merge-base
+   check below, and still `git -C ~/aws fetch origin` and plan from a fresh worktree of ejc3/aws origin/main.
    Its content is agent instructions for the dev boxes: review it as you would code that runs there (it steers agents
    that hold their own credentials), and check `bash scripts/content-guard.sh` passed. `git -C ~/aws fetch origin` and check that
    origin/main contains the merge commit (`git -C ~/aws merge-base --is-ancestor <merge sha> origin/main`): a merge on
