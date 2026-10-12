@@ -35,7 +35,7 @@ locals {
   # the new address is verified, then is retired (URLs off, then deleted with its application).
   claw_master_dashboard_worker_list = [
     { name = "claude-master-dashboard", id = "a3016d88fb32412aa5fff7e271eb17a3", urls = true, path = "/claude-master" },
-    { name = "claw-master-dashboard", id = "df3cf048457e4063b4e60ce88d9388f0", urls = false, path = "/claw-master" },
+    { name = "claw-master-dashboard", id = "df3cf048457e4063b4e60ce88d9388f0", urls = true, path = "/claw-master" },
   ]
   # A Worker is left out until the first deploy has created it and its id is set.
   claw_master_dashboard_workers = { for w in local.claw_master_dashboard_worker_list : w.name => w if w.id != "" }
