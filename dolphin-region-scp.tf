@@ -12,8 +12,11 @@
 #   every OU and every account, so nothing else changes. That enabling is the one organization-wide step here.
 # - Global services are exempt (NotAction): their calls carry us-east-1 or no region, and sign-in, billing and
 #   Identity Center must keep working wherever the console sends them.
-# - OrganizationAccountAccessRole is exempt: it is assumable only from this account's administrators, and it is the
-#   break-glass path to clean up anything found in another region. Service-linked roles are never subject to SCPs.
+# - No principal is exempt, OrganizationAccountAccessRole included: an exemption by role name would be a bypass, since
+#   an administrator inside the Dolphin account (dolphin-terraform) can rewrite that role's trust policy and assume it.
+#   This account's Terraform touches the Dolphin account only in the three regions. Break-glass for anything found
+#   elsewhere is detaching this policy from the management account, which SCPs never restrict. Service-linked roles are
+#   never subject to SCPs.
 # - The region list is local.dolphin_security_regions itself, so monitoring and the policy cannot drift apart.
 
 locals {
@@ -66,7 +69,6 @@ locals {
       Resource  = "*"
       Condition = {
         StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }
-        ArnNotLike      = { "aws:PrincipalARN" = "arn:aws:iam::*:role/OrganizationAccountAccessRole" }
       }
     }]
   }

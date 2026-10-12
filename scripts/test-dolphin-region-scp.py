@@ -47,9 +47,11 @@ class DolphinRegionScpTests(unittest.TestCase):
         for regional in ("ec2:*", "s3:*", "lambda:*", "kms:*", "config:*", "guardduty:*", "acm:*", "bedrock:*"):
             self.assertNotIn(regional, actions)
 
-    def test_only_the_org_access_role_is_exempt(self):
-        self.assertIn('ArnNotLike      = { "aws:PrincipalARN" = "arn:aws:iam::*:role/OrganizationAccountAccessRole" }', SCP)
-        self.assertEqual(SCP.count("aws:PrincipalARN"), 1)
+    def test_no_principal_is_exempt(self):
+        # A role-name exemption is a bypass: an administrator in the Dolphin account can rewrite that role's trust.
+        self.assertNotIn("aws:PrincipalARN", SCP)
+        self.assertNotIn("aws:PrincipalArn", SCP)
+        self.assertNotRegex(SCP, r"ArnNotLike|ArnNotEquals|StringNotLike")
 
 
 if __name__ == "__main__":

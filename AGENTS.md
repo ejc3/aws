@@ -1347,8 +1347,9 @@ Terraform must never close it. Nothing in this account becomes reachable from it
 - **Only the monitored regions work there.** `dolphin-region-scp.tf`: a service control policy on the Dolphin OU (only)
   denies every regional action outside `local.dolphin_security_regions`, the three regions monitored above, so a leaked
   Dolphin credential cannot use a region nobody watches. Global services (IAM, STS, Organizations, Identity Center,
-  CloudFront, Route 53, billing, support and the like) are exempt, and so is `OrganizationAccountAccessRole`, which only
-  this account's administrators can assume (break-glass cleanup). The organization has the SCP policy type enabled for
+  CloudFront, Route 53, billing, support and the like) are exempt; no principal is (an exemption by role name would let a
+  Dolphin administrator rewrite that role's trust and escape it). Break-glass is detaching the policy from this account,
+  which SCPs never restrict. The organization has the SCP policy type enabled for
   it; AWS attached FullAWSAccess everywhere when it was, so the root, dev-staging and this account are unaffected (SCPs
   never apply to the management account). A new Dolphin region is added to `local.dolphin_security_regions`, which
   extends monitoring and the policy together.
