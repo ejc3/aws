@@ -61,16 +61,17 @@ class ClaimTests(unittest.TestCase):
 
 
 class HookTests(unittest.TestCase):
-    def test_hook_asks_only_when_the_watch_is_stale_and_records_nothing(self):
+    def test_hook_always_reminds_and_records_nothing(self):
         with tempfile.TemporaryDirectory() as home:
-            first = run(["bash", str(HOOK)], home, input="{}")
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertIn("/pr-watch", json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"])
-            self.assertFalse((pathlib.Path(home) / ".local/state/pr-watch/heartbeat").exists())  # no claim by the hook
-            env = dict(os.environ, HOME=home, CLAUDE_CODE_MESSAGING_SOCKET="/s/owner")
-            subprocess.run(["bash", str(CLAIM), "claim"], env=env, check=True, capture_output=True)
-            second = run(["bash", str(HOOK)], home, input="{}")
-            self.assertEqual(second.stdout, "")
+            for _ in range(2):  # fresh or stale, every session keeps a (standby) job
+                out = run(["bash", str(HOOK)], home, input="{}")
+                self.assertEqual(out.returncode, 0, out.stderr)
+                ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("/pr-watch", ctx)
+                self.assertIn("standby", ctx)
+                env = dict(os.environ, HOME=home, CLAUDE_CODE_MESSAGING_SOCKET="/s/owner")
+                subprocess.run(["bash", str(CLAIM), "claim"], env=env, check=True, capture_output=True)
+            self.assertNotIn("/s/hook", (pathlib.Path(home) / ".local/state/pr-watch/heartbeat").read_text())
 
 
 class InstallerTests(unittest.TestCase):
@@ -117,7 +118,7 @@ class SkillTextTests(unittest.TestCase):
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500", "--repos <repo>",
                        "job_created", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
-                       "unapplied", "right before every push, merge or apply", "--repos <repo>) gh"):
+                       "unapplied", "right before every push, merge or apply", "--repos <repo>) gh", "answer\n   `standby`"):
             self.assertIn(phrase, skill)
 
 

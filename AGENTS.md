@@ -844,9 +844,9 @@ dolphin-labs-hq pull requests from his own server.
   concern nobody can resolve holds the pull request for the owner.
 - `scripts/pr-watch-install.sh --watcher` (main jumpbox, `ubuntu`) installs the skill, `claim.sh` and a SessionStart
   hook. A `CronCreate` job lives only as long as its session, so each run claims a heartbeat
-  (`~/.local/state/pr-watch/heartbeat`, under flock, keyed by the session's messaging socket); when no session has run
-  it for 45 minutes, the hook asks the next session to schedule it, and a run that finds another session's fresh claim
-  deletes its own job. A session that is never prompted never claims it.
+  (`~/.local/state/pr-watch/heartbeat`, under flock, keyed by the session's messaging socket). Nothing fires when a
+  session ends, so the hook has every interactive session keep a job: the heartbeat's holder does the work, the others
+  answer `standby` and take over once it is 45 minutes stale. A session that is never prompted never claims it.
 - `scripts/pr-watch-install.sh --dev-rule --ssh HOST [--as USER]` writes `scripts/pr-watch/dev-box-rule.md` as a marked
   block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. Agents there open
   pull requests (draft while working) and issues, and never merge, push to a default branch, apply or deploy. That is

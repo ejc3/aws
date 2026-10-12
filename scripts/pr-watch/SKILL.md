@@ -43,8 +43,9 @@ to approve if it is safe; we have many code review agents"):
 
 ## Each run
 
-0. **Claim the watch.** `bash ~/.local/share/pr-watch/claim.sh claim`. `other`: another session runs the watch; delete
-   this session's `/pr-watch` job (CronList, CronDelete) and stop. `owner`: go on, and run it again between items so a
+0. **Claim the watch.** `bash ~/.local/share/pr-watch/claim.sh claim`. `other`: another session runs the watch; answer
+   `standby` in one line and stop, keeping this session's job (every interactive session keeps one, so the watch
+   resumes within a run of the owner going away: nothing else notices a session ending). `owner`: go on, and run it again between items so a
    long run keeps the claim (it goes stale after 45 minutes without one): between items, at least every 15 minutes
    while waiting on CI or a reviewer, and right before every push, merge or apply. If a refresh ever prints `other`,
    another session has taken over: stop at once, without pushing, merging or applying. **Renew the job before it
