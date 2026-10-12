@@ -758,16 +758,29 @@ def fingerprint(path):
 
 
 class Integrity:
-    def __init__(self, baseline, emit, remark):
+    def __init__(self, baseline, emit, remark, unwatched=()):
         self.baseline = {path: dict(value) for path, value in baseline.items()}
         self.emit = emit
         self.remark = remark
         self.reported = {}
+        # An unwatched file (watch: false) has no open sensor, so an in-place rewrite that keeps its size and restores
+        # its mtime would pass inode/size/mtime. ctime moves on any write or utime and cannot be set back by its owner,
+        # so it is recorded when the agent starts and compared too. Watched files are left out: the polling fallback
+        # arms them with utime, which moves ctime by itself.
+        self.ctimes = {}
+        for path in unwatched:
+            try:
+                self.ctimes[path] = os.stat(path).st_ctime_ns
+            except OSError:
+                pass
 
     def check(self):
         for path, expected in sorted(self.baseline.items()):
             try:
                 current = fingerprint(path)
+                if path in self.ctimes:
+                    current = dict(current, ctime_ns=os.stat(path).st_ctime_ns)
+                    expected = dict(expected, ctime_ns=self.ctimes[path])
             except OSError:
                 current = None
             if current is None:
@@ -1287,7 +1300,8 @@ def command_run():
     sensor_thread = threading.Thread(target=sensor.run, name="sensor", daemon=True)
     sensor_thread.start()
     integrity = Integrity({path: record["fingerprint"] for path, record in state["files"].items()},
-                          dispatch, getattr(sensor, "mark", lambda path: None))
+                          dispatch, getattr(sensor, "mark", lambda path: None),
+                          unwatched=[path for path, record in state["files"].items() if not record["watch"]])
     log("running: " + str(len(watched)) + " watched paths, sensor " + sensor.name)
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     while True:

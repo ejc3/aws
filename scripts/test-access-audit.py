@@ -656,6 +656,27 @@ class ReviewRegressionTest(unittest.TestCase):
         finally:
             agent.ctypes.get_errno = original
 
+    def test_an_unwatched_file_rewritten_in_place_with_its_mtime_restored_is_reported(self):
+        path = self.directory + "/unwatched"
+        Path(path).write_text("original")
+        reports = []
+        integrity = agent.Integrity({path: agent.fingerprint(path)}, reports.append, lambda p: None, unwatched=[path])
+        integrity.check()
+        self.assertEqual(reports, [])
+        st = os.stat(path)
+        time.sleep(0.02)
+        with open(path, "r+") as handle:
+            handle.write("tampered")  # same length
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # mtime put back
+        self.assertEqual(agent.fingerprint(path), {"ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+        integrity.check()
+        self.assertEqual([r["reason"] for r in reports], ["registered path modified"])
+        watched = agent.Integrity({path: agent.fingerprint(path)}, reports.append, lambda p: None)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # the polling sensor's arm, on a watched file
+        reports.clear()
+        watched.check()
+        self.assertEqual(reports, [])
+
     # Process ancestry, captured while the reader is still held.
     def test_ancestry_lists_this_process_and_its_parents_with_start_tokens(self):
         chain = agent.process_ancestry(os.getpid(), "linux")
