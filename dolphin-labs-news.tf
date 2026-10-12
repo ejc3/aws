@@ -468,15 +468,16 @@ resource "aws_iam_role_policy" "box_dolphin_labs_news_journal" {
     Version = "2012-10-17"
     Statement = [
       {
+        # GetObjectVersion too: the versions an overwrite kept are part of the history a replay may need.
         Sid      = "ReadJournals"
         Effect   = "Allow"
-        Action   = "s3:GetObject"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = ["${aws_s3_bucket.dolphin_labs_news.arn}/journal/*", "${aws_s3_bucket.dolphin_labs_news.arn}/local/*"]
       },
       {
         Sid       = "ListJournals"
         Effect    = "Allow"
-        Action    = "s3:ListBucket"
+        Action    = ["s3:ListBucket", "s3:ListBucketVersions"]
         Resource  = aws_s3_bucket.dolphin_labs_news.arn
         Condition = { StringLike = { "s3:prefix" = ["journal/*", "local/*"] } }
       },

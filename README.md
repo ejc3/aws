@@ -2051,6 +2051,26 @@ host from the registry and applying deletes its principal, reporter, stream and 
   stream and FIFO reader, reporting limits, integrity, and the Terraform boundaries).
 - `sudo python3 -S -B scripts/test-access-audit-live.py`: the live Linux fanotify sensor.
 
+## dolphin-labs news pass
+
+`dolphin-labs-news.tf` runs dolphin-labs' team-news pass as a Lambda on a schedule, in place of the hourly GitHub job
+(`refresh-news.yml` in dolphin-labs-hq/dolphin-labs). It is created switched off (`dolphin_labs_news_enabled =
+false`). To turn it on, in this order:
+
+1. Merge dolphin-labs' `deploy-news.yml` and let it deploy the bundle (it reads the role ARN and names from
+   `terraform output dolphin_labs_news`). Until then the function runs a stand-in that fails on purpose.
+2. Put the Upstash Redis credentials in the `dolphin-labs/news` secret, from a 0600 file, never on a command line:
+   `aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/news --secret-string
+   file://news-secret.json` with `{"KV_REST_API_URL": "...", "KV_REST_API_TOKEN": "..."}`; then shred the file.
+3. Turn off `refresh-news.yml`'s schedule in dolphin-labs. Both running would bill Haiku and Browserbase twice and
+   journal two passes an hour.
+4. Set `dolphin_labs_news_enabled = true` in `dolphin-labs-news.tf`, merge, and apply. The errors alarm and the
+   'not running' alarm (`dolphin-labs-news-pass-not-running`) then watch it.
+
+Each pass journals to `s3://dolphin-labs-news-<account>/journal/` for 400 days. The bucket is versioned and only the
+administration set may delete a version, so a bad deploy cannot erase the history; nextjs-dev can read every
+version for replays.
+
 ## Private browser manager
 
 `browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for

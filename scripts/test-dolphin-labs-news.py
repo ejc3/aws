@@ -51,6 +51,13 @@ class AccessTests(unittest.TestCase):
     def test_boxes_are_nextjs_dev_only_never_the_io_boxes_role(self):
         boxes = block("aws_iam_role_policy", "box_dolphin_labs_news_journal")
         self.assertIn("for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id }", boxes)
+        # the versions an overwrite kept are readable for replays, still only under journal/ and local/
+        self.assertIn('Action   = ["s3:GetObject", "s3:GetObjectVersion"]', boxes)
+        self.assertIn('Action    = ["s3:ListBucket", "s3:ListBucketVersions"]', boxes)
+        self.assertIn('"s3:prefix" = ["journal/*", "local/*"]', boxes)
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("## dolphin-labs news pass", readme)
+        self.assertIn("Turn off `refresh-news.yml`'s schedule", readme)
         self.assertNotIn("dev_ebs_only", TF)
 
 
