@@ -78,9 +78,11 @@ class TrustTests(unittest.TestCase):
         conditions = dict(re.findall(r'"token\.actions\.githubusercontent\.com:(\w+)"\s*=\s*"([^"]+)"', trust))
         self.assertEqual(conditions, {
             "aud": "sts.amazonaws.com",
-            "sub": "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main",
             "job_workflow_ref": "dolphin-labs-hq/dolphin-labs/.github/workflows/refresh-news.yml@refs/heads/main",
         })
+        # sub comes from the one local both dolphin-labs roles use, pinned to GitHub's immutable ids.
+        self.assertRegex(trust, r'"token\.actions\.githubusercontent\.com:sub"\s*=\s*local\.dolphin_labs_main_sub')
+        self.assertIn('dolphin_labs_main_sub = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"', TF)
 
     def test_output_names_what_the_workflow_needs(self):
         out = block("output", "dolphin_labs_news_bedrock")

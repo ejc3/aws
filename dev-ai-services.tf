@@ -113,8 +113,8 @@ resource "aws_iam_role_policy_attachment" "dev_pricing_read" {
 #     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
 # Terraform owns the container and who may read it; the value is set out of band and never enters
 # git (put-secret-value with a 0600 file). Readers: the administration set, dev-server-role (the
-# metal boxes), nextjs-dev-role (the dolphin box), dev-ebs-only-role (the parallel boxes) and the
-# dolphin-labs news pass. Every account on nextjs-dev has full sudo, so
+# metal boxes), nextjs-dev-role (the dolphin box) and the dolphin-labs news pass's Lambda role. Not
+# dev-ebs-only-role: it is the I/O box's role too (io-box.tf). Every account on nextjs-dev has full sudo, so
 # the grant is box-wide, as with the ElevenLabs key.
 resource "aws_secretsmanager_secret" "browserbase" {
   name                    = "browserbase/credentials"
@@ -123,10 +123,10 @@ resource "aws_secretsmanager_secret" "browserbase" {
   tags                    = { Name = "browserbase/credentials", Project = "dev" }
 }
 
-# dolphin-labs' news pass reads it for the pages it opens in a browser (dolphin-labs-news.tf), and
-# the parallel boxes (dev-ebs-only-role) for the news captures and replays that run there.
+# dolphin-labs' news pass reads it for the pages it opens in a browser (dolphin-labs-news.tf); its role
+# grants itself the read, so it is a reader here but takes no attachment below.
 locals {
-  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dev_ebs_only.arn, aws_iam_role.dolphin_labs_news_pass.arn]
+  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "browserbase" {
@@ -159,7 +159,7 @@ resource "aws_iam_policy" "browserbase_read" {
 }
 
 resource "aws_iam_role_policy_attachment" "browserbase_read" {
-  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name, dev_ebs_only = aws_iam_role.dev_ebs_only.name }
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
   role       = each.value
   policy_arn = aws_iam_policy.browserbase_read.arn
 }

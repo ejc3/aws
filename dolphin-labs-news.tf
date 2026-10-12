@@ -3,16 +3,20 @@
 # It replaces the GitHub Actions job (dolphin-labs-hq/dolphin-labs refresh-news.yml); the GitHub OIDC
 # role dolphin-labs-news-bedrock (bedrock-haiku.tf) stays until that job is retired.
 #
-#   dolphin-labs-news-pass        the function. Terraform creates it with a stand-in handler
-#                                 (dolphin-labs-news/placeholder.mjs) and then leaves its code alone:
-#                                 dolphin-labs-hq/dolphin-labs deploy-news.yml (main) uploads a bundle to
-#                                 code/ and calls UpdateFunctionCode through dolphin-labs-news-deploy.
+#   dolphin-labs-news-pass        the function. Terraform creates it with a stand-in (dolphin-labs-news/
+#                                 index.mjs) and owns its configuration, the handler `index.handler`
+#                                 included; deploy-news.yml (main) of dolphin-labs-hq/dolphin-labs uploads a
+#                                 bundle to code/ and calls UpdateFunctionCode through
+#                                 dolphin-labs-news-deploy, and may change nothing else.
 #   dolphin-labs-news-<account>   the bucket:
 #                                   journal/  one compressed record per pass (its parsed inputs, the
 #                                             schedule, each Haiku prompt without page text and its
 #                                             answer, score components, outputs, the commit). Kept
-#                                             400 days, Infrequent Access after 30, so a season and the
-#                                             one before can be replayed against changed code.
+#                                             400 days, so a season and the one before can be replayed
+#                                             against changed code. The bucket is versioned: a PUT over
+#                                             an existing record keeps the old one as a noncurrent
+#                                             version for 400 days, and only the administration set may
+#                                             delete a version, so a bad deploy cannot erase history.
 #                                   local/    journals of passes run on a dev box. 30 days.
 #                                   code/     deployed bundles. Lambda copies the code at update time,
 #                                             so a bundle is kept 30 days only for a redeploy.
@@ -20,33 +24,33 @@
 #                                 the site reads the lists from. Value set out of band.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
 #
-# The schedule starts DISABLED. Turn on dolphin_labs_news_enabled after the first deploy and after the
-# secret has a value; a run before that fails on the stand-in, which the errors alarm reports.
+# The schedule starts DISABLED. Switch-over, in order: the first deploy of the bundle; the secret's value;
+# turn OFF refresh-news.yml's schedule in dolphin-labs (both would run every hour, bill Haiku and
+# Browserbase twice and journal two passes per hour); then set dolphin_labs_news_enabled = true here. A run
+# before the deploy fails on the stand-in, which the errors alarm reports; once enabled, the 'has not run'
+# alarm watches that the schedule actually fires.
 #
 # Who reaches what:
 #   the function            Bedrock Haiku 5.5; journal/ (write); the two secrets (read); its own logs
-#   deploy-news.yml (main)  code/ (write); UpdateFunctionCode and GetFunction on this function only
+#   deploy-news.yml (main)  code/ (write); UpdateFunctionCode, GetFunction(Configuration) on this function only
 #   refresh-news.yml (main) journal/ (write), through dolphin-labs-news-bedrock, until it is retired
-#   nextjs-dev, dev-ebs-only (the dolphin box and the parallel boxes, where replays run)
-#                           journal/ and local/ (read); local/ (write)
+#   nextjs-dev (the dolphin box, where replays run)
+#                           journal/ and local/ (read); local/ (write). Not dev-ebs-only: that role is the
+#                           I/O box's too (io-box.tf), and a persistent NFS server has no business here.
 
 variable "dolphin_labs_news_enabled" {
-  description = "Run dolphin-labs' news pass on its schedule. false keeps the function and its data and stops the runs."
+  description = "Run dolphin-labs' news pass on its schedule. false keeps the function and its data and stops the runs. Turn refresh-news.yml's schedule off in dolphin-labs first (see the file header)."
   type        = bool
   default     = false
-}
-
-variable "dolphin_labs_news_schedule" {
-  description = "When the news pass runs (EventBridge Scheduler expression, UTC). The function gets NEWS_PASS_MINUTES from local.dolphin_labs_news_minutes; change the two together."
-  type        = string
-  default     = "cron(37 * * * ? *)"
 }
 
 locals {
   dolphin_labs_news_name    = "dolphin-labs-news-pass"
   dolphin_labs_news_bucket  = "dolphin-labs-news-${data.aws_caller_identity.current.account_id}"
   dolphin_labs_news_minutes = 60
-  dolphin_labs_news_sub     = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"
+  # One number drives the schedule, the function's NEWS_PASS_MINUTES and the alarms' period. Hourly runs
+  # at :37 (off the hour, as the GitHub job did); anything else is a plain rate.
+  dolphin_labs_news_schedule = local.dolphin_labs_news_minutes == 60 ? "cron(37 * * * ? *)" : "rate(${local.dolphin_labs_news_minutes} minutes)"
 }
 
 # -------------------------------------------------------------------------------------
@@ -73,6 +77,15 @@ resource "aws_s3_bucket_ownership_controls" "dolphin_labs_news" {
   }
 }
 
+# Versioned so that a PUT over an existing journal record (a replay, a buggy deploy) keeps the original as a
+# noncurrent version; deleting a version is refused outside the administration set (bucket policy).
+resource "aws_s3_bucket_versioning" "dolphin_labs_news" {
+  bucket = aws_s3_bucket.dolphin_labs_news.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "dolphin_labs_news" {
   bucket = aws_s3_bucket.dolphin_labs_news.id
   rule {
@@ -82,9 +95,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "dolphin_labs_news
   }
 }
 
-# A journal record is written once under a key naming its pass; nothing rewrites one. No principal but
-# the administration set may delete from journal/, so a bad deploy cannot erase the history it would be
-# judged against.
+# A journal record is written once under a key naming its pass. No principal but the administration set may
+# delete from journal/, and with versioning an overwrite only adds a version, so a bad deploy cannot erase
+# the history it would be judged against.
 resource "aws_s3_bucket_policy" "dolphin_labs_news" {
   bucket = aws_s3_bucket.dolphin_labs_news.id
   policy = jsonencode({
@@ -119,12 +132,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
     filter {
       prefix = "journal/"
     }
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
     expiration {
       days = 400
+    }
+    noncurrent_version_expiration {
+      noncurrent_days = 400
     }
   }
   rule {
@@ -136,6 +148,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
     expiration {
       days = 30
     }
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
   }
   rule {
     id     = "code"
@@ -146,6 +161,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
     expiration {
       days = 30
     }
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
   }
   rule {
     id     = "abort-incomplete-uploads"
@@ -154,7 +172,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
     abort_incomplete_multipart_upload {
       days_after_initiation = 2
     }
+    expiration {
+      expired_object_delete_marker = true
+    }
   }
+  depends_on = [aws_s3_bucket_versioning.dolphin_labs_news]
 }
 
 # -------------------------------------------------------------------------------------
@@ -192,7 +214,7 @@ resource "aws_secretsmanager_secret_policy" "dolphin_labs_news" {
 
 data "archive_file" "dolphin_labs_news_placeholder" {
   type        = "zip"
-  source_file = "${path.module}/dolphin-labs-news/placeholder.mjs"
+  source_file = "${path.module}/dolphin-labs-news/index.mjs"
   output_path = "${path.module}/.terraform/dolphin-labs-news-placeholder.zip"
 }
 
@@ -246,11 +268,11 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
   function_name = local.dolphin_labs_news_name
   description   = "dolphin-labs team news: one pass over every source, Haiku stages, lists to Redis, journal to S3"
   role          = aws_iam_role.dolphin_labs_news_pass.arn
-  handler       = "placeholder.handler"
+  handler       = "index.handler"
   runtime       = "nodejs22.x"
   architectures = ["arm64"]
-  # The pass sets its own deadline from NEWS_PASS_DEADLINE_MS and stops starting model calls 20 s before
-  # it; the function's limit leaves a minute after that for the writes.
+  # The pass sets its own deadline from NEWS_PASS_DEADLINE_MS (780 s, 13 minutes) and stops starting model
+  # calls 20 s before it; the 900 s limit leaves two minutes after the deadline for the writes.
   timeout     = 900
   memory_size = 2048
   filename    = data.archive_file.dolphin_labs_news_placeholder.output_path
@@ -279,9 +301,10 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
 
   tags = { Name = local.dolphin_labs_news_name, Project = "dolphin-labs" }
 
-  # deploy-news.yml owns the code and the handler it names; Terraform owns everything else.
+  # deploy-news.yml owns the code; Terraform owns everything else, the handler included (the bundle's
+  # entry point is index.mjs exporting handler, as the stand-in's is).
   lifecycle {
-    ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version, handler]
+    ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version]
   }
 }
 
@@ -327,7 +350,7 @@ resource "aws_scheduler_schedule" "dolphin_labs_news_pass" {
 
   flexible_time_window { mode = "OFF" }
 
-  schedule_expression          = var.dolphin_labs_news_schedule
+  schedule_expression          = local.dolphin_labs_news_schedule
   schedule_expression_timezone = "UTC"
 
   target {
@@ -360,6 +383,26 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_pass_errors" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
+# Errors only see passes that ran. Once the schedule is on, a schedule or scheduler role that stops firing,
+# or passes dropped by the one-at-a-time limit, show as no invocations at all: two periods without one alarm.
+resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_pass_not_running" {
+  count               = var.dolphin_labs_news_enabled ? 1 : 0
+  alarm_name          = "dolphin-labs-news-pass-not-running"
+  alarm_description   = "dolphin-labs-news-pass has not been invoked for two scheduled periods: the schedule, its role or the target is broken. Team news is not refreshing."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_labs_news_pass.function_name }
+  statistic           = "Sum"
+  period              = local.dolphin_labs_news_minutes * 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
 # -------------------------------------------------------------------------------------
 # Deploy (GitHub OIDC, deploy-news.yml on main)
 # -------------------------------------------------------------------------------------
@@ -379,7 +422,7 @@ resource "aws_iam_role" "dolphin_labs_news_deploy" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub"              = local.dolphin_labs_news_sub
+          "token.actions.githubusercontent.com:sub"              = local.dolphin_labs_main_sub
           "token.actions.githubusercontent.com:job_workflow_ref" = "dolphin-labs-hq/dolphin-labs/.github/workflows/deploy-news.yml@refs/heads/main"
         }
       }
@@ -403,9 +446,10 @@ resource "aws_iam_role_policy" "dolphin_labs_news_deploy" {
       {
         Sid    = "UpdateTheFunctionsCode"
         Effect = "Allow"
-        # GetFunction to wait for the update to finish; UpdateFunctionConfiguration only to name the
-        # bundle's handler. Not its role, environment or permissions: those are Terraform's.
-        Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration"]
+        # Code only, and the reads to wait for the update to finish. No UpdateFunctionConfiguration: IAM
+        # cannot narrow it to the handler, and it would also reach the environment, layers, runtime and
+        # timeout. Terraform sets the handler (index.handler) that the bundle provides.
+        Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration"]
         Resource = aws_lambda_function.dolphin_labs_news_pass.arn
       },
     ]
@@ -417,7 +461,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_deploy" {
 # -------------------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "box_dolphin_labs_news_journal" {
-  for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id, dev-ebs-only = aws_iam_role.dev_ebs_only.id }
+  for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id }
   name     = "dolphin-labs-news-journal"
   role     = each.value
   policy = jsonencode({
