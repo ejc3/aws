@@ -62,15 +62,30 @@ locals {
   ]
   dolphin_region_scp = {
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyOutsideMonitoredRegions"
-      Effect    = "Deny"
-      NotAction = local.dolphin_region_scp_global_actions
-      Resource  = "*"
-      Condition = {
-        StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }
-      }
-    }]
+    Statement = [
+      {
+        Sid       = "DenyOutsideMonitoredRegions"
+        Effect    = "Deny"
+        NotAction = local.dolphin_region_scp_global_actions
+        Resource  = "*"
+        Condition = {
+          StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }
+        }
+      },
+      {
+        # aws:RequestedRegion is the endpoint called, not where a bucket goes: CreateBucket through an allowed endpoint
+        # can name another region in LocationConstraint. Denied only when a constraint is given (Null false) and is not
+        # one of the three; no constraint means us-east-1, which is allowed.
+        Sid      = "DenyBucketsOutsideMonitoredRegions"
+        Effect   = "Deny"
+        Action   = "s3:CreateBucket"
+        Resource = "*"
+        Condition = {
+          StringNotEquals = { "s3:LocationConstraint" = local.dolphin_security_regions }
+          Null            = { "s3:LocationConstraint" = "false" }
+        }
+      },
+    ]
   }
 }
 

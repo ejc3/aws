@@ -31,21 +31,26 @@ class DolphinRegionScpTests(unittest.TestCase):
         self.assertNotIn("dev_staging", att)
 
     def test_regions_are_exactly_the_monitored_ones(self):
-        self.assertIn('StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }', SCP)
+        self.assertRegex(SCP, r'StringNotEquals\s*=\s*\{ "aws:RequestedRegion" = local\.dolphin_security_regions \}')
         regions = re.findall(r'"([a-z]{2}-[a-z]+-\d)"', re.search(r"dolphin_security_regions = \[(.*?)\]", SEC).group(1))
         self.assertEqual(regions, ["us-west-1", "us-west-2", "us-east-1"])
 
     def test_deny_with_global_services_exempt_and_regional_ones_not(self):
         policy = block("aws_organizations_policy", "dolphin_region_deny")
         self.assertIn('type        = "SERVICE_CONTROL_POLICY"', policy)
-        self.assertIn('Effect    = "Deny"', SCP)
-        self.assertIn("NotAction = local.dolphin_region_scp_global_actions", SCP)
+        self.assertRegex(SCP, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(SCP, r"NotAction\s*=\s*local\.dolphin_region_scp_global_actions")
         actions = re.findall(r'^\s+"([a-z0-9-]+:[A-Za-z*]+)",$', SCP, re.M)
         for needed in ("iam:*", "sts:*", "organizations:*", "sso:*", "identitystore:*", "sso-oauth:*", "signin:*",
                        "cloudfront:*", "route53:*", "support:*", "health:*", "billing:*"):
             self.assertIn(needed, actions)
         for regional in ("ec2:*", "s3:*", "lambda:*", "kms:*", "config:*", "guardduty:*", "acm:*", "bedrock:*"):
             self.assertNotIn(regional, actions)
+
+    def test_buckets_cannot_be_created_in_another_region_through_an_allowed_endpoint(self):
+        self.assertRegex(SCP, r'Action\s*=\s*"s3:CreateBucket"')
+        self.assertRegex(SCP, r'StringNotEquals\s*=\s*\{ "s3:LocationConstraint" = local\.dolphin_security_regions \}')
+        self.assertRegex(SCP, r'Null\s*=\s*\{ "s3:LocationConstraint" = "false" \}')
 
     def test_no_principal_is_exempt(self):
         # A role-name exemption is a bypass: an administrator in the Dolphin account can rewrite that role's trust.
