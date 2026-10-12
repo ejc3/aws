@@ -579,6 +579,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn("[for queue in aws_sqs_queue.access_audit_forward_dlq : queue.arn]",
                       block(TERRAFORM, "aws_iam_role_policy", "security_delivery_health"))
 
+    def test_access_audit_notify_keeps_failed_events_in_the_watched_central_dlq(self):
+        audit = (ROOT / "access-audit.tf").read_text()
+        self.assertIn("dead_letter_config { arn = aws_sqs_queue.security_delivery_failures.arn }",
+                      block(audit, "aws_cloudwatch_event_target", "access_audit_notify"))
+        self.assertIn("aws_cloudwatch_event_rule.access_audit_notify.arn",
+                      block(TERRAFORM, "aws_sqs_queue_policy", "security_delivery_failures"))
+
     def test_access_audit_secrets_are_administration_only(self):
         audit = (ROOT / "access-audit.tf").read_text()
         policy = block(audit, "aws_secretsmanager_secret_policy", "access_audit")

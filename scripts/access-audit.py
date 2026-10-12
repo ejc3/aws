@@ -87,6 +87,8 @@ class Layout:
         # JSON stdout (if any) is delivered as a report. Absent by default; the agent never
         # installs it. It must be root-owned and not group/world-writable to be run.
         self.event_handler = self.config_dir + "/event_handler"
+        # Written at the first install; proves a later install that these directories are this agent's.
+        self.marker = self.config_dir + "/.install-marker"
 
     @classmethod
     def installed(cls):
@@ -466,17 +468,31 @@ class FanotifySensor:
         self.fd = self.libc.fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, flags)
         if self.fd < 0:
             raise OSError(ctypes.get_errno(), "fanotify_init failed")
-        for path in self.paths:
-            self.mark(path)
+        # Fail closed: a registered path this sensor cannot watch (a mark limit, ENOSPC) must not leave a healthy
+        # heartbeat over an unwatched file. Raising here makes choose_sensor fall back to polling, and command_run
+        # reports that degradation as tamper.
+        failed = [error for error in (self._add_mark(path) for path in self.paths) if error not in (None, 2)]
+        if failed:
+            os.close(self.fd)
+            raise OSError(failed[0], "fanotify_mark failed for " + str(len(failed)) + " registered path(s)")
+
+    def _add_mark(self, path):
+        """None when marked; else the errno (2: the path is missing, which the integrity check reports)."""
+        if self.libc.fanotify_mark(self.fd, FAN_MARK_ADD, FAN_OPEN_PERM, -100, path.encode()) != 0:
+            return ctypes.get_errno()
+        self.remember(path)
+        return None
 
     def mark(self, path):
-        if self.libc.fanotify_mark(self.fd, FAN_MARK_ADD, FAN_OPEN_PERM, -100, path.encode()) != 0:
-            error = ctypes.get_errno()
-            if error != 2:  # a missing path is reported by the integrity check
-                log("fanotify_mark failed for a registered path: errno " + str(error))
-            return False
-        self.remember(path)
-        return True
+        error = self._add_mark(path)
+        if error is None:
+            return True
+        if error != 2:
+            log("fanotify_mark failed for a registered path: errno " + str(error))
+            if self.emit:  # a re-mark that fails leaves the new inode unwatched: say so remotely
+                self.emit({"kind": "tamper", "reason": "could not watch a registered path (errno " + str(error) + ")",
+                           "sensor": self.name})
+        return False
 
     def remember(self, path):
         # The mark is on the inode, so an open through any other name (a hard link, a bind
@@ -1153,11 +1169,28 @@ def require_root():
         raise SystemExit("access-audit: run as root")
 
 
+def marker_text(layout):
+    return layout.name + " agent install marker v1\n"
+
+
+def has_marker(layout):
+    """Our own install: a root-owned regular marker file with the expected contents, not a common filename."""
+    try:
+        st = os.lstat(layout.marker)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_size > 256:
+            return False
+        with open(layout.marker) as handle:
+            return handle.read() == marker_text(layout)
+    except OSError:
+        return False
+
+
 def refuse_foreign_dirs(layout):
     """A service name may match a real package (/etc/nginx): never chmod or write into a directory this agent did not make."""
-    for directory, marks in ((layout.config_dir, (layout.state, layout.config)), (layout.agent_dir, (layout.agent,)),
-                             (layout.helper_dir, (layout.fifo,))):
-        if os.path.lexists(directory) and not any(os.path.lexists(mark) for mark in marks):
+    if has_marker(layout):
+        return
+    for directory in (layout.config_dir, layout.agent_dir, layout.helper_dir):
+        if os.path.lexists(directory):
             raise SystemExit(layout.name + ": " + directory + " exists and was not made by this agent; choose another service_name")
 
 
@@ -1173,6 +1206,8 @@ def command_install():
     refuse_foreign_dirs(layout)
     os.makedirs(layout.config_dir, mode=0o700, exist_ok=True)
     os.chmod(layout.config_dir, 0o700)
+    if not has_marker(layout):
+        write_private(layout.marker, marker_text(layout))
     previous = load_json(layout.state, {})
     state = place_files(bundle, previous,
                         save=lambda partial: write_private(layout.state, json.dumps(partial, indent=2, sort_keys=True)))
@@ -1204,7 +1239,7 @@ def command_uninstall():
             os.rmdir(directory)
         except OSError:
             pass
-    for path in (layout.config, layout.state, layout.agent):
+    for path in (layout.config, layout.state, layout.agent, layout.marker):
         if os.path.exists(path):
             os.unlink(path)
     for directory in (layout.agent_dir, layout.config_dir):

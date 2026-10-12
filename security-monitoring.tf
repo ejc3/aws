@@ -527,6 +527,7 @@ resource "aws_sqs_queue_policy" "security_delivery_failures" {
           aws_cloudwatch_event_rule.security_notify.arn,
           aws_cloudwatch_event_rule.security_delivery_health.arn,
           aws_cloudwatch_event_rule.dolphin_security_inspector.arn,
+          aws_cloudwatch_event_rule.access_audit_notify.arn,
         ] } }
       },
       {

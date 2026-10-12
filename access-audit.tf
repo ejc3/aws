@@ -2,7 +2,7 @@
 # (scripts/access-audit.py); registered principals report any AWS API use.
 # Which hosts, paths and principals are registered is private operator data:
 # it lives only in the access-audit/config secret and Terraform state, never in
-# this repository. Rollout is in docs/access-audit.md.
+# this repository. Rollout is in README.md, "Host access audit".
 
 variable "enable_access_audit" {
   description = "Read access-audit/config and build the audit for the hosts it registers. Populate the secret first."
@@ -326,6 +326,9 @@ resource "aws_cloudwatch_event_target" "access_audit_notify" {
     maximum_event_age_in_seconds = 86400
     maximum_retry_attempts       = 185
   }
+  # After the retries, a principal-use event that SNS never took is kept (with the caller details the alarm's count
+  # cannot carry) in the central security DLQ, whose depth the security delivery observer alarms on.
+  dead_letter_config { arn = aws_sqs_queue.security_delivery_failures.arn }
 
   input_transformer {
     input_paths = {

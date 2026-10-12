@@ -46,6 +46,14 @@ def bundle(directory, files=None):
                 {"path": directory + "/notes", "owner": USER, "content": "{{random_hex:8}}", "watch": False}]}
 
 
+def runbook():
+    """The rollout section of README.md (the operator entry point holds it; no separate doc file)."""
+    text = (ROOT / "README.md").read_text()
+    start = text.index("\n## Host access audit\n")
+    end = text.index("\n## ", start + 1)
+    return text[start:end]
+
+
 class FakeClient:
     def __init__(self, fail=0):
         self.calls = []
@@ -302,18 +310,26 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(agent.Layout("widgetd", "local.custom.name").label, "local.custom.name")
 
     def test_install_refuses_a_directory_it_did_not_make(self):
-        root = self.directory if hasattr(self, "directory") else tempfile.mkdtemp()
+        root = tempfile.mkdtemp()
         layout = agent.Layout("widgetd")
         for attr in ("config_dir", "agent_dir", "helper_dir"):
             setattr(layout, attr, os.path.join(root, attr))
         layout.state, layout.config = layout.config_dir + "/state.json", layout.config_dir + "/config.json"
-        layout.agent, layout.fifo = layout.agent_dir + "/widgetd", layout.helper_dir + "/events"
+        layout.agent, layout.marker = layout.agent_dir + "/widgetd", layout.config_dir + "/.install-marker"
         agent.refuse_foreign_dirs(layout)  # nothing there yet
-        os.mkdir(layout.config_dir)  # a package's own directory
+        os.mkdir(layout.config_dir)  # a package's own directory, even with a conventional filename in it
+        Path(layout.config).write_text("{}")
         with self.assertRaises(SystemExit):
             agent.refuse_foreign_dirs(layout)
-        Path(layout.state).write_text("{}")  # ours, from an earlier install
-        agent.refuse_foreign_dirs(layout)
+        Path(layout.marker).write_text("something else\n")
+        with self.assertRaises(SystemExit):
+            agent.refuse_foreign_dirs(layout)
+        Path(layout.marker).write_text(agent.marker_text(layout))
+        if os.geteuid() == 0:
+            agent.refuse_foreign_dirs(layout)  # ours: a root-owned marker with the expected text
+        else:
+            with self.assertRaises(SystemExit):  # the right text but not root-owned is not proof
+                agent.refuse_foreign_dirs(layout)
 
     def test_load_json_without_permission_is_the_default(self):
         original = agent.open if hasattr(agent, "open") else None
@@ -615,6 +631,31 @@ class ReviewRegressionTest(unittest.TestCase):
             sensor.remember(registered)
         self.assertLessEqual(len(sensor.inodes), agent.MAX_INODES_PER_PATH)
 
+    def test_a_mark_that_cannot_be_installed_fails_the_sensor_or_reports_tamper(self):
+        class Libc:
+            def __init__(self, errno):
+                self.errno = errno
+            def fanotify_mark(self, *args):
+                return -1
+        registered = self.directory + "/registered"
+        Path(registered).write_text("x")
+        sensor = agent.FanotifySensor.__new__(agent.FanotifySensor)
+        emitted = []
+        sensor.paths, sensor.emit, sensor.ignore, sensor.inodes, sensor.fd = {registered}, emitted.append, set(), {}, -1
+        original = agent.ctypes.get_errno
+        agent.ctypes.get_errno = lambda: 28  # ENOSPC: the mark limit
+        try:
+            sensor.libc = Libc(28)
+            self.assertFalse(sensor.mark(registered))
+            self.assertEqual(emitted[0]["kind"], "tamper")
+            self.assertIn("errno 28", emitted[0]["reason"])
+            emitted.clear()
+            agent.ctypes.get_errno = lambda: 2  # a missing path is the integrity check's to report
+            self.assertFalse(sensor.mark(registered))
+            self.assertEqual(emitted, [])
+        finally:
+            agent.ctypes.get_errno = original
+
     # Process ancestry, captured while the reader is still held.
     def test_ancestry_lists_this_process_and_its_parents_with_start_tokens(self):
         chain = agent.process_ancestry(os.getpid(), "linux")
@@ -832,7 +873,7 @@ class ClosureRegressionTest(unittest.TestCase):
         self.assertEqual(created, [])
 
     def test_runbook_does_not_promise_uninstall_recovers_a_failed_install(self):
-        docs = (ROOT / "docs/access-audit.md").read_text()
+        docs = runbook()
         self.assertNotIn("including any placed by an install that failed part-way", docs)
         self.assertIn("re-run the install", docs)
 
@@ -854,10 +895,14 @@ class TerraformRegistryTest(unittest.TestCase):
 
 class DocsTest(unittest.TestCase):
     def test_runbook_commands_use_the_installed_layout(self):
-        docs = (ROOT / "docs/access-audit.md").read_text()
+        docs = runbook()
         self.assertNotIn("/usr/local/libexec/access-audit/agent.py", docs)
         self.assertNotIn("com.ejc3", docs)
         self.assertIn("/usr/local/libexec/hostmetricsd/hostmetricsd", docs)
+        self.assertIn("umask 077", docs)
+        self.assertIn("set -euo pipefail", docs)
+        self.assertIn("trap 'status=$?; shred -u bundle.json", docs)
+        self.assertFalse((ROOT / "docs/access-audit.md").exists())
 
 
 class TerraformBoundaryTest(unittest.TestCase):
