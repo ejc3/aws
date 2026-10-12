@@ -1304,7 +1304,7 @@ that production and non-production share nothing:
 
 ### Sites also deploying to Cloudflare Workers (staging copies)
 
-The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step) also deploy a second copy
+The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step, dolphin-maps) also deploy a second copy
 to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions.
 
 **Standing rule (owner, 2026-10-11): Cloudflare is where the sites are going, so parity runs one way.** Every web app
@@ -1321,8 +1321,9 @@ containers Terraform writes into the project for colton-games (`colton-games-acc
 `vercel-env/<site>/<target>` is the SOURCE. Change a value there and apply, never in the Vercel dashboard; a variable added or
 removed in Vercel is picked up by re-running `scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names,
 targets, sensitivity, never a value), and every existing variable is imported by its id, never recreated. A new app ships on
-Cloudflare. One app is not on Cloudflare yet: dolphin-maps (`dolphin-labs-hq/dolphin-maps`, Vercel only, no `<site>-stage`
-Worker); bringing it over follows the order below.
+Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come over (2026-10-11): `dolphin-maps-stage`,
+deployed by its `cloudflare-stage.yml`; it has no runtime secrets, so no `workers-stage/dolphin-maps` container until it
+needs one.
 
 **Which production is behind Cloudflare (2026-10-11).** cc-games.org itself is served by the `colton-games-prod` Worker since
 the cutover below, so its zone protection applies. Every other production hostname (www.cc-games.org and the old domains,
