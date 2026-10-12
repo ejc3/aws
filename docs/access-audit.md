@@ -107,8 +107,9 @@ other private values in this repository.
 
 Re-running the install replaces only files the agent placed and that are unchanged since.
 `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd uninstall` stops the service and
-removes only those files, including any placed by an install that failed part-way. Removing a host from the registry and applying deletes its principal,
-reporter, stream and heartbeat alarm.
+removes only those files. If an install fails part-way, fix the bundle and re-run the install:
+it records each file as it is placed, so the retry takes over the ones already there. Removing a
+host from the registry and applying deletes its principal, reporter, stream and heartbeat alarm.
 
 ## Tests
 

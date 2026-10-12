@@ -680,6 +680,58 @@ class ReviewRegressionTest(unittest.TestCase):
         self.assertEqual((before.st_mode, before.st_uid, before.st_mtime_ns), (after.st_mode, after.st_uid, after.st_mtime_ns))
 
 
+class ClosureRegressionTest(unittest.TestCase):
+    """Regressions from the closure review of the review fixes."""
+
+    def test_unwatched_registered_file_is_not_matched_by_inode(self):
+        directory = os.path.realpath(tempfile.mkdtemp())
+        watched, unwatched = directory + "/watched", directory + "/unwatched"
+        for path in (watched, unwatched):
+            Path(path).write_text("x")
+        sensor = agent.FanotifySensor.__new__(agent.FanotifySensor)
+        sensor.paths, sensor.emit, sensor.ignore, sensor.inodes = {watched}, None, set(), {}
+        sensor.remember(watched)
+        sensor.remember(unwatched)  # Integrity re-marks every installed file, watched or not
+        fd = os.open(unwatched, os.O_RDONLY)
+        try:
+            self.assertIsNone(sensor.describe(fd, os.getpid(), -1))
+        finally:
+            os.close(fd)
+
+    def test_handler_that_never_reads_stdin_is_killed_at_the_deadline(self):
+        import threading
+        directory = tempfile.mkdtemp()
+        path = directory + "/handler"
+        Path(path).write_text("#!/bin/sh\nexec sleep 30\n")
+        os.chmod(path, 0o700)
+        emitted = []
+        runner = agent.HandlerRunner(path, emitted.append, is_safe=lambda p: True)
+        original, agent.HANDLER_TIMEOUT = agent.HANDLER_TIMEOUT, 1
+        try:
+            worker = threading.Thread(target=runner.handle, args=({"kind": "file-read", "path": "/p", "detail": "x" * (4 << 20)},),
+                                      daemon=True)
+            worker.start()
+            worker.join(6)
+        finally:
+            agent.HANDLER_TIMEOUT = original
+        self.assertFalse(worker.is_alive(), "blocked writing the event to a handler that never reads it")
+        self.assertIn("timed out", emitted[0]["detail"])
+
+    def test_registered_path_directly_under_the_root(self):
+        created = []
+        fd = agent.open_parent("/example-token", pwd.getpwuid(os.getuid()), False, created)
+        try:
+            self.assertEqual((os.fstat(fd).st_dev, os.fstat(fd).st_ino), (os.stat("/").st_dev, os.stat("/").st_ino))
+        finally:
+            os.close(fd)
+        self.assertEqual(created, [])
+
+    def test_runbook_does_not_promise_uninstall_recovers_a_failed_install(self):
+        docs = (ROOT / "docs/access-audit.md").read_text()
+        self.assertNotIn("including any placed by an install that failed part-way", docs)
+        self.assertIn("re-run the install", docs)
+
+
 class TerraformRegistryTest(unittest.TestCase):
     def test_registry_instances_are_keyed_by_unmarked_host_names_only(self):
         self.assertRegex(TERRAFORM, r"access_audit_host_keys\s*=\s*nonsensitive\(toset\(keys\(local\.access_audit_hosts\)\)\)")

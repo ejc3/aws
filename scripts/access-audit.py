@@ -461,13 +461,17 @@ class FanotifySensor:
 
     def remember(self, path):
         # The mark is on the inode, so an open through any other name (a hard link, a bind
-        # mount) is reported too: events are matched by inode, then by name.
+        # mount) is reported too: events are matched by inode, then by name. Only watched
+        # paths are recorded; the integrity check re-marks unwatched files as well.
+        real = os.path.realpath(path)
+        if real not in self.paths:
+            return
         try:
-            st = os.stat(path)
+            st = os.stat(real)
         except OSError:
             return
-        self.inodes = {key: value for key, value in self.inodes.items() if value != path}
-        self.inodes[(st.st_dev, st.st_ino)] = path
+        self.inodes = {key: value for key, value in self.inodes.items() if value != real}
+        self.inodes[(st.st_dev, st.st_ino)] = real
 
     def parse(self, data):
         offset, own = 0, os.getpid()
@@ -785,20 +789,30 @@ class HandlerRunner:
         process = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
         try:
-            try:
-                process.stdin.write(payload)
+            # Writing the event and reading the result share one deadline, so a handler that
+            # never reads its stdin cannot block the writer either.
+            stdin, stdout = process.stdin.fileno(), process.stdout.fileno()
+            os.set_blocking(stdin, False)
+            pending, output = memoryview(payload), b""
+            if not pending:
                 process.stdin.close()
-            except BrokenPipeError:
-                pass
-            output = b""
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("timed out after " + str(HANDLER_TIMEOUT) + " seconds")
-                ready, _, _ = select.select([process.stdout], [], [], remaining)
-                if not ready:
+                readable, writable, _ = select.select([stdout], [stdin] if pending else [], [], remaining)
+                if writable:
+                    try:
+                        pending = pending[os.write(stdin, pending[:1 << 16]):]
+                    except BlockingIOError:
+                        pass
+                    except BrokenPipeError:
+                        pending = pending[:0]
+                    if not pending:
+                        process.stdin.close()
+                if not readable:
                     continue
-                chunk = os.read(process.stdout.fileno(), HANDLER_MAX_OUTPUT + 1 - len(output))
+                chunk = os.read(stdout, HANDLER_MAX_OUTPUT + 1 - len(output))
                 if not chunk:
                     break
                 output += chunk
@@ -816,6 +830,11 @@ class HandlerRunner:
                 process.kill()
                 process.wait()
             process.stdout.close()
+            if not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
 
     def handle(self, report):
         try:
@@ -942,7 +961,7 @@ def open_parent(path, owner, chown, created):
     fd = os.open("/", DIRECTORY_FLAGS)
     current = ""
     try:
-        for name in os.path.dirname(path).split("/")[1:]:
+        for name in [part for part in os.path.dirname(path).split("/") if part]:
             current += "/" + name
             try:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -1001,7 +1020,8 @@ def place_files(bundle, previous, chown=True, keygen=generate_ssh_key, save=None
     """Place registered files. Never overwrites a file this agent did not place unchanged.
 
     Every owner and template is resolved before the first write. `save` is called with the
-    state after each file, so a failure part-way leaves a record that retry and uninstall use."""
+    state after each file, so a failure part-way leaves a record: re-running the install
+    takes over the files already placed."""
     placed = previous.get("files", {})
     for item in bundle["files"]:
         path = item["path"]
