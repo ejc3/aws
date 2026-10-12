@@ -58,7 +58,6 @@ locals {
     "tax:*",
     "trustedadvisor:*",
     "waf:*",
-    "wafv2:*",
   ]
   dolphin_region_scp = {
     Version = "2012-10-17"

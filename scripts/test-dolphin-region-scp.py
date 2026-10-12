@@ -44,7 +44,7 @@ class DolphinRegionScpTests(unittest.TestCase):
         for needed in ("iam:*", "sts:*", "organizations:*", "sso:*", "identitystore:*", "sso-oauth:*", "signin:*",
                        "cloudfront:*", "route53:*", "support:*", "health:*", "billing:*"):
             self.assertIn(needed, actions)
-        for regional in ("ec2:*", "s3:*", "lambda:*", "kms:*", "config:*", "guardduty:*", "acm:*", "bedrock:*"):
+        for regional in ("ec2:*", "s3:*", "lambda:*", "kms:*", "config:*", "guardduty:*", "acm:*", "bedrock:*", "wafv2:*"):
             self.assertNotIn(regional, actions)
 
     def test_buckets_cannot_be_created_in_another_region_through_an_allowed_endpoint(self):
