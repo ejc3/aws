@@ -45,15 +45,16 @@ to approve if it is safe; we have many code review agents"):
 
 ## Each run
 
-0. **Claim the watch.** `bash ~/.local/share/pr-watch/claim.sh claim`. `other`: another session runs the watch; answer
-   `standby` in one line and stop, keeping this session's job (every interactive session keeps one, so the watch
-   resumes within a run of the owner going away: nothing else notices a session ending). `owner`: go on, and run it again between items so a
-   long run keeps the claim (it goes stale after 45 minutes without one): between items, at least every 15 minutes
-   while waiting on CI or a reviewer, and right before every push, merge or apply. If a refresh ever prints `other`,
-   another session has taken over: stop at once, without pushing, merging or applying. **Renew the job before it
-   expires:** a recurring CronCreate job deletes itself after 7 days and nothing tells the session, so record when this session
-   created its job (`job_created` in the state file); when that is more than 6 days ago, CronDelete it and CronCreate a
-   new one (same cron and prompt), and record the new time.
+0. **Keep this session's job alive, then claim the watch.** First, in every session, owner or standby: a recurring
+   CronCreate job deletes itself after 7 days and nothing tells the session, so record when this session created its
+   job in the state file's `jobs` map, keyed by this session's `$CLAUDE_CODE_MESSAGING_SOCKET`; when that is more than
+   6 days ago, CronDelete it and CronCreate a new one (same cron and prompt) and record the new time. Then
+   `bash ~/.local/share/pr-watch/claim.sh claim`. `other`: another session runs the watch; answer `standby` in one line
+   and stop, keeping the job (every interactive session keeps one, so the watch resumes within a run of the owner going
+   away: nothing else notices a session ending). `owner`: go on, and claim again so a long run keeps it (it goes stale
+   after 45 minutes without one): between items, at least every 15 minutes while waiting on CI or a reviewer, and right
+   before every push, merge or apply. If a claim ever prints `other`, another session has taken over: stop at once,
+   without pushing, merging or applying.
 1. **Find work.** Open PRs and issues authored by `ejc3` in `ejc3/aws`:
    `gh pr list -R ejc3/aws --author ejc3 --state open --limit 500` and `gh issue list -R ejc3/aws --author ejc3 --state
    open --limit 500` (the default limit is 30). Keep `~/.local/state/pr-watch/state.json` (number, head sha, draft or
@@ -75,7 +76,8 @@ to approve if it is safe; we have many code review agents"):
    you disagree. Loop until CI is green and the reviewers have signed off on the head commit, within AGENTS.md's stop
    rule (about three rounds, then report what is left). Then merge with the repository's usual method (`ejc3/aws`
    squashes), pinned to the commit the reviewers signed off on (add it to `unapplied` BEFORE the merge, so a session
-   that dies right after merging still leaves the apply to be retried): `gh pr merge --match-head-commit <that sha>`. If the
+   that dies right after merging still leaves the apply to be retried): `gh pr merge <number> -R ejc3/aws --squash --match-head-commit <that sha>` (name the PR: without one, gh picks the PR of
+   the current branch). If the
    head moved (anyone can push as `ejc3`), the new commits go through the loop again. Builds and tests run in CI or
    on fcvm-metal-arm (see Trust; the jumpbox also has only 2 vCPU), and so does a local `codex review`.
 4. **After a merge: apply.** `git -C ~/aws fetch origin` and check that
