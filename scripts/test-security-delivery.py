@@ -1198,6 +1198,7 @@ class DolphinSecurityTests(unittest.TestCase):
             self.assertIn("aws_s3_bucket.dolphin_security_config", body)
             member = block(DOLPHIN, "aws_guardduty_member", "dolphin_" + region)
             self.assertIn("module.security_main_" + region + ".guardduty_detector_id", member)
+            self.assertIn("depends_on = [module.dolphin_security_" + region + "]", member)
             accepter = block(DOLPHIN, "aws_guardduty_invite_accepter", "dolphin_" + region)
             self.assertIn("module.dolphin_security_" + region + ".guardduty_detector_id", accepter)
             self.assertIsNotNone(re.search(r'^module "security_defaults_dolphin_' + region + r'" \{', DOLPHIN, re.M))

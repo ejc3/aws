@@ -279,6 +279,8 @@ resource "aws_guardduty_member" "dolphin_ap_south_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_south_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_south_1" {
@@ -315,6 +317,8 @@ resource "aws_guardduty_member" "dolphin_ap_northeast_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_northeast_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_northeast_1" {
@@ -351,6 +355,8 @@ resource "aws_guardduty_member" "dolphin_ap_northeast_2" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_northeast_2]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_northeast_2" {
@@ -387,6 +393,8 @@ resource "aws_guardduty_member" "dolphin_ap_northeast_3" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_northeast_3]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_northeast_3" {
@@ -423,6 +431,8 @@ resource "aws_guardduty_member" "dolphin_ap_southeast_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_southeast_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_southeast_1" {
@@ -459,6 +469,8 @@ resource "aws_guardduty_member" "dolphin_ap_southeast_2" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ap_southeast_2]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ap_southeast_2" {
@@ -495,6 +507,8 @@ resource "aws_guardduty_member" "dolphin_ca_central_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_ca_central_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_ca_central_1" {
@@ -531,6 +545,8 @@ resource "aws_guardduty_member" "dolphin_eu_central_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_eu_central_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_eu_central_1" {
@@ -567,6 +583,8 @@ resource "aws_guardduty_member" "dolphin_eu_north_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_eu_north_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_eu_north_1" {
@@ -603,6 +621,8 @@ resource "aws_guardduty_member" "dolphin_eu_west_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_eu_west_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_eu_west_1" {
@@ -639,6 +659,8 @@ resource "aws_guardduty_member" "dolphin_eu_west_2" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_eu_west_2]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_eu_west_2" {
@@ -675,6 +697,8 @@ resource "aws_guardduty_member" "dolphin_eu_west_3" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_eu_west_3]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_eu_west_3" {
@@ -711,6 +735,8 @@ resource "aws_guardduty_member" "dolphin_sa_east_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_sa_east_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_sa_east_1" {
@@ -747,6 +773,8 @@ resource "aws_guardduty_member" "dolphin_us_east_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_us_east_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_us_east_1" {
@@ -783,6 +811,8 @@ resource "aws_guardduty_member" "dolphin_us_east_2" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_us_east_2]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_us_east_2" {
@@ -819,6 +849,8 @@ resource "aws_guardduty_member" "dolphin_us_west_1" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_us_west_1]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_us_west_1" {
@@ -855,6 +887,8 @@ resource "aws_guardduty_member" "dolphin_us_west_2" {
   email                      = local.dolphin_account_email
   invite                     = true
   disable_email_notification = true
+  # InviteMembers needs GuardDuty already enabled in the member.
+  depends_on = [module.dolphin_security_us_west_2]
 }
 
 resource "aws_guardduty_invite_accepter" "dolphin_us_west_2" {
@@ -868,7 +902,8 @@ resource "aws_guardduty_invite_accepter" "dolphin_us_west_2" {
 resource "aws_securityhub_member" "dolphin" {
   account_id = aws_organizations_account.dolphin.id
   invite     = true
-  depends_on = [module.security_main_us_west_1]
+  # Security Hub must be enabled on both sides before the invitation.
+  depends_on = [module.security_main_us_west_1, module.dolphin_security_us_west_1]
 }
 
 resource "aws_securityhub_invite_accepter" "dolphin" {
