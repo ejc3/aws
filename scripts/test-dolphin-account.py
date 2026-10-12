@@ -121,13 +121,19 @@ class DolphinBootstrapTests(unittest.TestCase):
 class DolphinSecurityTests(unittest.TestCase):
     def test_monitoring_grants_the_dolphin_account_nothing_here(self):
         text = (ROOT / "dolphin-security.tf").read_text()
-        # The only resource policy is the Config bucket's, in the Dolphin account, for its own Config service.
-        self.assertEqual(text.count("Principal = "), 3)
+        # The only resource policy is the Config bucket's, in the Dolphin account, for its own Config service; the one
+        # role is this account's own, trusted only by this account's EventBridge rule.
+        self.assertEqual(text.count("Principal = "), 4)
+        self.assertEqual(text.count('resource "aws_iam_role" '), 1)
+        role = block(text, 'resource "aws_iam_role" "dolphin_security_inspector"')
+        self.assertNotIn("provider", role)
+        self.assertIn('Principal = { Service = "events.amazonaws.com" }', role)
+        self.assertIn('"aws:SourceAccount" = data.aws_caller_identity.current.account_id', role)
         self.assertEqual(text.count('resource "aws_s3_bucket_policy"'), 1)
         policy = block(text, 'resource "aws_s3_bucket_policy" "dolphin_security_config"')
         self.assertIn("provider = aws.dolphin\n", policy)
         self.assertEqual(policy.count("Principal = "), 3)
-        for forbidden in ("aws_cloudwatch_event_bus_policy", "assume_role_policy", "aws_iam_role", "aws_sns_topic_policy",
+        for forbidden in ("aws_cloudwatch_event_bus_policy", "aws_sns_topic_policy",
                           "aws_sqs_queue_policy", "aws_kms_key", "aws_lambda_permission"):
             self.assertNotIn('resource "' + forbidden, text)
 

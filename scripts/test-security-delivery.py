@@ -1213,7 +1213,9 @@ class DolphinSecurityTests(unittest.TestCase):
         rule = block(DOLPHIN, "aws_cloudwatch_event_rule", "dolphin_security_inspector")
         self.assertIn("AwsAccountId = [aws_organizations_account.dolphin.id]", rule)
         self.assertIn(':product/aws/inspector', rule)
-        self.assertIn('"dolphin-security-inspector"', block(TERRAFORM, "aws_iam_role", "security_forward"))
+        self.assertNotIn("dolphin", block(TERRAFORM, "aws_iam_role", "security_forward"))  # its own role, see below
+        self.assertIn("aws_iam_role.dolphin_security_inspector.arn", block(DOLPHIN, "aws_cloudwatch_event_target", "dolphin_security_inspector"))
+        self.assertIn("aws_cloudwatch_event_rule.dolphin_security_inspector.arn", block(DOLPHIN, "aws_iam_role", "dolphin_security_inspector"))
         self.assertIn("aws_cloudwatch_event_rule.dolphin_security_inspector.arn",
                       block(TERRAFORM, "aws_sqs_queue_policy", "security_delivery_failures"))
 

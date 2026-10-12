@@ -915,6 +915,38 @@ resource "aws_cloudwatch_event_target" "dolphin_security_inspector" {
   rule      = aws_cloudwatch_event_rule.dolphin_security_inspector.name
   target_id = "central-security-alerts"
   arn       = aws_cloudwatch_event_bus.security_alerts.arn
-  role_arn  = aws_iam_role.security_forward.arn
+  role_arn  = aws_iam_role.dolphin_security_inspector.arn
   dead_letter_config { arn = aws_sqs_queue.security_delivery_failures.arn }
+}
+
+# Its own role, not security-findings-forward: every security module depends on that role's policy, so changing that
+# role's trust would defer every module's data sources to apply time and plan their Config roles for replacement.
+# A same-account role needs no entry in the central bus policy; its identity policy is enough.
+resource "aws_iam_role" "dolphin_security_inspector" {
+  name = "dolphin-security-inspector-forward"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnEquals    = { "aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_security_inspector.arn }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "dolphin_security_inspector" {
+  name = "publish-central-security-events"
+  role = aws_iam_role.dolphin_security_inspector.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "events:PutEvents"
+      Resource = aws_cloudwatch_event_bus.security_alerts.arn
+    }]
+  })
 }

@@ -397,8 +397,7 @@ resource "aws_iam_role" "security_forward" {
       Action    = "sts:AssumeRole"
       Condition = {
         StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
-        # dolphin-security-inspector: dolphin-security.tf.
-        ArnLike = { "aws:SourceArn" = [for rule in ["security-forward-findings", "security-forward-audit", "dolphin-security-inspector"] :
+        ArnLike = { "aws:SourceArn" = [for rule in ["security-forward-findings", "security-forward-audit"] :
           "arn:aws:events:*:${data.aws_caller_identity.current.account_id}:rule/${rule}"
         ] }
       }
