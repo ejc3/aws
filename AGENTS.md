@@ -442,7 +442,8 @@ state, secret-payload, Lambda-environment, or log-read access to make a GitHub f
 pass. Those reads can convey administrator credentials. Full plans belong on a jumpbox;
 a successful validation is not an empty live plan. The shared main/staging CI roles are
 retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
-(`imagine.tf`) and `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`), each trusted for one repository's `main`
+(`imagine.tf`), `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`) and `dolphin-labs-news-deploy`
+(`dolphin-labs-news.tf`), each trusted for one repository's `main`
 or environment.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
@@ -1208,6 +1209,18 @@ Available if a task needs them; neither needs a key on disk.
   other workflow, branch or pull request (the trust pins GitHub's immutable `sub` and `job_workflow_ref`).
   Same grant as the boxes. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
   workflow needs.
+- **dolphin-labs' news pass in AWS** (`dolphin-labs-news.tf`). Lambda `dolphin-labs-news-pass` on an
+  EventBridge schedule (off until `dolphin_labs_news_enabled`), with Haiku 5.5, the Upstash Redis
+  credentials in `dolphin-labs/news` and Browserbase from `browserbase/credentials`. Each pass writes a
+  journal record to `s3://dolphin-labs-news-<account>/journal/` (400 days; deletes there are refused
+  outside the administration set, and the bucket is versioned, so an overwrite keeps the original for 400
+  days) so ranking changes can be replayed. nextjs-dev's role reads `journal/` and `local/` and writes
+  `local/` (not dev-ebs-only: the I/O box shares that role). Code arrives from `deploy-news.yml` on `main`
+  through role `dolphin-labs-news-deploy` (GitHub OIDC, code only: no UpdateFunctionConfiguration);
+  Terraform owns the configuration, the handler `index.handler` included. Switch-over: deploy, set the
+  secret, turn refresh-news.yml's schedule off in dolphin-labs, then `dolphin_labs_news_enabled = true`
+  (both running would bill Haiku and Browserbase twice); an Errors alarm and, once enabled, a 'not running'
+  alarm watch it. Output `dolphin_labs_news` holds the deploy workflow's variables.
 - **ElevenLabs** (voice and sound for the games). The key is in Secrets Manager,
   `games/elevenlabs-api-key` (us-west-1), readable by dev-server-role and nextjs-dev-role only
   (`dev-ai-services.tf`). Fetch it into the environment when needed, never onto a command line
@@ -1216,8 +1229,8 @@ Available if a task needs them; neither needs a key on disk.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
-  `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role and admins may read it
-  (`dev-ai-services.tf`). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
+  `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
+  role and admins may read it (`dev-ai-services.tf`; not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
 - **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds

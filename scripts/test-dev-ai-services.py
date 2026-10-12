@@ -42,13 +42,15 @@ class ElevenLabsSecretTests(unittest.TestCase):
         attach = block("aws_iam_role_policy_attachment", "elevenlabs_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
 
-    def test_browserbase_is_for_the_two_dev_roles(self):
+    def test_browserbase_is_for_the_two_dev_roles_and_the_news_pass(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "browserbase"', TF)
         self.assertNotRegex(TF, r"bb_live_[A-Za-z0-9]{6,}")
         policy = block("aws_secretsmanager_secret_policy", "browserbase")
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.browserbase_readers)', policy)
-        self.assertIn("browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]", TF)
+        self.assertIn("browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn]", TF)
+        # dev-ebs-only is the I/O box's role too (io-box.tf): never a reader.
+        self.assertNotIn("dev_ebs_only", TF[TF.index("browserbase_readers"):TF.index("browserbase_readers") + 300])
         doc = block("aws_iam_policy_document", "browserbase_read")
         self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', doc)
         self.assertIn("resources = [aws_secretsmanager_secret.browserbase.arn]", doc)

@@ -46,6 +46,9 @@ jobs:
       - name: One Terraform run at a time on the jumpboxes (run-lock wrapper)
         run: python3 -B scripts/test-terraform-run-lock.py
 
+      - name: dolphin-labs news pass (journal, deploy scope, alarms)
+        run: python3 -S -B scripts/test-dolphin-labs-news.py
+
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 

@@ -27,6 +27,10 @@
 #   - us-west-2, as opencode's DeepSeek (dev-user-data.tf): callers set the region explicitly.
 
 locals {
+  # GitHub's immutable subject for main of dolphin-labs-hq/dolphin-labs (owner and repository ids), shared by
+  # the two roles its workflows assume: this file's and dolphin-labs-news.tf's deploy role.
+  dolphin_labs_main_sub = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"
+
   bedrock_haiku_region  = "us-west-2"
   bedrock_haiku_model   = "anthropic.claude-haiku-5-5"
   bedrock_haiku_profile = "us.${local.bedrock_haiku_model}"
@@ -116,7 +120,7 @@ resource "aws_iam_role" "dolphin_labs_news_bedrock" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub"              = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub"              = local.dolphin_labs_main_sub
           "token.actions.githubusercontent.com:job_workflow_ref" = "dolphin-labs-hq/dolphin-labs/.github/workflows/refresh-news.yml@refs/heads/main"
         }
       }
