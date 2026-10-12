@@ -28,25 +28,33 @@ read_container() {
     aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
     return
   fi
-  # A one-hour session in the Dolphin account, kept in this subshell's environment (never on a command line or on disk),
-  # used for this one read and gone when the subshell exits.
-  local creds
-  creds=$(aws sts assume-role --role-arn "arn:aws:iam::$SOURCE_ACCOUNT:role/OrganizationAccountAccessRole" \
-    --role-session-name "workers-stage-secrets-$(id -un)" --query Credentials --output json) || return 1
+  # A one-hour session in the Dolphin account, held only in a subshell's environment (never on a command line or on
+  # disk), used for this one read. It fails closed: with no complete session there is no read at all, because the
+  # caller's own credentials would read this account's copy, which is not the source any more.
+  local key secret token
+  read -r key secret token < <(aws sts assume-role --role-arn "arn:aws:iam::$SOURCE_ACCOUNT:role/OrganizationAccountAccessRole" \
+    --role-session-name "workers-stage-secrets-$(id -un)" \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text) || true
+  if [[ -z "${key:-}" || -z "${secret:-}" || -z "${token:-}" || "$key" == None || "$token" == None ]]; then
+    echo "no session in account $SOURCE_ACCOUNT (assume-role of OrganizationAccountAccessRole failed)" >&2
+    return 1
+  fi
   (
-    eval "$(printf '%s' "$creds" | python3 -c '
-import json, shlex, sys
-c = json.load(sys.stdin)
-for k, v in (("AWS_ACCESS_KEY_ID", "AccessKeyId"), ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), ("AWS_SESSION_TOKEN", "SessionToken")):
-    print("export %s=%s" % (k, shlex.quote(c[v])))
-')"
-    unset AWS_PROFILE
-    aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
+    export AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_SESSION_TOKEN="$token"
+    # Either profile variable makes the CLI ignore the session in the environment.
+    unset AWS_PROFILE AWS_DEFAULT_PROFILE
+    exec aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
   )
 }
 
-JSON=$(read_container 2>/dev/null) \
-  || { echo "workers-stage/$SITE has no value yet in account ${SOURCE_ACCOUNT:-this one}: put one first (see workers-stage-secrets.tf)" >&2; exit 1; }
+# AWS's error text names the cause (AccessDenied, ExpiredToken, ResourceNotFound) and carries no secret; show it.
+ERR=$(mktemp)
+trap 'rm -f "$ERR"' EXIT
+if ! JSON=$(read_container 2>"$ERR"); then
+  echo "could not read workers-stage/$SITE in account ${SOURCE_ACCOUNT:-this one}; if it has no value yet, put one first (see workers-stage-secrets.tf):" >&2
+  sed 's/^/  /' "$ERR" >&2
+  exit 1
+fi
 
 # Refuse anything that is not a plain {NAME: non-empty string} object, or that is Vercel's placeholder for a hidden value.
 printf '%s' "$JSON" | python3 -c '
