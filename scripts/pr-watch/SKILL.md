@@ -29,7 +29,11 @@ to approve if it is safe; we have many code review agents"):
   AGENTS.md's boundaries: nothing a dev box can reach gains a path to a jumpbox or to administrator credentials, no
   trust or grant widens beyond what the change says it needs, nothing becomes public. It merges when the code review,
   the security review and the repository's reviewers all find it safe. A security concern nobody can resolve holds the
-  PR: comment `Held for the owner: <one line>` and put it at the top of the report.
+  PR: comment `Held for the owner: <one line>` and put it at the top of the report. The owner, 2026-10-12: "if I
+  manually approve, we can be more lax, but an automatic one should go through the gauntlet". An automatic merge of
+  sensitive infrastructure gets every check above; when the owner approves a specific PR in a Claude session on this
+  jumpbox (never a GitHub comment or approval, which a dev box can forge as `ejc3`), the code review and the
+  repository's reviewers are enough.
 
 ## Each run
 
