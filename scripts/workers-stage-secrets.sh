@@ -4,7 +4,9 @@
 #   scripts/workers-stage-secrets.sh SITE          e.g. imagine -> reads workers-stage/imagine, loads Worker imagine-stage
 #
 # Source of truth: the Secrets Manager container workers-stage/SITE (JSON of variable name -> value; see
-# workers-stage-secrets.tf). It is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this
+# workers-stage-secrets.tf). Dolphin's sites (dolphin-labs, dolphin-films) keep theirs in the Dolphin account
+# (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
+# administration; every other site's container is in this account. It is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this
 # script's output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a
 # deploy is uploading can be lost when that deploy activates.
 set -euo pipefail
@@ -15,8 +17,44 @@ SITE=${1:?usage: workers-stage-secrets.sh SITE}
 WORKER="$SITE-stage"
 ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
-JSON=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text 2>/dev/null) \
-  || { echo "workers-stage/$SITE has no value yet: put one first (see workers-stage-secrets.tf)" >&2; exit 1; }
+DOLPHIN_ACCOUNT_ID=484888470752
+case "$SITE" in
+  dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
+  *) SOURCE_ACCOUNT="" ;;
+esac
+
+read_container() {
+  if [[ -z "$SOURCE_ACCOUNT" ]]; then
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
+    return
+  fi
+  # A one-hour session in the Dolphin account, held only in a subshell's environment (never on a command line or on
+  # disk), used for this one read. It fails closed: with no complete session there is no read at all, because the
+  # caller's own credentials would read this account's copy, which is not the source any more.
+  local key secret token
+  read -r key secret token < <(aws sts assume-role --role-arn "arn:aws:iam::$SOURCE_ACCOUNT:role/OrganizationAccountAccessRole" \
+    --role-session-name "workers-stage-secrets-$(id -un)" \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text) || true
+  if [[ -z "${key:-}" || -z "${secret:-}" || -z "${token:-}" || "$key" == None || "$token" == None ]]; then
+    echo "no session in account $SOURCE_ACCOUNT (assume-role of OrganizationAccountAccessRole failed)" >&2
+    return 1
+  fi
+  (
+    export AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_SESSION_TOKEN="$token"
+    # Either profile variable makes the CLI ignore the session in the environment.
+    unset AWS_PROFILE AWS_DEFAULT_PROFILE
+    exec aws secretsmanager get-secret-value --region us-west-1 --secret-id "workers-stage/$SITE" --query SecretString --output text
+  )
+}
+
+# AWS's error text names the cause (AccessDenied, ExpiredToken, ResourceNotFound) and carries no secret; show it.
+ERR=$(mktemp)
+trap 'rm -f "$ERR"' EXIT
+if ! JSON=$(read_container 2>"$ERR"); then
+  echo "could not read workers-stage/$SITE in account ${SOURCE_ACCOUNT:-this one}; if it has no value yet, put one first (see workers-stage-secrets.tf):" >&2
+  sed 's/^/  /' "$ERR" >&2
+  exit 1
+fi
 
 # Refuse anything that is not a plain {NAME: non-empty string} object, or that is Vercel's placeholder for a hidden value.
 printf '%s' "$JSON" | python3 -c '
