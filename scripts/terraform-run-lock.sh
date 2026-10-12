@@ -9,7 +9,8 @@
 # state takes one host-wide lock and holds it until Terraform exits; the rest pass straight through.
 #
 #   waits for the lock:   init plan apply destroy import refresh state taint untaint force-unlock test console validate,
-#                         providers lock, providers mirror (they rewrite .terraform.lock.hcl / download providers;
+#                         providers lock, providers mirror, providers schema (they rewrite .terraform.lock.hcl,
+#                         download providers or start every provider plugin;
 #                         console holds the state lock, and console -plan plans; validate starts provider plugins)
 #   passes through:       everything else (fmt, version, providers, output, show, graph, get, -help)
 #
@@ -55,7 +56,7 @@ done
 
 case "$sub $sub2" in
   "init "* | "plan "* | "apply "* | "destroy "* | "import "* | "refresh "* | "state "* | "taint "* | "untaint "* | \
-    "force-unlock "* | "test "* | "console "* | "validate "* | "providers lock" | "providers mirror") ;;
+    "force-unlock "* | "test "* | "console "* | "validate "* | "providers lock" | "providers mirror" | "providers schema") ;;
   *) exec "$real" "$@" ;;
 esac
 

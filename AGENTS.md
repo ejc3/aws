@@ -220,7 +220,7 @@ check and a fresh plan decide.
 `/usr/local/lib/terraform-run-lock/terraform`, by the `terraform-run-lock` SSM association (`terraform-run-lock.tf`,
 `scripts/terraform-run-lock-install.sh`) on change and daily, so a Terraform upgrade that overwrites the wrapper is
 moved aside and the wrapper restored by the next run. `init`, `plan`, `apply`, `destroy`, `import`, `refresh`,
-`state`, `taint`, `untaint`, `force-unlock`, `test`, `console`, `validate`, `providers lock` and `providers mirror` wait for one host lock
+`state`, `taint`, `untaint`, `force-unlock`, `test`, `console`, `validate`, `providers lock`, `providers mirror` and `providers schema` wait for one host lock
 (`/var/lib/terraform-run-lock/lock`), held by `flock -o` until Terraform exits or is killed (a provider that
 outlives a killed Terraform never holds it); a waiting run prints which pid and command holds it. Cheap commands (`fmt`, `version`, `output`, `show`, `providers`, `graph`, ...) pass straight
 through. `TF_RUN_LOCK_NOWAIT=1` gives up at once with exit 75 (the Stop hook uses it, then skips its drift check),

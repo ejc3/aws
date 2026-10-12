@@ -147,12 +147,12 @@ class WrapperTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def test_providers_lock_and_mirror_take_the_lock_but_plain_providers_does_not(self):
+    def test_providers_lock_mirror_and_schema_take_the_lock_but_plain_providers_does_not(self):
         a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
         for args, expect in ((["providers", "lock", "-platform=linux_arm64"], 75), (["providers", "mirror", "d"], 75),
                              (["console"], 75), (["console", "-plan"], 75), (["validate"], 75),
-                             (["providers"], 0), (["providers", "schema", "-json"], 0)):
+                             (["providers"], 0), (["providers", "schema", "-json"], 75)):
             r = subprocess.run(["bash", str(WRAPPER), *args], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
                                capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, expect, (args, r.stderr))
