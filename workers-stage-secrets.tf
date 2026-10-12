@@ -26,7 +26,7 @@
 #     read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < <(aws sts assume-role \
 #       --role-arn arn:aws:iam::<Dolphin account id>:role/OrganizationAccountAccessRole --role-session-name put-value \
 #       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
-#     [ -n "$AWS_SESSION_TOKEN" ] && [ "$AWS_SESSION_TOKEN" != None ]
+#     [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SESSION_TOKEN" ] && [ "$AWS_SESSION_TOKEN" != None ] || exit 1
 #     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; unset AWS_PROFILE AWS_DEFAULT_PROFILE
 #     aws secretsmanager put-secret-value --region us-west-1 --secret-id workers-stage/<site> \
 #       --secret-string file:///dev/stdin < <a 0600 JSON file> )
