@@ -61,6 +61,9 @@ class DolphinRegionScpTests(unittest.TestCase):
             self.assertIn('"%s"' % action, stmt)
         self.assertNotIn("Condition", stmt)
 
+    def test_the_account_cannot_leave_the_organization_and_shed_the_policy(self):
+        self.assertRegex(SCP, r'Action\s*=\s*"organizations:LeaveOrganization"')
+
     def test_no_principal_is_exempt(self):
         # A role-name exemption is a bypass: an administrator in the Dolphin account can rewrite that role's trust.
         self.assertNotIn("aws:PrincipalARN", SCP)

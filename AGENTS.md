@@ -1351,7 +1351,8 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   Dolphin administrator rewrite that role's trust and escape it). Break-glass is detaching the policy from this account,
   which SCPs never restrict. The organization has the SCP policy type enabled for
   it; AWS attached FullAWSAccess everywhere when it was, so the root, dev-staging and this account are unaffected (SCPs
-  never apply to the management account). Copies into other regions started from an allowed one are denied too: buckets
+  never apply to the management account). The account cannot leave the organization to shed it. Copies into other
+  regions started from an allowed one are denied too: buckets
   with another LocationConstraint, and replication or copy actions (ECR, S3, Secrets Manager, KMS, Backup, StackSets,
   DynamoDB replicas). A new Dolphin region is added to `local.dolphin_security_regions`, which
   extends monitoring and the policy together.

@@ -72,6 +72,13 @@ locals {
         }
       },
       {
+        # Leaving the organization would drop this policy; organizations:* is otherwise exempt for the global reads.
+        Sid      = "DenyLeavingTheOrganization"
+        Effect   = "Deny"
+        Action   = "organizations:LeaveOrganization"
+        Resource = "*"
+      },
+      {
         # Actions called in an allowed region that put copies in another one: aws:RequestedRegion sees only the source,
         # and the copy is often made by a service-linked role, which SCPs never cover. The Dolphin account uses none of
         # them; allowing one means adding its destination check here first.
