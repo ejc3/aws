@@ -118,7 +118,7 @@ class SkillTextTests(unittest.TestCase):
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
                        "`jobs` map", "-R ejc3/aws --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
-                       "unapplied", "right before every push, merge or apply", "answer\n   `standby`", "focus on aws repo only", "went from draft to ready", "BEFORE the merge"):
+                       "unapplied", "before every push, merge or apply", "answer\n   `standby`", "focus on aws repo only", "went from draft to ready", "BEFORE the merge"):
             self.assertIn(phrase, skill)
 
 
