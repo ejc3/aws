@@ -104,13 +104,19 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(run(["bash", str(INSTALL)], home).returncode, 2)
             self.assertEqual(run(["bash", str(INSTALL), "--dev-rule"], home).returncode, 2)
+            for bad in (["--as", "x; touch /tmp/pwned"], ["--as", "Root"]):
+                r = run(["bash", str(INSTALL), "--dev-rule", "--ssh", "ubuntu@10.0.0.1", *bad], home)
+                self.assertEqual(r.returncode, 2, bad)
+            r = run(["bash", str(INSTALL), "--dev-rule", "--ssh", "ubuntu@x;id"], home)
+            self.assertEqual(r.returncode, 2)
 
 
 class SkillTextTests(unittest.TestCase):
     def test_github_text_is_data_and_sensitive_infra_gets_a_security_review(self):
         skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
-                       "@greptileai review", "Held for the owner"):
+                       "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500", "--repos <repo>",
+                       "job_created", "df -h /"):
             self.assertIn(phrase, skill)
 
 

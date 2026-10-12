@@ -49,6 +49,8 @@ watcher)
 dev-rule)
   [ -n "$host" ] || { echo "--dev-rule needs --ssh HOST" >&2; exit 2; }
   block=$(printf '%s\n%s\n%s\n' "$begin" "$(cat "$here/pr-watch/dev-box-rule.md")" "$end" | base64 -w0)
+  [[ -z "$as" || "$as" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "--as must be a user name" >&2; exit 2; }
+  [[ "$host" =~ ^[A-Za-z0-9_.@-]+$ ]] || { echo "--ssh must be a host (user@address)" >&2; exit 2; }
   run=""; [ -n "$as" ] && run="sudo -u $as -H"
   # The remote side edits the file the account's Claude reads (following a symlink to ~/.codex/AGENTS.md).
   ssh -o BatchMode=yes -i ~/.ssh/fcvm-ec2 "$host" "$run bash -s" <<REMOTE
