@@ -192,6 +192,31 @@ has been removed.
 Commit AND push every change: the live infrastructure, the terraform files and git must
 not drift apart.
 
+### Coordinate Terraform with other Claude sessions
+
+Before starting a Terraform plan or apply on a jumpbox, use Claude Code's `ListAgents`
+and `SendMessage` tools to contact the other sessions working on this infrastructure,
+including sessions in separate worktrees. Ask whether one already owns a Terraform run
+and tell them what you intend to run. One session owns the run; other sessions wait and
+reuse its result when it covers their checkout and intended changes. Announce completion,
+failure or cancellation so waiting sessions can continue. Re-plan when the configuration
+or live infrastructure has changed since that result.
+
+Check for running Terraform and provider processes before starting, even if no peer
+answers or appears in the listing. Silence is not permission to overlap. If a run is
+already active, ask its owning session for status rather than launching a second plan.
+Messages arrive between tool calls and cannot interrupt a running command, so messaging
+does not replace the Stop hook's process check and nonblocking lock. Do not start extra
+Claude sessions just to coordinate Terraform, or kill another session's work without the
+operator's authorization.
+
+Cross-session messaging is built in on supported Claude Code versions: same-machine
+messaging requires v2.1.224 or later, or v2.1.248 or later on third-party providers.
+Use `/list-agents` (also `/peers`) to verify availability. Cross-machine discovery needs
+Remote Control and a claude.ai sign-in. If the tools are unavailable, report that and
+continue to enforce a single Terraform run through process checks; do not bypass inbound
+message controls. See https://code.claude.com/docs/en/cross-session-messaging.
+
 ## Technical Details
 
 ### How this repo is driven
