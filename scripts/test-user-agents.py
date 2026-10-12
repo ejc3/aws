@@ -127,7 +127,7 @@ class SeederTests(unittest.TestCase):
 
 
 class TextTests(unittest.TestCase):
-    def test_the_file_is_a_title_the_session_values_paragraph_and_the_models_section(self):
+    def test_the_file_is_a_title_the_session_values_paragraph_and_two_sections(self):
         text = TEXT.read_text()
         lines = text.split("\n")
         self.assertRegex(lines[0], r"^# \S")
@@ -136,7 +136,12 @@ class TextTests(unittest.TestCase):
         self.assertTrue(lines[2].endswith("before every push."))
         # The owner, 2026-10-10: every account is told which cheaper models exist and when to hand them work.
         self.assertEqual(lines[4], "## Cheaper models for straightforward work")
-        self.assertEqual([l for l in lines if l.startswith("#")], [lines[0], lines[4]], "one title, one section")
+        headings = [l for l in lines if l.startswith("#")]
+        self.assertEqual(headings[:2], [lines[0], lines[4]])
+        # The owner, 2026-10-12: drafts behind Cloudflare Access ship without asking.
+        self.assertEqual(headings[2:], ["## Drafts behind Cloudflare Access always ship"], "one title, two sections")
+        self.assertIn("A draft deployed behind a Cloudflare Access gate is always okay to push, without asking", text)
+        self.assertIn("Only a public, ungated production launch needs the owner's go-ahead.", text)
         for model in ("`haiku`", "`sonnet`", "Opus 5.5"):
             self.assertIn(model, text)
         # Subagents only ever go down a model: a Sonnet session must not start an Opus subagent (owner, 2026-10-10).

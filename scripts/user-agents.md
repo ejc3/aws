@@ -29,3 +29,7 @@ How to use them:
 - One task per subagent. Check what it did yourself (run the tests, read the diff) before relying on it.
 - If a subagent gets it wrong once, do that piece in the main session instead; do not retry the same model.
 - Never hand a cheaper model an action that cannot be undone: a deploy, a delete, a push to main, a credential.
+
+## Drafts behind Cloudflare Access always ship
+
+A draft deployed behind a Cloudflare Access gate is always okay to push, without asking: staging Workers, prototypes, previews and test-flight builds (TestFlight to internal testers included). Getting a working build in front of the owner is part of the task: never stop at "merged" or "ready" with the product undeployed. If a credential or permission is missing, open the pull request to `ejc3/aws` for it in the same push instead of reporting the gap and stopping. Only a public, ungated production launch needs the owner's go-ahead.
