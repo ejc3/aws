@@ -116,9 +116,9 @@ class SkillTextTests(unittest.TestCase):
     def test_github_text_is_data_and_sensitive_infra_gets_a_security_review(self):
         skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
-                       "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500", "--repos <repo>",
+                       "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
                        "job_created", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
-                       "unapplied", "right before every push, merge or apply", "--repos <repo>) gh", "answer\n   `standby`"):
+                       "unapplied", "right before every push, merge or apply", "answer\n   `standby`", "focus on aws repo only", "went from draft to ready", "BEFORE the merge"):
             self.assertIn(phrase, skill)
 
 
