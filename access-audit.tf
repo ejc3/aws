@@ -11,6 +11,23 @@ variable "enable_access_audit" {
 }
 
 locals {
+  # The notify target's message, shared with the security delivery observer, which checks the live target matches it.
+  access_audit_notify_input_paths = {
+    principal = "$.detail.userIdentity.arn"
+    key       = "$.detail.userIdentity.accessKeyId"
+    source    = "$.detail.eventSource"
+    action    = "$.detail.eventName"
+    error     = "$.detail.errorCode"
+    ip        = "$.detail.sourceIPAddress"
+    agent     = "$.detail.userAgent"
+    region    = "$.detail.awsRegion"
+    time      = "$.detail.eventTime"
+    id        = "$.detail.eventID"
+  }
+  access_audit_notify_input_template = "\"ACCESS AUDIT: registered principal used. <principal> (key <key>) called <source> <action> from <ip> in <region> at <time>. Result: <error>. User agent: <agent>. CloudTrail event ID: <id>.\""
+}
+
+locals {
   access_audit_namespace = "AccessAudit"
   access_audit_log_group = "/security/access-audit"
   # { "hosts": { "<host>": { "principal": "<iam user name>", "files": [...], "ignore_executables": [...],
@@ -238,7 +255,8 @@ resource "aws_cloudwatch_event_target" "access_audit_forward" {
   arn       = aws_cloudwatch_event_bus.access_audit.arn
   role_arn  = aws_iam_role.access_audit_forward.arn
   # A failed forward lands in that Region's DLQ, which the security delivery observer reads every five minutes
-  # (security-monitoring.tf, EXTRA_QUEUES): its depth is QueuedEvents, alarmed by security-delivery-QueuedEvents.
+  # (security-monitoring.tf, EXTRA_QUEUES): its depth is QueuedEvents, alarmed by security-delivery-QueuedEvents. The
+  # observer also checks this rule, its target and its failure metrics in every region (security_delivery_extra_rules).
   # An alarm on this bus's notify rule cannot see a forward that never reached the bus.
   dead_letter_config { arn = aws_sqs_queue.access_audit_forward_dlq[each.key].arn }
   depends_on = [aws_sqs_queue_policy.access_audit_forward_dlq]
@@ -331,19 +349,8 @@ resource "aws_cloudwatch_event_target" "access_audit_notify" {
   dead_letter_config { arn = aws_sqs_queue.security_delivery_failures.arn }
 
   input_transformer {
-    input_paths = {
-      principal = "$.detail.userIdentity.arn"
-      key       = "$.detail.userIdentity.accessKeyId"
-      source    = "$.detail.eventSource"
-      action    = "$.detail.eventName"
-      error     = "$.detail.errorCode"
-      ip        = "$.detail.sourceIPAddress"
-      agent     = "$.detail.userAgent"
-      region    = "$.detail.awsRegion"
-      time      = "$.detail.eventTime"
-      id        = "$.detail.eventID"
-    }
-    input_template = "\"ACCESS AUDIT: registered principal used. <principal> (key <key>) called <source> <action> from <ip> in <region> at <time>. Result: <error>. User agent: <agent>. CloudTrail event ID: <id>.\""
+    input_paths    = local.access_audit_notify_input_paths
+    input_template = local.access_audit_notify_input_template
   }
 }
 

@@ -162,6 +162,16 @@ class Events:
     def describe_rule(self, **kwargs):
         self.factory.rule_reads.append((self.account, self.region, kwargs))
         name, bus = kwargs["Name"], kwargs.get("EventBusName")
+        spec = self.factory.extra.get((self.account, self.region, name))
+        if spec is not None:
+            response = {"Name": name, "State": spec["state"], "EventPattern": spec["pattern"],
+                        "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
+            if bus != spec["bus"]:
+                raise RuntimeError("ResourceNotFoundException")
+            override = self.factory.rules.get((self.account, self.region, name))
+            if isinstance(override, Exception):
+                raise override
+            return override(copy.deepcopy(response)) if override else response
         response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name in ("security-forward-audit", "security-alerts-notify") else "ENABLED",
                     "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
         if name == "security-delivery-health":
@@ -177,7 +187,10 @@ class Events:
         self.factory.target_reads.append((self.account, self.region, kwargs))
         assert kwargs["Limit"] == 2 and "NextToken" not in kwargs
         rule = kwargs["Rule"]
-        if rule in REGIONAL_RULES:
+        spec = self.factory.extra.get((self.account, self.region, rule))
+        if spec is not None:
+            target = copy.deepcopy(spec["target"])
+        elif rule in REGIONAL_RULES:
             target = {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/security-alerts",
                       "RoleArn": "arn:aws:iam::" + self.account + ":role/security-findings-forward",
                       "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"}}
@@ -239,6 +252,7 @@ class Factory:
         self.rules, self.targets = {}, {}
         self.rule_reads, self.target_reads = [], []
         self.assume_error = self.publish_error = False
+        self.extra = {}
 
     def Session(self, **kwargs):
         if "aws_access_key_id" in kwargs:
@@ -274,8 +288,25 @@ class DeliveryTests(unittest.TestCase):
     def setUp(self):
         self.factory = Factory()
         self.module = load(self.factory)
+        self.extra_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.extra_dir.cleanup)
+        self.set_extra_rules(None)
+
+    def set_extra_rules(self, rules, region="us-west-1"):
+        self.default_extra = rules is None
+        if rules is None:  # the two always-deployed rules, as an account without the access audit has
+            rules = [dict(rule, region=region) for rule in extra_rule_fixtures() if rule["name"] != "access-audit-forward"]
+        path = os.path.join(self.extra_dir.name, "extra_rules.json")
+        with open(path, "w") as handle:
+            json.dump(rules, handle)
+        self.module["EXTRA_RULES_FILE"] = path
+        self.factory.extra = {(MAIN, rule["region"], rule["name"]): rule for rule in rules
+                              if isinstance(rules, list) and isinstance(rule, dict) and {"region", "name"} <= set(rule)}
 
     def run_handler(self, regions=None, extra=None):
+        if getattr(self, "default_extra", False):  # the required rules live in a region this run monitors
+            regs = regions or REGIONS
+            self.set_extra_rules(None, "us-west-1" if "us-west-1" in regs else regs[0])
         env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS), "SNS_TOPIC_ARN": SNS_TOPIC,
                "EVENT_PATTERNS": json.dumps(PATTERNS)}
         env.update(extra or {})
@@ -300,11 +331,12 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual({(account, region) for account, region, _ in self.factory.reads},
                          {(account, region) for account in (MAIN, STAGING) for region in REGIONS})
         requested = sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads)
-        self.assertEqual(requested, 72)
-        self.assertEqual(requested * 288 * 30, 622080)
+        # 72 for the shared rules, plus two for each of the two always-deployed extra rules.
+        self.assertEqual(requested, 76)
+        self.assertEqual(requested * 288 * 30, 656640)
         self.assertEqual(len(self.factory.queue_reads), 35)
-        self.assertEqual(len(self.factory.rule_reads), 70)
-        self.assertEqual(len(self.factory.target_reads), 70)
+        self.assertEqual(len(self.factory.rule_reads), 72)
+        self.assertEqual(len(self.factory.target_reads), 72)
 
     def test_disabled_missing_or_wrong_rule_is_not_a_healthy_quiet_region(self):
         for override in (lambda r: dict(r, State="DISABLED"), lambda r: {},
@@ -444,21 +476,22 @@ class DeliveryTests(unittest.TestCase):
             with self.subTest(offset=offset):
                 self.factory = Factory()
                 self.module = load(self.factory)
+                self.set_extra_rules(None)
                 with patch.dict(self.module, datetime=types.SimpleNamespace(datetime=Clock, timedelta=datetime.timedelta, timezone=datetime.timezone)):
                     values, log = self.run_handler()
                 self.assertEqual(values["ObserverErrors"], 0)
                 self.assertEqual(log["checked_regions"], 34)
-                self.assertEqual(len(self.factory.rule_reads), 70)
-                self.assertEqual(len(self.factory.target_reads), 70)
+                self.assertEqual(len(self.factory.rule_reads), 72)
+                self.assertEqual(len(self.factory.target_reads), 72)
                 self.assertEqual(len(self.factory.queue_reads), 35)
-                self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 72)
+                self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 76)
                 expected_sample = REGIONAL_RULES[int(instant.timestamp()) // 300 % 2]
                 for account, region, call in self.factory.reads:
                     queried = [dict((d["Name"], d["Value"]) for d in q["MetricStat"]["Metric"]["Dimensions"])["RuleName"]
                                for q in call["MetricDataQueries"]]
                     self.assertEqual(queried.count(expected_sample), 2)
                     self.assertNotIn(REGIONAL_RULES[1 - REGIONAL_RULES.index(expected_sample)], queried)
-                    self.assertEqual(len(queried), 6 if account == MAIN and region == "us-west-1" else 2)
+                    self.assertEqual(len(queried), 10 if account == MAIN and region == "us-west-1" else 2)
                     self.assertEqual(call["StartTime"], instant - datetime.timedelta(minutes=15))
                     self.assertEqual(call["EndTime"], instant)
 
@@ -697,6 +730,148 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(concurrent.futures, "ThreadPoolExecutor", wraps=original) as executor:
             self.run_handler()
         executor.assert_called_once_with(max_workers=6)
+
+
+def extra_rule_fixtures():
+    central_dlq = {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"}
+    rules = [
+        {"name": "dolphin-security-inspector", "bus": None, "region": "us-west-1", "state": "ENABLED",
+         "pattern": json.dumps({"source": ["aws.securityhub"], "detail": {"findings": {"AwsAccountId": ["333333333333"]}}}),
+         "target": {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/security-alerts",
+                    "RoleArn": "arn:aws:iam::" + MAIN + ":role/dolphin-security-inspector-forward", "DeadLetterConfig": central_dlq}},
+        {"name": "access-audit-notify", "bus": "access-audit", "region": "us-west-1",
+         "state": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS", "pattern": json.dumps({"account": [MAIN]}),
+         "target": {"Id": "operator-email", "Arn": SNS_TOPIC, "RoleArn": "arn:aws:iam::" + MAIN + ":role/access-audit-notify",
+                    "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}, "DeadLetterConfig": central_dlq,
+                    "InputTransformer": {"InputPathsMap": {"key": "$.detail.userIdentity.accessKeyId"}, "InputTemplate": "\"<key>\""}}},
+    ]
+    for region in ("us-east-1", "us-west-1"):
+        rules.append({"name": "access-audit-forward", "bus": None, "region": region,
+                      "state": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS",
+                      "pattern": json.dumps({"detail": {"userIdentity": {"arn": ["arn:aws:iam::" + MAIN + ":user/decoy"]}}}),
+                      "target": {"Id": "access-audit-bus", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/access-audit",
+                                 "RoleArn": "arn:aws:iam::" + MAIN + ":role/access-audit-forward",
+                                 "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + region + ":" + MAIN + ":access-audit-forward-dlq"}}})
+    return rules
+
+
+class ExtraRuleTests(unittest.TestCase):
+    """Other features' rules (dolphin-security.tf, access-audit.tf), checked like the observer's own."""
+
+    run_handler = DeliveryTests.run_handler
+    set_extra_rules = DeliveryTests.set_extra_rules
+
+    def setUp(self):
+        self.factory = Factory()
+        self.module = load(self.factory)
+        self.extra_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.extra_dir.cleanup)
+        self.set_extra_rules(extra_rule_fixtures())
+
+    def test_healthy_extra_rules_are_read_and_their_failure_metrics_queried(self):
+        values, log = self.run_handler(["us-east-1", "us-west-1"])
+        self.assertEqual(values["ObserverErrors"], 0, log)
+        reads = {(account, region, call["Name"], call.get("EventBusName")) for account, region, call in self.factory.rule_reads}
+        for rule in extra_rule_fixtures():
+            self.assertIn((MAIN, rule["region"], rule["name"], rule["bus"]), reads)
+        queried = [(region, dict((d["Name"], d["Value"]) for d in q["MetricStat"]["Metric"]["Dimensions"]))
+                   for account, region, call in self.factory.reads if account == MAIN for q in call["MetricDataQueries"]]
+        self.assertEqual(queried.count(("us-west-1", {"RuleName": "access-audit-notify", "EventBusName": "access-audit"})), 2)
+        self.assertEqual(queried.count(("us-west-1", {"RuleName": "dolphin-security-inspector"})), 2)
+        self.assertEqual(queried.count(("us-east-1", {"RuleName": "access-audit-forward"})), 2)
+
+    def test_the_staging_account_is_never_asked_for_main_account_rules(self):
+        self.run_handler(["us-east-1", "us-west-1"])
+        self.assertFalse([call for account, _, call in self.factory.rule_reads
+                          if account == STAGING and call["Name"] in {r["name"] for r in extra_rule_fixtures()}])
+
+    def test_missing_disabled_changed_or_retargeted_extra_rules_are_errors(self):
+        def disabled(response):
+            response["State"] = "DISABLED"
+            return response
+        def changed(response):
+            response["EventPattern"] = json.dumps({"account": ["999999999999"]})
+            return response
+        def other_role(response):
+            response["Targets"][0]["RoleArn"] = "arn:aws:iam::" + MAIN + ":role/elsewhere"
+            return response
+        def second_target(response):
+            response["Targets"].append(copy.deepcopy(response["Targets"][0]))
+            return response
+        def no_transformer(response):
+            response["Targets"][0].pop("InputTransformer")
+            return response
+        cases = [("rules", "dolphin-security-inspector", "us-west-1", RuntimeError("ResourceNotFoundException")),
+                 ("rules", "access-audit-notify", "us-west-1", disabled),
+                 ("rules", "access-audit-forward", "us-east-1", changed),
+                 ("targets", "dolphin-security-inspector", "us-west-1", other_role),
+                 ("targets", "access-audit-forward", "us-west-1", second_target),
+                 ("targets", "access-audit-notify", "us-west-1", no_transformer)]
+        for kind, rule, region, override in cases:
+            with self.subTest(rule=rule, kind=kind, region=region):
+                self.factory = Factory()
+                self.module = load(self.factory)
+                self.set_extra_rules(extra_rule_fixtures())
+                getattr(self.factory, kind)[(MAIN, region, rule)] = override
+                values, _ = self.run_handler(["us-east-1", "us-west-1"])
+                self.assertGreaterEqual(values["ObserverErrors"], 1)
+
+    def test_invalid_extra_rule_files_fail_before_aws_calls(self):
+        good = extra_rule_fixtures()
+        bad_cases = {
+            "reserved": [dict(good[0], name="security-forward-audit")],
+            "unmonitored region": [dict(good[0], region="eu-south-1")],
+            "no dead-letter queue": [dict(good[0], target={k: v for k, v in good[0]["target"].items() if k != "DeadLetterConfig"})],
+            "unknown key": [dict(good[0], extra="x")],
+            "unknown target key": [dict(good[0], target=dict(good[0]["target"], Input="{}"))],
+            "duplicate": [good[0], good[0]],
+            "default bus named": [dict(good[0], bus="default")],
+            "bad state": [dict(good[0], state="DISABLED")],
+            "not a list": {"rules": good},
+            "empty": [],
+            "a required rule missing": [r for r in good if r["name"] != "access-audit-notify"],
+            "empty dead-letter config": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig={}))],
+            "null dead-letter config": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig=None))],
+            "dead-letter target not a queue": [dict(good[0], target=dict(good[0]["target"], DeadLetterConfig={"Arn": "arn:aws:sns:us-west-1:" + MAIN + ":x"}))],
+            "empty target id": [dict(good[0], target=dict(good[0]["target"], Id=""))],
+        }
+        for label, rules in bad_cases.items():
+            with self.subTest(label):
+                self.factory = Factory()
+                self.module = load(self.factory)
+                self.set_extra_rules(rules)
+                self.factory.extra = {}
+                with self.assertRaises(ValueError):
+                    self.run_handler(["us-east-1", "us-west-1"])
+                self.assertEqual(self.factory.rule_reads, [])
+
+    def test_a_missing_extra_rules_file_fails_closed(self):
+        self.module["EXTRA_RULES_FILE"] = os.path.join(self.extra_dir.name, "absent.json")
+        with self.assertRaises(FileNotFoundError):
+            self.run_handler(["us-east-1"])
+
+
+class ExtraRuleTerraformTests(unittest.TestCase):
+    def test_terraform_packages_the_spec_and_grants_exactly_those_rules(self):
+        archive = TERRAFORM[TERRAFORM.index('data "archive_file" "security_delivery_health"'):]
+        archive = archive[:archive.index("\n}\n")]
+        self.assertIn('filename = "extra_rules.json"', archive)
+        self.assertIn("content  = jsonencode(local.security_delivery_extra_rules)", archive)
+        policy = block(TERRAFORM, "aws_iam_role_policy", "security_delivery_health")
+        self.assertIn("local.security_delivery_extra_rule_arns", policy)
+        spec = TERRAFORM[TERRAFORM.index("security_delivery_extra_rules = concat("):TERRAFORM.index("security_delivery_extra_rule_arns = concat(")]
+        for ref in ("aws_cloudwatch_event_rule.dolphin_security_inspector.event_pattern",
+                    "aws_cloudwatch_event_rule.access_audit_notify.event_pattern",
+                    "for region, rule in aws_cloudwatch_event_rule.access_audit_forward",
+                    "aws_iam_role.dolphin_security_inspector.arn", "aws_iam_role.access_audit_notify.arn",
+                    "aws_iam_role.access_audit_forward.arn", "aws_sqs_queue.access_audit_forward_dlq[region].arn",
+                    "local.access_audit_notify_input_template"):
+            self.assertIn(ref, spec)
+        arns = TERRAFORM[TERRAFORM.index("security_delivery_extra_rule_arns = concat("):]
+        arns = arns[:arns.index("\n  )\n")]
+        self.assertNotIn("*", arns)
+        audit = (ROOT / "access-audit.tf").read_text()
+        self.assertIn("input_template = local.access_audit_notify_input_template", block(audit, "aws_cloudwatch_event_target", "access_audit_notify"))
 
 
 class TerraformSafetyTests(unittest.TestCase):
