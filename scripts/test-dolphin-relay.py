@@ -41,7 +41,9 @@ class DeployTokenTests(unittest.TestCase):
         env = block("github_repository_environment", "dolphin_relay")
         self.assertIn("protected_branches     = false", env)
         self.assertIn("custom_branch_policies = true", env)
-        self.assertIn("can_admins_bypass = false", env)
+        # GitHub keeps true here; the main-only branch policy is what holds (probe, 2026-10-12, in dolphin-relay.tf).
+        self.assertIn("can_admins_bypass = true", env)
+        self.assertIn("custom_branch_policies = true", env)
         self.assertIn('branch_pattern = "main"', block("github_repository_environment_deployment_policy", "dolphin_relay_main"))
         sec = block("github_actions_environment_secret", "dolphin_relay_cloudflare_token")
         self.assertIn('secret_name     = "CLOUDFLARE_API_TOKEN"', sec)

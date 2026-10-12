@@ -147,8 +147,11 @@ resource "github_repository_environment" "dolphin_relay" {
   provider    = github.dolphin_relay
   repository  = local.dolphin_relay_repository
   environment = local.dolphin_relay_environment
-  # The provider defaults this to true: a repository administrator could then deploy from any ref and get the token.
-  can_admins_bypass = false
+  # GitHub stores true for this private repository whatever is sent (false never persists, so false only drifts), and it
+  # does not weaken the main-only rule: on 2026-10-12 a probe workflow on another branch, pushed by an organization
+  # owner, was refused with "Branch ... is not allowed to deploy to relay due to environment protection rules". The
+  # bypass covers required reviewers and wait timers, which this environment does not use.
+  can_admins_bypass = true
   deployment_branch_policy {
     protected_branches     = false
     custom_branch_policies = true
