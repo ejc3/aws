@@ -56,7 +56,7 @@ class DolphinRegionScpTests(unittest.TestCase):
         stmt = SCP[SCP.index('"DenyCrossRegionCopies"'):]
         stmt = stmt[:stmt.index("},")]
         for action in ("ecr:PutReplicationConfiguration", "s3:PutReplicationConfiguration",
-                       "secretsmanager:ReplicateSecretToRegions", "kms:ReplicateKey", "backup:StartCopyJob",
+                       "secretsmanager:ReplicateSecretToRegions", "kms:ReplicateKey", "backup:StartCopyJob", "lambda:EnableReplication*",
                        "cloudformation:CreateStackInstances", "dynamodb:CreateTableReplica"):
             self.assertIn('"%s"' % action, stmt)
         self.assertNotIn("Condition", stmt)

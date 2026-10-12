@@ -90,6 +90,7 @@ locals {
           "dynamodb:CreateTableReplica",
           "ecr:PutReplicationConfiguration",
           "kms:ReplicateKey",
+          "lambda:EnableReplication*",
           "s3:PutReplicationConfiguration",
           "secretsmanager:ReplicateSecretToRegions",
         ]
