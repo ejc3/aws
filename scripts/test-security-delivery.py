@@ -1192,7 +1192,11 @@ class DolphinSecurityTests(unittest.TestCase):
 
     def test_every_region_is_monitored_without_forwarding_and_joined_by_invitation(self):
         modules = dict(re.findall(r'^module "dolphin_security_([a-z0-9_]+)" \{(.*?)^\}', DOLPHIN, re.M | re.S))
-        self.assertEqual(set(modules), {region.replace("-", "_") for region in REGIONS})
+        regions = re.findall(r'"([a-z]{2}-[a-z]+-\d)"', re.search(r"dolphin_security_regions = \[(.*?)\]", DOLPHIN).group(1))
+        self.assertEqual(regions, ["us-west-1", "us-west-2", "us-east-1"])
+        self.assertEqual(set(modules), {region.replace("-", "_") for region in regions})
+        # Each provider alias is another provider process in every plan (the jumpbox ran out of memory at 73).
+        self.assertEqual(len(re.findall(r'^provider "aws"', DOLPHIN, re.M)), 2)
         for region, body in modules.items():
             self.assertRegex(body, r"forward_findings\s*=\s*false")
             self.assertIn("aws_s3_bucket.dolphin_security_config", body)
