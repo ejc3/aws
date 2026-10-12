@@ -1344,6 +1344,14 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   CloudTrail (its key's encryption context lists the Dolphin account) still records every call. The AI-services opt-out
   at the root covers it. Do not add it to `security_account_ids`: that list admits an account's principals to this
   account's Config bucket and central event bus.
+- **Only the monitored regions work there.** `dolphin-region-scp.tf`: a service control policy on the Dolphin OU (only)
+  denies every regional action outside `local.dolphin_security_regions`, the three regions monitored above, so a leaked
+  Dolphin credential cannot use a region nobody watches. Global services (IAM, STS, Organizations, Identity Center,
+  CloudFront, Route 53, billing, support and the like) are exempt, and so is `OrganizationAccountAccessRole`, which only
+  this account's administrators can assume (break-glass cleanup). The organization has the SCP policy type enabled for
+  it; AWS attached FullAWSAccess everywhere when it was, so the root, dev-staging and this account are unaffected (SCPs
+  never apply to the management account). A new Dolphin region is added to `local.dolphin_security_regions`, which
+  extends monitoring and the policy together.
 
 ### dolphin-films credentials
 

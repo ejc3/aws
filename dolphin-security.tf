@@ -19,8 +19,8 @@
 #
 # Why three regions and not all 17 as for dev-staging: every provider alias is another terraform-provider-aws process
 # in every plan, and sixteen more took a plan on the 8 GB jumpbox to 73 of them and out of memory (2026-10-12, with
-# credential lookups timing out). The other regions are closed to the Dolphin account by intent, not by policy yet: a
-# region-deny SCP on the Dolphin OU is the follow-up that makes "unmonitored" mean "unusable".
+# credential lookups timing out). The other regions are closed to the Dolphin account by policy: a service control
+# policy on the Dolphin OU (dolphin-region-scp.tf) denies every regional action outside these three.
 #
 # What it does not cover: the Dolphin account's CloudTrail control-plane alerts (root sign-in, StopLogging, IAM
 # changes) that security-forward-audit raises for the other two accounts; they need an event path into this account.
