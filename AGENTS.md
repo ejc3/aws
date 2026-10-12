@@ -1153,6 +1153,14 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
+- **Cloudflare deploys (Workers and D1)**, metal boxes only. `cloudflare-dev-deploy-token` (us-west-1) is a Cloudflare
+  token with Workers Scripts Write, D1 Write and Account Settings Read on the account (`cloudflare-dev-deploy.tf`): create
+  an app's D1 database, run its first `wrangler deploy`, and install the token as the app repo's `CLOUDFLARE_API_TOKEN`
+  (`gh secret set CLOUDFLARE_API_TOKEN -R OWNER/REPO` reading it from stdin) so the repo's CI deploys every merge after
+  that. It can replace any Worker in the account, production ones included, so ship through the app's CI, not by hand.
+  `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id
+  cloudflare-dev-deploy-token --query SecretString --output text)`; never onto a command line, into a file in a repo or
+  a commit. Not readable from nextjs-dev. Rotate with `terraform apply -replace=cloudflare_account_token.dev_deploy`.
 - **The claw-master dashboard, as an agent**, metal boxes only. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
   (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
