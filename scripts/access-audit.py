@@ -803,6 +803,7 @@ class Integrity:
 HANDLER_TRIGGERS = {"file-read", "tamper"}
 HANDLER_TIMEOUT = 15
 HANDLER_MAX_OUTPUT = 64 << 10
+HANDLER_GRACE = 60
 
 
 def handler_is_safe(path):
@@ -825,22 +826,41 @@ class HandlerRunner:
         self.is_safe = is_safe
         self.run = run or self._run
         self.queue = queue.Queue(maxsize=50)
-        # Pids of handler processes running now. A report whose reader or any ancestor is one of
-        # them came from the handler itself (it opened a watched path): it is the agent's own
-        # work, like an open by the agent's pid, so it is neither reported nor offered again,
-        # which would otherwise loop. A pid is only in the set while that process is alive, so
-        # no unrelated process can carry it in its ancestry.
+        # Handler processes, as (pid, start) from the same ancestry the sensors report. A report whose
+        # reader or any ancestor is one of them came from the handler itself (it opened a watched
+        # path): it is the agent's own work, like an open by the agent's pid, so it is neither
+        # reported nor offered again, which would otherwise loop. The start token rules out a
+        # reused pid; a handler is remembered for HANDLER_GRACE seconds after it exits, because
+        # eslogger delivers through a FIFO and can report an open after a short handler is gone.
         self.active = set()
+        self.recent = {}  # (pid, start) -> monotonic time it exited
+        self.last_activity = None
+        self.clock = time.monotonic
+
+    def identities(self):
+        now = self.clock()
+        for key, ended in list(self.recent.items()):
+            if now - ended > HANDLER_GRACE:
+                self.recent.pop(key, None)
+        return set(self.active) | set(self.recent)
 
     def owns(self, report):
-        if not self.active:
+        known = self.identities()
+        if not known:
             return False
-        pids = {entry.get("pid") for entry in report.get("ancestry", []) if isinstance(entry, dict)}
-        pids.add(report.get("pid"))
-        return bool(pids & self.active)
+        chain = [entry for entry in report.get("ancestry", []) if isinstance(entry, dict)]
+        return any((entry.get("pid"), entry.get("start")) in known for entry in chain)
+
+    def nearby(self):
+        """A handler is running or ran in the last HANDLER_GRACE seconds."""
+        return bool(self.active) or (self.last_activity is not None and self.clock() - self.last_activity <= HANDLER_GRACE)
 
     def offer(self, report):
         if report.get("kind") not in HANDLER_TRIGGERS or not self.is_safe(self.path):
+            return
+        # A read the sensor could not attribute (the atime poll knows no reader) may be the handler's own:
+        # it is still reported, but not handed back to the handler while one is running or just ran.
+        if report.get("kind") == "file-read" and "pid" not in report and self.nearby():
             return
         try:
             self.queue.put_nowait(report)
@@ -853,7 +873,10 @@ class HandlerRunner:
         deadline = time.monotonic() + HANDLER_TIMEOUT
         process = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
-        self.active.add(process.pid)
+        chain = process_ancestry(process.pid, platform_name())
+        identity = (process.pid, chain[0]["start"] if chain else None)
+        self.active.add(identity)
+        self.last_activity = self.clock()
         try:
             # Writing the event and reading the result share one deadline, so a handler that
             # never reads its stdin cannot block the writer either.
@@ -895,7 +918,8 @@ class HandlerRunner:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            self.active.discard(process.pid)
+            self.active.discard(identity)
+            self.recent[identity] = self.last_activity = self.clock()
             process.stdout.close()
             if not process.stdin.closed:
                 try:
@@ -1139,8 +1163,18 @@ def write_placed(dirfd, name, data, mode, owner, chown, stamp, replace_sha256=No
                     raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name)
         try:
             os.link(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
-        except FileExistsError:
-            raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name) from None
+        except BaseException as error:
+            if aside is not None:
+                # The displaced file is this agent's own, verified unchanged: put it back if the name is
+                # free, otherwise remove it, so it is never left hidden under a temporary name.
+                try:
+                    os.link(aside, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+                except OSError:
+                    pass
+                os.unlink(aside, dir_fd=dirfd)
+            if isinstance(error, FileExistsError):
+                raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name) from None
+            raise
         os.unlink(temporary, dir_fd=dirfd)
         if aside is not None:
             os.unlink(aside, dir_fd=dirfd)
@@ -1300,9 +1334,14 @@ def pause_service(layout, platform):
     install starts it again (install_service)."""
     if platform == "linux":
         subprocess.run(["systemctl", "stop", layout.name], capture_output=True)
+        state = subprocess.run(["systemctl", "is-active", layout.name], capture_output=True, text=True).stdout.strip()
+        still = state in ("active", "activating", "deactivating", "reloading")
     else:
         for label in (layout.label, layout.helper_label):
             subprocess.run(["launchctl", "bootout", "system/" + label], capture_output=True)
+        still = subprocess.run(["launchctl", "print", "system/" + layout.label], capture_output=True).returncode == 0
+    if still:
+        raise SystemExit(layout.name + ": could not stop the running agent; not replacing its files")
 
 
 def platform_name():

@@ -1930,14 +1930,25 @@ The `access-audit` CloudWatch dashboard shows all of them and the latest host re
 lands in a dead-letter queue (`access-audit-forward-dlq` in the Region of the failed rule, or
 `security-central-delivery-dlq` in us-west-1 for the notification) and is kept 14 days. While it is
 there, the security observer's `security-delivery-QueuedEvents` alarm stays in ALARM, so a later,
-unrelated failure raises no new alarm. Once the cause is fixed, read what is queued (the events
-carry the call or report that was missed) and then empty the queue so the alarm returns to OK:
+unrelated failure raises no new alarm. Once the cause is fixed, drain the queue into a private file
+(the events carry the call or report that was missed, so keep them), deleting each batch only after
+it is saved, until the queue is empty; the alarm then returns to OK:
 
 ```bash
-Q=$(aws sqs get-queue-url --region <region> --queue-name <queue> --query QueueUrl --output text)
-aws sqs receive-message --region <region> --queue-url "$Q" --max-number-of-messages 10 --attribute-names All
-aws sqs purge-queue --region <region> --queue-url "$Q"
+( umask 077; set -euo pipefail
+  Q=$(aws sqs get-queue-url --region <region> --queue-name <queue> --query QueueUrl --output text)
+  while :; do
+    batch=$(aws sqs receive-message --region <region> --queue-url "$Q" --max-number-of-messages 10 \
+      --wait-time-seconds 5 --visibility-timeout 120 --attribute-names All)
+    [ -n "$batch" ] && [ "$(jq '.Messages | length' <<<"$batch")" -gt 0 ] || break
+    jq -c '.Messages[]' <<<"$batch" >> dead-letters.jsonl
+    jq -r '.Messages[].ReceiptHandle' <<<"$batch" | while read -r handle; do
+      aws sqs delete-message --region <region> --queue-url "$Q" --receipt-handle "$handle"
+    done
+  done )
 ```
+
+Read `dead-letters.jsonl`, act on it, then shred it.
 
 This is the same for the other security dead-letter queues.
 
