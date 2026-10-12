@@ -34,6 +34,27 @@ resource "aws_secretsmanager_secret" "access_audit_config" {
   recovery_window_in_days = 7
 }
 
+# Administration only, as every comparable secret here (people.tf): the registry names the planted paths and principals,
+# and the bundles carry each host's reporter and planted keys (and any generated SSH key).
+resource "aws_secretsmanager_secret_policy" "access_audit" {
+  for_each = {
+    config  = aws_secretsmanager_secret.access_audit_config.arn
+    bundles = aws_secretsmanager_secret.access_audit_bundles.arn
+  }
+  secret_arn = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = each.value
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
 data "aws_secretsmanager_secret_version" "access_audit_config" {
   count     = var.enable_access_audit ? 1 : 0
   secret_id = aws_secretsmanager_secret.access_audit_config.id

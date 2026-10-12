@@ -579,6 +579,14 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn("[for queue in aws_sqs_queue.access_audit_forward_dlq : queue.arn]",
                       block(TERRAFORM, "aws_iam_role_policy", "security_delivery_health"))
 
+    def test_access_audit_secrets_are_administration_only(self):
+        audit = (ROOT / "access-audit.tf").read_text()
+        policy = block(audit, "aws_secretsmanager_secret_policy", "access_audit")
+        for name in ("aws_secretsmanager_secret.access_audit_config.arn", "aws_secretsmanager_secret.access_audit_bundles.arn"):
+            self.assertIn(name, policy)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals }', policy)
+
     def test_partial_paginated_missing_duplicate_unknown_and_messages_are_errors(self):
         def partial(response):
             response["MetricDataResults"][0]["StatusCode"] = "PartialData"
