@@ -215,14 +215,19 @@ claude.ai account can appear through Remote Control) is not a run owner and its 
 jumpbox is a forbidden direction (above). Never skip a plan or reuse a result because a peer reports one; the process
 check and a fresh plan decide.
 
-**The run lock (#408).** On the jumpboxes `terraform` is a wrapper (`scripts/terraform-run-lock.sh`, installed as
-`/usr/local/sbin/terraform` by `terraform-run-lock.tf`, ahead of the real `/usr/local/bin/terraform` on every PATH).
-`init`, `plan`, `apply`, `destroy`, `import`, `refresh`, `state`, `taint`, `untaint`, `force-unlock` and `test` wait
-for one host lock (`/var/lib/terraform-run-lock/lock`), held until Terraform exits or is killed; a waiting run prints
-which pid and command holds it. Cheap commands (`fmt`, `validate`, `version`, `output`, `show`, `providers`, ...) pass
-straight through. `TF_RUN_LOCK_NOWAIT=1` gives up at once with exit 75 (the Stop hook uses it, then skips its drift
-check), `TF_RUN_LOCK_WAIT=N` caps the wait (default 1800 s). It never adds `-lock=false`. A run started by the real
-binary's full path bypasses it, so the Stop hook still checks for running Terraform processes too.
+**The run lock (#408).** On the jumpboxes `terraform` is a wrapper (`scripts/terraform-run-lock.sh`), installed AT
+`/usr/local/bin/terraform` (the path shells already resolve; zsh caches command paths) with the real binary moved to
+`/usr/local/lib/terraform-run-lock/terraform`, by the `terraform-run-lock` SSM association (`terraform-run-lock.tf`,
+`scripts/terraform-run-lock-install.sh`) on change and daily, so a Terraform upgrade that overwrites the wrapper is
+moved aside and the wrapper restored by the next run. `init`, `plan`, `apply`, `destroy`, `import`, `refresh`,
+`state`, `taint`, `untaint`, `force-unlock`, `test`, `providers lock` and `providers mirror` wait for one host lock
+(`/var/lib/terraform-run-lock/lock`), held until Terraform exits or is killed; a waiting run prints which pid and
+command holds it. Cheap commands (`fmt`, `validate`, `version`, `output`, `show`, `providers`, ...) pass straight
+through. `TF_RUN_LOCK_NOWAIT=1` gives up at once with exit 75 (the Stop hook uses it, then skips its drift check),
+`TF_RUN_LOCK_WAIT=N` caps the wait (default 1800 s). It never adds `-lock=false`. To upgrade Terraform, install the
+new binary at `/usr/local/lib/terraform-run-lock/terraform` (or at `/usr/local/bin/terraform` and let the daily run
+move it). A run started by the real binary's full path bypasses the lock, so the Stop hook still checks for running
+Terraform processes too.
 
 Cross-session messaging is built in on supported Claude Code versions: same-machine
 messaging requires v2.1.224 or later, or v2.1.248 or later on third-party providers.

@@ -1,18 +1,22 @@
 #!/bin/bash
+# TERRAFORM-RUN-LOCK-WRAPPER (the installer recognises this file by that marker)
 # terraform (wrapper): one Terraform run at a time on this host (#408).
 #
-# Installed on the jumpboxes as /usr/local/sbin/terraform, ahead of the real binary on every PATH (scripts/
-# ssm-terraform-run-lock.sh, terraform-run-lock.tf). Two plans at once on a 2-vCPU, 8 GB jumpbox ran it out of memory
+# Installed on the jumpboxes AT /usr/local/bin/terraform, the path every shell already resolves (zsh caches command
+# paths), with the real binary moved to /usr/local/lib/terraform-run-lock/terraform (scripts/terraform-run-lock-install.sh,
+# run by an SSM association in terraform-run-lock.tf, daily and on change). Two plans at once on a 2-vCPU, 8 GB jumpbox ran it out of memory
 # (73 provider processes, 2026-10-12) and staled an apply (2026-10-11). Every command that loads providers or touches
 # state takes one host-wide lock and holds it until Terraform exits; the rest pass straight through.
 #
-#   waits for the lock:   init plan apply destroy import refresh state taint untaint force-unlock test
+#   waits for the lock:   init plan apply destroy import refresh state taint untaint force-unlock test,
+#                         providers lock, providers mirror (they rewrite .terraform.lock.hcl / download providers)
 #   passes through:       everything else (fmt, validate, version, providers, output, show, console, graph, get, -help)
 #
 #   TF_RUN_LOCK_NOWAIT=1  do not wait: exit 75 at once if another run holds the lock (the Stop hook uses this)
 #   TF_RUN_LOCK_WAIT=N    seconds to wait before giving up with 75 (default 1800)
 #   TF_RUN_LOCK_FILE      the lock file (default /var/lib/terraform-run-lock/lock, made by the installer)
-#   TF_RUN_LOCK_REAL      the real terraform (default: the first terraform on PATH that is not this wrapper)
+#   TF_RUN_LOCK_REAL      the real terraform (default /usr/local/lib/terraform-run-lock/terraform, else the first
+#                         terraform on PATH that is not this wrapper)
 #
 # The lock is an flock on fd 9, opened here and inherited by Terraform through exec, so it is held for exactly as long
 # as the run lives and released when it exits or is killed. It never adds -lock=false: Terraform's own state lock is a
@@ -22,6 +26,7 @@ set -u
 self=$(readlink -f "${BASH_SOURCE[0]}")
 
 real=${TF_RUN_LOCK_REAL:-}
+[ -z "$real" ] && [ -x /usr/local/lib/terraform-run-lock/terraform ] && real=/usr/local/lib/terraform-run-lock/terraform
 if [ -z "$real" ]; then
   IFS=: read -r -a dirs <<<"${PATH:-}"
   for d in "${dirs[@]}"; do
@@ -35,17 +40,20 @@ if [ -z "$real" ] || [ ! -x "$real" ] || [ "$(readlink -f "$real")" = "$self" ];
 fi
 
 # The subcommand is the first argument that is not a global option (-chdir=DIR comes before it).
-sub=""
+sub="" sub2=""
 for a in "$@"; do
   case "$a" in
-    -chdir=*) continue ;;
-    -*) break ;;
-    *) sub=$a; break ;;
+    -chdir=*) [ -z "$sub" ] && continue ;;
   esac
+  if [ -z "$sub" ]; then
+    case "$a" in -*) break ;; *) sub=$a; continue ;; esac
+  fi
+  case "$a" in -*) continue ;; *) sub2=$a; break ;; esac
 done
 
-case "$sub" in
-  init | plan | apply | destroy | import | refresh | state | taint | untaint | force-unlock | test) ;;
+case "$sub $sub2" in
+  "init "* | "plan "* | "apply "* | "destroy "* | "import "* | "refresh "* | "state "* | "taint "* | "untaint "* | \
+    "force-unlock "* | "test "* | "providers lock" | "providers mirror") ;;
   *) exec "$real" "$@" ;;
 esac
 

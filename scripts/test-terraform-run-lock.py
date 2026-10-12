@@ -2,16 +2,19 @@
 """The jumpbox terraform wrapper (scripts/terraform-run-lock.sh): one state-touching run at a time, cheap commands pass."""
 import os
 import pathlib
+import re
 import signal
+import stat
 import subprocess
 import tempfile
+import textwrap
 import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WRAPPER = ROOT / "scripts/terraform-run-lock.sh"
 HOOK = (ROOT / ".claude/hooks/verify-consistent.sh").read_text()
-INSTALLER = (ROOT / "scripts/ssm-terraform-run-lock.sh").read_text()
+INSTALLER = ROOT / "scripts/terraform-run-lock-install.sh"
 TF = (ROOT / "terraform-run-lock.tf").read_text()
 
 FAKE = """#!/bin/bash
@@ -115,6 +118,16 @@ class WrapperTests(unittest.TestCase):
                            capture_output=True, text=True, timeout=10)
         self.assertEqual(b.returncode, 0, b.stderr)
 
+    def test_providers_lock_and_mirror_take_the_lock_but_plain_providers_does_not(self):
+        a = self.start("apply", FAKE_SLEEP="1.5")
+        self.wait_started("apply")
+        for args, expect in ((["providers", "lock", "-platform=linux_arm64"], 75), (["providers", "mirror", "d"], 75),
+                             (["providers"], 0), (["providers", "schema", "-json"], 0)):
+            r = subprocess.run(["bash", str(WRAPPER), *args], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, expect, (args, r.stderr))
+        a.communicate(timeout=20)
+
     def test_the_exit_code_and_arguments_are_the_real_binarys(self):
         r = subprocess.run(["bash", str(WRAPPER), "plan", "-detailed-exitcode", "-no-color"],
                            env=dict(self.env, FAKE_RC="2"), capture_output=True, text=True, timeout=10)
@@ -158,12 +171,71 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("aws-stop-hook-tfplan-", HOOK)  # one lock, the wrapper's
         self.assertIn("pgrep -x 'terraform|terraform-provi'", HOOK)
 
-    def test_installer_puts_it_ahead_of_the_real_binary_with_a_precreated_lock(self):
-        self.assertIn("/usr/local/sbin/terraform", INSTALLER)
-        self.assertIn("install -m 0666 /dev/null /var/lib/terraform-run-lock/lock", INSTALLER)
-        self.assertIn('mv -f /usr/local/sbin/terraform.new /usr/local/sbin/terraform', INSTALLER)
-        self.assertIn("for_each = local.admin_tmux_boxes", TF)
-        self.assertIn('filesha256("${path.module}/scripts/terraform-run-lock.sh")', TF)
+    def test_the_association_runs_daily_on_every_admin_box(self):
+        self.assertIn('schedule_expression = "rate(1 day)"', TF)
+        self.assertIn("values = values(local.admin_tmux_boxes)", TF)
+        self.assertIn('chomp(file("${path.module}/scripts/terraform-run-lock.sh"))', TF)
+        self.assertIn('chomp(file("${path.module}/scripts/terraform-run-lock-install.sh"))', TF)
+
+
+def render_association_script():
+    """The association's commands as Terraform renders them: file() inlined by indent(4, ...), then <<- strips 4."""
+    body = re.search(r"terraform_run_lock_install = <<-EOT\n(.*?)\n  EOT", TF, re.S).group(1)
+    def inline(m):
+        return textwrap.indent((ROOT / m.group(1)).read_text().rstrip("\n"), " " * 4)[4:]
+    body = re.sub(r'\$\{indent\(4, chomp\(file\("\$\{path\.module\}/([^"]+)"\)\)\)\}', inline, body)
+    return textwrap.dedent(body)
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.dirs = {k: self.tmp / k for k in ("bin", "lib", "lockdir")}
+        self.dirs["bin"].mkdir()
+        self.env = dict(os.environ, BIN_DIR=str(self.dirs["bin"]), LIB_DIR=str(self.dirs["lib"]),
+                        LOCK_DIR=str(self.dirs["lockdir"]))
+        self.script = self.tmp / "association.sh"
+        self.script.write_text(render_association_script())
+
+    def put_real(self, version):
+        p = self.dirs["bin"] / "terraform"
+        p.write_text(f"#!/bin/bash\necho 'Terraform v{version}'\n")
+        p.chmod(0o755)
+
+    def run_install(self):
+        return subprocess.run(["bash", str(self.script)], env=self.env, capture_output=True, text=True, timeout=30)
+
+    def test_the_rendered_script_carries_the_files_byte_for_byte(self):
+        text = render_association_script()
+        self.assertIn(WRAPPER.read_text(), text)
+        self.assertIn(INSTALLER.read_text(), text)
+
+    def test_first_install_moves_the_real_binary_and_puts_the_wrapper_in_its_place(self):
+        self.put_real("1.10.3")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dirs["bin"] / "terraform").read_text(), WRAPPER.read_text())
+        self.assertIn("v1.10.3", (self.dirs["lib"] / "terraform").read_text())
+        lock = self.dirs["lockdir"] / "lock"
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o666)
+        self.assertIn("Terraform v1.10.3", r.stdout)  # the wrapper's passthrough reached the moved binary
+
+    def test_a_rerun_changes_nothing_and_an_upgrade_is_repaired(self):
+        self.put_real("1.10.3")
+        self.run_install()
+        r = self.run_install()
+        self.assertNotIn("moved", r.stdout)
+        self.assertNotIn("installed the wrapper", r.stdout)
+        self.put_real("1.11.0")  # an upgrade overwrote the wrapper
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("v1.11.0", (self.dirs["lib"] / "terraform").read_text())
+        self.assertEqual((self.dirs["bin"] / "terraform").read_text(), WRAPPER.read_text())
+
+    def test_no_real_binary_means_no_wrapper(self):
+        r = self.run_install()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.dirs["bin"] / "terraform").exists())
 
 
 if __name__ == "__main__":
