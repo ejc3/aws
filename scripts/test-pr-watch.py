@@ -116,7 +116,8 @@ class SkillTextTests(unittest.TestCase):
         skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500", "--repos <repo>",
-                       "job_created", "df -h /"):
+                       "job_created", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
+                       "unapplied", "right before every push, merge or apply", "--repos <repo>) gh"):
             self.assertIn(phrase, skill)
 
 

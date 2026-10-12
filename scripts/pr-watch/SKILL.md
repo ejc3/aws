@@ -33,24 +33,34 @@ to approve if it is safe; we have many code review agents"):
   manually approve, we can be more lax, but an automatic one should go through the gauntlet". An automatic merge of
   sensitive infrastructure gets every check above; when the owner approves a specific PR in a Claude session on this
   jumpbox (never a GitHub comment or approval, which a dev box can forge as `ejc3`), the code review and the
-  repository's reviewers are enough.
+  repository's reviewers are enough. A PR this session opened at the owner's direct request in the conversation is
+  approved by that request.
+- **Never run a PR's own code on this jumpbox before it merges**: its tests, builds, generators, scripts, hooks, or a
+  `terraform init/plan` of its branch (a plan runs `data "external"` programs and provisioners with the administrator
+  role). This box holds administrator credentials, and a PR from a compromised dev box would run with them. Its code
+  runs in the repository's credential-free CI or on fcvm-metal-arm. Test a fix of your own here only once the PR's
+  changes to test and build code have been read and found harmless; when in doubt, use fcvm-metal-arm.
 
 ## Each run
 
 0. **Claim the watch.** `bash ~/.local/share/pr-watch/claim.sh claim`. `other`: another session runs the watch; delete
    this session's `/pr-watch` job (CronList, CronDelete) and stop. `owner`: go on, and run it again between items so a
-   long run keeps the claim (it goes stale after 45 minutes without one). **Renew the job before it expires:** a
-   recurring CronCreate job deletes itself after 7 days and nothing tells the session, so record when this session
+   long run keeps the claim (it goes stale after 45 minutes without one): between items, at least every 15 minutes
+   while waiting on CI or a reviewer, and right before every push, merge or apply. If a refresh ever prints `other`,
+   another session has taken over: stop at once, without pushing, merging or applying. **Renew the job before it
+   expires:** a recurring CronCreate job deletes itself after 7 days and nothing tells the session, so record when this session
    created its job (`job_created` in the state file); when that is more than 6 days ago, CronDelete it and CronCreate a
    new one (same cron and prompt), and record the new time.
 1. **Find work.** Open PRs and issues authored by `ejc3` in repositories owned by `ejc3` and `dolphin-labs-hq`:
    `gh search prs --author ejc3 --state open --owner ejc3 --limit 500` and `--owner dolphin-labs-hq`, the same with
    `gh search issues` (the default limit is 30). The `ejc3` gh login reads both owners; for a write in dolphin-labs-hq
-   it lacks permission for, mint a token for that one repository:
-   `GH_TOKEN=$(~/aws/scripts/github-app-token.py dolphin-labs-hq --repos <repo>)`. Keep
-   `~/.local/state/pr-watch/state.json` (repo, number, head sha, check and review state, last action, outcome) and work
+   it lacks permission for, pass a token for that one repository to that one command:
+   `GH_TOKEN=$(~/aws/scripts/github-app-token.py dolphin-labs-hq --repos <repo>) gh ...` (a bare assignment is not
+   exported, so `gh` would not see it). Keep `~/.local/state/pr-watch/state.json` (repo, number, head sha, check and review state, last action, outcome) and work
    items that are new, whose head changed, or whose last outcome was waiting on CI or a reviewer (a check finishing does
-   not change the head, so those are looked at again every run). With nothing
+   not change the head, so those are looked at again every run). The state also keeps `unapplied`: every merged
+   `ejc3/aws` or `dolphin-aws` PR whose apply has not finished with an empty follow-up plan. A merged PR is no longer
+   open, so that list is the only thing that brings a failed apply back; work it first every run. With nothing
    new, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
 2. **Leave work in progress alone.** Only note, never touch: a draft PR; a PR with a push in the last 45 minutes from
    another session (head commit time, a local worktree on its branch); an issue already linked to an open PR.
@@ -63,14 +73,17 @@ to approve if it is safe; we have many code review agents"):
    you disagree. Loop until CI is green and the reviewers have signed off on the head commit, within AGENTS.md's stop
    rule (about three rounds, then report what is left). Then merge with the repository's usual method (`ejc3/aws`
    squashes), pinned to the commit the reviewers signed off on: `gh pr merge --match-head-commit <that sha>`. If the
-   head moved (anyone can push as `ejc3`), the new commits go through the loop again. Heavy builds and tests run in CI or on fcvm-metal-arm, never on the jumpbox (2 vCPU); that includes a
-   local `codex review` of a Next.js repository.
-4. **After a merge: apply.** `ejc3/aws`: a fresh worktree off origin/main (`git -C ~/aws worktree add --detach
+   head moved (anyone can push as `ejc3`), the new commits go through the loop again. Builds and tests run in CI or
+   on fcvm-metal-arm (see Trust; the jumpbox also has only 2 vCPU), and so does a local `codex review`.
+4. **After a merge: apply.** Add the PR to `unapplied` first. `ejc3/aws`: `git -C ~/aws fetch origin` and check that
+   origin/main contains the merge commit (`git -C ~/aws merge-base --is-ancestor <merge sha> origin/main`): a merge on
+   GitHub does not move the local ref, and a worktree from a stale ref would apply the tree before the merge. Then a
+   fresh worktree off origin/main (`git -C ~/aws worktree add --detach
    /tmp/tf-$(date +%s) origin/main`), `umask 002`, `terraform init -input=false -lockfile=readonly`, plan, read the
    plan, apply the saved plan, require an empty follow-up plan. Check `df -h /` before the init (each worktree's
    providers take about 1 GB of the 40 GB root), and `git worktree remove --force` the worktree on every way out, a
-   failed or stopped run included. One Terraform run at a
-   time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions
+   failed or stopped run included. Remove the PR from `unapplied` only after the empty follow-up plan. One Terraform
+   run at a time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions
    (agree on one run owner and tell them when it ends); `-lock-timeout=10m`, never `-lock=false`. A plan that replaces
    or destroys something unexpected stops the run and goes to the owner. `dolphin-labs-hq/dolphin-aws`: it applies
    only from nextjs-dev, as `ejc3` there, with its `scripts/apply.sh` (`ssh -i ~/.ssh/fcvm-ec2 ubuntu@<nextjs-dev
