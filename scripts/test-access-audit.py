@@ -46,6 +46,14 @@ def bundle(directory, files=None):
                 {"path": directory + "/notes", "owner": USER, "content": "{{random_hex:8}}", "watch": False}]}
 
 
+def owner_made_symlink(target, link):
+    """A symlink the file's owner made. Run as root, a symlink would be root's own in a root-owned temporary
+    directory, which the agent deliberately follows (macOS /var); hand it to an unprivileged owner instead."""
+    os.symlink(target, link)
+    if os.geteuid() == 0:
+        os.lchown(link, 65534, 65534)
+
+
 def runbook():
     """The rollout section of README.md (the operator entry point holds it; no separate doc file)."""
     text = (ROOT / "README.md").read_text()
@@ -810,7 +818,7 @@ class ReviewRegressionTest(unittest.TestCase):
     # Installer: never follow a link the file owner controls.
     def test_symlinked_directory_in_a_registered_path_is_refused(self):
         target = os.path.realpath(tempfile.mkdtemp())
-        os.symlink(target, self.directory + "/link")
+        owner_made_symlink(target, self.directory + "/link")
         files = [{"path": self.directory + "/link/creds", "owner": USER, "content": "a"}]
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             agent.place_files(bundle(self.directory, files), {}, chown=False)
@@ -830,19 +838,19 @@ class ReviewRegressionTest(unittest.TestCase):
         Path(victim).write_text("root's file")
         before = os.stat(victim)
         files = [{"path": self.directory + "/creds", "owner": USER, "content": "a"}]
-        original = agent.os.replace
+        original = agent.os.link
 
-        def swap_then_replace(src, dst, **kwargs):
+        def swap_then_link(src, dst, **kwargs):  # placement links the finished file in, then checks it
             original(src, dst, **kwargs)
             dirfd = kwargs.get("dst_dir_fd")
             os.unlink(dst, dir_fd=dirfd) if dirfd is not None else os.unlink(dst)
             os.symlink(victim, dst, dir_fd=dirfd) if dirfd is not None else os.symlink(victim, dst)
-        agent.os.replace = swap_then_replace
+        agent.os.link = swap_then_link
         try:
             with self.assertRaises(RuntimeError):
                 agent.place_files(bundle(self.directory, files), {}, chown=False)
         finally:
-            agent.os.replace = original
+            agent.os.link = original
         after = os.stat(victim)
         self.assertEqual((before.st_mode, before.st_uid, before.st_mtime_ns), (after.st_mode, after.st_uid, after.st_mtime_ns))
 
@@ -897,6 +905,144 @@ class ClosureRegressionTest(unittest.TestCase):
         docs = runbook()
         self.assertNotIn("including any placed by an install that failed part-way", docs)
         self.assertIn("re-run the install", docs)
+
+
+class FollowUpTest(unittest.TestCase):
+    """#407: the access-audit follow-ups from the #378 review."""
+
+    def setUp(self):
+        self.directory = os.path.realpath(tempfile.mkdtemp())
+
+    # Event-handler loop: the handler's own opens are the agent's own work.
+    def test_reports_from_the_handlers_process_tree_go_nowhere(self):
+        runner = agent.HandlerRunner("/etc/x/event_handler", lambda report: None, is_safe=lambda path: True)
+        submitted = []
+        dispatch = agent.make_dispatch(submitted.append, runner)
+        runner.active.add(4242)
+        dispatch({"kind": "file-read", "path": "/p", "pid": 4242})
+        dispatch({"kind": "file-read", "path": "/p", "pid": 9, "ancestry": [{"pid": 9, "start": "1"}, {"pid": 4242, "start": "2"}]})
+        self.assertEqual(submitted, [])
+        self.assertTrue(runner.queue.empty())
+        dispatch({"kind": "file-read", "path": "/p", "pid": 77, "ancestry": [{"pid": 77, "start": "1"}]})
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(runner.queue.qsize(), 1)
+
+    def test_a_running_handler_is_tracked_only_while_it_runs(self):
+        import threading
+        script = Path(self.directory) / "handler"
+        script.write_text("#!/bin/sh\ncat >/dev/null\nsleep 1\n")
+        script.chmod(0o700)
+        runner = agent.HandlerRunner(str(script), lambda report: None, is_safe=lambda path: True)
+        worker = threading.Thread(target=runner._run, args=(b"{}",))
+        worker.start()
+        deadline = time.monotonic() + 5
+        while not runner.active and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(runner.active), 1)
+        worker.join(10)
+        self.assertEqual(runner.active, set())
+
+    # Reinstall: the running agent is stopped before its files are replaced.
+    def test_pause_stops_the_running_agent_on_each_platform(self):
+        calls = []
+        original = agent.subprocess.run
+        agent.subprocess.run = lambda args, **kwargs: calls.append(args)
+        try:
+            layout = agent.Layout("widgetd", "local.widgetd")
+            agent.pause_service(layout, "linux")
+            agent.pause_service(layout, "darwin")
+        finally:
+            agent.subprocess.run = original
+        self.assertEqual(calls, [["systemctl", "stop", "widgetd"], ["launchctl", "bootout", "system/local.widgetd"],
+                                 ["launchctl", "bootout", "system/local.widgetd.helper"]])
+
+    def test_install_pauses_an_existing_agent_before_it_touches_any_file(self):
+        import inspect
+        source = inspect.getsource(agent.command_install)
+        self.assertIn("if previous:\n        pause_service(layout, platform_name())", source)
+        self.assertLess(source.index("pause_service("), source.index("place_files("))
+
+    # Uninstall: reached through descriptors, never through a symlinked parent.
+    def test_remove_never_follows_a_symlinked_parent(self):
+        state = agent.place_files(bundle(self.directory), {}, chown=False)
+        creds = self.directory + "/a/b/creds"
+        elsewhere = os.path.realpath(tempfile.mkdtemp())
+        os.makedirs(elsewhere + "/b")
+        Path(elsewhere + "/b/creds").write_text(Path(creds).read_text())  # same content, someone else's file
+        os.rename(self.directory + "/a", self.directory + "/a-moved")
+        owner_made_symlink(elsewhere, self.directory + "/a")
+        agent.remove_placed(creds, state["files"][creds])
+        self.assertTrue(os.path.exists(elsewhere + "/b/creds"))
+        agent.remove_created_dir(self.directory + "/a/b")
+        self.assertTrue(os.path.isdir(elsewhere + "/b"))
+
+    def test_remove_takes_only_the_unchanged_file(self):
+        state = agent.place_files(bundle(self.directory), {}, chown=False)
+        creds, notes = self.directory + "/a/b/creds", self.directory + "/notes"
+        with open(notes, "a") as handle:
+            handle.write("edited")
+        agent.remove_placed(creds, state["files"][creds])
+        agent.remove_placed(notes, state["files"][notes])
+        self.assertFalse(os.path.exists(creds))
+        self.assertTrue(os.path.exists(notes))
+        agent.remove_created_dir(self.directory + "/a/b")
+        agent.remove_created_dir(self.directory + "/a")
+        self.assertFalse(os.path.exists(self.directory + "/a"))
+
+    # A retained dead-letter message holds the alarm: the runbook says how to clear it.
+    def test_runbook_says_to_empty_the_dead_letter_queue_after_a_failure(self):
+        text = runbook()
+        for phrase in ("access-audit-forward-dlq", "security-central-delivery-dlq", "security-delivery-QueuedEvents",
+                       "aws sqs purge-queue"):
+            self.assertIn(phrase, text)
+
+    def test_a_fifo_in_place_of_a_placed_file_is_left_and_never_blocks(self):
+        # The stat said "regular file" and a FIFO was swapped in before the open: the open must not block.
+        Path(self.directory + "/regular").write_text("x")
+        regular = os.stat(self.directory + "/regular")
+        dirfd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        original = agent.os.stat
+        agent.os.stat = lambda name, **kwargs: regular if name == "pipe" else original(name, **kwargs)
+        try:
+            os.mkfifo("pipe", 0o600, dir_fd=dirfd)
+            self.assertFalse(agent.placed_unchanged(dirfd, "pipe", "0" * 64))
+        finally:
+            agent.os.stat = original
+            os.close(dirfd)
+
+    # Install race: a file the owner creates after the checks is never overwritten.
+    def race(self, previous, make):
+        original = agent.open_parent
+
+        def open_then_race(path, *args, **kwargs):
+            fd = original(path, *args, **kwargs)
+            make(path)
+            return fd
+        agent.open_parent = open_then_race
+        try:
+            with self.assertRaisesRegex(RuntimeError, "refusing to overwrite|changed while"):
+                agent.place_files(bundle(self.directory), previous, chown=False)
+        finally:
+            agent.open_parent = original
+
+    def test_a_file_created_after_the_check_is_not_overwritten(self):
+        def make(path):
+            if not os.path.exists(path):
+                Path(path).write_text("the owner's file")
+        self.race({}, make)
+        self.assertEqual(Path(self.directory + "/a/b/creds").read_text(), "the owner's file")
+
+    def test_a_placed_file_swapped_after_the_check_is_put_back_not_overwritten(self):
+        state = agent.place_files(bundle(self.directory), {}, chown=False)
+        creds = self.directory + "/a/b/creds"
+
+        def make(path):
+            if path == creds:
+                os.unlink(path)
+                Path(path).write_text("the owner's file")
+        self.race(state, make)
+        self.assertEqual(Path(creds).read_text(), "the owner's file")
+        self.assertEqual([n for n in os.listdir(self.directory + "/a/b") if n.startswith((".old-", ".tmp-"))], [])
 
 
 class TerraformRegistryTest(unittest.TestCase):

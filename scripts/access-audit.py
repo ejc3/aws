@@ -825,6 +825,19 @@ class HandlerRunner:
         self.is_safe = is_safe
         self.run = run or self._run
         self.queue = queue.Queue(maxsize=50)
+        # Pids of handler processes running now. A report whose reader or any ancestor is one of
+        # them came from the handler itself (it opened a watched path): it is the agent's own
+        # work, like an open by the agent's pid, so it is neither reported nor offered again,
+        # which would otherwise loop. A pid is only in the set while that process is alive, so
+        # no unrelated process can carry it in its ancestry.
+        self.active = set()
+
+    def owns(self, report):
+        if not self.active:
+            return False
+        pids = {entry.get("pid") for entry in report.get("ancestry", []) if isinstance(entry, dict)}
+        pids.add(report.get("pid"))
+        return bool(pids & self.active)
 
     def offer(self, report):
         if report.get("kind") not in HANDLER_TRIGGERS or not self.is_safe(self.path):
@@ -840,6 +853,7 @@ class HandlerRunner:
         deadline = time.monotonic() + HANDLER_TIMEOUT
         process = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
+        self.active.add(process.pid)
         try:
             # Writing the event and reading the result share one deadline, so a handler that
             # never reads its stdin cannot block the writer either.
@@ -881,6 +895,7 @@ class HandlerRunner:
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            self.active.discard(process.pid)
             process.stdout.close()
             if not process.stdin.closed:
                 try:
@@ -1039,9 +1054,63 @@ def open_parent(path, owner, chown, created):
         raise
 
 
-def write_placed(dirfd, name, data, mode, owner, chown, stamp):
+def open_existing_parent(path):
+    """Like open_parent, for a path that should already exist: walk from '/' one component at a
+    time with O_NOFOLLOW (the same narrow symlink exception), create nothing. Raises
+    FileNotFoundError if a directory is gone, RuntimeError for a symlink the owner could have made."""
+    fd = os.open("/", DIRECTORY_FLAGS)
+    current = ""
+    try:
+        for name in [part for part in os.path.dirname(path).split("/") if part]:
+            current += "/" + name
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISLNK(st.st_mode):
+                parent = os.fstat(fd)
+                if parent.st_uid != 0 or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or st.st_uid != 0:
+                    raise RuntimeError("refusing a symlink in a registered path: " + current)
+                child = os.open(name, DIRECTORY_FLAGS, dir_fd=fd)
+            else:
+                child = os.open(name, DIRECTORY_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def placed_unchanged(dirfd, name, sha256):
+    """True if `name` in `dirfd` is a regular file (not a symlink) whose content hashes to `sha256`,
+    checked on the descriptor actually opened."""
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    # O_NONBLOCK: a FIFO swapped in after the stat would otherwise hang this (root) open forever.
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            return False
+        data, chunk = b"", b"x"
+        while chunk and len(data) <= MAX_FILE_BYTES:
+            chunk = os.read(fd, MAX_FILE_BYTES + 1 - len(data))
+            data += chunk
+    finally:
+        os.close(fd)
+    return (opened.st_dev, opened.st_ino) == (st.st_dev, st.st_ino) and hashlib.sha256(data).hexdigest() == sha256
+
+
+def write_placed(dirfd, name, data, mode, owner, chown, stamp, replace_sha256=None):
     """Write one registered file inside `dirfd`. Mode, owner and times are set on the open
-    descriptor before the rename, and the result is checked to be that same file."""
+    descriptor before it is linked in, and the result is checked to be that same file.
+
+    Nothing an owner made is ever overwritten, even if it appears after the install's checks: a
+    new path is linked in with link(2), which fails if the name exists. A path this agent placed
+    before (`replace_sha256` is its recorded content) is first renamed aside and checked to be
+    that unchanged file; anything else is put back and the install stops."""
     temporary = ".tmp-" + secrets.token_hex(8)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
     try:
@@ -1052,7 +1121,29 @@ def write_placed(dirfd, name, data, mode, owner, chown, stamp):
             os.fchown(fd, owner.pw_uid, owner.pw_gid)
         os.fchmod(fd, mode)
         os.utime(fd, (stamp, stamp))
-        os.replace(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        aside = None
+        if replace_sha256 is not None:
+            aside = ".old-" + secrets.token_hex(8)
+            try:
+                os.rename(name, aside, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            except FileNotFoundError:
+                aside = None  # gone since the check: nothing to displace
+            else:
+                if not placed_unchanged(dirfd, aside, replace_sha256):
+                    try:
+                        os.link(aside, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+                        os.unlink(aside, dir_fd=dirfd)
+                    except OSError:
+                        raise RuntimeError("a registered path changed while it was being placed; the owner's file is "
+                                           "left as " + aside) from None
+                    raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name)
+        try:
+            os.link(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+        except FileExistsError:
+            raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name) from None
+        os.unlink(temporary, dir_fd=dirfd)
+        if aside is not None:
+            os.unlink(aside, dir_fd=dirfd)
         written = os.fstat(fd)
         st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
         if (st.st_dev, st.st_ino) != (written.st_dev, written.st_ino):
@@ -1097,7 +1188,8 @@ def place_files(bundle, previous, chown=True, keygen=generate_ssh_key, save=None
         dirfd = open_parent(path, owner, chown, created_dirs)
         try:
             stamp = time.time() - item.get("age_days", 120) * 86400 - secrets.randbelow(86400)
-            stamped = write_placed(dirfd, os.path.basename(path), data, int(item.get("mode", "0600"), 8), owner, chown, stamp)
+            stamped = write_placed(dirfd, os.path.basename(path), data, int(item.get("mode", "0600"), 8), owner, chown, stamp,
+                                   replace_sha256=placed[path]["sha256"] if path in placed else None)
         finally:
             os.close(dirfd)
         files[path] = {"sha256": hashlib.sha256(data[:MAX_FILE_BYTES + 1]).hexdigest(),
@@ -1110,13 +1202,42 @@ def place_files(bundle, previous, chown=True, keygen=generate_ssh_key, save=None
 
 
 def remove_placed(path, record):
+    """Remove a file this agent placed, only if it is still that unchanged file. Its directories may
+    belong to the file's owner, so it is reached through directory descriptors (never by name),
+    the check and the unlink use the same directory, and a symlink is never followed."""
     try:
-        if sha256_file(path) == record["sha256"]:
-            os.unlink(path)
+        dirfd = open_existing_parent(path)
+    except FileNotFoundError:
+        return
+    except RuntimeError as error:
+        log("left a registered path in place: " + str(error))
+        return
+    try:
+        name = os.path.basename(path)
+        try:
+            os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if placed_unchanged(dirfd, name, record["sha256"]):
+            os.unlink(name, dir_fd=dirfd)
         else:
             log("left a registered path in place because its content changed: " + path)
-    except FileNotFoundError:
+    finally:
+        os.close(dirfd)
+
+
+def remove_created_dir(path):
+    """rmdir a directory the install created, through its parent's descriptor; only if empty."""
+    try:
+        parent = open_existing_parent(path)
+    except (FileNotFoundError, RuntimeError):
+        return
+    try:
+        os.rmdir(os.path.basename(path), dir_fd=parent)
+    except OSError:
         pass
+    finally:
+        os.close(parent)
 
 
 def install_service(layout, platform):
@@ -1173,6 +1294,17 @@ def stop_service(layout, platform):
             pass
 
 
+def pause_service(layout, platform):
+    """Stop a running agent (not disable or remove it) before an install replaces or reads its files:
+    otherwise it reports every replaced inode, and the installer's own reads, as tamper. The
+    install starts it again (install_service)."""
+    if platform == "linux":
+        subprocess.run(["systemctl", "stop", layout.name], capture_output=True)
+    else:
+        for label in (layout.label, layout.helper_label):
+            subprocess.run(["launchctl", "bootout", "system/" + label], capture_output=True)
+
+
 def platform_name():
     return "darwin" if sys.platform == "darwin" else "linux"
 
@@ -1222,6 +1354,8 @@ def command_install():
     if not has_marker(layout):
         write_private(layout.marker, marker_text(layout))
     previous = load_json(layout.state, {})
+    if previous:
+        pause_service(layout, platform_name())
     state = place_files(bundle, previous,
                         save=lambda partial: write_private(layout.state, json.dumps(partial, indent=2, sort_keys=True)))
     platform = platform_name()
@@ -1248,10 +1382,7 @@ def command_uninstall():
     for path, record in state.get("files", {}).items():
         remove_placed(path, record)
     for directory in reversed(state.get("dirs", [])):
-        try:
-            os.rmdir(directory)
-        except OSError:
-            pass
+        remove_created_dir(directory)
     for path in (layout.config, layout.state, layout.agent, layout.marker):
         if os.path.exists(path):
             os.unlink(path)
@@ -1264,6 +1395,17 @@ def command_uninstall():
 
 
 # --- Service -----------------------------------------------------------------
+
+def make_dispatch(submit, handler):
+    """Every sensor and integrity report goes to the reporter and, if it is a trigger, the handler;
+    a report caused by the handler's own process tree goes nowhere (see HandlerRunner.owns)."""
+    def dispatch(report):
+        if handler.owns(report):
+            return
+        submit(report)
+        handler.offer(report)
+    return dispatch
+
 
 def choose_sensor(platform, paths, emit, ignore, fifo):
     build = (lambda: FanotifySensor(paths, emit, ignore)) if platform == "linux" else (lambda: MacSensor(paths, emit, ignore, fifo))
@@ -1289,9 +1431,7 @@ def command_run():
     handler = HandlerRunner(layout.event_handler, reporter.submit)
     threading.Thread(target=handler.run_loop, name="handler", daemon=True).start()
 
-    def dispatch(report):
-        reporter.submit(report)
-        handler.offer(report)
+    dispatch = make_dispatch(reporter.submit, handler)
 
     watched = sorted(os.path.realpath(path) for path, record in state["files"].items() if record["watch"])
     sensor, degraded = choose_sensor(platform_name(), watched, dispatch, config["ignore_executables"], layout.fifo)
