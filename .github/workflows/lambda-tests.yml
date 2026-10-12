@@ -37,6 +37,9 @@ jobs:
       - name: PR and issue watch installer and hook
         run: python3 -B scripts/test-pr-watch.py
 
+      - name: Agent instructions distributed from ejc3/agents-md
+        run: python3 -S -B scripts/test-agents-md.py
+
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 

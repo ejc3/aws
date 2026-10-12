@@ -104,12 +104,7 @@ class InstallerTests(unittest.TestCase):
     def test_rejects_unknown_usage(self):
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(run(["bash", str(INSTALL)], home).returncode, 2)
-            self.assertEqual(run(["bash", str(INSTALL), "--dev-rule"], home).returncode, 2)
-            for bad in (["--as", "x; touch /tmp/pwned"], ["--as", "Root"]):
-                r = run(["bash", str(INSTALL), "--dev-rule", "--ssh", "ubuntu@10.0.0.1", *bad], home)
-                self.assertEqual(r.returncode, 2, bad)
-            r = run(["bash", str(INSTALL), "--dev-rule", "--ssh", "ubuntu@x;id"], home)
-            self.assertEqual(r.returncode, 2)
+            self.assertEqual(run(["bash", str(INSTALL), "--dev-rule"], home).returncode, 2)  # retired: agents-md
 
 
 class SkillTextTests(unittest.TestCase):
@@ -117,17 +112,9 @@ class SkillTextTests(unittest.TestCase):
         skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
-                       "`jobs` map", "-R ejc3/aws --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
-                       "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`"):
+                       "`jobs` map", "-R <repo> --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
+                       "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`"):
             self.assertIn(phrase, skill)
-
-
-class RuleTextTests(unittest.TestCase):
-    def test_dev_boxes_propose_only(self):
-        rule = (ROOT / "scripts/pr-watch/dev-box-rule.md").read_text()
-        for phrase in ("Never merge", "push to `main`", "apply Terraform", "draft", "for the `ejc3/aws` repository only",
-                       "Every other repository works as it always has"):
-            self.assertIn(phrase, rule)
 
 
 if __name__ == "__main__":

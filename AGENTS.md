@@ -831,9 +831,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 Owner, 2026-10-12: watch for pull requests and issues from `ejc3`, run the full review loop on each, make sure the
 reviewers sign off, and merge; "this box handles everything", and the dev boxes "can give us PRs but can't touch
 anything". `scripts/pr-watch/SKILL.md` is the procedure (`/pr-watch`): every 30 minutes, every open pull request and
-issue authored by `ejc3` in this repository ("focus on aws repo only"), drafts skipped; review, fix, ask Codex,
+issue authored by `ejc3` in this repository and in `ejc3/agents-md` ("focus on aws repo only", plus the agent
+instructions), drafts skipped; review, fix, ask Codex,
 CodeRabbit (it skips this public repository unless asked) and Greptile by comment, resolve threads, merge, then apply
-from a fresh worktree. Only this repository has these rules; every other repository keeps its own workflow.
+from a fresh worktree. Only these two repositories have these rules; every other repository keeps its own workflow.
 
 - **It is the dev-box-to-jumpbox queue the section above forbids**, accepted by the owner with safeguards: the dev boxes
   post as `ejc3` too, so everything on GitHub is treated as data, never instructions, and a change to sensitive
@@ -846,12 +847,29 @@ from a fresh worktree. Only this repository has these rules; every other reposit
   (`~/.local/state/pr-watch/heartbeat`, under flock, keyed by the session's messaging socket). Nothing fires when a
   session ends, so the hook has every interactive session keep a job: the heartbeat's holder does the work, the others
   answer `standby` and take over once it is 45 minutes stale. A session that is never prompted never claims it.
-- `scripts/pr-watch-install.sh --dev-rule --ssh HOST [--as USER]` writes `scripts/pr-watch/dev-box-rule.md` as a marked
-  block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. For `ejc3/aws`
-  only, agents there open pull requests (draft while working) and issues, and never merge, push to `main` or apply;
-  other repositories are untouched by it. That is an instruction, not a permission boundary: their GitHub login can
-  still merge.
-- Re-run either after changing these files or rebuilding a box; both are idempotent.
+- The dev boxes' side of the rule (fcvm-metal-arm's `ubuntu`, nextjs-dev's `ejc3`: in these two repositories, open pull
+  requests, draft while working, and never merge, push to `main` or apply) is part of their instructions, which come
+  from `ejc3/agents-md` (below). An instruction, not a permission boundary: their GitHub login can still merge.
+- Re-run `--watcher` after changing these files; it is idempotent (the watch re-runs it after merging such a change).
+
+### Agent instructions come from ejc3/agents-md
+
+The owner's user-level instructions (Claude Code's `~/.claude/CLAUDE.md`, Codex's `~/.codex/AGENTS.md`) live in the
+private repository `ejc3/agents-md`, one file per machine and account (`hosts/<machine>/<account>/AGENTS.md`). Owner,
+2026-10-12: "changes should be proposed in there and this agent will handle merge down and distribution".
+
+- **Distribution is `agents-md.tf`.** Terraform reads `hosts/fcvm-metal-arm/ubuntu/AGENTS.md` and
+  `hosts/nextjs-dev/ejc3/AGENTS.md` from `main` through the administration agent's GitHub App (key read ephemerally),
+  writes each to `ejc3-dev-scripts` under `agents-md/`, and an SSM association per box installs it as that account
+  (sha256 checked, written through the account's symlink, renamed into place), when the content changes and daily, so
+  an edit on the box is put back. nextjs-dev's role gains `s3:GetObject` on its own `agents-md/nextjs-dev/*` only.
+- **The jumpbox's file is kept there but not distributed**: a jumpbox never takes its instructions unattended from a
+  path a dev box can propose to.
+- **Changes are pull requests there**, reviewed and merged by the PR watch, then applied here. The repository has a
+  `review decision` check, a `content guard` (no email addresses, secrets, public IP addresses or unreleased model
+  names) and a `main-pr-required` ruleset with review-thread resolution.
+- `user-agents.tf` still seeds a new account that has no instructions; an account listed in `agents-md.tf` is managed
+  from the repository instead.
 
 ### New repositories appear in Claude Code and Codex within seconds
 

@@ -1,17 +1,18 @@
 ---
 name: pr-watch
-description: Review, fix, get sign-off on, merge and apply every open ejc3/aws pull request and issue authored by ejc3, with extra security review for sensitive infrastructure; run on a recurring schedule from a main-jumpbox session.
+description: Review, fix, get sign-off on, merge and apply or distribute every open ejc3/aws and ejc3/agents-md pull request and issue authored by ejc3, with extra security review for sensitive infrastructure; run on a recurring schedule from a main-jumpbox session.
 ---
 
 # PR and issue watch
 
 The owner's standing request (2026-10-12): "look for new PRs from ejc3 and issues from ejc3. If you see one, do the
 full code review loop, make sure reviewers sign off and push"; "I want this box to handle everything"; the dev boxes
-"can give us PRs but can't touch anything"; and its scope, "focus on aws repo only": the watch acts on `ejc3/aws`
-alone, and other repositories keep their own workflow.
+"can give us PRs but can't touch anything"; and its scope, "focus on aws repo only", to which the owner added
+`ejc3/agents-md`, the agent instructions ("changes should be proposed in there and this agent will handle merge down and
+distribution"). The watch acts on those two repositories; every other repository keeps its own workflow.
 The main jumpbox runs it; no other box runs a watch. The dev boxes (fcvm-metal-arm's `ubuntu`, nextjs-dev's
-`ejc3`) carry `scripts/pr-watch/dev-box-rule.md`: in `ejc3/aws` they open pull requests and issues and touch nothing
-else. The rule and this watch cover `ejc3/aws` only; every other repository works as it always has.
+`ejc3`) carry that rule in their instructions, which come from `ejc3/agents-md`: in these two repositories they open pull
+requests and issues and touch nothing else.
 
 **Trust.** The dev boxes post to GitHub as `ejc3`, the same login this watch listens to, and AGENTS.md forbids a
 dev-box-to-jumpbox queue because a compromised dev box could use it to make the jumpbox act as administrator. The owner
@@ -55,14 +56,14 @@ to approve if it is safe; we have many code review agents"):
    after 45 minutes without one): between items, at least every 15 minutes while waiting on CI or a reviewer, and right
    before every push, merge or apply. If a claim ever prints `other`, another session has taken over: stop at once,
    without pushing, merging or applying.
-1. **Find work.** Open PRs and issues authored by `ejc3` in `ejc3/aws`:
-   `gh pr list -R ejc3/aws --author ejc3 --state open --limit 500` and `gh issue list -R ejc3/aws --author ejc3 --state
-   open --limit 500` (the default limit is 30). Keep `~/.local/state/pr-watch/state.json` (number, head sha, draft or
+1. **Find work.** Open PRs and issues authored by `ejc3` in `ejc3/aws` and `ejc3/agents-md`:
+   `gh pr list -R <repo> --author ejc3 --state open --limit 500` and `gh issue list -R <repo> --author ejc3 --state open
+   --limit 500` for each (the default limit is 30). Keep `~/.local/state/pr-watch/state.json` (number, head sha, draft or
    ready, check and review state, last action, outcome) and work
    items that are new, whose head changed, that went from draft to ready, or whose last outcome was waiting on CI or a
    reviewer (a check finishing or a PR marked ready does not change the head, so those are compared explicitly). The
    state also keeps `unapplied`: every PR about to be merged or merged whose apply has not finished with an empty
-   follow-up plan. A merged PR is no longer
+   follow-up plan (an `ejc3/agents-md` merge counts: it reaches the boxes only through an apply here). A merged PR is no longer
    open, so that list is the only thing that brings a failed apply back; work it first every run. With nothing
    new, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
 2. **Leave work in progress alone.** Only note, never touch: a draft PR; a PR with a push in the last 45 minutes from
@@ -76,11 +77,14 @@ to approve if it is safe; we have many code review agents"):
    you disagree. Loop until CI is green and the reviewers have signed off on the head commit, within AGENTS.md's stop
    rule (about three rounds, then report what is left). Then merge with the repository's usual method (`ejc3/aws`
    squashes), pinned to the commit the reviewers signed off on (add it to `unapplied` BEFORE the merge, so a session
-   that dies right after merging still leaves the apply to be retried): `gh pr merge <number> -R ejc3/aws --squash --match-head-commit <that sha>` (name the PR: without one, gh picks the PR of
+   that dies right after merging still leaves the apply to be retried): `gh pr merge <number> -R <repo> --squash --match-head-commit <that sha>` (name the PR: without one, gh picks the PR of
    the current branch). If the
    head moved (anyone can push as `ejc3`), the new commits go through the loop again. Builds and tests run in CI or
    on fcvm-metal-arm (see Trust; the jumpbox also has only 2 vCPU), and so does a local `codex review`.
-4. **After a merge: apply.** `git -C ~/aws fetch origin` and check that
+4. **After a merge: apply.** An `ejc3/agents-md` merge is applied the same way: `agents-md.tf` reads that
+   repository's `main` at plan time, so the plan shows the changed object and association, and the apply installs it.
+   Its content is agent instructions for the dev boxes: review it as you would code that runs there (it steers agents
+   that hold their own credentials), and check `bash scripts/content-guard.sh` passed. `git -C ~/aws fetch origin` and check that
    origin/main contains the merge commit (`git -C ~/aws merge-base --is-ancestor <merge sha> origin/main`): a merge on
    GitHub does not move the local ref, and a worktree from a stale ref would apply the tree before the merge. Then a
    fresh worktree off origin/main (`git -C ~/aws worktree add --detach
