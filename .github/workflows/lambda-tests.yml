@@ -169,6 +169,8 @@ jobs:
 
       - name: dolphin-films Vercel environment (written by Terraform, behind a gate, a token of its own)
         run: python3 -S -B scripts/test-dolphin-films-vercel.py
+      - name: dolphin-maps loops (schedules off and in Los Angeles time, the app's secret for the function only, deploy from main)
+        run: python3 -S -B scripts/test-dolphin-maps-loop.py
 
       - name: Windows playtest box (dev-box-only access, no peer route, kept game disk, 1h idle stop)
         run: python3 -S -B scripts/test-wbox.py
