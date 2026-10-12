@@ -34,6 +34,9 @@ jobs:
       - name: Security group descriptions use only characters EC2 accepts
         run: python3 -S -B scripts/test-sg-descriptions.py
 
+      - name: PR and issue watch installer and hook
+        run: python3 -B scripts/test-pr-watch.py
+
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 

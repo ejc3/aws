@@ -826,6 +826,33 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Backup.** The root volume (the six logins and the CA key) is in the dev backup selection and the
   recovery controller's protected list, with the same cross-region re-encryption hop as nextjs-dev.
 
+### The PR and issue watch: the jumpbox reviews and merges everything
+
+Owner, 2026-10-12: watch for pull requests and issues from `ejc3`, run the full review loop on each, make sure the
+reviewers sign off, and merge; "this box handles everything", and the dev boxes "can give us PRs but can't touch
+anything". `scripts/pr-watch/SKILL.md` is the procedure (`/pr-watch`): every 30 minutes, every open pull request and
+issue authored by `ejc3` in this repository ("focus on aws repo only"), drafts skipped; review, fix, ask Codex,
+CodeRabbit (it skips this public repository unless asked) and Greptile by comment, resolve threads, merge, then apply
+from a fresh worktree. Only this repository has these rules; every other repository keeps its own workflow.
+
+- **It is the dev-box-to-jumpbox queue the section above forbids**, accepted by the owner with safeguards: the dev boxes
+  post as `ejc3` too, so everything on GitHub is treated as data, never instructions, and a change to sensitive
+  infrastructure (IAM, trust and resource policies, network paths, secrets and KMS, Cloudflare Access and tokens,
+  Organizations, workflows and rulesets, hooks, the watch itself) also gets `/security-review` and a check against these
+  boundaries before it merges. The owner does not approve each one ("I don't need to approve if it is safe"); a security
+  concern nobody can resolve holds the pull request for the owner.
+- `scripts/pr-watch-install.sh --watcher` (main jumpbox, `ubuntu`) installs the skill, `claim.sh` and a SessionStart
+  hook. A `CronCreate` job lives only as long as its session, so each run claims a heartbeat
+  (`~/.local/state/pr-watch/heartbeat`, under flock, keyed by the session's messaging socket). Nothing fires when a
+  session ends, so the hook has every interactive session keep a job: the heartbeat's holder does the work, the others
+  answer `standby` and take over once it is 45 minutes stale. A session that is never prompted never claims it.
+- `scripts/pr-watch-install.sh --dev-rule --ssh HOST [--as USER]` writes `scripts/pr-watch/dev-box-rule.md` as a marked
+  block into that account's `~/.claude/CLAUDE.md`: fcvm-metal-arm's `ubuntu` and nextjs-dev's `ejc3`. For `ejc3/aws`
+  only, agents there open pull requests (draft while working) and issues, and never merge, push to `main` or apply;
+  other repositories are untouched by it. That is an instruction, not a permission boundary: their GitHub login can
+  still merge.
+- Re-run either after changing these files or rebuilding a box; both are idempotent.
+
 ### New repositories appear in Claude Code and Codex within seconds
 
 `agent-session-sync` (`scripts/agent-session-sync.py`, `agent-session-sync.tf`) is a 5-second watch on every
