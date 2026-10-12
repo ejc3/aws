@@ -216,6 +216,46 @@ resource "aws_cloudwatch_event_target" "access_audit_forward" {
   target_id = "access-audit-bus"
   arn       = aws_cloudwatch_event_bus.access_audit.arn
   role_arn  = aws_iam_role.access_audit_forward.arn
+  # A failed forward lands in that Region's DLQ, which the security delivery observer reads every five minutes
+  # (security-monitoring.tf, EXTRA_QUEUES): its depth is QueuedEvents, alarmed by security-delivery-QueuedEvents.
+  # An alarm on this bus's notify rule cannot see a forward that never reached the bus.
+  dead_letter_config { arn = aws_sqs_queue.access_audit_forward_dlq[each.key].arn }
+  depends_on = [aws_sqs_queue_policy.access_audit_forward_dlq]
+}
+
+# A DLQ must be in its rule's Region. Failed events are kept for recovery, never consumed automatically.
+resource "aws_sqs_queue" "access_audit_forward_dlq" {
+  for_each                  = aws_cloudwatch_event_rule.access_audit_forward
+  region                    = each.key
+  name                      = "access-audit-forward-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+  tags                      = { Managed = "terraform", Purpose = "access-audit" }
+}
+
+resource "aws_sqs_queue_policy" "access_audit_forward_dlq" {
+  for_each  = aws_sqs_queue.access_audit_forward_dlq
+  region    = each.key
+  queue_url = each.value.url
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = each.value.arn
+        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.access_audit_forward[each.key].arn } }
+      },
+      {
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "sqs:*"
+        Resource  = each.value.arn
+        Condition = { Bool = { "aws:SecureTransport" = "false", "aws:PrincipalIsAWSService" = "false" } }
+      }
+    ]
+  })
 }
 
 resource "aws_cloudwatch_event_rule" "access_audit_notify" {

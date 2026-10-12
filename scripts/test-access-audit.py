@@ -355,6 +355,35 @@ class ReporterTest(unittest.TestCase):
         self.reporter.deliver({"kind": "tamper", "reason": "x", "host": "example-host"})
         self.assertEqual(self.client.calls[-1][3]["emails_suppressed_before"], 3)
 
+    def test_deliver_reports_each_destination(self):
+        results = self.reporter.deliver({"kind": "test", "host": "example-host"})
+        self.assertEqual(results, {"log": True, "metrics": True, "email": True})
+
+    def test_test_alert_fails_when_a_destination_does_not_take_it(self):
+        class Layout:
+            name, config = "widgetd", "/nonexistent/config.json"
+        clients = []
+        class Broken(FakeClient):
+            def publish(self, topic, subject, message):
+                raise RuntimeError("SNS refused")
+        def run(client_type):
+            originals = (agent.require_root, agent.Layout.installed, agent.load_json, agent.AwsClient, agent.Reporter.retry)
+            retry = agent.Reporter.retry
+            agent.require_root = lambda: None
+            agent.Layout.installed = staticmethod(lambda: Layout())
+            agent.load_json = lambda path, default: {"host": "example-host", "namespace": "AccessAudit", "log_group": "/g",
+                                                     "topic_arn": "arn:t", "reporter": {}, "region": "us-west-1"}
+            agent.AwsClient = lambda creds, region: clients.append(client_type()) or clients[-1]
+            agent.Reporter.retry = staticmethod(lambda action, attempts=5, sleep=None: retry(action, attempts, sleep=lambda _: None))
+            try:
+                agent.command_test_alert()
+            finally:
+                (agent.require_root, agent.Layout.installed, agent.load_json, agent.AwsClient, agent.Reporter.retry) = originals
+        run(FakeClient)  # every destination takes it: no exception
+        with self.assertRaises(SystemExit) as raised:
+            run(Broken)
+        self.assertIn("NOT delivered to: email", str(raised.exception))
+
     def test_retry_survives_transient_errors(self):
         self.client.fail = 2
         self.assertTrue(agent.Reporter.retry(lambda: self.client.publish("t", "s", "{}"), sleep=lambda _: None))

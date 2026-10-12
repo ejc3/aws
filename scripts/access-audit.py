@@ -271,10 +271,10 @@ class Reporter:
         return True
 
     def deliver(self, report):
+        """Send one report; returns {destination: True/False} (email is None when rate-limited)."""
         config = self.config
         if report["kind"] == "heartbeat":
-            self.retry(lambda: self.client.put_metrics(config["namespace"], [("Heartbeat", {"Host": config["host"]})]))
-            return
+            return {"metrics": self.retry(lambda: self.client.put_metrics(config["namespace"], [("Heartbeat", {"Host": config["host"]})]))}
         with self.lock:
             if self.dropped:
                 report["dropped_before"] = self.dropped
@@ -283,12 +283,14 @@ class Reporter:
             report["emails_suppressed_before"] = self.suppressed
         message = json.dumps(report, sort_keys=True)
         metric = METRIC_FOR_KIND[report["kind"]]
-        self.retry(lambda: self.client.put_log(config["log_group"], config["host"], message))
-        self.retry(lambda: self.client.put_metrics(config["namespace"], [(metric, {}), (metric, {"Host": config["host"]})]))
+        results = {"log": self.retry(lambda: self.client.put_log(config["log_group"], config["host"], message)),
+                   "metrics": self.retry(lambda: self.client.put_metrics(config["namespace"], [(metric, {}), (metric, {"Host": config["host"]})])),
+                   "email": None}
         if self.allow_email():
             if "emails_suppressed_before" in report:
                 self.suppressed = 0
-            self.retry(lambda: self.client.publish(config["topic_arn"], subject_for(report), json.dumps(report, indent=2, sort_keys=True)))
+            results["email"] = self.retry(lambda: self.client.publish(config["topic_arn"], subject_for(report), json.dumps(report, indent=2, sort_keys=True)))
+        return results
 
     @staticmethod
     def retry(action, attempts=5, sleep=time.sleep):
@@ -1251,10 +1253,14 @@ def command_test_alert():
     if not config:
         raise SystemExit(layout.name + ": not installed")
     reporter = Reporter(config, AwsClient(config["reporter"], config["region"]))
-    reporter.deliver({"kind": "test", "host": config["host"],
-                      "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-                      "note": "operator-initiated test; no registered path was opened"})
-    print(layout.name + ": test alert sent")
+    results = reporter.deliver({"kind": "test", "host": config["host"],
+                                "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                                "note": "operator-initiated test; no registered path was opened"})
+    # The rollout uses this to prove the whole path: every destination must have taken the report.
+    failed = sorted(name for name, ok in results.items() if ok is not True)
+    if failed:
+        raise SystemExit(layout.name + ": test alert NOT delivered to: " + ", ".join(failed))
+    print(layout.name + ": test alert sent (log, metrics, email)")
 
 
 def main(argv):

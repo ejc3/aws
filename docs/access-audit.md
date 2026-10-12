@@ -94,16 +94,19 @@ other private values in this repository.
    pipe it with the agent to the host (directly, or through the dev box that reaches it):
 
    ```bash
-   aws secretsmanager get-secret-value --region us-west-1 --secret-id access-audit/bundles \
-     --query SecretString --output text | jq -c '."example-host"' > bundle.json
-   scp scripts/access-audit.py example-host:/tmp/access-audit.py
-   ssh example-host 'sudo python3 -I /tmp/access-audit.py install && rm /tmp/access-audit.py' < bundle.json
-   shred -u bundle.json
+   # umask 077 in a subshell: bundle.json holds the reporter key, the planted key and any generated SSH private key,
+   # so it is created 0600 and never readable by another account, even before the shred.
+   ( umask 077
+     aws secretsmanager get-secret-value --region us-west-1 --secret-id access-audit/bundles \
+       --query SecretString --output text | jq -c '."example-host"' > bundle.json
+     scp scripts/access-audit.py example-host:/tmp/access-audit.py
+     ssh example-host 'sudo python3 -I /tmp/access-audit.py install && rm /tmp/access-audit.py' < bundle.json
+     shred -u bundle.json )
    ```
 
 5. Prove the delivery path without touching a registered file:
    `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd test-alert` sends one email and
-   log line labelled TEST. With a `service_name`, the path is `/usr/local/libexec/<name>/<name>`.
+   log line labelled TEST, and exits nonzero naming any destination (log, metrics, email) that did not take it. With a `service_name`, the path is `/usr/local/libexec/<name>/<name>`.
 
 Re-running the install replaces only files the agent placed and that are unchanged since.
 `sudo python3 -I /usr/local/libexec/hostmetricsd/hostmetricsd uninstall` stops the service and

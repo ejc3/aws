@@ -548,6 +548,37 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(values["ObserverErrors"], 0)
         self.assertEqual(len(log["unhealthy"]), 2)
 
+    def test_extra_queues_are_read_in_the_main_account_only_and_count_as_queued(self):
+        self.factory.queues[(MAIN, "us-east-1", "access-audit-forward-dlq")] = dict(zip(COUNTERS, ["1", "0", "2"]))
+        values, _ = self.run_handler(["us-east-1"], extra={"EXTRA_QUEUES": json.dumps(["access-audit-forward-dlq"])})
+        self.assertEqual(values["QueuedEvents"], 3)
+        self.assertEqual(values["ObserverErrors"], 0)
+        reads = {(account, kwargs["QueueUrl"].rsplit("/", 1)[1]) for account, _, kwargs in self.factory.queue_reads}
+        self.assertIn((MAIN, "access-audit-forward-dlq"), reads)
+        self.assertNotIn((STAGING, "access-audit-forward-dlq"), reads)
+
+    def test_missing_extra_queue_is_an_error_and_bad_lists_are_refused(self):
+        self.factory.queues[(MAIN, "us-east-1", "access-audit-forward-dlq")] = RuntimeError("missing")
+        values, _ = self.run_handler(["us-east-1"], extra={"EXTRA_QUEUES": json.dumps(["access-audit-forward-dlq"])})
+        self.assertGreaterEqual(values["ObserverErrors"], 1)
+        for bad in ("{}", '["a b"]', '["x","x"]', '["security-findings-delivery-dlq"]', json.dumps(["q%d" % i for i in range(5)])):
+            with self.assertRaises(ValueError, msg=bad):
+                self.run_handler(["us-east-1"], extra={"EXTRA_QUEUES": bad})
+
+    def test_access_audit_forward_targets_have_a_watched_regional_dlq(self):
+        audit = (ROOT / "access-audit.tf").read_text()
+        target = block(audit, "aws_cloudwatch_event_target", "access_audit_forward")
+        self.assertIn("dead_letter_config { arn = aws_sqs_queue.access_audit_forward_dlq[each.key].arn }", target)
+        queue = block(audit, "aws_sqs_queue", "access_audit_forward_dlq")
+        self.assertIn("for_each                  = aws_cloudwatch_event_rule.access_audit_forward", queue)
+        self.assertIn('name                      = "access-audit-forward-dlq"', queue)
+        policy = block(audit, "aws_sqs_queue_policy", "access_audit_forward_dlq")
+        self.assertIn('"aws:SourceArn" = aws_cloudwatch_event_rule.access_audit_forward[each.key].arn', policy)
+        observer = block(TERRAFORM, "aws_lambda_function", "security_delivery_health")
+        self.assertIn('["access-audit-forward-dlq"]', observer)
+        self.assertIn("[for queue in aws_sqs_queue.access_audit_forward_dlq : queue.arn]",
+                      block(TERRAFORM, "aws_iam_role_policy", "security_delivery_health"))
+
     def test_partial_paginated_missing_duplicate_unknown_and_messages_are_errors(self):
         def partial(response):
             response["MetricDataResults"][0]["StatusCode"] = "PartialData"
