@@ -58,7 +58,8 @@ to approve if it is safe; we have many code review agents"):
    without pushing, merging or applying.
 1. **Find work.** Open PRs and issues authored by `ejc3` in `ejc3/aws` and `ejc3/agents-md`:
    `gh pr list -R <repo> --author ejc3 --state open --limit 500` and `gh issue list -R <repo> --author ejc3 --state open
-   --limit 500` for each (the default limit is 30). Keep `~/.local/state/pr-watch/state.json` (number, head sha, draft or
+   --limit 500` for each (the default limit is 30). Keep `~/.local/state/pr-watch/state.json`, every item and every `unapplied` entry keyed by `<repo>#<number>` (both
+   repositories have the same numbers) (head sha, draft or
    ready, check and review state, last action, outcome) and work
    items that are new, whose head changed, that went from draft to ready, or whose last outcome was waiting on CI or a
    reviewer (a check finishing or a PR marked ready does not change the head, so those are compared explicitly). The
