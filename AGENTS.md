@@ -855,7 +855,7 @@ from a fresh worktree. Only these two repositories have these rules; every other
 ### Agent instructions come from ejc3/agents-md
 
 The owner's user-level instructions (Claude Code's `~/.claude/CLAUDE.md`, Codex's `~/.codex/AGENTS.md`) live in the
-private repository `ejc3/agents-md`, one file per machine and account (`hosts/<machine>/<account>/AGENTS.md`). Owner,
+public repository `ejc3/agents-md`, one file per machine and account (`hosts/<machine>/<account>/AGENTS.md`). Owner,
 2026-10-12: "changes should be proposed in there and this agent will handle merge down and distribution".
 
 - **Distribution is `agents-md.tf`.** Terraform reads `hosts/fcvm-metal-arm/ubuntu/AGENTS.md` and

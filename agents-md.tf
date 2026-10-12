@@ -1,6 +1,6 @@
 # agents-md.tf
 #
-# The owner's user-level agent instructions live in the private repository ejc3/agents-md (owner, 2026-10-12: changes
+# The owner's user-level agent instructions live in the public repository ejc3/agents-md (owner, 2026-10-12: changes
 # are proposed there, this jumpbox's agent merges them and distributes them). Terraform reads each automatically
 # distributed file from that repository's main branch, puts it in the dev-scripts bucket, and an SSM association
 # installs it on its machine as its account, replacing what is there:
@@ -22,7 +22,7 @@ locals {
   agents_md_github_app = jsondecode(ephemeral.aws_secretsmanager_secret_version.agents_md_github_app.secret_string)
 }
 
-# The administration agent's GitHub App (github-admin-tokens.tf), installed on the ejc3 account, reads the private
+# The administration agent's GitHub App (github-admin-tokens.tf), installed on the ejc3 account, reads the
 # repository. Read ephemerally: the key is never in state.
 ephemeral "aws_secretsmanager_secret_version" "agents_md_github_app" {
   secret_id = aws_secretsmanager_secret.github_app_admin.id
