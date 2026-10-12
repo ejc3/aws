@@ -31,13 +31,19 @@ watcher)
   mkdir -p ~/.claude/skills/pr-watch ~/.local/share/pr-watch
   install -m 0644 "$here/pr-watch/SKILL.md" ~/.claude/skills/pr-watch/SKILL.md
   install -m 0755 "$here/pr-watch/session-start.sh" ~/.local/share/pr-watch/session-start.sh
-  settings=~/.claude/settings.json
-  [ -f "$settings" ] || echo '{}' >"$settings"
+  install -m 0755 "$here/pr-watch/claim.sh" ~/.local/share/pr-watch/claim.sh
+  # Write through a symlinked settings.json rather than replacing the link.
+  settings=$(readlink -f ~/.claude/settings.json 2>/dev/null || echo ~/.claude/settings.json)
+  [ -s "$settings" ] || echo '{}' >"$settings"
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  # Drop only our own hook entries (a hook without a command, such as a prompt hook, is kept), then add ours once.
   jq --arg cmd "bash $HOME/.local/share/pr-watch/session-start.sh" '
-    .hooks.SessionStart = ([(.hooks.SessionStart // [])[] | select(([.hooks[]?.command] | map(test("pr-watch")) | any) | not)]
+    .hooks.SessionStart = ([(.hooks.SessionStart // [])[]
+        | .hooks = [.hooks[]? | select(((.command // "") | test("pr-watch/session-start")) | not)]
+        | select((.hooks | length) > 0)]
       + [{hooks: [{type: "command", command: $cmd, timeout: 10}]}])' "$settings" >"$tmp"
-  mv "$tmp" "$settings"
+  cat "$tmp" >"$settings"
   echo "installed the pr-watch skill and SessionStart hook for $(id -un)"
   ;;
 dev-rule)

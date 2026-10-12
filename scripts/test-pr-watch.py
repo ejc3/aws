@@ -18,38 +18,59 @@ def run(cmd, home, **kw):
     return subprocess.run(cmd, env=env, capture_output=True, text=True, **kw)
 
 
+CLAIM = ROOT / "scripts/pr-watch/claim.sh"
+
+
+class ClaimTests(unittest.TestCase):
+    def claim(self, home, me, *args, **env):
+        e = dict(os.environ, HOME=str(home), CLAUDE_CODE_MESSAGING_SOCKET=me, **env)
+        return subprocess.run(["bash", str(CLAIM), *args], env=e, capture_output=True, text=True).stdout.strip()
+
+    def test_first_claim_owns_and_another_session_is_turned_away_while_fresh(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(self.claim(home, "/s/a", "status"), "stale")
+            self.assertEqual(self.claim(home, "/s/a", "claim"), "owner")
+            self.assertEqual(self.claim(home, "/s/a", "claim"), "owner")  # refreshing keeps it
+            self.assertEqual(self.claim(home, "/s/b", "claim"), "other")
+            self.assertEqual(self.claim(home, "/s/b", "status"), "fresh")
+
+    def test_a_stale_heartbeat_is_taken_over(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(self.claim(home, "/s/a", "claim"), "owner")
+            beat = pathlib.Path(home) / ".local/state/pr-watch/heartbeat"
+            beat.write_text("%d /s/a\n" % (time.time() - 2701))
+            self.assertEqual(self.claim(home, "/s/b", "status"), "stale")
+            self.assertEqual(self.claim(home, "/s/b", "claim"), "owner")
+            self.assertEqual(self.claim(home, "/s/a", "claim"), "other")
+
+    def test_racing_sessions_get_exactly_one_owner(self):
+        with tempfile.TemporaryDirectory() as home:
+            procs = [subprocess.Popen(["bash", str(CLAIM), "claim"], stdout=subprocess.PIPE, text=True,
+                                      env=dict(os.environ, HOME=home, CLAUDE_CODE_MESSAGING_SOCKET="/s/%d" % i))
+                     for i in range(8)]
+            results = [p.communicate()[0].strip() for p in procs]
+            self.assertEqual(results.count("owner"), 1, results)
+            self.assertEqual(results.count("other"), 7, results)
+
+    def test_a_garbled_heartbeat_counts_as_stale(self):
+        with tempfile.TemporaryDirectory() as home:
+            state = pathlib.Path(home) / ".local/state/pr-watch"
+            state.mkdir(parents=True)
+            (state / "heartbeat").write_text("not-a-time /s/a\n")
+            self.assertEqual(self.claim(home, "/s/b", "claim"), "owner")
+
+
 class HookTests(unittest.TestCase):
-    def test_first_session_owns_the_watch_and_a_live_owner_silences_others(self):
+    def test_hook_asks_only_when_the_watch_is_stale_and_records_nothing(self):
         with tempfile.TemporaryDirectory() as home:
             first = run(["bash", str(HOOK)], home, input="{}")
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertIn("/pr-watch", json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"])
-            # A live process whose command line names claude owns it: another session is told nothing.
-            fake = subprocess.Popen(["bash", "-c", "exec -a claude-fake sleep 30"])
-            try:
-                time.sleep(0.2)
-                (pathlib.Path(home) / ".local/state/pr-watch/owner").write_text(f"{fake.pid}\n")
-                second = run(["bash", str(HOOK)], home, input="{}")
-                self.assertEqual(second.returncode, 0, second.stderr)
-                self.assertEqual(second.stdout, "")
-            finally:
-                fake.kill()
-                fake.wait()
-            # Once the owner is gone, the next session takes over.
-            third = run(["bash", str(HOOK)], home, input="{}")
-            self.assertIn("/pr-watch", third.stdout)
-
-    def test_a_reused_pid_that_is_not_claude_does_not_keep_ownership(self):
-        with tempfile.TemporaryDirectory() as home:
-            other = subprocess.Popen(["sleep", "30"])
-            try:
-                state = pathlib.Path(home) / ".local/state/pr-watch"
-                state.mkdir(parents=True)
-                (state / "owner").write_text(f"{other.pid}\n")
-                self.assertIn("/pr-watch", run(["bash", str(HOOK)], home, input="{}").stdout)
-            finally:
-                other.kill()
-                other.wait()
+            self.assertFalse((pathlib.Path(home) / ".local/state/pr-watch/heartbeat").exists())  # no claim by the hook
+            env = dict(os.environ, HOME=home, CLAUDE_CODE_MESSAGING_SOCKET="/s/owner")
+            subprocess.run(["bash", str(CLAIM), "claim"], env=env, check=True, capture_output=True)
+            second = run(["bash", str(HOOK)], home, input="{}")
+            self.assertEqual(second.stdout, "")
 
 
 class InstallerTests(unittest.TestCase):
@@ -58,24 +79,39 @@ class InstallerTests(unittest.TestCase):
             claude = pathlib.Path(home) / ".claude"
             claude.mkdir()
             existing = {"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "keep-me"}]}],
-                                  "SessionStart": [{"hooks": [{"type": "command", "command": "other-start"}]}]},
+                                  "SessionStart": [{"hooks": [{"type": "command", "command": "other-start"},
+                                                              {"type": "prompt", "prompt": "a prompt hook"}]}]},
                         "model": "example-model"}
-            (claude / "settings.json").write_text(json.dumps(existing))
+            real = pathlib.Path(home) / "dotfiles-settings.json"
+            real.write_text(json.dumps(existing))
+            (claude / "settings.json").symlink_to(real)
             for _ in range(2):
                 result = run(["bash", str(INSTALL), "--watcher"], home)
                 self.assertEqual(result.returncode, 0, result.stderr)
-            settings = json.loads((claude / "settings.json").read_text())
+            self.assertTrue((claude / "settings.json").is_symlink())  # written through, link kept
+            settings = json.loads(real.read_text())
             self.assertEqual(settings["model"], "example-model")
             self.assertEqual(settings["hooks"]["PreToolUse"], existing["hooks"]["PreToolUse"])
-            commands = [h["command"] for group in settings["hooks"]["SessionStart"] for h in group["hooks"]]
+            commands = [h["command"] for group in settings["hooks"]["SessionStart"] for h in group["hooks"] if "command" in h]
             self.assertEqual(commands.count("other-start"), 1)
+            prompts = [h for group in settings["hooks"]["SessionStart"] for h in group["hooks"] if h["type"] == "prompt"]
+            self.assertEqual(len(prompts), 1)
             self.assertEqual(len([c for c in commands if "pr-watch" in c]), 1)
             self.assertTrue((claude / "skills/pr-watch/SKILL.md").is_file())
+            self.assertTrue((pathlib.Path(home) / ".local/share/pr-watch/claim.sh").is_file())
 
     def test_rejects_unknown_usage(self):
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(run(["bash", str(INSTALL)], home).returncode, 2)
             self.assertEqual(run(["bash", str(INSTALL), "--dev-rule"], home).returncode, 2)
+
+
+class SkillTextTests(unittest.TestCase):
+    def test_github_text_is_data_and_sensitive_infra_gets_a_security_review(self):
+        skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
+        for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
+                       "@greptileai review", "Held for the owner"):
+            self.assertIn(phrase, skill)
 
 
 class RuleTextTests(unittest.TestCase):

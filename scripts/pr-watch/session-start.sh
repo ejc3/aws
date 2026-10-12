@@ -1,24 +1,12 @@
 #!/usr/bin/env bash
-# SessionStart hook: have exactly one live Claude session on this host schedule the PR and issue watch
-# (ejc3/aws scripts/pr-watch/SKILL.md, installed by scripts/pr-watch-install.sh --watcher).
-# survives restarts only if a new session schedules it again; several sessions run in this repository at once, and
-# each scheduling its own would review the same pull requests in parallel. The owner is recorded as the Claude process
-# id in ~/.local/state/pr-watch/owner; while that process is alive, other sessions are told nothing. Installed on the
-# main jumpbox only. Prints context for the model; changes nothing else.
+# SessionStart hook for the PR and issue watch (ejc3/aws scripts/pr-watch/SKILL.md, installed by
+# scripts/pr-watch-install.sh --watcher on the main jumpbox only). A CronCreate job lives only as long as its session,
+# so when no session has run the watch for 45 minutes (claim.sh status: stale) this asks the new session to schedule
+# it. It records nothing: a session owns the watch only once a /pr-watch run claims the heartbeat, so a session that
+# is never prompted (remote control, claude -p) cannot hold it. Prints context for the model; changes nothing.
 set -uo pipefail
 cat >/dev/null
-
-state="$HOME/.local/state/pr-watch"
-mkdir -p "$state"
-owner_file="$state/owner"
-me=$PPID # the claude process that runs this hook
-
-owner=$(cat "$owner_file" 2>/dev/null || true)
-if [ -n "$owner" ] && [ "$owner" != "$me" ] && kill -0 "$owner" 2>/dev/null \
-  && tr '\0' ' ' <"/proc/$owner/cmdline" 2>/dev/null | grep -q claude; then
-  exit 0
-fi
-printf '%s\n' "$me" >"$owner_file.tmp" && mv "$owner_file.tmp" "$owner_file"
-
+here=$(cd "$(dirname "$0")" && pwd)
+[ "$(bash "$here/claim.sh" status 2>/dev/null)" = stale ] || exit 0
 jq -n '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
-  "This session owns the standing PR and issue watch (ejc3/aws scripts/pr-watch/SKILL.md). Check CronList; if no job runs /pr-watch, create one with CronCreate (cron \"7,37 * * * *\", prompt \"/pr-watch\", recurring) and tell the owner it runs for up to 7 days or until this session ends. Do not create a second one."}}'
+  "The standing PR and issue watch (ejc3/aws scripts/pr-watch/SKILL.md) has not run for 45 minutes. If this is an interactive session: check CronList; if no job runs /pr-watch, create one with CronCreate (cron \"7,37 * * * *\", prompt \"/pr-watch\", recurring), run /pr-watch once now so it claims the watch, and tell the owner it runs for up to 7 days or until this session ends. A run that finds another session owns the watch deletes its own job."}}'
