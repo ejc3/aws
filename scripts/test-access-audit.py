@@ -1126,6 +1126,19 @@ class FollowUpTest(unittest.TestCase):
         self.assertEqual(Path(creds).read_text(), "the owner's file")
         self.assertEqual([n for n in os.listdir(self.directory + "/a/b") if n.startswith((".old-", ".tmp-"))], [])
 
+    def test_a_directory_swapped_in_for_a_placed_file_is_put_back(self):
+        state = agent.place_files(bundle(self.directory), {}, chown=False)
+        creds = self.directory + "/a/b/creds"
+
+        def make(path):
+            if path == creds:
+                os.unlink(path)
+                os.mkdir(path)
+                Path(path + "/owner-data").write_text("mine")
+        self.race(state, make)
+        self.assertEqual(Path(creds + "/owner-data").read_text(), "mine")
+        self.assertEqual([n for n in os.listdir(self.directory + "/a/b") if n.startswith((".old-", ".tmp-"))], [])
+
     def test_the_displaced_file_is_never_stranded_when_the_final_link_loses_its_race(self):
         state = agent.place_files(bundle(self.directory), {}, chown=False)
         creds = self.directory + "/a/b/creds"

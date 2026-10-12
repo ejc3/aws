@@ -1171,11 +1171,21 @@ def write_placed(dirfd, name, data, mode, owner, chown, stamp, replace_sha256=No
                 aside = None  # gone since the check: nothing to displace
             else:
                 if not placed_unchanged(dirfd, aside, replace_sha256):
+                    # Not ours any more: put the owner's entry back under its name. A directory cannot be
+                    # hard-linked, so anything that is not a plain file or symlink is renamed back, only onto
+                    # a name that is still free.
                     try:
-                        os.link(aside, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
-                        os.unlink(aside, dir_fd=dirfd)
+                        if stat.S_ISDIR(os.stat(aside, dir_fd=dirfd, follow_symlinks=False).st_mode):
+                            try:
+                                os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                                raise FileExistsError(name)
+                            except FileNotFoundError:
+                                os.rename(aside, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+                        else:
+                            os.link(aside, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+                            os.unlink(aside, dir_fd=dirfd)
                     except OSError:
-                        raise RuntimeError("a registered path changed while it was being placed; the owner's file is "
+                        raise RuntimeError("a registered path changed while it was being placed; the owner's entry is "
                                            "left as " + aside) from None
                     raise RuntimeError("refusing to overwrite an existing file the agent did not place: " + name)
         try:
