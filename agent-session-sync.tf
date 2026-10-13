@@ -5,8 +5,9 @@
 # jumpboxes. Before this, the metal boxes looked once at boot (fcvm-claude-rc), nextjs-dev started only
 # each user's one working folder every 5 minutes (agents-enable), and the jumpboxes looked nowhere, so
 # a repo cloned today waited for a reboot or a person. See scripts/agent-session-sync.py for what
-# counts as new: a MAIN checkout only (a linked worktree never does), a finished clone, an allowed
-# owner, and nothing that existed when the watcher first looked.
+# counts as new: a checkout or worktree MARKED for interactive use (claude-interactive in its git dir), a
+# finished clone, an allowed owner, and nothing that existed when the watcher first looked. After a reboot
+# it opens the folders scripts/agent-active-dirs.py names (prompted or marked in the last 30 days).
 #
 # ONE script and ONE template unit, installed by the same snippet everywhere, so the boxes cannot
 # drift apart the way three bespoke launchers did. Per-box policy is a drop-in setting ASS_ARGS.
@@ -19,6 +20,13 @@ ${file("${path.module}/scripts/agent-session-sync.py")}
 AGENTSYNC
 chmod 755 /usr/local/bin/agent-session-sync.new
 mv -f /usr/local/bin/agent-session-sync.new /usr/local/bin/agent-session-sync
+# The one rule for which folders get a session after a boot (prompted or marked in 30 days); the boot
+# launchers and the watcher all call it.
+cat > /usr/local/bin/agent-active-dirs.new <<'AGENTACTIVE'
+${file("${path.module}/scripts/agent-active-dirs.py")}
+AGENTACTIVE
+chmod 755 /usr/local/bin/agent-active-dirs.new
+mv -f /usr/local/bin/agent-active-dirs.new /usr/local/bin/agent-active-dirs
 cat > /etc/systemd/system/agent-session-sync@.service <<'AGENTSYNCUNIT'
 ${file("${path.module}/scripts/agent-session-sync@.service")}
 AGENTSYNCUNIT
@@ -53,6 +61,7 @@ resource "terraform_data" "admin_agent_session_sync" {
     instance = each.value
     script   = filesha256("${path.module}/scripts/agent-session-sync.py")
     seeder   = filesha256("${path.module}/scripts/codex-seed-thread.py")
+    active   = filesha256("${path.module}/scripts/agent-active-dirs.py")
     unit     = filesha256("${path.module}/scripts/agent-session-sync@.service")
     helper   = filesha256("${path.module}/scripts/ssm-agent-session-sync.sh")
     args     = local.agent_session_sync_ubuntu_args

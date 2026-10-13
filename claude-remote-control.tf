@@ -35,8 +35,9 @@ else
 fi
 rm -f "$TCLAUDE_TMP"
 
-# Record interactive t-claude use in host-local state. Claude history itself cannot be
-# used for this: claude-code-sync deliberately merges history.jsonl across ARM and x86.
+# Interactive t-claude use marks the folder for interactive use: claude-interactive in its git dir, the
+# marker agent-active-dirs and agent-session-sync read (a linked worktree has its own git dir, so it is
+# marked on its own). The git dir is never tracked, so the marker never shows in git status.
 cat > /usr/local/bin/fcvm-claude-track <<'TRACKER'
 #!/bin/bash
 set -uo pipefail
@@ -49,16 +50,6 @@ case "$repo" in
   /home/ubuntu/*) ;;
   *) exit 0 ;;
 esac
-
-# MAIN CHECKOUTS ONLY -- never a linked `git worktree`. In a linked worktree the
-# per-worktree git dir differs from the repository's common dir; in the main
-# checkout they are the same. Branch worktrees are short-lived and numerous (73 on
-# this box at one point, one agent each), and an agent per branch is neither wanted
-# nor affordable: they consume memory, each stalls on its own trust prompt, and they
-# bury the session that matters.
-gitdir=$(git -C "$repo" rev-parse --path-format=absolute --git-dir 2>/dev/null) || exit 0
-commondir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
-[ "$gitdir" = "$commondir" ] || exit 0
 
 origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || exit 0
 case "$origin" in
@@ -80,13 +71,8 @@ case "$origin" in
   */claude-code-history|*/claude-code-history.git|*/claude-code-sync|*/claude-code-sync.git) exit 0 ;;
 esac
 
-STATE="$HOME/.local/state/fcvm-claude"
-umask 077
-mkdir -p "$STATE"
-key=$(printf '%s' "$repo" | sha256sum | awk '{print $1}')
-tmp=$(mktemp "$STATE/.repo.XXXXXX") || exit 0
-printf '%s\n' "$repo" > "$tmp"
-mv -f "$tmp" "$STATE/repo-$key"
+gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+touch "$gitdir/claude-interactive"
 TRACKER
 chmod 755 /usr/local/bin/fcvm-claude-track
 
@@ -116,11 +102,11 @@ grep -qxF '[ -f ~/.config/fcvm-t-claude.zsh ] && source ~/.config/fcvm-t-claude.
     >> /home/ubuntu/.zshrc
 chown ubuntu:ubuntu /home/ubuntu/.zshrc
 
-# Launch the host-local active set. It is the union of repositories used through
-# interactive t-claude on this host during the last 30 days and local user-owned checkouts
-# that have recent host-local HEAD movement or uncommitted work. Shallow home-directory
-# globs cover ordinary clones; synchronized Claude history is used only to FIND possible
-# nested roots, never as the activity signal.
+# Launch the folders with session activity in the last 30 days (owner, 2026-10-13): a person prompted
+# a Claude conversation there, or it was marked for interactive use (claude-interactive in its git dir).
+# The rule is /usr/local/bin/agent-active-dirs (scripts/agent-active-dirs.py), shared with nextjs-dev's
+# agents-start and agent-session-sync's post-reboot launch. A folder nobody prompted stays closed. Linked
+# worktrees count as their own folders; the origin allowlist below still applies.
 cat > /usr/local/bin/fcvm-claude-active-repos <<'LAUNCHER'
 #!/bin/bash
 set -uo pipefail
@@ -128,8 +114,6 @@ set -uo pipefail
 export HOME=/home/ubuntu
 export PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 STATE="$HOME/.local/state/fcvm-claude"
-CUTOFF_S=$(( $(date +%s) - 30 * 24 * 60 * 60 ))
-CUTOFF_MS=$(( CUTOFF_S * 1000 ))
 REPOS=$(mktemp)
 trap 'rm -f "$REPOS"' EXIT
 
@@ -189,12 +173,7 @@ add_repo() {
     *) return 0 ;;
   esac
 
-  # Main checkouts only -- skip linked worktrees. See the note at the gate above.
-  local gitdir commondir
-  gitdir=$(git -C "$repo" rev-parse --path-format=absolute --git-dir 2>/dev/null) || return 0
-  commondir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
-  [ "$gitdir" = "$commondir" ] || return 0
-
+  # A linked worktree shares its main checkout's origin, so the allowlist below covers it too.
   origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || return 0
   case "$origin" in
     https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
@@ -210,49 +189,9 @@ add_repo() {
   printf '%s\n' "$repo" >> "$REPOS"
 }
 
-locally_active() {
-  local repo="$1" head_log head_activity dirty
-  head_log=$(git -C "$repo" rev-parse --path-format=absolute --git-path logs/HEAD 2>/dev/null)
-  head_activity=$(stat -c %Y "$head_log" 2>/dev/null || echo 0)
-  dirty=$(git -C "$repo" status --porcelain --untracked-files=normal 2>/dev/null | sed -n '1p')
-  [ "$head_activity" -ge "$CUTOFF_S" ] 2>/dev/null || [ -n "$dirty" ]
-}
-
-# Exact host-local t-claude use, including nested repositories and worktrees.
-for marker in "$STATE"/repo-*; do
-  [ -f "$marker" ] || continue
-  marker_time=$(stat -c %Y "$marker" 2>/dev/null) || continue
-  [ "$marker_time" -ge "$CUTOFF_S" ] || continue
-  IFS= read -r repo < "$marker" || continue
-  add_repo "$repo"
-done
-
-# First-deployment seed and automatic coverage for locally active top-level checkouts.
-for candidate in /home/ubuntu/* /home/ubuntu/src/*; do
-  [ -e "$candidate/.git" ] || continue
-  repo=$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null) || continue
-  locally_active "$repo" && add_repo "$repo"
-done
-
-# Claude sync merges history across hosts, so these paths are candidates only. Requiring
-# this host's reflog/dirty state prevents activity on ARM from selecting an idle x86 clone
-# (and vice versa) while still finding active nested worktrees without a recursive scan.
-HISTORY="$HOME/.claude/history.jsonl"
-if [ -s "$HISTORY" ]; then
-  while IFS= read -r project; do
-    case "$project" in
-      /home/ubuntu/*) ;;
-      *) continue ;;
-    esac
-    [ -d "$project" ] || continue
-    repo=$(git -C "$project" rev-parse --show-toplevel 2>/dev/null) || continue
-    locally_active "$repo" && add_repo "$repo"
-  done < <(
-    jq -r --argjson cutoff "$CUTOFF_MS" \
-      'select((.timestamp? | type) == "number" and .timestamp >= $cutoff) | .project? // empty' \
-      "$HISTORY" 2>/dev/null | sort -u
-  )
-fi
+while IFS= read -r folder; do
+  add_repo "$folder"
+done < <(/usr/local/bin/agent-active-dirs --home "$HOME" 2>/dev/null)
 
 sort -u "$REPOS" -o "$REPOS"
 mkdir -p "$STATE"
