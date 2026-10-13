@@ -5,16 +5,24 @@ Installed as /usr/local/bin/agent-session-sync and run as a small service (agent
 or agent-session-sync@<user>.service on nextjs-dev) on every box that keeps remote-control sessions.
 It replaces "the boot launcher looked once, at boot" with a cheap watch loop (default every 5 s).
 
-WHAT COUNTS AS NEW. A top-level checkout, directly under one of the roots (default ~/* and ~/src/*),
-that appeared after the watcher first looked:
-  * a MAIN checkout only: `.git` is a DIRECTORY. A linked `git worktree` has `.git` as a FILE, so a
-    random worktree is never new, and nothing nested below a root is ever scanned;
+WHAT COUNTS AS NEW. A folder marked for interactive use after the watcher first looked: the file
+`claude-interactive` in its git directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`, which
+agents do when they clone a repository or create a worktree the user wants to prompt). Owner's rule,
+2026-10-13: a session for what is used interactively, not for every clone. Looked for in:
+  * a checkout directly under one of the roots (default ~/* and ~/src/*) whose `.git` is a directory;
+  * a linked worktree of such a checkout, wherever it lives (git records it in .git/worktrees/<name>);
+    a subagent's worktree under .claude/worktrees/ never counts;
   * finished: HEAD resolves, no *.lock in .git (a clone, fetch or checkout is still running) and the
     index exists (a clone writes it last), so a half-cloned repo is not launched;
   * allowed: its origin is owned by an allowed owner (the account's own GitHub login, plus
     ~/.config/agent-session-sync/owners and --owner) or is an exact --repo, and it is not claude-code-sync.
 The FIRST run only records what already exists and launches nothing: the boot launcher decided about
-those (a clone idle for 30 days was skipped on purpose and must stay skipped).
+those.
+
+AFTER A REBOOT it starts Claude in every folder agent-active-dirs names (a person prompted there, or it was
+marked, in the last 30 days): the same rule the boot launchers use, so a folder nobody prompted stays closed.
+On a box with a boot launcher those windows already exist and t-claude only attaches; on the jumpboxes,
+which have none, this is the boot launch.
 
 WHAT IT DOES for a new repo: pre-accept Claude's per-folder trust prompt (only for a repo that passed
 the gates above), start `t-claude --auto --remote-control` there (a window in the user's EXISTING tmux
@@ -89,6 +97,32 @@ def read_origin(git_dir):
     return None
 
 
+MARKER = "claude-interactive"
+
+
+def git_dirs(path):
+    """(git dir, common git dir) of a checkout or a linked worktree, or (None, None)."""
+    dot = os.path.join(path, ".git")
+    if os.path.isdir(dot) and not os.path.islink(dot):
+        return dot, dot
+    try:
+        with open(dot) as fh:
+            line = fh.read().strip()
+    except OSError:
+        return None, None
+    if not line.startswith("gitdir:"):
+        return None, None
+    gitdir = line[len("gitdir:"):].strip()
+    gitdir = gitdir if os.path.isabs(gitdir) else os.path.normpath(os.path.join(path, gitdir))
+    try:
+        with open(os.path.join(gitdir, "commondir")) as fh:
+            common = fh.read().strip()
+        common = common if os.path.isabs(common) else os.path.normpath(os.path.join(gitdir, common))
+    except OSError:
+        common = gitdir
+    return gitdir, common
+
+
 def is_main_checkout(path):
     """`.git` is a directory. A linked worktree (or a submodule) has a `.git` FILE."""
     git = os.path.join(path, ".git")
@@ -96,7 +130,9 @@ def is_main_checkout(path):
 
 
 def is_finished(path):
-    git = os.path.join(path, ".git")
+    git, _ = git_dirs(path)
+    if git is None:
+        return False
     try:
         names = os.listdir(git)
     except OSError:
@@ -111,7 +147,8 @@ def is_finished(path):
 
 
 def is_allowed(path, owners, repos):
-    origin = parse_origin(read_origin(os.path.join(path, ".git")))
+    _, common = git_dirs(path)
+    origin = parse_origin(read_origin(common)) if common else None
     if not origin:
         return False
     owner, repo = origin
@@ -121,7 +158,7 @@ def is_allowed(path, owners, repos):
 
 
 def candidates(roots):
-    """Directories directly under the roots whose .git is a directory."""
+    """Folders marked for interactive use: checkouts directly under the roots, and their linked worktrees."""
     seen = set()
     for pattern in roots:
         for p in glob.glob(pattern):
@@ -129,10 +166,24 @@ def candidates(roots):
             if name.startswith("."):
                 continue
             real = os.path.realpath(p)
-            if real in seen or not is_main_checkout(real):
+            if not is_main_checkout(real):
                 continue
-            seen.add(real)
-            yield real
+            git = os.path.join(real, ".git")
+            if real not in seen and os.path.exists(os.path.join(git, MARKER)):
+                seen.add(real)
+                yield real
+            for admin in sorted(glob.glob(os.path.join(git, "worktrees", "*"))):
+                if not os.path.exists(os.path.join(admin, MARKER)):
+                    continue
+                try:
+                    with open(os.path.join(admin, "gitdir")) as fh:
+                        wt = os.path.realpath(os.path.dirname(fh.read().strip()))
+                except OSError:
+                    continue
+                if wt in seen or "/.claude/worktrees/" in wt + "/" or not os.path.isdir(wt):
+                    continue
+                seen.add(wt)
+                yield wt
 
 
 def github_login(home):
@@ -195,8 +246,11 @@ def refresh_owners(cfg):
 def repo_identity(path):
     """[device, inode] of the checkout's .git directory: stable while the checkout lives (git never replaces
     the directory itself), different for a replacement clone at the same path."""
+    git, _ = git_dirs(path)
+    if git is None:
+        return None
     try:
-        st = os.stat(os.path.join(path, ".git"))
+        st = os.stat(git)
     except OSError:
         return None
     return [st.st_dev, st.st_ino]
@@ -225,6 +279,8 @@ class State:
         self.path = path
         self.first_run = not os.path.exists(path)
         self.known = {}
+        # After a reboot: the active folders still to launch, and those launched this boot (trust is kept for them).
+        self.boot = {"pending": [], "launched": [], "tried": {}}
         self.boot_id = current_boot_id() if boot_id is None else boot_id
         saved = None
         if not self.first_run:
@@ -232,6 +288,7 @@ class State:
                 with open(path) as fh:
                     data = json.load(fh)
                 self.known = data.get("known", {})
+                self.boot.update(data.get("boot") or {})
                 saved = data.get("boot_id")
             except (OSError, ValueError):
                 self.known = {}
@@ -242,7 +299,7 @@ class State:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".known.")
         with os.fdopen(fd, "w") as fh:
-            json.dump({"known": self.known, "boot_id": self.boot_id}, fh, indent=1, sort_keys=True)
+            json.dump({"known": self.known, "boot_id": self.boot_id, "boot": self.boot}, fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
 
@@ -255,25 +312,34 @@ def scan_once(cfg, state, launcher, now=None):
     present = set(found)
     attempted = []
 
-    # A path that is no longer a main checkout is forgotten, so deleting and re-cloning is new again.
+    # A path that is no longer a marked checkout is forgotten, so deleting and re-cloning is new again.
     for path in [p for p in state.known if p not in present]:
         del state.known[path]
 
-    # The host rebooted since the state was written: its tmux windows are gone, so every Claude session THIS
-    # WATCHER launched is to be launched again. (Repos recorded at the first run were never ours to launch:
-    # the boot launcher owns those. Codex threads persist in Codex itself, so they are left alone.) Done
-    # once; a window the user closes afterwards stays closed.
-    if state.rebooted:
-        again = [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded") and not e.get("ignored")]
-        for p in again:
-            state.known[p]["claude"] = False
-            state.known[p].setdefault("tried", {}).pop("claude", None)
-        if again:
-            log("host rebooted: starting Claude again in %d repositories" % len(again))
-        state.rebooted = False
-
     owners_changed = refresh_owners(cfg)
     owners, repos = cfg["owners"], cfg["repos"]
+
+    # The host rebooted since the state was written: its tmux windows are gone. Start Claude in every folder
+    # with session activity in the last 30 days (agent-active-dirs: prompted or marked), the boot launchers'
+    # own rule, so a folder nobody prompted stays closed. Done once per boot; a window the user closes
+    # afterwards stays closed. Codex threads persist in Codex itself, so they are left alone.
+    if state.rebooted:
+        active = [p for p in cfg["active_dirs"](cfg) if is_allowed(p, owners, repos)]
+        state.boot = {"pending": active, "launched": [], "tried": {}}
+        log("host rebooted: starting Claude in %d folders with session activity in the last 30 days" % len(active))
+        state.rebooted = False
+    for path in list(state.boot["pending"]):
+        tried = state.boot.setdefault("tried", {})
+        if path in tried and now - tried[path] < RETRY_SECONDS:
+            continue
+        tried[path] = now
+        ok = launcher.start("claude", path)
+        if ok:
+            state.boot["pending"].remove(path)
+            state.boot["launched"].append(path)
+            attempted.append((path, "claude", ok))
+        elif getattr(launcher, "cheap_retry", {}).get("claude"):
+            tried.pop(path, None)             # no tmux server yet: cheap to look again next tick
 
     for path in found:
         entry = state.known.get(path)
@@ -329,7 +395,8 @@ def scan_once(cfg, state, launcher, now=None):
                 if getattr(launcher, "cheap_retry", {}).get(kind):
                     tried.pop(kind, None)
     state.first_run = False
-    keep_trust(cfg["home"], [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")], state)
+    keep_trust(cfg["home"], [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")]
+               + list(state.boot.get("launched", [])), state)
     state.save()
     return attempted
 
@@ -498,7 +565,21 @@ def build_config(args):
         "owners": allowed_owners(home, args.owner or []), "owners_extra": list(args.owner or []),
         "owners_sig": owners_signature(home), "repos": set(args.repo or []),
         "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
+        "active_dirs": lambda cfg, tool=args.active_dirs: run_active_dirs(tool, cfg["home"]),
     }
+
+
+def run_active_dirs(tool, home):
+    """The folders agent-active-dirs names for this account, or none when it cannot run."""
+    try:
+        r = subprocess.run([tool, "--home", home], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("agent-active-dirs did not run: %s" % exc)
+        return []
+    if r.returncode != 0:
+        log("agent-active-dirs failed: %s" % r.stderr.strip()[-300:])
+        return []
+    return [line for line in r.stdout.splitlines() if line.strip()]
 
 
 def file_version(path):
@@ -517,6 +598,7 @@ def main(argv):
     ap.add_argument("--repo", action="append", help="one allowed OWNER/REPO, exactly")
     ap.add_argument("--t-claude", default="auto", help="t-claude.zsh to source (default: the system copy, else ~/.config/t-claude.zsh)")
     ap.add_argument("--codex-seed", default="/usr/local/bin/codex-seed-thread")
+    ap.add_argument("--active-dirs", default="/usr/local/bin/agent-active-dirs")
     ap.add_argument("--tmux", default="tmux")
     ap.add_argument("--state-dir")
     ap.add_argument("--interval", type=float, default=5.0)

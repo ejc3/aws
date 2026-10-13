@@ -599,12 +599,16 @@ check both the allow and a deliberate deny.
 
 ### Metal Claude startup
 
-`fcvm-claude-rc.service` starts `t-claude --remote-control` at boot for host-local active
-repositories. Interactive t-claude use writes an unsynchronized marker; recent local HEAD
-reflog movement and dirty worktrees seed checkouts automatically. Do not use Claude's
-`history.jsonl` as the activity signal: `claude-code-sync` merges it across ARM and x86;
-the launcher reads it only as a bounded index of possible nested roots and still requires
-host-local Git activity. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
+`fcvm-claude-rc.service` starts `t-claude --remote-control` at boot in every folder with session
+activity in the last 30 days (owner, 2026-10-13): a person prompted a Claude conversation there, or it
+was marked for interactive use (`claude-interactive` in its git directory; interactive t-claude use
+touches it, and agents touch it when they clone or create a worktree for the user). The rule is one
+script, `scripts/agent-active-dirs.py` (`/usr/local/bin/agent-active-dirs --explain` shows why each folder
+qualifies), shared with nextjs-dev's `agents-start` and with `agent-session-sync` after a reboot. It
+reads the prompt's origin Claude Code records (`origin.kind: human`), so SDK-injected turns, background
+task notices and settings commands broadcast to every window (`/model`) do not count. A folder nobody
+prompted stays closed at the next boot; linked worktrees count as their own folders, subagent worktrees
+under `.claude/worktrees/` never do. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
 uses t-claude's default path-derived sessions. t-claude follows its `main` branch, so the unit
 is guarded by an integrity check (`zsh -n` on the installed file) rather than a fixed hash,
 and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
@@ -925,11 +929,12 @@ folder every 5 minutes (`agents-enable`) and the jumpboxes looked nowhere. Measu
 launcher: a live `--remote-control` session existed 0.9 s after a clone finished; worst case is the 5 s
 scan plus about a second.
 
-- **What is new.** A top-level checkout directly under `~/*` or `~/src/*`, appearing after the watcher first
-  looked. A MAIN checkout only: `.git` must be a directory, so a linked `git worktree` (its `.git` is a
-  file) is never new, and nothing nested is scanned. The clone must be finished (no `*.lock`, the index
-  exists). The first run only records what exists and launches nothing, so an old clone the boot launcher
-  skipped stays skipped.
+- **What is new.** A folder marked for interactive use after the watcher first looked: `claude-interactive`
+  in its git directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`). A checkout directly under
+  `~/*` or `~/src/*`, or a linked worktree of one wherever it lives; a subagent worktree under
+  `.claude/worktrees/` never counts. An unmarked clone gets no session (owner, 2026-10-13: sessions for
+  what is used interactively). The checkout must be finished (no `*.lock`, the index exists). The first run
+  only records what exists and launches nothing.
 - **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
   `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
   also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.
@@ -939,9 +944,10 @@ scan plus about a second.
   yet does not hold up Claude.
 - **Surviving the things that happen to a box.** t-claude is looked for on every attempt, so a watcher that
   starts before the installer has put it in place retries instead of recording "done". tmux windows do not
-  survive a reboot but `known.json` does, so it keeps the boot id: after a reboot, Claude is started again
-  once for every repository THIS watcher launched (Codex threads live in Codex and are left alone; repos
-  recorded at the first run belong to the boot launcher). A running Claude rewrites `~/.claude.json` from its
+  survive a reboot but `known.json` does, so it keeps the boot id: after a reboot, Claude is started once in
+  every folder `agent-active-dirs` names (prompted or marked in the last 30 days, allowed owner), the boot
+  launchers' own rule, retried each tick until the user's tmux server exists (the pending list is kept on
+  disk). Codex threads live in Codex and are left alone. A running Claude rewrites `~/.claude.json` from its
   cached copy and drops a trust entry added meanwhile (the same reason `claude-remote-control.tf` trusts every
   repo before starting any session), so the watcher keeps trust for what it launched: one stat per tick, a
   re-add only when the file changed and an entry is missing.

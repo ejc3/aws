@@ -1,8 +1,8 @@
 #!/bin/bash
 # ssm-agent-session-sync.sh <instance-id> <region>
 #
-# Installs the new-repo watcher (scripts/agent-session-sync.py, its template unit, and the Codex seeder
-# scripts/codex-seed-thread.py it calls) on a RUNNING admin
+# Installs the new-repo watcher (scripts/agent-session-sync.py, its template unit, the Codex seeder
+# scripts/codex-seed-thread.py and the activity rule scripts/agent-active-dirs.py it calls) on a RUNNING admin
 # box through SSM Run Command, enables agent-session-sync@ubuntu and starts it if it is not running.
 # Called by terraform_data.admin_agent_session_sync (agent-session-sync.tf) with ASS_ARGS in the
 # environment (the ubuntu account's policy; none of it is a secret).
@@ -26,6 +26,7 @@ done
 
 script=$(base64 -w0 "$here/agent-session-sync.py")
 seeder=$(base64 -w0 "$here/codex-seed-thread.py")
+active=$(base64 -w0 "$here/agent-active-dirs.py")
 unit=$(base64 -w0 "$here/agent-session-sync@.service")
 # Files are replaced ATOMICALLY (a half-written script must never be what a running watcher re-executes), and
 # only when they differ. A changed SCRIPT needs no restart: the watcher re-executes itself when its own file
@@ -37,12 +38,14 @@ set -e
 t=\$(mktemp -d); trap 'rm -rf "\$t"' EXIT
 echo $script | base64 -d > "\$t/script"
 echo $seeder | base64 -d > "\$t/seeder"
+echo $active | base64 -d > "\$t/active"
 echo $unit | base64 -d > "\$t/unit"
 printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '$ASS_ARGS' > "\$t/policy"
 restart=0
 put() { cmp -s "\$1" "\$2" && return 1; install -m "\$3" "\$1" "\$2.new" && mv -f "\$2.new" "\$2"; }
 put "\$t/script" /usr/local/bin/agent-session-sync 755 || true
 put "\$t/seeder" /usr/local/bin/codex-seed-thread 755 || true      # the watcher seeds Codex threads through it
+put "\$t/active" /usr/local/bin/agent-active-dirs 755 || true      # which folders open after a reboot
 put "\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1
 install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
 put "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf 644 && restart=1

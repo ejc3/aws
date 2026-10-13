@@ -20,7 +20,14 @@ def git(path, *args):
     subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, env=ENV)
 
 
-def make_repo(root, name, origin="https://github.com/ejc3/example", commit=True):
+def mark(path):
+    """What an agent does for a folder the user wants to prompt: touch claude-interactive in its git dir."""
+    gitdir = subprocess.run(["git", "-C", str(path), "rev-parse", "--absolute-git-dir"], check=True,
+                            capture_output=True, text=True, env=ENV).stdout.strip()
+    Path(gitdir, "claude-interactive").touch()
+
+
+def make_repo(root, name, origin="https://github.com/ejc3/example", commit=True, marked=True):
     p = Path(root) / name
     p.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(p)], check=True, env=ENV)
@@ -29,6 +36,8 @@ def make_repo(root, name, origin="https://github.com/ejc3/example", commit=True)
         (p / "f").write_text("x")
         git(p, "add", "f")
         git(p, "commit", "-q", "-m", "c")
+    if marked:
+        (p / ".git" / "claude-interactive").touch()
     return p
 
 
@@ -50,7 +59,9 @@ class Base(unittest.TestCase):
         self.home = Path(self.tmp) / "home"
         self.home.mkdir()
         self.cfg = {"home": str(self.home), "roots": [str(self.home / "*"), str(self.home / "src" / "*")],
-                    "owners": {"ejc3"}, "repos": set(), "state_dir": str(Path(self.tmp) / "state")}
+                    "owners": {"ejc3"}, "repos": set(), "state_dir": str(Path(self.tmp) / "state"),
+                    "active_dirs": lambda cfg: list(self.active)}
+        self.active = []
         self.state = ass.State(os.path.join(self.cfg["state_dir"], "known.json"))
         self.launcher = FakeLauncher()
 
@@ -91,7 +102,7 @@ class WhatIsNotNewTests(Base):
         super().setUp()
         self.scan()  # past the first run
 
-    def test_a_linked_worktree_is_never_new(self):
+    def test_an_unmarked_linked_worktree_is_not_new(self):
         main = make_repo(self.home, "main")
         self.scan(now=1005)
         self.launcher.calls.clear()
@@ -101,16 +112,40 @@ class WhatIsNotNewTests(Base):
         self.scan(now=1010)
         self.assertEqual(self.launcher.calls, [], "a random worktree must not start sessions")
 
-    def test_the_rule_itself_not_a_side_effect_excludes_a_worktree(self):
-        # The origin check would also reject a worktree (it has no .git/config), so pin the rule.
+    def test_an_unmarked_worktree_is_not_a_candidate_and_a_marked_one_is(self):
         main = make_repo(self.home, "main")
         wt = self.home / "main-feature"
         git(main, "worktree", "add", "-q", str(wt), "-b", "feature")
-        self.assertTrue(ass.is_main_checkout(str(main)))
-        self.assertFalse(ass.is_main_checkout(str(wt)))
         found = [os.path.basename(p) for p in ass.candidates(self.cfg["roots"])]
         self.assertIn("main", found)
         self.assertNotIn("main-feature", found)
+        mark(wt)
+        found = [os.path.basename(p) for p in ass.candidates(self.cfg["roots"])]
+        self.assertIn("main-feature", found)
+
+    def test_an_unmarked_clone_is_not_launched_until_it_is_marked(self):
+        r = make_repo(self.home, "plain", marked=False)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [], "only folders marked for interactive use get a session")
+        mark(r)
+        self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))])
+
+    def test_a_marked_worktree_elsewhere_is_launched_and_takes_the_main_checkout_s_owner(self):
+        main = make_repo(self.home, "main", marked=False)   # the checkout itself is not for interactive use
+        wt = Path(self.tmp) / "elsewhere" / "feature"
+        git(main, "worktree", "add", "-q", str(wt), "-b", "feature")
+        mark(wt)
+        self.scan(now=1005)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(wt)), ("codex", str(wt))])
+
+    def test_a_subagent_worktree_never_counts_even_when_marked(self):
+        main = make_repo(self.home, "main", marked=False)
+        wt = main / ".claude" / "worktrees" / "agent-1"
+        git(main, "worktree", "add", "-q", str(wt), "-b", "agent-1")
+        mark(wt)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [])
 
     def test_nothing_nested_below_a_root_is_scanned(self):
         make_repo(self.home / "projects", "deep")
@@ -296,13 +331,28 @@ class RebootTests(Base):
         self.scan(now=2000, state=state)
         self.assertEqual(self.launcher.calls, [])
 
-    def test_after_a_reboot_claude_is_started_again_for_what_the_watcher_launched_and_codex_is_not(self):
+    def test_after_a_reboot_claude_starts_in_the_active_folders_only_and_codex_is_left_alone(self):
+        idle = make_repo(self.home, "idle", marked=False)
+        self.active = [str(self.fresh)]               # agent-active-dirs: prompted or marked in 30 days
         state = self.state_for("boot-B")
         self.assertTrue(state.rebooted)
         self.scan(now=2000, state=state)
         self.assertEqual(self.launcher.calls, [("claude", str(self.fresh))], "Codex threads live in Codex, not tmux")
+        self.assertNotIn(str(idle), [p for _, p in self.launcher.calls])
+
+    def test_a_folder_the_watcher_launched_but_nobody_prompted_stays_closed_after_a_reboot(self):
+        self.active = []
+        self.scan(now=2000, state=self.state_for("boot-B"))
+        self.assertEqual(self.launcher.calls, [], "no session activity in 30 days: not reopened")
+
+    def test_an_active_folder_that_is_not_allowed_is_not_launched(self):
+        other = make_repo(self.home, "theirs", origin="https://github.com/someone-else/x", marked=False)
+        self.active = [str(other)]
+        self.scan(now=2000, state=self.state_for("boot-B"))
+        self.assertEqual(self.launcher.calls, [])
 
     def test_it_is_done_once_a_window_closed_afterwards_stays_closed(self):
+        self.active = [str(self.fresh)]
         state = self.state_for("boot-B")
         self.scan(now=2000, state=state)
         self.launcher.calls.clear()
@@ -310,15 +360,19 @@ class RebootTests(Base):
         self.assertEqual(self.launcher.calls, [])
         self.assertEqual(self.state_for("boot-B").rebooted, False, "the new boot id was saved")
 
-    def test_repos_recorded_at_the_first_run_belong_to_the_boot_launcher_not_to_this(self):
-        old = self.home / "old"
-        # the first run was before `fresh` existed in setUp; add an entry as the first run would have
-        self.state.known[str(old)] = {"claude": True, "codex": True, "seeded": True}
-        old.mkdir()
+    def test_with_no_tmux_server_yet_the_boot_launch_is_retried_every_tick_and_survives_a_restart(self):
+        self.active = [str(self.fresh)]
+        self.launcher.ok["claude"] = False            # cheap_retry: no tmux server yet (a jumpbox after a reboot)
         state = self.state_for("boot-B")
-        state.known[str(old)] = {"claude": True, "codex": True, "seeded": True}
         self.scan(now=2000, state=state)
-        self.assertNotIn(str(old), [p for _, p in self.launcher.calls])
+        self.scan(now=2001, state=state)
+        self.assertEqual(self.launcher.calls.count(("claude", str(self.fresh))), 2)
+        self.launcher.ok["claude"] = True
+        self.launcher.calls.clear()
+        restarted = self.state_for("boot-B")         # the watcher restarts on the same boot
+        self.assertFalse(restarted.rebooted)
+        self.scan(now=2002, state=restarted)
+        self.assertEqual(self.launcher.calls, [("claude", str(self.fresh))], "the pending launch was kept on disk")
 
     def test_an_older_state_file_without_a_boot_id_is_not_taken_for_a_reboot(self):
         path = os.path.join(self.cfg["state_dir"], "known.json")

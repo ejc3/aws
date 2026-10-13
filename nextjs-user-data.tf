@@ -1419,6 +1419,22 @@ if [ -f "$EXTRA" ]; then
     printf '%s\n' "$XD" >> "$DIRS_NEW"
   done < "$EXTRA"
 fi
+# Every folder with session activity in the last 30 days (owner, 2026-10-13): prompted in a Claude
+# conversation, or marked for interactive use (claude-interactive in its git dir). The same rule as
+# fcvm-claude-rc and agent-session-sync: /usr/local/bin/agent-active-dirs. A folder nobody prompted
+# stays closed; agent-extra-dirs above is for pinning one regardless.
+while IFS= read -r XD; do
+  [ -d "$XD" ] || continue
+  [ "$XD" = "$WORKDIR" ] && continue
+  grep -qxF -- "$XD" "$DIRS_NEW" && continue
+  zsh -c '
+    source ~/.config/t-claude.zsh 2>/dev/null || exit 1
+    cd -- "$1" || exit 1
+    t-claude --auto --remote-control
+  ' agents-start "$XD" </dev/null
+  echo "agents-start: t-claude invoked for $WHO in $XD (active in the last 30 days)"
+  printf '%s\n' "$XD" >> "$DIRS_NEW"
+done < <(/usr/local/bin/agent-active-dirs --home "$HOME" 2>/dev/null)
 mv -f "$DIRS_NEW" "$DIRS_STATE/dirs"
 
 # Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
