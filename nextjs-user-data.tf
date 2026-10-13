@@ -99,7 +99,7 @@ locals {
   nextjs_users = ["colton", "connor", "colin", "ejc3", "skevh"]
   # Accounts whose boot-launched folders also get a Codex thread (codex-seed@<user>), so each
   # folder shows up in their Codex app. Deliberately not everyone: skevh is left out.
-  nextjs_codex_seed_users = ["colton", "connor", "ejc3"]
+  nextjs_codex_seed_users = ["colton", "connor", "colin", "ejc3"]
 
   # Keys the account owner logs in with, on top of the shared fcvm key above. Declared
   # here rather than pasted into the box so a rebuild does not lose someone's access --

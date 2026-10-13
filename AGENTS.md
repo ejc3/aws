@@ -622,7 +622,7 @@ Every folder that gets a window at boot also gets a Codex thread, so it shows up
 app: `fcvm-codex-seed.service` reads the launcher's list (`~/.local/state/fcvm-claude/repos`)
 and seeds one message per folder through the running Codex daemon, and a timer retries until
 Codex is logged in. nextjs-dev does the same per user with `codex-seed@<user>`, for
-`local.nextjs_codex_seed_users` only (Colton, Connor and ejc3). A folder that already has a
+`local.nextjs_codex_seed_users` only (Colton, Connor, Colin and ejc3). A folder that already has a
 thread is only checked.
 
 The tmux these sessions run is `tmux-scroll` (t-claude prefers it), pinned by release tag and

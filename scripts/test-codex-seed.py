@@ -162,7 +162,7 @@ class WiringTests(unittest.TestCase):
         self.assertIn("RemainAfterExit=yes", unit, "without it the timer would re-run a successful seed forever")
 
     def test_nextjs_seeds_only_ejc3_colton_and_connor(self):
-        self.assertIn('nextjs_codex_seed_users = ["colton", "connor", "ejc3"]', NEXTJS)
+        self.assertIn('nextjs_codex_seed_users = ["colton", "connor", "colin", "ejc3"]', NEXTJS)
         self.assertNotIn("skevh", NEXTJS.split("nextjs_codex_seed_users =", 1)[1].split("\n", 1)[0])
         self.assertIn('case " ${join(" ", local.nextjs_codex_seed_users)} " in *" $u "*)', NEXTJS)
         unit = NEXTJS.split("cat > /etc/systemd/system/codex-seed@.service <<'UNIT'", 1)[1].split("\nUNIT\n", 1)[0]
