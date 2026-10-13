@@ -5,6 +5,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -319,6 +320,26 @@ class RebootTests(Base):
         state.known[str(old)] = {"claude": True, "codex": True, "seeded": True}
         self.scan(now=2000, state=state)
         self.assertNotIn(str(old), [p for _, p in self.launcher.calls])
+
+    def test_after_a_reboot_a_repo_idle_for_over_30_days_stays_closed(self):
+        old = self.fresh.parent / "stale"
+        env = dict(ENV, GIT_COMMITTER_DATE="@%d +0000" % (time.time() - 90 * 86400),
+                   GIT_AUTHOR_DATE="@%d +0000" % (time.time() - 90 * 86400))
+        subprocess.run(["git", "init", "-q", str(old)], check=True, env=env)
+        (old / "f").write_text("x")
+        subprocess.run(["git", "-C", str(old), "add", "f"], check=True, env=env)
+        subprocess.run(["git", "-C", str(old), "commit", "-q", "-m", "c"], check=True, env=env)
+        self.assertLess(ass.last_activity(str(old)), time.time() - 31 * 86400)
+        state = self.state_for("boot-B")
+        state.known[str(old)] = {"claude": True, "codex": True}
+        self.scan(now=2000, state=state)
+        launched = [p for _, p in self.launcher.calls]
+        self.assertNotIn(str(old), launched, "no commit or checkout move in 90 days: not relaunched")
+        self.assertIn(str(self.fresh), launched, "a repo committed to today is still relaunched")
+
+    def test_last_activity_reads_the_newest_commit(self):
+        self.assertGreater(ass.last_activity(str(self.fresh)), time.time() - 3600)
+        self.assertEqual(ass.last_activity(str(self.fresh.parent / "missing")), 0)
 
     def test_an_older_state_file_without_a_boot_id_is_not_taken_for_a_reboot(self):
         path = os.path.join(self.cfg["state_dir"], "known.json")

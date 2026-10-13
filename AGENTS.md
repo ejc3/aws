@@ -940,7 +940,7 @@ scan plus about a second.
 - **Surviving the things that happen to a box.** t-claude is looked for on every attempt, so a watcher that
   starts before the installer has put it in place retries instead of recording "done". tmux windows do not
   survive a reboot but `known.json` does, so it keeps the boot id: after a reboot, Claude is started again
-  once for every repository THIS watcher launched (Codex threads live in Codex and are left alone; repos
+  once for every repository THIS watcher launched that has a commit or checkout move in the last 30 days (the boot launcher's window; older ones stay closed) (Codex threads live in Codex and are left alone; repos
   recorded at the first run belong to the boot launcher). A running Claude rewrites `~/.claude.json` from its
   cached copy and drops a trust entry added meanwhile (the same reason `claude-remote-control.tf` trusts every
   repo before starting any session), so the watcher keeps trust for what it launched: one stat per tick, a

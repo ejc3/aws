@@ -204,6 +204,22 @@ def repo_identity(path):
 
 # ------------------------------------------------------------------ state
 
+RELAUNCH_DAYS = 30
+
+
+def last_activity(path):
+    """Newest commit on any branch or HEAD reflog entry, as epoch seconds (0 when git cannot say). The boot
+    launcher (fcvm-claude-active-repos) keys on the same 30-day window of local activity."""
+    newest = 0
+    for args in (["log", "-1", "--all", "--format=%ct"], ["reflog", "-1", "--format=%ct", "HEAD"]):
+        try:
+            out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30).stdout.strip()
+            newest = max(newest, int(out or 0))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return newest
+
+
 def current_boot_id():
     """Changes on every boot of the host, never on a restart of this process."""
     try:
@@ -265,6 +281,13 @@ def scan_once(cfg, state, launcher, now=None):
     # once; a window the user closes afterwards stays closed.
     if state.rebooted:
         again = [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded") and not e.get("ignored")]
+        # Only what was worked on lately: a repo with no commit or checkout move in RELAUNCH_DAYS stays closed,
+        # as the boot launcher leaves it. Without this every repo the watcher ever started came back each boot.
+        cutoff = time.time() - RELAUNCH_DAYS * 86400
+        stale = [p for p in again if last_activity(p) < cutoff]
+        again = [p for p in again if p not in stale]
+        if stale:
+            log("host rebooted: leaving %d repositories with no activity in %d days closed" % (len(stale), RELAUNCH_DAYS))
         for p in again:
             state.known[p]["claude"] = False
             state.known[p].setdefault("tried", {}).pop("claude", None)
