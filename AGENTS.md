@@ -1221,7 +1221,9 @@ Available if a task needs them; neither needs a key on disk.
   journal record to `s3://dolphin-labs-news-<account>/journal/` (400 days; deletes there are refused
   outside the administration set, and the bucket is versioned, so an overwrite keeps the original for 400
   days) so ranking changes can be replayed. nextjs-dev's role reads `journal/` and `local/` and writes
-  `local/` (not dev-ebs-only: the I/O box shares that role). Code arrives from `deploy-news.yml` on `main`
+  `local/` (not dev-ebs-only: the I/O box shares that role); it can also read the function, its logs,
+  its schedule and the secret's metadata (never its value), and invoke it by hand to check a pass before
+  switch-over. Code arrives from `deploy-news.yml` on `main`
   through role `dolphin-labs-news-deploy` (GitHub OIDC, code only: no UpdateFunctionConfiguration);
   Terraform owns the configuration, the handler `index.handler` included. Switch-over: deploy, set the
   secret, turn refresh-news.yml's schedule off in dolphin-labs, then `dolphin_labs_news_enabled = true`
