@@ -28,6 +28,7 @@ locals {
     "imagine/Eb2wzrlD6SnGuMJP"      = { key = "AUTH_GOOGLE_SECRET", target = ["production"], sensitive = true }
     "imagine/JEzGQiiMWC5MTxJb"      = { key = "AUTH_SECRET", target = ["production"], sensitive = true }
     "imagine/WdCwLI113MzRRKg3"      = { key = "IMAGINE_AWS_REGION", target = ["production"], sensitive = false }
+    "imagine/X3AeUYylxHqDRgGT"      = { key = "IMAGINE_AWS_REGION", target = ["preview"], sensitive = false }
     "imagine/PnOICgPqYgResZnu"      = { key = "IMAGINE_DB_TOKEN", target = ["production"], sensitive = true }
     "imagine/s9iQlZDeZTonNtVw"      = { key = "IMAGINE_DB_TOKEN", target = ["preview"], sensitive = true }
     "imagine/PHzwdtDBm2HNSFgV"      = { key = "IMAGINE_DB_URL", target = ["production"], sensitive = true }
@@ -36,6 +37,10 @@ locals {
     "imagine/pS6eVSMXihYwDfuF"      = { key = "IMAGINE_ENV", target = ["production"], sensitive = false }
     "imagine/aE2ZTm5cS8qAXAA0"      = { key = "IMAGINE_SCALE_FUNCTION", target = ["production"], sensitive = false }
     "imagine/EetHFi2rbAvGFlVQ"      = { key = "IMAGINE_SCALE_ROLE_ARN", target = ["production"], sensitive = false }
+    "imagine/SLYWNx9NXQAbCv2T"      = { key = "IMAGINE_STORE", target = ["preview"], sensitive = false }
+    "imagine/iOUVat9xJaBwGxMn"      = { key = "IMAGINE_STORE", target = ["production"], sensitive = false }
+    "imagine/8EQAtUW1OEVz72Sa"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["preview"], sensitive = false }
+    "imagine/qLucGXXiJECjPpfD"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["production"], sensitive = false }
     "imagine/JmRprF78qR6nGLnK"      = { key = "IMAGINE_TOKEN_SIGNING_KEY", target = ["production"], sensitive = true }
     "imagine/Mi1paHwIMOyXaUob"      = { key = "IMAGINE_WS_URL", target = ["production"], sensitive = false }
     "imagine/zsBijtQOs75gEOaM"      = { key = "TURSO_AUTH_TOKEN", target = ["production"], sensitive = false }
