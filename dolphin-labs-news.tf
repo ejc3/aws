@@ -491,6 +491,44 @@ resource "aws_iam_role_policy" "box_dolphin_labs_news_journal" {
   })
 }
 
+# Boxes: see the deployed pass and test it by hand before production moves to it. Invoking runs
+# one real pass, the same work the hourly job does. The secret's value stays out of reach:
+# metadata only, enough to see that a value has been set.
+resource "aws_iam_role_policy" "box_dolphin_labs_news_operate" {
+  for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id }
+  name     = "dolphin-labs-news-operate"
+  role     = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "InspectAndInvokeThePass"
+        Effect   = "Allow"
+        Action   = ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:InvokeFunction"]
+        Resource = aws_lambda_function.dolphin_labs_news_pass.arn
+      },
+      {
+        Sid      = "ReadItsLogs"
+        Effect   = "Allow"
+        Action   = ["logs:DescribeLogStreams", "logs:GetLogEvents", "logs:FilterLogEvents"]
+        Resource = [aws_cloudwatch_log_group.dolphin_labs_news_pass.arn, "${aws_cloudwatch_log_group.dolphin_labs_news_pass.arn}:*"]
+      },
+      {
+        Sid      = "SeeItsSchedule"
+        Effect   = "Allow"
+        Action   = ["scheduler:GetSchedule"]
+        Resource = aws_scheduler_schedule.dolphin_labs_news_pass.arn
+      },
+      {
+        Sid      = "SeeThatTheSecretIsSet"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:DescribeSecret", "secretsmanager:ListSecretVersionIds"]
+        Resource = aws_secretsmanager_secret.dolphin_labs_news.arn
+      },
+    ]
+  })
+}
+
 # The hourly GitHub job (refresh-news.yml, role dolphin-labs-news-bedrock in bedrock-haiku.tf) journals
 # its passes too, until the Lambda replaces it: write only, under journal/.
 resource "aws_iam_role_policy" "dolphin_labs_news_bedrock_journal" {
