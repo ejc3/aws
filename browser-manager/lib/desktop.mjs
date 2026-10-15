@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { VNC_PIXEL_RATIO } from './frame-viewport.mjs';
+import { createCdpMux, startCdpBridge } from './cdp-bridge.mjs';
 
 const execute = promisify(execFile);
 const desktopMode = `${1440 * VNC_PIXEL_RATIO}x${900 * VNC_PIXEL_RATIO}`;
@@ -84,10 +85,8 @@ export function isAppSchemeRedirect(u) {
     && !/^(https?|wss?|ftp|about|chrome|chrome-extension|devtools|data|blob|file|view-source|javascript):/i.test(u);
 }
 
-function maskChromeUserAgent(child, url, captureFile) {
+function maskChromeUserAgent(mux, url, captureFile) {
   try {
-    const writer = child.stdio[3], reader = child.stdio[4];
-    if (!writer || !reader) return;
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
     const userAgentMetadata = {
       brands: [{ brand: 'Not_A Brand', version: '8' }, { brand: 'Chromium', version: '131' }, { brand: 'Google Chrome', version: '131' }],
@@ -95,45 +94,36 @@ function maskChromeUserAgent(child, url, captureFile) {
       fullVersionList: [{ brand: 'Not_A Brand', version: '8.0.0.0' }, { brand: 'Chromium', version: '131.0.6778.86' }, { brand: 'Google Chrome', version: '131.0.6778.86' }],
       platform: 'Windows', platformVersion: '15.0.0', architecture: 'x86', model: '', mobile: false, bitness: '64', wow64: false,
     };
-    let id = 0, buffer = Buffer.alloc(0);
     const masked = new Set();
-    const send = (method, params = {}, sessionId) => {
-      try { writer.write(`${JSON.stringify({ id: ++id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`); } catch { /* pipe closed */ }
-    };
-    writer.on('error', () => {});
-    reader.on('error', () => {});
-    reader.on('data', (part) => {
-      try {
-        buffer = Buffer.concat([buffer, part]);
-        let end;
-        while ((end = buffer.indexOf(0)) !== -1) {
-          const packet = buffer.subarray(0, end); buffer = buffer.subarray(end + 1);
-          let message;
-          try { message = JSON.parse(packet.toString('utf8')); } catch { continue; }
-          if (message.method === 'Target.attachedToTarget') {
-            const sessionId = message.params?.sessionId;
-            const type = message.params?.targetInfo?.type;
-            if (sessionId && type === 'page' && !masked.has(sessionId)) {
-              masked.add(sessionId);
-              send('Emulation.setUserAgentOverride', { userAgent, userAgentMetadata }, sessionId);
-              send('Page.addScriptToEvaluateOnNewDocument', { source: "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" }, sessionId);
-              send('Page.enable', {}, sessionId);
-              // Capture custom-scheme redirects the browser cannot follow (e.g. an OAuth flow
-              // that ends at vsfapp://…?code=…): the URL appears as a requestWillBeSent we log
-              // to a file, so a headless operator can read a deep-link the desktop can't open.
-              if (captureFile) send('Network.enable', {}, sessionId);
-              if (url && url !== 'about:blank') send('Page.navigate', { url }, sessionId);
-            }
-            if (sessionId) send('Runtime.runIfWaitingForDebugger', {}, sessionId);
-          } else if (captureFile && message.method === 'Network.requestWillBeSent') {
-            if (isAppSchemeRedirect(message.params?.request?.url)) {
-              try { appendFileSync(captureFile, message.params.request.url + '\n'); } catch { /* best-effort */ }
-            }
-          }
+    // The start URL is opened once, in the first page. A bridge client attaching later re-announces existing pages with
+    // new sessions: those are masked too, but never sent back to the start URL.
+    let navigated = false;
+    mux.onEvent((message) => {
+      if (message.method === 'Target.attachedToTarget') {
+        const sessionId = message.params?.sessionId;
+        const type = message.params?.targetInfo?.type;
+        if (sessionId && type === 'page' && !masked.has(sessionId)) {
+          masked.add(sessionId);
+          mux.send('Emulation.setUserAgentOverride', { userAgent, userAgentMetadata }, sessionId);
+          mux.send('Page.addScriptToEvaluateOnNewDocument', { source: "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" }, sessionId);
+          mux.send('Page.enable', {}, sessionId);
+          // Capture custom-scheme redirects the browser cannot follow (e.g. an OAuth flow
+          // that ends at vsfapp://…?code=…): the URL appears as a requestWillBeSent we log
+          // to a file, so a headless operator can read a deep-link the desktop can't open.
+          if (captureFile) mux.send('Network.enable', {}, sessionId);
+          if (!navigated && url && url !== 'about:blank') mux.send('Page.navigate', { url }, sessionId);
+          navigated = true;
         }
-      } catch { /* ignore malformed frame */ }
+        if (sessionId) mux.send('Runtime.runIfWaitingForDebugger', {}, sessionId);
+      } else if (message.method === 'Target.detachedFromTarget') {
+        masked.delete(message.params?.sessionId);
+      } else if (captureFile && message.method === 'Network.requestWillBeSent') {
+        if (isAppSchemeRedirect(message.params?.request?.url)) {
+          try { appendFileSync(captureFile, message.params.request.url + '\n'); } catch { /* best-effort */ }
+        }
+      }
     });
-    send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+    mux.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
   } catch { /* masking is best-effort */ }
 }
 
@@ -144,6 +134,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
   // A rejection can precede the readiness race (for example, spawn ENOENT).
   void failed.promise.catch(() => {});
   let closing;
+  let bridge; // the CDP bridge, opened on request (openCdpBridge below)
   const resizeAbort = new AbortController();
   let resizeTail = Promise.resolve();
   let navigationRead;
@@ -156,6 +147,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       resizeAbort.abort();
       await resizeTail;
       navigationResolve?.({ canGoBack: null });
+      if (bridge) await bridge.then((b) => b.close(), () => {});
       const browser = children.find(({ label }) => label === 'Browser');
       if (browser) {
         // Chromium handles SIGINT as normal AttemptExit; SIGTERM takes the shorter SessionEnding
@@ -257,7 +249,16 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       // Launch blank so no unmasked request reaches a bot-protected origin; the mask navigates.
       '--start-maximized', '--window-size=1440,900', 'about:blank',
     ], env, ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']);
-    maskChromeUserAgent(browser, url, join(runtimeDir, 'app-redirects.log'));
+    // One reader for the debugging pipe, shared by the mask and any CDP bridge (lib/cdp-bridge.mjs).
+    const mux = browser.stdio[3] && browser.stdio[4] ? createCdpMux(browser.stdio[3], browser.stdio[4]) : null;
+    if (mux) maskChromeUserAgent(mux, url, join(runtimeDir, 'app-redirects.log'));
+    // Opened on request (POST /api/browsers/<name>/cdp on the owner-only control socket), closed with the browser.
+    const openCdpBridge = async () => {
+      if (!mux) throw new Error('This browser has no debugging pipe');
+      if (closing) throw new Error('Browser is closing');
+      bridge ??= startCdpBridge(mux).catch((error) => { bridge = undefined; throw error; });
+      return { wsEndpoint: (await bridge).wsEndpoint };
+    };
     let navigationReader;
     const getNavigation = () => {
       if (closing || signal.aborted || resizeAbort.signal.aborted) return Promise.resolve({ canGoBack: null });
@@ -422,7 +423,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       })(),
     ]);
     if (signal.aborted) throw new Error('Desktop start cancelled');
-    return { socketPath, close, closed: failed.promise.catch(close), resize, getNavigation };
+    return { socketPath, close, closed: failed.promise.catch(close), resize, getNavigation, openCdpBridge };
   } catch (error) {
     await close();
     throw error;

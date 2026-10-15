@@ -296,6 +296,16 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, {
           typeof state?.canGoBack === 'boolean' ? state.canGoBack : null };
       } catch { return { canGoBack: null }; }
     },
+    /** A loopback CDP endpoint for a running browser (lib/cdp-bridge.mjs); local control socket only. */
+    async openCdpBridge(name) {
+      checkedName(name);
+      const record = records.get(name);
+      if (!record) throw new HttpError(404, 'Unknown browser');
+      const desktop = record.desktop;
+      if (closed || record.state !== 'running' || !desktop) throw new HttpError(409, 'Start this browser before attaching to it');
+      if (typeof desktop.openCdpBridge !== 'function') throw new HttpError(501, 'This platform has no CDP bridge');
+      return desktop.openCdpBridge();
+    },
     getSocket(name) {
       checkedName(name);
       const record = records.get(name);
