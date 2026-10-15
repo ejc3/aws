@@ -656,7 +656,7 @@ poll that ran while a job's runner was booting put up a second host for the same
 whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
-**Controller tokens from a GitHub App (2026-10-11).** For the dolphin-labs-hq repos (`local.runner_app_github_app_repos` in
+**Controller tokens from a GitHub App (2026-10-11).** For the dolphin-labs-hq repos and `ejc3/imagine` (`local.runner_app_github_app_repos` in
 `runner-app.tf`) the controller mints an installation token from the runners GitHub App (`github-app/runners`: the
 controller and the jumpbox role only) on each run, narrowed to that one repository and to administration:write +
 actions:read, expiring within the hour. The JWT is signed in pure Python (`app_runner.py`, `rs256`), because the Lambda
@@ -664,12 +664,15 @@ runtime has no openssl. Until the secret has a value, or when minting fails (log
 (`github-runner/repo-pat/<owner>/<repo>`) is used, so the PATs stay until the app is proven. The dolphin-labs-hq repos'
 webhooks are managed as the administration agent's GitHub App (`app_auth` from `github-app/aws-admin`), not with those PATs,
 so once the controller has run on app tokens the PATs have no remaining user and can be retired. CoderColton's colton-games keeps
-its PAT: the app would have to be installed from Colton's account.
+its PAT: the app would have to be installed from Colton's account. `ejc3/imagine` takes the app's token only once the app
+is installed on the `ejc3` account with **only `imagine` selected** and that installation id is in `github-app/runners`
+(`installations.ejc3`); until then `app_token()` finds no `ejc3` installation and its PAT is used. An installation on all
+of `ejc3`'s repositories would let the controller's role mint administration tokens for `ejc3/fcvm` and `ejc3/aws` too.
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 
-`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films` and `dolphin-labs-hq/dolphin-maps`
-run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps`
+and `ejc3/imagine` run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
 nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
 controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
 `runner-app/`).
@@ -679,11 +682,11 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   path unchanged. The served repos go to Lambda `github-app-runner`, `queued` only.
   Anything else is answered and dropped.
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
-  `self-hosted`, `linux`, `x64`, the repo label (`cc-games` or `dolphin`) and one size
+  `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin` or `imagine`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
   `dolphin-films` (a downstream of `dolphin-labs`) and `dolphin-maps` use the `dolphin` label too. Runners
   register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
-  runner, cap or token.
+  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, l]`.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
@@ -716,7 +719,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
   zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
   `too-many-app-runners-<label>` (`-dolphin-films` and `-dolphin-maps` for those repos, which share a label) above one repo's own cap, so a single repo running away is
-  visible even while the total is under the combined cap; `github-app-runner-reconcile-silent`
+  visible even while the total is under the combined cap. `imagine-runner-hours-daily` fires when Imagine's
+  `LiveRunners` averages above 4 over 24 hours (96 host-hours, about $70 on `l` spot): a cap held all day, which the
+  per-repo alarm (over the cap) never sees. `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
@@ -754,6 +759,37 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Tokens.** Each repo's controller token is `github-runner/repo-pat/<owner>/<repo>`
   (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
   created with the same tokens through an `ephemeral` read, so the tokens never enter state.
+
+### `ejc3/imagine`
+
+Imagine (`ejc3/imagine`: Rust built to WebAssembly and to a NIF, an Elixir server, a Next.js app tested in Chromium,
+a container image) was added on 2026-10-15, when its GitHub-hosted minutes, about 16,700 a week, had Actions refusing its
+jobs for billing. It has the same owner as `ejc3/fcvm`, so its separation from fcvm's metal rests on the repository,
+never the owner:
+
+- **Registration.** Its controller asks `POST /repos/ejc3/imagine/actions/runners/registration-token` with Imagine's own
+  token, and its hosts run `config.sh --url https://github.com/ejc3/imagine`. A repository-level runner is never given
+  another repository's job, whatever labels either asks for.
+- **Labels and routing.** The front sends `ejc3/fcvm` to the metal webhook unchanged and `ejc3/imagine` here, by the full
+  repository name. A job is served only if every label is in Imagine's set, so fcvm's `ARM64`/`X64` jobs never match.
+- **Webhook.** `github_repository_webhook.runner_app_imagine`, made as the administration GitHub App's `ejc3`
+  installation (`github-app/aws-admin`), the same way as the dolphin-labs-hq hooks. Not the default `ejc3` provider:
+  `github-webhook-admin-pat` is limited to `ejc3/fcvm`, and must stay so.
+- **Gate.** `imagine_token_ready` (starts false) keeps the token read, the controller entry, the hook and the daily alarm
+  out of every plan until `github-runner/repo-pat/ejc3/imagine` has a value. Set its default to true in a commit, never
+  with `-var`.
+- **Cap and cost.** 8 hosts, its own `too-many-app-runners-imagine`, and `imagine-runner-hours-daily`. On `l`
+  (c7a.8xlarge, about $0.72/h with its disk and address) the cap bounds Imagine at about $138 a day.
+- **What the stock image lacks.** Bootstrap installs only the runner, build tools, git, curl, jq, zip and passwordless
+  sudo. Imagine's workflow brings the rest per job: Erlang/OTP and Elixir through `erlef/setup-beam` (which, on a
+  self-hosted runner, needs `ImageOS=ubuntu24` in the job's environment; hosted images set it), rustup itself (the
+  stock image has none; the existing `rustup toolchain install` then reads `rust-toolchain.toml`), Node and pnpm through
+  their setup actions, Chromium's libraries through `playwright install --with-deps` (apt through sudo), and a container
+  engine for `make e2e-image` (`docker.io` and `docker-buildx`, or `podman`, from apt). `actions/cache` and
+  `Swatinem/rust-cache` work unchanged. No AMI is baked, so no owner approval is involved: Canonical's image is the only
+  one this controller may launch.
+- **arm64.** Imagine's `deploy` job builds the arm64 image its Fargate service runs, on GitHub's `ubuntu-24.04-arm`. These
+  pools are x86 only, so that job stays there. It runs only on pushes to main, and skips the build when the backend did not change.
 
 ## Controller-first credential migration
 
@@ -926,7 +962,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
-| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs). Never in TF state: Terraform manages no version |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs); `ejc3/imagine`'s needs no `Webhooks`, its hook is the administration app's. Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
@@ -1059,8 +1095,8 @@ Still open (accepted for now):
 
 ## Threat model: runners for other repos
 
-Runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs` and its downstream
-`dolphin-labs-hq/dolphin-films` (Pattern C,
+Runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, its downstream
+`dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps` and `ejc3/imagine` (Pattern C,
 `runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
 second place people outside the owner run code on AWS resources we manage. Every writer on
 those repos, and every bot that opens pull requests there (for example
@@ -1093,14 +1129,16 @@ Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-on
 internet attacker's access, not more. Nor can it reach fcvm's metal runners' SSH: their group
 admits SSH only from itself and the operator addresses.
 
-**Cost limits.** Each repo may run at most 8 VMs at once, enforced by the controller before
-every launch. `too-many-app-runners` fires when the total stays above 16 for 15 minutes: it
-detects the controller launching past its caps, not the caps being reached (8 + 8 is normal
-saturation and does not alarm). The reconcile terminates any VM older than 3 hours, but only
+**Cost limits.** Each repo may run at most its cap of VMs at once (8; `dolphin-films` and
+`dolphin-maps` 2), enforced by the controller before every launch. `too-many-app-runners` fires
+when the total stays above the sum of the caps (28) for 15 minutes: it detects the controller
+launching past its caps, not the caps being reached (every repo at its cap is normal saturation
+and does not alarm). The reconcile terminates any VM older than 3 hours, but only
 while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own
 shutdown, and if the reconcile stops, `github-app-runner-errors` or
 `github-app-runner-reconcile-silent` fires and the VM runs until someone terminates it. With
-reaping working, the worst case, both repos kept saturated with 64-core VMs, is about $15/hour.
+reaping working, the worst case, every repo kept at its cap with 64-core VMs (28 at about $1.35/h
+spot in us-west-1 on 2026-10-15), is about $38/hour.
 
 **Shutting it off**
 
@@ -1117,7 +1155,9 @@ reaping working, the worst case, both repos kept saturated with 64-core VMs, is 
 3. Remove the hooks while Terraform can still read the tokens it deletes them with:
    `terraform destroy -target='github_repository_webhook.runner_app_colton_games[0]'
    -target='github_repository_webhook.runner_app_dolphin_labs[0]'
-   -target='github_repository_webhook.runner_app_dolphin_films[0]'`, then commit
+   -target='github_repository_webhook.runner_app_dolphin_films[0]'
+   -target='github_repository_webhook.runner_app_dolphin_maps[0]'
+   -target='github_repository_webhook.runner_app_imagine[0]'`, then commit
    `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
    does not work: it also drops the token reads, so the providers have no credentials to
    delete with. The repo's owner can instead revoke its controller token in GitHub, which
@@ -1171,7 +1211,7 @@ operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
 **Open gaps, most severe first**
 
 1. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
-   `dolphin-labs` 2027-09-28, `dolphin-films` a year after it is minted (record the date here).
+   `dolphin-labs` 2027-09-28, `dolphin-films` and `imagine` a year after each is minted (record the date here).
    That repo's runners stop registering when its token expires;
    renew each before then (Regenerate in GitHub keeps its permissions).
 

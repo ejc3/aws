@@ -31,10 +31,13 @@ FRONT_TF = (ROOT / "runner-webhook-front.tf").read_text()
 REPOS_TF = (ROOT / "runner-repos.tf").read_text()
 
 COLTON, DOLPHIN = "CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"
+# ejc3/imagine shares its owner with ejc3/fcvm (the metal runners), so its separation from fcvm is tested by repository.
+IMAGINE, FCVM = "ejc3/imagine", "ejc3/fcvm"
 SIZES = {"xl": ["c7a.16xlarge", "c7i.16xlarge"], "l": ["c7a.8xlarge", "c7i.8xlarge"], "s": ["c7a.2xlarge"]}
 REPOS = {
     COLTON: {"label": "cc-games", "max": 3, "pat_secret": f"github-runner/repo-pat/{COLTON}", "sizes": SIZES},
     DOLPHIN: {"label": "dolphin", "max": 3, "pat_secret": f"github-runner/repo-pat/{DOLPHIN}", "sizes": SIZES},
+    IMAGINE: {"label": "imagine", "max": 3, "pat_secret": f"github-runner/repo-pat/{IMAGINE}", "sizes": SIZES},
 }
 SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
@@ -212,7 +215,8 @@ class Hooked:
 def load_app(tokens=None):
     ec2, ssm, dynamo, cw = FakeEC2(), FakeSSM(), FakeDynamo(), FakeCloudWatch()
     secrets = FakeSecrets(tokens if tokens is not None else {
-        f"github-runner/repo-pat/{COLTON}": "PAT-COLTON", f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN"})
+        f"github-runner/repo-pat/{COLTON}": "PAT-COLTON", f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN",
+        f"github-runner/repo-pat/{IMAGINE}": "PAT-IMAGINE"})
     fake_boto3 = types.ModuleType("boto3")
     configs = []
     def client(name, region_name=None, config=None):
@@ -253,6 +257,19 @@ class RoutingTests(unittest.TestCase):
                        ["self-hosted", "cc-games", "xl", "gpu"], ["self-hosted", "dolphin", "xl"], ["ubuntu-latest"]):
             self.assertIsNone(app.job_size(cfg, labels), labels)
 
+    def test_each_repos_labels_select_only_its_own_config(self):
+        # A job is offered to a repo's controller only if every label is that repo's. Imagine's labels never select
+        # another repo's config and theirs never select Imagine's; fcvm's metal labels select none of them.
+        app, *_ = load_app()
+        for repo, cfg in REPOS.items():
+            for other, other_cfg in REPOS.items():
+                labels = ["self-hosted", other_cfg["label"], "l"]
+                self.assertEqual(app.job_size(cfg, labels), "l" if other == repo else None, (repo, labels))
+            for fcvm_labels in (["self-hosted", "ARM64"], ["self-hosted", "X64"], ["self-hosted", "Linux", "X64"],
+                                ["self-hosted", "imagine", "ARM64", "l"], ["self-hosted", "imagine", "l", "dolphin"]):
+                self.assertIsNone(app.job_size(cfg, fcvm_labels), (repo, fcvm_labels))
+        self.assertEqual(app.job_size(REPOS[IMAGINE], ["self-hosted", "Linux", "X64", "imagine", "xl"]), "xl")
+
 
 class LaunchTests(unittest.TestCase):
     def deliver(self, app, repo=COLTON, labels=("self-hosted", "cc-games", "xl"), job=7, action="queued"):
@@ -279,6 +296,43 @@ class LaunchTests(unittest.TestCase):
         self.assertIn(f"REPO='{COLTON}'", kw["UserData"])
         self.assertIn("LABELS='cc-games,xl'", kw["UserData"])
         self.assertNotIn("REGTOKEN", kw["UserData"], "the registration token must never be in user data")
+
+    def test_an_imagine_job_gets_a_host_registered_to_imagine_alone(self):
+        app, ec2, ssm, secrets = load_app()
+        result = self.deliver(app, repo=IMAGINE, labels=("self-hosted", "imagine", "l"), job=11)
+        self.assertEqual(result["outcome"], "launched")
+        (kw,) = ec2.launched
+        self.assertEqual(kw["InstanceType"], "c7a.8xlarge")
+        tags = {t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}
+        self.assertEqual((tags["Role"], tags["Repo"], tags["JobId"], tags["Size"]), ("github-app-runner", IMAGINE, "11", "l"))
+        self.assertEqual(kw["IamInstanceProfile"], {"Name": "github-app-runner-profile"})
+        # Its registration token is Imagine's, asked with Imagine's token, and nothing of any other repo is read.
+        self.assertIn(("POST", f"/repos/{IMAGINE}/actions/runners/registration-token", "PAT-IMAGINE"), app.github.calls)
+        self.assertEqual(secrets.read, [f"github-runner/repo-pat/{IMAGINE}"])
+        self.assertFalse([c for c in app.github.calls if not c[1].startswith(f"/repos/{IMAGINE}/")], app.github.calls)
+        self.assertIn(f"REPO='{IMAGINE}'", kw["UserData"])
+        self.assertIn("LABELS='imagine,l'", kw["UserData"])
+        self.assertNotIn("REGTOKEN", kw["UserData"])
+
+    def test_a_job_naming_another_repos_label_is_not_launched_for(self):
+        app, ec2, *_ = load_app()
+        for repo, labels in ((IMAGINE, ("self-hosted", "cc-games", "l")), (COLTON, ("self-hosted", "imagine", "l")),
+                             (IMAGINE, ("self-hosted", "ARM64"))):
+            self.assertEqual(self.deliver(app, repo=repo, labels=labels), {"ignored": "labels"}, (repo, labels))
+        self.assertEqual(ec2.launched, [])
+
+    def test_a_delivery_for_fcvm_reaching_the_app_runner_launches_nothing(self):
+        app, ec2, *_ = load_app()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.deliver(app, repo=FCVM, labels=("self-hosted", "imagine", "l")), {"ignored": "repo"})
+        self.assertEqual(ec2.launched, [])
+
+    def test_imagines_cap_is_its_own(self):
+        app, ec2, *_ = load_app()
+        ec2.instances += [instance(f"i-{n}", IMAGINE, str(100 + n), 1) for n in range(3)]
+        self.assertEqual(self.deliver(app, repo=IMAGINE, labels=("self-hosted", "imagine", "l"))["outcome"], "cap")
+        self.assertEqual(self.deliver(app)["outcome"], "launched", "Imagine at its cap holds no other repo back")
 
     def test_a_redelivered_job_launches_nothing(self):
         app, ec2, *_ = load_app()
@@ -720,7 +774,7 @@ class ReconcileTests(unittest.TestCase):
         app.handler({"reconcile": True}, None)
         _, data = app.fake_cloudwatch.metrics[-1]
         counts = {d["Dimensions"][0]["Value"]: d["Value"] for d in data}
-        self.assertEqual(counts, {COLTON: 1, DOLPHIN: 0, "ALL": 1})
+        self.assertEqual(counts, {COLTON: 1, DOLPHIN: 0, IMAGINE: 0, "ALL": 1})
 
     def test_no_aws_call_or_github_request_starts_after_the_deadline(self):
         app, *_ = load_app()
@@ -900,6 +954,34 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("@@REPO@@", text)
         self.assertIn("@@LABELS@@", text)
 
+    def test_a_host_registers_to_its_own_repository_only(self):
+        # Run bootstrap's real registration step, rendered for Imagine, against a fake sudo and config.sh: the runner is
+        # registered at the repository level, to https://github.com/ejc3/imagine, and a repository-level runner is never
+        # given another repository's job (ejc3/fcvm's included, though both have one owner).
+        app, *_ = load_app()
+        rendered = app.user_data(IMAGINE, "imagine,l")
+        start = rendered.index("printf '%s' \"$REG_TOKEN\" | sudo -u runner")
+        step = rendered[start:rendered.index("unset REG_TOKEN", start)]
+        tmp = Path(tempfile.mkdtemp(prefix="register."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        (tmp / "bin").mkdir()
+        (tmp / "bin" / "sudo").write_text('#!/bin/bash\n[ "$1 $2 $3" = "-u runner -H" ] || exit 9\nshift 3\nexec "$@"\n')
+        (tmp / "config.sh").write_text('#!/bin/bash\nprintf "%s\\n" "$@" > args\nprintf %s "$ACTIONS_RUNNER_INPUT_TOKEN" > token\n')
+        for f in (tmp / "bin" / "sudo", tmp / "config.sh"):
+            f.chmod(0o755)
+        script = ("REPO=$(sed -n \"s/^REPO='\\(.*\\)'$/\\1/p\" user-data); LABELS=$(sed -n \"s/^LABELS='\\(.*\\)'$/\\1/p\" user-data)\n"
+                  "INSTANCE_ID=i-0abc WORK=/home/runner/work REG_TOKEN=REGTOKEN\n" + step)
+        (tmp / "user-data").write_text(rendered)
+        out = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True, timeout=30,
+                             env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        args = (tmp / "args").read_text().split("\n")
+        self.assertEqual(args[args.index("--url") + 1], f"https://github.com/{IMAGINE}")
+        self.assertEqual(args[args.index("--labels") + 1], "imagine,l")
+        self.assertIn("--ephemeral", args)
+        self.assertNotIn("REGTOKEN", args)
+        self.assertEqual((tmp / "token").read_text(), "REGTOKEN")
+
     def test_the_tool_cache_is_where_setup_python_interpreters_expect_it(self):
         # setup-python's prebuilt Pythons are linked against /opt/hostedtoolcache. From the
         # runner's default _work/_tool, a subprocess with a clean environment failed to load
@@ -946,7 +1028,7 @@ def load_front():
     sys.modules["boto3"] = fake_boto3
     import os
     os.environ.update({"WEBHOOK_SECRET": "s", "DELIVERY_TARGET": "arn:delivery", "FCVM_REPO": "ejc3/fcvm",
-                       "APP_REPOS": json.dumps([COLTON, DOLPHIN]), "APP_DELIVERY_TARGET": "arn:app"})
+                       "APP_REPOS": json.dumps([COLTON, DOLPHIN, IMAGINE]), "APP_DELIVERY_TARGET": "arn:app"})
     ns = {}
     exec(compile(front_source(), "front", "exec"), ns)
     return ns["handler"], client
@@ -984,6 +1066,17 @@ class FrontTests(unittest.TestCase):
         done = handler(signed({"action": "completed", "workflow_job": self.JOB, "repository": {"full_name": COLTON}}), None)
         self.assertEqual(done["statusCode"], 200)
         self.assertEqual(len(client.calls), 1)
+
+    def test_imagine_goes_to_the_app_runner_and_fcvm_still_to_its_metal_webhook(self):
+        # One owner, two paths: the front decides by the full repository name, never by the owner or the labels.
+        handler, client = load_front()
+        job = dict(self.JOB, labels=["self-hosted", "imagine", "l"])
+        handler(signed({"action": "queued", "workflow_job": job, "repository": {"full_name": "ejc3/Imagine"}}), None)
+        handler(signed({"action": "queued", "workflow_job": job, "repository": {"full_name": FCVM}}), None)
+        handler(signed({"action": "completed", "workflow_job": job, "repository": {"full_name": IMAGINE}}), None)
+        self.assertEqual([c["FunctionName"] for c in client.calls], ["arn:app", "arn:delivery"])
+        self.assertEqual(json.loads(client.calls[0]["Payload"])["repo"], IMAGINE)
+        self.assertNotIn("repo", json.loads(client.calls[1]["Payload"]), "fcvm's webhook is given no repository to act on")
 
     def test_other_repositories_are_dropped(self):
         handler, client = load_front()
@@ -1049,11 +1142,13 @@ class WiringTests(unittest.TestCase):
             alias = re.search(r"provider   = github\.(\w+)", hook[0]).group(1)
             provider = re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, APP_TF, re.S).group()
             self.assertIn('owner = "%s"' % owner, provider, repo)
-            if owner == "dolphin-labs-hq":
-                # Managed as the administration agent's GitHub App, so the repos' controller PATs can be retired.
+            if owner in ("dolphin-labs-hq", "ejc3"):
+                # Managed as the administration agent's GitHub App, so the repos' controller PATs can be retired. For an
+                # ejc3 repo that is also what keeps it off the default provider, whose token is limited to ejc3/fcvm.
                 self.assertIn("app_auth", provider, repo)
-                self.assertIn('installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])', provider, repo)
+                self.assertIn('installation_id = tostring(local.github_app_admin.installations["%s"])' % owner, provider, repo)
                 self.assertNotIn("runner_repo_pat", provider, repo)
+                self.assertNotIn("github_webhook_admin_pat", provider, repo)
             else:
                 self.assertIn('runner_repo_pat["%s"].secret_string' % repo, provider, repo)
             self.assertIn('events     = ["workflow_job"]', hook[0])
@@ -1154,7 +1249,8 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertTrue(self.verify(f"{head}.{body}".encode(), pad(sig)))
 
     def app_with(self, secret_value, mint=None):
-        tokens = {f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN", f"github-runner/repo-pat/{COLTON}": "PAT-COLTON"}
+        tokens = {f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN", f"github-runner/repo-pat/{COLTON}": "PAT-COLTON",
+                  f"github-runner/repo-pat/{IMAGINE}": "PAT-IMAGINE"}
         if secret_value is not None:
             tokens["github-app/runners"] = secret_value
         app, ec2, ssm, secrets = load_app(tokens=tokens)
@@ -1193,6 +1289,19 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertEqual(app.repo_pat(dict(REPOS[COLTON], app_repo=COLTON)), "PAT-COLTON")
         self.assertEqual(calls, [])
 
+    def test_imagine_uses_its_pat_until_the_app_has_an_ejc3_installation_then_a_token_for_imagine_only(self):
+        # The app is installed on dolphin-labs-hq only until the operator installs it on ejc3: until then Imagine's PAT.
+        app, calls, _ = self.app_with(self.creds())
+        self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
+        self.assertEqual(calls, [])
+        both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
+                           "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
+        app, calls, _ = self.app_with(both)
+        self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "ghs_minted")
+        ((method, path, body),) = calls
+        self.assertEqual((method, path), ("POST", "/app/installations/888/access_tokens"))
+        self.assertEqual(body["repositories"], ["imagine"], "narrowed to imagine, never every ejc3 repository")
+
     def test_a_failed_mint_falls_back_to_the_pat_and_says_why(self):
         def mint(*a):
             raise RuntimeError("GitHub 502")
@@ -1222,10 +1331,11 @@ class RunnersAppTokenTests(unittest.TestCase):
 class RunnersAppTerraformTests(unittest.TestCase):
     TF = (ROOT / "runner-app.tf").read_text()
 
-    def test_exactly_the_dolphin_repos_take_app_tokens_and_colton_keeps_its_pat(self):
+    def test_exactly_the_dolphin_repos_and_imagine_take_app_tokens_and_colton_keeps_its_pat(self):
         m = re.search(r"runner_app_github_app_repos = \[(.*?)\]", self.TF)
         repos = re.findall(r'"([^"]+)"', m.group(1))
-        self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps"])
+        self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps",
+                                         "ejc3/imagine"])
         self.assertNotIn(COLTON, repos)
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
