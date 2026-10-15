@@ -2080,7 +2080,8 @@ false`). To turn it on, in this order:
 
 1. Merge dolphin-labs' `deploy-news.yml` and let it deploy the bundle (it reads the role ARN and names from
    `terraform output dolphin_labs_news`). Until then the function runs a stand-in that fails on purpose.
-2. Put the Upstash Redis credentials in the `dolphin-labs/news` secret, from a 0600 file, never on a command line:
+2. Put the Dolphin Redis's production URL and token (`prod` in `dolphin-redis/clients`, Dolphin account) in the
+   `dolphin-labs/news` secret, from a 0600 file, never on a command line:
    `aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/news --secret-string
    file://news-secret.json` with `{"KV_REST_API_URL": "...", "KV_REST_API_TOKEN": "..."}`; then shred the file.
 3. Turn off `refresh-news.yml`'s schedule in dolphin-labs. Both running would bill Haiku and Browserbase twice and
