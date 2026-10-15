@@ -76,9 +76,9 @@ class WatchTests(unittest.TestCase):
         self.assertIn('NEWS_PASS_MINUTES     = tostring(local.dolphin_labs_news_minutes)', TF)
         self.assertRegex(TF, r'dolphin_labs_news_schedule = local\.dolphin_labs_news_minutes == 60 \?')
 
-    def test_switch_says_to_retire_the_github_job_first(self):
+    def test_is_on_and_says_to_retire_the_github_job_first(self):
         var = block("variable", "dolphin_labs_news_enabled")
-        self.assertRegex(var, r"default     = (true|false)")
+        self.assertRegex(var, r"default     = true\b")
         self.assertIn("refresh-news.yml", var)
         self.assertIn("two minutes after the deadline", TF)
 
