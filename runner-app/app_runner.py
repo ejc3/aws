@@ -133,6 +133,7 @@ def github(method, path, pat, body=None):
 RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
 APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
 _APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
+_APP_SCOPE_OK = {}  # installation id -> expiry epoch seconds of its last passed scope check
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
 
@@ -198,7 +199,9 @@ def app_token(repo):
     installation = (creds.get('installations') or {}).get(owner)
     if not (creds.get('app_id') and creds.get('private_key') and installation):
         return None
-    out = github('POST', f'/app/installations/{installation}/access_tokens', app_jwt(creds['app_id'], creds['private_key']),
+    jwt = app_jwt(creds['app_id'], creds['private_key'])
+    check_installation_scope(installation, owner, jwt)
+    out = github('POST', f'/app/installations/{installation}/access_tokens', jwt,
                  body={'repositories': [name], 'permissions': APP_TOKEN_PERMISSIONS})
     token = out.get('token')
     if not isinstance(token, str) or not token.startswith('ghs_'):
@@ -209,6 +212,32 @@ def app_token(repo):
         expires = time.time() + 3000
     _APP_TOKENS[repo] = (token, expires)
     return token
+
+
+def check_installation_scope(installation, owner, jwt):
+    """Refuse an installation that covers more than the repos this controller serves for `owner`.
+
+    The app's key can mint administration tokens for every repository its installation covers, and this Lambda handles
+    webhook payloads, so an installation on "All repositories" (GitHub's default choice) or one that also selects another
+    repository would let this role mint administration tokens there. Checked against the installation itself, with a
+    metadata-only token for the listing, and remembered for an hour; a refusal raises, and repo_pat logs it and uses the
+    repo's own token.
+    """
+    if _APP_SCOPE_OK.get(installation, 0) > time.time():
+        return
+    info = github('GET', f'/app/installations/{installation}', jwt)
+    if info.get('repository_selection') != 'selected':
+        raise RuntimeError(f'the runners app installation on {owner} covers all repositories; refusing it '
+                           '(install it with "Only select repositories" and the served ones)')
+    served = {repo.split('/', 1)[1] for repo, cfg in config()[0].items()
+              if cfg.get('app_repo') and repo.split('/', 1)[0] == owner}
+    probe = github('POST', f'/app/installations/{installation}/access_tokens', jwt, body={'permissions': {'metadata': 'read'}})
+    listing = github('GET', '/installation/repositories?per_page=100', probe.get('token', ''))
+    names = {r.get('name') for r in listing.get('repositories') or []}
+    if listing.get('total_count') != len(names) or not names <= served:
+        raise RuntimeError(f'the runners app installation on {owner} also covers {sorted(names - served) or "more than one page"}; '
+                           'refusing it (select only the served repositories)')
+    _APP_SCOPE_OK[installation] = time.time() + 3600
 
 
 def repo_pat(cfg):

@@ -57,8 +57,9 @@ resource "aws_secretsmanager_secret_policy" "github_runner_repo_pat" {
         ArnNotLike = {
           # local.games_mp_admin_principals (games-multiplayer.tf) is the account's standard
           # administration set: root, the jumpbox admin role, SSO administrators.
-          # github-app-runner (runner-app.tf) is the controller that actually uses these tokens.
-          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_lambda[0].arn, aws_iam_role.runner_app_lambda[0].arn])
+          # github-app-runner (runner-app.tf) is the controller that uses these tokens. fcvm's metal controller
+          # (runner_lambda) never reads them: it serves ejc3/fcvm with /github-runner/pat only.
+          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_app_lambda[0].arn])
         }
       }
     }]

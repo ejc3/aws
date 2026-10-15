@@ -1248,7 +1248,10 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertEqual(json.loads(pad(body)), {"iat": 1_800_000_000 - 60, "exp": 1_800_000_000 + 540, "iss": "4242"})
         self.assertTrue(self.verify(f"{head}.{body}".encode(), pad(sig)))
 
-    def app_with(self, secret_value, mint=None):
+    # What each installation covers, as GitHub reports it: 777 is dolphin-labs-hq's, 888 is ejc3's.
+    SCOPES = {"777": ("selected", ["dolphin-labs"]), "888": ("selected", ["imagine"])}
+
+    def app_with(self, secret_value, mint=None, scopes=None):
         tokens = {f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN", f"github-runner/repo-pat/{COLTON}": "PAT-COLTON",
                   f"github-runner/repo-pat/{IMAGINE}": "PAT-IMAGINE"}
         if secret_value is not None:
@@ -1256,14 +1259,34 @@ class RunnersAppTokenTests(unittest.TestCase):
         app, ec2, ssm, secrets = load_app(tokens=tokens)
         app.RUNNER_APP_SECRET = "github-app/runners"
         app._APP_TOKENS.clear()
-        calls = []
+        app._APP_SCOPE_OK.clear()
+        # As in production, the controller's config names app_repo for the repos the app serves (not Colton's).
+        served = {repo: dict(cfg, app_repo=repo if repo != COLTON else "") for repo, cfg in REPOS.items()}
+        app.config = lambda: (served, SUBNETS)
+        scopes = scopes or self.SCOPES
+        calls, scope_calls, probed = [], [], []
 
         def github(method, path, pat, body=None):
+            installation = path.split("/")[3] if path.startswith("/app/installations/") else None
+            if method == "GET" and path.startswith("/app/installations/"):
+                scope_calls.append(path)
+                return {"repository_selection": scopes[installation][0]}
+            if method == "POST" and path.endswith("/access_tokens") and "repositories" not in (body or {}):
+                scope_calls.append(path)
+                self.assertEqual(body, {"permissions": {"metadata": "read"}}, "the listing token reads metadata only")
+                probed.append(installation)
+                return {"token": "ghs_probe"}
+            if method == "GET" and path.startswith("/installation/repositories"):
+                scope_calls.append(path)
+                self.assertEqual(pat, "ghs_probe")
+                names = scopes[probed[-1]][1]
+                return {"total_count": len(names), "repositories": [{"name": n} for n in names]}
             calls.append((method, path, body))
             if mint is not None:
                 return mint(method, path, pat, body)
             return {"token": "ghs_minted", "expires_at": "2099-01-01T00:00:00Z"}
         app.github = github
+        app.scope_calls = scope_calls
         return app, calls, secrets
 
     def creds(self):
@@ -1317,6 +1340,36 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertNotIn("github-app/runners", secrets.read)
         self.assertEqual(calls, [])
 
+    def test_an_installation_on_all_repositories_is_refused_and_the_pat_used(self):
+        # GitHub's default choice when installing an app: every repository of the owner, ejc3/aws included.
+        scopes = dict(self.SCOPES, **{"777": ("all", ["dolphin-labs", "dolphin-films", "aws"])})
+        app, calls, _ = self.app_with(self.creds(), scopes=scopes)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "PAT-DOLPHIN")
+        self.assertEqual(calls, [], "no administration token is minted from it")
+        self.assertIn("covers all repositories", out.getvalue())
+
+    def test_an_installation_that_also_selects_another_repository_is_refused(self):
+        scopes = dict(self.SCOPES, **{"888": ("selected", ["imagine", "aws"])})
+        both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
+                           "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
+        app, calls, _ = self.app_with(both, scopes=scopes)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
+        self.assertEqual(calls, [])
+        self.assertIn("also covers ['aws']", out.getvalue())
+
+    def test_the_scope_check_runs_once_an_hour_per_installation(self):
+        app, calls, _ = self.app_with(self.creds())
+        cfg = dict(REPOS[DOLPHIN], app_repo=DOLPHIN)
+        self.assertEqual(app.repo_pat(cfg), "ghs_minted")
+        self.assertEqual(len(app.scope_calls), 3)
+        app._APP_TOKENS.clear()
+        self.assertEqual(app.repo_pat(cfg), "ghs_minted")
+        self.assertEqual(len(app.scope_calls), 3, "the passed check is remembered")
+
     def test_running_out_of_time_is_not_swallowed(self):
         app, *_ = load_app()
         app.RUNNER_APP_SECRET = "github-app/runners"
@@ -1339,6 +1392,14 @@ class RunnersAppTerraformTests(unittest.TestCase):
         self.assertNotIn(COLTON, repos)
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
+
+    def test_only_the_app_controller_and_administration_can_read_the_repo_tokens(self):
+        # fcvm's metal controller (runner_lambda) serves ejc3/fcvm with /github-runner/pat and never reads these.
+        autoscale = (ROOT / "runner-autoscale.tf").read_text()
+        self.assertNotIn("aws_secretsmanager_secret.github_runner_repo_pat", autoscale)
+        policy = REPOS_TF[REPOS_TF.index('resource "aws_secretsmanager_secret_policy" "github_runner_repo_pat"'):]
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_app_lambda[0].arn])', policy)
+        self.assertNotIn("aws_iam_role.runner_lambda", policy)
 
     def test_the_controller_reads_the_app_secret_and_only_it_and_the_jumpboxes_can(self):
         self.assertIn("RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name", self.TF)
