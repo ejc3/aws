@@ -86,6 +86,25 @@ test('settings that would outlive the client are acknowledged but never reach th
   assert.deepEqual(got, [{ id: 3, result: {} }, { id: 4, sessionId: 'S2', result: {} }]);
 });
 
+test("a client cannot replace the desktop's own auto-attach setting", async () => {
+  const fake = fakeBrowser();
+  const mux = createCdpMux(fake.writer, fake.reader);
+  const own = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
+  mux.send('Target.setAutoAttach', own);
+  const got = [];
+  const client = mux.attach((m) => got.push(m));
+  client.command({ id: 1, method: 'Target.setAutoAttach', params: { flatten: true, waitForDebuggerOnStart: true, autoAttach: true } });
+  client.command({ id: 2, method: 'Target.setAutoAttach', params: { autoAttach: false, waitForDebuggerOnStart: false } });
+  client.command({ id: 3, method: 'Target.setAutoAttach', params: { ...own, filter: [{ type: 'iframe' }] } });
+  client.command({ id: 4, method: 'Target.setAutoAttach', sessionId: 'S5', params: { autoAttach: false, waitForDebuggerOnStart: false } });
+  await tick(); await tick();
+  const forwarded = fake.seen.filter((m) => m.method === 'Target.setAutoAttach');
+  assert.equal(forwarded.length, 3, "the desktop's own call, the identical client call, and the session-scoped one");
+  assert.deepEqual(forwarded.slice(1).map((m) => [m.params.autoAttach, m.sessionId]), [[true, undefined], [false, 'S5']]);
+  assert.deepEqual(got.find((m) => m.id === 2), { id: 2, result: {} });
+  assert.deepEqual(got.find((m) => m.id === 3), { id: 3, result: {} });
+});
+
 test('a detached client gets nothing more, and its pending replies are dropped', async () => {
   const fake = fakeBrowser();
   fake.writer.removeAllListeners('data'); // this browser never answers

@@ -16,8 +16,15 @@ export const REFUSED_METHODS = new Set(['Browser.close', 'Browser.crash', 'Brows
 // download by the person would land in a directory that no longer exists. The browser keeps its own settings.
 export const IGNORED_METHODS = new Set(['Browser.setDownloadBehavior', 'Page.setDownloadBehavior']);
 
+// Browser-level Target.setAutoAttach is per connection, and every client shares the desktop's one connection: a client's
+// call would replace the desktop's own setting (the one that masks and captures every new tab) and outlive the client.
+// So a client's call is forwarded only when it asks for exactly the desktop's setting (what Playwright sends); anything
+// else is acknowledged and dropped. Calls scoped to a session (a page's own child targets) pass through.
+const sameParams = (a = {}, b = {}) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+
 export function createCdpMux(writer, reader) {
   let nextId = 0;
+  let ownAutoAttach = null; // the desktop's browser-level Target.setAutoAttach params
   let buffer = Buffer.alloc(0);
   const pending = new Map(); // pipe id -> { deliver, id }
   const listeners = new Set();
@@ -49,6 +56,7 @@ export function createCdpMux(writer, reader) {
   return {
     /** The desktop's own commands: fire and forget, replies are dropped. */
     send(method, params = {}, sessionId) {
+      if (method === 'Target.setAutoAttach' && !sessionId) ownAutoAttach = params;
       const id = ++nextId;
       pending.set(id, { deliver: () => {}, id });
       write({ id, method, params, ...(sessionId ? { sessionId } : {}) });
@@ -70,7 +78,8 @@ export function createCdpMux(writer, reader) {
               error: { code: -32000, message: `${message.method} is refused by browser-manager: this is someone's live browser` } });
             return;
           }
-          if (IGNORED_METHODS.has(message.method)) {
+          if (IGNORED_METHODS.has(message.method) || (message.method === 'Target.setAutoAttach' && !message.sessionId &&
+              ownAutoAttach && !sameParams(message.params, ownAutoAttach))) {
             deliver({ id: message.id, ...(message.sessionId ? { sessionId: message.sessionId } : {}), result: {} });
             return;
           }
