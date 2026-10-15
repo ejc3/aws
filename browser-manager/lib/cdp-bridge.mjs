@@ -11,6 +11,11 @@ import { WebSocketServer } from 'ws';
 // open and close its own tabs, never the browser.
 export const REFUSED_METHODS = new Set(['Browser.close', 'Browser.crash', 'Browser.crashGpuProcess']);
 
+// Commands acknowledged but never forwarded: they change how the person's browser behaves after the client has gone.
+// Playwright's connect_over_cdp points downloads at its own temporary directory and deletes it on exit, so a later
+// download by the person would land in a directory that no longer exists. The browser keeps its own settings.
+export const IGNORED_METHODS = new Set(['Browser.setDownloadBehavior', 'Page.setDownloadBehavior']);
+
 export function createCdpMux(writer, reader) {
   let nextId = 0;
   let buffer = Buffer.alloc(0);
@@ -63,6 +68,10 @@ export function createCdpMux(writer, reader) {
           if (REFUSED_METHODS.has(message.method)) {
             deliver({ id: message.id, ...(message.sessionId ? { sessionId: message.sessionId } : {}),
               error: { code: -32000, message: `${message.method} is refused by browser-manager: this is someone's live browser` } });
+            return;
+          }
+          if (IGNORED_METHODS.has(message.method)) {
+            deliver({ id: message.id, ...(message.sessionId ? { sessionId: message.sessionId } : {}), result: {} });
             return;
           }
           const id = ++nextId;

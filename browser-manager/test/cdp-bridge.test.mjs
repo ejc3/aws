@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { WebSocket } from 'ws';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createAuthorizer } from '../lib/auth.mjs';
-import { createCdpMux, startCdpBridge, REFUSED_METHODS } from '../lib/cdp-bridge.mjs';
+import { createCdpMux, startCdpBridge, REFUSED_METHODS, IGNORED_METHODS } from '../lib/cdp-bridge.mjs';
 import { createHttpServer } from '../lib/http.mjs';
 
 // A fake browser on the other end of the pipe: records what reaches it and answers every command with { echo: id }.
@@ -71,6 +71,19 @@ test('commands that would end the live browser are refused and never reach it', 
   client.command({ method: 'No.id' });
   await tick();
   assert.equal(got.at(-1).error.code, -32600);
+});
+
+test('settings that would outlive the client are acknowledged but never reach the browser', async () => {
+  const fake = fakeBrowser();
+  const mux = createCdpMux(fake.writer, fake.reader);
+  const got = [];
+  const client = mux.attach((m) => got.push(m));
+  client.command({ id: 3, method: 'Browser.setDownloadBehavior', params: { behavior: 'allowAndName', downloadPath: '/tmp/playwright-artifacts' } });
+  client.command({ id: 4, method: 'Page.setDownloadBehavior', sessionId: 'S2', params: { behavior: 'deny' } });
+  await tick(); await tick();
+  assert.equal(IGNORED_METHODS.size, 2);
+  assert.deepEqual(fake.seen, []);
+  assert.deepEqual(got, [{ id: 3, result: {} }, { id: 4, sessionId: 'S2', result: {} }]);
 });
 
 test('a detached client gets nothing more, and its pending replies are dropped', async () => {
