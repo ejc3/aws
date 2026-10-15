@@ -668,10 +668,13 @@ its PAT: the app would have to be installed from Colton's account. `ejc3/imagine
 is installed on the `ejc3` account with **only `imagine` selected** and that installation id is in `github-app/runners`
 (`installations.ejc3`); until then `app_token()` finds no `ejc3` installation and its PAT is used. An installation on all
 of `ejc3`'s repositories would let the controller's role mint administration tokens for `ejc3/fcvm` and `ejc3/aws` too, so
-the controller checks every installation before minting from it (`check_installation_scope`, once an hour): GitHub must
-report `repository_selection: selected`, and the repositories it covers (listed with a metadata-only token) must be
-served repos of that owner. Anything else is refused, logged (`runners app token failed (... refusing it ...)`), and the
-repo's own PAT is used.
+the controller checks every installation before minting from it (`check_installation_scope`): the installation must
+belong to that owner, GitHub must report `repository_selection: selected`, and the repositories it covers (listed with a
+metadata-only token, revoked afterwards) must all be in `APP_INSTALLATION_REPOS`, every repo the app is meant to cover
+(`runner_app_github_app_repos`, token gates or not, so a repo whose gate is off does not make a correct installation look
+too broad). Anything else is refused, logged (`runners app token failed (... refusing it ...)`), and the repo's own PAT
+is used. A pass is remembered for an hour, a refusal for ten minutes. It guards the controller's own minting; whoever
+holds the controller's role can still read the app's key, so the installation itself must stay narrow.
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 

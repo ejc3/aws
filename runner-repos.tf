@@ -26,7 +26,7 @@
 #   printf %s "$TOKEN" | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin
 #
-# Only administration and the runner controllers (runner_lambda, runner_app_lambda) may read it. The runner INSTANCE role has no
+# Only administration and Pattern C's controller (runner_app_lambda) may read it; fcvm's metal controller never does. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
   runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]

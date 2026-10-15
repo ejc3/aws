@@ -1248,8 +1248,13 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertEqual(json.loads(pad(body)), {"iat": 1_800_000_000 - 60, "exp": 1_800_000_000 + 540, "iss": "4242"})
         self.assertTrue(self.verify(f"{head}.{body}".encode(), pad(sig)))
 
-    # What each installation covers, as GitHub reports it: 777 is dolphin-labs-hq's, 888 is ejc3's.
-    SCOPES = {"777": ("selected", ["dolphin-labs"]), "888": ("selected", ["imagine"])}
+    # What each installation covers, as GitHub reports it (account, selection, repositories): 777 is dolphin-labs-hq's,
+    # with the three repos live today, 888 is ejc3's.
+    SCOPES = {"777": ("dolphin-labs-hq", "selected", ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films",
+                                                       "dolphin-labs-hq/dolphin-maps"]),
+              "888": ("ejc3", "selected", ["ejc3/imagine"])}
+    APP_INSTALLATION_REPOS = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps",
+                              "ejc3/imagine"]
 
     def app_with(self, secret_value, mint=None, scopes=None):
         tokens = {f"github-runner/repo-pat/{DOLPHIN}": "PAT-DOLPHIN", f"github-runner/repo-pat/{COLTON}": "PAT-COLTON",
@@ -1263,6 +1268,7 @@ class RunnersAppTokenTests(unittest.TestCase):
         # As in production, the controller's config names app_repo for the repos the app serves (not Colton's).
         served = {repo: dict(cfg, app_repo=repo if repo != COLTON else "") for repo, cfg in REPOS.items()}
         app.config = lambda: (served, SUBNETS)
+        os.environ["APP_INSTALLATION_REPOS"] = json.dumps(self.APP_INSTALLATION_REPOS)
         scopes = scopes or self.SCOPES
         calls, scope_calls, probed = [], [], []
 
@@ -1270,7 +1276,11 @@ class RunnersAppTokenTests(unittest.TestCase):
             installation = path.split("/")[3] if path.startswith("/app/installations/") else None
             if method == "GET" and path.startswith("/app/installations/"):
                 scope_calls.append(path)
-                return {"repository_selection": scopes[installation][0]}
+                return {"account": {"login": scopes[installation][0]}, "repository_selection": scopes[installation][1]}
+            if method == "DELETE" and path == "/installation/token":
+                scope_calls.append(path)
+                self.assertEqual(pat, "ghs_probe", "only the listing token is revoked")
+                return {}
             if method == "POST" and path.endswith("/access_tokens") and "repositories" not in (body or {}):
                 scope_calls.append(path)
                 self.assertEqual(body, {"permissions": {"metadata": "read"}}, "the listing token reads metadata only")
@@ -1279,8 +1289,8 @@ class RunnersAppTokenTests(unittest.TestCase):
             if method == "GET" and path.startswith("/installation/repositories"):
                 scope_calls.append(path)
                 self.assertEqual(pat, "ghs_probe")
-                names = scopes[probed[-1]][1]
-                return {"total_count": len(names), "repositories": [{"name": n} for n in names]}
+                names = scopes[probed[-1]][2]
+                return {"total_count": len(names), "repositories": [{"full_name": n, "name": n.split("/")[1]} for n in names]}
             calls.append((method, path, body))
             if mint is not None:
                 return mint(method, path, pat, body)
@@ -1342,7 +1352,7 @@ class RunnersAppTokenTests(unittest.TestCase):
 
     def test_an_installation_on_all_repositories_is_refused_and_the_pat_used(self):
         # GitHub's default choice when installing an app: every repository of the owner, ejc3/aws included.
-        scopes = dict(self.SCOPES, **{"777": ("all", ["dolphin-labs", "dolphin-films", "aws"])})
+        scopes = dict(self.SCOPES, **{"777": ("dolphin-labs-hq", "all", ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-aws"])})
         app, calls, _ = self.app_with(self.creds(), scopes=scopes)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -1351,7 +1361,7 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertIn("covers all repositories", out.getvalue())
 
     def test_an_installation_that_also_selects_another_repository_is_refused(self):
-        scopes = dict(self.SCOPES, **{"888": ("selected", ["imagine", "aws"])})
+        scopes = dict(self.SCOPES, **{"888": ("ejc3", "selected", ["ejc3/imagine", "ejc3/aws"])})
         both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
                            "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
         app, calls, _ = self.app_with(both, scopes=scopes)
@@ -1359,16 +1369,48 @@ class RunnersAppTokenTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
         self.assertEqual(calls, [])
-        self.assertIn("also covers ['aws']", out.getvalue())
+        self.assertIn("also covers ['ejc3/aws']", out.getvalue())
 
     def test_the_scope_check_runs_once_an_hour_per_installation(self):
         app, calls, _ = self.app_with(self.creds())
         cfg = dict(REPOS[DOLPHIN], app_repo=DOLPHIN)
         self.assertEqual(app.repo_pat(cfg), "ghs_minted")
-        self.assertEqual(len(app.scope_calls), 3)
+        self.assertEqual(len(app.scope_calls), 4, "installation, listing token, listing, revoke")
+        self.assertEqual(app.scope_calls[-1], "/installation/token")
         app._APP_TOKENS.clear()
         self.assertEqual(app.repo_pat(cfg), "ghs_minted")
-        self.assertEqual(len(app.scope_calls), 3, "the passed check is remembered")
+        self.assertEqual(len(app.scope_calls), 4, "the passed check is remembered")
+        app._APP_TOKENS.clear()
+        app._APP_SCOPE_OK[777] = (0, None)  # the hour is up
+        self.assertEqual(app.repo_pat(cfg), "ghs_minted")
+        self.assertEqual(len(app.scope_calls), 8, "and checked again once it expires")
+
+    def test_a_covered_repo_whose_gate_is_off_does_not_make_the_installation_too_broad(self):
+        # dolphin-maps' token gate off (it is then missing from REPOS), while the installation still selects it.
+        app, calls, _ = self.app_with(self.creds())
+        app.config = lambda: ({DOLPHIN: dict(REPOS[DOLPHIN], app_repo=DOLPHIN)}, SUBNETS)
+        self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "ghs_minted")
+
+    def test_another_accounts_installation_is_refused_even_with_a_same_named_repository(self):
+        both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
+                           "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
+        scopes = dict(self.SCOPES, **{"888": ("someone-else", "selected", ["someone-else/imagine"])})
+        app, calls, _ = self.app_with(both, scopes=scopes)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
+        self.assertEqual(calls, [])
+        self.assertIn("belongs to someone-else, not ejc3", out.getvalue())
+
+    def test_a_refusal_is_remembered_rather_than_checked_on_every_call(self):
+        scopes = dict(self.SCOPES, **{"777": ("dolphin-labs-hq", "all", ["dolphin-labs-hq/dolphin-labs"])})
+        app, calls, _ = self.app_with(self.creds(), scopes=scopes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "PAT-DOLPHIN")
+            first = len(app.scope_calls)
+            self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "PAT-DOLPHIN")
+        self.assertEqual(len(app.scope_calls), first)
+        self.assertEqual(calls, [])
 
     def test_running_out_of_time_is_not_swallowed(self):
         app, *_ = load_app()
@@ -1392,6 +1434,9 @@ class RunnersAppTerraformTests(unittest.TestCase):
         self.assertNotIn(COLTON, repos)
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
+
+    def test_the_controller_knows_every_repo_the_app_may_cover_gates_or_not(self):
+        self.assertIn("APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)", self.TF)
 
     def test_only_the_app_controller_and_administration_can_read_the_repo_tokens(self):
         # fcvm's metal controller (runner_lambda) serves ejc3/fcvm with /github-runner/pat and never reads these.
