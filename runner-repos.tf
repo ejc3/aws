@@ -26,7 +26,7 @@
 #   printf %s "$TOKEN" | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id github-runner/repo-pat/<owner>/<repo> --secret-string file:///dev/stdin
 #
-# Only administration and the runner controllers (runner_lambda, runner_app_lambda) may read it. The runner INSTANCE role has no
+# Only administration and Pattern C's controller (runner_app_lambda) may read it; fcvm's metal controller never does. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
   runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
@@ -57,8 +57,9 @@ resource "aws_secretsmanager_secret_policy" "github_runner_repo_pat" {
         ArnNotLike = {
           # local.games_mp_admin_principals (games-multiplayer.tf) is the account's standard
           # administration set: root, the jumpbox admin role, SSO administrators.
-          # github-app-runner (runner-app.tf) is the controller that actually uses these tokens.
-          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_lambda[0].arn, aws_iam_role.runner_app_lambda[0].arn])
+          # github-app-runner (runner-app.tf) is the controller that uses these tokens. fcvm's metal controller
+          # (runner_lambda) never reads them: it serves ejc3/fcvm with /github-runner/pat only.
+          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.runner_app_lambda[0].arn])
         }
       }
     }]

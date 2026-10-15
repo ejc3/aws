@@ -667,7 +667,14 @@ so once the controller has run on app tokens the PATs have no remaining user and
 its PAT: the app would have to be installed from Colton's account. `ejc3/imagine` takes the app's token only once the app
 is installed on the `ejc3` account with **only `imagine` selected** and that installation id is in `github-app/runners`
 (`installations.ejc3`); until then `app_token()` finds no `ejc3` installation and its PAT is used. An installation on all
-of `ejc3`'s repositories would let the controller's role mint administration tokens for `ejc3/fcvm` and `ejc3/aws` too.
+of `ejc3`'s repositories would let the controller's role mint administration tokens for `ejc3/fcvm` and `ejc3/aws` too, so
+the controller checks every installation before minting from it (`check_installation_scope`): the installation must
+belong to that owner, GitHub must report `repository_selection: selected`, and the repositories it covers (listed with a
+metadata-only token, revoked afterwards) must all be in `APP_INSTALLATION_REPOS`, every repo the app is meant to cover
+(`runner_app_github_app_repos`, token gates or not, so a repo whose gate is off does not make a correct installation look
+too broad). Anything else is refused, logged (`runners app token failed (... refusing it ...)`), and the repo's own PAT
+is used. A pass is remembered for an hour, a refusal for ten minutes. It guards the controller's own minting; whoever
+holds the controller's role can still read the app's key, so the installation itself must stay narrow.
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 
@@ -963,7 +970,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
-| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller), `github-runner-lambda-role` and administration only (resource policy); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs); `ejc3/imagine`'s needs no `Webhooks`, its hook is the administration app's. Never in TF state: Terraform manages no version |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller) and administration only (resource policy; fcvm's metal controller, `github-runner-lambda-role`, never reads them); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs); `ejc3/imagine`'s needs no `Webhooks`, its hook is the administration app's. Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
@@ -1121,7 +1128,7 @@ reconcile ran clean.
   table (checked with `simulate-principal-policy`).
 
 **What it cannot do**: register runners or touch webhooks (the per-repo tokens are readable
-only by the two controller Lambdas and administrators, verified by `simulate-principal-policy`
+only by Pattern C's controller and administrators, verified by `simulate-principal-policy`
 with the secrets' resource policies); read another job's registration token (instance-bound);
 connect to another runner of the same kind (no inbound); reach the admin fleet over a private
 route (the runner VPC is not peered with it); launch or stop instances. A job does have the

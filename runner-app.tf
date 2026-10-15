@@ -413,6 +413,9 @@ resource "aws_lambda_function" "runner_app" {
       IDLE_MINUTES         = "10"
       MAX_LIFETIME_MINUTES = "180"
       VOLUME_GB            = "80"
+
+      # Every repo the runners app is meant to cover, token gates or not: what an installation may select.
+      APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)
     }
   }
 

@@ -133,6 +133,7 @@ def github(method, path, pat, body=None):
 RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
 APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
 _APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
+_APP_SCOPE_OK = {}  # (installation id, owner) -> (expiry epoch seconds, refusal message or None) of its last scope check
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
 
@@ -198,7 +199,9 @@ def app_token(repo):
     installation = (creds.get('installations') or {}).get(owner)
     if not (creds.get('app_id') and creds.get('private_key') and installation):
         return None
-    out = github('POST', f'/app/installations/{installation}/access_tokens', app_jwt(creds['app_id'], creds['private_key']),
+    jwt = app_jwt(creds['app_id'], creds['private_key'])
+    check_installation_scope(installation, owner, jwt)
+    out = github('POST', f'/app/installations/{installation}/access_tokens', jwt,
                  body={'repositories': [name], 'permissions': APP_TOKEN_PERMISSIONS})
     token = out.get('token')
     if not isinstance(token, str) or not token.startswith('ghs_'):
@@ -209,6 +212,57 @@ def app_token(repo):
         expires = time.time() + 3000
     _APP_TOKENS[repo] = (token, expires)
     return token
+
+
+def check_installation_scope(installation, owner, jwt):
+    """Refuse an installation that is not `owner`'s or covers more than the repos the app is meant to cover there.
+
+    The app's key can mint administration tokens for every repository its installation covers, and this Lambda handles
+    webhook payloads, so an installation on "All repositories" (GitHub's default choice), one that also selects another
+    repository, or another account's installation recorded by mistake must not be minted from. Checked against the
+    installation itself, with a metadata-only token for the listing (revoked afterwards). A pass is remembered for an hour,
+    a refusal for ten minutes; a refusal raises, and repo_pat logs it and uses the repo's own token. The allowed set is
+    APP_INSTALLATION_REPOS (every repo the app is meant to cover), not REPOS, which leaves out repos whose gate is off.
+    """
+    key = (installation, owner.lower())  # a check is valid only for the owner it was made for
+    until, refusal = _APP_SCOPE_OK.get(key, (0, None))
+    if until > time.time():
+        if refusal:
+            raise RuntimeError(refusal)
+        return
+
+    def refuse(reason):
+        message = f'the runners app installation {installation} {reason}; refusing it'
+        _APP_SCOPE_OK[key] = (time.time() + 600, message)
+        raise RuntimeError(message)
+
+    info = github('GET', f'/app/installations/{installation}', jwt)
+    account = ((info.get('account') or {}).get('login') or '').lower()
+    if account != owner.lower():
+        refuse(f'belongs to {account or "no account"}, not {owner}')
+    if info.get('repository_selection') != 'selected':
+        refuse(f'on {owner} covers all repositories (install it with "Only select repositories" and the served ones)')
+    allowed = {repo.lower() for repo in json.loads(os.environ.get('APP_INSTALLATION_REPOS') or '[]')
+               if repo.split('/', 1)[0].lower() == owner.lower()}
+    probe = github('POST', f'/app/installations/{installation}/access_tokens', jwt, body={'permissions': {'metadata': 'read'}})
+    token = probe.get('token') or ''
+    if not token:
+        refuse('gave no listing token')
+    try:
+        listing = github('GET', '/installation/repositories?per_page=100', token)
+    finally:
+        try:
+            github('DELETE', '/installation/token', token)
+        except OutOfTime:
+            raise
+        except Exception:
+            pass  # it expires within the hour on its own and can only read metadata
+    names = {(r.get('full_name') or '').lower() for r in listing.get('repositories') or []}
+    if listing.get('total_count') != len(names):
+        refuse('covers more repositories than one listing page')
+    if not names <= allowed:
+        refuse(f'on {owner} also covers {sorted(names - allowed)} (select only the served repositories)')
+    _APP_SCOPE_OK[key] = (time.time() + 3600, None)
 
 
 def repo_pat(cfg):
