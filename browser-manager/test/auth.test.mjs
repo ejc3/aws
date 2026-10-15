@@ -53,7 +53,8 @@ test('instance names and start URLs cannot select filesystem, socket, or executa
 
 test('production config refuses missing audience and unsafe origins', () => {
   assert.throws(() => readConfig({}));
-  const env = { BM_ACCESS_AUD: config.audience, BM_ACCESS_SERVICE_TOKEN_ID: serviceTokenId };
+  // #268 took the owner's address out of the code: it now comes only from BM_OWNER_EMAIL.
+  const env = { BM_ACCESS_AUD: config.audience, BM_ACCESS_SERVICE_TOKEN_ID: serviceTokenId, BM_OWNER_EMAIL: 'owner@example.com' };
   assert.equal(readConfig(env).port, 3210);
   for (const change of [{ BM_BASE_URL: 'http://public.example.test' }, { BM_BASE_URL: 'https://x.test/path' },
     { BM_ACCESS_ISSUER: 'http://team.cloudflareaccess.com' }, { BM_ACCESS_ISSUER: 'https://attacker.test' },

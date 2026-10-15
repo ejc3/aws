@@ -49,6 +49,14 @@ export function createApi({ manager, baseUrl, local = false, transport = 'vnc' }
     if (req.method !== 'POST') throw new HttpError(404, 'Unknown API route');
     if (!local) requireOrigin(req, baseUrl);
     const data = await readBody(req);
+    // The CDP bridge hands a debugging endpoint for a live, signed-in browser to the caller: the owner-only local
+    // control socket only, never the web listener.
+    const cdp = /^\/api\/browsers\/([a-z0-9-]+)\/cdp$/.exec(path);
+    if (cdp) {
+      if (!local) throw new HttpError(404, 'Unknown API route');
+      if (Object.keys(data).length) throw new HttpError(400, 'Unsupported cdp field');
+      json(res, 200, await manager.openCdpBridge(instanceName(cdp[1]))); return true;
+    }
     const action = /^\/api\/browsers\/([a-z0-9-]+)\/(start|stop|rename|viewport)$/.exec(path);
     if (path !== '/api/browsers' && !action) throw new HttpError(404, 'Unknown API route');
     const name = instanceName(action ? action[1] : data.name);
