@@ -41,7 +41,7 @@
 variable "dolphin_labs_news_enabled" {
   description = "Run dolphin-labs' news pass on its schedule. false keeps the function and its data and stops the runs. Turn refresh-news.yml's schedule off in dolphin-labs first (see the file header)."
   type        = bool
-  default     = true # on since 2026-10-14; refresh-news.yml is off in dolphin-labs
+  default     = true # on since 2026-10-15; refresh-news.yml is off in dolphin-labs (NEWS_RUNS_IN_AWS)
 }
 
 locals {
