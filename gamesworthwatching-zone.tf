@@ -11,9 +11,15 @@
 # is a fully supported Vercel setup. If you ever genuinely need Vercel as the NAMESERVER,
 # the domain has to move to a different registrar first.
 #
-# PROXY MUST STAY OFF. An orange-clouded record terminates TLS at Cloudflare, and Vercel's
-# domain verification and certificate issuance then fail against Cloudflare's edge rather
-# than reaching Vercel. proxied = false is not a preference here, it is a requirement.
+# PRODUCTION IS ON CLOUDFLARE (2026-10-15; the dolphin-labs Vercel team is being retired). With
+# local.gww_on_cloudflare the records are proxied and two Workers routes send gamesworthwatching.com/*
+# and www.gamesworthwatching.com/* to the Worker dolphin-labs-prod (web/wrangler.jsonc env.production
+# in dolphin-labs-hq/dolphin-labs, deployed by its cloudflare-stage.yml; its cf-worker.mjs redirects www
+# to the apex, as Vercel did, and runs the every-minute cron vercel.json had). The record contents stay
+# Vercel's: a route answers every request, so nothing reaches them, and setting the switch to false is
+# the rollback while the Vercel project exists. DNS-only is what Vercel needs: an orange-clouded record
+# terminates TLS at Cloudflare, and Vercel's certificate issuance then fails. Either half alone is
+# harmless: a route on a DNS-only record does nothing, a proxied record without the route reaches Vercel.
 
 variable "gww_zone_id" {
   description = "Zone id for gamesworthwatching.com (registered through Cloudflare Registrar, so the zone was created automatically)"
@@ -40,14 +46,19 @@ variable "gww_vercel_cname" {
   default     = "cname.vercel-dns.com"
 }
 
+locals {
+  gww_on_cloudflare = true
+  gww_worker        = "dolphin-labs-prod"
+}
+
 resource "cloudflare_dns_record" "gww_apex" {
   zone_id = var.gww_zone_id
   name    = "gamesworthwatching.com"
   type    = "A"
   content = var.gww_vercel_a
-  proxied = false # see the header: proxying breaks Vercel cert issuance
-  ttl     = 300
-  comment = "vercel apex"
+  proxied = local.gww_on_cloudflare
+  ttl     = local.gww_on_cloudflare ? 1 : 300
+  comment = local.gww_on_cloudflare ? "proxied; served by Worker ${local.gww_worker}" : "vercel apex"
 }
 
 resource "cloudflare_dns_record" "gww_www" {
@@ -55,12 +66,19 @@ resource "cloudflare_dns_record" "gww_www" {
   name    = "www"
   type    = "CNAME"
   content = var.gww_vercel_cname
-  proxied = false
-  ttl     = 300
-  comment = "vercel www"
+  proxied = local.gww_on_cloudflare
+  ttl     = local.gww_on_cloudflare ? 1 : 300
+  comment = local.gww_on_cloudflare ? "proxied; Worker ${local.gww_worker} redirects (308) to the apex" : "vercel www"
+}
+
+resource "cloudflare_workers_route" "gww" {
+  for_each = local.gww_on_cloudflare ? toset(["gamesworthwatching.com/*", "www.gamesworthwatching.com/*"]) : toset([])
+  zone_id  = var.gww_zone_id
+  pattern  = each.value
+  script   = local.gww_worker
 }
 
 output "gamesworthwatching" {
   description = "Domain status and what is left to do on the Vercel side"
-  value       = "gamesworthwatching.com -> Vercel (A ${var.gww_vercel_a}, www CNAME ${var.gww_vercel_cname}, unproxied). Remaining: add the domain to the Vercel project, then `vercel domains inspect` and override gww_vercel_a/gww_vercel_cname if it issues per-domain targets."
+  value       = local.gww_on_cloudflare ? "gamesworthwatching.com -> Cloudflare Worker ${local.gww_worker} (proxied records, Workers routes)" : "gamesworthwatching.com -> Vercel (A ${var.gww_vercel_a}, www CNAME ${var.gww_vercel_cname}, unproxied)"
 }

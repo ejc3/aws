@@ -1463,9 +1463,14 @@ Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come o
 deployed by its `cloudflare-stage.yml`; it has no runtime secrets, so no `workers-stage/dolphin-maps` container until it
 needs one.
 
-**Which production is behind Cloudflare (2026-10-11).** cc-games.org itself is served by the `colton-games-prod` Worker since
-the cutover below, so its zone protection applies. Every other production hostname (www.cc-games.org and the old domains,
-which Vercel still redirects; yourfantasymovie.com) and the multiplayer `play.cc-games.*` entries are DNS-only records
+**Which production is behind Cloudflare (2026-10-15).** cc-games.org itself is served by the `colton-games-prod` Worker since
+the cutover below, so its zone protection applies. The Dolphin sites left Vercel on 2026-10-15 (its dolphin-labs team is being
+retired): gamesworthwatching.com is served by `dolphin-labs-prod` (`gamesworthwatching-zone.tf`, which also runs the old Vercel
+cron as a Cron Trigger) and yourfantasymovie.com by `dolphin-films-prod` (`yourfantasymovie.tf`), each through proxied records
+and Workers routes behind one switch. Their secrets are production's, loaded from AWS with `wrangler secret bulk`: dolphin-labs
+from `vercel-env/dolphin-labs/production`, dolphin-films from `dolphin-films/prod/*` plus its address lists (`people.tf`).
+dolphin-maps had no public production (its Vercel URL was behind Vercel's login); `dolphin-maps-stage` behind Access replaces it.
+Every other production hostname (www.cc-games.org and the old domains, which Vercel still redirects) and the multiplayer `play.cc-games.*` entries are DNS-only records
 pointing at Vercel or the games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
 get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees
 Cloudflare's addresses instead of players'. Cloudflare's protections reach production when production is served by a Worker
