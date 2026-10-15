@@ -24,3 +24,7 @@ tfplan
 
 # Python
 __pycache__/
+
+# browser-manager moved to github.com/ejc3/browser-manager; an older checkout may still hold its
+# untracked node_modules, .next and local files here.
+/browser-manager/

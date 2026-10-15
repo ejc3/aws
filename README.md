@@ -2260,10 +2260,22 @@ For later credential retrieval, the Mac's existing SSO administrator session can
 `browser-manager-mac-connector`, which can read only that connector secret. No AWS
 credentials are required by the running browser-manager or tunnel process.
 
-The deployed checkout is `/Users/ejcampbell/src/aws-browser-manager/browser-manager`; move it to a clone of the public
-repository at a permanent path the next time the Mac is updated, then rerun `node scripts/install-macos.mjs` there.
-Do not `git pull` the old checkout first: this repository no longer contains the application, and pulling would delete
-the code its LaunchAgents run.
+The Mac still runs the application from an old checkout of this repository, project path
+`/Users/ejcampbell/src/aws-browser-manager/browser-manager`. Do not `git pull` it: this repository no longer contains
+the application, and pulling would delete the code its LaunchAgents run. The macOS installer keeps its installation tied
+to that exact project path ("Another checkout owns this installation; keep its fixed path"), so move to the public
+repository by putting its clone at the same path, in one sitting (the LaunchAgents keep running the old code until the
+installer restarts them):
+
+```bash
+mv ~/src/aws-browser-manager ~/src/aws-browser-manager.before-public
+mkdir ~/src/aws-browser-manager
+git clone https://github.com/ejc3/browser-manager ~/src/aws-browser-manager/browser-manager
+cd ~/src/aws-browser-manager/browser-manager && npm ci --ignore-scripts && npm run build
+node scripts/install-macos.mjs /absolute/private/browser-manager.env
+```
+
+Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 
 ## File map
 
