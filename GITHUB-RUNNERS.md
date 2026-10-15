@@ -720,7 +720,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
   `too-many-app-runners-<label>` (`-dolphin-films` and `-dolphin-maps` for those repos, which share a label) above one repo's own cap, so a single repo running away is
   visible even while the total is under the combined cap. `imagine-runner-hours-daily` fires when Imagine's
-  `LiveRunners` averages above 4 over 24 hours (96 host-hours, about $70 on `l` spot): a cap held all day, which the
+  `LiveRunners` averages above 4 over 24 hours (96 host-hours: about $70 on `l` spot, about $130 on `xl`): a cap held all day, which the
   per-repo alarm (over the cap) never sees. `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a
@@ -779,7 +779,8 @@ never the owner:
   out of every plan until `github-runner/repo-pat/ejc3/imagine` has a value. Set its default to true in a commit, never
   with `-var`.
 - **Cap and cost.** 8 hosts, its own `too-many-app-runners-imagine`, and `imagine-runner-hours-daily`. On `l`
-  (c7a.8xlarge, about $0.72/h with its disk and address) the cap bounds Imagine at about $138 a day.
+  (c7a.8xlarge, about $0.72/h with its disk and address) the cap bounds Imagine at about $138 a day; jobs may also ask
+  for `xl` (c7a.16xlarge, about $1.35/h), which raises that bound to about $260 a day.
 - **What the stock image lacks.** Bootstrap installs only the runner, build tools, git, curl, jq, zip and passwordless
   sudo. Imagine's workflow brings the rest per job: Erlang/OTP and Elixir through `erlef/setup-beam` (which, on a
   self-hosted runner, needs `ImageOS=ubuntu24` in the job's environment; hosted images set it), rustup itself (the

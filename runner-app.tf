@@ -69,7 +69,9 @@ locals {
   # ejc3/imagine takes the app's token once the app is installed on ejc3 (selected repositories: imagine only) and that
   # installation is in github-app/runners; until then app_token() finds no ejc3 installation and its PAT is used.
   runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
-  runner_app_max_total        = sum([for c in values(local.runner_app_repos) : c.max])
+  # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
+  # counting its cap would loosen the combined alarm before it serves anything.
+  runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])
 
   # Canonical's own account. Only its images may be launched by this controller.
   runner_app_ami_owner = "099720109477"
@@ -492,7 +494,7 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 15 minutes
   threshold           = local.runner_app_max_total
-  alarm_description   = "More app-repo runners than every repo's cap allows, for 15+ minutes - the controller is over-launching"
+  alarm_description   = "More app-repo runners than every served repo's cap allows, for 15+ minutes - the controller is over-launching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
@@ -553,7 +555,7 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   threshold           = 4
-  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average over 24 hours (96+ host-hours, about $70/day on l spot)"
+  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average over 24 hours (96+ host-hours: about $70/day on l spot, about $130 on xl)"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
