@@ -2247,7 +2247,8 @@ and does not restart the browser. Older browsers initially display their stable 
 to bot protection (ChatGPT answered one with a Cloudflare "verify you are human" check); the running desktop is not.
 `browserctl cdp <name>` prints a loopback CDP endpoint for a running browser, for Playwright's `connect_over_cdp` or
 any CDP client; it is handed out only through the owner-only control socket, behind a random token, and refuses
-`Browser.close`. `browserctl job <name> <job>` runs a job from `browser-manager/jobs/` in a new tab of that browser
+`Browser.close`. Each client gets its own browser-level session: it sees and drives only the tabs it attaches, never the
+desktop's own sessions, and everything it set (emulation, auto-attach) is undone when it disconnects. `browserctl job <name> <job>` runs a job from `browser-manager/jobs/` in a new tab of that browser
 and closes only that tab:
 
 ```bash

@@ -95,8 +95,8 @@ function maskChromeUserAgent(mux, url, captureFile) {
       platform: 'Windows', platformVersion: '15.0.0', architecture: 'x86', model: '', mobile: false, bitness: '64', wow64: false,
     };
     const masked = new Set();
-    // The start URL is opened once, in the first page. A bridge client attaching later re-announces existing pages with
-    // new sessions: those are masked too, but never sent back to the start URL.
+    // The start URL is opened once, in the first page. Bridge clients have sessions of their own (lib/cdp-bridge.mjs),
+    // so these events are the desktop's alone; pages a client opens are attached here too, and masked.
     let navigated = false;
     mux.onEvent((message) => {
       if (message.method === 'Target.attachedToTarget') {

@@ -8,12 +8,14 @@ import { createAuthorizer } from '../lib/auth.mjs';
 import { createCdpMux, startCdpBridge, REFUSED_METHODS, IGNORED_METHODS } from '../lib/cdp-bridge.mjs';
 import { createHttpServer } from '../lib/http.mjs';
 
-// A fake browser on the other end of the pipe: records what reaches it and answers every command with { echo: id }.
+// A fake browser on the other end of the pipe: records what reaches it, gives each Target.attachToBrowserTarget a new
+// session id, and answers every other command with { echo: method }, carrying the command's session id as Chrome does.
 function fakeBrowser() {
   const toBrowser = new PassThrough();
   const fromBrowser = new PassThrough();
   const seen = [];
   let buffer = '';
+  let browserSessions = 0;
   toBrowser.on('data', (part) => {
     buffer += part.toString('utf8');
     let end;
@@ -21,100 +23,129 @@ function fakeBrowser() {
       const message = JSON.parse(buffer.slice(0, end));
       buffer = buffer.slice(end + 1);
       seen.push(message);
-      fromBrowser.write(`${JSON.stringify({ id: message.id, result: { echo: message.method } })}\0`);
+      const result = message.method === 'Target.attachToBrowserTarget' ? { sessionId: `B${++browserSessions}` }
+        : message.method === 'Target.attachToTarget' ? { sessionId: `T-${message.params.targetId}` } : { echo: message.method };
+      fromBrowser.write(`${JSON.stringify({ id: message.id, result, ...(message.sessionId ? { sessionId: message.sessionId } : {}) })}\0`);
     }
   });
   const event = (message) => fromBrowser.write(`${JSON.stringify(message)}\0`);
   return { writer: toBrowser, reader: fromBrowser, seen, event };
 }
-const tick = () => new Promise((resolve) => setImmediate(resolve));
+const tick = async (n = 3) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const sent = (fake, method) => fake.seen.filter((m) => m.method === method);
 
-test('two clients may use the same ids: each reply returns with its own id to its own sender', async () => {
+test('each client is a separate connection: its commands run in its own browser session, replies keep its ids', async () => {
   const fake = fakeBrowser();
   const mux = createCdpMux(fake.writer, fake.reader);
   const a = [], b = [];
   const ca = mux.attach((m) => a.push(m));
   const cb = mux.attach((m) => b.push(m));
-  ca.command({ id: 1, method: 'Target.getTargets' });
+  ca.command({ id: 1, method: 'Target.getTargets' }); // queued until its session exists
   cb.command({ id: 1, method: 'Browser.getVersion' });
   mux.send('Page.enable', {}, 'S1'); // the desktop's own command: its reply goes nowhere
-  await tick(); await tick();
-  const pipeIds = fake.seen.map((m) => m.id);
-  assert.equal(new Set(pipeIds).size, 3, 'ids on the pipe are unique');
+  await tick();
+  assert.equal(new Set(fake.seen.map((m) => m.id)).size, fake.seen.length, 'ids on the pipe are unique');
+  assert.equal(sent(fake, 'Target.attachToBrowserTarget').length, 2);
+  assert.equal(sent(fake, 'Target.getTargets')[0].sessionId, 'B1');
+  assert.equal(sent(fake, 'Browser.getVersion')[0].sessionId, 'B2');
   assert.deepEqual(a, [{ id: 1, result: { echo: 'Target.getTargets' } }]);
   assert.deepEqual(b, [{ id: 1, result: { echo: 'Browser.getVersion' } }]);
-  assert.equal(fake.seen[2].sessionId, 'S1');
 });
 
-test('events reach every client and the desktop listener', async () => {
+test("events reach only the session's owner; the desktop never sees a client's", async () => {
   const fake = fakeBrowser();
   const mux = createCdpMux(fake.writer, fake.reader);
-  const a = [], b = [], own = [];
+  const a = [], b = [], desktop = [];
+  mux.onEvent((m) => desktop.push(m));
   mux.attach((m) => a.push(m));
   mux.attach((m) => b.push(m));
-  mux.onEvent((m) => own.push(m));
-  fake.event({ method: 'Target.attachedToTarget', params: { sessionId: 'S9' } });
   await tick();
-  for (const list of [a, b, own]) assert.equal(list[0].method, 'Target.attachedToTarget');
+  fake.event({ method: 'Target.attachedToTarget', sessionId: 'B1', params: { sessionId: 'P1', targetInfo: { type: 'page' } } });
+  fake.event({ method: 'Page.loadEventFired', sessionId: 'P1', params: {} });
+  fake.event({ method: 'Target.attachedToTarget', params: { sessionId: 'S9', targetInfo: { type: 'page' } } });
+  await tick();
+  assert.deepEqual(a.map((m) => [m.method, m.sessionId]), [['Target.attachedToTarget', undefined], ['Page.loadEventFired', 'P1']]);
+  assert.deepEqual(b, []);
+  assert.deepEqual(desktop.map((m) => m.params.sessionId), ['S9']);
 });
 
-test('commands that would end the live browser are refused and never reach it', async () => {
+test("a client cannot use the desktop's sessions or another client's", async () => {
+  const fake = fakeBrowser();
+  const mux = createCdpMux(fake.writer, fake.reader);
+  const a = [];
+  const ca = mux.attach((m) => a.push(m));
+  mux.attach(() => {});
+  await tick();
+  fake.event({ method: 'Target.attachedToTarget', sessionId: 'B2', params: { sessionId: 'P2', targetInfo: { type: 'page' } } });
+  await tick();
+  ca.command({ id: 5, method: 'Emulation.setFocusEmulationEnabled', sessionId: 'S1', params: { enabled: true } });
+  ca.command({ id: 6, method: 'Runtime.evaluate', sessionId: 'P2', params: { expression: '1' } });
+  await tick();
+  assert.equal(sent(fake, 'Emulation.setFocusEmulationEnabled').length + sent(fake, 'Runtime.evaluate').length, 0);
+  assert.deepEqual(a.map((m) => m.error?.code), [-32001, -32001]);
+});
+
+test('commands that would end or reconfigure the live browser never reach it', async () => {
   const fake = fakeBrowser();
   const mux = createCdpMux(fake.writer, fake.reader);
   const got = [];
   const client = mux.attach((m) => got.push(m));
+  await tick();
   for (const method of REFUSED_METHODS) client.command({ id: 7, method });
+  client.command({ id: 3, method: 'Browser.setDownloadBehavior', params: { behavior: 'allowAndName', downloadPath: '/tmp/playwright-artifacts' } });
   client.command({ id: 8, method: 'Target.createTarget', params: { url: 'about:blank' } });
-  await tick(); await tick();
-  assert.deepEqual(fake.seen.map((m) => m.method), ['Target.createTarget']);
+  await tick();
+  assert.deepEqual(fake.seen.map((m) => m.method), ['Target.attachToBrowserTarget', 'Target.createTarget']);
   assert.equal(got.filter((m) => m.error?.message?.includes('refused')).length, REFUSED_METHODS.size);
+  assert.deepEqual(got.find((m) => m.id === 3), { id: 3, result: {} });
+  assert.equal(IGNORED_METHODS.size, 2);
   client.command({ method: 'No.id' });
   await tick();
   assert.equal(got.at(-1).error.code, -32600);
 });
 
-test('settings that would outlive the client are acknowledged but never reach the browser', async () => {
+test("a client's auto-attach is scoped to its own session, never the desktop's connection", async () => {
   const fake = fakeBrowser();
   const mux = createCdpMux(fake.writer, fake.reader);
-  const got = [];
-  const client = mux.attach((m) => got.push(m));
-  client.command({ id: 3, method: 'Browser.setDownloadBehavior', params: { behavior: 'allowAndName', downloadPath: '/tmp/playwright-artifacts' } });
-  client.command({ id: 4, method: 'Page.setDownloadBehavior', sessionId: 'S2', params: { behavior: 'deny' } });
-  await tick(); await tick();
-  assert.equal(IGNORED_METHODS.size, 2);
-  assert.deepEqual(fake.seen, []);
-  assert.deepEqual(got, [{ id: 3, result: {} }, { id: 4, sessionId: 'S2', result: {} }]);
+  mux.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  const client = mux.attach(() => {});
+  client.command({ id: 1, method: 'Target.setAutoAttach', params: { autoAttach: false, waitForDebuggerOnStart: false } });
+  await tick();
+  assert.deepEqual(sent(fake, 'Target.setAutoAttach').map((m) => m.sessionId), [undefined, 'B1']);
 });
 
-test("a client cannot replace the desktop's own auto-attach setting", async () => {
+test('detaching a client detaches every session it owned, so nothing it set outlives it', async () => {
   const fake = fakeBrowser();
-  const mux = createCdpMux(fake.writer, fake.reader);
-  const own = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
-  mux.send('Target.setAutoAttach', own);
-  const got = [];
-  const client = mux.attach((m) => got.push(m));
-  client.command({ id: 1, method: 'Target.setAutoAttach', params: { flatten: true, waitForDebuggerOnStart: true, autoAttach: true } });
-  client.command({ id: 2, method: 'Target.setAutoAttach', params: { autoAttach: false, waitForDebuggerOnStart: false } });
-  client.command({ id: 3, method: 'Target.setAutoAttach', params: { ...own, filter: [{ type: 'iframe' }] } });
-  client.command({ id: 4, method: 'Target.setAutoAttach', sessionId: 'S5', params: { autoAttach: false, waitForDebuggerOnStart: false } });
-  await tick(); await tick();
-  const forwarded = fake.seen.filter((m) => m.method === 'Target.setAutoAttach');
-  assert.equal(forwarded.length, 3, "the desktop's own call, the identical client call, and the session-scoped one");
-  assert.deepEqual(forwarded.slice(1).map((m) => [m.params.autoAttach, m.sessionId]), [[true, undefined], [false, 'S5']]);
-  assert.deepEqual(got.find((m) => m.id === 2), { id: 2, result: {} });
-  assert.deepEqual(got.find((m) => m.id === 3), { id: 3, result: {} });
-});
-
-test('a detached client gets nothing more, and its pending replies are dropped', async () => {
-  const fake = fakeBrowser();
-  fake.writer.removeAllListeners('data'); // this browser never answers
+  fake.writer.removeAllListeners('data');
   const mux = createCdpMux(fake.writer, fake.reader);
   const got = [];
+  let buffer = '';
+  const answered = [];
+  fake.writer.on('data', (part) => {
+    buffer += part.toString('utf8');
+    let end;
+    while ((end = buffer.indexOf('\0')) !== -1) {
+      const message = JSON.parse(buffer.slice(0, end));
+      buffer = buffer.slice(end + 1);
+      answered.push(message);
+      // Answers only the session request: the client's command stays pending.
+      if (message.method === 'Target.attachToBrowserTarget') fake.reader.write(`${JSON.stringify({ id: message.id, result: { sessionId: 'B1' } })}\0`);
+    }
+  });
   const client = mux.attach((m) => got.push(m));
-  client.command({ id: 1, method: 'Page.navigate' });
+  await tick();
+  fake.event({ method: 'Target.attachedToTarget', sessionId: 'B1', params: { sessionId: 'P1', targetInfo: { type: 'page' } } });
+  await tick();
+  client.command({ id: 1, method: 'Emulation.setFocusEmulationEnabled', sessionId: 'P1', params: { enabled: true } });
+  await tick();
+  got.length = 0;
   client.detach();
-  fake.event({ method: 'Page.loadEventFired' });
-  fake.reader.write(`${JSON.stringify({ id: 1, result: {} })}\0`);
+  await tick();
+  const detaches = answered.filter((m) => m.method === 'Target.detachFromTarget');
+  assert.deepEqual(detaches.map((m) => [m.params.sessionId, m.sessionId]), [['P1', 'B1'], ['B1', undefined]]);
+  fake.event({ method: 'Page.loadEventFired', sessionId: 'P1', params: {} });
+  const pendingId = answered.find((m) => m.method === 'Emulation.setFocusEmulationEnabled').id;
+  fake.reader.write(`${JSON.stringify({ id: pendingId, result: {} })}\0`);
   await tick();
   assert.deepEqual(got, []);
 });
