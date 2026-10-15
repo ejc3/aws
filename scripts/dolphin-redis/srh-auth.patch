@@ -1,0 +1,44 @@
+diff --git a/lib/srh/http/base_router.ex b/lib/srh/http/base_router.ex
+index d788eff..e02d5c5 100644
+--- a/lib/srh/http/base_router.ex
++++ b/lib/srh/http/base_router.ex
+@@ -6,7 +6,8 @@ defmodule Srh.Http.BaseRouter do
+ 
+   plug(:match)
+   plug(Srh.Http.ContentTypeCheckPlug)
+-  plug(Plug.Parsers, parsers: [:json], pass: ["application/json"], json_decoder: Jason)
++  plug(:require_token)
++  plug(Plug.Parsers, parsers: [:json], pass: ["application/json"], json_decoder: Jason, length: 64_000_000)
+   plug(:dispatch)
+ 
+   get "/" do
+@@ -32,6 +33,29 @@ defmodule Srh.Http.BaseRouter do
+     )
+   end
+ 
++  # Local patch: a request without this server's token is refused before its body is read, so the larger body limit
++  # above is available only to callers holding the token.
++  defp require_token(%Plug.Conn{method: "GET"} = conn, _opts), do: conn
++
++  defp require_token(conn, _opts) do
++    expected = "Bearer " <> (System.get_env("SRH_TOKEN") || "")
++
++    case Plug.Conn.get_req_header(conn, "authorization") do
++      [header] when byte_size(expected) > 7 ->
++        if Plug.Crypto.secure_compare(header, expected), do: conn, else: refuse(conn)
++
++      _ ->
++        refuse(conn)
++    end
++  end
++
++  defp refuse(conn) do
++    conn
++    |> Plug.Conn.put_resp_content_type("application/json")
++    |> Plug.Conn.send_resp(401, ~s({"error":"Unauthorized"}))
++    |> Plug.Conn.halt()
++  end
++
+   defp do_command_request(conn, success_lambda) do
+     encoding_enabled = handle_extract_encoding?(conn)
+ 

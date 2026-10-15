@@ -33,10 +33,11 @@ locals {
   }
   dolphin_redis_images = {
     valkey = "valkey/valkey:8.1.10-alpine"
-    # serverless-redis-http 0.0.10 built on the instance with Plug's request-body limit raised from its 8 MB default
-    # to 64 MB (the build step in the boot script below): the news pass writes a hash of about 8 MB in one request, which the
-    # stock image refuses with an empty 500 (2026-10-15 09:37). Upstash allowed 10 MB on its free plan.
-    srh         = "srh-local:0.0.10-body64mb"
+    # serverless-redis-http 0.0.10 built on the instance with scripts/dolphin-redis/srh-auth.patch (the build step in the boot
+    # script below): the request-body limit goes from Plug's 8 MB default to 64 MB, because the news pass writes a hash
+    # of about 8 MB in one request and the stock image refuses that with an empty 500 (2026-10-15 09:37; Upstash allowed
+    # 10 MB), and the token is checked before the body is read, so only a caller holding it can make the server parse one.
+    srh         = "srh-local:0.0.10-auth-body64mb"
     cloudflared = "cloudflare/cloudflared:2026.9.3"
   }
 }
@@ -205,16 +206,15 @@ locals {
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap defaults 0 0' >> /etc/fstab
     install -d -m 0700 /var/lib/valkey
     # Build the REST server (see local.dolphin_redis_images.srh). The Erlang VM needs more memory than a t4g.micro has
-    # to compile it, so a temporary swap file is added for the build and the data store is kept out of the OOM killer.
+    # to compile it, so a temporary swap file is added for the build (the data store itself always runs with --oom-score-adj -1000).
     if ! docker image inspect ${local.dolphin_redis_images.srh} >/dev/null 2>&1; then
       dnf install -y git
-      for p in $(pgrep -f valkey-server); do echo -1000 > /proc/$p/oom_score_adj; done
       swapoff /swap-build 2>/dev/null || true; rm -f /swap-build
       fallocate -l 3G /swap-build && chmod 600 /swap-build && mkswap /swap-build >/dev/null && swapon /swap-build
       rm -rf /opt/srh-src && git clone -q https://github.com/hiett/serverless-redis-http /opt/srh-src
       git -C /opt/srh-src checkout -q ${local.dolphin_redis_srh_commit}
-      sed -i 's/json_decoder: Jason)/json_decoder: Jason, length: 64_000_000)/' /opt/srh-src/lib/srh/http/base_router.ex
-      grep -q 'length: 64_000_000' /opt/srh-src/lib/srh/http/base_router.ex
+      echo '${base64encode(file("${path.module}/scripts/dolphin-redis/srh-auth.patch"))}' | base64 -d > /opt/srh.patch
+      git -C /opt/srh-src apply /opt/srh.patch
       (cd /opt/srh-src && nice -n 19 docker build -q -t ${local.dolphin_redis_images.srh} .)
       swapoff /swap-build; rm -f /swap-build
     fi
@@ -226,7 +226,7 @@ locals {
     [ -n "$${S:-}" ] || { echo "dolphin-redis: cannot read ${aws_secretsmanager_secret.dolphin_redis_instance.name}" >&2; exit 1; }
     docker network inspect kv >/dev/null 2>&1 || docker network create kv
     docker rm -f valkey srh-prod srh-stage cloudflared 2>/dev/null || true
-    docker run -d --name valkey --network kv --restart unless-stopped -v /var/lib/valkey:/data \
+    docker run -d --name valkey --network kv --restart unless-stopped --oom-score-adj -1000 -v /var/lib/valkey:/data \
       ${local.dolphin_redis_images.valkey} valkey-server --appendonly yes --appendfsync everysec \
       --save 900 1 --maxmemory 384mb --maxmemory-policy noeviction
     %{for env, r in local.dolphin_redis~}
