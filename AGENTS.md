@@ -1402,21 +1402,34 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   DynamoDB replicas). A new Dolphin region is added to `local.dolphin_security_regions`, which
   extends monitoring and the policy together.
 
-### The Dolphin Redis (dolphin-redis.tf)
+### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
-cannot be transferred between teams) to one t4g.micro in the Dolphin account (owner, 2026-10-15), built from here with the
-Dolphin provider because its tunnel and DNS are Cloudflare's. Valkey stores the data (append-only file on the root volume,
-daily snapshots kept 7 days, `prevent_destroy`); serverless-redis-http speaks Upstash's REST protocol in front of it, so the
-sites' `@upstash/redis` code runs unchanged (built on the instance from a pinned commit with `scripts/dolphin-redis/srh-auth.patch`: the request-body limit goes from 8
-to 64 MB, because the news pass writes a hash of about 8 MB in one request and the stock server answers that with an empty
-500, and the token is checked before any body is read); cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
-`https://kv-stage.gamesworthwatching.com` (staging, db 1). No inbound rule: the REST bearer token is the credential, as with
-Upstash. Each consumer's URL and token come from `dolphin-redis/clients` in the Dolphin account: the production Worker (via
-`vercel-env/dolphin-labs/production`), the staging Worker (`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`)
-and the dolphin-labs repository's `KV_REST_API_*` Actions secrets. Rotate a token with
-`terraform apply -replace='random_password.dolphin_redis_token["prod"]'`, re-run the instance's boot script over SSM, and
-copy the new value to those consumers. Manage the instance through SSM (AmazonSSMManagedInstanceCore), never SSH.
+cannot be transferred between teams) on 2026-10-15. Since 11:55 that day it runs on **ECS Fargate in the Dolphin account**,
+built by `dolphin-labs-hq/dolphin-aws` (`redis.tf`, applied from nextjs-dev only): one task of four containers, Valkey
+(append-only file on EFS, replicated across zones and backed up daily), serverless-redis-http for production (db 0) and
+staging (db 1), and cloudflared. serverless-redis-http speaks Upstash's REST protocol, so the sites' `@upstash/redis`
+code runs unchanged; its image is built by dolphin-aws's CodeBuild job with `scripts/dolphin-redis/srh-auth.patch` from
+here (the request-body limit goes from 8 to 64 MB, because the news pass writes a hash of about 8 MB in one request and the
+stock server answers that with an empty 500, and the token is checked before any body is read). Failover is the task being
+replaced: 74 s measured for a stopped task. A probe Lambda, alarms on the topic `dolphin-alerts` and the dashboard
+`dolphin-platform` watch it.
+
+This repository still owns what the task reads: the tunnel, its DNS (`https://kv.gamesworthwatching.com` for production,
+`https://kv-stage.gamesworthwatching.com` for staging) and the tokens, in `dolphin-redis/instance` (tunnel and REST tokens,
+read by the task) and `dolphin-redis/clients` (each consumer's URL and token) in the Dolphin account, because they are
+Cloudflare's and Cloudflare credentials stay off nextjs-dev. No inbound rule: the REST bearer token is the credential, as
+with Upstash. Consumers: the production Worker (via `vercel-env/dolphin-labs/production`), the staging Worker
+(`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`) and the dolphin-labs repository's `KV_REST_API_*`
+Actions secrets. Rotate a token with `terraform apply -replace='random_password.dolphin_redis_token["prod"]'` here, then
+start a new task so it reads the secret again, and copy the new value to those consumers. The service is in the Dolphin
+account, so the restart needs a session there, not this account's credentials: from a jumpbox, assume
+`OrganizationAccountAccessRole` in the Dolphin account as `scripts/workers-stage-secrets.sh` does (output
+`dolphin_account_id` has the id) and run `aws ecs update-service --region us-west-1 --cluster dolphin --service redis
+--force-new-deployment` with that session; about a minute of downtime.
+
+The t4g.micro this section used to describe (`aws_instance.dolphin_redis`) no longer serves: its REST servers and
+connector are stopped, and its Valkey is kept only as a fallback copy until it is retired from `dolphin-redis.tf`.
 
 ### dolphin-films credentials
 
