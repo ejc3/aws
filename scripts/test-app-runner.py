@@ -1381,7 +1381,7 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertEqual(app.repo_pat(cfg), "ghs_minted")
         self.assertEqual(len(app.scope_calls), 4, "the passed check is remembered")
         app._APP_TOKENS.clear()
-        app._APP_SCOPE_OK[777] = (0, None)  # the hour is up
+        app._APP_SCOPE_OK[(777, "dolphin-labs-hq")] = (0, None)  # the hour is up
         self.assertEqual(app.repo_pat(cfg), "ghs_minted")
         self.assertEqual(len(app.scope_calls), 8, "and checked again once it expires")
 
@@ -1401,6 +1401,18 @@ class RunnersAppTokenTests(unittest.TestCase):
             self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
         self.assertEqual(calls, [])
         self.assertIn("belongs to someone-else, not ejc3", out.getvalue())
+
+    def test_a_passed_check_does_not_carry_over_to_another_owner_mapped_to_the_same_installation(self):
+        # The same installation id recorded for two owners by mistake: dolphin-labs-hq's pass must not cover ejc3.
+        same = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
+                           "installations": {"dolphin-labs-hq": 777, "ejc3": 777}})
+        app, calls, _ = self.app_with(same)
+        self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "ghs_minted")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "PAT-IMAGINE")
+        self.assertIn("belongs to dolphin-labs-hq, not ejc3", out.getvalue())
+        self.assertEqual(len(calls), 1, "no administration token minted for ejc3 from dolphin-labs-hq's installation")
 
     def test_a_refusal_is_remembered_rather_than_checked_on_every_call(self):
         scopes = dict(self.SCOPES, **{"777": ("dolphin-labs-hq", "all", ["dolphin-labs-hq/dolphin-labs"])})

@@ -133,7 +133,7 @@ def github(method, path, pat, body=None):
 RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
 APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
 _APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
-_APP_SCOPE_OK = {}  # installation id -> (expiry epoch seconds, refusal message or None) of its last scope check
+_APP_SCOPE_OK = {}  # (installation id, owner) -> (expiry epoch seconds, refusal message or None) of its last scope check
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
 
@@ -224,7 +224,8 @@ def check_installation_scope(installation, owner, jwt):
     a refusal for ten minutes; a refusal raises, and repo_pat logs it and uses the repo's own token. The allowed set is
     APP_INSTALLATION_REPOS (every repo the app is meant to cover), not REPOS, which leaves out repos whose gate is off.
     """
-    until, refusal = _APP_SCOPE_OK.get(installation, (0, None))
+    key = (installation, owner.lower())  # a check is valid only for the owner it was made for
+    until, refusal = _APP_SCOPE_OK.get(key, (0, None))
     if until > time.time():
         if refusal:
             raise RuntimeError(refusal)
@@ -232,7 +233,7 @@ def check_installation_scope(installation, owner, jwt):
 
     def refuse(reason):
         message = f'the runners app installation {installation} {reason}; refusing it'
-        _APP_SCOPE_OK[installation] = (time.time() + 600, message)
+        _APP_SCOPE_OK[key] = (time.time() + 600, message)
         raise RuntimeError(message)
 
     info = github('GET', f'/app/installations/{installation}', jwt)
@@ -261,7 +262,7 @@ def check_installation_scope(installation, owner, jwt):
         refuse('covers more repositories than one listing page')
     if not names <= allowed:
         refuse(f'on {owner} also covers {sorted(names - allowed)} (select only the served repositories)')
-    _APP_SCOPE_OK[installation] = (time.time() + 3600, None)
+    _APP_SCOPE_OK[key] = (time.time() + 3600, None)
 
 
 def repo_pat(cfg):
