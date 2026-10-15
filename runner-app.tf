@@ -36,11 +36,17 @@ locals {
   # of dolphin-labs' 8. `alarm` names its per-repo alarm, which would otherwise collide with
   # dolphin-labs' (both are named after the label). dolphin-maps (another dolphin-labs-hq
   # project) is the same shape: the `dolphin` label, its own cap of 2, its own alarm.
+  #
+  # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
+  # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
+  # another repository's job), serve only jobs whose every label is in its own set, and its
+  # deliveries are routed here by repository.full_name while fcvm's still go to the metal webhook.
   runner_app_repos = {
     "CoderColton/colton-games"      = { label = "cc-games", max = 8 }
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
+    "ejc3/imagine"                  = { label = "imagine", max = 8 }
   }
 
   # A repo whose token gate is false is left out of the controller's REPOS as well: with no token its every reconcile
@@ -60,8 +66,12 @@ locals {
   # Repos whose controller token comes from the runners GitHub App (github-app/runners, below) rather than a year-long PAT:
   # the app is installed on these. A repo outside an owner the app can be installed on (CoderColton's colton-games: the app
   # would need Colton's own account) keeps its PAT. The PAT stays the fallback until the app is proven in production.
-  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps"]
-  runner_app_max_total        = sum([for c in values(local.runner_app_repos) : c.max])
+  # ejc3/imagine takes the app's token once the app is installed on ejc3 (selected repositories: imagine only) and that
+  # installation is in github-app/runners; until then app_token() finds no ejc3 installation and its PAT is used.
+  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
+  # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
+  # counting its cap would loosen the combined alarm before it serves anything.
+  runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])
 
   # Canonical's own account. Only its images may be launched by this controller.
   runner_app_ami_owner = "099720109477"
@@ -484,7 +494,7 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 15 minutes
   threshold           = local.runner_app_max_total
-  alarm_description   = "More app-repo runners than every repo's cap allows, for 15+ minutes - the controller is over-launching"
+  alarm_description   = "More app-repo runners than every served repo's cap allows, for 15+ minutes - the controller is over-launching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
@@ -532,6 +542,27 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   dimensions          = { Repo = each.key }
   statistic           = "Maximum"
   period              = 300
+  treat_missing_data  = "notBreaching"
+}
+
+# ejc3/imagine's spend over a day, from the same metric: LiveRunners averaged over 24 hours is the number of hosts it
+# kept up on average. Above 4 (96 host-hours, about $70 a day on `l` spot) is several times its measured volume when it
+# moved here (about 34 runs a day). The per-repo too-many alarm sees a burst over the cap; this sees a cap held too long.
+# Missing data is the reconcile-silent alarm's to report.
+resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
+  count               = var.enable_github_runner && var.imagine_token_ready ? 1 : 0
+  alarm_name          = "imagine-runner-hours-daily"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 4
+  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average over 24 hours (96+ host-hours: about $70/day on l spot, about $130 on xl)"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "LiveRunners"
+  dimensions          = { Repo = "ejc3/imagine" }
+  statistic           = "Average"
+  period              = 86400
   treat_missing_data  = "notBreaching"
 }
 
@@ -585,6 +616,14 @@ variable "dolphin_maps_token_ready" {
   default     = true
 }
 
+# The same gate for ejc3/imagine: true once its controller token is stored (runner-repos.tf). Its hook is made by the
+# administration GitHub App, but the gate still keeps the token read and the controller entry out until the token exists.
+variable "imagine_token_ready" {
+  description = "ejc3/imagine's controller token has a value in Secrets Manager, so its webhook can be created"
+  type        = bool
+  default     = false
+}
+
 locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
 
@@ -593,9 +632,11 @@ locals {
   runner_app_token_gates = {
     "dolphin-labs-hq/dolphin-films" = var.dolphin_films_token_ready
     "dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready
+    "ejc3/imagine"                  = var.imagine_token_ready
   }
   dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready
   dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready
+  imagine_webhook       = local.runner_app_webhooks && var.imagine_token_ready
 
   runner_app_webhook_repos = [
     for r in local.runner_extra_repos : r
@@ -705,6 +746,38 @@ resource "github_repository_webhook" "runner_app_dolphin_films" {
   count      = local.dolphin_films_webhook ? 1 : 0
   provider   = github.dolphin_films
   repository = "dolphin-films"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+# ejc3/imagine's hook, made as the administration GitHub App's ejc3 installation (all of ejc3's repositories, with
+# repository_hooks write). Not the default provider: that one holds github-webhook-admin-pat, limited to ejc3/fcvm.
+provider "github" {
+  alias = "imagine"
+  owner = "ejc3"
+  dynamic "app_auth" {
+    for_each = local.imagine_webhook ? [1] : []
+    content {
+      id              = tostring(local.github_app_admin.app_id)
+      installation_id = tostring(local.github_app_admin.installations["ejc3"])
+      pem_file        = local.github_app_admin.private_key
+    }
+  }
+}
+
+resource "github_repository_webhook" "runner_app_imagine" {
+  count      = local.imagine_webhook ? 1 : 0
+  provider   = github.imagine
+  repository = "imagine"
   events     = ["workflow_job"]
   active     = true
 
