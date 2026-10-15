@@ -5,9 +5,14 @@
 # and its two domains were created with the Vercel CLI as the owner, like imagine's: the Terraform Vercel provider here reaches
 # the colton-games team only (vercel.tf). Only the DNS is Terraform's.
 #
-# DNS only, never proxied: proxying breaks Vercel's certificate issuance (vercel-cc-games.tf). The values are the ones Vercel
-# reports for this project (GET /v6/domains/yourfantasymovie.com/config, "recommendedIPv4" and "recommendedCNAME", rank 1).
-# `www` is a Vercel redirect (308) to the apex.
+# PRODUCTION IS ON CLOUDFLARE (2026-10-15; the dolphin-labs Vercel team is being retired). With
+# local.yourfantasymovie_on_cloudflare the records are proxied and two Workers routes send yourfantasymovie.com/* and
+# www.yourfantasymovie.com/* to the Worker dolphin-films-prod (films/web/wrangler.jsonc env.production, deployed by the
+# repository's films-cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex, as Vercel did). The record contents
+# stay Vercel's (GET /v6/domains/yourfantasymovie.com/config, "recommendedIPv4" and "recommendedCNAME", rank 1): a route
+# answers every request, so nothing reaches them, and setting the switch to false is the rollback while the Vercel project
+# exists. DNS-only is what Vercel needs (proxying breaks its certificate issuance, vercel-cc-games.tf). Either half alone is
+# harmless: a route on a DNS-only record does nothing, a proxied record without the route reaches Vercel.
 
 variable "yourfantasymovie_zone_id" {
   description = "Cloudflare zone id for yourfantasymovie.com (registered through Cloudflare Registrar 2026-10-05)"
@@ -16,7 +21,9 @@ variable "yourfantasymovie_zone_id" {
 }
 
 locals {
-  yourfantasymovie_apex_ips = ["216.150.1.1", "216.150.16.1"]
+  yourfantasymovie_apex_ips      = ["216.150.1.1", "216.150.16.1"]
+  yourfantasymovie_on_cloudflare = true
+  yourfantasymovie_worker        = "dolphin-films-prod"
 }
 
 resource "cloudflare_dns_record" "yourfantasymovie_apex" {
@@ -25,9 +32,9 @@ resource "cloudflare_dns_record" "yourfantasymovie_apex" {
   name     = "yourfantasymovie.com"
   type     = "A"
   content  = each.value
-  proxied  = false # proxying breaks Vercel cert issuance
-  ttl      = 300
-  comment  = "vercel apex; Fantasy Films (dolphin-films, films/web)"
+  proxied  = local.yourfantasymovie_on_cloudflare
+  ttl      = local.yourfantasymovie_on_cloudflare ? 1 : 300
+  comment  = local.yourfantasymovie_on_cloudflare ? "proxied; served by Worker ${local.yourfantasymovie_worker}" : "vercel apex; Fantasy Films (dolphin-films, films/web)"
 }
 
 resource "cloudflare_dns_record" "yourfantasymovie_www" {
@@ -35,7 +42,14 @@ resource "cloudflare_dns_record" "yourfantasymovie_www" {
   name    = "www"
   type    = "CNAME"
   content = "ecf035147d87bc65.vercel-dns-016.com"
-  proxied = false
-  ttl     = 300
-  comment = "vercel www; redirects (308) to yourfantasymovie.com"
+  proxied = local.yourfantasymovie_on_cloudflare
+  ttl     = local.yourfantasymovie_on_cloudflare ? 1 : 300
+  comment = local.yourfantasymovie_on_cloudflare ? "proxied; Worker ${local.yourfantasymovie_worker} redirects (308) to the apex" : "vercel www; redirects (308) to yourfantasymovie.com"
+}
+
+resource "cloudflare_workers_route" "yourfantasymovie" {
+  for_each = local.yourfantasymovie_on_cloudflare ? toset(["yourfantasymovie.com/*", "www.yourfantasymovie.com/*"]) : toset([])
+  zone_id  = var.yourfantasymovie_zone_id
+  pattern  = each.value
+  script   = local.yourfantasymovie_worker
 }

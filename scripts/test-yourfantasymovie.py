@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""yourfantasymovie.tf: the Fantasy Films hostname. DNS only (never proxied: that breaks Vercel certificate issuance), the
-records Vercel reports for the project, and nothing else here (the Vercel project is made with its CLI)."""
+"""yourfantasymovie.tf: the Fantasy Films hostname. Served by the Worker dolphin-films-prod through proxied records and
+Workers routes, one switch (local.yourfantasymovie_on_cloudflare) that also turns the records back to DNS only for Vercel."""
 import re
 import unittest
 from pathlib import Path
@@ -11,16 +11,23 @@ FILMS = (ROOT / "dolphin-films.tf").read_text()
 
 
 class DnsTests(unittest.TestCase):
-    def test_every_record_is_dns_only_and_in_the_one_zone(self):
+    def test_every_record_follows_the_switch_and_is_in_the_one_zone(self):
         records = re.findall(r'resource "cloudflare_dns_record" "(\w+)" \{(.*?)\n\}', TF, re.S)
         self.assertEqual(sorted(n for n, _ in records), ["yourfantasymovie_apex", "yourfantasymovie_www"])
         for name, body in records:
-            self.assertIn("proxied  = false" if "proxied  =" in body else "proxied = false", body, name)
-            self.assertIn("zone_id", body)
+            self.assertRegex(body, r"proxied +=  ?local\.yourfantasymovie_on_cloudflare\n", name)
+            self.assertRegex(body, r"ttl +=  ?local\.yourfantasymovie_on_cloudflare \? 1 : 300\n", name)
             self.assertIn("var.yourfantasymovie_zone_id", body)
 
+    def test_the_routes_send_apex_and_www_to_the_production_worker_only_when_switched(self):
+        self.assertIn('yourfantasymovie_worker        = "dolphin-films-prod"', TF)
+        route = re.search(r'resource "cloudflare_workers_route" "yourfantasymovie" \{(.*?)\n\}', TF, re.S).group(1)
+        self.assertIn('local.yourfantasymovie_on_cloudflare ? toset(["yourfantasymovie.com/*", "www.yourfantasymovie.com/*"]) : toset([])', route)
+        self.assertIn("var.yourfantasymovie_zone_id", route)
+        self.assertIn("local.yourfantasymovie_worker", route)
+
     def test_the_apex_has_vercels_two_addresses_and_www_a_cname(self):
-        self.assertIn('yourfantasymovie_apex_ips = ["216.150.1.1", "216.150.16.1"]', TF)
+        self.assertRegex(TF, r'yourfantasymovie_apex_ips += \["216\.150\.1\.1", "216\.150\.16\.1"\]')
         self.assertIn('type    = "CNAME"', TF)
         self.assertRegex(TF, r'content = "[a-z0-9]+\.vercel-dns-\d+\.com"')
 
