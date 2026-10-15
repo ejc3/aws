@@ -2095,22 +2095,12 @@ version for replays.
 
 ## Private browser manager
 
-`browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
-multiple named browser desktops on one host. One dedicated Cloudflare Tunnel hostname routes
-`/browsers/<name>` to that exact desktop; it does not modify Dolphin Labs or its tunnel.
-The dashboard can create/start/stop browsers and rename their display labels; the CLI prints the same shareable desktop URLs.
-It is single-owner, not a multi-tenant service: separate profiles isolate browser sessions,
-but are not separate OS security boundaries. These browsers have the host user's normal
-network and filesystem access. Only that owner should have Cloudflare Access permission.
-
-The dashboard and browser-view WebSocket both require a verified Cloudflare Access
-JWT for the configured audience and owner. Mutations require the expected Origin. The local
-CLI uses an owner-only Unix socket, not a public bearer token. VNC uses private Unix sockets,
-not public ports; unknown instance names cannot become arbitrary network or filesystem targets.
-Every managed desktop has its own display and persistent browser profile. Stopping a desktop
-retains its profile. There is no profile-deletion command, arbitrary executable launcher,
-or remote CDP endpoint. Browser processes remain sandboxed. An expired Access session loses
-its live desktop connection and must sign in again before reconnecting.
+The application, its `browserctl` CLI and the CDP bridge for scripted jobs live in the public repository
+[ejc3/browser-manager](https://github.com/ejc3/browser-manager): installation, usage, the viewer, the security model and
+development are documented there. This repository provisions what it runs behind: the dedicated tunnels, DNS records,
+owner-only Access applications and service tokens for `browsers.cc-games.dev` (fcvm-metal-arm) and
+`mac-browsers.cc-games.dev` (the personal Mac), and the secrets that carry their credentials (`browser-manager.tf`,
+`browser-manager-mac.tf`). It does not modify Dolphin Labs or its tunnel. Only the owner has Access permission.
 
 ### 1. Apply on your administration host
 
@@ -2192,178 +2182,41 @@ fail closed, not accept an arbitrary replacement service identity.
 
 ### 2. Install on the browser host
 
-Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
-desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3 dbus libglib2.0-bin at-spi2-core python3-dbus`) and a current
-[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
-with `--token-file` support. Do not disable the Chrome sandbox to make installation pass.
-
-In the transferred environment file, add `BM_BROWSER_BIN=/absolute/path/to/chrome` if Chrome
-is not installed at a standard `/usr/bin/chromium`, `/usr/bin/chromium-browser`, or
-`/usr/bin/google-chrome` path. The installer never downloads/replaces a browser or imports
-any browser's credentials. Then, from this checkout:
+On fcvm-metal-arm, as `ubuntu`, the checkout is `~/browser-manager` (a clone of the public repository) and the
+installer gets the transferred environment file and the tunnel token retrieved above:
 
 ```bash
-cd browser-manager
-npm ci --ignore-scripts
-npm run build
-./scripts/install.sh /absolute/path/browser-manager.env /home/ubuntu/.config/browser-manager/tunnel-token
+git clone https://github.com/ejc3/browser-manager ~/browser-manager && cd ~/browser-manager
+npm ci --ignore-scripts && npm run build
+./scripts/install.sh /home/ubuntu/.config/browser-manager/browser-manager.env /home/ubuntu/.config/browser-manager/tunnel-token
 ```
 
-Run the installer as the browser owner, not root. It installs two **user** systemd units,
-`browser-manager.service` and `browser-manager-tunnel.service`, and `~/.local/bin/browserctl`.
-Only these units are restarted. Existing browser services and Dolphin remain untouched.
-The checkout must stay at the same path; to update it, rebuild and rerun the installer.
-If prompted, an administrator can enable logout/reboot persistence with
-`loginctl enable-linger <browser-user>`.
+To update: `git pull`, `npm ci --ignore-scripts && npm run build`, and rerun the installer with only the environment
+file (the tunnel unit is left as it is). The installer restarts `browser-manager.service`, which restarts every desktop
+(profiles and logins are kept); ask before doing it while someone may be using one. A desktop on an external profile
+(`--profile`) can come back in an error state after that restart, because Chrome leaves its `Singleton*` lock links
+behind: once `pgrep -f <profile path>` shows nothing, unlink the three links and `browserctl start <name>`.
 
-State and profiles live under `~/.local/state/browser-manager` (private to the owner).
-Configuration and token files live under `~/.config/browser-manager`. The supported installer
-uses that fixed state location so the CLI and service always agree. The application listens
-only on `127.0.0.1:3210`; raw VNC and local CLI traffic use private Unix sockets.
+### OpenClaw viewers
 
-### 3. Use it
+The OpenClaw viewer credentials are the service tokens above. On the Mac, from a clone of the public repository, with
+the allowed hosts and the Access team in the environment (the helper takes them from nowhere else):
 
 ```bash
-browserctl start claude --url https://claude.ai
-browserctl start research --url https://example.com
-browserctl list
-browserctl url claude
-browserctl rename claude "Claude · Personal"
-browserctl stop research
-```
-
-Open `https://browsers.cc-games.dev`, sign in through Google as the configured owner, then
-open either desktop (for example `/browsers/claude`). Log in to websites within that desktop;
-those logins stay in its host-side profile. Closing a viewer tab does not stop the browser.
-Up to 32 names can be registered. Stop retains a name and its profile, and Start reuses it.
-On service restart, previously running managed desktops are restored from saved desired state.
-
-Use **Rename** on a browser card to edit its display label (1–80 characters, no control characters).
-Labels are trimmed and saved; the dashboard and desktop title show them. Renaming never changes
-the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
-and does not restart the browser. Older browsers initially display their stable name as the label.
-
-**Automating a signed-in browser (CDP bridge).** A script that launches its own copy of a profile is a new visitor
-to bot protection (ChatGPT answered one with a Cloudflare "verify you are human" check); the running desktop is not.
-`browserctl cdp <name>` prints a loopback CDP endpoint for a running browser, for Playwright's `connect_over_cdp` or
-any CDP client; it is handed out only through the owner-only control socket, behind a random token, and refuses
-`Browser.close`. Each client gets its own browser-level session: it sees and drives only the tabs it attaches, never the
-desktop's own sessions, and everything it set (emulation, auto-attach) is undone when it disconnects. `browserctl job <name> <job>` runs a job from `browser-manager/jobs/` in a new tab of that browser
-and closes only that tab:
-
-```bash
-python3 -m venv ~/pw-venv && ~/pw-venv/bin/pip install playwright   # once; jobs drive the manager's browser
-browserctl job codex codex-code-review.py list
-browserctl job codex codex-code-review.py enable owner/repo
-```
-
-A job never solves a human-verification challenge: it reports it, and you clear it once in the live desktop.
-
-For machine-controlled viewers, create the two dedicated OpenClaw browser profiles and
-an empty tab in each once. Leave existing profiles in place. Install the helper's dependencies
-on the Mac, then stream each
-AWS secret directly into it. The helper exchanges the service credential over HTTPS
-with only the credential's allowlisted browser-manager hostname, refuses redirects,
-verifies the returned Access JWT and a cookie-only API request, then installs a host-scoped cookie.
-The helper pins each hostname to its own dedicated profile, never a normal browsing profile.
-It never installs the long-lived service
-secret as profile-wide browser headers or puts it in argv, a file, or command output:
-
-```bash
-openclaw browser create-profile --name secure-browser-viewer --color '#6B5BFF'
-openclaw browser --browser-profile secure-browser-viewer open about:blank
-openclaw browser create-profile --name secure-mac-browser-viewer --color '#16A34A'
-openclaw browser --browser-profile secure-mac-browser-viewer open about:blank
-npm --prefix browser-manager ci --ignore-scripts
+export BM_VIEWER_PROFILES='{"https://browsers.cc-games.dev":"secure-browser-viewer","https://mac-browsers.cc-games.dev":"secure-mac-browser-viewer"}'
+export BM_ACCESS_ISSUER=https://ejc3.cloudflareaccess.com
 aws --profile browser-manager-openclaw secretsmanager get-secret-value \
   --secret-id browser-manager-openclaw-access --query SecretString --output text \
-  | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-browser-viewer
+  | node scripts/configure-openclaw-viewer.mjs secure-browser-viewer
 aws --profile browser-manager-openclaw secretsmanager get-secret-value \
   --secret-id browser-manager-mac-openclaw-access --query SecretString --output text \
-  | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-mac-browser-viewer
+  | node scripts/configure-openclaw-viewer.mjs secure-mac-browser-viewer
 ```
 
-Use `secure-browser-viewer` for `browsers.cc-games.dev` and `secure-mac-browser-viewer`
-for `mac-browsers.cc-games.dev`. An expired AWS SSO session must be renewed with
-`aws sso login --profile AdministratorAccess-928413605543` before secret retrieval;
-the helper does not copy administrator credentials or silently bypass failed login.
-The helper clears any legacy
-profile-wide headers, sets only the short-lived host-scoped Access cookie, and navigates
-to the dashboard. Browser cookies are credentials and may be persisted in that local
-profile; the one-year service-token secret never enters it. Run the helper again when
-the Access session expires. Website passwords entered inside a remote
-desktop stay in that remote desktop's persistent host-side profile; they are not copied to
-the local viewer.
+An expired AWS SSO session must be renewed with `aws sso login --profile AdministratorAccess-928413605543` first; the
+helper does not copy administrator credentials or bypass a failed login.
 
-Use **Back** beside the desktop title to go back in the remote browser's history. The separate
-top-left arrow returns to the browser-manager dashboard instead. Back follows the active remote
-Chrome window/tab's native toolbar state, including navigation from other viewers. It is disabled
-while disconnected or when the native state is unavailable. Foreground viewers refresh this
-read-only state every 500 ms after the previous read completes; background polling pauses.
-Each desktop uses its own private accessibility bus and one persistent native reader, kept alive
-until Chrome exits. Repeatedly subscribing and disconnecting short-lived readers can crash
-Chromium's ATK keyboard-event handler, including on versions 151 and 153. A slow read returns
-unknown without tearing down the subscription. No browsing history URLs are returned and no
-remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
-On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
-Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
-the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
-480–900 logical CSS pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
-the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
-viewers of that same browser also see the change; separate browser instances are unaffected.
-The Phone button follows the actual shared framebuffer in every connected viewer, not a cached
-metadata response. A second viewer can toggle the current mode without refreshing or reconnecting;
-local Fit scaling and viewer-window resizing do not change the shared mode.
-Tabs, page state, and logins remain in place: switching modes does not restart or reload the
-browser. The mode survives viewer reconnects, but a browser/service restart starts in Desktop
-mode. Phone changes the viewport, not the browser's user agent; it is not an iOS emulator.
-**Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
-input also work directly. **Fit to screen** scales independently for each viewer; only the
-explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
-viewing browser supports it.
-
-In the Linux VNC viewer, swipe with one finger to scroll the remote page or the panel
-where the swipe starts. A quick swipe has a short glide; touching again stops it. Reduced-motion
-preferences disable the glide. Tap normally to click; to drag an item, tap once, then touch
-and drag within a moment. Long-press and multitouch gestures keep noVNC's existing behavior.
-Mouse input is unchanged. VNC carries discrete wheel steps, so this improves touch handling
-but cannot promise pixel-for-pixel scrolling or a native phone's frame rate over the network.
-
-In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting and actual size
-are already the same (less than one pixel of difference), or while disconnected. It re-enables
-when the shared display or available viewer space changes, including rotation and opening the
-keyboard, and retains its on/off setting.
-
-The Linux VNC browser renders at fixed 2× density: a 390 × 844 Phone viewport has a
-780 × 1688 framebuffer, while Desktop has 2880 × 1800 pixels. Text and browser controls
-keep their logical size; **Fit** off means logical actual size, not one physical framebuffer
-pixel per CSS pixel. This supplies more detail on high-density screens at four times the
-source pixel count; it is not lossless or full native density on every phone. Existing
-desktops pick up the density change when restarted.
-
-VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
-reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
-stronger compression; changing connection hints updates the live connection. Browsers without
-these hints, including Safari, keep high quality. These are browser hints, not a throughput test.
-
-Disconnected viewers retry automatically while their tab is visible and focused, waiting
-1, 2, 4, 8, then at most 10 seconds between failed attempts. Returning to the tab reconnects
-immediately, including after phone suspension; background retries pause. A successful connection
-resets the delay. Manual **Reconnect** remains available. Retries never bypass Access sign-in;
-if it has expired, reload to sign in again. Reconnecting the viewer does not restart the browser.
-
-To reuse an existing login profile without copying it, first close its existing browser using
-that browser's normal service controls, then run
-`browserctl start <name> --profile /absolute/profile/path` on this host. The CLI alone permits
-explicit profiles; public API requests cannot select a filesystem path. External profiles with
-Chrome locks are refused. Do not remove locks while another browser could be running. Reusing
-a profile starts a new managed desktop; it does not attach VNC to an already-running display.
-
-For service diagnostics use `systemctl --user status browser-manager browser-manager-tunnel`
-and `journalctl --user -u browser-manager -u browser-manager-tunnel`. If the shell has no user
-bus address, prefix these with `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`.
-Cloudflare errors before sign-in usually mean the apply/connector is not ready; a stopped
-desktop can be started from the dashboard. A profile remains on disk even if startup fails.
+### Connector rotation
 
 The AWS browser connector secret is Terraform-managed. For an intentional rotation, bump
 `random_bytes.browser_manager_tunnel_secret.keepers.rotation`, review a fresh full plan, and
@@ -2391,40 +2244,11 @@ running; unauthenticated access returned the Access login redirect and the dedic
 service-token request reached the application with HTTP 200. The Mac tunnel was not
 changed, and x86 remained stopped with the next-boot refresh requirement above.
 
-### Development and acceptance
+### The personal Mac
 
-`npm test`, `npm run typecheck`, and `npm run build` are the focused CI gate. Install `x11vnc`
-before testing (CI does this automatically). Tests cover signed Access identities, Origin
-enforcement, exact socket routing, expiry, and lifecycle without needing a Cloudflare account.
-A small native VNC regression checks that the real server accepts Unix-socket connections
-and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
-`BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
-on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
-It checks desktop/phone layout, 2× rendering with unchanged logical sizes, real VNC input
-including small-target clicks with Fit on and off, native phone-width reflow and restoration,
-phone-mode navigation, reconnect, and profile retention. Screenshots
-go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
-printed temporary directory and all test desktops are stopped. New E2E findings should get
-the smallest practical regression at the layer responsible, not a new proof framework.
-
-### Native browsers on the personal Mac
-
-`https://mac-browsers.cc-games.dev` is an independent browser manager on the personal
-Mac, not the optional AWS Mac instance. Chrome renders webpages, stores its profiles and
-uses the Mac's network locally. The AWS browser list at `browsers.cc-games.dev` is separate;
-there is no profile synchronization or automatic federation. The Mac has its own tunnel
-and Access application/audience. Never run its connector with the AWS browser tunnel token:
-Cloudflare would load-balance requests between two different machines' browser lists.
-
-The Mac backend starts installed, sandboxed **native headed Chrome** with a dedicated
-profile per browser. It streams webpage images and accepts only bounded tab, navigation,
-pointer, key and explicit text commands through an authenticated WebSocket. Browser-manager
-supplies the tabs and address bar; Chrome's native toolbar, macOS file dialogs, Touch ID and
-the rest of the Mac desktop are not streamed. Downloads are disabled in managed Mac browsers.
-Chrome debugging uses inherited private pipes, never a listening debug port or public CDP
-proxy. No Screen Recording or Accessibility grant is requested. The normal Chrome profile
-and existing OpenClaw services are not touched, and website logins must be made in the new
-managed profiles. Profiles are private but are not separate OS security boundaries.
+`https://mac-browsers.cc-games.dev` is an independent browser manager on the personal Mac (native Chrome; see the public
+repository), not the optional AWS Mac instance, with its own tunnel and Access application. Never run its connector with
+the AWS browser tunnel token: Cloudflare would load-balance between two machines' browser lists.
 
 Terraform runs only on the jumpbox. After reviewing/applying the full plan, export
 `terraform output -raw browser_manager_mac_env` into a private environment file. The Mac's
@@ -2436,33 +2260,22 @@ For later credential retrieval, the Mac's existing SSO administrator session can
 `browser-manager-mac-connector`, which can read only that connector secret. No AWS
 credentials are required by the running browser-manager or tunnel process.
 
-Install as the logged-in Mac user from a full checkout at a permanent path (the deployed
-path is `/Users/ejcampbell/src/aws-browser-manager`). Existing Chrome and Node.js 22.13+
-are prerequisites; `brew install cloudflared` supplies the connector. From `browser-manager`:
+The Mac still runs the application from an old checkout of this repository, project path
+`/Users/ejcampbell/src/aws-browser-manager/browser-manager`. Do not `git pull` it: this repository no longer contains
+the application, and pulling would delete the code its LaunchAgents run. The macOS installer keeps its installation tied
+to that exact project path ("Another checkout owns this installation; keep its fixed path"), so move to the public
+repository by putting its clone at the same path, in one sitting (the LaunchAgents keep running the old code until the
+installer restarts them):
 
 ```bash
-npm ci --ignore-scripts
-npm run build
-node scripts/install-macos.mjs /absolute/private/browser-manager.env /absolute/private/tunnel-token
-browserctl start personal --url https://example.com
+mv ~/src/aws-browser-manager ~/src/aws-browser-manager.before-public
+mkdir ~/src/aws-browser-manager
+git clone https://github.com/ejc3/browser-manager ~/src/aws-browser-manager/browser-manager
+cd ~/src/aws-browser-manager/browser-manager && npm ci --ignore-scripts && npm run build
+node scripts/install-macos.mjs /absolute/private/browser-manager.env
 ```
 
-The installer owns only the user LaunchAgents `com.ejc3.browser-manager` and
-`com.ejc3.browser-manager-tunnel`. They restart on that user's login, not before FileVault
-unlock; logout or sleep makes the Mac URL unavailable. It does not change power settings.
-State stays under `~/.local/state/browser-manager`, configuration under
-`~/.config/browser-manager`. Rerun the installer after rebuilding to update only these
-services; previously running managed browsers are restored and their profiles retained.
-Always use this GUI LaunchAgent startup path: Chrome started directly under SSH on this
-Mac cannot access Keychain (`errSecInteractionNotAllowed`) and cannot persist encrypted
-cookies. Do not substitute an unencrypted password store or a mock Keychain. If macOS
-requests Keychain authorization, the owner must approve it in their GUI login session.
-Open the Mac URL on your phone and sign in as the same configured owner. Multiple viewers
-of one named browser share its selected tab and input; different names have separate profiles.
-
-`npm test`, `npm run typecheck`, and `npm run build` also run on macOS; the native Linux
-VNC test is skipped there. The Mac backend and authenticated page-transport regressions
-cover private pipes, bounded actions, profile isolation and immediate session expiry.
+Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 
 ## File map
 
@@ -2480,7 +2293,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
-| Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
+| Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
 | Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |

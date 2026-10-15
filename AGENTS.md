@@ -1467,7 +1467,7 @@ bindings, KV, D1, R2, Durable Objects, Queues, Cron Triggers, the zone's WAF and
 Cloudflare-only app (claude-master-dashboard) needs no Vercel project. Until a site's production moves, its Vercel production
 deployment must keep working: a change may not break it, but new capability is built for Cloudflare first. This replaces the
 2026-10-10 rule ("every web app supports both clouds"). It covers the apps deployed as sites (Vercel projects and
-`<site>-stage` Workers), not host-local tools such as `browser-manager/` (bound to loopback on its host, reached through its
+`<site>-stage` Workers), not host-local tools such as browser-manager (github.com/ejc3/browser-manager; bound to loopback on its host, reached through its
 own tunnel). Each app repository's agent instructions carry the matching section. Every secret lives in AWS Secrets Manager.
 Where it lives today: Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the
 containers Terraform writes into the project for colton-games (`colton-games-accounts.tf`), dolphin-films

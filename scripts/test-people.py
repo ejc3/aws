@@ -77,8 +77,6 @@ class PeopleTests(unittest.TestCase):
         self.assertNotIn('variable "dev_staging_email"', (ROOT / "dev-staging-account.tf").read_text())
         self.assertIn("local.dev_staging_email", (ROOT / "dev-staging-account.tf").read_text())
         self.assertNotIn("browser_manager_owner    =", (ROOT / "browser-manager.tf").read_text())
-        auth = (ROOT / "browser-manager" / "lib" / "auth.mjs").read_text()
-        self.assertIn("env.BM_OWNER_EMAIL || ''", auth)  # no built-in owner: the Terraform output is required
 
     def test_no_tracked_file_holds_a_mailbox_except_known_non_mailbox_forms(self):
         files = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True, check=True).stdout.split("\n")
