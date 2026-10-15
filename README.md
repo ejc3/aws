@@ -2075,8 +2075,8 @@ host from the registry and applying deletes its principal, reporter, stream and 
 ## dolphin-labs news pass
 
 `dolphin-labs-news.tf` runs dolphin-labs' team-news pass as a Lambda on a schedule, in place of the hourly GitHub job
-(`refresh-news.yml` in dolphin-labs-hq/dolphin-labs). It is created switched off (`dolphin_labs_news_enabled =
-false`). To turn it on, in this order:
+(`refresh-news.yml` in dolphin-labs-hq/dolphin-labs). It is on (`dolphin_labs_news_enabled = true`) and
+dolphin-labs' `NEWS_RUNS_IN_AWS` variable keeps the GitHub job off. Bringing it up from scratch, in this order:
 
 1. Merge dolphin-labs' `deploy-news.yml` and let it deploy the bundle (it reads the role ARN and names from
    `terraform output dolphin_labs_news`). Until then the function runs a stand-in that fails on purpose.

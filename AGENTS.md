@@ -1216,7 +1216,7 @@ Available if a task needs them; neither needs a key on disk.
   Same grant as the boxes. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
   workflow needs.
 - **dolphin-labs' news pass in AWS** (`dolphin-labs-news.tf`). Lambda `dolphin-labs-news-pass` on an
-  EventBridge schedule (off until `dolphin_labs_news_enabled`), with Haiku 5.5, the Dolphin Redis's
+  EventBridge schedule (on; `dolphin_labs_news_enabled`), with Haiku 5.5, the Dolphin Redis's
   production URL and token (`dolphin-redis.tf`) in `dolphin-labs/news` and Browserbase from `browserbase/credentials`. Each pass writes a
   journal record to `s3://dolphin-labs-news-<account>/journal/` (400 days; deletes there are refused
   outside the administration set, and the bucket is versioned, so an overwrite keeps the original for 400
