@@ -192,6 +192,9 @@ jobs:
       - name: "yourfantasymovie.com DNS (Fantasy Films): DNS only, Vercel's records, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
 
+      - name: "Dolphin Redis: in the Dolphin account, no inbound path, data kept, no credential in the file"
+        run: python3 -S -B scripts/test-dolphin-redis.py
+
       - name: "claude-master certificates renew themselves: the four SSM scripts run for real, the Lambda against fake AWS, the role can send nothing else"
         run: python3 -S -B scripts/test-claw-master-cert-renew.py
 
