@@ -1408,7 +1408,9 @@ dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the re
 cannot be transferred between teams) to one t4g.micro in the Dolphin account (owner, 2026-10-15), built from here with the
 Dolphin provider because its tunnel and DNS are Cloudflare's. Valkey stores the data (append-only file on the root volume,
 daily snapshots kept 7 days, `prevent_destroy`); serverless-redis-http speaks Upstash's REST protocol in front of it, so the
-sites' `@upstash/redis` code runs unchanged; cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
+sites' `@upstash/redis` code runs unchanged (built on the instance from a pinned commit with `scripts/dolphin-redis/srh-auth.patch`: the request-body limit goes from 8
+to 64 MB, because the news pass writes a hash of about 8 MB in one request and the stock server answers that with an empty
+500, and the token is checked before any body is read); cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
 `https://kv-stage.gamesworthwatching.com` (staging, db 1). No inbound rule: the REST bearer token is the credential, as with
 Upstash. Each consumer's URL and token come from `dolphin-redis/clients` in the Dolphin account: the production Worker (via
 `vercel-env/dolphin-labs/production`), the staging Worker (`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`)
@@ -1476,6 +1478,10 @@ targets, sensitivity, never a value), and every existing variable is imported by
 Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come over (2026-10-11): `dolphin-maps-stage`,
 deployed by its `cloudflare-stage.yml`; it has no runtime secrets, so no `workers-stage/dolphin-maps` container until it
 needs one.
+
+**The account is on Workers Paid (since 2026-10-15).** On the Free plan a request gets about 10 ms of CPU; Next.js pages need
+150-900 ms and `/coverage` about 5 s, so gamesworthwatching.com returned 503 (`exceededCpu`) under load until the account
+was upgraded and each production Worker given `limits.cpu_ms = 30000`. Never move a site's production onto a Free-plan account.
 
 **Which production is behind Cloudflare (2026-10-15).** cc-games.org itself is served by the `colton-games-prod` Worker since
 the cutover below, so its zone protection applies. The Dolphin sites left Vercel on 2026-10-15 (its dolphin-labs team is being
