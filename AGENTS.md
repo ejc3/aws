@@ -1422,8 +1422,11 @@ Cloudflare's and Cloudflare credentials stay off nextjs-dev. No inbound rule: th
 with Upstash. Consumers: the production Worker (via `vercel-env/dolphin-labs/production`), the staging Worker
 (`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`) and the dolphin-labs repository's `KV_REST_API_*`
 Actions secrets. Rotate a token with `terraform apply -replace='random_password.dolphin_redis_token["prod"]'` here, then
-start a new task so it reads the secret again (`aws ecs update-service --cluster dolphin --service redis
---force-new-deployment`, about a minute of downtime), and copy the new value to those consumers.
+start a new task so it reads the secret again, and copy the new value to those consumers. The service is in the Dolphin
+account, so the restart needs a session there, not this account's credentials: from a jumpbox, assume
+`OrganizationAccountAccessRole` in the Dolphin account as `scripts/workers-stage-secrets.sh` does (output
+`dolphin_account_id` has the id) and run `aws ecs update-service --region us-west-1 --cluster dolphin --service redis
+--force-new-deployment` with that session; about a minute of downtime.
 
 The t4g.micro this section used to describe (`aws_instance.dolphin_redis`) no longer serves: its REST servers and
 connector are stopped, and its Valkey is kept only as a fallback copy until it is retired from `dolphin-redis.tf`.
