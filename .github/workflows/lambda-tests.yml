@@ -42,6 +42,8 @@ jobs:
 
       - name: Dolphin relay deploy credentials stay in a main-only environment
         run: python3 -S -B scripts/test-dolphin-relay.py
+      - name: browser-manager tunnel rotation (browser-manager.tf)
+        run: python3 -S -B scripts/test-browser-manager-tunnel.py
 
       - name: One Terraform run at a time on the jumpboxes (run-lock wrapper)
         run: python3 -B scripts/test-terraform-run-lock.py
