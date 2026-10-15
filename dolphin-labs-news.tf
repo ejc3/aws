@@ -20,8 +20,8 @@
 #                                   local/    journals of passes run on a dev box. 30 days.
 #                                   code/     deployed bundles. Lambda copies the code at update time,
 #                                             so a bundle is kept 30 days only for a redeploy.
-#   dolphin-labs/news             JSON secret: KV_REST_API_URL and KV_REST_API_TOKEN, the Upstash Redis
-#                                 the site reads the lists from. Value set out of band.
+#   dolphin-labs/news             JSON secret: KV_REST_API_URL and KV_REST_API_TOKEN, the Dolphin Redis
+#                                 (dolphin-redis.tf) the site reads the lists from. Value set out of band.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
 #
 # The schedule starts DISABLED. Switch-over, in order: the first deploy of the bundle; the secret's value;
@@ -180,7 +180,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
 }
 
 # -------------------------------------------------------------------------------------
-# Secret (Upstash Redis)
+# Secret (the Dolphin Redis, dolphin-redis.tf)
 # -------------------------------------------------------------------------------------
 
 # Set the value out of band, from a 0600 file, never on a command line:
@@ -188,7 +188,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "dolphin_labs_news" {
 #     --secret-string file://news-secret.json      # {"KV_REST_API_URL": "...", "KV_REST_API_TOKEN": "..."}
 resource "aws_secretsmanager_secret" "dolphin_labs_news" {
   name                    = "dolphin-labs/news"
-  description             = "dolphin-labs news pass: the Upstash Redis it writes (JSON: KV_REST_API_URL, KV_REST_API_TOKEN). Value set out of band; see dolphin-labs-news.tf."
+  description             = "dolphin-labs news pass: the Redis it writes (dolphin-redis.tf; Upstash REST protocol) (JSON: KV_REST_API_URL, KV_REST_API_TOKEN). Value set out of band; see dolphin-labs-news.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "dolphin-labs/news", Project = "dolphin-labs" }
 }
