@@ -117,7 +117,7 @@ test('the bridge listens on loopback behind a token, relays commands, and closes
 
 test('the CDP route exists only on the local control socket, never on the web listener', async () => {
   const keys = await generateKeyPair('RS256');
-  const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', serviceTokenId: '', owner: 'owner@example.test' };
+  const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', serviceTokenId: '', owner: 'owner@example.com' };
   const token = await new SignJWT({ email: config.owner }).setProtectedHeader({ alg: 'RS256' })
     .setIssuedAt().setSubject('owner').setIssuer(config.issuer).setAudience(config.audience)
     .setExpirationTime('5m').sign(keys.privateKey);

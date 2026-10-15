@@ -4,6 +4,8 @@
     enable <owner/repo> [...]    turn automatic review on for each named repository
 """
 import os
+import re
+import tempfile
 
 SETTINGS = "https://chatgpt.com/codex/settings/code-review"
 
@@ -31,22 +33,38 @@ def _switches(page):
     return out
 
 
+def _shot(page):
+    # The settings page lists private repositories: keep the screenshot in a directory only this user can read.
+    path = os.path.join(tempfile.mkdtemp(prefix="codex-code-review-"), "settings.png")
+    page.screenshot(path=path, full_page=True)
+    return path
+
+
+def _names(repo, label):
+    # The complete owner/name, not a prefix: example/project must not match example/project-tools.
+    return re.search(r"(?<![\w./-])" + re.escape(repo.lower()) + r"(?![\w./-])", label.lower()) is not None
+
+
 def run(page, args):
     state = _load(page)
     if state != "ok":
-        page.screenshot(path=os.path.join(os.environ.get("TMPDIR", "/tmp"), "codex-code-review.png"), full_page=True)
-        return {"state": state, "url": page.url, "screenshot": os.path.join(os.environ.get("TMPDIR", "/tmp"), "codex-code-review.png")}
+        return {"state": state, "url": page.url, "screenshot": _shot(page)}
     if not args or args[0] == "list":
-        page.screenshot(path=os.path.join(os.environ.get("TMPDIR", "/tmp"), "codex-code-review.png"), full_page=True)
-        return {"state": "ok", "text": " ".join(page.inner_text("body").split())[:4000], "switches": _switches(page)}
+        return {"state": "ok", "screenshot": _shot(page), "text": " ".join(page.inner_text("body").split())[:4000],
+                "switches": _switches(page)}
     if args[0] == "enable":
-        changed = []
+        changed, already, missing = [], [], []
         for repo in args[1:]:
-            for s in _switches(page):
-                if repo.lower() in s["label"].lower() and not s["on"]:
-                    page.locator("[role=switch]").nth(s["index"]).click()
-                    page.wait_for_timeout(1500)
-                    changed.append(repo)
-                    break
-        return {"state": "ok", "changed": changed, "switches": _switches(page)}
+            matches = [s for s in _switches(page) if _names(repo, s["label"])]
+            if not matches:
+                missing.append(repo)
+            elif all(s["on"] for s in matches):
+                already.append(repo)
+            else:
+                for s in matches:
+                    if not s["on"]:
+                        page.locator("[role=switch]").nth(s["index"]).click()
+                        page.wait_for_timeout(1500)
+                changed.append(repo)
+        return {"state": "ok", "changed": changed, "already_on": already, "not_found": missing, "switches": _switches(page)}
     return {"error": "unknown command " + args[0]}

@@ -19,6 +19,11 @@ try {
     const { fileURLToPath } = await import('node:url');
     const runner = fileURLToPath(new URL('./browser-job.py', import.meta.url));
     const python = process.env.BM_JOB_PYTHON || join(homedir(), 'pw-venv/bin/python');
+    const { existsSync } = await import('node:fs');
+    if (!existsSync(python)) {
+      throw new Error(`browserctl job needs Python with Playwright at ${python} (or set BM_JOB_PYTHON):\n` +
+        '  python3 -m venv ~/pw-venv && ~/pw-venv/bin/pip install playwright\n(no browser download: jobs drive the manager\'s browser)');
+    }
     const result = spawnSync(python, [runner, name, ...args], { stdio: 'inherit' });
     process.exit(result.status ?? 1);
   }

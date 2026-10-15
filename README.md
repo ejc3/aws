@@ -2243,6 +2243,21 @@ Labels are trimmed and saved; the dashboard and desktop title show them. Renamin
 the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
 and does not restart the browser. Older browsers initially display their stable name as the label.
 
+**Automating a signed-in browser (CDP bridge).** A script that launches its own copy of a profile is a new visitor
+to bot protection (ChatGPT answered one with a Cloudflare "verify you are human" check); the running desktop is not.
+`browserctl cdp <name>` prints a loopback CDP endpoint for a running browser, for Playwright's `connect_over_cdp` or
+any CDP client; it is handed out only through the owner-only control socket, behind a random token, and refuses
+`Browser.close`. `browserctl job <name> <job>` runs a job from `browser-manager/jobs/` in a new tab of that browser
+and closes only that tab:
+
+```bash
+python3 -m venv ~/pw-venv && ~/pw-venv/bin/pip install playwright   # once; jobs drive the manager's browser
+browserctl job codex codex-code-review.py list
+browserctl job codex codex-code-review.py enable owner/repo
+```
+
+A job never solves a human-verification challenge: it reports it, and you clear it once in the live desktop.
+
 For machine-controlled viewers, create the two dedicated OpenClaw browser profiles and
 an empty tab in each once. Leave existing profiles in place. Install the helper's dependencies
 on the Mac, then stream each
