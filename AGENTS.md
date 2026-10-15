@@ -1408,7 +1408,9 @@ dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the re
 cannot be transferred between teams) to one t4g.micro in the Dolphin account (owner, 2026-10-15), built from here with the
 Dolphin provider because its tunnel and DNS are Cloudflare's. Valkey stores the data (append-only file on the root volume,
 daily snapshots kept 7 days, `prevent_destroy`); serverless-redis-http speaks Upstash's REST protocol in front of it, so the
-sites' `@upstash/redis` code runs unchanged; cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
+sites' `@upstash/redis` code runs unchanged (built on the instance from a pinned commit with its request-body limit raised
+from 8 to 64 MB: the news pass writes a hash of about 8 MB in one request, and the stock server answers that with an
+empty 500); cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
 `https://kv-stage.gamesworthwatching.com` (staging, db 1). No inbound rule: the REST bearer token is the credential, as with
 Upstash. Each consumer's URL and token come from `dolphin-redis/clients` in the Dolphin account: the production Worker (via
 `vercel-env/dolphin-labs/production`), the staging Worker (`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`)

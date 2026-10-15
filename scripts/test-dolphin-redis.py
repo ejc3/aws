@@ -43,6 +43,13 @@ class DolphinRedisTests(unittest.TestCase):
         self.assertNotRegex(TF, r"(eyJ[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})")
         self.assertIn("random_password.dolphin_redis_token", TF)
 
+    def test_the_rest_server_is_built_from_a_pinned_commit_with_a_raised_body_limit(self):
+        self.assertRegex(TF, r'dolphin_redis_srh_commit = "[0-9a-f]{40}"')
+        self.assertRegex(TF, r'srh +=  ?"srh-local:0\.0\.10-body64mb"')
+        self.assertIn("git -C /opt/srh-src checkout -q ${local.dolphin_redis_srh_commit}", TF)
+        self.assertIn("grep -q 'length: 64_000_000'", TF)
+        self.assertIn("echo -1000 > /proc/$p/oom_score_adj", TF)
+
     def test_the_instance_may_read_only_its_own_secret(self):
         [(_, pol)] = resources("aws_iam_role_policy")
         self.assertIn('Action = "secretsmanager:GetSecretValue"', pol)

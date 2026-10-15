@@ -25,13 +25,18 @@
 # (workers-stage/dolphin-labs), the news pass (dolphin-labs/news) and the dolphin-labs repository's KV_REST_API_* secrets.
 
 locals {
+  # serverless-redis-http tag 0.0.10; the image is built from this commit (see local.dolphin_redis_images.srh).
+  dolphin_redis_srh_commit = "794c5a372fa3997e08320250235f32e5a86338a3"
   dolphin_redis = {
     prod  = { host = "kv.gamesworthwatching.com", port = 8079, db = 0 }
     stage = { host = "kv-stage.gamesworthwatching.com", port = 8078, db = 1 }
   }
   dolphin_redis_images = {
-    valkey      = "valkey/valkey:8.1.10-alpine"
-    srh         = "hiett/serverless-redis-http:0.0.10"
+    valkey = "valkey/valkey:8.1.10-alpine"
+    # serverless-redis-http 0.0.10 built on the instance with Plug's request-body limit raised from its 8 MB default
+    # to 64 MB (the build step in the boot script below): the news pass writes a hash of about 8 MB in one request, which the
+    # stock image refuses with an empty 500 (2026-10-15 09:37). Upstash allowed 10 MB on its free plan.
+    srh         = "srh-local:0.0.10-body64mb"
     cloudflared = "cloudflare/cloudflared:2026.9.3"
   }
 }
@@ -199,6 +204,20 @@ locals {
     swapon /swapfile 2>/dev/null || true
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap defaults 0 0' >> /etc/fstab
     install -d -m 0700 /var/lib/valkey
+    # Build the REST server (see local.dolphin_redis_images.srh). The Erlang VM needs more memory than a t4g.micro has
+    # to compile it, so a temporary swap file is added for the build and the data store is kept out of the OOM killer.
+    if ! docker image inspect ${local.dolphin_redis_images.srh} >/dev/null 2>&1; then
+      dnf install -y git
+      for p in $(pgrep -f valkey-server); do echo -1000 > /proc/$p/oom_score_adj; done
+      swapoff /swap-build 2>/dev/null || true; rm -f /swap-build
+      fallocate -l 3G /swap-build && chmod 600 /swap-build && mkswap /swap-build >/dev/null && swapon /swap-build
+      rm -rf /opt/srh-src && git clone -q https://github.com/hiett/serverless-redis-http /opt/srh-src
+      git -C /opt/srh-src checkout -q ${local.dolphin_redis_srh_commit}
+      sed -i 's/json_decoder: Jason)/json_decoder: Jason, length: 64_000_000)/' /opt/srh-src/lib/srh/http/base_router.ex
+      grep -q 'length: 64_000_000' /opt/srh-src/lib/srh/http/base_router.ex
+      (cd /opt/srh-src && nice -n 19 docker build -q -t ${local.dolphin_redis_images.srh} .)
+      swapoff /swap-build; rm -f /swap-build
+    fi
     # The role's policy can take a minute to reach a new instance: retry the read for up to five minutes.
     for i in $(seq 1 30); do
       S=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.dolphin_redis_instance.name} --query SecretString --output text 2>/dev/null) && break
