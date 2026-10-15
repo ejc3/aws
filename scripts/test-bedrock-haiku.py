@@ -59,8 +59,9 @@ class GrantTests(unittest.TestCase):
         attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?\.id", roles.group(1)))
         self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
-        # is an administrator (jumpbox_admin), is a CI machine, or is the Mac (its own resource above).
-        not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "mac_instance"}
+        # is an administrator (jumpbox_admin), is a CI machine, is the Mac (its own resource above), or is in the
+        # Dolphin account (dolphin_redis, which calls no model).
+        not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "mac_instance", "dolphin_redis"}
         profile_roles = set()
         for tf in ROOT.glob("*.tf"):
             for m in re.finditer(r'^resource "aws_iam_instance_profile" "\w+" \{\n.*?^\}', tf.read_text(), re.S | re.M):

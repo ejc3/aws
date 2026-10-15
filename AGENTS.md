@@ -1402,6 +1402,20 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   DynamoDB replicas). A new Dolphin region is added to `local.dolphin_security_regions`, which
   extends monitoring and the policy together.
 
+### The Dolphin Redis (dolphin-redis.tf)
+
+dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
+cannot be transferred between teams) to one t4g.micro in the Dolphin account (owner, 2026-10-15), built from here with the
+Dolphin provider because its tunnel and DNS are Cloudflare's. Valkey stores the data (append-only file on the root volume,
+daily snapshots kept 7 days, `prevent_destroy`); serverless-redis-http speaks Upstash's REST protocol in front of it, so the
+sites' `@upstash/redis` code runs unchanged; cloudflared publishes `https://kv.gamesworthwatching.com` (production, db 0) and
+`https://kv-stage.gamesworthwatching.com` (staging, db 1). No inbound rule: the REST bearer token is the credential, as with
+Upstash. Each consumer's URL and token come from `dolphin-redis/clients` in the Dolphin account: the production Worker (via
+`vercel-env/dolphin-labs/production`), the staging Worker (`workers-stage/dolphin-labs`), the news pass (`dolphin-labs/news`)
+and the dolphin-labs repository's `KV_REST_API_*` Actions secrets. Rotate a token with
+`terraform apply -replace='random_password.dolphin_redis_token["prod"]'`, re-run the instance's boot script over SSM, and
+copy the new value to those consumers. Manage the instance through SSM (AmazonSSMManagedInstanceCore), never SSH.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
