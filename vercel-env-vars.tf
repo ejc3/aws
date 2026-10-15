@@ -42,6 +42,7 @@ locals {
     "imagine/8EQAtUW1OEVz72Sa"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["preview"], sensitive = false }
     "imagine/qLucGXXiJECjPpfD"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["production"], sensitive = false }
     "imagine/JmRprF78qR6nGLnK"      = { key = "IMAGINE_TOKEN_SIGNING_KEY", target = ["production"], sensitive = true }
+    "imagine/8PHqSc6PPqV5pT1I"      = { key = "IMAGINE_URL", target = ["production"], sensitive = false }
     "imagine/Mi1paHwIMOyXaUob"      = { key = "IMAGINE_WS_URL", target = ["production"], sensitive = false }
     "imagine/zsBijtQOs75gEOaM"      = { key = "TURSO_AUTH_TOKEN", target = ["production"], sensitive = false }
     "imagine/9yGkla7PrqprmKlY"      = { key = "TURSO_DATABASE_URL", target = ["production"], sensitive = false }
