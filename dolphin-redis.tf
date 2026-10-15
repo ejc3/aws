@@ -199,7 +199,12 @@ locals {
     swapon /swapfile 2>/dev/null || true
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap defaults 0 0' >> /etc/fstab
     install -d -m 0700 /var/lib/valkey
-    S=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.dolphin_redis_instance.name} --query SecretString --output text)
+    # The role's policy can take a minute to reach a new instance: retry the read for up to five minutes.
+    for i in $(seq 1 30); do
+      S=$(aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.dolphin_redis_instance.name} --query SecretString --output text 2>/dev/null) && break
+      sleep 10
+    done
+    [ -n "$${S:-}" ] || { echo "dolphin-redis: cannot read ${aws_secretsmanager_secret.dolphin_redis_instance.name}" >&2; exit 1; }
     docker network inspect kv >/dev/null 2>&1 || docker network create kv
     docker rm -f valkey srh-prod srh-stage cloudflared 2>/dev/null || true
     docker run -d --name valkey --network kv --restart unless-stopped -v /var/lib/valkey:/data \
@@ -252,7 +257,11 @@ resource "aws_instance" "dolphin_redis" {
     prevent_destroy = true
     ignore_changes  = [ami, user_data]
   }
-  depends_on = [aws_secretsmanager_secret_version.dolphin_redis_instance]
+  depends_on = [
+    aws_secretsmanager_secret_version.dolphin_redis_instance,
+    aws_iam_role_policy.dolphin_redis_secret,
+    aws_iam_role_policy_attachment.dolphin_redis_ssm,
+  ]
 }
 
 # Daily snapshots of the root volume (the append-only file), kept a week.
@@ -273,7 +282,7 @@ resource "aws_iam_role_policy_attachment" "dolphin_redis_dlm" {
 
 resource "aws_dlm_lifecycle_policy" "dolphin_redis" {
   provider           = aws.dolphin
-  description        = "Dolphin Redis root volume, daily, 7 kept"
+  description        = "Dolphin Redis root volume daily snapshots kept 7 days"
   execution_role_arn = aws_iam_role.dolphin_redis_dlm.arn
   state              = "ENABLED"
   policy_details {
