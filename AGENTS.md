@@ -1409,8 +1409,8 @@ cannot be transferred between teams) on 2026-10-15. Since 11:55 that day it runs
 built by `dolphin-labs-hq/dolphin-aws` (`redis.tf`, applied from nextjs-dev only): one task of four containers, Valkey
 (append-only file on EFS, replicated across zones and backed up daily), serverless-redis-http for production (db 0) and
 staging (db 1), and cloudflared. serverless-redis-http speaks Upstash's REST protocol, so the sites' `@upstash/redis`
-code runs unchanged; its image is built by dolphin-aws's CodeBuild job with `scripts/dolphin-redis/srh-auth.patch` from
-here (the request-body limit goes from 8 to 64 MB, because the news pass writes a hash of about 8 MB in one request and the
+code runs unchanged; its image is built by dolphin-aws's CodeBuild job with that repository's `images/srh-auth.patch` (the
+request-body limit goes from 8 to 64 MB, because the news pass writes a hash of about 8 MB in one request and the
 stock server answers that with an empty 500, and the token is checked before any body is read). Failover is the task being
 replaced: 74 s measured for a stopped task. A probe Lambda, alarms on the topic `dolphin-alerts` and the dashboard
 `dolphin-platform` watch it.
@@ -1428,8 +1428,9 @@ account, so the restart needs a session there, not this account's credentials: f
 `dolphin_account_id` has the id) and run `aws ecs update-service --region us-west-1 --cluster dolphin --service redis
 --force-new-deployment` with that session; about a minute of downtime.
 
-The t4g.micro this section used to describe (`aws_instance.dolphin_redis`) no longer serves: its REST servers and
-connector are stopped, and its Valkey is kept only as a fallback copy until it is retired from `dolphin-redis.tf`.
+The t4g.micro that served it first (built in `dolphin-redis.tf`) was retired on 2026-10-16 after ECS had served a day
+cleanly; its root volume (kept on termination) and its last daily snapshots stay in the Dolphin account as a cold copy of
+the data from before the move.
 
 ### dolphin-films credentials
 
