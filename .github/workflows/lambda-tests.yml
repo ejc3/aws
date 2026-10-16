@@ -253,3 +253,6 @@ jobs:
 
       - name: Greptile review settings and rule scopes (offline)
         run: python3 -S -B scripts/test-greptile-config.py
+
+      - name: gamesworthwatching.com redirects http and www at the edge, assets included
+        run: python3 -S -B scripts/test-gww-redirects.py
