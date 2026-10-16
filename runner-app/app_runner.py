@@ -836,6 +836,16 @@ def publish_counts(results):
         cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
 
 
+def rotated(order, round_no):
+    """The repos for this round, starting one further along each round (the reconcile runs every two minutes), so every
+    repo goes first in turn: a slow one cannot always take the time the others need, and with more than two repos a
+    reversal alone would never put the middle one first."""
+    if not order:
+        return order
+    start = round_no % len(order)
+    return order[start:] + order[:start]
+
+
 def handler(event, context):
     started = time.monotonic()
     DEADLINE[0] = float('inf')
@@ -846,9 +856,7 @@ def handler(event, context):
         results, failed = [], []
         remaining = (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
         order = list(repos.items())
-        # Alternate which repo goes first, so a slow one cannot always take the time the other needs.
-        if int(time.time() // 120) % 2:
-            order.reverse()
+        order = rotated(order, int(time.time() // 120))
         for index, (repo, cfg) in enumerate(order):
             share = max(0.0, remaining - (time.monotonic() - started)) / (len(order) - index)
             DEADLINE[0] = time.monotonic() + share

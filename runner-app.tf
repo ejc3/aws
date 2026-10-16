@@ -548,24 +548,26 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   treat_missing_data  = "notBreaching"
 }
 
-# ejc3/imagine's spend over a day, from the same metric: LiveRunners averaged over 24 hours is the number of hosts it
-# kept up on average. Above 4 (96 host-hours, about $70 a day on `l` spot) is several times its measured volume when it
-# moved here (about 34 runs a day). The per-repo too-many alarm sees a burst over the cap; this sees a cap held too long.
+# ejc3/imagine's spend, from the same metric: LiveRunners averaged over an hour is the number of hosts it kept up in that
+# hour. More than 4 in 6 of the last 24 hours is several times its measured volume when it moved here (about 34 runs a day),
+# and an hourly window reports a runaway within about six hours, where one 24-hour period could take more than a day. The
+# per-repo too-many alarm sees a burst over the cap; this sees a cap held too long.
 # Missing data is the reconcile-silent alarm's to report.
 resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   count               = var.enable_github_runner && var.imagine_token_ready ? 1 : 0
   alarm_name          = "imagine-runner-hours-daily"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
+  evaluation_periods  = 24
+  datapoints_to_alarm = 6
   threshold           = 4
-  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average over 24 hours (96+ host-hours: about $70/day on l spot, about $130 on xl)"
+  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average in 6 of the last 24 hours (24+ host-hours past its usual volume: about $18 on l spot)"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
   metric_name         = "LiveRunners"
   dimensions          = { Repo = "ejc3/imagine" }
   statistic           = "Average"
-  period              = 86400
+  period              = 3600
   treat_missing_data  = "notBreaching"
 }
 
@@ -697,10 +699,17 @@ locals {
     for r in local.runner_extra_repos : r
     if lookup(local.runner_app_token_gates, r, true)
   ]
+
+  # Only the hooks made with a repo's own controller PAT read it. The dolphin-labs-hq and ejc3 hooks are made as the
+  # administration GitHub App, so their PATs are never read here and can be retired without breaking a plan.
+  runner_app_pat_hook_repos = [
+    for r in local.runner_app_webhook_repos : r
+    if !contains(["dolphin-labs-hq", "ejc3"], split("/", r)[0])
+  ]
 }
 
 ephemeral "aws_secretsmanager_secret_version" "runner_repo_pat" {
-  for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])
+  for_each  = local.runner_app_webhooks ? toset(local.runner_app_pat_hook_repos) : toset([])
   secret_id = aws_secretsmanager_secret.github_runner_repo_pat[each.value].id
 }
 
@@ -736,18 +745,6 @@ provider "github" {
   }
 }
 
-provider "github" {
-  alias = "dolphin_films"
-  owner = "dolphin-labs-hq"
-  dynamic "app_auth" {
-    for_each = local.dolphin_films_webhook ? [1] : []
-    content {
-      id              = tostring(local.github_app_admin.app_id)
-      installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
-      pem_file        = local.github_app_admin.private_key
-    }
-  }
-}
 
 resource "github_repository_webhook" "runner_app_colton_games" {
   count      = local.runner_app_webhooks ? 1 : 0
@@ -766,19 +763,6 @@ resource "github_repository_webhook" "runner_app_colton_games" {
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
 }
 
-# dolphin-maps' own token, for the same reason.
-provider "github" {
-  alias = "dolphin_maps"
-  owner = "dolphin-labs-hq"
-  dynamic "app_auth" {
-    for_each = local.dolphin_maps_webhook ? [1] : []
-    content {
-      id              = tostring(local.github_app_admin.app_id)
-      installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
-      pem_file        = local.github_app_admin.private_key
-    }
-  }
-}
 
 resource "github_repository_webhook" "runner_app_dolphin_labs" {
   count      = local.runner_app_webhooks ? 1 : 0
@@ -799,7 +783,7 @@ resource "github_repository_webhook" "runner_app_dolphin_labs" {
 
 resource "github_repository_webhook" "runner_app_dolphin_films" {
   count      = local.dolphin_films_webhook ? 1 : 0
-  provider   = github.dolphin_films
+  provider   = github.dolphin_labs
   repository = "dolphin-films"
   events     = ["workflow_job"]
   active     = true
@@ -814,24 +798,12 @@ resource "github_repository_webhook" "runner_app_dolphin_films" {
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
 }
 
-# ejc3/imagine's hook, made as the administration GitHub App's ejc3 installation (all of ejc3's repositories, with
-# repository_hooks write). Not the default provider: that one holds github-webhook-admin-pat, limited to ejc3/fcvm.
-provider "github" {
-  alias = "imagine"
-  owner = "ejc3"
-  dynamic "app_auth" {
-    for_each = local.imagine_webhook ? [1] : []
-    content {
-      id              = tostring(local.github_app_admin.app_id)
-      installation_id = tostring(local.github_app_admin.installations["ejc3"])
-      pem_file        = local.github_app_admin.private_key
-    }
-  }
-}
 
+# ejc3/imagine's hook, made as the administration GitHub App's ejc3 installation through agents-md.tf's provider (the same
+# app, installation and owner). Not the default provider: that one holds github-webhook-admin-pat, limited to ejc3/fcvm.
 resource "github_repository_webhook" "runner_app_imagine" {
   count      = local.imagine_webhook ? 1 : 0
-  provider   = github.imagine
+  provider   = github.agents_md
   repository = "imagine"
   events     = ["workflow_job"]
   active     = true
@@ -848,7 +820,7 @@ resource "github_repository_webhook" "runner_app_imagine" {
 
 resource "github_repository_webhook" "runner_app_dolphin_maps" {
   count      = local.dolphin_maps_webhook ? 1 : 0
-  provider   = github.dolphin_maps
+  provider   = github.dolphin_labs
   repository = "dolphin-maps"
   events     = ["workflow_job"]
   active     = true

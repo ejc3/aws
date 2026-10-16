@@ -28,6 +28,7 @@ APP = ROOT / "runner-app" / "app_runner.py"
 BOOTSTRAP = ROOT / "runner-app" / "bootstrap.sh"
 APP_TF = (ROOT / "runner-app.tf").read_text()
 FRONT_TF = (ROOT / "runner-webhook-front.tf").read_text()
+AGENTS_MD_TF = (ROOT / "agents-md.tf").read_text()
 REPOS_TF = (ROOT / "runner-repos.tf").read_text()
 
 COLTON, DOLPHIN = "CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"
@@ -766,6 +767,27 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn(DOLPHIN, repos, "the healthy repo was still reconciled and counted")
         self.assertNotIn("ALL", repos, "a total that counts the failed repo as zero would hide its hosts")
 
+    def test_every_repo_goes_first_in_turn(self):
+        app, *_ = load_app()
+        repos = ["a", "b", "c", "d", "e"]
+        firsts = [app.rotated(repos, n)[0] for n in range(10)]
+        self.assertEqual(firsts, repos + repos, "a reversal alone never puts the middle repo first")
+        for n in range(5):
+            self.assertEqual(sorted(app.rotated(repos, n)), repos, "a rotation keeps every repo exactly once")
+        self.assertEqual(app.rotated([], 3), [])
+
+    def test_the_round_number_picks_the_first_repo(self):
+        app, *_ = load_app()
+        order = []
+        app.reconcile = lambda repo, cfg, subnets: order.append(repo) or {"repo": repo, "live": 0}
+        served = list(app.config()[0])
+        for n in range(len(served)):
+            order.clear()
+            app.time = types.SimpleNamespace(monotonic=time.monotonic, time=lambda n=n: n * 120.0 + 1)
+            app.handler({"reconcile": True}, None)
+            self.assertEqual(order[0], served[n % len(served)])
+            self.assertEqual(sorted(order), sorted(served))
+
     def test_a_round_that_counted_every_repo_publishes_the_total(self):
         app, ec2, *_ = load_app()
         ec2.instances.append(instance("i-busy", COLTON, "4", 30))
@@ -1116,7 +1138,24 @@ class WiringTests(unittest.TestCase):
         served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
         tokens = re.findall(r'"([^"]+/[^"]+)"', re.search(r"runner_extra_repos = \[([^\]]+)\]", REPOS_TF).group(1))
         self.assertEqual(sorted(served), sorted(tokens))
-        self.assertIn("APP_REPOS           = jsonencode(keys(local.runner_app_repos))", FRONT_TF)
+        # The front forwards only what the controller serves: a repo whose token gate is off is out of both.
+        self.assertIn("APP_REPOS           = jsonencode(keys(local.runner_app_config))", FRONT_TF)
+
+    def test_only_hooks_made_with_a_pat_read_one(self):
+        # Every plan reads each PAT in the set, so a PAT no provider uses would fail every plan once it is retired.
+        eph = re.search(r'ephemeral "aws_secretsmanager_secret_version" "runner_repo_pat" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("toset(local.runner_app_pat_hook_repos)", eph)
+        pat_hooks = re.search(r"runner_app_pat_hook_repos = \[.*?\n  \]", APP_TF, re.S).group()
+        self.assertIn('!contains(["dolphin-labs-hq", "ejc3"], split("/", r)[0])', pat_hooks)
+        used = set(re.findall(r'runner_repo_pat\["([^"]+)"\]\.secret_string', APP_TF))
+        self.assertEqual(used, {COLTON})
+
+    def test_imagine_runaway_alarm_reports_within_hours(self):
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("period              = 3600", alarm)
+        self.assertIn("evaluation_periods  = 24", alarm)
+        self.assertIn("datapoints_to_alarm = 6", alarm)
+        self.assertIn('statistic           = "Average"', alarm)
 
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
@@ -1140,13 +1179,21 @@ class WiringTests(unittest.TestCase):
             hook = [h for h in hooks if 'repository = "%s"' % name in h]
             self.assertEqual(len(hook), 1, repo)
             alias = re.search(r"provider   = github\.(\w+)", hook[0]).group(1)
-            provider = re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, APP_TF, re.S).group()
+            provider = (re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, APP_TF, re.S) or
+                        re.search(r'provider "github" \{\n  alias = "%s"\n.*?\n\}' % alias, AGENTS_MD_TF, re.S)).group()
             self.assertIn('owner = "%s"' % owner, provider, repo)
             if owner in ("dolphin-labs-hq", "ejc3"):
                 # Managed as the administration agent's GitHub App, so the repos' controller PATs can be retired. For an
                 # ejc3 repo that is also what keeps it off the default provider, whose token is limited to ejc3/fcvm.
+                # One provider per owner: ejc3's is agents-md.tf's (the same app and installation).
+                if owner == "ejc3":
+                    self.assertEqual(alias, "agents_md", repo)
+                    provider = re.search(r'provider "github" \{\n  alias = "agents_md"\n.*?\n\}', AGENTS_MD_TF, re.S).group()
+                    self.assertIn('installation_id = tostring(local.agents_md_github_app.installations["ejc3"])', provider)
+                else:
+                    self.assertEqual(alias, "dolphin_labs", repo)
+                    self.assertIn('installation_id = tostring(local.github_app_admin.installations["%s"])' % owner, provider, repo)
                 self.assertIn("app_auth", provider, repo)
-                self.assertIn('installation_id = tostring(local.github_app_admin.installations["%s"])' % owner, provider, repo)
                 self.assertNotIn("runner_repo_pat", provider, repo)
                 self.assertNotIn("github_webhook_admin_pat", provider, repo)
             else:
