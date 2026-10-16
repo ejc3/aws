@@ -1502,6 +1502,9 @@ retired): gamesworthwatching.com is served by `dolphin-labs-prod` (`gamesworthwa
 cron as a Cron Trigger) and yourfantasymovie.com by `dolphin-films-prod` (`yourfantasymovie.tf`), each through proxied records
 and Workers routes behind one switch. Their secrets are production's, loaded from AWS with `wrangler secret bulk`: dolphin-labs
 from `vercel-env/dolphin-labs/production`, dolphin-films from `dolphin-films/prod/*` plus its address lists (`people.tf`).
+After each production deploy, dolphin-labs' `e2e (Production)` job reads `dolphin-labs-prod`'s Workers Logs with a token that
+can do nothing else (`dolphin-labs-ci-logs.tf`: a secret of the repository's `production-check` environment, main only). It
+reads every Worker's logs in the account, not just dolphin-labs-prod's: Cloudflare cannot scope it to one Worker.
 dolphin-maps had no public production (its Vercel URL was behind Vercel's login); `dolphin-maps-stage` behind Access replaces it.
 Every other production hostname (www.cc-games.org and the old domains, which Vercel still redirects) and the multiplayer `play.cc-games.*` entries are DNS-only records
 pointing at Vercel or the games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
