@@ -1457,7 +1457,9 @@ class RunnersAppTerraformTests(unittest.TestCase):
     def test_a_refused_installation_alarms(self):
         flt = self.TF[self.TF.index('resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused"'):]
         self.assertIn('pattern        = "\\"refusing it\\""', flt)
-        self.assertIn('log_group_name = "/aws/lambda/${aws_lambda_function.runner_app[0].function_name}"', flt)
+        self.assertIn("log_group_name = aws_cloudwatch_log_group.runner_app[0].name", flt)
+        self.assertIn('name  = "/aws/lambda/github-app-runner"', self.TF)
+        self.assertIn('to = aws_cloudwatch_log_group.runner_app[0]', self.TF, "the existing group is adopted, not recreated")
         alarm = self.TF[self.TF.index('resource "aws_cloudwatch_metric_alarm" "runner_app_installation_refused"'):]
         self.assertIn('metric_name         = "InstallationRefused"', alarm)
         self.assertIn("alarm_actions       = [aws_sns_topic.cost_alerts.arn]", alarm)

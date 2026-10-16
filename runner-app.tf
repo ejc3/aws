@@ -571,10 +571,22 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
 
 # A refused runners-app installation (app_runner.py check_installation_scope) only falls back to the repo's own PAT and logs
 # "... refusing it": the installation itself is too broad and stays so until someone narrows it, so it alarms.
+# The controller's log group, managed so the metric filter below never races Lambda's implicit creation of it (a fresh
+# deployment has the function before it has ever logged). Adopted, not recreated; retention stays as it was (never expire).
+resource "aws_cloudwatch_log_group" "runner_app" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "/aws/lambda/github-app-runner"
+}
+
+import {
+  to = aws_cloudwatch_log_group.runner_app[0]
+  id = "/aws/lambda/github-app-runner"
+}
+
 resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused" {
   count          = var.enable_github_runner ? 1 : 0
   name           = "github-app-runner-installation-refused"
-  log_group_name = "/aws/lambda/${aws_lambda_function.runner_app[0].function_name}"
+  log_group_name = aws_cloudwatch_log_group.runner_app[0].name
   pattern        = "\"refusing it\""
   metric_transformation {
     name          = "InstallationRefused"
