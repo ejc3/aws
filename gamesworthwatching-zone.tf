@@ -82,3 +82,44 @@ output "gamesworthwatching" {
   description = "Domain status and what is left to do on the Vercel side"
   value       = local.gww_on_cloudflare ? "gamesworthwatching.com -> Cloudflare Worker ${local.gww_worker} (proxied records, Workers routes)" : "gamesworthwatching.com -> Vercel (A ${var.gww_vercel_a}, www CNAME ${var.gww_vercel_cname}, unproxied)"
 }
+
+# HTTPS AND THE APEX FOR EVERYTHING, ASSETS INCLUDED (dolphin-labs#583). The Worker redirects www and plain http to
+# https://gamesworthwatching.com (cf-worker.mjs), but only for what reaches it: its static assets (/_next/static/...,
+# /data/*.json, images) are served before the Worker runs, so http:// and www requests for them were answered in place.
+# These run at the edge ahead of the Worker and its assets. Not `run_worker_first` in wrangler.jsonc: that sends every
+# asset through the Worker, which costs an invocation per file and puts the Worker's cold start (measured 2026-10-16:
+# p99 785 ms for its http redirect, against 143 ms for an asset) in front of them. Both rules act only on proxied
+# traffic, so with local.gww_on_cloudflare false (the rollback) they do nothing.
+#
+# CREDENTIAL: Zone Settings write and Single Redirect (Dynamic URL Redirects) write on this zone, which the provider
+# token carries for cc-games.org only (AGENTS.md); its policy needs this zone added first, the same one-PUT change.
+resource "cloudflare_zone_setting" "gww_always_use_https" {
+  zone_id    = var.gww_zone_id
+  setting_id = "always_use_https"
+  value      = "on"
+}
+
+resource "cloudflare_ruleset" "gww_redirects" {
+  zone_id     = var.gww_zone_id
+  name        = "gamesworthwatching.com redirects"
+  description = "www to the apex before the Worker and its assets (gamesworthwatching-zone.tf)"
+  kind        = "zone"
+  phase       = "http_request_dynamic_redirect"
+
+  rules = [
+    {
+      ref         = "www_to_apex"
+      description = "www.gamesworthwatching.com to https://gamesworthwatching.com, path and query kept (308, as the Worker answers)"
+      expression  = "(http.host eq \"www.gamesworthwatching.com\")"
+      action      = "redirect"
+      action_parameters = {
+        from_value = {
+          status_code           = 308
+          target_url            = { expression = "concat(\"https://gamesworthwatching.com\", http.request.uri.path)" }
+          preserve_query_string = true
+        }
+      }
+      enabled = true
+    },
+  ]
+}
