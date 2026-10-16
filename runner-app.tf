@@ -585,8 +585,9 @@ data "aws_cloudwatch_log_groups" "runner_app" {
 }
 
 import {
-  for_each = var.enable_github_runner && contains(data.aws_cloudwatch_log_groups.runner_app.log_group_names, "/aws/lambda/github-app-runner") ? toset(["0"]) : toset([])
-  to       = aws_cloudwatch_log_group.runner_app[tonumber(each.key)]
+  # A map, so the index is each.value (a number): an import's `to` may not call functions.
+  for_each = var.enable_github_runner && contains(data.aws_cloudwatch_log_groups.runner_app.log_group_names, "/aws/lambda/github-app-runner") ? { only = 0 } : {}
+  to       = aws_cloudwatch_log_group.runner_app[each.value]
   id       = "/aws/lambda/github-app-runner"
 }
 

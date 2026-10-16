@@ -1459,7 +1459,7 @@ class RunnersAppTerraformTests(unittest.TestCase):
         self.assertIn('pattern        = "\\"refusing it\\""', flt)
         self.assertIn("log_group_name = aws_cloudwatch_log_group.runner_app[0].name", flt)
         self.assertIn('name  = "/aws/lambda/github-app-runner"', self.TF)
-        self.assertIn("to       = aws_cloudwatch_log_group.runner_app[tonumber(each.key)]", self.TF, "the existing group is adopted")
+        self.assertIn("to       = aws_cloudwatch_log_group.runner_app[each.value]", self.TF, "the existing group is adopted (no function call: an import address may not have one)")
         imp = self.TF[self.TF.index("import {\n  for_each = var.enable_github_runner"):]
         self.assertIn('contains(data.aws_cloudwatch_log_groups.runner_app.log_group_names, "/aws/lambda/github-app-runner")', imp.split("}")[0],
                       "only where the group exists and the runners are on")
