@@ -2,8 +2,7 @@
 #
 # A read-only Workers Logs token for dolphin-labs-hq/dolphin-labs' GitHub Actions (dolphin-labs#583). After every
 # production deploy, that repository's cloudflare-stage.yml runs its Playwright suite against gamesworthwatching.com and
-# then reads the production Worker's (dolphin-labs-prod) Workers Logs for the same window: any exceededCpu,
-# exceededMemory or exception outcome fails the run. On 2026-10-15 the Worker answered Error 1102 (exceededCpu, #435)
+# then reads the Workers Logs of the version that deploy made live: any outcome but ok or canceled fails the run. On 2026-10-15 the Worker answered Error 1102 (exceededCpu, #435)
 # while every check that existed stayed green. Until this secret exists the log step skips with a notice.
 #
 #   CLOUDFLARE_OBSERVABILITY_TOKEN   secret of the `production-check` environment in dolphin-labs-hq/dolphin-labs.
@@ -12,6 +11,10 @@
 #                                    permission to the account, not to one Worker, so it reads EVERY Worker's logs
 #                                    (colton-games-prod's too), which is why only main may hold it. Checked
 #                                    2026-10-16: a token with this one group answers the telemetry query (HTTP 200).
+#                                    Cloudflare's API reference lists Workers Observability Write for that endpoint;
+#                                    Write would also let the job change the account's observability configuration,
+#                                    so it is not granted. If a run answers 403, the job reports a permissions gap,
+#                                    not a failing deploy: add Workers Observability Write then.
 #
 # An environment secret, admitted to the `main` branch only (as dolphin-relay.tf does for the relay's deploy token),
 # rather than a repository secret: Workers Logs carry request paths and visitors' coarse location, and a repository
