@@ -8,7 +8,10 @@
 #
 #   CLOUDFLARE_OBSERVABILITY_TOKEN   secret of the `production-check` environment in dolphin-labs-hq/dolphin-labs.
 #                                    Workers Observability Read on this account and nothing else: it can query logs,
-#                                    and cannot deploy, change, tail or read any zone.
+#                                    and cannot deploy, change, tail or read any zone. Cloudflare scopes this
+#                                    permission to the account, not to one Worker, so it reads EVERY Worker's logs
+#                                    (colton-games-prod's too), which is why only main may hold it. Checked
+#                                    2026-10-16: a token with this one group answers the telemetry query (HTTP 200).
 #
 # An environment secret, admitted to the `main` branch only (as dolphin-relay.tf does for the relay's deploy token),
 # rather than a repository secret: Workers Logs carry request paths and visitors' coarse location, and a repository
