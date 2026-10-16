@@ -1414,6 +1414,13 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertIn("belongs to dolphin-labs-hq, not ejc3", out.getvalue())
         self.assertEqual(len(calls), 1, "no administration token minted for ejc3 from dolphin-labs-hq's installation")
 
+    def test_a_passed_check_expires_before_the_token_it_allowed(self):
+        # Tokens are reused until ten minutes of their hour are left; the pass must be shorter, so each mint re-checks.
+        app, calls, _ = self.app_with(self.creds())
+        self.assertEqual(app.repo_pat(dict(REPOS[DOLPHIN], app_repo=DOLPHIN)), "ghs_minted")
+        until, _ = app._APP_SCOPE_OK[(777, "dolphin-labs-hq")]
+        self.assertLess(until - time.time(), 50 * 60)
+
     def test_a_refusal_is_remembered_rather_than_checked_on_every_call(self):
         scopes = dict(self.SCOPES, **{"777": ("dolphin-labs-hq", "all", ["dolphin-labs-hq/dolphin-labs"])})
         app, calls, _ = self.app_with(self.creds(), scopes=scopes)
@@ -1446,6 +1453,16 @@ class RunnersAppTerraformTests(unittest.TestCase):
         self.assertNotIn(COLTON, repos)
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
+
+    def test_a_refused_installation_alarms(self):
+        flt = self.TF[self.TF.index('resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused"'):]
+        self.assertIn('pattern        = "\\"refusing it\\""', flt)
+        self.assertIn('log_group_name = "/aws/lambda/${aws_lambda_function.runner_app[0].function_name}"', flt)
+        alarm = self.TF[self.TF.index('resource "aws_cloudwatch_metric_alarm" "runner_app_installation_refused"'):]
+        self.assertIn('metric_name         = "InstallationRefused"', alarm)
+        self.assertIn("alarm_actions       = [aws_sns_topic.cost_alerts.arn]", alarm)
+        app_src = (ROOT / "runner-app" / "app_runner.py").read_text()
+        self.assertIn("refusing it", app_src, "the filter matches the controller's own refusal message")
 
     def test_the_controller_knows_every_repo_the_app_may_cover_gates_or_not(self):
         self.assertIn("APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)", self.TF)

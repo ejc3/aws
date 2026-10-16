@@ -569,6 +569,38 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   treat_missing_data  = "notBreaching"
 }
 
+# A refused runners-app installation (app_runner.py check_installation_scope) only falls back to the repo's own PAT and logs
+# "... refusing it": the installation itself is too broad and stays so until someone narrows it, so it alarms.
+resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused" {
+  count          = var.enable_github_runner ? 1 : 0
+  name           = "github-app-runner-installation-refused"
+  log_group_name = "/aws/lambda/${aws_lambda_function.runner_app[0].function_name}"
+  pattern        = "\"refusing it\""
+  metric_transformation {
+    name          = "InstallationRefused"
+    namespace     = "GitHubAppRunner"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "runner_app_installation_refused" {
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "github-app-runner-installation-refused"
+  alarm_description   = "The runners GitHub App's installation was refused as too broad (another account, all repositories, or a repository it does not serve); the controller is using the repos' own PATs. Narrow the installation (GITHUB-RUNNERS.md)."
+  namespace           = "GitHubAppRunner"
+  metric_name         = "InstallationRefused"
+  statistic           = "Sum"
+  period              = 600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  depends_on          = [aws_cloudwatch_log_metric_filter.runner_app_installation_refused]
+}
+
 resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {
   count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "github-app-runner-errors"

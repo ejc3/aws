@@ -134,6 +134,7 @@ RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
 APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
 _APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
 _APP_SCOPE_OK = {}  # (installation id, owner) -> (expiry epoch seconds, refusal message or None) of its last scope check
+APP_SCOPE_PASS_SECONDS = 2700
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
 
@@ -262,7 +263,9 @@ def check_installation_scope(installation, owner, jwt):
         refuse('covers more repositories than one listing page')
     if not names <= allowed:
         refuse(f'on {owner} also covers {sorted(names - allowed)} (select only the served repositories)')
-    _APP_SCOPE_OK[key] = (time.time() + 3600, None)
+    # Shorter than a token's reuse (minted for an hour, reused until ten minutes are left), so every mint re-checks: a
+    # broadened installation is noticed by the next token, not up to two tokens later.
+    _APP_SCOPE_OK[key] = (time.time() + APP_SCOPE_PASS_SECONDS, None)
 
 
 def repo_pat(cfg):
