@@ -569,6 +569,57 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   treat_missing_data  = "notBreaching"
 }
 
+# A refused runners-app installation (app_runner.py check_installation_scope) only falls back to the repo's own PAT and logs
+# "... refusing it": the installation itself is too broad and stays so until someone narrows it, so it alarms.
+# The controller's log group, managed so the metric filter below never races Lambda's implicit creation of it (a fresh
+# deployment has the function before it has ever logged). Adopted, not recreated; retention stays as it was (never expire).
+resource "aws_cloudwatch_log_group" "runner_app" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "/aws/lambda/github-app-runner"
+}
+
+# Adopt the group only where it already exists and the runners are on: a fresh deployment creates it, and the one-flip
+# teardown (enable_github_runner = false) leaves nothing for the import to target.
+data "aws_cloudwatch_log_groups" "runner_app" {
+  log_group_name_prefix = "/aws/lambda/github-app-runner"
+}
+
+import {
+  for_each = var.enable_github_runner && contains(data.aws_cloudwatch_log_groups.runner_app.log_group_names, "/aws/lambda/github-app-runner") ? toset(["0"]) : toset([])
+  to       = aws_cloudwatch_log_group.runner_app[tonumber(each.key)]
+  id       = "/aws/lambda/github-app-runner"
+}
+
+resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused" {
+  count          = var.enable_github_runner ? 1 : 0
+  name           = "github-app-runner-installation-refused"
+  log_group_name = aws_cloudwatch_log_group.runner_app[0].name
+  pattern        = "\"refusing it\""
+  metric_transformation {
+    name          = "InstallationRefused"
+    namespace     = "GitHubAppRunner"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "runner_app_installation_refused" {
+  count               = var.enable_github_runner ? 1 : 0
+  alarm_name          = "github-app-runner-installation-refused"
+  alarm_description   = "The runners GitHub App's installation was refused as too broad (another account, all repositories, or a repository it does not serve); the controller is using the repos' own PATs. Narrow the installation (GITHUB-RUNNERS.md)."
+  namespace           = "GitHubAppRunner"
+  metric_name         = "InstallationRefused"
+  statistic           = "Sum"
+  period              = 600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  depends_on          = [aws_cloudwatch_log_metric_filter.runner_app_installation_refused]
+}
+
 resource "aws_cloudwatch_metric_alarm" "runner_app_errors" {
   count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "github-app-runner-errors"
