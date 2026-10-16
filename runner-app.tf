@@ -578,9 +578,16 @@ resource "aws_cloudwatch_log_group" "runner_app" {
   name  = "/aws/lambda/github-app-runner"
 }
 
+# Adopt the group only where it already exists and the runners are on: a fresh deployment creates it, and the one-flip
+# teardown (enable_github_runner = false) leaves nothing for the import to target.
+data "aws_cloudwatch_log_groups" "runner_app" {
+  log_group_name_prefix = "/aws/lambda/github-app-runner"
+}
+
 import {
-  to = aws_cloudwatch_log_group.runner_app[0]
-  id = "/aws/lambda/github-app-runner"
+  for_each = var.enable_github_runner && contains(data.aws_cloudwatch_log_groups.runner_app.log_group_names, "/aws/lambda/github-app-runner") ? toset(["0"]) : toset([])
+  to       = aws_cloudwatch_log_group.runner_app[tonumber(each.key)]
+  id       = "/aws/lambda/github-app-runner"
 }
 
 resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused" {
