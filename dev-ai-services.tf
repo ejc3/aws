@@ -167,17 +167,18 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 
 # App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
-# secret holds ISSUER_ID, KEY_ID and PRIVATE_KEY (the .p8 text). The owner creates the key in App
+# secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
+# signs the builds). The owner creates the key in App
 # Store Connect (Users and Access, Integrations, role App Manager) and sets the value out of band:
-#   read -rs ISSUER; read -rs KEY_ID; jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --rawfile p AuthKey.p8 \
-#     '{ISSUER_ID: $i, KEY_ID: $k, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
+#   read -rs ISSUER; read -rs KEY_ID; read -rs TEAM; jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" \
+#     --rawfile p AuthKey.p8 '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin; rm AuthKey.p8
 # Readers: the administration set and nextjs-dev-role (the dolphin box, which archives on the Mac
 # build tunnel and uploads). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
 # with browserbase/credentials. Not dev-server-role: the metal boxes do not build the apps.
 resource "aws_secretsmanager_secret" "app_store_connect" {
   name                    = "games-worth-watching/app-store-connect"
-  description             = "App Store Connect API key for Games Worth Watching (JSON: ISSUER_ID, KEY_ID, PRIVATE_KEY). Value set out of band; see dev-ai-services.tf."
+  description             = "App Store Connect API key for Games Worth Watching (JSON: ISSUER_ID, KEY_ID, TEAM_ID, PRIVATE_KEY). Value set out of band; see dev-ai-services.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "games-worth-watching/app-store-connect", Project = "dolphin-labs" }
 }

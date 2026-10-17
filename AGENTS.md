@@ -1253,7 +1253,7 @@ Available if a task needs them; neither needs a key on disk.
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
 - **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
   nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
-  `ISSUER_ID`, `KEY_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
+  `ISSUER_ID`, `KEY_ID`, `TEAM_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
   (`dev-ai-services.tf`). Load it into the environment with the same `eval "$(... | jq -r 'to_entries[] | ...')"`
   as Browserbase; a tool that needs the key as a file gets a 0600 temporary file it deletes after use.
 - **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
