@@ -75,3 +75,35 @@ resource "github_actions_environment_secret" "dolphin_labs_ci_logs" {
   secret_name     = "CLOUDFLARE_OBSERVABILITY_TOKEN"
   plaintext_value = cloudflare_account_token.dolphin_labs_ci_logs.value
 }
+
+# The Workers deploy token (workers-deploy.tf) for dolphin-labs' cloudflare-stage.yml deploy jobs, as a secret of a
+# `cloudflare-deploy` environment admitted to `main` only. It was a repository secret, set by
+# scripts/workers-deploy-secret.sh, and so readable by a workflow run on any branch. Workers Scripts Write reaches every
+# Worker in the account, production included, and cannot be scoped to one (dolphin-relay.tf), so the branch rule is
+# the control. Once the deploy jobs name the environment, the repository secret is deleted. Rotating workers_deploy
+# (workers-deploy.tf) rewrites this secret on the next apply.
+resource "github_repository_environment" "dolphin_labs_cloudflare_deploy" {
+  provider          = github.dolphin_labs_ci
+  repository        = local.dolphin_labs_ci_repository
+  environment       = "cloudflare-deploy"
+  can_admins_bypass = true
+  deployment_branch_policy {
+    protected_branches     = false
+    custom_branch_policies = true
+  }
+}
+
+resource "github_repository_environment_deployment_policy" "dolphin_labs_cloudflare_deploy_main" {
+  provider       = github.dolphin_labs_ci
+  repository     = local.dolphin_labs_ci_repository
+  environment    = github_repository_environment.dolphin_labs_cloudflare_deploy.environment
+  branch_pattern = "main"
+}
+
+resource "github_actions_environment_secret" "dolphin_labs_cloudflare_deploy" {
+  provider        = github.dolphin_labs_ci
+  repository      = local.dolphin_labs_ci_repository
+  environment     = github_repository_environment.dolphin_labs_cloudflare_deploy.environment
+  secret_name     = "CLOUDFLARE_API_TOKEN"
+  plaintext_value = cloudflare_account_token.workers_deploy.value
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""dolphin-labs-ci-logs.tf: dolphin-labs' post-deploy check gets a token that can only read Workers Logs, and only a job
-on that repository's main branch can read it."""
+"""dolphin-labs-ci-logs.tf: dolphin-labs' post-deploy check gets a token that can only read Workers Logs, and a main-only
+environment holds the Workers deploy token for its deploy jobs. Until those jobs name the environment and the old
+repository secret is deleted (dolphin-labs#643), the repository secret still gives the deploy token to any branch."""
 import re
 import unittest
 from pathlib import Path
@@ -46,9 +47,23 @@ class GitHubTests(unittest.TestCase):
         self.assertIn("cloudflare_account_token.dolphin_labs_ci_logs.value", sec)
         self.assertNotIn("github_actions_secret", re.sub(r"github_actions_environment_secret", "", TF))
 
+    def test_deploy_token_lives_in_a_main_only_environment(self):
+        # Workers Scripts Write reaches every Worker, production included: only main may hold it.
+        env = block("github_repository_environment", "dolphin_labs_cloudflare_deploy")
+        self.assertIn('environment       = "cloudflare-deploy"', env)
+        self.assertIn("custom_branch_policies = true", env)
+        self.assertIn("protected_branches     = false", env)
+        policy = block("github_repository_environment_deployment_policy", "dolphin_labs_cloudflare_deploy_main")
+        self.assertIn('branch_pattern = "main"', policy)
+        self.assertIn("github_repository_environment.dolphin_labs_cloudflare_deploy.environment", policy)
+        sec = block("github_actions_environment_secret", "dolphin_labs_cloudflare_deploy")
+        self.assertIn('secret_name     = "CLOUDFLARE_API_TOKEN"', sec)
+        self.assertIn("environment     = github_repository_environment.dolphin_labs_cloudflare_deploy.environment", sec)
+        self.assertIn("cloudflare_account_token.workers_deploy.value", sec)
+
     def test_every_github_resource_uses_the_app_provider(self):
         resources = re.findall(r'^resource "github_[a-z_]+" "[^"]+" \{\n(.*?)^\}', TF, re.M | re.S)
-        self.assertEqual(len(resources), 3)
+        self.assertEqual(len(resources), 6)
         for body in resources:
             self.assertIn("provider", body)
             self.assertIn("github.dolphin_labs_ci", body)

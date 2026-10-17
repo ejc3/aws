@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The Cloudflare Workers deploy token (workers-deploy.tf and the script that installs it): a narrow typed token resource,
 an administrators-only container, and no secret ever on a command line."""
+import os
 import re
 import subprocess
 import unittest
@@ -85,6 +86,17 @@ class InstallScriptTests(unittest.TestCase):
     def test_arguments_are_validated_before_use(self):
         self.assertIn('[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]', INSTALL)
         self.assertIn('[[ -z "$AS" || "$AS" =~ ^[a-z][a-z0-9_-]*$ ]]', INSTALL)
+
+    def test_refuses_dolphin_labs_before_reading_the_token(self):
+        # dolphin-labs' copy is a main-only environment secret Terraform writes; a repository secret would undo that.
+        env = dict(os.environ, PATH="/nonexistent")
+        # GitHub resolves repository names case-insensitively, so every spelling is refused.
+        for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs"):
+            r = subprocess.run(["/bin/bash", str(ROOT / "scripts" / "workers-deploy-secret.sh"), repo],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 3, (repo, r.stderr))
+            self.assertIn("cloudflare-deploy environment", r.stderr)
+        self.assertLess(INSTALL.index("dolphin-labs-hq/dolphin-labs)"), INSTALL.index("secretsmanager get-secret-value"))
 
     def test_refuses_an_empty_stored_token(self):
         self.assertIn('"${#TOKEN}" -ge 30', INSTALL)
