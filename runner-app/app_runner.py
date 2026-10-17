@@ -11,7 +11,9 @@ correct:
     powers off, and InstanceInitiatedShutdownBehavior=terminate deletes it.
   * NO reuse, ever, and nothing shared between repos: each repo has its own label, cap, PAT
     and Repo tag, and a host never outlives its job. The cap is a number of hosts (`max`) and,
-    where a repo sets one, a number of vCPUs (`max_vcpus`) as well: see ensure_runner().
+    where a repo sets one, a number of vCPUs (`max_vcpus`) as well: see ensure_runner(). A repo in a budget group
+    (ejc3/imagine; the dolphin repos together) takes its caps from that group's leaky bucket of dollars: high ceilings
+    while the bucket is healthy, its old caps once it would clip. See "budget buckets" below.
   * A reconcile every two minutes (EventBridge) re-derives the truth from GitHub and EC2: it
     launches for queued jobs that have no runner (a lost delivery, a spot refusal), and
     terminates hosts that never registered (BOOT_GRACE), sat idle (IDLE_LIMIT) or outlived
@@ -344,6 +346,178 @@ def host_vcpus(instance, cfg):
     if size in (cfg.get('vcpus') or {}):
         return int(cfg['vcpus'][size])
     return largest_vcpus(cfg)
+
+
+# ---------------------------------------------------------------- budget buckets
+# A repo whose config names a `budget_group` (runner-app.tf runner_budget_groups) draws on that group's leaky bucket of
+# dollars, one DynamoDB item per group in BUDGET_TABLE: {level_usd, updated_at, rate_usd_h, throttled, spend, version}.
+#
+#   * Refill: daily_usd / 86400 per second, the level capped at capacity_days x daily_usd.
+#   * Drain: what the group's hosts cost over the same interval, at VCPU_HOUR_USD per vCPU-hour plus HOST_HOUR_USD per
+#     host-hour (its disk and public IPv4). A host still live is charged from the later of the last update and its
+#     launch; a host launched since the last update and gone already is charged from its launch to now; a host that was
+#     live at the last update and is gone now is charged the whole interval, through the burn rate stored then
+#     (rate_usd_h). Over, not under: a host that ended mid-interval is charged to its end.
+#   * The level never goes below zero. Spend at the throttled caps past the refill is not carried as debt; it is in the
+#     7-day spend (`spend`, hourly sums of the drain over the last 168 hours) and its alarm.
+#   * Mode: burst (the group's burst ceilings) or throttled (each repo's throttled caps). Burst turns throttled when the
+#     level is under reserve_fraction of capacity, or would reach zero within lookahead_hours at the current burn
+#     (counting the host about to be launched). Throttled turns burst only once the level is back to resume_fraction of
+#     capacity and the projection is clear. Throttling only stops launches: nothing here terminates a host.
+#   * Every update is a conditional write on the item's version. A writer that loses re-reads and recomputes from the
+#     winner's state, so an interval is never counted twice; after BUCKET_WRITE_ATTEMPTS losses the launch defers.
+#   * A missing item (the first round, or a deleted item) starts full. Time that moved backwards counts as no time, and
+#     a gap longer than MAX_LIFETIME counts as MAX_LIFETIME: refill for a longer outage is lost (the safe side), and no
+#     host outlives MAX_LIFETIME, so no host can be owed for longer.
+BUDGET_TABLE = os.environ.get('BUDGET_TABLE', '')
+VCPU_HOUR_USD = float(os.environ.get('VCPU_HOUR_USD') or 0)
+HOST_HOUR_USD = float(os.environ.get('HOST_HOUR_USD') or 0)
+BUCKET_WRITE_ATTEMPTS = 3
+SPEND_WINDOW_HOURS = 7 * 24
+
+
+class BucketBusy(Exception):
+    """The bucket's conditional write lost BUCKET_WRITE_ATTEMPTS times in a row."""
+
+
+def budget_groups():
+    return json.loads(os.environ.get('BUDGET_GROUPS') or '{}')
+
+
+def group_repos(group, repos):
+    """The served repos (REPOS) that draw on `group`."""
+    return sorted(repo for repo, cfg in repos.items() if cfg.get('budget_group') == group)
+
+
+def capacity_usd(g):
+    return float(g['daily_usd']) * float(g['capacity_days'])
+
+
+def host_rate(instance, cfg):
+    """Dollars an hour one host costs at the stated constants."""
+    return host_vcpus(instance, cfg) * VCPU_HOUR_USD + HOST_HOUR_USD
+
+
+def size_rate(cfg, size):
+    return size_vcpus(cfg, size) * VCPU_HOUR_USD + HOST_HOUR_USD
+
+
+def would_throttle(level, throttled, burn_h, g):
+    """The group's next mode: True for throttled. `burn_h` is dollars an hour, including any host about to launch."""
+    capacity = capacity_usd(g)
+    net_h = float(g['daily_usd']) / 24 - burn_h
+    empties = net_h < 0 and level + net_h * float(g['lookahead_hours']) <= 0
+    if throttled:
+        return empties or level < float(g['resume_fraction']) * capacity
+    return empties or level < float(g['reserve_fraction']) * capacity
+
+
+def bucket_step(item, now_s, listed, cfg_of, g, extra_h=0.0):
+    """The bucket's state after refilling and draining up to `now_s`, from its stored `item` (None: start full).
+
+    `listed` is every host of the group's repos EC2 lists, in any state; `cfg_of(instance)` is its repo's config.
+    `extra_h` is the rate of a host about to be launched, which only the mode decision counts. Pure: no AWS call."""
+    capacity = capacity_usd(g)
+    rates = [(i, host_rate(i, cfg_of(i)), i['LaunchTime'].timestamp()) for i in listed]
+    live = [(i, r, t) for i, r, t in rates if i.get('State', {}).get('Name') in LIVE_STATES]
+    live_ids = {i['InstanceId'] for i, _, _ in live}
+    burn_h = sum(r for _, r, _ in live)
+    if item is None:
+        return {'level_usd': capacity, 'updated_at': now_s, 'rate_usd_h': burn_h, 'spend': {}, 'drained': 0.0,
+                'elapsed': 0.0, 'burn_h': burn_h, 'version': 0, 'new': True,
+                'throttled': would_throttle(capacity, False, burn_h + extra_h, g)}
+    elapsed = min(max(now_s - item['updated_at'], 0.0), MAX_LIFETIME.total_seconds())
+    start = now_s - elapsed
+    drained = 0.0
+    for instance, rate, launched in rates:
+        if instance['InstanceId'] in live_ids:
+            drained += rate * max(0.0, now_s - max(start, launched)) / 3600
+        elif launched > start:
+            drained += rate * max(0.0, now_s - launched) / 3600
+    still = sum(r for _, r, t in live if t <= start)
+    drained += max(0.0, item['rate_usd_h'] - still) * elapsed / 3600
+    level = min(capacity, max(0.0, item['level_usd'] + float(g['daily_usd']) * elapsed / 86400 - drained))
+    hour = str(int(now_s // 3600 * 3600))
+    spend = {h: v for h, v in item['spend'].items() if int(h) > now_s - SPEND_WINDOW_HOURS * 3600}
+    if drained:
+        spend[hour] = spend.get(hour, 0.0) + drained
+    # now_s even when time moved backwards: at most that skew (milliseconds on Lambda) is then counted twice.
+    return {'level_usd': level, 'updated_at': now_s, 'rate_usd_h': burn_h, 'spend': spend,
+            'drained': drained, 'elapsed': elapsed, 'burn_h': burn_h, 'version': item['version'], 'new': False,
+            'throttled': would_throttle(level, item['throttled'], burn_h + extra_h, g)}
+
+
+def read_bucket(group):
+    got = dynamodb.get_item(TableName=BUDGET_TABLE, Key={'group': {'S': group}}, ConsistentRead=True).get('Item')
+    if not got:
+        return None
+    return {'level_usd': float(got['level_usd']['N']), 'updated_at': float(got['updated_at']['N']),
+            'rate_usd_h': float(got.get('rate_usd_h', {}).get('N', '0')), 'throttled': bool(got.get('throttled', {}).get('BOOL')),
+            'spend': {h: float(v['N']) for h, v in (got.get('spend', {}).get('M') or {}).items()},
+            'version': int(got.get('version', {}).get('N', '0'))}
+
+
+def write_bucket(group, state):
+    """Conditional on the version read (or on there being no item), so a concurrent writer makes this one fail."""
+    num = lambda v: f'{v:.6f}'
+    item = {'group': {'S': group}, 'level_usd': {'N': num(state['level_usd'])},
+            'updated_at': {'N': f"{state['updated_at']:.3f}"}, 'rate_usd_h': {'N': num(state['rate_usd_h'])},
+            'throttled': {'BOOL': bool(state['throttled'])},
+            'spend': {'M': {h: {'N': num(v)} for h, v in state['spend'].items()}},
+            'version': {'N': str(state['version'] + 1)}}
+    if state['new']:
+        dynamodb.put_item(TableName=BUDGET_TABLE, Item=item, ConditionExpression='attribute_not_exists(#g)',
+                          ExpressionAttributeNames={'#g': 'group'})
+    else:
+        dynamodb.put_item(TableName=BUDGET_TABLE, Item=item, ConditionExpression='#v = :v',
+                          ExpressionAttributeNames={'#v': 'version'},
+                          ExpressionAttributeValues={':v': {'N': str(state['version'])}})
+
+
+def group_listing(group, repos):
+    """Every host of the group's served repos that EC2 lists, in any state (terminated hosts stay listed about an hour)."""
+    members = group_repos(group, repos)
+    if not members:
+        return []
+    listed = ec2.get_paginator('describe_instances').paginate(Filters=[
+        {'Name': 'tag:Role', 'Values': [ROLE]},
+        {'Name': 'tag:Repo', 'Values': members},
+    ])
+    return [i for page in listed for r in page['Reservations'] for i in r['Instances']]
+
+
+def update_bucket(group, repos, listed=None, extra_h=0.0):
+    """Refill and drain `group`'s bucket to now and store it; the new state. Raises BucketBusy after losing every write."""
+    g = budget_groups()[group]
+    listed = group_listing(group, repos) if listed is None else listed
+    cfg_of = lambda i: repos.get(tag(i, 'Repo')) or next(iter(repos.values()))
+    for _ in range(BUCKET_WRITE_ATTEMPTS):
+        state = bucket_step(read_bucket(group), now().timestamp(), listed, cfg_of, g, extra_h)
+        try:
+            write_bucket(group, state)
+        except dynamodb.exceptions.ConditionalCheckFailedException:
+            continue
+        state['group'], state['capacity'], state['spend_7d'] = group, capacity_usd(g), sum(state['spend'].values())
+        return state
+    raise BucketBusy(f'budget {group}: the bucket changed under {BUCKET_WRITE_ATTEMPTS} writes in a row')
+
+
+def limits(cfg, throttled):
+    """(host cap, vCPU cap or None) for a repo in its group's mode. `max` and `max_vcpus` bound every mode."""
+    g = budget_groups()[cfg['budget_group']]
+    if throttled:
+        hosts, vcpus = int(cfg['throttled_max']), cfg.get('throttled_max_vcpus')
+    else:
+        hosts, vcpus = int(g['burst_max']), g.get('burst_max_vcpus')
+    hosts = min(hosts, int(cfg['max']))
+    if cfg.get('max_vcpus') is not None:
+        vcpus = int(cfg['max_vcpus']) if vcpus is None else min(int(vcpus), int(cfg['max_vcpus']))
+    return hosts, None if vcpus is None else int(vcpus)
+
+
+def describe_bucket(state):
+    return (f"{'throttled' if state['throttled'] else 'burst'}, budget {state['group']} at "
+            f"${state['level_usd']:.2f} of ${state['capacity']:.2f}")
 
 
 def job_size(cfg, labels):
@@ -749,13 +923,26 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     the repo's hosts in use, plus those of the launches not listed yet (each claim's own), plus the vCPUs of the size
     this job asks for, would pass it. A repo without `max_vcpus` is capped by hosts alone.
 
+    A repo in a budget group is capped by its group's mode instead (limits()): burst gives the group's burst ceilings,
+    throttled the repo's throttled caps, and `max` and `max_vcpus` still bound both. The bucket is refilled and drained
+    first (update_bucket), and the mode decided counting the host this job would add. A full cap only makes the job
+    wait; running hosts are never touched.
+
     `busy` names hosts whose runner is running a job. A host tagged for this job cannot serve it
     if it is busy while the job is still queued: GitHub gave it another job with the same labels,
     and an ephemeral runner takes only one. The job then needs a host of its own."""
     # Claims first, then a fresh listing: every launch whose claim was read is, in that listing,
     # either not yet visible (the claim stands in for it) or visible and counted by its real
     # state. `live`, taken earlier in the invocation, is only added to that, never trusted alone.
-    claimed, listed = active_claims(repo), listed_instances(repo)
+    budget = cfg.get('budget_group') or ''
+    repos = config()[0] if budget else {}
+    claimed = active_claims(repo)
+    if budget:
+        # One listing of the whole group serves the cap (this repo's hosts) and the bucket (every member's).
+        group_listed = group_listing(budget, repos)
+        listed = [i for i in group_listed if tag(i, 'Repo') == repo]
+    else:
+        listed = listed_instances(repo)
     running = live + [i for i in listed if i.get('State', {}).get('Name') in LIVE_STATES]
     if any(tag(i, 'JobId') == job_id and i['InstanceId'] not in busy for i in running):
         return 'exists', token
@@ -771,16 +958,28 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
+    max_hosts, max_vcpus, mode = int(cfg['max']), cfg.get('max_vcpus'), ''
+    if budget:
+        # Refill and drain to now, and decide the mode counting the host this job would add.
+        ids = {i['InstanceId'] for i in group_listed}
+        try:
+            state = update_bucket(budget, repos, group_listed + [i for i in live if i['InstanceId'] not in ids],
+                                  size_rate(cfg, size))
+        except BucketBusy as conflict:
+            print(f'{repo}: {conflict}; job {job_id} waits for the next round')
+            return 'deferred', token
+        max_hosts, max_vcpus = limits(cfg, state['throttled'])
+        mode = f' ({describe_bucket(state)})'
     # Hosts by instance (two hosts can carry one JobId, above), plus claims for launches not in
     # `running` at all. A launch this invocation made is in `live` (with its ClientToken) but not
     # yet listed: its claim must stay, but it is one slot, not two.
     held = {i.get('ClientToken') or '' for i in running}
     unseen = {job for job, (nonce, _) in claimed.items() if not (nonce and any(t.startswith(nonce + '-') for t in held))}
     in_use = {i['InstanceId'] for i in running} | unseen
-    if len(in_use) >= int(cfg['max']):
-        print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
+    if len(in_use) >= max_hosts:
+        print(f"{repo}: at its cap of {max_hosts} runners; job {job_id} waits{mode}")
         return 'cap', token
-    capped = cfg.get('max_vcpus') is not None
+    capped = max_vcpus is not None
     need = size_vcpus(cfg, size) if capped else known_vcpus(cfg, size)
     if capped:
         # Each host once (`running` can list one twice: `live` and the fresh listing), by its own vCPUs; each unseen
@@ -789,9 +988,9 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
         hosts = {i['InstanceId']: i for i in running}
         used = (sum(host_vcpus(i, cfg) for i in hosts.values())
                 + sum(claimed[job][1] if claimed[job][1] is not None else largest_vcpus(cfg) for job in unseen))
-        if used + need > int(cfg['max_vcpus']):
-            print(f"{repo}: at its cap of {cfg['max_vcpus']} vCPUs ({used} in use, an {size} runner needs {need}); "
-                  f"job {job_id} waits")
+        if used + need > int(max_vcpus):
+            print(f"{repo}: at its cap of {max_vcpus} vCPUs ({used} in use, an {size} runner needs {need}); "
+                  f"job {job_id} waits{mode}")
             return 'cap', token
     nonce = claim(repo, job_id, need)
     if not nonce:
@@ -930,13 +1129,35 @@ def reconcile_repo(repo, cfg, subnets, result):
         result['live'] = len(live)
         if cfg.get('vcpus'):
             result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
-        if outcome == 'cap':
+        if outcome in ('cap', 'deferred'):
             break
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
     return result
 
 
-def publish_counts(results):
+def reconcile_buckets(repos):
+    """Refill and drain every budget group's bucket once a round, whether or not anything launches; ([state], [failed
+    group]). A bucket whose write keeps losing is skipped this round (the next launch decision or round catches up)."""
+    states, failed = [], []
+    for group in sorted(budget_groups()):
+        if not group_repos(group, repos):
+            continue
+        try:
+            state = update_bucket(group, repos)
+        except BucketBusy as conflict:
+            print(str(conflict))
+            continue
+        except Exception as error:
+            failed.append(group)
+            print(f'budget {group}: update failed: {type(error).__name__}: {error}')
+            continue
+        states.append(state)
+        print(f"{describe_bucket(state)}; burning ${state['burn_h']:.2f}/h, refilling "
+              f"${float(budget_groups()[group]['daily_usd']) / 24:.2f}/h; 7-day spend ${state['spend_7d']:.2f}")
+    return states, failed
+
+
+def publish_counts(results, buckets=()):
     """LiveRunners per repo, and in total when every repo was counted. The too-many and
     reconcile-silent alarms read this: AWS/EC2 has no per-tag instance count to alarm on. A total
     that silently counted a skipped or failed repo as zero would hide its hosts from the
@@ -944,7 +1165,10 @@ def publish_counts(results):
     row trip reconcile-silent (missing = breaching), which is what they are.
 
     LiveVcpus, per repo, is the vCPUs of those same hosts: the per-repo vCPU alarm and Imagine's
-    spend alarm read it (runner-app.tf). Nothing reads a vCPU total, so none is published."""
+    spend alarm read it (runner-app.tf). Nothing reads a vCPU total, so none is published.
+
+    Per budget group: BucketLevelUsd, Throttled (0 or 1) and SpendUsd7d (the last 168 hours of the bucket's drain), which
+    the throttled-hours and weekly-spend alarms read."""
     data = [{'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
              'Value': r['live'], 'Unit': 'Count'} for r in results if 'live' in r]
     data += [{'MetricName': 'LiveVcpus', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
@@ -952,6 +1176,11 @@ def publish_counts(results):
     if all('live' in r for r in results):
         data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
                      'Value': sum(r['live'] for r in results), 'Unit': 'Count'})
+    for state in buckets:
+        dims = [{'Name': 'Group', 'Value': state['group']}]
+        data += [{'MetricName': 'BucketLevelUsd', 'Dimensions': dims, 'Value': round(state['level_usd'], 4), 'Unit': 'None'},
+                 {'MetricName': 'Throttled', 'Dimensions': dims, 'Value': 1 if state['throttled'] else 0, 'Unit': 'Count'},
+                 {'MetricName': 'SpendUsd7d', 'Dimensions': dims, 'Value': round(state['spend_7d'], 4), 'Unit': 'None'}]
     if data:
         cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
 
@@ -973,7 +1202,11 @@ def handler(event, context):
     if event.get('reconcile') or event.get('source') == 'aws.events':
         # Each repo on its own: one repo's revoked token or GitHub timeout must not stop the
         # other's launches and reaping. The invocation still fails afterwards, for the alarm.
-        results, failed = [], []
+        results = []
+        # The buckets first, with no deadline of their own yet (each call is bounded): a round refills and drains
+        # every group even when nothing is queued.
+        buckets, failed = reconcile_buckets(repos)
+        failed = [f'budget {group}' for group in failed]
         remaining = (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
         order = list(repos.items())
         order = rotated(order, int(time.time() // 120))
@@ -987,7 +1220,7 @@ def handler(event, context):
                 print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
                 results.append({'repo': repo, 'error': type(error).__name__})
         DEADLINE[0] = float('inf')
-        publish_counts(results)
+        publish_counts(results, buckets)
         if failed:
             raise RuntimeError(f'reconcile failed for {", ".join(failed)}')
         return results

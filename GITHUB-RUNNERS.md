@@ -711,10 +711,13 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
   failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
-  with its `JobId`. Each repo has its own cap (8; `dolphin-films`, `dolphin-maps` and `dolphin-family` 2), counted as the hosts `DescribeInstances` lists
+  with its `JobId`. Each repo has its own cap, counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
-  A repo may also set `max_vcpus` (`ejc3/imagine`: 192, with `max = 24` hosts kept as a backstop). A launch then waits when the
+  For `ejc3/imagine` and the dolphin repos the cap is set by their [budget bucket](#budget-buckets): 512 vCPUs and 64 hosts
+  each while the bucket is healthy, their old caps (Imagine 8 hosts and 192 vCPUs, `dolphin-labs` 8, `dolphin-films`,
+  `dolphin-maps` and `dolphin-family` 2) while it is throttled. `colton-games` is in no bucket and keeps its cap of 8.
+  A repo may also set `max_vcpus`, a vCPU cap in every mode (no repo sets it now; a bucket's caps work the same way). A launch then waits when the
   vCPUs of the repo's hosts in use, plus those of its launches not listed yet, plus the vCPUs of the size the job asks for,
   would pass it. The vCPUs per size come from one map, `runner_app_size_vcpus` (`s` 8, `l` 32, `xl` 64), next to
   `runner_app_sizes` in `runner-app.tf`; a plan refuses an instance type whose vCPUs differ from its size's. A host is
@@ -732,15 +735,16 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
-  zero would hide its hosts. It also publishes `GitHubAppRunner/LiveVcpus`, the vCPUs of those hosts, per repo.
-  `too-many-app-runners` fires above the combined cap (the sum of every served repo's host cap, Imagine's backstop of 24
-  included), and
-  `too-many-app-runners-<label>` (`-dolphin-films` and `-dolphin-maps` for those repos, which share a label) above one repo's own cap, so a single repo running away is
-  visible even while the total is under the combined cap. A repo with a vCPU cap also gets
-  `too-many-app-runner-vcpus-<label>`, its `LiveVcpus` above that cap for 15 minutes: a repo over-launching large hosts
-  passes its vCPU cap long before its host backstop. `imagine-runner-hours-daily` fires when Imagine's
-  `LiveVcpus`, averaged over an hour, is above 128 (four `l` hosts) in 6 of the last 24 hours (768 vCPU-hours past its
-  usual volume, about $18 at spot): a cap held too long, which the per-repo alarms (over a cap) never see. `github-app-runner-reconcile-silent`
+  zero would hide its hosts. It also publishes `GitHubAppRunner/LiveVcpus`, the vCPUs of those hosts, per repo, and per
+  budget group `BucketLevelUsd`, `Throttled` (0 or 1) and `SpendUsd7d`.
+  `too-many-app-runners` fires above the combined cap: the sum of the most hosts each served repo may hold in any mode
+  (`peak_max`: a budgeted repo's burst ceiling of 64, else its `max`; 264 today, 328 once dolphin-family is served).
+  `too-many-app-runners-<label>` (`-dolphin-films`, `-dolphin-maps` and `-dolphin-family` for those repos, which share a label) fires above one
+  repo's own `peak_max`, so a single repo running away is visible even while the total is under the combined cap. A repo
+  with a vCPU ceiling in some mode (every budgeted repo) also gets `too-many-app-runner-vcpus-<label>`, its `LiveVcpus`
+  above that ceiling (512) for 15 minutes: a repo over-launching large hosts passes its vCPU ceiling long before its host
+  backstop. The budget alarms are under [Budget buckets](#budget-buckets). `imagine-runner-hours-daily` is now a backstop
+  to the bucket's arithmetic (below). `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
@@ -780,6 +784,82 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`runner-repos.tf`), a Secrets Manager container Terraform never reads. The webhooks are
   created with the same tokens through an `ephemeral` read, so the tokens never enter state.
 
+### Budget buckets
+
+The owner, 2026-10-17: "Let's change ci to be a leaky bucket. Whereas long as we are roughly trending to be within our
+budget we allow mass parallel. When we think we will clip, we restrict to 8. Do that for dolphin too." Then: smooth it over
+a week, so a quiet stretch banks room for a busy day.
+
+- **Groups.** Two buckets, `runner_budget_groups` in `runner-app.tf`: `imagine` (ejc3/imagine) and `dolphin`
+  (dolphin-labs, dolphin-films, dolphin-maps, and dolphin-family once its token gate is on; they share the `dolphin`
+  label and one owner). Each is **$50 a day**. colton-games is in neither and is capped by its 8 hosts as before.
+- **The bucket.** One DynamoDB item per group in `github-app-runner-budget`: `level_usd`, `updated_at`, the burn rate at
+  that update, the mode, hourly sums of the drain over the last 7 days, and a version. On every reconcile (every 2
+  minutes) and before every launch decision, the controller refills it by $50 / 86,400 s for each second since the last
+  update, at most to **$100 (two days' budget)**, and drains what the group's hosts cost over the same interval. The
+  level never goes below zero.
+- **The cost.** vCPU-seconds of the group's hosts at **$0.027 per vCPU-hour**, plus **$0.016 per host-hour** for each
+  host's 80 GB gp3 volume and public IPv4 address. Both are constants in `runner_cost`, never the pricing APIs at run
+  time, and both are set a little high on purpose:
+  - Spot in us-west-1 on 2026-10-17, every type in the pools, both AZs: `s` $0.175-0.205/h ($0.0218-0.0257 per
+    vCPU-hour), `l` $0.605-0.664/h ($0.0189-0.0208), `xl` $0.986-1.351/h ($0.0154-0.0211). $0.027 is above the dearest,
+    c7a.2xlarge at $0.0257.
+  - $0.005/h per public IPv4 address (AWS's charge since 2024-02-01), plus 80 GB at $0.096/GB-month for gp3 in
+    us-west-1, which is $0.0105/h. Together $0.0155, rounded up to $0.016.
+  - A host still live is charged from the later of the last update and its launch. A host launched since the last update
+    and gone already (EC2 lists terminated hosts for about an hour) is charged from its launch to now. A host live at the
+    last update and gone now is charged the whole interval. Each errs high.
+- **Modes.** In **burst** each repo may hold 512 vCPUs and 64 hosts (`burst_max_vcpus`, `burst_max`; 64 `s` hosts are
+  512 vCPUs). In **throttled** each repo falls back to its old caps (`throttled_max`, `throttled_max_vcpus`): Imagine 8
+  hosts and 192 vCPUs, dolphin-labs 8, dolphin-films, dolphin-maps and dolphin-family 2. `max` stays a hard backstop in
+  both modes (64 for these repos), so `max = 0` still stops a repo.
+  - Burst turns throttled when the level is under **15%** of capacity ($15), or would reach zero within **2 hours** at
+    the current burn, counting the host the job would add. So in burst a launch goes ahead only while the group's burn
+    after it stays under level / 2 h + $2.08/h: $52/h with a full bucket, about 1,900 vCPUs across the dolphin repos.
+    One repo at its full burst (512 vCPUs of `s`, $14.85/h, $12.77/h net of the refill) throttles at about $25.50.
+    The lookahead is 2 hours rather than 1 because at 1 hour that repo would reach the $15 reserve first, and the
+    lookahead would never decide anything.
+  - Throttled turns burst only once the level is back to **30%** ($30) and the projection is clear, so the mode does not
+    flap around one mark.
+  - Throttling never terminates a host, and running jobs finish. It only stops launches past the throttled caps, and the
+    queued jobs wait as at any cap. The wait is logged with the mode, the level and the cap, for example
+    `ejc3/imagine: at its cap of 8 runners; job N waits (throttled, budget imagine at $25.00 of $100.00)`.
+- **Edge cases.** The item is written conditionally on its version, so two writers cannot both count one interval: the
+  loser re-reads and recomputes from the winner's state, and after 3 lost writes in a row the launch defers to the next
+  round (the reconcile skips that group's update and logs it). A missing item (the first round, or one deleted by hand)
+  starts full. Time that moved backwards counts as no time. A gap longer than 3 hours (the controller was not running)
+  counts as 3 hours: no host outlives 3 hours, so none can be owed for longer, and the refill lost for a longer outage
+  errs on the safe side.
+- **What it bounds.** Over the long run, burst spend averages at most $50 a day per group. In any one day a group can
+  burst through at most its full bucket plus that day's refill, about $150, so a quiet weekend banks room for a busy
+  Monday. Over any 7 days it is at most $350 of refill plus whatever was banked at the start, so up to $450. Two limits:
+  - **The throttled caps are not inside the bucket.** Spend at the throttled caps past the refill is not carried as debt
+    (the level stops at zero). Imagine throttled holds at most 192 vCPUs, about $5.30 an hour or $127 a day. The dolphin
+    repos throttled hold at most 12 hosts (14 with dolphin-family), which as `xl` would be 768 vCPUs (896), about $21 an
+    hour ($24). Those were the caps before the bucket. Measured over the 24 hours before this change, Imagine averaged
+    about 42 vCPUs (about $28 a day at these constants, about $25 at the spot prices paid) and dolphin-labs about 23
+    (about $16), both well under the refill.
+  - **It bounds dollars a day, not vCPUs at an instant.** At once, Imagine may hold 512 vCPUs, the dolphin repos about
+    1,900 together (each under its own 512), and colton-games 512 (8 `xl`): about 2,900 vCPUs in all, against 1,472
+    (1,600 with dolphin-family) under the old caps. The account's spot vCPU quota (`L-34B43A08`, us-west-1) bounds it
+    below that; past the quota, launches fail as capacity refusals and jobs wait.
+- **Alarms.**
+  - `github-app-runner-budget-throttled-<group>`: throttled for at least half the hour in more than 8 of the last 24
+    hours. Throttling is the bucket working; a third of a day means the work no longer fits the budget.
+  - `github-app-runner-budget-weekly-<group>`: `SpendUsd7d` (the last 168 hours of the bucket's drain) above $350. A
+    backstop to the arithmetic. It can fire on legitimate use (a week that started with a full bucket, or long throttled
+    spells), and then it says a week cost more than its budget.
+  - `imagine-runner-hours-daily` was `LiveVcpus` above 128 in 6 of 24 hours, which bursting now reaches on an ordinary
+    busy day. It is now `LiveVcpus` above 296 in every one of the last 24 hours: $150 a day is 232 vCPUs held all day,
+    and hosts still running when the bucket throttles can add 3 hours of 512 vCPUs, 64 averaged over the day. It reads
+    the controller's own host count, not the bucket, so it catches the bucket draining too little.
+  - On a day when both groups spend their full bucket (about $300), the account's $200 a day AWS Budgets alert
+    (`cost-alerts.tf`) can fire. That is expected and informational.
+- **Changing it.** Edit `daily_usd` in `runner_budget_groups`, or a value in `runner_budget_defaults` (capacity, burst
+  ceilings, lookahead, reserve, resume, the throttled-hours alarm), and apply. The stored level is kept; the refill and
+  the capacity change at once, and a level above a lowered capacity is cut to it on the next update. To reset a bucket to
+  full, delete its item. To take a repo out of the buckets, remove it from its group; it is then capped by its `max`.
+
 ### `ejc3/imagine`
 
 Imagine (`ejc3/imagine`: Rust built to WebAssembly and to a NIF, an Elixir server, a Next.js app tested in Chromium,
@@ -798,13 +878,11 @@ never the owner:
 - **Gate.** `imagine_token_ready` (starts false) keeps the token read, the controller entry, the hook and the daily alarm
   out of every plan until `github-runner/repo-pat/ejc3/imagine` has a value. Set its default to true in a commit, never
   with `-var`.
-- **Cap and cost.** 192 vCPUs (`max_vcpus`), with 24 hosts as a backstop; its own `too-many-app-runners-imagine`,
-  `too-many-app-runner-vcpus-imagine` and `imagine-runner-hours-daily`. One CI run asks for four `s` and one `l` (64
-  vCPUs), so 192 is three runs at once; the old cap of 8 hosts held a second run's jobs for 5 to 11 minutes. Spot cost
-  follows vCPUs, so the cap bounds Imagine at about $3.80 to $5.30 an hour (about $90 to $130 a day): 192 vCPUs as 3 `xl`
-  hosts (c7a.16xlarge, about $1.25/h with its disk and address) at the low end, as 24 `s` hosts (c7a.2xlarge, about
-  $0.22/h) at the high end, where each host's disk and address count 24 times. The cap of 8 hosts bounded it at up to
-  512 vCPUs (8 `xl`, about $10 an hour).
+- **Cap and cost.** Its [budget bucket](#budget-buckets), `imagine`, $50 a day: 512 vCPUs and 64 hosts while it is
+  healthy, 8 hosts and 192 vCPUs while it is throttled. One CI run asks for four `s` and one `l` (64 vCPUs), so a full
+  bucket runs eight at once. Before the bucket it was capped at 192 vCPUs and 24 hosts, and before that at 8 hosts,
+  which held a second run's jobs for 5 to 11 minutes. Its own `too-many-app-runners-imagine`,
+  `too-many-app-runner-vcpus-imagine`, `imagine-runner-hours-daily` and the budget alarms.
 - **What the stock image lacks.** Bootstrap installs only the runner, build tools, git, curl, jq, zip and passwordless
   sudo. Imagine's workflow brings the rest per job: Erlang/OTP and Elixir through `erlef/setup-beam` (which, on a
   self-hosted runner, needs `ImageOS=ubuntu24` in the job's environment; hosted images set it), rustup itself (the
@@ -1223,20 +1301,21 @@ Terminal on the jumpbox and dev boxes are open to `0.0.0.0/0` and `::/0`, key-on
 internet attacker's access, not more. Nor can it reach fcvm's metal runners' SSH: their group
 admits SSH only from itself and the operator addresses.
 
-**Cost limits.** Each repo may run at most its cap of VMs at once (8; `dolphin-films` and
-`dolphin-maps` 2), enforced by the controller before every launch. `too-many-app-runners` fires
-when the total stays above the sum of the caps (28) for 15 minutes: it detects the controller
-launching past its caps, not the caps being reached (every repo at its cap is normal saturation
-and does not alarm). The reconcile terminates any VM older than 3 hours, but only
-while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own
-shutdown, and if the reconcile stops, `github-app-runner-errors` or
-`github-app-runner-reconcile-silent` fires and the VM runs until someone terminates it. With
-reaping working, the worst case, every repo kept at its cap with 64-core VMs (28 at about $1.35/h
-spot in us-west-1 on 2026-10-15), is about $38/hour.
+**Cost limits.** Each repo may run at most its cap of VMs at once, enforced by the controller before every launch: for
+the budgeted repos the cap their [budget bucket](#budget-buckets) allows (64 hosts and 512 vCPUs in burst, the old caps
+throttled), for colton-games 8. Each bucket bounds its group's burst spend to $50 a day on average, about $150 in any
+one day. `too-many-app-runners` fires when the total stays above the sum of the burst ceilings (264) for 15 minutes: it
+detects the controller launching past its caps, not the caps being reached. The reconcile terminates any VM older than
+3 hours, but only while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own shutdown,
+and if the reconcile stops, `github-app-runner-errors` or `github-app-runner-reconcile-silent` fires and the VM runs
+until someone terminates it. A bucket that stops being updated stops launches too, since every launch decision updates
+it first. With reaping working, the hourly worst case is about 2,900 vCPUs at once (Imagine 512, the dolphin repos about
+1,900, colton-games 512), about $80 an hour. Each bucket's projection lets its share of that through only while its level
+covers two hours of it, so the rate falls as the levels do.
 
 **Shutting it off**
 
-1. Set the repo's `max` to 0 in `runner-app.tf` and apply: no new VMs, even from the reconcile,
+1. Set the repo's `max` to 0 in `runner-app.tf` and apply (it bounds every budget mode too): no new VMs, even from the reconcile,
    which launches for queued jobs without any webhook.
 2. Terminate what is running (add `Name=tag:Repo,Values=<owner>/<repo>` for one repo):
 
