@@ -845,6 +845,14 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
   `.path` from `/etc/github-app-runner/path`). The pins are one `versions` block in `runner-app-image.tf`; they must
   match ejc3/imagine's `rust-toolchain.toml`, its CI workflow and `web/package.json`, and are not read from that
   repository, which is private.
+- **The Node web images.** `dolphin-labs-runner`, `dolphin-films-runner`, `dolphin-maps-runner` and
+  `colton-games-runner`, one per repo (an image carries its repo's tag), all from `runner-app/images/node-web-runner.sh`
+  with each repo's pins: the newest Node of its major (checked against nodejs.org's SHASUMS256) and the newest build of
+  each Python minor from actions/python-versions (installed by that build's own `setup.sh`), both in the tool cache where
+  `actions/setup-node` and `actions/setup-python` look before they download; Playwright's system libraries and its
+  browsers in the runner's `~/.cache/ms-playwright` for the version in the repo's lockfile; and any packages a job
+  `apt-get install`s (colton-games: PostgreSQL 16). Nothing goes on `PATH`: the setup steps put the tool-cache copies
+  there. A repo boots its image once its entry names it (`image = "<name>"`), after the image's first build.
 - **The pipeline.** Lambda `github-app-runner-image` (`runner-app/image_builder.py`), the shape of fcvm's builder
   (Pattern A) without a GitHub identity: weekly (Monday 09:00 UTC, `{"build": true}`) and on demand it launches one
   on-demand `github-app-runner-image-builder` host from Canonical's image into the runner subnets with

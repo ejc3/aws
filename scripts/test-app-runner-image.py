@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BUILDER_PY = ROOT / "runner-app" / "image_builder.py"
 IMAGE_BUILD = ROOT / "runner-app" / "image-build.sh"
 IMAGINE_SCRIPT = ROOT / "runner-app" / "images" / "imagine-runner.sh"
+NODE_WEB_SCRIPT = ROOT / "runner-app" / "images" / "node-web-runner.sh"
 # Read where the tests use them, and empty when missing, so each test fails on its own on a tree without the pipeline.
 IMAGE_TF = (ROOT / "runner-app-image.tf").read_text() if (ROOT / "runner-app-image.tf").exists() else ""
 APP_TF = (ROOT / "runner-app.tf").read_text()
@@ -410,6 +411,128 @@ class ImageScriptTests(unittest.TestCase):
         self.assertIn("printf '%s\\n' /home/runner/.cargo/bin \"$NODE_DIR/bin\" > /etc/github-app-runner/path", text,
                       "bootstrap.sh puts these first on a job's PATH")
         self.assertIn("usermod -aG docker runner", text, "a job reaches docker's socket without sudo")
+
+
+class NodeWebImageScriptTests(unittest.TestCase):
+    """runner-app/images/node-web-runner.sh's Node and Python steps, run for real against local archives and a fake curl."""
+
+    def fixture(self, corrupt_node=False):
+        tmp = Path(tempfile.mkdtemp(prefix="node-web-script."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        served = tmp / "served"
+        # Node: an index newest first, one tarball per version, and its SHASUMS256.txt.
+        (served / "node").mkdir(parents=True)
+        index = []
+        for version in ("v24.11.0", "v22.21.1", "v22.21.0"):
+            src = tmp / "node-src" / f"node-{version}-linux-x64"
+            (src / "bin").mkdir(parents=True)
+            (src / "bin" / "node").write_text(f"#!/bin/sh\necho {version}\n")
+            (served / "node" / version).mkdir()
+            archive = served / "node" / version / f"node-{version}-linux-x64.tar.gz"
+            with tarfile.open(archive, "w:gz") as tf:
+                tf.add(src, arcname=src.name)
+            digest = "0" * 64 if corrupt_node else hashlib.sha256(archive.read_bytes()).hexdigest()
+            (served / "node" / version / "SHASUMS256.txt").write_text(
+                f"{'1' * 64}  node-{version}-darwin-x64.tar.gz\n{digest}  {archive.name}\n")
+            index.append({"version": version})
+        (served / "node" / "index.json").write_text(json.dumps(index))
+        # Python: actions/python-versions' manifest, newest first; each build carries its own setup.sh.
+        manifest = []
+        for version, stable in (("3.12.16", False), ("3.12.15", True), ("3.12.14", True), ("3.11.17", True)):
+            files = []
+            for platform_version, arch in (("22.04", "x64"), ("24.04", "arm64"), ("24.04", "x64")):
+                name = f"python-{version}-linux-{platform_version}-{arch}.tar.gz"
+                src = tmp / "py-src" / name
+                src.mkdir(parents=True)
+                (src / "setup.sh").write_text(
+                    f'echo "{version} {platform_version} {arch} $RUNNER_TOOL_CACHE ${{AGENT_TOOLSDIRECTORY-unset}}"'
+                    f' >> "$RUNNER_TOOL_CACHE/setup.log"\n'
+                    f'mkdir -p "$RUNNER_TOOL_CACHE/Python/{version}/x64" && touch "$RUNNER_TOOL_CACHE/Python/{version}/x64.complete"\n')
+                with tarfile.open(served / name, "w:gz") as tf:
+                    tf.add(src / "setup.sh", arcname="./setup.sh")
+                files.append({"filename": name, "arch": arch, "platform": "linux", "platform_version": platform_version,
+                              "download_url": f"https://mirror.example/{name}"})
+            manifest.append({"version": version, "stable": stable, "files": files})
+        (served / "manifest.json").write_text(json.dumps(manifest))
+        (tmp / "bin").mkdir()
+        (tmp / "bin" / "curl").write_text(
+            '#!/bin/bash\nout=; url=\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; --retry) shift 2;; '
+            '-*) shift;; *) url=$1; shift;; esac; done\n'
+            f'file={served}/${{url#https://mirror.example/}}\n[ -f "$file" ] || exit 22\n'
+            'if [ -n "$out" ]; then cp "$file" "$out"; else cat "$file"; fi\n')
+        (tmp / "bin" / "curl").chmod(0o755)
+        (tmp / "toolcache").mkdir()
+        return tmp
+
+    def run_steps(self, tmp, steps, **pins):
+        exports = " ".join(f"{k}={v}" for k, v in pins.items())
+        script = (f"set -euo pipefail\nexport IMAGE_SCRIPT_FUNCTIONS_ONLY=1 TOOL_CACHE={tmp}/toolcache TMPDIR={tmp} "
+                  f"NODE_MIRROR=https://mirror.example/node PYTHON_MANIFEST=https://mirror.example/manifest.json "
+                  f"AGENT_TOOLSDIRECTORY=/somewhere/else {exports}\nsource {NODE_WEB_SCRIPT}\n{steps}\n")
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                              env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin"})
+
+    def test_node_lands_where_setup_node_finds_it(self):
+        tmp = self.fixture()
+        out = self.run_steps(tmp, 'install_node; echo "bin=$NODE_BIN"', NODE_MAJOR="22")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        cache = tmp / "toolcache"
+        # @actions/tool-cache cacheDir(dir, 'node', version): <cache>/node/<version without v>/<arch> and <arch>.complete.
+        self.assertTrue((cache / "node/22.21.1/x64/bin/node").is_file(), "the newest of the major, its top dir stripped")
+        self.assertTrue((cache / "node/22.21.1/x64.complete").is_file())
+        self.assertFalse((cache / "node/24.11.0").exists())
+        self.assertIn(f"bin={cache}/node/22.21.1/x64/bin", out.stdout, "Playwright's npx runs on that Node")
+
+    def test_a_node_archive_that_does_not_match_its_shasums_fails_the_build(self):
+        tmp = self.fixture(corrupt_node=True)
+        out = self.run_steps(tmp, "install_node", NODE_MAJOR="22")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse((tmp / "toolcache/node/22.21.1/x64.complete").exists())
+
+    def test_each_python_minor_is_its_newest_stable_build_for_this_release_installed_by_its_setup(self):
+        tmp = self.fixture()
+        out = self.run_steps(tmp, "install_python", PYTHON_VERSIONS="3.11,3.12")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        log = (tmp / "toolcache/setup.log").read_text().splitlines()
+        # setup.sh prefers AGENT_TOOLSDIRECTORY when it is set at all, so it is unset for it.
+        self.assertEqual(log, [f"3.11.17 24.04 x64 {tmp}/toolcache unset", f"3.12.15 24.04 x64 {tmp}/toolcache unset"])
+        self.assertTrue((tmp / "toolcache/Python/3.12.15/x64.complete").is_file())
+
+    def test_a_minor_with_no_build_fails_the_build(self):
+        tmp = self.fixture()
+        out = self.run_steps(tmp, "install_python", PYTHON_VERSIONS="3.9")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no Python 3.9 build", out.stderr)
+
+    def test_playwright_needs_both_its_pins(self):
+        tmp = self.fixture()
+        for pins in ({"PLAYWRIGHT_VERSION": "1.62.1"}, {"PLAYWRIGHT_BROWSERS": "chromium"}):
+            out = self.run_steps(tmp, "main", NODE_MAJOR="22", **pins)
+            self.assertNotEqual(out.returncode, 0, pins)
+            self.assertIn("set with PLAYWRIGHT_", out.stderr)
+
+    def test_the_script_is_valid_and_every_image_using_it_pins_only_what_it_reads(self):
+        subprocess.run(["bash", "-n", str(NODE_WEB_SCRIPT)], check=True)
+        text = NODE_WEB_SCRIPT.read_text()
+        known = {"NODE_MAJOR", "PYTHON_VERSIONS", "PLAYWRIGHT_VERSION", "PLAYWRIGHT_BROWSERS", "APT_PACKAGES"}
+        for pin in known:
+            self.assertIn("${" + pin, text, "the script reads every pin an image may set")
+        entries = re.findall(r'^    "([a-z0-9-]+)" = \{\n      repo\s+= "([^"]+)"\n      script = "node-web-runner\.sh"\n'
+                             r'(.*?)\n      versions = \{\n(.*?)\n      \}', IMAGE_TF, re.M | re.S)
+        self.assertEqual({e[0] for e in entries},
+                         {"dolphin-labs-runner", "dolphin-films-runner", "dolphin-maps-runner", "colton-games-runner"})
+        repos = set(re.findall(r'^    "([^"]+/[^"]+)"\s+= \{ label', APP_TF, re.M))
+        for name, repo, _, block in entries:
+            pins = dict(re.findall(r'^\s+([A-Z_]+)\s+= "([^"]*)"', block, re.M))
+            self.assertIn("NODE_MAJOR", pins, name)
+            self.assertLessEqual(set(pins), known, name)
+            self.assertEqual("PLAYWRIGHT_VERSION" in pins, "PLAYWRIGHT_BROWSERS" in pins, name)
+            self.assertIn(repo, repos, f"{name} is for an app runner repo")
+            for value in pins.values():
+                self.assertRegex(value, r"^[A-Za-z0-9][A-Za-z0-9._:/@+,-]{0,199}$", "image_builder.py's VERSION_VALUE")
+
+    def test_a_script_several_images_share_is_packaged_once(self):
+        self.assertIn("for_each = toset([for image in local.runner_app_images : image.script])", IMAGE_TF)
 
 
 class TerraformTests(unittest.TestCase):
