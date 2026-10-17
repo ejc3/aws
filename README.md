@@ -446,10 +446,21 @@ out of `~/.ssh/config` and is safe to rerun. Both aliases use the pre-existing
 that private key. Restoring it is a prerequisite on an entirely fresh ARM root.
 
 The Macs initiate the outbound tunnels. On EJ's MacBook Pro, the
-`com.ejcampbell.fcvm-macbook.sshd` and `com.ejcampbell.fcvm-macbook.tunnel` LaunchAgents
-start at user login and reconnect the tunnel after failures. The route is
-`fcvm-arm 127.0.0.1:2223 -> MacBook 127.0.0.1:22222`; the MacBook's SSH listener accepts
-only public-key login for `ejcampbell`. Keep the Mac awake and online. These are local
+`com.ejcampbell.fcvm-macbook.tunnel` LaunchAgent starts at user login and reconnects the
+tunnel after failures. Since 2026-10-17 the route is `fcvm-arm 127.0.0.1:2223 -> MacBook
+127.0.0.1:22`: macOS Remote Login (System Settings > General > Sharing), with "Allow full
+disk access for remote users" on, and this box's key in the Mac's `~/.ssh/authorized_keys`.
+It was `127.0.0.1:22222`, a private `sshd` started by the `com.ejcampbell.fcvm-macbook.sshd`
+LaunchAgent (public-key login for `ejcampbell` only), which stays installed as a fallback.
+
+Why the move: an external drive is a removable volume to macOS privacy controls, and under
+the private `sshd` every program a session runs is its own responsible process, so each one
+(node, xcodegen, CocoaPods, any new binary) stopped at a "would like to access files on a
+removable volume" prompt on the Mac's screen, and hung there until someone answered it. A
+Full Disk Access grant on `/usr/sbin/sshd` did not change that. Remote Login sessions are
+attributed to `/usr/libexec/sshd-keygen-wrapper`, which "Allow full disk access for remote
+users" grants, so everything run over it reaches the drive with no prompt. Both host keys
+are pinned below: Remote Login's, and the private `sshd`'s for the fallback. Keep the Mac awake and online. These are local
 Mac services, not the optional EC2 Mac, and no AWS inbound port is needed.
 
 The MacBook also has Peekaboo 4.4.0 installed for screen control over this same SSH
