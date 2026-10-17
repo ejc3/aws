@@ -1,5 +1,6 @@
 # SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of its Remote Login,
-# so a connection needs both Cloudflare Access (a second factor) and an SSH key. See MACBOOK.md.
+# so a connection needs both Cloudflare Access (a second factor) and an SSH key. The runbook,
+# both phases with their checks, is README "MacBook: Moving SSH behind Cloudflare Access".
 #
 #   macbook-ssh.cc-games.dev  -> the MacBook's Remote Login (ssh://localhost:22), keys only
 #
@@ -7,19 +8,22 @@
 #   EJ                 -- the browser-manager owner policy (Google or one-time PIN)
 #   fcvm-arm's agents  -- one service token, `macbook-ssh-access` in Secrets Manager
 #
-# Client (fcvm-arm):
-#   ssh -o ProxyCommand='cloudflared access ssh --hostname %h --service-token-id $ID --service-token-secret $SECRET' \
-#     ejcampbell@macbook-ssh.cc-games.dev
+# Client (fcvm-arm): `ssh macbook` with ProxyCommand ~/.ssh/macbook-access-proxy, which reads
+# the service token from Secrets Manager into TUNNEL_SERVICE_TOKEN_ID/_SECRET and execs
+# `cloudflared access ssh --hostname %h`. Never pass the token as --id/--secret: arguments
+# are visible to every user of the box in `ps`.
 #
 # Bring-up, phase 1 (this file): apply. Nothing changes for the MacBook yet: the reverse SSH tunnel
 # (mac-reverse-tunnels.tf) still carries `ssh macbook`. Phase 2, from fcvm-arm over that tunnel:
 # install the connector on the MacBook with the token below, check a connection through Cloudflare
-# succeeds with the service token and fails without it, then move `Host macbook` here, retire the
-# reverse tunnel, and close the MacBook's port 22 to everything but itself (pf).
+# succeeds with the service token and is refused without it, then move `Host macbook` to it
+# (mac-reverse-tunnels.tf), retire the reverse tunnel, and close the MacBook's port 22 to
+# everything but itself (pf).
 #
-# Both credentials are readable by fcvm-arm's role (dev_server): the connector token so it can be
-# installed on the MacBook over the existing route (no other path reaches the Mac), the service
-# token because fcvm-arm is the client. The connector token runs this one tunnel and nothing else.
+# Both credentials are readable by the dev_server role (fcvm-arm's, and also fcvm-x86's): the
+# connector token so it can be installed on the MacBook over the existing route (no other path
+# reaches the Mac), the service token because fcvm-arm is the client. The connector token runs
+# this one tunnel and nothing else.
 
 locals {
   macbook_ssh_hostname = "macbook-ssh.cc-games.dev"
