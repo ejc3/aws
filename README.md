@@ -701,9 +701,12 @@ Expect: the log ends in `Registered tunnel connection` lines, and the tunnel rep
 { set +x; } 2>/dev/null
 T=$(aws secretsmanager get-secret-value --secret-id cloudflare-tunnel-token \
       --region us-west-1 --query SecretString --output text)
-printf 'Authorization: Bearer %s\n' "$T" | curl -s -H @- \
-  "https://api.cloudflare.com/client/v4/accounts/12ea67fb7ced068de03f35c22688e436/cfd_tunnel?name=macbook-ssh&is_deleted=false" \
-  | python3 -c 'import json,sys; [print(t["status"], len(t.get("connections") or [])) for t in json.load(sys.stdin)["result"]]'
+A=https://api.cloudflare.com/client/v4/accounts/12ea67fb7ced068de03f35c22688e436/cfd_tunnel
+read -r ID STATUS < <(printf 'Authorization: Bearer %s\n' "$T" | curl -s -H @- "$A?name=macbook-ssh&is_deleted=false" \
+  | python3 -c 'import json,sys; t=json.load(sys.stdin)["result"][0]; print(t["id"], t["status"])')
+# The connection count comes from the tunnel's own endpoint, which Cloudflare keeps current.
+printf 'Authorization: Bearer %s\n' "$T" | curl -s -H @- "$A/$ID/connections" \
+  | python3 -c 'import json,sys; print(sys.argv[1], len(json.load(sys.stdin)["result"]))' "$STATUS"
 unset T
 ```
 
@@ -843,8 +846,11 @@ pass. Undo, so the next boot does not put it back:
   `cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh` (a new tunnel id and token), which
   disconnects the Mac's connector, the route that `ssh macbook` would use to install the
   new one. An ordinary apply changes nothing (the configuration has not changed), so the
-  rotation is forced. First restore the reverse route (the way back, above), then, from a
-  fresh worktree, `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
+  rotation is forced. First restore the reverse route (the way back, above), then stop the
+  Mac's connector (`launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared`):
+  Cloudflare refuses to delete a tunnel with active connections, and Terraform deletes this one
+  before it creates the new one. Then, from a fresh worktree,
+  `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
   (a new tunnel, its config and DNS record follow it, and `macbook-ssh-tunnel` gets the new
   token; the old tunnel's config cannot be destroyed by Terraform, so delete the old tunnel in
   the API afterwards). Then send the new token as in step 1 (the `aws ... | ssh macbook 'umask 077; cat > ...'` line), restart
