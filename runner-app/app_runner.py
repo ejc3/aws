@@ -358,9 +358,11 @@ def host_vcpus(instance, cfg):
 #     launch; a host launched since the last update and gone already is charged from its launch to now; a host that was
 #     live at the last update and is gone now is charged the whole interval, through the burn rate stored then
 #     (rate_usd_h). Over, not under: a host that ended mid-interval is charged to its end.
-#   * The level never goes below zero. Spend at the throttled caps past the refill is not carried as debt; it is in the
-#     7-day spend (`spend`, hourly sums of the drain over the last 168 hours) and its alarm.
-#   * Mode: burst (the group's burst ceilings) or throttled (each repo's throttled caps). Burst turns throttled when the
+#   * The level never goes below zero. The 7-day spend (`spend`, hourly sums of the drain over the last 168 hours) is
+#     kept with it, for its alarm.
+#   * Mode: burst (the group's burst ceilings, per repo) or throttled (each repo's throttled_max hosts, and the group's
+#     repos together throttled_vcpus vCPUs: the refill rate's worth, so throttled spend cannot outrun the refill; a
+#     group holding nothing may still launch one host of any size, so no job waits forever). Burst turns throttled when the
 #     level is under reserve_fraction of capacity, or would reach zero within lookahead_hours at the current burn
 #     (counting the host about to be launched). Throttled turns burst only once the level is back to resume_fraction of
 #     capacity and the projection is clear. Throttling only stops launches: nothing here terminates a host.
@@ -503,10 +505,11 @@ def update_bucket(group, repos, listed=None, extra_h=0.0):
 
 
 def limits(cfg, throttled):
-    """(host cap, vCPU cap or None) for a repo in its group's mode. `max` and `max_vcpus` bound every mode."""
+    """(host cap, per-repo vCPU cap or None) for a repo in its group's mode. `max` and `max_vcpus` bound every mode."""
     g = budget_groups()[cfg['budget_group']]
     if throttled:
-        hosts, vcpus = int(cfg['throttled_max']), cfg.get('throttled_max_vcpus')
+        # The group-wide throttled_vcpus is checked in ensure_runner(), across every repo of the group.
+        hosts, vcpus = int(cfg['throttled_max']), None
     else:
         hosts, vcpus = int(g['burst_max']), g.get('burst_max_vcpus')
     hosts = min(hosts, int(cfg['max']))
@@ -992,6 +995,10 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             print(f"{repo}: at its cap of {max_vcpus} vCPUs ({used} in use, an {size} runner needs {need}); "
                   f"job {job_id} waits{mode}")
             return 'cap', token
+    if budget and state['throttled']:
+        outcome = throttled_group_check(repo, cfg, budget, repos, group_listed, running, unseen, claimed, size, job_id, mode)
+        if outcome:
+            return outcome, token
     nonce = claim(repo, job_id, need)
     if not nonce:
         return 'claimed', token
@@ -1012,6 +1019,36 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     if definite:
         release(repo, job_id)
     return 'failed', token
+
+
+def throttled_group_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode):
+    """'cap' when a throttled group's repos together would pass its throttled_vcpus with this job's host, else None.
+
+    Counted like the per-repo vCPU cap, across the group: every live host of every member (each once, by its own
+    vCPUs), this repo's launches not listed yet (by their claims) and the other members' too. A group holding nothing
+    may launch one host of any size, so a job larger than the cap still runs, alone."""
+    cap = int(budget_groups()[group]['throttled_vcpus'])
+    hosts = {i['InstanceId']: i for i in group_listed if i.get('State', {}).get('Name') in LIVE_STATES}
+    hosts.update({i['InstanceId']: i for i in running})
+    tokens = {i.get('ClientToken') or '' for i in hosts.values()}
+    used = sum(host_vcpus(i, repos.get(tag(i, 'Repo')) or cfg) for i in hosts.values())
+    used += sum(claimed[job][1] if claimed[job][1] is not None else largest_vcpus(cfg) for job in unseen)
+    others = 0
+    for member in group_repos(group, repos):
+        if member == repo:
+            continue
+        for _, (nonce, vcpus) in active_claims(member).items():
+            if not (nonce and any(t.startswith(nonce + '-') for t in tokens)):
+                used += vcpus if vcpus is not None else largest_vcpus(cfg)
+                others += 1
+    need = size_vcpus(cfg, size)
+    if not hosts and not unseen and not others:
+        return None   # the group holds nothing: one host of any size
+    if used + need > cap:
+        print(f"{repo}: at its group's throttled cap of {cap} vCPUs ({used} in use across budget {group}, an {size} "
+              f"runner needs {need}); job {job_id} waits{mode}")
+        return 'cap'
+    return None
 
 
 def reap(repo, cfg, pat, live, runners, complete=True):

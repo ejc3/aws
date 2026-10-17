@@ -39,8 +39,7 @@ locals {
   # when the vCPUs in use (live hosts, and launches not listed yet, each by its own size) plus
   # those of the size the job asks for would pass it. `max` stays as a host-count backstop. A repo
   # without `max_vcpus` is capped by hosts alone. No repo sets it now: the budgeted repos' vCPU caps come from their
-  # group (burst_max_vcpus) and `throttled_max_vcpus` (ejc3/imagine's 192: three full CI runs, one run asking for four
-  # `s` and one `l`, 64 vCPUs), and are counted the same way.
+  # group (burst_max_vcpus per repo, throttled_vcpus for the whole group), and are counted the same way.
   #
   # dolphin-films (a downstream of dolphin-labs, dolphin-films.tf) asks for the same `dolphin`
   # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
@@ -59,16 +58,16 @@ locals {
   # boot the newest available build of it that this account's pipeline made and tagged, and Canonical's Ubuntu 24.04,
   # with a log line saying so, when there is none. A repo without `image` boots Canonical's image, as before.
   #
-  # A repo in a budget group (runner_budget_groups, below) also sets `throttled_max` (and optionally
-  # `throttled_max_vcpus`): its caps while its group is throttled. While the group is in burst it gets the group's
-  # burst ceilings instead. `max` (and `max_vcpus`, where set) stay a hard backstop in both modes, and setting `max = 0`
+  # A repo in a budget group (runner_budget_groups, below) also sets `throttled_max`: its host cap while its group is
+  # throttled, when the group's repos together are also held to the group's throttled_vcpus. While the group is in
+  # burst it gets the group's burst ceilings instead. `max` (and `max_vcpus`, where set) stay a hard backstop in both modes, and setting `max = 0`
   # still stops a repo outright. For these repos `max` is the burst host ceiling, 64.
   runner_app_repos = {
     "CoderColton/colton-games"      = { label = "cc-games", max = 8, image = "colton-games-runner" }
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 64, throttled_max = 8, image = "dolphin-labs-runner" }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 64, throttled_max = 2, image = "dolphin-films-runner", alarm = "dolphin-films" }
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 64, throttled_max = 2, image = "dolphin-maps-runner", alarm = "dolphin-maps" }
-    "ejc3/imagine"                  = { label = "imagine", max = 64, throttled_max = 8, throttled_max_vcpus = 192, image = "imagine-runner" }
+    "ejc3/imagine"                  = { label = "imagine", max = 64, throttled_max = 8, image = "imagine-runner" }
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
     "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-family" }
@@ -78,7 +77,8 @@ locals {
   # "Budget buckets"). It refills at daily_usd a day, continuously (daily_usd / 86400 a second), and holds at most
   # capacity_days of it, so a quiet stretch banks room for a busy day. It drains by what the group's live hosts cost at
   # runner_cost. While the bucket is healthy the group's repos burst to burst_max hosts and burst_max_vcpus vCPUs each;
-  # when it would clip, they fall back to their throttled caps.
+  # when it would clip, they fall back to their throttled caps: each repo its throttled_max hosts, and the group's repos
+  # together throttled_vcpus vCPUs (below), so throttled spend is at most the refill and the bucket cannot drain further.
   #
   #   throttle  when the level is under reserve_fraction of capacity, or would reach zero within lookahead_hours at the
   #             current burn (counting the host about to be launched);
@@ -106,7 +106,15 @@ locals {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
     dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }
   }
-  runner_budget = { for name, g in local.runner_budget_groups : name => merge(local.runner_budget_defaults, g) }
+  # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
+  # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
+  # host_hour_usd), at vcpu_hour_usd, rounded down: at $50 a day, imagine 72 vCPUs (8 hosts) and dolphin 68 (14 hosts).
+  # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
+  # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
+  # still under the refill ($2.08/h).
+  runner_budget = { for name, g in local.runner_budget_groups : name => merge(local.runner_budget_defaults, g, {
+    throttled_vcpus = max(0, floor((g.daily_usd / 24 - sum(concat([0], [for r in g.repos : try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd) / local.runner_cost.vcpu_hour_usd))
+  }) }
   # repo => its group's name.
   runner_app_budget_group = merge([for name, g in local.runner_budget_groups : { for repo in g.repos : repo => name }]...)
 
@@ -139,9 +147,8 @@ locals {
       app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""
 
       # "": in no budget group, capped by max and max_vcpus alone (colton-games).
-      budget_group        = lookup(local.runner_app_budget_group, repo, "")
-      throttled_max       = try(c.throttled_max, c.max)
-      throttled_max_vcpus = try(c.throttled_max_vcpus, null)
+      budget_group  = lookup(local.runner_app_budget_group, repo, "")
+      throttled_max = try(c.throttled_max, c.max)
       # The most this repo may hold in any mode, which its too-many alarms watch: its burst ceilings within its hard
       # backstop for a budgeted repo, else its caps.
       peak_max = contains(keys(local.runner_app_budget_group), repo) ? min(c.max, local.runner_budget[local.runner_app_budget_group[repo]].burst_max) : c.max
@@ -543,7 +550,8 @@ resource "aws_lambda_function" "runner_app" {
       BUDGET_TABLE = aws_dynamodb_table.runner_app_budget[0].name
       BUDGET_GROUPS = jsonencode({ for name, g in local.runner_budget : name => {
         daily_usd       = g.daily_usd, capacity_days = g.capacity_days, burst_max = g.burst_max, burst_max_vcpus = g.burst_max_vcpus,
-        lookahead_hours = g.lookahead_hours, reserve_fraction = g.reserve_fraction, resume_fraction = g.resume_fraction
+        lookahead_hours = g.lookahead_hours, reserve_fraction = g.reserve_fraction, resume_fraction = g.resume_fraction,
+        throttled_vcpus = g.throttled_vcpus
       } })
       VCPU_HOUR_USD = tostring(local.runner_cost.vcpu_hour_usd)
       HOST_HOUR_USD = tostring(local.runner_cost.host_hour_usd)
@@ -757,7 +765,7 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" {
 # arithmetic, so this is the backstop that catches the bucket draining too little. While bursting, the bucket lets a
 # group spend at most its full capacity plus a day's refill in any day ($150: 232 vCPUs held all day at runner_cost),
 # and the hosts still running when it throttles come on top (no host outlives 3 hours: 3 h of 512 vCPUs is 64 averaged
-# over the day). Throttled, Imagine holds at most 192 vCPUs. So a day in which every hour averages more than
+# over the day). Throttled, Imagine holds at most its group's 72 vCPUs. So a day in which every hour averages more than
 # 232 + 64 = 296 vCPUs is more than the bucket can allow. Until the bucket this fired at 128 vCPUs in 6 of 24 hours,
 # which bursting now reaches on an ordinary busy day; the bucket enforces the spend, and this is retuned to a backstop.
 # Missing data is the reconcile-silent alarm's to report.
@@ -809,8 +817,9 @@ resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" {
 
 # Per budget group: the last 7 days of the bucket's drain (SpendUsd7d) above 7 days of budget, a backstop to the
 # bucket's arithmetic. The bucket bounds the long-run average to daily_usd, but a week that starts with a full bucket
-# may spend its whole capacity on top ($350 + $100), and spend at the throttled caps past the refill is not carried as
-# debt. So this can fire on legitimate use: it says a week cost more than its budget, and is informational.
+# may spend its whole capacity on top ($350 + $100), and hosts launched in burst run on after a throttle (up to 3 hours)
+# while the level is already at zero. So this can fire on legitimate use: it says a week cost more than its budget, and
+# is informational.
 resource "aws_cloudwatch_metric_alarm" "runner_budget_weekly" {
   for_each            = var.enable_github_runner ? local.runner_budget_served : {}
   alarm_name          = "github-app-runner-budget-weekly-${each.key}"
