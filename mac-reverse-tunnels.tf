@@ -29,6 +29,7 @@ MACCONFIG
 # Public host identity read directly from EJ's MacBook Pro when its tunnel was set up.
 cat > /home/ubuntu/.ssh/known_hosts.mac-tunnels <<'MACHOSTKEYS'
 ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAX5Q08R6QP8SbnpXPZTKTwGgrLz4DnGMZzRw2EDGaxn
+ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL
 MACHOSTKEYS
 
 # Include first so an old Host * cannot override a managed destination. Migrate only
