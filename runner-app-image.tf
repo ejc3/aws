@@ -8,6 +8,7 @@
 #   EventBridge, every 5 min --> github-app-runner-image {}               image a finished builder, prune
 #   on demand: aws lambda invoke --function-name github-app-runner-image \
 #                --cli-binary-format raw-in-base64-out --payload '{"build": ["imagine-runner"]}' /dev/stdout
+#   (any image's name; several at once, or `true` for all of them)
 #
 # The same shape as fcvm's image pipeline (github-ami-builder.tf): a named builder host provisions itself from user
 # data, can do nothing but report one progress tag, and is imaged and terminated by whoever launched it. Here that is a
@@ -54,6 +55,55 @@ locals {
         ELIXIR_VERSION     = "1.20.4"
         PLAYWRIGHT_VERSION = "1.63.0"
         LIBSQL_IMAGE       = "ghcr.io/tursodatabase/libsql-server:v0.24.32"
+      }
+    }
+
+    # The Node web sites, one image per repo (an image carries its repo's tag; the controller boots it for that repo
+    # alone). One script, runner-app/images/node-web-runner.sh; it reads what each pin means. The pins must match each
+    # repository: NODE_MAJOR the node-version (or .nvmrc) of its actions/setup-node steps, PYTHON_VERSIONS the
+    # python-version of its actions/setup-python steps, PLAYWRIGHT_VERSION the @playwright/test version in the
+    # package-lock.json its e2e jobs install from and PLAYWRIGHT_BROWSERS the browsers they install, APT_PACKAGES what
+    # its jobs apt-get install. A pin that falls behind costs time, never correctness.
+    "dolphin-labs-runner" = {
+      repo   = "dolphin-labs-hq/dolphin-labs"
+      script = "node-web-runner.sh"
+      # .github/workflows/ci.yml, cloudflare-stage.yml, refresh-publish.yml; web/package-lock.json.
+      versions = {
+        NODE_MAJOR          = "22"
+        PYTHON_VERSIONS     = "3.11"
+        PLAYWRIGHT_VERSION  = "1.62.1"
+        PLAYWRIGHT_BROWSERS = "chromium,webkit"
+      }
+    }
+    "dolphin-films-runner" = {
+      repo   = "dolphin-labs-hq/dolphin-films"
+      script = "node-web-runner.sh"
+      # .github/workflows/ci.yml, films-ci.yml; web/package-lock.json.
+      versions = {
+        NODE_MAJOR          = "22"
+        PYTHON_VERSIONS     = "3.11"
+        PLAYWRIGHT_VERSION  = "1.62.1"
+        PLAYWRIGHT_BROWSERS = "chromium"
+      }
+    }
+    "dolphin-maps-runner" = {
+      repo   = "dolphin-labs-hq/dolphin-maps"
+      script = "node-web-runner.sh"
+      # .github/workflows/ci.yml, scrape-live.yml (Python's Playwright drives a remote browser: nothing to install).
+      versions = {
+        NODE_MAJOR      = "22"
+        PYTHON_VERSIONS = "3.12"
+      }
+    }
+    "colton-games-runner" = {
+      repo   = "CoderColton/colton-games"
+      script = "node-web-runner.sh"
+      # .nvmrc; .github/workflows/e2e.yml (PostgreSQL for the isolated storage tests); package-lock.json.
+      versions = {
+        NODE_MAJOR          = "24"
+        PLAYWRIGHT_VERSION  = "1.61.1"
+        PLAYWRIGHT_BROWSERS = "chromium,webkit"
+        APT_PACKAGES        = "postgresql-16,postgresql-client-16"
       }
     }
   }
@@ -133,10 +183,11 @@ data "archive_file" "runner_app_image" {
     filename = "bootstrap.sh"
   }
   dynamic "source" {
-    for_each = local.runner_app_images
+    # Each script once: several images share one.
+    for_each = toset([for image in local.runner_app_images : image.script])
     content {
-      content  = file("${path.module}/runner-app/images/${source.value.script}")
-      filename = "images/${source.value.script}"
+      content  = file("${path.module}/runner-app/images/${source.value}")
+      filename = "images/${source.value}"
     }
   }
 }
