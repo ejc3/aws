@@ -408,11 +408,15 @@ data "aws_iam_policy_document" "parallel_box_control" {
   }
 
   # Read-only lookups the script makes: find the running box, price the pools, locate the
-  # volume's AZ. None of these accept resource-level scoping in IAM.
+  # volume's AZ, and (for --fallback and `pbox capacity`) score the spot pools of every US
+  # AZ and list which types each AZ offers. None of these accept resource-level scoping in IAM.
   statement {
     sid    = "DescribeForPbox"
     effect = "Allow"
     actions = [
+      "ec2:GetSpotPlacementScores",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInstanceTypeOfferings",
       "ec2:DescribeInstances",
       "ec2:DescribeInstanceTypes",
       "ec2:DescribeInstanceStatus",
