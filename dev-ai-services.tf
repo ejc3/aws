@@ -169,7 +169,8 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
 # secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
 # signs the builds). The owner creates the key in App
-# Store Connect (Users and Access, Integrations, role App Manager) and sets the value out of band:
+# Store Connect (Users and Access, Integrations, role Admin: cloud signing creates
+# the distribution certificate) and sets the value out of band:
 #   read -rs ISSUER; read -rs KEY_ID; read -rs TEAM; jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" \
 #     --rawfile p AuthKey.p8 '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin; rm AuthKey.p8
