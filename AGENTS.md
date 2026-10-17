@@ -1251,6 +1251,11 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
+  nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
+  `ISSUER_ID`, `KEY_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
+  (`dev-ai-services.tf`). Load it into the environment with the same `eval "$(... | jq -r 'to_entries[] | ...')"`
+  as Browserbase; a tool that needs the key as a file gets a 0600 temporary file it deletes after use.
 - **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
   the paid Anthropic API key that claw-master uses only after every subscription profile is out of
   quota (`dev-ai-services.tf`). From `claude-master-e356d0a` the server checks every 5 minutes that it can pay
