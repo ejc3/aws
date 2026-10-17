@@ -150,8 +150,10 @@ resource "aws_secretsmanager_secret_version" "macbook_ssh_access" {
 }
 
 resource "aws_iam_role_policy" "dev_server_macbook_ssh" {
-  name = "read-macbook-ssh"
-  role = aws_iam_role.dev_server.id
+  # Only while fcvm-arm exists: the grant names its instance.
+  count = var.enable_firecracker_instance ? 1 : 0
+  name  = "read-macbook-ssh"
+  role  = aws_iam_role.dev_server.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
