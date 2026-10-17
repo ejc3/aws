@@ -1925,9 +1925,13 @@ class BootstrapOnAPrebuiltImageTests(unittest.TestCase):
         config_path = "/usr/local/sbin:/usr/local/bin:/usr/bin"
         for listed, expected in ((True, "/home/runner/.cargo/bin:/opt/node/bin:" + config_path), (False, config_path)):
             (tmp / ".path").write_text(config_path + "\n")
+            (tmp / ".env").write_text("RUNNER_TOOL_CACHE=/opt/hostedtoolcache\n")
             script = block.replace("/etc/github-app-runner/path", str(tmp / "path") if listed else str(tmp / "absent"))
             subprocess.run(["bash", "-c", f"set -euo pipefail\nDIR={tmp}\n{script}"], check=True, timeout=30)
             self.assertEqual((tmp / ".path").read_text().strip(), expected, f"listed: {listed}")
+            # The listener run.sh starts reads .env, and only runsvc.sh reads .path: the jobs' PATH is .env's.
+            env_paths = [line[len("PATH="):] for line in (tmp / ".env").read_text().splitlines() if line.startswith("PATH=")]
+            self.assertEqual(env_paths, [expected] if listed else [], f"listed: {listed}")
         self.assertLess(text.index("exec ./config.sh"), text.index("if [ -s /etc/github-app-runner/path ]"),
                         "config.sh writes .path; prepend after it")
 

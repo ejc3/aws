@@ -838,11 +838,13 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
 - **What is in `imagine-runner`.** Everything bootstrap installs, by bootstrap itself (`GITHUB_APP_RUNNER_PREPARE_ONLY=1`,
   which stops before registration), so the runner is bootstrap's pin, refreshed at every build; then
   `runner-app/images/imagine-runner.sh`: pkg-config, docker.io and docker-buildx (the runner in the docker group), rustup
-  in the runner's home with the pinned toolchain, rustfmt, clippy and `wasm32-unknown-unknown`, Node 22 (checked against
-  nodejs.org's SHASUMS256) and pnpm in `/opt/node`, OTP and Elixir from builds.hex.pm (checked against the listing's
+  in the runner's home with the pinned toolchain, rustfmt, clippy and `wasm32-unknown-unknown`, Node at the version
+  ejc3/imagine's setup action pins (checked against nodejs.org's SHASUMS256) and pnpm in `/opt/node`, OTP and Elixir from builds.hex.pm (checked against the listing's
   sha256) in the tool cache exactly where `erlef/setup-beam` caches them, Playwright's Chromium system libraries, and the
-  libSQL server image. `~/.cargo/bin` and `/opt/node/bin` go first on every job's `PATH` (bootstrap rewrites the runner's
-  `.path` from `/etc/github-app-runner/path`). The pins are one `versions` block in `runner-app-image.tf`; they must
+  libSQL server image. `~/.cargo/bin` and `/opt/node/bin` go first on every job's `PATH`: bootstrap puts them, from
+  `/etc/github-app-runner/path`, before the `PATH` config.sh saw and writes that into the runner's `.env`, which the
+  listener `run.sh` starts reads. (The runner's `.path` is read only by the service script `runsvc.sh`, which these
+  hosts do not use, so a `PATH` in `.path` alone never reached a job.) The pins are one `versions` block in `runner-app-image.tf`; they must
   match ejc3/imagine's `rust-toolchain.toml`, its CI workflow and `web/package.json`, and are not read from that
   repository, which is private.
 - **The Node web images.** `dolphin-labs-runner`, `dolphin-films-runner`, `dolphin-maps-runner` and
@@ -871,11 +873,11 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
   `image = "imagine-runner"` (a separate one-line change). Imagine's per-step times are then compared with the Canonical
   baseline above. Expected: about 20 s per small job and 65 s per e2e job, plus part of the 55 s boot, less what lazy
   loading takes back, and less the steps below that download anyway (Node, pnpm and OTP: roughly 5-10 s of it).
-- **What the image cannot save yet.** Imagine's setup decides what to download, and three of its steps download
-  regardless of what is installed: its Node step always fetches the newest Node 22, `pnpm/action-setup` always installs
-  pnpm, and `erlef/setup-beam` never finds a cached OTP. setup-beam caches OTP under the version `ubuntu-24.04/OTP-<v>`,
-  which `@actions/tool-cache`'s `find` cannot match (it is not a semantic version), so only Elixir is found there. Those
-  savings need changes in ejc3/imagine's setup, or in setup-beam; the image already has what they would use.
+- **What Imagine's setup takes from the image.** Its setup action uses what is installed at the version it asks for:
+  Node at its pin (`NODE_VERSION` here must be that pin), pnpm at `web/package.json`'s `packageManager`, OTP and Elixir
+  from the tool cache in setup-beam's layout (set up by the action itself: setup-beam caches OTP under the version
+  `ubuntu-24.04/OTP-<v>`, which `@actions/tool-cache`'s `find` cannot match, so setup-beam never finds it), and buildx
+  0.25.0 or later. Node, pnpm and rustup are found through the job's `PATH`, above.
 
 ## Controller-first credential migration
 
