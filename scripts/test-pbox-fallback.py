@@ -175,6 +175,7 @@ class FallbackScript(unittest.TestCase):
         rc, _, err = self.pbox("up", "1", "--fallback", quota="us-west-2", capacity="us-east-1/us-east-1b")
         self.assertEqual(rc, 0, err)
         self.assertIn("over the account's quota", err)
+        (self.tmp / "state").unlink()  # the fake remembers one launched box, whatever its number
         rc, _, err = self.pbox("up", "2", "--fallback", quota="us-east-1 us-west-2")
         self.assertEqual(rc, 4, err)
 
