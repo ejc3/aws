@@ -1415,8 +1415,8 @@ class VcpuCapTerraformTests(unittest.TestCase):
     def test_imagine_is_capped_at_192_vcpus_with_24_hosts_as_the_backstop_and_no_other_repo_changes(self):
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
         self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }')
-        self.assertEqual(rows[COLTON], '{ label = "cc-games", max = 8 }')
-        self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 8 }')
+        self.assertEqual(rows[COLTON], '{ label = "cc-games", max = 8, image = "colton-games-runner" }')
+        self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 8, image = "dolphin-labs-runner" }')
         self.assertEqual([r for r, row in rows.items() if "max_vcpus" in row], [IMAGINE])
         config = re.search(r"runner_app_config = \{.*?\n  \}", APP_TF, re.S).group()
         self.assertIn("max_vcpus  = try(c.max_vcpus, null)", config)
@@ -1854,7 +1854,11 @@ class PrebuiltImageTerraformTests(unittest.TestCase):
         self.assertIn('c.image == "" || try(local.runner_app_images[c.image].repo, "") == repo', fn,
                       "a plan refuses an image that is unknown or built for another repo")
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
-        self.assertEqual([r for r, row in rows.items() if "image" in row and r != IMAGINE], [], "no other repo opts in")
+        # Each opted-in repo boots the image built for it; dolphin-family has no workflows yet and no image.
+        images = {r: re.search(r'image = "([^"]+)"', row).group(1) for r, row in rows.items() if "image" in row}
+        self.assertEqual(images, {IMAGINE: "imagine-runner", COLTON: "colton-games-runner",
+                                  DOLPHIN: "dolphin-labs-runner", "dolphin-labs-hq/dolphin-films": "dolphin-films-runner",
+                                  "dolphin-labs-hq/dolphin-maps": "dolphin-maps-runner"})
 
     def test_imagine_boots_its_prebuilt_image(self):
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
