@@ -262,3 +262,6 @@ jobs:
 
       - name: gamesworthwatching.com redirects http and www at the edge, assets included
         run: python3 -S -B scripts/test-gww-redirects.py
+
+      - name: CI settings audit parses every trigger and reports failed reads (offline)
+        run: python3 -S -B scripts/test-audit-ci-settings.py
