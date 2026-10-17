@@ -14,7 +14,9 @@
 # Workers Builds deploy token does (issue #22); dev boxes cannot read state. Issue #16 rules out
 # curl and local-exec for Cloudflare resources, so there is no mint script. ROTATE with
 # `terraform apply -replace=cloudflare_account_token.workers_deploy`, then re-run
-# `scripts/workers-deploy-secret.sh OWNER/REPO` for each site repo. The token is deliberately not
+# `scripts/workers-deploy-secret.sh OWNER/REPO` for each site repo except dolphin-labs, whose copy is the
+# `cloudflare-deploy` environment secret the same apply rewrites (dolphin-labs-ci-logs.tf; the script refuses that
+# repo). The token is deliberately not
 # IP-pinned: GitHub's runners have no stable address.
 #
 # WHERE THE VALUE GOES: a GitHub Actions secret named CLOUDFLARE_API_TOKEN in each site repo

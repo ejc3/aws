@@ -1522,7 +1522,9 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   Builds deploy token's is; dev boxes cannot read state). Permissions: Workers Scripts Write and Account Settings Read on the one
   account. There is deliberately no mint script (issue #16: no curl or local-exec for Cloudflare resources). Rotate with
   `terraform apply -replace=cloudflare_account_token.workers_deploy`, then `scripts/workers-deploy-secret.sh OWNER/REPO [account]`
-  for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied).
+  for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied),
+  except dolphin-labs: its deploy jobs read the token from the main-only `cloudflare-deploy` environment, which the same apply
+  rewrites (`dolphin-labs-ci-logs.tf`), and the script refuses to set a repository secret there.
 - **The account token is pinned to the jumpboxes' addresses, IPv6 included.** `cloudflare-account-token` allows only
   `52.9.31.202/32`, `13.56.106.229/32` and the two jumpboxes' IPv6 `/128`s. Terraform's HTTP client prefers IPv6, so an IPv4-only
   pin fails every plan with `9109 Cannot use the access token from location: 2600:...`. If a jumpbox is replaced or gains a new

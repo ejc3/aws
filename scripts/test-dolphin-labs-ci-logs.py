@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""dolphin-labs-ci-logs.tf: dolphin-labs' post-deploy check gets a token that can only read Workers Logs, and its deploy
-jobs get the Workers deploy token; only jobs on that repository's main branch can read either."""
+"""dolphin-labs-ci-logs.tf: dolphin-labs' post-deploy check gets a token that can only read Workers Logs, and a main-only
+environment holds the Workers deploy token for its deploy jobs. Until those jobs name the environment and the old
+repository secret is deleted (dolphin-labs#643), the repository secret still gives the deploy token to any branch."""
 import re
 import unittest
 from pathlib import Path
