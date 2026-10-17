@@ -1005,18 +1005,18 @@ Terraform creates only the container `games-worth-watching/app-store-connect` (u
 TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, after the apply:
 
 1. In App Store Connect, Users and Access, Integrations, App Store Connect API, create a team key with the **Admin**
-   role (cloud signing creates the distribution certificate, which App Manager may not). Download its `.p8` file and
-   note the Issuer ID, the Key ID and the developer Team ID.
+   role (cloud signing creates the distribution certificate, which App Manager may not). Download its `.p8` file (Apple names it
+   `AuthKey_<KEY_ID>.p8`) into the current directory, and note the Issuer ID, the Key ID and the developer Team ID.
 2. On a jumpbox, put the four values as one JSON object without echoing them, then delete the file:
 
    ```bash
    read -rs ISSUER; read -rs KEY_ID; read -rs TEAM
    set -o pipefail
-   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" --rawfile p AuthKey.p8 \
+   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" --rawfile p "AuthKey_${KEY_ID}.p8" \
      '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' \
      | aws secretsmanager put-secret-value --region us-west-1 \
          --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin \
-     && rm AuthKey.p8
+     && rm "AuthKey_${KEY_ID}.p8"
    unset ISSUER KEY_ID TEAM
    ```
 
