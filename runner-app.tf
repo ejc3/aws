@@ -678,7 +678,7 @@ variable "dolphin_maps_token_ready" {
 variable "imagine_token_ready" {
   description = "ejc3/imagine's controller token has a value in Secrets Manager, so its webhook can be created"
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {
