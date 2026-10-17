@@ -14,6 +14,7 @@
 #   dolphin-labs-hq/dolphin-films  minted by ejc3 as org admin (its own token: each is limited
 #                                  to one repo, so dolphin-labs' cannot register runners here)
 #   dolphin-labs-hq/dolphin-maps   minted by ejc3 as org admin (its own token, likewise)
+#   dolphin-labs-hq/dolphin-family minted by ejc3 as org admin (its own token, likewise)
 #   ejc3/imagine                   minted by ejc3, Administration RW + Actions read only: its hook
 #                                  is made by the administration GitHub App, not with this token.
 #                                  Never fcvm's /github-runner/pat, which is limited to ejc3/fcvm.
@@ -29,7 +30,7 @@
 # Only administration and Pattern C's controller (runner_app_lambda) may read it; fcvm's metal controller never does. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
-  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
+  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family", "ejc3/imagine"]
 }
 
 resource "aws_secretsmanager_secret" "github_runner_repo_pat" {

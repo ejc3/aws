@@ -35,7 +35,7 @@ locals {
   # so sharing the label shares nothing else: its cap of 2 is its own and it can never take one
   # of dolphin-labs' 8. `alarm` names its per-repo alarm, which would otherwise collide with
   # dolphin-labs' (both are named after the label). dolphin-maps (another dolphin-labs-hq
-  # project) is the same shape: the `dolphin` label, its own cap of 2, its own alarm.
+  # project) is the same shape: the `dolphin` label, its own cap of 2, its own alarm; so is dolphin-family.
   #
   # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
   # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
@@ -47,6 +47,9 @@ locals {
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
     "ejc3/imagine"                  = { label = "imagine", max = 8 }
+
+    # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
+    "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 2, alarm = "dolphin-family" }
   }
 
   # A repo whose token gate is false is left out of the controller's REPOS as well: with no token its every reconcile
@@ -68,6 +71,7 @@ locals {
   # would need Colton's own account) keeps its PAT. The PAT stays the fallback until the app is proven in production.
   # ejc3/imagine takes the app's token once the app is installed on ejc3 (selected repositories: imagine only) and that
   # installation is in github-app/runners; until then app_token() finds no ejc3 installation and its PAT is used.
+  # dolphin-family is not here: it uses its own controller token until the runners app's installation is widened to it.
   runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
   # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
   # counting its cap would loosen the combined alarm before it serves anything.
@@ -673,6 +677,13 @@ variable "dolphin_maps_token_ready" {
   default     = true
 }
 
+# The same gate for dolphin-family: false until the org owner has minted and stored its token, then true in a commit.
+variable "dolphin_family_token_ready" {
+  description = "dolphin-labs-hq/dolphin-family's controller token has a value in Secrets Manager, so its webhook can be created"
+  type        = bool
+  default     = false
+}
+
 # The same gate for ejc3/imagine: true once its controller token is stored (runner-repos.tf). Its hook is made by the
 # administration GitHub App, but the gate still keeps the token read and the controller entry out until the token exists.
 variable "imagine_token_ready" {
@@ -690,10 +701,14 @@ locals {
     "dolphin-labs-hq/dolphin-films" = var.dolphin_films_token_ready
     "dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready
     "ejc3/imagine"                  = var.imagine_token_ready
+
+    "dolphin-labs-hq/dolphin-family" = var.dolphin_family_token_ready
   }
   dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready
   dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready
   imagine_webhook       = local.runner_app_webhooks && var.imagine_token_ready
+
+  dolphin_family_webhook = local.runner_app_webhooks && var.dolphin_family_token_ready
 
   runner_app_webhook_repos = [
     for r in local.runner_extra_repos : r
@@ -822,6 +837,23 @@ resource "github_repository_webhook" "runner_app_dolphin_maps" {
   count      = local.dolphin_maps_webhook ? 1 : 0
   provider   = github.dolphin_labs
   repository = "dolphin-maps"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+resource "github_repository_webhook" "runner_app_dolphin_family" {
+  count      = local.dolphin_family_webhook ? 1 : 0
+  provider   = github.dolphin_labs
+  repository = "dolphin-family"
   events     = ["workflow_job"]
   active     = true
 
