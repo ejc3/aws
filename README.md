@@ -842,8 +842,12 @@ pass. Undo, so the next boot does not put it back:
   tunnel, and nothing more: every request still has to pass Access. Rotating it replaces
   `cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh` (a new tunnel id and token), which
   disconnects the Mac's connector, the route that `ssh macbook` would use to install the
-  new one. So first restore the reverse route (the way back, above), then send the new
-  token as in step 1 (the `aws ... | ssh macbook 'umask 077; cat > ...'` line), restart
+  new one. An ordinary apply changes nothing (the configuration has not changed), so the
+  rotation is forced. First restore the reverse route (the way back, above), then, from a
+  fresh worktree, `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
+  (a new tunnel, its config and DNS record follow it, and `macbook-ssh-tunnel` gets the new
+  token; the old tunnel's config cannot be destroyed by Terraform, so delete the old tunnel in
+  the API afterwards). Then send the new token as in step 1 (the `aws ... | ssh macbook 'umask 077; cat > ...'` line), restart
   the connector with `launchctl kickstart -k gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared`,
   repeat step 3, point `Host macbook` back through Cloudflare (step 4) and check
   `ssh macbook 'echo through cloudflare'`, and only then retire the reverse route again
