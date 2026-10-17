@@ -54,6 +54,9 @@ def get(tok, path):
             return e.code, json.load(e)
         except ValueError:
             return e.code, None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        # A timeout, a refused connection or a truncated body: status 0, which every caller reports as not readable.
+        return 0, None
 
 
 def paged(tok, path, key):
@@ -90,7 +93,8 @@ def workflows(tok, full):
 
 def triggers(text):
     """The workflow's trigger names, from the `on:` key (inline list, map or single word)."""
-    m = re.search(r"^(?:on|\"on\"|'on'|true):\s*(.*)$", text, re.M)
+    # [ \t]*, not \s*: \s would cross the newline and read a block's first key as the inline form.
+    m = re.search(r"^(?:on|\"on\"|'on'|true):[ \t]*(.*)$", text, re.M)
     if not m:
         return set()
     inline = m.group(1).strip()
