@@ -97,6 +97,22 @@ class FakeEC2:
     def terminate_instances(self, InstanceIds):
         self.terminated += InstanceIds
 
+    def describe_images(self, Owners, Filters):
+        """As EC2 answers: Owners by account id, each filter a match on any of its values. With `ignore_image_filters`, a
+        listing that lets everything through, so the controller's own check is what is tested."""
+        self.image_queries = getattr(self, "image_queries", []) + [{"Owners": Owners, "Filters": Filters}]
+        if getattr(self, "image_error", None):
+            raise self.image_error
+        images = list(getattr(self, "images", []))
+        if getattr(self, "ignore_image_filters", False):
+            return {"Images": images}
+        def matches(image, name, values):
+            if name.startswith("tag:"):
+                return any(t["Key"] == name[4:] and t["Value"] in values for t in image.get("Tags", []))
+            return {"state": image.get("State"), "architecture": image.get("Architecture")}[name] in values
+        return {"Images": [i for i in images if i["OwnerId"] in Owners
+                           and all(matches(i, f["Name"], f["Values"]) for f in Filters)]}
+
 
 class FakeDynamo:
     """The launch-claim table: a conditional put that only one caller can win."""
@@ -1722,6 +1738,203 @@ class RunnersAppTerraformTests(unittest.TestCase):
         self.assertIn("[aws_secretsmanager_secret.github_app_runners[0].arn])", self.TF)
         self.assertIn('"aws:PrincipalArn" = concat([aws_iam_role.runner_app_lambda[0].arn], local.github_admin_token_readers)', self.TF)
         self.assertIn('count                   = var.enable_github_runner ? 1 : 0\n  name                    = "github-app/runners"', self.TF)
+
+
+# ---------------------------------------------------------------- prebuilt images (runner-app-image.tf)
+ACCOUNT, CANONICAL = "123456789012", "099720109477"
+IMAGE_PURPOSE = "github-app-runner-image"
+
+
+def ami(image_id, created, owner=ACCOUNT, purpose=IMAGE_PURPOSE, name="imagine-runner", repo=IMAGINE,
+        state="available", arch="x86_64"):
+    tags = [{"Key": k, "Value": v} for k, v in (("Purpose", purpose), ("Image", name), ("Repo", repo)) if v is not None]
+    return {"ImageId": image_id, "OwnerId": owner, "CreationDate": created, "State": state, "Architecture": arch,
+            "RootDeviceName": "/dev/sda1", "Tags": tags}
+
+
+def image_cfg(image="imagine-runner"):
+    """Imagine's config as runner-app.tf passes it once it sets `image`."""
+    return dict(REPOS[IMAGINE], image=image)
+
+
+class PrebuiltImageTests(unittest.TestCase):
+    """A repo that sets `image` boots the newest build of it made and tagged by this account's pipeline, for that repo;
+    every other repo, and an opted-in repo with no such image, boots Canonical's Ubuntu 24.04."""
+
+    def launch(self, app, cfg, repo=IMAGINE, job=31):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            outcome, _ = app.ensure_runner(repo, cfg, SUBNETS, "PAT", str(job), "s", [])
+        return outcome, out.getvalue()
+
+    def test_an_opted_in_repo_launches_the_newest_tagged_image_this_account_built_for_it(self):
+        app, ec2, *_ = load_app()
+        ec2.images = [ami("ami-old", "2026-10-05T09:20:00.000Z"), ami("ami-new", "2026-10-12T09:20:00.000Z"),
+                      ami("ami-middle", "2026-10-08T09:20:00.000Z")]
+        outcome, log = self.launch(app, image_cfg())
+        self.assertEqual(outcome, "launched")
+        (kw,) = ec2.launched
+        self.assertEqual(kw["ImageId"], "ami-new")
+        self.assertEqual(kw["BlockDeviceMappings"][0]["DeviceName"], "/dev/sda1")
+        self.assertIn("launching from imagine-runner image ami-new", log)
+        # Asked of EC2 as this account's own images, by the pipeline's tags, for this repo, available and x86.
+        (query,) = ec2.image_queries
+        self.assertEqual(query["Owners"], [ACCOUNT])
+        filters = {f["Name"]: f["Values"] for f in query["Filters"]}
+        self.assertEqual(filters, {"tag:Purpose": [IMAGE_PURPOSE], "tag:Image": ["imagine-runner"], "tag:Repo": [IMAGINE],
+                                   "state": ["available"], "architecture": ["x86_64"]})
+
+    def test_a_repo_that_has_not_opted_in_still_launches_canonicals_image(self):
+        # The opt-in is per repo: with images on hand, the repo that names one gets it, and a repo that does not (another
+        # repo, or Imagine's own entry without `image`) gets Canonical's, without listing any image.
+        app, ec2, *_ = load_app()
+        ec2.images = [ami("ami-new", "2026-10-12T09:20:00.000Z"), ami("ami-colton", "2026-10-12T09:20:00.000Z", repo=COLTON)]
+        for repo, cfg in ((IMAGINE, image_cfg()), (IMAGINE, REPOS[IMAGINE]), (COLTON, REPOS[COLTON]),
+                          (IMAGINE, image_cfg(image=""))):
+            self.assertEqual(self.launch(app, cfg, repo=repo, job=len(ec2.launched) + 40)[0], "launched")
+        self.assertEqual([kw["ImageId"] for kw in ec2.launched], ["ami-new"] + ["ami-canonical"] * 3)
+        self.assertEqual(len(getattr(ec2, "image_queries", [])), 1, "only the opted-in launch lists images")
+
+    def test_with_no_image_it_falls_back_to_canonicals_and_says_so(self):
+        app, ec2, *_ = load_app()
+        ec2.images = []
+        outcome, log = self.launch(app, image_cfg())
+        self.assertEqual(outcome, "launched")
+        self.assertEqual(ec2.launched[0]["ImageId"], "ami-canonical")
+        self.assertIn("no available imagine-runner image built by this account; launching Canonical's Ubuntu 24.04 instead", log)
+
+    def test_an_image_that_cannot_be_listed_falls_back_to_canonicals_and_says_why(self):
+        app, ec2, *_ = load_app()
+        ec2.image_error = Refused("RequestLimitExceeded")
+        outcome, log = self.launch(app, image_cfg())
+        self.assertEqual((outcome, ec2.launched[0]["ImageId"]), ("launched", "ami-canonical"))
+        self.assertIn("listing its imagine-runner images failed (Refused", log)
+
+    def test_an_untagged_foreign_or_unfinished_image_is_never_chosen(self):
+        # Every one of these is newer than the one good image, and the listing lets them all through: the controller's
+        # own check still picks the good one, and with the good one gone, Canonical's.
+        newer = "2026-10-14T09:20:00.000Z"
+        decoys = [ami("ami-no-purpose", newer, purpose=None), ami("ami-fcvm-purpose", newer, purpose="github-runner"),
+                  ami("ami-other-account", newer, owner="210987654321"), ami("ami-canonical-owner", newer, owner=CANONICAL),
+                  ami("ami-other-name", newer, name="dolphin-runner"), ami("ami-other-repo", newer, repo=COLTON),
+                  ami("ami-pending", newer, state="pending"), ami("ami-arm", newer, arch="arm64")]
+        for ignore in (False, True):
+            app, ec2, *_ = load_app()
+            ec2.ignore_image_filters = ignore
+            ec2.images = decoys + [ami("ami-good", "2026-10-01T09:20:00.000Z")]
+            self.launch(app, image_cfg())
+            ec2.images = decoys
+            self.launch(app, image_cfg(), job=32)
+            self.assertEqual([kw["ImageId"] for kw in ec2.launched], ["ami-good", "ami-canonical"], f"filters ignored: {ignore}")
+
+
+class PrebuiltImageTerraformTests(unittest.TestCase):
+    POLICY = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
+
+    def statement(self, sid):
+        return self.POLICY.split(f'Sid      = "{sid}"', 1)[1].split("\n      },", 1)[0]
+
+    def test_the_launch_policy_admits_only_this_accounts_images_with_the_pipelines_tag(self):
+        stmt = self.statement("LaunchPrebuiltRunnerImages")
+        self.assertIn('Action   = "ec2:RunInstances"', stmt)
+        self.assertIn('Resource = "arn:aws:ec2:us-west-1::image/*"', stmt)
+        self.assertIn('"ec2:Owner"               = data.aws_caller_identity.current.account_id', stmt)
+        self.assertIn('"aws:ResourceTag/Purpose" = local.runner_app_image_purpose', stmt)
+        self.assertNotIn("github-runner\"", stmt, "never fcvm's Purpose=github-runner images")
+        # Every image statement is one of the two: Canonical's, or this account's tagged ones.
+        image_statements = re.findall(r'Sid\s+= "([^"]+)"[^}]*?Resource\s+= "arn:aws:ec2:us-west-1::image/\*"', self.POLICY, re.S)
+        self.assertEqual(image_statements, ["LaunchCanonicalImagesOnly", "LaunchPrebuiltRunnerImages"])
+        image_tf = (ROOT / "runner-app-image.tf").read_text()
+        self.assertIn('runner_app_image_purpose           = "github-app-runner-image"', image_tf)
+
+    def test_image_is_optional_and_defaults_to_canonicals(self):
+        config = re.search(r"runner_app_config = \{.*?\n  \}", APP_TF, re.S).group()
+        self.assertIn('image      = try(c.image, "")', config)
+        fn = re.search(r'resource "aws_lambda_function" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('c.image == "" || try(local.runner_app_images[c.image].repo, "") == repo', fn,
+                      "a plan refuses an image that is unknown or built for another repo")
+        rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
+        self.assertEqual([r for r, row in rows.items() if "image" in row and r != IMAGINE], [], "no other repo opts in")
+
+
+class BootstrapOnAPrebuiltImageTests(unittest.TestCase):
+    """bootstrap.sh's install steps skip what a prebuilt image already has, and install it on Canonical's image."""
+
+    def run_block(self, start, end, setup, stubs):
+        text = BOOTSTRAP.read_text()
+        block = text[text.index(start):text.index(end, text.index(start))]
+        tmp = Path(tempfile.mkdtemp(prefix="bootstrap-block."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        (tmp / "bin").mkdir()
+        for name, body in stubs.items():
+            (tmp / "bin" / name).write_text("#!/bin/bash\n" + body)
+            (tmp / "bin" / name).chmod(0o755)
+        out = subprocess.run(["bash", "-c", "set -euo pipefail\n" + setup + "\n" + block], cwd=tmp, capture_output=True,
+                             text=True, timeout=30, env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin", "T": str(tmp)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return tmp
+
+    def test_packages_are_installed_only_when_one_is_missing(self):
+        log = 'echo "$(basename "$0") $*" >> "$T/calls"\n'
+        start, end = "PACKAGES=(", "id -u runner"
+        installed = {"dpkg-query": "echo 'install ok installed'\n", "apt-get": log}
+        tmp = self.run_block(start, end, "", installed)
+        self.assertFalse((tmp / "calls").exists(), "a prebuilt image runs no apt at all")
+        missing = {"dpkg-query": '[ "${@: -1}" = jq ] && exit 1; echo "install ok installed"\n', "apt-get": log}
+        tmp = self.run_block(start, end, "", missing)
+        calls = (tmp / "calls").read_text().splitlines()
+        self.assertEqual(calls[0], "apt-get update -q")
+        self.assertTrue(calls[1].startswith("apt-get install -y -q python3-boto3 git curl jq"), calls)
+
+    def test_the_runner_is_downloaded_unless_this_exact_version_is_there(self):
+        text = BOOTSTRAP.read_text()
+        version = re.search(r"^RUNNER_VERSION='([^']+)'$", text, re.M).group(1)
+        start, end = 'if [ "$(cat "$DIR/.runner-version"', "# The tool cache lives"
+        stubs = {"curl": 'echo "curl $*" >> "$T/calls"\n', "sha256sum": "cat >/dev/null\n", "tar": "true\n",
+                 "chown": "true\n"}
+        setup = (f"RUNNER_VERSION='{version}' RUNNER_SHA256=x DIR=$T/actions-runner\n"
+                 'mkdir -p "$DIR/bin"; printf "#!/bin/bash\\necho deps >> $T/calls\\n" > "$DIR/bin/installdependencies.sh"; '
+                 'chmod +x "$DIR/bin/installdependencies.sh"\n')
+        for marker, downloads in ((version, False), ("2.300.0", True), (None, True)):
+            write = f'echo {marker} > "$DIR/.runner-version"' if marker else "true"
+            # A fresh download unpacks a new installdependencies.sh; the stub tar unpacks nothing, so put one back.
+            stubs["tar"] = ('mkdir -p "$T/actions-runner/bin"; printf "#!/bin/bash\\necho deps >> $T/calls\\n" '
+                            '> "$T/actions-runner/bin/installdependencies.sh"; chmod +x "$T/actions-runner/bin/installdependencies.sh"\n')
+            tmp = self.run_block(start, end, setup + write, stubs)
+            calls = (tmp / "calls").read_text().splitlines() if (tmp / "calls").exists() else []
+            self.assertEqual(any(c.startswith("curl ") for c in calls), downloads, (marker, calls))
+            self.assertEqual("deps" in calls, downloads, (marker, calls))
+            self.assertEqual((tmp / "actions-runner" / ".runner-version").read_text().strip(), version)
+
+    def test_a_prebuilt_images_tool_directories_go_first_on_the_jobs_path(self):
+        text = BOOTSTRAP.read_text()
+        block = text[text.index("if [ -s /etc/github-app-runner/path ]"):text.index("sudo -u runner -H ./run.sh")]
+        tmp = Path(tempfile.mkdtemp(prefix="path."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        (tmp / "path").write_text("/home/runner/.cargo/bin\n/opt/node/bin\n")
+        config_path = "/usr/local/sbin:/usr/local/bin:/usr/bin"
+        for listed, expected in ((True, "/home/runner/.cargo/bin:/opt/node/bin:" + config_path), (False, config_path)):
+            (tmp / ".path").write_text(config_path + "\n")
+            script = block.replace("/etc/github-app-runner/path", str(tmp / "path") if listed else str(tmp / "absent"))
+            subprocess.run(["bash", "-c", f"set -euo pipefail\nDIR={tmp}\n{script}"], check=True, timeout=30)
+            self.assertEqual((tmp / ".path").read_text().strip(), expected, f"listed: {listed}")
+        self.assertLess(text.index("exec ./config.sh"), text.index("if [ -s /etc/github-app-runner/path ]"),
+                        "config.sh writes .path; prepend after it")
+
+    def test_prepare_only_installs_and_stops_before_registration_and_never_powers_off(self):
+        text = BOOTSTRAP.read_text()
+        stop = text.index('if [ "$PREPARE_ONLY" = 1 ]; then')
+        self.assertLess(text.index('install -d -o runner -g runner "$WORK"'), stop)
+        self.assertLess(stop, text.index("REG_TOKEN=$(python3"))
+        self.assertIn("exit 0", text[stop:text.index("fi", stop)])
+        self.assertIn("PREPARE_ONLY=${GITHUB_APP_RUNNER_PREPARE_ONLY:-0}", text)
+        trap = text.index("trap 'sync; shutdown -h now' EXIT")
+        self.assertIn('if [ "$PREPARE_ONLY" != 1 ]; then\n  trap', text[trap - 40:trap + 5])
+        # User data for a job host never sets it: outside comments, it is only ever read.
+        app, *_ = load_app()
+        code = [l for l in app.user_data(IMAGINE, "imagine,s").splitlines() if not l.lstrip().startswith("#")]
+        self.assertEqual([l for l in code if "GITHUB_APP_RUNNER_PREPARE_ONLY" in l],
+                         ["PREPARE_ONLY=${GITHUB_APP_RUNNER_PREPARE_ONLY:-0}"])
 
 
 if __name__ == "__main__":
