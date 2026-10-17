@@ -8,7 +8,7 @@
 #   fcvm-arm's agents  -- one service token, `macbook-ssh-access` in Secrets Manager
 #
 # Client (fcvm-arm):
-#   ssh -o ProxyCommand='cloudflared access ssh --hostname %h --id $ID --secret $SECRET' \
+#   ssh -o ProxyCommand='cloudflared access ssh --hostname %h --service-token-id $ID --service-token-secret $SECRET' \
 #     ejcampbell@macbook-ssh.cc-games.dev
 #
 # Bring-up, phase 1 (this file): apply. Nothing changes for the MacBook yet: the reverse SSH tunnel
@@ -158,6 +158,8 @@ resource "aws_iam_role_policy" "dev_server_macbook_ssh" {
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
       Resource = [aws_secretsmanager_secret.macbook_ssh_tunnel.arn, aws_secretsmanager_secret.macbook_ssh_access.arn]
+      # dev_server is fcvm-x86's role too: only credentials issued to fcvm-arm's own instance may read these.
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
     }]
   })
 }
