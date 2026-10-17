@@ -437,6 +437,12 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('alarm_name          = "github-app-runner-image-errors"', self.block("aws_cloudwatch_metric_alarm", "runner_app_image_errors"))
         self.assertIn('--payload \'{"build": ["imagine-runner"]}\'', IMAGE_TF, "the on-demand call is written down")
 
+    def test_the_functions_describe_calls_stay_in_us_west_1(self):
+        # Describe calls take no resource ARN, so without the region condition the role could list every region.
+        policy = self.block("aws_iam_role_policy", "runner_app_image_lambda")
+        describe = self.statement(policy, "Describe")
+        self.assertIn('"aws:RequestedRegion" = "us-west-1"', describe)
+
     def test_the_builder_host_can_only_report_complete(self):
         policy = self.block("aws_iam_role_policy", "runner_app_image_builder")
         allows = re.findall(r'Effect\s*=\s*"Allow"\s*\n\s*Action\s*=\s*("[^"]*"|\[[^\]]*\])', policy)

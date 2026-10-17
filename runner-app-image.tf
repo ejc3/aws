@@ -180,10 +180,12 @@ resource "aws_iam_role_policy" "runner_app_image_lambda" {
         Resource = "arn:aws:ssm:us-west-1::parameter/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
       },
       {
-        Sid      = "Describe"
-        Effect   = "Allow"
-        Action   = ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSnapshots"]
-        Resource = "*"
+        # Describe calls take no resource ARN, so the region is the bound: the function's clients are pinned to us-west-1.
+        Sid       = "Describe"
+        Effect    = "Allow"
+        Action    = ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSnapshots"]
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = "us-west-1" } }
       },
       {
         # As runner-app.tf's LaunchCanonicalImagesOnly: Canonical's images report ImageOwnerAlias "amazon".
