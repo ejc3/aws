@@ -174,7 +174,8 @@ class WatchdogHarness(unittest.TestCase):
             def describe_instances(self, Filters):
                 return {'Reservations': [{'Instances': [
                     {'InstanceId': iid, 'LaunchTime': now - datetime.timedelta(minutes=age),
-                     'Tags': [{'Key': 'Name', 'Value': name}]} for iid, name, age in instances]}]}
+                     'Tags': [{'Key': 'Name', 'Value': name}] + [{'Key': k, 'Value': v} for k, v in extra]}
+                    for iid, name, age, *more in instances for extra in [more[0] if more else {}.items()]]}]}
 
             def terminate_instances(self, InstanceIds):
                 if terminate_error:
@@ -231,6 +232,16 @@ class WatchdogHarness(unittest.TestCase):
         # each parallel box's alert names ITS slot: the restart command selects that slot's work volume
         for cmd in ('pbox up 2\n', 'pbox up 3\n', 'pbox up\n'):
             self.assertTrue(any(cmd in b for b in idle), (cmd, idle))
+
+    def test_a_fallback_boxs_notice_says_its_fresh_volume_is_gone(self):
+        # pbox-fallback.tf's boxes run on a fresh volume deleted with them: "untouched" would send the owner looking.
+        _, calls = self.run_watchdog([('i-fb', 'parallel-box-2', 45, {'Fallback': 'true'}.items()),
+                                      ('i-home', 'parallel-box-3', 45)], {'i-fb': 1.0, 'i-home': 1.0})
+        fb = [b for b in calls['body'] if 'i-fb' in b][0]
+        home = [b for b in calls['body'] if 'i-home' in b][0]
+        self.assertIn('fresh work volume was deleted with it', fb)
+        self.assertNotIn('Its work volume is untouched', fb)
+        self.assertIn('Its work volume is untouched', home)
 
     def test_failed_terminate_alerts(self):
         actions, calls = self.run_watchdog([('i-old', 'gpu-box', 250), ('i-idle', 'gpu-box', 45)],

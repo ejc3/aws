@@ -254,6 +254,9 @@ jobs:
       - name: pbox shows whether a parallel box is bought spot or on-demand
         run: python3 -S -B scripts/test-parallel-box-mode.py
 
+      - name: "pbox up --fallback: other US AZs with a fresh work volume; plain up exits 3 naming it (pbox-fallback.tf)"
+        run: python3 -S -B scripts/test-pbox-fallback.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
