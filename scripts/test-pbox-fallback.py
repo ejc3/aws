@@ -81,6 +81,9 @@ elif "run-instances" in a:
     if not subnet and os.environ.get("FAKE_HOME_ERROR"):
         print("An error occurred (UnauthorizedOperation) when calling the RunInstances operation")
         sys.exit(254)
+    if subnet and region in os.environ.get("FAKE_QUOTA", "").split():
+        print("An error occurred (VcpuLimitExceeded) when calling the RunInstances operation")
+        sys.exit(254)
     if region + "/" + az in os.environ.get("FAKE_CAPACITY", "").split():
         open(os.environ["FAKE_STATE"], "w").write(region + " " + az)
         print("i-0fallback")
@@ -103,12 +106,12 @@ class FallbackScript(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
 
-    def pbox(self, *args, capacity="", home_error=False, launched=None):
+    def pbox(self, *args, capacity="", home_error=False, launched=None, quota=""):
         if launched:
             (self.tmp / "state").write_text(launched)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp),
                    FAKE_LOG=str(self.log), FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER),
-                   FAKE_CAPACITY=capacity, FAKE_HOME_ERROR="1" if home_error else "",
+                   FAKE_CAPACITY=capacity, FAKE_HOME_ERROR="1" if home_error else "", FAKE_QUOTA=quota,
                    PARALLEL_BOX_TYPES="c8g.48xlarge m8g.48xlarge")
         env.pop("PARALLEL_BOX_REGION", None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
@@ -152,6 +155,28 @@ class FallbackScript(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertTrue(out.strip().endswith("region=us-east-1 az=us-east-1b type=c8g.48xlarge ip=203.0.113.9 work=fresh"))
         self.assertFalse(any("subnet-w2b" in c for c in self.calls("run-instances")))
+
+    def test_regions_still_finds_a_box_running_outside_them(self):
+        # --regions narrows where a new box is searched for, never where an existing one is looked for.
+        rc, out, _ = self.pbox("up", "4", "--regions", "us-east-1", launched="us-west-2 us-west-2b",
+                               capacity="us-east-1/us-east-1a")
+        self.assertEqual(rc, 0)
+        self.assertIn("running box=4 region=us-west-2 az=us-west-2b", out)
+        self.assertEqual(self.calls("run-instances"), [])
+
+    def test_regions_needs_a_value(self):
+        for args in (("up", "2", "--regions"), ("up", "2", "--regions=")):
+            rc, _, err = self.pbox(*args)
+            self.assertEqual(rc, 1, args)
+            self.assertIn("--regions needs a list", err)
+        self.assertEqual(self.calls("run-instances"), [])
+
+    def test_a_quota_refusal_is_no_capacity_there_not_a_real_error(self):
+        rc, _, err = self.pbox("up", "1", "--fallback", quota="us-west-2", capacity="us-east-1/us-east-1b")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("over the account's quota", err)
+        rc, _, err = self.pbox("up", "2", "--fallback", quota="us-east-1 us-west-2")
+        self.assertEqual(rc, 4, err)
 
     def test_unknown_region_is_refused(self):
         rc, _, err = self.pbox("up", "2", "--regions=us-east-9")

@@ -129,8 +129,13 @@ while [ $# -gt 0 ]; do
     1|2|3|4) BOX="$1" ;;
     kvm) MODE="kvm" ;; # "up kvm" is shorthand for box 1 in kvm mode
     --fallback) FALLBACK=1 ;;
-    --regions) shift; ONLY_REGIONS="${1:-}"; FALLBACK=1 ;;
-    --regions=*) ONLY_REGIONS="${1#--regions=}"; FALLBACK=1 ;;
+    --regions)
+      shift
+      [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
+      ONLY_REGIONS="$1"; FALLBACK=1 ;;
+    --regions=*)
+      ONLY_REGIONS="${1#--regions=}"; FALLBACK=1
+      [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-4)"; exit 1 ;;
     *) say "unknown argument '$1' (a box 1-4, kvm, --fallback, --regions r1,r2)"; exit 1 ;;
   esac
@@ -144,13 +149,16 @@ FB_TEMPLATE="$(pointer fallback template)"
 FB_REGIONS="$(pointer fallback regions)"
 fb_subnet() { pointer fallback regions "$1" subnets "$2"; } # fb_subnet REGION AZ
 fb_azs() { pointer fallback regions "$1" subnets; }        # fb_azs REGION
+# FB_REGIONS stays every site, so a box is found (and not launched twice) wherever it runs; --regions narrows only
+# where a new launch is searched for.
+SEARCH_REGIONS="$FB_REGIONS"
 if [ -n "$ONLY_REGIONS" ]; then
   for r in ${ONLY_REGIONS//,/ }; do
     case " $FB_REGIONS " in *" $r "*) ;; *)
       say "no fallback site in '$r' (the sites: ${FB_REGIONS:-none published in /infra/parallel-box})"; exit 1 ;;
     esac
   done
-  FB_REGIONS="${ONLY_REGIONS//,/ }"
+  SEARCH_REGIONS="${ONLY_REGIONS//,/ }"
 fi
 
 set_box() {
@@ -292,8 +300,8 @@ placement_scores() {
 fallback_order() {
   local r az
   # shellcheck disable=SC2086 # a list of regions
-  placement_scores $FB_REGIONS > "$TMP/scored" || : > "$TMP/scored"
-  for r in $FB_REGIONS; do
+  placement_scores $SEARCH_REGIONS > "$TMP/scored" || : > "$TMP/scored"
+  for r in $SEARCH_REGIONS; do
     for az in $(fb_azs "$r"); do
       awk -v r="$r" -v z="$az" '$2 == r && $3 == z { print; found = 1 } END { if (!found) print "? " r " " z }' "$TMP/scored"
     done
@@ -352,6 +360,9 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   case "$OUT" in
     *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*Unsupported*|*capacity-not-available*)
       say "    no capacity for $t in $az -- trying the next one" ;;
+    *VcpuLimitExceeded*|*MaxSpotInstanceCountExceeded*|*InstanceLimitExceeded*)
+      # A regional quota is as final for this region as missing capacity: try elsewhere, not "fix that first".
+      say "    over the account's quota for $t in $REGION -- trying the next one" ;;
     *)
       REAL_ERROR=1
       say "    launch failed for $t in $az:"
@@ -461,7 +472,7 @@ case "$CMD" in
     fi
 
     # ------------------------------------------------------------- fallback sites
-    if [ -z "$FB_REGIONS" ] || [ -z "$FB_TEMPLATE" ]; then
+    if [ -z "$SEARCH_REGIONS" ] || [ -z "$FB_TEMPLATE" ]; then
       say "FAILED: no fallback sites are published in /infra/parallel-box (pbox-fallback.tf not applied?)."
       exit 4
     fi
@@ -509,7 +520,7 @@ case "$CMD" in
       say "FAILED: no fallback launch succeeded, and at least one failed for a reason other than capacity (above)."
       exit 1
     fi
-    say "FAILED: no capacity in the home AZ or any fallback AZ ($FB_REGIONS) for any of: $TYPES"
+    say "FAILED: no capacity in the home AZ or any fallback AZ ($SEARCH_REGIONS) for any of: $TYPES"
     exit 4
     ;;
 

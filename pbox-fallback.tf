@@ -313,3 +313,26 @@ resource "aws_iam_role_policy_attachment" "nextjs_dev_parallel_box_fallback" {
   role       = aws_iam_role.nextjs_dev.name
   policy_arn = aws_iam_policy.parallel_box_fallback.arn
 }
+
+# us-west-1 already runs a watchdog under exactly these names, left from the July 2026 parallel box and in no state.
+# Adopt it rather than collide with it (CreateFunction would fail, and PutRule would silently overwrite its rule):
+# the apply then gives it this module's code, environment and the shared role.
+import {
+  to = module.pbox_fallback_us_west_1.aws_lambda_function.watchdog[0]
+  id = "parallel-box-watchdog"
+}
+
+import {
+  to = module.pbox_fallback_us_west_1.aws_cloudwatch_event_rule.watchdog[0]
+  id = "parallel-box-watchdog"
+}
+
+import {
+  to = module.pbox_fallback_us_west_1.aws_cloudwatch_event_target.watchdog[0]
+  id = "parallel-box-watchdog/parallel-box-watchdog"
+}
+
+import {
+  to = module.pbox_fallback_us_west_1.aws_lambda_permission.watchdog[0]
+  id = "parallel-box-watchdog/AllowExecutionFromCloudWatch"
+}
