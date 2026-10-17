@@ -453,6 +453,8 @@ disk access for remote users" on, and this box's key in the Mac's `~/.ssh/author
 It was `127.0.0.1:22222`, a private `sshd` started by the `com.ejcampbell.fcvm-macbook.sshd`
 LaunchAgent (public-key login for `ejcampbell` only), which stays installed as a fallback.
 
+[`MACBOOK.md`](MACBOOK.md) is the full setup: both ends, the scratch drive, checks, recovery and a rebuild.
+
 Why the move: an external drive is a removable volume to macOS privacy controls, and under
 the private `sshd` every program a session runs is its own responsible process, so each one
 (node, xcodegen, CocoaPods, any new binary) stopped at a "would like to access files on a
