@@ -1180,7 +1180,7 @@ class WiringTests(unittest.TestCase):
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
         # one alarm that each apply rewrites for the other repo, so one cap would go unwatched.
-        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, max_vcpus = \d+)?(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
+        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, max_vcpus = \d+)?(?:, image = "[^"]+")?(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
         served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
         self.assertEqual([repo for repo, _, _ in rows], served, "every served repo's row must parse")
         names = [alarm or label for _, label, alarm in rows]
@@ -1414,7 +1414,7 @@ class VcpuCapTests(unittest.TestCase):
 class VcpuCapTerraformTests(unittest.TestCase):
     def test_imagine_is_capped_at_192_vcpus_with_24_hosts_as_the_backstop_and_no_other_repo_changes(self):
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
-        self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 24, max_vcpus = 192 }')
+        self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }')
         self.assertEqual(rows[COLTON], '{ label = "cc-games", max = 8 }')
         self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 8 }')
         self.assertEqual([r for r, row in rows.items() if "max_vcpus" in row], [IMAGINE])
@@ -1855,6 +1855,12 @@ class PrebuiltImageTerraformTests(unittest.TestCase):
                       "a plan refuses an image that is unknown or built for another repo")
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
         self.assertEqual([r for r, row in rows.items() if "image" in row and r != IMAGINE], [], "no other repo opts in")
+
+    def test_imagine_boots_its_prebuilt_image(self):
+        rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
+        self.assertIn('image = "imagine-runner"', rows[IMAGINE])
+        image_tf = (ROOT / "runner-app-image.tf").read_text()
+        self.assertIn('"imagine-runner" = {\n      repo   = "ejc3/imagine"', image_tf, "built for Imagine itself")
 
 
 class BootstrapOnAPrebuiltImageTests(unittest.TestCase):
