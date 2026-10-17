@@ -329,7 +329,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.xlarge` | 400 GB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
-| `parallel-box`, `parallel-box-2` .. `parallel-box-4` | `us-west-2d` or `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
+| `parallel-box`, `parallel-box-2` .. `parallel-box-4` | `us-west-2d` or `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
@@ -347,6 +347,8 @@ GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> 
 Cloudflare Access -> outbound tunnel -> nextjs-dev -> 127.0.0.1 project ports
 
 us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
+        |
+        |   fallback parallel boxes: their own isolated VPCs in four US regions, no peer, SSH only
         |
         +-> AWS Backup -> us-east-1 DR vault + dev-staging account vault
 ```
