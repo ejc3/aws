@@ -693,8 +693,21 @@ ssh macbook 'launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflar
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist'
 ```
 
-Expect: the tunnel `macbook-ssh` shows one healthy connector in the Cloudflare dashboard,
-and the log ends in `Registered tunnel connection` lines. Like the reverse tunnel, a
+Expect: the log ends in `Registered tunnel connection` lines, and the tunnel reports
+`healthy` with at least one connection. Check that from a jumpbox (only
+`cloudflare-tunnel-token` may read tunnel state; it goes to curl on stdin, never argv):
+
+```bash
+{ set +x; } 2>/dev/null
+T=$(aws secretsmanager get-secret-value --secret-id cloudflare-tunnel-token \
+      --region us-west-1 --query SecretString --output text)
+printf 'Authorization: Bearer %s\n' "$T" | curl -s -H @- \
+  "https://api.cloudflare.com/client/v4/accounts/12ea67fb7ced068de03f35c22688e436/cfd_tunnel?name=macbook-ssh&is_deleted=false" \
+  | python3 -c 'import json,sys; [print(t["status"], len(t.get("connections") or [])) for t in json.load(sys.stdin)["result"]]'
+unset T
+```
+
+`healthy 2` (or any count above zero) is a pass; `down 0` or `inactive 0` is not. Like the reverse tunnel, a
 LaunchAgent runs only while `ejcampbell` is logged in; after a reboot, both routes are down
 until someone logs in at the Mac.
 
@@ -817,8 +830,11 @@ pass. Undo, so the next boot does not put it back:
 - **`ssh macbook` hangs or is refused**: on the Mac,
   `launchctl kickstart -k gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared` and read
   `~/Library/Logs/macbook-ssh-cloudflared.log`. If the connector is healthy but the proxy
-  command is refused, check the service token: it lasts a year (`duration = "8760h"`), and
-  the apply that replaces it also updates the secret the proxy command reads.
+  command is refused, check the service token: it lasts a year (`duration = "8760h"`), and an
+  expired one is not replaced by an ordinary apply (its configuration has not changed). Replace
+  it from a fresh worktree: `terraform apply -replace=cloudflare_zero_trust_access_service_token.macbook_ssh_fcvm`.
+  The same apply rewrites `macbook-ssh-access`, which the proxy command reads on every connection,
+  so nothing changes on fcvm-arm. Then check `ssh macbook true` succeeds.
 - **The way back**: put the reverse-tunnel plist back in `~/Library/LaunchAgents`, bootstrap
   it, and point `Host macbook` at `127.0.0.1:2223` again (revert step 4). Both routes end at
   the same Remote Login and verify the same pinned key, so they can run side by side.
