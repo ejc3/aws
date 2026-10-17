@@ -27,8 +27,19 @@ locals {
     s  = ["c7a.2xlarge", "c7i.2xlarge", "c8i.2xlarge", "c6a.2xlarge", "c6i.2xlarge"]
   }
 
+  # vCPUs of one host of each size. Every type listed under a size has this many: these are all
+  # 4 vCPUs per "xlarge", which the controller's precondition below checks by each type's name.
+  # The one map the controller counts vCPUs by (each repo's `vcpus`, and each host's Vcpus tag).
+  runner_app_size_vcpus = { xl = 64, l = 32, s = 8 }
+
   # One entry per served repo. `max` bounds that repo's concurrent hosts; it is separate from
   # fcvm's four per architecture, so these repos can never take fcvm's metal.
+  #
+  # `max_vcpus` (optional) bounds the vCPUs of a repo's concurrent hosts as well: a launch waits
+  # when the vCPUs in use (live hosts, and launches not listed yet, each by its own size) plus
+  # those of the size the job asks for would pass it. `max` stays as a host-count backstop. A repo
+  # without `max_vcpus` is capped by hosts alone. ejc3/imagine's 192 is three full CI runs at once
+  # (one run asks for four `s` and one `l`, 64 vCPUs); 24 hosts is 192 vCPUs of `s`.
   #
   # dolphin-films (a downstream of dolphin-labs, dolphin-films.tf) asks for the same `dolphin`
   # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
@@ -46,7 +57,7 @@ locals {
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
-    "ejc3/imagine"                  = { label = "imagine", max = 8 }
+    "ejc3/imagine"                  = { label = "imagine", max = 24, max_vcpus = 192 }
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
     "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 2, alarm = "dolphin-family" }
@@ -59,8 +70,10 @@ locals {
     for repo, c in local.runner_app_repos : repo => {
       label      = c.label
       max        = c.max
+      max_vcpus  = try(c.max_vcpus, null) # null: no vCPU cap, hosts alone
       pat_secret = "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
+      vcpus      = local.runner_app_size_vcpus
       # Every entry carries app_repo so the map stays one type; empty means "no app, use the PAT".
       app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""
     } if lookup(local.runner_app_token_gates, repo, true)
@@ -74,8 +87,12 @@ locals {
   # dolphin-family is not here: it uses its own controller token until the runners app's installation is widened to it.
   runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
   # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
-  # counting its cap would loosen the combined alarm before it serves anything.
+  # counting its cap would loosen the combined alarm before it serves anything. A repo with a vCPU cap counts its host
+  # backstop: ejc3/imagine's 24 is exactly the most hosts its 192 vCPUs can be (24 `s`), so no lower host count is safe.
   runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])
+
+  # The repos with a vCPU cap: each gets a vCPU alarm at that cap (too_many_app_runner_vcpus_per_repo).
+  runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.max_vcpus != null }
 
   # Canonical's own account. Only its images may be launched by this controller.
   runner_app_ami_owner = "099720109477"
@@ -310,7 +327,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-app-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Repo", "Size", "JobId", "InspectorEc2Exclusion"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion"] }
         }
       },
       {
@@ -366,7 +383,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = aws_dynamodb_table.runner_app_claims[0].arn
       },
       {
-        # Its own runner-count metric, which the alarms below read.
+        # Its own runner-count and vCPU metrics, which the alarms below read.
         Sid       = "PublishRunnerCounts"
         Effect    = "Allow"
         Action    = "cloudwatch:PutMetricData"
@@ -424,6 +441,19 @@ resource "aws_lambda_function" "runner_app" {
   }
 
   tags = { Name = "github-app-runner" }
+
+  lifecycle {
+    precondition {
+      # The vCPU caps count a host by its size, so every type listed under a size must have that size's vCPUs. These
+      # pools are all 4 vCPUs per "xlarge" (c6a/c6i/c7a/c7i/c8i): an N-xlarge type has 4N.
+      condition = alltrue(flatten([
+        for size, types in local.runner_app_sizes : [
+          for t in types : try(4 * tonumber(regex("\\.([0-9]+)xlarge$", t)[0]), -1) == lookup(local.runner_app_size_vcpus, size, 0)
+        ]
+      ]))
+      error_message = "Every instance type under a size in runner_app_sizes must have runner_app_size_vcpus[size] vCPUs."
+    }
+  }
 
   depends_on = [aws_iam_role_policy.runner_app_lambda]
 }
@@ -493,8 +523,10 @@ resource "aws_dynamodb_table" "runner_app_claims" {
   tags = { Name = "github-app-runner-claims" }
 }
 
-# The controller publishes GitHubAppRunner/LiveRunners (Repo=ALL and per repo) on every
-# 2-minute reconcile. AWS/EC2 has no per-tag instance count, so this is the only reliable one.
+# The controller publishes GitHubAppRunner/LiveRunners (Repo=ALL and per repo) and LiveVcpus (per
+# repo) on every 2-minute reconcile. AWS/EC2 has no per-tag instance count, so this is the only
+# reliable one. The combined cap is the sum of every repo's host cap (`max`), which a repo with a
+# vCPU cap keeps as its backstop, so above it the controller is over-launching whatever the sizes.
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "too-many-app-runners"
@@ -552,10 +584,30 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   treat_missing_data  = "notBreaching"
 }
 
-# ejc3/imagine's spend, from the same metric: LiveRunners averaged over an hour is the number of hosts it kept up in that
-# hour. More than 4 in 6 of the last 24 hours is several times its measured volume when it moved here (about 34 runs a day),
-# and an hourly window reports a runaway within about six hours, where one 24-hour period could take more than a day. The
-# per-repo too-many alarm sees a burst over the cap; this sees a cap held too long.
+# Per repo with a vCPU cap: the host alarm above sees only the backstop, and a repo over-launching large hosts passes its
+# vCPU cap long before its host count (7 `xl` hosts are 448 vCPUs). Each such repo's LiveVcpus above its own vCPU cap.
+resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" {
+  for_each            = var.enable_github_runner ? local.runner_app_vcpu_capped : {}
+  alarm_name          = "too-many-app-runner-vcpus-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3 # 15 minutes
+  threshold           = each.value.max_vcpus
+  alarm_description   = "More ${each.key} app runner vCPUs than its cap of ${each.value.max_vcpus}, for 15+ minutes - the controller is over-launching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "LiveVcpus"
+  dimensions          = { Repo = each.key }
+  statistic           = "Maximum"
+  period              = 300
+  treat_missing_data  = "notBreaching"
+}
+
+# ejc3/imagine's spend: LiveVcpus averaged over an hour is the vCPUs it kept up in that hour, and spot cost follows vCPUs,
+# not hosts (an `s` host is a quarter of an `l`). More than 128 (four `l` hosts, as the host-count form of this alarm was
+# priced) in 6 of the last 24 hours is several times its measured volume when it moved here (about 34 runs a day), and an
+# hourly window reports a runaway within about six hours, where one 24-hour period could take more than a day. The
+# per-repo too-many alarms see a burst over a cap; this sees a cap held too long.
 # Missing data is the reconcile-silent alarm's to report.
 resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   count               = var.enable_github_runner && var.imagine_token_ready ? 1 : 0
@@ -563,12 +615,12 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 24
   datapoints_to_alarm = 6
-  threshold           = 4
-  alarm_description   = "ejc3/imagine kept more than 4 app runners up on average in 6 of the last 24 hours (24+ host-hours past its usual volume: about $18 on l spot)"
+  threshold           = 128
+  alarm_description   = "ejc3/imagine kept more than 128 app runner vCPUs (four l hosts) up on average in 6 of the last 24 hours (768+ vCPU-hours past its usual volume: about $18 at spot)"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
-  metric_name         = "LiveRunners"
+  metric_name         = "LiveVcpus"
   dimensions          = { Repo = "ejc3/imagine" }
   statistic           = "Average"
   period              = 3600
