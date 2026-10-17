@@ -48,8 +48,9 @@ class DeployTokenTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_served_with_the_dolphin_label_and_its_own_cap(self):
-        self.assertIn('"dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 2, alarm = "dolphin-family" }', RUNNER_APP)
+    def test_served_with_the_dolphin_label_and_its_own_throttled_cap(self):
+        # Its throttled cap is 2 (runner-app.tf runner_budget_groups: it draws on the dolphin bucket); 64 is its backstop.
+        self.assertIn('"dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-family" }', RUNNER_APP)
         self.assertIn('"dolphin-labs-hq/dolphin-family"', RUNNER_REPOS)
 
     def test_its_token_gate_starts_closed(self):

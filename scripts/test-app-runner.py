@@ -9,6 +9,7 @@ import importlib.util
 import base64
 import contextlib
 import io
+import math
 import os
 import json
 import re
@@ -19,6 +20,7 @@ import textwrap
 import time
 import types
 import unittest
+from unittest import mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,7 +50,10 @@ SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
 ENV = {"REPOS": json.dumps(REPOS), "LAUNCH_SUBNETS": json.dumps(SUBNETS), "SECURITY_GROUP_ID": "sg-app",
        "INSTANCE_PROFILE": "github-app-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012",
-       "CLAIMS_TABLE": "github-app-runner-claims"}
+       "CLAIMS_TABLE": "github-app-runner-claims",
+       # No budget groups unless a test gives some (BudgetTests): every repo above is capped by its own caps alone.
+       "BUDGET_TABLE": "github-app-runner-budget", "BUDGET_GROUPS": "{}",
+       "VCPU_HOUR_USD": "0.027", "HOST_HOUR_USD": "0.016"}
 NOW = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
 
 
@@ -115,15 +120,42 @@ class FakeEC2:
 
 
 class FakeDynamo:
-    """The launch-claim table: a conditional put that only one caller can win."""
+    """The launch-claim table: a conditional put that only one caller can win. And the budget table: one item per group,
+    a consistent get and a put conditional on the item's absence or its version. `conflicts` makes that many bucket
+    writes lose to another writer, which `rival(item)` (when set) stands for by storing its own newer item first."""
     class exceptions:
         class ConditionalCheckFailedException(Exception):
             pass
 
     def __init__(self):
         self.items, self.deleted, self.queries = {}, [], []
+        self.buckets, self.bucket_reads, self.bucket_writes, self.conflicts, self.rival = {}, [], [], 0, None
 
-    def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues):
+    def get_item(self, TableName, Key, ConsistentRead=False):
+        assert TableName == "github-app-runner-budget" and ConsistentRead, (TableName, ConsistentRead)
+        self.bucket_reads.append(Key["group"]["S"])
+        item = self.buckets.get(Key["group"]["S"])
+        return {"Item": json.loads(json.dumps(item))} if item else {}
+
+    def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues=None, ExpressionAttributeNames=None):
+        if TableName == "github-app-runner-budget":
+            group = Item["group"]["S"]
+            self.bucket_writes.append(Item)
+            if self.conflicts:
+                self.conflicts -= 1
+                if self.rival:
+                    self.buckets[group] = self.rival(self.buckets.get(group))
+                raise self.exceptions.ConditionalCheckFailedException(group)
+            held = self.buckets.get(group)
+            if ConditionExpression == "attribute_not_exists(#g)":
+                ok = held is None and ExpressionAttributeNames == {"#g": "group"}
+            else:
+                ok = (ConditionExpression == "#v = :v" and held is not None
+                      and held["version"]["N"] == ExpressionAttributeValues[":v"]["N"])
+            if not ok:
+                raise self.exceptions.ConditionalCheckFailedException(group)
+            self.buckets[group] = Item
+            return
         key, t = (Item["repo"]["S"], Item["job"]["S"]), int(ExpressionAttributeValues[":now"]["N"])
         held = self.items.get(key)
         if held is not None and int(held["expires_at"]["N"]) >= t:
@@ -1170,17 +1202,38 @@ class WiringTests(unittest.TestCase):
         used = set(re.findall(r'runner_repo_pat\["([^"]+)"\]\.secret_string', APP_TF))
         self.assertEqual(used, {COLTON})
 
-    def test_imagine_runaway_alarm_reports_within_hours(self):
+    def test_imagine_runaway_alarm_is_a_backstop_past_what_its_bucket_allows_in_a_day(self):
+        # The bucket enforces Imagine's spend; this alarm, on the controller's own vCPU count, catches the bucket's
+        # arithmetic going wrong: every hour of a day above what the bucket can let out in one.
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("period              = 3600", alarm)
         self.assertIn("evaluation_periods  = 24", alarm)
-        self.assertIn("datapoints_to_alarm = 6", alarm)
+        self.assertIn("datapoints_to_alarm = 20", alarm, "one quiet hour must not clear it")
         self.assertIn('statistic           = "Average"', alarm)
+        self.assertIn("threshold           = local.imagine_runner_alarm_vcpus", alarm)
+
+    def test_the_controllers_environment_leaves_out_the_alarm_only_fields(self):
+        # Lambda's environment is capped at 4 KB in all; peak_max and peak_max_vcpus are read by the alarms alone.
+        self.assertIn('REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v '
+                      'if !contains(["peak_max", "peak_max_vcpus", "sizes", "vcpus"], k) } })', APP_TF)
+        self.assertIn('REPO_SHARED       = jsonencode({ sizes = local.runner_app_sizes, vcpus = local.runner_app_size_vcpus })',
+                      APP_TF)
+        self.assertNotIn("peak_max", (ROOT / "runner-app" / "app_runner.py").read_text())
+
+    def test_shared_settings_arrive_once_and_reach_every_repo(self):
+        app = load_app()[0]
+        slim = {repo: {k: v for k, v in cfg.items() if k not in ("sizes", "vcpus")} for repo, cfg in REPOS.items()}
+        shared = {"sizes": REPOS[COLTON]["sizes"], "vcpus": REPOS[COLTON]["vcpus"]}
+        with mock.patch.dict(os.environ, {"REPOS": json.dumps(slim), "REPO_SHARED": json.dumps(shared)}):
+            repos, _ = app.config()
+        for repo in REPOS:
+            self.assertEqual(repos[repo]["sizes"], shared["sizes"], repo)
+            self.assertEqual(repos[repo]["vcpus"], shared["vcpus"], repo)
 
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
         # one alarm that each apply rewrites for the other repo, so one cap would go unwatched.
-        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, max_vcpus = \d+)?(?:, image = "[^"]+")?(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
+        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, max_vcpus = \d+)?(?:, throttled_max = \d+)?(?:, throttled_max_vcpus = \d+)?(?:, image = "[^"]+")?(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
         served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
         self.assertEqual([repo for repo, _, _ in rows], served, "every served repo's row must parse")
         names = [alarm or label for _, label, alarm in rows]
@@ -1271,7 +1324,7 @@ class WiringTests(unittest.TestCase):
     def test_each_repo_alarms_above_its_own_cap(self):
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("for_each            = var.enable_github_runner ? local.runner_app_config : {}", alarm)
-        self.assertIn("threshold           = each.value.max", alarm)
+        self.assertIn("threshold           = each.value.peak_max", alarm)
         self.assertIn('metric_name         = "LiveRunners"', alarm)
         self.assertIn("dimensions          = { Repo = each.key }", alarm)
         self.assertIn("'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text(),
@@ -1412,12 +1465,12 @@ class VcpuCapTests(unittest.TestCase):
 
 
 class VcpuCapTerraformTests(unittest.TestCase):
-    def test_imagine_is_capped_at_192_vcpus_with_24_hosts_as_the_backstop_and_no_other_repo_changes(self):
+    def test_imagine_throttles_to_8_hosts_bursts_to_its_backstop_and_colton_is_unchanged(self):
         rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
-        self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }')
+        self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 64, throttled_max = 8, image = "imagine-runner" }')
         self.assertEqual(rows[COLTON], '{ label = "cc-games", max = 8, image = "colton-games-runner" }')
-        self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 8, image = "dolphin-labs-runner" }')
-        self.assertEqual([r for r, row in rows.items() if "max_vcpus" in row], [IMAGINE])
+        self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 64, throttled_max = 8, image = "dolphin-labs-runner" }')
+        self.assertEqual([r for r, row in rows.items() if "max_vcpus" in row], [])
         config = re.search(r"runner_app_config = \{.*?\n  \}", APP_TF, re.S).group()
         self.assertIn("max_vcpus  = try(c.max_vcpus, null)", config)
         self.assertIn("vcpus      = local.runner_app_size_vcpus", config)
@@ -1440,28 +1493,468 @@ class VcpuCapTerraformTests(unittest.TestCase):
         self.assertEqual(keys, ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion"])
 
     def test_each_vcpu_capped_repo_alarms_above_its_vcpu_cap(self):
-        self.assertIn("runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.max_vcpus != null }", APP_TF)
+        self.assertIn("runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.peak_max_vcpus != null }", APP_TF)
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("for_each            = var.enable_github_runner ? local.runner_app_vcpu_capped : {}", alarm)
         self.assertIn('alarm_name          = "too-many-app-runner-vcpus-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"', alarm)
-        self.assertIn("threshold           = each.value.max_vcpus", alarm)
+        self.assertIn("threshold           = each.value.peak_max_vcpus", alarm)
         self.assertIn('metric_name         = "LiveVcpus"', alarm)
         self.assertIn("dimensions          = { Repo = each.key }", alarm)
         self.assertIn('statistic           = "Maximum"', alarm)
         self.assertIn("'MetricName': 'LiveVcpus', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text())
-        # The host alarms stay: the combined one still sums every repo's host cap, Imagine's backstop included.
-        self.assertIn("runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])", APP_TF)
+        # The host alarms stay: the combined one sums the most hosts each repo may hold in any mode.
+        self.assertIn("runner_app_max_total = sum([for c in values(local.runner_app_config) : c.peak_max])", APP_TF)
         combined = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("threshold           = local.runner_app_max_total", combined)
         self.assertIn('metric_name         = "LiveRunners"', combined)
 
-    def test_imagines_spend_alarm_counts_vcpus_at_the_spend_it_was_priced_at(self):
-        # Four l hosts (the host-count form's "$18 on l spot") are 128 vCPUs; held 6 hours, 768 vCPU-hours.
+    def test_imagines_spend_alarm_counts_vcpus_past_its_buckets_daily_most(self):
+        # $50 a day with two days banked lets out at most $150 in a day: 232 vCPUs all day at $0.027 per vCPU-hour; the
+        # hosts running when it throttles add 3 h of 512 vCPUs, 64 averaged over the day. 296.
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn('metric_name         = "LiveVcpus"', alarm)
-        self.assertIn("threshold           = 128", alarm)
+        local = re.search(r"imagine_runner_alarm_vcpus = \((.*?)\n  \)", APP_TF, re.S).group(1)
+        self.assertIn("ceil(local.runner_budget.imagine.daily_usd * (1 + local.runner_budget.imagine.capacity_days) / 24 / local.runner_cost.vcpu_hour_usd)", local)
+        self.assertIn("+ ceil(local.runner_budget.imagine.burst_max_vcpus * 3 / 24)", local)
+        import math
+        self.assertEqual(math.ceil(50 * (1 + 2) / 24 / 0.027) + math.ceil(512 * 3 / 24), 296)
         self.assertIn('dimensions          = { Repo = "ejc3/imagine" }', alarm)
         self.assertIn('statistic           = "Average"', alarm)
+
+
+# ---------------------------------------------------------------- budget buckets
+FILMS = "dolphin-labs-hq/dolphin-films"
+# runner-app.tf's runner_budget_defaults, as BUDGET_GROUPS carries them to the controller.
+GROUP = {"daily_usd": 50, "capacity_days": 2, "burst_max": 64, "burst_max_vcpus": 512, "lookahead_hours": 2,
+         "reserve_fraction": 0.15, "resume_fraction": 0.30}
+# Each repo's config as runner-app.tf passes it once the budget groups exist. Colton is in no group, as there.
+BUDGET_REPOS = {
+    COLTON: dict(REPOS[COLTON], budget_group="", throttled_max=3, throttled_max_vcpus=None),
+    DOLPHIN: dict(REPOS[DOLPHIN], max=64, budget_group="dolphin", throttled_max=8, throttled_max_vcpus=None),
+    FILMS: dict(REPOS[DOLPHIN], max=64, budget_group="dolphin", throttled_max=2, throttled_max_vcpus=None,
+                pat_secret=f"github-runner/repo-pat/{FILMS}"),
+    IMAGINE: dict(REPOS[IMAGINE], max=64, budget_group="imagine", throttled_max=8),
+}
+# runner-app.tf's throttled_vcpus at $50 a day: (50/24 - hosts x 0.016) / 0.027, rounded down, with imagine's 8 throttled
+# hosts and dolphin's 14 (8 + 2 + 2 + 2).
+GROUPS = {"imagine": dict(GROUP, throttled_vcpus=72), "dolphin": dict(GROUP, throttled_vcpus=68)}
+# Dollars an hour per host at $0.027 per vCPU-hour plus $0.016 per host-hour.
+RATE = {"s": 8 * 0.027 + 0.016, "l": 32 * 0.027 + 0.016, "xl": 64 * 0.027 + 0.016}
+REFILL_H = 50 / 24
+
+
+def load_budget_app(groups=None):
+    app, ec2, ssm, secrets = load_app({f"github-runner/repo-pat/{r}": f"PAT-{r}" for r in BUDGET_REPOS})
+    os.environ["REPOS"] = json.dumps(BUDGET_REPOS)
+    os.environ["BUDGET_GROUPS"] = json.dumps(groups or GROUPS)
+    return app, ec2
+
+
+def bucket(app, group, level, at=NOW, throttled=False, rate=0.0, spend=None, version=1):
+    app.fake_dynamo.buckets[group] = {
+        "group": {"S": group}, "level_usd": {"N": str(level)}, "updated_at": {"N": str(at.timestamp())},
+        "rate_usd_h": {"N": str(rate)}, "throttled": {"BOOL": throttled},
+        "spend": {"M": {h: {"N": str(v)} for h, v in (spend or {}).items()}}, "version": {"N": str(version)}}
+
+
+def level_of(app, group):
+    return float(app.fake_dynamo.buckets[group]["level_usd"]["N"])
+
+
+def item(level, at, rate=0.0, throttled=False, spend=None, version=1):
+    """A stored bucket as read_bucket() returns it."""
+    return {"level_usd": level, "updated_at": at, "rate_usd_h": rate, "throttled": throttled, "spend": spend or {},
+            "version": version}
+
+
+def aged(repo, sizes, minutes, state="running", first=0):
+    out = hosts(repo, sizes, first)
+    for host in out:
+        host["LaunchTime"], host["State"] = NOW - timedelta(minutes=minutes), {"Name": state}
+    return out
+
+
+class BudgetArithmeticTests(unittest.TestCase):
+    """bucket_step(): refill at $50/86,400 s, drain by what the hosts cost, capped at two days' budget."""
+
+    def step(self, app, stored, listed, now=NOW, g=GROUP):
+        return app.bucket_step(stored, now.timestamp(), listed, lambda i: BUDGET_REPOS[IMAGINE], g)
+
+    def test_an_hour_refills_a_twenty_fourth_of_the_budget_and_drains_what_ran(self):
+        app, _ = load_budget_app()
+        t = NOW.timestamp()
+        # An l host live across the whole hour: charged the hour.
+        state = self.step(app, item(40, t - 3600, rate=RATE["l"]), aged(IMAGINE, ["l"], 120))
+        self.assertAlmostEqual(state["drained"], RATE["l"], places=9)
+        self.assertAlmostEqual(state["level_usd"], 40 + REFILL_H - RATE["l"], places=9)
+        # One launched half-way through: charged from its launch.
+        state = self.step(app, item(40, t - 3600), aged(IMAGINE, ["l"], 30))
+        self.assertAlmostEqual(state["drained"], RATE["l"] / 2, places=9)
+        # One live at the last update and gone now: charged the whole interval, through the rate stored then.
+        state = self.step(app, item(40, t - 3600, rate=RATE["l"]), [])
+        self.assertAlmostEqual(state["drained"], RATE["l"], places=9)
+        # One launched since the last update and terminated already (EC2 still lists it): charged from launch to now.
+        state = self.step(app, item(40, t - 3600), aged(IMAGINE, ["l"], 20, state="terminated"))
+        self.assertAlmostEqual(state["drained"], RATE["l"] * 20 / 60, places=9)
+        self.assertAlmostEqual(state["rate_usd_h"], 0.0, places=9, msg="a terminated host burns nothing from now on")
+
+    def test_the_level_is_capped_at_two_days_budget_and_never_goes_below_zero(self):
+        app, _ = load_budget_app()
+        t = NOW.timestamp()
+        self.assertEqual(self.step(app, item(99, t - 3600), [])["level_usd"], 100, "capacity is 2 x $50")
+        self.assertEqual(self.step(app, item(1, t - 3600, rate=8 * RATE["xl"]), aged(IMAGINE, ["xl"] * 8, 90))["level_usd"], 0)
+        one_day = dict(GROUP, capacity_days=1)
+        self.assertEqual(self.step(app, item(49, t - 3600), [], g=one_day)["level_usd"], 50)
+
+    def test_time_moving_backwards_counts_as_none_and_a_huge_gap_as_three_hours(self):
+        app, _ = load_budget_app()
+        t = NOW.timestamp()
+        state = self.step(app, item(40, t + 600, rate=RATE["s"]), aged(IMAGINE, ["s"], 30))
+        self.assertEqual((state["level_usd"], state["drained"], state["elapsed"], state["updated_at"]), (40, 0.0, 0.0, t))
+        state = self.step(app, item(0, t - 10 * 86400), [])
+        self.assertEqual(state["elapsed"], 3 * 3600, "a gap is clamped to MAX_LIFETIME")
+        self.assertAlmostEqual(state["level_usd"], 50 * 3 / 24, places=9)
+
+    def test_the_7_day_spend_keeps_168_hours_of_drain(self):
+        app, _ = load_budget_app()
+        t = NOW.timestamp()
+        old, recent = str(int(t - 8 * 86400) // 3600 * 3600), str(int(t - 6 * 86400) // 3600 * 3600)
+        state = self.step(app, item(40, t - 3600, rate=RATE["l"], spend={old: 30.0, recent: 12.5}), aged(IMAGINE, ["l"], 120))
+        self.assertNotIn(old, state["spend"])
+        self.assertAlmostEqual(sum(state["spend"].values()), 12.5 + RATE["l"], places=9)
+
+    def test_a_group_idle_two_days_bursts_on_day_three_past_a_one_day_bucket_and_stops_at_two_days(self):
+        app, _ = load_budget_app()
+
+        def run(g):
+            t, stored = NOW.timestamp(), item(0, NOW.timestamp())
+            for _ in range(3 * 720):                                    # three idle days of 2-minute reconciles
+                t += 120
+                stored = self.step(app, stored, [], now=datetime.fromtimestamp(t, timezone.utc), g=g)
+                self.assertLessEqual(stored["level_usd"], 50 * g["capacity_days"] + 1e-9)
+            banked, start = stored["level_usd"], t
+            burst = [dict(h, LaunchTime=datetime.fromtimestamp(t, timezone.utc)) for h in aged(IMAGINE, ["s"] * 64, 0)]
+            spent = 0.0
+            while not stored["throttled"]:                              # 64 s hosts, 512 vCPUs, until it throttles
+                t += 120
+                stored = self.step(app, stored, burst, now=datetime.fromtimestamp(t, timezone.utc), g=g)
+                spent += stored["drained"]
+            return banked, spent, (t - start) / 3600
+
+        banked, spent, hours = run(GROUP)
+        self.assertAlmostEqual(banked, 100, places=6, msg="three idle days bank two days' budget, not three")
+        one_day_banked, one_day_spent, _ = run(dict(GROUP, capacity_days=1))
+        self.assertAlmostEqual(one_day_banked, 50, places=6)
+        self.assertGreater(spent, 50 + REFILL_H * hours, "more than a one-day bucket could ever let out in that time")
+        self.assertGreater(spent, 2.5 * one_day_spent)
+        self.assertLessEqual(spent, 100 + REFILL_H * hours + 1e-6, "no more than the two-day bank plus the refill")
+
+    def test_the_mode_throttles_at_the_reserve_or_the_projection_and_resumes_only_at_the_higher_mark(self):
+        app, _ = load_budget_app()
+        throttle = app.would_throttle
+        self.assertTrue(throttle(14.99, False, 0, GROUP), "under the 15% reserve")
+        self.assertFalse(throttle(15.0, False, 0, GROUP))
+        burn = 9 * RATE["xl"]                                           # $15.70/h: empties $25 within two hours
+        self.assertTrue(throttle(25.0, False, burn, GROUP))
+        self.assertFalse(throttle(30.0, False, burn, GROUP))
+        self.assertTrue(throttle(29.99, True, 0, GROUP), "throttled stays throttled below the 30% mark")
+        self.assertFalse(throttle(30.0, True, 0, GROUP))
+        self.assertTrue(throttle(80.0, True, 50.0, GROUP), "and resumes only with a clear projection")
+
+
+class BudgetLaunchTests(unittest.TestCase):
+    """The bucket deciding launches through ensure_runner() and the reconcile."""
+
+    def ensure(self, app, repo, job, size, live=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            outcome, _ = app.ensure_runner(repo, BUDGET_REPOS[repo], SUBNETS, "PAT", str(job), size, list(live or []))
+        return outcome, out.getvalue()
+
+    def reconcile(self, app):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = app.handler({"reconcile": True}, None)
+        return result, out.getvalue()
+
+    def test_launches_ec2_does_not_list_yet_count_in_the_mode_decision(self):
+        # Five xl launches EC2 has not listed yet: the sixth decision counts their claims as burn ($10.46/h with its own),
+        # which empties the $16 bucket within the 2-hour lookahead, so it throttles; counting only listed hosts, every
+        # decision would see an empty group and keep bursting.
+        app, ec2 = load_budget_app()
+        ec2.listing_lags = True
+        bucket(app, "imagine", 16.0)
+        outcomes = [self.ensure(app, IMAGINE, job, "xl")[0] for job in range(1, 7)]
+        self.assertEqual(outcomes, ["launched"] * 5 + ["cap"])
+        self.assertTrue(app.fake_dynamo.buckets["imagine"]["throttled"]["BOOL"])
+
+    def test_a_claim_whose_host_already_ended_is_not_held_against_the_group(self):
+        # dolphin-films' host is listed, terminated, while its claim waits for films' next round: dolphin-labs must not
+        # count that claim as vCPUs in use.
+        app, ec2 = load_budget_app()
+        ec2.listing_lags = True
+        bucket(app, "dolphin", 5.0, throttled=True)
+        self.assertEqual(self.ensure(app, FILMS, 1, "l")[0], "launched")
+        kw = ec2.launched[-1]
+        ec2.instances.append({"InstanceId": "i-ended", "Tags": kw["TagSpecifications"][0]["Tags"], "LaunchTime": NOW,
+                              "State": {"Name": "terminated"}, "ClientToken": kw["ClientToken"]})
+        ec2.listing_lags = False
+        self.assertEqual(self.ensure(app, DOLPHIN, 2, "xl")[0], "launched", "the group holds nothing")
+
+    def test_burst_under_budget_lets_imagine_past_its_old_cap_of_8(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(IMAGINE, ["s"] * 8, 5)
+        outcome, _ = self.ensure(app, IMAGINE, 9, "s")
+        self.assertEqual(outcome, "launched", "a full bucket bursts past the throttled cap of 8")
+        self.assertEqual(len(ec2.launched), 1)
+        stored = app.fake_dynamo.buckets["imagine"]
+        self.assertEqual((stored["throttled"], level_of(app, "imagine")), ({"BOOL": False}, 100.0))
+        self.assertEqual(app.limits(BUDGET_REPOS[IMAGINE], False), (64, 512))
+        self.assertEqual(app.limits(BUDGET_REPOS[IMAGINE], True), (8, None), "throttled vCPUs are the group's (72)")
+        self.assertEqual(app.limits(dict(BUDGET_REPOS[IMAGINE], max=0), False), (0, 512), "max = 0 still stops it")
+
+    def test_a_projection_that_would_empty_within_the_lookahead_throttles_and_refuses_the_9th_host(self):
+        app, ec2 = load_budget_app()
+        live = aged(IMAGINE, ["xl"] * 8, 5)
+        ec2.instances += live
+        bucket(app, "imagine", 25.0, rate=8 * RATE["xl"])
+        self.assertFalse(app.would_throttle(25.0, False, 8 * RATE["xl"], GROUP), "without the 9th the projection is clear")
+        outcome, log = self.ensure(app, IMAGINE, 9, "xl")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("ejc3/imagine: at its cap of 8 runners; job 9 waits (throttled, budget imagine at $25.00 of $100.00)", log)
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(app.fake_dynamo.buckets["imagine"]["throttled"], {"BOOL": True})
+        self.assertEqual(app.fake_dynamo.items, {}, "a job held back by the bucket takes no claim")
+
+    def test_a_throttled_group_stays_throttled_until_the_level_clears_the_resume_mark(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(IMAGINE, ["s"] * 8, 5)
+        bucket(app, "imagine", 28.0, throttled=True, rate=8 * RATE["s"])
+        self.assertFalse(app.would_throttle(28.0, False, 9 * RATE["s"], GROUP), "in burst, $28 would let the 9th through")
+        outcome, log = self.ensure(app, IMAGINE, 9, "s")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("(throttled, budget imagine at $28.00 of $100.00)", log)
+        bucket(app, "imagine", 31.0, throttled=True, rate=8 * RATE["s"], version=7)
+        self.assertEqual(self.ensure(app, IMAGINE, 9, "s")[0], "launched")
+        self.assertEqual(app.fake_dynamo.buckets["imagine"]["throttled"], {"BOOL": False})
+
+    def test_a_missing_bucket_starts_full(self):
+        app, ec2 = load_budget_app()
+        self.reconcile(app)
+        self.assertEqual({g: level_of(app, g) for g in app.fake_dynamo.buckets}, {"imagine": 100.0, "dolphin": 100.0})
+        bucket(app, "imagine", 3.0, at=NOW - timedelta(minutes=2))
+        del app.fake_dynamo.buckets["imagine"]                          # deleted by hand
+        self.reconcile(app)
+        self.assertEqual(level_of(app, "imagine"), 100.0)
+
+    def test_a_lost_write_rereads_and_counts_the_interval_once(self):
+        app, ec2 = load_budget_app()
+        bucket(app, "imagine", 50.0, at=NOW - timedelta(hours=1), version=4)
+        # Another writer refilled the same hour first; the loser must start from its state, not refill the hour again.
+        app.fake_dynamo.conflicts = 1
+        app.fake_dynamo.rival = lambda held: dict(held, level_usd={"N": str(50 + REFILL_H)},
+                                                  updated_at={"N": str(NOW.timestamp())}, version={"N": "5"})
+        self.assertEqual(self.ensure(app, IMAGINE, 1, "s")[0], "launched")
+        self.assertAlmostEqual(level_of(app, "imagine"), 50 + REFILL_H, places=5)
+        self.assertEqual(len(app.fake_dynamo.bucket_writes), 2)
+        self.assertEqual(app.fake_dynamo.buckets["imagine"]["version"], {"N": "6"})
+
+    def test_a_bucket_that_keeps_changing_defers_the_launch(self):
+        app, ec2 = load_budget_app()
+        bucket(app, "imagine", 50.0, at=NOW - timedelta(minutes=2), version=4)
+        app.fake_dynamo.conflicts = 3
+        app.fake_dynamo.rival = lambda held: held and dict(held, version={"N": str(int(held["version"]["N"]) + 1)})
+        outcome, log = self.ensure(app, IMAGINE, 1, "s")
+        self.assertEqual(outcome, "deferred")
+        self.assertIn("budget imagine: the bucket changed under 3 writes in a row; job 1 waits for the next round", log)
+        self.assertEqual((ec2.launched, app.fake_dynamo.items), ([], {}), "no launch and no claim")
+        # In a reconcile the backlog stops there, as at a cap.
+        app.github.runs[(IMAGINE, "queued")] = [1]
+        app.github.jobs[1] = [{"id": n, "status": "queued", "labels": ["self-hosted", "imagine", "s"]} for n in (21, 22)]
+        # Every write loses: the round's own updates (dolphin's, then imagine's, three each, skipped and logged) and
+        # the first job's three.
+        app.fake_dynamo.conflicts = 9
+        result, _ = self.reconcile(app)
+        self.assertEqual([r["outcomes"] for r in result if r["repo"] == IMAGINE], [{"deferred": 1}])
+
+    def test_the_dolphin_repos_share_one_bucket(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["s"] * 3, 120) + aged(FILMS, ["l"] * 2, 120, first=10)
+        bucket(app, "dolphin", 60.0, at=NOW - timedelta(hours=1), rate=3 * RATE["s"] + 2 * RATE["l"])
+        self.reconcile(app)
+        self.assertEqual(sorted(app.fake_dynamo.buckets), ["dolphin", "imagine"], "one bucket for every dolphin repo")
+        self.assertAlmostEqual(level_of(app, "dolphin"), 60 + REFILL_H - 3 * RATE["s"] - 2 * RATE["l"], places=5)
+        # dolphin-labs' burn throttles dolphin-films: films has two small hosts, and its xl job meets its throttled cap.
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["xl"] * 8, 5) + aged(FILMS, ["s"] * 2, 5, first=10)
+        bucket(app, "dolphin", 25.0, rate=8 * RATE["xl"] + 2 * RATE["s"])
+        outcome, log = self.ensure(app, FILMS, 9, "xl")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("at its cap of 2 runners; job 9 waits (throttled, budget dolphin at $25.00 of $100.00)", log)
+
+    def test_throttled_spend_cannot_outrun_the_refill(self):
+        # Throttled, the group fills to its 72 vCPUs whatever the sizes, and what it then burns is under the refill, so
+        # the bucket cannot drain while throttled.
+        for sizes in (["s"] * 12, ["l"] * 4, ["xl", "s", "s", "l"], ["l", "s"] * 6):
+            app, ec2 = load_budget_app()
+            bucket(app, "imagine", 5.0, throttled=True)
+            for job, size in enumerate(sizes):
+                self.ensure(app, IMAGINE, job, size)
+            live = [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]} for kw in ec2.launched]
+            vcpus = sum(int(t["Vcpus"]) for t in live)
+            burn = sum(RATE[t["Size"]] for t in live)
+            self.assertLessEqual(vcpus, 72, sizes)
+            self.assertLessEqual(burn, REFILL_H, (sizes, burn))
+            self.assertLessEqual(len(live), 8, sizes)
+            # The bucket then rises an hour later, never falls.
+            app.now = lambda: NOW + timedelta(hours=1)
+            state = app.update_bucket("imagine", BUDGET_REPOS, [dict(h, State={"Name": "running"}) for h in ec2.instances])
+            self.assertGreaterEqual(state["level_usd"], 5.0, sizes)
+        # The cap the reconcile holds the group to, from Terraform's formula at these constants.
+        self.assertEqual(math.floor((50 / 24 - 8 * 0.016) / 0.027), 72)
+        self.assertEqual(math.floor((50 / 24 - 14 * 0.016) / 0.027), 68)
+
+    def test_a_single_large_job_runs_when_its_throttled_group_holds_nothing(self):
+        # A $20 a day group's throttled cap is under one xl host's 64 vCPUs; the xl still runs, alone.
+        small = dict(GROUP, daily_usd=20, throttled_vcpus=26)
+        app, ec2 = load_budget_app({"imagine": small, "dolphin": small})
+        bucket(app, "imagine", 1.0, throttled=True)
+        self.assertEqual(self.ensure(app, IMAGINE, 1, "xl")[0], "launched", "an empty group takes one host of any size")
+        outcome, log = self.ensure(app, IMAGINE, 2, "s")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("at its group's throttled cap of 26 vCPUs (64 in use across budget imagine, an s runner needs 8); job 2 waits"
+                      " (throttled, budget imagine at $1.00 of $40.00)", log)
+        # Not listed yet, the xl still counts by its claim: the group is not empty.
+        app, ec2 = load_budget_app({"imagine": small, "dolphin": small})
+        ec2.listing_lags = True
+        bucket(app, "imagine", 1.0, throttled=True)
+        self.assertEqual(self.ensure(app, IMAGINE, 1, "l")[0], "launched")
+        self.assertEqual(self.ensure(app, IMAGINE, 2, "l")[0], "cap")
+        # At $50 a day an l and an xl each fit on their own, and an xl fits beside an s.
+        app, ec2 = load_budget_app()
+        bucket(app, "imagine", 1.0, throttled=True)
+        self.assertEqual([self.ensure(app, IMAGINE, j, z)[0] for j, z in enumerate(["xl", "s", "s"])], ["launched", "launched", "cap"])
+
+    def test_the_dolphin_repos_share_the_throttled_cap(self):
+        # dolphin-labs holds 64 of the group's 68 throttled vCPUs; dolphin-films, holding nothing of its own cap of 2, waits.
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["s"] * 8, 5)
+        bucket(app, "dolphin", 5.0, throttled=True, rate=8 * RATE["s"])
+        outcome, log = self.ensure(app, FILMS, 9, "s")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("dolphin-labs-hq/dolphin-films: at its group's throttled cap of 68 vCPUs (64 in use across budget dolphin, "
+                      "an s runner needs 8); job 9 waits (throttled", log)
+        # A launch of dolphin-labs' that EC2 does not list yet counts too (its claim), for the other repos.
+        app, ec2 = load_budget_app()
+        ec2.listing_lags = True
+        bucket(app, "dolphin", 5.0, throttled=True)
+        self.assertEqual(self.ensure(app, DOLPHIN, 1, "xl")[0], "launched")
+        self.assertEqual(self.ensure(app, FILMS, 2, "s")[0], "cap", "64 claimed by dolphin-labs + 8 passes 68")
+        # In burst the same hosts hold nothing back: the cap is the throttled mode's.
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["s"] * 8, 5)
+        self.assertEqual(self.ensure(app, FILMS, 9, "s")[0], "launched")
+
+    def test_colton_games_is_in_no_bucket_and_keeps_its_own_cap(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(COLTON, ["xl"] * 3, 5)
+        app.github.runs[(COLTON, "queued")] = [1]
+        app.github.jobs[1] = [{"id": 31, "status": "queued", "labels": ["self-hosted", "cc-games", "s"]}]
+        _, log = self.reconcile(app)
+        self.assertIn("CoderColton/colton-games: at its cap of 3 runners; job 31 waits\n", log)
+        self.assertEqual(sorted(set(app.fake_dynamo.bucket_reads)), ["dolphin", "imagine"])
+        _, data = app.fake_cloudwatch.metrics[-1]
+        self.assertEqual({d["Dimensions"][0]["Value"] for d in data if d["MetricName"] == "BucketLevelUsd"}, {"imagine", "dolphin"})
+        self.assertEqual(ec2.launched, [])
+
+    def test_throttling_never_terminates_a_running_host(self):
+        app, ec2 = load_budget_app()
+        busy = aged(IMAGINE, ["s"] * 20, 30)                            # 20 hosts, past the throttled cap of 8
+        ec2.instances += busy
+        app.github.runners[IMAGINE] = {i["InstanceId"]: {"id": n, "name": i["InstanceId"], "busy": True, "status": "online",
+                                                         "labels": [{"name": "imagine"}]} for n, i in enumerate(busy)}
+        app.github.runs[(IMAGINE, "queued")] = [1]
+        app.github.jobs[1] = [{"id": 41, "status": "queued", "labels": ["self-hosted", "imagine", "s"]}]
+        bucket(app, "imagine", 5.0, at=NOW - timedelta(minutes=2), throttled=True, rate=20 * RATE["s"])
+        result, log = self.reconcile(app)
+        self.assertEqual(ec2.terminated, [])
+        self.assertEqual(ec2.launched, [])
+        self.assertIn("at its cap of 8 runners; job 41 waits (throttled", log)
+        self.assertEqual([r["live"] for r in result if r["repo"] == IMAGINE], [20])
+
+    def test_each_group_publishes_its_level_its_mode_and_its_7_day_spend(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(IMAGINE, ["l"], 120)
+        recent = str(int(NOW.timestamp() - 86400) // 3600 * 3600)
+        bucket(app, "imagine", 20.0, at=NOW - timedelta(hours=1), rate=RATE["l"], spend={recent: 40.0})
+        self.reconcile(app)
+        _, data = app.fake_cloudwatch.metrics[-1]
+        got = {(d["MetricName"], d["Dimensions"][0]["Value"]): d["Value"] for d in data if d["Dimensions"][0]["Name"] == "Group"}
+        self.assertAlmostEqual(got[("BucketLevelUsd", "imagine")], 20 + REFILL_H - RATE["l"], places=3)
+        self.assertAlmostEqual(got[("SpendUsd7d", "imagine")], 40 + RATE["l"], places=3)
+        self.assertEqual((got[("Throttled", "imagine")], got[("Throttled", "dolphin")]), (0, 0))
+        self.assertEqual(got[("BucketLevelUsd", "dolphin")], 100.0)
+
+
+class BudgetTerraformTests(unittest.TestCase):
+    def test_two_50_dollar_buckets_two_days_deep_imagine_alone_and_the_dolphin_repos_together(self):
+        groups = re.search(r"runner_budget_groups = \{(.*?)\n  \}", APP_TF, re.S).group(1)
+        self.assertIn('imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }', groups)
+        self.assertIn('dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", '
+                      '"dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }', groups)
+        self.assertNotIn(COLTON, groups)
+        defaults = dict(re.findall(r"^\s+(\w+)\s+= ([\d.]+)", re.search(r"runner_budget_defaults = \{(.*?)\n  \}", APP_TF, re.S).group(1), re.M))
+        self.assertEqual(defaults, {"capacity_days": "2", "burst_max": "64", "burst_max_vcpus": "512", "lookahead_hours": "2",
+                                    "reserve_fraction": "0.15", "resume_fraction": "0.30", "throttled_alarm_hours": "8"})
+        rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
+        for repo, throttled in ((DOLPHIN, 8), (FILMS, 2), ("dolphin-labs-hq/dolphin-maps", 2), ("dolphin-labs-hq/dolphin-family", 2), (IMAGINE, 8)):
+            self.assertIn(f"max = 64, throttled_max = {throttled}", rows[repo], repo)
+
+    def test_the_cost_constants_are_stated_with_their_sources_and_passed_to_the_controller(self):
+        cost = re.search(r"runner_cost = \{(.*?)\n  \}", APP_TF, re.S).group(1)
+        self.assertIn("vcpu_hour_usd = 0.027", cost)
+        self.assertIn("host_hour_usd = 0.016", cost)
+        for source in ("describe-spot-price-history", "$0.005/h", "$0.096/GB-month"):
+            self.assertIn(source, cost)
+        fn = re.search(r'resource "aws_lambda_function" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("VCPU_HOUR_USD = tostring(local.runner_cost.vcpu_hour_usd)", fn)
+        self.assertIn("HOST_HOUR_USD = tostring(local.runner_cost.host_hour_usd)", fn)
+        self.assertIn("BUDGET_TABLE = aws_dynamodb_table.runner_app_budget[0].name", fn)
+        self.assertRegex(APP_TF, r'budget_group\s+= lookup\(local.runner_app_budget_group, repo, ""\)')
+
+    def test_the_throttled_vcpu_cap_is_the_refill_rate_less_the_throttled_hosts_overhead(self):
+        budget = re.search(r"runner_budget = \{ for name, g in local.runner_budget_groups : name => merge\(.*?\n  \}\) \}", APP_TF, re.S).group()
+        self.assertIn("throttled_vcpus = max(0, floor((g.daily_usd / 24 - sum(concat([0], [for r in g.repos : "
+                      "try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd) / "
+                      "local.runner_cost.vcpu_hour_usd))", budget)
+        fn = re.search(r'resource "aws_lambda_function" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("throttled_vcpus = g.throttled_vcpus", fn)
+        self.assertNotIn("throttled_max_vcpus", APP_TF, "the throttled vCPU cap is the group's, not a repo's")
+
+    def test_the_bucket_table_and_the_controllers_access_to_it(self):
+        table = re.search(r'resource "aws_dynamodb_table" "runner_app_budget" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('hash_key     = "group"', table)
+        policy = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
+        stmt = policy.split('Sid      = "BudgetBuckets"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]', stmt)
+        self.assertIn("Resource = aws_dynamodb_table.runner_app_budget[0].arn", stmt)
+
+    def test_each_group_alarms_when_throttled_too_long_and_when_a_week_costs_more_than_its_budget(self):
+        throttled = re.search(r'resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" \{.*?\n\}', APP_TF, re.S).group()
+        for line in ('metric_name         = "Throttled"', "dimensions          = { Group = each.key }", "period              = 3600",
+                     "evaluation_periods  = 24", "datapoints_to_alarm = each.value.throttled_alarm_hours + 1",
+                     'statistic           = "Average"', "threshold           = 0.5"):
+            self.assertIn(line, throttled)
+        weekly = re.search(r'resource "aws_cloudwatch_metric_alarm" "runner_budget_weekly" \{.*?\n\}', APP_TF, re.S).group()
+        for line in ('metric_name         = "SpendUsd7d"', "dimensions          = { Group = each.key }",
+                     "threshold           = 7 * each.value.daily_usd", 'statistic           = "Maximum"'):
+            self.assertIn(line, weekly)
+        source = APP.read_text()
+        for metric in ("BucketLevelUsd", "Throttled", "SpendUsd7d"):
+            self.assertIn(f"'MetricName': '{metric}', 'Dimensions': dims", source)
+        self.assertIn("dims = [{'Name': 'Group', 'Value': state['group']}]", source)
+        # The per-repo alarms watch the burst ceilings: a burst within them is the bucket's to allow.
+        self.assertIn("peak_max = contains(keys(local.runner_app_budget_group), repo) ? min(c.max, local.runner_budget[local.runner_app_budget_group[repo]].burst_max) : c.max", APP_TF)
 
 
 class RunnersAppTokenTests(unittest.TestCase):

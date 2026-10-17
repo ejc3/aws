@@ -38,15 +38,16 @@ locals {
   # `max_vcpus` (optional) bounds the vCPUs of a repo's concurrent hosts as well: a launch waits
   # when the vCPUs in use (live hosts, and launches not listed yet, each by its own size) plus
   # those of the size the job asks for would pass it. `max` stays as a host-count backstop. A repo
-  # without `max_vcpus` is capped by hosts alone. ejc3/imagine's 192 is three full CI runs at once
-  # (one run asks for four `s` and one `l`, 64 vCPUs); 24 hosts is 192 vCPUs of `s`.
+  # without `max_vcpus` is capped by hosts alone. No repo sets it now: the budgeted repos' vCPU caps come from their
+  # group (burst_max_vcpus per repo, throttled_vcpus for the whole group), and are counted the same way.
   #
   # dolphin-films (a downstream of dolphin-labs, dolphin-films.tf) asks for the same `dolphin`
   # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
-  # so sharing the label shares nothing else: its cap of 2 is its own and it can never take one
-  # of dolphin-labs' 8. `alarm` names its per-repo alarm, which would otherwise collide with
-  # dolphin-labs' (both are named after the label). dolphin-maps (another dolphin-labs-hq
-  # project) is the same shape: the `dolphin` label, its own cap of 2, its own alarm; so is dolphin-family.
+  # so sharing the label shares no runner, host or cap: its caps (throttled 2) are its own and it can never take one of
+  # dolphin-labs' hosts. What the dolphin repos do share is one budget bucket (runner_budget_groups). `alarm` names its
+  # per-repo alarm, which would otherwise collide with dolphin-labs' (both are named after the label). dolphin-maps
+  # (another dolphin-labs-hq project) is the same shape: the `dolphin` label, its own caps, its own alarm; so is
+  # dolphin-family.
   #
   # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
   # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
@@ -56,15 +57,78 @@ locals {
   # `image` (optional) names a prebuilt image from runner-app-image.tf, built for that same repo. The repo's hosts then
   # boot the newest available build of it that this account's pipeline made and tagged, and Canonical's Ubuntu 24.04,
   # with a log line saying so, when there is none. A repo without `image` boots Canonical's image, as before.
+  #
+  # A repo in a budget group (runner_budget_groups, below) also sets `throttled_max`: its host cap while its group is
+  # throttled, when the group's repos together are also held to the group's throttled_vcpus. While the group is in
+  # burst it gets the group's burst ceilings instead. `max` (and `max_vcpus`, where set) stay a hard backstop in both modes, and setting `max = 0`
+  # still stops a repo outright. For these repos `max` is the burst host ceiling, 64.
   runner_app_repos = {
     "CoderColton/colton-games"      = { label = "cc-games", max = 8, image = "colton-games-runner" }
-    "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8, image = "dolphin-labs-runner" }
-    "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, image = "dolphin-films-runner", alarm = "dolphin-films" }
-    "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, image = "dolphin-maps-runner", alarm = "dolphin-maps" }
-    "ejc3/imagine"                  = { label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }
+    "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 64, throttled_max = 8, image = "dolphin-labs-runner" }
+    "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 64, throttled_max = 2, image = "dolphin-films-runner", alarm = "dolphin-films" }
+    "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 64, throttled_max = 2, image = "dolphin-maps-runner", alarm = "dolphin-maps" }
+    "ejc3/imagine"                  = { label = "imagine", max = 64, throttled_max = 8, image = "imagine-runner" }
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
-    "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 2, alarm = "dolphin-family" }
+    "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-family" }
+  }
+
+  # BUDGET. Each group is a leaky bucket of dollars (runner-app/app_runner.py, "budget buckets"; GITHUB-RUNNERS.md,
+  # "Budget buckets"). It refills at daily_usd a day, continuously (daily_usd / 86400 a second), and holds at most
+  # capacity_days of it, so a quiet stretch banks room for a busy day. It drains by what the group's live hosts cost at
+  # runner_cost. While the bucket is healthy the group's repos burst to burst_max hosts and burst_max_vcpus vCPUs each;
+  # when it would clip, they fall back to their throttled caps: each repo its throttled_max hosts, and the group's repos
+  # together throttled_vcpus vCPUs (below), so throttled spend is at most the refill and the bucket cannot drain further.
+  #
+  #   throttle  when the level is under reserve_fraction of capacity, or would reach zero within lookahead_hours at the
+  #             current burn (counting the host about to be launched);
+  #   resume    only once the level is back to resume_fraction of capacity and the projection is clear (hysteresis).
+  #
+  # Throttling never terminates a host; it only stops launches past the throttled caps, and the jobs wait in the queue as
+  # at any cap. To change a budget, change daily_usd here (or a default below) and apply; the bucket keeps its level,
+  # and only the refill rate and the capacity change.
+  #
+  # The dolphin repos share one bucket: they share the `dolphin` label and one owner. dolphin-family draws on it once its
+  # token gate is on (a repo outside runner_app_config is not served and is not counted). colton-games is in no group.
+  runner_budget_defaults = {
+    capacity_days   = 2   # the bucket holds two days' budget ($100 at $50/day)
+    burst_max       = 64  # hosts per repo in burst: the most hosts 512 vCPUs can be (64 `s`)
+    burst_max_vcpus = 512 # vCPUs per repo in burst
+    # Throttle when the bucket would empty within this long at the current burn. One repo at its full burst (512 vCPUs
+    # of `s`, $14.85/h) loses $12.77/h net of the refill, so a 1-hour lookahead would never fire before the $15
+    # reserve; 2 hours throttles it at about $25.50.
+    lookahead_hours       = 2
+    reserve_fraction      = 0.15 # throttle also when the level is under this fraction of capacity ($15)
+    resume_fraction       = 0.30 # back to burst only at this fraction ($30), so the mode does not flap
+    throttled_alarm_hours = 8    # alarm when a group was throttled in more than this many of the last 24 hours
+  }
+  runner_budget_groups = {
+    imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
+    dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }
+  }
+  # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
+  # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
+  # host_hour_usd), at vcpu_hour_usd, rounded down: at $50 a day, imagine 72 vCPUs (8 hosts) and dolphin 68 (14 hosts).
+  # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
+  # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
+  # still under the refill ($2.08/h).
+  runner_budget = { for name, g in local.runner_budget_groups : name => merge(local.runner_budget_defaults, g, {
+    throttled_vcpus = max(0, floor((g.daily_usd / 24 - sum(concat([0], [for r in g.repos : try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd) / local.runner_cost.vcpu_hour_usd))
+  }) }
+  # repo => its group's name.
+  runner_app_budget_group = merge([for name, g in local.runner_budget_groups : { for repo in g.repos : repo => name }]...)
+
+  # COST. Constants, never the pricing APIs at run time, each set slightly high on purpose: the bucket should throttle a
+  # little early rather than late.
+  runner_cost = {
+    # Spot, us-west-1, every type in runner_app_sizes on 2026-10-17 (describe-spot-price-history, both AZs):
+    # s (2xlarge) $0.175-0.205/h = $0.0218-0.0257 per vCPU-hour; l (8xlarge) $0.605-0.664/h = $0.0189-0.0208;
+    # xl (16xlarge) $0.986-1.351/h = $0.0154-0.0211. 0.027 is above the dearest (c7a.2xlarge, $0.0257).
+    vcpu_hour_usd = 0.027
+    # Per host-hour, whatever its size: its public IPv4 address, $0.005/h (AWS's charge for every public IPv4 address
+    # since 2024-02-01), plus its 80 GB gp3 root volume at $0.096/GB-month in us-west-1 (80 x 0.096 / 730 h = $0.0105/h).
+    # $0.0155/h, rounded up.
+    host_hour_usd = 0.016
   }
 
   # A repo whose token gate is false is left out of the controller's REPOS as well: with no token its every reconcile
@@ -81,6 +145,16 @@ locals {
       vcpus      = local.runner_app_size_vcpus
       # Every entry carries app_repo so the map stays one type; empty means "no app, use the PAT".
       app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""
+
+      # "": in no budget group, capped by max and max_vcpus alone (colton-games).
+      budget_group  = lookup(local.runner_app_budget_group, repo, "")
+      throttled_max = try(c.throttled_max, c.max)
+      # The most this repo may hold in any mode, which its too-many alarms watch: its burst ceilings within its hard
+      # backstop for a budgeted repo, else its caps.
+      peak_max = contains(keys(local.runner_app_budget_group), repo) ? min(c.max, local.runner_budget[local.runner_app_budget_group[repo]].burst_max) : c.max
+      peak_max_vcpus = (contains(keys(local.runner_app_budget_group), repo)
+        ? (try(c.max_vcpus, null) == null ? local.runner_budget[local.runner_app_budget_group[repo]].burst_max_vcpus : min(c.max_vcpus, local.runner_budget[local.runner_app_budget_group[repo]].burst_max_vcpus))
+      : try(c.max_vcpus, null))
     } if lookup(local.runner_app_token_gates, repo, true)
   }
 
@@ -92,12 +166,17 @@ locals {
   # dolphin-family is not here: it uses its own controller token until the runners app's installation is widened to it.
   runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
   # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
-  # counting its cap would loosen the combined alarm before it serves anything. A repo with a vCPU cap counts its host
-  # backstop: ejc3/imagine's 24 is exactly the most hosts its 192 vCPUs can be (24 `s`), so no lower host count is safe.
-  runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])
+  # counting its cap would loosen the combined alarm before it serves anything. Each repo counts the most hosts it may
+  # hold in any mode (peak_max): a budgeted repo's burst ceiling of 64, which is exactly the most hosts its 512 vCPUs can
+  # be (64 `s`), so no lower host count is safe.
+  runner_app_max_total = sum([for c in values(local.runner_app_config) : c.peak_max])
 
-  # The repos with a vCPU cap: each gets a vCPU alarm at that cap (too_many_app_runner_vcpus_per_repo).
-  runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.max_vcpus != null }
+  # The repos with a vCPU ceiling in some mode (every budgeted repo, and any with max_vcpus): each gets a vCPU alarm at
+  # its peak (too_many_app_runner_vcpus_per_repo).
+  runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.peak_max_vcpus != null }
+
+  # The groups with at least one served repo: each gets a bucket, its metrics and its alarms.
+  runner_budget_served = { for name, g in local.runner_budget : name => g if length([for r in g.repos : r if contains(keys(local.runner_app_config), r)]) > 0 }
 
   # Canonical's own account. Its images, and this account's own prebuilt images tagged by runner-app-image.tf's
   # pipeline, are the only ones this controller may launch.
@@ -405,6 +484,13 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = aws_dynamodb_table.runner_app_claims[0].arn
       },
       {
+        # The budget buckets (app_runner.py update_bucket): a consistent read, then a write conditional on the version.
+        Sid      = "BudgetBuckets"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.runner_app_budget[0].arn
+      },
+      {
         # Its own runner-count and vCPU metrics, which the alarms below read.
         Sid       = "PublishRunnerCounts"
         Effect    = "Allow"
@@ -444,7 +530,10 @@ resource "aws_lambda_function" "runner_app" {
 
   environment {
     variables = {
-      REPOS             = jsonencode(local.runner_app_config)
+      # Lambda's environment is 4 KB in all. peak_max and peak_max_vcpus are for the alarms only, and the size lists are
+      # the same for every repo: they go once, in REPO_SHARED, which the controller folds into each repo's config.
+      REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v if !contains(["peak_max", "peak_max_vcpus", "sizes", "vcpus"], k) } })
+      REPO_SHARED       = jsonencode({ sizes = local.runner_app_sizes, vcpus = local.runner_app_size_vcpus })
       RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
@@ -459,6 +548,16 @@ resource "aws_lambda_function" "runner_app" {
 
       # Every repo the runners app is meant to cover, token gates or not: what an installation may select.
       APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)
+
+      # The budget buckets (locals above): one item per group in BUDGET_TABLE.
+      BUDGET_TABLE = aws_dynamodb_table.runner_app_budget[0].name
+      BUDGET_GROUPS = jsonencode({ for name, g in local.runner_budget : name => {
+        daily_usd       = g.daily_usd, capacity_days = g.capacity_days, burst_max = g.burst_max, burst_max_vcpus = g.burst_max_vcpus,
+        lookahead_hours = g.lookahead_hours, reserve_fraction = g.reserve_fraction, resume_fraction = g.resume_fraction,
+        throttled_vcpus = g.throttled_vcpus
+      } })
+      VCPU_HOUR_USD = tostring(local.runner_cost.vcpu_hour_usd)
+      HOST_HOUR_USD = tostring(local.runner_cost.host_hour_usd)
     }
   }
 
@@ -479,6 +578,18 @@ resource "aws_lambda_function" "runner_app" {
       # A repo may boot only an image built for it: the controller asks for the image's Repo tag to be the repo's own.
       condition     = alltrue([for repo, c in local.runner_app_config : c.image == "" || try(local.runner_app_images[c.image].repo, "") == repo])
       error_message = "A repo's `image` must name an entry of runner_app_images (runner-app-image.tf) whose repo is that repo."
+    }
+    precondition {
+      # A repo draws on at most one bucket, and every repo a group names is one this file serves.
+      condition     = length(local.runner_app_budget_group) == length(flatten([for g in values(local.runner_budget_groups) : g.repos])) && alltrue([for r in keys(local.runner_app_budget_group) : contains(keys(local.runner_app_repos), r)])
+      error_message = "Every repo in runner_budget_groups must be in runner_app_repos, and in only one group."
+    }
+    precondition {
+      # A budgeted repo's throttled caps sit inside its hard backstop, and the thresholds are ordered.
+      condition = alltrue([for repo, c in local.runner_app_config : c.budget_group == "" || (c.throttled_max <= c.max && can(local.runner_app_repos[repo].throttled_max))]) && alltrue([
+        for g in values(local.runner_budget) : g.daily_usd > 0 && g.capacity_days >= 1 && 0 < g.reserve_fraction && g.reserve_fraction < g.resume_fraction && g.resume_fraction <= 1 && g.lookahead_hours > 0
+      ])
+      error_message = "A budgeted repo needs throttled_max <= max; each group needs daily_usd > 0, capacity_days >= 1, lookahead_hours > 0 and 0 < reserve_fraction < resume_fraction <= 1."
     }
   }
 
@@ -550,10 +661,31 @@ resource "aws_dynamodb_table" "runner_app_claims" {
   tags = { Name = "github-app-runner-claims" }
 }
 
+# One item per budget group (app_runner.py, "budget buckets"): {level_usd, updated_at, rate_usd_h, throttled, spend,
+# version}. Nothing here is precious: a missing item starts full, so no point-in-time recovery.
+resource "aws_dynamodb_table" "runner_app_budget" {
+  count        = var.enable_github_runner ? 1 : 0
+  name         = "github-app-runner-budget"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "group"
+
+  attribute {
+    name = "group"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = false
+  }
+
+  tags = { Name = "github-app-runner-budget" }
+}
+
 # The controller publishes GitHubAppRunner/LiveRunners (Repo=ALL and per repo) and LiveVcpus (per
 # repo) on every 2-minute reconcile. AWS/EC2 has no per-tag instance count, so this is the only
-# reliable one. The combined cap is the sum of every repo's host cap (`max`), which a repo with a
-# vCPU cap keeps as its backstop, so above it the controller is over-launching whatever the sizes.
+# reliable one. The combined cap is the sum of the most hosts each repo may hold in any mode
+# (peak_max: a budgeted repo's burst ceiling, else its `max`), so above it the controller is over-launching whatever the
+# sizes.
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" {
   count               = var.enable_github_runner ? 1 : 0
   alarm_name          = "too-many-app-runners"
@@ -592,15 +724,16 @@ resource "aws_cloudwatch_metric_alarm" "app_runner_reconcile_silent" {
 }
 
 # Per repo: the combined alarm above fires only when EVERY repo is saturated together, so one
-# repo over-launching on its own would go unseen. Each repo's LiveRunners above its own cap.
+# repo over-launching on its own would go unseen. Each repo's LiveRunners above the most it may hold in any mode
+# (peak_max: a budgeted repo's burst ceiling; a burst within it is the bucket's to allow, not an over-launch).
 # Named after the repo's label, or its `alarm` where two repos share a label.
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   for_each            = var.enable_github_runner ? local.runner_app_config : {}
   alarm_name          = "too-many-app-runners-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 15 minutes
-  threshold           = each.value.max
-  alarm_description   = "More ${each.key} app runners than its cap of ${each.value.max}, for 15+ minutes - the controller is over-launching"
+  threshold           = each.value.peak_max
+  alarm_description   = "More ${each.key} app runners than its cap of ${each.value.peak_max}, for 15+ minutes - the controller is over-launching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
@@ -611,15 +744,16 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runners_per_repo" {
   treat_missing_data  = "notBreaching"
 }
 
-# Per repo with a vCPU cap: the host alarm above sees only the backstop, and a repo over-launching large hosts passes its
-# vCPU cap long before its host count (7 `xl` hosts are 448 vCPUs). Each such repo's LiveVcpus above its own vCPU cap.
+# Per repo with a vCPU ceiling: the host alarm above sees only the backstop, and a repo over-launching large hosts passes
+# its vCPU ceiling long before its host count (9 `xl` hosts are 576 vCPUs). Each such repo's LiveVcpus above its peak
+# (peak_max_vcpus: a budgeted repo's burst ceiling of 512, else its max_vcpus).
 resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" {
   for_each            = var.enable_github_runner ? local.runner_app_vcpu_capped : {}
   alarm_name          = "too-many-app-runner-vcpus-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 15 minutes
-  threshold           = each.value.max_vcpus
-  alarm_description   = "More ${each.key} app runner vCPUs than its cap of ${each.value.max_vcpus}, for 15+ minutes - the controller is over-launching"
+  threshold           = each.value.peak_max_vcpus
+  alarm_description   = "More ${each.key} app runner vCPUs than its cap of ${each.value.peak_max_vcpus}, for 15+ minutes - the controller is over-launching"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
@@ -630,26 +764,80 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" {
   treat_missing_data  = "notBreaching"
 }
 
-# ejc3/imagine's spend: LiveVcpus averaged over an hour is the vCPUs it kept up in that hour, and spot cost follows vCPUs,
-# not hosts (an `s` host is a quarter of an `l`). More than 128 (four `l` hosts, as the host-count form of this alarm was
-# priced) in 6 of the last 24 hours is several times its measured volume when it moved here (about 34 runs a day), and an
-# hourly window reports a runaway within about six hours, where one 24-hour period could take more than a day. The
-# per-repo too-many alarms see a burst over a cap; this sees a cap held too long.
+# ejc3/imagine's spend, measured apart from the bucket: LiveVcpus is the controller's own host count, not the bucket's
+# arithmetic, so this is the backstop that catches the bucket draining too little. While bursting, the bucket lets a
+# group spend at most its full capacity plus a day's refill in any day ($150: 232 vCPUs held all day at runner_cost),
+# and the hosts still running when it throttles come on top (no host outlives 3 hours: 3 h of 512 vCPUs is 64 averaged
+# over the day). Throttled, Imagine holds at most its group's 72 vCPUs. So a day in which every hour averages more than
+# 232 + 64 = 296 vCPUs is more than the bucket can allow. Until the bucket this fired at 128 vCPUs in 6 of 24 hours,
+# which bursting now reaches on an ordinary busy day; the bucket enforces the spend, and this is retuned to a backstop.
 # Missing data is the reconcile-silent alarm's to report.
+locals {
+  imagine_runner_alarm_vcpus = (
+    ceil(local.runner_budget.imagine.daily_usd * (1 + local.runner_budget.imagine.capacity_days) / 24 / local.runner_cost.vcpu_hour_usd)
+    + ceil(local.runner_budget.imagine.burst_max_vcpus * 3 / 24)
+  )
+}
+
 resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   count               = var.enable_github_runner && var.imagine_token_ready ? 1 : 0
   alarm_name          = "imagine-runner-hours-daily"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 24
-  datapoints_to_alarm = 6
-  threshold           = 128
-  alarm_description   = "ejc3/imagine kept more than 128 app runner vCPUs (four l hosts) up on average in 6 of the last 24 hours (768+ vCPU-hours past its usual volume: about $18 at spot)"
+  # 20 of 24, not all 24: one quiet hour (missing data is not breaching) would clear an every-hour alarm. 20 hours above
+  # the threshold is more vCPU-hours than a full bucket plus a day's refill can pay for, so it never fires on real use.
+  datapoints_to_alarm = 20
+  threshold           = local.imagine_runner_alarm_vcpus
+  alarm_description   = "ejc3/imagine kept more than ${local.imagine_runner_alarm_vcpus} app runner vCPUs up on average in 20 of the last 24 hours: more than its budget bucket can allow in a day. The bucket's arithmetic or its cost constants (runner-app.tf runner_cost) are wrong."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
   metric_name         = "LiveVcpus"
   dimensions          = { Repo = "ejc3/imagine" }
   statistic           = "Average"
+  period              = 3600
+  treat_missing_data  = "notBreaching"
+}
+
+# Per budget group: throttled in more than throttled_alarm_hours of the last 24 (an hour counts when the group was
+# throttled for at least half of it). Throttling is the bucket working, so a short spell is normal; a third of a day
+# means the work no longer fits the budget, and the owner decides whether to raise daily_usd.
+resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" {
+  for_each            = var.enable_github_runner ? local.runner_budget_served : {}
+  alarm_name          = "github-app-runner-budget-throttled-${each.key}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 24
+  datapoints_to_alarm = each.value.throttled_alarm_hours + 1
+  threshold           = 0.5
+  alarm_description   = "The ${each.key} runner budget (${each.value.daily_usd} USD a day) was throttled in more than ${each.value.throttled_alarm_hours} of the last 24 hours: its repos ran at their throttled caps. Raise daily_usd in runner-app.tf if the work has grown."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "Throttled"
+  dimensions          = { Group = each.key }
+  statistic           = "Average"
+  period              = 3600
+  treat_missing_data  = "notBreaching"
+}
+
+# Per budget group: the last 7 days of the bucket's drain (SpendUsd7d) above 7 days of budget, a backstop to the
+# bucket's arithmetic. The bucket bounds the long-run average to daily_usd, but a week that starts with a full bucket
+# may spend its whole capacity on top ($350 + $100), and hosts launched in burst run on after a throttle (up to 3 hours)
+# while the level is already at zero. So this can fire on legitimate use: it says a week cost more than its budget, and
+# is informational.
+resource "aws_cloudwatch_metric_alarm" "runner_budget_weekly" {
+  for_each            = var.enable_github_runner ? local.runner_budget_served : {}
+  alarm_name          = "github-app-runner-budget-weekly-${each.key}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 7 * each.value.daily_usd
+  alarm_description   = "The ${each.key} runners cost more than ${7 * each.value.daily_usd} USD over the last 7 days (the budget bucket's drain at runner-app.tf runner_cost)."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "SpendUsd7d"
+  dimensions          = { Group = each.key }
+  statistic           = "Maximum"
   period              = 3600
   treat_missing_data  = "notBreaching"
 }
