@@ -132,17 +132,21 @@ printf '%s' "$REG_TOKEN" | sudo -u runner -H bash -c \
   _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"
 unset REG_TOKEN
 
-# .env is read by run.sh and handed to every job: AGENT_TOOLSDIRECTORY for the setup-* actions,
-# RUNNER_TOOL_CACHE for the runner's own ${{ runner.tool_cache }}.
+# .env is read by the runner's listener, which run.sh starts, and its variables reach every job:
+# AGENT_TOOLSDIRECTORY for the setup-* actions, RUNNER_TOOL_CACHE for the runner's own
+# ${{ runner.tool_cache }}.
 printf 'AGENT_TOOLSDIRECTORY=%s\nRUNNER_TOOL_CACHE=%s\n' "$TOOL_CACHE" "$TOOL_CACHE" >> "$DIR/.env"
 
-# .path is the PATH config.sh saw (sudo's secure_path), which run.sh hands every job. A prebuilt
-# image lists the directories its toolchains live in (runner-app/images/), one per line, so a
-# job's setup finds them already installed; Canonical's image has no such file.
+# A prebuilt image lists the directories its toolchains live in (runner-app/images/), one per
+# line, so a job's setup finds them already installed; Canonical's image has no such file. They
+# go first on the PATH config.sh saw (sudo's secure_path, in .path), and that PATH goes into
+# .env: the listener run.sh starts reads .env, not .path (only the service script runsvc.sh,
+# which these hosts do not use, reads .path), so a PATH in .path alone never reached a job.
 if [ -s /etc/github-app-runner/path ]; then
   EXTRA_PATH=$(paste -sd: /etc/github-app-runner/path)
   JOB_PATH=$(cat "$DIR/.path")
   printf '%s:%s\n' "$EXTRA_PATH" "$JOB_PATH" > "$DIR/.path"
+  printf 'PATH=%s:%s\n' "$EXTRA_PATH" "$JOB_PATH" >> "$DIR/.env"
 fi
 
 sudo -u runner -H ./run.sh

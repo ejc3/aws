@@ -35,7 +35,7 @@ ACCOUNT, OTHER = "123456789012", "210987654321"
 PURPOSE, BUILDER = "github-app-runner-image", "github-app-runner-image-builder"
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
 VERSIONS = {"RUST_TOOLCHAIN": "1.93.0", "RUST_COMPONENTS": "rustfmt,clippy", "RUST_TARGETS": "wasm32-unknown-unknown",
-            "NODE_MAJOR": "22", "PNPM_VERSION": "10.29.1", "OTP_VERSION": "29.1.1", "ELIXIR_VERSION": "1.20.4",
+            "NODE_VERSION": "22.23.3", "PNPM_VERSION": "10.29.1", "OTP_VERSION": "29.1.1", "ELIXIR_VERSION": "1.20.4",
             "PLAYWRIGHT_VERSION": "1.63.0", "LIBSQL_IMAGE": "ghcr.io/tursodatabase/libsql-server:v0.24.32"}
 IMAGES = {"imagine-runner": {"repo": "ejc3/imagine", "script": "imagine-runner.sh", "versions": VERSIONS,
                              "builder_types": ["c7a.2xlarge", "c7i.2xlarge"]}}
@@ -399,6 +399,42 @@ class ImageScriptTests(unittest.TestCase):
         self.assertTrue((tmp / "toolcache/otp/ubuntu-24.04/OTP-29.1.1/x64.complete").exists(), "OTP's own sha matched")
         self.assertIn("FAILED", out.stdout + out.stderr, "sha256sum refused the Elixir archive")
         self.assertFalse((tmp / "toolcache/elixir/1.20.4-otp-29/x64.complete").exists())
+
+    def test_node_is_the_pinned_version_not_the_newest_of_its_major(self):
+        # ejc3/imagine's setup action uses an installed Node only at the version it pins, so the image installs exactly
+        # that one, whatever nodejs.org lists as newer.
+        tmp = Path(tempfile.mkdtemp(prefix="image-node."))
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
+        served = tmp / "served" / "dist"
+        served.mkdir(parents=True)
+        for version in ("v22.99.0", "v22.23.3"):
+            src = tmp / "node-src" / f"node-{version}-linux-x64"
+            (src / "bin").mkdir(parents=True)
+            (src / "bin" / "node").write_text(f"#!/bin/sh\necho {version}\n")
+            (src / "bin" / "node").chmod(0o755)
+            (served / version).mkdir()
+            archive = served / version / f"node-{version}-linux-x64.tar.gz"
+            with tarfile.open(archive, "w:gz") as tf:
+                tf.add(src, arcname=src.name)
+            (served / version / "SHASUMS256.txt").write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+        (served / "index.json").write_text(json.dumps([{"version": "v22.99.0"}, {"version": "v22.23.3"}]))
+        (tmp / "bin").mkdir()
+        (tmp / "bin" / "curl").write_text(
+            '#!/bin/bash\nout=; url=\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; --retry) shift 2;; '
+            '-*) shift;; *) url=$1; shift;; esac; done\n'
+            f'file={tmp / "served"}/${{url#https://nodejs.org/}}\n[ -f "$file" ] || exit 22\n'
+            'if [ -n "$out" ]; then cp "$file" "$out"; else cat "$file"; fi\n')
+        (tmp / "bin" / "npm").write_text(f'#!/bin/bash\necho "$*" > {tmp}/npm\n')
+        for f in ("curl", "npm"):
+            (tmp / "bin" / f).chmod(0o755)
+        script = (f"set -euo pipefail\nexport IMAGE_SCRIPT_FUNCTIONS_ONLY=1 NODE_DIR={tmp}/opt-node\nsource {IMAGINE_SCRIPT}\n"
+                  "NODE_VERSION=22.23.3 NODE_MAJOR=22 PNPM_VERSION=10.29.1 install_node\n")
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                             env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin", "TMPDIR": str(tmp)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        node = subprocess.run([str(tmp / "opt-node/bin/node")], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(node, "v22.23.3", "the pin, not v22.99.0, the newest 22 listed")
+        self.assertIn("pnpm@10.29.1", (tmp / "npm").read_text())
 
     def test_the_script_is_valid_and_needs_every_pin_runner_app_image_tf_gives_it(self):
         subprocess.run(["bash", "-n", str(IMAGINE_SCRIPT)], check=True)
