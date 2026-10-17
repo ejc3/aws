@@ -530,7 +530,8 @@ resource "aws_lambda_function" "runner_app" {
 
   environment {
     variables = {
-      REPOS             = jsonencode(local.runner_app_config)
+      # peak_max and peak_max_vcpus are for the alarms only: left out, the environment stays under Lambda's 4 KB.
+      REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v if !contains(["peak_max", "peak_max_vcpus"], k) } })
       RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
@@ -781,9 +782,11 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
   alarm_name          = "imagine-runner-hours-daily"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 24
-  datapoints_to_alarm = 24
+  # 20 of 24, not all 24: one quiet hour (missing data is not breaching) would clear an every-hour alarm. 20 hours above
+  # the threshold is more vCPU-hours than a full bucket plus a day's refill can pay for, so it never fires on real use.
+  datapoints_to_alarm = 20
   threshold           = local.imagine_runner_alarm_vcpus
-  alarm_description   = "ejc3/imagine kept more than ${local.imagine_runner_alarm_vcpus} app runner vCPUs up on average in every one of the last 24 hours: more than its budget bucket can allow in a day. The bucket's arithmetic or its cost constants (runner-app.tf runner_cost) are wrong."
+  alarm_description   = "ejc3/imagine kept more than ${local.imagine_runner_alarm_vcpus} app runner vCPUs up on average in 20 of the last 24 hours: more than its budget bucket can allow in a day. The bucket's arithmetic or its cost constants (runner-app.tf runner_cost) are wrong."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"

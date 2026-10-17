@@ -1207,9 +1207,15 @@ class WiringTests(unittest.TestCase):
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("period              = 3600", alarm)
         self.assertIn("evaluation_periods  = 24", alarm)
-        self.assertIn("datapoints_to_alarm = 24", alarm)
+        self.assertIn("datapoints_to_alarm = 20", alarm, "one quiet hour must not clear it")
         self.assertIn('statistic           = "Average"', alarm)
         self.assertIn("threshold           = local.imagine_runner_alarm_vcpus", alarm)
+
+    def test_the_controllers_environment_leaves_out_the_alarm_only_fields(self):
+        # Lambda's environment is capped at 4 KB in all; peak_max and peak_max_vcpus are read by the alarms alone.
+        self.assertIn('REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v '
+                      'if !contains(["peak_max", "peak_max_vcpus"], k) } })', APP_TF)
+        self.assertNotIn("peak_max", (ROOT / "runner-app" / "app_runner.py").read_text())
 
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
