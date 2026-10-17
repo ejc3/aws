@@ -20,10 +20,10 @@
 # (mac-reverse-tunnels.tf), retire the reverse tunnel, and close the MacBook's port 22 to
 # everything but itself (pf).
 #
-# Both credentials are readable by the dev_server role (fcvm-arm's, and also fcvm-x86's): the
-# connector token so it can be installed on the MacBook over the existing route (no other path
-# reaches the Mac), the service token because fcvm-arm is the client. The connector token runs
-# this one tunnel and nothing else.
+# Both credentials are readable only by fcvm-arm's instance (the dev_server role, which fcvm-x86
+# shares, with ec2:SourceInstanceARN pinned to fcvm-arm): the connector token so it can be
+# installed on the MacBook over the existing route (no other path reaches the Mac), the service
+# token because fcvm-arm is the client. The connector token runs this one tunnel and nothing else.
 
 locals {
   macbook_ssh_hostname = "macbook-ssh.cc-games.dev"

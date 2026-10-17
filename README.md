@@ -659,8 +659,8 @@ removable-volume prompts, and signing still needs the desktop session.
 | Proxy command | fcvm-arm, `~/.ssh/macbook-access-proxy` | step 2, then Terraform (step 4) |
 | Port 22 closed to the network | the Mac, `/etc/pf.anchors/macbook-ssh` and `/Library/LaunchDaemons/com.ejcampbell.macbook-ssh.pf.plist` | step 6, owner's `sudo` |
 
-Both secrets are readable by the `dev_server` role. fcvm-x86 has that role too, so in
-practice both dev boxes can read them, not only fcvm-arm.
+Both secrets are readable only by fcvm-arm's instance. fcvm-x86 shares the `dev_server` role,
+so the grant is pinned to fcvm-arm with `ec2:SourceInstanceARN` (`macbook-ssh.tf`).
 
 **Secrets never go on a command line**, here or on the Mac: `ps` shows every argument to
 every user of a shared box. The connector token goes to the Mac on SSH's standard input and
