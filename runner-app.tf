@@ -530,8 +530,10 @@ resource "aws_lambda_function" "runner_app" {
 
   environment {
     variables = {
-      # peak_max and peak_max_vcpus are for the alarms only: left out, the environment stays under Lambda's 4 KB.
-      REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v if !contains(["peak_max", "peak_max_vcpus"], k) } })
+      # Lambda's environment is 4 KB in all. peak_max and peak_max_vcpus are for the alarms only, and the size lists are
+      # the same for every repo: they go once, in REPO_SHARED, which the controller folds into each repo's config.
+      REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v if !contains(["peak_max", "peak_max_vcpus", "sizes", "vcpus"], k) } })
+      REPO_SHARED       = jsonencode({ sizes = local.runner_app_sizes, vcpus = local.runner_app_size_vcpus })
       RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])

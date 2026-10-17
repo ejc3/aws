@@ -20,6 +20,7 @@ import textwrap
 import time
 import types
 import unittest
+from unittest import mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1214,8 +1215,20 @@ class WiringTests(unittest.TestCase):
     def test_the_controllers_environment_leaves_out_the_alarm_only_fields(self):
         # Lambda's environment is capped at 4 KB in all; peak_max and peak_max_vcpus are read by the alarms alone.
         self.assertIn('REPOS             = jsonencode({ for repo, c in local.runner_app_config : repo => { for k, v in c : k => v '
-                      'if !contains(["peak_max", "peak_max_vcpus"], k) } })', APP_TF)
+                      'if !contains(["peak_max", "peak_max_vcpus", "sizes", "vcpus"], k) } })', APP_TF)
+        self.assertIn('REPO_SHARED       = jsonencode({ sizes = local.runner_app_sizes, vcpus = local.runner_app_size_vcpus })',
+                      APP_TF)
         self.assertNotIn("peak_max", (ROOT / "runner-app" / "app_runner.py").read_text())
+
+    def test_shared_settings_arrive_once_and_reach_every_repo(self):
+        app = load_app()[0]
+        slim = {repo: {k: v for k, v in cfg.items() if k not in ("sizes", "vcpus")} for repo, cfg in REPOS.items()}
+        shared = {"sizes": REPOS[COLTON]["sizes"], "vcpus": REPOS[COLTON]["vcpus"]}
+        with mock.patch.dict(os.environ, {"REPOS": json.dumps(slim), "REPO_SHARED": json.dumps(shared)}):
+            repos, _ = app.config()
+        for repo in REPOS:
+            self.assertEqual(repos[repo]["sizes"], shared["sizes"], repo)
+            self.assertEqual(repos[repo]["vcpus"], shared["vcpus"], repo)
 
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
@@ -1663,6 +1676,30 @@ class BudgetLaunchTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             result = app.handler({"reconcile": True}, None)
         return result, out.getvalue()
+
+    def test_launches_ec2_does_not_list_yet_count_in_the_mode_decision(self):
+        # Five xl launches EC2 has not listed yet: the sixth decision counts their claims as burn ($10.46/h with its own),
+        # which empties the $16 bucket within the 2-hour lookahead, so it throttles; counting only listed hosts, every
+        # decision would see an empty group and keep bursting.
+        app, ec2 = load_budget_app()
+        ec2.listing_lags = True
+        bucket(app, "imagine", 16.0)
+        outcomes = [self.ensure(app, IMAGINE, job, "xl")[0] for job in range(1, 7)]
+        self.assertEqual(outcomes, ["launched"] * 5 + ["cap"])
+        self.assertTrue(app.fake_dynamo.buckets["imagine"]["throttled"]["BOOL"])
+
+    def test_a_claim_whose_host_already_ended_is_not_held_against_the_group(self):
+        # dolphin-films' host is listed, terminated, while its claim waits for films' next round: dolphin-labs must not
+        # count that claim as vCPUs in use.
+        app, ec2 = load_budget_app()
+        ec2.listing_lags = True
+        bucket(app, "dolphin", 5.0, throttled=True)
+        self.assertEqual(self.ensure(app, FILMS, 1, "l")[0], "launched")
+        kw = ec2.launched[-1]
+        ec2.instances.append({"InstanceId": "i-ended", "Tags": kw["TagSpecifications"][0]["Tags"], "LaunchTime": NOW,
+                              "State": {"Name": "terminated"}, "ClientToken": kw["ClientToken"]})
+        ec2.listing_lags = False
+        self.assertEqual(self.ensure(app, DOLPHIN, 2, "xl")[0], "launched", "the group holds nothing")
 
     def test_burst_under_budget_lets_imagine_past_its_old_cap_of_8(self):
         app, ec2 = load_budget_app()

@@ -117,7 +117,14 @@ def now():
 
 
 def config():
-    return json.loads(os.environ['REPOS']), json.loads(os.environ['LAUNCH_SUBNETS'])
+    """(repo => config, subnets). Settings every repo shares (the size lists) arrive once, in REPO_SHARED, and are
+    folded into each repo's config, so Lambda's 4 KB environment does not carry a copy per repo."""
+    repos = json.loads(os.environ['REPOS'])
+    shared = json.loads(os.environ.get('REPO_SHARED') or '{}')
+    for cfg in repos.values():
+        for key, value in shared.items():
+            cfg.setdefault(key, value)
+    return repos, json.loads(os.environ['LAUNCH_SUBNETS'])
 
 
 # ---------------------------------------------------------------- GitHub
@@ -502,6 +509,20 @@ def update_bucket(group, repos, listed=None, extra_h=0.0):
         state['group'], state['capacity'], state['spend_7d'] = group, capacity_usd(g), sum(state['spend'].values())
         return state
     raise BucketBusy(f'budget {group}: the bucket changed under {BUCKET_WRITE_ATTEMPTS} writes in a row')
+
+
+def pending_rate(group, repos, repo, claimed, seen):
+    """Dollars an hour of the group's accepted launches that EC2 does not list yet: every member's claim with no host of
+    its own in `seen` (any state; its nonce prefixes the host's ClientToken). The mode decision counts them, so a run of
+    launches before the first is listed cannot each see the same stale burn. Draining still waits for the listing."""
+    tokens = {i.get('ClientToken') or '' for i in seen}
+    rate = 0.0
+    for member in group_repos(group, repos):
+        mcfg = repos[member]
+        for _, (nonce, vcpus) in (claimed if member == repo else active_claims(member)).items():
+            if not (nonce and any(tok.startswith(nonce + '-') for tok in tokens)):
+                rate += (vcpus if vcpus is not None else largest_vcpus(mcfg)) * VCPU_HOUR_USD + HOST_HOUR_USD
+    return rate
 
 
 def limits(cfg, throttled):
@@ -967,7 +988,7 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
         ids = {i['InstanceId'] for i in group_listed}
         try:
             state = update_bucket(budget, repos, group_listed + [i for i in live if i['InstanceId'] not in ids],
-                                  size_rate(cfg, size))
+                                  size_rate(cfg, size) + pending_rate(budget, repos, repo, claimed, group_listed + live))
         except BucketBusy as conflict:
             print(f'{repo}: {conflict}; job {job_id} waits for the next round')
             return 'deferred', token
@@ -1030,7 +1051,9 @@ def throttled_group_check(repo, cfg, group, repos, group_listed, running, unseen
     cap = int(budget_groups()[group]['throttled_vcpus'])
     hosts = {i['InstanceId']: i for i in group_listed if i.get('State', {}).get('Name') in LIVE_STATES}
     hosts.update({i['InstanceId']: i for i in running})
-    tokens = {i.get('ClientToken') or '' for i in hosts.values()}
+    # A claim is backed once its own host is listed in ANY state, as release() judges it: one whose host already ended
+    # is not more vCPUs in use (counting it held the group back until its own repo next ran).
+    tokens = {i.get('ClientToken') or '' for i in list(group_listed) + list(running)}
     used = sum(host_vcpus(i, repos.get(tag(i, 'Repo')) or cfg) for i in hosts.values())
     used += sum(claimed[job][1] if claimed[job][1] is not None else largest_vcpus(cfg) for job in unseen)
     others = 0
