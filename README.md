@@ -524,7 +524,7 @@ ssh macbook ─> 127.0.0.1:2223 ═══ reverse tunnel ═══> 127.0.0.1:22
 | Keys only | `/etc/ssh/sshd_config.d/050-keys-only.conf` | `PasswordAuthentication no`, `KbdInteractiveAuthentication no` |
 | fcvm-arm's key | `~/.ssh/authorized_keys` | the `to-mac` public key |
 | The tunnel | `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.tunnel.plist` | `-R 127.0.0.1:2223:127.0.0.1:22` |
-| Fallback `sshd` | `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.sshd.plist`, `~/.ssh/fcvm-macbook/sshd_config` | `127.0.0.1:22222`, keys only, unused |
+| Desktop-session `sshd` | `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.sshd.plist`, `~/.ssh/fcvm-macbook/sshd_config` | `127.0.0.1:22222`, keys only; `ssh macbook-desktop` |
 | Scratch drive | `/Volumes/Scratch` (external APFS, 1.8 TB) | see below |
 
 Remote Login listens on every interface, as macOS has it; with the drop-in it accepts
@@ -564,12 +564,19 @@ a process can also be started as responsible for itself
 The cost is that any Remote Login session has full disk access. It is reachable only with
 a key, and only by an administrator.
 
-##### MacBook: Code signing needs the desktop session
+##### MacBook: the desktop session, `ssh macbook-desktop`
 
-A Remote Login session is outside the logged-in user's desktop session, so it cannot use
-the login keychain: `security show-keychain-info` says "User interaction is not allowed" and
-`codesign` (an Xcode archive) fails with `errSecInternalComponent`. Run anything that
-signs as a one-off LaunchAgent in the user's GUI domain, which the SSH session can start:
+A Remote Login session is outside the logged-in user's desktop session. It cannot use the
+login keychain (`security show-keychain-info` says "User interaction is not allowed" and
+`codesign`, an Xcode archive, fails with `errSecInternalComponent`), and it may not send
+Apple Events (`osascript` to Chrome: "Not authorized to send Apple events", -1743).
+
+The private `sshd` on `127.0.0.1:22222` runs in the desktop session, so `ssh macbook-desktop`
+(a jump through Remote Login to it, verified by its pinned host key) can do both: drive
+Chrome with AppleScript, read the keychain. Its programs meet the removable-volume prompts,
+so keep what it touches on the internal disk. For a long signing job (an archive), a one-off
+LaunchAgent in the user's GUI domain, started from either session, keeps running if the
+connection drops:
 
 ```bash
 # On the Mac: a job that runs once in the desktop session, logging to a file.
