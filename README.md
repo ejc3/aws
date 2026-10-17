@@ -853,8 +853,9 @@ pass. Undo, so the next boot does not put it back:
   `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
   (a new tunnel, its config and DNS record follow it, and `macbook-ssh-tunnel` gets the new
   token; the old tunnel's config cannot be destroyed by Terraform, so delete the old tunnel in
-  the API afterwards). Then send the new token as in step 1 (the `aws ... | ssh macbook 'umask 077; cat > ...'` line), restart
-  the connector with `launchctl kickstart -k gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared`,
+  the API afterwards). Then send the new token as in step 1 (the `aws ... | ssh macbook 'umask 077; cat > ...'` line), start
+  the connector again with
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`,
   repeat step 3, point `Host macbook` back through Cloudflare (step 4) and check
   `ssh macbook 'echo through cloudflare'`, and only then retire the reverse route again
   (step 5).
