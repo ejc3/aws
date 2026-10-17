@@ -61,9 +61,25 @@ class GitHubTests(unittest.TestCase):
         self.assertIn("environment     = github_repository_environment.dolphin_labs_cloudflare_deploy.environment", sec)
         self.assertIn("cloudflare_account_token.workers_deploy.value", sec)
 
+    def test_dolphin_films_deploy_token_lives_only_in_main_only_environments(self):
+        env = block("github_repository_environment", "dolphin_films_cloudflare_deploy")
+        self.assertIn('repository        = "dolphin-films"', env)
+        self.assertIn('environment       = "cloudflare-deploy"', env)
+        self.assertIn("custom_branch_policies = true", env)
+        policy = block("github_repository_environment_deployment_policy", "dolphin_films_cloudflare_deploy_main")
+        self.assertIn('branch_pattern = "main"', policy)
+        for name, environment in (("dolphin_films_cloudflare_deploy",
+                                   "github_repository_environment.dolphin_films_cloudflare_deploy.environment"),
+                                  ("dolphin_films_cloudflare_production", '"cloudflare-production"')):
+            sec = block("github_actions_environment_secret", name)
+            self.assertIn('repository      = "dolphin-films"', sec)
+            self.assertIn("environment     = %s" % environment, sec)
+            self.assertIn('secret_name     = "CLOUDFLARE_API_TOKEN"', sec)
+            self.assertIn("cloudflare_account_token.workers_deploy.value", sec)
+
     def test_every_github_resource_uses_the_app_provider(self):
         resources = re.findall(r'^resource "github_[a-z_]+" "[^"]+" \{\n(.*?)^\}', TF, re.M | re.S)
-        self.assertEqual(len(resources), 6)
+        self.assertEqual(len(resources), 10)
         for body in resources:
             self.assertIn("provider", body)
             self.assertIn("github.dolphin_labs_ci", body)

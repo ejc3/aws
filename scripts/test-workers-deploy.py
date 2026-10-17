@@ -91,12 +91,12 @@ class InstallScriptTests(unittest.TestCase):
         # dolphin-labs' copy is a main-only environment secret Terraform writes; a repository secret would undo that.
         env = dict(os.environ, PATH="/nonexistent")
         # GitHub resolves repository names case-insensitively, so every spelling is refused.
-        for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs"):
+        for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs", "dolphin-labs-hq/dolphin-films"):
             r = subprocess.run(["/bin/bash", str(ROOT / "scripts" / "workers-deploy-secret.sh"), repo],
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 3, (repo, r.stderr))
-            self.assertIn("cloudflare-deploy environment", r.stderr)
-        self.assertLess(INSTALL.index("dolphin-labs-hq/dolphin-labs)"), INSTALL.index("secretsmanager get-secret-value"))
+            self.assertIn("main-only environments", r.stderr)
+        self.assertLess(INSTALL.index("dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films)"), INSTALL.index("secretsmanager get-secret-value"))
 
     def test_refuses_an_empty_stored_token(self):
         self.assertIn('"${#TOKEN}" -ge 30', INSTALL)
