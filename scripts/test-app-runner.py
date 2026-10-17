@@ -35,10 +35,14 @@ COLTON, DOLPHIN = "CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"
 # ejc3/imagine shares its owner with ejc3/fcvm (the metal runners), so its separation from fcvm is tested by repository.
 IMAGINE, FCVM = "ejc3/imagine", "ejc3/fcvm"
 SIZES = {"xl": ["c7a.16xlarge", "c7i.16xlarge"], "l": ["c7a.8xlarge", "c7i.8xlarge"], "s": ["c7a.2xlarge"]}
+# runner-app.tf's runner_app_size_vcpus, which every repo's config carries as `vcpus`.
+VCPUS = {"xl": 64, "l": 32, "s": 8}
+# Every repo's config carries `vcpus` and `max_vcpus` as Terraform passes them (null: no vCPU cap). These three have none;
+# VcpuCapTests gives Imagine its vCPU cap.
 REPOS = {
-    COLTON: {"label": "cc-games", "max": 3, "pat_secret": f"github-runner/repo-pat/{COLTON}", "sizes": SIZES},
-    DOLPHIN: {"label": "dolphin", "max": 3, "pat_secret": f"github-runner/repo-pat/{DOLPHIN}", "sizes": SIZES},
-    IMAGINE: {"label": "imagine", "max": 3, "pat_secret": f"github-runner/repo-pat/{IMAGINE}", "sizes": SIZES},
+    COLTON: {"label": "cc-games", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{COLTON}", "sizes": SIZES, "vcpus": VCPUS},
+    DOLPHIN: {"label": "dolphin", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{DOLPHIN}", "sizes": SIZES, "vcpus": VCPUS},
+    IMAGINE: {"label": "imagine", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{IMAGINE}", "sizes": SIZES, "vcpus": VCPUS},
 }
 SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
@@ -795,7 +799,7 @@ class ReconcileTests(unittest.TestCase):
                                                  "labels": [{"name": "cc-games"}]}}
         app.handler({"reconcile": True}, None)
         _, data = app.fake_cloudwatch.metrics[-1]
-        counts = {d["Dimensions"][0]["Value"]: d["Value"] for d in data}
+        counts = {d["Dimensions"][0]["Value"]: d["Value"] for d in data if d["MetricName"] == "LiveRunners"}
         self.assertEqual(counts, {COLTON: 1, DOLPHIN: 0, IMAGINE: 0, "ALL": 1})
 
     def test_no_aws_call_or_github_request_starts_after_the_deadline(self):
@@ -1160,7 +1164,7 @@ class WiringTests(unittest.TestCase):
     def test_repos_that_share_a_label_still_get_their_own_alarm(self):
         # CloudWatch alarm names are unique per region: two repos named after one label would be
         # one alarm that each apply rewrites for the other repo, so one cap would go unwatched.
-        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
+        rows = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label = "([^"]+)", max = \d+(?:, max_vcpus = \d+)?(?:, alarm = "([^"]+)")? \}', APP_TF, re.M)
         served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
         self.assertEqual([repo for repo, _, _ in rows], served, "every served repo's row must parse")
         names = [alarm or label for _, label, alarm in rows]
@@ -1256,6 +1260,192 @@ class WiringTests(unittest.TestCase):
         self.assertIn("dimensions          = { Repo = each.key }", alarm)
         self.assertIn("'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text(),
                       "the controller must publish the per-repo series this alarm reads")
+
+
+def vcpu_cfg(max_vcpus=192, max_hosts=24):
+    """Imagine's config as runner-app.tf passes it: a vCPU cap with a host-count backstop."""
+    return dict(REPOS[IMAGINE], max=max_hosts, max_vcpus=max_vcpus)
+
+
+def hosts(repo, sizes, first=0):
+    """Listed hosts of these sizes, tagged by Size only (as hosts launched before the Vcpus tag)."""
+    return [instance(f"i-{repo.split('/')[1]}-{first + n}", repo, str(9000 + first + n), 5, size=size)
+            for n, size in enumerate(sizes)]
+
+
+def old_claim(app, repo, job, nonce):
+    """A claim made before claims recorded vCPUs: repo, job and nonce only."""
+    t = int(NOW.timestamp())
+    app.fake_dynamo.items[(repo, job)] = {"repo": {"S": repo}, "job": {"S": job}, "nonce": {"S": nonce},
+                                          "expires_at": {"N": str(t + 600)}, "ttl": {"N": str(t + 86400)}}
+
+
+class VcpuCapTests(unittest.TestCase):
+    """A repo with `max_vcpus` (Imagine) waits when the vCPUs in use plus the job's own would pass it; `max` stays as a
+    host-count backstop; a repo without `max_vcpus` is capped by hosts alone, exactly as before."""
+
+    def ensure(self, app, cfg, job, size, live=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            outcome, _ = app.ensure_runner(IMAGINE, cfg, SUBNETS, "PAT", str(job), size, list(live or []))
+        return outcome, out.getvalue()
+
+    def launched_tags(self, ec2):
+        return [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]} for kw in ec2.launched]
+
+    def test_at_the_vcpu_cap_an_s_job_waits_and_launches_while_its_room_is_left(self):
+        app, ec2, *_ = load_app()
+        cfg = vcpu_cfg()
+        ec2.instances += hosts(IMAGINE, ["l"] * 5 + ["s"] * 3)          # 160 + 24 = 184 of 192: 8 left, room for one s
+        self.assertEqual(self.ensure(app, cfg, 1, "s")[0], "launched", "8 vCPUs left fit an s host exactly")
+        outcome, log = self.ensure(app, cfg, 2, "s")                     # 192 of 192 in use: nothing left
+        self.assertEqual(outcome, "cap", "at the vCPU cap (9 hosts, under the 24-host backstop) an s job waits")
+        self.assertIn("at its cap of 192 vCPUs (192 in use, an s runner needs 8); job 2 waits", log)
+        self.assertEqual(len(ec2.launched), 1)
+
+    def test_an_l_job_waits_when_only_s_sized_room_is_left(self):
+        app, ec2, *_ = load_app()
+        cfg = vcpu_cfg()
+        ec2.instances += hosts(IMAGINE, ["l"] * 5 + ["s"])               # 168 of 192: 24 left, under an l's 32
+        outcome, log = self.ensure(app, cfg, 1, "l")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("(168 in use, an l runner needs 32)", log)
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(self.ensure(app, cfg, 2, "s")[0], "launched", "the same room still fits an s host")
+        self.assertEqual([t["Size"] for t in self.launched_tags(ec2)], ["s"])
+
+    def test_launches_the_listing_has_not_caught_up_with_count_their_own_size(self):
+        # Separate deliveries, each before EC2 lists any of the earlier launches: only the claims stand for them, and
+        # each must count its own host's vCPUs (not one slot, and not the largest size).
+        app, ec2, *_ = load_app()
+        ec2.listing_lags = True
+        cfg = vcpu_cfg()
+        for job, size in enumerate(["l"] * 5 + ["s"] * 3):                # 184 vCPUs claimed, none listed
+            self.assertEqual(self.ensure(app, cfg, job, size)[0], "launched", (job, size))
+        self.assertEqual(sorted(int(item["vcpus"]["N"]) for item in app.fake_dynamo.items.values()), [8] * 3 + [32] * 5,
+                         "each claim records the vCPUs of the host it launches")
+        outcome, log = self.ensure(app, cfg, 100, "l")
+        self.assertEqual(outcome, "cap", "five l and three s claims are 184 vCPUs: an l does not fit")
+        self.assertIn("(184 in use, an l runner needs 32)", log)
+        self.assertEqual(self.ensure(app, cfg, 101, "s")[0], "launched", "an s does: claims count their size, not the largest")
+        self.assertEqual(self.ensure(app, cfg, 102, "s")[0], "cap")
+        self.assertEqual(len(ec2.launched), 9)
+
+    def test_a_claim_made_before_claims_recorded_vcpus_counts_as_the_largest_size(self):
+        app, ec2, *_ = load_app()
+        cfg = vcpu_cfg()
+        ec2.instances += hosts(IMAGINE, ["s"] * 7)                        # 56
+        old_claim(app, IMAGINE, "500", "aaaa")                            # 64 each, as xl: 184 in all
+        old_claim(app, IMAGINE, "501", "bbbb")
+        outcome, log = self.ensure(app, cfg, 1, "l")
+        self.assertEqual(outcome, "cap", "counted as s (72 in use) an l would launch; as the largest it must wait")
+        self.assertIn("(184 in use, an l runner needs 32)", log)
+        self.assertEqual(self.ensure(app, cfg, 2, "s")[0], "launched")
+        self.assertEqual(self.ensure(app, cfg, 3, "s")[0], "cap")
+
+    def test_a_repo_without_max_vcpus_is_capped_by_hosts_alone(self):
+        # Colton has no vCPU cap: two xl hosts (128 vCPUs) and an xl job launch, as before, up to its 3 hosts. Its
+        # launch still records its vCPUs (the host's Vcpus tag and its claim), which the LiveVcpus metric counts.
+        app, ec2, *_ = load_app()
+        cfg = REPOS[COLTON]
+        ec2.instances += hosts(COLTON, ["xl", "xl"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            first, _ = app.ensure_runner(COLTON, cfg, SUBNETS, "PAT", "1", "xl", [])
+            (item,) = app.fake_dynamo.items.values()   # the next check sees this launch listed and releases its claim
+            second, _ = app.ensure_runner(COLTON, cfg, SUBNETS, "PAT", "2", "s", [])
+        self.assertEqual((first, second), ("launched", "cap"))
+        self.assertIn("at its cap of 3 runners; job 2 waits", out.getvalue())
+        self.assertNotIn("vCPUs", out.getvalue())
+        (tags,) = self.launched_tags(ec2)
+        self.assertEqual((tags["Size"], tags["Vcpus"]), ("xl", "64"))
+        self.assertEqual(item["vcpus"], {"N": "64"})
+
+    def test_the_host_backstop_holds_under_a_vcpu_cap(self):
+        app, ec2, *_ = load_app()
+        cfg = vcpu_cfg(max_vcpus=192, max_hosts=3)
+        ec2.instances += hosts(IMAGINE, ["s", "s"])                       # 16 of 192 vCPUs, 2 of 3 hosts
+        self.assertEqual(self.ensure(app, cfg, 1, "s")[0], "launched")
+        (item,) = app.fake_dynamo.items.values()
+        self.assertEqual(item["vcpus"], {"N": "8"}, "the claim records its host's vCPUs")
+        outcome, log = self.ensure(app, cfg, 2, "s")                     # 24 of 192 vCPUs, 3 of 3 hosts
+        self.assertEqual(outcome, "cap", "176 vCPUs are free, but the host backstop is reached")
+        self.assertIn("at its cap of 3 runners; job 2 waits", log)
+
+    def test_a_host_counts_by_its_vcpus_tag_then_its_size_then_as_the_largest(self):
+        app, *_ = load_app()
+        cfg = vcpu_cfg()
+        tagged = instance("i-t", IMAGINE, "1", 1, size="s")
+        tagged["Tags"].append({"Key": "Vcpus", "Value": "12"})
+        bare = instance("i-b", IMAGINE, "2", 1)
+        bare["Tags"] = [t for t in bare["Tags"] if t["Key"] != "Size"]
+        self.assertEqual([app.host_vcpus(i, cfg) for i in (tagged, instance("i-l", IMAGINE, "3", 1, size="l"), bare)],
+                         [12, 32, 64])
+
+    def test_each_repos_live_vcpus_are_published_next_to_its_host_count(self):
+        app, ec2, *_ = load_app()
+        busy = hosts(IMAGINE, ["l", "s", "s"])
+        ec2.instances += busy
+        app.github.runners[IMAGINE] = {i["InstanceId"]: {"id": n, "name": i["InstanceId"], "busy": True, "status": "online",
+                                                         "labels": [{"name": "imagine"}]} for n, i in enumerate(busy)}
+        app.handler({"reconcile": True}, None)
+        _, data = app.fake_cloudwatch.metrics[-1]
+        vcpus = {d["Dimensions"][0]["Value"]: d["Value"] for d in data if d["MetricName"] == "LiveVcpus"}
+        self.assertEqual(vcpus, {COLTON: 0, DOLPHIN: 0, IMAGINE: 48})
+        self.assertEqual({d["Unit"] for d in data if d["MetricName"] == "LiveVcpus"}, {"Count"})
+
+
+class VcpuCapTerraformTests(unittest.TestCase):
+    def test_imagine_is_capped_at_192_vcpus_with_24_hosts_as_the_backstop_and_no_other_repo_changes(self):
+        rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
+        self.assertEqual(rows[IMAGINE], '{ label = "imagine", max = 24, max_vcpus = 192 }')
+        self.assertEqual(rows[COLTON], '{ label = "cc-games", max = 8 }')
+        self.assertEqual(rows[DOLPHIN], '{ label = "dolphin", max = 8 }')
+        self.assertEqual([r for r, row in rows.items() if "max_vcpus" in row], [IMAGINE])
+        config = re.search(r"runner_app_config = \{.*?\n  \}", APP_TF, re.S).group()
+        self.assertIn("max_vcpus  = try(c.max_vcpus, null)", config)
+        self.assertIn("vcpus      = local.runner_app_size_vcpus", config)
+
+    def test_the_vcpu_map_has_every_size_and_matches_every_type_listed_under_it(self):
+        vcpus = dict((k, int(v)) for k, v in re.findall(r"(\w+) = (\d+)", re.search(r"runner_app_size_vcpus = \{([^}]*)\}", APP_TF).group(1)))
+        sizes = re.search(r"runner_app_sizes = \{(.*?)\n  \}", APP_TF, re.S).group(1)
+        listed = {size: re.findall(r'"([^"]+)"', types_) for size, types_ in re.findall(r"(\w+)\s*=\s*\[([^\]]+)\]", sizes)}
+        self.assertEqual(set(vcpus), set(listed))
+        for size, names in listed.items():
+            for name in names:
+                self.assertEqual(4 * int(re.search(r"\.(\d+)xlarge$", name).group(1)), vcpus[size], name)
+        fn = re.search(r'resource "aws_lambda_function" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("precondition {", fn, "a plan refuses a type whose vCPUs differ from its size's")
+        self.assertIn('== lookup(local.runner_app_size_vcpus, size, 0)', fn)
+
+    def test_a_host_may_be_tagged_with_its_vcpus_at_launch(self):
+        policy = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
+        keys = re.findall(r'"([^"]+)"', re.search(r'"aws:TagKeys" = \[([^\]]+)\]', policy).group(1))
+        self.assertEqual(keys, ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion"])
+
+    def test_each_vcpu_capped_repo_alarms_above_its_vcpu_cap(self):
+        self.assertIn("runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.max_vcpus != null }", APP_TF)
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("for_each            = var.enable_github_runner ? local.runner_app_vcpu_capped : {}", alarm)
+        self.assertIn('alarm_name          = "too-many-app-runner-vcpus-${try(local.runner_app_repos[each.key].alarm, each.value.label)}"', alarm)
+        self.assertIn("threshold           = each.value.max_vcpus", alarm)
+        self.assertIn('metric_name         = "LiveVcpus"', alarm)
+        self.assertIn("dimensions          = { Repo = each.key }", alarm)
+        self.assertIn('statistic           = "Maximum"', alarm)
+        self.assertIn("'MetricName': 'LiveVcpus', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}]", APP.read_text())
+        # The host alarms stay: the combined one still sums every repo's host cap, Imagine's backstop included.
+        self.assertIn("runner_app_max_total = sum([for c in values(local.runner_app_config) : c.max])", APP_TF)
+        combined = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn("threshold           = local.runner_app_max_total", combined)
+        self.assertIn('metric_name         = "LiveRunners"', combined)
+
+    def test_imagines_spend_alarm_counts_vcpus_at_the_spend_it_was_priced_at(self):
+        # Four l hosts (the host-count form's "$18 on l spot") are 128 vCPUs; held 6 hours, 768 vCPU-hours.
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('metric_name         = "LiveVcpus"', alarm)
+        self.assertIn("threshold           = 128", alarm)
+        self.assertIn('dimensions          = { Repo = "ejc3/imagine" }', alarm)
+        self.assertIn('statistic           = "Average"', alarm)
 
 
 class RunnersAppTokenTests(unittest.TestCase):

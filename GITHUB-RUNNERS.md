@@ -693,7 +693,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
   `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too. Runners
   register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
-  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, l]`.
+  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
@@ -714,6 +714,14 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   with its `JobId`. Each repo has its own cap (8; `dolphin-films`, `dolphin-maps` and `dolphin-family` 2), counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
+  A repo may also set `max_vcpus` (`ejc3/imagine`: 192, with `max = 24` hosts kept as a backstop). A launch then waits when the
+  vCPUs of the repo's hosts in use, plus those of its launches not listed yet, plus the vCPUs of the size the job asks for,
+  would pass it. The vCPUs per size come from one map, `runner_app_size_vcpus` (`s` 8, `l` 32, `xl` 64), next to
+  `runner_app_sizes` in `runner-app.tf`; a plan refuses an instance type whose vCPUs differ from its size's. A host is
+  counted by its `Vcpus` tag, set at launch (a host launched before that tag existed, by its `Size` tag through the map).
+  A claim records the vCPUs of the host it launches; a claim from before claims recorded them counts as the largest size,
+  the safe side. The reconcile takes jobs oldest first and stops at the first that waits, so a smaller job behind it does
+  not take the room it is next for. A repo without `max_vcpus` is capped by hosts alone, as before.
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
   listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
   nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
@@ -724,11 +732,15 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
-  zero would hide its hosts. `too-many-app-runners` fires above the combined cap, and
+  zero would hide its hosts. It also publishes `GitHubAppRunner/LiveVcpus`, the vCPUs of those hosts, per repo.
+  `too-many-app-runners` fires above the combined cap (the sum of every served repo's host cap, Imagine's backstop of 24
+  included), and
   `too-many-app-runners-<label>` (`-dolphin-films` and `-dolphin-maps` for those repos, which share a label) above one repo's own cap, so a single repo running away is
-  visible even while the total is under the combined cap. `imagine-runner-hours-daily` fires when Imagine's
-  `LiveRunners` averages above 4 over 24 hours (96 host-hours: about $70 on `l` spot, about $130 on `xl`): a cap held all day, which the
-  per-repo alarm (over the cap) never sees. `github-app-runner-reconcile-silent`
+  visible even while the total is under the combined cap. A repo with a vCPU cap also gets
+  `too-many-app-runner-vcpus-<label>`, its `LiveVcpus` above that cap for 15 minutes: a repo over-launching large hosts
+  passes its vCPU cap long before its host backstop. `imagine-runner-hours-daily` fires when Imagine's
+  `LiveVcpus`, averaged over an hour, is above 128 (four `l` hosts) in 6 of the last 24 hours (768 vCPU-hours past its
+  usual volume, about $18 at spot): a cap held too long, which the per-repo alarms (over a cap) never see. `github-app-runner-reconcile-silent`
   fires when no total arrives for 15 minutes, because then some repo is not being reaped. One
   repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
@@ -785,9 +797,13 @@ never the owner:
 - **Gate.** `imagine_token_ready` (starts false) keeps the token read, the controller entry, the hook and the daily alarm
   out of every plan until `github-runner/repo-pat/ejc3/imagine` has a value. Set its default to true in a commit, never
   with `-var`.
-- **Cap and cost.** 8 hosts, its own `too-many-app-runners-imagine`, and `imagine-runner-hours-daily`. On `l`
-  (c7a.8xlarge, about $0.72/h with its disk and address) the cap bounds Imagine at about $138 a day; jobs may also ask
-  for `xl` (c7a.16xlarge, about $1.35/h), which raises that bound to about $260 a day.
+- **Cap and cost.** 192 vCPUs (`max_vcpus`), with 24 hosts as a backstop; its own `too-many-app-runners-imagine`,
+  `too-many-app-runner-vcpus-imagine` and `imagine-runner-hours-daily`. One CI run asks for four `s` and one `l` (64
+  vCPUs), so 192 is three runs at once; the old cap of 8 hosts held a second run's jobs for 5 to 11 minutes. Spot cost
+  follows vCPUs, so the cap bounds Imagine at about $3.80 to $5.30 an hour (about $90 to $130 a day): 192 vCPUs as 3 `xl`
+  hosts (c7a.16xlarge, about $1.25/h with its disk and address) at the low end, as 24 `s` hosts (c7a.2xlarge, about
+  $0.22/h) at the high end, where each host's disk and address count 24 times. The cap of 8 hosts bounded it at up to
+  512 vCPUs (8 `xl`, about $10 an hour).
 - **What the stock image lacks.** Bootstrap installs only the runner, build tools, git, curl, jq, zip and passwordless
   sudo. Imagine's workflow brings the rest per job: Erlang/OTP and Elixir through `erlef/setup-beam` (which, on a
   self-hosted runner, needs `ImageOS=ubuntu24` in the job's environment; hosted images set it), rustup itself (the

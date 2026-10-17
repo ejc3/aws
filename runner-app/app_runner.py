@@ -10,7 +10,8 @@ correct:
     --ephemeral, takes one job (not necessarily that one; the count is what matters), and
     powers off, and InstanceInitiatedShutdownBehavior=terminate deletes it.
   * NO reuse, ever, and nothing shared between repos: each repo has its own label, cap, PAT
-    and Repo tag, and a host never outlives its job.
+    and Repo tag, and a host never outlives its job. The cap is a number of hosts (`max`) and,
+    where a repo sets one, a number of vCPUs (`max_vcpus`) as well: see ensure_runner().
   * A reconcile every two minutes (EventBridge) re-derives the truth from GitHub and EC2: it
     launches for queued jobs that have no runner (a lost delivery, a spot refusal), and
     terminates hosts that never registered (BOOT_GRACE), sat idle (IDLE_LIMIT) or outlived
@@ -298,6 +299,46 @@ def repo_pat(cfg):
     return value.strip() or None
 
 
+# ---------------------------------------------------------------- vCPUs
+# runner-app.tf's runner_app_size_vcpus, passed in every repo's config as `vcpus`: the vCPUs of one host of each size.
+# Every instance type listed under a size has that many (runner-app.tf checks it), so a size is enough to count a host.
+def size_vcpus(cfg, size):
+    """vCPUs of one `size` host. A size the map lacks is a configuration error, raised so the error alarm fires."""
+    vcpus = cfg.get('vcpus') or {}
+    if size not in vcpus:
+        raise RuntimeError(f"no vCPU count for size {size!r} in the repo's config")
+    return int(vcpus[size])
+
+
+def largest_vcpus(cfg):
+    """The vCPUs of the largest size: what a host or claim of unknown size counts as, the safe side of the cap."""
+    vcpus = cfg.get('vcpus') or {}
+    if not vcpus:
+        raise RuntimeError("no vCPU counts in the repo's config")
+    return max(int(v) for v in vcpus.values())
+
+
+def known_vcpus(cfg, size):
+    """vCPUs of one `size` host when the config has them, else None (a config from before `vcpus`)."""
+    value = (cfg.get('vcpus') or {}).get(size)
+    return None if value is None else int(value)
+
+
+def host_vcpus(instance, cfg):
+    """vCPUs of a host: its Vcpus tag (set at launch, so a later change to the sizes cannot miscount it), else its Size
+    tag through the map (hosts launched before the Vcpus tag existed), else the largest size."""
+    try:
+        value = int(tag(instance, 'Vcpus') or 0)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    size = tag(instance, 'Size')
+    if size in (cfg.get('vcpus') or {}):
+        return int(cfg['vcpus'][size])
+    return largest_vcpus(cfg)
+
+
 def job_size(cfg, labels):
     """The size label a job asks for when the job is this repo's, else None.
 
@@ -513,6 +554,7 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
     ami = ssm.get_parameter(Name=CANONICAL_AMI_PARAM)['Parameter']['Value']
     labels = f"{cfg['label']},{size}"
     data = user_data(repo, labels)
+    vcpus = known_vcpus(cfg, size)
     last_error, attempt = None, 0
     # Only these mean EC2 created nothing, so another pool is safe to try. Anything else -- a
     # timeout, a throttle, a 5xx -- may have launched an instance after all, so stop: the next
@@ -556,7 +598,7 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                             {'Key': 'Size', 'Value': size},
                             {'Key': 'JobId', 'Value': job_id},
                             {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
-                        ]},
+                        ] + ([{'Key': 'Vcpus', 'Value': str(vcpus)}] if vcpus is not None else [])},
                         {'ResourceType': 'volume', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                         {'ResourceType': 'network-interface', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                     ])
@@ -611,14 +653,18 @@ def settle(repo, instance_id, instance_type, subnet, job_id, labels, token):
 
 
 # ---------------------------------------------------------------- policy
-def claim(repo, job_id):
-    """The claim's nonce if this invocation may launch for the job (see CLAIM_SECONDS), else None."""
+def claim(repo, job_id, vcpus):
+    """The claim's nonce if this invocation may launch for the job (see CLAIM_SECONDS), else None.
+
+    The claim records the vCPUs of the host it launches, so a launch EC2 does not list yet counts its own size against
+    the repo's vCPU cap (ensure_runner)."""
     t, nonce = int(now().timestamp()), uuid.uuid4().hex
     try:
         dynamodb.put_item(
             TableName=os.environ['CLAIMS_TABLE'],
             Item={'repo': {'S': repo}, 'job': {'S': job_id}, 'nonce': {'S': nonce},
-                  'expires_at': {'N': str(t + CLAIM_SECONDS)}, 'ttl': {'N': str(t + 86400)}},
+                  'expires_at': {'N': str(t + CLAIM_SECONDS)}, 'ttl': {'N': str(t + 86400)},
+                  **({'vcpus': {'N': str(vcpus)}} if vcpus is not None else {})},
             ConditionExpression='attribute_not_exists(job) OR expires_at < :now',
             ExpressionAttributeValues={':now': {'N': str(t)}})
         return nonce
@@ -627,8 +673,8 @@ def claim(repo, job_id):
 
 
 def active_claims(repo):
-    """{job: nonce} for the jobs this repo launched for (or is launching for) within
-    CLAIM_SECONDS. A consistent read:
+    """{job: (nonce, vcpus)} for the jobs this repo launched for (or is launching for) within
+    CLAIM_SECONDS; vcpus is None for a claim made before claims recorded it. A consistent read:
     together with the serialized controller (reserved concurrency 1) it makes the repo cap hold
     even when DescribeInstances has not caught up with a burst of launches."""
     t, found, page = int(now().timestamp()), {}, {}
@@ -636,7 +682,8 @@ def active_claims(repo):
         response = dynamodb.query(
             TableName=os.environ['CLAIMS_TABLE'], ConsistentRead=True,
             KeyConditionExpression='repo = :repo', ExpressionAttributeValues={':repo': {'S': repo}}, **page)
-        found.update({item['job']['S']: item.get('nonce', {}).get('S', '')
+        found.update({item['job']['S']: (item.get('nonce', {}).get('S', ''),
+                                         int(item['vcpus']['N']) if 'vcpus' in item else None)
                       for item in response.get('Items', []) if int(item['expires_at']['N']) >= t})
         if 'LastEvaluatedKey' not in response:
             return found
@@ -654,6 +701,10 @@ def release(repo, job_id):
 def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=frozenset()):
     """Launch for `job_id` unless it already has a host or the repo is at its cap.
 
+    The cap is `max` hosts and, where the repo sets `max_vcpus`, that many vCPUs too: the job waits when the vCPUs of
+    the repo's hosts in use, plus those of the launches not listed yet (each claim's own), plus the vCPUs of the size
+    this job asks for, would pass it. A repo without `max_vcpus` is capped by hosts alone.
+
     `busy` names hosts whose runner is running a job. A host tagged for this job cannot serve it
     if it is busy while the job is still queued: GitHub gave it another job with the same labels,
     and an ephemeral runner takes only one. The job then needs a host of its own."""
@@ -670,7 +721,7 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     # no listed host of its own -- even if an older host of the same job is listed -- stays.
     # Clean up FIRST, before deciding this job is "claimed".
     tokens = {i.get('ClientToken') or '' for i in listed}
-    for job, nonce in list(claimed.items()):
+    for job, (nonce, _) in list(claimed.items()):
         if nonce and any(t.startswith(nonce + '-') for t in tokens):
             release(repo, job)
             del claimed[job]
@@ -680,12 +731,25 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     # `running` at all. A launch this invocation made is in `live` (with its ClientToken) but not
     # yet listed: its claim must stay, but it is one slot, not two.
     held = {i.get('ClientToken') or '' for i in running}
-    unseen = {job for job, nonce in claimed.items() if not (nonce and any(t.startswith(nonce + '-') for t in held))}
+    unseen = {job for job, (nonce, _) in claimed.items() if not (nonce and any(t.startswith(nonce + '-') for t in held))}
     in_use = {i['InstanceId'] for i in running} | unseen
     if len(in_use) >= int(cfg['max']):
         print(f"{repo}: at its cap of {cfg['max']} runners; job {job_id} waits")
         return 'cap', token
-    nonce = claim(repo, job_id)
+    capped = cfg.get('max_vcpus') is not None
+    need = size_vcpus(cfg, size) if capped else known_vcpus(cfg, size)
+    if capped:
+        # Each host once (`running` can list one twice: `live` and the fresh listing), by its own vCPUs; each unseen
+        # launch by its claim's. A claim made before claims recorded vCPUs counts as the largest size: too high only
+        # holds a job back until that claim's host is listed or the claim expires, where too low could pass the cap.
+        hosts = {i['InstanceId']: i for i in running}
+        used = (sum(host_vcpus(i, cfg) for i in hosts.values())
+                + sum(claimed[job][1] if claimed[job][1] is not None else largest_vcpus(cfg) for job in unseen))
+        if used + need > int(cfg['max_vcpus']):
+            print(f"{repo}: at its cap of {cfg['max_vcpus']} vCPUs ({used} in use, an {size} runner needs {need}); "
+                  f"job {job_id} waits")
+            return 'cap', token
+    nonce = claim(repo, job_id, need)
     if not nonce:
         return 'claimed', token
     try:
@@ -698,7 +762,8 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
         release(repo, job_id)
         raise
     if instance_id:
-        live.append({'InstanceId': instance_id, 'Tags': [{'Key': 'JobId', 'Value': job_id}],
+        live.append({'InstanceId': instance_id, 'Tags': [{'Key': 'JobId', 'Value': job_id}, {'Key': 'Size', 'Value': size}]
+                     + ([{'Key': 'Vcpus', 'Value': str(need)}] if need is not None else []),
                      'LaunchTime': now(), 'State': {'Name': 'pending'}, 'ClientToken': f'{nonce}-local'})
         return 'launched', token
     if definite:
@@ -796,6 +861,8 @@ def reconcile_repo(repo, cfg, subnets, result):
     # From here on, a stop at the deadline still reports these (live grows with each launch).
     result['outcomes'] = outcomes
     result['live'] = len(live)
+    if cfg.get('vcpus'):
+        result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
     # The scan gets half the remaining share, so jobs it finds always have time to launch: a
     # queue big or slow enough to use the whole share would otherwise be found and dropped on
     # every round.
@@ -809,12 +876,16 @@ def reconcile_repo(repo, cfg, subnets, result):
     for job_id, size in jobs:
         # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
         # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
+        # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
+        # oldest first, and the one that waits keeps its turn for the room the next host frees.
         if out_of_time():
             outcomes['deferred'] = outcomes.get('deferred', 0) + 1
             break
         outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
         result['live'] = len(live)
+        if cfg.get('vcpus'):
+            result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
         if outcome == 'cap':
             break
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
@@ -826,9 +897,14 @@ def publish_counts(results):
     reconcile-silent alarms read this: AWS/EC2 has no per-tag instance count to alarm on. A total
     that silently counted a skipped or failed repo as zero would hide its hosts from the
     too-many alarm, so a round without every count publishes no total; rounds like that in a
-    row trip reconcile-silent (missing = breaching), which is what they are."""
+    row trip reconcile-silent (missing = breaching), which is what they are.
+
+    LiveVcpus, per repo, is the vCPUs of those same hosts: the per-repo vCPU alarm and Imagine's
+    spend alarm read it (runner-app.tf). Nothing reads a vCPU total, so none is published."""
     data = [{'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
              'Value': r['live'], 'Unit': 'Count'} for r in results if 'live' in r]
+    data += [{'MetricName': 'LiveVcpus', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
+              'Value': r['vcpus'], 'Unit': 'Count'} for r in results if 'vcpus' in r]
     if all('live' in r for r in results):
         data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
                      'Value': sum(r['live'] for r in results), 'Unit': 'Count'})
