@@ -42,14 +42,15 @@ locals {
       script = "imagine-runner.sh"
       # These must match ejc3/imagine: RUST_* its rust-toolchain.toml (channel, components, targets); OTP_VERSION,
       # ELIXIR_VERSION and the libSQL server image its .github/workflows/ci.yml; PNPM_VERSION and PLAYWRIGHT_VERSION its
-      # web/package.json (packageManager, @playwright/test); NODE_MAJOR the Node its setup action installs. They are not
+      # web/package.json (packageManager, @playwright/test); NODE_VERSION the Node its setup action pins
+      # (.github/actions/setup/action.yml, node-version), which a job uses when it finds that version. They are not
       # read from that repository, which is private. A pin that falls behind costs time, never correctness: the job's
       # own setup installs the version it asks for.
       versions = {
         RUST_TOOLCHAIN     = "1.93.0"
         RUST_COMPONENTS    = "rustfmt,clippy"
         RUST_TARGETS       = "wasm32-unknown-unknown"
-        NODE_MAJOR         = "22"
+        NODE_VERSION       = "22.23.3"
         PNPM_VERSION       = "10.29.1"
         OTP_VERSION        = "29.1.1"
         ELIXIR_VERSION     = "1.20.4"

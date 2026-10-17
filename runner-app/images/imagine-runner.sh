@@ -39,11 +39,10 @@ install_rust() {
 }
 
 install_node() {
-  # The newest Node of the pinned major, checked against nodejs.org's SHASUMS256.txt, and pnpm.
-  local version name
-  version=$(get https://nodejs.org/dist/index.json \
-    | jq -r --arg major "v$NODE_MAJOR." '[.[] | select(.version | startswith($major))][0].version')
-  [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no Node $NODE_MAJOR release listed" >&2; return 1; }
+  # The pinned Node, the version ejc3/imagine's setup action pins (its node-version input), so a
+  # job finds it and downloads none; checked against nodejs.org's SHASUMS256.txt; and pnpm.
+  local version=v$NODE_VERSION name
+  [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "NODE_VERSION=$NODE_VERSION is not a version" >&2; return 1; }
   name=node-$version-linux-x64.tar.gz
   get -o "/tmp/$name" "https://nodejs.org/dist/$version/$name"
   get "https://nodejs.org/dist/$version/SHASUMS256.txt" | grep " $name\$" | (cd /tmp && sha256sum -c -)
@@ -103,7 +102,7 @@ pull_images() {
 }
 
 main() {
-  : "${RUST_TOOLCHAIN:?}" "${RUST_COMPONENTS:?}" "${RUST_TARGETS:?}" "${NODE_MAJOR:?}" "${PNPM_VERSION:?}"
+  : "${RUST_TOOLCHAIN:?}" "${RUST_COMPONENTS:?}" "${RUST_TARGETS:?}" "${NODE_VERSION:?}" "${PNPM_VERSION:?}"
   : "${OTP_VERSION:?}" "${ELIXIR_VERSION:?}" "${PLAYWRIGHT_VERSION:?}" "${LIBSQL_IMAGE:?}"
   install_packages
   install_rust
