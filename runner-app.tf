@@ -57,10 +57,10 @@ locals {
   # boot the newest available build of it that this account's pipeline made and tagged, and Canonical's Ubuntu 24.04,
   # with a log line saying so, when there is none. A repo without `image` boots Canonical's image, as before.
   runner_app_repos = {
-    "CoderColton/colton-games"      = { label = "cc-games", max = 8 }
-    "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
-    "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
-    "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
+    "CoderColton/colton-games"      = { label = "cc-games", max = 8, image = "colton-games-runner" }
+    "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8, image = "dolphin-labs-runner" }
+    "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, image = "dolphin-films-runner", alarm = "dolphin-films" }
+    "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, image = "dolphin-maps-runner", alarm = "dolphin-maps" }
     "ejc3/imagine"                  = { label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).

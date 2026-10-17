@@ -852,7 +852,7 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
   `actions/setup-node` and `actions/setup-python` look before they download; Playwright's system libraries and its
   browsers in the runner's `~/.cache/ms-playwright` for the version in the repo's lockfile; and any packages a job
   `apt-get install`s (colton-games: PostgreSQL 16). Nothing goes on `PATH`: the setup steps put the tool-cache copies
-  there. A repo boots its image once its entry names it (`image = "<name>"`), after the image's first build.
+  there. Each repo boots its image (`image = "<name>"` in its entry); the first builds were on 2026-10-17.
 - **The pipeline.** Lambda `github-app-runner-image` (`runner-app/image_builder.py`), the shape of fcvm's builder
   (Pattern A) without a GitHub identity: weekly (Monday 09:00 UTC, `{"build": true}`) and on demand it launches one
   on-demand `github-app-runner-image-builder` host from Canonical's image into the runner subnets with
