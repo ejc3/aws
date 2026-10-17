@@ -26,7 +26,7 @@ class PointerTests(unittest.TestCase):
 
     def test_the_pointer_is_published_for_the_dev_boxes_and_they_may_read_it(self):
         self.assertIn('name        = "/infra/parallel-box"', OHIO)
-        self.assertIn("jsonencode({ region = local.parallel_box_region })", OHIO)
+        self.assertIn("jsonencode({ region = local.parallel_box_region, fallback = local.pbox_fallback_pointer })", OHIO)
         self.assertIn("aws_ssm_parameter.parallel_box_region.arn", STATUS)
         # read only, and only that one parameter
         stmt = re.search(r'Sid\s+= "ReadParallelBoxRegion".*?\n    \},', STATUS, re.S).group(0)
@@ -107,7 +107,8 @@ class RetiredSiteTests(unittest.TestCase):
         # the slot list, the volume list and the watchdog's tag list are one thing
         self.assertRegex(LAUNCH, r'parallel_boxes\s*=\s*\{ for n in \[1, 2, 3, 4\] : tostring\(n\) => \{ name = n == 1 \? "parallel-box" : "parallel-box-\$\{n\}" \} \}')
         self.assertRegex(LAUNCH, r'parallel_box_names\s*=\s*\[for k in sort\(keys\(local\.parallel_boxes\)\) : local\.parallel_boxes\[k\]\.name\]')
-        self.assertIn('case "$BOX" in ""|1|2|3|4) ;;', SCRIPT)
+        self.assertIn('1|2|3|4) BOX="$1" ;;', SCRIPT)
+        self.assertIn("""[0-9]*) say "unknown box '$1' (use 1-4)"; exit 1 ;;""", SCRIPT)
         self.assertIn('for n in 1 2 3 4; do status_one "$n"; done', SCRIPT)
         self.assertIn('VOLTAG="$NAME-work"', SCRIPT)
 

@@ -275,11 +275,12 @@ resource "aws_lambda_permission" "parallel_watchdog_ohio" {
 
 # ============================================================ which region `pbox` uses
 # Read by scripts/parallel-box.sh on every dev box (a plain SSM read, the same way /infra/applied-status is). The
-# parameter holds no secret; the policy that lets a dev box read it is in applied-status.tf.
+# parameter holds no secret; the policy that lets a dev box read it is in applied-status.tf. "fallback" is where
+# `pbox up N --fallback` may launch instead (pbox-fallback.tf): the template name and region => AZ => subnet.
 resource "aws_ssm_parameter" "parallel_box_region" {
   name        = "/infra/parallel-box"
-  description = "Which region the parallel boxes launch in (see ohio-pbox.tf); read by scripts/parallel-box.sh"
+  description = "Which region the parallel boxes launch in (see ohio-pbox.tf) and their fallback sites (pbox-fallback.tf); read by scripts/parallel-box.sh"
   type        = "String"
   tier        = "Standard"
-  value       = jsonencode({ region = local.parallel_box_region })
+  value       = jsonencode({ region = local.parallel_box_region, fallback = local.pbox_fallback_pointer })
 }

@@ -4,21 +4,36 @@
 # boxes (slots 1-4; ohio-pbox.tf, parallel-box-launch.tf), each with its own persistent
 # work volume, so four parallel jobs can run at once.
 #
-#   pbox up [N]       launch box 1 (or N, 1-4); tries several instance types
+#   pbox up [N]       launch box 1 (or N, 1-4) in the home AZ; tries several instance types
 #   pbox up [N] kvm   same box, METAL pools only: /dev/kvm for hypervisor
 #                     workloads (fcvm/firecracker). Boots in many minutes.
-#   pbox down [N]     terminate it. Its work volume is KEPT.
-#   pbox status       every box: running? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
+#   pbox up [N] --fallback
+#                     home AZ first; if it has no capacity, every other US AZ that has a
+#                     fallback site (pbox-fallback.tf), best spot placement score first.
+#                     A FALLBACK BOX STARTS WITH AN EMPTY WORK VOLUME, deleted with the box.
+#   pbox up [N] --regions us-east-1,us-west-2
+#                     the same, searching only these regions' fallback sites
+#   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
+#   pbox status       every box: running where? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
 #   pbox status N     just box N
 #   pbox ssh [N]      connect
 #   pbox ip [N]       print the IP
+#   pbox capacity [N] spot placement scores (1-10) for the type list in the home AZ and every
+#                     fallback AZ; launches nothing
+#
+# For scripts, `up` exits 0 when the box is up (stdout's last line is
+#   "launched box=N region=R az=Z type=T ip=IP work=persistent|fresh", or "running ..." when it already was),
+#   3 when the home AZ had no capacity and --fallback was not given (retry with it), 4 when no
+#   fallback AZ had capacity either, and 1 for any other failure.
 #
 # CAPACITY IS THE HARD PART. A 192-core spot request pinned to one AZ and one instance
 # type scores 1/10 for fulfilment; allowing several instance types raises that
-# materially. The persistent volumes are AZ-locked, so we cannot roam AZs without
-# snapshotting -- but we CAN try every Graviton family in the volume's AZ, which is what
-# the list below does. Each attempt is reported, so a failure is visible rather than a
-# silent five-minute hang.
+# materially. The persistent volumes are AZ-locked, so a home launch tries every Graviton
+# family in the volume's AZ, which is what the list below does. When that is not enough,
+# --fallback goes to the other US AZs, with a fresh, empty work volume instead of the
+# persistent one: the caller decides whether that is acceptable, which is why it is never
+# the default. Each attempt is reported, so a failure is visible rather than a silent
+# five-minute hang.
 #
 # THIS SCRIPT DOES NOT RUN TERRAFORM, AND DOES NOT TOUCH THE JUMPBOX.
 #
@@ -73,12 +88,23 @@ fi
 SELF="$(basename "${BASH_SOURCE[0]}")"
 say() { printf '%s\n' "$*" >&2; }
 
-# Which region the boxes live in. Terraform publishes it (ohio-pbox.tf, /infra/parallel-box, in us-west-1), so moving them is
-# one apply and never a script edit on every dev box. PARALLEL_BOX_REGION overrides it for a one-off.
+# Which region the boxes live in, and their fallback sites. Terraform publishes both (ohio-pbox.tf, /infra/parallel-box,
+# in us-west-1), so moving them is one apply and never a script edit on every dev box. PARALLEL_BOX_REGION overrides the
+# home region for a one-off.
+POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)"
+pointer() { # pointer KEY...: the value at that path in the pointer (an object's keys, space-separated), or nothing
+  printf '%s' "$POINTER" | python3 -c 'import json, sys
+try:
+    v = json.load(sys.stdin)
+    for k in sys.argv[1:]:
+        v = v[k]
+except Exception:
+    sys.exit(0)
+print(" ".join(v) if isinstance(v, dict) else v if isinstance(v, str) else "")' "$@" 2>/dev/null
+}
 REGION="${PARALLEL_BOX_REGION:-}"
 if [ -z "$REGION" ]; then
-  REGION="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["region"])' 2>/dev/null)"
+  REGION="$(pointer region)"
 fi
 if [ -z "$REGION" ]; then
   say "FATAL: cannot read which region the parallel boxes are in (SSM /infra/parallel-box in us-west-1)."
@@ -86,19 +112,46 @@ if [ -z "$REGION" ]; then
   exit 1
 fi
 
+HOME_REGION="$REGION"
+
 # ---------------------------------------------------------------------------------
 # Box selection. Box 1 keeps the original, unnumbered names (tag "parallel-box",
 # launch template "parallel-box") so nothing existing moves; boxes 2-4 are suffixed.
 # ---------------------------------------------------------------------------------
 CMD="${1:-status}"
-BOX="${2:-}"
-MODE="${3:-}"
-
-# "up kvm" is shorthand for box 1 in kvm mode.
-if [ "$BOX" = "kvm" ]; then MODE="kvm"; BOX=1; fi
-case "$BOX" in ""|1|2|3|4) ;; *) say "unknown box '$BOX' (use 1-4)"; exit 1 ;; esac
-case "$MODE" in ""|kvm) ;; *) say "unknown mode '$MODE' (only 'kvm')"; exit 1 ;; esac
+[ $# -gt 0 ] && shift
+BOX=""
+MODE=""
+FALLBACK=""
+ONLY_REGIONS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    1|2|3|4) BOX="$1" ;;
+    kvm) MODE="kvm" ;; # "up kvm" is shorthand for box 1 in kvm mode
+    --fallback) FALLBACK=1 ;;
+    --regions) shift; ONLY_REGIONS="${1:-}"; FALLBACK=1 ;;
+    --regions=*) ONLY_REGIONS="${1#--regions=}"; FALLBACK=1 ;;
+    [0-9]*) say "unknown box '$1' (use 1-4)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-4, kvm, --fallback, --regions r1,r2)"; exit 1 ;;
+  esac
+  shift
+done
 [ "$MODE" = "kvm" ] && TYPES="$KVM_TYPES"
+if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
+
+# The fallback sites (pbox-fallback.tf): their template name, and region => AZ => subnet.
+FB_TEMPLATE="$(pointer fallback template)"
+FB_REGIONS="$(pointer fallback regions)"
+fb_subnet() { pointer fallback regions "$1" subnets "$2"; } # fb_subnet REGION AZ
+fb_azs() { pointer fallback regions "$1" subnets; }        # fb_azs REGION
+if [ -n "$ONLY_REGIONS" ]; then
+  for r in ${ONLY_REGIONS//,/ }; do
+    case " $FB_REGIONS " in *" $r "*) ;; *)
+      say "no fallback site in '$r' (the sites: ${FB_REGIONS:-none published in /infra/parallel-box})"; exit 1 ;;
+    esac
+  done
+  FB_REGIONS="${ONLY_REGIONS//,/ }"
+fi
 
 set_box() {
   if [ "$1" = "1" ]; then
@@ -137,6 +190,46 @@ box_id() {
     --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v '^None$' || true
 }
 
+# Point REGION at wherever the box runs: home first, then the fallback regions. A box that is not running anywhere
+# leaves REGION at home, where `up` launches it first.
+locate_box() {
+  local r id
+  for r in $(all_regions); do
+    id=$(aws ec2 describe-instances --region "$r" \
+      --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+      --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v '^None$' || true)
+    if [ -n "$id" ] && [ "${id#i-}" != "$id" ]; then REGION="$r"; return 0; fi
+  done
+  REGION="$HOME_REGION"
+  return 1
+}
+
+# Home first, then each fallback region once (us-east-2 is both home and a fallback site for its other AZs).
+all_regions() {
+  local r seen=" "
+  for r in "$HOME_REGION" $FB_REGIONS; do
+    case "$seen" in *" $r "*) continue ;; esac
+    seen="$seen$r "
+    echo "$r"
+  done
+}
+
+# "fresh" for a box launched at a fallback site (its launch template tags it Fallback=true), else "persistent".
+box_work() {
+  local f
+  # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+  f=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[0].Instances[0].Tags[?Key==`Fallback`].Value | [0]' --output text 2>/dev/null)
+  [ "$f" = "true" ] && echo fresh || echo persistent
+}
+
+box_az() {
+  aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text 2>/dev/null | grep -v '^None$' || true
+}
+
 work_volume() {
   aws ec2 describe-volumes --region "$REGION" \
     --filters "Name=tag:Name,Values=$VOLTAG" \
@@ -146,6 +239,7 @@ work_volume() {
 status_one() {
   set_box "$1"
   echo "parallel-box $1:"
+  locate_box || true
   IP="$(box_ip)"
   if [ -n "$IP" ]; then
     T=$(aws ec2 describe-instances --region "$REGION" \
@@ -156,12 +250,18 @@ status_one() {
       --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
     case "$L" in spot) BOUGHT="spot" ;; None|"") BOUGHT="ON-DEMAND (about 3x spot)" ;; *) BOUGHT="$L" ;; esac
     echo "  state:  RUNNING at $IP ($T, $BOUGHT)"
+    if [ "$(box_work)" = "fresh" ]; then
+      echo "  where:  FALLBACK site $(box_az) -- its /mnt/work is a fresh volume, deleted with the box"
+    elif [ "$REGION" != "$HOME_REGION" ] || [ -n "$FB_REGIONS" ]; then
+      echo "  where:  home, $(box_az)"
+    fi
     ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
       "ubuntu@$IP" 'echo "  cores:  $(nproc)"; echo "  load:   $(uptime | sed "s/.*load average: //")"; echo "  work:   $(df -h /mnt/work | awk "NR==2{print \$3\" used of \"\$2}")"' 2>/dev/null \
       || echo "  (running, but SSH not answering yet)"
   else
     echo "  state:  down (\$0 compute)"
   fi
+  REGION="$HOME_REGION"
   echo "  volume: $(aws ec2 describe-volumes --region "$REGION" \
     --filters "Name=tag:Name,Values=$VOLTAG" \
     --query 'Volumes[0].[VolumeId,Size,State]' --output text 2>/dev/null) (persistent)"
@@ -172,12 +272,111 @@ status_one() {
   esac
 }
 
+# Spot placement scores (1-10, how likely a request for one of $TYPES is to be fulfilled) of single AZs, as lines
+# "score region az". Arguments: the regions. The API answers with zone IDs; they are mapped to this account's names.
+placement_scores() {
+  local r
+  # shellcheck disable=SC2086 # $TYPES is a list of words on purpose
+  aws ec2 get-spot-placement-scores --region "$HOME_REGION" --target-capacity 1 --single-availability-zone \
+    --region-names "$@" --instance-types $TYPES \
+    --query 'SpotPlacementScores[].[Score,Region,AvailabilityZoneId]' --output text 2>/dev/null > "$TMP/scores" || return 1
+  for r in "$@"; do
+    aws ec2 describe-availability-zones --region "$r" \
+      --query 'AvailabilityZones[].[ZoneId,ZoneName]' --output text 2>/dev/null
+  done > "$TMP/zones"
+  awk 'NR == FNR { name[$1] = $2; next } ($3 in name) { print $1, $2, name[$3] }' "$TMP/zones" "$TMP/scores"
+}
+
+# The fallback AZs to try, best score first: lines "score region az". An AZ the scores do not mention (or every AZ,
+# when the scores cannot be read) is kept with score "?", after the scored ones, in the published order.
+fallback_order() {
+  local r az
+  # shellcheck disable=SC2086 # a list of regions
+  placement_scores $FB_REGIONS > "$TMP/scored" || : > "$TMP/scored"
+  for r in $FB_REGIONS; do
+    for az in $(fb_azs "$r"); do
+      awk -v r="$r" -v z="$az" '$2 == r && $3 == z { print; found = 1 } END { if (!found) print "? " r " " z }' "$TMP/scored"
+    done
+  done | sort -s -t' ' -k1,1nr
+}
+
+# Wait until the box answers SSH, then report it. $1: what the work volume is ("persistent" or "fresh").
+wait_ready() {
+  # Metal firmware init takes many minutes on top of the normal boot -- give kvm
+  # mode 25 min before declaring failure (virtualized boxes keep the 10 min bound).
+  WAIT_TRIES=60
+  [ "$MODE" = "kvm" ] && WAIT_TRIES=150
+  for i in $(seq 1 "$WAIT_TRIES"); do
+    IP="$(box_ip)"
+    if [ -n "$IP" ] && ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+         -o BatchMode=yes "ubuntu@$IP" true 2>/dev/null; then
+      say "Ready at $IP"
+      ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
+        'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"' >&2 2>/dev/null || true
+      if [ "$MODE" = "kvm" ]; then
+        # The entire point of metal: prove /dev/kvm exists and make it usable by
+        # ubuntu (group change applies from the next SSH session on).
+        if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" \
+             'test -c /dev/kvm && sudo usermod -aG kvm ubuntu' 2>/dev/null; then
+          say "  kvm:   /dev/kvm present; ubuntu in kvm group (applies on next login)"
+        else
+          say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
+          say "That should be impossible on a *.metal type -- investigate before using."
+          exit 1
+        fi
+      fi
+      echo "launched box=${BOX:-1} region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+      exit 0
+    fi
+    [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
+    sleep 10
+  done
+  say "Launched but SSH did not come up in $((WAIT_TRIES / 6)) min; check: $SELF status"
+  exit 1
+}
+
+# One launch attempt. Sets OUT and returns 0 with the instance id in OUT, or 1; a failure that is not about capacity
+# also sets REAL_ERROR, so a permissions bug is not reported as a busy afternoon.
+try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
+  local t="$1" az="$2" rc
+  shift 2
+  OUT=$(aws ec2 run-instances --region "$REGION" --instance-type "$t" --count 1 "$@" \
+    --query 'Instances[0].InstanceId' --output text 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
+    return 0
+  fi
+  # Capacity is the expected failure and is worth distinguishing from a real error
+  # (a bad policy, a deleted template) -- otherwise a permissions bug looks exactly
+  # like a busy afternoon and gets retried 28 times.
+  case "$OUT" in
+    *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*Unsupported*|*capacity-not-available*)
+      say "    no capacity for $t in $az -- trying the next one" ;;
+    *)
+      REAL_ERROR=1
+      say "    launch failed for $t in $az:"
+      printf '%s\n' "$OUT" | sed 's/^/      /' >&2 ;;
+  esac
+  say ""
+  return 1
+}
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
 case "$CMD" in
-  ip) box_ip ;;
+  ip)
+    locate_box || true
+    box_ip
+    ;;
 
   up)
-    IP="$(box_ip)"
-    if [ -n "$IP" ]; then say "Already running at $IP"; exit 0; fi
+    if locate_box; then
+      IP="$(box_ip)"
+      say "Already running at ${IP:-(no IP yet)} in $REGION"
+      echo "running box=${BOX:-1} region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
+      exit 0
+    fi
 
     VOL="$(work_volume)"
     [ -n "$VOL" ] || { say "FATAL: no work volume tagged $VOLTAG in $REGION"; exit 1; }
@@ -197,6 +396,7 @@ case "$CMD" in
     say ""
 
     ID=""
+    REAL_ERROR=""
     for T in $TYPES; do
       CORES=$(aws ec2 describe-instance-types --region "$REGION" --instance-types "$T" \
         --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null)
@@ -215,105 +415,145 @@ case "$CMD" in
       # Everything except the instance type comes from the launch template, so a typo
       # here cannot land the box in the wrong subnet, on the wrong AMI, or without the
       # Name tag its IAM policy and its idle watchdog both depend on.
-      OUT=$(aws ec2 run-instances --region "$REGION" \
-        --launch-template "LaunchTemplateName=$LT,Version=\$Latest" \
-        --instance-type "$T" --count 1 \
-        --query 'Instances[0].InstanceId' --output text 2>&1)
-      RC=$?
-
-      if [ "$RC" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
-        ID="$OUT"; CHOSEN="$T"; break
+      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest"; then
+        ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"; break
       fi
-
-      # Capacity is the expected failure and is worth distinguishing from a real error
-      # (a bad policy, a deleted template) -- otherwise a permissions bug looks exactly
-      # like a busy afternoon and gets retried 28 times.
-      case "$OUT" in
-        *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*Unsupported*|*capacity-not-available*)
-          say "    no capacity for $T -- trying the next type" ;;
-        *)
-          say "    launch failed for $T:"
-          printf '%s\n' "$OUT" | sed 's/^/      /' >&2 ;;
-      esac
-      say ""
     done
 
-    if [ -z "$ID" ]; then
+    if [ -n "$ID" ]; then
       say ""
-      case "$MODE_NOW" in
-        spot|on-demand) say "FAILED: no ${MODE_NOW} capacity in $AZ for any of: $TYPES" ;;
-        *) say "FAILED: no capacity in $AZ for any of: $TYPES (purchase mode unknown)" ;;
-      esac
-      say "Options:"
-      say "  - retry later; capacity fluctuates hour to hour"
-      say "  - override the list:  PARALLEL_BOX_TYPES='c8g.16xlarge' $SELF up $BOX"
-      say "  - move the volume to another AZ via snapshot (ask Claude for the roaming setup)"
-      exit 1
+      say "Launched $CHOSEN as $ID. Attaching the work volume..."
+
+      # The volume must be attached AFTER the instance exists -- a launch template cannot
+      # carry a pre-existing volume -- and EC2 rejects an attach while the instance is
+      # still pending. The boot-time mount loop waits for the device, so it is racing this
+      # attach and wins as long as we do it promptly.
+      aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
+      if ! aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
+             --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; then
+        say "FAILED to attach $VOL to $ID. The box is up but has no /mnt/work."
+        say "Check: aws ec2 describe-volumes --region $REGION --volume-ids $VOL"
+        exit 1
+      fi
+
+      say "Waiting for SSH and the work disk to mount..."
+      wait_ready persistent
     fi
 
     say ""
-    say "Launched $CHOSEN as $ID. Attaching the work volume..."
-
-    # The volume must be attached AFTER the instance exists -- a launch template cannot
-    # carry a pre-existing volume -- and EC2 rejects an attach while the instance is
-    # still pending. The boot-time mount loop waits for the device, so it is racing this
-    # attach and wins as long as we do it promptly.
-    aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
-    if ! aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
-           --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; then
-      say "FAILED to attach $VOL to $ID. The box is up but has no /mnt/work."
-      say "Check: aws ec2 describe-volumes --region $REGION --volume-ids $VOL"
+    case "$MODE_NOW" in
+      spot|on-demand) say "FAILED: no ${MODE_NOW} capacity in $AZ for any of: $TYPES" ;;
+      *) say "FAILED: no capacity in $AZ for any of: $TYPES (purchase mode unknown)" ;;
+    esac
+    if [ -n "$REAL_ERROR" ]; then
+      say "At least one launch failed for a reason other than capacity (above): fix that first."
       exit 1
     fi
 
-    say "Waiting for SSH and the work disk to mount..."
-    # Metal firmware init takes many minutes on top of the normal boot -- give kvm
-    # mode 25 min before declaring failure (virtualized boxes keep the 10 min bound).
-    WAIT_TRIES=60
-    [ "$MODE" = "kvm" ] && WAIT_TRIES=150
-    for i in $(seq 1 "$WAIT_TRIES"); do
-      IP="$(box_ip)"
-      if [ -n "$IP" ] && ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-           -o BatchMode=yes "ubuntu@$IP" true 2>/dev/null; then
-        say "Ready at $IP"
-        ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
-          'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"' 2>/dev/null || true
-        if [ "$MODE" = "kvm" ]; then
-          # The entire point of metal: prove /dev/kvm exists and make it usable by
-          # ubuntu (group change applies from the next SSH session on).
-          if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" \
-               'test -c /dev/kvm && sudo usermod -aG kvm ubuntu' 2>/dev/null; then
-            say "  kvm:   /dev/kvm present; ubuntu in kvm group (applies on next login)"
-          else
-            say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
-            say "That should be impossible on a *.metal type -- investigate before using."
-            exit 1
-          fi
+    if [ -z "$FALLBACK" ]; then
+      say "Options:"
+      say "  - retry later; capacity fluctuates hour to hour"
+      say "  - override the list:  PARALLEL_BOX_TYPES='c8g.16xlarge' $SELF up ${BOX:-1}"
+      say "  - launch in another US AZ with an EMPTY work volume (deleted with the box):"
+      say "      $SELF up ${BOX:-1} --fallback      (or --regions us-east-1,us-west-2)"
+      say "    \`$SELF capacity ${BOX:-1}\` shows which AZs score best."
+      exit 3
+    fi
+
+    # ------------------------------------------------------------- fallback sites
+    if [ -z "$FB_REGIONS" ] || [ -z "$FB_TEMPLATE" ]; then
+      say "FAILED: no fallback sites are published in /infra/parallel-box (pbox-fallback.tf not applied?)."
+      exit 4
+    fi
+    say ""
+    say "FALLBACK: trying the other US AZs. The box gets a FRESH, EMPTY work volume there, deleted with the box;"
+    say "  nothing from the home volume ($VOL) is on it, and /srv/io is not mounted."
+    fallback_order > "$TMP/order"
+    say "AZs by spot placement score (10 = most likely), for any of the types:"
+    sed 's/^/    /' "$TMP/order" >&2
+    say ""
+
+    while read -r SCORE R FAZ <&3; do
+      REGION="$R"
+      SUBNET="$(fb_subnet "$R" "$FAZ")"
+      [ -n "$SUBNET" ] || continue
+      # Only the types this AZ offers: a missing type is a quick "Unsupported", but 28 of them per AZ add up.
+      # shellcheck disable=SC2086 # $TYPES is a list of words on purpose
+      OFFERED=" $(aws ec2 describe-instance-type-offerings --region "$R" --location-type availability-zone \
+        --filters "Name=location,Values=$FAZ" "Name=instance-type,Values=${TYPES// /,}" \
+        --query 'InstanceTypeOfferings[].InstanceType' --output text 2>/dev/null | tr '\t' ' ') "
+      say "--> $FAZ ($R, score $SCORE)"
+      for T in $TYPES; do
+        if [ "$OFFERED" != "  " ] && [ "${OFFERED#* "$T" }" = "$OFFERED" ]; then continue; fi
+        say "--> trying $T in $FAZ ..."
+        # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces
+        # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
+        if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
+             --subnet-id "$SUBNET" \
+             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}]" \
+                                  "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
+                                  "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then
+          ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$FAZ"; break 2
         fi
-        exit 0
+      done
+    done 3< "$TMP/order"
+
+    if [ -n "$ID" ]; then
+      say ""
+      say "Launched $CHOSEN as $ID in $CHOSEN_AZ ($REGION), with a fresh work volume."
+      say "Waiting for SSH and the work disk to mount..."
+      wait_ready fresh
+    fi
+    REGION="$HOME_REGION"
+    if [ -n "$REAL_ERROR" ]; then
+      say "FAILED: no fallback launch succeeded, and at least one failed for a reason other than capacity (above)."
+      exit 1
+    fi
+    say "FAILED: no capacity in the home AZ or any fallback AZ ($FB_REGIONS) for any of: $TYPES"
+    exit 4
+    ;;
+
+  capacity)
+    VOL="$(work_volume)"
+    HOME_AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
+      --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
+    say "Spot placement scores (1-10) for one instance of any of: $TYPES"
+    # shellcheck disable=SC2046 # a list of regions
+    if ! placement_scores $(all_regions) > "$TMP/all"; then
+      say "FAILED to read spot placement scores (ec2:GetSpotPlacementScores)."
+      exit 1
+    fi
+    sort -s -t' ' -k1,1nr "$TMP/all" | while read -r SCORE R Z; do
+      if [ "$Z" = "$HOME_AZ" ]; then
+        echo "$SCORE $R $Z home (persistent work volume)"
+      elif [ -n "$(fb_subnet "$R" "$Z")" ]; then
+        echo "$SCORE $R $Z fallback (fresh work volume)"
       fi
-      [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
-      sleep 10
     done
-    say "Launched but SSH did not come up in $((WAIT_TRIES / 6)) min; check: $SELF status"
-    exit 1
     ;;
 
   down)
+    locate_box || true
     ID="$(box_id)"
     if [ -z "$ID" ]; then
       say "$NAME is already down."
       exit 0
     fi
-    say "Terminating $NAME ($ID). Its work volume is kept."
+    WORK="$(box_work)"
+    say "Terminating $NAME ($ID) in $REGION."
     # Terminate detaches the work volume on its own; delete_on_termination is false for
     # it (it is not part of the launch template's block device mappings at all), so the
-    # disk survives. Only the 30GB root goes away, which is what it is for.
+    # disk survives. Only the 30GB root goes away, which is what it is for. A fallback
+    # box's fresh work volume IS in its template, and goes with it.
     if ! aws ec2 terminate-instances --region "$REGION" --instance-ids "$ID" >/dev/null 2>&1; then
       say "FAILED to terminate $ID"
       exit 1
     fi
-    say "Down. Volume retained: $(work_volume)"
+    if [ "$WORK" = "fresh" ]; then
+      say "Down. It was a fallback box: its fresh work volume is deleted with it."
+    else
+      say "Down. Volume retained: $(work_volume)"
+    fi
     ;;
 
   status)
@@ -326,13 +566,14 @@ case "$CMD" in
     ;;
 
   ssh)
+    locate_box || true
     IP="$(box_ip)"
-    [ -n "$IP" ] || { say "Box is down. Run: $SELF up $BOX"; exit 1; }
+    [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:-1}"; exit 1; }
     exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
     ;;
 
   *)
-    sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     exit 1
     ;;
 esac
