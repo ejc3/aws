@@ -24,6 +24,20 @@ Host macbook
     StrictHostKeyChecking yes
     ServerAliveInterval 30
     ServerAliveCountMax 3
+
+# The MacBook's desktop session: its private sshd (127.0.0.1:22222), reached through Remote
+# Login. For what a Remote Login session cannot do: Apple Events and the login keychain
+# (code signing). See README, "MacBook: the desktop session".
+Host macbook-desktop
+    HostName 127.0.0.1
+    Port 22222
+    User ejcampbell
+    ProxyJump macbook
+    IdentityFile ~/.ssh/to-mac
+    IdentitiesOnly yes
+    HostKeyAlias ejs-macbook-pro-via-fcvm
+    UserKnownHostsFile ~/.ssh/known_hosts.mac-tunnels
+    StrictHostKeyChecking yes
 MACCONFIG
 
 # Public host identity read directly from EJ's MacBook Pro when its tunnel was set up.
