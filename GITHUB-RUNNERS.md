@@ -691,7 +691,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin` or `imagine`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
-  `dolphin-films` (a downstream of `dolphin-labs`) and `dolphin-maps` use the `dolphin` label too. Runners
+  `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too. Runners
   register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
   runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, l]`.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
@@ -711,7 +711,7 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   (`github-app-runner-claims`), a conditional write only one invocation can win. That holds even
   while `DescribeInstances` has not yet caught up with a host launched seconds earlier. A definite
   failure releases the claim; an ambiguous one keeps it for 15 minutes. Each VM is also tagged
-  with its `JobId`. Each repo has its own cap (8; `dolphin-films` and `dolphin-maps` 2), counted as the hosts `DescribeInstances` lists
+  with its `JobId`. Each repo has its own cap (8; `dolphin-films`, `dolphin-maps` and `dolphin-family` 2), counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
