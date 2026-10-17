@@ -135,7 +135,10 @@ def lambda_handler(event, context):
         else:
             # parallel-box is slot 1; parallel-box-N is slot N (the same shape as gbox).
             up_cmd = "pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1])
-            kept = "Its work volume is untouched"
+            fallback = any(t["Key"] == "Fallback" and t["Value"] == "true" for t in inst.get("Tags", []))
+            # A fallback box (pbox-fallback.tf) ran on a fresh volume that dies with it; only the home volume persists.
+            kept = ("It was a fallback box: its fresh work volume was deleted with it (the home work volume is untouched)"
+                    if fallback else "Its work volume is untouched")
         print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
