@@ -1546,7 +1546,7 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   registrar token is.)
 - **The Workers' runtime secrets are kept in AWS, not in Cloudflare.** A Worker's secrets are write-only (nothing can read one
   back), so `workers-stage-secrets.tf` owns one administration-only container per site, `workers-stage/<site>` (JSON of variable
-  name to value; dolphin-labs' and dolphin-films' are in the Dolphin account under the same names, below), and
+  name to value; the Dolphin sites' (dolphin-labs, dolphin-films, dolphin-maps) are in the Dolphin account under the same names, below), and
   `scripts/workers-stage-secrets.sh SITE` loads it into `<site>-stage` through `wrangler secret bulk`
   (stdin, names printed only; it refuses an empty value or a bracketed placeholder). Change a value by editing the container and
   re-running the script, after the site's own deploy has finished (a secret change made while a deploy uploads can be lost when

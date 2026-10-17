@@ -7,8 +7,9 @@
 #
 #   workers-stage/imagine   workers-stage/remote-claw   workers-stage/nest-step   workers-stage/colton-games
 #
-# Dolphin's two sites (dolphin-labs, dolphin-films) keep theirs in the Dolphin account under the same names
-# (dolphin-labs-hq/dolphin-aws, secrets.tf; moved 2026-10-11, step 1 of its docs/secrets-migration.md). The loader reads
+# Dolphin's sites (dolphin-labs, dolphin-films, dolphin-maps) keep theirs in the Dolphin account under the same names
+# (dolphin-labs-hq/dolphin-aws, secrets.tf; the first two moved 2026-10-11, step 1 of its docs/secrets-migration.md;
+# dolphin-maps' was made there). The loader reads
 # them there through OrganizationAccountAccessRole; put a value there the same way, never back in this account.
 #
 # Terraform owns only the containers and who may read them (administration only: a dev box has no reason to hold
@@ -18,7 +19,7 @@
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id workers-stage/<site> \
 #     --secret-string file:///dev/stdin < <a 0600 JSON file, or a pipe>
 #
-# For dolphin-labs and dolphin-films, the same command with a session in the Dolphin account, all inside one subshell
+# For the Dolphin sites, the same command with a session in the Dolphin account, all inside one subshell
 # that stops at the first failure (no session means no write, not a write with this account's credentials) and takes
 # the credentials with it when it ends. They are only ever in the environment, never on a command line:
 #
