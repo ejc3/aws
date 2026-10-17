@@ -812,7 +812,7 @@ never the owner:
   their setup actions, Chromium's libraries through `playwright install --with-deps` (apt through sudo), and a container
   engine for `make e2e-image` (`docker.io` and `docker-buildx`, or `podman`, from apt). `actions/cache` and
   `Swatinem/rust-cache` work unchanged. A prebuilt image with all of these, `imagine-runner`, is built weekly
-  ([Prebuilt images](#prebuilt-images)); Imagine boots it once its entry sets `image = "imagine-runner"`.
+  ([Prebuilt images](#prebuilt-images)), and Imagine boots it (`image = "imagine-runner"` in its entry).
 - **arm64.** Imagine's `deploy` job builds the arm64 image its Fargate service runs, on GitHub's `ubuntu-24.04-arm`. These
   pools are x86 only, so that job stays there. It runs only on pushes to main, and skips the build when the backend did not change.
 
@@ -859,7 +859,7 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
 - **Lazy loading.** A volume restored from a snapshot fetches each block from S3 on its first read, so the first `cargo`,
   `beam` or Chromium start on a fresh host is slower than on Canonical's image, and some of the saving may go. Fast
   Snapshot Restore would remove that at about $540 a month per AZ, and is not enabled. The rollout measures it instead:
-  apply 1 creates the pipeline and builds one image while Imagine stays on Canonical's; apply 2 sets Imagine's
+  apply 1 created the pipeline and built one image while Imagine stayed on Canonical's; apply 2 set Imagine's
   `image = "imagine-runner"` (a separate one-line change). Imagine's per-step times are then compared with the Canonical
   baseline above. Expected: about 20 s per small job and 65 s per e2e job, plus part of the 55 s boot, less what lazy
   loading takes back, and less the steps below that download anyway (Node, pnpm and OTP: roughly 5-10 s of it).

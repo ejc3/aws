@@ -61,7 +61,7 @@ locals {
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 2, alarm = "dolphin-films" }
     "dolphin-labs-hq/dolphin-maps"  = { label = "dolphin", max = 2, alarm = "dolphin-maps" }
-    "ejc3/imagine"                  = { label = "imagine", max = 24, max_vcpus = 192 }
+    "ejc3/imagine"                  = { label = "imagine", max = 24, max_vcpus = 192, image = "imagine-runner" }
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
     "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 2, alarm = "dolphin-family" }
