@@ -91,3 +91,71 @@ output "cloudflare_workers_deploy_token_secret" {
   description = "Secrets Manager name of the Workers deploy token (us-west-1). Written by Terraform from cloudflare_account_token.workers_deploy."
   value       = aws_secretsmanager_secret.cloudflare_workers_deploy_token.name
 }
+
+# ============================================================ where the token lives in GitHub
+# Each site repo's deploy job takes this token from a `cloudflare-deploy` environment admitted to `main` only, never
+# from a repository secret: a repository secret is readable by a workflow run on any branch, and Workers Scripts Write
+# reaches every Worker in the account, production included (dolphin-relay.tf), so the branch rule is the control.
+# dolphin-labs and dolphin-films are in dolphin-labs-ci-logs.tf (#452, #455); these are the rest (ejc3/aws#466). Once a
+# repo's deploy job names the environment, its repository secret is deleted. Rotating workers_deploy rewrites every one
+# on the next apply. ts-api is not here: it deploys to its own Cloudflare account with its own token.
+locals {
+  # repo name => the ejc3 repos, through the administration agent's GitHub App on ejc3 (agents-md.tf's provider).
+  workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw"])
+}
+
+resource "github_repository_environment" "workers_deploy_ejc3" {
+  provider          = github.agents_md
+  for_each          = local.workers_deploy_environments_ejc3
+  repository        = each.key
+  environment       = "cloudflare-deploy"
+  can_admins_bypass = true
+  deployment_branch_policy {
+    protected_branches     = false
+    custom_branch_policies = true
+  }
+}
+
+resource "github_repository_environment_deployment_policy" "workers_deploy_ejc3_main" {
+  provider       = github.agents_md
+  for_each       = local.workers_deploy_environments_ejc3
+  repository     = each.key
+  environment    = github_repository_environment.workers_deploy_ejc3[each.key].environment
+  branch_pattern = "main"
+}
+
+resource "github_actions_environment_secret" "workers_deploy_ejc3" {
+  provider        = github.agents_md
+  for_each        = local.workers_deploy_environments_ejc3
+  repository      = each.key
+  environment     = github_repository_environment.workers_deploy_ejc3[each.key].environment
+  secret_name     = "CLOUDFLARE_API_TOKEN"
+  plaintext_value = cloudflare_account_token.workers_deploy.value
+}
+
+# dolphin-maps, through the same App's dolphin-labs-hq installation (dolphin-labs-ci-logs.tf's provider).
+resource "github_repository_environment" "workers_deploy_dolphin_maps" {
+  provider          = github.dolphin_labs_ci
+  repository        = "dolphin-maps"
+  environment       = "cloudflare-deploy"
+  can_admins_bypass = true
+  deployment_branch_policy {
+    protected_branches     = false
+    custom_branch_policies = true
+  }
+}
+
+resource "github_repository_environment_deployment_policy" "workers_deploy_dolphin_maps_main" {
+  provider       = github.dolphin_labs_ci
+  repository     = "dolphin-maps"
+  environment    = github_repository_environment.workers_deploy_dolphin_maps.environment
+  branch_pattern = "main"
+}
+
+resource "github_actions_environment_secret" "workers_deploy_dolphin_maps" {
+  provider        = github.dolphin_labs_ci
+  repository      = "dolphin-maps"
+  environment     = github_repository_environment.workers_deploy_dolphin_maps.environment
+  secret_name     = "CLOUDFLARE_API_TOKEN"
+  plaintext_value = cloudflare_account_token.workers_deploy.value
+}

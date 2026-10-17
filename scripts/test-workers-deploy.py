@@ -91,12 +91,36 @@ class InstallScriptTests(unittest.TestCase):
         # dolphin-labs' copy is a main-only environment secret Terraform writes; a repository secret would undo that.
         env = dict(os.environ, PATH="/nonexistent")
         # GitHub resolves repository names case-insensitively, so every spelling is refused.
-        for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs", "dolphin-labs-hq/dolphin-films"):
+        for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs", "dolphin-labs-hq/dolphin-films",
+                     "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "EJC3/Remote-Claw"):
             r = subprocess.run(["/bin/bash", str(ROOT / "scripts" / "workers-deploy-secret.sh"), repo],
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 3, (repo, r.stderr))
             self.assertIn("main-only environments", r.stderr)
-        self.assertLess(INSTALL.index("dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films)"), INSTALL.index("secretsmanager get-secret-value"))
+        self.assertLess(INSTALL.index("dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films|"), INSTALL.index("secretsmanager get-secret-value"))
+
+    def test_every_other_site_repo_gets_a_main_only_environment(self):
+        # ejc3/aws#466: imagine, remote-claw and dolphin-maps take the token from a `cloudflare-deploy` environment
+        # admitted to main only, each with the deploy token as its CLOUDFLARE_API_TOKEN.
+        src = code(TF)
+        self.assertIn('workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw"])', src)
+        for env, policy, secret, provider in (
+                ("workers_deploy_ejc3", "workers_deploy_ejc3_main", "workers_deploy_ejc3", "github.agents_md"),
+                ("workers_deploy_dolphin_maps", "workers_deploy_dolphin_maps_main", "workers_deploy_dolphin_maps",
+                 "github.dolphin_labs_ci")):
+            e = re.search(r'resource "github_repository_environment" "' + env + r'" \{.*?\n\}', src, re.S).group()
+            self.assertIn('environment       = "cloudflare-deploy"', e)
+            self.assertIn("custom_branch_policies = true", e)
+            self.assertIn("protected_branches     = false", e)
+            self.assertIn("provider          = " + provider, e)
+            p = re.search(r'resource "github_repository_environment_deployment_policy" "' + policy + r'" \{.*?\n\}', src, re.S).group()
+            self.assertIn('branch_pattern = "main"', p)
+            s = re.search(r'resource "github_actions_environment_secret" "' + secret + r'" \{.*?\n\}', src, re.S).group()
+            self.assertIn('secret_name     = "CLOUDFLARE_API_TOKEN"', s)
+            self.assertIn("plaintext_value = cloudflare_account_token.workers_deploy.value", s)
+            # Every repo here is refused by the install script, so nobody puts the repository secret back.
+        for repo in ("ejc3/imagine", "ejc3/remote-claw", "dolphin-labs-hq/dolphin-maps"):
+            self.assertIn(repo, INSTALL.split("case", 1)[1].split("esac", 1)[0])
 
     def test_refuses_an_empty_stored_token(self):
         self.assertIn('"${#TOKEN}" -ge 30', INSTALL)
