@@ -165,6 +165,60 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
 
+# App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
+# key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
+# secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
+# signs the builds). The owner creates the key in App
+# Store Connect (Users and Access, Integrations, role Admin: cloud signing creates
+# the distribution certificate) and sets the value out of band:
+#   read -rs ISSUER; read -rs KEY_ID; read -rs TEAM; jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" \
+#     --rawfile p "AuthKey_${KEY_ID}.p8" '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
+#     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin && rm "AuthKey_${KEY_ID}.p8"
+# (with set -o pipefail; the .p8 is the only copy, so it is removed only after the upload succeeds)
+# Readers: the administration set and nextjs-dev-role (the dolphin box, which archives on the Mac
+# build tunnel and uploads). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
+# with browserbase/credentials. Not dev-server-role: the metal boxes do not build the apps.
+resource "aws_secretsmanager_secret" "app_store_connect" {
+  name                    = "games-worth-watching/app-store-connect"
+  description             = "App Store Connect API key for Games Worth Watching (JSON: ISSUER_ID, KEY_ID, TEAM_ID, PRIVATE_KEY). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "games-worth-watching/app-store-connect", Project = "dolphin-labs" }
+}
+
+resource "aws_secretsmanager_secret_policy" "app_store_connect" {
+  secret_arn = aws_secretsmanager_secret.app_store_connect.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDolphinBoxCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.app_store_connect.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn]) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "app_store_connect_read" {
+  statement {
+    sid       = "ReadTheAppStoreConnectKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.app_store_connect.arn]
+  }
+}
+
+resource "aws_iam_policy" "app_store_connect_read" {
+  name        = "dev-app-store-connect-read"
+  description = "Dolphin box: read the Games Worth Watching App Store Connect key (games-worth-watching/app-store-connect) and nothing else"
+  policy      = data.aws_iam_policy_document.app_store_connect_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "app_store_connect_read" {
+  role       = aws_iam_role.nextjs_dev.name
+  policy_arn = aws_iam_policy.app_store_connect_read.arn
+}
+
 # Anthropic API key, the final paid backup for claw-master (`--backup-api-key env:CLAW_MASTER_BACKUP_API_KEY`; the
 # binary still reads CLAUDE_MASTER_BACKUP_API_KEY, its name before the rename), used only after every subscription
 # profile is out of quota. It lived in ~/claude_api.txt on fcvm;

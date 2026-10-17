@@ -999,6 +999,34 @@ Roll this out in order; do not collapse the safety gates into one apply:
 Every gate change is a reviewed, committed Terraform change. Do not disable either gate
 after its protected resources exist; `prevent_destroy` is intended to stop that rollback.
 
+### Games Worth Watching: the App Store Connect key for TestFlight
+
+Terraform creates only the container `games-worth-watching/app-store-connect` (us-west-1, `dev-ai-services.tf`);
+TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, after the apply:
+
+1. In App Store Connect, Users and Access, Integrations, App Store Connect API, create a team key with the **Admin**
+   role (cloud signing creates the distribution certificate, which App Manager may not). Download its `.p8` file (Apple names it
+   `AuthKey_<KEY_ID>.p8`) into the current directory, and note the Issuer ID, the Key ID and the developer Team ID.
+2. On a jumpbox, put the four values as one JSON object without echoing them, then delete the file:
+
+   ```bash
+   read -rs ISSUER; read -rs KEY_ID; read -rs TEAM
+   set -o pipefail
+   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" --rawfile p "AuthKey_${KEY_ID}.p8" \
+     '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' \
+     | aws secretsmanager put-secret-value --region us-west-1 \
+         --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin \
+     && rm "AuthKey_${KEY_ID}.p8"
+   unset ISSUER KEY_ID TEAM
+   ```
+
+   The `.p8` file is the only copy (App Store Connect does not offer it again), so it is removed only after the
+   upload succeeds; on a failure, fix the cause and run the pipeline again.
+
+Only administration and nextjs-dev's role can read it, and every account on nextjs-dev has sudo, so treat the key as
+readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect and put a new one the
+same way to rotate.
+
 ### Colton Games accounts: sign-in, site admins and push
 
 `colton-games-accounts.tf` holds what the site's accounts features need outside the games
