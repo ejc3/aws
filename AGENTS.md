@@ -1490,8 +1490,9 @@ containers Terraform writes into the project for colton-games (`colton-games-acc
 removed in Vercel is picked up by re-running `scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names,
 targets, sensitivity, never a value), and every existing variable is imported by its id, never recreated. A new app ships on
 Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come over (2026-10-11): `dolphin-maps-stage`,
-deployed by its `cloudflare-stage.yml`; it has no runtime secrets, so no `workers-stage/dolphin-maps` container until it
-needs one.
+deployed by its `cloudflare-stage.yml`. Its accounts need runtime secrets on staging (#454): `workers-stage/dolphin-maps`
+lives in the Dolphin account with dolphin-labs' and dolphin-films' (dolphin-aws `secrets.tf`), holding non-production
+values only, and `scripts/workers-stage-secrets.sh dolphin-maps` loads it.
 
 **The account is on Workers Paid (since 2026-10-15).** On the Free plan a request gets about 10 ms of CPU; Next.js pages need
 150-900 ms and `/coverage` about 5 s, so gamesworthwatching.com returned 503 (`exceededCpu`) under load until the account

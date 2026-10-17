@@ -17,7 +17,7 @@ TF = (ROOT / "workers-stage-secrets.tf").read_text()
 SCRIPT = ROOT / "scripts" / "workers-stage-secrets.sh"
 SITES = ["colton-games", "imagine", "nest-step", "remote-claw"]
 # Kept in the Dolphin account (dolphin-labs-hq/dolphin-aws) and read there through OrganizationAccountAccessRole.
-DOLPHIN_SITES = ["dolphin-films", "dolphin-labs"]
+DOLPHIN_SITES = ["dolphin-films", "dolphin-labs", "dolphin-maps"]
 DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
 ALL_TF = "\n".join(p.read_text() for p in ROOT.glob("*.tf"))
 

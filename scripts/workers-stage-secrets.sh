@@ -4,7 +4,7 @@
 #   scripts/workers-stage-secrets.sh SITE          e.g. imagine -> reads workers-stage/imagine, loads Worker imagine-stage
 #
 # Source of truth: the Secrets Manager container workers-stage/SITE (JSON of variable name -> value; see
-# workers-stage-secrets.tf). Dolphin's sites (dolphin-labs, dolphin-films) keep theirs in the Dolphin account
+# workers-stage-secrets.tf). Dolphin's sites (dolphin-labs, dolphin-films, dolphin-maps) keep theirs in the Dolphin account
 # (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
 # administration; every other site's container is in this account. It is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this
 # script's output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a
@@ -19,7 +19,7 @@ ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
 DOLPHIN_ACCOUNT_ID=484888470752
 case "$SITE" in
-  dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
+  dolphin-labs | dolphin-films | dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
   *) SOURCE_ACCOUNT="" ;;
 esac
 
