@@ -117,6 +117,7 @@ class SecretTests(unittest.TestCase):
 
 
 RUNNER_APP = (ROOT / "runner-app.tf").read_text()
+AGENTS_MD = (ROOT / "agents-md.tf").read_text()
 
 
 class WebhookGateTests(unittest.TestCase):
@@ -135,12 +136,10 @@ class WebhookGateTests(unittest.TestCase):
         # the token read skips the repo, the provider reads no token and the webhook has no count
         self.assertIn('"dolphin-labs-hq/dolphin-films" = var.dolphin_films_token_ready', RUNNER_APP)
         self.assertIn("if lookup(local.runner_app_token_gates, r, true)", RUNNER_APP)
-        self.assertIn("for_each  = local.runner_app_webhooks ? toset(local.runner_app_webhook_repos) : toset([])", RUNNER_APP)
-        provider = re.search(r'alias = "dolphin_films".*?\n\}', RUNNER_APP, re.S).group()
-        self.assertIn("for_each = local.dolphin_films_webhook ? [1] : []", provider)
-        self.assertIn("pem_file        = local.github_app_admin.private_key", provider)
-        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
-        self.assertEqual(hook.group(1), "local.dolphin_films_webhook ? 1 : 0")
+        # Its hook is made as the administration app (dolphin-labs-hq's one provider), so no PAT of its own is read.
+        self.assertIn("for_each  = local.runner_app_webhooks ? toset(local.runner_app_pat_hook_repos) : toset([])", RUNNER_APP)
+        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_films" \{.*?\n  count\s+= (.*?)\n  provider\s+= (.*?)\n', RUNNER_APP, re.S)
+        self.assertEqual(hook.groups(), ("local.dolphin_films_webhook ? 1 : 0", "github.dolphin_labs"))
 
     def test_a_gated_repo_is_left_out_of_the_controller_config(self):
         config = re.search(r"runner_app_config = \{.*?\n  \}", RUNNER_APP, re.S).group()
@@ -151,30 +150,27 @@ class WebhookGateTests(unittest.TestCase):
         self.assertRegex(gate, r"default\s+= (true|false)")
         self.assertIn("dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready", RUNNER_APP)
         self.assertIn('"dolphin-labs-hq/dolphin-maps"  = var.dolphin_maps_token_ready', RUNNER_APP)
-        provider = re.search(r'alias = "dolphin_maps".*?\n\}', RUNNER_APP, re.S).group()
-        self.assertIn("for_each = local.dolphin_maps_webhook ? [1] : []", provider)
-        self.assertIn("pem_file        = local.github_app_admin.private_key", provider)
-        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_maps" \{.*?\n  count\s+= (.*?)\n', RUNNER_APP, re.S)
-        self.assertEqual(hook.group(1), "local.dolphin_maps_webhook ? 1 : 0")
+        hook = re.search(r'resource "github_repository_webhook" "runner_app_dolphin_maps" \{.*?\n  count\s+= (.*?)\n  provider\s+= (.*?)\n', RUNNER_APP, re.S)
+        self.assertEqual(hook.groups(), ("local.dolphin_maps_webhook ? 1 : 0", "github.dolphin_labs"))
 
     def test_imagine_has_the_same_gate_and_its_hook_is_made_as_the_admin_apps_ejc3_installation(self):
         gate = re.search(r'variable "imagine_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
         self.assertRegex(gate, r"default\s+= (true|false)")
         self.assertIn("imagine_webhook       = local.runner_app_webhooks && var.imagine_token_ready", RUNNER_APP)
         self.assertIn('"ejc3/imagine"                  = var.imagine_token_ready', RUNNER_APP)
-        provider = re.search(r'alias = "imagine".*?\n\}', RUNNER_APP, re.S).group()
+        # ejc3's one administration-app provider is agents-md.tf's (the same app and installation).
+        provider = re.search(r'alias = "agents_md".*?\n\}', AGENTS_MD, re.S).group()
         self.assertIn('owner = "ejc3"', provider)
-        self.assertIn("for_each = local.imagine_webhook ? [1] : []", provider)
-        self.assertIn('installation_id = tostring(local.github_app_admin.installations["ejc3"])', provider)
+        self.assertIn('installation_id = tostring(local.agents_md_github_app.installations["ejc3"])', provider)
         # Never the default ejc3 provider: its github-webhook-admin-pat is limited to ejc3/fcvm.
         self.assertNotIn("token", provider)
         hook = re.search(r'resource "github_repository_webhook" "runner_app_imagine" \{.*?\n  count\s+= (.*?)\n  provider\s+= (.*?)\n', RUNNER_APP, re.S)
-        self.assertEqual(hook.groups(), ("local.imagine_webhook ? 1 : 0", "github.imagine"))
+        self.assertEqual(hook.groups(), ("local.imagine_webhook ? 1 : 0", "github.agents_md"))
         # The daily runner-hours alarm exists only while Imagine is served.
         alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" \{.*?\n\}', RUNNER_APP, re.S).group()
         self.assertIn("count               = var.enable_github_runner && var.imagine_token_ready ? 1 : 0", alarm)
         self.assertIn('dimensions          = { Repo = "ejc3/imagine" }', alarm)
-        self.assertIn("period              = 86400", alarm)
+        self.assertIn("period              = 3600", alarm)
         self.assertIn('statistic           = "Average"', alarm)
 
     def test_the_other_repos_keep_the_global_gate_only(self):

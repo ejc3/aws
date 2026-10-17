@@ -192,7 +192,7 @@ resource "aws_lambda_function" "runner_webhook_front" {
       DELIVERY_TARGET = aws_lambda_alias.runner_webhook_delivery[0].arn
       # Routing by repository (runner-app.tf).
       FCVM_REPO           = "ejc3/fcvm"
-      APP_REPOS           = jsonencode(keys(local.runner_app_repos))
+      APP_REPOS           = jsonencode(keys(local.runner_app_config))
       APP_DELIVERY_TARGET = aws_lambda_function.runner_app[0].arn
     }
   }
