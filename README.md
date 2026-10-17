@@ -1011,12 +1011,17 @@ TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, 
 
    ```bash
    read -rs ISSUER; read -rs KEY_ID; read -rs TEAM
+   set -o pipefail
    jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" --rawfile p AuthKey.p8 \
      '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' \
      | aws secretsmanager put-secret-value --region us-west-1 \
-         --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin
-   rm AuthKey.p8; unset ISSUER KEY_ID TEAM
+         --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin \
+     && rm AuthKey.p8
+   unset ISSUER KEY_ID TEAM
    ```
+
+   The `.p8` file is the only copy (App Store Connect does not offer it again), so it is removed only after the
+   upload succeeds; on a failure, fix the cause and run the pipeline again.
 
 Only administration and nextjs-dev's role can read it, and every account on nextjs-dev has sudo, so treat the key as
 readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect and put a new one the

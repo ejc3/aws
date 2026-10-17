@@ -173,7 +173,8 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 # the distribution certificate) and sets the value out of band:
 #   read -rs ISSUER; read -rs KEY_ID; read -rs TEAM; jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --arg t "$TEAM" \
 #     --rawfile p AuthKey.p8 '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
-#     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin; rm AuthKey.p8
+#     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin && rm AuthKey.p8
+# (with set -o pipefail; the .p8 is the only copy, so it is removed only after the upload succeeds)
 # Readers: the administration set and nextjs-dev-role (the dolphin box, which archives on the Mac
 # build tunnel and uploads). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
 # with browserbase/credentials. Not dev-server-role: the metal boxes do not build the apps.
