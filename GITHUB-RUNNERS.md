@@ -745,8 +745,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   repo's failure (a
   revoked token, a GitHub timeout) does not stop the other repo's reconcile; the invocation
   still fails for `github-app-runner-errors`.
-- **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI). `runner-app/bootstrap.sh` installs
-  actions/runner (pinned, sha256-verified) and takes its registration token from
+- **Bootstrap.** Stock Ubuntu 24.04 (Canonical AMI), or a repo's own prebuilt image where it sets `image`
+  ([Prebuilt images](#prebuilt-images), below). `runner-app/bootstrap.sh` installs
+  actions/runner (pinned, sha256-verified; each install step skips what a prebuilt image already has) and takes its registration token from
   `/github-runner/bootstrap/<instance-id>`, the same instance-bound handoff as Pattern B: the
   host's role can read only the parameter tagged with its own instance ARN. The token
   reaches `config.sh` as `ACTIONS_RUNNER_INPUT_TOKEN`, never on argv. It registers
@@ -810,10 +811,63 @@ never the owner:
   stock image has none; the existing `rustup toolchain install` then reads `rust-toolchain.toml`), Node and pnpm through
   their setup actions, Chromium's libraries through `playwright install --with-deps` (apt through sudo), and a container
   engine for `make e2e-image` (`docker.io` and `docker-buildx`, or `podman`, from apt). `actions/cache` and
-  `Swatinem/rust-cache` work unchanged. No AMI is baked, so no owner approval is involved: Canonical's image is the only
-  one this controller may launch.
+  `Swatinem/rust-cache` work unchanged. A prebuilt image with all of these, `imagine-runner`, is built weekly
+  ([Prebuilt images](#prebuilt-images)); Imagine boots it once its entry sets `image = "imagine-runner"`.
 - **arm64.** Imagine's `deploy` job builds the arm64 image its Fargate service runs, on GitHub's `ubuntu-24.04-arm`. These
   pools are x86 only, so that job stays there. It runs only on pushes to main, and skips the build when the backend did not change.
+
+### Prebuilt images
+
+Until 2026-10-17 Canonical's Ubuntu 24.04 was the only image this controller could launch. The owner widened that rule for
+this alone ("Yes, custom runner") after measuring what a stock boot costs Imagine: 53-59 s from boot to job start (apt,
+build tools, the 180 MB runner), then about 30 s of setup in every job and about 80 s in e2e (pkg-config 3.5 s; the Rust
+toolchain and wasm32 target 8-12 s; Node 22 and the pnpm store about 7 s; OTP 29.1.1 and Elixir 1.20.4 4-9 s; in e2e,
+Playwright's Chromium libraries 17-21 s and docker.io, buildx and the libSQL image about 20 s). `runner-app-image.tf`
+builds images of everything a repo's jobs install, and a repo opts in by naming one.
+
+- **The rule, widened only this far.** `github-app-runner-lambda` may launch an image only if Canonical owns it
+  (`LaunchCanonicalImagesOnly`, as before) or this account owns it **and** it carries `Purpose=github-app-runner-image`
+  (`LaunchPrebuiltRunnerImages`), the tag only the pipeline's own role may put on, at `CreateImage`. Not fcvm's
+  `Purpose=github-runner` images, which fcvm's launcher and the Ohio replicator pick by that tag, and no image of any
+  other account. The controller asks for the newest available x86 image tagged with the repo's `image` name and its own
+  `Repo`, and checks owner and tags itself as well; a plan refuses an `image` built for another repo.
+- **Never wrong, only slower.** A repo without `image` launches Canonical's image, unchanged. An opted-in repo with no
+  such image, or whose images cannot be listed, launches Canonical's too, with a log line saying so. On a prebuilt image
+  the bootstrap skips what is there (the packages, the runner of its exact pinned version) and installs anything else as
+  on a stock host; the jobs' own setup steps still install any toolchain that is missing or of another version.
+- **What is in `imagine-runner`.** Everything bootstrap installs, by bootstrap itself (`GITHUB_APP_RUNNER_PREPARE_ONLY=1`,
+  which stops before registration), so the runner is bootstrap's pin, refreshed at every build; then
+  `runner-app/images/imagine-runner.sh`: pkg-config, docker.io and docker-buildx (the runner in the docker group), rustup
+  in the runner's home with the pinned toolchain, rustfmt, clippy and `wasm32-unknown-unknown`, Node 22 (checked against
+  nodejs.org's SHASUMS256) and pnpm in `/opt/node`, OTP and Elixir from builds.hex.pm (checked against the listing's
+  sha256) in the tool cache exactly where `erlef/setup-beam` caches them, Playwright's Chromium system libraries, and the
+  libSQL server image. `~/.cargo/bin` and `/opt/node/bin` go first on every job's `PATH` (bootstrap rewrites the runner's
+  `.path` from `/etc/github-app-runner/path`). The pins are one `versions` block in `runner-app-image.tf`; they must
+  match ejc3/imagine's `rust-toolchain.toml`, its CI workflow and `web/package.json`, and are not read from that
+  repository, which is private.
+- **The pipeline.** Lambda `github-app-runner-image` (`runner-app/image_builder.py`), the shape of fcvm's builder
+  (Pattern A) without a GitHub identity: weekly (Monday 09:00 UTC, `{"build": true}`) and on demand it launches one
+  on-demand `github-app-runner-image-builder` host from Canonical's image into the runner subnets with
+  `github-app-runner-sg`; the host provisions itself, tags itself `BuildStatus=complete` (its role's only permission) and
+  powers off. Every 5 minutes the function images a stopped, complete builder, terminates it once the image is
+  available, keeps the newest 3 images of each name and deregisters the rest with their snapshots. A builder that stops
+  without completing, runs past 60 minutes, or whose image fails is terminated after its console (the end of its build
+  log) is printed to the function's log, and `github-app-runner-image-errors` fires. On demand:
+  `aws lambda invoke --function-name github-app-runner-image --cli-binary-format raw-in-base64-out --payload '{"build": ["imagine-runner"]}' /dev/stdout`.
+- **Cost.** About 15 GB of snapshot per image, three kept (about $2.25 a month), and a 20-30 minute weekly build on one
+  on-demand c7a.2xlarge (under $1 a month): about $2-3 a month.
+- **Lazy loading.** A volume restored from a snapshot fetches each block from S3 on its first read, so the first `cargo`,
+  `beam` or Chromium start on a fresh host is slower than on Canonical's image, and some of the saving may go. Fast
+  Snapshot Restore would remove that at about $540 a month per AZ, and is not enabled. The rollout measures it instead:
+  apply 1 creates the pipeline and builds one image while Imagine stays on Canonical's; apply 2 sets Imagine's
+  `image = "imagine-runner"` (a separate one-line change). Imagine's per-step times are then compared with the Canonical
+  baseline above. Expected: about 20 s per small job and 65 s per e2e job, plus part of the 55 s boot, less what lazy
+  loading takes back, and less the steps below that download anyway (Node, pnpm and OTP: roughly 5-10 s of it).
+- **What the image cannot save yet.** Imagine's setup decides what to download, and three of its steps download
+  regardless of what is installed: its Node step always fetches the newest Node 22, `pnpm/action-setup` always installs
+  pnpm, and `erlef/setup-beam` never finds a cached OTP. setup-beam caches OTP under the version `ubuntu-24.04/OTP-<v>`,
+  which `@actions/tool-cache`'s `find` cannot match (it is not a semantic version), so only Elixir is found there. Those
+  savings need changes in ejc3/imagine's setup, or in setup-beam; the image already has what they would use.
 
 ## Controller-first credential migration
 
@@ -1031,11 +1085,19 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   exactly two targets, the webhook's `delivery` alias and `github-app-runner` (Pattern C),
   with an explicit deny on invoking anything else. No EC2, SSM, DynamoDB or PAT access.
 - **`github-app-runner-lambda`** (Pattern C's controller): read the two per-repo tokens;
-  `RunInstances` only with Canonical images, into the runner subnets, with
+  `RunInstances` only with Canonical images or this account's own images tagged `Purpose=github-app-runner-image`, into
+  the runner subnets, with
   `github-app-runner-sg`, `github-app-runner-profile`, IMDSv2 and tag `Role=github-app-runner`;
   terminate only instances with that tag; `iam:PassRole` only on
   `github-app-runner-instance-role`, only to EC2 (explicit deny on any other role); write and
   delete only the instance-bound `/github-runner/bootstrap/*` credential.
+- **`github-app-runner-image-lambda`** (the prebuilt image pipeline): `RunInstances` only from Canonical's images, as
+  `Name=github-app-runner-image-builder` hosts of three listed types with IMDSv2, the builder profile and an encrypted
+  gp3 root of at most 30 GB, into the runner subnets with `github-app-runner-sg`; `CreateImage`, `TerminateInstances`
+  and `GetConsoleOutput` only on those hosts; images and snapshots created only tagged `Purpose=github-app-runner-image`,
+  and only those deregistered and deleted; tags only at creation; `iam:PassRole` only on the builder role.
+- **`github-app-runner-image-builder-role`** (the builder host): tag a builder `BuildStatus=complete`, nothing else; an
+  explicit deny on IAM, STS, Secrets Manager, SSM parameters and S3 reads.
 - **`github-app-runner-instance-role`** (Pattern C's hosts): read and delete only its own
   instance-bound bootstrap credential; everything else is implicit or explicit deny. The
   per-repo token secrets' resource policies admit only the administrators and the two

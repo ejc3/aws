@@ -52,6 +52,10 @@ locals {
   # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
   # another repository's job), serve only jobs whose every label is in its own set, and its
   # deliveries are routed here by repository.full_name while fcvm's still go to the metal webhook.
+  #
+  # `image` (optional) names a prebuilt image from runner-app-image.tf, built for that same repo. The repo's hosts then
+  # boot the newest available build of it that this account's pipeline made and tagged, and Canonical's Ubuntu 24.04,
+  # with a log line saying so, when there is none. A repo without `image` boots Canonical's image, as before.
   runner_app_repos = {
     "CoderColton/colton-games"      = { label = "cc-games", max = 8 }
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 8 }
@@ -71,6 +75,7 @@ locals {
       label      = c.label
       max        = c.max
       max_vcpus  = try(c.max_vcpus, null) # null: no vCPU cap, hosts alone
+      image      = try(c.image, "")       # "": Canonical's image
       pat_secret = "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
       vcpus      = local.runner_app_size_vcpus
@@ -94,7 +99,8 @@ locals {
   # The repos with a vCPU cap: each gets a vCPU alarm at that cap (too_many_app_runner_vcpus_per_repo).
   runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.max_vcpus != null }
 
-  # Canonical's own account. Only its images may be launched by this controller.
+  # Canonical's own account. Its images, and this account's own prebuilt images tagged by runner-app-image.tf's
+  # pipeline, are the only ones this controller may launch.
   runner_app_ami_owner = "099720109477"
 }
 
@@ -222,8 +228,9 @@ resource "aws_iam_instance_profile" "runner_app" {
   role  = aws_iam_role.runner_app_instance[0].name
 }
 
-# Launch, tag and terminate only github-app-runner instances, only from Canonical's images,
-# only into the runner subnets with github-app-runner-sg and github-app-runner-profile (whose
+# Launch, tag and terminate only github-app-runner instances, only from Canonical's images or this
+# account's own images tagged Purpose=github-app-runner-image (runner-app-image.tf), only into the
+# runner subnets with github-app-runner-sg and github-app-runner-profile (whose
 # role can consume its own bootstrap credential and nothing else). Broker a host's own
 # bootstrap credential exactly as fcvm's controller does. Read only the served repos'
 # controller tokens.
@@ -273,6 +280,21 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         # parameter, so this only bounds it to AWS-published images.
         Condition = {
           StringEquals = { "ec2:Owner" = [local.runner_app_ami_owner, "amazon"] }
+        }
+      },
+      {
+        # The owner widened the Canonical-only rule for this alone (GITHUB-RUNNERS.md, "Prebuilt images"): an image this
+        # account owns AND that carries the tag only runner-app-image.tf's pipeline puts on at CreateImage. Not fcvm's
+        # Purpose=github-runner images, and no image of any other account.
+        Sid      = "LaunchPrebuiltRunnerImages"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1::image/*"
+        Condition = {
+          StringEquals = {
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
+            "aws:ResourceTag/Purpose" = local.runner_app_image_purpose
+          }
         }
       },
       {
@@ -452,6 +474,11 @@ resource "aws_lambda_function" "runner_app" {
         ]
       ]))
       error_message = "Every instance type under a size in runner_app_sizes must have runner_app_size_vcpus[size] vCPUs."
+    }
+    precondition {
+      # A repo may boot only an image built for it: the controller asks for the image's Repo tag to be the repo's own.
+      condition     = alltrue([for repo, c in local.runner_app_config : c.image == "" || try(local.runner_app_images[c.image].repo, "") == repo])
+      error_message = "A repo's `image` must name an entry of runner_app_images (runner-app-image.tf) whose repo is that repo."
     }
   }
 

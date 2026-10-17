@@ -17,6 +17,10 @@ correct:
     terminates hosts that never registered (BOOT_GRACE), sat idle (IDLE_LIMIT) or outlived
     any job (MAX_LIFETIME). Offline runner records left by dead hosts are deleted.
 
+A host boots Canonical's Ubuntu 24.04, or, for a repo whose config names an `image`, the newest
+build of that prebuilt image (runner-app-image.tf), falling back to Canonical's when there is none:
+see runner_image().
+
 The function runs one execution at a time (reserved concurrency 1), so two deliveries can
 never both decide a job is uncovered and launch twice.
 
@@ -44,6 +48,9 @@ from botocore.config import Config
 REGION = 'us-west-1'
 ROLE = 'github-app-runner'
 CANONICAL_AMI_PARAM = '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
+# The tag runner-app-image.tf's pipeline puts on every image it builds, and the only own-account images the launch policy
+# admits (runner-app.tf, LaunchPrebuiltRunnerImages).
+IMAGE_PURPOSE = 'github-app-runner-image'
 LIVE_STATES = ['pending', 'running']
 
 BOOT_GRACE = timedelta(minutes=int(os.environ.get('BOOT_GRACE_MINUTES', '10')))
@@ -549,9 +556,46 @@ def broker(instance_id, token, expires):
         ])
 
 
+def newest_image(repo, name):
+    """The newest available x86 image of `name` that this account's image pipeline built for `repo`, or None."""
+    account = os.environ['RUNNER_ACCOUNT_ID']
+    listed = ec2.describe_images(Owners=[account], Filters=[
+        {'Name': 'tag:Purpose', 'Values': [IMAGE_PURPOSE]},
+        {'Name': 'tag:Image', 'Values': [name]},
+        {'Name': 'tag:Repo', 'Values': [repo]},
+        {'Name': 'state', 'Values': ['available']},
+        {'Name': 'architecture', 'Values': ['x86_64']},
+    ])['Images']
+    # The filters are the request; this is the rule. Never an image of another account, or one without the tags.
+    ours = [i for i in listed if i.get('OwnerId') == account and i.get('State') == 'available'
+            and i.get('Architecture') == 'x86_64' and tag(i, 'Purpose') == IMAGE_PURPOSE
+            and tag(i, 'Image') == name and tag(i, 'Repo') == repo]
+    return max(ours, key=lambda i: i['CreationDate'], default=None)
+
+
+def runner_image(repo, cfg):
+    """(AMI id, root device) for `repo`'s next host. A repo whose config names an `image` gets that prebuilt image's
+    newest build; every other repo, and an opted-in repo with no such image (or none that can be listed), gets
+    Canonical's Ubuntu 24.04. A host from Canonical's image installs what it lacks, so falling back is only slower."""
+    name = cfg.get('image') or ''
+    if name:
+        try:
+            image = newest_image(repo, name)
+        except OutOfTime:
+            raise
+        except Exception as error:
+            image = None
+            print(f'{repo}: listing its {name} images failed ({type(error).__name__}: {error})')
+        if image:
+            print(f"{repo}: launching from {name} image {image['ImageId']} built {image['CreationDate']}")
+            return image['ImageId'], image.get('RootDeviceName') or '/dev/sda1'
+        print(f"{repo}: no available {name} image built by this account; launching Canonical's Ubuntu 24.04 instead")
+    return ssm.get_parameter(Name=CANONICAL_AMI_PARAM)['Parameter']['Value'], '/dev/sda1'
+
+
 def launch(repo, cfg, subnets, size, job_id, token, nonce):
     """One spot VM for `size`, trying each subnet and instance type in order."""
-    ami = ssm.get_parameter(Name=CANONICAL_AMI_PARAM)['Parameter']['Value']
+    ami, root_device = runner_image(repo, cfg)
     labels = f"{cfg['label']},{size}"
     data = user_data(repo, labels)
     vcpus = known_vcpus(cfg, size)
@@ -580,7 +624,7 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                         'AssociatePublicIpAddress': True, 'Ipv6AddressCount': 1,
                     }],
                     IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
-                    BlockDeviceMappings=[{'DeviceName': '/dev/sda1', 'Ebs': {
+                    BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {
                         'VolumeSize': VOLUME_GB, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}}],
                     UserData=data,
                     # InstanceMetadataTags: Inspector's SSM plugin reads InspectorEc2Exclusion from

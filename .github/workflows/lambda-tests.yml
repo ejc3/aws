@@ -121,6 +121,8 @@ jobs:
         run: python3 -S -B scripts/test-codex-seed.py
       - name: App-repo runners route, launch, cap and reap (offline)
         run: python3 -S -B scripts/test-app-runner.py
+      - name: App-repo runner images build weekly, from Canonical's image, and retire only their own (offline)
+        run: python3 -S -B scripts/test-app-runner-image.py
 
       - name: Console capture redacts private keys before archiving (offline)
         run: python3 -S -B scripts/test-console-capture-redaction.py
