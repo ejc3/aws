@@ -107,3 +107,41 @@ resource "github_actions_environment_secret" "dolphin_labs_cloudflare_deploy" {
   secret_name     = "CLOUDFLARE_API_TOKEN"
   plaintext_value = cloudflare_account_token.workers_deploy.value
 }
+
+# The same for dolphin-films (dolphin-labs-hq/dolphin-films, films-cloudflare-stage.yml): its staging deploy job takes the
+# token from a main-only `cloudflare-deploy` environment, and its production job from the `cloudflare-production`
+# environment it already uses (main only; it holds production's Turso pair and is not managed here), so the
+# repository secret can be deleted. One environment per job, which is why production's copy goes into its own.
+resource "github_repository_environment" "dolphin_films_cloudflare_deploy" {
+  provider          = github.dolphin_labs_ci
+  repository        = "dolphin-films"
+  environment       = "cloudflare-deploy"
+  can_admins_bypass = true
+  deployment_branch_policy {
+    protected_branches     = false
+    custom_branch_policies = true
+  }
+}
+
+resource "github_repository_environment_deployment_policy" "dolphin_films_cloudflare_deploy_main" {
+  provider       = github.dolphin_labs_ci
+  repository     = "dolphin-films"
+  environment    = github_repository_environment.dolphin_films_cloudflare_deploy.environment
+  branch_pattern = "main"
+}
+
+resource "github_actions_environment_secret" "dolphin_films_cloudflare_deploy" {
+  provider        = github.dolphin_labs_ci
+  repository      = "dolphin-films"
+  environment     = github_repository_environment.dolphin_films_cloudflare_deploy.environment
+  secret_name     = "CLOUDFLARE_API_TOKEN"
+  plaintext_value = cloudflare_account_token.workers_deploy.value
+}
+
+resource "github_actions_environment_secret" "dolphin_films_cloudflare_production" {
+  provider        = github.dolphin_labs_ci
+  repository      = "dolphin-films"
+  environment     = "cloudflare-production"
+  secret_name     = "CLOUDFLARE_API_TOKEN"
+  plaintext_value = cloudflare_account_token.workers_deploy.value
+}

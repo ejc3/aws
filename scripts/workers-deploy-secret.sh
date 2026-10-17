@@ -14,11 +14,11 @@ REPO=${1:?usage: workers-deploy-secret.sh OWNER/REPO [nextjs-dev-account]}
 AS=${2:-}
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "not an OWNER/REPO: $REPO" >&2; exit 2; }
 [[ -z "$AS" || "$AS" =~ ^[a-z][a-z0-9_-]*$ ]] || { echo "not an account name: $AS" >&2; exit 2; }
-# A repo whose deploy jobs read the token from a main-only environment secret that Terraform writes
+# A repo whose deploy jobs read the token from main-only environment secrets that Terraform writes
 # (dolphin-labs-ci-logs.tf): a repository secret there would hand it to a run on any branch again.
 case "${REPO,,}" in
-  dolphin-labs-hq/dolphin-labs)
-    echo "$REPO takes the token from its main-only cloudflare-deploy environment, written by terraform apply" >&2
+  dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films)
+    echo "$REPO takes the token from main-only environments written by terraform apply" >&2
     echo "(dolphin-labs-ci-logs.tf); not setting a repository secret" >&2
     exit 3 ;;
 esac
