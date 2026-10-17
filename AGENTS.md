@@ -1490,8 +1490,9 @@ containers Terraform writes into the project for colton-games (`colton-games-acc
 removed in Vercel is picked up by re-running `scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names,
 targets, sensitivity, never a value), and every existing variable is imported by its id, never recreated. A new app ships on
 Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come over (2026-10-11): `dolphin-maps-stage`,
-deployed by its `cloudflare-stage.yml`; it has no runtime secrets, so no `workers-stage/dolphin-maps` container until it
-needs one.
+deployed by its `cloudflare-stage.yml`. Its accounts need runtime secrets on staging (#454): `workers-stage/dolphin-maps`
+lives in the Dolphin account with dolphin-labs' and dolphin-films' (dolphin-aws `secrets.tf`), holding non-production
+values only, and `scripts/workers-stage-secrets.sh dolphin-maps` loads it.
 
 **The account is on Workers Paid (since 2026-10-15).** On the Free plan a request gets about 10 ms of CPU; Next.js pages need
 150-900 ms and `/coverage` about 5 s, so gamesworthwatching.com returned 503 (`exceededCpu`) under load until the account
@@ -1545,7 +1546,7 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   registrar token is.)
 - **The Workers' runtime secrets are kept in AWS, not in Cloudflare.** A Worker's secrets are write-only (nothing can read one
   back), so `workers-stage-secrets.tf` owns one administration-only container per site, `workers-stage/<site>` (JSON of variable
-  name to value; dolphin-labs' and dolphin-films' are in the Dolphin account under the same names, below), and
+  name to value; the Dolphin sites' (dolphin-labs, dolphin-films, dolphin-maps) are in the Dolphin account under the same names, below), and
   `scripts/workers-stage-secrets.sh SITE` loads it into `<site>-stage` through `wrangler secret bulk`
   (stdin, names printed only; it refuses an empty value or a bracketed placeholder). Change a value by editing the container and
   re-running the script, after the site's own deploy has finished (a secret change made while a deploy uploads can be lost when
