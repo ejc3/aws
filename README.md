@@ -589,9 +589,12 @@ ssh macbook 'd=$(mktemp -d); printf "#include <stdio.h>\nint main(int c,char**v)
   clang -o $d/probe-$RANDOM $d/p.c && ($d/probe-* /Volumes/Scratch/.DS_Store & K=$!;
   for i in 1 2 3 4 5 6; do kill -0 $K 2>/dev/null || exit 0; sleep 1; done; echo BLOCKED; kill $K); rm -rf $d'
 
-# Passwords are refused: expect "Permission denied (publickey)".
-ssh macbook 'ssh -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null -p 22 ejcampbell@127.0.0.1 true'
+# Passwords are refused. This reads the methods Remote Login offers, so it does not depend on
+# the client: expect exactly "Authentications that can continue: publickey". A list that also
+# names password or keyboard-interactive means the keys-only drop-in is missing or ignored.
+ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
+  -o NumberOfPasswordPrompts=0 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -p 22 ejcampbell@127.0.0.1 true 2>&1 | grep "Authentications that can continue"'
 ```
 
 **Symptom of the old problem:** a build step that sits at 0% CPU for minutes.
