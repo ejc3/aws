@@ -187,8 +187,9 @@ nothing untargeted changes, so the existing hooks stay), put its token, then run
 fine-grained token limited to that one repo with Administration and Webhooks read-write and Actions read-only, minted
 by the repo's owner: CoderColton for `colton-games` (ejc3 has write, not admin, there), ejc3 as
 org admin for `dolphin-labs`, `dolphin-films`, `dolphin-maps` and `dolphin-family`, ejc3 for `imagine` (Administration read-write and Actions
-read-only only: its hook is made by the administration GitHub App). `dolphin-films`, `dolphin-maps` and `imagine` are each behind
-their own gate in `runner-app.tf`, `dolphin_films_token_ready`, `dolphin_maps_token_ready` and `imagine_token_ready` (each starts false): until
+read-only only: its hook is made by the administration GitHub App). `dolphin-films`, `dolphin-maps`, `dolphin-family` and `imagine` are each behind
+their own gate in `runner-app.tf`, `dolphin_films_token_ready`, `dolphin_maps_token_ready`, `dolphin_family_token_ready` and
+`imagine_token_ready` (each starts false): until
 the token has a value, that repo's hook, token read and controller entry are not planned, so every plan passes and the
 controller does not report it as missing a token. Put the token, then set that default to true in a commit and apply. Put each value
 without echoing it:
