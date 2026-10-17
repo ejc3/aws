@@ -74,6 +74,23 @@ a process can also be started as responsible for itself
 The cost is that any Remote Login session has full disk access. It is reachable only with
 a key, and only by an administrator.
 
+## Code signing needs the desktop session
+
+A Remote Login session is outside the logged-in user's desktop session, so it cannot use
+the login keychain: `security show-keychain-info` says "User interaction is not allowed" and
+`codesign` (an Xcode archive) fails with `errSecInternalComponent`. Run anything that
+signs as a one-off LaunchAgent in the user's GUI domain, which the SSH session can start:
+
+```bash
+# On the Mac: a job that runs once in the desktop session, logging to a file.
+launchctl bootstrap gui/$(id -u) job.plist      # RunAtLoad, no KeepAlive
+launchctl bootout gui/$(id -u)/<label>          # afterwards
+```
+
+Such a job is its own responsible process, so it would meet the removable-volume prompts
+again: give it inputs and outputs on the internal disk (copy what it needs there, delete it
+afterwards). dolphin-labs-hq/dolphin-maps' TestFlight upload runs this way.
+
 ## Checks
 
 ```bash
