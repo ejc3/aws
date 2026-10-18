@@ -73,10 +73,10 @@ class TerraformTests(unittest.TestCase):
         self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }', TF)
 
     def test_the_retired_dolphin_labs_team_is_not_managed(self):
-        # The Dolphin sites left Vercel and their team is being deleted (dolphin-vercel-retired.tf forgets what was here).
+        # The Dolphin sites left Vercel and their team is retired (ejc3/aws #503 forgot what Terraform managed there).
         for text in (TF, VARS, (ROOT / "scripts" / "vercel-env-inventory.py").read_text()):
             self.assertNotIn("team_4TayirAcbgetrOUgYXghMXJH", text)
-            self.assertNotIn("dolphin", re.sub(r"#.*", "", text).replace("dolphin-vercel-retired.tf", ""))
+            self.assertNotIn("dolphin", re.sub(r"#.*", "", text))
         self.assertNotIn("dolphin-labs", inv.PROJECTS)
 
     def test_the_dolphin_containers_stay_but_are_not_vercel_records(self):

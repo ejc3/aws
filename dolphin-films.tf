@@ -46,7 +46,7 @@
 #                  token, not by Terraform: no Turso resource is managed in this repo.
 #   Vercel         nothing. The project was in the dolphin-labs team, which is being deleted
 #                  (2026-10-18); Terraform forgot the variables it wrote there
-#                  (dolphin-vercel-retired.tf). No address is written in this repository.
+#                  (ejc3/aws #503). No address is written in this repository.
 #   DNS            yourfantasymovie.com (yourfantasymovie.tf): proxied records and Workers routes
 #                  to dolphin-films-prod.
 #

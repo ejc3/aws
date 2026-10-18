@@ -70,7 +70,7 @@ resource "aws_secretsmanager_secret_policy" "vercel_api_token_coltons" {
 # takes its value from the first and a precondition refuses the plan if the targets' containers disagree.
 #
 # Not here: colton-games, whose Terraform-written variables live in their own file. Nor dolphin-labs: it left Vercel
-# (gamesworthwatching-zone.tf) and its team is being deleted, so its variables are forgotten (dolphin-vercel-retired.tf);
+# (gamesworthwatching-zone.tf) and its team is retired, so its variables were forgotten (ejc3/aws #503);
 # its containers stay, as the source of the dolphin-labs-prod Worker's secrets (vercel-env-secrets.tf).
 #
 # Adding a variable: put its value in the target's container, add it in Vercel or let Terraform create it (re-run the

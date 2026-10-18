@@ -11,7 +11,7 @@
 #   ts-api         preview production
 #
 # THE DOLPHIN SITES' CONTAINERS (local.vercel_env_dolphin) outlive their Vercel team, which is being deleted (2026-10-18,
-# dolphin-vercel-retired.tf). They are no longer records of Vercel and nothing captures into them:
+# ejc3/aws #503). They are no longer records of Vercel and nothing captures into them:
 #   dolphin-labs   development preview production   vercel-env/dolphin-labs/production is the source the production
 #                  Worker dolphin-labs-prod's secrets are loaded from (`wrangler secret bulk`; AGENTS.md, "Which
 #                  production is behind Cloudflare"): change a value there, then load it into the Worker.

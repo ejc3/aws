@@ -8,7 +8,7 @@
 # gamesworthwatching.com/* and www.gamesworthwatching.com/* to dolphin-labs-prod (web/wrangler.jsonc env.production in
 # dolphin-labs-hq/dolphin-labs, deployed by its cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex and
 # runs the every-minute cron as a Cron Trigger). Production moved off Vercel on 2026-10-15 and the dolphin-labs Vercel
-# team is being deleted (2026-10-18, dolphin-vercel-retired.tf), so there is no Vercel rollback any more: no switch, and
+# team is retired (2026-10-18, ejc3/aws #503), so there is no Vercel rollback any more: no switch, and
 # nothing here points at Vercel.
 #
 # NO ORIGIN, ON PURPOSE. A proxied record exists only so the routes have a hostname to match; a route answers every
