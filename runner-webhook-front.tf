@@ -13,7 +13,8 @@
 #
 # It also ROUTES by repository.full_name. ejc3/fcvm (and any delivery that names no repository,
 # which is how fcvm's own deliveries were always handled) goes to github-runner-webhook exactly
-# as before. A repo served by runner-app.tf goes to github-app-runner, queued jobs only; every
+# as before. A repo served by runner-app.tf goes to github-app-runner: queued jobs, and failed or
+# cancelled completions on one of its hosts (to rerun a job lost with a reclaimed spot host); every
 # other repository is answered and dropped. Lambda puts a throttled asynchronous event back in its
 # queue and retries it, so a burst waits instead of being dropped, and the webhook still
 # decides every launch one execution at a time.
@@ -43,8 +44,13 @@ data "archive_file" "runner_webhook_front" {
       # from here. The webhook refuses them on this path anyway; see DELIVERY_ALIAS there.
       JOB_FIELDS = ('id', 'run_id', 'labels', 'created_at', 'runner_id', 'runner_name',
                     'conclusion', 'completed_at')
-      # What github-app-runner reads. It needs only queued jobs: its hosts are ephemeral.
+      # What github-app-runner reads of a queued job.
       APP_JOB_FIELDS = ('id', 'run_id', 'labels')
+      # And of a completed one: only a failed or cancelled job that one of its hosts (named i-...) ran, which it reruns
+      # once if AWS reclaimed that spot host mid-job (app_runner.py, "spot reruns"). Its hosts are ephemeral, so no
+      # other completion needs it.
+      APP_COMPLETED_FIELDS = ('id', 'run_id', 'run_attempt', 'name', 'conclusion', 'runner_name', 'completed_at')
+      APP_RERUN_CONCLUSIONS = ('failure', 'cancelled')
 
       def verify_signature(body, signature, secret):
           """GitHub's X-Hub-Signature-256 over the raw body. No secret rejects everything."""
@@ -84,10 +90,13 @@ data "archive_file" "runner_webhook_front" {
               served = {r.lower(): r for r in json.loads(os.environ.get('APP_REPOS') or '[]')}
               if repo.lower() not in served:
                   return {'statusCode': 200, 'body': f'Ignoring repository: {repo[:100]}'}
-              if action != 'queued':
+              lost = (action == 'completed' and job.get('conclusion') in APP_RERUN_CONCLUSIONS
+                      and str(job.get('runner_name') or '').startswith('i-'))
+              if action != 'queued' and not lost:
                   return {'statusCode': 200, 'body': f'Ignoring action for {served[repo.lower()]}: {action}'}
+              fields = APP_JOB_FIELDS if action == 'queued' else APP_COMPLETED_FIELDS
               app_event = {'repo': served[repo.lower()], 'action': action,
-                           'workflow_job': {key: job[key] for key in APP_JOB_FIELDS if key in job},
+                           'workflow_job': {key: job[key] for key in fields if key in job},
                            'delivery': {'id': delivery, 'received_at': time.time()}}
               try:
                   lambda_client.invoke(FunctionName=os.environ['APP_DELIVERY_TARGET'], InvocationType='Event',

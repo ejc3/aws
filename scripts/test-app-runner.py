@@ -50,7 +50,7 @@ SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
 ENV = {"REPOS": json.dumps(REPOS), "LAUNCH_SUBNETS": json.dumps(SUBNETS), "SECURITY_GROUP_ID": "sg-app",
        "INSTANCE_PROFILE": "github-app-runner-profile", "RUNNER_ACCOUNT_ID": "123456789012",
-       "CLAIMS_TABLE": "github-app-runner-claims",
+       "CLAIMS_TABLE": "github-app-runner-claims", "RERUNS_TABLE": "github-app-runner-reruns",
        # No budget groups unless a test gives some (BudgetTests): every repo above is capped by its own caps alone.
        "BUDGET_TABLE": "github-app-runner-budget", "BUDGET_GROUPS": "{}",
        "VCPU_HOUR_USD": "0.027", "HOST_HOUR_USD": "0.016"}
@@ -102,6 +102,12 @@ class FakeEC2:
     def terminate_instances(self, InstanceIds):
         self.terminated += InstanceIds
 
+    def describe_instances(self, InstanceIds):
+        found = [i for i in self.instances if i["InstanceId"] in InstanceIds]
+        if not found:
+            raise Refused("InvalidInstanceID.NotFound")
+        return {"Reservations": [{"Instances": found}]}
+
     def describe_images(self, Owners, Filters):
         """As EC2 answers: Owners by account id, each filter a match on any of its values. With `ignore_image_filters`, a
         listing that lets everything through, so the controller's own check is what is tested."""
@@ -130,6 +136,26 @@ class FakeDynamo:
     def __init__(self):
         self.items, self.deleted, self.queries = {}, [], []
         self.buckets, self.bucket_reads, self.bucket_writes, self.conflicts, self.rival = {}, [], [], 0, None
+        self.reruns = {}
+
+    def put_rerun(self, Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames):
+        assert ConditionExpression == "attribute_not_exists(job)", ConditionExpression
+        key = (Item["repo"]["S"], Item["job"]["S"])
+        if key in self.reruns:
+            raise self.exceptions.ConditionalCheckFailedException(key)
+        self.reruns[key] = json.loads(json.dumps(Item))
+
+    def update_item(self, TableName, Key, UpdateExpression, ConditionExpression, ExpressionAttributeNames,
+                    ExpressionAttributeValues):
+        assert TableName == "github-app-runner-reruns" and ConditionExpression == "#s = :from", (TableName, ConditionExpression)
+        key = (Key["repo"]["S"], Key["job"]["S"])
+        held = self.reruns.get(key)
+        if held is None or held[ExpressionAttributeNames["#s"]]["S"] != ExpressionAttributeValues[":from"]["S"]:
+            raise self.exceptions.ConditionalCheckFailedException(key)
+        assert UpdateExpression.startswith("SET "), UpdateExpression
+        for part in UpdateExpression[4:].split(", "):
+            name, value = part.split(" = ")
+            held[ExpressionAttributeNames[name]] = ExpressionAttributeValues[value]
 
     def get_item(self, TableName, Key, ConsistentRead=False):
         assert TableName == "github-app-runner-budget" and ConsistentRead, (TableName, ConsistentRead)
@@ -138,6 +164,8 @@ class FakeDynamo:
         return {"Item": json.loads(json.dumps(item))} if item else {}
 
     def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues=None, ExpressionAttributeNames=None):
+        if TableName == "github-app-runner-reruns":
+            return self.put_rerun(Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames)
         if TableName == "github-app-runner-budget":
             group = Item["group"]["S"]
             self.bucket_writes.append(Item)
@@ -163,8 +191,17 @@ class FakeDynamo:
         self.items[key] = Item
 
     def query(self, TableName, ConsistentRead, KeyConditionExpression, ExpressionAttributeValues, **kw):
-        self.queries.append(ConsistentRead)
         repo = ExpressionAttributeValues[":repo"]["S"]
+        if TableName == "github-app-runner-reruns":
+            v, mine = ExpressionAttributeValues, [i for (r, _), i in self.reruns.items() if r == repo]
+            assert ConsistentRead, kw
+            if kw["FilterExpression"] == "#s IN (:pending, :spot)":
+                keep = [i for i in mine if i["state"]["S"] in (v[":pending"]["S"], v[":spot"]["S"])]
+            else:
+                assert kw["FilterExpression"] == "run_id = :run AND called = :yes", kw
+                keep = [i for i in mine if i["run_id"] == v[":run"] and i["called"] == v[":yes"]]
+            return {"Items": json.loads(json.dumps(keep))}
+        self.queries.append(ConsistentRead)
         return {"Items": [item for (r, _), item in self.items.items() if r == repo]}
 
     def delete_item(self, TableName, Key):
@@ -217,9 +254,33 @@ class FakeSecrets:
 class FakeGitHub:
     def __init__(self):
         self.calls, self.runs, self.jobs, self.runners, self.job_status = [], {}, {}, {}, {}
+        # run id -> {"status", "conclusion", "run_attempt"}; a rerun GitHub accepts starts the run's next attempt.
+        self.run_info, self.reruns, self.rerun_refusal, self.rerun_lost = {}, [], None, False
 
     def __call__(self, method, path, pat, body=None):
         self.calls.append((method, path, pat))
+        m = re.match(r"/repos/(.+?)/actions/jobs/(\d+)/rerun$", path)
+        if m and method == "POST":
+            if self.rerun_refusal:
+                raise urllib.error.HTTPError(path, self.rerun_refusal, "refused", {}, io.BytesIO(b'{"message":"no"}'))
+            job = int(m.group(2))
+            run = next(r for r, info in self.run_info.items() if job in info.get("jobs", ()))
+            info = self.run_info[run]
+            info.update(status="queued", conclusion=None, run_attempt=info.get("run_attempt", 1) + 1,
+                        jobs=tuple(j + 1000 if j == job else j for j in info["jobs"]))
+            self.reruns.append((m.group(1), job, pat))
+            if self.rerun_lost:
+                raise TimeoutError("The read operation timed out")
+            return {}
+        m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs\?filter=latest&per_page=100&page=(\d+)$", path)
+        if m and int(m.group(2)) in self.run_info:
+            ids = self.run_info[int(m.group(2))]["jobs"]
+            return {"jobs": [{"id": j} for j in ids][(int(m.group(3)) - 1) * 100:int(m.group(3)) * 100]}
+        m = re.match(r"/repos/(.+?)/actions/runs/(\d+)$", path)
+        if m:
+            info = self.run_info[int(m.group(2))]
+            return {"id": int(m.group(2)), "status": info["status"], "conclusion": info.get("conclusion"),
+                    "run_attempt": info.get("run_attempt", 1)}
         if path.endswith("/actions/runners/registration-token"):
             return {"token": "REGTOKEN", "expires_at": "2026-09-27T17:00:00Z"}
         m = re.match(r"/repos/(.+?)/actions/runs\?status=(\w+)", path)
@@ -721,7 +782,9 @@ class LaunchTests(unittest.TestCase):
     def test_other_repos_completions_and_foreign_labels_are_ignored(self):
         app, ec2, *_ = load_app()
         self.assertEqual(self.deliver(app, repo="ejc3/fcvm"), {"ignored": "repo"})
-        self.assertEqual(self.deliver(app, action="completed"), {"ignored": "action"})
+        # A completion is read only for a failed or cancelled job (SpotRerunTests); this one names no conclusion.
+        self.assertEqual(self.deliver(app, action="completed"), {"ignored": "conclusion"})
+        self.assertEqual(self.deliver(app, action="in_progress"), {"ignored": "action"})
         self.assertEqual(self.deliver(app, labels=("self-hosted", "ARM64")), {"ignored": "labels"})
         self.assertEqual(ec2.launched, [])
 
@@ -1152,6 +1215,32 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(json.loads(client.calls[0]["Payload"])["repo"], IMAGINE)
         self.assertNotIn("repo", json.loads(client.calls[1]["Payload"]), "fcvm's webhook is given no repository to act on")
 
+    def test_a_failed_or_cancelled_job_on_one_of_our_hosts_reaches_the_app_runner(self):
+        handler, client = load_front()
+        job = dict(self.JOB, run_attempt=1, name="gym", conclusion="failure", runner_name="i-0123456789abcdef0",
+                   completed_at="2026-10-18T17:05:47Z", steps=[{"name": "x"}], head_sha="abc")
+        r = handler(signed({"action": "completed", "workflow_job": job, "repository": {"full_name": IMAGINE}}), None)
+        self.assertEqual(r["statusCode"], 202)
+        (call,) = client.calls
+        self.assertEqual(call["FunctionName"], "arn:app")
+        event = json.loads(call["Payload"])
+        self.assertEqual((event["repo"], event["action"]), (IMAGINE, "completed"))
+        self.assertEqual(event["workflow_job"], {"id": 9, "run_id": 5, "run_attempt": 1, "name": "gym", "conclusion": "failure",
+                                                 "runner_name": "i-0123456789abcdef0", "completed_at": "2026-10-18T17:05:47Z"})
+        handler(signed({"action": "completed", "workflow_job": dict(job, conclusion="cancelled"),
+                        "repository": {"full_name": IMAGINE}}), None)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_other_completions_never_reach_the_app_runner(self):
+        # A success needs nothing (the host powers off), and a job no host of ours ran is not ours to rerun.
+        handler, client = load_front()
+        for conclusion, runner in (("success", "i-0123456789abcdef0"), ("skipped", "i-0123456789abcdef0"),
+                                   ("failure", "GitHub Actions 12"), ("failure", None), ("timed_out", "i-0123456789abcdef0")):
+            job = dict(self.JOB, conclusion=conclusion, runner_name=runner)
+            r = handler(signed({"action": "completed", "workflow_job": job, "repository": {"full_name": IMAGINE}}), None)
+            self.assertEqual(r["statusCode"], 200, (conclusion, runner))
+        self.assertEqual(client.calls, [])
+
     def test_other_repositories_are_dropped(self):
         handler, client = load_front()
         r = handler(signed({"action": "queued", "workflow_job": self.JOB, "repository": {"full_name": "someone/else"}}), None)
@@ -1159,7 +1248,238 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
+SPOT, OWN_SHUTDOWN = "Server.SpotInstanceTermination", "Client.InstanceInitiatedShutdown"
+# As on 2026-10-18: AWS took the host, and GitHub failed its job about ten minutes later.
+LOST_AT, ENDED_AT = NOW - timedelta(minutes=19), NOW - timedelta(minutes=10)
+HOST = "i-06f716994d281cf1a"
+
+
+def ended_host(ec2, iid=HOST, repo=IMAGINE, state="terminated", reason=SPOT, at=LOST_AT):
+    """One of `repo`'s hosts as EC2 lists it after it ended: `reason` None while EC2 has none yet."""
+    host = instance(iid, repo, "1", 30, size="s")
+    host["State"] = {"Name": state}
+    if reason:
+        host["StateReason"] = {"Code": reason, "Message": f"{reason}: ended"}
+        host["StateTransitionReason"] = f"{'Service' if reason == SPOT else 'User'} initiated ({at:%Y-%m-%d %H:%M:%S} GMT)"
+    ec2.instances.append(host)
+    return host
+
+
+def completion(job=501, run=900, attempt=1, name="gym", conclusion="failure", runner=HOST, ended=ENDED_AT, repo=IMAGINE):
+    return {"repo": repo, "action": "completed", "workflow_job": {
+        "id": job, "run_id": run, "run_attempt": attempt, "name": name, "conclusion": conclusion, "runner_name": runner,
+        "completed_at": ended.strftime("%Y-%m-%dT%H:%M:%SZ")}}
+
+
+class SpotRerunTests(unittest.TestCase):
+    def app(self, run_status="in_progress", conclusion=None):
+        app, ec2, *_ = load_app()
+        app.github.run_info[900] = {"status": run_status, "conclusion": conclusion, "jobs": (501,)}
+        return app, ec2
+
+    def spot_metrics(self, app):
+        return [(d["MetricName"], d["Dimensions"][0]["Value"]) for ns, data in app.fake_cloudwatch.metrics
+                for d in data if d["MetricName"].startswith("Spot") and ns == "GitHubAppRunner"]
+
+    def posts(self, app):
+        return [c for c in app.github.calls if c[0] == "POST" and c[1].endswith("/rerun")]
+
+    def state(self, app, key=(IMAGINE, "501")):
+        return app.fake_dynamo.reruns[key]["state"]["S"]
+
+    def reconcile(self, app):
+        return app.handler({"reconcile": True}, None)
+
+    def test_a_job_lost_with_its_spot_host_is_rerun_exactly_once_when_its_run_finishes(self):
+        app, ec2 = self.app()
+        ended_host(ec2)
+        self.assertEqual(app.handler(completion(), None), {"repo": IMAGINE, "job": 501, "rerun": "spot"})
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE)])
+        # GitHub refuses a rerun while the run's other jobs still run, so nothing is asked for yet.
+        self.assertEqual(self.posts(app), [])
+        self.reconcile(app)
+        self.assertEqual(self.posts(app), [])
+        app.github.run_info[900].update(status="completed", conclusion="failure")
+        (result,) = [r for r in self.reconcile(app) if r["repo"] == IMAGINE]
+        self.assertEqual(result["reruns"], {"rerun": 1})
+        self.assertEqual(app.github.reruns, [(IMAGINE, 501, "PAT-IMAGINE")])
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerun", IMAGINE)])
+        self.assertEqual(self.state(app), "rerun")
+        # Later rounds, a redelivery of the same completion, and the rerun's own job (same run and name, a new id) lost
+        # to another reclaimed host: none earns a second rerun.
+        self.reconcile(app)
+        self.assertEqual(app.handler(completion(), None)["rerun"], "already recorded")
+        self.assertEqual(app.github.run_info[900]["jobs"], (1501,))
+        ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa1")
+        self.assertEqual(app.handler(completion(job=1501, attempt=2, runner="i-0aaaaaaaaaaaaaaa1"), None)["rerun"],
+                         "already rerun")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 1)
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerun", IMAGINE)])
+
+    def test_a_lost_job_whose_run_already_finished_is_rerun_at_once(self):
+        app, ec2 = self.app("completed", "failure")
+        ended_host(ec2)
+        self.assertEqual(app.handler(completion(conclusion="cancelled"), None)["rerun"], "rerun")
+        self.assertEqual(app.github.reruns, [(IMAGINE, 501, "PAT-IMAGINE")])
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerun", IMAGINE)])
+
+    def test_a_real_failure_is_never_rerun(self):
+        # The host powered itself off after its job, as every host does: the failure is the job's own.
+        app, ec2 = self.app("completed", "failure")
+        ended_host(ec2, reason=OWN_SHUTDOWN, at=ENDED_AT + timedelta(seconds=20))
+        self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
+        self.reconcile(app)
+        self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
+        # Terminated by the reaper (an API call) is not a spot loss either.
+        ended_host(ec2, iid="i-0bbbbbbbbbbbbbbb1", reason="Client.UserInitiatedShutdown")
+        self.assertEqual(app.handler(completion(job=601, name="lint", runner="i-0bbbbbbbbbbbbbbb1"), None)["rerun"], "not-spot")
+        self.reconcile(app)
+        self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
+
+    def test_a_host_still_up_when_its_job_fails_is_judged_by_a_later_round(self):
+        # The completion can come before EC2 has the host's state reason: decided later, never guessed.
+        app, ec2 = self.app("completed", "failure")
+        host = ended_host(ec2, state="running", reason=None)
+        self.assertEqual(app.handler(completion(), None)["rerun"], "pending")
+        self.reconcile(app)
+        self.assertEqual(self.state(app), "pending")
+        host.update(State={"Name": "terminated"}, StateReason={"Code": OWN_SHUTDOWN},
+                    StateTransitionReason=f"User initiated ({ENDED_AT:%Y-%m-%d %H:%M:%S} GMT)")
+        self.reconcile(app)
+        self.assertEqual(self.state(app), "not-spot")
+        self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
+        # One EC2 never decides about is given up, not rerun.
+        ended_host(ec2, iid="i-0ccccccccccccccc1", state="running", reason=None)
+        app.handler(completion(job=701, name="e2e", runner="i-0ccccccccccccccc1"), None)
+        app.now = lambda: NOW + app.DECIDE_WINDOW + timedelta(minutes=1)
+        self.reconcile(app)
+        self.assertEqual(self.state(app, (IMAGINE, "701")), "unknown")
+        self.assertEqual(self.posts(app), [])
+
+    def test_a_host_reclaimed_after_its_job_ended_keeps_the_jobs_result(self):
+        app, ec2 = self.app("completed", "failure")
+        ended_host(ec2, at=ENDED_AT + timedelta(seconds=30))
+        self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
+        self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
+
+    def test_a_spot_end_without_both_times_is_never_rerun(self):
+        app, ec2 = self.app("completed", "failure")
+        host = ended_host(ec2)
+        host["StateTransitionReason"] = "Service initiated"
+        self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
+        app2, ec2b = self.app("completed", "failure")
+        ended_host(ec2b)
+        event = completion(job=502)
+        event["workflow_job"]["completed_at"] = None
+        self.assertEqual(app2.handler(event, None)["rerun"], "not-spot")
+        self.assertEqual((self.posts(app) + self.posts(app2), self.spot_metrics(app) + self.spot_metrics(app2)), ([], []))
+
+    def test_success_and_jobs_our_hosts_did_not_run_record_nothing(self):
+        app, ec2 = self.app("completed", "failure")
+        ended_host(ec2)
+        ended_host(ec2, iid="i-0ddddddddddddddd1", repo=DOLPHIN)
+        self.assertEqual(app.handler(completion(conclusion="success"), None), {"ignored": "conclusion"})
+        for runner in ("GitHub Actions 12", "i-0ddddddddddddddd1", "i-0eeeeeeeeeeeeeee1", None):
+            self.assertEqual(app.handler(completion(runner=runner), None), {"ignored": "not our host"}, runner)
+        self.assertEqual(app.fake_dynamo.reruns, {})
+        self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
+
+    def test_a_refused_rerun_is_retried_until_its_window_then_counted_as_failed(self):
+        # Until the owner grants Actions write, GitHub answers 403: the loss is still seen and counted.
+        app, ec2 = self.app("completed", "failure")
+        app.github.rerun_refusal = 403
+        ended_host(ec2)
+        self.assertEqual(app.handler(completion(), None)["rerun"], "spot")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 2)
+        app.now = lambda: NOW + app.RERUN_WINDOW + timedelta(minutes=1)
+        self.reconcile(app)
+        self.assertEqual(self.state(app), "failed")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 3)
+        self.assertEqual(app.github.reruns, [])
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerunFailed", IMAGINE)])
+
+    def test_a_rerun_whose_answer_was_lost_is_not_asked_for_again(self):
+        app, ec2 = self.app("completed", "failure")
+        app.github.rerun_lost = True
+        ended_host(ec2)
+        self.assertEqual(app.handler(completion(), None)["rerun"], "spot")
+        self.reconcile(app)   # the run's attempt has moved on: the call worked
+        self.assertEqual(self.state(app), "rerun")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 1)
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerun", IMAGINE)])
+
+    def test_a_run_someone_else_reran_or_cancelled_is_left_alone(self):
+        app, ec2 = self.app("completed", "cancelled")
+        ended_host(ec2)
+        self.assertEqual(app.handler(completion(), None)["rerun"], "superseded")
+        # A person reran this job: its newer execution (1511) replaced it among the run's latest.
+        app.github.run_info[901] = {"status": "in_progress", "run_attempt": 2, "jobs": (1511,)}
+        app.handler(completion(job=511, run=901), None)
+        self.assertEqual(self.state(app, (IMAGINE, "511")), "superseded")
+        self.assertEqual(self.posts(app), [])
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotLost", IMAGINE)])
+
+    def test_a_later_attempt_lost_to_spot_after_a_real_failure_is_still_rerun_once(self):
+        # Attempt 1 failed on its own and a person reran it; attempt 2 lost its host. That job has had no automatic rerun.
+        app, ec2 = self.app("completed", "failure")
+        ended_host(ec2, reason=OWN_SHUTDOWN, at=ENDED_AT + timedelta(seconds=20))
+        self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
+        app.github.run_info[900].update(run_attempt=2, jobs=(501, 502))
+        ended_host(ec2, iid="i-0fffffffffffffff1")
+        self.assertEqual(app.handler(completion(job=502, attempt=2, runner="i-0fffffffffffffff1"), None)["rerun"], "rerun")
+        self.assertEqual(app.github.reruns, [(IMAGINE, 502, "PAT-IMAGINE")])
+
+    def test_two_jobs_lost_in_one_run_are_each_rerun_once(self):
+        # Rerunning the first moves the run to a new attempt; the second was not part of that rerun and still needs its
+        # own, once the new attempt has finished. Both share a display name, which must not merge them.
+        app, ec2 = self.app("in_progress")
+        app.github.run_info[900]["jobs"] = (501, 503)
+        ended_host(ec2)
+        ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa2")
+        app.handler(completion(job=501, name="test"), None)
+        app.handler(completion(job=503, name="test", runner="i-0aaaaaaaaaaaaaaa2"), None)
+        self.assertEqual(sorted(k for _, k in app.fake_dynamo.reruns), ["501", "503"])
+        app.github.run_info[900].update(status="completed", conclusion="failure")
+        self.reconcile(app)
+        self.assertEqual([j for _, j, _ in app.github.reruns], [501], "the run's next attempt is running: 503 waits")
+        self.assertEqual((self.state(app, (IMAGINE, "501")), self.state(app, (IMAGINE, "503"))), ("rerun", "spot"))
+        app.github.run_info[900].update(status="completed", conclusion="failure")
+        self.reconcile(app)
+        self.assertEqual([j for _, j, _ in app.github.reruns], [501, 503])
+        self.assertEqual(self.state(app, (IMAGINE, "503")), "rerun")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 2)
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE)] * 2 + [("SpotRerun", IMAGINE)] * 2)
+        # A same-named job of the first attempt failing later is its own job, not a rerun of one.
+        ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa3")
+        app.github.run_info[900].update(jobs=(1501, 1503, 505), status="completed", conclusion="failure")
+        self.assertEqual(app.handler(completion(job=505, name="test", runner="i-0aaaaaaaaaaaaaaa3"), None)["rerun"], "rerun")
+
+    def test_the_rerun_record_is_bounded_in_time(self):
+        app, ec2 = self.app()
+        ended_host(ec2)
+        app.handler(completion(), None)
+        record = app.fake_dynamo.reruns[(IMAGINE, "501")]
+        self.assertEqual(int(record["ttl"]["N"]), int(NOW.timestamp()) + 7 * 86400)
+        self.assertEqual(record["instance"]["S"], HOST)
+
+
 class WiringTests(unittest.TestCase):
+    def test_spot_reruns_have_their_own_table_and_a_grant_on_it_alone(self):
+        stmt = APP_TF.split('Sid      = "SpotReruns"', 1)[1].split("\n      },", 1)[0]
+        self.assertIn('Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]', stmt)
+        self.assertIn("Resource = aws_dynamodb_table.runner_app_reruns[0].arn", stmt)
+        self.assertIn("RERUNS_TABLE      = aws_dynamodb_table.runner_app_reruns[0].name", APP_TF)
+        table = re.search(r'resource "aws_dynamodb_table" "runner_app_reruns" \{.*?\n\}', APP_TF, re.S).group()
+        self.assertIn('name         = "github-app-runner-reruns"', table)
+        self.assertRegex(table, r'ttl \{\s*attribute_name = "ttl"\s*enabled\s*= true')
+        # Rerun detection reads instances by id, which the controller could already do.
+        self.assertIn('Action   = ["ec2:DescribeInstances", "ec2:DescribeImages"]', APP_TF)
+
     def test_the_image_statement_matches_how_iam_sees_canonical_images(self):
         # Live: ami-0150109d3dd43737d is OwnerId 099720109477 with ImageOwnerAlias "amazon",
         # and RunInstances was refused on it until "amazon" was allowed.
@@ -2048,6 +2368,23 @@ class RunnersAppTokenTests(unittest.TestCase):
     def creds(self):
         return json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(), "installations": {"dolphin-labs-hq": 777}})
 
+    def test_the_rerun_token_is_minted_apart_with_actions_write_alone(self):
+        refused = []
+
+        def mint(method, path, pat, body):
+            if body["permissions"].get("actions") == "write":
+                refused.append(body)
+                raise urllib.error.HTTPError(path, 422, "The permissions requested are not granted", {}, None)
+            return {"token": "ghs_launch", "expires_at": "2099-01-01T00:00:00Z"}
+        app, calls, _ = self.app_with(self.creds(), mint=mint)
+        cfg = dict(REPOS[DOLPHIN], app_repo=DOLPHIN)
+        self.assertEqual(app.repo_pat(cfg), "ghs_launch")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(app.repo_pat(cfg, app.RERUN_TOKEN_PERMISSIONS), "PAT-DOLPHIN",
+                             "an app without Actions write falls back to the repo's own token for reruns")
+        self.assertEqual(refused, [{"repositories": ["dolphin-labs"], "permissions": {"actions": "write", "metadata": "read"}}])
+        self.assertEqual(app.repo_pat(cfg), "ghs_launch", "the launch token is cached apart and untouched")
+
     def test_an_app_repo_gets_a_narrowed_installation_token_reused_while_it_lasts(self):
         app, calls, _ = self.app_with(self.creds())
         cfg = dict(REPOS[DOLPHIN], app_repo=DOLPHIN)
@@ -2181,7 +2518,7 @@ class RunnersAppTokenTests(unittest.TestCase):
         app, *_ = load_app()
         app.RUNNER_APP_SECRET = "github-app/runners"
 
-        def boom(repo):
+        def boom(repo, permissions=None):
             raise app.OutOfTime("deadline")
         app.app_token = boom
         with self.assertRaises(app.OutOfTime):

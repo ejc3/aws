@@ -18,6 +18,8 @@ correct:
     launches for queued jobs that have no runner (a lost delivery, a spot refusal), and
     terminates hosts that never registered (BOOT_GRACE), sat idle (IDLE_LIMIT) or outlived
     any job (MAX_LIFETIME). Offline runner records left by dead hosts are deleted.
+  * A job that failed because AWS reclaimed its spot host mid-job is rerun once, when its run has finished: see
+    "spot reruns". A real failure is never rerun.
 
 A host boots Canonical's Ubuntu 24.04, or, for a repo whose config names an `image`, the newest
 build of that prebuilt image (runner-app-image.tf), falling back to Canonical's when there is none:
@@ -37,6 +39,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 import uuid
 import urllib.error
@@ -144,12 +147,14 @@ def github(method, path, pat, body=None):
 # ---------------------------------------------------------------- the runners GitHub App
 # A repo whose config names `app_repo` takes an installation token from the runners GitHub App (Secrets Manager
 # RUNNER_APP_SECRET, JSON: app_id, private_key, installations {owner: id}) instead of a year-long PAT: minted here, narrowed
-# to that one repository and to administration:write + actions:read, and expiring within the hour. The app's JWT is signed
-# in pure Python (RSA PKCS#1 v1.5 over SHA-256, standard library only): the Lambda runtime has no openssl and no
+# to that one repository and to administration:write + actions:read, and expiring within the hour. A rerun after a spot loss
+# (below) mints its own token, actions:write alone, so an app that lacks that grant loses only the reruns. The app's JWT is
+# signed in pure Python (RSA PKCS#1 v1.5 over SHA-256, standard library only): the Lambda runtime has no openssl and no
 # `cryptography`. Until the secret has a value, or when minting fails, the repo's own PAT is used and the reason logged.
 RUNNER_APP_SECRET = os.environ.get('RUNNER_APP_SECRET', '')
 APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata': 'read'}
-_APP_TOKENS = {}  # repo -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
+RERUN_TOKEN_PERMISSIONS = {'actions': 'write', 'metadata': 'read'}
+_APP_TOKENS = {}  # (repo, permissions) -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
 _APP_SCOPE_OK = {}  # (installation id, owner) -> (expiry epoch seconds, refusal message or None) of its last scope check
 APP_SCOPE_PASS_SECONDS = 2700
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
@@ -201,9 +206,11 @@ def app_jwt(app_id, pem, at=None):
     return f'{head}.{body}.{_b64url(rs256(f"{head}.{body}".encode(), pem))}'
 
 
-def app_token(repo):
+def app_token(repo, permissions=None):
     """An installation token for `repo` from the runners app, or None when the app is not set up for it."""
-    cached = _APP_TOKENS.get(repo)
+    permissions = permissions or APP_TOKEN_PERMISSIONS
+    key = (repo, tuple(sorted(permissions.items())))
+    cached = _APP_TOKENS.get(key)
     if cached and cached[1] - time.time() > 600:
         return cached[0]
     try:
@@ -220,7 +227,7 @@ def app_token(repo):
     jwt = app_jwt(creds['app_id'], creds['private_key'])
     check_installation_scope(installation, owner, jwt)
     out = github('POST', f'/app/installations/{installation}/access_tokens', jwt,
-                 body={'repositories': [name], 'permissions': APP_TOKEN_PERMISSIONS})
+                 body={'repositories': [name], 'permissions': permissions})
     token = out.get('token')
     if not isinstance(token, str) or not token.startswith('ghs_'):
         raise RuntimeError('GitHub returned no installation token')
@@ -228,7 +235,7 @@ def app_token(repo):
         expires = datetime.fromisoformat(out['expires_at'].replace('Z', '+00:00')).timestamp()
     except Exception:
         expires = time.time() + 3000
-    _APP_TOKENS[repo] = (token, expires)
+    _APP_TOKENS[key] = (token, expires)
     return token
 
 
@@ -285,16 +292,17 @@ def check_installation_scope(installation, owner, jwt):
     _APP_SCOPE_OK[key] = (time.time() + APP_SCOPE_PASS_SECONDS, None)
 
 
-def repo_pat(cfg):
+def repo_pat(cfg, permissions=None):
     """This repo's controller token, or None while it has none yet.
 
-    With RUNNER_APP_SECRET set and the repo named in `app_repo`: an installation token from the runners app. Otherwise,
-    or when the app is not set up or minting fails (logged), the repo's own PAT: a Terraform-managed CONTAINER with no
-    Terraform-managed version (runner-repos.tf), so the token never enters state; its owner puts the value in by hand.
+    With RUNNER_APP_SECRET set and the repo named in `app_repo`: an installation token from the runners app, with
+    `permissions` (default APP_TOKEN_PERMISSIONS). Otherwise, or when the app is not set up or minting fails (logged), the
+    repo's own PAT: a Terraform-managed CONTAINER with no Terraform-managed version (runner-repos.tf), so the token never
+    enters state; its owner puts the value in by hand.
     """
     if RUNNER_APP_SECRET and cfg.get('app_repo'):
         try:
-            token = app_token(cfg['app_repo'])
+            token = app_token(cfg['app_repo'], permissions)
             if token:
                 return token
             print(f"{cfg['app_repo']}: the runners app is not set up for it yet; using the repo's own token")
@@ -1191,6 +1199,11 @@ def reconcile_repo(repo, cfg, subnets, result):
             result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
         if outcome in ('cap', 'deferred'):
             break
+    # Jobs lost with a reclaimed spot host, after the launches: a rerun can wait a round, a queued job should not.
+    reruns = reconcile_reruns(repo, cfg)
+    if reruns:
+        result['reruns'] = reruns
+        print(f'{repo}: spot reruns {reruns}')
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
     return result
 
@@ -1245,6 +1258,308 @@ def publish_counts(results, buckets=()):
         cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data)
 
 
+# ---------------------------------------------------------------- spot reruns
+# A host is one-time spot. When AWS reclaims it mid-job the runner dies with it, GitHub fails the job about ten minutes
+# later ("The self-hosted runner lost communication with the server"), and nothing queues it again: the runner was
+# ephemeral. Measured on 2026-10-18: one of ejc3/imagine's hosts was reclaimed at 16:56:36 and its job failed at
+# 17:05:47; another at 17:02:52, its job at 17:12:44. Both hosts read StateReason
+# Server.SpotInstanceTermination, and both runs were still running other jobs when the job failed.
+#
+# So a failed or cancelled job whose runner was one of our hosts gets a record in RERUNS_TABLE, keyed by its job id (a
+# job's display name need not be unique within a run), and moves through
+#
+#   pending   the host's fate is not known yet: it is still listed as running or has no state reason. Rechecked every
+#             reconcile; after DECIDE_WINDOW it becomes `unknown`.
+#   spot      EC2 says the host was reclaimed (Server.SpotInstanceTermination) BEFORE the job ended: counted once as
+#             SpotLost. A rerun is asked for once the run has completed (GitHub refuses one while the run's other jobs
+#             still run), retried every reconcile until RERUN_WINDOW, then `failed` (SpotRerunFailed).
+#   rerun     GitHub accepted the rerun (SpotRerun), or the job was found rerun after a call whose answer was lost.
+#   not-spot  the host ended for any other reason (it powered off after its job, or the reaper terminated it), or was
+#             reclaimed only after the job had ended: a real result, never rerun.
+#   superseded someone else reran this job first, or cancelled the run: left alone.
+#
+# Whether THIS job was rerun is read from the run's latest executions (`jobs?filter=latest`): once a job is rerun its
+# newer execution replaces it there, while a job the rerun did not select keeps its own id. So when two jobs of one run
+# were lost, rerunning the first moves the run to a new attempt but leaves the second to be rerun when that attempt
+# finishes. A call whose answer was lost is never repeated: the next round finds the job replaced.
+#
+# At most one automatic rerun per logical job: a record is created once per job id (a conditional write), and a job
+# whose run already holds a record of ours with the same name, an earlier attempt and a rerun call made is the rerun's
+# own job (or a later one of the same name) and earns none. Every state change is a write conditional on the state it
+# leaves.
+RERUNS_TABLE = os.environ.get('RERUNS_TABLE', '')
+RERUN_CONCLUSIONS = ('failure', 'cancelled')
+SPOT_REASON = 'Server.SpotInstanceTermination'
+DECIDE_WINDOW = timedelta(minutes=30)
+RERUN_WINDOW = timedelta(hours=6)
+RERUN_RECORD_DAYS = 7
+LATEST_JOB_PAGES = 10
+
+
+def parse_time(value):
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')) if value else None
+    except ValueError:
+        return None
+
+
+def reclaimed_at(instance):
+    """When EC2 ended the host, from StateTransitionReason ("Service initiated (2026-10-18 17:02:52 GMT)"), or None."""
+    found = re.search(r'\((\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) GMT\)', instance.get('StateTransitionReason') or '')
+    return datetime.strptime(found.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc) if found else None
+
+
+def spot_verdict(instance, completed_at):
+    """'spot', 'not-spot', or None while EC2 cannot say yet (the host is still listed as up, or has no state reason)."""
+    if instance.get('State', {}).get('Name') not in ('shutting-down', 'terminated'):
+        return None
+    code = (instance.get('StateReason') or {}).get('Code') or ''
+    if not code:
+        return None
+    if code != SPOT_REASON:
+        return 'not-spot'
+    at, ended = reclaimed_at(instance), parse_time(completed_at)
+    if not (at and ended):
+        return 'not-spot'   # without both times nothing shows the host went first: a real failure is never rerun
+    if at > ended:
+        return 'not-spot'   # the job had already ended when AWS took the host: its result is its own
+    return 'spot'
+
+
+def our_host(repo, instance_id):
+    """The host EC2 lists as `instance_id` when it is one of this repo's runners, else None."""
+    if not re.fullmatch(r'i-[0-9a-f]{8,17}', instance_id or ''):
+        return None
+    try:
+        listed = ec2.describe_instances(InstanceIds=[instance_id])
+    except OutOfTime:
+        raise
+    except Exception as error:
+        if ((getattr(error, 'response', None) or {}).get('Error', {}).get('Code')) == 'InvalidInstanceID.NotFound':
+            return None
+        raise
+    for reservation in listed.get('Reservations') or []:
+        for instance in reservation.get('Instances') or []:
+            if (instance.get('InstanceId') == instance_id and tag(instance, 'Role') == ROLE
+                    and tag(instance, 'Repo') == repo):
+                return instance
+    return None
+
+
+def ddb(value):
+    if isinstance(value, bool):
+        return {'BOOL': value}
+    if isinstance(value, (int, float)):
+        return {'N': str(value)}
+    return {'S': str(value)}
+
+
+def rerun_record(item):
+    out = {}
+    for k, v in item.items():
+        out[k] = v.get('S') if 'S' in v else (int(float(v['N'])) if 'N' in v else v.get('BOOL'))
+    return out
+
+
+def move_rerun(repo, rec, to, **fields):
+    """Move `rec` from its state to `to`, setting `fields`; False when another writer moved it first."""
+    names, values, sets = {'#s': 'state'}, {':from': {'S': rec['state']}, ':to': {'S': to}}, ['#s = :to']
+    for i, (k, v) in enumerate(sorted(fields.items())):
+        names[f'#f{i}'], values[f':f{i}'] = k, ddb(v)
+        sets.append(f'#f{i} = :f{i}')
+    try:
+        with handoff():
+            dynamodb.update_item(TableName=RERUNS_TABLE, Key={'repo': {'S': repo}, 'job': {'S': rec['job']}},
+                                 UpdateExpression='SET ' + ', '.join(sets), ConditionExpression='#s = :from',
+                                 ExpressionAttributeNames=names, ExpressionAttributeValues=values)
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        return False
+    rec.update(fields, state=to)
+    return True
+
+
+def count_spot(repo, metric):
+    """SpotLost, SpotRerun or SpotRerunFailed, per repo. Rare, and CloudWatch bills a series only in hours it gets data."""
+    cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=[
+        {'MetricName': metric, 'Dimensions': [{'Name': 'Repo', 'Value': repo}], 'Value': 1, 'Unit': 'Count'}])
+
+
+def job_completed(repo, cfg, job):
+    """A failed or cancelled job's completion: record it if one of our hosts ran it, then settle what can be settled."""
+    if not RERUNS_TABLE:
+        return {'ignored': 'reruns off'}
+    if job.get('conclusion') not in RERUN_CONCLUSIONS:
+        return {'ignored': 'conclusion'}
+    if job.get('id') is None or job.get('run_id') is None:
+        return {'ignored': 'job'}
+    instance = our_host(repo, str(job.get('runner_name') or ''))
+    if instance is None:
+        return {'ignored': 'not our host'}
+    t, attempt = int(now().timestamp()), int(job.get('run_attempt') or 1)
+    parent = rerun_parent(repo, job, attempt)
+    if parent:
+        print(f"{repo}: job {job['id']} is a later execution of job {parent['job_id']}, already rerun once; not again")
+        return {'repo': repo, 'job': job['id'], 'rerun': 'already rerun'}
+    rec = {'job': str(job['id']), 'job_id': str(job['id']), 'run_id': str(job['run_id']), 'run_attempt': attempt,
+           'name': str(job.get('name') or ''), 'instance': instance['InstanceId'], 'conclusion': job['conclusion'],
+           'completed_at': str(job.get('completed_at') or ''), 'state': 'pending', 'first_seen': t, 'called': False}
+    try:
+        dynamodb.put_item(
+            TableName=RERUNS_TABLE,
+            Item={'repo': {'S': repo}, 'ttl': {'N': str(t + RERUN_RECORD_DAYS * 86400)}, **{k: ddb(v) for k, v in rec.items()}},
+            ConditionExpression='attribute_not_exists(job)')
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        print(f"{repo}: job {job['id']} already has a rerun record; nothing more to do")
+        return {'repo': repo, 'job': job['id'], 'rerun': 'already recorded'}
+    print(f"{repo}: job {job['id']} ended {job['conclusion']} on {instance['InstanceId']}; checking whether AWS reclaimed it")
+    return {'repo': repo, 'job': job['id'], 'rerun': settle_rerun(repo, cfg, rec, instance)}
+
+
+def rerun_parent(repo, job, attempt):
+    """The record of ours that already asked to rerun this logical job, or None: same run, same name, an earlier
+    attempt, and a rerun call made. A name need not be unique, so this errs toward "already rerun" (no second rerun)."""
+    if not job.get('name'):
+        return None
+    page = {}
+    while True:
+        response = dynamodb.query(
+            TableName=RERUNS_TABLE, ConsistentRead=True, KeyConditionExpression='repo = :repo',
+            FilterExpression='run_id = :run AND called = :yes',
+            ExpressionAttributeValues={':repo': {'S': repo}, ':run': {'S': str(job['run_id'])}, ':yes': {'BOOL': True}},
+            **page)
+        for item in response.get('Items', []):
+            rec = rerun_record(item)
+            if rec.get('name') == job['name'] and rec.get('run_attempt', 0) < attempt and rec.get('job_id') != str(job['id']):
+                return rec
+        if 'LastEvaluatedKey' not in response:
+            return None
+        page = {'ExclusiveStartKey': response['LastEvaluatedKey']}
+
+
+def still_latest(repo, rec, token):
+    """True while the record's job is still its run's latest execution of that job (it has not been rerun)."""
+    for page in range(1, LATEST_JOB_PAGES + 1):
+        jobs = github('GET', f"/repos/{repo}/actions/runs/{rec['run_id']}/jobs?filter=latest&per_page=100&page={page}",
+                      token).get('jobs') or []
+        if any(str(j.get('id')) == rec['job_id'] for j in jobs):
+            return True
+        if len(jobs) < 100:
+            return False
+    return True   # a run too large to list: assume not rerun, and GitHub refuses a rerun of a job that was
+
+
+def settle_rerun(repo, cfg, rec, instance=None, tokens=None):
+    """Advance one record as far as it can go now; its state afterwards. `tokens` caches the repo's tokens for a round."""
+    tokens = {} if tokens is None else tokens
+    t = now()
+    if rec['state'] == 'pending':
+        instance = instance or our_host(repo, rec['instance'])
+        verdict = spot_verdict(instance, rec.get('completed_at')) if instance else None
+        if verdict is None:
+            if instance is None or t - datetime.fromtimestamp(rec['first_seen'], timezone.utc) > DECIDE_WINDOW:
+                move_rerun(repo, rec, 'unknown')
+                print(f"{repo}: job {rec['job_id']}: could not tell how {rec['instance']} ended; not rerunning it")
+            return rec['state']
+        if verdict == 'not-spot':
+            move_rerun(repo, rec, 'not-spot')
+            return rec['state']
+        if not move_rerun(repo, rec, 'spot'):
+            return rec['state']
+        print(f"{repo}: job {rec['job_id']} was lost with its spot host {rec['instance']} "
+              f"({(instance.get('StateTransitionReason') or '').strip()}); it is rerun once its run has finished")
+        count_spot(repo, 'SpotLost')
+    if rec['state'] != 'spot':
+        return rec['state']
+    if 'read' not in tokens:
+        tokens['read'] = repo_pat(cfg)
+    if not tokens['read']:
+        return rec['state']
+    run = github('GET', f"/repos/{repo}/actions/runs/{rec['run_id']}", tokens['read'])
+    # A newer attempt alone proves nothing about this job (a rerun of another job of the run makes one too): only this
+    # job's own replacement among the run's latest executions does.
+    if int(run.get('run_attempt') or 1) > rec['run_attempt'] and not still_latest(repo, rec, tokens['read']):
+        # This job was rerun already: by a call of ours whose answer was lost, or by a person.
+        if rec.get('called'):
+            if move_rerun(repo, rec, 'rerun'):
+                count_spot(repo, 'SpotRerun')
+        else:
+            move_rerun(repo, rec, 'superseded')
+            print(f"{repo}: job {rec['job_id']}: it was rerun by someone else; leaving it")
+        return rec['state']
+    if run.get('status') == 'completed' and run.get('conclusion') == 'cancelled':
+        move_rerun(repo, rec, 'superseded')
+        print(f"{repo}: job {rec['job_id']}: its run was cancelled; not rerunning it")
+        return rec['state']
+    expired = t - datetime.fromtimestamp(rec['first_seen'], timezone.utc) > RERUN_WINDOW
+    if run.get('status') != 'completed':
+        if expired:
+            give_up(repo, rec, f"its run was still {run.get('status')} after {RERUN_WINDOW}")
+        return rec['state']
+    if 'rerun' not in tokens:
+        tokens['rerun'] = repo_pat(cfg, RERUN_TOKEN_PERMISSIONS)
+    if not tokens['rerun']:
+        return rec['state']
+    if out_of_time():
+        raise OutOfTime(f"rerun of job {rec['job_id']}")
+    # Recorded before the call: if its answer is lost, the next round reads the run's attempt to learn what happened.
+    if not move_rerun(repo, rec, 'spot', called=True):
+        return rec['state']
+    try:
+        github('POST', f"/repos/{repo}/actions/jobs/{rec['job_id']}/rerun", tokens['rerun'], body={})
+    except urllib.error.HTTPError as error:
+        detail = error.read(300).decode('utf-8', 'replace') if hasattr(error, 'read') else ''
+        print(f"{repo}: GitHub refused to rerun job {rec['job_id']} ({error.code}: {detail[:200]})")
+        # A refusal is definite: nothing was rerun. (403 here is usually a token without Actions write.)
+        move_rerun(repo, rec, 'spot', called=False, error=f'{error.code}')
+        if expired:
+            give_up(repo, rec, f'GitHub refused every rerun for {RERUN_WINDOW}')
+        return rec['state']
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        print(f"{repo}: rerun of job {rec['job_id']} got no answer ({type(error).__name__}); the next round checks the run")
+        return rec['state']
+    if move_rerun(repo, rec, 'rerun'):
+        print(f"{repo}: reran job {rec['job_id']} (run {rec['run_id']}, attempt {rec['run_attempt']}) after its spot host was lost")
+        count_spot(repo, 'SpotRerun')
+    return rec['state']
+
+
+def give_up(repo, rec, why):
+    if move_rerun(repo, rec, 'failed'):
+        print(f"{repo}: job {rec['job_id']} lost with its spot host is NOT rerun: {why}")
+        count_spot(repo, 'SpotRerunFailed')
+
+
+def open_reruns(repo):
+    """This repo's records still waiting on EC2 (pending) or on GitHub (spot)."""
+    found, page = [], {}
+    while True:
+        response = dynamodb.query(
+            TableName=RERUNS_TABLE, ConsistentRead=True, KeyConditionExpression='repo = :repo',
+            FilterExpression='#s IN (:pending, :spot)', ExpressionAttributeNames={'#s': 'state'},
+            ExpressionAttributeValues={':repo': {'S': repo}, ':pending': {'S': 'pending'}, ':spot': {'S': 'spot'}}, **page)
+        found += [rerun_record(item) for item in response.get('Items', [])]
+        if 'LastEvaluatedKey' not in response:
+            return found
+        page = {'ExclusiveStartKey': response['LastEvaluatedKey']}
+
+
+def reconcile_reruns(repo, cfg):
+    """Advance every open record of the repo, oldest first, within the repo's time share; {state: count}."""
+    if not RERUNS_TABLE:
+        return {}
+    outcomes, tokens = {}, {}
+    for rec in sorted(open_reruns(repo), key=lambda r: r.get('first_seen', 0)):
+        if out_of_time():
+            break
+        try:
+            state = settle_rerun(repo, cfg, rec, tokens=tokens)
+        except urllib.error.URLError as error:
+            print(f"{repo}: rerun check for job {rec.get('job_id')} failed ({type(error).__name__}); next round retries")
+            state = 'error'
+        outcomes[state] = outcomes.get(state, 0) + 1
+    return outcomes
+
+
 def rotated(order, round_no):
     """The repos for this round, starting one further along each round (the reconcile runs every two minutes), so every
     repo goes first in turn: a slow one cannot always take the time the others need, and with more than two repos a
@@ -1288,10 +1603,21 @@ def handler(event, context):
     if repo not in repos:
         print(f'ignoring a delivery for {repo!r}: not a served repo')
         return {'ignored': 'repo'}
-    if event.get('action') != 'queued':
-        # Ephemeral hosts power off after their job; a completion needs no work here.
+    action, cfg, job = event.get('action'), repos[repo], event.get('workflow_job') or {}
+    if action == 'completed':
+        # Ephemeral hosts power off after their job, so a completion matters only when the job failed or was cancelled
+        # because AWS took its spot host (see "spot reruns"); the front forwards no other.
+        DEADLINE[0] = started + (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
+        try:
+            return job_completed(repo, cfg, job)
+        except OutOfTime as stop:
+            print(f"{repo}: completion of job {job.get('id')} stopped at the invocation's deadline, before {stop}; "
+                  'the reconcile carries on from its record')
+            return {'repo': repo, 'job': job.get('id'), 'rerun': 'out of time'}
+        finally:
+            DEADLINE[0] = float('inf')
+    if action != 'queued':
         return {'ignored': 'action'}
-    cfg, job = repos[repo], event.get('workflow_job') or {}
     size = job_size(cfg, job.get('labels'))
     if not size or job.get('id') is None:
         return {'ignored': 'labels'}

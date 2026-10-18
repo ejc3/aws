@@ -686,7 +686,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 
 - **Routing.** The same front (`github-runner-webhook-front`) routes by `repository.full_name`
   after the signature check. `ejc3/fcvm`, and deliveries naming no repository, take Pattern B's
-  path unchanged. The served repos go to Lambda `github-app-runner`, `queued` only.
+  path unchanged. The served repos go to Lambda `github-app-runner`: `queued` jobs, and `completed` ones only when
+  they failed or were cancelled on one of its hosts (`runner_name` `i-...`), for spot reruns (below).
   Anything else is answered and dropped.
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin` or `imagine`) and one size
@@ -770,6 +771,31 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   idle host's runner is deregistered before the host is terminated, and kept if GitHub refuses
   because it took a job since the listing)
   that never registered after 10 minutes, sat idle 10 minutes, or are older than 3 hours.
+- **Spot reruns (#488).** A host is one-time spot, so when AWS reclaims it mid-job the runner dies, GitHub fails the job
+  about ten minutes later ("The self-hosted runner lost communication with the server", no log), and nothing queues it
+  again. On 2026-10-18 two `ejc3/imagine` jobs went that way during a burst of about 18 pull requests: one host
+  was reclaimed at 16:56:36 (CloudTrail `BidEvictedEvent`; StateReason `Server.SpotInstanceTermination`) and its job failed
+  at 17:05:47, another at 17:02:52 and 17:12:44, both c7a.2xlarge in us-west-1c. Now a failed or cancelled
+  job whose runner was one of the repo's hosts gets a record in `github-app-runner-reruns` (one per job id, a week's
+  TTL). The job is rerun (`POST /repos/{repo}/actions/jobs/{id}/rerun`) only if EC2 reports that host ended with
+  `Server.SpotInstanceTermination` at a time before the job ended. Any other end (its own power-off after the job, the
+  reaper) is a real result and is never rerun. The completion can arrive before EC2 has the host's state reason, and GitHub
+  refuses a rerun while the run's other jobs still run, so each reconcile carries open records on: undecided after 30
+  minutes counts as not reclaimed, and a run still running after 6 hours is given up. **At most one automatic rerun per
+  job**: records are created and moved only by conditional writes, and a job whose run already holds a record with the
+  same name, an earlier attempt and a rerun call made is the rerun's own job and earns none. Whether a job was rerun is
+  read from the run's latest executions (`jobs?filter=latest`), not from the run's attempt number: two jobs lost in one
+  run are each rerun, the second once the attempt the first started has finished, and a call whose answer was lost is
+  not repeated. A job someone else reran, or a run someone cancelled, is left alone. Metrics, per repo in `GitHubAppRunner`: `SpotLost`, `SpotRerun` and
+  `SpotRerunFailed`. The rerun needs **Actions: write**, which neither the runners app (`dolphin-labs-runners`: Actions
+  read) nor the repo PATs (Actions read) hold yet. Until the owner grants it, each loss is detected, logged and counted as
+  `SpotRerunFailed` after 6 hours of refusals. The rerun token is minted on its own (`actions: write` only), so the
+  missing grant never touches the launch token.
+- **Spreading the risk.** Each size already tries five instance families (c7a, c7i, c8i, c6a, c6i) across the runner
+  subnets, but in a fixed order, so a burst lands mostly on the first pool with capacity (both losses above were
+  c7a.2xlarge in one AZ). A capacity-optimized fleet request (`CreateFleet`) would pick the deepest pool, but it needs a
+  launch template and new IAM, and it changes the launch path the claims and handoff are built around. On-demand
+  fallback costs about three times the spot price the budget buckets assume. Neither is done; the rerun covers a loss.
 - **Isolation.** Security group `github-app-runner-sg` has **no inbound** at all, and fcvm's
   `github-runner-sg` does not admit it (its SSH rule is self-referencing, not the VPC CIDR).
   Jobs run as their own role, `github-app-runner-instance-role` (profile
