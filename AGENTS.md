@@ -1534,7 +1534,8 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied),
   except dolphin-labs, dolphin-films, dolphin-maps, imagine and remote-claw: their deploy jobs read the token from main-only
   `cloudflare-deploy` environments, which the same apply rewrites (`dolphin-labs-ci-logs.tf`, `workers-deploy.tf`), and the
-  script refuses to set a repository secret there.
+  script refuses to set a repository secret there. The CoderColton sites (colton-games, nest-step) also deploy from a main-only
+  `cloudflare-deploy` environment, outside Terraform's GitHub owners: the script writes their token there, never to the repository.
 - **The account token is pinned to the jumpboxes' addresses, IPv6 included.** `cloudflare-account-token` allows only
   `52.9.31.202/32`, `13.56.106.229/32` and the two jumpboxes' IPv6 `/128`s. Terraform's HTTP client prefers IPv6, so an IPv4-only
   pin fails every plan with `9109 Cannot use the access token from location: 2600:...`. If a jumpbox is replaced or gains a new

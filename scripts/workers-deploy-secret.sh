@@ -24,11 +24,11 @@ case "${REPO,,}" in
     exit 3 ;;
 esac
 
-# A repo outside Terraform's GitHub owners (CoderColton) whose deploy job reads the token from its own main-only
+# Repos outside Terraform's GitHub owners (CoderColton) whose deploy job reads the token from its own main-only
 # `cloudflare-deploy` environment: the secret goes there, never to the repository.
 ENV_ARGS=()
 case "${REPO,,}" in
-  codercolton/colton-games) ENV_ARGS=(--env cloudflare-deploy) ;;
+  codercolton/colton-games|codercolton/nest-step) ENV_ARGS=(--env cloudflare-deploy) ;;
 esac
 
 TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-workers-deploy-token --query SecretString --output text)
