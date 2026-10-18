@@ -504,8 +504,9 @@ ssh macbook ─> 127.0.0.1:2223 ═══ reverse tunnel ═══> 127.0.0.1:22
 ```
 
 - **The Mac dials out.** The `com.ejcampbell.fcvm-macbook.tunnel` LaunchAgent runs
-  `ssh -NT -R 127.0.0.1:2223:127.0.0.1:22 fcvm` at login and reconnects after failures.
-  No inbound port is open on the Mac or in AWS.
+  `ssh -NT -R 127.0.0.1:2223:127.0.0.1:22` to fcvm-arm's Elastic IP as `ubuntu` at login and
+  reconnects after failures, with a key of its own that fcvm-arm accepts for that one
+  forward and nothing else. No inbound port is open on the Mac or in AWS.
 - **The tunnel ends at macOS Remote Login**, the system `sshd`, on the Mac's localhost.
   Until 2026-10-17 it ended at a private `sshd` on `127.0.0.1:22222`, started by the
   `com.ejcampbell.fcvm-macbook.sshd` LaunchAgent. That agent stays installed as a fallback
@@ -631,8 +632,60 @@ ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=passw
    remote users"; install the keys-only drop-in:
    `printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf`.
 2. Put the `to-mac` public key in `~/.ssh/authorized_keys` (mode 600).
-3. Install the tunnel LaunchAgent with `-R 127.0.0.1:2223:127.0.0.1:22 fcvm`, `KeepAlive`
-   and `RunAtLoad`, and bootstrap it.
+3. Make the tunnel's key and LaunchAgent. The key is used for the tunnel only: make a new
+   one on the Mac (`ssh-keygen -t ed25519 -N '' -f ~/.ssh/<tunnel-key>`), and authorize its
+   public half on fcvm-arm (`ubuntu`'s `~/.ssh/authorized_keys`) restricted to the one forward:
+
+   ```
+   restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:2223",permitopen="127.0.0.1:9" ssh-ed25519 AAAA... <comment>
+   ```
+
+   `port-forwarding` turns local (`-L`) forwarding back on as well as remote, so `permitopen` pins
+   it to a closed port: without it the Mac's key could open connections from fcvm-arm to anything
+   fcvm-arm reaches. Check it: an `ssh -L` with that key must fail with "administratively prohibited".
+
+   Pin fcvm-arm's host key on the Mac (`ssh-keyscan -t ed25519` it into `~/.ssh/known_hosts`, only
+   the key type you verify, and compare the fingerprint with `ssh fcvm-arm 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'` from
+   another machine), then write `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.tunnel.plist`.
+   It names the address and key directly, so it depends on no `~/.ssh/config` entry and no agent:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key><string>com.ejcampbell.fcvm-macbook.tunnel</string>
+     <key>ProgramArguments</key>
+     <array>
+       <string>/usr/bin/ssh</string><string>-NT</string>
+       <string>-o</string><string>BatchMode=yes</string>
+       <string>-o</string><string>ConnectTimeout=15</string>
+       <string>-o</string><string>ServerAliveInterval=30</string>
+       <string>-o</string><string>ServerAliveCountMax=3</string>
+       <string>-o</string><string>ExitOnForwardFailure=yes</string>
+       <string>-o</string><string>StrictHostKeyChecking=yes</string>
+       <string>-o</string><string>IdentitiesOnly=yes</string>
+       <string>-o</string><string>IdentityAgent=none</string>
+       <string>-o</string><string>ControlMaster=no</string>
+       <string>-o</string><string>ControlPath=none</string>
+       <string>-R</string><string>127.0.0.1:2223:127.0.0.1:22</string>
+       <string>-i</string><string>/Users/USER/.ssh/TUNNEL-KEY</string>
+       <string>ubuntu@FCVM-ARM-ELASTIC-IP</string>
+     </array>
+     <key>RunAtLoad</key><true/>
+     <key>KeepAlive</key><true/>
+     <key>ThrottleInterval</key><integer>15</integer>
+     <key>ProcessType</key><string>Background</string>
+     <key>StandardOutPath</key><string>/Users/USER/Library/Logs/fcvm-macbook/tunnel.stdout.log</string>
+     <key>StandardErrorPath</key><string>/Users/USER/Library/Logs/fcvm-macbook/tunnel.stderr.log</string>
+   </dict>
+   </plist>
+   ```
+
+   `mkdir -p ~/Library/Logs/fcvm-macbook`, then
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.tunnel.plist`.
+   `ExitOnForwardFailure` makes a stale listener on fcvm-arm (a half-dead earlier tunnel) end the
+   attempt instead of leaving a tunnel with no forward; launchd retries every 15 seconds.
 4. On fcvm-arm, `mac-reverse-tunnels.tf`'s installer writes the alias and the pinned
    host keys. If the Mac's Remote Login host key changed (a reinstall), pin the new one there.
 5. Run the checks above.
