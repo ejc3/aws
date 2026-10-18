@@ -925,21 +925,35 @@ pass. Undo, so the next boot does not put it back:
 - **The connector token leaked**: anyone holding it can run a connector for this one
   tunnel, and nothing more: every request still has to pass Access. Rotating it replaces
   `cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh` (a new tunnel id and token), which
-  disconnects the Mac's connector, the route that `ssh mac` would use to install the
-  new one. An ordinary apply changes nothing (the configuration has not changed), so the
-  rotation is forced. First restore the reverse route (the way back, above), then stop the
-  Mac's connector (`launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared`):
-  Cloudflare refuses to delete a tunnel with active connections, and Terraform deletes this one
-  before it creates the new one. Then, from a fresh worktree,
-  `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
-  (a new tunnel, its config and DNS record follow it, and `macbook-ssh-tunnel` gets the new
-  token; the old tunnel's config cannot be destroyed by Terraform, so delete the old tunnel in
-  the API afterwards). Then send the new token as in step 1 (the `aws ... | ssh mac 'umask 077; cat > ...'` line), start
-  the connector again with
-  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`,
-  repeat step 3 and check
-  `ssh mac 'echo through cloudflare'`, and only then retire the reverse route again
-  (step 5).
+  disconnects the Mac's connector, the route `ssh mac` goes through. So `ssh mac` does not
+  work for any of the steps below: they all run over the reverse route. An ordinary apply
+  changes nothing (the configuration has not changed), so the rotation is forced.
+  1. Restore the reverse route (the way back, above) and, on fcvm-arm, name it for the steps
+     that follow (`ssh mac` is not used again until the last one):
+
+     ```bash
+     back() { ssh -p 2223 -o HostKeyAlias=ejs-macbook-pro-via-fcvm -o UserKnownHostsFile=~/.ssh/known_hosts.mac-tunnels \
+                -o StrictHostKeyChecking=yes -i ~/.ssh/to-mac -o IdentitiesOnly=yes ejcampbell@127.0.0.1 "$@"; }
+     back 'hostname'
+     ```
+  2. Stop the Mac's connector over it: `back 'launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared'`.
+     Cloudflare refuses to delete a tunnel with active connections, and Terraform deletes this one
+     before it creates the new one.
+  3. From a fresh worktree on a jumpbox,
+     `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
+     (a new tunnel, its config and DNS record follow it, and `macbook-ssh-tunnel-token` gets the new
+     token; the old tunnel's config cannot be destroyed by Terraform, so delete the old tunnel in
+     the API afterwards).
+  4. On fcvm-arm, send the new token over the reverse route and start the connector again:
+
+     ```bash
+     aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-ssh-tunnel-token \
+         --query SecretString --output text \
+       | back 'umask 077; mkdir -p ~/.cloudflared && cat > ~/.cloudflared/macbook-ssh.token'
+     back 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist'
+     ```
+  5. Repeat phase 2's step 3 (Access lets the service token in) and check
+     `ssh mac 'echo through cloudflare'`; only then retire the reverse route again (phase 2's step 5).
 
 ### macOS VMs on the MacBook (ejc3, skevh)
 
