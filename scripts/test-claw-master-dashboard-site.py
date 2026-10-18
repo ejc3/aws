@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """claw-master-dashboard-site.tf: Access on the dashboard Worker admits the owner's named people first, then exactly
-one service token for metal-box agents (#374), whose secret only administration and dev-server-role can read."""
+one service token for metal-box agents (#374), whose secret only administration and dev-server-role can read; the
+Worker's own allowlist is written by Terraform from the same list."""
 import re
 import unittest
 from pathlib import Path
@@ -43,6 +44,55 @@ class AccessTests(unittest.TestCase):
         out = block("output", "claw_master_dashboard")
         self.assertIn("agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_id", out)
         self.assertNotIn("client_secret", out)
+
+
+class AllowlistTests(unittest.TestCase):
+    """One list of people: the Access policy and the Worker's own check both come from people/addresses, through one
+    local, and Terraform is the only writer of the Worker's copy (a KV value; v5 has no Worker-secret resource)."""
+
+    LOCAL = "local.claw_master_dashboard_people"
+
+    def test_one_local_reads_people_and_both_consumers_read_it(self):
+        # Exactly one expression in this file reads people/addresses: the list's definition.
+        self.assertEqual(len(re.findall(r"local\.people\.", TF)), 2, "only the owner and the named list")
+        self.assertRegex(
+            TF,
+            r"claw_master_dashboard_people = concat\(\[nonsensitive\(local\.people\.owner\)\], "
+            r"try\(nonsensitive\(local\.people\.claude_master_dashboard\), \[\]\)\)",
+        )
+        pol = block('resource "cloudflare_zero_trust_access_policy"', "claw_master_dashboard_owner")
+        self.assertIn("include = [for e in %s : { email = { email = e } }]" % self.LOCAL, pol)
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_allowed_emails")
+        self.assertIn('value = sensitive(join(",", %s))' % self.LOCAL, kv)
+
+    def test_the_kv_value_is_the_key_the_worker_reads_in_its_own_namespace(self):
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_allowed_emails")
+        self.assertIn('key_name     = "allowed-emails"', kv)
+        self.assertIn("namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id", kv)
+        self.assertNotIn("metadata", kv)
+
+    def test_the_namespace_survives_and_its_id_is_an_output_but_the_list_is_not(self):
+        ns = block('resource "cloudflare_workers_kv_namespace"', "claw_master_dashboard_config")
+        self.assertIn("prevent_destroy = true", ns)
+        out = block("output", "claw_master_dashboard")
+        self.assertIn("allowlist_kv_namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id", out)
+        self.assertNotIn("claw_master_dashboard_people", out)
+        self.assertNotIn("cloudflare_workers_kv.", out)
+        self.assertNotIn("local.people", out)
+
+    def test_no_second_list_is_described_as_set_by_hand(self):
+        self.assertNotIn("must name the same people", TF)
+        self.assertNotRegex(TF, r"against DASHBOARD_ALLOWED_EMAILS")
+        self.assertIn("Terraform writes that key from the same local as the Access policy", TF)
+
+    def test_the_cloudflare_provider_is_the_default_one(self):
+        # The KV writes go through the provider token (Workers KV Storage Write added for this), never the token
+        # minter or the Workers Builds alias.
+        for kind, name in (
+            ('resource "cloudflare_workers_kv_namespace"', "claw_master_dashboard_config"),
+            ('resource "cloudflare_workers_kv"', "claw_master_dashboard_allowed_emails"),
+        ):
+            self.assertNotRegex(block(kind, name), r"(?m)^\s*provider\s*=")
 
 
 class ReaderKeyTests(unittest.TestCase):
