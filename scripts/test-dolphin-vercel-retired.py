@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""dolphin-vercel-retired.tf: the dolphin-labs Vercel team is being deleted, so no Terraform here manages it any more.
-What vercel-env.tf and the old dolphin-films-vercel.tf managed there is FORGOTTEN (removed blocks, destroy = false: no
-Vercel call, so the plan is the same before and after the deletion), the AWS secret that held its token and that secret's
-policy are DESTROYED, the provider alias stays only as a placeholder that
-reads no secret, and the AWS containers that feed the Cloudflare production Workers stay."""
+"""The dolphin-labs Vercel team is retired (2026-10-18, ejc3/aws #503): Terraform forgot what it managed there and destroyed
+the AWS secret that held its token. dolphin-vercel-retired.tf, which did that, is gone now that it has applied: no Terraform
+names the team, uses its provider alias or brings its resources back, and the AWS containers that feed the Cloudflare
+production Workers stay."""
 import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEAM = "team_4TayirAcbgetrOUgYXghMXJH"
-RETIRED = (ROOT / "dolphin-vercel-retired.tf").read_text()
 
 
 def tf_files():
@@ -55,34 +53,14 @@ class NothingManagesTheTeam(unittest.TestCase):
             self.assertNotRegex(text, r'"dolphin-(labs|films)": \(', script)
 
 
-class VercelForgottenAwsDestroyed(unittest.TestCase):
-    def removed(self, destroy):
-        return re.findall(r"^removed \{\n  from = (\S+)\n\n  lifecycle \{\n    destroy = %s\n  \}\n\}$" % destroy, RETIRED, re.M)
-
-    def test_the_vercel_objects_are_forgotten(self):
-        # No Vercel call: the plan is the same before and after the team is deleted.
-        self.assertEqual(sorted(self.removed("false")), [
-            "vercel_project_environment_variable.dolphin_films",
-            "vercel_project_environment_variable.vercel_env_dolphin_labs",
-        ])
-
-    def test_the_aws_token_container_and_its_policy_are_destroyed(self):
-        # AWS changes go through Terraform: no hand deletion is left behind.
-        self.assertEqual(sorted(self.removed("true")), [
-            "aws_secretsmanager_secret.dolphin_films_vercel_api_token",
-            "aws_secretsmanager_secret_policy.dolphin_films_vercel_api_token",
-        ])
-        self.assertEqual(RETIRED.count("removed {"), 4)
-
-    def test_the_provider_alias_is_a_placeholder_that_reads_nothing(self):
-        # Terraform refuses to plan an object whose provider configuration is gone, a forget included, so the alias stays
-        # until the apply; a forget never calls the API, so the token is a constant of the shape Vercel's provider accepts.
-        provider = re.search(r'^provider "vercel" \{\n(.*?)^\}', RETIRED, re.M | re.S).group(1)
-        self.assertIn('alias     = "dolphin_labs"', provider)
-        self.assertRegex(provider, r'api_token = "[a-z]{24}"\n')
-        self.assertNotIn("ephemeral", code(RETIRED))
-        self.assertNotIn("data ", code(RETIRED))
-        self.assertNotRegex(code(RETIRED), r'^resource ', "only the provider and removed blocks")
+class TheRetirementFileIsGone(unittest.TestCase):
+    def test_the_one_shot_file_and_its_alias_are_gone(self):
+        # It forgot the Vercel objects and destroyed the token secret in one apply; nothing is left for it to do.
+        self.assertFalse((ROOT / "dolphin-vercel-retired.tf").exists())
+        for name, text in ALL_CODE.items():
+            # Other providers (the GitHub one) have their own dolphin_labs alias; only the Vercel one is gone.
+            self.assertNotRegex(text, r'provider "vercel" \{[^}]*alias\s*=\s*"dolphin_labs"', name)
+            self.assertNotIn("vercel_project_environment_variable.vercel_env_dolphin_labs", text, name)
 
 
 class TheWorkersSourcesStay(unittest.TestCase):

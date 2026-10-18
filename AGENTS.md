@@ -1519,8 +1519,8 @@ split by environment so that production and non-production share nothing:
 - `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, are the `dolphin_films`
   key of `people/addresses` (`people.tf`), loaded into the Worker with its other secrets. Never write an
   address into a file, a test, a commit or a pull request here.
-- **No Vercel.** The project was in the dolphin-labs Vercel team, which is being deleted (owner, 2026-10-18).
-  `dolphin-films-vercel.tf` is gone and `dolphin-vercel-retired.tf` makes Terraform forget the variables it wrote
+- **No Vercel.** The project was in the dolphin-labs Vercel team, which is retired (owner, 2026-10-18).
+  `dolphin-films-vercel.tf` is gone and ejc3/aws #503 made Terraform forget the variables it wrote
   there, without calling Vercel (see "Sites also deploying to Cloudflare Workers").
 - The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
   `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
@@ -1564,9 +1564,9 @@ served by `dolphin-labs-prod` (`gamesworthwatching-zone.tf`, which also runs the
 yourfantasymovie.com by `dolphin-films-prod` (`yourfantasymovie.tf`), each through always-proxied records and Workers routes.
 There is no Vercel rollback: the owner decided on 2026-10-18 to delete the dolphin-labs Vercel team (projects dolphin-labs,
 dolphin-films, dolphin-maps, already disconnected from GitHub), so the switches are gone and nothing in this repository manages
-that team. `dolphin-vercel-retired.tf` makes Terraform forget what `vercel-env.tf` and the old `dolphin-films-vercel.tf` wrote
-there (`removed` blocks with `destroy = false`: no Vercel call, so the plan is the same before and after the deletion; its
-provider alias is a placeholder kept only until that apply, then the whole file goes in a follow-up), and destroys the AWS
+that team. ejc3/aws #503 made Terraform forget what `vercel-env.tf` and the old `dolphin-films-vercel.tf` wrote
+there (`removed` blocks with `destroy = false`: no Vercel call, so nothing depends on when the team itself goes; the one-shot
+file and its placeholder provider alias were deleted once that applied), and destroyed the AWS
 secret that held the team's token (`vercel-api-token-dolphin-labs`, with its policy and its 30-day recovery window). The records have no
 origin on purpose: each apex is the Workers-only placeholder A `192.0.2.1` and each www a proxied CNAME to its apex (kept a
 CNAME: the provider replaces a record whose type changes, and the delete would leave www without a record). Their secrets are production's, loaded

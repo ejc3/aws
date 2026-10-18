@@ -7,7 +7,7 @@
 # yourfantasymovie.com/* and www.yourfantasymovie.com/* to dolphin-films-prod (films/web/wrangler.jsonc env.production, deployed
 # by the repository's films-cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex). Production moved off Vercel on
 # 2026-10-15 and the dolphin-labs Vercel team, which held the dolphin-films project, is being deleted (2026-10-18,
-# dolphin-vercel-retired.tf), so there is no Vercel rollback: no switch, and nothing here points at Vercel.
+# ejc3/aws #503), so there is no Vercel rollback: no switch, and nothing here points at Vercel.
 #
 # NO ORIGIN, ON PURPOSE. A proxied record exists only so the routes have a hostname to match; a route answers every request,
 # so the content is never contacted. The apex is the standard Workers-only placeholder, A 192.0.2.1 (TEST-NET-1, routes
