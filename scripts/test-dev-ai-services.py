@@ -57,6 +57,22 @@ class ElevenLabsSecretTests(unittest.TestCase):
         attach = block("aws_iam_role_policy_attachment", "browserbase_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
 
+    def test_deepseek_is_for_the_two_dev_roles_and_the_scrapers(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "deepseek"', TF)
+        self.assertNotRegex(TF, r"sk-[0-9a-f]{24,}")
+        policy = block("aws_secretsmanager_secret_policy", "deepseek")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.deepseek_readers)', policy)
+        self.assertIn("deepseek_readers = local.browserbase_readers", TF)
+        doc = block("aws_iam_policy_document", "deepseek_read")
+        self.assertIn("resources = [aws_secretsmanager_secret.deepseek.arn]", doc)
+        attach = block("aws_iam_role_policy_attachment", "deepseek_read")
+        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
+        for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
+            src = (ROOT / f).read_text()
+            self.assertIn("aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn]", src)
+            self.assertIn("DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.deepseek.name", src)
+
     def test_claw_master_backup_key_is_for_the_metal_role_only(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "claw_master_backup_key"', TF)
         self.assertNotRegex(TF, r"sk-ant-[A-Za-z0-9_-]{6,}")

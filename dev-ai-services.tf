@@ -165,6 +165,61 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
 
+# DeepSeek's own API (api.deepseek.com: chat, reasoning, and its fetch and search tools), an alternative to the models
+# on Amazon Bedrock and to Browserbase for the scrapers. One JSON secret holds DEEPSEEK_API_KEY, so an agent exports it:
+#   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id deepseek/api-key \
+#     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
+# Terraform owns the container and who may read it; the value is set out of band (put-secret-value from a 0600 file)
+# and never enters git. Readers are Browserbase's: the administration set, dev-server-role (the metal boxes),
+# nextjs-dev-role (the dolphin box), and the two scraping jobs, the dolphin-labs news pass and the dolphin-maps loops,
+# whose roles grant themselves the read (dolphin-labs-news.tf, dolphin-maps-loop.tf). Not dev-ebs-only-role (the I/O
+# box's role too). Every account on nextjs-dev has full sudo, so the grant is box-wide, as with Browserbase.
+resource "aws_secretsmanager_secret" "deepseek" {
+  name                    = "deepseek/api-key"
+  description             = "DeepSeek API key (JSON: DEEPSEEK_API_KEY). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "deepseek/api-key", Project = "dev" }
+}
+
+locals {
+  deepseek_readers = local.browserbase_readers
+}
+
+resource "aws_secretsmanager_secret_policy" "deepseek" {
+  secret_arn = aws_secretsmanager_secret.deepseek.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationTheDevBoxesAndTheScrapersCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.deepseek.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.deepseek_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "deepseek_read" {
+  statement {
+    sid       = "ReadTheDeepSeekKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.deepseek.arn]
+  }
+}
+
+resource "aws_iam_policy" "deepseek_read" {
+  name        = "dev-deepseek-read"
+  description = "Dev boxes: read the DeepSeek API key (deepseek/api-key) and nothing else"
+  policy      = data.aws_iam_policy_document.deepseek_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "deepseek_read" {
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
+  policy_arn = aws_iam_policy.deepseek_read.arn
+}
+
 # App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
 # secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that

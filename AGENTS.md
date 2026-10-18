@@ -1254,6 +1254,12 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **DeepSeek API** (chat and reasoning models, plus its fetch and search tools), metal boxes, nextjs-dev and the
+  scrapers: an alternative to the Bedrock models and to Browserbase. One JSON secret, `deepseek/api-key` (us-west-1), holds
+  `DEEPSEEK_API_KEY`; dev-server-role, nextjs-dev-role, the dolphin-labs news pass's and the dolphin-maps loops' Lambda roles
+  (their functions get `DEEPSEEK_SECRET_ID`) and admins may read it (`dev-ai-services.tf`; not dev-ebs-only). Export it with
+  the same `eval "$(aws secretsmanager get-secret-value ... --secret-id deepseek/api-key ... | jq -r 'to_entries[] | ...')"`
+  as Browserbase. Never onto a command line, into a file in a repo or a commit.
 - **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
   nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
   `ISSUER_ID`, `KEY_ID`, `TEAM_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
