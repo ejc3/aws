@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # claude-master-mac-setup -- set a Mac up to use the shared Claude subscriptions through the Cloudflare
-# tunnel (claw-master-tunnel.tf), reaching it from fcvm-metal-arm (mac-reverse-tunnels.tf: `ssh mac`
+# tunnel (claw-master-tunnel.tf), reaching it from fcvm-metal-arm (mac-ssh-client.tf: `ssh mac`
 # from there, through Cloudflare Access).
 #
 #   scripts/claw-master-mac-setup.sh mac        run on a jumpbox as an AWS administrator
