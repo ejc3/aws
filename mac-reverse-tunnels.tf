@@ -2,6 +2,21 @@
 # reverse forwards; they do not open an AWS security-group port or start a tunnel.
 # The existing ~/.ssh/to-mac private key stays on the persistent ARM root.
 locals {
+  # cloudflared for Host macbook's proxy command, pinned with claw-master's (claw-master-tunnel.tf). Kept out of
+  # mac_reverse_tunnel_setup, which scripts/test-mac-tunnel-aliases.py runs as plain bash.
+  macbook_cloudflared_install = <<-MACCFD
+install -d -o ubuntu -g ubuntu /home/ubuntu/.local/bin
+if ! echo "${local.cloudflared_sha256_linux_arm}  /home/ubuntu/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1; then
+  if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${local.cloudflared_version}/cloudflared-linux-arm64" -o /tmp/cloudflared.new \
+     && echo "${local.cloudflared_sha256_linux_arm}  /tmp/cloudflared.new" | sha256sum -c - >/dev/null; then
+    install -o ubuntu -g ubuntu -m 755 /tmp/cloudflared.new /home/ubuntu/.local/bin/cloudflared
+  else
+    echo "WARNING: cloudflared ${local.cloudflared_version} did not download or match its sha256; ssh macbook needs it" >&2
+  fi
+  rm -f /tmp/cloudflared.new
+fi
+MACCFD
+
   mac_reverse_tunnel_setup = <<-MACSETUP
 install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
 
@@ -47,6 +62,7 @@ MACCONFIG
 cat > /home/ubuntu/.ssh/macbook-access-proxy <<'MACPROXY'
 #!/bin/sh
 set -eu
+set +x
 s=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-ssh-access \
       --query SecretString --output text)
 TUNNEL_SERVICE_TOKEN_ID=$(printf '%s' "$s" | jq -r .client_id)
@@ -102,5 +118,5 @@ MACSETUP
 
 output "mac_reverse_tunnel_usage" {
   description = "SSH back to the Macs while their outbound tunnels are connected"
-  value       = "from fcvm-arm as ubuntu: ssh mac (127.0.0.1:2222) | ssh macbook (127.0.0.1:2223)"
+  value       = "from fcvm-arm as ubuntu: ssh mac (127.0.0.1:2222) | ssh macbook (Cloudflare Access, macbook-ssh.cc-games.dev)"
 }
