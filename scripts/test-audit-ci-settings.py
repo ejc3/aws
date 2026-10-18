@@ -75,6 +75,31 @@ class PinTests(unittest.TestCase):
         self.assertEqual(audit.unpinned("  - uses: ./local\n  - uses: docker://alpine:3\n"), set())
 
 
+class OwnerTokenTests(unittest.TestCase):
+    def run_main(self, owner, app_token):
+        lines = []
+        with mock.patch.object(audit.sys, "argv", ["audit", owner]), \
+                mock.patch.object(audit, "token", return_value=app_token), \
+                mock.patch.object(audit, "user_token", return_value="personal") as user, \
+                mock.patch.object(audit, "audit_org_runner_groups"), \
+                mock.patch.object(audit, "paged", return_value=([], 200)) as paged, \
+                mock.patch("builtins.print", side_effect=lambda *a, **k: lines.append(" ".join(map(str, a)))):
+            audit.main()
+        return lines, user, paged
+
+    def test_a_failed_app_token_for_an_app_owner_is_reported_not_replaced(self):
+        lines, user, paged = self.run_main("dolphin-labs-hq", None)
+        user.assert_not_called()
+        paged.assert_not_called()
+        self.assertTrue(any("minting failed" in l for l in lines), lines)
+
+    def test_an_owner_without_the_app_is_read_with_the_callers_login(self):
+        lines, user, paged = self.run_main("CoderColton", None)
+        user.assert_called_once()
+        self.assertEqual(paged.call_args[0][0], "personal")
+        self.assertTrue(paged.call_args[0][1].startswith("/user/repos"))
+
+
 class ReadFailureTests(unittest.TestCase):
     def test_a_transport_error_is_status_zero_not_an_exception(self):
         for error in (urllib.error.URLError("no route"), TimeoutError("slow"), ConnectionResetError()):

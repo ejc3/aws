@@ -38,6 +38,9 @@ DEPLOY_SECRET = re.compile(r"(CLOUDFLARE|DEPLOY|VERCEL|AWS_|WRANGLER|FLY_|NETLIF
 # The owner's own organisations and accounts (owner, 2026-10-17: "i dont need pins of my own repos").
 OWN_OWNERS = ("ejc3", "dolphin-labs-hq", "CoderColton")
 DEFAULT_OWNERS = list(OWN_OWNERS)
+# Where the administration app is installed. A failed token there is an error to report, never a reason to audit the
+# smaller set a personal login can see; only the other owners are read with the caller's own login.
+APP_OWNERS = ("ejc3", "dolphin-labs-hq")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -333,6 +336,9 @@ def main():
     print(f"{'repository':42} {'runners':11} {'item':22} {'state':5} detail")
     for owner in owners:
         tok, listing = token(owner), "/installation/repositories"
+        if not tok and owner.lower() in {o.lower() for o in APP_OWNERS}:
+            report(owner, "-", "warn", "no app token for this owner (minting failed): not audited")
+            continue
         if not tok:
             # The app is not installed there: the caller's own login, over the repositories it can reach.
             tok, listing = user_token(), "/user/repos?affiliation=owner,collaborator,organization_member"
