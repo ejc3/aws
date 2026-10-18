@@ -1,13 +1,15 @@
-# SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of the Mac's
-# desktop-session sshd, so a connection needs both Cloudflare Access (a second factor) and an SSH
-# key. It is the ONE way in: every client (mac-ssh-client.tf) uses it, and no reverse tunnel remains.
-# The runbook is README "The MacBook: remote access and its scratch drive".
+# SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of the Mac's Remote
+# Login, so a connection needs both Cloudflare Access (a second factor) and an SSH key. It is the ONE
+# way in: every client (mac-ssh-client.tf) uses it, and no reverse tunnel remains. The runbook is
+# README "The MacBook: remote access and its scratch drive".
 #
-#   macbook-ssh.cc-games.dev  -> the Mac's desktop-session sshd (ssh://127.0.0.1:22222), keys only
+#   macbook-ssh.cc-games.dev  -> macOS Remote Login (ssh://127.0.0.1:22), keys only
 #
-# That sshd (LaunchAgent com.ejcampbell.fcvm-macbook.sshd, ~/.ssh/fcvm-macbook/sshd_config,
-# 127.0.0.1 only) runs in the logged-in desktop session and has Full Disk Access, so one session
-# reaches the external drive, sends Apple Events and uses the login keychain.
+# Remote Login sessions are attributed to /usr/libexec/sshd-keygen-wrapper, which holds Full Disk
+# Access (so a freshly built program reaches /Volumes/Scratch with no prompt) and Automation for
+# System Events and Chrome. The login keychain (signing) is one hop further, in the GUI session:
+# `mac-gui` (scripts/mac-setup.sh). The desktop-session sshd on 22222 that this pointed at before
+# was retired: every new binary it ran stopped at a removable-volume prompt.
 #
 # Who gets in through Access: service tokens only, one per client, each in its own secret.
 #   fcvm-arm, ubuntu     macbook-ssh-access              (readable by fcvm-arm's instance)
@@ -105,8 +107,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "macbook_ssh" {
     ingress = [
       {
         hostname = local.macbook_ssh_hostname
-        # The desktop-session sshd, not Remote Login (22): see the header. 127.0.0.1, its only ListenAddress.
-        service = "ssh://127.0.0.1:22222"
+        # macOS Remote Login: see the header.
+        service = "ssh://127.0.0.1:22"
         # The connector itself refuses a request without a valid Access token for this application.
         origin_request = {
           access = {

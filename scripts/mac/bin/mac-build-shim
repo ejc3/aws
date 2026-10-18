@@ -1,0 +1,61 @@
+#!/bin/sh
+# Installed as ~/.local/bin/swift, ~/.local/bin/xcodebuild and ~/.local/bin/xcrun (symlinks), ahead of
+# /usr/bin on PATH. Heavy builds go through mac-build (at most two at once); everything else runs the
+# real tool directly, with no other effect. Installed by ejc3/aws scripts/mac-setup.sh.
+real=${MAC_REAL_BIN_DIR:-/usr/bin}
+tool=${0##*/}
+cap() { exec "${MAC_BUILD:-$HOME/.local/bin/mac-build}" "$real/$tool" "$@"; }
+pass() { exec "$real/$tool" "$@"; }
+
+[ -n "${MAC_BUILD_SLOT:-}" ] && pass "$@"
+
+# xcodebuild: an informational flag means no build; otherwise it builds (the default action is build).
+xcodebuild_builds() {
+  for a in "$@"; do
+    case "$a" in
+      -version|-list|-showsdks|-showBuildSettings|-showdestinations|-showTestPlans|-help|-usage|-license|\
+      -checkFirstLaunchStatus|-runFirstLaunch|-find-executable|-find-library|-find|-downloadPlatform|\
+      -downloadAllPlatforms|-importPlatform|-exportLocalizations|-importLocalizations|-resolvePackageDependencies)
+        return 1 ;;
+    esac
+  done
+  return 0
+}
+
+case "$tool" in
+  swift)
+    case "${1:-}" in build|test|run) cap "$@" ;; esac
+    pass "$@" ;;
+  xcodebuild)
+    xcodebuild_builds "$@" && cap "$@"
+    pass "$@" ;;
+  xcrun)
+    # Skip xcrun's own options to find the tool it runs.
+    i=1
+    while [ $i -le $# ]; do
+      eval "a=\${$i}"
+      case "$a" in
+        -sdk|--sdk|-toolchain|--toolchain) i=$((i + 2)) ;;
+        -f|--find|-h|--help|--version|--show-sdk-*|--show-toolchain-path|-k|--kill-cache) pass "$@" ;;
+        -*) i=$((i + 1)) ;;
+        *) break ;;
+      esac
+    done
+    [ $i -le $# ] || pass "$@"
+    eval "t=\${$i}"; j=$((i + 1))
+    if [ $j -le $# ]; then eval "n=\${$j}"; else n=; fi
+    case "$t" in
+      swift) case "$n" in build|test|run) cap "$@" ;; esac ;;
+      xcodebuild)
+        builds=yes; k=$j
+        while [ $k -le $# ]; do
+          eval "a=\${$k}"
+          xcodebuild_builds "$a" || builds=no
+          k=$((k + 1))
+        done
+        [ $builds = yes ] && cap "$@" ;;
+    esac
+    pass "$@" ;;
+  *)
+    echo "mac-build-shim: installed under an unknown name: $tool" >&2; exit 2 ;;
+esac

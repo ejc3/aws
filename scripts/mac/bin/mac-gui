@@ -1,0 +1,52 @@
+#!/bin/zsh
+# mac-gui [--timeout SECONDS] [--] COMMAND [ARGS...]
+#
+# Runs COMMAND in the logged-in user's GUI session (its launchd bootstrap namespace), from any SSH
+# session. That is what the login keychain needs: codesign, xcodebuild archive/export with signing,
+# notarytool with a keychain profile, `security` on the login keychain. Everything else (builds on
+# /Volumes/Scratch, osascript to System Events and Chrome, Peekaboo) works in a plain `ssh mac`.
+#
+# stdin, stdout and stderr are the caller's; the exit status is COMMAND's (124 on timeout). The
+# working directory and the environment are kept. Installed by ejc3/aws scripts/mac-setup.sh.
+set -u
+timeout=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --timeout) timeout=$2; shift 2 ;;
+    --timeout=*) timeout=${1#*=}; shift ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "usage: mac-gui [--timeout SECONDS] [--] COMMAND [ARGS...]" >&2; exit 2; }
+[[ $timeout == <-> ]] || { echo "mac-gui: --timeout takes whole seconds" >&2; exit 2; }
+
+# The environment travels in a 0600 file read by the inner shell: sudo resets it, and an
+# argument list would show it to every user of the Mac in ps.
+umask 077
+envfile=$(mktemp "${TMPDIR:-/tmp}/mac-gui-env.XXXXXX") || exit 1
+trap 'rm -f "$envfile"' EXIT
+export -p | grep -v -E '^(export |typeset -x )?(SUDO_[A-Z_]*|SSH_AUTH_SOCK|SHLVL|OLDPWD|PWD|_)=' > "$envfile"
+
+uid=$(id -u); user=$(id -un)
+run=(/usr/bin/sudo -n /bin/launchctl asuser "$uid" /usr/bin/sudo -n -u "$user" /bin/zsh -c \
+  'source "$1"; rm -f "$1"; cd "$2" || exit 1; shift 2; exec "$@"' mac-gui "$envfile" "$PWD" "$@")
+if [ "$timeout" -gt 0 ]; then
+  # The command runs in its own process group; at the deadline the whole group gets TERM, then KILL,
+  # and mac-gui exits 124 like timeout(1). macOS has no timeout(1).
+  /usr/bin/perl -e '
+    my $t = shift;
+    my $pid = fork() // die "mac-gui: fork: $!\n";
+    if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV or exit 127 }
+    $SIG{ALRM} = sub {
+      kill "TERM", -$pid; sleep 2; kill "KILL", -$pid;
+      print STDERR "mac-gui: timed out after ${t}s\n"; exit 124;
+    };
+    alarm $t;
+    waitpid($pid, 0);
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$timeout" "${run[@]}"
+  exit $?
+fi
+"${run[@]}"
