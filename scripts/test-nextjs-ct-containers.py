@@ -112,6 +112,52 @@ class MigrateTests(unittest.TestCase):
         rsync_home = next(l for l in m.splitlines() if "rsync -aHAX" in l)
         self.assertNotIn("--delete", rsync_home)
 
+    def test_seed_is_one_stream_final_is_parallel_and_any_failure_fails(self):
+        m = (HOST / "nextjs-ct-migrate").read_text()
+        final = m.split('if [ -n "$FINAL" ]; then\n    rsync', 1)[1].split("else", 1)[0]
+        self.assertIn('"/var/log/nextjs-ct-migrate-$U.log" 2>&1 &', final)
+        seed = m.split('if [ -n "$FINAL" ]; then\n    rsync', 1)[1].split("else", 1)[1].split("fi", 1)[0]
+        self.assertNotIn("&\n", seed)
+        self.assertIn('wait "${p%%:*}" || FAILED="$FAILED ${p#*:}"', m)
+        self.assertIn('[ -z "$FAILED" ] || {', m)
+
+    def test_an_interrupted_final_pass_stops_its_copies(self):
+        # Review of #491 (CodeRabbit): SIGTERM while the parallel copies run must kill and reap every one of
+        # them and fail, never leave rsync --delete mirroring homes behind the operator's back.
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"users": {"alice": {}, "boss": {}}}))
+            fake(d, "rsync", 'echo $$ >> "$PIDFILE"; exec sleep 60\n')
+            fake(d, "ssh", "exit 0\n")
+            fake(d, "systemctl", "exit 0\n")
+            fake(d, "id", "echo 1001\n")
+            text = (HOST / "nextjs-ct-migrate").read_text().replace("/etc/nextjs-ct/config.json", str(d / "config.json")) \
+                .replace("/var/log/nextjs-ct-migrate-", str(d / "log-"))
+            (d / "m.sh").write_text(text)
+            env = {"PATH": f"{d}:/usr/bin:/bin", "PIDFILE": str(d / "pids")}
+            proc = subprocess.Popen(["bash", str(d / "m.sh"), "10.0.0.1", "--final"], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(100):
+                if (d / "pids").exists() and len((d / "pids").read_text().split()) == 2:
+                    break
+                time.sleep(0.05)
+            pids = [int(p) for p in (d / "pids").read_text().split()]
+            self.assertEqual(len(pids), 2)
+            proc.terminate()
+            out, err = proc.communicate(timeout=20)
+            time.sleep(0.2)
+            alive = []
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                    os.kill(pid, 9)  # do not leave the fake behind if the script did
+                except ProcessLookupError:
+                    pass
+            self.assertEqual(alive, [], "copies left running after the interrupt")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("interrupted; copies stopped", err)
+
     def test_final_pass_fails_when_published_projects_cannot_be_copied(self):
         # Review of #490 (Codex P2).
         m = (HOST / "nextjs-ct-migrate").read_text()

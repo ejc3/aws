@@ -24,16 +24,43 @@ USERS=$(jq -r '.users | keys[]' "$CONFIG")
 if [ -n "$FINAL" ]; then
   for U in $USERS; do systemctl stop "systemd-nspawn@$U.service"; done
 fi
+# The seed copies one home at a time: the old disk's random reads are the limit (node_modules), and four
+# parallel streams took the live box to 20% I/O pressure on 2026-10-18 where one stream kept it near 1%.
+# The final pass copies every home at once: the old box's services are stopped by then, and the time it
+# takes is the downtime (a no-change pass scanned 93,000 files in 10 seconds).
+PIDS=() FAILED=""
+# Never leave background copies running: an interrupted --final must not keep mirroring homes while the
+# operator restarts containers or retries. Installed before the first copy starts.
+stop_copies() {
+  local p
+  for p in "${PIDS[@]}"; do kill "${p%%:*}" 2>/dev/null || true; done
+  for p in "${PIDS[@]}"; do wait "${p%%:*}" 2>/dev/null || true; done
+  PIDS=()
+}
+T=""
+trap 'stop_copies; [ -z "$T" ] || rm -rf "$T"' EXIT
+trap 'echo "nextjs-ct-migrate: interrupted; copies stopped, containers left stopped" >&2; exit 130' INT TERM
 for U in $USERS; do
   id -u "$U" >/dev/null 2>&1 || { echo "nextjs-ct-migrate: no account $U here yet; run setup first" >&2; exit 1; }
   # An account added after nextjs-dev has nothing to bring.
   $SSH "ubuntu@$OLD" test -d "/home/$U" || { echo "nextjs-ct-migrate: no /home/$U on the old box; skipping"; continue; }
   echo "nextjs-ct-migrate: /home/$U"
-  rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
-    "ubuntu@$OLD:/home/$U/" "/home/$U/"
+  if [ -n "$FINAL" ]; then
+    rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+      "ubuntu@$OLD:/home/$U/" "/home/$U/" > "/var/log/nextjs-ct-migrate-$U.log" 2>&1 &
+    PIDS+=("$!:$U")
+  else
+    rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+      "ubuntu@$OLD:/home/$U/" "/home/$U/" || FAILED="$FAILED $U"
+  fi
 done
+for p in "${PIDS[@]}"; do
+  wait "${p%%:*}" || FAILED="$FAILED ${p#*:}"
+done
+PIDS=()
+[ -z "$FAILED" ] || { echo "nextjs-ct-migrate: copying failed for:$FAILED (final pass: /var/log/nextjs-ct-migrate-<user>.log)" >&2; exit 1; }
 
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d)
 # Fatal on the final pass: a cutover without the projects published since the seed would leave their URLs dead.
 $SSH "ubuntu@$OLD" test -d /var/lib/ndev/instances && HAVE_NDEV=0 || HAVE_NDEV=$?
 [ "$HAVE_NDEV" = 255 ] && { echo "nextjs-ct-migrate: cannot reach the old box for its published projects" >&2; [ -z "$FINAL" ] || exit 1; }
