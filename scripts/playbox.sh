@@ -15,9 +15,11 @@
 #   playbox ip N          its private IP
 #
 # For scripts, `up` exits 0 when DCV answers (stdout's last line is
-# "launched slot=N type=T ip=IP", or "running slot=N ip=IP" when it already was), 3 when no type
-# had spot capacity, 4 when DCV did not answer in time (the box is left running; check again),
-# and 1 for any other failure.
+# "launched slot=N type=T ip=IP", or "running slot=N ip=IP" when the slot already had a box), 3
+# when no type had spot capacity, 4 when DCV did not answer in time (the box is left running;
+# check again), and 1 for any other failure. An existing box is not taken as ready: `up` resumes
+# its setup -- attaches the D: disk if it is not attached (a launcher interrupted between
+# launch and attach leaves it so) and waits for DCV exactly as for a new launch.
 #
 # THIS SCRIPT DOES NOT RUN TERRAFORM, AND DOES NOT TOUCH THE JUMPBOX. Terraform owns the launch
 # templates, the D: disks, the passwords and the tag-scoped grant (playbox-control); this
@@ -82,10 +84,80 @@ box_ip() {
   [ -n "$row" ] && printf '%s\n' "$row" | awk '{print $4}'
 }
 
-# volume-id state availability-zone of the slot's D: disk
+# volume-id state availability-zone attached-instance-id (None when detached) of the slot's D: disk
 data_volume() {
   aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
-    --query 'Volumes[0].[VolumeId,State,AvailabilityZone]' --output text 2>/dev/null | grep '^vol-' || true
+    --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-' || true
+}
+
+# wait_volume_free: wait (up to 2 minutes) for the D: disk to be available; a box that was just
+# terminated may still be letting go of it. Sets VOL VSTATE AZ ATTACHED; fails if it stays busy.
+wait_volume_free() {
+  read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
+  [ -n "${VOL:-}" ] || { say "FATAL: no D: disk tagged $VOLTAG in $REGION (is playbox.tf applied?)"; return 1; }
+  for _ in $(seq 1 24); do
+    [ "$VSTATE" = "available" ] && return 0
+    say "    D: disk $VOL is $VSTATE; waiting for it to be free..."
+    sleep 5
+    read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
+  done
+  [ "$VSTATE" = "available" ] && return 0
+  say "FAILED: D: disk $VOL is still $VSTATE${ATTACHED:+ (attached to $ATTACHED)}. Is another $NAME running? $SELF status $SLOT"
+  return 1
+}
+
+# attach_data ID: make sure the slot's D: disk is attached to instance ID, attaching it if it is
+# not. A box that cannot get its disk is terminated: its setup waits for D: and would only run
+# up a bill. Two `up`s racing to attach to the same box both succeed (the loser finds it attached).
+attach_data() {
+  local id="$1" out
+  read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
+  if [ -n "${VOL:-}" ] && [ "$ATTACHED" = "$id" ]; then
+    say "D: disk $VOL is attached to $id."
+    return 0
+  fi
+  if wait_volume_free; then
+    # A launch template cannot carry an existing volume, and EC2 refuses an attach while the
+    # instance is pending. Windows' setup waits for the disk, so attaching promptly is enough.
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$id" 2>/dev/null
+    if out=$(aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" --instance-id "$id" --device xvdf 2>&1); then
+      say "Attached D: disk $VOL to $id."
+      return 0
+    fi
+    read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
+    if [ "$ATTACHED" = "$id" ]; then
+      say "D: disk $VOL is attached to $id."
+      return 0
+    fi
+    say "FAILED to attach $VOL to $id:"; printf '%s\n' "$out" | sed 's/^/  /' >&2
+  fi
+  if aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" >/dev/null 2>&1; then
+    say "Terminated $id; nothing was changed on the disk."
+  else
+    say "Could not terminate $id either: run $SELF down $SLOT"
+  fi
+  return 1
+}
+
+# wait_dcv LINE: wait for DCV on the slot's box, then print LINE plus " ip=IP" on stdout and exit
+# 0; exit 4 if it does not answer in DCV_WAIT_MINUTES.
+wait_dcv() {
+  local i ip=""
+  say "Windows is setting up (the GPU driver, DCV, a reboot): DCV usually answers 15-20 minutes after launch."
+  for i in $(seq 1 $((DCV_WAIT_MINUTES * 4))); do
+    [ -n "$ip" ] || ip="$(box_ip)"
+    if [ -n "$ip" ] && dcv_answers "$ip"; then
+      say "$NAME is up."
+      connect_hint "$ip"
+      echo "$1 ip=$ip"
+      exit 0
+    fi
+    [ $((i % 8)) -eq 0 ] && say "    still setting up ($((i / 4)) min)..."
+    sleep 15
+  done
+  say "$NAME is running but DCV did not answer within $DCV_WAIT_MINUTES minutes. It is left running;"
+  say "check with: $SELF status $SLOT (an admin can read C:\\playbox-setup.log through Systems Manager)."
+  exit 4
 }
 
 dcv_answers() { # dcv_answers IP: does anything accept a TCP connection on 8443?
@@ -147,12 +219,12 @@ case "$CMD" in
     if [ -z "$ROW" ]; then
       if [ -n "$(box_ids)" ]; then echo "$NAME: launching"; else echo "$NAME: down (\$0 compute)"; fi
     else
-      read -r _ T L IP LT <<< "$ROW"
-      case "$L" in spot) BOUGHT="spot" ;; *) BOUGHT="ON-DEMAND" ;; esac
+      read -r _ T _ IP LT <<< "$ROW"
+      # Spot only: the template asks for it and the grant refuses anything else.
       if dcv_answers "$IP"; then READY="DCV answering"; else READY="still setting up (DCV not answering yet)"; fi
-      echo "$NAME: RUNNING at $IP ($T, $BOUGHT), $READY; the watchdog ends it after an idle hour or at $(ends_at "$LT")"
+      echo "$NAME: RUNNING at $IP ($T, spot), $READY; the watchdog ends it after an idle hour or at $(ends_at "$LT")"
     fi
-    read -r VOL VSTATE _ <<< "$(data_volume)"
+    read -r VOL VSTATE _ ATTACHED <<< "$(data_volume)"
     echo "  D: disk: ${VOL:-MISSING} (${VSTATE:-?}, kept between launches)"
     ;;
 
@@ -178,26 +250,22 @@ case "$CMD" in
     ;;
 
   up)
-    ROW="$(box_row)"
-    if [ -n "$ROW" ]; then
-      read -r _ _ _ IP _ <<< "$ROW"
-      say "$NAME is already running."
-      connect_hint "$IP"
-      echo "running slot=$SLOT ip=$IP"
-      exit 0
+    # A box already exists: resume its setup rather than trust it. It is `running` long before
+    # its D: disk is attached and DCV is up, and a launcher interrupted between run-instances and
+    # attach-volume leaves one that would wait for its disk forever.
+    IDS="$(box_ids)"
+    if [ -n "$IDS" ]; then
+      if [ "$(wc -l <<< "$IDS")" -gt 1 ]; then
+        say "FAILED: more than one $NAME exists ($(tr '\n' ' ' <<< "$IDS")). Run: $SELF down $SLOT, then $SELF up $SLOT"
+        exit 1
+      fi
+      ID="$IDS"
+      say "$NAME already exists ($ID); making sure its D: disk is attached and its setup finishes."
+      attach_data "$ID" || exit 1
+      wait_dcv "running slot=$SLOT"
     fi
-    if [ -n "$(box_ids)" ]; then say "$NAME is already launching; run: $SELF status $SLOT"; exit 0; fi
 
-    read -r VOL VSTATE AZ <<< "$(data_volume)"
-    [ -n "${VOL:-}" ] || { say "FATAL: no D: disk tagged $VOLTAG in $REGION (is playbox.tf applied?)"; exit 1; }
-    # A box that was just terminated may still be letting go of the disk.
-    for _ in $(seq 1 24); do
-      [ "$VSTATE" = "available" ] && break
-      say "    D: disk $VOL is $VSTATE; waiting for it to be free..."
-      sleep 5
-      read -r VOL VSTATE AZ <<< "$(data_volume)"
-    done
-    [ "$VSTATE" = "available" ] || { say "FAILED: D: disk $VOL is still $VSTATE. Is another $NAME running? $SELF status $SLOT"; exit 1; }
+    wait_volume_free || exit 1
     say "D: disk $VOL is in $AZ; $NAME launches there (EBS is AZ-locked)."
 
     ID=""
@@ -207,7 +275,7 @@ case "$CMD" in
         --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
       say "--> trying spot $T (\$${PRICE:-?}/hour) in $AZ ..."
       # Everything but the type comes from the slot's launch template, so nothing here can change
-      # the AMI, the subnet, the security group, the role or the tags.
+      # the AMI, the subnet, the security group, the role, the tags or the spot market.
       OUT=$(aws ec2 run-instances --region "$REGION" \
         --launch-template "LaunchTemplateName=$NAME,Version=\$Latest" \
         --instance-type "$T" --count 1 \
@@ -234,35 +302,7 @@ case "$CMD" in
     fi
 
     say "Launched $CHOSEN as $ID. Attaching the D: disk..."
-    # A launch template cannot carry an existing volume, and EC2 refuses an attach while the
-    # instance is pending. Windows' setup waits for the disk, so attaching promptly is enough.
-    aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
-    if ! ATTACH=$(aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" --instance-id "$ID" --device xvdf 2>&1); then
-      say "FAILED to attach $VOL to $ID:"; printf '%s\n' "$ATTACH" | sed 's/^/  /' >&2
-      # A box without its D: disk would only run up a bill while its setup waits: end it.
-      if aws ec2 terminate-instances --region "$REGION" --instance-ids "$ID" >/dev/null 2>&1; then
-        say "Terminated $ID; nothing was changed on the disk."
-      else
-        say "Could not terminate $ID either: run $SELF down $SLOT"
-      fi
-      exit 1
-    fi
-
-    IP="$(box_ip)"
-    say "Windows is setting up (the GPU driver, DCV, a reboot): DCV usually answers 15-20 minutes after launch."
-    for i in $(seq 1 $((DCV_WAIT_MINUTES * 4))); do
-      [ -n "$IP" ] || IP="$(box_ip)"
-      if [ -n "$IP" ] && dcv_answers "$IP"; then
-        say "$NAME is up."
-        connect_hint "$IP"
-        echo "launched slot=$SLOT type=$CHOSEN ip=$IP"
-        exit 0
-      fi
-      [ $((i % 8)) -eq 0 ] && say "    still setting up ($((i / 4)) min)..."
-      sleep 15
-    done
-    say "$NAME is running but DCV did not answer within $DCV_WAIT_MINUTES minutes. It is left running;"
-    say "check with: $SELF status $SLOT (an admin can read C:\\playbox-setup.log through Systems Manager)."
-    exit 4
+    attach_data "$ID" || exit 1
+    wait_dcv "launched slot=$SLOT type=$CHOSEN"
     ;;
 esac

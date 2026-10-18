@@ -1,6 +1,6 @@
 # playbox.tf
 #
-# THE PLAYBOXES: three on-demand Windows spot boxes with an NVIDIA GPU, one per kid, for
+# THE PLAYBOXES: three Windows spot boxes, launched when wanted, with an NVIDIA GPU, one per kid, for
 # playtesting Roblox games (Roblox Player and Roblox Studio). Slots are numbered, not named:
 # `playbox up 2` / `playbox down 2` (scripts/playbox.sh) from a dev box. Which kid has which
 # slot is not written down here.
@@ -59,7 +59,9 @@
 # I/O-box peer route -- as wbox's has, so a desktop that runs downloaded games cannot reach
 # the fleet's NFS scratch.
 #
-# FIRST BOOT OF EACH LAUNCH (user_data, retried at each boot until it completes once): sets
+# FIRST BOOT OF EACH LAUNCH (user_data): first the box's own lifetime backstop (below), then
+# the setup, tried twice; if both attempts fail the box shuts itself down, which terminates it
+# (instance_initiated_shutdown_behavior), so the next `playbox up` starts clean. It sets
 # the Administrator password from Secrets Manager (playbox-N/administrator-password,
 # generated here; the dev roles may read it), finds the D: disk by its EBS volume id and
 # formats it only if RAW, installs the NVIDIA GRID driver and Amazon DCV (each from the D:
@@ -70,7 +72,8 @@
 # WHO MAY LAUNCH: the dev roles pbox uses (dev-server-role on the metal boxes, nextjs-dev-role
 # on the kids' box). An instance-role grant is box-wide (every account on nextjs-dev has
 # sudo); what bounds it is the policy below -- three slot names, three templates, two
-# instance types, this role only -- and the watchdog's idle and lifetime limits.
+# instance types, spot only, this role only -- and the watchdog's idle and lifetime limits,
+# backed by alarms on the watchdog and by each box's own deadline task.
 
 locals {
   # Three slots; each needs nothing else (its volume, template, password and watchdog entry
@@ -286,18 +289,52 @@ resource "aws_iam_instance_profile" "playbox" {
 
 # ============================================================ first boot of each launch
 locals {
-  # Runs at every boot (persist) until one run completes every step; only then is the marker
-  # written on C:, so a failure (the password or its grant still propagating, D: not yet
-  # attached) is retried at the next boot instead of being recorded as done. C: is new at
-  # every launch, so every launch runs it once.
+  # Runs at every boot (persist). C: is new at every launch, so every launch runs it once:
+  #
+  # 1. THE LIFETIME BACKSTOP, at every boot and before anything that can fail. The first run
+  #    of a launch writes C:\playbox\deadline.txt (the first boot's time plus
+  #    local.playbox_max_hours, the watchdog's own lifetime) and every run registers the
+  #    playbox-deadline task: at startup and every 15 minutes, as SYSTEM, it runs
+  #    `shutdown /s /t 0` once the deadline has passed, and the shutdown terminates the
+  #    instance. A spot box that the watchdog Lambda stopped watching (an error, a broken
+  #    schedule; both alarm below) therefore still ends. Not `shutdown /t 21600`: the setup's
+  #    own Restart-Computer would cancel a pending shutdown.
+  # 2. THE SETUP, until one run completes every step; only then is the marker written on C:.
+  #    A failure (the password or its grant still propagating, D: not attached within ten
+  #    minutes, an installer failing) is retried once in the same run. If the retry fails too
+  #    the box shuts itself down within a minute: a box that cannot finish its setup only
+  #    runs up a bill, and nothing would reboot it to try again.
   playbox_user_data = {
     for slot, name in local.playbox_slots : slot => <<-PS
 <powershell>
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Start-Transcript -Path 'C:\playbox-setup.log' -Append
-if (Test-Path 'C:\playbox-setup.done') { Stop-Transcript; exit 0 }
+
+function Set-PlayboxDeadline {
+  New-Item -ItemType Directory -Force 'C:\playbox' | Out-Null
+  if (-not (Test-Path 'C:\playbox\deadline.txt')) {
+    # The first run of a launch is on its first boot (C: is new), so that boot is the launch.
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+    Set-Content -Path 'C:\playbox\deadline.txt' -Value $boot.AddHours(${local.playbox_max_hours}).ToString('o')
+  }
+  # An unreadable deadline ends the box too: this is the backstop for a forgotten bill.
+  Set-Content -Path 'C:\playbox\deadline.ps1' -Encoding UTF8 -Value @'
 try {
+  $deadline = [DateTime]::Parse((Get-Content -Raw 'C:\playbox\deadline.txt').Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+} catch { $deadline = [DateTime]::MinValue }
+if ([DateTime]::UtcNow -ge $deadline.ToUniversalTime()) { shutdown.exe /s /t 0 /f /c 'playbox lifetime reached' }
+'@
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\playbox\deadline.ps1'
+  $triggers = @(
+    (New-ScheduledTaskTrigger -AtStartup),
+    (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15))
+  )
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  Register-ScheduledTask -TaskName 'playbox-deadline' -Action $action -Trigger $triggers -Principal $principal -Force | Out-Null
+}
+
+function Invoke-PlayboxSetup {
   $pw = $null
   for ($i = 0; $i -lt 30 -and -not $pw; $i++) {
     try { $pw = (Get-SECSecretValue -SecretId '${aws_secretsmanager_secret.playbox_admin[slot].name}' -Region '${local.playbox_region}').SecretString }
@@ -351,6 +388,9 @@ try {
   }
   $p = Start-Process $exe -ArgumentList '-s', '-noreboot', '-clean' -Wait -PassThru
   Write-Output "NVIDIA installer exit code $($p.ExitCode)"
+  # NVIDIA documents 0 (success) and 1 (success, reboot required: the setup reboots at its
+  # end); anything else is a failure, and a GPU box without its driver is not done.
+  if ($p.ExitCode -notin 0, 1) { throw "NVIDIA driver install failed: exit code $($p.ExitCode)" }
   New-Item -Path 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\GridLicensing' -Force | Out-Null
   New-ItemProperty -Path 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\GridLicensing' -Name 'NvCplDisableManageLicensePage' -PropertyType DWord -Value 1 -Force | Out-Null
 
@@ -408,13 +448,36 @@ Stop-Transcript | Out-Null
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Administrator'
   $principal = New-ScheduledTaskPrincipal -UserId 'Administrator' -LogonType Interactive
   Register-ScheduledTask -TaskName 'playbox-roblox' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+}
 
+try {
+  Set-PlayboxDeadline
+} catch {
+  Write-Output "could not set the lifetime backstop: $_ -- shutting down rather than run without it"
+  Stop-Transcript
+  shutdown.exe /s /t 60 /c 'playbox lifetime backstop failed'
+  exit 1
+}
+if (Test-Path 'C:\playbox-setup.done') { Stop-Transcript; exit 0 }
+$done = $false
+for ($attempt = 1; $attempt -le 2 -and -not $done; $attempt++) {
+  try {
+    Invoke-PlayboxSetup
+    $done = $true
+  } catch {
+    Write-Output "playbox setup attempt $attempt failed: $_"
+  }
+}
+if ($done) {
   New-Item 'C:\playbox-setup.done' -ItemType File | Out-Null
   Stop-Transcript
   Restart-Computer -Force
-} catch {
-  Write-Output "playbox setup failed: $_ -- it runs again at the next boot"
+} else {
+  # Nothing reboots a box to try again, and a box that cannot finish only runs up a bill:
+  # shut down, which terminates the instance; the next playbox up starts clean.
+  Write-Output 'playbox setup failed twice: shutting down (the instance terminates)'
   Stop-Transcript
+  shutdown.exe /s /t 60 /c 'playbox setup failed'
 }
 </powershell>
 <persist>true</persist>
@@ -564,6 +627,15 @@ data "aws_iam_policy_document" "playbox_control" {
       test     = "ArnEquals"
       variable = "ec2:InstanceProfile"
       values   = [aws_iam_instance_profile.playbox.arn]
+    }
+
+    # Spot only: the template asks for spot, and this refuses a launch that overrides the
+    # market (any other costs several times as much). ec2:InstanceMarketType is a RunInstances
+    # condition key on the instance resource (Service Authorization Reference).
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:InstanceMarketType"
+      values   = ["spot"]
     }
   }
 
@@ -839,6 +911,39 @@ resource "aws_lambda_permission" "playbox_watchdog" {
   function_name = aws_lambda_function.playbox_watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.playbox_watchdog.arn
+}
+
+# The watchdog must not be the thing that fails silently: a spot box it stops watching runs
+# until the box's own deadline task ends it. It errors, or it stops being invoked at all (a
+# missing datapoint is breaching here, on purpose), as auto-reboot.tf's alarms.
+resource "aws_cloudwatch_metric_alarm" "playbox_watchdog_errors" {
+  alarm_name          = "playbox-watchdog-errors"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 900
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "The playbox watchdog Lambda raised an error: an idle or expired Windows playtest spot box may not be terminated (playbox.tf)."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+  dimensions          = { FunctionName = aws_lambda_function.playbox_watchdog.function_name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "playbox_watchdog_not_running" {
+  alarm_name          = "playbox-watchdog-not-running"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 900
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "The playbox watchdog Lambda has not run for 15 minutes (it runs every 5): nothing ends an idle Windows playtest spot box but its own ${local.playbox_max_hours}-hour deadline (playbox.tf)."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "breaching"
+  dimensions          = { FunctionName = aws_lambda_function.playbox_watchdog.function_name }
 }
 
 output "playbox_launch_templates" {

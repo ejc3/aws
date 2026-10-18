@@ -140,10 +140,70 @@ class Boot(unittest.TestCase):
         roblox = ud.split("https://www.roblox.com/download/client", 1)[1].split("New-Item -ItemType Directory -Force 'C:\\playbox'", 1)[0]
         self.assertIn("catch { Write-Output", roblox)
 
-    def test_no_template_sequences_but_the_three_intended(self):
+    def test_no_template_sequences_but_the_four_intended(self):
         found = re.findall(r"\$\{[^}]*\}|%\{", user_data())
-        self.assertEqual(found, ["${aws_secretsmanager_secret.playbox_admin[slot].name}", "${local.playbox_region}",
-                                 '${replace(aws_ebs_volume.playbox_data[slot].id, "-", "")}'])
+        self.assertEqual(found, ["${local.playbox_max_hours}", "${aws_secretsmanager_secret.playbox_admin[slot].name}",
+                                 "${local.playbox_region}", '${replace(aws_ebs_volume.playbox_data[slot].id, "-", "")}'])
+
+    def test_a_failed_nvidia_install_fails_the_setup(self):
+        ud = user_data()
+        start = ud.index("$p = Start-Process $exe -ArgumentList '-s', '-noreboot', '-clean' -Wait -PassThru")
+        check = ud.index("if ($p.ExitCode -notin 0, 1) { throw \"NVIDIA driver install failed: exit code $($p.ExitCode)\" }")
+        # checked right after the installer, before the next step (the license key) and long before the marker
+        self.assertLess(start, check)
+        self.assertLess(check, ud.index("GridLicensing"))
+        self.assertLess(check, ud.index("New-Item 'C:\\playbox-setup.done'"))
+        self.assertEqual(ud.count("-ArgumentList '-s', '-noreboot', '-clean'"), 1)
+
+    def test_a_failed_setup_is_retried_once_then_the_box_shuts_down(self):
+        ud = user_data()
+        tail = ud[ud.index("if (Test-Path 'C:\\playbox-setup.done') { Stop-Transcript; exit 0 }"):]
+        self.assertIn("for ($attempt = 1; $attempt -le 2 -and -not $done; $attempt++) {", tail)
+        self.assertIn("    Invoke-PlayboxSetup\n    $done = $true\n", tail)
+        ok, failed = tail.split("} else {", 1)
+        self.assertIn("if ($done) {", ok)
+        self.assertIn("New-Item 'C:\\playbox-setup.done' -ItemType File", ok)
+        self.assertIn("Restart-Computer -Force", ok)
+        self.assertNotIn("playbox-setup.done", failed)
+        self.assertNotIn("Restart-Computer", failed)
+        self.assertIn("shutdown.exe /s /t 60", failed)
+        # the marker and the reboot are written only there, outside the setup function
+        self.assertEqual(ud.count("New-Item 'C:\\playbox-setup.done'"), 1)
+        self.assertEqual(ud.count("Restart-Computer"), 1)
+        body = ud[ud.index("function Invoke-PlayboxSetup {"):ud.index("try {\n  Set-PlayboxDeadline")]
+        self.assertNotIn("playbox-setup.done", body)
+        self.assertNotIn("Restart-Computer", body)
+        self.assertNotIn("runs again at the next boot", TF)
+        # the shutdown terminates the instance, so the next playbox up starts clean
+        self.assertIn('instance_initiated_shutdown_behavior = "terminate"', block("aws_launch_template", "playbox"))
+
+    def test_the_box_ends_itself_at_the_watchdogs_lifetime(self):
+        ud = user_data()
+        fn = ud[ud.index("function Set-PlayboxDeadline {"):ud.index("function Invoke-PlayboxSetup {")]
+        # written once per launch (C: is new), from its first boot, with the watchdog's own lifetime
+        self.assertIn("if (-not (Test-Path 'C:\\playbox\\deadline.txt')) {", fn)
+        self.assertIn("(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()", fn)
+        self.assertIn("$boot.AddHours(${local.playbox_max_hours}).ToString('o')", fn)
+        self.assertIn("MAX_AGE_MINUTES = jsonencode({ for n in local.playbox_names : n => local.playbox_max_hours * 60 })",
+                      block("aws_lambda_function", "playbox_watchdog"))
+        # checked at startup and every 15 minutes, as SYSTEM, by a task, not by a pending shutdown
+        self.assertIn("(New-ScheduledTaskTrigger -AtStartup)", fn)
+        self.assertIn("-RepetitionInterval (New-TimeSpan -Minutes 15)", fn)
+        self.assertNotIn("-RepetitionDuration", fn)
+        self.assertIn("New-ScheduledTaskPrincipal -UserId 'SYSTEM'", fn)
+        self.assertIn("Register-ScheduledTask -TaskName 'playbox-deadline'", fn)
+        self.assertIn("if ([DateTime]::UtcNow -ge $deadline.ToUniversalTime()) { shutdown.exe /s /t 0", fn)
+        self.assertIn("} catch { $deadline = [DateTime]::MinValue }", fn)
+        self.assertNotRegex(ud, r"shutdown(\.exe)? /s /t [1-9]\d{3,}")
+        # set at every boot before the done check and the setup, and a failure to set it ends the box
+        self.assertLess(ud.index("try {\n  Set-PlayboxDeadline\n} catch {"), ud.index("if (Test-Path 'C:\\playbox-setup.done')"))
+        backstop = ud[ud.index("try {\n  Set-PlayboxDeadline"):ud.index("if (Test-Path 'C:\\playbox-setup.done')")]
+        self.assertIn("shutdown.exe /s /t 60", backstop)
+        self.assertIn("exit 1", backstop)
+
+    def test_user_data_fits_ec2s_limit(self):
+        # 16 KB before base64; the template sequences expand to short strings
+        self.assertLess(len(("<powershell>\n" + user_data()).encode()), 15000)
 
     def test_the_template_is_one_time_spot_tags_everything_and_needs_imdsv2(self):
         lt = block("aws_launch_template", "playbox")
@@ -186,6 +246,15 @@ class Grant(unittest.TestCase):
         self.assertIn('values   = ["dedicated", "host"]', s)
         self.assertIn("resources = [local.playbox_instance_arn]", s)
 
+    def test_spot_only(self):
+        s = statement("RunPlayboxInstanceOnly")
+        self.assertRegex(s, r'test     = "StringEquals"\n\s+variable = "ec2:InstanceMarketType"\n\s+values   = \["spot"\]\n')
+        self.assertNotIn("on-demand", block("aws_iam_policy_document", "playbox_control"))
+        self.assertIn('market_type = "spot"', block("aws_launch_template", "playbox"))
+        # the script never renders or asks for an on-demand box
+        self.assertNotIn("ON-DEMAND", SCRIPT)
+        self.assertNotRegex(SCRIPT, r"--instance-market-options|on-demand")
+
     def test_the_root_volume_is_the_templates_shape(self):
         s = statement("RunPlayboxRootVolume")
         for key in ('"ec2:VolumeType"', '"ec2:VolumeSize"', '"ec2:Encrypted"'):
@@ -217,7 +286,8 @@ class Grant(unittest.TestCase):
         doc = block("aws_iam_policy_document", "playbox_control")
         actions = set(re.findall(r'"((?:ec2|iam|secretsmanager|ssm|s3):\w+)"', doc)) - {
             "ec2:LaunchTemplate", "ec2:InstanceType", "ec2:Tenancy", "ec2:MetadataHttpTokens", "ec2:InstanceProfile",
-            "ec2:VolumeType", "ec2:VolumeSize", "ec2:Encrypted", "ec2:CreateAction", "iam:PassedToService"}
+            "ec2:VolumeType", "ec2:VolumeSize", "ec2:Encrypted", "ec2:CreateAction", "iam:PassedToService",
+            "ec2:InstanceMarketType"}
         self.assertEqual(actions, {"ec2:RunInstances", "ec2:CreateTags", "ec2:TerminateInstances", "ec2:AttachVolume",
                                    "iam:PassRole", "secretsmanager:GetSecretValue", "ec2:DescribeInstances",
                                    "ec2:DescribeVolumes", "ec2:DescribeSpotPriceHistory"})
@@ -246,6 +316,24 @@ class Watchdog(unittest.TestCase):
         self.assertIn('schedule_expression = "rate(5 minutes)"', block("aws_cloudwatch_event_rule", "playbox_watchdog"))
         # the parallel boxes' role is not widened to reach these
         self.assertNotIn("playbox", block("aws_iam_role_policy", "parallel_watchdog", WATCHDOG))
+
+    def test_alarms_when_the_watchdog_errors_or_stops_running(self):
+        for name, metric, op, threshold, missing in (
+                ("playbox_watchdog_errors", "Errors", "GreaterThanOrEqualToThreshold", 1, "notBreaching"),
+                ("playbox_watchdog_not_running", "Invocations", "LessThanThreshold", 1, "breaching")):
+            with self.subTest(alarm=name):
+                a = block("aws_cloudwatch_metric_alarm", name)
+                self.assertRegex(a, r'metric_name\s+= "%s"\n' % metric)
+                self.assertRegex(a, r'namespace\s+= "AWS/Lambda"\n')
+                self.assertRegex(a, r'comparison_operator\s+= "%s"\n' % op)
+                self.assertRegex(a, r'threshold\s+= %d\n' % threshold)
+                self.assertRegex(a, r'period\s+= 900\n')
+                self.assertRegex(a, r'statistic\s+= "Sum"\n')
+                self.assertRegex(a, r'treat_missing_data\s+= "%s"\n' % missing)
+                self.assertRegex(a, r'alarm_actions\s+= \[aws_sns_topic\.cost_alerts\.arn\]\n')
+                self.assertIn("dimensions          = { FunctionName = aws_lambda_function.playbox_watchdog.function_name }", a)
+        # the same topic the watchdog itself reports to
+        self.assertIn("SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn", block("aws_lambda_function", "playbox_watchdog"))
 
     def run_watchdog(self, instances, cpu):
         code = textwrap.dedent(re.search(r"parallel_watchdog_code = <<-PY\n(.*?)\n  PY", WATCHDOG, re.S).group(1))
@@ -306,8 +394,10 @@ class Watchdog(unittest.TestCase):
 
 
 FAKE_AWS = r'''#!PYTHON -I
-# A stand-in for the aws CLI. $FAKE_STATE/<Name> holds a running box's instance id; every call is logged to
-# $FAKE_STATE/calls; FAKE_NO_CAPACITY lists types with no spot capacity; FAKE_ATTACH_FAILS makes attach-volume fail.
+# A stand-in for the aws CLI. $FAKE_STATE/<Name> holds a running box's instance id (one per line);
+# $FAKE_STATE/<vol>.attached the instance a D: disk is attached to (detached once that box is gone); every call is
+# logged to $FAKE_STATE/calls; FAKE_NO_CAPACITY lists types with no spot capacity; FAKE_ATTACH_FAILS makes
+# attach-volume fail; FAKE_ATTACH_RACE makes it fail because another `up` attached it to the same box first.
 import os, sys
 state = os.environ["FAKE_STATE"]
 args = sys.argv[1:]
@@ -338,7 +428,10 @@ if op == "describe-instances":
     else:
         print(iid)
 elif op == "describe-volumes":
-    print("vol-0%s\tavailable\tus-west-1a" % tag_name().split("-")[1])
+    vol = "vol-0%s" % tag_name().split("-")[1]
+    att = box(vol + ".attached")
+    live = att and any(att in box(n).split() for n in os.listdir(state) if n.startswith("playbox-") and "." not in n)
+    print("%s\t%s\tus-west-1a\t%s" % (vol, "in-use" if live else "available", att if live else "None"))
 elif op == "describe-spot-price-history":
     print("0.2554")
 elif op == "run-instances":
@@ -350,14 +443,17 @@ elif op == "run-instances":
     open(os.path.join(state, name), "w").write("i-new-%s\n" % name)
     print("i-new-%s" % name)
 elif op == "attach-volume":
-    if os.environ.get("FAKE_ATTACH_FAILS"):
+    if os.environ.get("FAKE_ATTACH_FAILS") or os.environ.get("FAKE_ATTACH_RACE"):
+        if os.environ.get("FAKE_ATTACH_RACE"):
+            open(os.path.join(state, opt("--volume-id") + ".attached"), "w").write(opt("--instance-id"))
         sys.stderr.write("An error occurred (VolumeInUse)\n")
         sys.exit(254)
+    open(os.path.join(state, opt("--volume-id") + ".attached"), "w").write(opt("--instance-id"))
 elif op == "terminate-instances":
     gone = args[args.index("--instance-ids") + 1:]
     gone = [g for g in gone if g.startswith("i-")]
     for name in os.listdir(state):
-        if name.startswith("playbox-") and box(name) in gone:
+        if name.startswith("playbox-") and "." not in name and box(name) in gone:
             os.remove(os.path.join(state, name))
 elif args[0] == "secretsmanager":
     print("fake-password-for-%s" % opt("--secret-id"))
@@ -375,7 +471,7 @@ class ScriptRuns(unittest.TestCase):
             d.mkdir()
         (bin_dir / "aws").write_text(FAKE_AWS.replace("PYTHON", sys.executable, 1))
         # DCV "answers" at once: the script's TCP probe runs under timeout, so a fake timeout that succeeds stands in.
-        (bin_dir / "timeout").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "timeout").write_text('#!/bin/sh\n[ -z "$FAKE_DCV_DOWN" ]\n')
         (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
         for f in ("aws", "timeout", "sleep"):
             (bin_dir / f).chmod(0o755)
@@ -421,12 +517,67 @@ class ScriptRuns(unittest.TestCase):
         self.assertIn("ec2 terminate-instances --region us-west-1 --instance-ids i-new-playbox-3", calls)
         self.assertFalse((self.state / "playbox-3").exists())
 
-    def test_up_of_a_running_slot_launches_nothing(self):
+    def test_up_of_a_running_slot_launches_nothing_and_resumes_its_attach(self):
+        # a launcher interrupted between run-instances and attach-volume left a box without its disk
         (self.state / "playbox-1").write_text("i-111\n")
         r, calls = self.playbox("up", "1")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "running slot=1 ip=10.0.69.1")
         self.assertFalse([c for c in calls if "run-instances" in c])
+        self.assertEqual([c for c in calls if "attach-volume" in c],
+                         ["ec2 attach-volume --region us-west-1 --volume-id vol-01 --instance-id i-111 --device xvdf"])
+        self.assertFalse([c for c in calls if "terminate-instances" in c])
+
+    def test_up_of_a_box_with_its_disk_attaches_nothing_and_still_waits_for_dcv(self):
+        (self.state / "playbox-2").write_text("i-222\n")
+        (self.state / "vol-02.attached").write_text("i-222")
+        r, calls = self.playbox("up", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "running slot=2 ip=10.0.69.2")
+        self.assertFalse([c for c in calls if "attach-volume" in c or "run-instances" in c])
+        # DCV not answering yet is not "ready": exit 4, the box left running
+        r, calls = self.playbox("up", "2", FAKE_DCV_DOWN="1")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("DCV did not answer within 30 minutes", r.stderr)
+        self.assertFalse([c for c in calls if "terminate-instances" in c or "run-instances" in c])
+        self.assertTrue((self.state / "playbox-2").exists())
+
+    def test_a_new_launch_whose_dcv_never_answers_exits_4(self):
+        r, calls = self.playbox("up", "3", FAKE_DCV_DOWN="1")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(len([c for c in calls if "attach-volume" in c]), 1)
+
+    def test_two_ups_racing_to_attach_both_succeed(self):
+        (self.state / "playbox-3").write_text("i-333\n")
+        r, calls = self.playbox("up", "3", FAKE_ATTACH_RACE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "running slot=3 ip=10.0.69.3")
+        self.assertFalse([c for c in calls if "terminate-instances" in c])
+
+    def test_a_resumed_box_whose_disk_cannot_be_attached_is_terminated(self):
+        (self.state / "playbox-1").write_text("i-111\n")
+        r, calls = self.playbox("up", "1", FAKE_ATTACH_FAILS="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ec2 terminate-instances --region us-west-1 --instance-ids i-111", calls)
+        self.assertEqual(r.stdout, "")
+
+    def test_a_disk_held_by_another_box_is_not_taken(self):
+        (self.state / "playbox-1").write_text("i-111\n")
+        (self.state / "playbox-old").write_text("i-old\n")  # a box of the slot that is still letting go of it
+        (self.state / "vol-01.attached").write_text("i-old")
+        r, calls = self.playbox("up", "1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still in-use (attached to i-old)", r.stderr)
+        self.assertFalse([c for c in calls if "attach-volume" in c])
+
+    def test_two_boxes_in_one_slot_are_refused(self):
+        (self.state / "playbox-2").write_text("i-a\ni-b\n")
+        r, calls = self.playbox("up", "2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("more than one playbox-2 exists (i-a i-b ). Run: playbox.sh down 2", r.stderr)
+        self.assertFalse([c for c in calls if "attach-volume" in c or "run-instances" in c or "terminate" in c])
 
     def test_down_terminates_only_its_own_slot(self):
         (self.state / "playbox-1").write_text("i-111\n")
