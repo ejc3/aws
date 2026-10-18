@@ -53,7 +53,7 @@ class BoxTests(unittest.TestCase):
         self.assertRegex(self.instance, r"encrypted\s+=\s+true")
 
     def test_bootstrap_fetches_its_own_script(self):
-        self.assertIn("s3://ejc3-dev-scripts/user-data/nextjs-ct.sh", self.instance)
+        self.assertIn("--bucket ejc3-dev-scripts --key user-data/nextjs-ct.sh", self.instance)
         self.assertIn('key          = "user-data/nextjs-ct.sh"', CT_USER_DATA)
         read = block(NEXTJS_DEV_TF, 'resource "aws_iam_role_policy" "nextjs_dev"')
         self.assertIn("/user-data/nextjs-ct.sh", read)
@@ -92,6 +92,75 @@ class EmbeddedFilesTests(unittest.TestCase):
         self.assertIn('base64encode(file("${path.module}/${src}"))', CT_USER_DATA)
 
 
+class FirstBootTests(unittest.TestCase):
+    """Review of #487: the first boot must not strand the box, rerun itself, or record a half-done setup."""
+
+    def setUp(self):
+        self.instance = block(CT_TF, 'resource "aws_instance" "nextjs_ct"')
+        self.script = CT_USER_DATA.split("nextjs_ct_user_data = <<-SCRIPT", 1)[1].split("\nSCRIPT\n", 1)[0]
+
+    def test_bootstrap_retries_the_download_and_passes_its_etag(self):
+        self.assertRegex(self.instance, r"for i in \$\(seq 1 120\); do\n\s+if META=\$\(aws s3api get-object")
+        self.assertIn('export NEXTJS_CT_ETAG=', self.instance)
+        self.assertNotIn("aws s3 cp s3://ejc3-dev-scripts/user-data/nextjs-ct.sh", self.instance)
+
+    def test_setup_sync_is_installed_before_anything_that_can_fail(self):
+        timer = self.script.index("systemctl enable --now setup-sync.timer")
+        self.assertLess(timer, self.script.index("apt-get"))
+        self.assertLess(self.script.index("${local.nextjs_ct_install_files}"), timer)
+
+    def test_required_packages_fail_the_run(self):
+        install = next(l for l in self.script.splitlines() if "systemd-container" in l)
+        follow = self.script.split(install, 1)[1].splitlines()[1]
+        self.assertIn("exit 1", follow)
+        self.assertNotIn("WARNING", follow)
+        self.assertIn('ERROR: the AWS CLI did not install"; exit 1', self.script)
+
+    def test_etag_is_recorded_only_after_health(self):
+        health = self.script.index("/usr/local/sbin/nextjs-ct-health || {")
+        self.assertLess(health, self.script.index("/var/lib/nextjs-setup/applied-etag"))
+        self.assertIn('"/usr/local/sbin/nextjs-ct-health" = "scripts/nextjs-ct/nextjs-ct-health"', CT_USER_DATA)
+
+    def test_a_run_outside_setup_sync_waits_for_the_lock(self):
+        self.assertIn('if [ -z "$${NEXTJS_CT_SETUP_LOCK_HELD:-}" ]; then\n  exec 9>/run/nextjs-ct-setup.lock', self.script)
+
+
+class HealthTests(unittest.TestCase):
+    def run_health(self, missing=(), timer=True):
+        with tempfile.TemporaryDirectory() as d:
+            bin_ = Path(d)
+            for cmd in ("aws", "jq", "nft", "systemd-nspawn", "machinectl", "debootstrap", "rsync"):
+                if cmd not in missing:
+                    (bin_ / cmd).write_text("#!/bin/sh\nexit 0\n")
+                    (bin_ / cmd).chmod(0o755)
+            (bin_ / "systemctl").write_text(f"#!/bin/sh\ncase \"$1 $3\" in 'is-enabled setup-sync.timer') exit {0 if timer else 1} ;; esac\nexit 0\n")
+            (bin_ / "systemctl").chmod(0o755)
+            sync = bin_ / "setup-sync"
+            sync.write_text("#!/bin/sh\n")
+            sync.chmod(0o755)
+            text = (SCRIPTS / "nextjs-ct-health").read_text().replace("/usr/local/bin/setup-sync", str(sync))
+            (bin_ / "health").write_text(text)
+            (bin_ / "health").chmod(0o755)
+            env = dict(os.environ, PATH=f"{bin_}:/usr/bin:/bin")
+            # The real tools in /usr/bin must not stand in for a missing fake.
+            env["PATH"] = str(bin_)
+            return subprocess.run(["/bin/bash", str(bin_ / "health")], env=env, capture_output=True, text=True)
+
+    def test_healthy(self):
+        r = self.run_health()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_missing_tool_is_unhealthy(self):
+        r = self.run_health(missing=("nft",))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("missing:nft", r.stdout)
+
+    def test_disabled_timer_is_unhealthy(self):
+        r = self.run_health(timer=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("disabled:setup-sync.timer", r.stdout)
+
+
 class SetupSyncTests(unittest.TestCase):
     """The real setup-sync, against a fake aws CLI serving a published script."""
 
@@ -116,7 +185,8 @@ esac
         for original, replacement in (("/tmp/", f"{self.root}/"),
                                       ("/var/lib/nextjs-setup", str(self.root / "state")),
                                       ("/var/log/setup-sync.log", str(self.root / "setup.log")),
-                                      ("/usr/local/sbin/nextjs-ct-health", str(self.root / "health"))):
+                                      ("/usr/local/sbin/nextjs-ct-health", str(self.root / "health")),
+                                      ("/run/nextjs-ct-setup.lock", str(self.root / "setup.lock"))):
             sync = sync.replace(original, replacement)
         sync = sync.replace("install -m 0640 -o root -g adm", "install -m 0640")
         self.sync = self.root / "setup-sync"
@@ -146,6 +216,20 @@ esac
         r = self.run_sync("#!/bin/bash\nexit 0\n", health=1)
         self.assertEqual(r.returncode, 1)
         self.assertIn("health check failed", r.stdout)
+        self.assertFalse(self.etag.exists())
+
+    def test_hands_the_script_its_etag_and_the_held_lock(self):
+        r = self.run_sync('#!/bin/bash\necho "etag=$NEXTJS_CT_ETAG held=$NEXTJS_CT_SETUP_LOCK_HELD"\n', health=0)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('etag="etag-1" held=1', (self.root / "setup.log").read_text())
+
+    def test_a_running_setup_makes_the_tick_wait_for_the_next(self):
+        import fcntl
+        with open(self.root / "setup.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            r = self.run_sync("#!/bin/bash\nexit 0\n", health=0)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("already running", r.stdout)
         self.assertFalse(self.etag.exists())
 
     def test_refuses_a_script_that_does_not_parse(self):

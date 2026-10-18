@@ -71,13 +71,28 @@ resource "aws_instance" "nextjs_ct" {
   user_data = base64encode(<<-BOOTSTRAP
     #!/bin/bash
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y unzip curl || true
-    if ! command -v aws >/dev/null 2>&1; then
-      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
-      cd /tmp && unzip -qo awscliv2.zip && ./aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
-    fi
-    aws s3 cp s3://ejc3-dev-scripts/user-data/nextjs-ct.sh /tmp/user_data.sh --region us-west-1
+    for i in $(seq 1 30); do
+      if ! command -v aws >/dev/null 2>&1; then
+        apt-get -o DPkg::Lock::Timeout=600 update -y && apt-get -o DPkg::Lock::Timeout=600 install -y unzip curl \
+          && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
+          && (cd /tmp && unzip -qo awscliv2.zip && ./aws/install) ; rm -rf /tmp/aws /tmp/awscliv2.zip
+      fi
+      command -v aws >/dev/null 2>&1 && break
+      sleep 10
+    done
+    # Retried until it succeeds: the first boot can race the network and the role's new S3 grant, and
+    # without this script nothing installs setup-sync, the only thing that could recover later.
+    # The ETag that was downloaded is handed to the script, which records it once it is healthy, so
+    # setup-sync's first tick does not run the same script again.
+    for i in $(seq 1 120); do
+      if META=$(aws s3api get-object --bucket ejc3-dev-scripts --key user-data/nextjs-ct.sh /tmp/user_data.sh --region us-west-1 --output json); then
+        break
+      fi
+      META=""
+      sleep $(( i < 12 ? i * 5 : 60 ))
+    done
+    [ -n "$META" ] || { echo "nextjs-ct bootstrap: could not fetch the setup script" >&2; exit 1; }
+    export NEXTJS_CT_ETAG=$(printf '%s' "$META" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ETag"])')
     chmod +x /tmp/user_data.sh && /tmp/user_data.sh
   BOOTSTRAP
   )

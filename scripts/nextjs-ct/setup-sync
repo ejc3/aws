@@ -11,6 +11,9 @@ KEY=user-data/nextjs-ct.sh
 STATE=/var/lib/nextjs-setup
 LOG=/var/log/setup-sync.log
 mkdir -p "$STATE"
+# One setup at a time (the first boot runs one too); a busy lock means try again at the next tick.
+exec 9>/run/nextjs-ct-setup.lock
+flock -n 9 || { echo "setup-sync: a setup is already running; next tick"; exit 0; }
 
 ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region us-west-1 --query ETag --output text 2>/dev/null)
 [ -n "$ETAG" ] || { echo "setup-sync: cannot reach s3://$BUCKET/$KEY"; exit 0; }
@@ -33,7 +36,7 @@ echo "setup-sync: running"
 [ -e "$LOG" ] || install -m 0640 -o root -g adm /dev/null "$LOG"
 chmod 0640 "$LOG"
 chgrp adm "$LOG"
-bash "$NEXT" >"$LOG" 2>&1
+NEXTJS_CT_SETUP_LOCK_HELD=1 NEXTJS_CT_ETAG="$ETAG" bash "$NEXT" >"$LOG" 2>&1
 RC=$?
 echo "setup-sync: finished rc=$RC"
 if [ "$RC" != 0 ]; then
