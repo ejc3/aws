@@ -53,6 +53,10 @@ SNS_REGION   = os.environ.get("SNS_REGION", "us-west-1")
 # box -- a reboot, `shutdown -c` or a launch-time --user-data override disarms it -- so this
 # is the lifetime that cannot be talked out of.
 MAX_AGE      = json.loads(os.environ.get("MAX_AGE_MINUTES", "{}"))
+# Names of which at most ONE instance may run: each member's own box (member-boxes.tf). IAM cannot
+# cap RunInstances' --count, so a launch of several (or a second `up`) is cut back here to the
+# oldest, and the rest are terminated with an alert.
+SINGLE_NAMES = set(n for n in os.environ.get("SINGLE_NAMES", "").split(",") if n)
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -80,6 +84,36 @@ def lambda_handler(event, context):
 
     results = []
     now = datetime.datetime.now(datetime.timezone.utc)
+
+    def name_of(inst):
+        return next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "parallel-box")
+
+    # One instance per single name: keep the oldest, terminate the rest, and say so.
+    groups = {}
+    for inst in instances:
+        if name_of(inst) in SINGLE_NAMES:
+            groups.setdefault(name_of(inst), []).append(inst)
+    extra = set()
+    for name, group in sorted(groups.items()):
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda i: (i["LaunchTime"], i["InstanceId"]))
+        keep, ids = group[0]["InstanceId"], [i["InstanceId"] for i in group[1:]]
+        extra.update(ids)
+        print("terminating extra %s %s: only one may run (keeping the oldest, %s)" % (name, ",".join(ids), keep))
+        try:
+            ec2.terminate_instances(InstanceIds=ids)
+            results.extend({"id": i, "action": "terminated_duplicate", "kept": keep} for i in ids)
+            notify("%s: %d extra instance(s) terminated" % (name, len(ids)),
+                   "%d instances named %s were running; only one may. Kept the oldest, %s, and terminated %s.\n"
+                   "Someone launched more than one (a --count, an overridden template, or two launches at once)."
+                   % (len(group), name, keep, ", ".join(ids)))
+        except Exception as e:
+            results.extend({"id": i, "action": "terminate_failed", "error": str(e)} for i in ids)
+            notify("%s: FAILED to terminate extra instances" % name,
+                   "%d instances named %s are running; only one may. TerminateInstances failed for %s: %s\n"
+                   "They keep costing money until someone terminates them." % (len(group), name, ", ".join(ids), e))
+    instances = [i for i in instances if i["InstanceId"] not in extra]
 
     for inst in instances:
         iid = inst["InstanceId"]
@@ -256,8 +290,10 @@ resource "aws_lambda_function" "parallel_watchdog" {
       # gpu-box.tf's hard lifetime, the same for every slot and for the members' gboxes; the
       # parallel boxes have none (a long job is their point).
       MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => var.gpu_box_max_hours * 60 })
-      SNS_REGION      = var.aws_region
-      SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
+      # one instance per member gbox
+      SINGLE_NAMES  = join(",", local.member_gbox_names)
+      SNS_REGION    = var.aws_region
+      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
   }
 

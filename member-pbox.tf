@@ -22,10 +22,13 @@
 #     LaunchTime, and the box's own deadline timer. The owner's boxes have none (a long job is
 #     their point); a member's also ends after 30 idle minutes, as the owner's do.
 #
-# ITS ADDRESS. Fixed per person (local.member_pbox_ips) in an explicit reservation of the Ohio
-# subnet, but Ohio peers only with the I/O box's us-west-2 VPC, so nothing in us-west-1 routes
-# to it: the box is reached at its public address, exactly as the owner's are (SSH only, key
-# only). A private path from nextjs-dev / nextjs-ct would be a new VPC peering, an owner call.
+# ITS OWN SUBNET, 10.12.2.0/24 in the pbox VPC, with a route table that has the internet and
+# nothing else: no route to the I/O box's peering and not in local.io_box_nfs_client_cidrs, so
+# root on a member's box cannot reach the owner's NFS scratch (the owner's subnet, 10.12.1.0/24,
+# has both). Its address is fixed per person (local.member_pbox_ips, an explicit reservation),
+# but nothing in us-west-1 routes to Ohio, so the box is reached at its public address, exactly
+# as the owner's are (SSH only, key only). A private path from nextjs-dev / nextjs-ct would be a
+# new VPC peering, an owner call.
 
 locals {
   member_pbox_slots  = { for p in local.member_box_people : p => "pbox-${p}" }
@@ -44,8 +47,8 @@ locals {
     "m8gd.24xlarge", "m9g.24xlarge", "m9gd.24xlarge", "i8g.24xlarge", "i8ge.24xlarge", "r8g.24xlarge", "r8gd.24xlarge",
   ]
 
-  # .8/29 of the Ohio pbox subnet, explicit; person i has .10 + i.
-  member_pbox_reserved_cidr = cidrsubnet(aws_subnet.ohio_pbox.cidr_block, 5, 1)
+  # .8/29 of the members' own pbox subnet, explicit; person i has .10 + i.
+  member_pbox_reserved_cidr = cidrsubnet(aws_subnet.member_pbox.cidr_block, 5, 1)
   member_pbox_ips           = { for p, i in local.member_box_index : p => cidrhost(local.member_pbox_reserved_cidr, 2 + i) }
 
   member_pbox_tag_keys = {
@@ -62,9 +65,40 @@ locals {
   member_pbox_work_arns     = [for k in sort(keys(local.member_pbox_slots)) : aws_ebs_volume.member_pbox_work[k].arn]
 }
 
+resource "aws_subnet" "member_pbox" {
+  provider                = aws.ohio
+  vpc_id                  = aws_vpc.ohio_pbox.id
+  cidr_block              = "10.12.2.0/24"
+  availability_zone       = local.ohio_pbox_az # the work volumes' AZ
+  map_public_ip_on_launch = false              # the template asks for one, for outbound traffic
+
+  tags = { Name = "member-pbox-subnet-ohio" }
+}
+
+# The internet and the VPC's implicit local route, nothing else. Never add the I/O box peer route,
+# and never add this subnet to local.io_box_nfs_client_cidrs. No IPv6 on the subnet, so there is no
+# v6 default route to need (the owner's subnet has both because it assigns v6 addresses).
+resource "aws_route_table" "member_pbox" {
+  provider = aws.ohio
+  vpc_id   = aws_vpc.ohio_pbox.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.ohio_pbox.id
+  }
+
+  tags = { Name = "member-pbox-rt-ohio" }
+}
+
+resource "aws_route_table_association" "member_pbox" {
+  provider       = aws.ohio
+  subnet_id      = aws_subnet.member_pbox.id
+  route_table_id = aws_route_table.member_pbox.id
+}
+
 resource "aws_ec2_subnet_cidr_reservation" "member_pbox" {
   provider         = aws.ohio
-  subnet_id        = aws_subnet.ohio_pbox.id
+  subnet_id        = aws_subnet.member_pbox.id
   cidr_block       = local.member_pbox_reserved_cidr
   reservation_type = "explicit"
   description      = "Fixed private addresses of the members' pboxes (member-pbox.tf)"
@@ -173,7 +207,7 @@ resource "aws_launch_template" "member_pbox" {
   }
 
   network_interfaces {
-    subnet_id                   = aws_subnet.ohio_pbox.id
+    subnet_id                   = aws_subnet.member_pbox.id
     private_ip_address          = local.member_pbox_ips[each.key]
     security_groups             = [aws_security_group.ohio_pbox.id]
     associate_public_ip_address = true
@@ -199,7 +233,7 @@ resource "aws_launch_template" "member_pbox" {
 
   user_data = base64encode(local.member_pbox_user_data[each.key])
 
-  depends_on = [aws_ec2_subnet_cidr_reservation.member_pbox]
+  depends_on = [aws_ec2_subnet_cidr_reservation.member_pbox, aws_route_table_association.member_pbox]
 }
 
 # ============================================================ what nextjs-dev may do
@@ -326,6 +360,15 @@ data "aws_iam_policy_document" "member_pbox_control" {
       variable = "aws:TagKeys"
       values   = local.member_pbox_tag_keys.eni
     }
+
+    # The ENI must be the template's own: a --network-interfaces override (another address, the
+    # fixed one dropped) makes this false. AWS's example policies use exactly this key on
+    # network-interface/* to forbid overriding the template's network interfaces.
+    condition {
+      test     = "Bool"
+      variable = "ec2:IsLaunchTemplateResource"
+      values   = ["true"]
+    }
   }
 
   statement {
@@ -334,7 +377,7 @@ data "aws_iam_policy_document" "member_pbox_control" {
     resources = concat(
       [
         "arn:aws:ec2:${local.member_pbox_region}::image/${var.parallel_box_ami_ohio}",
-        "arn:aws:ec2:${local.member_pbox_region}:${local.member_pbox_account}:subnet/${aws_subnet.ohio_pbox.id}",
+        "arn:aws:ec2:${local.member_pbox_region}:${local.member_pbox_account}:subnet/${aws_subnet.member_pbox.id}",
         "arn:aws:ec2:${local.member_pbox_region}:${local.member_pbox_account}:security-group/${aws_security_group.ohio_pbox.id}",
         "arn:aws:ec2:${local.member_pbox_region}:${local.member_pbox_account}:key-pair/${aws_key_pair.ohio_pbox.key_name}",
       ],

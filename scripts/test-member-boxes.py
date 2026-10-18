@@ -30,6 +30,7 @@ GTF = (ROOT / "member-gbox.tf").read_text()
 ALL = COMMON + WTF + PTF + GTF
 WATCHDOG = (ROOT / "parallel-box-watchdog.tf").read_text()
 OHIO = (ROOT / "ohio-pbox.tf").read_text()
+ALARMS = (ROOT / "watchdog-alarms.tf").read_text()
 SCRIPTS = ROOT / "scripts"
 WMEMBER = (SCRIPTS / "wbox-member.sh").read_text()
 WBOX = (SCRIPTS / "wbox.sh").read_text()
@@ -135,10 +136,10 @@ class Addresses(unittest.TestCase):
         self.assertIn("member_wbox_reserved_cidr = cidrsubnet(aws_subnet.member_wbox.cidr_block, 5, 1)", WTF)
         self.assertEqual(self.expected("10.0.69.8/29"), {"colton": "10.0.69.10", "connor": "10.0.69.11", "colin": "10.0.69.12", "skevh": "10.0.69.13"})
         self.assertEqual(str(list(ipaddress.ip_network("10.0.69.0/24").subnets(new_prefix=29))[1]), "10.0.69.8/29")
-        # pbox: the Ohio subnet 10.12.1.0/24, its .8/29
-        self.assertIn('cidr_block                      = "10.12.1.0/24"', OHIO)
-        self.assertIn("member_pbox_reserved_cidr = cidrsubnet(aws_subnet.ohio_pbox.cidr_block, 5, 1)", PTF)
-        self.assertEqual(self.expected("10.12.1.8/29")["skevh"], "10.12.1.13")
+        # pbox: the members' own Ohio subnet 10.12.2.0/24, its .8/29
+        self.assertIn('cidr_block              = "10.12.2.0/24"', block("aws_subnet", "member_pbox"))
+        self.assertIn("member_pbox_reserved_cidr = cidrsubnet(aws_subnet.member_pbox.cidr_block, 5, 1)", PTF)
+        self.assertEqual(self.expected("10.12.2.8/29")["skevh"], "10.12.2.13")
         # gbox: the us-west-2a default subnet (172.31.32.0/20 on 2026-10-18), the /28 at offset 4064
         self.assertIn("member_gbox_reserved_cidr = cidrsubnet(data.aws_subnet.member_gbox.cidr_block, 8, 254)", GTF)
         res = list(ipaddress.ip_network("172.31.32.0/20").subnets(new_prefix=28))[254]
@@ -283,7 +284,7 @@ class Grants(unittest.TestCase):
                    "ec2:DescribeSpotPriceHistory", "ec2:DescribeInstanceTypes", "ec2:DescribeLaunchTemplateVersions"}
         keys = {"ec2:LaunchTemplate", "ec2:InstanceType", "ec2:Tenancy", "ec2:MetadataHttpTokens", "ec2:InstanceProfile",
                 "ec2:VolumeType", "ec2:VolumeSize", "ec2:Encrypted", "ec2:CreateAction", "iam:PassedToService",
-                "ec2:InstanceMarketType"}
+                "ec2:InstanceMarketType", "ec2:IsLaunchTemplateResource"}
         for kind in self.KINDS:
             actions = set(re.findall(r'"((?:ec2|iam|secretsmanager|ssm|s3):\w+)"', self.doc(kind))) - keys
             self.assertLessEqual(actions, allowed, kind)
@@ -319,7 +320,7 @@ class Watchdogs(unittest.TestCase):
             self.assertRegex(a, r'alarm_actions\s+= \[aws_sns_topic\.cost_alerts\.arn\]\n')
             self.assertIn("FunctionName = aws_lambda_function.member_wbox_watchdog.function_name", a)
 
-    def run_watchdog(self, instances, cpu, names, max_age):
+    def run_watchdog(self, instances, cpu, names, max_age, single=()):
         code = textwrap.dedent(re.search(r"parallel_watchdog_code = <<-PY\n(.*?)\n  PY", WATCHDOG, re.S).group(1))
         now = datetime.datetime.now(datetime.timezone.utc)
         calls = {"terminate": [], "body": []}
@@ -346,7 +347,8 @@ class Watchdogs(unittest.TestCase):
         saved_mod, saved_env = sys.modules.get("boto3"), dict(os.environ)
         sys.modules["boto3"] = fake
         os.environ.update(TAG_NAMES=",".join(names), IDLE_MINUTES="60", IDLE_CPU_PCT="15",
-                          MAX_AGE_MINUTES=json.dumps({n: max_age for n in names}), SNS_TOPIC_ARN="arn:aws:sns:test")
+                          MAX_AGE_MINUTES=json.dumps({n: max_age for n in names}), SNS_TOPIC_ARN="arn:aws:sns:test",
+                          SINGLE_NAMES=",".join(single))
         try:
             env = {}
             exec(compile(code, "index.py", "exec"), env)
@@ -385,6 +387,102 @@ class Watchdogs(unittest.TestCase):
         self.assertIn("  gbox up 3\n", calls["body"][0])
         _, calls = self.run_watchdog([("i-2", "parallel-box", 90)], {"i-2": [1.0, 1.0]}, ["parallel-box"], 9999)
         self.assertIn("  pbox up\n", calls["body"][0])
+
+
+class OneInstancePerMember(unittest.TestCase):
+    """IAM cannot cap RunInstances' count, nor stop a user-data override: the watchdogs keep one instance per member."""
+
+    wd = Watchdogs.run_watchdog
+    IDLE_DESKTOP = Watchdogs.IDLE_DESKTOP
+
+    def test_every_watchdog_names_the_members_as_single(self):
+        self.assertIn('SINGLE_NAMES    = join(",", local.member_wbox_names)', block("aws_lambda_function", "member_wbox_watchdog"))
+        self.assertRegex(block("aws_lambda_function", "parallel_watchdog", WATCHDOG), r'SINGLE_NAMES\s+= join\(",", local\.member_gbox_names\)')
+        self.assertIn('SINGLE_NAMES    = join(",", local.member_pbox_names)', block("aws_lambda_function", "parallel_watchdog_ohio", OHIO))
+
+    def test_extra_instances_are_terminated_keeping_the_oldest_with_an_alert(self):
+        busy = [40.0, 40.0]
+        actions, calls = self.wd(
+            [("i-new", "pbox-colin", 50), ("i-old", "pbox-colin", 200), ("i-mid", "pbox-colin", 90), ("i-sk", "pbox-skevh", 120)],
+            {"i-old": busy, "i-sk": busy}, ["pbox-colin", "pbox-skevh"], 9999, single=["pbox-colin", "pbox-skevh"])
+        self.assertEqual(sorted(calls["terminate"]), ["i-mid", "i-new"])
+        self.assertEqual(actions, {"i-new": "terminated_duplicate", "i-mid": "terminated_duplicate", "i-old": "busy", "i-sk": "busy"})
+        self.assertEqual(len(calls["body"]), 1)
+        self.assertIn("Kept the oldest, i-old, and terminated i-mid, i-new.", calls["body"][0])
+
+    def test_the_kept_one_still_meets_the_lifetime_and_idle_rules(self):
+        actions, calls = self.wd([("i-1", "wbox-connor", 400), ("i-2", "wbox-connor", 10)], {}, ["wbox-connor"], 360,
+                                  single=["wbox-connor"])
+        self.assertEqual(actions, {"i-2": "terminated_duplicate", "i-1": "terminated_lifetime"})
+
+    def test_names_not_listed_are_left_alone(self):
+        actions, calls = self.wd([("i-a", "parallel-box", 100), ("i-b", "parallel-box", 80)], {"i-a": [40.0, 40.0], "i-b": [40.0, 40.0]},
+                                  ["parallel-box"], 9999, single=["pbox-colin"])
+        self.assertEqual(actions, {"i-a": "busy", "i-b": "busy"})
+        self.assertEqual(calls["terminate"], [])
+
+    def test_the_eni_cannot_be_overridden(self):
+        for kind in ("wbox", "pbox", "gbox"):
+            doc = block("aws_iam_policy_document", "member_%s_control" % kind)
+            sid = next(s for s in run_statements(doc) if s.endswith("Eni"))
+            self.assertRegex(statement(sid, doc), r'test     = "Bool"\n\s+variable = "ec2:IsLaunchTemplateResource"\n\s+values   = \["true"\]')
+
+
+class MemberPboxNetwork(unittest.TestCase):
+    def test_own_subnet_with_no_peer_route_and_no_nfs(self):
+        rt = block("aws_route_table", "member_pbox")
+        self.assertEqual(rt.count("route {"), 1)
+        self.assertIn("gateway_id = aws_internet_gateway.ohio_pbox.id", rt)
+        self.assertNotRegex(rt, r"vpc_peering|transit_gateway")
+        self.assertNotRegex(PTF + OHIO, r'aws_route"\s+"\w+"\s*\{[^}]*aws_route_table\.member_pbox')
+        self.assertIn("route_table_id = aws_route_table.member_pbox.id", block("aws_route_table_association", "member_pbox"))
+        self.assertNotIn("member_pbox", re.search(r"io_box_nfs_client_cidrs = concat\((.*?)\n  \)", (ROOT / "io-box.tf").read_text(), re.S).group(1))
+        self.assertIn("subnet_id                   = aws_subnet.member_pbox.id", block("aws_launch_template", "member_pbox"))
+        self.assertIn("subnet_id        = aws_subnet.member_pbox.id", block("aws_ec2_subnet_cidr_reservation", "member_pbox"))
+        self.assertIn(":subnet/${aws_subnet.member_pbox.id}", statement("RunMemberPboxReferencedResources"))
+        self.assertNotIn("aws_subnet.ohio_pbox", PTF)
+        self.assertIn("availability_zone       = local.ohio_pbox_az", block("aws_subnet", "member_pbox"))
+
+
+class WatchdogAlarms(unittest.TestCase):
+    SITES = (("parallel_watchdog", "aws.west2", "aws_lambda_function.parallel_watchdog"),
+             ("parallel_watchdog_ohio", "aws.ohio", "aws_lambda_function.parallel_watchdog_ohio"))
+
+    def test_both_parallel_watchdogs_have_the_two_alarms(self):
+        for prefix, provider, fn in self.SITES:
+            for suffix, metric, op, missing in (("errors", "Errors", "GreaterThanOrEqualToThreshold", "notBreaching"),
+                                                ("not_running", "Invocations", "LessThanThreshold", "breaching")):
+                with self.subTest(alarm="%s_%s" % (prefix, suffix)):
+                    a = block("aws_cloudwatch_metric_alarm", "%s_%s" % (prefix, suffix), ALARMS)
+                    self.assertIn("provider            = %s" % provider, a)
+                    self.assertRegex(a, r'metric_name\s+= "%s"\n' % metric)
+                    self.assertRegex(a, r'comparison_operator\s+= "%s"\n' % op)
+                    self.assertRegex(a, r'threshold\s+= 1\n')
+                    self.assertRegex(a, r'period\s+= 900\n')
+                    self.assertRegex(a, r'treat_missing_data\s+= "%s"\n' % missing)
+                    self.assertIn("dimensions          = { FunctionName = %s.function_name }" % fn, a)
+
+    def test_each_regions_alarms_are_relayed_to_the_alert_topic(self):
+        for region, prefix in (("west2", "parallel_watchdog"), ("ohio", "parallel_watchdog_ohio")):
+            rule = block("aws_cloudwatch_event_rule", "watchdog_alarm_relay_%s" % region, ALARMS)
+            for suffix in ("errors", "not_running"):
+                self.assertIn("aws_cloudwatch_metric_alarm.%s_%s.arn" % (prefix, suffix), rule)
+                self.assertIn("aws_cloudwatch_metric_alarm.%s_%s.arn" % (prefix, suffix), block("aws_cloudwatch_event_rule", "watchdog_alarms", ALARMS))
+            target = block("aws_cloudwatch_event_target", "watchdog_alarm_relay_%s" % region, ALARMS)
+            self.assertIn("arn       = local.watchdog_alarm_bus_arn", target)
+            self.assertIn("role_arn  = aws_iam_role.watchdog_alarm_relay.arn", target)
+        self.assertIn('"arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:event-bus/default"', ALARMS)
+        self.assertIn('detail        = { state = { value = ["ALARM"] } }', ALARMS)
+        self.assertIn("arn       = aws_sns_topic.cost_alerts.arn", block("aws_cloudwatch_event_target", "watchdog_alarms", ALARMS))
+        role = block("aws_iam_role_policy", "watchdog_alarm_relay", ALARMS)
+        self.assertIn('Statement = [{ Effect = "Allow", Action = "events:PutEvents", Resource = local.watchdog_alarm_bus_arn }]', role)
+        self.assertIn('"aws:SourceAccount"', block("aws_iam_role", "watchdog_alarm_relay", ALARMS))
+        topic = (ROOT / "cost-alerts.tf").read_text()
+        self.assertIn('Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.watchdog_alarms.arn } }', topic)
+        # the alarms carry no action of their own: an alarm may only notify a topic in its region
+        for prefix, _, _ in self.SITES:
+            for suffix in ("errors", "not_running"):
+                self.assertNotIn("alarm_actions", block("aws_cloudwatch_metric_alarm", "%s_%s" % (prefix, suffix), ALARMS))
 
 
 class LinuxDeadline(unittest.TestCase):

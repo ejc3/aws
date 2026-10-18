@@ -282,6 +282,15 @@ data "aws_iam_policy_document" "member_gbox_control" {
       variable = "aws:TagKeys"
       values   = local.member_gbox_tag_keys.eni
     }
+
+    # The ENI must be the template's own: a --network-interfaces override (another address, the
+    # fixed one dropped) makes this false. AWS's example policies use exactly this key on
+    # network-interface/* to forbid overriding the template's network interfaces.
+    condition {
+      test     = "Bool"
+      variable = "ec2:IsLaunchTemplateResource"
+      values   = ["true"]
+    }
   }
 
   statement {

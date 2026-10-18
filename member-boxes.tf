@@ -27,8 +27,8 @@
 #   wbox: the member wbox subnet (10.0.69.0/24, us-west-1a): same VPC as nextjs-dev and nextjs-ct, reachable
 #   gbox: the us-west-2a default subnet: reachable from the dev fleet over the I/O box peering (main.tf routes
 #         the whole us-west-2 default VPC to it), and its security group admits SSH from the fleet subnets only
-#   pbox: the Ohio pbox subnet: NOT routed from us-west-1 (Ohio peers only with the I/O box's VPC), so today it
-#         is reached at its public address, as the owner's are; the private one is pinned for a future peering
+#   pbox: the members' own Ohio subnet (no I/O box peer route, no NFS): NOT routed from us-west-1, so it is
+#         reached at its public address, as the owner's are; the private one is pinned for a future peering
 #
 # COST. Each kind is reaped like the owner's (the watchdogs: pbox and gbox after 30 idle minutes, wbox after an
 # idle hour below 15% CPU) and, unlike the owner's pbox, every member box also has a hard lifetime enforced twice:

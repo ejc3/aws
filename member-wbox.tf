@@ -732,6 +732,15 @@ data "aws_iam_policy_document" "member_wbox_control" {
       variable = "aws:TagKeys"
       values   = local.member_wbox_tag_keys.eni
     }
+
+    # The ENI must be the template's own: a --network-interfaces override (another address, the
+    # fixed one dropped) makes this false. AWS's example policies use exactly this key on
+    # network-interface/* to forbid overriding the template's network interfaces.
+    condition {
+      test     = "Bool"
+      variable = "ec2:IsLaunchTemplateResource"
+      values   = ["true"]
+    }
   }
 
   # What the call references, pinned to exact ARNs: this AMI, this subnet, this security
@@ -912,6 +921,7 @@ resource "aws_lambda_function" "member_wbox_watchdog" {
       IDLE_CPU_PCT    = tostring(local.member_wbox_idle_cpu_pct)
       TAG_NAMES       = join(",", local.member_wbox_names)
       MAX_AGE_MINUTES = jsonencode({ for n in local.member_wbox_names : n => local.member_box_max_hours * 60 })
+      SINGLE_NAMES    = join(",", local.member_wbox_names) # one instance per member wbox
       SNS_REGION      = var.aws_region
       SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }
