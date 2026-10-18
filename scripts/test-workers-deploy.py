@@ -122,7 +122,7 @@ class InstallScriptTests(unittest.TestCase):
         for repo in ("ejc3/imagine", "ejc3/remote-claw", "dolphin-labs-hq/dolphin-maps"):
             self.assertIn(repo, INSTALL.split("case", 1)[1].split("esac", 1)[0])
 
-    def test_colton_games_gets_its_environment_secret_not_a_repository_secret(self):
+    def test_codercolton_sites_get_their_environment_secret_not_a_repository_secret(self):
         # CoderColton is outside Terraform's GitHub owners: its main-only `cloudflare-deploy` environment is set by
         # this script, and only there (ejc3/aws#466).
         import tempfile
@@ -133,12 +133,13 @@ class InstallScriptTests(unittest.TestCase):
                     f.write("#!/bin/bash\n" + body + "\n")
                 os.chmod(os.path.join(d, name), 0o755)
             env = dict(os.environ, PATH=d + ":/usr/bin:/bin")
-            for repo in ("CoderColton/colton-games", "ejc3/ts-api"):
+            for repo in ("CoderColton/colton-games", "CoderColton/nest-step", "ejc3/ts-api"):
                 r = subprocess.run(["/bin/bash", str(ROOT / "scripts" / "workers-deploy-secret.sh"), repo],
                                    capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0, r.stderr)
             lines = open(calls).read().splitlines()
         self.assertEqual(lines, ["secret set CLOUDFLARE_API_TOKEN --repo CoderColton/colton-games --env cloudflare-deploy",
+                                 "secret set CLOUDFLARE_API_TOKEN --repo CoderColton/nest-step --env cloudflare-deploy",
                                  "secret set CLOUDFLARE_API_TOKEN --repo ejc3/ts-api"])
 
     def test_refuses_an_empty_stored_token(self):
