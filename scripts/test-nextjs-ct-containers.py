@@ -40,10 +40,12 @@ CONFIG = {
     "session_policy_arns": {"alice": ["arn:aws:iam::111111111111:policy/nextjs-ct-member-alice"],
                             "carol": ["arn:aws:iam::111111111111:policy/nextjs-ct-member-carol"]},
     "io_box_ip": "172.31.48.10",
-    "member_box_ips": ["10.0.69.10", "10.12.2.10", "172.31.47.226", "10.0.69.11", "10.12.2.11", "172.31.47.227"],
+    "member_box_ips": ["10.0.69.10", "172.31.47.226", "10.0.69.11", "172.31.47.227"],
     "users": {
-        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.10", "10.12.2.10", "172.31.47.226"]},
-        "carol": {"uid": 1002, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.11", "10.12.2.11", "172.31.47.227"]},
+        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.10", "172.31.47.226"]},
+        "carol": {"uid": 1002, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.11", "172.31.47.227"]},
+        # A member whose managed policy is missing from session_policy_arns (a config written mid-change, say).
+        "dave": {"uid": 1004, "zone": "cc-games.dev", "owner": False, "box_ips": []},
         "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True, "box_ips": []},
     },
 }
@@ -81,6 +83,10 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
         self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
+        # The owner's `wbox run` output (security review of #502): the bucket (ListBucket) and its objects.
+        out = member.split('Sid      = "OwnerOnlyWboxOutput"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action   = ["s3:GetObject", "s3:ListBucket"]', out)
+        self.assertIn('Resource = [aws_s3_bucket.wbox_output.arn, "${aws_s3_bucket.wbox_output.arn}/*"]', out)
 
     def test_each_member_has_a_managed_session_policy_naming_their_own_boxes(self):
         # An inline session policy is capped at 2,048 characters; a member's denials name that member's own three
@@ -91,8 +97,12 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("nextjs_ct_member_users = [for u in local.nextjs_users : u if !contains(local.nextjs_ct_owners, u)]", TF)
         self.assertIn("session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }", TF)
         self.assertNotIn("aws_iam_role_policy_attachment\" \"nextjs_ct_member", TF)
+        self.assertIn('tags        = { Purpose = "session-policy", AttachedTo = "none", Account = each.key }', res)
         own = TF.split("nextjs_ct_own_boxes = {", 1)[1].split("\n  ] }\n", 1)[0]
         box = TF.split("nextjs_ct_member_box_all = {", 1)[1].split("\n  } }\n", 1)[0]
+        # A member pbox is in Ohio with no route from this VPC: no private address of one in PermitOpen or the firewall.
+        self.assertIn("ips = [local.member_wbox_ips[p], local.member_gbox_ips[p]]", box)
+        self.assertNotIn("member_pbox_ips", TF)
         # Their own: names, launch templates, volumes by explicit ARN, the wbox role, the two secrets.
         for ref in ("local.member_wbox_slots[p]", "local.member_pbox_slots[p]", "local.member_gbox_slots[p]",
                     "aws_launch_template.member_wbox[p].arn", "aws_launch_template.member_pbox[p].arn",
@@ -165,6 +175,8 @@ class HostScriptTests(unittest.TestCase):
              "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
                           arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token"),
                           sp + "macbook-ssh-access-nextjs-ejc3-*"]},
+            {"Sid": "OwnerOnlyWboxOutput", "Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
+             "Resource": ["arn:aws:s3:::wbox-output-111111111111", "arn:aws:s3:::wbox-output-111111111111/*"]},
             {"Sid": "NoMemberNeedsThese", "Effect": "Deny", "Action": acts("NoMemberNeedsThese"), "Resource": "*"},
             {"Sid": "OtherMembersBoxSecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [sp + f"{k}-AbCdEf" for o in ("connor", "colin", "skevh") for k in (f"member-box/{o}/ssh-key", f"wbox-{o}/administrator-password")]},
@@ -317,7 +329,7 @@ JSON
         cls.calls = d / "calls"
         env = dict(os.environ, NEXTJS_CT_CONFIG=str(d / "config.json"), NEXTJS_CT_IMDS_PORT=str(cls.port),
                    NEXTJS_CT_AWS=str(d / "aws"), NEXTJS_CT_REAL_IMDS="http://127.0.0.1:9",
-                   NEXTJS_CT_IMDS_USERS=json.dumps({"127.0.0.1": "alice", "127.0.0.2": "boss"}), CALLS=str(cls.calls))
+                   NEXTJS_CT_IMDS_USERS=json.dumps({"127.0.0.1": "alice", "127.0.0.2": "boss", "127.0.0.4": "dave"}), CALLS=str(cls.calls))
         cls.proc = subprocess.Popen(["python3", "-I", str(HOST / "nextjs-ct-imds")], env=env,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
@@ -367,6 +379,14 @@ JSON
         call = next(c for c in self.calls.read_text().split("---\n") if "ct-boss" in c)
         self.assertIn('"Sid":"everyone"', call)
         self.assertNotIn("--policy-arns", call)  # the owner is not narrowed to any member's boxes
+
+    def test_a_member_without_a_policy_arn_is_refused_never_given_the_owners_session(self):
+        # Security review of #502: only the owner flag makes a session without a managed policy.
+        tok = self.token("127.0.0.4")
+        status, body = self.req("GET", "/latest/meta-data/iam/security-credentials/nextjs-dev-role", {"X-aws-ec2-metadata-token": tok}, "127.0.0.4")
+        self.assertEqual(status, 500)
+        self.assertNotIn("AKIAFAKE", body)
+        self.assertNotIn("ct-dave", self.calls.read_text() if self.calls.exists() else "")
 
     def test_a_token_is_good_only_where_it_was_issued(self):
         tok = self.token("127.0.0.2")
@@ -506,8 +526,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertLess(forward.index('iifname "ve-alice" ip daddr 172.31.48.10 drop'), forward.index("ct state established,related accept"))
         self.assertLess(forward.index('iifname "ve-alice" ip saddr != 10.88.1.2 drop'), forward.index("ct state established,related accept"))
         # Another member's boxes: refused to each member, their own boxes and the owner untouched.
-        self.assertIn('iifname "ve-alice" ip daddr { 10.0.69.11, 10.12.2.11, 172.31.47.227 } drop', nft)
-        self.assertIn('iifname "ve-carol" ip daddr { 10.0.69.10, 10.12.2.10, 172.31.47.226 } drop', nft)
+        self.assertIn('iifname "ve-alice" ip daddr { 10.0.69.11, 172.31.47.227 } drop', nft)
+        self.assertIn('iifname "ve-carol" ip daddr { 10.0.69.10, 172.31.47.226 } drop', nft)
         self.assertNotIn('iifname "ve-boss" ip daddr {', nft)
         self.assertLess(forward.index('iifname "ve-alice" ip daddr { 10.0.69.11'), forward.index("ct state established,related accept"))
 
@@ -518,8 +538,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("ForceCommand /usr/local/sbin/nextjs-ct-enter", alice)
         carol = conf.split("Match User carol\n", 1)[1].split("\nMatch", 1)[0]
         # A member may forward to their own container and their own three boxes, nothing else.
-        self.assertIn("PermitOpen 10.88.1.2:* 10.0.69.10:* 10.12.2.10:* 172.31.47.226:*\n", alice + "\n")
-        self.assertIn("PermitOpen 10.88.2.2:* 10.0.69.11:* 10.12.2.11:* 172.31.47.227:*\n", carol + "\n")
+        self.assertIn("PermitOpen 10.88.1.2:* 10.0.69.10:* 172.31.47.226:*\n", alice + "\n")
+        self.assertIn("PermitOpen 10.88.2.2:* 10.0.69.11:* 172.31.47.227:*\n", carol + "\n")
         self.assertIn("PermitOpen 10.88.3.2:*\n", boss + "\n")
         self.assertIn("AllowTcpForwarding local", alice)
         self.assertIn("PermitListen none", alice)

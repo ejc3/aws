@@ -92,6 +92,13 @@ locals {
       )
     },
     {
+      # The output of the owner's `wbox run` (wbox.tf: the role reads wbox-output/wbox/*). Members' wboxes do not use it.
+      Sid      = "OwnerOnlyWboxOutput"
+      Effect   = "Deny"
+      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Resource = [aws_s3_bucket.wbox_output.arn, "${aws_s3_bucket.wbox_output.arn}/*"]
+    },
+    {
       Sid      = "NoMemberNeedsThese"
       Effect   = "Deny"
       Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"]
@@ -106,10 +113,13 @@ locals {
     volumes   = [aws_ebs_volume.member_wbox_data[p].arn, aws_ebs_volume.member_pbox_work[p].arn]
     role      = aws_iam_role.member_wbox[p].arn
     secrets   = [aws_secretsmanager_secret.member_box_ssh[p].arn, aws_secretsmanager_secret.member_wbox_admin[p].arn]
-    ips       = [local.member_wbox_ips[p], local.member_pbox_ips[p], local.member_gbox_ips[p]]
+    # The private addresses this box reaches: the wbox (us-west-1) and the gbox (us-west-2, over the I/O box peering).
+    # A member pbox is in Ohio with no route from here; it is reached at its public address, and the boundary there
+    # is the member's own SSH key (denied to every other member above), not the network.
+    ips = [local.member_wbox_ips[p], local.member_gbox_ips[p]]
   } }
   nextjs_ct_member_box     = { for p, b in local.nextjs_ct_member_box_all : p => b if contains(local.nextjs_users, p) }
-  nextjs_ct_member_box_ips = flatten([for p in local.member_box_people : [local.member_wbox_ips[p], local.member_gbox_ips[p], local.member_pbox_ips[p]]])
+  nextjs_ct_member_box_ips = flatten([for p, b in local.nextjs_ct_member_box_all : b.ips])
   nextjs_ct_ec2_launched   = ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*:*:network-interface/*"]
 
   # A member may act on their own boxes only. nextjs-dev-role's member-*-control grants admit every member's box; these
@@ -541,7 +551,8 @@ SCRIPT
 resource "aws_iam_policy" "nextjs_ct_member" {
   for_each    = toset(local.nextjs_ct_member_users)
   name        = "nextjs-ct-member-${each.key}"
-  description = "Session policy for ${each.key}'s container on nextjs-ct: nextjs-dev-role narrowed to what that person may use"
+  description = "SESSION policy only, attached to no principal: passed with ${each.key}'s nextjs-ct container session, it can only narrow nextjs-dev-role (Allow * intersects the role; every other statement denies)"
+  tags        = { Purpose = "session-policy", AttachedTo = "none", Account = each.key }
   policy = jsonencode({
     Version   = "2012-10-17"
     Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes))

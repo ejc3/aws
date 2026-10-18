@@ -1071,10 +1071,14 @@ login.
   member's session also carries that member's managed policy (`nextjs-ct-member-<user>`), which admits their
   own wbox, pbox and gbox (`member-boxes.tf`) and nothing of anyone else's: their own two secrets, launches
   only from their own launch templates with their own Name tags, start, stop and terminate only their own,
-  attach only their own volumes, pass only their own wbox role.
+  attach only their own volumes, pass only their own wbox role. Nor can a member read the output of the owner's
+  `wbox run` (the `wbox-output-<account>` bucket).
 - **The boxes**: `wbox`, `pbox` and `gbox` are in every container and act on that person's own boxes. A member
-  may forward a port to their own boxes through ssh (`ssh -L 8443:<own wbox address>:8443 ...`), and their
-  container cannot reach anyone else's.
+  may forward a port to their own wbox or gbox through ssh (`ssh -L 8443:<own wbox address>:8443 ...`), and
+  their container is refused the private addresses of every other member's wbox and gbox. A pbox is different:
+  it is in Ohio, reached at its public address, and its security group admits SSH from anywhere, so another
+  member CAN reach its SSH port. The boundary there is the per-member SSH key (`member-box/<person>/ssh-key`),
+  which every other member's session is denied.
 - **The MacBook** is reachable from `ejc3`'s container only, by `ssh mac`: the same Cloudflare route as every other
   box (`mac-ssh-client.tf`), with ejc3's own Access token, which every member's AWS session is denied.
 

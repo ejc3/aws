@@ -100,11 +100,16 @@ class State:
             if cached and cached[1] - time.time() > REFRESH_BEFORE:
                 return cached[0]
             # The inline policy is everyone's; a member's session also carries that member's managed policy
-            # (nextjs-ct-member-<user>), which names their own boxes. No ARN listed: the owner.
+            # (nextjs-ct-member-<user>), which names their own boxes. Only the owner flag makes a session without
+            # one: a member whose policy is missing from the config gets no credentials, never the owner's session.
+            owner = self.config.get("users", {}).get(user, {}).get("owner") is True
+            arns = self.config.get("session_policy_arns", {}).get(user, [])
+            if not owner and not arns:
+                print(f"nextjs-ct-imds: refusing {user}: a member with no session policy ARN in the config", file=sys.stderr)
+                return None
             cmd = [AWS, "sts", "assume-role", "--role-arn", self.config["role_arn"],
                    "--role-session-name", f"ct-{user}", "--duration-seconds", "3600",
                    "--policy", json.dumps(self.config["session_policy"], separators=(",", ":")), "--output", "json"]
-            arns = self.config.get("session_policy_arns", {}).get(user, [])
             if arns:
                 cmd += ["--policy-arns"] + [f"arn={a}" for a in arns]
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
