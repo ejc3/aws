@@ -38,7 +38,7 @@ class BoxTests(unittest.TestCase):
         # claw-master renewal all look for "nextjs-dev").
         self.assertNotIn('resource "aws_eip"', CT_TF)
         self.assertNotIn('resource "aws_eip_association"', CT_TF)
-        self.assertRegex(self.instance, r'Name\s+=\s+"nextjs-ct"')
+        self.assertRegex(self.instance, r'Name\s+=\s+local\.nextjs_ct_serving \? "nextjs-dev" : "nextjs-ct"')
 
     def test_box_shares_the_role_and_security_group(self):
         self.assertIn("aws_iam_instance_profile.nextjs_dev.name", self.instance)
@@ -58,6 +58,46 @@ class BoxTests(unittest.TestCase):
         read = block(NEXTJS_DEV_TF, 'resource "aws_iam_role_policy" "nextjs_dev"')
         self.assertIn("/user-data/nextjs-ct.sh", read)
         self.assertIn("/user-data/nextjs.sh", read)
+
+
+class CutoverSwitchTests(unittest.TestCase):
+    """One value, local.nextjs_ct_serving, moves everything keyed to the nextjs box; false until the owner's go."""
+
+    def test_switch_is_off(self):
+        self.assertIn("nextjs_ct_serving = false", (ROOT / "nextjs-ct-user-data.tf").read_text())
+
+    def test_everything_keyed_to_the_box_reads_the_live_instance(self):
+        self.assertIn("nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)", CT_TF)
+        assoc = block(NEXTJS_DEV_TF, 'resource "aws_eip_association" "nextjs_dev"')
+        self.assertIn("instance_id   = local.nextjs_live_instance.id", assoc)
+        self.assertIn("volume/${local.nextjs_live_instance.root_block_device[0].volume_id}", NEXTJS_DEV_TF)
+        alarms = (ROOT / "nextjs-alarms.tf").read_text()
+        self.assertNotIn("aws_instance.nextjs_dev", alarms)
+        self.assertEqual(alarms.count("local.nextjs_live_instance"), 6)
+        self.assertIn("[local.nextjs_live_instance.id]", (ROOT / "agents-md.tf").read_text())
+        self.assertIn('Name    = local.nextjs_ct_serving ? "nextjs-dev-retired" : "nextjs-dev"', NEXTJS_DEV_TF)
+
+    def test_address_and_old_box_move_only_after_the_new_box_applied_the_switch(self):
+        # Review of #490 (Codex P1): otherwise the EIP moves to a box whose tunnels are still off (cutover), or the
+        # old box starts while the new one still holds the tunnels (rollback).
+        conv = block(CT_TF, 'resource "terraform_data" "nextjs_ct_converge"')
+        self.assertIn("serving  = local.nextjs_ct_serving", conv)
+        self.assertIn("scripts/ssm-nextjs-ct-converge.sh", conv)
+        self.assertIn("depends_on = [aws_s3_object.nextjs_ct_user_data]", conv)
+        self.assertIn("depends_on = [terraform_data.nextjs_ct_converge]", block(CT_TF, 'resource "aws_ec2_instance_state" "nextjs_dev"'))
+        self.assertIn("depends_on = [terraform_data.nextjs_ct_converge]", block(NEXTJS_DEV_TF, 'resource "aws_eip_association" "nextjs_dev"'))
+        helper = (ROOT / "scripts" / "ssm-nextjs-ct-converge.sh").read_text()
+        self.assertIn("flock -w 3600 /run/nextjs-ct-setup.lock true", helper)
+        self.assertIn("systemctl start setup-sync.service", helper)
+        self.assertIn('jq -r .serving /etc/nextjs-ct/config.json', helper)
+        self.assertIn("/usr/local/sbin/nextjs-ct-health || exit 1", helper)
+        self.assertIn('cloudflared@$z.service', helper)
+        subprocess.run(["bash", "-n", str(ROOT / "scripts" / "ssm-nextjs-ct-converge.sh")], check=True)
+
+    def test_old_box_is_stopped_never_terminated(self):
+        state = block(CT_TF, 'resource "aws_ec2_instance_state" "nextjs_dev"')
+        self.assertIn('state       = local.nextjs_ct_serving ? "stopped" : "running"', state)
+        self.assertRegex(block(NEXTJS_DEV_TF, 'resource "aws_instance" "nextjs_dev"'), r"delete_on_termination\s+=\s+false")
 
 
 class SelfAssumeTests(unittest.TestCase):
@@ -119,7 +159,7 @@ class FirstBootTests(unittest.TestCase):
     def test_etag_is_recorded_only_after_health(self):
         health = self.script.index("/usr/local/sbin/nextjs-ct-health || {")
         self.assertLess(health, self.script.index("/var/lib/nextjs-setup/applied-etag"))
-        self.assertIn('"/usr/local/sbin/nextjs-ct-health" = "scripts/nextjs-ct/nextjs-ct-health"', CT_USER_DATA)
+        self.assertRegex(CT_USER_DATA, r'"/usr/local/sbin/nextjs-ct-health"\s+=\s+"scripts/nextjs-ct/nextjs-ct-health"')
 
     def test_a_run_outside_setup_sync_waits_for_the_lock(self):
         self.assertIn('if [ -z "$${NEXTJS_CT_SETUP_LOCK_HELD:-}" ]; then\n  exec 9>/run/nextjs-ct-setup.lock', self.script)

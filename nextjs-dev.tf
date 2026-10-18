@@ -295,7 +295,7 @@ resource "aws_instance" "nextjs_dev" {
   }
 
   tags = {
-    Name    = "nextjs-dev"
+    Name    = local.nextjs_ct_serving ? "nextjs-dev-retired" : "nextjs-dev"
     Purpose = "Next.js dev servers behind a Cloudflare Tunnel"
     DevEBS  = "true"
   }
@@ -310,7 +310,7 @@ locals {
   # Resolved from the instance rather than hardcoded like the metal boxes' volumes: a spot
   # replacement mints a new volume id, and a hardcoded ARN would keep backing up the old
   # detached one while the live disk silently went unprotected.
-  nextjs_root_volume_arn = var.enable_nextjs_dev ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.nextjs_dev[0].root_block_device[0].volume_id}" : ""
+  nextjs_root_volume_arn = var.enable_nextjs_dev ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${local.nextjs_live_instance.root_block_device[0].volume_id}" : ""
 }
 
 resource "aws_eip" "nextjs_dev" {
@@ -321,8 +321,11 @@ resource "aws_eip" "nextjs_dev" {
 
 resource "aws_eip_association" "nextjs_dev" {
   count         = var.enable_nextjs_dev ? 1 : 0
-  instance_id   = aws_instance.nextjs_dev[0].id
+  instance_id   = local.nextjs_live_instance.id # nextjs-ct from the cutover (nextjs-ct.tf)
   allocation_id = aws_eip.nextjs_dev[0].id
+
+  # Moves only after nextjs-ct has applied the switch (nextjs-ct.tf, terraform_data.nextjs_ct_converge).
+  depends_on = [terraform_data.nextjs_ct_converge]
 }
 
 output "nextjs_dev_public_ip" {

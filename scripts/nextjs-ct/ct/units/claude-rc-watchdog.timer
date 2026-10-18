@@ -1,0 +1,9 @@
+[Unit]
+Description=Check for wedged Claude Remote Control sessions
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

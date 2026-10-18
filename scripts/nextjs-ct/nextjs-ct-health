@@ -1,7 +1,9 @@
 #!/bin/bash
-# nextjs-ct-health -- is the host set up? setup-sync records a published script only when this passes,
-# so a half-done setup is retried rather than remembered as applied. Prints what is wrong; exit 1 if anything is.
+# nextjs-ct-health -- is the host set up, and is every container up? setup-sync records a published
+# script only when this passes, so a half-done setup is retried rather than remembered as applied.
+# Prints what is wrong; exit 1 if anything is.
 set -uo pipefail
+CONFIG=/etc/nextjs-ct/config.json
 BAD=""
 for cmd in aws jq nft systemd-nspawn machinectl debootstrap rsync; do
   command -v "$cmd" >/dev/null 2>&1 || BAD="$BAD missing:$cmd"
@@ -11,6 +13,22 @@ systemctl is-enabled --quiet setup-sync.timer 2>/dev/null || BAD="$BAD disabled:
 systemctl is-active --quiet setup-sync.timer 2>/dev/null || BAD="$BAD inactive:setup-sync.timer"
 systemctl is-active --quiet snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null \
   || systemctl is-active --quiet amazon-ssm-agent.service 2>/dev/null || BAD="$BAD down:ssm-agent"
+if [ -r "$CONFIG" ]; then
+  for unit in earlyoom.service nextjs-ct-firewall.service nextjs-ct-imds.service; do
+    systemctl is-active --quiet "$unit" || BAD="$BAD down:$unit"
+  done
+  nft list table inet nextjs_ct_filter >/dev/null 2>&1 || BAD="$BAD missing:firewall"
+  [ -s /etc/ssh/sshd_config.d/90-nextjs-ct.conf ] || BAD="$BAD missing:sshd-rules"
+  for U in $(jq -r '.users | keys[]' "$CONFIG"); do
+    machinectl show "$U" -p State --value 2>/dev/null | grep -qx running || { BAD="$BAD down:container-$U"; continue; }
+    systemctl -M "$U" is-active --quiet nextjs-ct-provision.service || BAD="$BAD unprovisioned:$U"
+  done
+  if [ "$(jq -r .serving "$CONFIG")" = true ]; then
+    for Z in $(jq -r '.zones | keys[]' "$CONFIG"); do
+      systemctl is-active --quiet "cloudflared@$Z.service" || BAD="$BAD down:cloudflared@$Z"
+    done
+  fi
+fi
 if [ -n "$BAD" ]; then
   echo "nextjs-ct-health: NOT healthy:$BAD"
   exit 1

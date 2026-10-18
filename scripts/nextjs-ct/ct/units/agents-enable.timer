@@ -1,0 +1,9 @@
+[Unit]
+Description=Check for newly logged-in agent users
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

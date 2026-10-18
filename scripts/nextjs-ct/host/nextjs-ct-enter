@@ -1,0 +1,31 @@
+#!/bin/bash
+# nextjs-ct-enter -- sshd's ForceCommand for every account on the box: carry the session into the
+# account's own container. Runs on the host as the person, after the host's sshd authenticated them
+# with their own ~/.ssh/authorized_keys (their home, the same directory their container mounts).
+#
+# The session is relayed with ssh to the container's sshd over the host-only link, so everything ssh
+# can carry works the same as before: an interactive shell with a pty, a command, scp, sftp, rsync,
+# git over ssh, agent forwarding, the exit status. The relay key is the host's (one per account,
+# readable by that account only) and the container's host key is pinned, so the far end is that
+# container and nothing else.
+set -uo pipefail
+U=$(id -un)
+D=/var/lib/nextjs-ct/enter/$U
+IP=$(cat "$D/ip" 2>/dev/null) || { echo "nextjs-ct: no container is set up for $U" >&2; exit 1; }
+OPTS=(-q -F /dev/null -i "$D/key" -o IdentitiesOnly=yes -o BatchMode=yes
+      -o UserKnownHostsFile="$D/known_hosts" -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes
+      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR
+      -o SendEnv=LANG -o SendEnv=LC_* -o SendEnv=COLORTERM)
+[ -n "${SSH_AUTH_SOCK:-}" ] && OPTS+=(-A)
+
+if [ -z "${SSH_ORIGINAL_COMMAND+set}" ]; then
+  # A login shell: a pty if the client asked for one.
+  if [ -n "${SSH_TTY:-}" ]; then exec ssh -t "${OPTS[@]}" "$U@$IP"; fi
+  exec ssh -T "${OPTS[@]}" "$U@$IP"
+fi
+case "$SSH_ORIGINAL_COMMAND" in
+  # A subsystem request reaches a ForceCommand as the subsystem's configured command.
+  /usr/lib/openssh/sftp-server|internal-sftp) exec ssh -T "${OPTS[@]}" -s "$U@$IP" sftp ;;
+esac
+if [ -n "${SSH_TTY:-}" ]; then exec ssh -t "${OPTS[@]}" "$U@$IP" -- "$SSH_ORIGINAL_COMMAND"; fi
+exec ssh -T "${OPTS[@]}" "$U@$IP" -- "$SSH_ORIGINAL_COMMAND"

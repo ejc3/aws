@@ -1,0 +1,38 @@
+#!/bin/bash
+# Enable this container's agent units once the account's credentials exist. Idempotent and quiet.
+# /etc/nextjs-ct/codex-seed marks an account in local.nextjs_codex_seed_users (written by provision).
+set -uo pipefail
+# Not before the box serves. Until the cutover the same accounts are live on nextjs-dev, and a second
+# claude --remote-control or Codex daemon here would resume the same conversations and show up twice on
+# everyone's phone. config.json's "serving" turns true with the cutover (nextjs-ct-user-data.tf).
+[ "$(jq -r '.serving' /opt/nextjs-ct/config.json 2>/dev/null)" = true ] || exit 0
+for u in $(cat /etc/nextjs-ct/user); do
+  id -u "$u" >/dev/null 2>&1 || continue
+  # Enable and start are checked SEPARATELY. `enable --now` can enable the unit and still
+  # fail to start it -- remote control not up yet, say -- and after that `is-enabled` is
+  # true forever, so a watcher keyed on it would never retry the start and the agent would
+  # stay down until someone noticed. Keyed on is-active, this converges on the next tick.
+  if [ -s "/home/$u/.claude/.credentials.json" ]; then
+    systemctl enable "claude-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "claude-rc@$u.service"       || systemctl start "claude-rc@$u.service" >/dev/null 2>&1 || true
+  fi
+  if [ -s "/home/$u/.codex/auth.json" ]; then
+    systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "codex-rc@$u.service"       || systemctl start "codex-rc@$u.service" >/dev/null 2>&1 || true
+    # A Codex thread for each folder agents-start opened, only for these accounts. --no-block:
+    # a new folder costs a model turn, and this watcher must not wait on it.
+    if [ -e /etc/nextjs-ct/codex-seed ]; then
+      systemctl enable "codex-seed@$u.service" >/dev/null 2>&1 || true
+      systemctl is-active --quiet "codex-seed@$u.service" || systemctl start --no-block "codex-seed@$u.service" >/dev/null 2>&1 || true
+    fi
+  fi
+  # The new-repo watch for the same accounts. It is independent of the Codex login above: an account that has
+  # logged in to Claude only (or Codex only) still gets it, and it starts what is logged in and retries the
+  # rest. A running one is left alone; it re-executes itself when its own file is replaced.
+  if [ -s "/home/$u/.claude/.credentials.json" ] || [ -s "/home/$u/.codex/auth.json" ]; then
+    if [ -e /etc/nextjs-ct/codex-seed ]; then
+      systemctl enable "agent-session-sync@$u.service" >/dev/null 2>&1 || true
+      systemctl is-active --quiet "agent-session-sync@$u.service" || systemctl start --no-block "agent-session-sync@$u.service" >/dev/null 2>&1 || true
+    fi
+  fi
+done

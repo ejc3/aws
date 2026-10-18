@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""nextjs-ct-imds -- each container's instance metadata service, answering on the host.
+
+Inside a container, 169.254.169.254:80 is redirected (nftables DNAT, per container interface) to this
+server on that container's own gateway address. Which container is asking is therefore the local
+address the connection arrived on; the firewall admits a container only to its own gateway, and only
+from its own address, so a container cannot ask as another.
+
+What it serves is the subset of IMDSv2 that the AWS CLI and SDKs use:
+
+  PUT /latest/api/token                       a session token (IMDSv2 is required, as on the real host)
+  GET .../iam/security-credentials/           the role name
+  GET .../iam/security-credentials/<role>     credentials for THIS container: a session of the box's own
+                                              role (assumed again, as ct-<user>) with the session policy
+                                              for that person, so it holds at most what the role holds
+  GET .../iam/info, placement, instance id... copied from the real metadata service (no secrets)
+
+Everything else is 404 -- user data, identity credentials, tags. A request carrying X-Forwarded-For is
+refused, as the real service does, so a proxy inside a container cannot be turned against it.
+
+Configuration is the box's config.json (users, owner flag, the two session policies, the role ARN).
+"""
+import json
+import os
+import pwd
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONFIG = os.environ.get("NEXTJS_CT_CONFIG", "/etc/nextjs-ct/config.json")
+PORT = int(os.environ.get("NEXTJS_CT_IMDS_PORT", "8169"))
+REAL = os.environ.get("NEXTJS_CT_REAL_IMDS", "http://169.254.169.254")
+AWS = os.environ.get("NEXTJS_CT_AWS", "aws")
+ROLE_NAME = "nextjs-dev-role"
+REFRESH_BEFORE = 15 * 60
+PASSTHROUGH = (
+    "placement/region", "placement/availability-zone", "instance-id", "instance-type", "ami-id",
+    "local-hostname", "hostname", "mac", "iam/info",
+)
+
+
+def gateway_of(uid):
+    return f"10.88.{uid - 1000}.1"
+
+
+class State:
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.lock = threading.Lock()
+        self.tokens = {}       # token -> (user, expiry)
+        self.creds = {}        # user -> (credentials dict, expiry epoch)
+        self.user_locks = {}
+        self.real_cache = {}
+        self.load()
+
+    def load(self):
+        with open(self.config_path) as f:
+            self.config = json.load(f)
+        users = {}
+        override = os.environ.get("NEXTJS_CT_IMDS_USERS")  # tests: {"<local address>": "<user>"}
+        if override:
+            self.by_gateway = json.loads(override)
+            return
+        for user, spec in self.config["users"].items():
+            try:
+                uid = pwd.getpwnam(user).pw_uid
+            except KeyError:
+                continue
+            users[gateway_of(uid)] = user
+        self.by_gateway = users
+
+    def user_for(self, local_address):
+        return self.by_gateway.get(local_address)
+
+    # ---- tokens
+    def new_token(self, user, ttl):
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            now = time.time()
+            self.tokens = {t: v for t, v in self.tokens.items() if v[1] > now}
+            self.tokens[token] = (user, now + ttl)
+        return token
+
+    def token_ok(self, token, user):
+        with self.lock:
+            entry = self.tokens.get(token or "")
+        return bool(entry) and entry[0] == user and entry[1] > time.time()
+
+    # ---- credentials
+    def credentials(self, user):
+        with self.lock:
+            ulock = self.user_locks.setdefault(user, threading.Lock())
+        with ulock:
+            cached = self.creds.get(user)
+            if cached and cached[1] - time.time() > REFRESH_BEFORE:
+                return cached[0]
+            spec = self.config["users"][user]
+            policy = self.config["session_policies"]["owner" if spec.get("owner") else "member"]
+            out = subprocess.run(
+                [AWS, "sts", "assume-role", "--role-arn", self.config["role_arn"],
+                 "--role-session-name", f"ct-{user}", "--duration-seconds", "3600",
+                 "--policy", json.dumps(policy, separators=(",", ":")), "--output", "json"],
+                capture_output=True, text=True, timeout=60)
+            if out.returncode != 0:
+                # stderr carries no secret (the CLI prints the error code and message only).
+                print(f"nextjs-ct-imds: assume-role for {user} failed: {out.stderr.strip()[:300]}", file=sys.stderr)
+                return None
+            c = json.loads(out.stdout)["Credentials"]
+            expiry = datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00")).timestamp()
+            doc = {
+                "Code": "Success",
+                "LastUpdated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "Type": "AWS-HMAC",
+                "AccessKeyId": c["AccessKeyId"],
+                "SecretAccessKey": c["SecretAccessKey"],
+                "Token": c["SessionToken"],
+                "Expiration": datetime.fromtimestamp(expiry, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            self.creds[user] = (doc, expiry)
+            print(f"nextjs-ct-imds: issued a session for {user} until {doc['Expiration']}", file=sys.stderr)
+            return doc
+
+    # ---- the real metadata service, for the harmless facts
+    def real(self, path):
+        with self.lock:
+            if path in self.real_cache:
+                return self.real_cache[path]
+        try:
+            req = urllib.request.Request(f"{REAL}/latest/api/token", method="PUT",
+                                         headers={"X-aws-ec2-metadata-token-ttl-seconds": "300"})
+            token = urllib.request.urlopen(req, timeout=3).read().decode()
+            req = urllib.request.Request(f"{REAL}/latest/{path}", headers={"X-aws-ec2-metadata-token": token})
+            value = urllib.request.urlopen(req, timeout=3).read().decode()
+        except Exception as exc:  # noqa: BLE001 -- any failure is a 404 to the caller
+            print(f"nextjs-ct-imds: real metadata {path}: {exc}", file=sys.stderr)
+            return None
+        with self.lock:
+            self.real_cache[path] = value
+        return value
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "EC2ws"
+    sys_version = ""
+    timeout = 5  # seconds for the request line and headers: a stalled client frees its slot
+
+    def log_message(self, fmt, *args):  # quiet: no per-request lines, and never a token
+        pass
+
+    def reply(self, code, body="", ctype="text/plain"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def who(self):
+        if "X-Forwarded-For" in self.headers:
+            self.reply(403)
+            return None
+        user = self.server.state.user_for(self.connection.getsockname()[0])
+        if not user:
+            self.reply(403)
+            return None
+        return user
+
+    def do_PUT(self):
+        user = self.who()
+        if not user:
+            return
+        if self.path != "/latest/api/token":
+            return self.reply(404)
+        try:
+            ttl = int(self.headers.get("X-aws-ec2-metadata-token-ttl-seconds", ""))
+        except ValueError:
+            return self.reply(400)
+        if not 1 <= ttl <= 21600:
+            return self.reply(400)
+        token = self.server.state.new_token(user, ttl)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("X-aws-ec2-metadata-token-ttl-seconds", str(ttl))
+        self.send_header("Content-Length", str(len(token)))
+        self.end_headers()
+        self.wfile.write(token.encode())
+
+    def do_GET(self):
+        user = self.who()
+        if not user:
+            return
+        if not self.server.state.token_ok(self.headers.get("X-aws-ec2-metadata-token"), user):
+            return self.reply(401)
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/latest/meta-data/"):
+            key = path[len("/latest/meta-data/"):]
+            if key in ("iam/security-credentials", "iam/security-credentials/"):
+                return self.reply(200, ROLE_NAME)
+            if key.rstrip("/") == f"iam/security-credentials/{ROLE_NAME}":
+                doc = self.server.state.credentials(user)
+                return self.reply(200, json.dumps(doc, indent=2), "application/json") if doc else self.reply(500)
+            if key == "":
+                return self.reply(200, "\n".join(["ami-id", "hostname", "iam/", "instance-id", "instance-type",
+                                                  "local-hostname", "mac", "placement/"]))
+            if key in ("iam", "iam/"):
+                return self.reply(200, "info\nsecurity-credentials/")
+            if key in ("placement", "placement/"):
+                return self.reply(200, "availability-zone\nregion")
+            if key in PASSTHROUGH:
+                value = self.server.state.real(f"meta-data/{key}")
+                return self.reply(200, value) if value is not None else self.reply(404)
+        if path == "/latest/dynamic/instance-identity/document":
+            value = self.server.state.real("dynamic/instance-identity/document")
+            return self.reply(200, value, "application/json") if value is not None else self.reply(404)
+        return self.reply(404)
+
+
+PER_CONTAINER = 8  # requests in flight per container; the SDKs make one or two at a time
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """One container cannot tie up the host: at most PER_CONTAINER connections in flight per local address
+    (each container has its own), and each handler gives up on a client that stalls (Handler.timeout)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slots_lock = threading.Lock()
+        self.in_flight = {}
+
+    def process_request(self, request, client_address):
+        try:
+            local = request.getsockname()[0]
+        except OSError:
+            self.shutdown_request(request)
+            return
+        with self.slots_lock:
+            if self.in_flight.get(local, 0) >= PER_CONTAINER:
+                self.shutdown_request(request)
+                return
+            self.in_flight[local] = self.in_flight.get(local, 0) + 1
+        try:
+            super().process_request(request, client_address)  # starts process_request_thread, which releases
+        except Exception:
+            self.release(local)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        local = request_local(request)  # before the handler closes the socket
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.release(local)
+
+    def release(self, local):
+        with self.slots_lock:
+            n = self.in_flight.get(local, 1) - 1
+            if n > 0:
+                self.in_flight[local] = n
+            else:
+                self.in_flight.pop(local, None)
+
+
+def request_local(request):
+    try:
+        return request.getsockname()[0]
+    except OSError:
+        return None
+
+
+def main():
+    server = BoundedServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
+    server.state = State(CONFIG)
+    print(f"nextjs-ct-imds: serving {len(server.state.by_gateway)} containers on port {PORT}", file=sys.stderr)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

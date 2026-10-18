@@ -104,10 +104,49 @@ resource "aws_instance" "nextjs_ct" {
     ignore_changes = [ami, user_data, user_data_base64]
   }
 
+  # Takes nextjs-dev's name at the cutover, so everything that finds the box by name follows it: the
+  # auto-reboot Lambda, claw-master's certificate renewal, the hop aliases on the metal boxes.
   tags = {
-    Name    = "nextjs-ct"
+    Name    = local.nextjs_ct_serving ? "nextjs-dev" : "nextjs-ct"
     Purpose = "Containerized replacement for nextjs-dev (one container per person)"
   }
+}
+
+# ---------------------------------------------------------------------------------
+# The cutover switch: local.nextjs_ct_serving (nextjs-ct-user-data.tf). Everything keyed to "the nextjs
+# box" reads local.nextjs_live_instance, so flipping that one value moves the Elastic IP, the Name tag,
+# the memory and disk alarms, the backup selection and the agents-md target together, starts this
+# box's tunnels and agents, and stops (never terminates) nextjs-dev. Flipping it back is the rollback.
+# ---------------------------------------------------------------------------------
+locals {
+  nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)
+}
+
+# Applies the switch on this box at once and checks it took (tunnels up when serving, down when not), so
+# the address moves and nextjs-dev stops or starts only afterwards: never dead URLs while setup-sync's
+# timer catches up, and never both boxes on one tunnel during a rollback.
+resource "terraform_data" "nextjs_ct_converge" {
+  count = var.enable_nextjs_ct ? 1 : 0
+
+  triggers_replace = {
+    serving  = local.nextjs_ct_serving
+    instance = aws_instance.nextjs_ct[0].id
+    helper   = filesha256("${path.module}/scripts/ssm-nextjs-ct-converge.sh")
+  }
+
+  provisioner "local-exec" {
+    command = "bash ${path.module}/scripts/ssm-nextjs-ct-converge.sh ${aws_instance.nextjs_ct[0].id} ${var.aws_region} ${local.nextjs_ct_serving}"
+  }
+
+  depends_on = [aws_s3_object.nextjs_ct_user_data]
+}
+
+resource "aws_ec2_instance_state" "nextjs_dev" {
+  count       = var.enable_nextjs_dev && var.enable_nextjs_ct ? 1 : 0
+  instance_id = aws_instance.nextjs_dev[0].id
+  state       = local.nextjs_ct_serving ? "stopped" : "running"
+
+  depends_on = [terraform_data.nextjs_ct_converge]
 }
 
 output "nextjs_ct_public_ip" {

@@ -1,0 +1,27 @@
+polkit.addRule(function(action, subject) {
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var verb = action.lookup("verb");
+  var allowed = ["start", "stop", "restart", "reload", "reload-or-restart", "try-restart"];
+  if (allowed.indexOf(verb) < 0) {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var unit = action.lookup("unit");
+  // Claude/Codex stay one-per-user. ndev allows the bare user instance plus any
+  // user-<slug> preview (multi-worktree publishes).
+  var exact = ["claude-rc@", "codex-rc@"];
+  for (var i = 0; i < exact.length; i++) {
+    if (unit === exact[i] + subject.user + ".service") {
+      return polkit.Result.YES;
+    }
+  }
+  var prefix = "ndev@";
+  if (unit.indexOf(prefix) === 0 && unit.slice(-8) === ".service") {
+    var inst = unit.substring(prefix.length, unit.length - 8);
+    if (inst === subject.user || inst.indexOf(subject.user + "-") === 0) {
+      return polkit.Result.YES;
+    }
+  }
+  return polkit.Result.NOT_HANDLED;
+});

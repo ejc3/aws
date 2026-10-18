@@ -1308,6 +1308,33 @@ Once credentials exist and their units have been enabled, services and remote-co
 agents start at boot. A reboot restores the published URLs without another interactive
 login.
 
+### The containerized replacement (nextjs-ct)
+
+`nextjs-ct` (`nextjs-ct.tf`, `nextjs-ct-user-data.tf`, `scripts/nextjs-ct/`) is being built next to
+`nextjs-dev` and takes its Elastic IP at the cutover; until then it serves nothing. On it every account,
+`ejc3` included, lives in a container of its own and nobody works on the host:
+
+- **Getting in** is unchanged: `ssh <user>@<box>`. The host's sshd checks the person's own
+  `~/.ssh/authorized_keys` and relays the session into their container (`nextjs-ct-enter`), so shells,
+  commands, scp, sftp, rsync, git and agent forwarding work as before. `-L` reaches only the person's own
+  container (`ssh -L 3000:10.88.N.2:3000 ...`). An admin enters a container from the `ubuntu` account with
+  `sudo machinectl shell <user>@<user>`.
+- **Inside**, the person is root (sudo, no password), installs what they like, and runs the same `ndev`,
+  Claude, Codex and t-claude as before. Their home is the host's `/home/<user>`, mounted in. Ports are the
+  container's own: two people can both use 3000.
+- **Publishing**: `ndev` records the project in the container; `nextjs-ct-ndev-sync` on the host checks it
+  and routes `<label>.<zone>` from that zone's `cloudflared` to `<container address>:<port>`.
+- **AWS**: `aws` and the SDKs work inside with no setup. The container's `169.254.169.254` is the host's
+  `nextjs-ct-imds`, which hands out a session of `nextjs-dev-role` narrowed by a session policy: no
+  container gets the tunnel credentials, the setup scripts or the SSM agent channel; only the owner's
+  gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the dev-box launchers.
+- **The MacBook** is reachable from `ejc3`'s container only (`ssh macbook`): the Mac's reverse tunnel lands
+  on the host's loopback and is relayed to that one container.
+
+What carries over at the cutover, and how: `scripts/nextjs-ct/host/nextjs-ct-migrate` (homes, published
+projects, crontabs, then the SSH host keys at the final pass). The cutover plan is in the pull request
+that added the container layer.
+
 ### Dolphin SSH through Cloudflare
 
 `ssh.dolphin-labs.dev` reaches this host's existing SSH daemon on `127.0.0.1:22`

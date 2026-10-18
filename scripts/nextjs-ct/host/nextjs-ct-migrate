@@ -1,0 +1,82 @@
+#!/bin/bash
+# nextjs-ct-migrate <old-box-address> [--final] -- copy every account's home and published projects
+# from nextjs-dev to this box. Only reads the old box (as ubuntu, with the hop key and `sudo rsync`).
+#
+#   without --final   the seed: bandwidth-capped (25 MB/s, a fifth of the old root volume's 125 MB/s) so the
+#                     live box stays responsive; containers here keep running.
+#   --final           the cutover's last pass, run after the old box's services are stopped: no cap, every
+#                     container here is stopped first so nothing writes a home while it is mirrored, and
+#                     --delete makes each home an exact copy. Containers are started again afterwards.
+#
+# Published projects move with their account: each /var/lib/ndev/instances/<label>.env on the old box
+# whose WHO is a container account goes to that container's /var/lib/ndev/instances/, where provision
+# re-enables it and nextjs-ct-ndev-sync routes it.
+set -euo pipefail
+OLD="${1:?usage: nextjs-ct-migrate <old-box-address> [--final]}"
+FINAL=""; [ "${2:-}" = "--final" ] && FINAL=1
+CONFIG=/etc/nextjs-ct/config.json
+KH=/var/lib/nextjs-ct/old-box-known-hosts
+SSH="ssh -i /home/ubuntu/.ssh/dev_hop -o IdentitiesOnly=yes -o UserKnownHostsFile=$KH -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+# The seed adds and updates only: it never deletes what exists in a home here. --final mirrors exactly.
+BW=(--bwlimit=25000); [ -z "$FINAL" ] || BW=(--delete)
+USERS=$(jq -r '.users | keys[]' "$CONFIG")
+
+if [ -n "$FINAL" ]; then
+  for U in $USERS; do systemctl stop "systemd-nspawn@$U.service"; done
+fi
+for U in $USERS; do
+  id -u "$U" >/dev/null 2>&1 || { echo "nextjs-ct-migrate: no account $U here yet; run setup first" >&2; exit 1; }
+  # An account added after nextjs-dev has nothing to bring.
+  $SSH "ubuntu@$OLD" test -d "/home/$U" || { echo "nextjs-ct-migrate: no /home/$U on the old box; skipping"; continue; }
+  echo "nextjs-ct-migrate: /home/$U"
+  rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+    "ubuntu@$OLD:/home/$U/" "/home/$U/"
+done
+
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# Fatal on the final pass: a cutover without the projects published since the seed would leave their URLs dead.
+$SSH "ubuntu@$OLD" test -d /var/lib/ndev/instances && HAVE_NDEV=0 || HAVE_NDEV=$?
+[ "$HAVE_NDEV" = 255 ] && { echo "nextjs-ct-migrate: cannot reach the old box for its published projects" >&2; [ -z "$FINAL" ] || exit 1; }
+if [ "$HAVE_NDEV" = 0 ]; then
+  rsync -a -e "$SSH" --rsync-path="sudo rsync" "ubuntu@$OLD:/var/lib/ndev/instances/" "$T/" \
+    || { echo "nextjs-ct-migrate: could not copy the published projects" >&2; [ -z "$FINAL" ] || exit 1; }
+fi
+for U in $USERS; do
+  SHIFT=$(( $(id -u "$U") * 65536 ))
+  D=/var/lib/nextjs-ct/ndev/$U/instances
+  install -d -m 755 -o "$SHIFT" -g "$SHIFT" "$D"
+  for f in "$T"/*.env; do
+    [ -f "$f" ] || continue
+    [ "$(sed -n 's/^WHO=//p' "$f" | head -n 1)" = "$U" ] || continue
+    install -m 644 -o "$SHIFT" -g "$SHIFT" "$f" "$D/$(basename "$f")"
+    echo "nextjs-ct-migrate: $U publishes $(sed -n 's/^HOST=//p' "$f" | head -n 1)"
+  done
+done
+
+# A crontab (skevh has one on nextjs-dev): provision installs it inside the container when it has none.
+for U in $USERS; do
+  SHIFT=$(( $(id -u "$U") * 65536 ))
+  if $SSH "ubuntu@$OLD" sudo crontab -l -u "$U" > "$T/crontab" 2>/dev/null && [ -s "$T/crontab" ]; then
+    install -m 600 -o "$SHIFT" -g "$SHIFT" "$T/crontab" "/var/lib/nextjs-ct/ndev/$U/crontab.migrated"
+    echo "nextjs-ct-migrate: $U's crontab carried over"
+  fi
+done
+
+# The old box's SSH host keys, at the final pass: the Elastic IP moves to this box, and every client that
+# pinned nextjs-dev's key (the Mac's reverse tunnel, the phones, the metal boxes' aliases) must see the same one.
+if [ -n "$FINAL" ]; then
+  rsync -a -e "$SSH" --rsync-path="sudo rsync" "ubuntu@$OLD:/etc/ssh/ssh_host_*" "$T/"
+  ls "$T"/ssh_host_*_key >/dev/null 2>&1 || { echo "nextjs-ct-migrate: could not copy the old host keys" >&2; exit 1; }
+  for k in "$T"/ssh_host_*; do
+    case "$k" in *.pub) install -m 644 "$k" "/etc/ssh/$(basename "$k")" ;; *) install -m 600 "$k" "/etc/ssh/$(basename "$k")" ;; esac
+  done
+  sshd -t && systemctl reload ssh.service
+  echo "nextjs-ct-migrate: SSH host keys carried over"
+fi
+
+if [ -n "$FINAL" ]; then
+  for U in $USERS; do systemctl start "systemd-nspawn@$U.service"; done
+  echo "nextjs-ct-migrate: containers started; provisioning re-enables each published project"
+fi
+/usr/local/sbin/nextjs-ct-ndev-sync || true
+echo "nextjs-ct-migrate: done"

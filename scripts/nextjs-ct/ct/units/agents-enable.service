@@ -1,0 +1,6 @@
+[Unit]
+Description=Enable per-user agent units once their credentials exist
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agents-enable

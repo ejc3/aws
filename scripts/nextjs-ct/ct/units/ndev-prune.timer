@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly ndev-prune
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

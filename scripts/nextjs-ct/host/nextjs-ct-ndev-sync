@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""nextjs-ct-ndev-sync -- route each published project's hostname to its container.
+
+`ndev` inside a container records what it published in that container's /var/lib/ndev/instances/
+<label>.env, a directory the host mounts in from /var/lib/nextjs-ct/ndev/<user>/. This program is the
+only writer of the host's cloudflared ingress: it reads those files, trusts none of them, and writes
+one ingress file per zone, routing <hostname> to http://<container address>:<port>.
+
+A record is routed only when all of these hold, checked here and not in the container:
+  * the label is <user> or <user>-<slug> (a-z, 0-9, -) and the hostname is <label>.<that user's zone>
+  * the port is a number from 1024 to 65535
+  * the project directory is inside /home/<user> and still exists (a deleted checkout loses its route)
+Files are opened without following symlinks, so a container cannot point the host at another file.
+Pinned routes (config.json pinned_routes) are added the same way.
+
+When the box is serving (config.json "serving": true, set at the cutover) a zone whose ingress changed
+has its connector restarted; before the cutover the files are written and nothing is started, so this
+box never takes connections from the live tunnels.
+"""
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+CONFIG = os.environ.get("NEXTJS_CT_CONFIG", "/etc/nextjs-ct/config.json")
+NDEV_ROOT = os.environ.get("NEXTJS_CT_NDEV_ROOT", "/var/lib/nextjs-ct/ndev")
+CF_DIR = os.environ.get("NEXTJS_CT_CLOUDFLARED_DIR", "/etc/cloudflared")
+HOME_ROOT = os.environ.get("NEXTJS_CT_HOME_ROOT", "/home")
+SYSTEMCTL = os.environ.get("NEXTJS_CT_SYSTEMCTL", "systemctl")
+LABEL = re.compile(r"^[a-z0-9-]+$")
+
+
+UIDS = json.loads(os.environ.get("NEXTJS_CT_UIDS", "{}"))  # tests: {"<user>": <uid>}
+
+
+def container_ip(user):
+    uid = UIDS[user] if user in UIDS else pwd.getpwnam(user).pw_uid
+    return f"10.88.{uid - 1000}.2"
+
+
+def read_records(user):
+    """Yield the KEY=VALUE dicts of a container's env files, never following a symlink."""
+    try:
+        top = os.open(os.path.join(NDEV_ROOT, user), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        try:
+            inst = os.open("instances", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=top)
+        except OSError:
+            return
+        try:
+            for name in sorted(os.listdir(inst)):
+                if not name.endswith(".env") or name.startswith("."):
+                    continue
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=inst)
+                except OSError:
+                    continue
+                with os.fdopen(fd) as f:
+                    st = os.fstat(f.fileno())
+                    if not stat.S_ISREG(st.st_mode) or st.st_size > 4096:
+                        continue
+                    rec = {}
+                    for line in f.read().splitlines():
+                        k, sep, v = line.partition("=")
+                        if sep and k in ("HOST", "PORT", "DIR", "WHO") and k not in rec:
+                            rec[k] = v
+                    rec["_label"] = name[:-4]
+                    yield rec
+        finally:
+            os.close(inst)
+    finally:
+        os.close(top)
+
+
+def valid(rec, user, zone):
+    """The route (hostname, port) for a record, or None with the reason printed."""
+    host, port, d, label = rec.get("HOST", ""), rec.get("PORT", ""), rec.get("DIR", ""), rec["_label"]
+    why = None
+    if not LABEL.match(label) or not (label == user or label.startswith(user + "-")):
+        why = f"label {label!r} is not {user} or {user}-<slug>"
+    elif host != f"{label}.{zone}":
+        why = f"hostname {host!r} is not {label}.{zone}"
+    elif not port.isdigit() or not 1024 <= int(port) <= 65535:
+        why = f"port {port!r}"
+    else:
+        home = os.path.join(HOME_ROOT, user)
+        real = os.path.realpath(d) if d.startswith("/") else ""
+        if not (real == home or real.startswith(home + "/")):
+            why = f"directory {d!r} is outside {home}"
+        elif not os.path.isdir(real):
+            return None  # a deleted checkout: no route, nothing to report
+    if why:
+        print(f"nextjs-ct-ndev-sync: {user}: not routing {label}: {why}", file=sys.stderr)
+        return None
+    return host, int(port)
+
+
+def desired(config):
+    zones = {z: {} for z in config["zones"]}
+    for user, spec in sorted(config["users"].items()):
+        zone = spec.get("zone")
+        if zone not in zones:
+            continue
+        try:
+            ip = container_ip(user)
+        except KeyError:
+            continue
+        for rec in read_records(user):
+            route = valid(rec, user, zone)
+            if route:
+                zones[zone][route[0]] = f"http://{ip}:{route[1]}"
+    for host, pin in sorted(config.get("pinned_routes", {}).items()):
+        if pin["zone"] in zones and host.endswith("." + pin["zone"]) and os.path.isdir(pin["dir"]):
+            try:
+                zones[pin["zone"]][host] = f"http://{container_ip(pin['user'])}:{int(pin['port'])}"
+            except KeyError:
+                pass
+    return zones
+
+
+def render(config, zone, routes):
+    lines = [f"tunnel: {config['zones'][zone]}", f"credentials-file: {CF_DIR}/creds-{zone}.json", "ingress:"]
+    reserved = config.get("ssh_hostnames", {}).get(zone)
+    if reserved:
+        lines += [f"  - hostname: {reserved}", "    service: ssh://127.0.0.1:22"]
+    for host in sorted(routes):
+        if host == reserved:
+            continue
+        lines += [f"  - hostname: {host}", f"    service: {routes[host]}"]
+    lines.append("  - service: http_status:404")
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    with open(CONFIG) as f:
+        config = json.load(f)
+    rc = 0
+    for zone, routes in desired(config).items():
+        path = os.path.join(CF_DIR, f"config-{zone}.yml")
+        text = render(config, zone, routes)
+        try:
+            with open(path) as f:
+                changed = f.read() != text
+        except FileNotFoundError:
+            changed = True
+        if changed:
+            tmp = path + ".new"
+            with open(tmp, "w") as f:
+                f.write(text)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            print(f"nextjs-ct-ndev-sync: {zone}: {len(routes)} route(s) written", file=sys.stderr)
+        if config.get("serving"):
+            unit = f"cloudflared@{zone}.service"
+            if changed:
+                rc |= subprocess.run([SYSTEMCTL, "restart", unit]).returncode
+            elif subprocess.run([SYSTEMCTL, "is-active", "--quiet", unit]).returncode != 0:
+                rc |= subprocess.run([SYSTEMCTL, "start", unit]).returncode
+    return 1 if rc else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+[Unit]
+Description=Repair Claude Remote Control when a session reports it failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-rc-watchdog

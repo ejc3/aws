@@ -1,0 +1,222 @@
+#!/bin/bash
+# nextjs-ct-machine <user> -- create or converge one person's container. Idempotent; run by the host
+# setup for every account in config.json, so adding a name to local.nextjs_users is all it takes.
+#
+#   host account    same name and uid as the container's, used only by the host's sshd to authenticate
+#                   the person (their own ~/.ssh/authorized_keys) and relay them inside; no sudo, and a login
+#                   shell (/bin/sh) that runs nothing from the home before the ForceCommand
+#   /home/<user>    stays on the host and is bind-mounted into the container, ID-mapped (host uid N is
+#                   container uid N) and nosuid/nodev, so a file the container's root makes in it can
+#                   never become a setuid program on the host
+#   container       /var/lib/machines/<user>, a copy of the template, booted by systemd-nspawn@<user>
+#                   with its own user namespace (container uid 0 = host uid <host uid> * 65536), its own
+#                   network namespace on a point-to-point link 10.88.<uid-1000>.1/.2, and the read-only
+#                   /opt/nextjs-ct (box files) and /opt/nextjs-ct-user (this container's identity)
+#
+# A running container is never restarted here: a changed .nspawn file takes effect at its next start,
+# which is said in the output. Provisioning inside it runs every time (nextjs-ct-provision.service).
+set -euo pipefail
+U="$1"
+CONFIG=/etc/nextjs-ct/config.json
+case "$U" in ''|*[!a-z0-9_-]*) echo "nextjs-ct-machine: bad user name '$U'" >&2; exit 1 ;; esac
+# The host end of the link is "ve-<name>"; past 15 characters systemd shortens it with a hash, and the
+# firewall rules name the interface. Twelve characters keeps it exact.
+[ "${#U}" -le 12 ] || { echo "nextjs-ct-machine: '$U' is longer than 12 characters" >&2; exit 1; }
+
+# ---- the host account (uid pinned in config.json for accounts that existed on nextjs-dev)
+PIN=$(jq -r --arg u "$U" '.users[$u].uid // empty' "$CONFIG")
+if ! id -u "$U" >/dev/null 2>&1; then
+  if [ -n "$PIN" ]; then groupadd -g "$PIN" "$U" 2>/dev/null || true; useradd -u "$PIN" -g "$PIN" -M -d "/home/$U" -s /bin/sh "$U"
+  else useradd -U -M -d "/home/$U" -s /bin/sh "$U"; fi
+fi
+UIDN=$(id -u "$U")
+[ -z "$PIN" ] || [ "$PIN" = "$UIDN" ] || { echo "nextjs-ct-machine: $U has uid $UIDN, config pins $PIN" >&2; exit 1; }
+N=$((UIDN - 1000))
+[ "$N" -ge 1 ] && [ "$N" -le 254 ] || { echo "nextjs-ct-machine: uid $UIDN of $U is outside 1001-1254" >&2; exit 1; }
+# sshd runs the ForceCommand through the account's login shell. /bin/sh (dash) reads no startup file for
+# `sh -c`, whereas bash would source ~/.bashrc -- a file the person writes from inside the container -- and
+# run it on the host, in the host's network namespace, before the relay. Never a shell that reads the home.
+usermod -s /bin/sh "$U"
+passwd -l "$U" >/dev/null 2>&1 || true
+IP=10.88.$N.2; GW=10.88.$N.1; SHIFT=$((UIDN * 65536))
+install -d -o "$U" -g "$U" -m 750 "/home/$U"
+install -d -o "$U" -g "$U" -m 700 "/home/$U/.ssh"
+
+# ---- keys: the person's own (declared in Terraform, appended, never replacing what they added),
+# retired ones removed. The box's admin key (the instance key pair, which nextjs-dev also put in every
+# account) is removed unless declared for the account: an admin reaches a container from the ubuntu
+# account with `sudo machinectl shell <user>@<user>`, the one way in for someone who is not the person.
+AK="/home/$U/.ssh/authorized_keys"
+touch "$AK"
+ADMIN_KEY=$(head -n 1 /home/ubuntu/.ssh/authorized_keys 2>/dev/null || true)
+if [ -n "$ADMIN_KEY" ] && ! jq -e --arg u "$U" --arg k "$ADMIN_KEY" '.users[$u].keys | index($k)' "$CONFIG" >/dev/null \
+   && grep -qxF -- "$ADMIN_KEY" "$AK"; then
+  grep -vxF -- "$ADMIN_KEY" "$AK" > "$AK.tmp" || true
+  mv -f "$AK.tmp" "$AK"
+  echo "nextjs-ct-machine: removed the admin key from $U"
+fi
+while IFS= read -r k; do
+  [ -n "$k" ] || continue
+  grep -qxF -- "$k" "$AK" || printf '%s\n' "$k" >> "$AK"
+done < <(jq -r --arg u "$U" '.users[$u].keys[]?' "$CONFIG")
+while IFS= read -r k; do
+  [ -n "$k" ] || continue
+  grep -qxF -- "$k" "$AK" || continue
+  grep -vxF -- "$k" "$AK" > "$AK.tmp" || true
+  mv -f "$AK.tmp" "$AK"
+  echo "nextjs-ct-machine: removed a retired key from $U"
+done < <(jq -r '.retired_keys[]?' "$CONFIG")
+chown "$U:$U" "$AK"; chmod 600 "$AK"
+
+# ---- this container's identity, read-only inside it; host-side relay key, readable by the person only
+ID=/var/lib/nextjs-ct/users/$U
+install -d -m 700 "$ID"
+printf '%s\n' "$U" > "$ID/user"; printf '%s\n' "$UIDN" > "$ID/uid"
+printf '%s\n' "$IP" > "$ID/ip"; printf '%s\n' "$GW" > "$ID/gateway"
+[ -s "$ID/ssh_host_ed25519_key" ] || ssh-keygen -q -t ed25519 -N '' -C "nextjs-ct-$U" -f "$ID/ssh_host_ed25519_key"
+EN=/var/lib/nextjs-ct/enter/$U
+install -d -m 700 -o "$U" -g "$U" "$EN"
+[ -s "$EN/key" ] || { ssh-keygen -q -t ed25519 -N '' -C "nextjs-ct-relay-$U" -f "$EN/key"; }
+chown "$U:$U" "$EN/key" "$EN/key.pub"; chmod 400 "$EN/key"
+cp "$EN/key.pub" "$ID/enter_key.pub"
+printf '%s %s\n' "$IP" "$(cut -d' ' -f1,2 "$ID/ssh_host_ed25519_key.pub")" > "$EN/known_hosts"
+printf '%s\n' "$IP" > "$EN/ip"
+chown "$U:$U" "$EN/known_hosts" "$EN/ip"; chmod 444 "$EN/known_hosts" "$EN/ip"
+
+# ---- the container's /var/lib/ndev: a host directory owned by the container's root (shifted uid)
+ND=/var/lib/nextjs-ct/ndev/$U
+install -d -m 755 /var/lib/nextjs-ct/ndev
+install -d -m 755 -o "$SHIFT" -g "$SHIFT" "$ND"
+
+# ---- the root filesystem: a copy of the template, made once
+M=/var/lib/machines/$U
+if [ ! -d "$M" ]; then
+  [ -e /var/lib/nextjs-ct/base/.complete ] || { echo "nextjs-ct-machine: no template yet" >&2; exit 1; }
+  rm -rf "$M.new"
+  cp -a --reflink=auto /var/lib/nextjs-ct/base "$M.new"
+  rm -f "$M.new/.complete"
+  mv "$M.new" "$M"
+  echo "nextjs-ct-machine: created the container for $U"
+fi
+
+# ---- home: nosuid,nodev on the host side, so the ID-mapped mount inherits both
+HOME_UNIT=$(systemd-escape -p --suffix=mount "/home/$U")
+cat > "/etc/systemd/system/$HOME_UNIT.new" <<EOF
+[Unit]
+Description=/home/$U without setuid or devices (its container's root can write here)
+
+[Mount]
+What=/home/$U
+Where=/home/$U
+Type=none
+Options=bind,nosuid,nodev
+
+[Install]
+WantedBy=local-fs.target
+EOF
+mv -f "/etc/systemd/system/$HOME_UNIT.new" "/etc/systemd/system/$HOME_UNIT"
+
+# ---- the container
+install -d /etc/systemd/nspawn
+cat > "/etc/systemd/nspawn/$U.nspawn.new" <<EOF
+# Managed by nextjs-ct-machine (nextjs-ct-user-data.tf). Changes apply at the container's next start.
+[Exec]
+Boot=yes
+Hostname=$U
+PrivateUsers=$SHIFT:65536
+ResolvConf=off
+Timezone=off
+LinkJournal=no
+
+[Files]
+# The template is owned by host root; the first boot shifts it into this container's uid range once.
+PrivateUsersOwnership=chown
+Bind=/home/$U:/home/$U:idmap
+Bind=$ND:/var/lib/ndev
+BindReadOnly=/var/lib/nextjs-ct/shared:/opt/nextjs-ct
+BindReadOnly=$ID:/opt/nextjs-ct-user:idmap
+
+[Network]
+Private=yes
+VirtualEthernet=yes
+EOF
+if ! cmp -s "/etc/systemd/nspawn/$U.nspawn.new" "/etc/systemd/nspawn/$U.nspawn"; then
+  mv -f "/etc/systemd/nspawn/$U.nspawn.new" "/etc/systemd/nspawn/$U.nspawn"
+  machinectl show "$U" >/dev/null 2>&1 && echo "nextjs-ct-machine: $U's container settings changed; they apply at its next start"
+else
+  rm -f "/etc/systemd/nspawn/$U.nspawn.new"
+fi
+install -d "/etc/systemd/system/systemd-nspawn@$U.service.d"
+cat > "/etc/systemd/system/systemd-nspawn@$U.service.d/nextjs-ct.conf" <<EOF
+[Unit]
+Requires=$HOME_UNIT nextjs-ct-firewall.service
+After=$HOME_UNIT nextjs-ct-firewall.service systemd-networkd.service
+
+[Service]
+# One person's runaway is killed inside their own container before it can page the box to death.
+MemoryMax=75%
+EOF
+
+# ---- the host end of the link
+cat > "/etc/systemd/network/10-ve-$U.network" <<EOF
+[Match]
+Name=ve-$U
+
+[Network]
+Address=$GW/24
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+
+# ---- the MacBook's reverse tunnel (owner only): its listener is on the host's loopback, which no
+# container can reach; relay this container's gateway port 2222 to it (the firewall admits only this one).
+if [ "$(jq -r --arg u "$U" '.users[$u].mac // false' "$CONFIG")" = true ]; then
+  cat > /etc/systemd/system/nextjs-ct-mac-tunnel.socket <<EOF
+[Unit]
+Description=The MacBook's reverse tunnel, for $U's container only
+
+[Socket]
+ListenStream=$GW:2222
+FreeBind=yes
+
+[Install]
+WantedBy=sockets.target
+EOF
+  cat > /etc/systemd/system/nextjs-ct-mac-tunnel.service <<'EOF'
+[Unit]
+Description=Relay to the MacBook's reverse tunnel on the host's loopback
+Requires=nextjs-ct-mac-tunnel.socket
+After=nextjs-ct-mac-tunnel.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:2222
+PrivateTmp=yes
+DynamicUser=yes
+EOF
+  MAC_TUNNEL=1
+fi
+
+systemctl daemon-reload
+networkctl reload >/dev/null 2>&1 || true
+[ -z "${MAC_TUNNEL:-}" ] || systemctl enable --now nextjs-ct-mac-tunnel.socket >/dev/null
+systemctl enable --now "$HOME_UNIT" >/dev/null
+systemctl enable "systemd-nspawn@$U.service" >/dev/null 2>&1
+if ! machinectl show "$U" -p State --value 2>/dev/null | grep -qx running; then
+  systemctl start "systemd-nspawn@$U.service"
+  for _ in $(seq 1 60); do
+    machinectl show "$U" -p State --value 2>/dev/null | grep -qx running && break
+    sleep 2
+  done
+fi
+# Provision: the container runs it at every boot (it is part of multi-user.target), so a container that
+# is still booting is joined rather than provisioned twice; one that is up is provisioned again.
+for _ in $(seq 1 90); do
+  st=$(systemctl -M "$U" show -p ActiveState --value nextjs-ct-provision.service 2>/dev/null) && [ -n "$st" ] && break
+  sleep 2
+done
+echo "nextjs-ct-machine: provisioning $U"
+case "${st:-}" in
+  activating) systemctl -M "$U" start nextjs-ct-provision.service ;;
+  *) systemctl -M "$U" restart nextjs-ct-provision.service ;;
+esac
+echo "nextjs-ct-machine: $U ready at $IP"
