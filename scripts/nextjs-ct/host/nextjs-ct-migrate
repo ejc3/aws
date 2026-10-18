@@ -24,14 +24,29 @@ USERS=$(jq -r '.users | keys[]' "$CONFIG")
 if [ -n "$FINAL" ]; then
   for U in $USERS; do systemctl stop "systemd-nspawn@$U.service"; done
 fi
+# The seed copies one home at a time: the old disk's random reads are the limit (node_modules), and four
+# parallel streams took the live box to 20% I/O pressure on 2026-10-18 where one stream kept it near 1%.
+# The final pass copies every home at once: the old box's services are stopped by then, and the time it
+# takes is the downtime (a no-change pass scanned 93,000 files in 10 seconds).
+PIDS=() FAILED=""
 for U in $USERS; do
   id -u "$U" >/dev/null 2>&1 || { echo "nextjs-ct-migrate: no account $U here yet; run setup first" >&2; exit 1; }
   # An account added after nextjs-dev has nothing to bring.
   $SSH "ubuntu@$OLD" test -d "/home/$U" || { echo "nextjs-ct-migrate: no /home/$U on the old box; skipping"; continue; }
   echo "nextjs-ct-migrate: /home/$U"
-  rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
-    "ubuntu@$OLD:/home/$U/" "/home/$U/"
+  if [ -n "$FINAL" ]; then
+    rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+      "ubuntu@$OLD:/home/$U/" "/home/$U/" > "/var/log/nextjs-ct-migrate-$U.log" 2>&1 &
+    PIDS+=("$!:$U")
+  else
+    rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+      "ubuntu@$OLD:/home/$U/" "/home/$U/" || FAILED="$FAILED $U"
+  fi
 done
+for p in "${PIDS[@]}"; do
+  wait "${p%%:*}" || FAILED="$FAILED ${p#*:}"
+done
+[ -z "$FAILED" ] || { echo "nextjs-ct-migrate: copying failed for:$FAILED (final pass: /var/log/nextjs-ct-migrate-<user>.log)" >&2; exit 1; }
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # Fatal on the final pass: a cutover without the projects published since the seed would leave their URLs dead.

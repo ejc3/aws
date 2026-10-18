@@ -112,6 +112,15 @@ class MigrateTests(unittest.TestCase):
         rsync_home = next(l for l in m.splitlines() if "rsync -aHAX" in l)
         self.assertNotIn("--delete", rsync_home)
 
+    def test_seed_is_one_stream_final_is_parallel_and_any_failure_fails(self):
+        m = (HOST / "nextjs-ct-migrate").read_text()
+        final = m.split('if [ -n "$FINAL" ]; then\n    rsync', 1)[1].split("else", 1)[0]
+        self.assertIn('"/var/log/nextjs-ct-migrate-$U.log" 2>&1 &', final)
+        seed = m.split('if [ -n "$FINAL" ]; then\n    rsync', 1)[1].split("else", 1)[1].split("fi", 1)[0]
+        self.assertNotIn("&\n", seed)
+        self.assertIn('wait "${p%%:*}" || FAILED="$FAILED ${p#*:}"', m)
+        self.assertIn('[ -z "$FAILED" ] || {', m)
+
     def test_final_pass_fails_when_published_projects_cannot_be_copied(self):
         # Review of #490 (Codex P2).
         m = (HOST / "nextjs-ct-migrate").read_text()
