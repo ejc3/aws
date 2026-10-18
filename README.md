@@ -1330,7 +1330,12 @@ login.
   on the host's loopback and is relayed to that one container.
 
 What carries over at the cutover, and how: `scripts/nextjs-ct/host/nextjs-ct-migrate` (homes, published
-projects, crontabs, then the SSH host keys at the final pass). The cutover plan is in the pull request
+projects, crontabs, then the SSH host keys at the final pass). One secret is rotated at the cutover rather than
+before it: on nextjs-dev every account could read the owner's wbox password (`wbox/administrator-password`), and
+on nextjs-ct members cannot, so once everyone is in a container run `terraform apply
+-replace=random_password.wbox_admin` and then, from ejc3's container, `wbox up` and
+`wbox run 'net user Administrator (Get-SECSecretValue -SecretId wbox/administrator-password -Region us-west-1).SecretString'`
+(the box sets the password only at its first boot). The cutover plan is in the pull request
 that added the container layer.
 
 ### Dolphin SSH through Cloudflare

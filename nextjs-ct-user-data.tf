@@ -80,10 +80,12 @@ locals {
       Sid    = "OwnerOnlySecrets"
       Effect = "Deny"
       Action = "secretsmanager:GetSecretValue"
-      # The hop key, the Google Docs token, and the owner's own wbox password (every member's wbox has its own).
+      # The hop key, the Google Docs token, the owner's own wbox password (every member's wbox has its own) and
+      # the owner's Cloudflare Access token for the MacBook (by name: a secret ARN ends in a random suffix).
       Resource = concat(
         [aws_secretsmanager_secret.dev_hop.arn, aws_secretsmanager_secret.wbox_admin.arn],
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:macbook-ssh-access-nextjs-ejc3-*"],
       )
     },
     {
@@ -106,7 +108,7 @@ locals {
       Version = "2012-10-17"
       Statement = concat(
         local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only,
-        contains(local.nextjs_ct_owners, u) ? [] : local.nextjs_ct_deny_member,
+        [for s in local.nextjs_ct_deny_member : s if !contains(local.nextjs_ct_owners, u)],
       )
     }
   }

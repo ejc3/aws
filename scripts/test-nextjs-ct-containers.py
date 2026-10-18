@@ -75,13 +75,14 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("ssmmessages:*", host)
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
+        self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
 
     def test_one_session_policy_per_account(self):
         # Keyed by account, so a member's policy can name that member's own resources and nobody else's; the owner
         # gets no member denials.
         block = TF.split("nextjs_ct_session_policies = {", 1)[1].split("\n  }\n", 1)[0]
         self.assertIn("for u in local.nextjs_users : u => {", block)
-        self.assertIn("contains(local.nextjs_ct_owners, u) ? [] : local.nextjs_ct_deny_member", block)
+        self.assertIn("[for s in local.nextjs_ct_deny_member : s if !contains(local.nextjs_ct_owners, u)]", block)
         imds = (HOST / "nextjs-ct-imds").read_text()
         self.assertIn('policy = self.config["session_policies"][user]', imds)
 
@@ -437,6 +438,10 @@ class GeneratorTests(unittest.TestCase):
         # The io-box scratch: refused to a member, not to the owner.
         self.assertIn('iifname "ve-alice" ip daddr 172.31.48.10 drop', nft)
         self.assertNotIn('iifname "ve-boss" ip daddr 172.31.48.10 drop', nft)
+        # Before the established/related accept, so a connection open at reload is cut too (review of #499).
+        forward = nft.split("chain forward {", 1)[1]
+        self.assertLess(forward.index('iifname "ve-alice" ip daddr 172.31.48.10 drop'), forward.index("ct state established,related accept"))
+        self.assertLess(forward.index('iifname "ve-alice" ip saddr != 10.88.1.2 drop'), forward.index("ct state established,related accept"))
 
     def test_sshd(self):
         conf = self.generate("nextjs-ct-sshd", "out")

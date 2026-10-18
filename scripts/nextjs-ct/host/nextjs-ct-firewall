@@ -67,9 +67,11 @@ $input    drop
   }
   chain forward {
     type filter hook forward priority filter; policy drop;
-    ct state established,related accept
+    # The per-container drops come before the established/related accept, so a reload also cuts a connection
+    # that was open when a rule was added (an NFS mount to the io-box, say), not only new ones.
     iifname "ve-*" meta nfproto ipv6 drop
-$fwd    iifname "ve-*" oifname "ve-*" drop
+$fwd    ct state established,related accept
+    iifname "ve-*" oifname "ve-*" drop
     iifname "ve-*" ip daddr 169.254.169.254 drop
     iifname "ve-*" accept
   }
