@@ -1363,6 +1363,18 @@ class SpotRerunTests(unittest.TestCase):
         self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
         self.assertEqual((self.posts(app), self.spot_metrics(app)), ([], []))
 
+    def test_a_spot_end_without_both_times_is_never_rerun(self):
+        app, ec2 = self.app("completed", "failure")
+        host = ended_host(ec2)
+        host["StateTransitionReason"] = "Service initiated"
+        self.assertEqual(app.handler(completion(), None)["rerun"], "not-spot")
+        app2, ec2b = self.app("completed", "failure")
+        ended_host(ec2b)
+        event = completion(job=502)
+        event["workflow_job"]["completed_at"] = None
+        self.assertEqual(app2.handler(event, None)["rerun"], "not-spot")
+        self.assertEqual((self.posts(app) + self.posts(app2), self.spot_metrics(app) + self.spot_metrics(app2)), ([], []))
+
     def test_success_and_jobs_our_hosts_did_not_run_record_nothing(self):
         app, ec2 = self.app("completed", "failure")
         ended_host(ec2)

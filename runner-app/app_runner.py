@@ -1319,7 +1319,9 @@ def spot_verdict(instance, completed_at):
     if code != SPOT_REASON:
         return 'not-spot'
     at, ended = reclaimed_at(instance), parse_time(completed_at)
-    if at and ended and at > ended:
+    if not (at and ended):
+        return 'not-spot'   # without both times nothing shows the host went first: a real failure is never rerun
+    if at > ended:
         return 'not-spot'   # the job had already ended when AWS took the host: its result is its own
     return 'spot'
 
