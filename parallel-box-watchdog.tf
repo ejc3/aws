@@ -41,7 +41,8 @@ import os, json, datetime, boto3
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
 # Comma-separated: both parallel boxes (parallel-box2.tf) and the GPU test boxes' four
-# slots (gpu-box.tf) share this one watchdog.
+# slots (gpu-box.tf) share this one watchdog; the Windows playtest boxes (playbox.tf) run the
+# same code as their own function in us-west-1.
 TAG_NAMES    = os.environ.get("TAG_NAMES", "parallel-box").split(",")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
 # The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
@@ -132,6 +133,10 @@ def lambda_handler(event, context):
             # gpu-box is slot 1; gpu-box-N is slot N.
             up_cmd = "gbox up" + ("" if name == "gpu-box" else " " + name.rsplit("-", 1)[1])
             kept = "Nothing on it persists"
+        elif name.startswith("playbox-"):
+            # The Windows playtest boxes (playbox.tf, their own function in us-west-1): playbox-N is slot N.
+            up_cmd = "playbox up " + name.rsplit("-", 1)[1]
+            kept = "Its D: disk (Roblox and its caches) is untouched"
         else:
             # parallel-box is slot 1; parallel-box-N is slot N (the same shape as gbox).
             up_cmd = "pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1])

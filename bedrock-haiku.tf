@@ -4,8 +4,8 @@
 #
 #   - every box's instance role that had no Bedrock. The owner, 2026-10-10: "I am fine if this box has
 #     haiku access. All boxes can be." That is nextjs-dev-role (the kids' box, no Bedrock until then:
-#     nextjs-dev.tf), dev-ebs-only-role (the I/O box and the parallel boxes), wbox-role,
-#     claude-master-server-role and, when the Mac is on, mac-dev-instance. The grant is Haiku 5.5, not every
+#     nextjs-dev.tf), dev-ebs-only-role (the I/O box and the parallel boxes), wbox-role, playbox-role (the
+#     Windows playtest spot boxes, playbox.tf), claude-master-server-role and, when the Mac is on, mac-dev-instance. The grant is Haiku 5.5, not every
 #     Anthropic model. The metal boxes already have every anthropic.* model through dev-server-role
 #     (BedrockRuntimeInvoke in dev-instance-common.tf); this file leaves them alone. Not here: the GPU boxes
 #     run with no instance profile at all (gpu-box.tf), the jumpboxes are administrators, and runners and
@@ -76,6 +76,7 @@ locals {
       nextjs-dev   = aws_iam_role.nextjs_dev.id
       dev-ebs-only = aws_iam_role.dev_ebs_only.id
       wbox         = aws_iam_role.wbox.id
+      playbox      = aws_iam_role.playbox.id
     },
     var.enable_claw_master_server ? { claude-master-server = aws_iam_role.claw_master_server[0].id } : {},
   )

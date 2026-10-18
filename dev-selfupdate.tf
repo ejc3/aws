@@ -256,6 +256,14 @@ WBOXB64
 chmod 755 /usr/local/bin/wbox
   EOT
 
+  # `playbox` -- up/down for the Windows playtest spot boxes (playbox.tf). Same embedding as pbox.
+  playbox_setup = <<-EOT
+base64 -d > /usr/local/bin/playbox <<'PLAYBOXB64'
+${base64encode(file("${path.module}/scripts/playbox.sh"))}
+PLAYBOXB64
+chmod 755 /usr/local/bin/playbox
+  EOT
+
   # ---------------------------------------------------------------------------
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------
