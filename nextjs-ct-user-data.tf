@@ -42,7 +42,7 @@ locals {
       Action = [
         "ssmmessages:*", "ec2messages:*", "ssm:UpdateInstance*", "ssm:*Association*", "ssm:Put*",
         "ssm:GetManifest", "ssm:GetDeployablePatchSnapshotForInstance", "ssm:*Document",
-        "cloudwatch:PutMetricData", "ec2:CreateVolume", "ec2:AttachVolume", "ec2:DetachVolume", "ec2:DeleteVolume",
+        "cloudwatch:PutMetricData",
       ]
       Resource = "*"
     },
@@ -88,6 +88,8 @@ locals {
       Action = [
         "ec2:RunInstances", "ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances",
         "ec2:TerminateInstances", "ec2:CreateTags", "ec2:GetPasswordData", "ssm:SendCommand",
+        # pbox attaches its persistent work volume to the box it launched; only the owner launches boxes.
+        "ec2:CreateVolume", "ec2:AttachVolume", "ec2:DetachVolume", "ec2:DeleteVolume",
       ]
       Resource = "*"
     },

@@ -75,6 +75,15 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("owner  = { Version = \"2012-10-17\", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }", TF)
 
+    def test_the_owner_can_attach_the_volumes_pbox_launches_with(self):
+        # #490 put the EBS actions in the host-only set, so `pbox up` from ejc3's container launched a box and then
+        # failed to attach its work volume. They are owner-only now: denied to members, allowed to the owner.
+        host = TF.split("nextjs_ct_deny_host_only = [", 1)[1].split("\n  ]\n", 1)[0]
+        member = TF.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
+        for action in ("ec2:AttachVolume", "ec2:CreateVolume", "ec2:DetachVolume", "ec2:DeleteVolume"):
+            self.assertNotIn(f'"{action}"', host, action)
+            self.assertIn(f'"{action}"', member, action)
+
     def test_no_container_can_assume_the_box_role_without_its_session_policy(self):
         # Review of #490 (Codex P1): the owner keeps sts:AssumeRole for the Dolphin role, and the role trusts
         # itself, so without this denial the owner's container could mint an unnarrowed session.
