@@ -2,6 +2,7 @@
 """claw-master-dashboard-site.tf: Access on the dashboard Worker admits the owner's named people first, then exactly
 one service token for metal-box agents (#374), whose secret only administration and dev-server-role can read; the
 Worker's own allowlist is written by Terraform from the same list."""
+import hashlib
 import re
 import unittest
 from pathlib import Path
@@ -93,6 +94,57 @@ class AllowlistTests(unittest.TestCase):
             ('resource "cloudflare_workers_kv"', "claw_master_dashboard_allowed_emails"),
         ):
             self.assertNotRegex(block(kind, name), r"(?m)^\s*provider\s*=")
+
+
+class AccountAliasTests(unittest.TestCase):
+    """The Worker's account aliases are derived from claude-master/account-labels with claw-master's own rules
+    (ejc3/CLIProxyAPI internal/clawmaster/metrics.go AccountKeyFor and sanitizeDimension, cmd/claw-master/main.go
+    loadAccountLabels), so that secret is the one place to name an account."""
+
+    # Made-up account ids and the codes `claw-master account-key` (release claw-master-39add35) printed for them.
+    CLAW_MASTER_SAYS = {
+        "12345678-90ab-cdef-1234-567890abcdef": "acct-ed043f31",
+        "0F0F0F0F-AAAA-BBBB-CCCC-DDDDEEEEFFFF": "acct-7eb455f9",
+        "aaaaaaaa-0000-0000-0000-000000000000": "acct-80e75d69",
+    }
+
+    @staticmethod
+    def account_key(account_id):
+        # What the Terraform expression computes: "acct-${substr(sha256(lower(id)), 0, 8)}" (sha256() is hex).
+        return "acct-" + hashlib.sha256(account_id.strip().lower().encode()).hexdigest()[:8]
+
+    def test_the_algorithm_reproduces_claw_masters_codes(self):
+        for account_id, code in self.CLAW_MASTER_SAYS.items():
+            self.assertEqual(self.account_key(account_id), code, account_id)
+
+    def test_terraform_hashes_the_lowercased_id_and_keeps_eight_hex_digits(self):
+        self.assertIn("lower(p[0]) => p[1]...", TF)
+        self.assertIn('"acct-${substr(sha256(id), 0, 8)}=', TF)
+
+    def test_names_are_sanitized_as_the_server_reports_them(self):
+        # sanitizeDimension: runs of other characters become "-", at most 48 characters.
+        self.assertIn('substr(replace(names[length(names) - 1], "/[^A-Za-z0-9._-]+/", "-"), 0, 48)', TF)
+
+    def test_lines_are_read_by_load_account_labels_rules(self):
+        self.assertIn('startswith(l, "#") ? []', TF)
+        self.assertIn('regexall("^([0-9A-Fa-f-]{8,64})\\\\s*=\\\\s*(.*\\\\S)$", l)', TF)
+        self.assertIn('regexall("^([0-9A-Fa-f-]{8,64})\\\\s+(.*\\\\S)$", l)', TF)
+        self.assertIn('replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\\r", "")', TF)
+
+    def test_written_sensitive_to_its_own_key_and_never_output(self):
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_account_aliases")
+        self.assertIn('key_name     = "account-aliases"', kv)
+        self.assertIn("namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id", kv)
+        self.assertIn("value = local.claw_master_dashboard_account_aliases", kv)
+        self.assertIn("claw_master_dashboard_account_aliases = sensitive(join(", TF)
+        out = block("output", "claw_master_dashboard")
+        self.assertNotIn("account_label", out)
+        self.assertNotIn("aliases", out)
+
+    def test_the_secret_is_read_only_where_the_server_exists(self):
+        data = block('data "aws_secretsmanager_secret_version"', "claw_master_account_labels")
+        self.assertIn("count     = var.enable_claw_master_server ? 1 : 0", data)
+        self.assertIn("secret_id = aws_secretsmanager_secret.claw_master_account_labels[0].id", data)
 
 
 class ReaderKeyTests(unittest.TestCase):

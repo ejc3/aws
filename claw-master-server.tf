@@ -255,6 +255,7 @@ resource "aws_iam_role_policy" "dev_server_claw_master_logs_read" {
 # and nothing else: a timer on the box (claude-master-account-labels.timer, every 10 minutes) rewrites the file
 # when the secret changed, and the running server reloads it within a minute, with no restart. A value with any
 # other kind of line is refused and the old file kept, because claw-master refuses to start on a bad line.
+# Terraform also reads it to write the dashboard Worker's account aliases (claw-master-dashboard-site.tf).
 # Never write a UUID or a name into this repository.
 resource "aws_secretsmanager_secret" "claw_master_account_labels" {
   count                   = var.enable_claw_master_server ? 1 : 0

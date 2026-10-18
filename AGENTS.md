@@ -909,7 +909,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   KV it is. Writing it needs **Workers KV Storage Write** (permission group `f7f0eda5697f475c90846e879bab8666`) on
   the provider token `cloudflare-tunnel-token`, added with one PUT of the token's own definition as the zone
   permissions were. The namespace id reaches the Worker as the `DASHBOARD_CONFIG_KV_ID` variable of that
-  repository's `production` environment (output `claw_master_dashboard`).
+  repository's `production` environment (output `claw_master_dashboard`). Its account aliases (`acct-<8 hex>=NAME`,
+  which fold an account's unnamed older points into the person's name) are the KV key `account-aliases` in the same
+  namespace, derived by Terraform from `claude-master/account-labels` with claw-master's own rules (`AccountKeyFor`:
+  `acct-` + the first 8 hex digits of sha256 of the lowercased id; the name as `sanitizeDimension` reports it), so
+  that secret is the one place to name an account; never set `DASHBOARD_ACCOUNT_ALIASES` on the Worker by hand.
 - **Cost shape.** CloudWatch bills every distinct combination of a metric's dimensions as its own custom metric
   (about $0.30 a month each) and every OTLP attribute becomes a dimension, so the proxy never crosses its axes:
   each metric carries at most three attributes and each axis (profile, user, box, model) has its own
