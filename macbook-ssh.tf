@@ -1,27 +1,26 @@
 # SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of the Mac's
 # desktop-session sshd, so a connection needs both Cloudflare Access (a second factor) and an SSH
-# key. The runbook is README "MacBook: Moving SSH behind Cloudflare Access".
+# key. It is the ONE way in: every client (mac-ssh-client.tf) uses it, and no reverse tunnel remains.
+# The runbook is README "The MacBook: remote access and its scratch drive".
 #
 #   macbook-ssh.cc-games.dev  -> the Mac's desktop-session sshd (ssh://127.0.0.1:22222), keys only
 #
 # That sshd (LaunchAgent com.ejcampbell.fcvm-macbook.sshd, ~/.ssh/fcvm-macbook/sshd_config,
 # 127.0.0.1 only) runs in the logged-in desktop session and has Full Disk Access, so one session
-# reaches the external drive, sends Apple Events and uses the login keychain. It is the one SSH
-# endpoint on the Mac; macOS Remote Login (port 22) is no longer a route.
+# reaches the external drive, sends Apple Events and uses the login keychain.
 #
-# Who gets in through Access:
-#   EJ                 -- the browser-manager owner policy (Google or one-time PIN)
-#   fcvm-arm's agents  -- one service token, `macbook-ssh-access` in Secrets Manager
+# Who gets in through Access: service tokens only, one per client, each in its own secret.
+#   fcvm-arm, ubuntu     macbook-ssh-access              (readable by fcvm-arm's instance)
+#   nextjs-dev, ejc3     macbook-ssh-access-nextjs-ejc3  (readable by nextjs-dev-role)
+#   EJ in a browser      the browser-manager owner policy (Google or one-time PIN)
 #
-# Client (fcvm-arm): `ssh mac` (mac-reverse-tunnels.tf) with ProxyCommand ~/.ssh/mac-access-proxy,
-# which reads the service token from Secrets Manager into TUNNEL_SERVICE_TOKEN_ID/_SECRET and execs
-# `cloudflared access ssh --hostname %h`. Never pass the token as --id/--secret: arguments are
-# visible to every user of the box in `ps`.
+# Each client's ProxyCommand ~/.ssh/mac-access-proxy reads its token from Secrets Manager into
+# TUNNEL_SERVICE_TOKEN_ID/_SECRET and execs `cloudflared access ssh --hostname %h`. Never pass a
+# token as --id/--secret: arguments are visible to every user of the box in `ps`.
 #
-# Both credentials are readable only by fcvm-arm's instance (the dev_server role, which fcvm-x86
-# shares, with ec2:SourceInstanceARN pinned to fcvm-arm): the connector token so it can be
-# installed on the MacBook over the existing route, the service token because fcvm-arm is the
-# client. The connector token runs this one tunnel and nothing else.
+# The connector token is readable only by fcvm-arm's instance (the dev_server role, which fcvm-x86
+# shares, with ec2:SourceInstanceARN pinned to fcvm-arm), so it can be installed on the MacBook over
+# the existing route. It runs this one tunnel and nothing else.
 
 locals {
   macbook_ssh_hostname = "macbook-ssh.cc-games.dev"
@@ -29,6 +28,11 @@ locals {
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
     aws_iam_role.jumpbox_admin[0].arn,
     aws_iam_role.dev_server.arn,
+  ]
+  macbook_ssh_nextjs_readers = [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
+    aws_iam_role.jumpbox_admin[0].arn,
+    aws_iam_role.nextjs_dev.arn,
   ]
 }
 
@@ -41,14 +45,27 @@ resource "cloudflare_zero_trust_access_service_token" "macbook_ssh_fcvm" {
   }
 }
 
+# ejc3 on nextjs-dev (and ejc3's container on the containerized box): a credential of its own, so
+# fcvm-arm's can be revoked or rotated without touching it and the other way round.
+resource "cloudflare_zero_trust_access_service_token" "macbook_ssh_nextjs_ejc3" {
+  account_id = var.cloudflare_account_id
+  name       = "macbook-ssh-nextjs-ejc3"
+  duration   = "8760h"
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# The agents' way in: the clients' service tokens, and no person.
 resource "cloudflare_zero_trust_access_policy" "macbook_ssh_fcvm" {
   account_id       = var.cloudflare_account_id
-  name             = "MacBook SSH: fcvm-arm agents"
+  name             = "MacBook SSH: agents' service tokens"
   decision         = "non_identity"
   session_duration = "12h"
-  include = [{
-    service_token = { token_id = cloudflare_zero_trust_access_service_token.macbook_ssh_fcvm.id }
-  }]
+  include = [
+    { service_token = { token_id = cloudflare_zero_trust_access_service_token.macbook_ssh_fcvm.id } },
+    { service_token = { token_id = cloudflare_zero_trust_access_service_token.macbook_ssh_nextjs_ejc3.id } },
+  ]
 }
 
 resource "cloudflare_zero_trust_access_application" "macbook_ssh" {
@@ -152,6 +169,52 @@ resource "aws_secretsmanager_secret_version" "macbook_ssh_access" {
   })
 }
 
+resource "aws_secretsmanager_secret" "macbook_ssh_access_nextjs_ejc3" {
+  name                    = "macbook-ssh-access-nextjs-ejc3"
+  description             = "Cloudflare Access service token for nextjs ejc3's SSH to the MacBook (JSON: client_id, client_secret, hostname)"
+  recovery_window_in_days = 30
+  tags                    = { Managed = "terraform", Name = "macbook-ssh-access-nextjs-ejc3" }
+}
+
+resource "aws_secretsmanager_secret_version" "macbook_ssh_access_nextjs_ejc3" {
+  secret_id = aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.macbook_ssh_nextjs_ejc3.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.macbook_ssh_nextjs_ejc3.client_secret
+    hostname      = local.macbook_ssh_hostname
+  })
+}
+
+resource "aws_iam_role_policy" "nextjs_dev_macbook_ssh" {
+  name = "read-macbook-ssh-nextjs-ejc3"
+  role = aws_iam_role.nextjs_dev.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.arn
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "macbook_ssh_access_nextjs_ejc3" {
+  secret_arn = aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndNextjsDevCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.arn
+      Condition = {
+        ArnNotEquals = { "aws:PrincipalArn" = local.macbook_ssh_nextjs_readers }
+      }
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "dev_server_macbook_ssh" {
   # Only while fcvm-arm exists: the grant names its instance.
   count = var.enable_firecracker_instance ? 1 : 0
@@ -197,5 +260,6 @@ output "macbook_ssh" {
     hostname           = local.macbook_ssh_hostname
     tunnel_secret_name = aws_secretsmanager_secret.macbook_ssh_tunnel.name
     access_secret_name = aws_secretsmanager_secret.macbook_ssh_access.name
+    nextjs_ejc3_secret = aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.name
   }
 }

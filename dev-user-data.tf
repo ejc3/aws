@@ -541,9 +541,12 @@ fi
 # Shell setup
 ${local.shell_setup}
 
-# Only ARM gets `ssh mac` (EJ's MacBook Pro through Cloudflare Access); its proxy command needs cloudflared.
-${local.macbook_cloudflared_install}
-${local.mac_reverse_tunnel_setup}
+# Only ARM gets `ssh mac` (EJ's MacBook Pro through Cloudflare Access, mac-ssh-client.tf), with its own
+# service token; the proxy command needs the pinned cloudflared.
+MAC_USER=ubuntu
+MAC_SECRET=macbook-ssh-access
+${local.mac_cloudflared_install}
+${local.mac_ssh_client_setup}
 
 # Claude Code -- the NATIVE installer, deliberately not npm.
 #

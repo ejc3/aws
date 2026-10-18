@@ -2305,6 +2305,18 @@ if [ -f /home/ubuntu/.ssh/dev_hop ] && id ejc3 >/dev/null 2>&1; then
   install -m 600 -o ejc3 -g ejc3 /home/ubuntu/.ssh/dev_hop /home/ejc3/.ssh/dev_hop
 fi
 
+# ejc3's `ssh mac` (EJ's MacBook Pro through Cloudflare Access, mac-ssh-client.tf) with ejc3's own service
+# token, macbook-ssh-access-nextjs-ejc3. For ejc3 ONLY: no other account gets the alias, the proxy command
+# or the pinned cloudflared. Convenience, not isolation: the token's secret is readable by nextjs-dev-role,
+# so by every account here with sudo. It opens only the Access gate; the Mac still wants ejc3's own key
+# (~/.ssh/to-mac, never installed by anything).
+if id ejc3 >/dev/null 2>&1; then
+MAC_USER=ejc3
+MAC_SECRET=macbook-ssh-access-nextjs-ejc3
+${local.mac_cloudflared_install}
+${local.mac_ssh_client_setup}
+fi
+
 # Private NFSv4 automount for the shared us-west-2 NVMe scratch box.
 ${local.io_box_client_setup}
 
