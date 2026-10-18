@@ -13,12 +13,14 @@ Host mac
     User ejcampbell
     IdentityFile ~/.ssh/to-mac
 
+# Through Cloudflare Access (macbook-ssh.tf) with fcvm-arm's service token; the far end is
+# the MacBook's Remote Login. README, "MacBook: Moving SSH behind Cloudflare Access".
 Host macbook
-    HostName 127.0.0.1
-    Port 2223
+    HostName macbook-ssh.cc-games.dev
     User ejcampbell
     IdentityFile ~/.ssh/to-mac
     IdentitiesOnly yes
+    ProxyCommand ~/.ssh/macbook-access-proxy %h
     HostKeyAlias ejs-macbook-pro-via-fcvm
     UserKnownHostsFile ~/.ssh/known_hosts.mac-tunnels
     StrictHostKeyChecking yes
@@ -39,6 +41,19 @@ Host macbook-desktop
     UserKnownHostsFile ~/.ssh/known_hosts.mac-tunnels
     StrictHostKeyChecking yes
 MACCONFIG
+
+# ProxyCommand for Host macbook. The Access service token reaches cloudflared through its
+# environment, never its arguments, and is read for each connection (a rotation needs nothing here).
+cat > /home/ubuntu/.ssh/macbook-access-proxy <<'MACPROXY'
+#!/bin/sh
+set -eu
+s=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-ssh-access \
+      --query SecretString --output text)
+TUNNEL_SERVICE_TOKEN_ID=$(printf '%s' "$s" | jq -r .client_id)
+TUNNEL_SERVICE_TOKEN_SECRET=$(printf '%s' "$s" | jq -r .client_secret)
+export TUNNEL_SERVICE_TOKEN_ID TUNNEL_SERVICE_TOKEN_SECRET
+PATH="$HOME/.local/bin:$PATH" exec cloudflared access ssh --hostname "$1"
+MACPROXY
 
 # Public host identity read directly from EJ's MacBook Pro when its tunnel was set up.
 cat > /home/ubuntu/.ssh/known_hosts.mac-tunnels <<'MACHOSTKEYS'
@@ -80,6 +95,8 @@ MACMIGRATE
 
 chown ubuntu:ubuntu /home/ubuntu/.ssh/config /home/ubuntu/.ssh/config.d-mac-tunnels /home/ubuntu/.ssh/known_hosts.mac-tunnels
 chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/config.d-mac-tunnels /home/ubuntu/.ssh/known_hosts.mac-tunnels
+chown ubuntu:ubuntu /home/ubuntu/.ssh/macbook-access-proxy
+chmod 700 /home/ubuntu/.ssh/macbook-access-proxy
 MACSETUP
 }
 

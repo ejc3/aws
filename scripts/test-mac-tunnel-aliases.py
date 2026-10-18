@@ -41,13 +41,22 @@ class MacTunnelAliases(unittest.TestCase):
         return dict(line.split(" ", 1) for line in result.stdout.splitlines())
 
     def check_destinations(self):
-        for alias, port in (("mac", "2222"), ("macbook", "2223")):
-            config = self.effective(alias)
-            self.assertEqual(config["hostname"], "127.0.0.1")
-            self.assertEqual(config["port"], port)
+        mac = self.effective("mac")
+        self.assertEqual((mac["hostname"], mac["port"]), ("127.0.0.1", "2222"))
+        # The MacBook is reached through Cloudflare Access, not a loopback forward.
+        book = self.effective("macbook")
+        self.assertEqual((book["hostname"], book["port"]), ("macbook-ssh.cc-games.dev", "22"))
+        self.assertIn("macbook-access-proxy", book["proxycommand"])
+        proxy = self.ssh / "macbook-access-proxy"
+        self.assertEqual(proxy.stat().st_mode & 0o777, 0o700)
+        self.assertIn("TUNNEL_SERVICE_TOKEN_SECRET", proxy.read_text())
+        run = [l for l in proxy.read_text().splitlines() if "cloudflared access ssh" in l]
+        self.assertEqual(len(run), 1)
+        for flag in ("--secret", "--id", "--service-token"):
+            self.assertNotIn(flag, run[0], "the token reaches cloudflared through its environment, never argv")
+        for config in (mac, book):
             self.assertEqual(config["user"], "ejcampbell")
             self.assertEqual(config["identityfile"], str(self.ssh / "to-mac"))
-        book = self.effective("macbook")
         self.assertEqual(book["hostkeyalias"], "ejs-macbook-pro-via-fcvm")
         self.assertEqual(book["stricthostkeychecking"], "true")
         self.assertEqual(book["userknownhostsfile"], str(self.ssh / "known_hosts.mac-tunnels"))

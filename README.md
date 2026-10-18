@@ -497,6 +497,11 @@ Cloudflare Access is in
 
 ##### MacBook: The route
 
+**Since 2026-10-18, `ssh macbook` goes through Cloudflare Access** (Access's service token,
+then the SSH key); see [MacBook: Moving SSH behind Cloudflare Access](#macbook-moving-ssh-behind-cloudflare-access).
+The reverse tunnel below is retired (its plist is in `~/Library/LaunchAgents.disabled/`) and
+is the way back.
+
 ```
 fcvm-arm                                   MacBook
 ssh macbook ─> 127.0.0.1:2223 ═══ reverse tunnel ═══> 127.0.0.1:22  macOS Remote Login
@@ -692,9 +697,16 @@ ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=passw
 
 ##### MacBook: Moving SSH behind Cloudflare Access
 
-**Status: phase 1 (`macbook-ssh.tf`) is Terraform; phase 2 below has not been run yet.**
-Until it has, `ssh macbook` is the reverse tunnel above, and nothing here is live. Update
-this section from "not run" to the date each check passed.
+**Status (2026-10-18): live.** Phase 1 (`macbook-ssh.tf`) is applied. Phase 2:
+
+| Step | Passed |
+|---|---|
+| 1. Connector on the Mac | 2026-10-18: four `Registered tunnel connection` lines |
+| 2. Proxy command on fcvm-arm | 2026-10-18 (installed by `mac-reverse-tunnels.tf` from this change) |
+| 3. Access: token in, nobody else | 2026-10-18: no credentials → `302` to the Access login; `cloudflared access ssh` without the token → a browser login and no session; with it → a session on the Mac's Remote Login |
+| 4. `Host macbook` through Cloudflare | 2026-10-18: `ssh macbook` and `ssh macbook-desktop` (Apple Events, keychain) both work through it |
+| 5. Reverse tunnel retired | 2026-10-18: booted out, plist in `~/Library/LaunchAgents.disabled/`; fcvm-arm's 2223 closed; `ssh macbook-desktop` still works (it jumps through Remote Login to the private `sshd` on the Mac's localhost, not through the tunnel) |
+| 6. Port 22 closed to the network | before: from the `ejc3` VM, `nc -z 192.168.64.1 22` succeeds; the rule waits for the owner's `sudo` (`~/.ssh/fcvm-macbook/firewall.sh` on the Mac, the commands below) |
 
 The goal: a connection to the MacBook needs Cloudflare Access (a second factor) as well as
 an SSH key, and the Mac takes no SSH from anywhere but its own connector.
@@ -715,7 +727,7 @@ removable-volume prompts, and signing still needs the desktop session.
 | Tunnel, DNS, Access application | Cloudflare (`macbook-ssh.tf`) | Terraform, phase 1 |
 | Connector token | Secrets Manager `macbook-ssh-tunnel-token` | Terraform, phase 1 |
 | Service token (`client_id`, `client_secret`, `hostname`) | Secrets Manager `macbook-ssh-access` | Terraform, phase 1 |
-| `cloudflared` | the Mac, `/opt/homebrew/bin/cloudflared`, 2025.4.0 or later (`--token-file`) | step 1 |
+| `cloudflared` | the Mac, `~/.local/bin/cloudflared` (2026.9.3; 2025.4.0 or later for `--token-file`) | step 1 |
 | Connector token file | the Mac, `~/.cloudflared/macbook-ssh.token`, mode 600 | step 1 |
 | Connector agent | the Mac, `~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist` | step 1 |
 | Proxy command | fcvm-arm, `~/.ssh/macbook-access-proxy` | step 2, then Terraform (step 4) |
