@@ -77,10 +77,14 @@ locals {
       Resource = "*"
     },
     {
-      Sid      = "OwnerOnlySecrets"
-      Effect   = "Deny"
-      Action   = "secretsmanager:GetSecretValue"
-      Resource = concat([aws_secretsmanager_secret.dev_hop.arn], [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn])
+      Sid    = "OwnerOnlySecrets"
+      Effect = "Deny"
+      Action = "secretsmanager:GetSecretValue"
+      # The hop key, the Google Docs token, and the owner's own wbox password (every member's wbox has its own).
+      Resource = concat(
+        [aws_secretsmanager_secret.dev_hop.arn, aws_secretsmanager_secret.wbox_admin.arn],
+        [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
+      )
     },
     {
       Sid    = "OwnerOnlyDevBoxes"
@@ -95,9 +99,16 @@ locals {
     },
   ]
   nextjs_ct_allow_all = [{ Sid = "UpToTheRole", Effect = "Allow", Action = "*", Resource = "*" }]
+  # One session policy per account, so a member's can name that member's own resources (their own boxes and
+  # secrets) and nobody else's. The credential server hands each container the policy under its account's name.
   nextjs_ct_session_policies = {
-    owner  = { Version = "2012-10-17", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }
-    member = { Version = "2012-10-17", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only, local.nextjs_ct_deny_member) }
+    for u in local.nextjs_users : u => {
+      Version = "2012-10-17"
+      Statement = concat(
+        local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only,
+        contains(local.nextjs_ct_owners, u) ? [] : local.nextjs_ct_deny_member,
+      )
+    }
   }
 
   nextjs_ct_config = {
@@ -107,6 +118,7 @@ locals {
     ssh_hostnames    = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
     pinned_routes    = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
     session_policies = local.nextjs_ct_session_policies
+    io_box_ip        = local.io_box_private_ip
     retired_keys     = local.nextjs_retired_user_keys
     claw_master      = { tag = local.claw_master_tag, sha256 = local.claw_master_sha256_aarch64, server = "${local.claw_master_server_ip}:${local.claw_master_server_port}" }
     tmux_scroll      = { tag = local.tmux_scroll_tag, sha256 = local.tmux_scroll_sha256_aarch64 }
