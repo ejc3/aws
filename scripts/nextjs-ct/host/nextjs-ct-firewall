@@ -12,6 +12,7 @@
 #   its own gateway, port 2222          the MacBook's reverse tunnel, owner accounts only (config.json
 #                                       users.<u>.mac): the Mac's listener is on the host's loopback
 #                                       and nextjs-ct-mac-tunnel.socket relays it to the owner only
+# A member's container (not the owner's) is also refused the io-box NFS scratch (config.json io_box_ip).
 # and nothing else: no other container, no other host port (sshd, the metadata service itself, any
 # loopback listener), no address but its own as the source, and no IPv6.
 set -euo pipefail
@@ -19,6 +20,7 @@ CONFIG=/etc/nextjs-ct/config.json
 OUT=/etc/nextjs-ct/firewall.nft
 PORT=8169
 
+IO_BOX=$(jq -r '.io_box_ip // empty' "$CONFIG")
 nat="" input="" fwd=""
 for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   id -u "$U" >/dev/null 2>&1 || continue
@@ -27,6 +29,10 @@ for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   IF="ve-$U"; IF=${IF:0:15}
   nat+="    iifname \"$IF\" ip saddr 10.88.$N.2 ip daddr 169.254.169.254 tcp dport 80 dnat to 10.88.$N.1:$PORT"$'\n'
   fwd+="    iifname \"$IF\" ip saddr != 10.88.$N.2 drop"$'\n'
+  # The io-box NFS scratch is the owner's: a member's traffic would otherwise leave as the host and be admitted.
+  if [ "$(jq -r --arg u "$U" '.users[$u].owner // false' "$CONFIG")" != true ] && [ -n "$IO_BOX" ]; then
+    fwd+="    iifname \"$IF\" ip daddr $IO_BOX drop"$'\n'
+  fi
   # A second bound under the credential server's own per-container cap: at most 16 connections at once.
   input+="    iifname \"$IF\" tcp dport $PORT ct count over 16 drop"$'\n'
   input+="    iifname \"$IF\" ip saddr 10.88.$N.2 ip daddr 10.88.$N.1 tcp dport $PORT ct status dnat accept"$'\n'
@@ -61,9 +67,11 @@ $input    drop
   }
   chain forward {
     type filter hook forward priority filter; policy drop;
-    ct state established,related accept
+    # The per-container drops come before the established/related accept, so a reload also cuts a connection
+    # that was open when a rule was added (an NFS mount to the io-box, say), not only new ones.
     iifname "ve-*" meta nfproto ipv6 drop
-$fwd    iifname "ve-*" oifname "ve-*" drop
+$fwd    ct state established,related accept
+    iifname "ve-*" oifname "ve-*" drop
     iifname "ve-*" ip daddr 169.254.169.254 drop
     iifname "ve-*" accept
   }

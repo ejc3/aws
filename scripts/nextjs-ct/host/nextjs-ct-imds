@@ -99,8 +99,7 @@ class State:
             cached = self.creds.get(user)
             if cached and cached[1] - time.time() > REFRESH_BEFORE:
                 return cached[0]
-            spec = self.config["users"][user]
-            policy = self.config["session_policies"]["owner" if spec.get("owner") else "member"]
+            policy = self.config["session_policies"][user]
             out = subprocess.run(
                 [AWS, "sts", "assume-role", "--role-arn", self.config["role_arn"],
                  "--role-session-name", f"ct-{user}", "--duration-seconds", "3600",

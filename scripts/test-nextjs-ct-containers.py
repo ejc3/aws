@@ -36,7 +36,8 @@ CONFIG = {
     "zones": {"cc-games.dev": "tunnel-a", "dolphin-labs.dev": "tunnel-b"},
     "ssh_hostnames": {"dolphin-labs.dev": "ssh.dolphin-labs.dev"},
     "pinned_routes": {},
-    "session_policies": {"owner": {"Statement": [{"Sid": "owner"}]}, "member": {"Statement": [{"Sid": "member"}]}},
+    "session_policies": {"alice": {"Statement": [{"Sid": "member"}]}, "boss": {"Statement": [{"Sid": "owner"}]}},
+    "io_box_ip": "172.31.48.10",
     "users": {
         "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False, "mac": False},
         "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True, "mac": True},
@@ -73,7 +74,17 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("data.aws_secretsmanager_secret.nextjs_connector", host)
         self.assertIn("ssmmessages:*", host)
         self.assertIn("security_config.arn}/sessions/*", host)
-        self.assertIn("owner  = { Version = \"2012-10-17\", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }", TF)
+        self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
+        self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
+
+    def test_one_session_policy_per_account(self):
+        # Keyed by account, so a member's policy can name that member's own resources and nobody else's; the owner
+        # gets no member denials.
+        block = TF.split("nextjs_ct_session_policies = {", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn("for u in local.nextjs_users : u => {", block)
+        self.assertIn("[for s in local.nextjs_ct_deny_member : s if !contains(local.nextjs_ct_owners, u)]", block)
+        imds = (HOST / "nextjs-ct-imds").read_text()
+        self.assertIn('policy = self.config["session_policies"][user]', imds)
 
     def test_the_owner_can_attach_the_volumes_pbox_launches_with(self):
         # #490 put the EBS actions in the host-only set, so `pbox up` from ejc3's container launched a box and then
@@ -106,7 +117,8 @@ class HostScriptTests(unittest.TestCase):
                           "arn:aws:s3:::ejc3-dev-scripts/*", "arn:aws:s3:::security-config-111111111111-us-west-1/sessions/*"]},
             {"Sid": "OwnerOnlyRoles", "Effect": "Deny", "Action": ["sts:AssumeRole", "iam:PassRole"], "Resource": "*"},
             {"Sid": "OwnerOnlySecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
-             "Resource": [arn.format("dev-hop-ssh-key"), arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token")]},
+             "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
+                          arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token")]},
             {"Sid": "OwnerOnlyDevBoxes", "Effect": "Deny", "Action": re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', TF.split("OwnerOnlyDevBoxes", 1)[1].split("Resource", 1)[0]), "Resource": "*"},
         ]
         size = len(json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":")))
@@ -423,6 +435,13 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn('iifname "ve-boss" ip saddr 10.88.3.2 ip daddr 10.88.3.1 tcp dport 2222 accept', nft)
         self.assertNotIn('"ve-alice" ip saddr 10.88.1.2 ip daddr 10.88.1.1 tcp dport 2222', nft)
         self.assertIn("type filter hook forward priority filter; policy drop;", nft)
+        # The io-box scratch: refused to a member, not to the owner.
+        self.assertIn('iifname "ve-alice" ip daddr 172.31.48.10 drop', nft)
+        self.assertNotIn('iifname "ve-boss" ip daddr 172.31.48.10 drop', nft)
+        # Before the established/related accept, so a connection open at reload is cut too (review of #499).
+        forward = nft.split("chain forward {", 1)[1]
+        self.assertLess(forward.index('iifname "ve-alice" ip daddr 172.31.48.10 drop'), forward.index("ct state established,related accept"))
+        self.assertLess(forward.index('iifname "ve-alice" ip saddr != 10.88.1.2 drop'), forward.index("ct state established,related accept"))
 
     def test_sshd(self):
         conf = self.generate("nextjs-ct-sshd", "out")
