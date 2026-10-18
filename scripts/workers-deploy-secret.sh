@@ -24,16 +24,23 @@ case "${REPO,,}" in
     exit 3 ;;
 esac
 
+# A repo outside Terraform's GitHub owners (CoderColton) whose deploy job reads the token from its own main-only
+# `cloudflare-deploy` environment: the secret goes there, never to the repository.
+ENV_ARGS=()
+case "${REPO,,}" in
+  codercolton/colton-games) ENV_ARGS=(--env cloudflare-deploy) ;;
+esac
+
 TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-workers-deploy-token --query SecretString --output text)
 [ "${#TOKEN}" -ge 30 ] || { echo "the stored token looks empty; apply workers-deploy.tf first" >&2; exit 1; }
 
 if [ -z "$AS" ]; then
-  printf '%s' "$TOKEN" | gh secret set CLOUDFLARE_API_TOKEN --repo "$REPO"
+  printf '%s' "$TOKEN" | gh secret set CLOUDFLARE_API_TOKEN --repo "$REPO" "${ENV_ARGS[@]}"
 else
   HOST=$(aws ec2 describe-instances --region us-west-1 --filters Name=tag:Name,Values=nextjs-dev Name=instance-state-name,Values=running \
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
   [ -n "$HOST" ] && [ "$HOST" != None ] || { echo "nextjs-dev is not running" >&2; exit 1; }
   printf '%s' "$TOKEN" | ssh -i ~/.ssh/fcvm-ec2 -o BatchMode=yes -o ConnectTimeout=8 "ubuntu@$HOST" \
-    "sudo -n -u $AS gh secret set CLOUDFLARE_API_TOKEN --repo $REPO"
+    "sudo -n -u $AS gh secret set CLOUDFLARE_API_TOKEN --repo $REPO ${ENV_ARGS[*]}"
 fi
 unset TOKEN
