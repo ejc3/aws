@@ -644,7 +644,19 @@ ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=passw
    remote users"; install the keys-only drop-in:
    `printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf`.
 2. Put the `to-mac` public key in `~/.ssh/authorized_keys` (mode 600).
-3. Make the tunnel's key and LaunchAgent. The key is used for the tunnel only: make a new
+3. **Bootstrap route, then the connector.** On a wiped Mac nothing reaches it yet, and the connector's own install
+   (phase 2 step 1 of [MacBook: Moving SSH behind Cloudflare Access](#macbook-moving-ssh-behind-cloudflare-access))
+   runs over SSH. So:
+   1. Bring up the reverse tunnel below first, and on fcvm-arm reach the Mac through it explicitly:
+      `ssh -p 2223 -o HostKeyAlias=ejs-macbook-pro-via-fcvm -o UserKnownHostsFile=~/.ssh/known_hosts.mac-tunnels
+      -i ~/.ssh/to-mac ejcampbell@127.0.0.1` (`Host macbook` already points at Cloudflare and will not connect yet).
+   2. Over that route, run phase 2 step 1 (the pinned `cloudflared` in `~/.local/bin`, the connector token file from
+      `macbook-ssh-tunnel-token`, the `com.ejcampbell.macbook-ssh.cloudflared` LaunchAgent), with the `ssh macbook`
+      in its commands replaced by the command above.
+   3. Check `ssh macbook` works through Cloudflare, then retire the tunnel again: `launchctl bootout` it and move its
+      plist to `~/Library/LaunchAgents.disabled/`, as on the live Mac. It stays the way back.
+
+   The reverse tunnel's key and LaunchAgent. The key is used for the tunnel only: make a new
    one on the Mac (`ssh-keygen -t ed25519 -N '' -f ~/.ssh/<tunnel-key>`), and authorize its
    public half on fcvm-arm (`ubuntu`'s `~/.ssh/authorized_keys`) restricted to the one forward:
 
@@ -698,7 +710,8 @@ ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=passw
    `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.tunnel.plist`.
    `ExitOnForwardFailure` makes a stale listener on fcvm-arm (a half-dead earlier tunnel) end the
    attempt instead of leaving a tunnel with no forward; launchd retries every 15 seconds.
-4. On fcvm-arm, `mac-reverse-tunnels.tf`'s installer writes the alias and the pinned
+4. On fcvm-arm, `mac-reverse-tunnels.tf`'s installer writes the aliases, the Access proxy command, the pinned
+   `cloudflared`, and the pinned
    host keys. If the Mac's Remote Login host key changed (a reinstall), pin the new one there.
 5. Run the checks above.
 
