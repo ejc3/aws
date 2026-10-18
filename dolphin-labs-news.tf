@@ -252,7 +252,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_pass" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.scraper_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -288,9 +288,9 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
     variables = {
       NEWS_SECRET_ID        = aws_secretsmanager_secret.dolphin_labs_news.name
       BROWSERBASE_SECRET_ID = aws_secretsmanager_secret.browserbase.name
-      DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.scraper_api_key["deepseek"].name
-      EXA_SECRET_ID         = aws_secretsmanager_secret.scraper_api_key["exa"].name
-      SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.scraper_api_key["scrapingdog"].name
+      DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.search_fetch_api_key["deepseek"].name
+      EXA_SECRET_ID         = aws_secretsmanager_secret.search_fetch_api_key["exa"].name
+      SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
       NEWS_BEDROCK_REGION   = local.bedrock_haiku_region
       NEWS_BEDROCK_MODEL    = local.bedrock_haiku_profile
       NEWS_JOURNAL_BUCKET   = aws_s3_bucket.dolphin_labs_news.bucket
