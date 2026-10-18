@@ -484,6 +484,14 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = aws_dynamodb_table.runner_app_claims[0].arn
       },
       {
+        # Jobs lost with a reclaimed spot host (app_runner.py, "spot reruns"): one record per logical job, created and
+        # moved between states only by conditional writes, so a job is rerun at most once.
+        Sid      = "SpotReruns"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.runner_app_reruns[0].arn
+      },
+      {
         # The budget buckets (app_runner.py update_bucket): a consistent read, then a write conditional on the version.
         Sid      = "BudgetBuckets"
         Effect   = "Allow"
@@ -536,6 +544,7 @@ resource "aws_lambda_function" "runner_app" {
       REPO_SHARED       = jsonencode({ sizes = local.runner_app_sizes, vcpus = local.runner_app_size_vcpus })
       RUNNER_APP_SECRET = aws_secretsmanager_secret.github_app_runners[0].name
       CLAIMS_TABLE      = aws_dynamodb_table.runner_app_claims[0].name
+      RERUNS_TABLE      = aws_dynamodb_table.runner_app_reruns[0].name
       LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SECURITY_GROUP_ID = aws_security_group.runner_app[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner_app[0].name
@@ -659,6 +668,38 @@ resource "aws_dynamodb_table" "runner_app_claims" {
   }
 
   tags = { Name = "github-app-runner-claims" }
+}
+
+# One item per failed or cancelled job that one of these hosts ran (app_runner.py, "spot reruns"): whether AWS reclaimed
+# the host mid-job, and whether the job was rerun. Items say what happened and are kept a week (TTL); nothing here is
+# precious, so no point-in-time recovery.
+resource "aws_dynamodb_table" "runner_app_reruns" {
+  count        = var.enable_github_runner ? 1 : 0
+  name         = "github-app-runner-reruns"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "repo"
+  range_key    = "job"
+
+  attribute {
+    name = "repo"
+    type = "S"
+  }
+
+  attribute {
+    name = "job"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = false
+  }
+
+  tags = { Name = "github-app-runner-reruns" }
 }
 
 # One item per budget group (app_runner.py, "budget buckets"): {level_usd, updated_at, rate_usd_h, throttled, spend,
