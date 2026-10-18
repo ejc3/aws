@@ -126,10 +126,65 @@ class AccountAliasTests(unittest.TestCase):
         self.assertIn('substr(replace(names[length(names) - 1], "/[^A-Za-z0-9._-]+/", "-"), 0, 48)', TF)
 
     def test_lines_are_read_by_load_account_labels_rules(self):
-        self.assertIn('startswith(l, "#") ? []', TF)
-        self.assertIn('regexall("^([0-9A-Fa-f-]{8,64})\\\\s*=\\\\s*(.*\\\\S)$", l)', TF)
-        self.assertIn('regexall("^([0-9A-Fa-f-]{8,64})\\\\s+(.*\\\\S)$", l)', TF)
+        self.assertIn('if l != "" && !startswith(l, "#")', TF)
         self.assertIn('replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\\r", "")', TF)
+        self.assertIn("claw_master_account_label_pairs     = concat([], local.claw_master_account_label_parsed...)", TF)
+
+    # Terraform's two line patterns, taken from the .tf file and applied here as Terraform applies them, to made-up
+    # labels. The verdicts are those of claw-master's loadAccountLabels (checked with its add() rule in Go).
+    def parse(self, text):
+        eq, space = [p.replace("\\\\", "\\") for p in re.findall(r'regexall\("(\^\(\[0-9A-Fa-f-\][^"]*)", l\)', TF)]
+        pairs, malformed = [], 0
+        for raw in text.replace("\r", "").split("\n"):
+            line = raw.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            m = re.search(eq if "=" in line else space, line)
+            if m:
+                pairs.append((m.group(1).lower(), m.group(2)))
+            else:
+                malformed += 1
+        return pairs, malformed
+
+    GOOD = (
+        "# ACCOUNT_UUID=NAME\r\n\r\n12345678-90ab-cdef-1234-567890abcdef=Alpha Person\n"
+        "0F0F0F0F-AAAA-BBBB-CCCC-DDDDEEEEFFFF   Bravo(laptop)\naaaaaaaa-0000-0000-0000-000000000000 = old-name\n"
+        "AAAAAAAA-0000-0000-0000-000000000000=new.name_ok\n"
+    )
+
+    def test_a_value_claw_master_accepts_parses_whole(self):
+        pairs, malformed = self.parse(self.GOOD)
+        self.assertEqual(malformed, 0)
+        self.assertEqual(
+            pairs,
+            [
+                ("12345678-90ab-cdef-1234-567890abcdef", "Alpha Person"),
+                ("0f0f0f0f-aaaa-bbbb-cccc-ddddeeeeffff", "Bravo(laptop)"),
+                ("aaaaaaaa-0000-0000-0000-000000000000", "old-name"),
+                ("aaaaaaaa-0000-0000-0000-000000000000", "new.name_ok"),
+            ],
+        )
+
+    def test_each_line_claw_master_rejects_is_counted(self):
+        for line in (
+            "not-a-uuid=Nobody",  # not an id
+            "12345678-90ab-cdef-1234-567890abcdef\tTabbed",  # strings.Cut splits at a space, never a tab
+            "12345678-90ab-cdef-1234-567890abcdef=",  # no name
+            "12345678-90ab-cdef-1234-567890abcdef",  # no separator
+            "12345678 90ab=Split",  # the first "=" decides, so the id holds a space
+        ):
+            self.assertEqual(self.parse(self.GOOD + line + "\n")[1], 1, line)
+
+    def test_a_malformed_line_fails_the_plan_naming_only_a_count(self):
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_account_aliases")
+        self.assertIn("condition     = local.claw_master_account_label_malformed == 0", kv)
+        message = re.search(r'error_message = "([^"]*)"', kv).group(1)
+        self.assertEqual(re.findall(r"\$\{([^}]*)\}", message), ["local.claw_master_account_label_malformed"])
+        self.assertIn("claw-master would reject the whole file", message)
+        self.assertIn(
+            "claw_master_account_label_malformed = nonsensitive(length([for m in local.claw_master_account_label_parsed : m if length(m) == 0]))",
+            TF,
+        )
 
     def test_written_sensitive_to_its_own_key_and_never_output(self):
         kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_account_aliases")

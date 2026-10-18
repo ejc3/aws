@@ -109,8 +109,9 @@ resource "cloudflare_workers_kv" "claw_master_dashboard_allowed_emails" {
 #     outside [A-Za-z0-9._-] becomes "-", at most 48 characters;
 #   - the lines are read by its loadAccountLabels rule (cmd/claw-master/main.go): blank lines and # comments are
 #     skipped, the id is 8 to 64 hex digits and dashes, split at the first "=" (at the first space when there is no
-#     "="), and a later line for the same account wins. A line that does not fit is skipped here (the server keeps its
-#     old file on one, claw-master-server.tf).
+#     "="), and a later line for the same account wins. Any other line fails the plan, as the server rejects the
+#     whole changed file on one and keeps its old labels (claw-master-server.tf): the aliases must never be written
+#     from a value the server is not using.
 # Everything derived from the secret stays marked sensitive: a plan shows that the aliases changed, never a name or code.
 # ---------------------------------------------------------------------------------
 data "aws_secretsmanager_secret_version" "claw_master_account_labels" {
@@ -122,12 +123,16 @@ locals {
   claw_master_account_label_lines = [
     for l in split("\n", replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\r", "")) : trimspace(l)
   ]
-  # [id, name] for each line that is a label.
-  claw_master_account_label_pairs = concat([], [
-    for l in local.claw_master_account_label_lines : startswith(l, "#") ? [] : (
-      strcontains(l, "=") ? regexall("^([0-9A-Fa-f-]{8,64})\\s*=\\s*(.*\\S)$", l) : regexall("^([0-9A-Fa-f-]{8,64})\\s+(.*\\S)$", l)
-    )
-  ]...)
+  # Per non-blank, non-# line: [[id, name]] when it is a label, [] when claw-master would reject it. Go's
+  # strings.Cut splits at the first "=", else at the first space (a space, not a tab), and trims both halves.
+  claw_master_account_label_parsed = [
+    for l in local.claw_master_account_label_lines : (
+      strcontains(l, "=") ? regexall("^([0-9A-Fa-f-]{8,64})\\s*=\\s*(.*\\S)$", l) : regexall("^([0-9A-Fa-f-]{8,64})\\s* \\s*(.*\\S)$", l)
+    ) if l != "" && !startswith(l, "#")
+  ]
+  # A count, not a value: safe to show in the plan's error.
+  claw_master_account_label_malformed = nonsensitive(length([for m in local.claw_master_account_label_parsed : m if length(m) == 0]))
+  claw_master_account_label_pairs     = concat([], local.claw_master_account_label_parsed...)
   # account id => every name given to it, in order (the last one wins, as in claw-master).
   claw_master_account_label_names = { for p in local.claw_master_account_label_pairs : lower(p[0]) => p[1]... }
   claw_master_dashboard_account_aliases = sensitive(join("\n", concat(
@@ -145,6 +150,13 @@ resource "cloudflare_workers_kv" "claw_master_dashboard_account_aliases" {
   key_name     = "account-aliases"
   # The header line keeps the value non-empty when there are no labels; the Worker skips # lines.
   value = local.claw_master_dashboard_account_aliases
+
+  lifecycle {
+    precondition {
+      condition     = local.claw_master_account_label_malformed == 0
+      error_message = "claude-master/account-labels has ${local.claw_master_account_label_malformed} malformed line(s) (not blank, not a # comment, not ACCOUNT_UUID=NAME); claw-master would reject the whole file and keep its old labels, so the dashboard's aliases are not written from it. Fix the secret (claw-master-server.tf)."
+    }
+  }
 }
 
 resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
