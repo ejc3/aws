@@ -165,6 +165,9 @@ jobs:
       - name: dolphin-labs.dev email forwards (privacy, ej@, steve@ from people/addresses only)
         run: python3 -S -B scripts/test-dolphin-labs-email.py
 
+      - name: Search and fetch provider usage poller (parsing, publishing, no key in logs)
+        run: python3 -S -B scripts/test-search-fetch-usage.py
+
       - name: Claude Haiku 5.5 on Bedrock (nextjs-dev and one dolphin-labs workflow on main, no other model)
         run: python3 -S -B scripts/test-bedrock-haiku.py
 

@@ -113,8 +113,8 @@ resource "aws_iam_role_policy_attachment" "dev_pricing_read" {
 #     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
 # Terraform owns the container and who may read it; the value is set out of band and never enters
 # git (put-secret-value with a 0600 file). Readers: the administration set, dev-server-role (the
-# metal boxes), nextjs-dev-role (the dolphin box), the dolphin-labs news pass's Lambda role and the dolphin-maps-loop
-# function (dolphin-maps-loop.tf). Not dev-ebs-only-role: it is the I/O box's role too (io-box.tf). Every account on
+# metal boxes), nextjs-dev-role (the dolphin box), the dolphin-labs news pass's Lambda role, the dolphin-maps-loop
+# function (dolphin-maps-loop.tf) and the search-fetch-usage poller (search-fetch-usage.tf). Not dev-ebs-only-role: it is the I/O box's role too (io-box.tf). Every account on
 # nextjs-dev has full sudo, so
 # the grant is box-wide, as with the ElevenLabs key.
 resource "aws_secretsmanager_secret" "browserbase" {
@@ -127,7 +127,7 @@ resource "aws_secretsmanager_secret" "browserbase" {
 # dolphin-labs' news pass reads it for the pages it opens in a browser (dolphin-labs-news.tf); its role
 # grants itself the read, so it is a reader here but takes no attachment below.
 locals {
-  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn, aws_iam_role.dolphin_maps_loop.arn]
+  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn, aws_iam_role.dolphin_maps_loop.arn, aws_iam_role.search_fetch_usage.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "browserbase" {
