@@ -74,11 +74,21 @@ resource "aws_iam_role" "nextjs_dev" {
   name = "nextjs-dev-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
+    Statement = [
+      {
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+      },
+      {
+        # The containerized box's credential server assumes this role again for each container, with a
+        # session policy that narrows it (nextjs-ct.tf). A role is never implicitly trusted by itself.
+        Sid       = "SelfForContainerSessions"
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = { AWS = local.nextjs_dev_role_arn }
+      },
+    ]
   })
   tags = { Name = "nextjs-dev-role" }
 }
@@ -144,10 +154,11 @@ resource "aws_iam_role_policy" "nextjs_dev" {
     Version = "2012-10-17"
     Statement = concat([
       {
-        Sid      = "ReadOwnSetupScript"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
-        Resource = "${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs.sh"
+        Sid    = "ReadOwnSetupScript"
+        Effect = "Allow"
+        Action = "s3:GetObject"
+        # nextjs-ct.sh is the containerized replacement's (nextjs-ct.tf), which shares this role.
+        Resource = ["${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs.sh", "${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs-ct.sh"]
       },
       {
         # Connector credentials and the dev-only hop key. The separate Access
