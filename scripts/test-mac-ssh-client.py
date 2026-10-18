@@ -79,9 +79,8 @@ class MacSshClient(unittest.TestCase):
             self.assertNotIn("proxycommand", config)
             self.assertNotIn("proxyjump", config)
         known = (self.ssh / "known_hosts.mac").read_text().splitlines()
-        self.assertEqual(known[0], f"ejs-macbook-pro-via-fcvm ssh-ed25519 {REMOTE_LOGIN_KEY}",
-                         "Remote Login's key is pinned first")
-        self.assertLessEqual(len(known), 2, "at most the retired desktop sshd's key besides, for the switch")
+        self.assertEqual(known, [f"ejs-macbook-pro-via-fcvm ssh-ed25519 {REMOTE_LOGIN_KEY}"],
+                         "only Remote Login's key is pinned")
 
     def test_fresh_install_writes_one_alias(self):
         self.install()

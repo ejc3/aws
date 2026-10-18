@@ -11,12 +11,10 @@
 locals {
   # macOS Remote Login's host key (/etc/ssh/ssh_host_ed25519_key.pub on the Mac; `ssh-keyscan -p 22 127.0.0.1`
   # run on the Mac agrees), read on the Mac itself. ONE copy: every `Host mac` here and ejc3's container on the
-  # containerized nextjs box (nextjs-ct-user-data.tf) pin it. The second line is the retired desktop-session sshd's
-  # key: the clients pick up a new pin only when their setup reruns, so it stays pinned until every client has run
-  # this, keeping `ssh mac` verifiable whichever end the ingress points at during the switch. Drop it afterwards.
+  # containerized nextjs box (nextjs-ct-user-data.tf) pin it. Nothing else answers for the Mac: the desktop-session
+  # sshd whose key was pinned during the switch to Remote Login is retired.
   mac_tunnel_host_keys = <<-MACHOSTKEYS
 ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL
-ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAX5Q08R6QP8SbnpXPZTKTwGgrLz4DnGMZzRw2EDGaxn
 MACHOSTKEYS
 
   # cloudflared for the proxy command, pinned with claw-master's (claw-master-tunnel.tf), into the account's
