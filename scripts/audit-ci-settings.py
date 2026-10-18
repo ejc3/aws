@@ -144,7 +144,7 @@ DEFAULT_PR_TYPES = {"opened", "synchronize", "reopened"}
 
 def pr_types(text, event):
     """The event's activity types; GitHub's default set when the workflow names none."""
-    m = re.search(rf"^([ \t]+){event}:[ \t]*\n", text, re.M)
+    m = re.search(rf"^([ \t]+){event}:[ \t]*(?:#.*)?\n", text, re.M)
     if not m:
         return DEFAULT_PR_TYPES
     # The event's own block: the lines indented deeper than its key, up to the next sibling.

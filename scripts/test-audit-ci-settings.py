@@ -37,6 +37,10 @@ class IndentationTests(unittest.TestCase):
         text = "on:\n    pull_request:\n        types:\n            - opened\n            - ready_for_review\n    push:\n"
         self.assertEqual(audit.pr_types(text, "pull_request"), {"opened", "ready_for_review"})
 
+    def test_a_comment_after_the_event_key_is_still_that_event(self):
+        text = "on:\n  pull_request_target: # PR events\n    types: [opened, ready_for_review]\n"
+        self.assertEqual(audit.pr_types(text, "pull_request_target"), {"opened", "ready_for_review"})
+
     def test_a_sibling_events_types_are_not_borrowed(self):
         text = "on:\n  pull_request:\n  pull_request_target:\n    types: [opened, ready_for_review]\n"
         self.assertEqual(audit.pr_types(text, "pull_request"), audit.DEFAULT_PR_TYPES)
