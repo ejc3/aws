@@ -48,9 +48,9 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn("games_mp_admin_principals", policy)
         self.assertNotIn("secret_string", TF)
 
-    def test_the_function_reads_its_two_secrets_and_writes_only_the_journal(self):
+    def test_the_function_reads_its_secrets_and_writes_only_the_journal(self):
         policy = block("aws_iam_role_policy", "dolphin_maps_loop")
-        self.assertIn("[aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn]", policy)
+        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.scraper_api_key : s.arn])", policy)
         self.assertIn('Resource = "${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"', policy)
         self.assertNotIn("code/", policy)
         self.assertIn("aws_iam_role.dolphin_maps_loop.arn", re.search(r"browserbase_readers = \[[^\]]*\]", AI).group())

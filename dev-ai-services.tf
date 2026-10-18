@@ -165,6 +165,71 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
   policy_arn = aws_iam_policy.browserbase_read.arn
 }
 
+# Scraping and search API keys, alternatives to Browserbase for the scrapers and to the Bedrock models: DeepSeek
+# (api.deepseek.com: chat, reasoning, and its fetch and search tools), Exa (exa.ai: web search, page contents and
+# crawling) and ScrapingDog (scrapingdog.com: scraping API with rendering and proxies). One JSON secret per provider,
+# `<provider>/api-key`, holds `<PROVIDER>_API_KEY`, so an agent exports it:
+#   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id deepseek/api-key \
+#     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
+# Terraform owns the containers and who may read them; values are set out of band (put-secret-value from a 0600 file)
+# and never enter git. Readers are Browserbase's: the administration set, dev-server-role (the metal boxes),
+# nextjs-dev-role (the dolphin box), and the two scraping jobs, the dolphin-labs news pass and the dolphin-maps loops,
+# whose roles grant themselves the read and get `<PROVIDER>_SECRET_ID` (dolphin-labs-news.tf, dolphin-maps-loop.tf).
+# Not dev-ebs-only-role (the I/O box's role too). Every account on nextjs-dev has full sudo, so the grant is box-wide,
+# as with Browserbase.
+locals {
+  scraper_api_keys = {
+    deepseek    = { title = "DeepSeek", env = "DEEPSEEK" }
+    exa         = { title = "Exa", env = "EXA" }
+    scrapingdog = { title = "ScrapingDog", env = "SCRAPINGDOG" }
+  }
+  scraper_api_key_readers = local.browserbase_readers
+}
+
+resource "aws_secretsmanager_secret" "scraper_api_key" {
+  for_each                = local.scraper_api_keys
+  name                    = "${each.key}/api-key"
+  description             = "${each.value.title} API key (JSON: ${each.value.env}_API_KEY). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "${each.key}/api-key", Project = "dev" }
+}
+
+resource "aws_secretsmanager_secret_policy" "scraper_api_key" {
+  for_each   = local.scraper_api_keys
+  secret_arn = aws_secretsmanager_secret.scraper_api_key[each.key].arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationTheDevBoxesAndTheScrapersCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.scraper_api_key[each.key].arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.scraper_api_key_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "scraper_api_keys_read" {
+  statement {
+    sid       = "ReadTheScraperApiKeys"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [for s in aws_secretsmanager_secret.scraper_api_key : s.arn]
+  }
+}
+
+resource "aws_iam_policy" "scraper_api_keys_read" {
+  name        = "dev-scraper-api-keys-read"
+  description = "Dev boxes: read the scraping and search API keys (deepseek, exa, scrapingdog /api-key) and nothing else"
+  policy      = data.aws_iam_policy_document.scraper_api_keys_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "scraper_api_keys_read" {
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
+  policy_arn = aws_iam_policy.scraper_api_keys_read.arn
+}
+
 # App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
 # secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
