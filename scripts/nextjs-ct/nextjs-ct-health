@@ -8,6 +8,7 @@ for cmd in aws jq nft systemd-nspawn machinectl debootstrap rsync; do
 done
 [ -x /usr/local/bin/setup-sync ] || BAD="$BAD missing:setup-sync"
 systemctl is-enabled --quiet setup-sync.timer 2>/dev/null || BAD="$BAD disabled:setup-sync.timer"
+systemctl is-active --quiet setup-sync.timer 2>/dev/null || BAD="$BAD inactive:setup-sync.timer"
 systemctl is-active --quiet snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null \
   || systemctl is-active --quiet amazon-ssm-agent.service 2>/dev/null || BAD="$BAD down:ssm-agent"
 if [ -n "$BAD" ]; then

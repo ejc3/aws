@@ -126,14 +126,14 @@ class FirstBootTests(unittest.TestCase):
 
 
 class HealthTests(unittest.TestCase):
-    def run_health(self, missing=(), timer=True):
+    def run_health(self, missing=(), timer=True, active=True):
         with tempfile.TemporaryDirectory() as d:
             bin_ = Path(d)
             for cmd in ("aws", "jq", "nft", "systemd-nspawn", "machinectl", "debootstrap", "rsync"):
                 if cmd not in missing:
                     (bin_ / cmd).write_text("#!/bin/sh\nexit 0\n")
                     (bin_ / cmd).chmod(0o755)
-            (bin_ / "systemctl").write_text(f"#!/bin/sh\ncase \"$1 $3\" in 'is-enabled setup-sync.timer') exit {0 if timer else 1} ;; esac\nexit 0\n")
+            (bin_ / "systemctl").write_text(f"#!/bin/sh\ncase \"$1 $3\" in 'is-enabled setup-sync.timer') exit {0 if timer else 1} ;; 'is-active setup-sync.timer') exit {0 if active else 1} ;; esac\nexit 0\n")
             (bin_ / "systemctl").chmod(0o755)
             sync = bin_ / "setup-sync"
             sync.write_text("#!/bin/sh\n")
@@ -159,6 +159,12 @@ class HealthTests(unittest.TestCase):
         r = self.run_health(timer=False)
         self.assertEqual(r.returncode, 1)
         self.assertIn("disabled:setup-sync.timer", r.stdout)
+
+
+    def test_enabled_but_stopped_timer_is_unhealthy(self):
+        r = self.run_health(active=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("inactive:setup-sync.timer", r.stdout)
 
 
 class SetupSyncTests(unittest.TestCase):
