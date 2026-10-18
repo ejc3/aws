@@ -1,0 +1,44 @@
+#!/bin/bash
+# Started by ndev@<label>.service. Reads what ndev-register recorded and serves it.
+# Listens on every address of THIS container: its network namespace is its own, and only the host's
+# cloudflared (and the account itself) can reach it.
+# %i is the hostname left-label (ejc3 or ejc3-<slug>), not necessarily a unix user.
+#
+# `ndev-run --check <label>` is the unit's ExecCondition. Exit 1 there means "skip this
+# start": systemd leaves the unit inactive rather than failed, and Restart=always does not
+# apply to a skipped condition. Without it a deleted checkout made `cd` fail, and the unit
+# restarted every 10 seconds forever.
+set -euo pipefail
+CHECK=""
+if [ "${1:-}" = "--check" ]; then CHECK=1; shift; fi
+LABEL="$1"
+ENVF="/var/lib/ndev/instances/$LABEL.env"
+# Legacy single-file layout (pre multi-instance): /var/lib/ndev/$USER.env
+if [ ! -f "$ENVF" ] && [ -f "/var/lib/ndev/$LABEL.env" ]; then
+  ENVF="/var/lib/ndev/$LABEL.env"
+fi
+DIR=""
+[ ! -f "$ENVF" ] || . "$ENVF"
+WHY=""
+if [ ! -f "$ENVF" ]; then
+  WHY="$LABEL has not published a project yet"
+elif [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
+  WHY="ndev@$LABEL: project dir $DIR is gone; run 'sudo ndev-prune' or re-publish with ndev"
+fi
+if [ -n "$WHY" ]; then
+  echo "$WHY" >&2
+  [ -z "$CHECK" ] || exit 1
+  exit 0    # removed while starting: one restart, then the condition skips it
+fi
+[ -z "$CHECK" ] || exit 0
+cd "$DIR"
+# node_modules lives on the root volume and survives reboots, but a fresh volume (or a
+# dependency change) would otherwise leave the service crash-looping on a missing module.
+[ -d node_modules ] || { echo "installing dependencies..."; pnpm install || npm install; }
+# Prefer `npm run dev` so package.json lifecycle hooks fire. dolphin-labs generates a
+# git-ignored dataset in `predev`; running `next dev` directly skipped it and every page
+# 500'd on a missing import -- which reads as a broken checkout, not a missing build step.
+if node -e 'process.exit(require("./package.json").scripts && require("./package.json").scripts.dev ? 0 : 1)' 2>/dev/null; then
+  exec npm run dev -- --port "$PORT" --hostname 0.0.0.0
+fi
+exec npx next dev --port "$PORT" --hostname 0.0.0.0

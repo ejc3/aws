@@ -1,0 +1,36 @@
+#!/bin/bash
+# ndev-register <hostname> <port> <user> <projectdir> -- record a published project in THIS container
+# and start its ndev@<label> unit. Called by ndev through sudo.
+#
+# Nothing here is trusted by the host. The host's nextjs-ct-ndev-sync reads the env files this writes
+# (the container's /var/lib/ndev is a host directory mounted in), checks every field again against
+# what this account may publish, and only then routes the hostname to <container address>:<port>.
+# The checks below exist to give the person a clear error at once rather than a route that never appears.
+set -euo pipefail
+HOST="$1"; PORT="$2"; WHO="$3"; DIR="$4"
+ME=$(cat /etc/nextjs-ct/user)
+[ "$WHO" = "$ME" ] || { echo "refusing: this container belongs to $ME, not $WHO" >&2; exit 1; }
+ZONE=$(/usr/local/bin/ndev-zone "$WHO")
+[ -n "$ZONE" ] || { echo "refusing: $WHO has no publishing zone" >&2; exit 1; }
+case "$HOST" in *".$ZONE") ;; *) echo "refusing: $HOST is not under $ZONE" >&2; exit 1 ;; esac
+LABEL="${HOST%.$ZONE}"
+case "$LABEL" in "$WHO"|"$WHO"-*) ;; *) echo "refusing: $HOST must be $WHO.$ZONE or $WHO-<slug>.$ZONE" >&2; exit 1 ;; esac
+case "$LABEL" in *[!a-z0-9-]*|"") echo "refusing: bad instance label $LABEL" >&2; exit 1 ;; esac
+case "$PORT" in ''|*[!0-9]*) echo "refusing: bad port $PORT" >&2; exit 1 ;; esac
+case "$DIR" in "/home/$WHO"|"/home/$WHO"/*) ;; *) echo "refusing: $DIR is outside /home/$WHO" >&2; exit 1 ;; esac
+[ -f "$DIR/package.json" ] || { echo "refusing: no package.json in $DIR" >&2; exit 1; }
+
+mkdir -p /var/lib/ndev/instances
+TMP=$(mktemp /var/lib/ndev/instances/.new.XXXXXX)
+printf 'HOST=%s\nPORT=%s\nDIR=%s\nWHO=%s\n' "$HOST" "$PORT" "$DIR" "$WHO" > "$TMP"
+chmod 644 "$TMP"
+mv -f "$TMP" "/var/lib/ndev/instances/$LABEL.env"
+
+# %i is the label; a drop-in names the real account so ndev@ejc3-foo runs as ejc3.
+DROP_DIR="/etc/systemd/system/ndev@$LABEL.service.d"
+mkdir -p "$DROP_DIR"
+printf '[Service]\nUser=%s\nGroup=%s\nWorkingDirectory=/home/%s\nEnvironment=HOME=/home/%s\n' "$WHO" "$WHO" "$WHO" "$WHO" > "$DROP_DIR/user.conf"
+systemctl daemon-reload
+systemctl enable "ndev@$LABEL.service" >/dev/null 2>&1
+systemctl restart "ndev@$LABEL.service"
+echo "registered $HOST -> port $PORT (ndev@$LABEL, enabled at boot)"

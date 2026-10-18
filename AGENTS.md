@@ -528,6 +528,27 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
   ports. Its IAM role reads one S3 object and two secrets, can describe instances for hop
   aliases, and has the scoped `DevEBS=true` temporary-volume policy. Don't re-narrow it
 
+### nextjs-ct: the containerized replacement (being built; takes over at the cutover)
+
+`nextjs-ct.tf`, `nextjs-ct-user-data.tf`, `scripts/nextjs-ct/` (README, "The containerized replacement"). Every
+account in `local.nextjs_users`, ejc3 included, gets a systemd-nspawn container; the host is admin and routing
+only. Rules an agent must keep:
+
+- **The host never runs anything from a person's home.** Host accounts exist only for sshd: login shell `/bin/sh`
+  (bash would source `~/.bashrc`, which the person writes from inside the container, on the host), `ForceCommand
+  nextjs-ct-enter`, `PermitUserRC no`, forwarding only to their own container. Host-side readers of
+  container-written files (`nextjs-ct-ndev-sync`) open them without following symlinks and re-check every field.
+- **One switch.** `local.nextjs_ct_serving` (false until the owner's go) moves the Elastic IP, Name tag, alarms,
+  backup selection and agents-md target, starts this box's tunnels and agents, and stops nextjs-dev. Never run
+  `cloudflared` here while it is false: the same tunnel credentials on two boxes split live traffic.
+- **AWS from a container is the role narrowed, never widened.** `nextjs-ct-imds` assumes nextjs-dev-role again with
+  `local.nextjs_ct_session_policies`; add a denial there, never an allow. Owner-only: other roles, the hop key, the
+  Google Docs token, the dev-box launchers.
+- **Ports are per container**; the host reaches a dev server at `10.88.<uid-1000>.2:<port>`. Only the owner's
+  container may reach the Mac's reverse tunnel (host loopback 2222, relayed by `nextjs-ct-mac-tunnel.socket`).
+- Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
+  --pipe --wait ...`) from `ubuntu`.
+
 ### Colton Games Workers Builds
 
 The ordinary Cloudflare provider remains authenticated with the account-owned tunnel

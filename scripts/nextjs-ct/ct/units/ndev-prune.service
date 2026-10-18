@@ -1,0 +1,6 @@
+[Unit]
+Description=Unpublish ndev projects whose directory has been deleted
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ndev-prune

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Claude/Codex update
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

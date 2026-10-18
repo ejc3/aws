@@ -20,7 +20,7 @@ class AgentsMdTests(unittest.TestCase):
         self.assertEqual(re.findall(r"\"([^\"]+)\"\s*=\s*\{", targets), ["fcvm-metal-arm/ubuntu", "nextjs-dev/ejc3"])
         self.assertNotIn("jumpbox", targets)
         self.assertIn("aws_instance.firecracker_dev[*].id", targets)
-        self.assertIn("aws_instance.nextjs_dev[*].id", targets)
+        self.assertIn("[local.nextjs_live_instance.id]", targets)
 
     def test_read_from_main_through_the_app_with_the_key_never_in_state(self):
         data = block("github_repository_file", "agents_md")

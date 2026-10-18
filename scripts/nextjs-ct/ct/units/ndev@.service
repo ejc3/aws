@@ -1,0 +1,21 @@
+[Unit]
+Description=next dev server for %i (published through that user's zone tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Default assumes %i is a unix user (ejc3, colton). Prefixed labels (ejc3-foo) get a
+# drop-in from ndev-register that sets User=/Group=/HOME to the real account.
+User=%i
+WorkingDirectory=/home/%i
+Environment=HOME=/home/%i
+Environment=NODE_ENV=development
+# Skip (inactive, not failed, no restart) when nothing is published or its dir is gone.
+ExecCondition=/usr/local/bin/ndev-run --check %i
+ExecStart=/usr/local/bin/ndev-run %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

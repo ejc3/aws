@@ -1,0 +1,18 @@
+[Unit]
+Description=Seed a Codex thread for each folder agents-start opened for %i
+After=claude-rc@%i.service codex-rc@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+ExecCondition=/bin/sh -c 'test -s /home/%i/.local/state/agents-start/dirs && /home/%i/.local/bin/codex login status >/dev/null 2>&1'
+ExecStart=/usr/local/bin/codex-seed-thread --from /home/%i/.local/state/agents-start/dirs
+Environment=CODEX_BIN=/home/%i/.local/bin/codex
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

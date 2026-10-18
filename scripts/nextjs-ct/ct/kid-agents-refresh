@@ -1,0 +1,77 @@
+#!/bin/bash
+set -uo pipefail
+WHO="${1:?usage: kid-agents-refresh <user>}"
+id "$WHO" >/dev/null 2>&1 || { echo "no such user $WHO" >&2; exit 1; }
+HOMEDIR="/home/$WHO"
+OUT="$HOMEDIR/Documents/Codex/AGENTS.md"
+install -d -o "$WHO" -g "$WHO" -m 755 "$HOMEDIR/Documents/Codex"
+
+HOST=""; PORT=""
+if [ -f "/var/lib/ndev/instances/$WHO.env" ]; then
+  . "/var/lib/ndev/instances/$WHO.env"
+elif [ -f "/var/lib/ndev/$WHO.env" ]; then
+  . "/var/lib/ndev/$WHO.env"
+fi
+
+# git must run AS the user: root gets "dubious ownership" on a user-owned repo and every
+# command returns empty, which silently produces a project list with no projects in it.
+#
+# Built in this loop rather than inside `sudo -u ... bash -c '...'`. In that form the
+# markdown backticks landed inside double quotes in the inner shell and were executed as
+# command substitution -- `~/%s` became an attempt to run /home/<user>/%s, and one repo
+# came out as three garbled lines. Here the backticks are backslash-escaped and never
+# reach a nested shell.
+BT='`'
+REPOS=""
+for d in "$HOMEDIR"/*/; do
+  [ -d "$d/.git" ] || continue
+  n=$(basename "$d")
+  r=$(sudo -u "$WHO" git -C "$d" remote get-url origin 2>/dev/null | sed 's|https://github.com/||;s|\.git$||')
+  b=$(sudo -u "$WHO" git -C "$d" branch --show-current 2>/dev/null)
+  REPOS="${REPOS}- ${BT}~/${n}${BT} — ${r:-no remote} (branch ${BT}${b:-detached}${BT})
+"
+done
+REPOS=$(printf '%s' "$REPOS")
+
+# Fail loudly rather than shipping an empty list. The metal-box generator produced one on
+# its first run and `|| true` hid it; the file looked fine and told an agent nothing.
+if [ -z "$REPOS" ]; then
+  echo "kid-agents-refresh: found no git repos for $WHO -- keeping existing AGENTS.md" >&2
+  [ -s "$OUT" ] && exit 0
+  REPOS="- (no git repositories yet -- ask the user what to work on)"
+fi
+
+TMP=$(mktemp)
+{
+  printf '# Read this first\n\n'
+  printf 'You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.\n'
+  printf '**That folder is not the project.** The real work is in one of these:\n\n'
+  printf '%s\n\n' "$REPOS"
+  printf 'They are writable inside your sandbox. Run commands from the project directory.\n\n'
+  printf '## The dev server is already running -- do not start one\n\n'
+  if [ -n "$HOST" ]; then
+    printf 'This project is live at https://%s on port %s.\n\n' "$HOST" "$PORT"
+  fi
+  printf 'It is a systemd service that starts at boot and restarts if it crashes. Running\n'
+  printf '`next dev` or `npm run dev` yourself collides on the port and breaks the live site.\n\n'
+  printf '**Your sandbox may have no network access, even to localhost.** When it does not,\n'
+  printf '`curl http://localhost:...` fails identically whether the server is healthy or truly\n'
+  printf 'stopped, so it tells you nothing. Never conclude from a failed curl that it is down.\n'
+  printf 'Check the service instead -- these need no network:\n\n'
+  printf '```bash\n'
+  printf 'systemctl is-active ndev@%s      # "active" means the site is up\n' "$WHO"
+  printf 'journalctl -u ndev@%s -n 50      # recent output, including compile errors\n' "$WHO"
+  printf 'sudo systemctl restart ndev@%s   # only if a change needs a full restart\n' "$WHO"
+  printf '```\n\n'
+  printf 'Next.js hot-reloads on save, so most edits need no restart at all.\n\n'
+  printf '## This machine\n\n'
+  printf -- '- This is your own container: **sudo needs no password** and installs stay here.\n'
+  printf '  Nothing you do here reaches anyone else on the box.\n'
+  printf -- '- Your home directory persists across reboots and is backed up daily.\n'
+  printf -- '- `git` is authenticated as your own GitHub account, and `vercel` as your own\n'
+  printf '  Vercel account. Both kids share one Vercel project, so pushing to `main`\n'
+  printf '  deploys the shared site.\n'
+} > "$TMP"
+install -m 644 -o "$WHO" -g "$WHO" "$TMP" "$OUT"
+rm -f "$TMP"
+echo "wrote $OUT ($(wc -c < "$OUT") bytes, $(printf '%s' "$REPOS" | grep -c '^- ') repo(s))"

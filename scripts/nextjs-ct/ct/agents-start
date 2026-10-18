@@ -1,0 +1,70 @@
+#!/bin/bash
+# NOT set -e: t-claude's final step attaches to the tmux session, which fails harmlessly
+# here ("open terminal failed: not a terminal") since systemd gives this no tty -- by that
+# point the session, window and claude launch have already succeeded. -e would treat that
+# expected failure as agents-start itself having failed.
+set -uo pipefail
+WHO="$1"
+export HOME="/home/$WHO"
+WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
+# Every folder this run opens a window for, for codex-seed@<user> (seeds a Codex thread in each).
+DIRS_STATE="$HOME/.local/state/agents-start"
+mkdir -p "$DIRS_STATE"
+DIRS_NEW=$(mktemp "$DIRS_STATE/dirs.XXXXXX")
+printf '%s\n' "$WORKDIR" > "$DIRS_NEW"
+zsh -c "
+  source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
+  cd '$WORKDIR' || exit 1
+  # --auto is REQUIRED for an unattended launcher. Without it t-claude takes the interactive
+  # path, `claude --resume`, which renders the session PICKER as soon as the user has any
+  # transcript -- and a picker waits for a keypress systemd will never send. The window then
+  # sits there with no claude running, so remote control has nothing to attach to. --auto
+  # resolves to `claude --continue` when transcripts exist, plain `claude` when they do not.
+  t-claude --auto --remote-control
+"
+echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
+
+# Extra managed folders (added 2026-09-25 by Claude, Starfall Arena handoff to Connor). Optional,
+# per user: ~/.config/agent-extra-dirs lists one folder per line (# comments and blanks skipped).
+# Each gets the same `t-claude --auto --remote-control` as WORKDIR above: its own tmux window,
+# keyed by folder, resuming that folder's newest conversation. No file = no change. Revert with
+# the .bak-20260925 copy beside this script.
+EXTRA="$HOME/.config/agent-extra-dirs"
+if [ -f "$EXTRA" ]; then
+  while IFS= read -r XD || [ -n "$XD" ]; do
+    case "$XD" in ''|'#'*) continue ;; esac
+    [ -d "$XD" ] || { echo "agents-start: $WHO extra dir $XD missing, skipped" >&2; continue; }
+    [ "$XD" = "$WORKDIR" ] && continue
+    zsh -c "
+      source ~/.config/t-claude.zsh 2>/dev/null || exit 1
+      cd '$XD' || exit 1
+      t-claude --auto --remote-control
+    " </dev/null
+    echo "agents-start: t-claude invoked for $WHO in $XD"
+    printf '%s\n' "$XD" >> "$DIRS_NEW"
+  done < "$EXTRA"
+fi
+# Every folder with session activity in the last 30 days (owner, 2026-10-13): prompted in a Claude
+# conversation, or marked for interactive use (claude-interactive in its git dir). The same rule as
+# fcvm-claude-rc and agent-session-sync: /usr/local/bin/agent-active-dirs. A folder nobody prompted
+# stays closed; agent-extra-dirs above is for pinning one regardless.
+while IFS= read -r XD; do
+  [ -d "$XD" ] || continue
+  [ "$XD" = "$WORKDIR" ] && continue
+  grep -qxF -- "$XD" "$DIRS_NEW" && continue
+  zsh -c '
+    source ~/.config/t-claude.zsh 2>/dev/null || exit 1
+    cd -- "$1" || exit 1
+    t-claude --auto --remote-control
+  ' agents-start "$XD" </dev/null
+  echo "agents-start: t-claude invoked for $WHO in $XD (active in the last 30 days)"
+  printf '%s\n' "$XD" >> "$DIRS_NEW"
+done < <(/usr/local/bin/agent-active-dirs --home "$HOME" 2>/dev/null)
+mv -f "$DIRS_NEW" "$DIRS_STATE/dirs"
+
+# Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
+# resumed conversation carries a Remote Control binding that is dead whenever the process that
+# owned it is gone. Handing that over "started but unreachable" is how the user finds out on
+# their phone. Give claude a moment to render, then repair before reporting success.
+sleep 20
+/usr/local/bin/claude-rc-ensure "$WHO" || true

@@ -1,0 +1,11 @@
+#!/bin/bash
+# ndev-zone <user>         -> the zone that account publishes to (empty: none)
+# ndev-zone --tunnel <zone> -> that zone's tunnel id (exit 1: unknown zone)
+# Read from the box's one configuration file, rendered by Terraform (nextjs-ct-user-data.tf).
+set -euo pipefail
+CONFIG="${NEXTJS_CT_CONFIG:-/opt/nextjs-ct/config.json}"
+[ -r "$CONFIG" ] || CONFIG=/etc/nextjs-ct/config.json
+case "${1:-}" in
+  --tunnel) jq -er --arg z "${2:-}" '.zones[$z] // empty' "$CONFIG" ;;
+  *) jq -r --arg u "${1:-}" '.users[$u].zone // empty' "$CONFIG" ;;
+esac

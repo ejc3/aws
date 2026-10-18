@@ -1,0 +1,13 @@
+[Unit]
+Description=Converge this container (nextjs-ct provision)
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /opt/nextjs-ct/ct/provision
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

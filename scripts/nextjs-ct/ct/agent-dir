@@ -1,0 +1,19 @@
+#!/bin/bash
+WHO="$1"
+ENVF=""
+[ -f "/var/lib/ndev/instances/$WHO.env" ] && ENVF="/var/lib/ndev/instances/$WHO.env"
+[ -z "$ENVF" ] && [ -f "/var/lib/ndev/$WHO.env" ] && ENVF="/var/lib/ndev/$WHO.env"
+DIR=""
+[ -n "$ENVF" ] && . "$ENVF"
+[ -n "$DIR" ] && [ -d "$DIR" ] || DIR="/home/$WHO"
+
+# Anchor on the REPO ROOT, not the directory ndev happens to publish.
+#
+# t-claude keys a tmux window by its folder, ndev records the Next.js app dir (.../web), and
+# the docs tell people to run `cd ~/<repo> && t-claude` from the root. Those are two
+# different folders, so the managed session and the one a person starts were guaranteed to
+# be different windows -- both running claude, and attaching landed you in the wrong one.
+# Anchoring here makes them the same window, and gives claude the whole repo besides.
+ROOT="$(sudo -u "$WHO" git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$ROOT" ] && [ -d "$ROOT" ] && DIR="$ROOT"
+printf '%s\n' "$DIR"

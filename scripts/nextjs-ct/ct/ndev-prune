@@ -1,0 +1,18 @@
+#!/bin/bash
+# ndev-prune -- retire every project published in this container whose directory no longer exists:
+# stop and disable its ndev@<label> unit and remove its env file and drop-in. The host drops the
+# hostname's route by itself (nextjs-ct-ndev-sync routes only env files whose directory exists).
+set -uo pipefail
+for f in /var/lib/ndev/instances/*.env; do
+  [ -f "$f" ] || continue
+  label=$(basename "$f" .env)
+  case "$label" in *[!a-z0-9-]*|"") continue ;; esac
+  dir=$(sed -n 's/^DIR=//p' "$f" | head -n 1)
+  [ -n "$dir" ] && [ -d "$dir" ] && continue
+  echo "ndev-prune: $label's project dir '$dir' is gone; unpublishing"
+  systemctl disable --now "ndev@$label.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "ndev@$label.service" >/dev/null 2>&1 || true
+  rm -f "$f"
+  rm -rf "/etc/systemd/system/ndev@$label.service.d"
+done
+systemctl daemon-reload

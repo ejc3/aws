@@ -104,10 +104,28 @@ resource "aws_instance" "nextjs_ct" {
     ignore_changes = [ami, user_data, user_data_base64]
   }
 
+  # Takes nextjs-dev's name at the cutover, so everything that finds the box by name follows it: the
+  # auto-reboot Lambda, claw-master's certificate renewal, the hop aliases on the metal boxes.
   tags = {
-    Name    = "nextjs-ct"
+    Name    = local.nextjs_ct_serving ? "nextjs-dev" : "nextjs-ct"
     Purpose = "Containerized replacement for nextjs-dev (one container per person)"
   }
+}
+
+# ---------------------------------------------------------------------------------
+# The cutover switch: local.nextjs_ct_serving (nextjs-ct-user-data.tf). Everything keyed to "the nextjs
+# box" reads local.nextjs_live_instance, so flipping that one value moves the Elastic IP, the Name tag,
+# the memory and disk alarms, the backup selection and the agents-md target together, starts this
+# box's tunnels and agents, and stops (never terminates) nextjs-dev. Flipping it back is the rollback.
+# ---------------------------------------------------------------------------------
+locals {
+  nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)
+}
+
+resource "aws_ec2_instance_state" "nextjs_dev" {
+  count       = var.enable_nextjs_dev && var.enable_nextjs_ct ? 1 : 0
+  instance_id = aws_instance.nextjs_dev[0].id
+  state       = local.nextjs_ct_serving ? "stopped" : "running"
 }
 
 output "nextjs_ct_public_ip" {

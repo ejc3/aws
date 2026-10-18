@@ -1,0 +1,78 @@
+#!/bin/bash
+# ndev [name] -- start `next dev` in this project and expose it under your zone.
+#
+# Defaults:
+#   - primary checkout (e.g. ~/dolphin-labs/web) -> https://$USER.<zone>
+#   - worktree under ~/worktrees/<slug>/... or ~/<repo>/.claude/worktrees/<slug>/...
+#     -> https://$USER-<slug>.<zone>
+# Explicit arg becomes $USER-<arg> unless it is already $USER or $USER-*.
+# Hostnames must stay $USER or $USER-* under the account's zone (no bare unrelated names).
+#
+# Multiple labels for one user stay up concurrently (ndev@ejc3 and ndev@ejc3-foo).
+#
+# Runs inside the account's own container. The port is derived from the hostname, so restarting
+# gives the same port and the tunnel mapping stays valid; ports cannot clash with another person's,
+# because every container has its own network namespace. The server listens on the container's
+# private address, which only the host can reach: the host's cloudflared forwards the hostname to
+# <container address>:<port> (nextjs-ct-ndev-sync on the host publishes it), and Cloudflare Access
+# gates it (Google for cc-games, GitHub for dolphin-labs). The box has no inbound web ports.
+set -euo pipefail
+DOMAIN=$(/usr/local/bin/ndev-zone "$USER")
+[ -n "$DOMAIN" ] || { echo "no publishing zone for $USER -- add them to local.nextjs_user_zone" >&2; exit 1; }
+
+sanitize() {
+  printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z' | sed 's/^-*//;s/-*$//'
+}
+
+HERE=$(pwd -P 2>/dev/null || pwd)
+if [ -n "${1:-}" ]; then
+  ARG=$(sanitize "$1")
+  [ -n "$ARG" ] || { echo "usage: ndev [name]" >&2; exit 1; }
+  case "$ARG" in
+    "$USER"|"$USER"-*) LABEL="$ARG" ;;
+    *) LABEL="$USER-$ARG" ;;
+  esac
+else
+  LABEL=""
+  case "$HERE" in
+    "/home/$USER/worktrees/"*)
+      SLUG="${HERE#/home/$USER/worktrees/}"
+      SLUG="${SLUG%%/*}"
+      LABEL="$USER-$(sanitize "$SLUG")"
+      ;;
+    *)
+      # e.g. /home/ejc3/dolphin-labs/.claude/worktrees/<slug>/web
+      SLUG=$(printf '%s' "$HERE" | sed -n "s|^/home/$USER/[^/]*/\\.claude/worktrees/\\([^/]*\\).*|\\1|p")
+      if [ -n "$SLUG" ]; then
+        LABEL="$USER-$(sanitize "$SLUG")"
+      fi
+      ;;
+  esac
+  [ -n "$LABEL" ] || LABEL="$USER"
+fi
+
+HOST="$LABEL.$DOMAIN"
+# Belt-and-suspenders with ndev-register's check.
+case "$LABEL" in
+  "$USER"|"$USER"-*) ;;
+  *) echo "refusing: hostname must be $USER.$DOMAIN or $USER-<slug>.$DOMAIN" >&2; exit 1 ;;
+esac
+PORT=$(( 3100 + ( $(printf '%s' "$HOST" | cksum | awk '{print $1}') % 800 ) ))
+
+[ -f package.json ] || { echo "no package.json here -- run ndev inside a Next.js project" >&2; exit 1; }
+
+# Hand the project to systemd rather than running it in this terminal. Publishing and
+# making it durable are then the same action -- there is no way to end up with a URL
+# registered in the tunnel but nothing set to restart behind it, which is exactly the
+# state a spot interruption left this box in before.
+sudo /usr/local/bin/ndev-register "$HOST" "$PORT" "$USER" "$(pwd)"
+echo ""
+echo "  https://$HOST   (port $PORT)"
+echo "  sign in when prompted -- Cloudflare Access gates every hostname"
+echo ""
+echo "  it keeps running after you log out, and comes back by itself if the box reboots."
+echo "  the URL starts working within a few seconds, once the host has published it."
+echo "    logs:    journalctl -u ndev@$LABEL -f"
+echo "    restart: systemctl restart ndev@$LABEL"
+echo "    stop:    systemctl stop ndev@$LABEL"
+echo ""

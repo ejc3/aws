@@ -17,7 +17,7 @@
 locals {
   agents_md_targets = {
     "fcvm-metal-arm/ubuntu" = { user = "ubuntu", instance_ids = aws_instance.firecracker_dev[*].id }
-    "nextjs-dev/ejc3"       = { user = "ejc3", instance_ids = aws_instance.nextjs_dev[*].id }
+    "nextjs-dev/ejc3"       = { user = "ejc3", instance_ids = var.enable_nextjs_dev ? [local.nextjs_live_instance.id] : [] }
   }
   agents_md_github_app = jsondecode(ephemeral.aws_secretsmanager_secret_version.agents_md_github_app.secret_string)
 }

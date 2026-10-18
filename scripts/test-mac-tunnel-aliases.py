@@ -14,6 +14,8 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "mac-reverse-tunnels.tf").read_text()
 SETUP = re.search(r"mac_reverse_tunnel_setup = <<-MACSETUP\n(.*?)\nMACSETUP", SOURCE, re.S).group(1)
+HOST_KEYS = re.search(r"mac_tunnel_host_keys = <<-MACHOSTKEYS\n(.*?\n)MACHOSTKEYS\n", SOURCE, re.S).group(1)
+SETUP = SETUP.replace("${local.mac_tunnel_host_keys}", HOST_KEYS)
 
 
 class MacTunnelAliases(unittest.TestCase):

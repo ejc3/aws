@@ -2,6 +2,13 @@
 # reverse forwards; they do not open an AWS security-group port or start a tunnel.
 # The existing ~/.ssh/to-mac private key stays on the persistent ARM root.
 locals {
+  # The MacBook's public host keys, read directly from EJ's MacBook Pro when its tunnel was set up. ONE copy: fcvm-arm's
+  # aliases below and ejc3's container on the containerized nextjs box (nextjs-ct-user-data.tf) both pin these.
+  mac_tunnel_host_keys = <<-MACHOSTKEYS
+ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAX5Q08R6QP8SbnpXPZTKTwGgrLz4DnGMZzRw2EDGaxn
+ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL
+MACHOSTKEYS
+
   # cloudflared for Host macbook's proxy command, pinned with claw-master's (claw-master-tunnel.tf). Kept out of
   # mac_reverse_tunnel_setup, which scripts/test-mac-tunnel-aliases.py runs as plain bash.
   macbook_cloudflared_install = <<-MACCFD
@@ -71,11 +78,9 @@ export TUNNEL_SERVICE_TOKEN_ID TUNNEL_SERVICE_TOKEN_SECRET
 PATH="$HOME/.local/bin:$PATH" exec cloudflared access ssh --hostname "$1"
 MACPROXY
 
-# Public host identity read directly from EJ's MacBook Pro when its tunnel was set up.
+# Public host identity read directly from EJ's MacBook Pro when its tunnel was set up (local.mac_tunnel_host_keys).
 cat > /home/ubuntu/.ssh/known_hosts.mac-tunnels <<'MACHOSTKEYS'
-ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAX5Q08R6QP8SbnpXPZTKTwGgrLz4DnGMZzRw2EDGaxn
-ejs-macbook-pro-via-fcvm ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL
-MACHOSTKEYS
+${local.mac_tunnel_host_keys}MACHOSTKEYS
 
 # Include first so an old Host * cannot override a managed destination. Migrate only
 # the two standalone hand-written stanzas; preserve unrelated hosts and includes.

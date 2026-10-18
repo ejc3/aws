@@ -1,0 +1,30 @@
+#!/bin/bash
+# nextjs-ct-base -- build the template every new container is copied from, once (and again only when
+# provision changes the packages it installs: the stamp is provision's sha256).
+#
+# Ubuntu 24.04 from debootstrap, then the same `provision --base` every container runs at boot, executed
+# here as a plain chroot-like nspawn (host network, no boot, no user namespace: the template holds no one's
+# data). Existing containers are never rebuilt from it; they converge by running provision themselves.
+set -euo pipefail
+B=/var/lib/nextjs-ct/base
+SHARED=/var/lib/nextjs-ct/shared
+STAMP=$(sha256sum "$SHARED/ct/provision" | cut -d' ' -f1)
+if [ -e "$B/.complete" ] && [ "$(cat "$B/.complete")" = "$STAMP" ]; then exit 0; fi
+rm -rf "$B.new"
+debootstrap --variant=minbase --components=main,universe \
+  --include=systemd,systemd-sysv,dbus,ca-certificates,curl,jq,sudo,openssh-server,iproute2,locales,gnupg \
+  noble "$B.new" http://ports.ubuntu.com/ubuntu-ports
+systemd-nspawn -q -D "$B.new" --resolv-conf=bind-host --timezone=off --bind-ro="$SHARED:/opt/nextjs-ct" \
+  /bin/bash /opt/nextjs-ct/ct/provision --base
+install -m 644 "$SHARED/ct/units/nextjs-ct-provision.service" "$B.new/etc/systemd/system/"
+ln -sf /etc/systemd/system/nextjs-ct-provision.service "$B.new/etc/systemd/system/multi-user.target.wants/nextjs-ct-provision.service"
+# The machine id is per container: systemd makes one at first boot when this file is empty.
+: > "$B.new/etc/machine-id"
+rm -f "$B.new/etc/hostname"   # debootstrap copied the host's; nspawn names each container after its machine
+rm -f "$B.new/var/lib/dbus/machine-id"
+printf '%s' "$STAMP" > "$B.new/.complete"
+rm -rf "$B.old"
+[ -d "$B" ] && mv "$B" "$B.old"
+mv "$B.new" "$B"
+rm -rf "$B.old"
+echo "nextjs-ct-base: template built ($STAMP)"

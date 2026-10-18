@@ -1,0 +1,34 @@
+[Unit]
+Description=Claude Code (t-claude) with remote control for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot + RemainAfterExit, not forking -- same fix as codex-rc@ below and for the same
+# reason: t-claude's `tmux new-session` daemonises the tmux SERVER independently of the
+# process that called it, so the launching zsh/bash returns quickly regardless of whether
+# any child survives. Type=forking expects a forked child for systemd to adopt; there
+# isn't one, so the unit flips to failed even though the session was created successfully.
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=HOME=/home/%i
+Environment=TERM=xterm-256color
+WorkingDirectory=/home/%i
+ExecStart=/usr/local/bin/agents-start %i
+# No Restart=, matching codex-rc@ below exactly -- checked its LIVE deployed unit rather
+# than trust memory of it, and confirmed the source here has none either. Caught the hard
+# way: `systemd-analyze verify` refuses Restart=always/on-success on a Type=oneshot service
+# outright ("isn't allowed"), so an earlier version of this unit with that combination
+# would never have started at all. codex-rc@'s actual resilience comes from the nightly
+# agent-update.timer calling `systemctl restart` explicitly, which works on a oneshot unit
+# regardless of Restart= -- that already covers this unit too, so nothing else is needed.
+#
+# No ExecStop either: there is no "stop remote control" operation to run here the way
+# codex has one. Killing the tmux server on stop would end every OTHER session in it too,
+# including ones opened by hand over SSH -- exactly the collision this unification is
+# meant to avoid, not reintroduce on the stop path. `systemctl stop` just marks the unit
+# inactive; the tmux session and claude process are untouched and still reachable.
+
+[Install]
+WantedBy=multi-user.target

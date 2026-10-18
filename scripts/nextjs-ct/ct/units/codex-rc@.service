@@ -1,0 +1,25 @@
+[Unit]
+Description=Codex app-server daemon with remote control for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+# No -c overrides here on purpose. `remote-control start` DISCARDS them: only the bare
+# foreground `codex remote-control` forwards root config overrides. And even if it did
+# forward them they would lose -- the ChatGPT client sends approvalPolicy and sandbox with
+# each thread/start, and codex merges them as
+#   sandbox_mode_override.or(self.sandbox_mode)
+# i.e. client beats config.toml (SessionFlags layer 30 > user config layer 20). Verified
+# on this box: a session rollout recorded approval_policy="on-request" and
+# sandbox_policy=workspace-write while config.toml said never/danger-full-access.
+# The approval mode is the app's to choose; nothing host-side can outrank it.
+ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; CX="/home/%i/.local/bin/codex"; "$CX" remote-control start >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do "$CX" remote-control start --json 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
+ExecStop=-/home/%i/.local/bin/codex remote-control stop
+
+[Install]
+WantedBy=multi-user.target

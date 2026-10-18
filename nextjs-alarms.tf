@@ -32,7 +32,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_disk_queue" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    VolumeId = aws_instance.nextjs_dev[0].root_block_device[0].volume_id
+    VolumeId = local.nextjs_live_instance.root_block_device[0].volume_id
   }
 }
 
@@ -53,7 +53,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_disk_read_flood" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    VolumeId = aws_instance.nextjs_dev[0].root_block_device[0].volume_id
+    VolumeId = local.nextjs_live_instance.root_block_device[0].volume_id
   }
 }
 
@@ -74,7 +74,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_cpu_credits" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    InstanceId = aws_instance.nextjs_dev[0].id
+    InstanceId = local.nextjs_live_instance.id
   }
 }
 
@@ -94,7 +94,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_status_check" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    InstanceId = aws_instance.nextjs_dev[0].id
+    InstanceId = local.nextjs_live_instance.id
   }
 }
 
@@ -121,7 +121,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_memory" {
   insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 
   dimensions = {
-    InstanceId = aws_instance.nextjs_dev[0].id
+    InstanceId = local.nextjs_live_instance.id
   }
 }
 
@@ -146,6 +146,6 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_swap" {
   insufficient_data_actions = [aws_sns_topic.cost_alerts.arn]
 
   dimensions = {
-    InstanceId = aws_instance.nextjs_dev[0].id
+    InstanceId = local.nextjs_live_instance.id
   }
 }

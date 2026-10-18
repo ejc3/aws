@@ -1,0 +1,303 @@
+#!/bin/bash
+# provision -- converge one person's container (or, with --base, the template every container starts from).
+#
+# Runs as root INSIDE the container: at every container boot (nextjs-ct-provision.service) and whenever
+# the host's setup-sync applies a new script (it starts that unit through `systemctl -M <user>`). It is
+# idempotent, so a second run changes nothing that is already right.
+#
+# Inputs, both mounted read-only from the host:
+#   /opt/nextjs-ct        the box's shared files: config.json (rendered by Terraform), these helpers,
+#                         the unit files and the snippets Terraform renders (shell environment, agent
+#                         watchers)
+#   /opt/nextjs-ct-user   this container's own identity: user, uid, address, gateway, its SSH host key
+#                         and the public half of the key the host's sshd relays sessions with
+#
+# The person is root in here and may change anything; nothing on the host relies on this script having
+# run. It exists so the container starts out with everything the old shared box gave each account.
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+SHARED=/opt/nextjs-ct
+CONFIG=$SHARED/config.json
+ME=/opt/nextjs-ct-user
+BASE=""
+[ "${1:-}" = "--base" ] && BASE=1
+cfg() { jq -r "$@" "$CONFIG"; }
+warn() { echo "WARNING: $*" >&2; FAILED=1; }
+FAILED=""
+
+# ---------------------------------------------------------------- packages (also the template)
+if ! [ -s /etc/apt/sources.list.d/ubuntu.sources ] || ! grep -q universe /etc/apt/sources.list.d/ubuntu.sources; then
+  # debootstrap leaves a one-line sources.list with main only.
+  rm -f /etc/apt/sources.list
+  cat > /etc/apt/sources.list.d/ubuntu.sources <<'SOURCES'
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: noble noble-updates noble-security
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+fi
+PKGS="ca-certificates curl wget gnupg git openssh-server openssh-client sudo zsh bash-completion jq unzip xz-utils
+  python3 python3-venv python3-pip build-essential pkg-config locales tzdata iproute2 iputils-ping
+  dnsutils less vim-tiny nano procps psmisc file rsync dbus polkitd systemd-container libpam-systemd
+  man-db lsof strace htop tree sqlite3 cron libevent-core-2.1-7t64 libutempter0 ncurses-term"
+# Only when something is missing: this runs at every container boot, and a boot should not wait on apt.
+MISSING=$(for p in $PKGS; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || echo "$p"; done)
+if [ -n "$MISSING" ]; then
+  apt-get update -q || warn "apt-get update failed"
+  # shellcheck disable=SC2086 # a list of package names on purpose
+  apt-get install -y -q --no-install-recommends $MISSING || warn "some packages failed to install: $(echo $MISSING)"
+fi
+locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+update-locale LANG=en_US.UTF-8 >/dev/null 2>&1 || true
+
+if ! command -v aws >/dev/null 2>&1; then
+  T=$(mktemp -d)
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$T/aws.zip" \
+    && (cd "$T" && unzip -qo aws.zip && ./aws/install) || warn "aws cli install failed"
+  rm -rf "$T"
+fi
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null && apt-get install -y -q nodejs || warn "node install failed"
+fi
+command -v pnpm >/dev/null 2>&1 || npm install -g pnpm >/dev/null 2>&1 || warn "pnpm install failed"
+command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || warn "vercel install failed"
+if ! command -v gh >/dev/null 2>&1; then
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update -q && apt-get install -y -q gh || warn "gh install failed"
+fi
+# Playwright's system libraries, once, as root, so nobody needs `--with-deps` (which runs apt).
+if [ ! -e /var/lib/nextjs-ct/playwright-deps ] && command -v npx >/dev/null 2>&1; then
+  mkdir -p /var/lib/nextjs-ct
+  npx --yes playwright install-deps chromium >/dev/null 2>&1 && touch /var/lib/nextjs-ct/playwright-deps \
+    || warn "playwright system deps not installed; e2e will need --with-deps"
+fi
+
+# tmux: the ejc3 3.x build, and the pinned scroll-native tmux-scroll beside it (tmux-scroll.tf).
+if ! /usr/local/bin/tmux -V 2>/dev/null | grep -q "3\.[6-9]"; then
+  T=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/binaries-3.x/tmux-$(uname -m).tar.gz" -o "$T/tmux.tgz"; then
+    tar xzf "$T/tmux.tgz" -C "$T" && install -m 755 "$T/tmux" /usr/local/bin/tmux
+  else
+    apt-get install -y -q tmux || warn "tmux install failed"
+  fi
+  rm -rf "$T"
+fi
+TS_TAG=$(cfg .tmux_scroll.tag); TS_SHA=$(cfg .tmux_scroll.sha256)
+if [ "$(uname -m)" = aarch64 ] && [ "$(cat /var/lib/tmux-scroll/sha256 2>/dev/null)" != "$TS_SHA" ]; then
+  T=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/tmux/releases/download/$TS_TAG/tmux-scroll-aarch64.tar.gz" -o "$T/ts.tgz" \
+     && echo "$TS_SHA  $T/ts.tgz" | sha256sum -c --quiet - \
+     && tar xzf "$T/ts.tgz" -C "$T" && grep -qa scroll-replay "$T/tmux-scroll" && "$T/tmux-scroll" -V >/dev/null 2>&1; then
+    [ -e /usr/local/bin/tmux-scroll ] && mv -f /usr/local/bin/tmux-scroll /usr/local/bin/tmux-scroll.prev
+    install -m 755 "$T/tmux-scroll" /usr/local/bin/tmux-scroll && mkdir -p /var/lib/tmux-scroll && echo "$TS_SHA" > /var/lib/tmux-scroll/sha256
+  else
+    warn "pinned tmux-scroll did not download or verify"
+  fi
+  rm -rf "$T"
+fi
+
+# claw-master client, pinned with the server (claw-master-server.tf), and the claude-master link t-claude runs.
+CM_TAG=$(cfg .claw_master.tag); CM_SHA=$(cfg .claw_master.sha256)
+if [ "$(uname -m)" = aarch64 ] && [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" != "$CM_SHA" ]; then
+  T=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claw-master-linux-arm64" -o "$T/cm" \
+     && echo "$CM_SHA  $T/cm" | sha256sum -c --quiet -; then
+    install -m 0755 "$T/cm" /usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master
+  else
+    warn "pinned claw-master did not download or verify"
+  fi
+  rm -rf "$T"
+fi
+[ -x /usr/local/bin/claw-master ] && ln -sfn claw-master /usr/local/bin/claude-master
+# Route Claude through the shared pool for an ENROLLED account (its client certificate is readable).
+ZE=/etc/zsh/zshenv
+if [ -f "$ZE" ]; then
+  sed -i '/^# >>> claude-master (managed by nextjs-ct) >>>$/,/^# <<< claude-master <<<$/d' "$ZE"
+  cat >> "$ZE" <<ZSHENV
+# >>> claude-master (managed by nextjs-ct) >>>
+if [ -x /usr/local/bin/claude-master ] && [ -r "\$HOME/.config/claude-master/client.pem" ]; then
+  export TCLAUDE_INFERENCE_SERVER="$(cfg .claw_master.server)"
+  export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
+fi
+# <<< claude-master <<<
+ZSHENV
+fi
+curl -fsSL --retry 3 https://raw.githubusercontent.com/ejc3/t-claude/main/nosync-wrap -o /tmp/nw \
+  && [ -s /tmp/nw ] && install -m 755 /tmp/nw /usr/local/bin/nosync-wrap; rm -f /tmp/nw
+
+# Helpers and units, the same in every container.
+for f in "$SHARED"/ct/*; do
+  [ -f "$f" ] || continue
+  case "$f" in *.rules) continue ;; esac
+  install -m 755 "$f" "/usr/local/bin/$(basename "$f")"
+done
+install -m 644 "$SHARED"/ct/units/* /etc/systemd/system/
+install -d /etc/polkit-1/rules.d && install -m 644 "$SHARED/ct/50-ndev-own-units.rules" /etc/polkit-1/rules.d/
+# Judged by what they install: each ends with a daemon-reload, which fails while the template is built
+# without a running systemd.
+bash "$SHARED/snippets/agent-session-sync-install.sh"; [ -x /usr/local/bin/agent-session-sync ] || warn "agent-session-sync install failed"
+bash "$SHARED/snippets/codex-seed-install.sh"; [ -x /usr/local/bin/codex-seed-thread ] || warn "codex seed install failed"
+bash "$SHARED/snippets/user-agents-seed-install.sh"; [ -x /usr/local/bin/user-agents-seed ] || warn "user-agents-seed install failed"
+# The container boots without the host's network services; networkd brings up host0 (configured below).
+systemctl enable systemd-networkd.service systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+systemctl enable ssh.service >/dev/null 2>&1 || true
+systemctl daemon-reload 2>/dev/null || true
+
+if [ -n "$BASE" ]; then
+  [ -z "$FAILED" ] || exit 1
+  echo "provision: template ready"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- this container's person
+U=$(cat "$ME/user"); UIDN=$(cat "$ME/uid"); IP=$(cat "$ME/ip"); GW=$(cat "$ME/gateway")
+case "$U" in ''|*[!a-z0-9_-]*) echo "provision: bad user '$U'" >&2; exit 1 ;; esac
+install -d /etc/nextjs-ct
+echo "$U" > /etc/nextjs-ct/user
+# The template's /etc/hostname came from the host that built it; the container is named after its person.
+[ "$(cat /etc/hostname 2>/dev/null)" = "$U" ] || echo "$U" > /etc/hostname
+[ "$(hostname)" = "$U" ] || hostname "$U"
+if [ "$(cfg --arg u "$U" '.users[$u].codex_seed')" = true ]; then touch /etc/nextjs-ct/codex-seed; else rm -f /etc/nextjs-ct/codex-seed; fi
+OWNER=$(cfg --arg u "$U" '.users[$u].owner')
+
+# Network: a fixed address on the host's point-to-point link, the VPC resolver, the host by name.
+cat > /etc/systemd/network/10-host0.network <<NET
+[Match]
+Name=host0
+
+[Network]
+Address=$IP/24
+Gateway=$GW
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+NET
+rm -f /etc/resolv.conf
+printf 'nameserver 169.254.169.253\noptions edns0 trust-ad\n' > /etc/resolv.conf
+grep -q ' nextjs-host$' /etc/hosts 2>/dev/null && sed -i '/ nextjs-host$/d' /etc/hosts
+echo "$GW nextjs-host" >> /etc/hosts
+networkctl reload >/dev/null 2>&1 || true
+
+# The account, with the host's uid, so the bind-mounted home is theirs; root here through sudo.
+getent group "$U" >/dev/null || groupadd -g "$UIDN" "$U"
+id -u "$U" >/dev/null 2>&1 || useradd -M -u "$UIDN" -g "$UIDN" -d "/home/$U" -s /usr/bin/zsh "$U"
+usermod -s /usr/bin/zsh -aG systemd-journal,adm "$U" 2>/dev/null || true
+printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$U" > /etc/sudoers.d/nextjs-ct-user.new
+visudo -cf /etc/sudoers.d/nextjs-ct-user.new >/dev/null && mv -f /etc/sudoers.d/nextjs-ct-user.new /etc/sudoers.d/nextjs-ct-user \
+  && chmod 440 /etc/sudoers.d/nextjs-ct-user
+
+# sshd: only the host's relay key, only from the host, only this account. The host pins this host key.
+install -m 600 "$ME/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key
+install -m 644 "$ME/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
+rm -f /etc/ssh/ssh_host_rsa_key* /etc/ssh/ssh_host_ecdsa_key*
+printf 'from="%s" %s\n' "$GW" "$(cat "$ME/enter_key.pub")" > /etc/ssh/nextjs-ct-relay-keys
+chmod 644 /etc/ssh/nextjs-ct-relay-keys
+cat > /etc/ssh/sshd_config.d/10-nextjs-ct.conf <<SSHD
+# Managed by the host (nextjs-ct): sessions arrive from the host's sshd, which authenticated the person.
+HostKey /etc/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /etc/ssh/nextjs-ct-relay-keys
+AllowUsers $U
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AcceptEnv LANG LC_* COLORTERM
+AllowAgentForwarding yes
+AllowTcpForwarding no
+X11Forwarding no
+SSHD
+sshd -t && { systemctl reload ssh.service 2>/dev/null || systemctl restart ssh.service; } || warn "sshd config rejected"
+
+# Units for this account. The person's systemd user manager and tmux outlive their sessions.
+loginctl enable-linger "$U" 2>/dev/null || true
+systemctl daemon-reload
+for t in claude-rc-watchdog.timer agents-enable.timer agent-update.timer ndev-prune.timer; do
+  systemctl enable --now "$t" >/dev/null 2>&1 || warn "$t not enabled"
+done
+
+H="/home/$U"
+as_user() { sudo -u "$U" -H env HOME="$H" "$@"; }
+# Claude Code (native, per account) and the standalone Codex install remote-control needs.
+as_user bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
+  || warn "claude install failed for $U"
+as_user bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+[ -x "$H/.codex/packages/standalone/current/codex" ] \
+  || as_user sh -c "cd $H && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 || warn "codex install failed for $U"
+
+# Codex: no approval prompts (the container is the sandbox), trusted project, project writable from the app's sessions.
+CFG="$H/.codex/config.toml"
+as_user mkdir -p "$H/.codex"
+as_user touch "$CFG"
+sed -i 's|^ *approval_policy *=.*|approval_policy = "never"|; s|^ *sandbox_mode *=.*|sandbox_mode = "danger-full-access"|' "$CFG"
+grep -q '^approval_policy' "$CFG" || sed -i '1i approval_policy = "never"' "$CFG"
+grep -q '^sandbox_mode' "$CFG" || sed -i '1i sandbox_mode = "danger-full-access"' "$CFG"
+[ -s "$CFG" ] || printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$CFG"
+PDIR=$(/usr/local/bin/agent-dir "$U" 2>/dev/null || echo "$H")
+grep -qF "[projects.\"$PDIR\"]" "$CFG" || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$PDIR" >> "$CFG"
+grep -q '^\[sandbox_workspace_write\]' "$CFG" || printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\nnetwork_access = true\n' "$PDIR" >> "$CFG"
+chown "$U:$U" "$CFG"
+install -d -o "$U" -g "$U" -m 755 "$H/Documents/Codex"
+/usr/local/bin/kid-agents-refresh "$U" || warn "AGENTS.md generation failed for $U"
+
+# Shell environment (t-claude, atuin, starship, fzf, tmux.conf): the same body every box runs.
+as_user bash < "$SHARED/snippets/user-shell-env.sh" >/dev/null 2>&1 || warn "shell env for $U had errors"
+/usr/local/bin/user-agents-seed "$U" || warn "user-agents-seed failed for $U"
+
+# git identity from the account's own gh login (GitHub's noreply address, never a real one).
+GH_ID=$(as_user gh api user --jq '.id' 2>/dev/null); GH_LOGIN=$(as_user gh api user --jq '.login' 2>/dev/null)
+GH_NAME=$(as_user gh api user --jq '.name // .login' 2>/dev/null)
+if [ -n "$GH_ID" ] && [ -n "$GH_LOGIN" ]; then
+  as_user git config --global user.name "$GH_NAME"
+  as_user git config --global user.email "$GH_ID+$GH_LOGIN@users.noreply.github.com"
+  as_user gh auth setup-git >/dev/null 2>&1 || true
+  for repo in $(cfg --arg u "$U" '.users[$u].repos[]?'); do
+    [ -d "$H/${repo##*/}" ] || as_user gh repo clone "$repo" "$H/${repo##*/}" >/dev/null 2>&1 || warn "could not clone $repo for $U"
+  done
+fi
+
+# Owner-only tools: the hop key (pbox and gbox reach their boxes with it), the dev-box launchers and the
+# MacBook aliases. Every other account's AWS session is denied what these need (nextjs-ct-user-data.tf).
+if [ "$OWNER" = true ]; then
+  set +x
+  HOPJSON=$(aws secretsmanager get-secret-value --secret-id dev-hop-ssh-key --region us-west-1 --query SecretString --output text 2>/dev/null) || HOPJSON=""
+  if [ -n "$HOPJSON" ]; then
+    as_user install -d -m 700 "$H/.ssh"
+    printf '%s' "$HOPJSON" | jq -r .private | as_user tee "$H/.ssh/dev_hop.new" >/dev/null
+    chmod 600 "$H/.ssh/dev_hop.new" && mv -f "$H/.ssh/dev_hop.new" "$H/.ssh/dev_hop"
+  else
+    warn "could not read the hop key for $U"
+  fi
+  unset HOPJSON
+  bash "$SHARED/snippets/owner-tools.sh" || warn "owner tools install failed"
+  bash "$SHARED/snippets/macbook-ssh.sh" "$U" || warn "macbook ssh config failed"
+fi
+
+# Re-enable what this account published, then retire what was deleted, then start the agents.
+for envf in /var/lib/ndev/instances/*.env; do
+  [ -s "$envf" ] || continue
+  label=$(basename "$envf" .env)
+  DIR=$(sed -n 's/^DIR=//p' "$envf" | head -1)
+  [ -n "$DIR" ] && [ -d "$DIR" ] || continue
+  install -d "/etc/systemd/system/ndev@$label.service.d"
+  printf '[Service]\nUser=%s\nGroup=%s\nWorkingDirectory=/home/%s\nEnvironment=HOME=/home/%s\n' "$U" "$U" "$U" "$U" \
+    > "/etc/systemd/system/ndev@$label.service.d/user.conf"
+done
+systemctl daemon-reload
+for envf in /var/lib/ndev/instances/*.env; do
+  [ -s "$envf" ] || continue
+  systemctl enable --now "ndev@$(basename "$envf" .env).service" >/dev/null 2>&1 || true
+done
+/usr/local/bin/ndev-prune || true
+/usr/local/bin/agents-enable || true
+
+# A crontab carried over from nextjs-dev (nextjs-ct-migrate leaves it here), installed once and only when
+# the account has none, so an edit made in the container is never overwritten.
+if [ -s /var/lib/ndev/crontab.migrated ]; then
+  crontab -l -u "$U" >/dev/null 2>&1 || crontab -u "$U" /var/lib/ndev/crontab.migrated || warn "could not install the migrated crontab"
+  mv -f /var/lib/ndev/crontab.migrated /var/lib/ndev/crontab.installed
+fi
+
+[ -z "$FAILED" ] || { echo "provision: finished with warnings for $U" >&2; exit 1; }
+echo "provision: $U ready"
