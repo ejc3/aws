@@ -27,7 +27,7 @@ locals {
   # added to local.nextjs_users later gets the next free uid; its container address follows from it.
   nextjs_ct_uid_pins = { colton = 1001, connor = 1002, ejc3 = 1003, skevh = 1004, colin = 1005 }
   # The owner. Their container keeps the owner-only grants (the Dolphin apply role, the hop key, the
-  # dev-box launchers) and is the only one that can reach the MacBook's reverse tunnel.
+  # owner's boxes) and is the only one with `ssh mac`. Everyone else is a member (aws_iam_policy.nextjs_ct_member).
   nextjs_ct_owners = ["ejc3"]
   # Serving the live tunnels. FALSE until the cutover: with the same tunnel credentials on two boxes,
   # Cloudflare would split every hostname's traffic between them.
@@ -66,22 +66,25 @@ locals {
       )
     },
   ]
-  # Denied to everyone but the owner: other roles (the Dolphin apply role), the hop key and the Google
-  # Docs token, and launching or driving the dev boxes (pbox, gbox, wbox), which reach their boxes with
-  # the hop key anyway.
+  # ---- members: one managed session policy each (aws_iam_policy.nextjs_ct_member below). An inline session policy
+  # is capped at 2,048 characters and a managed one at 6,144, and a member's denials name that member's own boxes.
+  nextjs_ct_member_users = [for u in local.nextjs_users : u if !contains(local.nextjs_ct_owners, u)]
+
+  # Denied to every member: other roles (the Dolphin apply role), the owner's secrets, and the box actions no
+  # member's own box needs.
   nextjs_ct_deny_member = [
     {
       Sid      = "OwnerOnlyRoles"
       Effect   = "Deny"
-      Action   = ["sts:AssumeRole", "iam:PassRole"]
+      Action   = "sts:AssumeRole"
       Resource = "*"
     },
     {
       Sid    = "OwnerOnlySecrets"
       Effect = "Deny"
       Action = "secretsmanager:GetSecretValue"
-      # The hop key, the Google Docs token, the owner's own wbox password (every member's wbox has its own) and
-      # the owner's Cloudflare Access token for the MacBook (by name: a secret ARN ends in a random suffix).
+      # The hop key, the Google Docs token, the owner's own wbox password and the owner's Cloudflare Access token
+      # for the MacBook (by name: a secret ARN ends in a random suffix).
       Resource = concat(
         [aws_secretsmanager_secret.dev_hop.arn, aws_secretsmanager_secret.wbox_admin.arn],
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
@@ -89,41 +92,126 @@ locals {
       )
     },
     {
-      Sid    = "OwnerOnlyDevBoxes"
-      Effect = "Deny"
-      Action = [
-        "ec2:RunInstances", "ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances",
-        "ec2:TerminateInstances", "ec2:CreateTags", "ec2:GetPasswordData", "ssm:SendCommand",
-        # pbox attaches its persistent work volume to the box it launched; only the owner launches boxes.
-        "ec2:CreateVolume", "ec2:AttachVolume", "ec2:DetachVolume", "ec2:DeleteVolume",
-      ]
+      # The output of the owner's `wbox run` (wbox.tf: the role reads wbox-output/wbox/*). Members' wboxes do not use it.
+      Sid      = "OwnerOnlyWboxOutput"
+      Effect   = "Deny"
+      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Resource = [aws_s3_bucket.wbox_output.arn, "${aws_s3_bucket.wbox_output.arn}/*"]
+    },
+    {
+      Sid      = "NoMemberNeedsThese"
+      Effect   = "Deny"
+      Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"]
       Resource = "*"
     },
   ]
+
+  # Each member's own three boxes (member-boxes.tf): wbox-<p>, pbox-<p>, gbox-<p>.
+  nextjs_ct_member_box_all = { for p in local.member_box_people : p => {
+    names     = [local.member_wbox_slots[p], local.member_pbox_slots[p], local.member_gbox_slots[p]]
+    templates = [aws_launch_template.member_wbox[p].arn, aws_launch_template.member_pbox[p].arn, aws_launch_template.member_gbox[p].arn]
+    volumes   = [aws_ebs_volume.member_wbox_data[p].arn, aws_ebs_volume.member_pbox_work[p].arn]
+    role      = aws_iam_role.member_wbox[p].arn
+    secrets   = [aws_secretsmanager_secret.member_box_ssh[p].arn, aws_secretsmanager_secret.member_wbox_admin[p].arn]
+    # The private addresses this box reaches: the wbox (us-west-1) and the gbox (us-west-2, over the I/O box peering).
+    # A member pbox is in Ohio with no route from here; it is reached at its public address, and the boundary there
+    # is the member's own SSH key (denied to every other member above), not the network.
+    ips = [local.member_wbox_ips[p], local.member_gbox_ips[p]]
+  } }
+  nextjs_ct_member_box     = { for p, b in local.nextjs_ct_member_box_all : p => b if contains(local.nextjs_users, p) }
+  nextjs_ct_member_box_ips = flatten([for p, b in local.nextjs_ct_member_box_all : b.ips])
+  nextjs_ct_ec2_launched   = ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*:*:network-interface/*"]
+
+  # A member may act on their own boxes only. nextjs-dev-role's member-*-control grants admit every member's box; these
+  # narrow a member's session to their own. Volumes are named by ARN, never only by an instance's tag: AttachVolume
+  # grants combine with parallel-box-launch.tf's and dev-ebs.tf's.
+  nextjs_ct_own_boxes = { for p, b in local.nextjs_ct_member_box : p => [
+    {
+      # Every other member's box key and wbox password, by ARN: a condition on secretsmanager:SecretId would compare
+      # whatever the caller sent (a name or an ARN), the resource is the secret itself.
+      Sid      = "OtherMembersBoxSecrets"
+      Effect   = "Deny"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = flatten([for o, ob in local.nextjs_ct_member_box_all : ob.secrets if o != p])
+    },
+    {
+      Sid       = "OwnBoxNamesOnly"
+      Effect    = "Deny"
+      Action    = ["ec2:RunInstances", "ec2:CreateTags"]
+      Resource  = local.nextjs_ct_ec2_launched
+      Condition = { StringNotEquals = { "aws:RequestTag/Name" = b.names } }
+    },
+    {
+      # A Name is set only as the box is launched: no renaming someone else's box into one of these names.
+      Sid       = "TagOnlyAtLaunch"
+      Effect    = "Deny"
+      Action    = "ec2:CreateTags"
+      Resource  = local.nextjs_ct_ec2_launched
+      Condition = { StringNotEquals = { "ec2:CreateAction" = "RunInstances" } }
+    },
+    {
+      Sid       = "OwnLaunchTemplatesOnly"
+      Effect    = "Deny"
+      Action    = "ec2:RunInstances"
+      Resource  = "arn:aws:ec2:*:*:instance/*"
+      Condition = { ArnNotEquals = { "ec2:LaunchTemplate" = b.templates } }
+    },
+    {
+      Sid       = "OwnBoxesOnly"
+      Effect    = "Deny"
+      Action    = ["ec2:TerminateInstances", "ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances", "ec2:AttachVolume", "ec2:DetachVolume"]
+      Resource  = "arn:aws:ec2:*:*:instance/*"
+      Condition = { StringNotEquals = { "ec2:ResourceTag/Name" = b.names } }
+    },
+    {
+      Sid         = "OwnVolumesOnly"
+      Effect      = "Deny"
+      Action      = ["ec2:AttachVolume", "ec2:DetachVolume"]
+      NotResource = concat(b.volumes, ["arn:aws:ec2:*:*:instance/*"])
+    },
+    {
+      Sid         = "OwnBoxRoleOnly"
+      Effect      = "Deny"
+      Action      = "iam:PassRole"
+      NotResource = [b.role]
+    },
+  ] }
+  # A member with no boxes of their own (added to local.nextjs_users, not to local.member_box_people).
+  nextjs_ct_no_boxes = [
+    {
+      Sid    = "NoBoxes"
+      Effect = "Deny"
+      Action = [
+        "ec2:RunInstances", "ec2:CreateTags", "ec2:TerminateInstances", "ec2:StartInstances", "ec2:StopInstances",
+        "ec2:RebootInstances", "ec2:AttachVolume", "ec2:DetachVolume", "iam:PassRole",
+      ]
+      Resource = "*"
+    },
+    {
+      Sid      = "NoBoxSecrets"
+      Effect   = "Deny"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = flatten([for o, ob in local.nextjs_ct_member_box_all : ob.secrets])
+    },
+  ]
+
   nextjs_ct_allow_all = [{ Sid = "UpToTheRole", Effect = "Allow", Action = "*", Resource = "*" }]
-  # One session policy per account, so a member's can name that member's own resources (their own boxes and
-  # secrets) and nobody else's. The credential server hands each container the policy under its account's name.
-  nextjs_ct_session_policies = {
-    for u in local.nextjs_users : u => {
-      Version = "2012-10-17"
-      Statement = concat(
-        local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only,
-        [for s in local.nextjs_ct_deny_member : s if !contains(local.nextjs_ct_owners, u)],
-      )
-    }
-  }
+  # The inline session policy, the same for every account; a member's session also carries their managed policy.
+  nextjs_ct_session_policy = { Version = "2012-10-17", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }
 
   nextjs_ct_config = {
-    role_arn         = local.nextjs_dev_role_arn
-    serving          = local.nextjs_ct_serving
-    zones            = local.nextjs_zone_tunnel
-    ssh_hostnames    = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
-    pinned_routes    = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
-    session_policies = local.nextjs_ct_session_policies
-    io_box_ip        = local.io_box_private_ip
-    retired_keys     = local.nextjs_retired_user_keys
-    claw_master      = { tag = local.claw_master_tag, sha256 = local.claw_master_sha256_aarch64, server = "${local.claw_master_server_ip}:${local.claw_master_server_port}" }
-    tmux_scroll      = { tag = local.tmux_scroll_tag, sha256 = local.tmux_scroll_sha256_aarch64 }
+    role_arn            = local.nextjs_dev_role_arn
+    serving             = local.nextjs_ct_serving
+    zones               = local.nextjs_zone_tunnel
+    ssh_hostnames       = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
+    pinned_routes       = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
+    session_policy      = local.nextjs_ct_session_policy
+    session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }
+    member_box_ips      = local.nextjs_ct_member_box_ips
+    io_box_ip           = local.io_box_private_ip
+    retired_keys        = local.nextjs_retired_user_keys
+    claw_master         = { tag = local.claw_master_tag, sha256 = local.claw_master_sha256_aarch64, server = "${local.claw_master_server_ip}:${local.claw_master_server_port}" }
+    tmux_scroll         = { tag = local.tmux_scroll_tag, sha256 = local.tmux_scroll_sha256_aarch64 }
     users = { for u in local.nextjs_users : u => {
       uid        = lookup(local.nextjs_ct_uid_pins, u, null)
       zone       = lookup(local.nextjs_user_zone, u, null)
@@ -131,6 +219,7 @@ locals {
       codex_seed = contains(local.nextjs_codex_seed_users, u)
       keys       = lookup(local.nextjs_user_keys, u, [])
       repos      = lookup(local.nextjs_user_repos, u, [])
+      box_ips    = try(local.nextjs_ct_member_box[u].ips, [])
     } }
   }
 
@@ -170,7 +259,7 @@ MACBOOK
     "/var/lib/nextjs-ct/shared/snippets/agent-session-sync-install.sh" = local.agent_session_sync_install
     "/var/lib/nextjs-ct/shared/snippets/codex-seed-install.sh"         = "${local.codex_seed_thread_install}\n${local.codex_restart_setup}"
     "/var/lib/nextjs-ct/shared/snippets/user-agents-seed-install.sh"   = local.user_agents_seed_install
-    "/var/lib/nextjs-ct/shared/snippets/owner-tools.sh"                = "${local.pbox_setup}\n${local.gbox_setup}\n${local.wbox_setup}"
+    "/var/lib/nextjs-ct/shared/snippets/box-tools.sh"                  = "${local.pbox_setup}\n${local.gbox_setup}\n${local.wbox_setup}\n${local.wbox_member_setup}"
     "/var/lib/nextjs-ct/shared/snippets/macbook-ssh.sh"                = local.nextjs_ct_macbook_ssh
   }
 
@@ -455,6 +544,19 @@ if [ -n "$${NEXTJS_CT_ETAG:-}" ]; then
 fi
 echo "nextjs-ct host ready"
 SCRIPT
+}
+
+# A member's managed session policy: up to nextjs-dev-role, minus the member denials, narrowed to their own boxes.
+# Passed by nextjs-ct-imds with every session it assumes for that member's container; attached to nothing.
+resource "aws_iam_policy" "nextjs_ct_member" {
+  for_each    = toset(local.nextjs_ct_member_users)
+  name        = "nextjs-ct-member-${each.key}"
+  description = "SESSION policy only, attached to no principal: passed with ${each.key}'s nextjs-ct container session, it can only narrow nextjs-dev-role (Allow * intersects the role; every other statement denies)"
+  tags        = { Purpose = "session-policy", AttachedTo = "none", Account = each.key }
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes))
+  })
 }
 
 resource "aws_s3_object" "nextjs_ct_user_data" {

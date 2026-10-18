@@ -257,8 +257,8 @@ if [ -n "$GH_ID" ] && [ -n "$GH_LOGIN" ]; then
   done
 fi
 
-# Owner-only tools: the hop key (pbox and gbox reach their boxes with it), the dev-box launchers and the
-# MacBook aliases. Every other account's AWS session is denied what these need (nextjs-ct-user-data.tf).
+# Owner-only: the hop key (the owner's pbox and gbox reach their boxes with it) and the
+# MacBook alias. Every other account's AWS session is denied both (nextjs-ct-user-data.tf).
 if [ "$OWNER" = true ]; then
   set +x
   HOPJSON=$(aws secretsmanager get-secret-value --secret-id dev-hop-ssh-key --region us-west-1 --query SecretString --output text 2>/dev/null) || HOPJSON=""
@@ -270,9 +270,11 @@ if [ "$OWNER" = true ]; then
     warn "could not read the hop key for $U"
   fi
   unset HOPJSON
-  bash "$SHARED/snippets/owner-tools.sh" || warn "owner tools install failed"
   bash "$SHARED/snippets/macbook-ssh.sh" "$U" || warn "macbook ssh config failed"
 fi
+# pbox, gbox and wbox, in every container: the owner's drive the owner's boxes with the hop key, a member's drive
+# that member's own three (member-boxes.tf), and the session policy admits nothing else.
+bash "$SHARED/snippets/box-tools.sh" || warn "box tools install failed"
 
 # Re-enable what this account published, then retire what was deleted, then start the agents.
 for envf in /var/lib/ndev/instances/*.env; do

@@ -1069,18 +1069,41 @@ login.
 - **AWS**: `aws` and the SDKs work inside with no setup. The container's `169.254.169.254` is the host's
   `nextjs-ct-imds`, which hands out a session of `nextjs-dev-role` narrowed by a session policy: no
   container gets the tunnel credentials, the setup scripts or the SSM agent channel; only the owner's
-  gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the dev-box launchers.
+  gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the owner's boxes. A
+  member's session also carries that member's managed policy (`nextjs-ct-member-<user>`), which admits their
+  own wbox, pbox and gbox (`member-boxes.tf`) and nothing of anyone else's: their own two secrets, launches
+  only from their own launch templates with their own Name tags, start, stop and terminate only their own,
+  attach only their own volumes, pass only their own wbox role. Nor can a member read the output of the owner's
+  `wbox run` (the `wbox-output-<account>` bucket).
+- **The boxes**: `wbox`, `pbox` and `gbox` are in every container and act on that person's own boxes. A member
+  may forward a port to their own wbox or gbox through ssh (`ssh -L 8443:<own wbox address>:8443 ...`), and
+  their container is refused the private addresses of every other member's wbox and gbox. A pbox is different:
+  it is in Ohio, reached at its public address, and its security group admits SSH from anywhere, so another
+  member CAN reach its SSH port. The boundary there is the per-member SSH key (`member-box/<person>/ssh-key`),
+  which every other member's session is denied. Both the keys and the member wbox passwords are a boundary only
+  once they have been rotated at the cutover (below): on nextjs-dev every account has sudo and the role reads all of
+  them, so any member could have saved another member's.
 - **The MacBook** is reachable from `ejc3`'s container only, by `ssh mac`: the same Cloudflare route as every other
   box (`mac-ssh-client.tf`), with ejc3's own Access token, which every member's AWS session is denied.
 
 What carries over at the cutover, and how: `scripts/nextjs-ct/host/nextjs-ct-migrate` (homes, published
-projects, crontabs, then the SSH host keys at the final pass). One secret is rotated at the cutover rather than
-before it: on nextjs-dev every account could read the owner's wbox password (`wbox/administrator-password`), and
-on nextjs-ct members cannot, so once everyone is in a container run `terraform apply
--replace=random_password.wbox_admin` and then, from ejc3's container, `wbox up` and
-`wbox run 'net user Administrator (Get-SECSecretValue -SecretId wbox/administrator-password -Region us-west-1).SecretString'`
-(the box sets the password only at its first boot). The cutover plan is in the pull request
-that added the container layer.
+projects, crontabs, then the SSH host keys at the final pass). Some secrets are rotated at the cutover rather than
+before it, because on nextjs-dev every account has sudo and the role reads them, and on nextjs-ct a member reads
+only their own:
+
+- **The members' box keys and wbox passwords**, after the final copy and before anyone is let in (in the same
+  apply as `nextjs_ct_serving = true`): with no member box running, `terraform apply` with
+  `-replace='tls_private_key.member_box["<person>"]'` and `-replace='random_password.member_wbox_admin["<person>"]'`
+  for each of colton, connor, colin and skevh, and on nextjs-ct `sudo rm -f /home/<person>/.ssh/member-box` (the
+  copied homes hold the old private key, which `pbox` and `gbox` would otherwise keep using). Nothing is pushed to
+  a box: every member box is a fresh instance per launch, takes the key and the password from the launch template
+  and Secrets Manager at its first boot, and the templates update their default version.
+- **The owner's wbox password** (`wbox/administrator-password`), once everyone is in a container: `terraform apply
+  -replace=random_password.wbox_admin` and then, from ejc3's container, `wbox up` and
+  `wbox run 'net user Administrator (Get-SECSecretValue -SecretId wbox/administrator-password -Region us-west-1).SecretString'`
+  (the owner's box keeps its disk and sets the password only at its first boot).
+
+The cutover plan is in the pull request that added the container layer.
 
 ### Dolphin SSH through Cloudflare
 
