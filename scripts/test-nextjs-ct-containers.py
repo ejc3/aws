@@ -457,6 +457,37 @@ class HostAccountTests(unittest.TestCase):
         self.assertIn("PrivateUsersOwnership=chown", files)  # a [Files] key: in [Exec] systemd ignores it
 
 
+class MacAliasTests(unittest.TestCase):
+    """ejc3's container gets ONE way to the MacBook (owner, 2026-10-18): `ssh mac`, the desktop-session sshd."""
+
+    def test_one_alias_replaces_the_two_old_ones(self):
+        body = TF.split("nextjs_ct_macbook_ssh = <<-MACBOOK\n", 1)[1].split("\nMACBOOK\n", 1)[0]
+        body = body.replace("${local.mac_tunnel_host_keys}", "alias ssh-ed25519 AAAA1\nalias ssh-ed25519 AAAA2\n")
+        body = body.replace('as() { sudo -u "$U" -H "$@"; }', 'as() { "$@"; }').replace('S="/home/$U/.ssh"', 'S="$HOME/.ssh"')
+        with tempfile.TemporaryDirectory() as d:
+            ssh = Path(d) / ".ssh"
+            ssh.mkdir()
+            (ssh / "config").write_text("Include config.d-macbook\nHost other\n    Port 1\n")
+            (ssh / "config.d-macbook").write_text("Host macbook\n")
+            (ssh / "known_hosts.macbook").write_text("x\n")
+            for _ in range(2):  # idempotent
+                subprocess.run(["bash", "-c", body, "mac", "ejc3"], env={"PATH": "/usr/bin:/bin", "HOME": d}, check=True)
+            config = (ssh / "config").read_text().splitlines()
+            self.assertEqual(config[0], "Include config.d-mac")
+            self.assertNotIn("Include config.d-macbook", config)
+            self.assertEqual(config.count("Include config.d-mac"), 1)
+            self.assertIn("Host other", config)
+            self.assertFalse((ssh / "config.d-macbook").exists())
+            self.assertFalse((ssh / "known_hosts.macbook").exists())
+            alias = (ssh / "config.d-mac").read_text()
+            self.assertEqual(re.findall(r"^Host (\S+)", alias, re.M), ["mac"])
+            self.assertIn("    HostName nextjs-host\n    Port 2222\n", alias)
+            self.assertIn("HostKeyAlias ejs-macbook-pro-via-fcvm", alias)
+            self.assertIn("UserKnownHostsFile ~/.ssh/known_hosts.mac\n", alias)
+            self.assertEqual((ssh / "known_hosts.mac").read_text(), "alias ssh-ed25519 AAAA1\nalias ssh-ed25519 AAAA2\n")
+            self.assertNotIn("ProxyJump", alias)
+
+
 class ContainerScriptTests(unittest.TestCase):
     def test_every_container_script_parses(self):
         for f in CT.iterdir():
