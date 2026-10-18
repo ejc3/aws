@@ -168,37 +168,8 @@ LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF
 
-# ---- the MacBook's reverse tunnel (owner only): its listener is on the host's loopback, which no
-# container can reach; relay this container's gateway port 2222 to it (the firewall admits only this one).
-if [ "$(jq -r --arg u "$U" '.users[$u].mac // false' "$CONFIG")" = true ]; then
-  cat > /etc/systemd/system/nextjs-ct-mac-tunnel.socket <<EOF
-[Unit]
-Description=The MacBook's reverse tunnel, for $U's container only
-
-[Socket]
-ListenStream=$GW:2222
-FreeBind=yes
-
-[Install]
-WantedBy=sockets.target
-EOF
-  cat > /etc/systemd/system/nextjs-ct-mac-tunnel.service <<'EOF'
-[Unit]
-Description=Relay to the MacBook's reverse tunnel on the host's loopback
-Requires=nextjs-ct-mac-tunnel.socket
-After=nextjs-ct-mac-tunnel.socket
-
-[Service]
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:2222
-PrivateTmp=yes
-DynamicUser=yes
-EOF
-  MAC_TUNNEL=1
-fi
-
 systemctl daemon-reload
 networkctl reload >/dev/null 2>&1 || true
-[ -z "${MAC_TUNNEL:-}" ] || systemctl enable --now nextjs-ct-mac-tunnel.socket >/dev/null
 systemctl enable --now "$HOME_UNIT" >/dev/null
 systemctl enable "systemd-nspawn@$U.service" >/dev/null 2>&1
 if ! machinectl show "$U" -p State --value 2>/dev/null | grep -qx running; then

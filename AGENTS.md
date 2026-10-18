@@ -545,7 +545,7 @@ only. Rules an agent must keep:
   `local.nextjs_ct_session_policies`; add a denial there, never an allow. Owner-only: other roles, the hop key, the
   Google Docs token, the dev-box launchers.
 - **Ports are per container**; the host reaches a dev server at `10.88.<uid-1000>.2:<port>`. Only the owner's
-  container may reach the Mac's reverse tunnel (host loopback 2222, relayed by `nextjs-ct-mac-tunnel.socket`).
+  container has `ssh mac` (Cloudflare Access with ejc3's own token, `mac-ssh-client.tf`); members' policies deny it.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
   --pipe --wait ...`) from `ubuntu`.
 

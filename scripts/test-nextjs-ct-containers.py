@@ -39,8 +39,8 @@ CONFIG = {
     "session_policies": {"alice": {"Statement": [{"Sid": "member"}]}, "boss": {"Statement": [{"Sid": "owner"}]}},
     "io_box_ip": "172.31.48.10",
     "users": {
-        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False, "mac": False},
-        "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True, "mac": True},
+        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False},
+        "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True},
     },
 }
 
@@ -432,8 +432,7 @@ class GeneratorTests(unittest.TestCase):
                         nft.index('iifname "ve-alice" ip saddr 10.88.1.2 ip daddr 10.88.1.1 tcp dport 8169 ct status dnat accept'))
         self.assertIn('iifname "ve-*" oifname "ve-*" drop', nft)
         self.assertIn('iifname "ve-*" meta nfproto ipv6 drop', nft)
-        self.assertIn('iifname "ve-boss" ip saddr 10.88.3.2 ip daddr 10.88.3.1 tcp dport 2222 accept', nft)
-        self.assertNotIn('"ve-alice" ip saddr 10.88.1.2 ip daddr 10.88.1.1 tcp dport 2222', nft)
+        self.assertNotIn("2222", nft)  # no Mac relay: the Mac is reached through Cloudflare only
         self.assertIn("type filter hook forward priority filter; policy drop;", nft)
         # The io-box scratch: refused to a member, not to the owner.
         self.assertIn('iifname "ve-alice" ip daddr 172.31.48.10 drop', nft)
@@ -451,7 +450,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("PermitOpen 10.88.1.2:*", alice)
         self.assertIn("AllowTcpForwarding local", alice)
         self.assertIn("PermitListen none", alice)
-        self.assertIn("PermitListen 127.0.0.1:2222 localhost:2222", boss)
+        self.assertIn("PermitListen none", boss)  # the owner too: no reverse tunnel lands on this box
+        self.assertIn("AllowTcpForwarding local", boss)
         self.assertTrue(conf.rstrip().endswith("Match all"))
 
 
@@ -476,35 +476,23 @@ class HostAccountTests(unittest.TestCase):
         self.assertIn("PrivateUsersOwnership=chown", files)  # a [Files] key: in [Exec] systemd ignores it
 
 
-class MacAliasTests(unittest.TestCase):
-    """ejc3's container gets ONE way to the MacBook (owner, 2026-10-18): `ssh mac`, the desktop-session sshd."""
+class MacTests(unittest.TestCase):
+    """ejc3's container reaches the MacBook the way every box does (owner, 2026-10-18: "cloudflare only")."""
 
-    def test_one_alias_replaces_the_two_old_ones(self):
+    def test_the_owner_gets_the_shared_cloudflare_client_with_their_own_token(self):
         body = TF.split("nextjs_ct_macbook_ssh = <<-MACBOOK\n", 1)[1].split("\nMACBOOK\n", 1)[0]
-        body = body.replace("${local.mac_tunnel_host_keys}", "alias ssh-ed25519 AAAA1\nalias ssh-ed25519 AAAA2\n")
-        body = body.replace('as() { sudo -u "$U" -H "$@"; }', 'as() { "$@"; }').replace('S="/home/$U/.ssh"', 'S="$HOME/.ssh"')
-        with tempfile.TemporaryDirectory() as d:
-            ssh = Path(d) / ".ssh"
-            ssh.mkdir()
-            (ssh / "config").write_text("Include config.d-macbook\nHost other\n    Port 1\n")
-            (ssh / "config.d-macbook").write_text("Host macbook\n")
-            (ssh / "known_hosts.macbook").write_text("x\n")
-            for _ in range(2):  # idempotent
-                subprocess.run(["bash", "-c", body, "mac", "ejc3"], env={"PATH": "/usr/bin:/bin", "HOME": d}, check=True)
-            config = (ssh / "config").read_text().splitlines()
-            self.assertEqual(config[0], "Include config.d-mac")
-            self.assertNotIn("Include config.d-macbook", config)
-            self.assertEqual(config.count("Include config.d-mac"), 1)
-            self.assertIn("Host other", config)
-            self.assertFalse((ssh / "config.d-macbook").exists())
-            self.assertFalse((ssh / "known_hosts.macbook").exists())
-            alias = (ssh / "config.d-mac").read_text()
-            self.assertEqual(re.findall(r"^Host (\S+)", alias, re.M), ["mac"])
-            self.assertIn("    HostName nextjs-host\n    Port 2222\n", alias)
-            self.assertIn("HostKeyAlias ejs-macbook-pro-via-fcvm", alias)
-            self.assertIn("UserKnownHostsFile ~/.ssh/known_hosts.mac\n", alias)
-            self.assertEqual((ssh / "known_hosts.mac").read_text(), "alias ssh-ed25519 AAAA1\nalias ssh-ed25519 AAAA2\n")
-            self.assertNotIn("ProxyJump", alias)
+        self.assertIn('MAC_USER="$1"', body)
+        self.assertIn("MAC_SECRET=macbook-ssh-access-nextjs-ejc3", body)
+        self.assertLess(body.index("${local.mac_cloudflared_install}"), body.index("${local.mac_ssh_client_setup}"))
+        self.assertIn('bash "$SHARED/snippets/macbook-ssh.sh" "$U"', (CT / "provision").read_text().split('if [ "$OWNER" = true ]; then', 1)[1])
+
+    def test_no_reverse_tunnel_relay_is_left(self):
+        for f in ("nextjs-ct-machine", "nextjs-ct-sshd", "nextjs-ct-firewall"):
+            text = (HOST / f).read_text()
+            self.assertNotIn("2222", text, f)
+            self.assertNotIn("mac-tunnel", text, f)
+            self.assertNotIn(".mac //", text, f)
+        self.assertNotRegex(TF, r"\bmac\s+=\s+contains")
 
 
 class ContainerScriptTests(unittest.TestCase):
