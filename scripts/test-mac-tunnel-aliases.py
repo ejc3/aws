@@ -41,13 +41,22 @@ class MacTunnelAliases(unittest.TestCase):
         return dict(line.split(" ", 1) for line in result.stdout.splitlines())
 
     def check_destinations(self):
-        for alias, port in (("mac", "2222"), ("macbook", "2223")):
-            config = self.effective(alias)
-            self.assertEqual(config["hostname"], "127.0.0.1")
-            self.assertEqual(config["port"], port)
+        mac = self.effective("mac")
+        self.assertEqual((mac["hostname"], mac["port"]), ("127.0.0.1", "2222"))
+        # The MacBook is reached through Cloudflare Access, not a loopback forward.
+        book = self.effective("macbook")
+        self.assertEqual((book["hostname"], book["port"]), ("macbook-ssh.cc-games.dev", "22"))
+        self.assertIn("macbook-access-proxy", book["proxycommand"])
+        proxy = self.ssh / "macbook-access-proxy"
+        self.assertEqual(proxy.stat().st_mode & 0o777, 0o700)
+        self.assertIn("TUNNEL_SERVICE_TOKEN_SECRET", proxy.read_text())
+        run = [l for l in proxy.read_text().splitlines() if "cloudflared access ssh" in l]
+        self.assertEqual(len(run), 1)
+        for flag in ("--secret", "--id", "--service-token"):
+            self.assertNotIn(flag, run[0], "the token reaches cloudflared through its environment, never argv")
+        for config in (mac, book):
             self.assertEqual(config["user"], "ejcampbell")
             self.assertEqual(config["identityfile"], str(self.ssh / "to-mac"))
-        book = self.effective("macbook")
         self.assertEqual(book["hostkeyalias"], "ejs-macbook-pro-via-fcvm")
         self.assertEqual(book["stricthostkeychecking"], "true")
         self.assertEqual(book["userknownhostsfile"], str(self.ssh / "known_hosts.mac-tunnels"))
@@ -88,6 +97,17 @@ class MacTunnelAliases(unittest.TestCase):
         self.assertIn("${local.mac_reverse_tunnel_setup}", arm)
         self.assertNotIn("${local.mac_reverse_tunnel_setup}", x86)
 
+
+class MacbookCloudflared(unittest.TestCase):
+    def test_a_rebuilt_arm_box_gets_the_pinned_cloudflared_the_proxy_runs(self):
+        block = re.search(r"macbook_cloudflared_install = <<-MACCFD\n(.*?)\nMACCFD", SOURCE, re.S).group(1)
+        self.assertIn("${local.cloudflared_version}/cloudflared-linux-arm64", block)
+        self.assertEqual(block.count("${local.cloudflared_sha256_linux_arm}"), 2, "both the installed and the new binary are checked")
+        self.assertIn("/home/ubuntu/.local/bin/cloudflared", block)
+        user_data = (ROOT / "dev-user-data.tf").read_text()
+        self.assertLess(user_data.index("${local.macbook_cloudflared_install}"),
+                        user_data.index("${local.mac_reverse_tunnel_setup}"))
+        self.assertIn('PATH="$HOME/.local/bin:$PATH" exec cloudflared', SETUP)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

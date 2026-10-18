@@ -541,7 +541,8 @@ fi
 # Shell setup
 ${local.shell_setup}
 
-# Only ARM terminates the outbound SSH tunnels from the two Macs.
+# Only ARM terminates the outbound SSH tunnels from the two Macs; Host macbook needs cloudflared.
+${local.macbook_cloudflared_install}
 ${local.mac_reverse_tunnel_setup}
 
 # Claude Code -- the NATIVE installer, deliberately not npm.

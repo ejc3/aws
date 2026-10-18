@@ -2,6 +2,21 @@
 # reverse forwards; they do not open an AWS security-group port or start a tunnel.
 # The existing ~/.ssh/to-mac private key stays on the persistent ARM root.
 locals {
+  # cloudflared for Host macbook's proxy command, pinned with claw-master's (claw-master-tunnel.tf). Kept out of
+  # mac_reverse_tunnel_setup, which scripts/test-mac-tunnel-aliases.py runs as plain bash.
+  macbook_cloudflared_install = <<-MACCFD
+install -d -o ubuntu -g ubuntu /home/ubuntu/.local/bin
+if ! echo "${local.cloudflared_sha256_linux_arm}  /home/ubuntu/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1; then
+  if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${local.cloudflared_version}/cloudflared-linux-arm64" -o /tmp/cloudflared.new \
+     && echo "${local.cloudflared_sha256_linux_arm}  /tmp/cloudflared.new" | sha256sum -c - >/dev/null; then
+    install -o ubuntu -g ubuntu -m 755 /tmp/cloudflared.new /home/ubuntu/.local/bin/cloudflared
+  else
+    echo "WARNING: cloudflared ${local.cloudflared_version} did not download or match its sha256; ssh macbook needs it" >&2
+  fi
+  rm -f /tmp/cloudflared.new
+fi
+MACCFD
+
   mac_reverse_tunnel_setup = <<-MACSETUP
 install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
 
@@ -13,12 +28,14 @@ Host mac
     User ejcampbell
     IdentityFile ~/.ssh/to-mac
 
+# Through Cloudflare Access (macbook-ssh.tf) with fcvm-arm's service token; the far end is
+# the MacBook's Remote Login. README, "MacBook: Moving SSH behind Cloudflare Access".
 Host macbook
-    HostName 127.0.0.1
-    Port 2223
+    HostName macbook-ssh.cc-games.dev
     User ejcampbell
     IdentityFile ~/.ssh/to-mac
     IdentitiesOnly yes
+    ProxyCommand ~/.ssh/macbook-access-proxy %h
     HostKeyAlias ejs-macbook-pro-via-fcvm
     UserKnownHostsFile ~/.ssh/known_hosts.mac-tunnels
     StrictHostKeyChecking yes
@@ -39,6 +56,20 @@ Host macbook-desktop
     UserKnownHostsFile ~/.ssh/known_hosts.mac-tunnels
     StrictHostKeyChecking yes
 MACCONFIG
+
+# ProxyCommand for Host macbook. The Access service token reaches cloudflared through its
+# environment, never its arguments, and is read for each connection (a rotation needs nothing here).
+cat > /home/ubuntu/.ssh/macbook-access-proxy <<'MACPROXY'
+#!/bin/sh
+set -eu
+set +x
+s=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-ssh-access \
+      --query SecretString --output text)
+TUNNEL_SERVICE_TOKEN_ID=$(printf '%s' "$s" | jq -r .client_id)
+TUNNEL_SERVICE_TOKEN_SECRET=$(printf '%s' "$s" | jq -r .client_secret)
+export TUNNEL_SERVICE_TOKEN_ID TUNNEL_SERVICE_TOKEN_SECRET
+PATH="$HOME/.local/bin:$PATH" exec cloudflared access ssh --hostname "$1"
+MACPROXY
 
 # Public host identity read directly from EJ's MacBook Pro when its tunnel was set up.
 cat > /home/ubuntu/.ssh/known_hosts.mac-tunnels <<'MACHOSTKEYS'
@@ -80,10 +111,12 @@ MACMIGRATE
 
 chown ubuntu:ubuntu /home/ubuntu/.ssh/config /home/ubuntu/.ssh/config.d-mac-tunnels /home/ubuntu/.ssh/known_hosts.mac-tunnels
 chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/config.d-mac-tunnels /home/ubuntu/.ssh/known_hosts.mac-tunnels
+chown ubuntu:ubuntu /home/ubuntu/.ssh/macbook-access-proxy
+chmod 700 /home/ubuntu/.ssh/macbook-access-proxy
 MACSETUP
 }
 
 output "mac_reverse_tunnel_usage" {
   description = "SSH back to the Macs while their outbound tunnels are connected"
-  value       = "from fcvm-arm as ubuntu: ssh mac (127.0.0.1:2222) | ssh macbook (127.0.0.1:2223)"
+  value       = "from fcvm-arm as ubuntu: ssh mac (127.0.0.1:2222) | ssh macbook (Cloudflare Access, macbook-ssh.cc-games.dev)"
 }
