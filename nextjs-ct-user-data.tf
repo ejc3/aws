@@ -388,6 +388,9 @@ Wants=network-online.target
 ExecStart=/usr/bin/python3 -I /usr/local/sbin/nextjs-ct-imds
 Restart=always
 RestartSec=2
+# The server also caps each container's connections in flight; these bound it as a whole.
+TasksMax=256
+MemoryMax=256M
 PrivateTmp=yes
 ProtectSystem=strict
 NoNewPrivileges=yes

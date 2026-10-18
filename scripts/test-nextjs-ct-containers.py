@@ -112,6 +112,13 @@ class MigrateTests(unittest.TestCase):
         rsync_home = next(l for l in m.splitlines() if "rsync -aHAX" in l)
         self.assertNotIn("--delete", rsync_home)
 
+    def test_final_pass_fails_when_published_projects_cannot_be_copied(self):
+        # Review of #490 (Codex P2).
+        m = (HOST / "nextjs-ct-migrate").read_text()
+        self.assertNotIn('"$T/" || true', m)
+        self.assertIn('could not copy the published projects" >&2; [ -z "$FINAL" ] || exit 1; }', m)
+        self.assertIn('[ "$HAVE_NDEV" = 255 ]', m)
+
     def test_final_pass_carries_the_old_host_keys_and_stops_containers_first(self):
         m = (HOST / "nextjs-ct-migrate").read_text()
         self.assertIn("ubuntu@$OLD:/etc/ssh/ssh_host_*", m)
@@ -238,6 +245,31 @@ JSON
         self.assertEqual(self.req("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"}, "127.0.0.3")[0], 403)
         self.assertEqual(self.req("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60", "X-Forwarded-For": "1.2.3.4"})[0], 403)
 
+    def test_one_container_cannot_tie_up_the_server(self):
+        # Review of #490 (Codex P1): stalled connections are capped per container and time out, and other
+        # containers are still served meanwhile.
+        stalled = [socket.create_connection(("127.0.0.1", self.port)) for _ in range(8)]
+        try:
+            time.sleep(0.3)
+            extra = socket.create_connection(("127.0.0.1", self.port))
+            extra.settimeout(3)
+            self.assertEqual(extra.recv(1), b"")  # closed at once: over the per-container cap
+            extra.close()
+            self.assertEqual(self.req("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"}, "127.0.0.2")[0], 200)
+        finally:
+            for s in stalled:
+                s.close()
+        time.sleep(0.5)
+        self.assertEqual(self.req("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"})[0], 200)
+
+    def test_a_stalled_client_is_dropped(self):
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.settimeout(10)
+        began = time.monotonic()
+        self.assertEqual(s.recv(1), b"")
+        self.assertLess(time.monotonic() - began, 8)
+        s.close()
+
     def test_nothing_else_is_served(self):
         tok = self.token()
         for path in ("/latest/user-data", "/latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance",
@@ -329,6 +361,8 @@ class GeneratorTests(unittest.TestCase):
         nft = self.generate("nextjs-ct-firewall", "out")
         self.assertIn('iifname "ve-alice" ip saddr 10.88.1.2 ip daddr 169.254.169.254 tcp dport 80 dnat to 10.88.1.1:8169', nft)
         self.assertIn('iifname "ve-alice" ip saddr != 10.88.1.2 drop', nft)
+        self.assertLess(nft.index('iifname "ve-alice" tcp dport 8169 ct count over 16 drop'),
+                        nft.index('iifname "ve-alice" ip saddr 10.88.1.2 ip daddr 10.88.1.1 tcp dport 8169 ct status dnat accept'))
         self.assertIn('iifname "ve-*" oifname "ve-*" drop', nft)
         self.assertIn('iifname "ve-*" meta nfproto ipv6 drop', nft)
         self.assertIn('iifname "ve-boss" ip saddr 10.88.3.2 ip daddr 10.88.3.1 tcp dport 2222 accept', nft)

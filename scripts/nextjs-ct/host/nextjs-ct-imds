@@ -147,6 +147,7 @@ class State:
 class Handler(BaseHTTPRequestHandler):
     server_version = "EC2ws"
     sys_version = ""
+    timeout = 5  # seconds for the request line and headers: a stalled client frees its slot
 
     def log_message(self, fmt, *args):  # quiet: no per-request lines, and never a token
         pass
@@ -219,8 +220,60 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(404)
 
 
+PER_CONTAINER = 8  # requests in flight per container; the SDKs make one or two at a time
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """One container cannot tie up the host: at most PER_CONTAINER connections in flight per local address
+    (each container has its own), and each handler gives up on a client that stalls (Handler.timeout)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slots_lock = threading.Lock()
+        self.in_flight = {}
+
+    def process_request(self, request, client_address):
+        try:
+            local = request.getsockname()[0]
+        except OSError:
+            self.shutdown_request(request)
+            return
+        with self.slots_lock:
+            if self.in_flight.get(local, 0) >= PER_CONTAINER:
+                self.shutdown_request(request)
+                return
+            self.in_flight[local] = self.in_flight.get(local, 0) + 1
+        try:
+            super().process_request(request, client_address)  # starts process_request_thread, which releases
+        except Exception:
+            self.release(local)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        local = request_local(request)  # before the handler closes the socket
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.release(local)
+
+    def release(self, local):
+        with self.slots_lock:
+            n = self.in_flight.get(local, 1) - 1
+            if n > 0:
+                self.in_flight[local] = n
+            else:
+                self.in_flight.pop(local, None)
+
+
+def request_local(request):
+    try:
+        return request.getsockname()[0]
+    except OSError:
+        return None
+
+
 def main():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = BoundedServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     server.state = State(CONFIG)
     print(f"nextjs-ct-imds: serving {len(server.state.by_gateway)} containers on port {PORT}", file=sys.stderr)

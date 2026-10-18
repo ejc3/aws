@@ -34,7 +34,13 @@ for U in $USERS; do
 done
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-rsync -a -e "$SSH" --rsync-path="sudo rsync" "ubuntu@$OLD:/var/lib/ndev/instances/" "$T/" || true
+# Fatal on the final pass: a cutover without the projects published since the seed would leave their URLs dead.
+$SSH "ubuntu@$OLD" test -d /var/lib/ndev/instances && HAVE_NDEV=0 || HAVE_NDEV=$?
+[ "$HAVE_NDEV" = 255 ] && { echo "nextjs-ct-migrate: cannot reach the old box for its published projects" >&2; [ -z "$FINAL" ] || exit 1; }
+if [ "$HAVE_NDEV" = 0 ]; then
+  rsync -a -e "$SSH" --rsync-path="sudo rsync" "ubuntu@$OLD:/var/lib/ndev/instances/" "$T/" \
+    || { echo "nextjs-ct-migrate: could not copy the published projects" >&2; [ -z "$FINAL" ] || exit 1; }
+fi
 for U in $USERS; do
   SHIFT=$(( $(id -u "$U") * 65536 ))
   D=/var/lib/nextjs-ct/ndev/$U/instances
