@@ -34,6 +34,7 @@ locals {
     "nextjs-ejc3"   = { instance = "nextjs-dev", account = "ejc3" }
     "nextjs-skevh"  = { instance = "nextjs-dev", account = "skevh" }
     "fcvm-arm"      = { instance = "fcvm-metal-arm", account = "ubuntu" }
+    "jumpbox"       = { instance = "jumpbox", account = "ubuntu" }
   }
   claw_master_cert_instance_names = distinct(concat(["claude-master-server"], [for c in values(local.claw_master_clients) : c.instance]))
 

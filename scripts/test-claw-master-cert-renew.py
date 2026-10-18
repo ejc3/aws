@@ -540,7 +540,7 @@ class TerraformTests(unittest.TestCase):
     def test_the_clients_are_the_enrolled_ones_and_feed_the_function(self):
         for name, instance, account in (("nextjs-colton", "nextjs-dev", "colton"), ("nextjs-connor", "nextjs-dev", "connor"),
                                         ("nextjs-colin", "nextjs-dev", "colin"),
-                                        ("nextjs-ejc3", "nextjs-dev", "ejc3"), ("nextjs-skevh", "nextjs-dev", "skevh"), ("fcvm-arm", "fcvm-metal-arm", "ubuntu")):
+                                        ("nextjs-ejc3", "nextjs-dev", "ejc3"), ("nextjs-skevh", "nextjs-dev", "skevh"), ("fcvm-arm", "fcvm-metal-arm", "ubuntu"), ("jumpbox", "jumpbox", "ubuntu")):
             self.assertRegex(TF, r'"%s"\s+= \{ instance = "%s", account = "%s" \}' % (name, instance, account))
         self.assertIn("CLIENTS             = jsonencode([for name, c in local.claw_master_clients", TF)
 

@@ -1,6 +1,6 @@
 # claw-master-client.tf
 #
-# The CLIENT side of the shared claw-master server on fcvm-metal-arm: the pinned `claw-master` binary and the
+# The CLIENT side of the shared claw-master server on fcvm-metal-arm and the main jumpbox: the pinned `claw-master` binary and the
 # routing that makes t-claude send inference through the pool. (nextjs-dev gets the same two things from its own
 # setup script, nextjs-user-data.tf; the server is claw-master-server.tf.) The pin is the server's: one tag and one
 # sha256 (local.claw_master_tag / claw_master_sha256_aarch64), so client and server are always the same build.
@@ -28,7 +28,12 @@
 # The client directory stays ~/.config/claude-master: t-claude passes it, and the certificate renewal works on it.
 
 locals {
-  claw_master_client_instances = var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : []
+  # fcvm-metal-arm, and the main jumpbox (owner, 2026-10-18: "flip this machine over to the pool too"). Its sessions take the
+  # pool only once its ubuntu account is enrolled (scripts/claw-master-enroll.sh jumpbox), as on fcvm.
+  claw_master_client_instances = concat(
+    var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : [],
+    var.enable_jumpbox ? [aws_instance.jumpbox[0].id] : [],
+  )
 
   claw_master_client_commands = <<-CMD
     set -u
