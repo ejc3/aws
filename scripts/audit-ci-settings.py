@@ -2,11 +2,14 @@
 """Audit the GitHub Actions settings of every repository we run CI for, against the owner's policy (#466):
 our self-hosted runners are fine anywhere, as long as no drive-by non-contributor can make them run.
 
-    scripts/audit-ci-settings.py [OWNER ...]        default: ejc3 dolphin-labs-hq
+    scripts/audit-ci-settings.py [OWNER ...]        default: ejc3 dolphin-labs-hq CoderColton
 
 Prints one line per repository and item: `pass`, `fail`, `warn` (needs a person to look) or `n/a`, with the reason.
 Read-only: every call is a GET. Tokens come from scripts/github-app-token.py (the administration GitHub App), one per
-owner, held in memory and never printed. A repository the app cannot read is reported, not skipped silently.
+owner, held in memory and never printed. An owner the app is not installed on (CoderColton) is read with the caller's
+own gh login instead (`GH_TOKEN`, else `gh auth token`), over the repositories that login can reach; settings that need
+admin there come back `warn ... not readable (404)`, so run it as an account with admin on that owner's repositories.
+A repository the token cannot read is reported, not skipped silently.
 
 Items (numbered as in #466):
   1 fork PR approval        public repos: approval required for all external contributors
@@ -17,7 +20,8 @@ Items (numbered as in #466):
   6 deploy secrets          no deploy-shaped secret is a repository secret (a PR workflow could read it)
   7 draft-skipped jobs      a job skipped for drafts is also triggered on ready_for_review
   8 branch protection       main requires the CI and `review decision` checks where the repository has them
-  9 pinned actions          third-party actions are pinned to a commit SHA
+  9 pinned actions          third-party actions are pinned to a commit SHA; the owners' own (OWN_OWNERS) are exempt,
+                            and GitHub's (actions/, github/) are third party here: they are pinned too
 """
 import base64
 import json
@@ -31,13 +35,26 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API = "https://api.github.com"
 DEPLOY_SECRET = re.compile(r"(CLOUDFLARE|DEPLOY|VERCEL|AWS_|WRANGLER|FLY_|NETLIFY|NPM_TOKEN|PYPI)", re.I)
-FIRST_PARTY = ("actions/", "github/")
+# The owner's own organisations and accounts (owner, 2026-10-17: "i dont need pins of my own repos").
+OWN_OWNERS = ("ejc3", "dolphin-labs-hq", "CoderColton")
+DEFAULT_OWNERS = list(OWN_OWNERS)
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def token(owner):
     out = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "github-app-token.py"), owner],
                          capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def user_token():
+    """The caller's own gh login, for an owner the app is not installed on."""
+    if os.environ.get("GH_TOKEN"):
+        return os.environ["GH_TOKEN"]
+    try:
+        out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+    except OSError:
+        return None
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
 
 
@@ -101,13 +118,18 @@ def triggers(text):
     if inline and not inline.startswith("#"):
         return set(re.findall(r"[a-z_]+", inline))
     block = text[m.end():]
-    names = set()
+    names, indent = set(), None
     for line in block.splitlines():
         if line.strip() == "" or line.lstrip().startswith("#"):
             continue
         if not line.startswith((" ", "\t")):
             break
-        k = re.match(r"^  ([a-z_]+):", line)
+        width = len(line) - len(line.lstrip())
+        if indent is None:
+            indent = width  # the first child sets the map's indentation: two spaces, four, a tab
+        if width != indent:
+            continue
+        k = re.match(r"^\s+([a-z_]+):", line)
         if k:
             names.add(k.group(1))
     return names
@@ -119,14 +141,21 @@ DEFAULT_PR_TYPES = {"opened", "synchronize", "reopened"}
 
 def pr_types(text, event):
     """The event's activity types; GitHub's default set when the workflow names none."""
-    m = re.search(rf"^  {event}:\s*\n((?:    .*\n|\s*\n)*)", text, re.M)
+    m = re.search(rf"^([ \t]+){event}:[ \t]*\n", text, re.M)
     if not m:
         return DEFAULT_PR_TYPES
-    t = re.search(r"types:\s*\[([^\]]*)\]", m.group(1))
+    # The event's own block: the lines indented deeper than its key, up to the next sibling.
+    own, body = len(m.group(1)), []
+    for line in text[m.end():].splitlines():
+        if line.strip() and len(line) - len(line.lstrip()) <= own:
+            break
+        body.append(line)
+    block = "\n".join(body) + "\n"
+    t = re.search(r"types:\s*\[([^\]]*)\]", block)
     if t:
         return {x.strip() for x in t.group(1).split(",")}
-    t = re.search(r"types:\s*\n((?:\s+-\s*\S+\s*\n)+)", m.group(1))
-    return {x.strip("- \n") for x in t.group(1).splitlines()} if t else DEFAULT_PR_TYPES
+    t = re.search(r"types:[ \t]*\n((?:\s+-\s*\S+[ \t]*\n)+)", block)
+    return {x.strip("- \t") for x in t.group(1).splitlines() if x.strip()} if t else DEFAULT_PR_TYPES
 
 
 TAGS = {}
@@ -214,12 +243,7 @@ def audit_repo(tok, repo, rulesets_main):
                else "none deploy-shaped")
 
     # 7: jobs skipped for drafts must also run on ready_for_review.
-    missing = []
-    for path, text in files.items():
-        if re.search(r"pull_request\.draft", text) and "pull_request" in triggers(text):
-            types = pr_types(text, "pull_request")
-            if "ready_for_review" not in types:
-                missing.append(path.rsplit("/", 1)[-1])
+    missing = draft_gaps(files)
     drafty = any(re.search(r"pull_request\.draft", t) for t in files.values())
     report(full, "7 draft-skipped jobs", "fail" if missing else ("pass" if drafty else "n/a"),
            ("not triggered on ready_for_review: " + ", ".join(missing)) if missing
@@ -253,14 +277,34 @@ def audit_repo(tok, repo, rulesets_main):
     # 9: third-party actions pinned to a SHA.
     loose = set()
     for text in files.values():
-        for uses in re.findall(r"uses:\s*['\"]?([^\s'\"#]+)", text):
-            if uses.startswith(("./", "docker://")) or uses.startswith(FIRST_PARTY) or "@" not in uses:
-                continue
-            ref = uses.rsplit("@", 1)[1]
-            if not SHA.match(ref):
-                loose.add(uses)
+        loose |= unpinned(text)
     report(full, "9 pinned actions", "fail" if loose else "pass",
            ("not pinned: " + ", ".join(sorted(loose))) if loose else "third-party actions pinned (or none)")
+
+
+def draft_gaps(files):
+    """Workflows that skip a job for drafts but are not triggered on ready_for_review, for either PR event."""
+    missing = []
+    for path, text in files.items():
+        if not re.search(r"pull_request\.draft", text):
+            continue
+        for event in sorted(triggers(text) & {"pull_request", "pull_request_target"}):
+            if "ready_for_review" not in pr_types(text, event):
+                missing.append(path.rsplit("/", 1)[-1] + ("" if event == "pull_request" else f" ({event})"))
+    return missing
+
+
+def unpinned(text):
+    """Actions referenced by a tag or branch instead of a commit SHA, the owners' own excepted."""
+    loose = set()
+    for uses in re.findall(r"uses:\s*['\"]?([^\s'\"#]+)", text):
+        if uses.startswith(("./", "docker://")) or "@" not in uses:
+            continue
+        if uses.split("/", 1)[0].lower() in {o.lower() for o in OWN_OWNERS}:
+            continue
+        if not SHA.match(uses.rsplit("@", 1)[1]):
+            loose.add(uses)
+    return loose
 
 
 def audit_org_runner_groups(tok, owner):
@@ -285,15 +329,19 @@ def audit_org_runner_groups(tok, owner):
 
 
 def main():
-    owners = sys.argv[1:] or ["ejc3", "dolphin-labs-hq"]
+    owners = sys.argv[1:] or DEFAULT_OWNERS
     print(f"{'repository':42} {'runners':11} {'item':22} {'state':5} detail")
     for owner in owners:
-        tok = token(owner)
+        tok, listing = token(owner), "/installation/repositories"
         if not tok:
-            report(owner, "-", "warn", "no token for this owner (the app is not installed there)")
-            continue
+            # The app is not installed there: the caller's own login, over the repositories it can reach.
+            tok, listing = user_token(), "/user/repos?affiliation=owner,collaborator,organization_member"
+            if not tok:
+                report(owner, "-", "warn", "no token for this owner (the app is not installed there, and no gh login)")
+                continue
+            report(owner, "-", "warn", "the app is not installed here: read with the caller's own gh login")
         audit_org_runner_groups(tok, owner)
-        repos, st = paged(tok, "/installation/repositories", "repositories")
+        repos, st = paged(tok, listing, "repositories")  # /user/repos answers a bare list, which paged reads too
         if st != 200:
             report(owner, "-", "warn", f"repository list incomplete ({st}): only {len(repos)} audited")
         for repo in sorted(repos, key=lambda r: r["full_name"]):
