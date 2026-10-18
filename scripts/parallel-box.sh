@@ -50,6 +50,12 @@
 # (parallel-box-launch.tf) allows launching ONLY these four tagged boxes, and passing only
 # the dev-ebs-only role. Terminating was already non-terraform: parallel-box-watchdog.tf
 # has always reaped these boxes with tag-scoped ec2:TerminateInstances.
+#
+# A MEMBER (member-boxes.tf: the account running this is one of MEMBERS) has one box of their
+# own, pbox-<person> (member-pbox.tf), with its own work volume, and these commands act on it
+# with no box number: `pbox up`, `pbox down`, `pbox status`, `pbox ssh`, `pbox ip`,
+# `pbox capacity`. No kvm mode and no fallback sites for it; it opens with the person's own key
+# (fetched once into ~/.ssh/member-box from Secrets Manager).
 set -uo pipefail
 
 
@@ -88,10 +94,34 @@ fi
 SELF="$(basename "${BASH_SOURCE[0]}")"
 say() { printf '%s\n' "$*" >&2; }
 
+MEMBERS="colton connor colin skevh" # local.member_box_people
+MEMBER_PBOX_REGION="us-east-2"      # local.member_pbox_region
+MEMBER="${MEMBER_BOX_USER:-$(id -un 2>/dev/null)}"
+case " $MEMBERS " in *" $MEMBER "*) ;; *) MEMBER="" ;; esac
+IP_WAIT_TRIES=18 # x10 s: a just-terminated member box may still hold its fixed address
+if [ -n "$MEMBER" ]; then
+  KEY="$HOME/.ssh/member-box"
+fi
+
+# The person's own key (member-boxes.tf), fetched once straight into a 0600 file (never a shell
+# variable); their box authorizes it and no other.
+member_key() {
+  [ -n "$MEMBER" ] && [ ! -s "$KEY" ] || return 0
+  install -d -m 700 "$HOME/.ssh"
+  if ! (umask 077; aws secretsmanager get-secret-value --region us-west-1 --secret-id "member-box/$MEMBER/ssh-key" \
+        --query SecretString --output text > "$KEY.tmp" 2>/dev/null) || [ ! -s "$KEY.tmp" ]; then
+    rm -f "$KEY.tmp"
+    say "FATAL: cannot read your box key (Secrets Manager member-box/$MEMBER/ssh-key)"; exit 1
+  fi
+  mv "$KEY.tmp" "$KEY"
+}
+
 # Which region the boxes live in, and their fallback sites. Terraform publishes both (ohio-pbox.tf, /infra/parallel-box,
 # in us-west-1), so moving them is one apply and never a script edit on every dev box. PARALLEL_BOX_REGION overrides the
 # home region for a one-off.
-POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)"
+# A member's box is always in its own region and has no fallback sites, so it reads no pointer.
+POINTER=""
+[ -n "$MEMBER" ] || POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)"
 pointer() { # pointer KEY...: the value at that path in the pointer (an object's keys, space-separated), or nothing
   printf '%s' "$POINTER" | python3 -c 'import json, sys
 try:
@@ -103,6 +133,7 @@ except Exception:
 print(" ".join(v) if isinstance(v, dict) else v if isinstance(v, str) else "")' "$@" 2>/dev/null
 }
 REGION="${PARALLEL_BOX_REGION:-}"
+[ -z "$MEMBER" ] || REGION="$MEMBER_PBOX_REGION"
 if [ -z "$REGION" ]; then
   REGION="$(pointer region)"
 fi
@@ -141,6 +172,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$MODE" ] || [ -n "$FALLBACK" ]; }; then
+  say "your pbox is pbox-$MEMBER: run '$SELF $CMD' with no box number, kvm or fallback"
+  exit 1
+fi
 [ "$MODE" = "kvm" ] && TYPES="$KVM_TYPES"
 if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
 
@@ -162,7 +197,9 @@ if [ -n "$ONLY_REGIONS" ]; then
 fi
 
 set_box() {
-  if [ "$1" = "1" ]; then
+  if [ -n "$MEMBER" ]; then
+    NAME="pbox-$MEMBER"
+  elif [ "$1" = "1" ]; then
     NAME="parallel-box"
   else
     NAME="parallel-box-$1"
@@ -171,6 +208,8 @@ set_box() {
   LT="$NAME" # launch template name matches the box name (parallel-box-launch.tf)
 }
 set_box "${BOX:-1}"
+BOX_LABEL="${BOX:-1}"
+[ -z "$MEMBER" ] || BOX_LABEL="$NAME"
 
 # How the NEXT launch will be bought, read from the launch template itself ($Latest, which is what `up` launches).
 # It is a Terraform choice (var.parallel_box_spot) that nothing else shows, so it is looked up rather than
@@ -246,7 +285,7 @@ work_volume() {
 
 status_one() {
   set_box "$1"
-  echo "parallel-box $1:"
+  if [ -n "$MEMBER" ]; then echo "$NAME:"; else echo "parallel-box $1:"; fi
   locate_box || true
   IP="$(box_ip)"
   if [ -n "$IP" ]; then
@@ -333,7 +372,11 @@ wait_ready() {
           exit 1
         fi
       fi
-      echo "launched box=${BOX:-1} region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+      if [ "${2:-}" = "running" ]; then
+        echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1"
+      else
+        echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+      fi
       exit 0
     fi
     [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
@@ -348,9 +391,16 @@ wait_ready() {
 try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   local t="$1" az="$2" rc
   shift 2
-  OUT=$(aws ec2 run-instances --region "$REGION" --instance-type "$t" --count 1 "$@" \
-    --query 'Instances[0].InstanceId' --output text 2>&1)
-  rc=$?
+  for _ in $(seq 1 "$IP_WAIT_TRIES"); do
+    OUT=$(aws ec2 run-instances --region "$REGION" --instance-type "$t" --count 1 "$@" \
+      --query 'Instances[0].InstanceId' --output text 2>&1)
+    rc=$?
+    # Only a member's box has a fixed address, which a just-terminated box may hold for a minute.
+    case "$OUT" in
+      *InvalidIPAddress.InUse*) say "    the previous $NAME still holds its fixed address; waiting..."; sleep 10 ;;
+      *) break ;;
+    esac
+  done
   if [ "$rc" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
     return 0
   fi
@@ -372,6 +422,46 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   return 1
 }
 
+# member_attach ID: make sure a member's work volume is attached to instance ID, attaching it if
+# it is not: the same checks for a fresh launch and for a box an earlier `up` left behind (an
+# interrupted launch, a failed first attach), whose boot is waiting for the disk. Two `up`s racing
+# to attach to the same box both succeed. A box that cannot get its disk is terminated: it would
+# only wait for it, at a 192-core price.
+member_attach() {
+  local id="$1" vol state az att out
+  read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+    --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+  [ -n "${vol:-}" ] || { say "FATAL: no work volume tagged $VOLTAG in $REGION"; return 1; }
+  for _ in $(seq 1 24); do
+    if [ "$att" = "$id" ]; then say "Work volume $vol is attached to $id."; return 0; fi
+    [ "$state" = "available" ] && break
+    say "    work volume $vol is $state${att:+ (attached to $att)}; waiting for it to be free..."
+    sleep 5
+    read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+      --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+  done
+  if [ "$state" = "available" ]; then
+    # EC2 rejects an attach while the instance is pending; the boot's mount loop waits for the device.
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$id" 2>/dev/null
+    if out=$(aws ec2 attach-volume --region "$REGION" --volume-id "$vol" --instance-id "$id" --device /dev/sdf 2>&1); then
+      say "Attached work volume $vol to $id."
+      return 0
+    fi
+    read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+      --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+    if [ "$att" = "$id" ]; then say "Work volume $vol is attached to $id."; return 0; fi
+    say "FAILED to attach $vol to $id:"; printf '%s\n' "$out" | sed 's/^/  /' >&2
+  else
+    say "FAILED: work volume $vol is still $state${att:+ (attached to $att)}. Is another $NAME running? $SELF status"
+  fi
+  if aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" >/dev/null 2>&1; then
+    say "Terminated $id; nothing was changed on the volume."
+  else
+    say "Could not terminate $id either: run $SELF down"
+  fi
+  return 1
+}
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -382,10 +472,22 @@ case "$CMD" in
     ;;
 
   up)
+    member_key
     if locate_box; then
+      if [ -n "$MEMBER" ]; then
+        # Not taken as ready: it may be the box of an interrupted launch, waiting for its volume.
+        ID="$(box_id)"
+        say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
+        member_attach "$ID" || exit 1
+        CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
+          --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+          --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+        CHOSEN_AZ="$(box_az)"
+        wait_ready persistent running
+      fi
       IP="$(box_ip)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
-      echo "running box=${BOX:-1} region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
+      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
       exit 0
     fi
 
@@ -439,9 +541,11 @@ case "$CMD" in
       # carry a pre-existing volume -- and EC2 rejects an attach while the instance is
       # still pending. The boot-time mount loop waits for the device, so it is racing this
       # attach and wins as long as we do it promptly.
-      aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
-      if ! aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
-             --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; then
+      if [ -n "$MEMBER" ]; then
+        member_attach "$ID" || exit 1
+      elif ! { aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null; \
+               aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
+                 --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; }; then
         say "FAILED to attach $VOL to $ID. The box is up but has no /mnt/work."
         say "Check: aws ec2 describe-volumes --region $REGION --volume-ids $VOL"
         exit 1
@@ -461,6 +565,10 @@ case "$CMD" in
       exit 1
     fi
 
+    if [ -n "$MEMBER" ]; then
+      say "Capacity changes hour to hour; try again later (\`$SELF capacity\` shows the spot placement score)."
+      exit 3
+    fi
     if [ -z "$FALLBACK" ]; then
       say "Options:"
       say "  - retry later; capacity fluctuates hour to hour"
@@ -568,8 +676,11 @@ case "$CMD" in
     ;;
 
   status)
-    # No explicit box -> show every slot; a numbered ask shows just that one.
-    if [ -z "$BOX" ]; then
+    # No explicit box -> show every slot; a numbered ask shows just that one. A member has one.
+    member_key
+    if [ -n "$MEMBER" ]; then
+      status_one "$NAME"
+    elif [ -z "$BOX" ]; then
       for n in 1 2 3 4; do status_one "$n"; done
     else
       status_one "$BOX"
@@ -577,6 +688,7 @@ case "$CMD" in
     ;;
 
   ssh)
+    member_key
     locate_box || true
     IP="$(box_ip)"
     [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:-1}"; exit 1; }

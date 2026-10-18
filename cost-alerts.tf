@@ -234,6 +234,16 @@ resource "aws_sns_topic_policy" "cost_alerts" {
           StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
           ArnLike      = { "aws:SourceArn" = "arn:aws:cloudwatch:us-west-1:${data.aws_caller_identity.current.account_id}:alarm:security-delivery-*" }
         }
+      },
+      {
+        # The parallel-box watchdogs' alarms in us-west-2 and us-east-2, relayed here by one
+        # EventBridge rule (watchdog-alarms.tf), and nothing else EventBridge sends.
+        Sid       = "AllowWatchdogAlarmRelay"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "SNS:Publish"
+        Resource  = aws_sns_topic.cost_alerts.arn
+        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.watchdog_alarms.arn } }
       }
     ]
   })

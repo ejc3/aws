@@ -41,7 +41,9 @@ import os, json, datetime, boto3
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
 # Comma-separated: both parallel boxes (parallel-box2.tf) and the GPU test boxes' four
-# slots (gpu-box.tf) share this one watchdog.
+# slots (gpu-box.tf) share this one watchdog, with the members' gboxes (member-gbox.tf); the
+# Ohio copy watches the parallel boxes and the members' pboxes (member-pbox.tf), and the
+# members' Windows boxes (member-wbox.tf) run the same code as their own function in us-west-1.
 TAG_NAMES    = os.environ.get("TAG_NAMES", "parallel-box").split(",")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
 # The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
@@ -51,6 +53,10 @@ SNS_REGION   = os.environ.get("SNS_REGION", "us-west-1")
 # box -- a reboot, `shutdown -c` or a launch-time --user-data override disarms it -- so this
 # is the lifetime that cannot be talked out of.
 MAX_AGE      = json.loads(os.environ.get("MAX_AGE_MINUTES", "{}"))
+# Names of which at most ONE instance may run: each member's own box (member-boxes.tf). IAM cannot
+# cap RunInstances' --count, so a launch of several (or a second `up`) is cut back here to the
+# oldest, and the rest are terminated with an alert.
+SINGLE_NAMES = set(n for n in os.environ.get("SINGLE_NAMES", "").split(",") if n)
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -78,6 +84,36 @@ def lambda_handler(event, context):
 
     results = []
     now = datetime.datetime.now(datetime.timezone.utc)
+
+    def name_of(inst):
+        return next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "parallel-box")
+
+    # One instance per single name: keep the oldest, terminate the rest, and say so.
+    groups = {}
+    for inst in instances:
+        if name_of(inst) in SINGLE_NAMES:
+            groups.setdefault(name_of(inst), []).append(inst)
+    extra = set()
+    for name, group in sorted(groups.items()):
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda i: (i["LaunchTime"], i["InstanceId"]))
+        keep, ids = group[0]["InstanceId"], [i["InstanceId"] for i in group[1:]]
+        extra.update(ids)
+        print("terminating extra %s %s: only one may run (keeping the oldest, %s)" % (name, ",".join(ids), keep))
+        try:
+            ec2.terminate_instances(InstanceIds=ids)
+            results.extend({"id": i, "action": "terminated_duplicate", "kept": keep} for i in ids)
+            notify("%s: %d extra instance(s) terminated" % (name, len(ids)),
+                   "%d instances named %s were running; only one may. Kept the oldest, %s, and terminated %s.\n"
+                   "Someone launched more than one (a --count, an overridden template, or two launches at once)."
+                   % (len(group), name, keep, ", ".join(ids)))
+        except Exception as e:
+            results.extend({"id": i, "action": "terminate_failed", "error": str(e)} for i in ids)
+            notify("%s: FAILED to terminate extra instances" % name,
+                   "%d instances named %s are running; only one may. TerminateInstances failed for %s: %s\n"
+                   "They keep costing money until someone terminates them." % (len(group), name, ", ".join(ids), e))
+    instances = [i for i in instances if i["InstanceId"] not in extra]
 
     for inst in instances:
         iid = inst["InstanceId"]
@@ -128,7 +164,15 @@ def lambda_handler(event, context):
             results.append({"id": iid, "action": "busy", "peak_cpu": round(peak, 1)})
             continue
 
-        if name.startswith("gpu-box"):
+        if name.split("-", 1)[0] in ("wbox", "pbox", "gbox"):
+            # A member's own box (member-boxes.tf), "<kind>-<person>": the person runs the plain
+            # command from their own account, which takes no slot.
+            kind = name.split("-", 1)[0]
+            up_cmd = "%s up   (run by %s)" % (kind, name.split("-", 1)[1])
+            kept = {"wbox": "Its D: disk (Roblox and its caches) is untouched",
+                    "pbox": "Its work volume is untouched",
+                    "gbox": "Nothing on it persists"}[kind]
+        elif name.startswith("gpu-box"):
             # gpu-box is slot 1; gpu-box-N is slot N.
             up_cmd = "gbox up" + ("" if name == "gpu-box" else " " + name.rsplit("-", 1)[1])
             kept = "Nothing on it persists"
@@ -165,7 +209,7 @@ def lambda_handler(event, context):
 # Every box this watchdog reaps, by exact Name tag: what it describes (TAG_NAMES) and what its
 # role may terminate are the same list, so a new GPU slot cannot be found but unkillable.
 locals {
-  parallel_watchdog_tag_names = concat(local.parallel_box_names, local.gpu_box_names)
+  parallel_watchdog_tag_names = concat(local.parallel_box_names, local.gpu_box_names, local.member_gbox_names, local.member_pbox_names)
 }
 
 data "archive_file" "parallel_watchdog" {
@@ -243,11 +287,13 @@ resource "aws_lambda_function" "parallel_watchdog" {
       IDLE_MINUTES = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT = tostring(var.parallel_box_idle_cpu_pct)
       TAG_NAMES    = join(",", local.parallel_watchdog_tag_names)
-      # gpu-box.tf's hard lifetime, the same for every slot; the parallel boxes have none (a
-      # long job is their point).
-      MAX_AGE_MINUTES = jsonencode({ for n in local.gpu_box_names : n => var.gpu_box_max_hours * 60 })
-      SNS_REGION      = var.aws_region
-      SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
+      # gpu-box.tf's hard lifetime, the same for every slot and for the members' gboxes; the
+      # parallel boxes have none (a long job is their point).
+      MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => var.gpu_box_max_hours * 60 })
+      # one instance per member gbox
+      SINGLE_NAMES  = join(",", local.member_gbox_names)
+      SNS_REGION    = var.aws_region
+      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
   }
 

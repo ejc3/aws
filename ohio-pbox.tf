@@ -226,7 +226,7 @@ resource "aws_ebs_volume" "ohio_parallel_work" {
 # ============================================================ idle watchdog
 # The same function as parallel-box-watchdog.tf's, in this region: CloudWatch metrics and TerminateInstances are
 # regional. It shares that role (IAM is global; the policy already allows terminating the parallel boxes by tag in any
-# region) and watches only the parallel boxes: the GPU boxes stay in us-west-2.
+# region) and watches the parallel boxes and the members' pboxes: the GPU boxes stay in us-west-2.
 resource "aws_lambda_function" "parallel_watchdog_ohio" {
   provider         = aws.ohio
   function_name    = "parallel-box-watchdog"
@@ -239,11 +239,15 @@ resource "aws_lambda_function" "parallel_watchdog_ohio" {
 
   environment {
     variables = {
-      IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
-      IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
-      TAG_NAMES     = join(",", local.parallel_box_names)
-      SNS_REGION    = var.aws_region
-      SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
+      IDLE_MINUTES = tostring(var.parallel_box_idle_minutes)
+      IDLE_CPU_PCT = tostring(var.parallel_box_idle_cpu_pct)
+      # The owner's parallel boxes and the members' pboxes (member-pbox.tf). Only the members'
+      # have a hard lifetime: a long job is the point of the owner's.
+      TAG_NAMES       = join(",", concat(local.parallel_box_names, local.member_pbox_names))
+      MAX_AGE_MINUTES = jsonencode({ for n in local.member_pbox_names : n => local.member_box_max_hours * 60 })
+      SINGLE_NAMES    = join(",", local.member_pbox_names) # one instance per member pbox
+      SNS_REGION      = var.aws_region
+      SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }
   }
 

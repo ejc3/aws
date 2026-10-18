@@ -331,6 +331,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-4` | `us-west-2d` or `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
+| `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number. Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
@@ -339,7 +340,8 @@ the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. O
 fleet's subnets (`10.0.1.0/24`, `10.0.2.0/24`) route to the peer. The games router and match
 engines have their own subnets in the same VPC (`10.0.64.0/22`) with no peer route
 (`docs/games-multiplayer.md`). The Imagine backend's subnets (`10.0.70.0/24`,
-`10.0.71.0/24`) use the same route table.
+`10.0.71.0/24`) use the same route table. The Windows playtest boxes' subnets (`10.0.68.0/24` for wbox,
+`10.0.69.0/24` for the members' wboxes) route to the internet only.
 
 ```text
 GitHub workflow jobs -> API Gateway -> front Lambda -> queued webhook Lambda -> disposable Spot runners
@@ -2588,6 +2590,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |
 | Windows playtest box (g4dn.xlarge, Server 2025, persistent D: game disk, reachable from the dev boxes only, `wbox up` / `wbox down` / `wbox run` / `wbox launch`, stops after 1 idle hour) | `wbox.tf`, `scripts/wbox.sh` |
+| Each member's own wbox, pbox and gbox (fixed private IPs, per-person keys, passwords and instance roles; `wbox` / `pbox` / `gbox` act on the member's own box when run from their account) | `member-boxes.tf`, `member-wbox.tf`, `member-pbox.tf`, `member-gbox.tf`, `scripts/wbox-member.sh` |
 | Shared claw-master server (t4g.micro at 10.0.1.50 holding the Claude subscription logins; boxes authenticate with certificates, Macs through a Cloudflare tunnel with an Access service token; no password, nothing inbound) | `claw-master-server.tf`, `claw-master-tunnel.tf`, `scripts/claw-master-login.sh --server`, `scripts/claw-master-enroll.sh`, `scripts/claw-master-mac-bundle.sh` |
 | Codex refresh (weekly SSM association on the jumpboxes and metal boxes) and `codex-restart` (see running vs installed, restart deliberately) | `codex-update.tf`, `scripts/codex-restart.sh` |
 | Starter user-level agent instructions (`~/.codex/AGENTS.md` with `~/.claude/CLAUDE.md` linked to it), created only for an account that has neither | `user-agents.tf`, `scripts/user-agents.md` (the text), `scripts/user-agents-seed.sh` |

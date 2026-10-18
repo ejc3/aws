@@ -256,6 +256,16 @@ WBOXB64
 chmod 755 /usr/local/bin/wbox
   EOT
 
+  # A member's `wbox` (member-wbox.tf): scripts/wbox.sh hands a member's commands to this file.
+  # Installed where members work (nextjs-dev). Same embedding as pbox.
+  wbox_member_setup = <<-EOT
+install -d -m 755 /usr/local/libexec
+base64 -d > /usr/local/libexec/wbox-member <<'WBOXMEMBERB64'
+${base64encode(file("${path.module}/scripts/wbox-member.sh"))}
+WBOXMEMBERB64
+chmod 755 /usr/local/libexec/wbox-member
+  EOT
+
   # ---------------------------------------------------------------------------
   # Boot-time convergence on the published setup script.
   # ---------------------------------------------------------------------------
