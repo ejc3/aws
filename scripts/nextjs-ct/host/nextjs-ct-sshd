@@ -5,7 +5,7 @@
 # Every account in config.json is carried into its own container by nextjs-ct-enter; nobody gets a
 # shell on the host (the admin account, ubuntu, is not listed and is unaffected). What ssh can forward:
 #   -L / -W   only to the account's own container address (ssh -L 3000:10.88.N.2:3000 ...)
-#   -R        nothing, except the MacBook's reverse tunnel on 127.0.0.1:2222 for the owner account
+#   -R        nothing
 #   agent     forwarded through to the container
 #   X11, tun, unix sockets   no
 set -euo pipefail
@@ -21,13 +21,8 @@ OUT=/etc/ssh/sshd_config.d/90-nextjs-ct.conf
     echo "Match User $U"
     echo "    ForceCommand /usr/local/sbin/nextjs-ct-enter"
     echo "    PermitOpen 10.88.$N.2:*"
-    if [ "$(jq -r --arg u "$U" '.users[$u].mac // false' "$CONFIG")" = true ]; then
-      echo "    AllowTcpForwarding yes"
-      echo "    PermitListen 127.0.0.1:2222 localhost:2222"
-    else
-      echo "    AllowTcpForwarding local"
-      echo "    PermitListen none"
-    fi
+    echo "    AllowTcpForwarding local"
+    echo "    PermitListen none"
     echo "    AllowAgentForwarding yes"
     echo "    AllowStreamLocalForwarding no"
     echo "    X11Forwarding no"

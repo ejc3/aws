@@ -90,7 +90,7 @@ for U in $USERS; do
 done
 
 # The old box's SSH host keys, at the final pass: the Elastic IP moves to this box, and every client that
-# pinned nextjs-dev's key (the Mac's reverse tunnel, the phones, the metal boxes' aliases) must see the same one.
+# pinned nextjs-dev's key (the phones, the laptops, the metal boxes' `ssh nextjs` and `ssh dolphin`) must see the same one.
 if [ -n "$FINAL" ]; then
   rsync -a -e "$SSH" --rsync-path="sudo rsync" "ubuntu@$OLD:/etc/ssh/ssh_host_*" "$T/"
   ls "$T"/ssh_host_*_key >/dev/null 2>&1 || { echo "nextjs-ct-migrate: could not copy the old host keys" >&2; exit 1; }

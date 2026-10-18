@@ -1068,8 +1068,8 @@ login.
   `nextjs-ct-imds`, which hands out a session of `nextjs-dev-role` narrowed by a session policy: no
   container gets the tunnel credentials, the setup scripts or the SSM agent channel; only the owner's
   gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the dev-box launchers.
-- **The MacBook** is reachable from `ejc3`'s container only, by one alias, `ssh mac` (the Mac's desktop-session sshd): the Mac's reverse tunnel lands
-  on the host's loopback and is relayed to that one container.
+- **The MacBook** is reachable from `ejc3`'s container only, by `ssh mac`: the same Cloudflare route as every other
+  box (`mac-ssh-client.tf`), with ejc3's own Access token, which every member's AWS session is denied.
 
 What carries over at the cutover, and how: `scripts/nextjs-ct/host/nextjs-ct-migrate` (homes, published
 projects, crontabs, then the SSH host keys at the final pass). One secret is rotated at the cutover rather than

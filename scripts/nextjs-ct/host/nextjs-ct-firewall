@@ -9,9 +9,6 @@
 #   169.254.169.254:80                  redirected to the host's nextjs-ct-imds on its own gateway, which
 #                                       answers with that container's own narrowed AWS session
 #   169.254.169.253:53                  the VPC resolver (forwarded like any other traffic)
-#   its own gateway, port 2222          the MacBook's reverse tunnel, owner accounts only (config.json
-#                                       users.<u>.mac): the Mac's listener is on the host's loopback
-#                                       and nextjs-ct-mac-tunnel.socket relays it to the owner only
 # A member's container (not the owner's) is also refused the io-box NFS scratch (config.json io_box_ip).
 # and nothing else: no other container, no other host port (sshd, the metadata service itself, any
 # loopback listener), no address but its own as the source, and no IPv6.
@@ -36,9 +33,6 @@ for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   # A second bound under the credential server's own per-container cap: at most 16 connections at once.
   input+="    iifname \"$IF\" tcp dport $PORT ct count over 16 drop"$'\n'
   input+="    iifname \"$IF\" ip saddr 10.88.$N.2 ip daddr 10.88.$N.1 tcp dport $PORT ct status dnat accept"$'\n'
-  if [ "$(jq -r --arg u "$U" '.users[$u].mac // false' "$CONFIG")" = true ]; then
-    input+="    iifname \"$IF\" ip saddr 10.88.$N.2 ip daddr 10.88.$N.1 tcp dport 2222 accept"$'\n'
-  fi
 done
 
 cat > "$OUT.new" <<EOF
