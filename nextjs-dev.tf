@@ -323,6 +323,9 @@ resource "aws_eip_association" "nextjs_dev" {
   count         = var.enable_nextjs_dev ? 1 : 0
   instance_id   = local.nextjs_live_instance.id # nextjs-ct from the cutover (nextjs-ct.tf)
   allocation_id = aws_eip.nextjs_dev[0].id
+
+  # Moves only after nextjs-ct has applied the switch (nextjs-ct.tf, terraform_data.nextjs_ct_converge).
+  depends_on = [terraform_data.nextjs_ct_converge]
 }
 
 output "nextjs_dev_public_ip" {

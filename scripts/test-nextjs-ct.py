@@ -77,6 +77,23 @@ class CutoverSwitchTests(unittest.TestCase):
         self.assertIn("[local.nextjs_live_instance.id]", (ROOT / "agents-md.tf").read_text())
         self.assertIn('Name    = local.nextjs_ct_serving ? "nextjs-dev-retired" : "nextjs-dev"', NEXTJS_DEV_TF)
 
+    def test_address_and_old_box_move_only_after_the_new_box_applied_the_switch(self):
+        # Review of #490 (Codex P1): otherwise the EIP moves to a box whose tunnels are still off (cutover), or the
+        # old box starts while the new one still holds the tunnels (rollback).
+        conv = block(CT_TF, 'resource "terraform_data" "nextjs_ct_converge"')
+        self.assertIn("serving  = local.nextjs_ct_serving", conv)
+        self.assertIn("scripts/ssm-nextjs-ct-converge.sh", conv)
+        self.assertIn("depends_on = [aws_s3_object.nextjs_ct_user_data]", conv)
+        self.assertIn("depends_on = [terraform_data.nextjs_ct_converge]", block(CT_TF, 'resource "aws_ec2_instance_state" "nextjs_dev"'))
+        self.assertIn("depends_on = [terraform_data.nextjs_ct_converge]", block(NEXTJS_DEV_TF, 'resource "aws_eip_association" "nextjs_dev"'))
+        helper = (ROOT / "scripts" / "ssm-nextjs-ct-converge.sh").read_text()
+        self.assertIn("flock -w 3600 /run/nextjs-ct-setup.lock true", helper)
+        self.assertIn("systemctl start setup-sync.service", helper)
+        self.assertIn('jq -r .serving /etc/nextjs-ct/config.json', helper)
+        self.assertIn("/usr/local/sbin/nextjs-ct-health || exit 1", helper)
+        self.assertIn('cloudflared@$z.service', helper)
+        subprocess.run(["bash", "-n", str(ROOT / "scripts" / "ssm-nextjs-ct-converge.sh")], check=True)
+
     def test_old_box_is_stopped_never_terminated(self):
         state = block(CT_TF, 'resource "aws_ec2_instance_state" "nextjs_dev"')
         self.assertIn('state       = local.nextjs_ct_serving ? "stopped" : "running"', state)

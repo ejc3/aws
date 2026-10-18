@@ -75,12 +75,23 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("owner  = { Version = \"2012-10-17\", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }", TF)
 
+    def test_no_container_can_assume_the_box_role_without_its_session_policy(self):
+        # Review of #490 (Codex P1): the owner keeps sts:AssumeRole for the Dolphin role, and the role trusts
+        # itself, so without this denial the owner's container could mint an unnarrowed session.
+        host = TF.split("nextjs_ct_deny_host_only = [", 1)[1].split("\n  ]\n", 1)[0]
+        stmt = host.split('Sid      = "NoSessionWithoutThisPolicy"', 1)[1].split("}", 1)[0]
+        self.assertIn('Effect   = "Deny"', stmt)
+        self.assertIn('Action   = "sts:AssumeRole"', stmt)
+        self.assertIn("Resource = local.nextjs_dev_role_arn", stmt)
+
     def test_member_session_policy_fits_the_sts_limit(self):
         # AssumeRole refuses a session policy over 2,048 characters. Render it with realistic ARNs.
         arn = "arn:aws:secretsmanager:us-west-1:111111111111:secret:{}-AbCdEf"
         statements = [
             {"Sid": "UpToTheRole", "Effect": "Allow", "Action": "*", "Resource": "*"},
             {"Sid": "HostOnlyAgents", "Effect": "Deny", "Action": re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', TF.split("HostOnlyAgents", 1)[1].split("Resource", 1)[0]), "Resource": "*"},
+            {"Sid": "NoSessionWithoutThisPolicy", "Effect": "Deny", "Action": "sts:AssumeRole",
+             "Resource": "arn:aws:iam::111111111111:role/nextjs-dev-role"},
             {"Sid": "HostOnlyData", "Effect": "Deny", "Action": ["secretsmanager:GetSecretValue", "s3:GetObject", "s3:PutObject"],
              "Resource": [arn.format("cloudflare-tunnel-credentials"), arn.format("cloudflare-dolphin-tunnel-credentials"),
                           "arn:aws:s3:::ejc3-dev-scripts/*", "arn:aws:s3:::security-config-111111111111-us-west-1/sessions/*"]},
@@ -91,6 +102,20 @@ class HostScriptTests(unittest.TestCase):
         ]
         size = len(json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":")))
         self.assertLess(size, 1900, size)
+
+
+class MigrateTests(unittest.TestCase):
+    def test_only_the_final_pass_deletes(self):
+        # Review of #490 (Codex P2): the seed must never delete what exists in a home on the new box.
+        m = (HOST / "nextjs-ct-migrate").read_text()
+        self.assertIn('BW=(--bwlimit=25000); [ -z "$FINAL" ] || BW=(--delete)', m)
+        rsync_home = next(l for l in m.splitlines() if "rsync -aHAX" in l)
+        self.assertNotIn("--delete", rsync_home)
+
+    def test_final_pass_carries_the_old_host_keys_and_stops_containers_first(self):
+        m = (HOST / "nextjs-ct-migrate").read_text()
+        self.assertIn("ubuntu@$OLD:/etc/ssh/ssh_host_*", m)
+        self.assertLess(m.index('systemctl stop "systemd-nspawn@$U.service"'), m.index("rsync -aHAX"))
 
 
 class EnterTests(unittest.TestCase):

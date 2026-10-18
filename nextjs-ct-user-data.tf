@@ -47,6 +47,14 @@ locals {
       Resource = "*"
     },
     {
+      # The box's own role, assumed again WITHOUT a session policy, would shed every denial here. The owner
+      # keeps sts:AssumeRole for other roles (the Dolphin apply role); nobody may assume this one.
+      Sid      = "NoSessionWithoutThisPolicy"
+      Effect   = "Deny"
+      Action   = "sts:AssumeRole"
+      Resource = local.nextjs_dev_role_arn
+    },
+    {
       # The tunnels' credentials (a container could otherwise run a connector for every hostname), the
       # setup scripts, and the session audit log.
       Sid    = "HostOnlyData"

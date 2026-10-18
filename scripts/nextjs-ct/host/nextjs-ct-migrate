@@ -17,7 +17,8 @@ FINAL=""; [ "${2:-}" = "--final" ] && FINAL=1
 CONFIG=/etc/nextjs-ct/config.json
 KH=/var/lib/nextjs-ct/old-box-known-hosts
 SSH="ssh -i /home/ubuntu/.ssh/dev_hop -o IdentitiesOnly=yes -o UserKnownHostsFile=$KH -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-BW=(--bwlimit=25000); [ -z "$FINAL" ] || BW=()
+# The seed adds and updates only: it never deletes what exists in a home here. --final mirrors exactly.
+BW=(--bwlimit=25000); [ -z "$FINAL" ] || BW=(--delete)
 USERS=$(jq -r '.users | keys[]' "$CONFIG")
 
 if [ -n "$FINAL" ]; then
@@ -28,7 +29,7 @@ for U in $USERS; do
   # An account added after nextjs-dev has nothing to bring.
   $SSH "ubuntu@$OLD" test -d "/home/$U" || { echo "nextjs-ct-migrate: no /home/$U on the old box; skipping"; continue; }
   echo "nextjs-ct-migrate: /home/$U"
-  rsync -aHAX --numeric-ids --delete --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
+  rsync -aHAX --numeric-ids --info=stats1 "${BW[@]}" -e "$SSH" --rsync-path="sudo rsync" \
     "ubuntu@$OLD:/home/$U/" "/home/$U/"
 done
 

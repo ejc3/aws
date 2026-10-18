@@ -122,10 +122,31 @@ locals {
   nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)
 }
 
+# Applies the switch on this box at once and checks it took (tunnels up when serving, down when not), so
+# the address moves and nextjs-dev stops or starts only afterwards: never dead URLs while setup-sync's
+# timer catches up, and never both boxes on one tunnel during a rollback.
+resource "terraform_data" "nextjs_ct_converge" {
+  count = var.enable_nextjs_ct ? 1 : 0
+
+  triggers_replace = {
+    serving  = local.nextjs_ct_serving
+    instance = aws_instance.nextjs_ct[0].id
+    helper   = filesha256("${path.module}/scripts/ssm-nextjs-ct-converge.sh")
+  }
+
+  provisioner "local-exec" {
+    command = "bash ${path.module}/scripts/ssm-nextjs-ct-converge.sh ${aws_instance.nextjs_ct[0].id} ${var.aws_region} ${local.nextjs_ct_serving}"
+  }
+
+  depends_on = [aws_s3_object.nextjs_ct_user_data]
+}
+
 resource "aws_ec2_instance_state" "nextjs_dev" {
   count       = var.enable_nextjs_dev && var.enable_nextjs_ct ? 1 : 0
   instance_id = aws_instance.nextjs_dev[0].id
   state       = local.nextjs_ct_serving ? "stopped" : "running"
+
+  depends_on = [terraform_data.nextjs_ct_converge]
 }
 
 output "nextjs_ct_public_ip" {
