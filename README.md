@@ -637,11 +637,15 @@ ssh macbook 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=passw
    public half on fcvm-arm (`ubuntu`'s `~/.ssh/authorized_keys`) restricted to the one forward:
 
    ```
-   restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:2223" ssh-ed25519 AAAA... <comment>
+   restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:2223",permitopen="127.0.0.1:9" ssh-ed25519 AAAA... <comment>
    ```
 
-   Pin fcvm-arm's host key on the Mac (`ssh-keyscan` it into `~/.ssh/known_hosts` and compare
-   the fingerprint with `ssh fcvm-arm 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'` from
+   `port-forwarding` turns local (`-L`) forwarding back on as well as remote, so `permitopen` pins
+   it to a closed port: without it the Mac's key could open connections from fcvm-arm to anything
+   fcvm-arm reaches. Check it: an `ssh -L` with that key must fail with "administratively prohibited".
+
+   Pin fcvm-arm's host key on the Mac (`ssh-keyscan -t ed25519` it into `~/.ssh/known_hosts`, only
+   the key type you verify, and compare the fingerprint with `ssh fcvm-arm 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'` from
    another machine), then write `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.tunnel.plist`.
    It names the address and key directly, so it depends on no `~/.ssh/config` entry and no agent:
 
