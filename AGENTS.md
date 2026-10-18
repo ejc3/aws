@@ -1561,8 +1561,9 @@ There is no Vercel rollback: the owner decided on 2026-10-18 to delete the dolph
 dolphin-films, dolphin-maps, already disconnected from GitHub), so the switches are gone and nothing in this repository manages
 that team. `dolphin-vercel-retired.tf` makes Terraform forget what `vercel-env.tf` and the old `dolphin-films-vercel.tf` wrote
 there (`removed` blocks with `destroy = false`: no Vercel call, so the plan is the same before and after the deletion; its
-provider alias is a placeholder kept only until that apply, then the whole file goes in a follow-up). The record contents still
-hold Vercel's old targets, inert under the routes; never remove a route while they do. Their secrets are production's, loaded
+provider alias is a placeholder kept only until that apply, then the whole file goes in a follow-up). The records have no
+origin on purpose: each apex is the Workers-only placeholder A `192.0.2.1` and each www a proxied CNAME to its apex (kept a
+CNAME: the provider replaces a record whose type changes, and the delete would leave www without a record). Their secrets are production's, loaded
 from AWS with `wrangler secret bulk`: dolphin-labs from `vercel-env/dolphin-labs/production` (no longer a Vercel record: the
 Worker's source, kept in `vercel-env-secrets.tf` as `local.vercel_env_dolphin`), dolphin-films from `dolphin-films/prod/*` plus
 its address lists (`people.tf`).

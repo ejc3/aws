@@ -9,13 +9,14 @@
 # dolphin-labs-hq/dolphin-labs, deployed by its cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex and
 # runs the every-minute cron as a Cron Trigger). Production moved off Vercel on 2026-10-15 and the dolphin-labs Vercel
 # team is being deleted (2026-10-18, dolphin-vercel-retired.tf), so there is no Vercel rollback any more: no switch, and
-# nothing here may point the zone back at Vercel.
+# nothing here points at Vercel.
 #
-# THE RECORD CONTENTS ARE INERT. A proxied record is only there so the routes have a hostname to match; a route answers
-# every request, so nothing is sent to the content. The values are the ones the records already hold (Vercel's old shared
-# apex address and CNAME), kept so that this change leaves the serving records exactly as they are. Do not remove a route
-# while the content is still these: with the team gone, a request that reached them would land on Vercel's edge for a
-# domain nobody there owns. Replacing them with an originless placeholder (an in-place content change) is a separate step.
+# NO ORIGIN, ON PURPOSE. A proxied record exists only so the routes have a hostname to match; a route answers every
+# request, so the content is never contacted. The apex is the standard Workers-only placeholder, A 192.0.2.1 (TEST-NET-1,
+# routes nowhere), and www is a proxied CNAME to the apex, so neither names anything outside this zone. www stays a CNAME
+# because the provider replaces a record whose type changes and Cloudflare refuses an A record beside a CNAME of the same
+# name: changing the type would leave www without a record between the delete and the create. The zone has no AAAA
+# records for either name (kv and kv-stage are dolphin-redis.tf's tunnel records).
 
 variable "gww_zone_id" {
   description = "Zone id for gamesworthwatching.com (registered through Cloudflare Registrar, so the zone was created automatically)"
@@ -31,20 +32,20 @@ resource "cloudflare_dns_record" "gww_apex" {
   zone_id = var.gww_zone_id
   name    = "gamesworthwatching.com"
   type    = "A"
-  content = "76.76.21.21"
+  content = "192.0.2.1"
   proxied = true
   ttl     = 1
-  comment = "proxied; served by Worker ${local.gww_worker}"
+  comment = "proxied; Worker ${local.gww_worker} route serves all; origin unreachable on purpose"
 }
 
 resource "cloudflare_dns_record" "gww_www" {
   zone_id = var.gww_zone_id
   name    = "www"
   type    = "CNAME"
-  content = "cname.vercel-dns.com"
+  content = "gamesworthwatching.com"
   proxied = true
   ttl     = 1
-  comment = "proxied; Worker ${local.gww_worker} redirects (308) to the apex"
+  comment = "proxied; Worker ${local.gww_worker} route serves all (308 to apex); no origin"
 }
 
 resource "cloudflare_workers_route" "gww" {

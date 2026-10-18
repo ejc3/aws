@@ -26,17 +26,40 @@ class DnsTests(unittest.TestCase):
         self.assertNotRegex(re.sub(r"#.*", "", TF), r'(?i)"vercel (apex|www)')
 
     def test_the_routes_send_apex_and_www_to_the_production_worker(self):
-        self.assertIn('yourfantasymovie_worker   = "dolphin-films-prod"', TF)
+        self.assertIn('yourfantasymovie_worker = "dolphin-films-prod"', TF)
         route = re.search(r'resource "cloudflare_workers_route" "yourfantasymovie" \{(.*?)\n\}', TF, re.S).group(1)
         self.assertIn('for_each = toset(["yourfantasymovie.com/*", "www.yourfantasymovie.com/*"])', route)
         self.assertIn("var.yourfantasymovie_zone_id", route)
         self.assertIn("local.yourfantasymovie_worker", route)
 
-    def test_the_record_contents_are_the_ones_already_served_so_nothing_is_replaced(self):
-        # Inert under the routes; changing them is a separate, deliberate step (the header says why).
-        self.assertRegex(TF, r'yourfantasymovie_apex_ips += \["216\.150\.1\.1", "216\.150\.16\.1"\]')
-        self.assertIn('type    = "CNAME"', TF)
-        self.assertRegex(TF, r'content = "[a-z0-9]+\.vercel-dns-\d+\.com"')
+    def records(self):
+        return dict(re.findall(r'resource "cloudflare_dns_record" "(\w+)" \{(.*?)\n\}', TF, re.S))
+
+    def test_the_records_have_no_origin(self):
+        # The apex is the Workers-only placeholder; www stays a CNAME (a type change is a delete+create, with a gap) and
+        # points at the apex, inside this zone.
+        records = self.records()
+        for name, rtype, content in (("yourfantasymovie_apex", "A", "192.0.2.1"),
+                                     ("yourfantasymovie_www", "CNAME", "yourfantasymovie.com")):
+            self.assertIn('type    = "%s"\n' % rtype, records[name])
+            self.assertIn('content = "%s"\n' % content, records[name])
+            self.assertNotIn("for_each", records[name], "one record per name")
+            comment = re.search(r'comment = "(.*)"$', records[name], re.M).group(1)
+            self.assertTrue(comment.startswith("proxied; Worker ${local.yourfantasymovie_worker} route serves all"), comment)
+            # Cloudflare's Free plan caps a record comment at 100 characters.
+            self.assertLessEqual(len(comment.replace("${local.yourfantasymovie_worker}", "dolphin-films-prod")), 100)
+
+    def test_no_record_names_vercel(self):
+        for name, body in self.records().items():
+            self.assertNotRegex(body, r"(?i)vercel|216\.150\.", name)
+        # The old addresses survive only as the moved block's source key.
+        code = re.sub(r"#.*", "", TF).replace('yourfantasymovie_apex["216.150.1.1"]', "")
+        self.assertNotRegex(code, r"(?i)vercel-dns|216\.150\.\d+\.\d+")
+
+    def test_the_old_two_record_apex_moves_one_record_in_place(self):
+        # The apex keeps a proxied record throughout: one old instance becomes the placeholder, the other is deleted.
+        self.assertRegex(TF, r'moved \{\n  from = cloudflare_dns_record\.yourfantasymovie_apex\["216\.150\.1\.1"\]\n'
+                             r'  to   = cloudflare_dns_record\.yourfantasymovie_apex\n\}')
 
     def test_the_zone_id_is_this_domains_and_no_other_zone_is_touched(self):
         self.assertIn('default     = "3580bb80ae9321c474048a88bfeec525"', TF)
@@ -44,7 +67,7 @@ class DnsTests(unittest.TestCase):
             self.assertNotIn(other, TF)
 
     def test_no_secret_or_vercel_resource_is_here(self):
-        self.assertNotIn("vercel", re.sub(r"#.*", "", TF).replace("vercel-dns-016.com", ""))
+        self.assertNotIn("vercel", re.sub(r"#.*", "", TF).lower())
         self.assertNotRegex(TF, r"eyJ[A-Za-z0-9_-]{20,}")
 
     def test_dolphin_films_tf_points_at_it(self):

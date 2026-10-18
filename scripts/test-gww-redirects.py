@@ -33,20 +33,31 @@ class RedirectTests(unittest.TestCase):
 
 
 class ServingTests(unittest.TestCase):
-    """The Worker dolphin-labs-prod is the only shape: proxied records and routes, no switch back to Vercel (the
-    dolphin-labs Vercel team is being deleted), and the record contents left as they are served."""
+    """The Worker dolphin-labs-prod is the only shape: proxied records with no origin, routes, and no switch back to
+    Vercel (the dolphin-labs Vercel team is being deleted)."""
 
     CODE = re.sub(r"#.*", "", TF)
 
-    def test_both_records_are_always_proxied(self):
-        for name, content in (("gww_apex", '"76.76.21.21"'), ("gww_www", '"cname.vercel-dns.com"')):
+    def test_both_records_are_proxied_and_have_no_origin(self):
+        # The apex is the Workers-only placeholder; www stays a CNAME (a type change is a delete+create, with a gap) and
+        # points at the apex, inside this zone.
+        for name, rtype, content in (("gww_apex", "A", "192.0.2.1"), ("gww_www", "CNAME", "gamesworthwatching.com")):
             record = block("cloudflare_dns_record", name)
             self.assertIn("zone_id = var.gww_zone_id", record)
+            self.assertIn('type    = "%s"\n' % rtype, record)
+            self.assertIn('content = "%s"\n' % content, record)
             self.assertIn("proxied = true\n", record)
             self.assertIn("ttl     = 1\n", record)
-            self.assertIn('comment = "proxied; ', record)
-            # Unchanged from what is served, so this file's history never replaces a serving record.
-            self.assertIn("content = %s\n" % content, record)
+            comment = re.search(r'comment = "(.*)"\n', record).group(1)
+            self.assertTrue(comment.startswith("proxied; Worker ${local.gww_worker} route serves all"), comment)
+            # Cloudflare's Free plan caps a record comment at 100 characters.
+            self.assertLessEqual(len(comment.replace("${local.gww_worker}", "dolphin-labs-prod")), 100)
+
+    def test_no_record_names_vercel(self):
+        for name in ("gww_apex", "gww_www"):
+            record = block("cloudflare_dns_record", name)
+            self.assertNotRegex(record, r"(?i)vercel|76\.76\.21\.|cname\.vercel-dns", name)
+        self.assertNotRegex(self.CODE, r"(?i)vercel-dns|76\.76\.21\.\d+")
 
     def test_the_routes_are_unconditional_and_go_to_the_production_worker(self):
         self.assertIn('gww_worker = "dolphin-labs-prod"', TF)
