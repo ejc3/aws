@@ -57,33 +57,24 @@ class ElevenLabsSecretTests(unittest.TestCase):
         attach = block("aws_iam_role_policy_attachment", "browserbase_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
 
-    def test_deepseek_is_for_the_two_dev_roles_and_the_scrapers(self):
-        self.assertNotIn('resource "aws_secretsmanager_secret_version" "deepseek"', TF)
-        self.assertNotRegex(TF, r"sk-[0-9a-f]{24,}")
-        policy = block("aws_secretsmanager_secret_policy", "deepseek")
+    def test_scraper_api_keys_are_for_the_two_dev_roles_and_the_scrapers(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "scraper_api_key"', TF)
+        self.assertNotRegex(TF, r"sk-[0-9a-f]{24,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b[0-9a-f]{24}\b")
+        for key in ("deepseek", "exa", "scrapingdog"):
+            self.assertRegex(TF, rf"\n    {key} +=")
+        policy = block("aws_secretsmanager_secret_policy", "scraper_api_key")
         self.assertIn('Effect    = "Deny"', policy)
-        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.deepseek_readers)', policy)
-        self.assertIn("deepseek_readers = local.browserbase_readers", TF)
-        doc = block("aws_iam_policy_document", "deepseek_read")
-        self.assertIn("resources = [aws_secretsmanager_secret.deepseek.arn]", doc)
-        attach = block("aws_iam_role_policy_attachment", "deepseek_read")
-        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.scraper_api_key_readers)', policy)
+        self.assertIn("scraper_api_key_readers = local.browserbase_readers", TF)
+        doc = block("aws_iam_policy_document", "scraper_api_keys_read")
+        self.assertIn("resources = [for s in aws_secretsmanager_secret.scraper_api_key : s.arn]", doc)
+        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }",
+                      block("aws_iam_role_policy_attachment", "scraper_api_keys_read"))
         for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
             src = (ROOT / f).read_text()
-            self.assertIn("aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn, aws_secretsmanager_secret.exa.arn]", src)
-            self.assertIn("DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.deepseek.name", src)
-
-    def test_exa_is_for_the_two_dev_roles_and_the_scrapers(self):
-        self.assertNotIn('resource "aws_secretsmanager_secret_version" "exa"', TF)
-        self.assertNotRegex(TF, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-        policy = block("aws_secretsmanager_secret_policy", "exa")
-        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.exa_readers)', policy)
-        self.assertIn("exa_readers = local.browserbase_readers", TF)
-        self.assertIn("resources = [aws_secretsmanager_secret.exa.arn]", block("aws_iam_policy_document", "exa_read"))
-        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }",
-                      block("aws_iam_role_policy_attachment", "exa_read"))
-        for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
-            self.assertIn("EXA_SECRET_ID         = aws_secretsmanager_secret.exa.name", (ROOT / f).read_text())
+            self.assertIn("aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.scraper_api_key : s.arn])", src)
+            for key, env in (("deepseek", "DEEPSEEK"), ("exa", "EXA"), ("scrapingdog", "SCRAPINGDOG")):
+                self.assertRegex(src, rf'{env}_SECRET_ID += aws_secretsmanager_secret.scraper_api_key\["{key}"\].name')
 
     def test_claw_master_backup_key_is_for_the_metal_role_only(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "claw_master_backup_key"', TF)

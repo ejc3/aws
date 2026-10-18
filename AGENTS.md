@@ -1254,15 +1254,15 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
-- **DeepSeek API** (chat and reasoning models, plus its fetch and search tools), metal boxes, nextjs-dev and the
-  scrapers: an alternative to the Bedrock models and to Browserbase. One JSON secret, `deepseek/api-key` (us-west-1), holds
-  `DEEPSEEK_API_KEY`; dev-server-role, nextjs-dev-role, the dolphin-labs news pass's and the dolphin-maps loops' Lambda roles
-  (their functions get `DEEPSEEK_SECRET_ID`) and admins may read it (`dev-ai-services.tf`; not dev-ebs-only). Export it with
-  the same `eval "$(aws secretsmanager get-secret-value ... --secret-id deepseek/api-key ... | jq -r 'to_entries[] | ...')"`
-  as Browserbase. Never onto a command line, into a file in a repo or a commit.
-- **Exa** (web search, page contents and crawling for agents), same readers as DeepSeek: secret `exa/api-key` (us-west-1),
-  JSON `EXA_API_KEY`; the two scraping Lambdas get `EXA_SECRET_ID` (`dev-ai-services.tf`). Export it the same way; never onto a
-  command line, into a file in a repo or a commit.
+- **Scraping and search APIs: DeepSeek, Exa, ScrapingDog**, metal boxes, nextjs-dev and the scrapers: alternatives to
+  Browserbase and to the Bedrock models (DeepSeek: chat and reasoning plus its fetch and search tools; Exa: web search and
+  page contents; ScrapingDog: scraping API with rendering and proxies). One JSON secret each in us-west-1,
+  `deepseek/api-key`, `exa/api-key`, `scrapingdog/api-key`, holding `DEEPSEEK_API_KEY`, `EXA_API_KEY` and
+  `SCRAPINGDOG_API_KEY`. Readers are Browserbase's: dev-server-role, nextjs-dev-role, the dolphin-labs news pass's and the
+  dolphin-maps loops' Lambda roles (their functions get `<PROVIDER>_SECRET_ID`) and admins (`dev-ai-services.tf`; not
+  dev-ebs-only). Export one with the same `eval "$(aws secretsmanager get-secret-value ... | jq -r 'to_entries[] | ...')"`
+  as Browserbase. Never onto a command line, into a file in a repo or a commit. How to use each, prices and our plans'
+  limits: the `deepseek`, `exa`, `scrapingdog` and `browserbase` skills in dolphin-labs-hq/dolphin-labs.
 - **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
   nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
   `ISSUER_ID`, `KEY_ID`, `TEAM_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
