@@ -178,10 +178,68 @@ class Peekaboo(Base):
         self.assertEqual(self.run_(BIN / "peekaboo", "type", "x").stdout, "cli type x\n")
 
 
+@unittest.skipUnless(shutil.which("zsh"), "needs zsh")
+class ZshEnv(Base):
+    """The managed ~/.zshenv block wins in a non-interactive zsh, whatever the file did before it."""
+
+    def setUp(self):
+        super().setUp()
+        self.zshenv = self.temp / ".zshenv"
+        self.local = self.temp / ".local" / "bin"
+        self.local.mkdir(parents=True)
+        self.system = self.temp / "usr-bin"
+        self.system.mkdir()
+        for d in (self.local, self.system):
+            for tool in ("swift", "xcodebuild", "xcrun"):
+                (d / tool).write_text("#!/bin/sh\n")
+                (d / tool).chmod(0o755)
+
+    def set_(self):
+        subprocess.run(["sh", str(ROOT / "scripts" / "mac" / "set-zshenv.sh"), str(self.zshenv)], check=True)
+
+    def resolved(self):
+        # As an SSH command runs: non-interactive, non-login zsh, which reads only ~/.zshenv.
+        env = {"HOME": str(self.temp), "PATH": f"{self.system}:/usr/bin:/bin", "ZDOTDIR": str(self.temp)}
+        r = subprocess.run(["zsh", "-c", "command -v swift xcodebuild xcrun"], capture_output=True, text=True,
+                           env=env, check=True)
+        return r.stdout.split()
+
+    def test_a_file_that_appends_local_bin_after_usr_bin_still_gets_the_shims_first(self):
+        # The case a "does it mention .local/bin" check let through: appended, and mentioned in a comment.
+        self.zshenv.write_text('# tools live in ~/.local/bin\nexport FOO=1\npath+=("$HOME/.local/bin")\n')
+        self.assertEqual(self.resolved()[0], str(self.system / "swift"), "precondition: /usr/bin first")
+        self.set_()
+        self.assertEqual(self.resolved(), [str(self.local / t) for t in ("swift", "xcodebuild", "xcrun")])
+        text = self.zshenv.read_text()
+        self.assertTrue(text.startswith("# tools live in ~/.local/bin\nexport FOO=1\n"), "the rest is kept")
+        self.assertTrue(text.rstrip("\n").endswith("# <<< mac-setup <<<"), "the block is last")
+
+    def test_rerun_is_a_no_op_and_an_old_block_is_replaced_in_place_and_moved_last(self):
+        self.zshenv.write_text("export A=1\n")
+        self.set_()
+        once = self.zshenv.read_text()
+        self.set_()
+        self.assertEqual(self.zshenv.read_text(), once)
+        self.assertEqual(once.count("# >>> mac-setup >>>"), 1)
+        # A stale block in the middle, with user lines after it that push /usr/bin back in front.
+        stale = once.replace("typeset -U path", "# old body\ntypeset -U path")
+        self.zshenv.write_text(stale + 'path=("%s" $path)\n' % self.system)
+        self.set_()
+        text = self.zshenv.read_text()
+        self.assertEqual(text.count("# >>> mac-setup >>>"), 1)
+        self.assertNotIn("# old body", text)
+        self.assertTrue(text.rstrip("\n").endswith("# <<< mac-setup <<<"))
+        self.assertEqual(self.resolved()[0], str(self.local / "swift"))
+
+    def test_a_missing_file_is_created(self):
+        self.set_()
+        self.assertEqual(self.resolved()[0], str(self.local / "swift"))
+
+
 class Files(unittest.TestCase):
     def test_syntax(self):
-        for f in ("mac-build-shim", "peekaboo"):
-            subprocess.run(["sh", "-n", str(BIN / f)], check=True)
+        for f in (BIN / "mac-build-shim", BIN / "peekaboo", ROOT / "scripts" / "mac" / "set-zshenv.sh"):
+            subprocess.run(["sh", "-n", str(f)], check=True)
         for f in ("mac-lease", "mac-build"):
             subprocess.run(["perl", "-c", str(BIN / f)], check=True, capture_output=True)
         if shutil.which("zsh"):
@@ -195,6 +253,9 @@ class Files(unittest.TestCase):
         for f in sorted(p.name for p in BIN.iterdir()):
             self.assertIn(f"bin/{f}", setup)
             self.assertIn(f, install)
+        self.assertIn("set-zshenv.sh bin |", setup, "the zshenv helper travels with the tools")
+        self.assertIn('"$src/set-zshenv.sh" "$HOME/.zshenv"', install)
+        self.assertNotIn("grep -q '\\.local/bin'", install, "no mention-based check decides the PATH")
 
     def test_mac_gui_keeps_secrets_off_the_command_line(self):
         gui = (BIN / "mac-gui").read_text()

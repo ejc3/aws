@@ -503,7 +503,7 @@ volume" prompt on the screen and hung there. It was retired.
 
 ##### MacBook: The agent tools (`scripts/mac-setup.sh`)
 
-All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (`~/.zshenv`):
+All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (a managed block, `# >>> mac-setup >>>`, kept last in `~/.zshenv`, so nothing earlier in the file can put `/usr/bin` ahead of the shims):
 
 - **`mac-gui [--timeout S] [--] CMD ...`**: runs CMD in the GUI session, keeping the working directory and
   environment (passed in a 0600 file, never on a command line); stdin, stdout, stderr and the exit status are CMD's,

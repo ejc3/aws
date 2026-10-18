@@ -18,9 +18,9 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/mac" && pwd)
 alias_=${1:-mac}
 [[ $alias_ =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: scripts/mac-setup.sh [SSH_ALIAS]" >&2; exit 2; }
-for f in install.zsh bin/mac-gui bin/mac-lease bin/mac-build bin/mac-build-shim bin/peekaboo; do
+for f in install.zsh set-zshenv.sh bin/mac-gui bin/mac-lease bin/mac-build bin/mac-build-shim bin/peekaboo; do
   [ -f "$here/$f" ] || { echo "mac-setup: missing $here/$f" >&2; exit 1; }
 done
 # One SSH session: the files as a tar stream on stdin, unpacked into a private temporary directory.
-tar -C "$here" -cf - install.zsh bin | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
+tar -C "$here" -cf - install.zsh set-zshenv.sh bin | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
   '/bin/zsh -c '\''d=$(mktemp -d) && tar -C "$d" -xf - && /bin/zsh "$d/install.zsh" "$d"; rc=$?; rm -rf "$d"; exit $rc'\'''
