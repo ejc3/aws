@@ -23,6 +23,12 @@
 # Each costs money only while running: parallel-box-watchdog.tf terminates it after 30 idle
 # minutes and at its hard lifetime (var.gpu_box_max_hours, from LaunchTime); the box also
 # arms its own shutdown timer as a backup.
+#
+# A MEMBER (member-boxes.tf: the account running this is one of MEMBERS) has one box of their
+# own, gbox-<person> (member-gbox.tf), and these commands act on it with no slot number:
+# `gbox up`, `gbox down`, `gbox status`, `gbox ssh`, `gbox ip`. It has a fixed private address,
+# reached over the dev fleet's peering, and opens with the person's own key (fetched once into
+# ~/.ssh/member-box from Secrets Manager), not the dev-hop key.
 set -uo pipefail
 
 REGION="us-west-2"
@@ -39,6 +45,12 @@ SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 
 SELF="$(basename "${BASH_SOURCE[0]}")"
 say() { printf '%s\n' "$*" >&2; }
 
+MEMBERS="colton connor colin skevh" # local.member_box_people
+MEMBER="${MEMBER_BOX_USER:-$(id -un 2>/dev/null)}"
+case " $MEMBERS " in *" $MEMBER "*) ;; *) MEMBER="" ;; esac
+IPQ="PublicIpAddress"   # the owner's boxes: SSH from nextjs-dev's address to the public one
+IP_WAIT_TRIES=18        # x10 s: a just-terminated member box may still hold its fixed address
+
 # Slot N -> its Name tag and launch template (the same string), and the suffix that
 # messages put after a command so they name the slot they are about.
 set_slot() {
@@ -50,7 +62,7 @@ set_slot() {
 box_ip() {
   aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null | grep -v '^None$' || true
+    --query "Reservations[0].Instances[0].$IPQ" --output text 2>/dev/null | grep -v '^None$' || true
 }
 
 # Every pending/running gpu-box, one id per line: two concurrent `up`s (or a hand-rolled
@@ -62,20 +74,41 @@ box_ids() {
 }
 
 need_key() {
+  if [ -n "$MEMBER" ] && [ ! -s "$KEY" ]; then
+    # The person's own key (member-boxes.tf), fetched once straight into a 0600 file (never a
+    # shell variable); the box authorizes it and no other.
+    install -d -m 700 "$HOME/.ssh"
+    if ! (umask 077; aws secretsmanager get-secret-value --region us-west-1 --secret-id "member-box/$MEMBER/ssh-key" \
+          --query SecretString --output text > "$KEY.tmp" 2>/dev/null) || [ ! -s "$KEY.tmp" ]; then
+      rm -f "$KEY.tmp"
+      say "FATAL: cannot read your box key (Secrets Manager member-box/$MEMBER/ssh-key)"; exit 1
+    fi
+    mv "$KEY.tmp" "$KEY"
+  fi
   [ -f "$KEY" ] || { say "FATAL: no dev-hop key at $KEY (dev-hop-key.tf installs it for ubuntu and ejc3)"; exit 1; }
 }
 
 CMD="${1:-status}"
 ARG="${2:-}"
-if [ "$CMD" = "status" ] && [ "$ARG" = "all" ]; then
+if [ -n "$MEMBER" ]; then
+  # A member's box: no slot. `status all` is just theirs.
+  [ -z "$ARG" ] || { [ "$CMD" = "status" ] && [ "$ARG" = "all" ]; } || {
+    say "your gbox is gbox-$MEMBER: run '$SELF $CMD' with no slot"; exit 1; }
+  NAME="gbox-$MEMBER"; LT="$NAME"; SUF=""
+  IPQ="PrivateIpAddress"
+  KEY="$HOME/.ssh/member-box"
+  SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+elif [ "$CMD" = "status" ] && [ "$ARG" = "all" ]; then
   # Run this script once per slot: each line is exactly that slot's own status.
   for N in $SLOTS; do "$BASH" "${BASH_SOURCE[0]}" status "$N"; done
   exit 0
 fi
-case " $SLOTS " in
-  *" ${ARG:-1} "*) set_slot "${ARG:-1}" ;;
-  *) say "unknown slot '$ARG' (use 1-4, or 'status all')"; exit 1 ;;
-esac
+if [ -z "$MEMBER" ]; then
+  case " $SLOTS " in
+    *" ${ARG:-1} "*) set_slot "${ARG:-1}" ;;
+    *) say "unknown slot '$ARG' (use 1-4, or 'status all')"; exit 1 ;;
+  esac
+fi
 
 case "$CMD" in
   ip) box_ip ;;
@@ -85,6 +118,32 @@ case "$CMD" in
     IP="$(box_ip)"
     if [ -n "$IP" ]; then say "Already running at $IP"; exit 0; fi
     if [ -n "$(box_ids)" ]; then say "Already launching; run: $SELF status$SUF"; exit 0; fi
+
+    if [ -n "$MEMBER" ]; then
+      # A member's box has one subnet and a fixed address, both in its template: only the type
+      # is chosen here, and a just-terminated box may hold the address for a minute.
+      ID=""
+      for T in $TYPES; do
+        say "--> trying $T ..."
+        for _ in $(seq 1 "$IP_WAIT_TRIES"); do
+          OUT=$(aws ec2 run-instances --region "$REGION" \
+            --launch-template "LaunchTemplateName=$LT,Version=\$Latest" \
+            --instance-type "$T" --count 1 \
+            --query 'Instances[0].InstanceId' --output text 2>&1)
+          RC=$?
+          case "$OUT" in
+            *InvalidIPAddress.InUse*) say "    the previous $NAME still holds its fixed address; waiting..."; sleep 10 ;;
+            *) break ;;
+          esac
+        done
+        if [ "$RC" -eq 0 ] && [ "${OUT#i-}" != "$OUT" ]; then ID="$OUT"; CHOSEN="$T"; break; fi
+        case "$OUT" in
+          *InsufficientInstanceCapacity*|*Unsupported*) say "    no capacity for $T there -- trying the next" ;;
+          *) say "    launch failed:"; printf '%s\n' "$OUT" | sed 's/^/      /' >&2; exit 1 ;;
+        esac
+      done
+      [ -n "$ID" ] || { say "FAILED: no capacity for any of: $TYPES"; exit 1; }
+    else
 
     # Which (type, AZ) pairs exist at all, looked up ONCE. An error here is a permissions or
     # region problem and must stop the launch -- read as "no offerings", it would come out
@@ -134,6 +193,7 @@ case "$CMD" in
       done
     done
     [ -n "$ID" ] || { say "FAILED: no capacity for any of: $TYPES"; exit 1; }
+    fi
 
     say "Launched $CHOSEN as $ID. Waiting for SSH..."
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null

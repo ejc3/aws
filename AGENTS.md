@@ -255,8 +255,10 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute and the four GPU test boxes
   (`gpu-box.tf`, slots `gpu-box` and `gpu-box-2`..`-4`) after 30m CPU idle, and each GPU box
-  at 4h from launch (its own shutdown timer is only a backup). The same code, as `playbox-watchdog` in us-west-1,
-  terminates the three Windows playtest spot boxes (`playbox.tf`) after one hour below 15% CPU and at 6h from launch
+  at 4h from launch (its own shutdown timer is only a backup). It and its Ohio copy also reap the members' own gboxes
+  and pboxes (`member-gbox.tf`, `member-pbox.tf`: 30m idle, 4h / 6h from launch), and the same code, as
+  `member-wbox-watchdog` in us-west-1, terminates the members' Windows spot boxes (`member-wbox.tf`) after one hour below
+  15% CPU and at 6h from launch. Every member box also ends itself at that deadline (a timer re-armed at each boot)
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
 - There is no application database. DynamoDB is limited to Terraform locking and runner
   registration claims. Older notes about Aurora Serverless auto-pause no longer apply
@@ -467,7 +469,7 @@ The long-lived development and administration instances are:
 | nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
-| playbox-1 .. playbox-3 | g4dn.xlarge (else g4dn.2xlarge), Windows Server 2025, us-west-1a | one-time spot, terminated after 1h below 15% CPU or 6h from launch | One Roblox playtest box per kid; persistent per-slot D: disk (Roblox, caches); RDP/DCV from dev boxes only; `playbox up/down/status/connect N` | playbox.tf |
+| wbox-, pbox-, gbox-`<member>` | per member (colton, connor, colin, skevh): a Windows g4dn spot box in us-west-1a, a Graviton spot box in us-east-2c, a small NVIDIA box in us-west-2a | launched and terminated on demand; idle and lifetime reaped | Each member's own boxes, each with a fixed private IP; the wbox and pbox keep a persistent disk per person. The same `wbox` / `pbox` / `gbox` commands, run from the member's account, act on them (`member-boxes.tf`) | member-wbox.tf, member-pbox.tf, member-gbox.tf |
 | claude-master-server | t4g.micro | on-demand | Holds the Claude subscription logins and serves every other box; clients authenticate with a certificate it issued; private only | claw-master-server.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
@@ -1207,7 +1209,7 @@ Available if a task needs them; neither needs a key on disk.
   nextjs-dev: DeepSeek and the other Anthropic models stay on the metal boxes.
 - **Claude Haiku 5.5 on Bedrock, on every box** (`bedrock-haiku.tf`). The kids' box and the other
   non-metal boxes had no Bedrock until the owner, 2026-10-10: "I am fine if this box has haiku access. All
-  boxes can be." `nextjs-dev-role`, `dev-ebs-only-role` (I/O and parallel boxes), `wbox-role`, `playbox-role`,
+  boxes can be." `nextjs-dev-role`, `dev-ebs-only-role` (I/O and parallel boxes), `wbox-role`, each member wbox's `wbox-<person>-role`,
   `claude-master-server-role` and, when the Mac is on, `mac-dev-instance` may invoke Haiku 5.5 and no other
   model; the metal boxes keep every `anthropic.*` model. The GPU boxes have no instance profile and get
   nothing. A new box role joins through `local.bedrock_haiku_box_roles`.
@@ -1719,8 +1721,8 @@ to the two metal servers.
 The I/O-box invocation of the same Lambda also checks five-minute disk and network sums.
 Returned disk activity of at least 1 MiB or network activity of at least 64 MiB keeps it
 running, but a missing I/O series currently counts as zero. The parallel box uses
-`parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU; the Windows playtest spot boxes run
-that code as their own `playbox-watchdog` (one hour below 15%, 6h lifetime; `playbox.tf`). `nextjs-dev` and
+`parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU; the members' Windows spot boxes run
+that code as their own `member-wbox-watchdog` (one hour below 15%, 6h lifetime; `member-wbox.tf`). `nextjs-dev` and
 the jumpboxes never idle-stop.
 
 ### Backup boundary

@@ -50,14 +50,15 @@ class GrantTests(unittest.TestCase):
         self.assertIn("role     = aws_iam_role.mac_instance[0].id", mac)
         self.assertIn("count    = var.enable_mac_dev ? 1 : 0", mac)
         # The roles' own files stay without Bedrock; the grant lives here.
-        for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "playbox.tf", "claw-master-server.tf", "mac-dev-secrets.tf"):
+        for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "member-wbox.tf", "claw-master-server.tf", "mac-dev-secrets.tf"):
             self.assertNotIn("bedrock:", (ROOT / tf).read_text(), tf)
 
     def test_every_box_role_without_bedrock_is_attached(self):
         roles = re.search(r"^  bedrock_haiku_box_roles = merge\(\n(.*?)^  \)", TF, re.S | re.M)
         self.assertIsNotNone(roles)
-        attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?\.id", roles.group(1)))
-        self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "playbox", "claw_master_server"})
+        # a per-instance role map (member wboxes) joins by a for expression over the resource
+        attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?(?:\.id\b| :)", roles.group(1)))
+        self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "member_wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
         # is an administrator (jumpbox_admin), is a CI machine, is the Mac (its own resource above), or is in the
         # Dolphin account (dolphin_redis, which calls no model).

@@ -20,6 +20,21 @@
 # SSH you already use: ssh -L 8443:<ip>:8443 fcvm-arm, then https://localhost:8443.
 set -uo pipefail
 
+# A MEMBER's account (member-boxes.tf) has a wbox of its own, wbox-<person>: a Windows spot box
+# launched and terminated on demand (member-wbox.tf), not this stop/start one. Its commands go to
+# wbox-member, installed next to this script on the boxes the members use; MEMBER_BOX_USER names
+# a member explicitly (the grant, not this script, decides whose box a session may touch).
+MEMBERS="colton connor colin skevh" # local.member_box_people
+MEMBER="${MEMBER_BOX_USER:-$(id -un 2>/dev/null)}"
+case " $MEMBERS " in
+  *" $MEMBER "*)
+    for m in "${WBOX_MEMBER:-}" /usr/local/libexec/wbox-member "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/wbox-member.sh"; do
+      [ -n "$m" ] && [ -x "$m" ] && MEMBER_BOX_USER="$MEMBER" exec "$m" "$@"
+    done
+    printf '%s\n' "wbox: no wbox-member script on this box for $MEMBER's wbox (scripts/wbox-member.sh)" >&2
+    exit 1 ;;
+esac
+
 REGION="us-west-1"
 NAME="wbox"
 SECRET="wbox/administrator-password"
