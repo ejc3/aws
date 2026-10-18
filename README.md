@@ -1067,7 +1067,14 @@ login.
 - **AWS**: `aws` and the SDKs work inside with no setup. The container's `169.254.169.254` is the host's
   `nextjs-ct-imds`, which hands out a session of `nextjs-dev-role` narrowed by a session policy: no
   container gets the tunnel credentials, the setup scripts or the SSM agent channel; only the owner's
-  gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the dev-box launchers.
+  gets other roles (the Dolphin apply role), the hop key, the Google Docs token and the owner's boxes. A
+  member's session also carries that member's managed policy (`nextjs-ct-member-<user>`), which admits their
+  own wbox, pbox and gbox (`member-boxes.tf`) and nothing of anyone else's: their own two secrets, launches
+  only from their own launch templates with their own Name tags, start, stop and terminate only their own,
+  attach only their own volumes, pass only their own wbox role.
+- **The boxes**: `wbox`, `pbox` and `gbox` are in every container and act on that person's own boxes. A member
+  may forward a port to their own boxes through ssh (`ssh -L 8443:<own wbox address>:8443 ...`), and their
+  container cannot reach anyone else's.
 - **The MacBook** is reachable from `ejc3`'s container only, by `ssh mac`: the same Cloudflare route as every other
   box (`mac-ssh-client.tf`), with ejc3's own Access token, which every member's AWS session is denied.
 

@@ -36,11 +36,15 @@ CONFIG = {
     "zones": {"cc-games.dev": "tunnel-a", "dolphin-labs.dev": "tunnel-b"},
     "ssh_hostnames": {"dolphin-labs.dev": "ssh.dolphin-labs.dev"},
     "pinned_routes": {},
-    "session_policies": {"alice": {"Statement": [{"Sid": "member"}]}, "boss": {"Statement": [{"Sid": "owner"}]}},
+    "session_policy": {"Statement": [{"Sid": "everyone"}]},
+    "session_policy_arns": {"alice": ["arn:aws:iam::111111111111:policy/nextjs-ct-member-alice"],
+                            "carol": ["arn:aws:iam::111111111111:policy/nextjs-ct-member-carol"]},
     "io_box_ip": "172.31.48.10",
+    "member_box_ips": ["10.0.69.10", "10.12.2.10", "172.31.47.226", "10.0.69.11", "10.12.2.11", "172.31.47.227"],
     "users": {
-        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False},
-        "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True},
+        "alice": {"uid": 1001, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.10", "10.12.2.10", "172.31.47.226"]},
+        "carol": {"uid": 1002, "zone": "cc-games.dev", "owner": False, "box_ips": ["10.0.69.11", "10.12.2.11", "172.31.47.227"]},
+        "boss": {"uid": 1003, "zone": "dolphin-labs.dev", "owner": True, "box_ips": []},
     },
 }
 
@@ -67,33 +71,64 @@ class HostScriptTests(unittest.TestCase):
     def test_session_policies_narrow_members_and_the_host_only_set(self):
         member = TF.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
         host = TF.split("nextjs_ct_deny_host_only = [", 1)[1].split("\n  ]\n", 1)[0]
-        self.assertIn('"sts:AssumeRole"', member)
+        self.assertIn('Action   = "sts:AssumeRole"', member)
         self.assertIn("aws_secretsmanager_secret.dev_hop.arn", member)
         self.assertIn("data.aws_secretsmanager_secret.nextjs_gdocs", member)
-        self.assertIn('"ec2:RunInstances"', member)
+        for action in ("ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"):
+            self.assertIn(f'"{action}"', member, action)
         self.assertIn("data.aws_secretsmanager_secret.nextjs_connector", host)
         self.assertIn("ssmmessages:*", host)
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
         self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
 
-    def test_one_session_policy_per_account(self):
-        # Keyed by account, so a member's policy can name that member's own resources and nobody else's; the owner
-        # gets no member denials.
-        block = TF.split("nextjs_ct_session_policies = {", 1)[1].split("\n  }\n", 1)[0]
-        self.assertIn("for u in local.nextjs_users : u => {", block)
-        self.assertIn("[for s in local.nextjs_ct_deny_member : s if !contains(local.nextjs_ct_owners, u)]", block)
+    def test_each_member_has_a_managed_session_policy_naming_their_own_boxes(self):
+        # An inline session policy is capped at 2,048 characters; a member's denials name that member's own three
+        # boxes, so each member gets a managed policy, attached to nothing and passed with the member's session only.
+        res = TF.split('resource "aws_iam_policy" "nextjs_ct_member" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("for_each    = toset(local.nextjs_ct_member_users)", res)
+        self.assertIn("concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes))", res)
+        self.assertIn("nextjs_ct_member_users = [for u in local.nextjs_users : u if !contains(local.nextjs_ct_owners, u)]", TF)
+        self.assertIn("session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }", TF)
+        self.assertNotIn("aws_iam_role_policy_attachment\" \"nextjs_ct_member", TF)
+        own = TF.split("nextjs_ct_own_boxes = {", 1)[1].split("\n  ] }\n", 1)[0]
+        box = TF.split("nextjs_ct_member_box_all = {", 1)[1].split("\n  } }\n", 1)[0]
+        # Their own: names, launch templates, volumes by explicit ARN, the wbox role, the two secrets.
+        for ref in ("local.member_wbox_slots[p]", "local.member_pbox_slots[p]", "local.member_gbox_slots[p]",
+                    "aws_launch_template.member_wbox[p].arn", "aws_launch_template.member_pbox[p].arn",
+                    "aws_launch_template.member_gbox[p].arn", "aws_ebs_volume.member_wbox_data[p].arn",
+                    "aws_ebs_volume.member_pbox_work[p].arn", "aws_iam_role.member_wbox[p].arn",
+                    "aws_secretsmanager_secret.member_box_ssh[p].arn", "aws_secretsmanager_secret.member_wbox_admin[p].arn"):
+            self.assertIn(ref, box, ref)
+        def stmt(sid):
+            return re.split(r'Sid +="' + sid + '"', own.replace('= "', '="'), maxsplit=1)[1].split("},\n    {", 1)[0].replace('="', '= "')
+        # By the secret's own ARN, never a condition on secretsmanager:SecretId (the caller's text: a name or an ARN).
+        self.assertIn("Resource = flatten([for o, ob in local.nextjs_ct_member_box_all : ob.secrets if o != p])", stmt("OtherMembersBoxSecrets"))
+        self.assertFalse('"secretsmanager:SecretId" =' in TF)
+        self.assertIn('StringNotEquals = { "ec2:CreateAction" = "RunInstances" }', stmt("TagOnlyAtLaunch"))
+        self.assertIn('StringNotEquals = { "aws:RequestTag/Name" = b.names }', stmt("OwnBoxNamesOnly"))
+        self.assertIn('"ec2:RunInstances", "ec2:CreateTags"', stmt("OwnBoxNamesOnly"))
+        self.assertIn('ArnNotEquals = { "ec2:LaunchTemplate" = b.templates }', stmt("OwnLaunchTemplatesOnly"))
+        for action in ("TerminateInstances", "StartInstances", "StopInstances", "RebootInstances", "AttachVolume", "DetachVolume"):
+            self.assertIn(f'"ec2:{action}"', stmt("OwnBoxesOnly"), action)
+        self.assertIn('StringNotEquals = { "ec2:ResourceTag/Name" = b.names }', stmt("OwnBoxesOnly"))
+        self.assertIn('NotResource = concat(b.volumes, ["arn:aws:ec2:*:*:instance/*"])', stmt("OwnVolumesOnly"))
+        self.assertIn('NotResource = [b.role]', stmt("OwnBoxRoleOnly"))
+        self.assertIn('Action      = "iam:PassRole"', stmt("OwnBoxRoleOnly"))
+
+    def test_imds_passes_the_members_managed_policy(self):
         imds = (HOST / "nextjs-ct-imds").read_text()
-        self.assertIn('policy = self.config["session_policies"][user]', imds)
+        self.assertIn('json.dumps(self.config["session_policy"]', imds)
+        self.assertIn('cmd += ["--policy-arns"] + [f"arn={a}" for a in arns]', imds)
+        self.assertNotIn("session_policies", imds)
 
     def test_the_owner_can_attach_the_volumes_pbox_launches_with(self):
         # #490 put the EBS actions in the host-only set, so `pbox up` from ejc3's container launched a box and then
-        # failed to attach its work volume. They are owner-only now: denied to members, allowed to the owner.
+        # failed to attach its work volume. A member may attach only their own volumes; the owner is not narrowed.
         host = TF.split("nextjs_ct_deny_host_only = [", 1)[1].split("\n  ]\n", 1)[0]
-        member = TF.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
-        for action in ("ec2:AttachVolume", "ec2:CreateVolume", "ec2:DetachVolume", "ec2:DeleteVolume"):
+        for action in ("ec2:AttachVolume", "ec2:CreateVolume", "ec2:DetachVolume", "ec2:DeleteVolume", "ec2:RunInstances"):
             self.assertNotIn(f'"{action}"', host, action)
-            self.assertIn(f'"{action}"', member, action)
+        self.assertIn("nextjs_ct_session_policy = { Version = \"2012-10-17\", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }", TF)
 
     def test_no_container_can_assume_the_box_role_without_its_session_policy(self):
         # Review of #490 (Codex P1): the owner keeps sts:AssumeRole for the Dolphin role, and the role trusts
@@ -104,25 +139,52 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn('Action   = "sts:AssumeRole"', stmt)
         self.assertIn("Resource = local.nextjs_dev_role_arn", stmt)
 
-    def test_member_session_policy_fits_the_sts_limit(self):
-        # AssumeRole refuses a session policy over 2,048 characters. Render it with realistic ARNs.
+    def test_session_policies_fit_the_limits(self):
+        # AssumeRole refuses an inline session policy over 2,048 characters; IAM refuses a managed policy over 6,144
+        # (whitespace not counted). Render both with realistic ARNs.
         arn = "arn:aws:secretsmanager:us-west-1:111111111111:secret:{}-AbCdEf"
-        statements = [
-            {"Sid": "UpToTheRole", "Effect": "Allow", "Action": "*", "Resource": "*"},
-            {"Sid": "HostOnlyAgents", "Effect": "Deny", "Action": re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', TF.split("HostOnlyAgents", 1)[1].split("Resource", 1)[0]), "Resource": "*"},
+        acts = lambda sid: re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', TF.split(sid, 1)[1].split("Resource", 1)[0])
+        allow = [{"Sid": "UpToTheRole", "Effect": "Allow", "Action": "*", "Resource": "*"}]
+        inline = allow + [
+            {"Sid": "HostOnlyAgents", "Effect": "Deny", "Action": acts("HostOnlyAgents"), "Resource": "*"},
             {"Sid": "NoSessionWithoutThisPolicy", "Effect": "Deny", "Action": "sts:AssumeRole",
              "Resource": "arn:aws:iam::111111111111:role/nextjs-dev-role"},
             {"Sid": "HostOnlyData", "Effect": "Deny", "Action": ["secretsmanager:GetSecretValue", "s3:GetObject", "s3:PutObject"],
              "Resource": [arn.format("cloudflare-tunnel-credentials"), arn.format("cloudflare-dolphin-tunnel-credentials"),
                           "arn:aws:s3:::ejc3-dev-scripts/*", "arn:aws:s3:::security-config-111111111111-us-west-1/sessions/*"]},
-            {"Sid": "OwnerOnlyRoles", "Effect": "Deny", "Action": ["sts:AssumeRole", "iam:PassRole"], "Resource": "*"},
+        ]
+        size = len(json.dumps({"Version": "2012-10-17", "Statement": inline}, separators=(",", ":")))
+        self.assertLess(size, 1900, size)
+        sp = "arn:aws:secretsmanager:us-west-1:111111111111:secret:"
+        names = ["wbox-colton", "pbox-colton", "gbox-colton"]
+        lt = "arn:aws:ec2:{}:111111111111:launch-template/lt-0123456789abcdef0"
+        launched = ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*:*:network-interface/*"]
+        managed = allow + [
+            {"Sid": "OwnerOnlyRoles", "Effect": "Deny", "Action": "sts:AssumeRole", "Resource": "*"},
             {"Sid": "OwnerOnlySecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
-                          arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token")]},
-            {"Sid": "OwnerOnlyDevBoxes", "Effect": "Deny", "Action": re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', TF.split("OwnerOnlyDevBoxes", 1)[1].split("Resource", 1)[0]), "Resource": "*"},
+                          arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token"),
+                          sp + "macbook-ssh-access-nextjs-ejc3-*"]},
+            {"Sid": "NoMemberNeedsThese", "Effect": "Deny", "Action": acts("NoMemberNeedsThese"), "Resource": "*"},
+            {"Sid": "OtherMembersBoxSecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
+             "Resource": [sp + f"{k}-AbCdEf" for o in ("connor", "colin", "skevh") for k in (f"member-box/{o}/ssh-key", f"wbox-{o}/administrator-password")]},
+            {"Sid": "TagOnlyAtLaunch", "Effect": "Deny", "Action": "ec2:CreateTags", "Resource": launched,
+             "Condition": {"StringNotEquals": {"ec2:CreateAction": "RunInstances"}}},
+            {"Sid": "OwnBoxNamesOnly", "Effect": "Deny", "Action": ["ec2:RunInstances", "ec2:CreateTags"], "Resource": launched,
+             "Condition": {"StringNotEquals": {"aws:RequestTag/Name": names}}},
+            {"Sid": "OwnLaunchTemplatesOnly", "Effect": "Deny", "Action": "ec2:RunInstances", "Resource": launched[0],
+             "Condition": {"ArnNotEquals": {"ec2:LaunchTemplate": [lt.format("us-west-1"), lt.format("us-east-2"), lt.format("us-west-1")]}}},
+            {"Sid": "OwnBoxesOnly", "Effect": "Deny", "Action": acts("Sid       = \"OwnBoxesOnly\""), "Resource": launched[0],
+             "Condition": {"StringNotEquals": {"ec2:ResourceTag/Name": names}}},
+            {"Sid": "OwnVolumesOnly", "Effect": "Deny", "Action": ["ec2:AttachVolume", "ec2:DetachVolume"],
+             "NotResource": ["arn:aws:ec2:us-west-1:111111111111:volume/vol-0123456789abcdef0",
+                             "arn:aws:ec2:us-east-2:111111111111:volume/vol-0123456789abcdef0", launched[0]]},
+            {"Sid": "OwnBoxRoleOnly", "Effect": "Deny", "Action": "iam:PassRole",
+             "NotResource": ["arn:aws:iam::111111111111:role/wbox-colton-role"]},
         ]
-        size = len(json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":")))
-        self.assertLess(size, 1900, size)
+        self.assertEqual(len(acts("Sid       = \"OwnBoxesOnly\"")), 6)
+        size = len(json.dumps({"Version": "2012-10-17", "Statement": managed}, separators=(",", ":")))
+        self.assertLess(size, 5500, size)
 
 
 class MigrateTests(unittest.TestCase):
@@ -243,7 +305,7 @@ class ImdsTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         d = Path(cls.tmp.name)
         (d / "config.json").write_text(json.dumps(CONFIG))
-        fake(d, "aws", """printf '%s\\n' "$@" >> "$CALLS"
+        fake(d, "aws", """{ printf '%s\\n' "$@"; echo ---; } >> "$CALLS"
 cat <<JSON
 {"Credentials": {"AccessKeyId": "AKIAFAKE", "SecretAccessKey": "secret", "SessionToken": "tok",
  "Expiration": "2099-01-01T00:00:00Z"}}
@@ -294,15 +356,17 @@ JSON
         self.assertEqual(status, 200)
         doc = json.loads(body)
         self.assertEqual((doc["Code"], doc["AccessKeyId"], doc["Token"]), ("Success", "AKIAFAKE", "tok"))
-        calls = self.calls.read_text()
-        self.assertIn("ct-alice", calls)
-        self.assertIn('"Sid":"member"', calls)
+        call = next(c for c in self.calls.read_text().split("---\n") if "ct-alice" in c)
+        self.assertIn('"Sid":"everyone"', call)
+        self.assertIn("--policy-arns\narn=arn:aws:iam::111111111111:policy/nextjs-ct-member-alice\n", call)
 
-    def test_owner_gets_the_owner_policy(self):
+    def test_owner_gets_no_member_policy(self):
         tok = self.token("127.0.0.2")
         status, _ = self.req("GET", "/latest/meta-data/iam/security-credentials/nextjs-dev-role", {"X-aws-ec2-metadata-token": tok}, "127.0.0.2")
         self.assertEqual(status, 200)
-        self.assertIn('"Sid":"owner"', self.calls.read_text())
+        call = next(c for c in self.calls.read_text().split("---\n") if "ct-boss" in c)
+        self.assertIn('"Sid":"everyone"', call)
+        self.assertNotIn("--policy-arns", call)  # the owner is not narrowed to any member's boxes
 
     def test_a_token_is_good_only_where_it_was_issued(self):
         tok = self.token("127.0.0.2")
@@ -414,7 +478,7 @@ class GeneratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / "config.json").write_text(json.dumps(CONFIG))
-            fake(d, "id", 'case "$2" in alice) echo 1001 ;; boss) echo 1003 ;; *) exit 1 ;; esac\n')
+            fake(d, "id", 'case "$2" in alice) echo 1001 ;; carol) echo 1002 ;; boss) echo 1003 ;; *) exit 1 ;; esac\n')
             for tool in ("nft", "sysctl", "sshd", "systemctl"):
                 fake(d, tool, "exit 0\n")
             text = (HOST / script).read_text().replace("/etc/nextjs-ct/config.json", str(d / "config.json")) \
@@ -441,13 +505,22 @@ class GeneratorTests(unittest.TestCase):
         forward = nft.split("chain forward {", 1)[1]
         self.assertLess(forward.index('iifname "ve-alice" ip daddr 172.31.48.10 drop'), forward.index("ct state established,related accept"))
         self.assertLess(forward.index('iifname "ve-alice" ip saddr != 10.88.1.2 drop'), forward.index("ct state established,related accept"))
+        # Another member's boxes: refused to each member, their own boxes and the owner untouched.
+        self.assertIn('iifname "ve-alice" ip daddr { 10.0.69.11, 10.12.2.11, 172.31.47.227 } drop', nft)
+        self.assertIn('iifname "ve-carol" ip daddr { 10.0.69.10, 10.12.2.10, 172.31.47.226 } drop', nft)
+        self.assertNotIn('iifname "ve-boss" ip daddr {', nft)
+        self.assertLess(forward.index('iifname "ve-alice" ip daddr { 10.0.69.11'), forward.index("ct state established,related accept"))
 
     def test_sshd(self):
         conf = self.generate("nextjs-ct-sshd", "out")
         alice = conf.split("Match User alice\n", 1)[1].split("\nMatch", 1)[0]
         boss = conf.split("Match User boss\n", 1)[1].split("\nMatch", 1)[0]
         self.assertIn("ForceCommand /usr/local/sbin/nextjs-ct-enter", alice)
-        self.assertIn("PermitOpen 10.88.1.2:*", alice)
+        carol = conf.split("Match User carol\n", 1)[1].split("\nMatch", 1)[0]
+        # A member may forward to their own container and their own three boxes, nothing else.
+        self.assertIn("PermitOpen 10.88.1.2:* 10.0.69.10:* 10.12.2.10:* 172.31.47.226:*\n", alice + "\n")
+        self.assertIn("PermitOpen 10.88.2.2:* 10.0.69.11:* 10.12.2.11:* 172.31.47.227:*\n", carol + "\n")
+        self.assertIn("PermitOpen 10.88.3.2:*\n", boss + "\n")
         self.assertIn("AllowTcpForwarding local", alice)
         self.assertIn("PermitListen none", alice)
         self.assertIn("PermitListen none", boss)  # the owner too: no reverse tunnel lands on this box

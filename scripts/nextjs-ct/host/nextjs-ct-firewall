@@ -9,7 +9,8 @@
 #   169.254.169.254:80                  redirected to the host's nextjs-ct-imds on its own gateway, which
 #                                       answers with that container's own narrowed AWS session
 #   169.254.169.253:53                  the VPC resolver (forwarded like any other traffic)
-# A member's container (not the owner's) is also refused the io-box NFS scratch (config.json io_box_ip).
+# A member's container (not the owner's) is also refused the io-box NFS scratch (config.json io_box_ip) and
+# every other member's boxes (config.json member_box_ips, less users.<u>.box_ips).
 # and nothing else: no other container, no other host port (sshd, the metadata service itself, any
 # loopback listener), no address but its own as the source, and no IPv6.
 set -euo pipefail
@@ -29,6 +30,11 @@ for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   # The io-box NFS scratch is the owner's: a member's traffic would otherwise leave as the host and be admitted.
   if [ "$(jq -r --arg u "$U" '.users[$u].owner // false' "$CONFIG")" != true ] && [ -n "$IO_BOX" ]; then
     fwd+="    iifname \"$IF\" ip daddr $IO_BOX drop"$'\n'
+  fi
+  # Another member's wbox, pbox or gbox: each answers only its own member's key, and this keeps it so.
+  if [ "$(jq -r --arg u "$U" '.users[$u].owner // false' "$CONFIG")" != true ]; then
+    OTHERS=$(jq -r --arg u "$U" '(.member_box_ips // []) - (.users[$u].box_ips // []) | join(", ")' "$CONFIG")
+    [ -n "$OTHERS" ] && fwd+="    iifname \"$IF\" ip daddr { $OTHERS } drop"$'\n'
   fi
   # A second bound under the credential server's own per-container cap: at most 16 connections at once.
   input+="    iifname \"$IF\" tcp dport $PORT ct count over 16 drop"$'\n'

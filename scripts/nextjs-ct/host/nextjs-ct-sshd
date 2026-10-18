@@ -20,7 +20,10 @@ OUT=/etc/ssh/sshd_config.d/90-nextjs-ct.conf
     echo ""
     echo "Match User $U"
     echo "    ForceCommand /usr/local/sbin/nextjs-ct-enter"
-    echo "    PermitOpen 10.88.$N.2:*"
+    # A member may also forward to their own boxes (RDP or DCV to their wbox, say); never another member's.
+    OPEN="10.88.$N.2:*"
+    for ip in $(jq -r --arg u "$U" '.users[$u].box_ips // [] | .[]' "$CONFIG"); do OPEN+=" $ip:*"; done
+    echo "    PermitOpen $OPEN"
     echo "    AllowTcpForwarding local"
     echo "    PermitListen none"
     echo "    AllowAgentForwarding yes"
