@@ -776,15 +776,17 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   again. On 2026-10-18 two `ejc3/imagine` jobs went that way during a burst of about 18 pull requests: one host
   was reclaimed at 16:56:36 (CloudTrail `BidEvictedEvent`; StateReason `Server.SpotInstanceTermination`) and its job failed
   at 17:05:47, another at 17:02:52 and 17:12:44, both c7a.2xlarge in us-west-1c. Now a failed or cancelled
-  job whose runner was one of the repo's hosts gets a record in `github-app-runner-reruns` (one per run and job name, a
-  week's TTL). The job is rerun (`POST /repos/{repo}/actions/jobs/{id}/rerun`) only if EC2 reports that host ended with
+  job whose runner was one of the repo's hosts gets a record in `github-app-runner-reruns` (one per job id, a week's
+  TTL). The job is rerun (`POST /repos/{repo}/actions/jobs/{id}/rerun`) only if EC2 reports that host ended with
   `Server.SpotInstanceTermination` at a time before the job ended. Any other end (its own power-off after the job, the
   reaper) is a real result and is never rerun. The completion can arrive before EC2 has the host's state reason, and GitHub
   refuses a rerun while the run's other jobs still run, so each reconcile carries open records on: undecided after 30
   minutes counts as not reclaimed, and a run still running after 6 hours is given up. **At most one automatic rerun per
-  job**: records are created and moved only by conditional writes, a rerun's own job (same run and name) never earns
-  another, and the run's attempt is read before every call so a call whose answer was lost is not repeated. A run someone
-  else reran or cancelled is left alone. Metrics, per repo in `GitHubAppRunner`: `SpotLost`, `SpotRerun` and
+  job**: records are created and moved only by conditional writes, and a job whose run already holds a record with the
+  same name, an earlier attempt and a rerun call made is the rerun's own job and earns none. Whether a job was rerun is
+  read from the run's latest executions (`jobs?filter=latest`), not from the run's attempt number: two jobs lost in one
+  run are each rerun, the second once the attempt the first started has finished, and a call whose answer was lost is
+  not repeated. A job someone else reran, or a run someone cancelled, is left alone. Metrics, per repo in `GitHubAppRunner`: `SpotLost`, `SpotRerun` and
   `SpotRerunFailed`. The rerun needs **Actions: write**, which neither the runners app (`dolphin-labs-runners`: Actions
   read) nor the repo PATs (Actions read) hold yet. Until the owner grants it, each loss is detected, logged and counted as
   `SpotRerunFailed` after 6 hours of refusals. The rerun token is minted on its own (`actions: write` only), so the

@@ -138,15 +138,10 @@ class FakeDynamo:
         self.buckets, self.bucket_reads, self.bucket_writes, self.conflicts, self.rival = {}, [], [], 0, None
         self.reruns = {}
 
-    RERUN_CREATE = "attribute_not_exists(job) OR (#s IN (:notspot, :unknown) AND run_attempt < :attempt)"
-
     def put_rerun(self, Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames):
-        assert ConditionExpression == self.RERUN_CREATE and ExpressionAttributeNames == {"#s": "state"}, ConditionExpression
+        assert ConditionExpression == "attribute_not_exists(job)", ConditionExpression
         key = (Item["repo"]["S"], Item["job"]["S"])
-        held = self.reruns.get(key)
-        v = ExpressionAttributeValues
-        if held is not None and not (held["state"]["S"] in (v[":notspot"]["S"], v[":unknown"]["S"])
-                                     and int(held["run_attempt"]["N"]) < int(v[":attempt"]["N"])):
+        if key in self.reruns:
             raise self.exceptions.ConditionalCheckFailedException(key)
         self.reruns[key] = json.loads(json.dumps(Item))
 
@@ -198,10 +193,14 @@ class FakeDynamo:
     def query(self, TableName, ConsistentRead, KeyConditionExpression, ExpressionAttributeValues, **kw):
         repo = ExpressionAttributeValues[":repo"]["S"]
         if TableName == "github-app-runner-reruns":
-            assert ConsistentRead and kw["FilterExpression"] == "#s IN (:pending, :spot)", kw
-            open_ = (ExpressionAttributeValues[":pending"]["S"], ExpressionAttributeValues[":spot"]["S"])
-            return {"Items": [json.loads(json.dumps(i)) for (r, _), i in self.reruns.items()
-                              if r == repo and i["state"]["S"] in open_]}
+            v, mine = ExpressionAttributeValues, [i for (r, _), i in self.reruns.items() if r == repo]
+            assert ConsistentRead, kw
+            if kw["FilterExpression"] == "#s IN (:pending, :spot)":
+                keep = [i for i in mine if i["state"]["S"] in (v[":pending"]["S"], v[":spot"]["S"])]
+            else:
+                assert kw["FilterExpression"] == "run_id = :run AND called = :yes", kw
+                keep = [i for i in mine if i["run_id"] == v[":run"] and i["called"] == v[":yes"]]
+            return {"Items": json.loads(json.dumps(keep))}
         self.queries.append(ConsistentRead)
         return {"Items": [item for (r, _), item in self.items.items() if r == repo]}
 
@@ -267,11 +266,16 @@ class FakeGitHub:
             job = int(m.group(2))
             run = next(r for r, info in self.run_info.items() if job in info.get("jobs", ()))
             info = self.run_info[run]
-            info.update(status="queued", conclusion=None, run_attempt=info.get("run_attempt", 1) + 1)
+            info.update(status="queued", conclusion=None, run_attempt=info.get("run_attempt", 1) + 1,
+                        jobs=tuple(j + 1000 if j == job else j for j in info["jobs"]))
             self.reruns.append((m.group(1), job, pat))
             if self.rerun_lost:
                 raise TimeoutError("The read operation timed out")
             return {}
+        m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs\?filter=latest&per_page=100&page=(\d+)$", path)
+        if m and int(m.group(2)) in self.run_info:
+            ids = self.run_info[int(m.group(2))]["jobs"]
+            return {"jobs": [{"id": j} for j in ids][(int(m.group(3)) - 1) * 100:int(m.group(3)) * 100]}
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)$", path)
         if m:
             info = self.run_info[int(m.group(2))]
@@ -1280,7 +1284,7 @@ class SpotRerunTests(unittest.TestCase):
     def posts(self, app):
         return [c for c in app.github.calls if c[0] == "POST" and c[1].endswith("/rerun")]
 
-    def state(self, app, key=(IMAGINE, "900/gym")):
+    def state(self, app, key=(IMAGINE, "501")):
         return app.fake_dynamo.reruns[key]["state"]["S"]
 
     def reconcile(self, app):
@@ -1305,9 +1309,10 @@ class SpotRerunTests(unittest.TestCase):
         # to another reclaimed host: none earns a second rerun.
         self.reconcile(app)
         self.assertEqual(app.handler(completion(), None)["rerun"], "already recorded")
+        self.assertEqual(app.github.run_info[900]["jobs"], (1501,))
         ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa1")
-        self.assertEqual(app.handler(completion(job=502, attempt=2, runner="i-0aaaaaaaaaaaaaaa1"), None)["rerun"],
-                         "already recorded")
+        self.assertEqual(app.handler(completion(job=1501, attempt=2, runner="i-0aaaaaaaaaaaaaaa1"), None)["rerun"],
+                         "already rerun")
         self.reconcile(app)
         self.assertEqual(len(self.posts(app)), 1)
         self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotRerun", IMAGINE)])
@@ -1349,7 +1354,7 @@ class SpotRerunTests(unittest.TestCase):
         app.handler(completion(job=701, name="e2e", runner="i-0ccccccccccccccc1"), None)
         app.now = lambda: NOW + app.DECIDE_WINDOW + timedelta(minutes=1)
         self.reconcile(app)
-        self.assertEqual(self.state(app, (IMAGINE, "900/e2e")), "unknown")
+        self.assertEqual(self.state(app, (IMAGINE, "701")), "unknown")
         self.assertEqual(self.posts(app), [])
 
     def test_a_host_reclaimed_after_its_job_ended_keeps_the_jobs_result(self):
@@ -1399,9 +1404,10 @@ class SpotRerunTests(unittest.TestCase):
         app, ec2 = self.app("completed", "cancelled")
         ended_host(ec2)
         self.assertEqual(app.handler(completion(), None)["rerun"], "superseded")
-        app.github.run_info[901] = {"status": "in_progress", "run_attempt": 2, "jobs": (511,)}
+        # A person reran this job: its newer execution (1511) replaced it among the run's latest.
+        app.github.run_info[901] = {"status": "in_progress", "run_attempt": 2, "jobs": (1511,)}
         app.handler(completion(job=511, run=901), None)
-        self.assertEqual(self.state(app, (IMAGINE, "901/gym")), "superseded")
+        self.assertEqual(self.state(app, (IMAGINE, "511")), "superseded")
         self.assertEqual(self.posts(app), [])
         self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE), ("SpotLost", IMAGINE)])
 
@@ -1415,11 +1421,37 @@ class SpotRerunTests(unittest.TestCase):
         self.assertEqual(app.handler(completion(job=502, attempt=2, runner="i-0fffffffffffffff1"), None)["rerun"], "rerun")
         self.assertEqual(app.github.reruns, [(IMAGINE, 502, "PAT-IMAGINE")])
 
+    def test_two_jobs_lost_in_one_run_are_each_rerun_once(self):
+        # Rerunning the first moves the run to a new attempt; the second was not part of that rerun and still needs its
+        # own, once the new attempt has finished. Both share a display name, which must not merge them.
+        app, ec2 = self.app("in_progress")
+        app.github.run_info[900]["jobs"] = (501, 503)
+        ended_host(ec2)
+        ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa2")
+        app.handler(completion(job=501, name="test"), None)
+        app.handler(completion(job=503, name="test", runner="i-0aaaaaaaaaaaaaaa2"), None)
+        self.assertEqual(sorted(k for _, k in app.fake_dynamo.reruns), ["501", "503"])
+        app.github.run_info[900].update(status="completed", conclusion="failure")
+        self.reconcile(app)
+        self.assertEqual([j for _, j, _ in app.github.reruns], [501], "the run's next attempt is running: 503 waits")
+        self.assertEqual((self.state(app, (IMAGINE, "501")), self.state(app, (IMAGINE, "503"))), ("rerun", "spot"))
+        app.github.run_info[900].update(status="completed", conclusion="failure")
+        self.reconcile(app)
+        self.assertEqual([j for _, j, _ in app.github.reruns], [501, 503])
+        self.assertEqual(self.state(app, (IMAGINE, "503")), "rerun")
+        self.reconcile(app)
+        self.assertEqual(len(self.posts(app)), 2)
+        self.assertEqual(self.spot_metrics(app), [("SpotLost", IMAGINE)] * 2 + [("SpotRerun", IMAGINE)] * 2)
+        # A same-named job of the first attempt failing later is its own job, not a rerun of one.
+        ended_host(ec2, iid="i-0aaaaaaaaaaaaaaa3")
+        app.github.run_info[900].update(jobs=(1501, 1503, 505), status="completed", conclusion="failure")
+        self.assertEqual(app.handler(completion(job=505, name="test", runner="i-0aaaaaaaaaaaaaaa3"), None)["rerun"], "rerun")
+
     def test_the_rerun_record_is_bounded_in_time(self):
         app, ec2 = self.app()
         ended_host(ec2)
         app.handler(completion(), None)
-        record = app.fake_dynamo.reruns[(IMAGINE, "900/gym")]
+        record = app.fake_dynamo.reruns[(IMAGINE, "501")]
         self.assertEqual(int(record["ttl"]["N"]), int(NOW.timestamp()) + 7 * 86400)
         self.assertEqual(record["instance"]["S"], HOST)
 

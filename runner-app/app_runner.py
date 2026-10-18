@@ -1265,36 +1265,35 @@ def publish_counts(results, buckets=()):
 # 17:05:47; another at 17:02:52, its job at 17:12:44. Both hosts read StateReason
 # Server.SpotInstanceTermination, and both runs were still running other jobs when the job failed.
 #
-# So a failed or cancelled job whose runner was one of our hosts gets a record in RERUNS_TABLE, keyed by the logical job
-# (run id and job name, which a rerun keeps while the job id changes), and moves through
+# So a failed or cancelled job whose runner was one of our hosts gets a record in RERUNS_TABLE, keyed by its job id (a
+# job's display name need not be unique within a run), and moves through
 #
 #   pending   the host's fate is not known yet: it is still listed as running or has no state reason. Rechecked every
 #             reconcile; after DECIDE_WINDOW it becomes `unknown`.
 #   spot      EC2 says the host was reclaimed (Server.SpotInstanceTermination) BEFORE the job ended: counted once as
 #             SpotLost. A rerun is asked for once the run has completed (GitHub refuses one while the run's other jobs
 #             still run), retried every reconcile until RERUN_WINDOW, then `failed` (SpotRerunFailed).
-#   rerun     GitHub accepted the rerun (SpotRerun), or the run's attempt moved on after a call whose answer was lost.
+#   rerun     GitHub accepted the rerun (SpotRerun), or the job was found rerun after a call whose answer was lost.
 #   not-spot  the host ended for any other reason (it powered off after its job, or the reaper terminated it), or was
 #             reclaimed only after the job had ended: a real result, never rerun.
-#   superseded someone else reran the run first, or cancelled it: left alone.
+#   superseded someone else reran this job first, or cancelled the run: left alone.
 #
-# At most one automatic rerun per logical job: a record is created only where none exists, or over a `not-spot` or
-# `unknown` one from an earlier attempt, so the rerun's own job (same run and name) never earns a second. Before every
-# call the run is read: an attempt beyond the record's means the rerun already happened, so a call whose answer was lost
-# is not repeated. Every state change is a write conditional on the state it leaves.
+# Whether THIS job was rerun is read from the run's latest executions (`jobs?filter=latest`): once a job is rerun its
+# newer execution replaces it there, while a job the rerun did not select keeps its own id. So when two jobs of one run
+# were lost, rerunning the first moves the run to a new attempt but leaves the second to be rerun when that attempt
+# finishes. A call whose answer was lost is never repeated: the next round finds the job replaced.
+#
+# At most one automatic rerun per logical job: a record is created once per job id (a conditional write), and a job
+# whose run already holds a record of ours with the same name, an earlier attempt and a rerun call made is the rerun's
+# own job (or a later one of the same name) and earns none. Every state change is a write conditional on the state it
+# leaves.
 RERUNS_TABLE = os.environ.get('RERUNS_TABLE', '')
 RERUN_CONCLUSIONS = ('failure', 'cancelled')
 SPOT_REASON = 'Server.SpotInstanceTermination'
 DECIDE_WINDOW = timedelta(minutes=30)
 RERUN_WINDOW = timedelta(hours=6)
 RERUN_RECORD_DAYS = 7
-FINAL_REPLACEABLE = ('not-spot', 'unknown')
-
-
-def rerun_key(job):
-    """The logical job: its run and name, which a rerun keeps (the job id does not). The job id when there is no name."""
-    name = job.get('name')
-    return f"{job['run_id']}/{name}" if name and job.get('run_id') is not None else f"job/{job['id']}"
+LATEST_JOB_PAGES = 10
 
 
 def parse_time(value):
@@ -1395,22 +1394,56 @@ def job_completed(repo, cfg, job):
     if instance is None:
         return {'ignored': 'not our host'}
     t, attempt = int(now().timestamp()), int(job.get('run_attempt') or 1)
-    rec = {'job': rerun_key(job), 'job_id': str(job['id']), 'run_id': str(job['run_id']), 'run_attempt': attempt,
-           'instance': instance['InstanceId'], 'conclusion': job['conclusion'],
+    parent = rerun_parent(repo, job, attempt)
+    if parent:
+        print(f"{repo}: job {job['id']} is a later execution of job {parent['job_id']}, already rerun once; not again")
+        return {'repo': repo, 'job': job['id'], 'rerun': 'already rerun'}
+    rec = {'job': str(job['id']), 'job_id': str(job['id']), 'run_id': str(job['run_id']), 'run_attempt': attempt,
+           'name': str(job.get('name') or ''), 'instance': instance['InstanceId'], 'conclusion': job['conclusion'],
            'completed_at': str(job.get('completed_at') or ''), 'state': 'pending', 'first_seen': t, 'called': False}
     try:
         dynamodb.put_item(
             TableName=RERUNS_TABLE,
             Item={'repo': {'S': repo}, 'ttl': {'N': str(t + RERUN_RECORD_DAYS * 86400)}, **{k: ddb(v) for k, v in rec.items()}},
-            ConditionExpression='attribute_not_exists(job) OR (#s IN (:notspot, :unknown) AND run_attempt < :attempt)',
-            ExpressionAttributeNames={'#s': 'state'},
-            ExpressionAttributeValues={':notspot': {'S': 'not-spot'}, ':unknown': {'S': 'unknown'},
-                                       ':attempt': {'N': str(attempt)}})
+            ConditionExpression='attribute_not_exists(job)')
     except dynamodb.exceptions.ConditionalCheckFailedException:
-        print(f"{repo}: job {job['id']} ({rec['job']}) already has a rerun record; nothing more to do")
+        print(f"{repo}: job {job['id']} already has a rerun record; nothing more to do")
         return {'repo': repo, 'job': job['id'], 'rerun': 'already recorded'}
     print(f"{repo}: job {job['id']} ended {job['conclusion']} on {instance['InstanceId']}; checking whether AWS reclaimed it")
     return {'repo': repo, 'job': job['id'], 'rerun': settle_rerun(repo, cfg, rec, instance)}
+
+
+def rerun_parent(repo, job, attempt):
+    """The record of ours that already asked to rerun this logical job, or None: same run, same name, an earlier
+    attempt, and a rerun call made. A name need not be unique, so this errs toward "already rerun" (no second rerun)."""
+    if not job.get('name'):
+        return None
+    page = {}
+    while True:
+        response = dynamodb.query(
+            TableName=RERUNS_TABLE, ConsistentRead=True, KeyConditionExpression='repo = :repo',
+            FilterExpression='run_id = :run AND called = :yes',
+            ExpressionAttributeValues={':repo': {'S': repo}, ':run': {'S': str(job['run_id'])}, ':yes': {'BOOL': True}},
+            **page)
+        for item in response.get('Items', []):
+            rec = rerun_record(item)
+            if rec.get('name') == job['name'] and rec.get('run_attempt', 0) < attempt and rec.get('job_id') != str(job['id']):
+                return rec
+        if 'LastEvaluatedKey' not in response:
+            return None
+        page = {'ExclusiveStartKey': response['LastEvaluatedKey']}
+
+
+def still_latest(repo, rec, token):
+    """True while the record's job is still its run's latest execution of that job (it has not been rerun)."""
+    for page in range(1, LATEST_JOB_PAGES + 1):
+        jobs = github('GET', f"/repos/{repo}/actions/runs/{rec['run_id']}/jobs?filter=latest&per_page=100&page={page}",
+                      token).get('jobs') or []
+        if any(str(j.get('id')) == rec['job_id'] for j in jobs):
+            return True
+        if len(jobs) < 100:
+            return False
+    return True   # a run too large to list: assume not rerun, and GitHub refuses a rerun of a job that was
 
 
 def settle_rerun(repo, cfg, rec, instance=None, tokens=None):
@@ -1440,14 +1473,16 @@ def settle_rerun(repo, cfg, rec, instance=None, tokens=None):
     if not tokens['read']:
         return rec['state']
     run = github('GET', f"/repos/{repo}/actions/runs/{rec['run_id']}", tokens['read'])
-    if int(run.get('run_attempt') or 1) > rec['run_attempt']:
-        # The run was rerun already: by a call of ours whose answer was lost, or by a person.
+    # A newer attempt alone proves nothing about this job (a rerun of another job of the run makes one too): only this
+    # job's own replacement among the run's latest executions does.
+    if int(run.get('run_attempt') or 1) > rec['run_attempt'] and not still_latest(repo, rec, tokens['read']):
+        # This job was rerun already: by a call of ours whose answer was lost, or by a person.
         if rec.get('called'):
             if move_rerun(repo, rec, 'rerun'):
                 count_spot(repo, 'SpotRerun')
         else:
             move_rerun(repo, rec, 'superseded')
-            print(f"{repo}: job {rec['job_id']}: its run was rerun by someone else; leaving it")
+            print(f"{repo}: job {rec['job_id']}: it was rerun by someone else; leaving it")
         return rec['state']
     if run.get('status') == 'completed' and run.get('conclusion') == 'cancelled':
         move_rerun(repo, rec, 'superseded')
