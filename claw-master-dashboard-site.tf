@@ -115,11 +115,17 @@ resource "cloudflare_workers_kv" "claw_master_dashboard_allowed_emails" {
 # Everything derived from the secret stays marked sensitive: a plan shows that the aliases changed, never a name or code.
 # ---------------------------------------------------------------------------------
 data "aws_secretsmanager_secret_version" "claw_master_account_labels" {
-  count     = var.enable_claw_master_server ? 1 : 0
+  count     = var.enable_claw_master_server && local.claw_master_account_labels_ready ? 1 : 0
   secret_id = aws_secretsmanager_secret.claw_master_account_labels[0].id
 }
 
 locals {
+  # A checked-in gate, as colton_games_accounts_ready is: GetSecretValue fails on a container with no value, which a
+  # data source cannot catch, so the read waits until the secret has one. On a cold bootstrap set it false, apply (the
+  # container is created and the aliases are only the header line), put the value, then set it back to true and apply.
+  # The live secret has a value (checked 2026-10-18).
+  claw_master_account_labels_ready = true
+
   claw_master_account_label_lines = [
     for l in split("\n", replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\r", "")) : trimspace(l)
   ]

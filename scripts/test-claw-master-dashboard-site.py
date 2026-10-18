@@ -198,7 +198,10 @@ class AccountAliasTests(unittest.TestCase):
 
     def test_the_secret_is_read_only_where_the_server_exists(self):
         data = block('data "aws_secretsmanager_secret_version"', "claw_master_account_labels")
-        self.assertIn("count     = var.enable_claw_master_server ? 1 : 0", data)
+        self.assertIn("count     = var.enable_claw_master_server && local.claw_master_account_labels_ready ? 1 : 0", data)
+        # The read is gated so a container with no value yet (a cold bootstrap) cannot fail the plan; without it the
+        # aliases are only the header line (the try() in the lines' local).
+        self.assertRegex(TF, r"(?m)^  claw_master_account_labels_ready = (true|false)$")
         self.assertIn("secret_id = aws_secretsmanager_secret.claw_master_account_labels[0].id", data)
 
 
