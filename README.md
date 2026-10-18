@@ -436,8 +436,9 @@ interactive launch attaches to the same work when run from that repository root.
 ### SSH to the MacBook: `ssh mac`
 
 There is one way into EJ's MacBook Pro, the same from every box, and one alias for it, `mac`: Cloudflare Access in
-front of the Mac's **desktop-session `sshd`** on its own `127.0.0.1:22222`. No reverse tunnel, and no inbound port on
-the Mac or in AWS.
+front of macOS **Remote Login** (`127.0.0.1:22` on the Mac). No reverse tunnel, and no inbound port on the Mac or in
+AWS. A plain `ssh mac` builds on the external drive, scripts System Events and Chrome, and drives the screen with
+Peekaboo; `mac-gui <cmd>` runs a command in the logged-in GUI session for what needs the login keychain (signing).
 
 | From | Service token (Secrets Manager) | Configured by |
 |---|---|---|
@@ -450,41 +451,26 @@ ejs-macbook-pro-via-fcvm` checked against `~/.ssh/known_hosts.mac`), the proxy c
 in `~/.local/bin`. Terraform never installs or copies the private key; restoring it is a prerequisite on a fresh root.
 The installer retires the old names (`macbook`, `macbook-desktop`, the reverse-tunnel `mac` on `127.0.0.1:2222`)
 and their files, backs `~/.ssh/config` up once per content (`config.before-mac.<hash>`), and is safe to rerun. Keep
-the Mac logged in, awake and online: its connector and its sshd are LaunchAgents and run only in the logged-in
-session. These are local Mac services, not the optional EC2 Mac.
-
-The MacBook also has Peekaboo 4.4.0 installed for screen control over this same SSH
-connection. Its menu-bar app starts at user login, with Screen Recording,
-Accessibility, and Event Synthesizing enabled. The `peekaboo` command is available
-in noninteractive SSH sessions and explicitly uses that app's local Bridge socket.
-Keep the Mac logged in, awake, and unlocked for UI control.
-
-```bash
-# Run from fcvm-arm; the screenshot is initially saved on the Mac.
-ssh mac 'peekaboo permissions status'
-ssh mac 'peekaboo see --mode screen --no-elements --path /tmp/macbook-screen.png'
-scp mac:/tmp/macbook-screen.png .
-```
-
-For UI actions, `peekaboo see --app <app> --window-title <title> --json` returns a
-snapshot and element IDs. Use those fresh IDs with `peekaboo click`, `peekaboo type`,
-and `peekaboo press`; inspect the UI again after each action. These Mac-local app
-permissions and login services are configured on the Mac, not by AWS Terraform.
+the Mac logged in, awake and online: its connector is a LaunchAgent and runs only in the logged-in session. These
+are local Mac services, not the optional EC2 Mac.
 
 #### The MacBook: remote access and its scratch drive
 
-How agents reach EJ's MacBook Pro over SSH, build on it, sign on it, and use its external
-scratch drive. The Cloudflare side is [`macbook-ssh.tf`](macbook-ssh.tf), the clients'
-side [`mac-ssh-client.tf`](mac-ssh-client.tf); the Mac side is local to the Mac and described
-here, so it can be checked and rebuilt.
+How agents reach EJ's MacBook Pro over SSH, build on it, sign on it, drive its screen, and use its external scratch
+drive. The Cloudflare side is [`macbook-ssh.tf`](macbook-ssh.tf), the clients' side
+[`mac-ssh-client.tf`](mac-ssh-client.tf), and everything installed on the Mac for agents comes from
+[`scripts/mac-setup.sh`](scripts/mac-setup.sh) (run it from fcvm-arm or nextjs-dev; it is idempotent).
 
 ##### MacBook: The route
 
 ```
 fcvm-arm (ubuntu) / nextjs-dev (ejc3)                                          MacBook
-ssh mac ─> cloudflared access ssh ─> Cloudflare Access ═══ tunnel macbook-ssh ═══> connector ─> 127.0.0.1:22222
-           (the account's own        (service tokens     macbook-ssh.cc-games.dev  (the Mac      desktop-session
-            service token)            only, no person)                              dials out)   sshd, keys only
+ssh mac ─> cloudflared access ssh ─> Cloudflare Access ═══ tunnel macbook-ssh ═══> connector ─> 127.0.0.1:22
+           (the account's own        (service tokens     macbook-ssh.cc-games.dev  (the Mac      Remote Login
+            service token)            only, no person)                              dials out)   (keys only)
+                                                                                                    │ mac-gui
+                                                                                                    ▼
+                                                                                      the GUI session (login keychain)
 ```
 
 - **Access** (`macbook-ssh.tf`): the application on `macbook-ssh.cc-games.dev` admits the browser-manager owner
@@ -494,46 +480,94 @@ ssh mac ─> cloudflared access ssh ─> Cloudflare Access ═══ tunnel macb
   `cloudflared` through `TUNNEL_SERVICE_TOKEN_ID` and `TUNNEL_SERVICE_TOKEN_SECRET`, never its arguments (`ps` shows
   every argument to every user of a shared box). A rotation needs nothing on the boxes.
 - **The connector** (`com.ejcampbell.macbook-ssh.cloudflared` on the Mac) is remotely managed: its ingress,
-  `ssh://127.0.0.1:22222`, comes from `macbook-ssh.tf` on apply.
+  `ssh://127.0.0.1:22`, comes from `macbook-ssh.tf` on apply.
 - **nextjs-dev's token is box-wide in practice**: every account there has sudo and can read what `nextjs-dev-role`
   reads. It opens only the Access gate; the Mac still wants ejc3's key. The containerized nextjs box hands it to
   ejc3's container only.
+
+##### MacBook: What works where
+
+macOS decides what a program may do (TCC) by its *responsible process*. Every Remote Login session, and everything
+it starts, is attributed to `/usr/libexec/sshd-keygen-wrapper`, so one set of grants covers every `ssh mac`:
+
+| Need | How | Why it works |
+|---|---|---|
+| Builds on `/Volumes/Scratch` (a freshly built binary included) | plain `ssh mac` | Full Disk Access on `sshd-keygen-wrapper` ("Allow full disk access for remote users") |
+| `osascript` to System Events and Google Chrome | plain `ssh mac` | Automation grants for `sshd-keygen-wrapper` (System Events, Chrome) |
+| Screenshots, clicks, typing | `peekaboo` | the Peekaboo app holds Screen Recording and Accessibility; the CLI talks to it over its Bridge socket |
+| The login keychain: `codesign`, `xcodebuild archive`/`-exportArchive` with signing, `security` on it | `mac-gui <cmd>` | runs `<cmd>` in the GUI session's launchd namespace (`sudo launchctl asuser`), where securityd serves the unlocked login keychain |
+
+A plain Remote Login session cannot reach the login keychain (`errSecInternalComponent` from `codesign`, "User
+interaction is not allowed" from `security`), whatever its grants; `mac-gui` is the one way to it. Until 2026-10-18
+the route ended at a private desktop-session `sshd` on `127.0.0.1:22222` instead, which had the keychain but made
+every new binary its own responsible process: each one stopped at a "would like to access files on a removable
+volume" prompt on the screen and hung there. It was retired.
+
+##### MacBook: The agent tools (`scripts/mac-setup.sh`)
+
+All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (a managed block, `# >>> mac-setup >>>`, kept last in `~/.zshenv`, so nothing earlier in the file can put `/usr/bin` ahead of the shims):
+
+- **`mac-gui [--timeout S] [--] CMD ...`**: runs CMD in the GUI session, keeping the working directory and
+  environment (passed in a 0600 file, never on a command line); stdin, stdout, stderr and the exit status are CMD's,
+  124 on timeout.
+- **`mac-lease`**: the desktop lease, so two sessions' clicks, typing and app relaunches do not interleave. Advisory
+  and lightweight: `mac-lease run NAME [--ttl S] [--wait S] -- CMD` holds it for one command; `take NAME` / `release
+  NAME` hold it across several `ssh mac` calls (default ttl 600 s, renewable by taking it again); `status` shows the
+  holder. The `peekaboo` wrapper waits (up to `MAC_LEASE_WAIT`, default 120 s) before any click, typing, app, window,
+  menu or dialog command while another session holds the lease; pass yours as `MAC_LEASE=NAME`. Looking (`see`,
+  `image`, `capture`, `permissions`) never waits. Take the lease before anything that relaunches or signs out of an
+  app (Chrome above all: a relaunch can sign App Store Connect out).
+- **`mac-build`**: at most two heavy builds at once (`MAC_BUILD_SLOTS`). Shims named `swift`, `xcodebuild` and
+  `xcrun` send `swift build|test|run`, xcodebuild actions and their `xcrun` forms through it, so every agent's builds
+  take a slot without asking; a third waits and says so once. `mac-build --status` shows who holds the slots. Four
+  parallel Swift builds once pushed the load average to 62 and timed out even `ssh mac ps`.
+- **`peekaboo`**: the Peekaboo CLI through the app's Bridge, with the lease check above.
+- `xcode-select` points at `/Applications/Xcode.app` (the Command Line Tools have no platform SDKs and no xcodebuild).
+
+##### MacBook: Permission prompts and other dialogs (policy)
+
+- **Agents may approve permission prompts their own work triggers** (owner, 2026-10-18: "Click allow"): Automation,
+  Accessibility, Screen Recording, Full Disk Access, keychain access for our signing. Prefer granting them to
+  `sshd-keygen-wrapper` (Remote Login), the one identity every session shares. A toggle in System Settings asks for
+  Touch ID or the password; that one goes to the owner, as does anything else asking for a password.
+- **Never answer another app's own dialog**: a keychain password prompt from Roblox Studio, a mail account password,
+  Time Machine offering to use Scratch, an app's sign-in. Report it (a screenshot and what it asks) and leave it.
+- Take the lease before driving the screen, and release it when done.
+
+##### MacBook: Signing (archive, export, upload)
+
+From a plain `ssh mac`, the build runs as usual and only the signing steps go through `mac-gui`. A minimal check,
+verified 2026-10-18 on a generated macOS app:
+
+```bash
+ssh mac 'cd /Volumes/Scratch/<project> &&
+  mac-gui --timeout 1800 xcodebuild -scheme App -configuration Release \
+    -archivePath build/App.xcarchive archive &&
+  codesign -dv --verbose=2 build/App.xcarchive/Products/Applications/App.app 2>&1 | grep Authority'
+#   Authority=Apple Development: ... (signed with the login keychain's identity)
+```
+
+`xcodebuild -exportArchive` and `xcrun altool`/`notarytool` go through `mac-gui` the same way. An upload that should
+survive the SSH connection dropping runs as a one-off LaunchAgent in the GUI domain instead (`launchctl bootstrap
+gui/$(id -u) job.plist` with `RunAtLoad` and no `KeepAlive`, logging to a file; `launchctl bootout
+gui/$(id -u)/<label>` afterwards). TestFlight groups, testers and build assignment go through the App Store Connect
+API with the `games-worth-watching/app-store-connect` key, not through Chrome.
 
 ##### MacBook: On the Mac
 
 | What | Where | State |
 |---|---|---|
-| Desktop-session `sshd` | `~/Library/LaunchAgents/com.ejcampbell.fcvm-macbook.sshd.plist` (`/usr/sbin/sshd -D -e -f ~/.ssh/fcvm-macbook/sshd_config`) | `127.0.0.1:22222` only, keys only, `ejcampbell` only |
-| Its host key | `~/.ssh/fcvm-macbook/ssh_host_ed25519_key` | `local.mac_tunnel_host_keys` |
-| Its authorized keys | `~/.ssh/fcvm-macbook/authorized_keys` | fcvm-arm's `to-mac`, nextjs-dev `ejc3`'s `to-mac` and `to-macbook-desktop` |
-| Full Disk Access | System Settings > Privacy & Security > Full Disk Access | `/usr/sbin/sshd` on (granted 2026-10-18) |
+| Remote Login | System Settings > General > Sharing > Remote Login | on, Administrators only, "Allow full disk access for remote users" on |
+| Keys only | `/etc/ssh/sshd_config.d/050-keys-only.conf` | `PasswordAuthentication no`, `KbdInteractiveAuthentication no` |
+| Clients' keys | `~/.ssh/authorized_keys` | fcvm-arm's and nextjs-dev `ejc3`'s `to-mac` public keys |
+| Host key | `/etc/ssh/ssh_host_ed25519_key.pub` | `local.mac_tunnel_host_keys` |
+| Automation (`sshd-keygen-wrapper`) | System Settings > Privacy & Security > Automation | System Events and Google Chrome on |
+| Agent tools | `~/.local/bin/{mac-gui,mac-lease,mac-build,mac-build-shim,peekaboo}`, shims `swift`, `xcodebuild`, `xcrun` | `scripts/mac-setup.sh` |
+| Peekaboo app | `~/Applications/Peekaboo.app`, LaunchAgent `com.ejcampbell.peekaboo` | Screen Recording, Accessibility |
 | `cloudflared` | `~/.local/bin/cloudflared` (2026.9.3; 2025.4.0 or later for `--token-file`) | pinned in `scripts/claw-master-mac-setup.sh` |
 | Connector token | `~/.cloudflared/macbook-ssh.token`, mode 600 (from `macbook-ssh-tunnel-token`) | |
 | Connector | `~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist` | remotely managed |
-| Remote Login | System Settings > General > Sharing > Remote Login | no route uses it; turn it off to close port 22 |
 | Scratch drive | `/Volumes/Scratch` (external APFS, 1.8 TB) | see below |
-
-The `sshd_config`, in full:
-
-```
-Port 22222
-ListenAddress 127.0.0.1
-HostKey /Users/ejcampbell/.ssh/fcvm-macbook/ssh_host_ed25519_key
-AuthorizedKeysFile /Users/ejcampbell/.ssh/fcvm-macbook/authorized_keys
-PidFile /Users/ejcampbell/.ssh/fcvm-macbook/sshd.pid
-AllowUsers ejcampbell
-PubkeyAuthentication yes
-AuthenticationMethods publickey
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PermitEmptyPasswords no
-PermitRootLogin no
-UsePAM no
-PrintMotd no
-PrintLastLog no
-X11Forwarding no
-Subsystem sftp internal-sftp
-```
 
 ##### MacBook: The scratch drive
 
@@ -544,53 +578,29 @@ external drive, one folder per project: `/Volumes/Scratch/<project>/`. For examp
 Simulator devices still live on the internal disk (CoreSimulator), so delete a tour's
 simulator after use. Never write a project's files into `~/src` loose.
 
-##### MacBook: Why the desktop-session sshd
-
-The desktop-session `sshd` runs in the logged-in user's GUI session, so a session through it can use the login
-keychain (`codesign`, an Xcode archive) and send Apple Events (`osascript` to Chrome or System Events). A macOS
-Remote Login session cannot: `security show-keychain-info` says "User interaction is not allowed", `codesign` fails
-with `errSecInternalComponent`, and `osascript` gets "Not authorized to send Apple events" (-1743).
-
-The external drive is a *removable volume* to macOS privacy controls: the first time a program touches one, macOS
-asks on the Mac's screen, "… would like to access files on a removable volume", and the program waits, blocked in
-the system call, until someone answers. Who is asked about is the *responsible process*
-([disclaim](https://github.com/torarnv/disclaim),
-[HackTricks: TCC](https://hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-tcc/index.html)).
-From 2026-10-17 to 2026-10-18 the route ended at Remote Login for that reason ("Allow full disk access for remote
-users" grants `/usr/libexec/sshd-keygen-wrapper`, which Remote Login sessions are attributed to). On 2026-10-18 the
-owner granted Full Disk Access to `/usr/sbin/sshd`; since then a session through the desktop-session `sshd` lists
-`/Volumes/Scratch` with no prompt, System Events answers Apple Events, and the codesigning identity is visible, so it
-became the one endpoint. If a build step stalls on the drive, see the symptom under [MacBook: Checks](#macbook-checks).
-
-For a long signing job (an archive), a one-off LaunchAgent in the user's GUI domain keeps running if the connection
-drops:
-
-```bash
-# On the Mac: a job that runs once in the desktop session, logging to a file.
-launchctl bootstrap gui/$(id -u) job.plist      # RunAtLoad, no KeepAlive
-launchctl bootout gui/$(id -u)/<label>          # afterwards
-```
-
-Such a job is its own responsible process, so give it inputs and outputs on the internal disk (copy what it needs
-there, delete it afterwards). dolphin-labs-hq/dolphin-maps' TestFlight upload runs this way.
-
 ##### MacBook: Checks
 
 ```bash
-# From fcvm-arm (ubuntu) or nextjs-dev (ejc3). The session must come from the desktop-session sshd:
-# expect a line "sshd: /usr/sbin/sshd -D -e -f /Users/ejcampbell/.ssh/fcvm-macbook/sshd_config".
+# From fcvm-arm (ubuntu) or nextjs-dev (ejc3). The session comes from Remote Login: sshd-session under launchd.
 ssh mac 'p=$$; while [ "$p" -gt 1 ]; do ps -o comm= -p $p; p=$(ps -o ppid= -p $p | tr -d " "); done'
 
-# The drive, Apple Events and the keychain, in one session.
-ssh mac 'ls /Volumes/Scratch | head -1;
-  osascript -e "tell application \"System Events\" to get name of first process whose frontmost is true" >/dev/null && echo apple-events-ok;
-  security find-identity -v -p codesigning | tail -1'
+# A program macOS has never seen reads the drive with no prompt ("read ok", not BLOCKED).
+ssh mac 'd=$(mktemp -d); printf "#include <stdio.h>\nint main(int c,char**v){return fopen(v[1],\"r\")?puts(\"read ok\"),0:2;}\n" > $d/p.c &&
+  clang -o $d/probe-$RANDOM $d/p.c && ($d/probe-* /Volumes/Scratch/.DS_Store & K=$!;
+  for i in 1 2 3 4 5 6; do kill -0 $K 2>/dev/null || exit 0; sleep 1; done; echo BLOCKED; kill $K); rm -rf $d'
+
+# Apple Events, Peekaboo, and the keychain through mac-gui.
+ssh mac 'osascript -e "tell application \"System Events\" to get name of first process whose frontmost is true";
+  osascript -e "tell application \"Google Chrome\" to get count of windows";
+  peekaboo permissions status | head -3;
+  mac-gui security show-keychain-info ~/Library/Keychains/login.keychain-db;
+  mac-lease status; mac-build --status'
 
 # Passwords are refused. This reads the methods the sshd offers, so it does not depend on the
 # client: expect exactly "Authentications that can continue: publickey".
 ssh mac 'ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
   -o NumberOfPasswordPrompts=0 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -p 22222 ejcampbell@127.0.0.1 true 2>&1 | grep "Authentications that can continue"'
+  -p 22 ejcampbell@127.0.0.1 true 2>&1 | grep "Authentications that can continue"'
 
 # Access lets a service token in and nobody else. Without credentials it answers with its login page:
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://macbook-ssh.cc-games.dev
@@ -615,22 +625,23 @@ unset T
 `healthy 2` (or any count above zero) is a pass; `down 0` or `inactive 0` is not.
 
 **Symptom of a removable-volume prompt:** a build step that sits at 0% CPU for minutes. `sample <pid> 2` on the Mac
-shows the main thread in `getcwd` or `open` on `/Volumes/Scratch`. Check the session's ancestry (above), then the
-Full Disk Access grant on `/usr/sbin/sshd`, before anything else.
+shows the main thread in `getcwd` or `open` on `/Volumes/Scratch`. Check the session's ancestry (above), then
+"Allow full disk access for remote users" (System Settings > General > Sharing > Remote Login, (i)), before anything
+else. A build that sits at "mac-build: waiting for one of 2 build slots" is the cap: `mac-build --status`.
 
 ##### MacBook: Recovery
 
 - **`ssh mac` hangs or is refused**: on the Mac,
   `launchctl kickstart -k gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared` and read
-  `~/Library/Logs/macbook-ssh-cloudflared.log`; `launchctl kickstart -k gui/$(id -u)/com.ejcampbell.fcvm-macbook.sshd`
-  for the sshd (log `~/Library/Logs/fcvm-macbook/sshd.stderr.log`). After a reboot nothing answers until someone
-  logs in at the Mac.
+  `~/Library/Logs/macbook-ssh-cloudflared.log`. After a reboot nothing answers until someone logs in at the Mac.
+- **`mac-gui` fails with a sudo error**: it needs passwordless `sudo` for `launchctl asuser` (the owner's account has
+  it). **`codesign` asks for the keychain password**: that prompt is the owner's; report it.
 - **A service token expired or leaked**: each lasts a year (`duration = "8760h"`), and an expired one is not
   replaced by an ordinary apply. Replace the one concerned from a fresh worktree,
   `terraform apply -replace=cloudflare_zero_trust_access_service_token.macbook_ssh_fcvm` (fcvm-arm) or
   `...macbook_ssh_nextjs_ejc3` (nextjs-dev). The same apply rewrites that client's secret, which the proxy command
   reads on every connection, so nothing changes on the box. Then check `ssh mac true` from that client.
-- **Reloading the sshd or the connector ends every session through it**, including the programs those sessions
+- **Reloading the connector ends every session through it**, including the programs those sessions
   started. Start long jobs on the Mac detached (`nohup … &`, logging to a file on the scratch drive) or as a one-off
   LaunchAgent (above).
 - **The connector token leaked**: anyone holding it can run a connector for this one tunnel, and nothing more: every
@@ -646,21 +657,18 @@ Full Disk Access grant on `/usr/sbin/sshd`, before anything else.
 
 ##### MacBook: Rebuilding from nothing
 
-1. **The desktop-session sshd.** On the Mac: `mkdir -p ~/.ssh/fcvm-macbook ~/Library/Logs/fcvm-macbook`,
-   `ssh-keygen -t ed25519 -N '' -f ~/.ssh/fcvm-macbook/ssh_host_ed25519_key`, write the `sshd_config` above, and a
-   LaunchAgent `com.ejcampbell.fcvm-macbook.sshd` running `/usr/sbin/sshd -D -e -f ~/.ssh/fcvm-macbook/sshd_config`
-   (`RunAtLoad`, `KeepAlive`, stderr to `~/Library/Logs/fcvm-macbook/sshd.stderr.log`); `launchctl bootstrap` it.
-   Grant `/usr/sbin/sshd` Full Disk Access (System Settings > Privacy & Security > Full Disk Access, `+`,
-   Cmd-Shift-G `/usr/sbin/sshd`). A new host key is a new identity: replace `local.mac_tunnel_host_keys` with its
-   public half, read on the Mac.
-2. **The clients' keys** in `~/.ssh/fcvm-macbook/authorized_keys` (mode 600): fcvm-arm's and nextjs-dev `ejc3`'s
-   `to-mac.pub`.
+1. **Remote Login.** On the Mac: turn on Remote Login (Administrators) and "Allow full disk access for remote users";
+   install the keys-only drop-in:
+   `printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf`.
+   A reinstalled Mac has a new host key: replace `local.mac_tunnel_host_keys` with
+   `/etc/ssh/ssh_host_ed25519_key.pub`, read on the Mac.
+2. **The clients' keys** in `~/.ssh/authorized_keys` (mode 600): fcvm-arm's and nextjs-dev `ejc3`'s `to-mac.pub`.
 3. **The connector.** Nothing reaches a wiped Mac, and only fcvm-arm (and administration) can read the connector
    token. Either do this at the Mac with the token from an administrator, or over a temporary bootstrap route: the
    Mac dials out to fcvm-arm with a tunnel-only key whose `ubuntu` `authorized_keys` line is
    `restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:2223",permitopen="127.0.0.1:9" ssh-ed25519 AAAA... <comment>`
    (`permitopen` pins local forwarding to a closed port), running
-   `ssh -NT -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -R 127.0.0.1:2223:127.0.0.1:22222 -i <key> ubuntu@<fcvm-arm's Elastic IP>`
+   `ssh -NT -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -R 127.0.0.1:2223:127.0.0.1:22 -i <key> ubuntu@<fcvm-arm's Elastic IP>`
    with fcvm-arm's host key pinned on the Mac from a machine that already trusts it, never accepted blind. Then from
    fcvm-arm, with `back` meaning `ssh -p 2223 -o HostKeyAlias=ejs-macbook-pro-via-fcvm -o UserKnownHostsFile=~/.ssh/known_hosts.mac -o StrictHostKeyChecking=yes -i ~/.ssh/to-mac -o IdentitiesOnly=yes ejcampbell@127.0.0.1`:
 
@@ -691,11 +699,15 @@ Full Disk Access grant on `/usr/sbin/sshd`, before anything else.
    Once `ssh mac` works, stop the bootstrap tunnel and remove its key line from fcvm-arm: Cloudflare is the only way in.
 4. **The clients**: the `dev-user-data.tf` and `nextjs-user-data.tf` setups install `Host mac` (fcvm-arm at its next
    boot through `dev-selfupdate`, nextjs-dev through `setup-sync`).
-5. Run the checks above.
+5. **The agent tools**: `scripts/mac-setup.sh` from fcvm-arm. Then the first `osascript` to System Events and to
+   Chrome from `ssh mac` each raise an Automation prompt for `sshd-keygen-wrapper`: Allow.
+6. Run the checks above.
 
-**History.** Until 2026-10-18 the Mac also kept reverse SSH tunnels to fcvm-arm (`127.0.0.1:2223`, retired that
-morning) and to nextjs-dev (`127.0.0.1:2222`, retired once ejc3's Cloudflare `mac` worked), and the Cloudflare route
-first ended at Remote Login on port 22. The owner chose Cloudflare as the only route.
+**History.** Until 2026-10-18 the Mac also kept reverse SSH tunnels to fcvm-arm (`127.0.0.1:2223`) and to nextjs-dev
+(`127.0.0.1:2222`); the owner chose Cloudflare as the only route and both were retired. The same day the route moved
+from Remote Login to a private desktop-session `sshd` (`127.0.0.1:22222`, for the keychain and Apple Events) and back
+(issue #505): under it every new binary stopped at a removable-volume prompt, and Remote Login with Automation grants
+plus `mac-gui` does everything it did.
 
 ### macOS VMs on the MacBook (ejc3, skevh)
 

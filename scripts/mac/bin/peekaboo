@@ -1,0 +1,23 @@
+#!/bin/sh
+# peekaboo through the Peekaboo app's Bridge socket (the app holds Screen Recording and Accessibility),
+# with the desktop lease: commands that click, type or move windows wait while another session holds
+# the lease (mac-lease), up to MAC_LEASE_WAIT seconds (default 120), then give up with 75. Set
+# MAC_LEASE=<name> for the lease you hold. Looking (see, image, capture, permissions, list) never waits.
+# Installed by ejc3/aws scripts/mac-setup.sh.
+export PEEKABOO_BRIDGE_SOCKET="$HOME/Library/Application Support/Peekaboo/bridge.sock"
+cli=${PEEKABOO_CLI:-"$HOME/Library/Application Support/Peekaboo/cli-4.4.0/peekaboo"}
+case "${1:-}" in
+  click|type|press|hotkey|scroll|drag|move|paste|set-value|action|app|window|menu|menubar|dialog|dock|space|swipe)
+    lease=${MAC_LEASE_BIN:-$HOME/.local/bin/mac-lease}
+    waited=0; limit=${MAC_LEASE_WAIT:-120}
+    until "$lease" check "${MAC_LEASE:-}" 2>/dev/null; do
+      if [ "$waited" -ge "$limit" ]; then
+        "$lease" check "${MAC_LEASE:-}"
+        echo "peekaboo: not driving the desktop while another session holds it" >&2
+        exit 75
+      fi
+      [ "$waited" -eq 0 ] && "$lease" status | sed 's/^/peekaboo: waiting for the desktop lease: /' >&2
+      sleep 2; waited=$((waited + 2))
+    done ;;
+esac
+exec "$cli" "$@"

@@ -1,0 +1,55 @@
+#!/usr/bin/perl
+# mac-build [--status] | mac-build COMMAND [ARGS...]
+#
+# At most MAC_BUILD_SLOTS (default 2) heavy builds at once on the MacBook. COMMAND runs once it
+# holds a slot (an flock on ~/.local/state/mac-build/slot.N, held by COMMAND and its children and
+# released when they exit, however they exit). Waiting is reported once on stderr. Nested builds
+# (MAC_BUILD_SLOT already set) run at once in their parent's slot.
+#
+# The swift, xcodebuild and xcrun shims in ~/.local/bin (mac-build-shim) send `swift build|test|run`,
+# xcodebuild actions and their xcrun forms here, so every agent's builds take a slot without asking.
+# Installed by ejc3/aws scripts/mac-setup.sh; MAC_STATE_DIR overrides the state directory.
+use strict;
+use warnings;
+use Fcntl qw(:flock O_RDWR O_CREAT);
+use File::Path qw(make_path);
+
+my $dir = ($ENV{MAC_STATE_DIR} // "$ENV{HOME}/.local/state") . "/mac-build";
+make_path($dir, { mode => 0700 });
+my $slots = ($ENV{MAC_BUILD_SLOTS} // '2') =~ /^([1-9]\d*)$/ ? $1 : 2;
+
+if (@ARGV && $ARGV[0] eq '--status') {
+    for my $n (1 .. $slots) {
+        sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "mac-build: $dir/slot.$n: $!\n";
+        if (flock($fh, LOCK_EX | LOCK_NB)) { print "slot $n: free\n"; flock($fh, LOCK_UN); next }
+        seek($fh, 0, 0);
+        my $who = <$fh> // "busy\n";
+        print "slot $n: $who";
+    }
+    exit 0;
+}
+@ARGV or do { print STDERR "usage: mac-build COMMAND [ARGS...] | mac-build --status\n"; exit 2 };
+exec { $ARGV[0] } @ARGV or exit 127 if defined $ENV{MAC_BUILD_SLOT};
+
+$^F = 1023;    # keep the slot's descriptor open across exec: COMMAND holds the lock, not this script
+my ($held, $said);
+until ($held) {
+    for my $n (1 .. $slots) {
+        sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "mac-build: $dir/slot.$n: $!\n";
+        if (flock($fh, LOCK_EX | LOCK_NB)) {
+            truncate($fh, 0); seek($fh, 0, 0);
+            my $what = join(' ', @ARGV); $what = substr($what, 0, 160);
+            syswrite($fh, sprintf("pid %d since %s: %s (in %s)\n", $$, scalar localtime, $what, $ENV{PWD} // '?'));
+            $ENV{MAC_BUILD_SLOT} = $n;
+            $held = $fh;
+            last;
+        }
+        close $fh;
+    }
+    last if $held;
+    unless ($said++) {
+        print STDERR "mac-build: waiting for one of $slots build slots (mac-build --status shows who holds them)\n";
+    }
+    sleep 3;
+}
+exec { $ARGV[0] } @ARGV or do { print STDERR "mac-build: $ARGV[0]: $!\n"; exit 127 };

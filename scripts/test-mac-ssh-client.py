@@ -17,7 +17,7 @@ SETUP = re.search(r"mac_ssh_client_setup = <<-MACSETUP\n(.*?)\nMACSETUP", SOURCE
 HOST_KEYS = re.search(r"mac_tunnel_host_keys = <<-MACHOSTKEYS\n(.*?\n)MACHOSTKEYS\n", SOURCE, re.S).group(1)
 SETUP = SETUP.replace("${local.mac_tunnel_host_keys}", HOST_KEYS).replace("$${", "${")
 TUNNEL = (ROOT / "macbook-ssh.tf").read_text()
-DESKTOP_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAIAX5Q08R6QP8SbnpXPZTKTwGgrLz4DnGMZzRw2EDGaxn"
+REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
 
 
 def block(source, start):
@@ -79,8 +79,9 @@ class MacSshClient(unittest.TestCase):
             self.assertNotIn("proxycommand", config)
             self.assertNotIn("proxyjump", config)
         known = (self.ssh / "known_hosts.mac").read_text().splitlines()
-        self.assertEqual(known, [f"ejs-macbook-pro-via-fcvm ssh-ed25519 {DESKTOP_KEY}"],
-                         "only the desktop-session sshd's key is pinned")
+        self.assertEqual(known[0], f"ejs-macbook-pro-via-fcvm ssh-ed25519 {REMOTE_LOGIN_KEY}",
+                         "Remote Login's key is pinned first")
+        self.assertLessEqual(len(known), 2, "at most the retired desktop sshd's key besides, for the switch")
 
     def test_fresh_install_writes_one_alias(self):
         self.install()
@@ -171,9 +172,9 @@ class Wiring(unittest.TestCase):
 
 
 class Cloudflare(unittest.TestCase):
-    def test_the_route_ends_at_the_desktop_session_sshd(self):
+    def test_the_route_ends_at_remote_login(self):
         services = re.findall(r'service\s*=\s*"(ssh://[^"]+)"', TUNNEL)
-        self.assertEqual(services, ["ssh://127.0.0.1:22222"])
+        self.assertEqual(services, ["ssh://127.0.0.1:22"])
 
     def test_access_admits_exactly_the_two_service_tokens_and_no_person(self):
         policy = re.search(r'resource "cloudflare_zero_trust_access_policy" "macbook_ssh_fcvm" \{(.*?)\n\}', TUNNEL, re.S).group(1)

@@ -1,0 +1,144 @@
+#!/usr/bin/perl
+# mac-lease: who is driving the MacBook's desktop right now. Advisory and lightweight: it keeps two
+# sessions' clicks, typing and app relaunches from interleaving, nothing more.
+#
+#   mac-lease take NAME [--ttl SECONDS] [--wait SECONDS]   hold it (renews if NAME already holds it)
+#   mac-lease release NAME                                  give it back (only its holder can)
+#   mac-lease run NAME [--ttl S] [--wait S] -- CMD [ARGS]   take, run CMD, release; exit status is CMD's
+#   mac-lease check [NAME]                                  0 if free or held by NAME, 75 if someone else holds it
+#   mac-lease status                                        print the holder, or "free"
+#
+# A lease ends when released, at its expiry (default ttl 600 s), or when the process that took it with
+# `run` exits. `take` fails with 75 while another live lease exists, unless --wait gives it time.
+# Installed by ejc3/aws scripts/mac-setup.sh; state in ~/.local/state/mac-lease (MAC_STATE_DIR overrides).
+use strict;
+use warnings;
+use Fcntl qw(:flock O_RDWR O_CREAT);
+use File::Path qw(make_path);
+use POSIX qw(strftime);
+
+my $dir = ($ENV{MAC_STATE_DIR} // "$ENV{HOME}/.local/state") . "/mac-lease";
+make_path($dir, { mode => 0700 });
+my $file = "$dir/lease";
+
+sub usage { print STDERR "usage: mac-lease take|release|run|check|status ... (see the top of $0)\n"; exit 2 }
+
+sub locked(&) {
+    my ($code) = @_;
+    sysopen(my $fh, "$dir/lock", O_RDWR | O_CREAT, 0600) or die "mac-lease: $dir/lock: $!\n";
+    flock($fh, LOCK_EX) or die "mac-lease: lock: $!\n";
+    my @r = $code->();
+    close $fh;
+    return wantarray ? @r : $r[0];
+}
+
+sub read_lease {
+    open(my $fh, '<', $file) or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    chomp $line;
+    my ($name, $expiry, $pid, $since) = split /\t/, $line;
+    return undef unless defined $expiry && $expiry =~ /^\d+$/;
+    return undef if $expiry <= time;                                   # expired
+    return undef if $pid && $pid =~ /^\d+$/ && $pid > 0 && !kill(0, $pid);   # its `run` process is gone
+    return { name => $name, expiry => $expiry, pid => $pid // 0, since => $since // $expiry };
+}
+
+sub describe {
+    my ($l) = @_;
+    return sprintf("%s (since %s, until %s%s)", $l->{name},
+        strftime("%H:%M:%S", localtime $l->{since}), strftime("%H:%M:%S", localtime $l->{expiry}),
+        $l->{pid} ? ", pid $l->{pid}" : "");
+}
+
+sub write_lease {
+    my ($name, $ttl, $pid, $since) = @_;
+    my $tmp = "$file.$$";
+    open(my $fh, '>', $tmp) or die "mac-lease: $tmp: $!\n";
+    chmod 0600, $tmp;
+    print $fh join("\t", $name, time + $ttl, $pid, $since), "\n";
+    close $fh or die "mac-lease: $tmp: $!\n";
+    rename $tmp, $file or die "mac-lease: $file: $!\n";
+}
+
+sub options {
+    my ($args) = @_;
+    my %o = (ttl => 600, wait => 0);
+    while (@$args && $args->[0] =~ /^--(ttl|wait)(?:=(\d+))?$/) {
+        my ($k, $v) = ($1, $2);
+        shift @$args;
+        $v = shift @$args unless defined $v;
+        defined $v && $v =~ /^\d+$/ or usage();
+        $o{$k} = $v;
+    }
+    return \%o;
+}
+
+sub take {
+    my ($name, $o, $pid) = @_;
+    my $deadline = time + $o->{wait};
+    my $said;
+    while (1) {
+        my $holder = locked {
+            my $l = read_lease();
+            if (!$l || $l->{name} eq $name) {
+                write_lease($name, $o->{ttl}, $pid, $l ? $l->{since} : time);
+                return undef;
+            }
+            return $l;
+        };
+        return 0 unless $holder;
+        if (time >= $deadline) {
+            print STDERR "mac-lease: the desktop is held by ", describe($holder), "\n";
+            return 75;
+        }
+        print STDERR "mac-lease: waiting for ", describe($holder), "\n" unless $said++;
+        sleep 2;
+    }
+}
+
+my $cmd = shift @ARGV // usage();
+my $name_ok = sub { defined $_[0] && $_[0] =~ /^[A-Za-z0-9._:@+-]{1,64}$/ or do { print STDERR "mac-lease: NAME is 1-64 of [A-Za-z0-9._:@+-]\n"; exit 2 } };
+
+if ($cmd eq 'status') {
+    my $l = locked { read_lease() };
+    print $l ? describe($l) . "\n" : "free\n";
+    exit 0;
+} elsif ($cmd eq 'check') {
+    my $name = shift @ARGV // '';
+    my $l = locked { read_lease() };
+    exit 0 if !$l || ($name ne '' && $l->{name} eq $name);
+    print STDERR "mac-lease: the desktop is held by ", describe($l), "\n";
+    exit 75;
+} elsif ($cmd eq 'take') {
+    my $name = shift @ARGV; $name_ok->($name);
+    my $o = options(\@ARGV);
+    @ARGV and usage();
+    exit take($name, $o, 0);
+} elsif ($cmd eq 'release') {
+    my $name = shift @ARGV; $name_ok->($name);
+    my $rc = locked {
+        my $l = read_lease();
+        return 0 unless $l;
+        return 75 unless $l->{name} eq $name;
+        unlink $file;
+        return 0;
+    };
+    print STDERR "mac-lease: not held by $name\n" if $rc;
+    exit $rc;
+} elsif ($cmd eq 'run') {
+    my $name = shift @ARGV; $name_ok->($name);
+    my $o = options(\@ARGV);
+    shift @ARGV if @ARGV && $ARGV[0] eq '--';
+    @ARGV or usage();
+    my $rc = take($name, $o, $$);
+    exit $rc if $rc;
+    local $ENV{MAC_LEASE} = $name;
+    my $status = system { $ARGV[0] } @ARGV;
+    locked { my $l = read_lease(); unlink $file if $l && $l->{name} eq $name; };
+    exit 127 if $status == -1;
+    exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
+} else {
+    usage();
+}
