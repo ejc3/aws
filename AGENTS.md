@@ -1263,6 +1263,10 @@ Available if a task needs them; neither needs a key on disk.
   dev-ebs-only). Export one with the same `eval "$(aws secretsmanager get-secret-value ... | jq -r 'to_entries[] | ...')"`
   as Browserbase. Never onto a command line, into a file in a repo or a commit. How to use each, prices and our plans'
   limits: the `deepseek`, `exa`, `scrapingdog` and `browserbase` skills in dolphin-labs-hq/dolphin-labs.
+  Their usage is graphed: `search-fetch-usage.tf` polls DeepSeek's balance, ScrapingDog's credits and Browserbase's minutes
+  and sessions every 30 minutes into CloudWatch namespace `SearchFetch` (dashboard `search-fetch`, alarms on a DeepSeek
+  balance under $10 and ScrapingDog under 10% of its credits). Exa is not polled: no balance API, and usage needs a team
+  service key.
 - **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
   nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
   `ISSUER_ID`, `KEY_ID`, `TEAM_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it
