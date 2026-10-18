@@ -32,13 +32,16 @@ class Parsing(unittest.TestCase):
         resp = {"is_available": True, "balance_infos": [
             {"currency": "USD", "total_balance": "97.50", "granted_balance": "0.00", "topped_up_balance": "97.50"}]}
         got = usage.deepseek("k", get=lambda url, h: resp)
+        with self.assertRaises(ValueError):
+            usage.deepseek("k", get=lambda url, h: {"is_available": True})
         self.assertIn(("Available", 1.0, {}), got)
         self.assertIn(("BalanceTotal", 97.5, {"Currency": "USD"}), got)
         self.assertIn(("BalanceToppedUp", 97.5, {"Currency": "USD"}), got)
 
     def test_deepseek_sends_the_key_as_a_bearer_header_not_in_the_url(self):
         seen = {}
-        usage.deepseek("secret-k", get=lambda url, h: seen.update(url=url, h=h) or {"is_available": False})
+        with self.assertRaises(ValueError):
+            usage.deepseek("secret-k", get=lambda url, h: seen.update(url=url, h=h) or {"is_available": False})
         self.assertNotIn("secret-k", seen["url"])
         self.assertEqual(seen["h"], {"Authorization": "Bearer secret-k"})
 
@@ -52,9 +55,11 @@ class Parsing(unittest.TestCase):
         self.assertEqual(got["ConcurrencyLimit"], 50)
         self.assertNotIn("apiKey", got)
 
-    def test_scrapingdog_with_no_known_fields_is_an_error(self):
+    def test_scrapingdog_without_both_credit_fields_is_an_error(self):
         with self.assertRaises(ValueError):
             usage.scrapingdog("k", get=lambda url, h=None: {"something": "else"})
+        with self.assertRaises(ValueError):
+            usage.scrapingdog("k", get=lambda url, h=None: {"requestLimit": 10, "threadCount": 3})
 
     def test_browserbase_usage_concurrency_and_running_sessions(self):
         def get(url, h):
@@ -75,6 +80,19 @@ class Parsing(unittest.TestCase):
             return []
         with self.assertRaises(ValueError):
             usage.browserbase("k", "proj", get=get)
+
+
+    def test_browserbase_missing_project_or_bad_sessions_is_an_error(self):
+        def get_factory(projects, sessions):
+            def get(url, h):
+                if url.endswith("/usage"):
+                    return {"browserMinutes": 1}
+                return projects if url.endswith("/v1/projects") else sessions
+            return get
+        with self.assertRaises(ValueError):
+            usage.browserbase("k", "proj", get=get_factory([{"id": "other", "concurrency": 3}], []))
+        with self.assertRaises(ValueError):
+            usage.browserbase("k", "proj", get=get_factory([{"id": "proj", "concurrency": 3}], {"data": []}))
 
 
 class Handler(unittest.TestCase):

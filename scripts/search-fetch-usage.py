@@ -53,12 +53,16 @@ def deepseek(key, get=_get_json):
             v = _num(info.get(field))
             if v is not None:
                 out.append((name, v, {"Currency": currency}))
+    if not any(name == "BalanceTotal" for name, _, _ in out):
+        raise ValueError("DeepSeek /user/balance returned no numeric total_balance")
     return out
 
 
 def scrapingdog(key, get=_get_json):
     data = get("https://api.scrapingdog.com/account?" + urllib.parse.urlencode({"api_key": key}))
     limit, used = _num(data.get("requestLimit")), _num(data.get("requestUsed"))
+    if limit is None or used is None:
+        raise ValueError("ScrapingDog /account returned no numeric requestLimit and requestUsed")
     out = []
     if limit is not None:
         out.append(("CreditsLimit", limit, {}))
@@ -72,8 +76,6 @@ def scrapingdog(key, get=_get_json):
         v = _num(data.get(field))
         if v is not None:
             out.append((name, v, {}))
-    if not out:
-        raise ValueError("ScrapingDog /account returned none of the expected fields")
     return out
 
 
@@ -88,12 +90,14 @@ def browserbase(key, project_id, get=_get_json):
     if not out:
         raise ValueError("Browserbase /usage returned neither browserMinutes nor proxyBytes")
     projects = get("https://api.browserbase.com/v1/projects", h)
-    for p in projects if isinstance(projects, list) else []:
-        if p.get("id") == project_id and _num(p.get("concurrency")) is not None:
-            out.append(("ConcurrencyLimit", _num(p["concurrency"]), {}))
+    mine = [p for p in projects if isinstance(p, dict) and p.get("id") == project_id] if isinstance(projects, list) else []
+    if not mine or _num(mine[0].get("concurrency")) is None:
+        raise ValueError("Browserbase /v1/projects did not list our project with a numeric concurrency")
+    out.append(("ConcurrencyLimit", _num(mine[0]["concurrency"]), {}))
     running = get("https://api.browserbase.com/v1/sessions?status=RUNNING", h)
-    if isinstance(running, list):
-        out.append(("SessionsRunning", float(len(running)), {}))
+    if not isinstance(running, list):
+        raise ValueError("Browserbase /v1/sessions did not return a list")
+    out.append(("SessionsRunning", float(len(running)), {}))
     return out
 
 
