@@ -11,7 +11,7 @@
 # back into this account.
 #
 # Consumers take the URL and token from `dolphin-redis/clients` in the Dolphin account (one JSON per environment):
-# the production Worker and Vercel's record (vercel-env/dolphin-labs/production), the staging Worker
+# the production Worker (through vercel-env/dolphin-labs/production, its secrets' source), the staging Worker
 # (workers-stage/dolphin-labs), the news pass (dolphin-labs/news) and the dolphin-labs repository's KV_REST_API_* secrets.
 # Rotating a token: AGENTS.md, "The Dolphin Redis".
 

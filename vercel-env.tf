@@ -1,7 +1,7 @@
 # vercel-env.tf
 #
-# Terraform writes the Vercel environments of the sites whose variables were set by hand (dolphin-labs, imagine,
-# remote-claw, nest-step) from AWS, so AWS is the one source for every site on both clouds (the standing rule in
+# Terraform writes the Vercel environments of the sites whose variables were set by hand (imagine, remote-claw,
+# nest-step) from AWS, so AWS is the one source for every site on both clouds (the standing rule in
 # AGENTS.md, "Sites also deploying to Cloudflare Workers"). This first part is the Vercel API token for the owner's
 # personal team (imagine, remote-claw), which no Terraform provider here could reach: an API token scoped to that one
 # team, minted by API with vercel-admin-token (github-admin-tokens.tf), never anyone's CLI login.
@@ -69,7 +69,9 @@ resource "aws_secretsmanager_secret_policy" "vercel_api_token_coltons" {
 # the same key on a target, and the next apply would write the container's value back). A variable on several targets
 # takes its value from the first and a precondition refuses the plan if the targets' containers disagree.
 #
-# Not here: dolphin-films and colton-games, whose Terraform-written variables live in their own files.
+# Not here: colton-games, whose Terraform-written variables live in their own file. Nor dolphin-labs: it left Vercel
+# (gamesworthwatching-zone.tf) and its team is being deleted, so its variables are forgotten (dolphin-vercel-retired.tf);
+# its containers stay, as the source of the dolphin-labs-prod Worker's secrets (vercel-env-secrets.tf).
 #
 # Adding a variable: put its value in the target's container, add it in Vercel or let Terraform create it (re-run the
 # inventory after a dashboard change), plan. Values pass through Terraform state, as for the other projects; state is
@@ -77,18 +79,16 @@ resource "aws_secretsmanager_secret_policy" "vercel_api_token_coltons" {
 locals {
   # Kept equal to PROJECTS in scripts/vercel-env-inventory.py (scripts/test-vercel-env.py checks).
   vercel_env_projects = {
-    "dolphin-labs" = { project_id = "prj_VZaPcYdmfnBhYKtuPK9KxjmMGQmW", team_id = "team_4TayirAcbgetrOUgYXghMXJH" }
-    "imagine"      = { project_id = "prj_MNp1CoEL7jqd3ufUb0lL98vTMBTV", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
-    "nest-step"    = { project_id = "prj_UEBlk5ovC3cPF0oaXwgZyGuRQtId", team_id = "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
-    "remote-claw"  = { project_id = "prj_qUeYYc7P87JmsQUipJG0m0kqmYbM", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
+    "imagine"     = { project_id = "prj_MNp1CoEL7jqd3ufUb0lL98vTMBTV", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
+    "nest-step"   = { project_id = "prj_UEBlk5ovC3cPF0oaXwgZyGuRQtId", team_id = "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
+    "remote-claw" = { project_id = "prj_qUeYYc7P87JmsQUipJG0m0kqmYbM", team_id = "team_fYexi4KRmIrq9wtYsiXs9e9H" }
   }
 
-  # Which provider reaches each team: the dolphin-labs token (dolphin-films-vercel.tf), the Colton's-team token minted for
-  # this file (vercel_api_token_coltons: the colton-games team's own token cannot see nest-step) and the personal-team token.
+  # Which provider reaches each team: the Colton's-team token minted for this file (vercel_api_token_coltons: the
+  # colton-games team's own token cannot see nest-step) and the personal-team token.
   vercel_env_by_team = {
-    dolphin_labs = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_4TayirAcbgetrOUgYXghMXJH" }
-    coltons      = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
-    ejc3         = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_fYexi4KRmIrq9wtYsiXs9e9H" }
+    coltons = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_luQ5Id7cevXQ5kBbxzV7Jk2B" }
+    ejc3    = { for id, v in local.vercel_env_vars : id => v if local.vercel_env_projects[split("/", id)[0]].team_id == "team_fYexi4KRmIrq9wtYsiXs9e9H" }
   }
 
   # The containers the variables need: "site/target".
@@ -130,29 +130,6 @@ provider "vercel" {
 provider "vercel" {
   alias     = "ejc3"
   api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_ejc3.secret_string)
-}
-
-resource "vercel_project_environment_variable" "vercel_env_dolphin_labs" {
-  provider   = vercel.dolphin_labs
-  for_each   = local.vercel_env_by_team.dolphin_labs
-  team_id    = local.vercel_env_projects[split("/", each.key)[0]].team_id
-  project_id = local.vercel_env_projects[split("/", each.key)[0]].project_id
-  key        = each.value.key
-  value      = local.vercel_env_value[each.key]
-  target     = each.value.target
-  sensitive  = each.value.sensitive
-  comment    = "managed by ejc3/aws vercel-env.tf from vercel-env/${split("/", each.key)[0]}"
-
-  lifecycle {
-    precondition {
-      condition     = local.vercel_env_value[each.key] != null
-      error_message = "vercel-env/${split("/", each.key)[0]}/${each.value.target[0]} has no ${each.value.key}."
-    }
-    precondition {
-      condition     = local.vercel_env_agrees[each.key]
-      error_message = "${each.value.key} differs between the containers of its targets (${join(", ", each.value.target)}) in vercel-env/${split("/", each.key)[0]}."
-    }
-  }
 }
 
 resource "vercel_project_environment_variable" "vercel_env_coltons" {
@@ -202,12 +179,6 @@ resource "vercel_project_environment_variable" "vercel_env_ejc3" {
 }
 
 # Take over the variables Vercel already holds, by id, instead of creating duplicates (which Vercel refuses).
-import {
-  for_each = local.vercel_env_by_team.dolphin_labs
-  to       = vercel_project_environment_variable.vercel_env_dolphin_labs[each.key]
-  id       = "${local.vercel_env_projects[split("/", each.key)[0]].team_id}/${local.vercel_env_projects[split("/", each.key)[0]].project_id}/${split("/", each.key)[1]}"
-}
-
 import {
   for_each = local.vercel_env_by_team.coltons
   to       = vercel_project_environment_variable.vercel_env_coltons[each.key]

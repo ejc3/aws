@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record a Vercel project's environment for one target in AWS Secrets Manager (vercel-env/<site>/<target>).
 
-    scripts/vercel-env-capture.py SITE TARGET          e.g. dolphin-labs production
+    scripts/vercel-env-capture.py SITE TARGET          e.g. imagine production
     scripts/vercel-env-capture.py --list               the sites and targets this knows
 
 Why this exists: Vercel never returns a variable of type `sensitive` once it is saved (not through the API, the CLI or the
@@ -39,8 +39,6 @@ import time
 # site -> (unix account on nextjs-dev holding the Vercel login, Vercel scope, project name, the project's root directory)
 SITES = {
     "colton-games": ("colton", "coltons-projects-7f9a4e8b", "colton-games", "."),
-    "dolphin-films": ("ejc3", "dolphin-labs", "dolphin-films", "films/web"),
-    "dolphin-labs": ("ejc3", "dolphin-labs", "dolphin-labs", "web"),
     "imagine": ("ejc3", "ejc3-7031s-projects", "imagine", "web"),
     "nest-step": ("colton", "coltons-projects-7f9a4e8b", "v0-immigrant-children-website", "."),
     "remote-claw": ("ejc3", "ejc3-7031s-projects", "remote-claw", "apps/web"),

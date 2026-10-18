@@ -110,10 +110,12 @@ class SecretTests(unittest.TestCase):
         self.assertIn("value       = { for key, secret in aws_secretsmanager_secret.dolphin_films : key => secret.name }", names)
         self.assertNotIn("secret_string", names)
         self.assertNotIn("sensitive", names)
-        # What Vercel gets is written by dolphin-films-vercel.tf, from these containers: this file names no variable
-        # of its own and reads no value.
+        # Nothing in Terraform reads these containers any more (the Vercel writer is gone with the dolphin-labs team):
+        # this file names no variable of its own and reads no value.
         self.assertNotRegex(CODE, r"FILMS_(?:SEED|ADMIN)_EMAILS")
-        self.assertIn("dolphin-films-vercel.tf", TF)
+        self.assertNotIn("secret_version", CODE)
+        self.assertNotIn("dolphin-films-vercel.tf", TF)
+        self.assertFalse((ROOT / "dolphin-films-vercel.tf").exists())
 
 
 RUNNER_APP = (ROOT / "runner-app.tf").read_text()

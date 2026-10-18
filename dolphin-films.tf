@@ -1,20 +1,22 @@
 # dolphin-films.tf
 #
 # AWS half of dolphin-films (dolphin-labs-hq/dolphin-films, private): a Next.js app at
-# films/web on Vercel, Google sign-in through Auth.js, a per-user store in Turso (libSQL),
+# films/web served by the Cloudflare Worker dolphin-films-prod (yourfantasymovie.tf; it left
+# Vercel on 2026-10-15), Google sign-in through Auth.js, a per-user store in Turso (libSQL),
 # and offline asset builders that run on the metal dev boxes. The app reads nothing from AWS
-# at run time, so there is no Vercel OIDC role here (imagine.tf has one because its web app
-# invokes a Lambda). What this file owns:
+# at run time. What this file owns:
 #
-#   Secrets Manager containers, one per environment and kind (JSON, values set out of band; read
-#   by Terraform, and so in state, once dolphin-films-vercel.tf's gate names them):
+#   Secrets Manager containers, one per environment and kind (JSON, values set out of band;
+#   Terraform never reads them):
 #     dolphin-films/prod/auth          AUTH_SECRET, AUTH_GOOGLE_ID, AUTH_GOOGLE_SECRET
 #     dolphin-films/prod/turso         TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
 #     dolphin-films/nonprod/auth       the same names, for preview deployments and local dev
 #     dolphin-films/nonprod/turso
 #   and who may read them:
-#     prod/*      the administration set only. Terraform writes production's values from these
-#                 into the Vercel project (dolphin-films-vercel.tf).
+#     prod/*      the administration set only. An administrator loads production's values from
+#                 these into the Worker dolphin-films-prod with `wrangler secret bulk`, with the
+#                 address lists from people/addresses (AGENTS.md, "Which production is behind
+#                 Cloudflare").
 #     nonprod/*   the administration set and dev-server-role (the metal boxes, where the app is
 #                 developed and the builders run). Not nextjs-dev-role: every account on that
 #                 box has sudo, so a grant there is box-wide.
@@ -42,12 +44,11 @@
 #                  key and no new Bedrock statement.
 #   Turso          the two databases (one per environment) are created with the platform
 #                  token, not by Terraform: no Turso resource is managed in this repo.
-#   Vercel         the project was made by hand; its environment is written by Terraform from
-#                  these containers and the people secret, with a token of its own for the
-#                  dolphin-labs team (dolphin-films-vercel.tf). No address is written in this
-#                  repository.
-#   DNS            yourfantasymovie.com (yourfantasymovie.tf): DNS records here, the Vercel project
-#                  `dolphin-films` (team dolphin-labs) and its domains made with the Vercel CLI as the owner.
+#   Vercel         nothing. The project was in the dolphin-labs team, which is being deleted
+#                  (2026-10-18); Terraform forgot the variables it wrote there
+#                  (dolphin-vercel-retired.tf). No address is written in this repository.
+#   DNS            yourfantasymovie.com (yourfantasymovie.tf): proxied records and Workers routes
+#                  to dolphin-films-prod.
 #
 # BRING-UP, once, in this order:
 #   1. Apply. The four containers exist and are empty.
@@ -61,8 +62,8 @@
 #        aws secretsmanager put-secret-value --region us-west-1 \
 #          --secret-id dolphin-films/<env>/<kind> --secret-string file://<a 0600 JSON file>
 #      then delete the file. `openssl rand -base64 33` makes an AUTH_SECRET.
-#   5. Bring up dolphin-films-vercel.tf (its header lists the steps): Terraform writes Production
-#      from prod/* and Preview from nonprod/*. The next deploy applies the site's migrations.
+#   5. Load prod/* (and the people/addresses lists) into dolphin-films-prod with `wrangler
+#      secret bulk`. The next deploy applies the site's migrations.
 #
 # On a metal box, an agent exports one secret's variables without printing them:
 #   eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth \
@@ -141,6 +142,3 @@ output "dolphin_films_secrets" {
   description = "Secrets Manager names of the dolphin-films credentials (us-west-1), by environment and kind. Values are set out of band."
   value       = { for key, secret in aws_secretsmanager_secret.dolphin_films : key => secret.name }
 }
-
-# What Terraform writes to the Vercel project: output dolphin_films_vercel_written
-# (dolphin-films-vercel.tf).

@@ -251,9 +251,8 @@ The server log says `account labels reloaded` with the number of names. A value 
 `ACCOUNT_UUID=NAME` is not copied, and the names already in use stay.
 
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
-kind. Terraform reads only the ones its gate names (`dolphin_films_vercel_ready` in `dolphin-films-vercel.tf`), to
-write them into the Vercel project; from then on their values are in Terraform state (administration only), as
-colton-games' accounts are. Production
+kind. Terraform never reads them: an administrator loads production's into the Cloudflare Worker
+`dolphin-films-prod` with `wrangler secret bulk`. Production
 and non-production get different values throughout: a Google OAuth client each, an `AUTH_SECRET` each, a
 Turso database each with its own token.
 
@@ -283,14 +282,11 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-films
   --secret-string file://<a 0600 JSON file> && shred -u <that file>
 ```
 
-Terraform writes the Vercel project's environment from these (`dolphin-films-vercel.tf`): Production from
-`prod/*`, Preview from `nonprod/*`, each variable sensitive, through a provider with its own token for the
-dolphin-labs team (`vercel-api-token-dolphin-labs`, administration only). `FILMS_SEED_EMAILS` and
-`FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, come from the `dolphin_films` key of the
-`people/addresses` secret (`{"prod": {"seeds": [...], "admins": [...]}, "nonprod": {...}}`). No address
-belongs in this repository. A gate, `dolphin_films_vercel_ready`, names the containers that have a value and
-starts empty; `terraform output dolphin_films_vercel_written` lists what is written. The bring-up order is in
-the header of `dolphin-films-vercel.tf`.
+The site is served by `dolphin-films-prod` on Cloudflare (`yourfantasymovie.tf`). Its Vercel project was in the
+dolphin-labs team, which is being deleted, and Terraform no longer writes to it (`dolphin-vercel-retired.tf`
+forgets what it wrote). `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads,
+come from the `dolphin_films` key of the `people/addresses` secret (`{"prod": {"seeds": [...], "admins": [...]},
+"nonprod": {...}}`) and are loaded into the Worker with its other secrets. No address belongs in this repository.
 
 This is a one-time secret-payload bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.

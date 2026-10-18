@@ -52,26 +52,41 @@ class TerraformTests(unittest.TestCase):
     def blocks(self):
         return re.findall(r'resource "vercel_project_environment_variable" "(vercel_env_[a-z0-9_]+)" \{(.*?)\n\}\n', TF, re.S)
 
-    def test_three_teams_each_with_checks_and_an_import(self):
+    def test_two_teams_each_with_checks_and_an_import(self):
         blocks = dict(self.blocks())
-        self.assertEqual(sorted(blocks), ["vercel_env_coltons", "vercel_env_dolphin_labs", "vercel_env_ejc3"])
+        self.assertEqual(sorted(blocks), ["vercel_env_coltons", "vercel_env_ejc3"])
         for name, body in blocks.items():
             self.assertEqual(body.count("precondition {"), 2, name)
             self.assertIn("value      = local.vercel_env_value[each.key]", body, name)
             self.assertIn(f"to       = vercel_project_environment_variable.{name}[each.key]", TF, name)
-        self.assertIn("provider   = vercel.dolphin_labs", blocks["vercel_env_dolphin_labs"])
         self.assertIn("provider   = vercel.ejc3", blocks["vercel_env_ejc3"])
         self.assertIn("provider   = vercel.coltons", blocks["vercel_env_coltons"])
         self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_coltons.secret_string)", TF)
 
     def test_the_import_id_is_team_project_and_variable(self):
         ids = re.findall(r'id       = "(\$\{.*?\})/(\$\{.*?\})/(\$\{split\("/", each.key\)\[1\]\})"', TF)
-        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(ids), 2)
 
     def test_the_personal_team_provider_reads_its_own_token(self):
         self.assertIn('alias     = "ejc3"', TF)
         self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.vercel_api_token_ejc3.secret_string)", TF)
         self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }', TF)
+
+    def test_the_retired_dolphin_labs_team_is_not_managed(self):
+        # The Dolphin sites left Vercel and their team is being deleted (dolphin-vercel-retired.tf forgets what was here).
+        for text in (TF, VARS, (ROOT / "scripts" / "vercel-env-inventory.py").read_text()):
+            self.assertNotIn("team_4TayirAcbgetrOUgYXghMXJH", text)
+            self.assertNotIn("dolphin", re.sub(r"#.*", "", text).replace("dolphin-vercel-retired.tf", ""))
+        self.assertNotIn("dolphin-labs", inv.PROJECTS)
+
+    def test_the_dolphin_containers_stay_but_are_not_vercel_records(self):
+        # vercel-env/dolphin-labs/production is the dolphin-labs-prod Worker's source; same addresses, not capturable.
+        dolphin = SECRETS.split("vercel_env_dolphin = {", 1)[1].split("}", 1)[0]
+        self.assertIn('"dolphin-labs"  = ["development", "preview", "production"]', dolphin)
+        self.assertIn('"dolphin-films" = ["preview", "production"]', dolphin)
+        targets = SECRETS.split("vercel_env_targets = {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("dolphin", targets)
+        self.assertIn("merge(local.vercel_env_targets, local.vercel_env_dolphin)", SECRETS)
 
     def test_values_come_only_from_the_containers(self):
         self.assertIn('local.vercel_env_record["${split("/", id)[0]}/${v.target[0]}"][v.key]', TF)
