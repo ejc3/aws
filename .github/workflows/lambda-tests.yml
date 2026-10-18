@@ -117,6 +117,8 @@ jobs:
 
       - name: Scroll-native tmux installs beside the normal one (offline)
         run: python3 -S -B scripts/test-tmux-scroll-install.py
+      - name: Containerized nextjs box (offline)
+        run: python3 -S -B scripts/test-nextjs-ct.py
       - name: Boot-time Codex thread seeding
         run: python3 -S -B scripts/test-codex-seed.py
       - name: App-repo runners route, launch, cap and reap (offline)

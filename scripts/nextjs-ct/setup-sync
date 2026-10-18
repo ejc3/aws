@@ -1,0 +1,51 @@
+#!/bin/bash
+# setup-sync -- apply a newly published nextjs-ct setup script (nextjs-ct.tf).
+#
+# The instance ignores user_data changes, so Terraform publishing the script to S3 reaches a
+# running box only through this timer. Same guards as nextjs-dev's: act only when the object's
+# ETag changes, refuse a script that fails `bash -n`, and record the ETag only when the run and
+# the health check both pass, so a failed run is retried ten minutes later.
+set -uo pipefail
+BUCKET=ejc3-dev-scripts
+KEY=user-data/nextjs-ct.sh
+STATE=/var/lib/nextjs-setup
+LOG=/var/log/setup-sync.log
+mkdir -p "$STATE"
+# One setup at a time (the first boot runs one too); a busy lock means try again at the next tick.
+exec 9>/run/nextjs-ct-setup.lock
+flock -n 9 || { echo "setup-sync: a setup is already running; next tick"; exit 0; }
+
+ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region us-west-1 --query ETag --output text 2>/dev/null)
+[ -n "$ETAG" ] || { echo "setup-sync: cannot reach s3://$BUCKET/$KEY"; exit 0; }
+[ "$ETAG" = "$(cat "$STATE/applied-etag" 2>/dev/null)" ] && exit 0
+
+echo "setup-sync: new script published (etag $ETAG), fetching"
+NEXT=$(mktemp /tmp/nextjs-ct-setup.XXXXXX.sh)
+ERR=$(mktemp /tmp/nextjs-ct-syntax.XXXXXX)
+trap 'rm -f "$NEXT" "$ERR"' EXIT
+aws s3 cp "s3://$BUCKET/$KEY" "$NEXT" --region us-west-1 >/dev/null 2>&1 \
+  || { echo "setup-sync: download failed, keeping current setup"; exit 0; }
+if ! bash -n "$NEXT" 2>"$ERR"; then
+  echo "setup-sync: REFUSING to run -- published script has a syntax error:"
+  sed 's/^/  /' "$ERR"
+  exit 0
+fi
+
+echo "setup-sync: running"
+# The run log holds the whole setup's output: root and adm only, set before the redirect writes it.
+[ -e "$LOG" ] || install -m 0640 -o root -g adm /dev/null "$LOG"
+chmod 0640 "$LOG"
+chgrp adm "$LOG"
+NEXTJS_CT_SETUP_LOCK_HELD=1 NEXTJS_CT_ETAG="$ETAG" bash "$NEXT" >"$LOG" 2>&1
+RC=$?
+echo "setup-sync: finished rc=$RC"
+if [ "$RC" != 0 ]; then
+  echo "setup-sync: setup failed; NOT recording this etag, so the next run retries"
+  exit 1
+fi
+if [ -x /usr/local/sbin/nextjs-ct-health ] && ! /usr/local/sbin/nextjs-ct-health; then
+  echo "setup-sync: health check failed; NOT recording this etag, so the next run retries"
+  exit 1
+fi
+printf '%s' "$ETAG" > "$STATE/applied-etag"
+echo "setup-sync: healthy, recorded etag"
