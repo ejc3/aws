@@ -230,27 +230,6 @@ resource "aws_iam_role_policy_attachment" "search_fetch_api_keys_read" {
   policy_arn = aws_iam_policy.search_fetch_api_keys_read.arn
 }
 
-# Renamed from scraper_* to search_fetch_* (owner, 2026-10-18): the same secrets, kept in place.
-moved {
-  from = aws_secretsmanager_secret.scraper_api_key
-  to   = aws_secretsmanager_secret.search_fetch_api_key
-}
-
-moved {
-  from = aws_secretsmanager_secret_policy.scraper_api_key
-  to   = aws_secretsmanager_secret_policy.search_fetch_api_key
-}
-
-moved {
-  from = aws_iam_policy.scraper_api_keys_read
-  to   = aws_iam_policy.search_fetch_api_keys_read
-}
-
-moved {
-  from = aws_iam_role_policy_attachment.scraper_api_keys_read
-  to   = aws_iam_role_policy_attachment.search_fetch_api_keys_read
-}
-
 # App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
 # secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
