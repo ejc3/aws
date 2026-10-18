@@ -85,6 +85,8 @@ def browserbase(key, project_id, get=_get_json):
         v = _num(usage.get(field))
         if v is not None:
             out.append((name, v, {}))
+    if not out:
+        raise ValueError("Browserbase /usage returned neither browserMinutes nor proxyBytes")
     projects = get("https://api.browserbase.com/v1/projects", h)
     for p in projects if isinstance(projects, list) else []:
         if p.get("id") == project_id and _num(p.get("concurrency")) is not None:
@@ -92,8 +94,6 @@ def browserbase(key, project_id, get=_get_json):
     running = get("https://api.browserbase.com/v1/sessions?status=RUNNING", h)
     if isinstance(running, list):
         out.append(("SessionsRunning", float(len(running)), {}))
-    if not out:
-        raise ValueError("Browserbase returned none of the expected fields")
     return out
 
 

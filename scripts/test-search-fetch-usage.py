@@ -68,6 +68,15 @@ class Parsing(unittest.TestCase):
         self.assertEqual(got, {"BrowserMinutes": 120, "ProxyBytes": 1048576, "ConcurrencyLimit": 25, "SessionsRunning": 2})
 
 
+    def test_browserbase_usage_without_its_fields_is_an_error_even_if_sessions_answer(self):
+        def get(url, h):
+            if url.endswith("/usage"):
+                return {"renamed": 1}
+            return []
+        with self.assertRaises(ValueError):
+            usage.browserbase("k", "proj", get=get)
+
+
 class Handler(unittest.TestCase):
     def test_publishes_every_provider_and_providerup(self):
         cw = FakeCW()
