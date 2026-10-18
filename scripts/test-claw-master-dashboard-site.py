@@ -2,6 +2,7 @@
 """claw-master-dashboard-site.tf: Access on the dashboard Worker admits the owner's named people first, then exactly
 one service token for metal-box agents (#374), whose secret only administration and dev-server-role can read; the
 Worker's own allowlist is written by Terraform from the same list."""
+import hashlib
 import re
 import unittest
 from pathlib import Path
@@ -93,6 +94,115 @@ class AllowlistTests(unittest.TestCase):
             ('resource "cloudflare_workers_kv"', "claw_master_dashboard_allowed_emails"),
         ):
             self.assertNotRegex(block(kind, name), r"(?m)^\s*provider\s*=")
+
+
+class AccountAliasTests(unittest.TestCase):
+    """The Worker's account aliases are derived from claude-master/account-labels with claw-master's own rules
+    (ejc3/CLIProxyAPI internal/clawmaster/metrics.go AccountKeyFor and sanitizeDimension, cmd/claw-master/main.go
+    loadAccountLabels), so that secret is the one place to name an account."""
+
+    # Made-up account ids and the codes `claw-master account-key` (release claw-master-39add35) printed for them.
+    CLAW_MASTER_SAYS = {
+        "12345678-90ab-cdef-1234-567890abcdef": "acct-ed043f31",
+        "0F0F0F0F-AAAA-BBBB-CCCC-DDDDEEEEFFFF": "acct-7eb455f9",
+        "aaaaaaaa-0000-0000-0000-000000000000": "acct-80e75d69",
+    }
+
+    @staticmethod
+    def account_key(account_id):
+        # What the Terraform expression computes: "acct-${substr(sha256(lower(id)), 0, 8)}" (sha256() is hex).
+        return "acct-" + hashlib.sha256(account_id.strip().lower().encode()).hexdigest()[:8]
+
+    def test_the_algorithm_reproduces_claw_masters_codes(self):
+        for account_id, code in self.CLAW_MASTER_SAYS.items():
+            self.assertEqual(self.account_key(account_id), code, account_id)
+
+    def test_terraform_hashes_the_lowercased_id_and_keeps_eight_hex_digits(self):
+        self.assertIn("lower(p[0]) => p[1]...", TF)
+        self.assertIn('"acct-${substr(sha256(id), 0, 8)}=', TF)
+
+    def test_names_are_sanitized_as_the_server_reports_them(self):
+        # sanitizeDimension: runs of other characters become "-", at most 48 characters.
+        self.assertIn('substr(replace(names[length(names) - 1], "/[^A-Za-z0-9._-]+/", "-"), 0, 48)', TF)
+
+    def test_lines_are_read_by_load_account_labels_rules(self):
+        self.assertIn('if l != "" && !startswith(l, "#")', TF)
+        self.assertIn('replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\\r", "")', TF)
+        self.assertIn("claw_master_account_label_pairs     = concat([], local.claw_master_account_label_parsed...)", TF)
+
+    # Terraform's two line patterns, taken from the .tf file and applied here as Terraform applies them, to made-up
+    # labels. The verdicts are those of claw-master's loadAccountLabels (checked with its add() rule in Go).
+    def parse(self, text):
+        eq, space = [p.replace("\\\\", "\\") for p in re.findall(r'regexall\("(\^\(\[0-9A-Fa-f-\][^"]*)", l\)', TF)]
+        pairs, malformed = [], 0
+        for raw in text.replace("\r", "").split("\n"):
+            line = raw.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            m = re.search(eq if "=" in line else space, line)
+            if m:
+                pairs.append((m.group(1).lower(), m.group(2)))
+            else:
+                malformed += 1
+        return pairs, malformed
+
+    GOOD = (
+        "# ACCOUNT_UUID=NAME\r\n\r\n12345678-90ab-cdef-1234-567890abcdef=Alpha Person\n"
+        "0F0F0F0F-AAAA-BBBB-CCCC-DDDDEEEEFFFF   Bravo(laptop)\naaaaaaaa-0000-0000-0000-000000000000 = old-name\n"
+        "AAAAAAAA-0000-0000-0000-000000000000=new.name_ok\n"
+    )
+
+    def test_a_value_claw_master_accepts_parses_whole(self):
+        pairs, malformed = self.parse(self.GOOD)
+        self.assertEqual(malformed, 0)
+        self.assertEqual(
+            pairs,
+            [
+                ("12345678-90ab-cdef-1234-567890abcdef", "Alpha Person"),
+                ("0f0f0f0f-aaaa-bbbb-cccc-ddddeeeeffff", "Bravo(laptop)"),
+                ("aaaaaaaa-0000-0000-0000-000000000000", "old-name"),
+                ("aaaaaaaa-0000-0000-0000-000000000000", "new.name_ok"),
+            ],
+        )
+
+    def test_each_line_claw_master_rejects_is_counted(self):
+        for line in (
+            "not-a-uuid=Nobody",  # not an id
+            "12345678-90ab-cdef-1234-567890abcdef\tTabbed",  # strings.Cut splits at a space, never a tab
+            "12345678-90ab-cdef-1234-567890abcdef=",  # no name
+            "12345678-90ab-cdef-1234-567890abcdef",  # no separator
+            "12345678 90ab=Split",  # the first "=" decides, so the id holds a space
+        ):
+            self.assertEqual(self.parse(self.GOOD + line + "\n")[1], 1, line)
+
+    def test_a_malformed_line_fails_the_plan_naming_only_a_count(self):
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_account_aliases")
+        self.assertIn("condition     = local.claw_master_account_label_malformed == 0", kv)
+        message = re.search(r'error_message = "([^"]*)"', kv).group(1)
+        self.assertEqual(re.findall(r"\$\{([^}]*)\}", message), ["local.claw_master_account_label_malformed"])
+        self.assertIn("claw-master would reject the whole file", message)
+        self.assertIn(
+            "claw_master_account_label_malformed = nonsensitive(length([for m in local.claw_master_account_label_parsed : m if length(m) == 0]))",
+            TF,
+        )
+
+    def test_written_sensitive_to_its_own_key_and_never_output(self):
+        kv = block('resource "cloudflare_workers_kv"', "claw_master_dashboard_account_aliases")
+        self.assertIn('key_name     = "account-aliases"', kv)
+        self.assertIn("namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id", kv)
+        self.assertIn("value = local.claw_master_dashboard_account_aliases", kv)
+        self.assertIn("claw_master_dashboard_account_aliases = sensitive(join(", TF)
+        out = block("output", "claw_master_dashboard")
+        self.assertNotIn("account_label", out)
+        self.assertNotIn("aliases", out)
+
+    def test_the_secret_is_read_only_where_the_server_exists(self):
+        data = block('data "aws_secretsmanager_secret_version"', "claw_master_account_labels")
+        self.assertIn("count     = var.enable_claw_master_server && local.claw_master_account_labels_ready ? 1 : 0", data)
+        # The read is gated so a container with no value yet (a cold bootstrap) cannot fail the plan; without it the
+        # aliases are only the header line (the try() in the lines' local).
+        self.assertRegex(TF, r"(?m)^  claw_master_account_labels_ready = (true|false)$")
+        self.assertIn("secret_id = aws_secretsmanager_secret.claw_master_account_labels[0].id", data)
 
 
 class ReaderKeyTests(unittest.TestCase):

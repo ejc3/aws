@@ -20,8 +20,11 @@
 #      check matters after a removal: Access refuses the person's next sign-in at once, but a
 #      session it already issued lasts 24h, and the Worker refuses that session within about two
 #      minutes (KV's cache plus the Worker's own).
-#   3. The Worker's URL switches, which turn on only after Access covers it.
-#   4. A read-only AWS key for the Worker, which cannot assume an AWS role (Workers have no
+#   3. The app's account aliases (key account-aliases in the same namespace), derived from
+#      claude-master/account-labels, the names claw-master itself reports, so that secret is the
+#      one place to name an account; nobody sets the Worker's aliases by hand.
+#   4. The Worker's URL switches, which turn on only after Access covers it.
+#   5. A read-only AWS key for the Worker, which cannot assume an AWS role (Workers have no
 #      OIDC identity AWS accepts). It may only read CloudWatch metrics in this region.
 #
 # ORDER, because a Worker's Access destination is its immutable id and that exists only after the
@@ -90,6 +93,76 @@ resource "cloudflare_workers_kv" "claw_master_dashboard_allowed_emails" {
   # Comma-separated, as the DASHBOARD_ALLOWED_EMAILS secret it replaces was. Marked sensitive here because the
   # provider's attribute is not: a plan shows that the list changed, never the addresses.
   value = sensitive(join(",", local.claw_master_dashboard_people))
+}
+
+# ---------------------------------------------------------------------------------
+# The Worker's account aliases (3 above), from the names claw-master itself uses. Points exported before an account had
+# a name carry its code, acct-<8 hex>; the dashboard folds each code into the person's name so they have one row. The
+# names live in
+# claude-master/account-labels (claw-master-server.tf), so Terraform derives the aliases from that secret and writes them
+# to the same namespace, key account-aliases, one `acct-<8 hex>=NAME` per line (it replaces the hand-set
+# DASHBOARD_ACCOUNT_ALIASES Worker secret). Adding a name is one edit of that secret and an apply.
+#
+# The derivation is claw-master's own (ejc3/CLIProxyAPI, internal/clawmaster/metrics.go):
+#   - the code is AccountKeyFor: "acct-" + the first 4 bytes, in hex, of sha256(lower(trim(ACCOUNT_UUID)));
+#   - the name is what the server reports for a labelled account, sanitizeDimension(label): each run of characters
+#     outside [A-Za-z0-9._-] becomes "-", at most 48 characters;
+#   - the lines are read by its loadAccountLabels rule (cmd/claw-master/main.go): blank lines and # comments are
+#     skipped, the id is 8 to 64 hex digits and dashes, split at the first "=" (at the first space when there is no
+#     "="), and a later line for the same account wins. Any other line fails the plan, as the server rejects the
+#     whole changed file on one and keeps its old labels (claw-master-server.tf): the aliases must never be written
+#     from a value the server is not using.
+# Everything derived from the secret stays marked sensitive: a plan shows that the aliases changed, never a name or code.
+# ---------------------------------------------------------------------------------
+data "aws_secretsmanager_secret_version" "claw_master_account_labels" {
+  count     = var.enable_claw_master_server && local.claw_master_account_labels_ready ? 1 : 0
+  secret_id = aws_secretsmanager_secret.claw_master_account_labels[0].id
+}
+
+locals {
+  # A checked-in gate, as colton_games_accounts_ready is: GetSecretValue fails on a container with no value, which a
+  # data source cannot catch, so the read waits until the secret has one. On a cold bootstrap set it false, apply (the
+  # container is created and the aliases are only the header line), put the value, then set it back to true and apply.
+  # The live secret has a value (checked 2026-10-18).
+  claw_master_account_labels_ready = true
+
+  claw_master_account_label_lines = [
+    for l in split("\n", replace(try(data.aws_secretsmanager_secret_version.claw_master_account_labels[0].secret_string, ""), "\r", "")) : trimspace(l)
+  ]
+  # Per non-blank, non-# line: [[id, name]] when it is a label, [] when claw-master would reject it. Go's
+  # strings.Cut splits at the first "=", else at the first space (a space, not a tab), and trims both halves.
+  claw_master_account_label_parsed = [
+    for l in local.claw_master_account_label_lines : (
+      strcontains(l, "=") ? regexall("^([0-9A-Fa-f-]{8,64})\\s*=\\s*(.*\\S)$", l) : regexall("^([0-9A-Fa-f-]{8,64})\\s* \\s*(.*\\S)$", l)
+    ) if l != "" && !startswith(l, "#")
+  ]
+  # A count, not a value: safe to show in the plan's error.
+  claw_master_account_label_malformed = nonsensitive(length([for m in local.claw_master_account_label_parsed : m if length(m) == 0]))
+  claw_master_account_label_pairs     = concat([], local.claw_master_account_label_parsed...)
+  # account id => every name given to it, in order (the last one wins, as in claw-master).
+  claw_master_account_label_names = { for p in local.claw_master_account_label_pairs : lower(p[0]) => p[1]... }
+  claw_master_dashboard_account_aliases = sensitive(join("\n", concat(
+    ["# acct-<8 hex>=NAME, written by Terraform from claude-master/account-labels (claw-master-dashboard-site.tf)"],
+    sort([
+      for id, names in local.claw_master_account_label_names :
+      "acct-${substr(sha256(id), 0, 8)}=${substr(replace(names[length(names) - 1], "/[^A-Za-z0-9._-]+/", "-"), 0, 48)}"
+    ]),
+  )))
+}
+
+resource "cloudflare_workers_kv" "claw_master_dashboard_account_aliases" {
+  account_id   = var.cloudflare_account_id
+  namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id
+  key_name     = "account-aliases"
+  # The header line keeps the value non-empty when there are no labels; the Worker skips # lines.
+  value = local.claw_master_dashboard_account_aliases
+
+  lifecycle {
+    precondition {
+      condition     = local.claw_master_account_label_malformed == 0
+      error_message = "claude-master/account-labels has ${local.claw_master_account_label_malformed} malformed line(s) (not blank, not a # comment, not ACCOUNT_UUID=NAME); claw-master would reject the whole file and keep its old labels, so the dashboard's aliases are not written from it. Fix the secret (claw-master-server.tf)."
+    }
+  }
 }
 
 resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {

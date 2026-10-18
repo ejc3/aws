@@ -248,7 +248,9 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id claude-master
 ```
 
 The server log says `account labels reloaded` with the number of names. A value with a line that is not
-`ACCOUNT_UUID=NAME` is not copied, and the names already in use stay.
+`ACCOUNT_UUID=NAME` is not copied, and the names already in use stay. The next Terraform apply also derives the
+claw-master dashboard's account aliases from it (`acct-<8 hex>=NAME`, the Workers KV key `account-aliases`,
+`claw-master-dashboard-site.tf`), so the dashboard folds an account's older, unnamed points into the same name.
 
 The dolphin-films credentials (`dolphin-films.tf`) are four JSON secrets in us-west-1, one per environment and
 kind. Terraform never reads them: an administrator loads production's into the Cloudflare Worker
