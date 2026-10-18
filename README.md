@@ -204,7 +204,9 @@ People's email addresses are not in this repository. `people/addresses` (us-west
 `staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email) and, optionally,
 `dolphin_steve` (Steve's Identity Center sign-in to the Dolphin account). To add someone to the allowlist, put the whole JSON again with the
 new address in `family` (a plan on a jumpbox then shows the Access policies changing; apply it). Terraform fails a plan,
-naming the key, if the secret is missing a key or `family` is empty. Put it without echoing:
+naming the key, if the secret is missing a key or `family` is empty. The optional `claude_master_dashboard` list names who,
+besides the owner, may open the claw-master dashboard: the same apply changes its Access policy and the allowlist the
+Worker itself checks (a Workers KV value Terraform writes), so nothing is set on the Worker by hand. Put it without echoing:
 
 ```bash
 read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-west-1 \

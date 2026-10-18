@@ -894,6 +894,17 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   weekly allowance, and more than 20 Anthropic errors in 10 minutes. Every query was checked against the live
   API (`window` and `result` are reserved words and must be quoted); `scripts/test-claw-master-server.py`
   keeps them valid.
+- **The claw-master dashboard site** (`claw-master-dashboard-site.tf`; the Worker `claw-master-dashboard`, code in
+  ejc3/claw-master-dashboard): who may open it is ONE list, the owner plus the `claude_master_dashboard` key of
+  `people/addresses`. Terraform builds the Access policy from it and writes the same list to the Workers KV key
+  `allowed-emails` (namespace `claw-master-dashboard-config`, bound in the Worker as `DASHBOARD_CONFIG`), which the
+  Worker checks every signed-in address against. To add or remove a person, edit `people/addresses` and apply; never
+  set a list on the Worker by hand (the `DASHBOARD_ALLOWED_EMAILS` Worker secret it replaces is deleted once the KV
+  read is live). v5 of the provider has no resource that sets one Worker secret without owning the Worker's code, so
+  KV it is. Writing it needs **Workers KV Storage Write** (permission group `f7f0eda5697f475c90846e879bab8666`) on
+  the provider token `cloudflare-tunnel-token`, added with one PUT of the token's own definition as the zone
+  permissions were. The namespace id reaches the Worker as the `DASHBOARD_CONFIG_KV_ID` variable of that
+  repository's `production` environment (output `claw_master_dashboard`).
 - **Cost shape.** CloudWatch bills every distinct combination of a metric's dimensions as its own custom metric
   (about $0.30 a month each) and every OTLP attribute becomes a dimension, so the proxy never crosses its axes:
   each metric carries at most three attributes and each axis (profile, user, box, model) has its own

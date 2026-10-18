@@ -12,10 +12,16 @@
 #      OAuth client). Its policy admits the owner and the people the owner named for it (the
 #      `claude_master_dashboard` list in people/addresses: Colton and Connor, 2026-10-10), never
 #      the family-wide cc-games allowlist as such: the dashboard names subscription accounts and
-#      the people using them. The app checks the Access assertion again, against its own
-#      DASHBOARD_ALLOWED_EMAILS, which must name the same people.
-#   2. The Worker's URL switches, which turn on only after Access covers it.
-#   3. A read-only AWS key for the Worker, which cannot assume an AWS role (Workers have no
+#      the people using them.
+#   2. The app's own allowlist. The Worker checks the Access assertion again, against a list it
+#      reads from the Workers KV namespace below (binding DASHBOARD_CONFIG, key allowed-emails).
+#      Terraform writes that key from the same local as the Access policy, so people/addresses is
+#      the one place to add or remove a person; nobody sets the Worker's list by hand. The second
+#      check matters after a removal: Access refuses the person's next sign-in at once, but a
+#      session it already issued lasts 24h, and the Worker refuses that session within about two
+#      minutes (KV's cache plus the Worker's own).
+#   3. The Worker's URL switches, which turn on only after Access covers it.
+#   4. A read-only AWS key for the Worker, which cannot assume an AWS role (Workers have no
 #      OIDC identity AWS accepts). It may only read CloudWatch metrics in this region.
 #
 # ORDER, because a Worker's Access destination is its immutable id and that exists only after the
@@ -25,8 +31,8 @@
 #   2. Set id (GET /accounts/<id>/workers/workers, or `wrangler deployments`) with urls = false
 #      and apply: Access adopts the Worker; nothing becomes reachable.
 #   3. Set urls = true here and workers_dev true in the repository's wrangler.jsonc; apply.
-# Never reverse 2 and 3. After step 2, set the Worker's secrets from output
-# "claw_master_dashboard" (docs/deploy.md in that repository).
+# Never reverse 2 and 3. After step 2, set the Worker's secrets and its KV namespace variable from
+# output "claw_master_dashboard" (docs/deploy.md in that repository).
 # ---------------------------------------------------------------------------------
 
 locals {
@@ -39,6 +45,11 @@ locals {
   ]
   # A Worker is left out until the first deploy has created it and its id is set.
   claw_master_dashboard_workers = { for w in local.claw_master_dashboard_worker_list : w.name => w if w.id != "" }
+
+  # Who the dashboard admits: the owner, then the people named for it. The ONE list: the Access policy reads it and
+  # Terraform writes it to the Worker's KV allowlist below. Unmarked as people.tf explains, each part on its own
+  # (nonsensitive() on the concatenation would leave the elements marked); the policy took exactly these values before.
+  claw_master_dashboard_people = concat([nonsensitive(local.people.owner)], try(nonsensitive(local.people.claude_master_dashboard), []))
 }
 
 resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
@@ -47,10 +58,38 @@ resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
   decision         = "allow"
   session_duration = "24h"
 
-  include = concat(
-    [{ email = { email = nonsensitive(local.people.owner) } }],
-    [for e in try(nonsensitive(local.people.claude_master_dashboard), []) : { email = { email = e } }],
-  )
+  include = [for e in local.claw_master_dashboard_people : { email = { email = e } }]
+}
+
+# ---------------------------------------------------------------------------------
+# The Worker's allowlist (2 above). Workers KV, because the pinned provider (ejc3/cloudflare 5.24.0) has no resource
+# that sets one secret on a Worker without owning its code: v5 dropped cloudflare_workers_secret, and a secret_text
+# binding exists only on cloudflare_workers_script / cloudflare_worker_version, which would take the code away from
+# the repository's Wrangler deploys. A KV value is a separate object: Terraform writes it, a deploy never touches it.
+#
+# The Worker binds the namespace by id (output claw_master_dashboard, allowlist_kv_namespace_id). The id is not a
+# credential; the deploy workflow takes it from the repository's production environment, as it takes the account id.
+# Writing it needs Workers KV Storage Write on the provider token (AGENTS.md, "The claw-master dashboard site").
+# The list is never empty (the owner is always on it), and the Worker admits nobody if the key is missing or empty.
+# ---------------------------------------------------------------------------------
+resource "cloudflare_workers_kv_namespace" "claw_master_dashboard_config" {
+  account_id = var.cloudflare_account_id
+  title      = "claw-master-dashboard-config"
+
+  lifecycle {
+    # The deployed Worker's binding names this id: a replacement would leave it bound to a deleted namespace, admitting
+    # nobody, until the repository's variable and a new deploy caught up.
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_kv" "claw_master_dashboard_allowed_emails" {
+  account_id   = var.cloudflare_account_id
+  namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id
+  key_name     = "allowed-emails"
+  # Comma-separated, as the DASHBOARD_ALLOWED_EMAILS secret it replaces was. Marked sensitive here because the
+  # provider's attribute is not: a plan shows that the list changed, never the addresses.
+  value = sensitive(join(",", local.claw_master_dashboard_people))
 }
 
 resource "cloudflare_zero_trust_access_application" "claw_master_dashboard" {
@@ -169,7 +208,7 @@ resource "aws_secretsmanager_secret_version" "claw_master_dashboard_reader" {
 # Agents on the metal boxes (#374): a service token of their own, so an agent can read what the dashboard shows
 # (`/api/claude-master/snapshot`) and check a deploy, as the owner does in a browser. The token is admitted by a
 # non_identity policy after the owner's; the Worker admits exactly its client id (DASHBOARD_SERVICE_TOKEN_CLIENT_ID,
-# matched against the assertion's common_name) and still checks every person against DASHBOARD_ALLOWED_EMAILS.
+# matched against the assertion's common_name) and still checks every person against its KV allowlist (above).
 # Readers: dev-server-role only (the metal boxes), which already reads the ClawMaster metrics and the
 # /claude-master/server log the dashboard is built from, so the page shows it nothing new. Not nextjs-dev-role:
 # every account there has sudo. Not the cc-games automation token or the Macs' token: revoking this touches nothing else.
@@ -255,5 +294,8 @@ output "claw_master_dashboard" {
     # The Worker secret DASHBOARD_SERVICE_TOKEN_CLIENT_ID (not secret: the client secret is the credential).
     agent_service_token_client_id = cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents.client_id
     agent_access_secret           = aws_secretsmanager_secret.claw_master_dashboard_agent_access.name
+    # The production environment's DASHBOARD_CONFIG_KV_ID variable in ejc3/claw-master-dashboard (not secret). The
+    # list itself is never an output.
+    allowlist_kv_namespace_id = cloudflare_workers_kv_namespace.claw_master_dashboard_config.id
   }
 }
