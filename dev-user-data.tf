@@ -541,7 +541,7 @@ fi
 # Shell setup
 ${local.shell_setup}
 
-# Only ARM terminates the outbound SSH tunnels from the two Macs; Host macbook needs cloudflared.
+# Only ARM gets `ssh mac` (EJ's MacBook Pro through Cloudflare Access); its proxy command needs cloudflared.
 ${local.macbook_cloudflared_install}
 ${local.mac_reverse_tunnel_setup}
 
