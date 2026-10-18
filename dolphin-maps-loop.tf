@@ -238,7 +238,7 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = [aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn]
+        Resource = [aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn, aws_secretsmanager_secret.exa.arn]
       },
       {
         Sid      = "WriteOwnLogs"
@@ -276,6 +276,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
     variables = {
       BROWSERBASE_SECRET_ID = aws_secretsmanager_secret.browserbase.name
       DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.deepseek.name
+      EXA_SECRET_ID         = aws_secretsmanager_secret.exa.name
       GITHUB_APP_SECRET_ID  = aws_secretsmanager_secret.dolphin_maps_loop_github_app.name
       LOOP_REPO             = "dolphin-labs-hq/dolphin-maps"
       LOOP_BRANCH           = "main"

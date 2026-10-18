@@ -1260,6 +1260,9 @@ Available if a task needs them; neither needs a key on disk.
   (their functions get `DEEPSEEK_SECRET_ID`) and admins may read it (`dev-ai-services.tf`; not dev-ebs-only). Export it with
   the same `eval "$(aws secretsmanager get-secret-value ... --secret-id deepseek/api-key ... | jq -r 'to_entries[] | ...')"`
   as Browserbase. Never onto a command line, into a file in a repo or a commit.
+- **Exa** (web search, page contents and crawling for agents), same readers as DeepSeek: secret `exa/api-key` (us-west-1),
+  JSON `EXA_API_KEY`; the two scraping Lambdas get `EXA_SECRET_ID` (`dev-ai-services.tf`). Export it the same way; never onto a
+  command line, into a file in a repo or a commit.
 - **App Store Connect** (Games Worth Watching's Apple apps: app record and TestFlight uploads),
   nextjs-dev only. One JSON secret, `games-worth-watching/app-store-connect` (us-west-1), holds
   `ISSUER_ID`, `KEY_ID`, `TEAM_ID` and `PRIVATE_KEY` (the .p8 text); only nextjs-dev-role and admins may read it

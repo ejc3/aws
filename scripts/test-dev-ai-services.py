@@ -70,8 +70,20 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
         for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
             src = (ROOT / f).read_text()
-            self.assertIn("aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn]", src)
+            self.assertIn("aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn, aws_secretsmanager_secret.exa.arn]", src)
             self.assertIn("DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.deepseek.name", src)
+
+    def test_exa_is_for_the_two_dev_roles_and_the_scrapers(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "exa"', TF)
+        self.assertNotRegex(TF, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        policy = block("aws_secretsmanager_secret_policy", "exa")
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.exa_readers)', policy)
+        self.assertIn("exa_readers = local.browserbase_readers", TF)
+        self.assertIn("resources = [aws_secretsmanager_secret.exa.arn]", block("aws_iam_policy_document", "exa_read"))
+        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }",
+                      block("aws_iam_role_policy_attachment", "exa_read"))
+        for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
+            self.assertIn("EXA_SECRET_ID         = aws_secretsmanager_secret.exa.name", (ROOT / f).read_text())
 
     def test_claw_master_backup_key_is_for_the_metal_role_only(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "claw_master_backup_key"', TF)

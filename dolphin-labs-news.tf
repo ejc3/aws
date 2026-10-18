@@ -252,7 +252,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_pass" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = [aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn]
+        Resource = [aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.deepseek.arn, aws_secretsmanager_secret.exa.arn]
       },
       {
         Sid      = "WriteOwnLogs"
@@ -289,6 +289,7 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
       NEWS_SECRET_ID        = aws_secretsmanager_secret.dolphin_labs_news.name
       BROWSERBASE_SECRET_ID = aws_secretsmanager_secret.browserbase.name
       DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.deepseek.name
+      EXA_SECRET_ID         = aws_secretsmanager_secret.exa.name
       NEWS_BEDROCK_REGION   = local.bedrock_haiku_region
       NEWS_BEDROCK_MODEL    = local.bedrock_haiku_profile
       NEWS_JOURNAL_BUCKET   = aws_s3_bucket.dolphin_labs_news.bucket
