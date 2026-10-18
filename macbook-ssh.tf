@@ -1,29 +1,27 @@
-# SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of its Remote Login,
-# so a connection needs both Cloudflare Access (a second factor) and an SSH key. The runbook,
-# both phases with their checks, is README "MacBook: Moving SSH behind Cloudflare Access".
+# SSH to EJ's MacBook Pro through Cloudflare: the tunnel and Access in front of the Mac's
+# desktop-session sshd, so a connection needs both Cloudflare Access (a second factor) and an SSH
+# key. The runbook is README "MacBook: Moving SSH behind Cloudflare Access".
 #
-#   macbook-ssh.cc-games.dev  -> the MacBook's Remote Login (ssh://localhost:22), keys only
+#   macbook-ssh.cc-games.dev  -> the Mac's desktop-session sshd (ssh://127.0.0.1:22222), keys only
+#
+# That sshd (LaunchAgent com.ejcampbell.fcvm-macbook.sshd, ~/.ssh/fcvm-macbook/sshd_config,
+# 127.0.0.1 only) runs in the logged-in desktop session and has Full Disk Access, so one session
+# reaches the external drive, sends Apple Events and uses the login keychain. It is the one SSH
+# endpoint on the Mac; macOS Remote Login (port 22) is no longer a route.
 #
 # Who gets in through Access:
 #   EJ                 -- the browser-manager owner policy (Google or one-time PIN)
 #   fcvm-arm's agents  -- one service token, `macbook-ssh-access` in Secrets Manager
 #
-# Client (fcvm-arm): `ssh macbook` with ProxyCommand ~/.ssh/macbook-access-proxy, which reads
-# the service token from Secrets Manager into TUNNEL_SERVICE_TOKEN_ID/_SECRET and execs
-# `cloudflared access ssh --hostname %h`. Never pass the token as --id/--secret: arguments
-# are visible to every user of the box in `ps`.
-#
-# Bring-up, phase 1 (this file): apply. Nothing changes for the MacBook yet: the reverse SSH tunnel
-# (mac-reverse-tunnels.tf) still carries `ssh macbook`. Phase 2, from fcvm-arm over that tunnel:
-# install the connector on the MacBook with the token below, check a connection through Cloudflare
-# succeeds with the service token and is refused without it, then move `Host macbook` to it
-# (mac-reverse-tunnels.tf), retire the reverse tunnel, and close the MacBook's port 22 to
-# everything but itself (pf).
+# Client (fcvm-arm): `ssh mac` (mac-reverse-tunnels.tf) with ProxyCommand ~/.ssh/mac-access-proxy,
+# which reads the service token from Secrets Manager into TUNNEL_SERVICE_TOKEN_ID/_SECRET and execs
+# `cloudflared access ssh --hostname %h`. Never pass the token as --id/--secret: arguments are
+# visible to every user of the box in `ps`.
 #
 # Both credentials are readable only by fcvm-arm's instance (the dev_server role, which fcvm-x86
 # shares, with ec2:SourceInstanceARN pinned to fcvm-arm): the connector token so it can be
-# installed on the MacBook over the existing route (no other path reaches the Mac), the service
-# token because fcvm-arm is the client. The connector token runs this one tunnel and nothing else.
+# installed on the MacBook over the existing route, the service token because fcvm-arm is the
+# client. The connector token runs this one tunnel and nothing else.
 
 locals {
   macbook_ssh_hostname = "macbook-ssh.cc-games.dev"
@@ -90,7 +88,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "macbook_ssh" {
     ingress = [
       {
         hostname = local.macbook_ssh_hostname
-        service  = "ssh://localhost:22"
+        # The desktop-session sshd, not Remote Login (22): see the header. 127.0.0.1, its only ListenAddress.
+        service = "ssh://127.0.0.1:22222"
         # The connector itself refuses a request without a valid Access token for this application.
         origin_request = {
           access = {

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 #
 # claude-master-mac-setup -- set a Mac up to use the shared Claude subscriptions through the Cloudflare
-# tunnel (claw-master-tunnel.tf), reaching it over the reverse tunnel the Mac keeps open to
-# fcvm-metal-arm (mac-reverse-tunnels.tf: `ssh mac` / `ssh macbook` from there).
+# tunnel (claw-master-tunnel.tf), reaching it from fcvm-metal-arm (mac-reverse-tunnels.tf: `ssh mac`
+# from there, through Cloudflare Access).
 #
-#   scripts/claw-master-mac-setup.sh macbook        run on a jumpbox as an AWS administrator
-#   scripts/claw-master-mac-setup.sh mac
+#   scripts/claw-master-mac-setup.sh mac        run on a jumpbox as an AWS administrator
 #
 # ADDITIVE AND OPT-IN. It installs into the user's home only (~/.local/bin, ~/.config/claude-master,
 # ~/Library/LaunchAgents) and leaves the Mac's own `claude`, its login and its settings alone: a
@@ -36,9 +35,9 @@ CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
 ALIAS=${1:-}
-[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claw-master-mac-setup.sh ALIAS   (mac or macbook: an ssh alias on fcvm-arm)" >&2; exit 2; }
+[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claw-master-mac-setup.sh ALIAS   (mac: the ssh alias on fcvm-arm)" >&2; exit 2; }
 
-# Run something on the Mac: jumpbox -> fcvm -> (reverse tunnel) -> Mac. stdin is passed through.
+# Run something on the Mac: jumpbox -> fcvm -> (Cloudflare Access) -> Mac. stdin is passed through.
 on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "ssh -o BatchMode=yes -o ConnectTimeout=10 $ALIAS $*"; }
 
 echo "0/6 the server must be serving the open listener (the tunnel leads nowhere otherwise)"
@@ -55,7 +54,7 @@ printf '%s\n' "$READY" | grep -q '^open listener: listening' || {
 printf '%s\n' "$CA" | grep -q 'BEGIN CERTIFICATE' || { echo "the server has no CA certificate yet" >&2; exit 1; }
 
 echo "1/6 reaching $ALIAS through fcvm"
-on_mac "'echo \$(hostname) \$(uname -sm)'" || { echo "$ALIAS is not connected: its reverse tunnel to fcvm is down (the Mac must be online and running its tunnel)" >&2; exit 1; }
+on_mac "'echo \$(hostname) \$(uname -sm)'" || { echo "$ALIAS is not connected: the Mac must be online, logged in and running its Cloudflare connector" >&2; exit 1; }
 [ "$(on_mac "'uname -sm'")" = "Darwin arm64" ] || { echo "this script installs the macOS arm64 builds" >&2; exit 1; }
 
 echo "2/6 installing claw-master $CM_TAG and cloudflared $CFD_VERSION (verified on the Mac)"
