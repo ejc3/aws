@@ -616,7 +616,8 @@ FAKE_AWS = r'''#!PYTHON -I
 # $FAKE_STATE/<vol>.attached the instance a volume is attached to (detached once that box is gone). Every call is
 # logged to $FAKE_STATE/calls. FAKE_NO_CAPACITY lists types with no capacity; FAKE_ATTACH_FAILS makes attach-volume
 # fail; FAKE_ATTACH_RACE makes it fail because another `up` attached it to the same box first; FAKE_IP_IN_USE=N makes
-# the first N run-instances fail with InvalidIPAddress.InUse.
+# the first N run-instances fail with InvalidIPAddress.InUse; FAKE_ATTACH_AT=N attaches a volume to its box just before
+# answering the Nth describe-volumes (another `up` on the same box got there in between).
 import os, sys
 state = os.environ["FAKE_STATE"]
 args = sys.argv[1:]
@@ -671,6 +672,10 @@ elif op == "describe-volumes":
         print("us-east-2c" if "AvailabilityZone" in opt("--query") else "None")
         sys.exit(0)
     vol = vol_of(name)
+    seen = int(box("describe-volumes-count") or 0) + 1
+    open(os.path.join(state, "describe-volumes-count"), "w").write(str(seen))
+    if str(seen) == os.environ.get("FAKE_ATTACH_AT"):
+        open(os.path.join(state, vol + ".attached"), "w").write(box(name.rsplit("-", 1)[0]).split()[0])
     att = box(vol + ".attached")
     live = att and any(att in box(n).split() for n in boxes())
     q = opt("--query")
@@ -744,6 +749,7 @@ class ScriptRuns(unittest.TestCase):
 
     def run_script(self, script, *args, user="colton", **env):
         (self.state / "calls").write_text("")
+        (self.state / "describe-volumes-count").write_text("0")
         r = subprocess.run(["bash", str(SCRIPTS / script), *args], env=dict(self.env, MEMBER_BOX_USER=user, **env),
                            capture_output=True, text=True, timeout=60)
         return r, (self.state / "calls").read_text().splitlines()
@@ -807,6 +813,15 @@ class ScriptRuns(unittest.TestCase):
         r, calls = self.run_script("wbox-member.sh", "up", user="colin")
         self.assertEqual(r.returncode, 1)
         self.assertIn("more than one wbox-colin exists", r.stderr)
+
+    def test_wbox_attach_found_done_by_another_up_meanwhile_is_success(self):
+        # the first read says detached; by the second, a concurrent `up` attached it to this same box
+        (self.state / "wbox-connor").write_text("i-222\n")
+        r, calls = self.run_script("wbox-member.sh", "up", user="connor", FAKE_ATTACH_AT="2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "running box=wbox-connor ip=10.0.0.7")
+        self.assertFalse([c for c in calls if "attach-volume" in c or "terminate" in c])
+        self.assertNotIn("waiting for it to be free", r.stderr)
 
     def test_wbox_waits_for_its_fixed_address_then_falls_back_to_the_larger_type(self):
         r, calls = self.run_script("wbox-member.sh", "up", FAKE_IP_IN_USE="2")
@@ -874,6 +889,52 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual(r.stdout.strip().splitlines()[-1],
                          "launched box=pbox-skevh region=us-east-2 az=us-east-2c type=c8g.48xlarge ip=203.0.113.7 work=persistent")
         self.assertIn("-i %s" % (self.home / ".ssh" / "member-box"), (self.state / "ssh").read_text())
+
+    def test_pbox_member_up_resumes_an_existing_box_instead_of_trusting_it(self):
+        # an interrupted launch left a running box without its work volume
+        (self.state / "pbox-skevh").write_text("i-7\n")
+        r, calls = self.run_script("parallel-box.sh", "up", user="skevh")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in calls if "run-instances" in c])
+        self.assertEqual([c for c in calls if "attach-volume" in c],
+                         ["ec2 attach-volume --region us-east-2 --volume-id vol-pbox-skevh-work --instance-id i-7 --device /dev/sdf"])
+        self.assertEqual(r.stdout.strip().splitlines()[-1],
+                         "running box=pbox-skevh region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
+        self.assertTrue((self.state / "ssh").exists(), "it waits for SSH as a fresh launch does")
+        # now attached: nothing to attach, still a running line
+        r, calls = self.run_script("parallel-box.sh", "up", user="skevh")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in calls if "attach-volume" in c or "terminate" in c])
+        self.assertIn("running box=pbox-skevh", r.stdout)
+
+    def test_pbox_member_attach_failures_and_races(self):
+        (self.state / "pbox-colin").write_text("i-8\n")
+        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_RACE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in calls if "terminate" in c])
+        (self.state / "vol-pbox-colin-work.attached").unlink()
+        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_FAILS="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ec2 terminate-instances --region us-east-2 --instance-ids i-8", calls)
+        # a fresh launch whose attach fails is terminated too
+        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_FAILS="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ec2 terminate-instances --region us-east-2 --instance-ids i-new-pbox-colin", calls)
+        # held by another instance: not taken, the box is ended rather than left waiting
+        (self.state / "pbox-colin").write_text("i-9\n")
+        (self.state / "pbox-colin-old").write_text("i-old\n")
+        (self.state / "vol-pbox-colin-work.attached").write_text("i-old")
+        r, calls = self.run_script("parallel-box.sh", "up", user="colin")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still in-use (attached to i-old)", r.stderr)
+        self.assertFalse([c for c in calls if "attach-volume" in c])
+
+    def test_pbox_owner_running_box_is_reported_as_before(self):
+        (self.state / "parallel-box").write_text("i-1\n")
+        r, calls = self.run_script("parallel-box.sh", "up", user="ejc3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
+        self.assertFalse([c for c in calls if "attach-volume" in c])
 
     def test_pbox_member_refuses_slots_kvm_and_fallback(self):
         for args in (("up", "2"), ("up", "kvm"), ("up", "--fallback"), ("up", "--regions", "us-east-1")):

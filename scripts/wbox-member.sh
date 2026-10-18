@@ -88,18 +88,22 @@ data_volume() {
     --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-' || true
 }
 
-# wait_volume_free: wait (up to 2 minutes) for the D: disk to be available; a box that was just
-# terminated may still be letting go of it. Sets VOL VSTATE AZ ATTACHED; fails if it stays busy.
+# wait_volume_free [ID]: wait (up to 2 minutes) for the D: disk to be available; a box that was
+# just terminated may still be letting go of it. Already attached to ID (another `up` on the same
+# box got there first) is success too. Sets VOL VSTATE AZ ATTACHED; fails if it stays busy.
 wait_volume_free() {
+  local target="${1:-}"
   read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
   [ -n "${VOL:-}" ] || { say "FATAL: no D: disk tagged $VOLTAG in $REGION (is member-wbox.tf applied?)"; return 1; }
   for _ in $(seq 1 24); do
+    [ -n "$target" ] && [ "$ATTACHED" = "$target" ] && return 0
     [ "$VSTATE" = "available" ] && return 0
     say "    D: disk $VOL is $VSTATE; waiting for it to be free..."
     sleep 5
     read -r VOL VSTATE AZ ATTACHED <<< "$(data_volume)"
   done
   [ "$VSTATE" = "available" ] && return 0
+  [ -n "$target" ] && [ "$ATTACHED" = "$target" ] && return 0
   say "FAILED: D: disk $VOL is still $VSTATE${ATTACHED:+ (attached to $ATTACHED)}. Is another $NAME running? $SELF status"
   return 1
 }
@@ -114,7 +118,11 @@ attach_data() {
     say "D: disk $VOL is attached to $id."
     return 0
   fi
-  if wait_volume_free; then
+  if wait_volume_free "$id"; then
+    if [ "$ATTACHED" = "$id" ]; then
+      say "D: disk $VOL is attached to $id."
+      return 0
+    fi
     # A launch template cannot carry an existing volume, and EC2 refuses an attach while the
     # instance is pending. Windows' setup waits for the disk, so attaching promptly is enough.
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$id" 2>/dev/null

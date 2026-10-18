@@ -372,7 +372,11 @@ wait_ready() {
           exit 1
         fi
       fi
-      echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+      if [ "${2:-}" = "running" ]; then
+        echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1"
+      else
+        echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+      fi
       exit 0
     fi
     [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
@@ -418,6 +422,46 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   return 1
 }
 
+# member_attach ID: make sure a member's work volume is attached to instance ID, attaching it if
+# it is not: the same checks for a fresh launch and for a box an earlier `up` left behind (an
+# interrupted launch, a failed first attach), whose boot is waiting for the disk. Two `up`s racing
+# to attach to the same box both succeed. A box that cannot get its disk is terminated: it would
+# only wait for it, at a 192-core price.
+member_attach() {
+  local id="$1" vol state az att out
+  read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+    --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+  [ -n "${vol:-}" ] || { say "FATAL: no work volume tagged $VOLTAG in $REGION"; return 1; }
+  for _ in $(seq 1 24); do
+    if [ "$att" = "$id" ]; then say "Work volume $vol is attached to $id."; return 0; fi
+    [ "$state" = "available" ] && break
+    say "    work volume $vol is $state${att:+ (attached to $att)}; waiting for it to be free..."
+    sleep 5
+    read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+      --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+  done
+  if [ "$state" = "available" ]; then
+    # EC2 rejects an attach while the instance is pending; the boot's mount loop waits for the device.
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$id" 2>/dev/null
+    if out=$(aws ec2 attach-volume --region "$REGION" --volume-id "$vol" --instance-id "$id" --device /dev/sdf 2>&1); then
+      say "Attached work volume $vol to $id."
+      return 0
+    fi
+    read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+      --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
+    if [ "$att" = "$id" ]; then say "Work volume $vol is attached to $id."; return 0; fi
+    say "FAILED to attach $vol to $id:"; printf '%s\n' "$out" | sed 's/^/  /' >&2
+  else
+    say "FAILED: work volume $vol is still $state${att:+ (attached to $att)}. Is another $NAME running? $SELF status"
+  fi
+  if aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" >/dev/null 2>&1; then
+    say "Terminated $id; nothing was changed on the volume."
+  else
+    say "Could not terminate $id either: run $SELF down"
+  fi
+  return 1
+}
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -430,6 +474,17 @@ case "$CMD" in
   up)
     member_key
     if locate_box; then
+      if [ -n "$MEMBER" ]; then
+        # Not taken as ready: it may be the box of an interrupted launch, waiting for its volume.
+        ID="$(box_id)"
+        say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
+        member_attach "$ID" || exit 1
+        CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
+          --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+          --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+        CHOSEN_AZ="$(box_az)"
+        wait_ready persistent running
+      fi
       IP="$(box_ip)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
       echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
@@ -486,9 +541,11 @@ case "$CMD" in
       # carry a pre-existing volume -- and EC2 rejects an attach while the instance is
       # still pending. The boot-time mount loop waits for the device, so it is racing this
       # attach and wins as long as we do it promptly.
-      aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
-      if ! aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
-             --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; then
+      if [ -n "$MEMBER" ]; then
+        member_attach "$ID" || exit 1
+      elif ! { aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null; \
+               aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
+                 --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; }; then
         say "FAILED to attach $VOL to $ID. The box is up but has no /mnt/work."
         say "Check: aws ec2 describe-volumes --region $REGION --volume-ids $VOL"
         exit 1
