@@ -1,18 +1,23 @@
 # vercel-env-secrets.tf
 #
-# AWS keeps every Vercel project's environment, so Vercel is not the only holder of a site's credentials. For dolphin-labs,
-# imagine, remote-claw and nest-step these containers are the SOURCE: vercel-env.tf writes the projects from them (change a value
+# AWS keeps every Vercel project's environment, so Vercel is not the only holder of a site's credentials. For imagine,
+# remote-claw and nest-step these containers are the SOURCE: vercel-env.tf writes the projects from them (change a value
 # here and apply). For the rest they are still records captured from Vercel, as described below.
 # One Secrets Manager container per project per Vercel target, `vercel-env/<site>/<target>` (JSON: variable name -> value),
 # for the sites that have variables:
 #
-#   colton-games   development preview production      dolphin-labs   development preview production
-#   dolphin-films  preview production
-#   nest-step      development preview production      imagine        preview production
-#   remote-claw    preview production                  ts-api         preview production
+#   colton-games   development preview production      nest-step      development preview production
+#   imagine        preview production                  remote-claw    preview production
+#   ts-api         preview production
 #
-# (dolphin-films' variables are written by Terraform from dolphin-films/{prod,nonprod}/* and people/addresses,
-# dolphin-films-vercel.tf: those stay the source and its records here are mirrors, as for colton-games' accounts.)
+# THE DOLPHIN SITES' CONTAINERS (local.vercel_env_dolphin) outlive their Vercel team, which is being deleted (2026-10-18,
+# dolphin-vercel-retired.tf). They are no longer records of Vercel and nothing captures into them:
+#   dolphin-labs   development preview production   vercel-env/dolphin-labs/production is the source the production
+#                  Worker dolphin-labs-prod's secrets are loaded from (`wrangler secret bulk`; AGENTS.md, "Which
+#                  production is behind Cloudflare"): change a value there, then load it into the Worker.
+#   dolphin-films  preview production               the last copy of what that Vercel project held. dolphin-films-prod's
+#                  secrets come from dolphin-films/{prod,nonprod}/* (dolphin-films.tf) and people/addresses instead.
+# Their names and Terraform addresses (aws_secretsmanager_secret.vercel_env["dolphin-labs/production"], ...) are unchanged.
 #
 # Terraform owns only the containers and who may read them (administration only); it never reads a value. Vercel never
 # returns a variable of type `sensitive` once saved, so the values are captured by `scripts/vercel-env-capture.py`, which
@@ -23,15 +28,19 @@
 
 locals {
   vercel_env_targets = {
-    "colton-games"  = ["development", "preview", "production"]
+    "colton-games" = ["development", "preview", "production"]
+    "imagine"      = ["preview", "production"]
+    "nest-step"    = ["development", "preview", "production"]
+    "remote-claw"  = ["preview", "production"]
+    "ts-api"       = ["preview", "production"]
+  }
+  vercel_env_records = toset(flatten([for site, targets in merge(local.vercel_env_targets, local.vercel_env_dolphin) : [for t in targets : "${site}/${t}"]]))
+
+  # Kept after the Dolphin sites left Vercel, and not capturable (no Vercel project any more): see the header.
+  vercel_env_dolphin = {
     "dolphin-films" = ["preview", "production"]
     "dolphin-labs"  = ["development", "preview", "production"]
-    "imagine"       = ["preview", "production"]
-    "nest-step"     = ["development", "preview", "production"]
-    "remote-claw"   = ["preview", "production"]
-    "ts-api"        = ["preview", "production"]
   }
-  vercel_env_records = toset(flatten([for site, targets in local.vercel_env_targets : [for t in targets : "${site}/${t}"]]))
 }
 
 resource "aws_secretsmanager_secret" "vercel_env" {

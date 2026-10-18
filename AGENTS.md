@@ -1497,19 +1497,19 @@ the data from before the move.
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
-on Vercel, Google sign-in, a Turso store) as four JSON secrets in us-west-1, split by environment so
-that production and non-production share nothing:
+served by the Worker `dolphin-films-prod`, Google sign-in, a Turso store) as four JSON secrets in us-west-1,
+split by environment so that production and non-production share nothing:
 
 - `dolphin-films/nonprod/auth` (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
-  `dolphin-films/nonprod/turso` (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`): local development and Vercel
-  previews. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
+  `dolphin-films/nonprod/turso` (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`): local development and
+  non-production. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
   without printing it:
   `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth
   --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.
   Never onto a command line, into a file in a repo or a commit.
 - `dolphin-films/prod/auth` and `dolphin-films/prod/turso`: production. Admins only; a dev box gets
-  `AccessDeniedException`, on purpose. Terraform writes the Vercel project's Production environment from them
-  (`dolphin-films-vercel.tf`); never set one of those names by hand in Vercel, or the next apply fails.
+  `AccessDeniedException`, on purpose. An administrator loads them into `dolphin-films-prod` with
+  `wrangler secret bulk` ("Which production is behind Cloudflare", below).
 - Turso has two kinds of credential. `turso/api-token` (above) is the account's platform token: it makes and
   deletes databases and mints their tokens, and the site never gets it. `TURSO_DATABASE_URL` and
   `TURSO_AUTH_TOKEN` are one database's address and a token for that database alone; those are the site's.
@@ -1517,25 +1517,24 @@ that production and non-production share nothing:
   write it to a 0600 JSON file for an administrator to put and never print it: a dev box cannot write a
   container. The site applies its own migrations when it deploys.
 - `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads, are the `dolphin_films`
-  key of `people/addresses` (`people.tf`); Terraform writes them with their environment's auth secret. Never
-  write an address into a file, a test, a commit or a pull request here.
-- `dolphin_films_vercel_ready` (`dolphin-films-vercel.tf`) names the containers Terraform reads. It is a
-  committed default, never a `-var`: a plan without the flag would propose deleting every variable.
+  key of `people/addresses` (`people.tf`), loaded into the Worker with its other secrets. Never write an
+  address into a file, a test, a commit or a pull request here.
+- **No Vercel.** The project was in the dolphin-labs Vercel team, which is being deleted (owner, 2026-10-18).
+  `dolphin-films-vercel.tf` is gone and `dolphin-vercel-retired.tf` makes Terraform forget the variables it wrote
+  there, without calling Vercel (see "Sites also deploying to Cloudflare Workers").
 - The asset builders run on the metal boxes with what the role already has: `browserbase/credentials`,
   `games/elevenlabs-api-key` (above) and Claude on Amazon Bedrock through the instance role
   (`BedrockRuntimeInvoke` in `dev-instance-common.tf`). There is no LLM API key to fetch.
 - Setting a value (admins): a 0600 JSON file and `put-secret-value`, as in `README.md`.
-- State: once `dolphin_films_vercel_ready` names a container, Terraform reads it and writes its values into
-  Vercel, so those values, the address lists and the dolphin-labs token's use are in Terraform state, as
-  colton-games' accounts are (`colton-games-accounts.tf`). State is readable by administration only, the same
-  boundary as the containers. Terraform is pinned to 1.10.3, so write-only arguments (1.11) are not
-  available. While the gate is empty nothing is read and nothing reaches state.
+- State: Terraform reads none of these values any more. What it wrote to Vercel before is still in older state
+  versions (administration only), and leaves the current state when the forget is applied.
 - CI runs on the app runners under the `dolphin` label with its own cap (`runner-app.tf`).
 
 ### Sites also deploying to Cloudflare Workers (staging copies)
 
-The owner's Vercel sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step, dolphin-maps) also deploy a second copy
-to Cloudflare Workers through OpenNext, from each repo's own GitHub Actions.
+The owner's sites (dolphin-labs, dolphin-films, imagine, remote-claw, colton-games, nest-step, dolphin-maps) deploy to Cloudflare
+Workers through OpenNext, from each repo's own GitHub Actions; imagine, remote-claw, colton-games and nest-step are also on Vercel.
+The Dolphin sites (dolphin-labs, dolphin-films, dolphin-maps) are Cloudflare-only: their Vercel team is being deleted (2026-10-18).
 
 **Standing rule (owner, 2026-10-11): Cloudflare is where the sites are going, so parity runs one way.** Every web app
 must work on Cloudflare Workers; nothing has to be brought to Vercel. A feature may use what only Cloudflare offers (Workers
@@ -1546,9 +1545,8 @@ deployment must keep working: a change may not break it, but new capability is b
 `<site>-stage` Workers), not host-local tools such as browser-manager (github.com/ejc3/browser-manager; bound to loopback on its host, reached through its
 own tunnel). Each app repository's agent instructions carry the matching section. Every secret lives in AWS Secrets Manager.
 Where it lives today: Cloudflare from `workers-stage/<site>` (loaded by `scripts/workers-stage-secrets.sh`); Vercel from the
-containers Terraform writes into the project for colton-games (`colton-games-accounts.tf`), dolphin-films
-(`dolphin-films-vercel.tf`) and, from `vercel-env.tf`, dolphin-labs, imagine, remote-claw and nest-step: for those four
-`vercel-env/<site>/<target>` is the SOURCE. Change a value there and apply, never in the Vercel dashboard; a variable added or
+containers Terraform writes into the project for colton-games (`colton-games-accounts.tf`) and, from `vercel-env.tf`,
+imagine, remote-claw and nest-step: for those three `vercel-env/<site>/<target>` is the SOURCE. Change a value there and apply, never in the Vercel dashboard; a variable added or
 removed in Vercel is picked up by re-running `scripts/vercel-env-inventory.py` (it writes `vercel-env-vars.tf`: ids, names,
 targets, sensitivity, never a value), and every existing variable is imported by its id, never recreated. A new app ships on
 Cloudflare. dolphin-maps (`dolphin-labs-hq/dolphin-maps`) was the last to come over (2026-10-11): `dolphin-maps-stage`,
@@ -1561,11 +1559,20 @@ values only, and `scripts/workers-stage-secrets.sh dolphin-maps` loads it.
 was upgraded and each production Worker given `limits.cpu_ms = 30000`. Never move a site's production onto a Free-plan account.
 
 **Which production is behind Cloudflare (2026-10-15).** cc-games.org itself is served by the `colton-games-prod` Worker since
-the cutover below, so its zone protection applies. The Dolphin sites left Vercel on 2026-10-15 (its dolphin-labs team is being
-retired): gamesworthwatching.com is served by `dolphin-labs-prod` (`gamesworthwatching-zone.tf`, which also runs the old Vercel
-cron as a Cron Trigger) and yourfantasymovie.com by `dolphin-films-prod` (`yourfantasymovie.tf`), each through proxied records
-and Workers routes behind one switch. Their secrets are production's, loaded from AWS with `wrangler secret bulk`: dolphin-labs
-from `vercel-env/dolphin-labs/production`, dolphin-films from `dolphin-films/prod/*` plus its address lists (`people.tf`).
+the cutover below, so its zone protection applies. The Dolphin sites left Vercel on 2026-10-15: gamesworthwatching.com is
+served by `dolphin-labs-prod` (`gamesworthwatching-zone.tf`, which also runs the old Vercel cron as a Cron Trigger) and
+yourfantasymovie.com by `dolphin-films-prod` (`yourfantasymovie.tf`), each through always-proxied records and Workers routes.
+There is no Vercel rollback: the owner decided on 2026-10-18 to delete the dolphin-labs Vercel team (projects dolphin-labs,
+dolphin-films, dolphin-maps, already disconnected from GitHub), so the switches are gone and nothing in this repository manages
+that team. `dolphin-vercel-retired.tf` makes Terraform forget what `vercel-env.tf` and the old `dolphin-films-vercel.tf` wrote
+there (`removed` blocks with `destroy = false`: no Vercel call, so the plan is the same before and after the deletion; its
+provider alias is a placeholder kept only until that apply, then the whole file goes in a follow-up), and destroys the AWS
+secret that held the team's token (`vercel-api-token-dolphin-labs`, with its policy and its 30-day recovery window). The records have no
+origin on purpose: each apex is the Workers-only placeholder A `192.0.2.1` and each www a proxied CNAME to its apex (kept a
+CNAME: the provider replaces a record whose type changes, and the delete would leave www without a record). Their secrets are production's, loaded
+from AWS with `wrangler secret bulk`: dolphin-labs from `vercel-env/dolphin-labs/production` (no longer a Vercel record: the
+Worker's source, kept in `vercel-env-secrets.tf` as `local.vercel_env_dolphin`), dolphin-films from `dolphin-films/prod/*` plus
+its address lists (`people.tf`).
 After each production deploy, dolphin-labs' `e2e (Production)` job reads `dolphin-labs-prod`'s Workers Logs with a token that
 can do nothing else (`dolphin-labs-ci-logs.tf`: a secret of the repository's `production-check` environment, main only). It
 reads every Worker's logs in the account, not just dolphin-labs-prod's: Cloudflare cannot scope it to one Worker.
@@ -1628,6 +1635,8 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   stdin and revoked and verified gone afterwards; an existing secret is never touched. `--skip-domain` keeps the custom domains off the throwaway but Vercel still moves the project's
   default `*.vercel.app` aliases to it (found on dolphin-labs 2026-10-07, which left that alias dangling for a few minutes), so the tool
   records the aliases first and sets them back after the delete. Re-run the tool for a site when its Vercel environment changes.
+  The Dolphin sites' containers (`vercel-env/dolphin-labs/*`, `vercel-env/dolphin-films/*`) stay but are no longer records and
+  the tool no longer knows those sites: their Vercel team is being deleted.
 - **Order for a new Worker, because Access protects a Worker by its immutable id and the id exists only after the first
   deploy:** (1) the site's first deploy with `workers_dev` and `preview_urls` false in its `wrangler.jsonc` creates the Worker
   with no public URL; (2) add its name and id to `local.workers_stage` with `urls = false` and apply (adopted, covered by

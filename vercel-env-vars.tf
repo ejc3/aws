@@ -3,80 +3,59 @@
 # whether it is sensitive. Never a value: values come from the vercel-env/<site>/<target> containers at plan time.
 locals {
   vercel_env_vars = {
-    "dolphin-labs/2yK4Xxiy5XL3SwXV" = { key = "BALLDONTLIE_API_KEY", target = ["production"], sensitive = true }
-    "dolphin-labs/cUgx7yyQzruqnhXS" = { key = "CRON_SECRET", target = ["production"], sensitive = true }
-    "dolphin-labs/3ZTROg7wvr0kF8Qy" = { key = "DUFFEL_API_KEY", target = ["preview"], sensitive = true }
-    "dolphin-labs/YUvSLp6nFLZRmvwd" = { key = "DUFFEL_API_KEY", target = ["production"], sensitive = true }
-    "dolphin-labs/5cmr7hgDvxmF49lr" = { key = "KV_REST_API_READ_ONLY_TOKEN", target = ["development", "preview"], sensitive = false }
-    "dolphin-labs/NGc54sCMlzjnZu0e" = { key = "KV_REST_API_READ_ONLY_TOKEN", target = ["production"], sensitive = false }
-    "dolphin-labs/JYBZUlE98MX2bS6S" = { key = "KV_REST_API_TOKEN", target = ["development", "preview"], sensitive = false }
-    "dolphin-labs/mjG8ESuawgi7QMdS" = { key = "KV_REST_API_TOKEN", target = ["production"], sensitive = false }
-    "dolphin-labs/rGYe51osxCs2FfQA" = { key = "KV_REST_API_URL", target = ["production"], sensitive = false }
-    "dolphin-labs/tWjlQ3D7ulYXF4N9" = { key = "KV_REST_API_URL", target = ["development", "preview"], sensitive = false }
-    "dolphin-labs/gWRzbCEtf1xhj6vN" = { key = "KV_URL", target = ["production"], sensitive = false }
-    "dolphin-labs/jbSVeVBMc7aH4Rjq" = { key = "KV_URL", target = ["development", "preview"], sensitive = false }
-    "dolphin-labs/7kFEzk6qKkcCFLJY" = { key = "NEXT_PUBLIC_COMEBACK_ALERTS_CFB_ENABLED", target = ["production"], sensitive = false }
-    "dolphin-labs/QKkzmNY2zpuwbh0M" = { key = "NEXT_PUBLIC_COMEBACK_ALERTS_NFL_ENABLED", target = ["production"], sensitive = false }
-    "dolphin-labs/2G7SvYgACFYCzU6w" = { key = "NEXT_PUBLIC_VAPID_PUBLIC_KEY", target = ["production"], sensitive = false }
-    "dolphin-labs/2y6yv3Rxi5gq7H7W" = { key = "REDIS_URL", target = ["development", "preview"], sensitive = false }
-    "dolphin-labs/bFDfHSjtnJQnyL2o" = { key = "REDIS_URL", target = ["production"], sensitive = false }
-    "dolphin-labs/xGAHsfaHYf9M0EPW" = { key = "SPORTS_PROVIDER_CFB", target = ["production"], sensitive = false }
-    "dolphin-labs/9F3GRCjs85LfKUmU" = { key = "SPORTS_PROVIDER_NFL", target = ["production"], sensitive = false }
-    "dolphin-labs/CRcjQdMMPgMBTJ9p" = { key = "VAPID_PRIVATE_KEY", target = ["production"], sensitive = true }
-    "dolphin-labs/fIZzUwccqUlQ0q7N" = { key = "VAPID_SUBJECT", target = ["production"], sensitive = false }
-    "imagine/nrC1NXIjrJCNJF8J"      = { key = "AUTH_GOOGLE_ID", target = ["production"], sensitive = false }
-    "imagine/Eb2wzrlD6SnGuMJP"      = { key = "AUTH_GOOGLE_SECRET", target = ["production"], sensitive = true }
-    "imagine/JEzGQiiMWC5MTxJb"      = { key = "AUTH_SECRET", target = ["production"], sensitive = true }
-    "imagine/WdCwLI113MzRRKg3"      = { key = "IMAGINE_AWS_REGION", target = ["production"], sensitive = false }
-    "imagine/X3AeUYylxHqDRgGT"      = { key = "IMAGINE_AWS_REGION", target = ["preview"], sensitive = false }
-    "imagine/PnOICgPqYgResZnu"      = { key = "IMAGINE_DB_TOKEN", target = ["production"], sensitive = true }
-    "imagine/s9iQlZDeZTonNtVw"      = { key = "IMAGINE_DB_TOKEN", target = ["preview"], sensitive = true }
-    "imagine/PHzwdtDBm2HNSFgV"      = { key = "IMAGINE_DB_URL", target = ["production"], sensitive = true }
-    "imagine/r5VwpCVgb4D7R62P"      = { key = "IMAGINE_DB_URL", target = ["preview"], sensitive = true }
-    "imagine/Z9Gkerv5w6goR8PT"      = { key = "IMAGINE_E2E_KEY", target = ["production"], sensitive = false }
-    "imagine/pS6eVSMXihYwDfuF"      = { key = "IMAGINE_ENV", target = ["production"], sensitive = false }
-    "imagine/aE2ZTm5cS8qAXAA0"      = { key = "IMAGINE_SCALE_FUNCTION", target = ["production"], sensitive = false }
-    "imagine/EetHFi2rbAvGFlVQ"      = { key = "IMAGINE_SCALE_ROLE_ARN", target = ["production"], sensitive = false }
-    "imagine/SLYWNx9NXQAbCv2T"      = { key = "IMAGINE_STORE", target = ["preview"], sensitive = false }
-    "imagine/iOUVat9xJaBwGxMn"      = { key = "IMAGINE_STORE", target = ["production"], sensitive = false }
-    "imagine/8EQAtUW1OEVz72Sa"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["preview"], sensitive = false }
-    "imagine/qLucGXXiJECjPpfD"      = { key = "IMAGINE_STORE_ROLE_ARN", target = ["production"], sensitive = false }
-    "imagine/JmRprF78qR6nGLnK"      = { key = "IMAGINE_TOKEN_SIGNING_KEY", target = ["production"], sensitive = true }
-    "imagine/8PHqSc6PPqV5pT1I"      = { key = "IMAGINE_URL", target = ["production"], sensitive = false }
-    "imagine/Mi1paHwIMOyXaUob"      = { key = "IMAGINE_WS_URL", target = ["production"], sensitive = false }
-    "imagine/zsBijtQOs75gEOaM"      = { key = "TURSO_AUTH_TOKEN", target = ["production"], sensitive = false }
-    "imagine/9yGkla7PrqprmKlY"      = { key = "TURSO_DATABASE_URL", target = ["production"], sensitive = false }
-    "nest-step/Lb1AWvNW52frqgzK"    = { key = "NEXT_PUBLIC_DEV_SUPABASE_REDIRECT_URL", target = ["development"], sensitive = false }
-    "nest-step/1zsxDNnidpNx5Bh5"    = { key = "NEXT_PUBLIC_SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/5uuIoghAcfVzFFYZ"    = { key = "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/XW3CVP3Nm7vEfp6g"    = { key = "NEXT_PUBLIC_SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/fbe45N3zgMDILfnv"    = { key = "POSTGRES_DATABASE", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/MooNWjyBYiwySliw"    = { key = "POSTGRES_HOST", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/I6zfph2SpSImD5YO"    = { key = "POSTGRES_PASSWORD", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/pY8Kime1nA7mkxFV"    = { key = "POSTGRES_PRISMA_URL", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/tsT0VGR67PLW3zEi"    = { key = "POSTGRES_URL", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/dVHWG2HtJAyTU52c"    = { key = "POSTGRES_URL_NON_POOLING", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/IDKbxRiYY6Cbo4NO"    = { key = "POSTGRES_USER", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/ONFtsJyArMoAebuw"    = { key = "SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/IZgVFtgz7e3aDk4p"    = { key = "SUPABASE_JWT_SECRET", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/w5xnii2KCY9TTHtc"    = { key = "SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/EeW78cX0YOE7L5Fr"    = { key = "SUPABASE_SECRET_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/rzvnMz3SJ0RurhAJ"    = { key = "SUPABASE_SERVICE_ROLE_KEY", target = ["development", "preview", "production"], sensitive = false }
-    "nest-step/DFCFMWpkzEoSZzHJ"    = { key = "SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
-    "remote-claw/CAI1jCoPYNPLnLZe"  = { key = "BROKER_BACKEND", target = ["production"], sensitive = true }
-    "remote-claw/T3XGYlTpOvlLB5Ph"  = { key = "BROKER_BACKEND", target = ["preview"], sensitive = false }
-    "remote-claw/TkYmrlQ8pfUyoEqv"  = { key = "CRON_SECRET", target = ["preview", "production"], sensitive = false }
-    "remote-claw/xwW5XcSCLLcRCOzV"  = { key = "DEV_SEED_TOKEN", target = ["preview"], sensitive = false }
-    "remote-claw/hJEGvSkpiLQDh1VP"  = { key = "TEMPORAL_ADDRESS", target = ["preview", "production"], sensitive = false }
-    "remote-claw/alay24rrhTPPLKxe"  = { key = "TEMPORAL_API_KEY", target = ["preview", "production"], sensitive = false }
-    "remote-claw/aK4UlkAc4tgWcMyx"  = { key = "TEMPORAL_NAMESPACE", target = ["preview", "production"], sensitive = false }
-    "remote-claw/GoP5QoTd1gsHijQY"  = { key = "TURSO_API_TOKEN", target = ["production"], sensitive = true }
-    "remote-claw/JipOMAoyi1vhbf42"  = { key = "TURSO_API_TOKEN", target = ["preview"], sensitive = false }
-    "remote-claw/40kVR6QT1TkuOvwO"  = { key = "TURSO_GROUP", target = ["production"], sensitive = true }
-    "remote-claw/Ws3ROYzr1fDIs83X"  = { key = "TURSO_GROUP", target = ["preview"], sensitive = false }
-    "remote-claw/BWhhU1lDkK4nNYco"  = { key = "TURSO_GROUP_AUTH_TOKEN", target = ["production"], sensitive = true }
-    "remote-claw/UDZApP40j4Fu2Duf"  = { key = "TURSO_GROUP_AUTH_TOKEN", target = ["preview"], sensitive = false }
-    "remote-claw/3VoL1H1wY90x13wG"  = { key = "TURSO_ORG", target = ["production"], sensitive = true }
-    "remote-claw/BCaTHaQ87XN1J5CD"  = { key = "TURSO_ORG", target = ["preview"], sensitive = false }
+    "imagine/nrC1NXIjrJCNJF8J"     = { key = "AUTH_GOOGLE_ID", target = ["production"], sensitive = false }
+    "imagine/Eb2wzrlD6SnGuMJP"     = { key = "AUTH_GOOGLE_SECRET", target = ["production"], sensitive = true }
+    "imagine/JEzGQiiMWC5MTxJb"     = { key = "AUTH_SECRET", target = ["production"], sensitive = true }
+    "imagine/WdCwLI113MzRRKg3"     = { key = "IMAGINE_AWS_REGION", target = ["production"], sensitive = false }
+    "imagine/X3AeUYylxHqDRgGT"     = { key = "IMAGINE_AWS_REGION", target = ["preview"], sensitive = false }
+    "imagine/PnOICgPqYgResZnu"     = { key = "IMAGINE_DB_TOKEN", target = ["production"], sensitive = true }
+    "imagine/s9iQlZDeZTonNtVw"     = { key = "IMAGINE_DB_TOKEN", target = ["preview"], sensitive = true }
+    "imagine/PHzwdtDBm2HNSFgV"     = { key = "IMAGINE_DB_URL", target = ["production"], sensitive = true }
+    "imagine/r5VwpCVgb4D7R62P"     = { key = "IMAGINE_DB_URL", target = ["preview"], sensitive = true }
+    "imagine/Z9Gkerv5w6goR8PT"     = { key = "IMAGINE_E2E_KEY", target = ["production"], sensitive = false }
+    "imagine/pS6eVSMXihYwDfuF"     = { key = "IMAGINE_ENV", target = ["production"], sensitive = false }
+    "imagine/aE2ZTm5cS8qAXAA0"     = { key = "IMAGINE_SCALE_FUNCTION", target = ["production"], sensitive = false }
+    "imagine/EetHFi2rbAvGFlVQ"     = { key = "IMAGINE_SCALE_ROLE_ARN", target = ["production"], sensitive = false }
+    "imagine/SLYWNx9NXQAbCv2T"     = { key = "IMAGINE_STORE", target = ["preview"], sensitive = false }
+    "imagine/iOUVat9xJaBwGxMn"     = { key = "IMAGINE_STORE", target = ["production"], sensitive = false }
+    "imagine/8EQAtUW1OEVz72Sa"     = { key = "IMAGINE_STORE_ROLE_ARN", target = ["preview"], sensitive = false }
+    "imagine/qLucGXXiJECjPpfD"     = { key = "IMAGINE_STORE_ROLE_ARN", target = ["production"], sensitive = false }
+    "imagine/JmRprF78qR6nGLnK"     = { key = "IMAGINE_TOKEN_SIGNING_KEY", target = ["production"], sensitive = true }
+    "imagine/8PHqSc6PPqV5pT1I"     = { key = "IMAGINE_URL", target = ["production"], sensitive = false }
+    "imagine/Mi1paHwIMOyXaUob"     = { key = "IMAGINE_WS_URL", target = ["production"], sensitive = false }
+    "imagine/zsBijtQOs75gEOaM"     = { key = "TURSO_AUTH_TOKEN", target = ["production"], sensitive = false }
+    "imagine/9yGkla7PrqprmKlY"     = { key = "TURSO_DATABASE_URL", target = ["production"], sensitive = false }
+    "nest-step/Lb1AWvNW52frqgzK"   = { key = "NEXT_PUBLIC_DEV_SUPABASE_REDIRECT_URL", target = ["development"], sensitive = false }
+    "nest-step/1zsxDNnidpNx5Bh5"   = { key = "NEXT_PUBLIC_SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/5uuIoghAcfVzFFYZ"   = { key = "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/XW3CVP3Nm7vEfp6g"   = { key = "NEXT_PUBLIC_SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/fbe45N3zgMDILfnv"   = { key = "POSTGRES_DATABASE", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/MooNWjyBYiwySliw"   = { key = "POSTGRES_HOST", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/I6zfph2SpSImD5YO"   = { key = "POSTGRES_PASSWORD", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/pY8Kime1nA7mkxFV"   = { key = "POSTGRES_PRISMA_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/tsT0VGR67PLW3zEi"   = { key = "POSTGRES_URL", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/dVHWG2HtJAyTU52c"   = { key = "POSTGRES_URL_NON_POOLING", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/IDKbxRiYY6Cbo4NO"   = { key = "POSTGRES_USER", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/ONFtsJyArMoAebuw"   = { key = "SUPABASE_ANON_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/IZgVFtgz7e3aDk4p"   = { key = "SUPABASE_JWT_SECRET", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/w5xnii2KCY9TTHtc"   = { key = "SUPABASE_PUBLISHABLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/EeW78cX0YOE7L5Fr"   = { key = "SUPABASE_SECRET_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/rzvnMz3SJ0RurhAJ"   = { key = "SUPABASE_SERVICE_ROLE_KEY", target = ["development", "preview", "production"], sensitive = false }
+    "nest-step/DFCFMWpkzEoSZzHJ"   = { key = "SUPABASE_URL", target = ["development", "preview", "production"], sensitive = false }
+    "remote-claw/CAI1jCoPYNPLnLZe" = { key = "BROKER_BACKEND", target = ["production"], sensitive = true }
+    "remote-claw/T3XGYlTpOvlLB5Ph" = { key = "BROKER_BACKEND", target = ["preview"], sensitive = false }
+    "remote-claw/TkYmrlQ8pfUyoEqv" = { key = "CRON_SECRET", target = ["preview", "production"], sensitive = false }
+    "remote-claw/xwW5XcSCLLcRCOzV" = { key = "DEV_SEED_TOKEN", target = ["preview"], sensitive = false }
+    "remote-claw/hJEGvSkpiLQDh1VP" = { key = "TEMPORAL_ADDRESS", target = ["preview", "production"], sensitive = false }
+    "remote-claw/alay24rrhTPPLKxe" = { key = "TEMPORAL_API_KEY", target = ["preview", "production"], sensitive = false }
+    "remote-claw/aK4UlkAc4tgWcMyx" = { key = "TEMPORAL_NAMESPACE", target = ["preview", "production"], sensitive = false }
+    "remote-claw/GoP5QoTd1gsHijQY" = { key = "TURSO_API_TOKEN", target = ["production"], sensitive = true }
+    "remote-claw/JipOMAoyi1vhbf42" = { key = "TURSO_API_TOKEN", target = ["preview"], sensitive = false }
+    "remote-claw/40kVR6QT1TkuOvwO" = { key = "TURSO_GROUP", target = ["production"], sensitive = true }
+    "remote-claw/Ws3ROYzr1fDIs83X" = { key = "TURSO_GROUP", target = ["preview"], sensitive = false }
+    "remote-claw/BWhhU1lDkK4nNYco" = { key = "TURSO_GROUP_AUTH_TOKEN", target = ["production"], sensitive = true }
+    "remote-claw/UDZApP40j4Fu2Duf" = { key = "TURSO_GROUP_AUTH_TOKEN", target = ["preview"], sensitive = false }
+    "remote-claw/3VoL1H1wY90x13wG" = { key = "TURSO_ORG", target = ["production"], sensitive = true }
+    "remote-claw/BCaTHaQ87XN1J5CD" = { key = "TURSO_ORG", target = ["preview"], sensitive = false }
   }
 }

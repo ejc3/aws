@@ -1,18 +1,19 @@
 # yourfantasymovie.com: the hostname of the Fantasy Films site (dolphin-labs-hq/dolphin-films, films/web).
 #
 # Registered through Cloudflare Registrar on 2026-10-05 (see AGENTS.md, "Cloudflare: domains, tokens"), so its zone is in this
-# account already. The Vercel project (`dolphin-films`, team `dolphin-labs`, root directory films/web, Git-connected to the repo)
-# and its two domains were created with the Vercel CLI as the owner, like imagine's: the Terraform Vercel provider here reaches
-# the colton-games team only (vercel.tf). Only the DNS is Terraform's.
+# account already.
 #
-# PRODUCTION IS ON CLOUDFLARE (2026-10-15; the dolphin-labs Vercel team is being retired). With
-# local.yourfantasymovie_on_cloudflare the records are proxied and two Workers routes send yourfantasymovie.com/* and
-# www.yourfantasymovie.com/* to the Worker dolphin-films-prod (films/web/wrangler.jsonc env.production, deployed by the
-# repository's films-cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex, as Vercel did). The record contents
-# stay Vercel's (GET /v6/domains/yourfantasymovie.com/config, "recommendedIPv4" and "recommendedCNAME", rank 1): a route
-# answers every request, so nothing reaches them, and setting the switch to false is the rollback while the Vercel project
-# exists. DNS-only is what Vercel needs (proxying breaks its certificate issuance, vercel-cc-games.tf). Either half alone is
-# harmless: a route on a DNS-only record does nothing, a proxied record without the route reaches Vercel.
+# SERVED BY THE WORKER dolphin-films-prod, and only by it. The records are proxied and two Workers routes send
+# yourfantasymovie.com/* and www.yourfantasymovie.com/* to dolphin-films-prod (films/web/wrangler.jsonc env.production, deployed
+# by the repository's films-cloudflare-stage.yml; its cf-worker.mjs redirects www to the apex). Production moved off Vercel on
+# 2026-10-15 and the dolphin-labs Vercel team, which held the dolphin-films project, is being deleted (2026-10-18,
+# dolphin-vercel-retired.tf), so there is no Vercel rollback: no switch, and nothing here points at Vercel.
+#
+# NO ORIGIN, ON PURPOSE. A proxied record exists only so the routes have a hostname to match; a route answers every request,
+# so the content is never contacted. The apex is the standard Workers-only placeholder, A 192.0.2.1 (TEST-NET-1, routes
+# nowhere), and www is a proxied CNAME to the apex, so neither names anything outside this zone. www stays a CNAME because the
+# provider replaces a record whose type changes and Cloudflare refuses an A record beside a CNAME of the same name: changing
+# the type would leave www without a record between the delete and the create. The zone has no AAAA records.
 
 variable "yourfantasymovie_zone_id" {
   description = "Cloudflare zone id for yourfantasymovie.com (registered through Cloudflare Registrar 2026-10-05)"
@@ -21,34 +22,39 @@ variable "yourfantasymovie_zone_id" {
 }
 
 locals {
-  yourfantasymovie_apex_ips      = ["216.150.1.1", "216.150.16.1"]
-  yourfantasymovie_on_cloudflare = true
-  yourfantasymovie_worker        = "dolphin-films-prod"
+  yourfantasymovie_worker = "dolphin-films-prod"
 }
 
 resource "cloudflare_dns_record" "yourfantasymovie_apex" {
-  for_each = toset(local.yourfantasymovie_apex_ips)
-  zone_id  = var.yourfantasymovie_zone_id
-  name     = "yourfantasymovie.com"
-  type     = "A"
-  content  = each.value
-  proxied  = local.yourfantasymovie_on_cloudflare
-  ttl      = local.yourfantasymovie_on_cloudflare ? 1 : 300
-  comment  = local.yourfantasymovie_on_cloudflare ? "proxied; served by Worker ${local.yourfantasymovie_worker}" : "vercel apex; Fantasy Films (dolphin-films, films/web)"
+  zone_id = var.yourfantasymovie_zone_id
+  name    = "yourfantasymovie.com"
+  type    = "A"
+  content = "192.0.2.1"
+  proxied = true
+  ttl     = 1
+  comment = "proxied; Worker ${local.yourfantasymovie_worker} route serves all; origin unreachable on purpose"
+}
+
+# The apex used to be two A records (Vercel's two addresses, for_each by address). One becomes the placeholder in place; the
+# other, cloudflare_dns_record.yourfantasymovie_apex["216.150.16.1"], is deleted (two identical placeholder records are
+# refused). The apex keeps a proxied record throughout.
+moved {
+  from = cloudflare_dns_record.yourfantasymovie_apex["216.150.1.1"]
+  to   = cloudflare_dns_record.yourfantasymovie_apex
 }
 
 resource "cloudflare_dns_record" "yourfantasymovie_www" {
   zone_id = var.yourfantasymovie_zone_id
   name    = "www"
   type    = "CNAME"
-  content = "ecf035147d87bc65.vercel-dns-016.com"
-  proxied = local.yourfantasymovie_on_cloudflare
-  ttl     = local.yourfantasymovie_on_cloudflare ? 1 : 300
-  comment = local.yourfantasymovie_on_cloudflare ? "proxied; Worker ${local.yourfantasymovie_worker} redirects (308) to the apex" : "vercel www; redirects (308) to yourfantasymovie.com"
+  content = "yourfantasymovie.com"
+  proxied = true
+  ttl     = 1
+  comment = "proxied; Worker ${local.yourfantasymovie_worker} route serves all (308 to apex); no origin"
 }
 
 resource "cloudflare_workers_route" "yourfantasymovie" {
-  for_each = local.yourfantasymovie_on_cloudflare ? toset(["yourfantasymovie.com/*", "www.yourfantasymovie.com/*"]) : toset([])
+  for_each = toset(["yourfantasymovie.com/*", "www.yourfantasymovie.com/*"])
   zone_id  = var.yourfantasymovie_zone_id
   pattern  = each.value
   script   = local.yourfantasymovie_worker
