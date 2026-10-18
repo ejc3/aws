@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """dolphin-vercel-retired.tf: the dolphin-labs Vercel team is being deleted, so no Terraform here manages it any more.
 What vercel-env.tf and the old dolphin-films-vercel.tf managed there is FORGOTTEN (removed blocks, destroy = false: no
-Vercel call, so the plan is the same before and after the deletion), the provider alias stays only as a placeholder that
+Vercel call, so the plan is the same before and after the deletion), the AWS secret that held its token and that secret's
+policy are DESTROYED, the provider alias stays only as a placeholder that
 reads no secret, and the AWS containers that feed the Cloudflare production Workers stay."""
 import re
 import unittest
@@ -54,19 +55,24 @@ class NothingManagesTheTeam(unittest.TestCase):
             self.assertNotRegex(text, r'"dolphin-(labs|films)": \(', script)
 
 
-class ForgottenNotDestroyed(unittest.TestCase):
-    def removed(self):
-        return re.findall(r"^removed \{\n  from = (\S+)\n\n  lifecycle \{\n    destroy = false\n  \}\n\}$", RETIRED, re.M)
+class VercelForgottenAwsDestroyed(unittest.TestCase):
+    def removed(self, destroy):
+        return re.findall(r"^removed \{\n  from = (\S+)\n\n  lifecycle \{\n    destroy = %s\n  \}\n\}$" % destroy, RETIRED, re.M)
 
-    def test_exactly_these_four_are_forgotten_and_none_destroyed(self):
-        self.assertEqual(sorted(self.removed()), [
-            "aws_secretsmanager_secret.dolphin_films_vercel_api_token",
-            "aws_secretsmanager_secret_policy.dolphin_films_vercel_api_token",
+    def test_the_vercel_objects_are_forgotten(self):
+        # No Vercel call: the plan is the same before and after the team is deleted.
+        self.assertEqual(sorted(self.removed("false")), [
             "vercel_project_environment_variable.dolphin_films",
             "vercel_project_environment_variable.vercel_env_dolphin_labs",
         ])
+
+    def test_the_aws_token_container_and_its_policy_are_destroyed(self):
+        # AWS changes go through Terraform: no hand deletion is left behind.
+        self.assertEqual(sorted(self.removed("true")), [
+            "aws_secretsmanager_secret.dolphin_films_vercel_api_token",
+            "aws_secretsmanager_secret_policy.dolphin_films_vercel_api_token",
+        ])
         self.assertEqual(RETIRED.count("removed {"), 4)
-        self.assertNotIn("destroy = true", RETIRED)
 
     def test_the_provider_alias_is_a_placeholder_that_reads_nothing(self):
         # Terraform refuses to plan an object whose provider configuration is gone, a forget included, so the alias stays

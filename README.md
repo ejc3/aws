@@ -284,7 +284,7 @@ aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-films
 
 The site is served by `dolphin-films-prod` on Cloudflare (`yourfantasymovie.tf`). Its Vercel project was in the
 dolphin-labs team, which is being deleted, and Terraform no longer writes to it (`dolphin-vercel-retired.tf`
-forgets what it wrote). `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads,
+forgets what it wrote and destroys the `vercel-api-token-dolphin-labs` secret). `FILMS_SEED_EMAILS` and `FILMS_ADMIN_EMAILS`, the lists of addresses the site reads,
 come from the `dolphin_films` key of the `people/addresses` secret (`{"prod": {"seeds": [...], "admins": [...]},
 "nonprod": {...}}`) and are loaded into the Worker with its other secrets. No address belongs in this repository.
 
