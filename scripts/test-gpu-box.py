@@ -232,11 +232,11 @@ class WatchdogHarness(unittest.TestCase):
         idle = [b for b in calls['body'] if 'below' in b]
         self.assertTrue(any('gbox up 3\n' in b for b in idle), idle)
         # each parallel box's alert names ITS slot: the restart command selects that slot's work volume
-        for cmd in ('pbox up 2\n', 'pbox up 3\n', 'pbox up 8\n', 'pbox up\n'):
+        for cmd in ('pbox up 2 FLAVOR\n', 'pbox up 3 FLAVOR\n', 'pbox up 8 FLAVOR\n', 'pbox up FLAVOR\n'):
             self.assertTrue(any(cmd in b for b in idle), (cmd, idle))
         # a member's pbox-<person> is not a slot: its notice names the person, never a slot number
         member = [b for b in idle if 'i-mc' in b][0]
-        self.assertIn('pbox up   (run by colton)\n', member)
+        self.assertIn('pbox up FLAVOR   (run by colton)\n', member)
 
     def test_a_fallback_boxs_notice_says_its_fresh_volume_is_gone(self):
         # pbox-fallback.tf's boxes run on a fresh volume deleted with them: "untouched" would send the owner looking.

@@ -1,7 +1,7 @@
 # pbox-fallback.tf
 #
-# FALLBACK SITES for the parallel boxes: where `pbox up N --fallback` (scripts/parallel-box.sh) launches when the home AZ
-# (ohio-pbox.tf, local.ohio_pbox_az) has no capacity for any instance type on the list. One site per US region
+# FALLBACK SITES for the parallel boxes: where `pbox up N FLAVOR --fallback` (scripts/parallel-box.sh) launches when the home AZ
+# (ohio-pbox.tf, local.ohio_pbox_az) has no capacity for any instance type of the flavor. One site per US region
 # (modules/pbox-fallback-site), covering every AZ of that region except the home AZ.
 #
 # A FALLBACK BOX STARTS WITH AN EMPTY WORK VOLUME. The persistent work volumes are AZ-locked at home and are not copied
@@ -9,7 +9,7 @@
 # deleted with it, so nothing on a fallback box outlives it, and the shared NFS scratch (/srv/io, us-west-2) is not
 # mounted: there is no peering to these VPCs.
 #
-# Plain `pbox up N` does not use any of this. It launches at home as before and, when the home AZ is out of capacity,
+# Plain `pbox up N FLAVOR` does not use any of this. It launches at home as before and, when the home AZ is out of capacity,
 # exits with a distinct status that names --fallback, so the caller (often an agent) decides whether a box with an empty
 # disk somewhere else is acceptable.
 #
@@ -77,6 +77,7 @@ locals {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y parallel build-essential git htop
+    ${local.pbox_local_nvme_setup}
 
     echo "* soft nofile 1048576" >> /etc/security/limits.conf
     echo "* hard nofile 1048576" >> /etc/security/limits.conf

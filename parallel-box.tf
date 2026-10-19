@@ -1,12 +1,11 @@
 # parallel-box.tf
 #
-# On-demand 192-core Graviton spot box for embarrassingly parallel work, with a persistent 300GB data disk that OUTLIVES the
-# instance. The boxes live in us-east-2 (ohio-pbox.tf: network, volumes, launch templates, watchdog); this file keeps what is
-# still us-west-2's.
+# On-demand Graviton spot box for parallel work, with a persistent 300GB data disk that OUTLIVES the instance. The boxes live in
+# us-east-2 (ohio-pbox.tf: network, volumes, launch templates, watchdog); this file keeps what is still us-west-2's.
 #
-# WHY c8g.48xlarge: 192 vCPU is the ceiling for Graviton across every family (c8g/m8g/r8g/x8g all cap at 48xlarge), and c8g is
-# the compute-optimized one, so it is the cheapest per core. Graviton runs one thread per core, so 192 vCPU really is 192 cores
-# -- unlike Intel, where 384 vCPU is 192 cores with SMT.
+# SIZE: 32 to 192 vCPU, by flavor (pbox-flavors.tf: the work's shape and size, which the caller must name). 192 vCPU is the
+# ceiling for Graviton across every family (c8g/m8g/r8g/x8g all cap at 48xlarge). Graviton runs one thread per core, so 192
+# vCPU really is 192 cores -- unlike Intel, where 384 vCPU is 192 cores with SMT.
 #
 # WHERE: they ran in us-west-2d until 2026-10-05 (us-west-1 has two AZs and was capacity-starved for 192-core instances) and
 # moved to us-east-2c, about 30% cheaper for the same pool. That site -- its two work volumes, the two snapshots each move took,
@@ -15,7 +14,7 @@
 # LIFECYCLE: the INSTANCE is not terraform's; it is launched from the launch template in parallel-box-launch.tf by
 # scripts/parallel-box.sh and terminated either by that script or by the idle watchdog.
 #
-#     scripts/parallel-box.sh up | down | status | ssh      (or `pbox ...` on a dev box)
+#     scripts/parallel-box.sh up FLAVOR | down | status | ssh | flavors      (or `pbox ...` on a dev box)
 #
 # COST: the instance is the expensive part. Down means $0 compute.
 

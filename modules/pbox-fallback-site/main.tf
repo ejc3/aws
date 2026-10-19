@@ -1,6 +1,6 @@
 # modules/pbox-fallback-site
 #
-# One region's FALLBACK site for the parallel boxes (pbox-fallback.tf): where `pbox up N --fallback` launches when the
+# One region's FALLBACK site for the parallel boxes (pbox-fallback.tf): where `pbox up N FLAVOR --fallback` launches when the
 # home AZ (ohio-pbox.tf) has no capacity. Everything a launch needs that is regional: a VPC with one public subnet per
 # listed AZ, a security group, a key pair, the AMI, one launch template per box, a flow log, and (where no other
 # watchdog already runs in this region) the idle watchdog.

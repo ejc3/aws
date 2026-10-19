@@ -3,7 +3,7 @@
 # EACH MEMBER'S PBOX: one many-core Graviton spot box per person in local.member_box_people
 # (member-boxes.tf), "pbox-<person>", with a persistent 100 GB work volume of its own, in Ohio
 # next to the owner's parallel boxes (ohio-pbox.tf: the VPC, subnet, security group and key
-# pair are shared; nothing of the owner's eight slots changes). A member runs `pbox up` /
+# pair are shared; nothing of the owner's eight slots changes). A member runs `pbox up FLAVOR` /
 # `pbox down` / `pbox ssh` from their own account: scripts/parallel-box.sh takes no slot number
 # for a member and acts on their box only.
 #
@@ -16,8 +16,8 @@
 #     data another's job wrote there;
 #   - no fallback sites: the box has a fixed address and a home volume, nothing else;
 #   - the person's own SSH key (member-boxes.tf), not the dev-hop key;
-#   - spot only, IMDSv2, an encrypted root, and only the instance types in
-#     local.member_pbox_types (the script's default list), all enforced by the grant;
+#   - spot only, IMDSv2 and an encrypted root, enforced by the grant, and only the instance types of
+#     the flavors other than kvm (local.member_pbox_types), enforced by pbox-flavor-types (pbox-flavors.tf);
 #   - a hard lifetime of local.member_box_max_hours, enforced twice: the Ohio watchdog by
 #     LaunchTime, and the box's own deadline timer. The owner's boxes have none (a long job is
 #     their point); a member's also ends after 30 idle minutes, as the owner's do.
@@ -38,14 +38,7 @@ locals {
   member_pbox_volume_size = 100
   member_pbox_root_size   = 30
 
-  # The default TYPES list of scripts/parallel-box.sh (192 and 96 cores, Graviton, virtualized);
-  # the grant allows exactly these. No metal: `pbox up kvm` is the owner's.
-  member_pbox_types = [
-    "c8g.48xlarge", "c8gb.48xlarge", "c8gd.48xlarge", "c8gn.48xlarge", "c9g.48xlarge", "c9gd.48xlarge", "m8g.48xlarge",
-    "m8gd.48xlarge", "m9g.48xlarge", "m9gd.48xlarge", "i8g.48xlarge", "i8ge.48xlarge", "r8g.48xlarge", "r8gd.48xlarge",
-    "c8g.24xlarge", "c8gb.24xlarge", "c8gd.24xlarge", "c8gn.24xlarge", "c9g.24xlarge", "c9gd.24xlarge", "m8g.24xlarge",
-    "m8gd.24xlarge", "m9g.24xlarge", "m9gd.24xlarge", "i8g.24xlarge", "i8ge.24xlarge", "r8g.24xlarge", "r8gd.24xlarge",
-  ]
+  # The instance types are local.member_pbox_types (pbox-flavors.tf): every flavor but kvm.
 
   # .8/29 of the members' own pbox subnet, explicit; person i has .10 + i.
   member_pbox_reserved_cidr = cidrsubnet(aws_subnet.member_pbox.cidr_block, 5, 1)
@@ -164,6 +157,7 @@ locals {
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
       apt-get install -y parallel build-essential git htop
+      ${local.pbox_local_nvme_setup}
       echo "* soft nofile 1048576" >> /etc/security/limits.conf
       echo "* hard nofile 1048576" >> /etc/security/limits.conf
       echo "${name} ready: $(nproc) cores, /mnt/work mounted"
@@ -237,10 +231,11 @@ resource "aws_launch_template" "member_pbox" {
 }
 
 # ============================================================ what nextjs-dev may do
-# The owner's parallel-box-control, narrowed: these templates, these names, the listed types,
-# spot, no instance profile, the person's own volume and key. Every RunInstances statement pins
-# these templates (the role holds the other box grants too, and IAM checks each resource of a
-# call against the union). Every resource is per person, so a session policy can narrow it.
+# The owner's parallel-box-control, narrowed: these templates, these names, spot, no instance profile,
+# the person's own volume and key (the instance types are pbox-flavor-types', pbox-flavors.tf). Every
+# RunInstances statement pins these templates (the role holds the other box grants too, and IAM checks
+# each resource of a call against the union). Every resource is per person, so a session policy can
+# narrow it.
 data "aws_iam_policy_document" "member_pbox_control" {
   statement {
     sid       = "RunMemberPboxInstance"
@@ -263,12 +258,6 @@ data "aws_iam_policy_document" "member_pbox_control" {
       test     = "ForAllValues:StringEquals"
       variable = "aws:TagKeys"
       values   = local.member_pbox_tag_keys.instance
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:InstanceType"
-      values   = local.member_pbox_types
     }
 
     condition {

@@ -168,7 +168,11 @@ def lambda_handler(event, context):
             # A member's own box (member-boxes.tf), "<kind>-<person>": the person runs the plain
             # command from their own account, which takes no slot.
             kind = name.split("-", 1)[0]
-            up_cmd = "%s up   (run by %s)" % (kind, name.split("-", 1)[1])
+            # A pbox takes a flavor (pbox-flavors.tf), which the watchdog does not know: it names the type the box ran as.
+            flavor = " FLAVOR" if kind == "pbox" else ""
+            up_cmd = "%s up%s   (run by %s)" % (kind, flavor, name.split("-", 1)[1])
+            if kind == "pbox":
+                up_cmd += "\n  (it ran as %s; `pbox flavors` lists the flavors)" % inst.get("InstanceType", "?")
             kept = {"wbox": "Its D: disk (Roblox and its caches) is untouched",
                     "pbox": "Its work volume is untouched",
                     "gbox": "Nothing on it persists"}[kind]
@@ -178,7 +182,8 @@ def lambda_handler(event, context):
             kept = "Nothing on it persists"
         else:
             # parallel-box is slot 1; parallel-box-N is slot N (the same shape as gbox).
-            up_cmd = "pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1])
+            up_cmd = ("pbox up" + ("" if name == "parallel-box" else " " + name.rsplit("-", 1)[1]) + " FLAVOR"
+                      + "\n  (it ran as %s; `pbox flavors` lists the flavors)" % inst.get("InstanceType", "?"))
             fallback = any(t["Key"] == "Fallback" and t["Value"] == "true" for t in inst.get("Tags", []))
             # A fallback box (pbox-fallback.tf) ran on a fresh volume that dies with it; only the home volume persists.
             kept = ("It was a fallback box: its fresh work volume was deleted with it (the home work volume is untouched)"
