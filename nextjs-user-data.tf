@@ -2313,10 +2313,26 @@ fi
 # (~/.ssh/to-mac, never installed by anything).
 if id ejc3 >/dev/null 2>&1; then
 MAC_USER=ejc3
+MAC_ALIAS=mac
 MAC_SECRET=macbook-ssh-access-nextjs-ejc3
 ${local.mac_cloudflared_install}
 ${local.mac_ssh_client_setup}
 fi
+
+# `ssh colton-mac` (Colton's Mac through Cloudflare Access, colton-mac-ssh.tf) for colton and ejc3 ONLY (owner,
+# 2026-10-19), each with its own service token (colton-mac-ssh-access-nextjs-<account>) and its own key,
+# ~/.ssh/to-colton-mac, made here as that account when missing; its public half goes on the Mac
+# (scripts/mac-ssh-connector-setup.sh). Convenience, not isolation, as above: nextjs-dev-role reads both tokens.
+for MAC_USER in colton ejc3; do
+if id "$MAC_USER" >/dev/null 2>&1; then
+MAC_ALIAS=colton-mac
+MAC_SECRET="colton-mac-ssh-access-nextjs-$MAC_USER"
+MAC_HOME="/home/$MAC_USER"
+${local.mac_cloudflared_install}
+${local.mac_ssh_client_setup}
+fi
+done
+unset MAC_ALIAS MAC_HOME
 
 # Private NFSv4 automount for the shared us-west-2 NVMe scratch box.
 ${local.io_box_client_setup}

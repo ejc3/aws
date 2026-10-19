@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Exercise the real `ssh mac` installer and OpenSSH's config parser without a live connection."""
+"""Exercise the real `ssh mac` / `ssh colton-mac` installer and OpenSSH's config parser without a live connection,
+the Cloudflare and secrets wiring of both Macs, and the Mac-side connector setup script against stubbed ssh and aws."""
 
 from pathlib import Path
 import grp
 import os
+import plistlib
 import pwd
 import re
 import subprocess
@@ -13,17 +15,31 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "mac-ssh-client.tf").read_text()
-SETUP = re.search(r"mac_ssh_client_setup = <<-MACSETUP\n(.*?)\nMACSETUP", SOURCE, re.S).group(1)
-HOST_KEYS = re.search(r"mac_tunnel_host_keys = <<-MACHOSTKEYS\n(.*?\n)MACHOSTKEYS\n", SOURCE, re.S).group(1)
-SETUP = SETUP.replace("${local.mac_tunnel_host_keys}", HOST_KEYS).replace("$${", "${")
 TUNNEL = (ROOT / "macbook-ssh.tf").read_text()
+COLTON = (ROOT / "colton-mac-ssh.tf").read_text()
+CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
 REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
+COLTON_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
 
 
-def block(source, start):
-    """The text of the user_data block that begins with `start` (up to the next top-level SCRIPT end)."""
-    rest = source.split(start, 1)[1]
-    return rest.split("\nSCRIPT\n", 1)[0]
+def mac_map():
+    """local.mac_ssh_macs, read from the HCL."""
+    body = re.search(r"\n  mac_ssh_macs = \{\n(.*?)\n  \}\n", SOURCE, re.S).group(1)
+    macs = {}
+    for alias, fields in re.findall(r"^    ([\w-]+) = \{\n(.*?)\n    \}", body, re.S | re.M):
+        macs[alias] = {k: (v.strip('"') if v.startswith('"') else v == "true")
+                       for k, v in re.findall(r"^\s+(\w+)\s*=\s*(\"[^\"]*\"|true|false)\s*$", fields, re.M)}
+    return macs
+
+
+def table():
+    """mac_ssh_client_table, rendered the way the join in mac-ssh-client.tf renders it."""
+    return "".join(f"{a} {m['hostname']} {m['user']} {m['host_key_alias']} {'yes' if m['make_key'] else 'no'} {m['host_key']}\n"
+                   for a, m in mac_map().items())
+
+
+SETUP = re.search(r"mac_ssh_client_setup = <<-MACSETUP\n(.*?)\nMACSETUP", SOURCE, re.S).group(1)
+SETUP = SETUP.replace("${local.mac_ssh_client_table}", table()).replace("$${", "${")
 
 
 class MacSshClient(unittest.TestCase):
@@ -41,17 +57,28 @@ class MacSshClient(unittest.TestCase):
         self.chown = 'chown "$MAC_USER:$MAC_USER"', f'chown "{self.user}:{self.group}"'
         self.setup = self.setup.replace(*self.chown).replace(
             '-o "$MAC_USER" -g "$MAC_USER"', f'-o "{self.user}" -g "{self.group}"')
+        # The test runs as the account already; root uses runuser to become it.
+        self.setup = self.setup.replace('runuser -u "$MAC_USER" -- ', "")
 
-    def install(self, secret="macbook-ssh-access"):
+    def install(self, secret="macbook-ssh-access", alias=None, check=True):
         env = dict(os.environ, MAC_USER=self.user, MAC_HOME=str(self.home), MAC_SECRET=secret)
-        script = "MAC_USER=$MAC_USER\nMAC_SECRET=$MAC_SECRET\n" + self.setup
-        subprocess.run(["bash", "-eu", "-c", script], check=True, capture_output=True, text=True,
-                       timeout=10, env=env)
+        env.pop("MAC_ALIAS", None)
+        script = "MAC_USER=$MAC_USER\nMAC_SECRET=$MAC_SECRET\n"
+        if alias:
+            script += f"MAC_ALIAS={alias}\n"
+        result = subprocess.run(["bash", "-eu", "-c", script + self.setup], capture_output=True, text=True,
+                                timeout=20, env=env)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
 
     def effective(self, alias):
         result = subprocess.run(["ssh", "-G", "-F", str(self.config), alias],
                                 check=True, capture_output=True, text=True, timeout=5)
         return dict(line.split(" ", 1) for line in result.stdout.splitlines())
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in self.ssh.iterdir()}
 
     def check_mac(self, secret="macbook-ssh-access"):
         mac = self.effective("mac")
@@ -81,6 +108,20 @@ class MacSshClient(unittest.TestCase):
         known = (self.ssh / "known_hosts.mac").read_text().splitlines()
         self.assertEqual(known, [f"ejs-macbook-pro-via-fcvm ssh-ed25519 {REMOTE_LOGIN_KEY}"],
                          "only Remote Login's key is pinned")
+        self.assertFalse((self.ssh / "to-mac").exists(), "EJ's key is never made by anything")
+
+    def check_colton(self, secret="colton-mac-ssh-access-fcvm"):
+        mac = self.effective("colton-mac")
+        self.assertEqual((mac["hostname"], mac["port"], mac["user"]), ("colton-mac-ssh.cc-games.dev", "22", "colton"))
+        self.assertIn(f"{self.ssh}/colton-mac-access-proxy", mac["proxycommand"])
+        self.assertEqual(mac["identityfile"], str(self.ssh / "to-colton-mac"))
+        self.assertEqual((mac["identitiesonly"], mac["hostkeyalias"], mac["stricthostkeychecking"]), ("yes", "colton-mac", "true"))
+        self.assertEqual(mac["userknownhostsfile"], str(self.ssh / "known_hosts.colton-mac"))
+        self.assertEqual((self.ssh / "known_hosts.colton-mac").read_text(), f"colton-mac {COLTON_HOST_KEY}\n")
+        self.assertIn(f"--secret-id {secret} ", (self.ssh / "colton-mac-access-proxy").read_text())
+        for name in ("config", "config.d-colton-mac", "known_hosts.colton-mac"):
+            self.assertEqual((self.ssh / name).stat().st_mode & 0o777, 0o600, name)
+        self.assertEqual((self.ssh / "colton-mac-access-proxy").stat().st_mode & 0o777, 0o700)
 
     def test_fresh_install_writes_one_alias(self):
         self.install()
@@ -91,6 +132,11 @@ class MacSshClient(unittest.TestCase):
         self.assertEqual(re.findall(r"(?im)^\s*host\s+(.*)$", managed), ["mac"])
         # The installer's ~/.ssh is the temp home here (see setUp).
         self.assertEqual(self.config.read_text().splitlines()[0], f"Include {self.ssh}/config.d-mac")
+
+    def test_an_unset_alias_is_mac_as_the_containers_snippet_relies_on(self):
+        self.install(alias=None)
+        self.check_mac()
+        self.assertFalse((self.ssh / "config.d-colton-mac").exists())
 
     def test_each_account_gets_its_own_secret(self):
         self.install(secret="macbook-ssh-access-nextjs-ejc3")
@@ -134,9 +180,9 @@ class MacSshClient(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_text(), original)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
-        before = {p.name: p.read_bytes() for p in self.ssh.iterdir()}
+        before = self.files()
         self.install()
-        self.assertEqual({p.name: p.read_bytes() for p in self.ssh.iterdir()}, before, "a rerun changes nothing")
+        self.assertEqual(self.files(), before, "a rerun changes nothing")
 
     def test_migrates_nextjs_ejc3s_hand_installed_aliases(self):
         (self.ssh / "config.d-macbook").write_text("Host macbook\n    Port 2222\n")
@@ -147,20 +193,116 @@ class MacSshClient(unittest.TestCase):
         self.assertNotIn("2222", self.config.read_text())
         self.assertNotIn("Include config.d-mac\n", self.config.read_text())
 
+    def test_an_include_below_a_host_is_moved_to_the_top(self):
+        self.config.write_text(f"Host *\n    User wrong-user\nInclude {self.ssh}/config.d-mac\n")
+        self.install()
+        self.assertEqual(self.config.read_text(), f"Include {self.ssh}/config.d-mac\n\nHost *\n    User wrong-user\n")
+        self.check_mac()
+
+    def test_colton_mac_makes_the_accounts_own_key_and_prints_only_its_public_half(self):
+        result = self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        self.check_colton()
+        key = self.ssh / "to-colton-mac"
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        public = (self.ssh / "to-colton-mac.pub").read_text().split()
+        self.assertEqual(public[-3:], [self.user, "->", "colton-mac"])
+        self.assertIn(" ".join(public[:2]), result.stdout)
+        private = key.read_text()
+        self.assertNotIn("PRIVATE KEY", result.stdout + result.stderr)
+        self.assertNotIn(private.splitlines()[1], result.stdout + result.stderr)
+        # An existing key is kept and not announced again.
+        again = self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        self.assertEqual(key.read_text(), private)
+        self.assertNotIn("made", again.stdout)
+
+    def test_both_macs_on_one_account_settle_without_rewriting_each_other(self):
+        (self.ssh / "config.d-devhop").write_text("Host fcvm-x86\n    HostName 192.0.2.10\n")
+        self.config.write_text(f"Include {self.ssh}/config.d-devhop\n\n# runners\nHost runner-*\n    User ubuntu\n")
+        self.install()
+        self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        self.install()
+        settled = self.files()
+        self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        self.install()
+        self.assertEqual(self.files(), settled, "neither installer rewrites the other's work")
+        self.check_mac()
+        self.check_colton()
+        self.assertEqual(self.effective("fcvm-x86")["hostname"], "192.0.2.10")
+        self.assertEqual(self.effective("runner-x")["user"], "ubuntu")
+        self.assertEqual(len([p for p in self.ssh.iterdir() if p.name.startswith("config.before-mac.")]), 2)
+
+    def test_colton_mac_takes_over_fcvm_arms_hand_installed_alias(self):
+        # As set up by hand on 2026-10-19 for the temporary reverse tunnel.
+        (self.ssh / "config.d-colton-mac").write_text("Host colton-mac\n    HostName 127.0.0.1\n    Port 2224\n")
+        (self.ssh / "known_hosts.colton-mac").write_text(f"colton-mac {COLTON_HOST_KEY}\n")
+        (self.ssh / "to-colton-mac").write_text("existing private key\n")
+        original = (f"Include {self.ssh}/config.d-colton-mac\nInclude {self.ssh}/config.d-mac\n\n"
+                    "Host runner-*\n    User ubuntu\n")
+        self.config.write_text(original)
+        self.install()
+        self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        self.assertEqual(self.config.read_text(), original, "both Includes were already in place")
+        self.check_colton()
+        self.check_mac()
+        self.assertEqual((self.ssh / "to-colton-mac").read_text(), "existing private key\n")
+
+    def test_an_unknown_alias_fails_and_writes_nothing(self):
+        result = self.install(alias="nobody-mac", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no Mac named 'nobody-mac'", result.stderr)
+        self.assertEqual(self.files(), {})
+
 
 class Wiring(unittest.TestCase):
-    def test_fcvm_arm_gets_it_as_ubuntu_with_its_token_and_x86_does_not(self):
+    def test_the_map_pins_both_macs(self):
+        macs = mac_map()
+        self.assertEqual(sorted(macs), ["colton-mac", "mac"])
+        self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
+                                       "host_key_alias": "ejs-macbook-pro-via-fcvm",
+                                       "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
+        self.assertEqual(macs["colton-mac"], {"hostname": "colton-mac-ssh.cc-games.dev", "user": "colton",
+                                              "host_key_alias": "colton-mac", "host_key": COLTON_HOST_KEY, "make_key": True})
+        self.assertIn('macbook_ssh_hostname = "macbook-ssh.cc-games.dev"', TUNNEL)
+        self.assertIn('colton_mac_ssh_hostname = "colton-mac-ssh.cc-games.dev"', COLTON)
+        self.assertIn('mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} '
+                      '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n"])', SOURCE)
+
+    def test_fcvm_arm_gets_both_macs_as_ubuntu_with_its_tokens_and_x86_does_not(self):
         source = (ROOT / "dev-user-data.tf").read_text()
         arm, x86 = source.split("  arm_user_data = <<-SCRIPT", 1)[1].split("  x86_user_data = <<-SCRIPT", 1)
-        self.assertIn("MAC_USER=ubuntu\nMAC_SECRET=macbook-ssh-access\n${local.mac_cloudflared_install}\n"
-                      "${local.mac_ssh_client_setup}", arm)
-        self.assertNotIn("${local.mac_ssh_client_setup}", x86)
+        self.assertIn("\n${local.fcvm_mac_ssh_clients}\n", arm)
+        self.assertNotIn("mac_ssh_client", x86)
+        snippet = re.search(r"fcvm_mac_ssh_clients = <<-FCVMMACS\n(.*?)\nFCVMMACS", SOURCE, re.S).group(1)
+        self.assertEqual(snippet, "MAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
+                                  "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
 
-    def test_nextjs_dev_installs_it_for_ejc3_only(self):
+    def test_a_daily_association_converges_the_running_fcvm_arm(self):
+        assoc = SOURCE[SOURCE.index('resource "aws_ssm_association" "fcvm_mac_ssh_clients"'):]
+        self.assertIn('schedule_expression = "rate(1 day)"', assoc)
+        self.assertIn("values = [aws_instance.firecracker_dev[0].id]", assoc)
+        commands = re.search(r'commands\s+= "(.*)"\n', assoc).group(1)
+        self.assertIn("${local.fcvm_mac_ssh_clients}FCVMMACSSH", commands)
+        self.assertIn('bash \\"$f\\" </dev/null', commands, "run by bash from a file, not by sh or from stdin")
+        # Rendered with a stand-in snippet, the command runs under sh and reports the snippet's status.
+        script = commands.encode().decode("unicode_escape").replace("${local.fcvm_mac_ssh_clients}", "echo ran; exit 3\n")
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual((result.returncode, result.stdout), (3, "ran\n"))
+
+    def test_nextjs_dev_installs_mac_for_ejc3_only_and_colton_mac_for_colton_and_ejc3(self):
         source = (ROOT / "nextjs-user-data.tf").read_text()
-        self.assertEqual(source.count("${local.mac_ssh_client_setup}"), 1)
-        self.assertIn("if id ejc3 >/dev/null 2>&1; then\nMAC_USER=ejc3\nMAC_SECRET=macbook-ssh-access-nextjs-ejc3\n"
+        self.assertEqual(source.count("${local.mac_ssh_client_setup}"), 2)
+        self.assertIn("if id ejc3 >/dev/null 2>&1; then\nMAC_USER=ejc3\nMAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access-nextjs-ejc3\n"
                       "${local.mac_cloudflared_install}\n${local.mac_ssh_client_setup}\nfi\n", source)
+        self.assertIn('for MAC_USER in colton ejc3; do\nif id "$MAC_USER" >/dev/null 2>&1; then\nMAC_ALIAS=colton-mac\n'
+                      'MAC_SECRET="colton-mac-ssh-access-nextjs-$MAC_USER"\nMAC_HOME="/home/$MAC_USER"\n'
+                      "${local.mac_cloudflared_install}\n${local.mac_ssh_client_setup}\nfi\ndone\n", source)
+
+    def test_the_containers_snippet_still_sets_only_user_and_secret(self):
+        # nextjs-ct-user-data.tf is not changed here: its snippet relies on MAC_ALIAS defaulting to mac.
+        body = (ROOT / "nextjs-ct-user-data.tf").read_text().split("nextjs_ct_macbook_ssh = <<-MACBOOK\n", 1)[1].split("\nMACBOOK\n", 1)[0]
+        self.assertNotIn("MAC_ALIAS", body)
+        self.assertIn('MAC_ALIAS="$${MAC_ALIAS:-mac}"', SOURCE)
 
     def test_the_pinned_cloudflared_is_checked_before_and_after_download(self):
         cfd = re.search(r"mac_cloudflared_install = <<-MACCFD\n(.*?)\nMACCFD", SOURCE, re.S).group(1)
@@ -190,6 +332,188 @@ class Cloudflare(unittest.TestCase):
         self.assertIn("aws_secretsmanager_secret.macbook_ssh_access_nextjs_ejc3.arn", grant)
         self.assertNotIn("macbook_ssh_access.arn", grant)
         self.assertNotIn("macbook_ssh_tunnel", grant)
+
+
+class ColtonCloudflare(unittest.TestCase):
+    def resource(self, kind, name):
+        return re.search(rf'resource "{kind}" "{name}" \{{(.*?)\n\}}', COLTON, re.S).group(1)
+
+    def clients(self):
+        body = re.search(r"colton_mac_ssh_clients = \{\n(.*?)\n  \}", COLTON, re.S).group(1)
+        return {k: dict(re.findall(r'(\w+) = ("[^"]*"|[\w.]+)', v))
+                for k, v in re.findall(r"^    ([\w-]+)\s+= \{ (.*) \}$", body, re.M)}
+
+    def test_three_clients_each_with_its_own_token_and_secret(self):
+        clients = self.clients()
+        self.assertEqual(sorted(clients), ["fcvm", "nextjs-colton", "nextjs-ejc3"])
+        self.assertEqual({k: (c["secret"], c["reader"]) for k, c in clients.items()}, {
+            "fcvm": ('"colton-mac-ssh-access-fcvm"', "aws_iam_role.dev_server.arn"),
+            "nextjs-colton": ('"colton-mac-ssh-access-nextjs-colton"', "aws_iam_role.nextjs_dev.arn"),
+            "nextjs-ejc3": ('"colton-mac-ssh-access-nextjs-ejc3"', "aws_iam_role.nextjs_dev.arn"),
+        })
+        self.assertIn("for_each   = local.colton_mac_ssh_clients", self.resource("cloudflare_zero_trust_access_service_token", "colton_mac_ssh"))
+
+    def test_the_route_ends_at_remote_login_and_the_connector_checks_access(self):
+        config = self.resource("cloudflare_zero_trust_tunnel_cloudflared_config", "colton_mac_ssh")
+        self.assertEqual(re.findall(r'service\s*=\s*"([^"]+)"', config), ["ssh://127.0.0.1:22", "http_status:404"])
+        self.assertIn("required  = true", config)
+        self.assertIn("aud_tag   = [cloudflare_zero_trust_access_application.colton_mac_ssh.aud]", config)
+
+    def test_access_admits_the_clients_tokens_and_the_owner(self):
+        policy = self.resource("cloudflare_zero_trust_access_policy", "colton_mac_ssh_clients")
+        self.assertIn('decision         = "non_identity"', policy)
+        self.assertIn("for k in sort(keys(local.colton_mac_ssh_clients)) : { service_token = { token_id = "
+                      "cloudflare_zero_trust_access_service_token.colton_mac_ssh[k].id } }", policy)
+        self.assertNotRegex(policy, r"email|group|everyone|ip\s*=")
+        app = self.resource("cloudflare_zero_trust_access_application", "colton_mac_ssh")
+        self.assertEqual(re.findall(r"id\s+= cloudflare_zero_trust_access_policy\.(\w+)\.id\n\s+precedence = (\d)", app),
+                         [("browser_manager_owner", "1"), ("colton_mac_ssh_clients", "2")])
+        self.assertIn("domain           = local.colton_mac_ssh_hostname", app)
+
+    def test_the_connector_token_is_administration_only(self):
+        admins = re.search(r"colton_mac_ssh_admins = \[(.*?)\n  \]", COLTON, re.S).group(1)
+        self.assertNotIn("dev_server", admins)
+        self.assertNotIn("nextjs_dev", admins)
+        policy = self.resource("aws_secretsmanager_secret_policy", "colton_mac_ssh_tunnel")
+        self.assertIn('"aws:PrincipalArn" = local.colton_mac_ssh_admins', policy)
+        for grant in ("dev_server_colton_mac_ssh", "nextjs_dev_colton_mac_ssh"):
+            self.assertNotIn("colton_mac_ssh_tunnel", self.resource("aws_iam_role_policy", grant))
+
+    def test_each_access_secret_admits_administration_and_its_one_client(self):
+        policy = self.resource("aws_secretsmanager_secret_policy", "colton_mac_ssh_access")
+        self.assertIn('"aws:PrincipalArn" = concat(local.colton_mac_ssh_admins, [each.value.reader])', policy)
+        fcvm = self.resource("aws_iam_role_policy", "dev_server_colton_mac_ssh")
+        self.assertIn('Resource = aws_secretsmanager_secret.colton_mac_ssh_access["fcvm"].arn', fcvm)
+        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', fcvm)
+        nextjs = self.resource("aws_iam_role_policy", "nextjs_dev_colton_mac_ssh")
+        self.assertEqual(re.findall(r'colton_mac_ssh_access\["([\w-]+)"\]', nextjs), ["nextjs-colton", "nextjs-ejc3"])
+
+    def test_the_dns_record_overrides_the_wildcard_for_the_tunnel(self):
+        record = self.resource("cloudflare_dns_record", "colton_mac_ssh")
+        self.assertIn("name    = local.colton_mac_ssh_hostname", record)
+        self.assertIn('content = "${cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh.id}.cfargotunnel.com"', record)
+
+
+class ConnectorScript(unittest.TestCase):
+    """scripts/mac-ssh-connector-setup.sh end to end, with ssh, aws and the macOS tools stubbed."""
+
+    TOKEN = "eyJhIjoiZXhhbXBsZS10b2tlbiJ9"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="mac-connector-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.home = root / "home"  # the Mac's and fcvm-arm's home alike: ssh runs commands locally here
+        (self.home / ".ssh").mkdir(parents=True)
+        (self.home / ".local/bin").mkdir(parents=True)
+        self.stubs = root / "stubs"
+        self.stubs.mkdir()
+        self.argv_log = root / "argv.log"
+        self.keys = {}
+        for name in ("fcvm", "colton", "ejc3"):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(root / name)], check=True)
+            self.keys[name] = " ".join((root / f"{name}.pub").read_text().split()[:2])
+        (self.home / ".ssh/to-colton-mac.pub").write_text(self.keys["fcvm"] + " fcvm-arm ubuntu -> colton-mac\n")
+        bin_sum = re.search(r"^CFD_SHA256_DARWIN_ARM64_BIN=(\S+)$", CONNECTOR.read_text(), re.M).group(1)
+        self.stub("ssh", f"""#!/usr/bin/env python3
+import os, subprocess, sys
+with open({str(self.argv_log)!r}, "a") as log:
+    log.write(repr(sys.argv[1:]) + "\\n")
+args = sys.argv[1:]
+i = 0
+while args[i].startswith("-"):
+    i += 2 if args[i] in ("-o", "-i", "-p") else 1
+data = sys.stdin.buffer.read()
+data = data.replace(b"export PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"export PATH={self.stubs}:/usr/bin:/bin")
+sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).returncode)
+""")
+        nextjs_out = f"colton {self.keys['colton']} nextjs-dev colton -> colton-mac\\nejc3 {self.keys['ejc3']} x\\n"
+        self.stub("aws", f"""#!/bin/sh
+echo "$*" >> {self.argv_log}
+case "$1 $2" in
+  "ec2 describe-instances") echo i-0123456789abcdef0 ;;
+  "ssm send-command") echo cmd-1 ;;
+  "ssm wait") ;;
+  "ssm get-command-invocation") printf '{nextjs_out}' ;;
+  "secretsmanager get-secret-value") echo "{self.TOKEN}" ;;
+  *) echo "unexpected aws $*" >&2; exit 1 ;;
+esac
+""")
+        self.stub("uname", 'echo "Darwin arm64"')
+        self.stub("shasum", f'echo "{bin_sum}  $3"')
+        self.stub("plutil", "exit 0")
+        self.stub("sleep", "exit 0")
+        self.stub("launchctl", f'echo "launchctl $*" >> {root}/launchctl.log')
+        cfd = self.home / ".local/bin/cloudflared"
+        cfd.write_text("#!/bin/sh\necho 'cloudflared version 2026.9.3'\n")
+        cfd.chmod(0o755)
+        self.launchctl = root / "launchctl.log"
+
+    def stub(self, name, body):
+        path = self.stubs / name
+        path.write_text(body if body.startswith("#!") else f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+
+    def run_setup(self, *args):
+        env = {"HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin", "FCVM_KEY": "/nonexistent"}
+        return subprocess.run(["bash", str(CONNECTOR), *args], capture_output=True, text=True, timeout=60,
+                              env=env, stdin=subprocess.DEVNULL)
+
+    def test_first_run_over_the_bootstrap_tunnel_installs_everything(self):
+        authorized = self.home / ".ssh/authorized_keys"
+        bootstrap_line = self.keys["fcvm"] + " fcvm-arm ubuntu -> colton-mac"
+        authorized.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIColtonsOwnKey0000000000000000000000000000 colton's own\n"
+                              + bootstrap_line + "\n")
+        result = self.run_setup("colton-mac", "--bootstrap-port", "2224")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        token = self.home / ".cloudflared/colton-mac-ssh.token"
+        self.assertEqual(token.read_text().strip(), self.TOKEN)
+        self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(self.TOKEN, self.argv_log.read_text(), "the token travels on stdin, never in argv")
+        self.assertNotIn(self.TOKEN, result.stdout + result.stderr)
+        self.assertIn("'-o', 'ProxyCommand=none', '-o', 'HostName=127.0.0.1', '-o', 'Port=2224', 'colton-mac'",
+                      self.argv_log.read_text())
+        plist = plistlib.loads((self.home / "Library/LaunchAgents/com.ccgames.colton-mac-ssh.cloudflared.plist").read_bytes())
+        self.assertEqual(plist["ProgramArguments"], [f"{self.home}/.local/bin/cloudflared", "tunnel", "--no-autoupdate",
+                                                     "run", "--token-file", f"{self.home}/.cloudflared/colton-mac-ssh.token"])
+        self.assertEqual((plist["Label"], plist["RunAtLoad"], plist["KeepAlive"]),
+                         ("com.ccgames.colton-mac-ssh.cloudflared", True, True))
+        self.assertIn("launchctl bootstrap gui/", self.launchctl.read_text())
+        lines = authorized.read_text().splitlines()
+        self.assertEqual(lines[0].split()[-1], "own", "the Mac's other keys are kept")
+        block = lines[lines.index("# >>> colton-mac clients (managed by aws scripts/mac-ssh-connector-setup.sh) >>>") + 1:
+                      lines.index("# <<< colton-mac clients <<<")]
+        self.assertEqual(block, [bootstrap_line, self.keys["colton"] + " nextjs-dev colton -> colton-mac",
+                                 self.keys["ejc3"] + " nextjs-dev ejc3 -> colton-mac"])
+        self.assertEqual(sum(self.keys["fcvm"].split()[1] in line for line in lines), 1, "the bootstrap line is folded in")
+        before = authorized.read_text()
+        again = self.run_setup("colton-mac")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(authorized.read_text(), before, "a re-run changes nothing")
+
+    def test_a_missing_client_key_stops_before_anything_is_installed(self):
+        (self.home / ".ssh/to-colton-mac.pub").unlink()
+        result = self.run_setup("colton-mac")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no ~/.ssh/to-colton-mac.pub", result.stderr)
+        self.assertFalse((self.home / ".cloudflared").exists())
+
+    def test_bad_arguments(self):
+        for args in [(), ("mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_setup(*args).returncode, 2)
+
+    def test_pins_match_the_other_mac_script(self):
+        other = (ROOT / "scripts/claw-master-mac-setup.sh").read_text()
+        for name in ("CFD_VERSION", "CFD_SHA256_DARWIN_ARM64_TGZ", "CFD_SHA256_DARWIN_ARM64_BIN"):
+            pin = re.compile(rf"^{name}=(\S+)$", re.M)
+            self.assertEqual(pin.search(CONNECTOR.read_text()).group(1), pin.search(other).group(1), name)
+
+    def test_its_clients_are_the_ones_terraform_issues_tokens_to(self):
+        text = CONNECTOR.read_text()
+        self.assertIn('CLIENTS="fcvm:ubuntu nextjs:colton nextjs:ejc3"', text)
+        self.assertIn("TUNNEL_SECRET=colton-mac-ssh-tunnel-token", text)
+        self.assertIn('name                    = "colton-mac-ssh-tunnel-token"', COLTON)
 
 
 if __name__ == "__main__":
