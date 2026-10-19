@@ -21,6 +21,8 @@ LOOKBACK = dt.timedelta(minutes=30)
 CFG = Config(retries={"max_attempts": 4, "mode": "standard"}, connect_timeout=10, read_timeout=30)
 
 SINCE = None  # set by main()
+POLLED = set()  # account ids read natively; another account's GuardDuty/Inspector copies in Security Hub are kept
+FAILED = []  # a service read that failed: main() exits 1 so the watch does not move its checkpoint past the gap
 
 
 def scopes(root):
@@ -63,6 +65,8 @@ def sessions():
 
 
 def out(**kw):
+    if "error" in kw and "kind" not in kw:
+        FAILED.append(kw)
     print(json.dumps(kw, default=str), flush=True)
 
 
@@ -75,7 +79,10 @@ def poll(acct, sess, region):
              "UpdatedAt": [{"Start": SINCE.isoformat(), "End": dt.datetime.now(dt.timezone.utc).isoformat()}]}
         for page in sh.get_paginator("get_findings").paginate(Filters=f):
             for x in page["Findings"]:
-                if x["ProductArn"].endswith((":product/aws/inspector", ":product/aws/guardduty")):
+                # GuardDuty and Inspector are read natively below for the accounts polled here; a member account's
+                # (the Dolphin account's) reach this Security Hub only, so its copies are kept.
+                if x["ProductArn"].endswith((":product/aws/inspector", ":product/aws/guardduty")) and \
+                        x["AwsAccountId"] in POLLED:
                     continue
                 out(src="securityhub", id=x["Id"], acct=acct, region=region, account=x["AwsAccountId"],
                     control=x.get("Compliance", {}).get("SecurityControlId") or x.get("GeneratorId"),
@@ -160,10 +167,15 @@ def main(argv):
     root, SINCE = argv[1], dt.datetime.fromisoformat(argv[2].replace("Z", "+00:00"))
     todo = scopes(root)
     for acct, sess in sessions():
+        POLLED.add(sess.client("sts", config=CFG).get_caller_identity()["Account"])
         for a, region in todo:
             if a == acct:
                 poll(acct, sess, region)
+    if FAILED:
+        print(f"alert-poll: {len(FAILED)} service reads failed; do not move alerts_checked_at", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))

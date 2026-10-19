@@ -190,6 +190,36 @@ class AlertPollTests(unittest.TestCase):
         self.assertEqual(set().union(*mod.AUDIT.values()), names)
         self.assertEqual(mod.PROTECTED_VAULTS, set(re.findall(r'"([a-z0-9-]+)"', audit[audit.index("backupVaultName"):].split("]")[0])))
 
+    def test_a_failed_read_makes_the_poll_fail_and_member_copies_are_kept(self):
+        mod, _ = self.load()
+        mod.FAILED.clear()
+        mod.out(src="guardduty", acct="main", region="us-west-1", error="ThrottlingException")
+        self.assertEqual(len(mod.FAILED), 1, "a failed read is recorded so main() exits 1")
+        printed = []
+        mod.out = lambda **kw: printed.append(kw)
+        mod.POLLED.clear()
+        mod.POLLED.add("111111111111")
+        finding = lambda acct: {"Id": f"f-{acct}", "ProductArn": "arn:aws:securityhub:us-west-1::product/aws/inspector",
+                                "AwsAccountId": acct, "Title": "t", "Severity": {"Label": "HIGH"},
+                                "Resources": [{"Id": "r"}], "Compliance": {}}
+
+        class SH:
+            def get_paginator(self, op):
+                class P:
+                    def paginate(self, **kw):
+                        return [{"Findings": [finding("111111111111"), finding("222222222222")]}]
+                return P()
+
+        class Sess:
+            def client(self, svc, **kw):
+                if svc == "securityhub":
+                    return SH()
+                raise RuntimeError("not stubbed")
+
+        mod.poll("main", Sess(), "us-west-1")
+        ids = [p["id"] for p in printed if p.get("src") == "securityhub" and "error" not in p]
+        self.assertEqual(ids, ["f-222222222222"], "a polled account's copy is dropped, a member account's is kept")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
