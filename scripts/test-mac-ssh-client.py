@@ -606,9 +606,14 @@ esac
         agent = self.owners_mac()
         token = self.home / ".cloudflared/macbook-ssh.token"
         token.chmod(0o644)  # drifted, e.g. after a restore
+        ak = self.home / ".ssh/authorized_keys"
         result = self.run_setup("mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(token.stat().st_mode & 0o777, 0o600, "an unchanged token still gets its mode back")
+        ak.chmod(0o664)  # now its content is current: a rerun must still repair the mode sshd's StrictModes checks
+        result = self.run_setup("mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(ak.stat().st_mode & 0o777, 0o600, "an unchanged authorized_keys still gets its mode back")
         self.assertEqual(agent.read_text(), self.OWNERS_PLIST.replace("HOME", str(self.home)), "its LaunchAgent, byte for byte")
         self.assertIn("connector: unchanged and loaded; not reloaded", result.stdout)
         self.assertIn("token unchanged", result.stdout)

@@ -49,14 +49,18 @@ class Wiring(unittest.TestCase):
 
     def test_each_object_is_readable_only_by_administration_and_its_box(self):
         readers = re.search(r"agent_local_md_readers = \{(.*?)\n  \}", TF, re.S).group(1)
-        self.assertIn('"fcvm-metal-arm/ubuntu" = { role = aws_iam_role.dev_server.arn, instances = aws_instance.firecracker_dev[*].arn }', readers)
-        self.assertIn('"nextjs-dev/ejc3"       = { role = aws_iam_role.nextjs_dev.arn, instances = [] }', readers)
+        self.assertIn('"fcvm-metal-arm/ubuntu" = { role = aws_iam_role.dev_server.arn, shared = true, instances = aws_instance.firecracker_dev[*].arn }', readers)
+        self.assertIn('"nextjs-dev/ejc3"       = { role = aws_iam_role.nextjs_dev.arn, shared = false, instances = [] }', readers)
         pol = block("aws_s3_bucket_policy", "dev_scripts")
         self.assertEqual(pol.count('Effect    = "Deny"'), 2)
         self.assertEqual(pol.count('Resource  = "${aws_s3_bucket.dev_scripts.arn}/agents-md/${k}/local.md"'), 2,
                          "the denials name the local.md objects only")
         self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, [r.role])', pol)
-        self.assertIn('"ec2:SourceInstanceARN" = r.instances', pol)
+        # A shared role keeps its instance denial even with no instance (the box disabled): it fails closed.
+        self.assertIn('"ec2:SourceInstanceARN" = length(r.instances) > 0 ? r.instances : [local.agent_local_md_no_instance]', pol)
+        self.assertIn("} if r.shared]", pol)
+        self.assertNotIn("if length(r.instances) > 0]", pol)
+        self.assertRegex(TF, r'agent_local_md_no_instance = "arn:aws:ec2:\$\{var.aws_region\}:\$\{data.aws_caller_identity.current.account_id\}:instance/none"')
         self.assertNotIn("Allow", pol)
         self.assertIn('key          = "agents-md/${each.key}/local.md"', block("aws_s3_object", "agent_local_md"))
 

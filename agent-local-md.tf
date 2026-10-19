@@ -28,11 +28,13 @@ locals {
     "nextjs-dev/ejc3"       = false
   }
 
-  # The role that may read each box's object, and the one instance of it when the role is shared.
+  # The role that may read each box's object and, when the role is shared, the one instance of it that may. A shared
+  # role with no such instance (the box disabled) gets an ARN no instance has, so the denial stays and fails closed.
   agent_local_md_readers = {
-    "fcvm-metal-arm/ubuntu" = { role = aws_iam_role.dev_server.arn, instances = aws_instance.firecracker_dev[*].arn }
-    "nextjs-dev/ejc3"       = { role = aws_iam_role.nextjs_dev.arn, instances = [] }
+    "fcvm-metal-arm/ubuntu" = { role = aws_iam_role.dev_server.arn, shared = true, instances = aws_instance.firecracker_dev[*].arn }
+    "nextjs-dev/ejc3"       = { role = aws_iam_role.nextjs_dev.arn, shared = false, instances = [] }
   }
+  agent_local_md_no_instance = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/none"
 
   agent_local_md_live = { for k, v in local.agents_md_targets : k => v if local.agent_local_md_ready[k] }
 }
@@ -96,9 +98,9 @@ resource "aws_s3_bucket_policy" "dev_scripts" {
         Resource  = "${aws_s3_bucket.dev_scripts.arn}/agents-md/${k}/local.md"
         Condition = {
           ArnEquals       = { "aws:PrincipalArn" = r.role }
-          StringNotEquals = { "ec2:SourceInstanceARN" = r.instances }
+          StringNotEquals = { "ec2:SourceInstanceARN" = length(r.instances) > 0 ? r.instances : [local.agent_local_md_no_instance] }
         }
-      } if length(r.instances) > 0],
+      } if r.shared],
     )
   })
 }

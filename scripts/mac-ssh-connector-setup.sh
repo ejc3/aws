@@ -212,7 +212,8 @@ awk -v b="\$BEGIN" -v e="\$END" -v whole="\$whole" -v keys="\$AK.keys" '
 { echo "\$BEGIN"; grep -v '^\$' "\$AK.keys"; echo "\$END"; } >> "\$AK.new"
 echo "authorized_keys: \$(grep -c '^ssh-' "\$AK.keys") managed keys"
 rm -f "\$AK.keys"
-if cmp -s "\$AK.new" "\$AK"; then rm -f "\$AK.new"; else chmod 600 "\$AK.new" && mv -f "\$AK.new" "\$AK"; fi
+if cmp -s "\$AK.new" "\$AK"; then rm -f "\$AK.new"; else mv -f "\$AK.new" "\$AK"; fi
+chmod 600 "\$AK"
 
 PLIST="\$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="\$HOME/$LOG_FILE"
