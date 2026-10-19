@@ -9,16 +9,21 @@
 #
 # It reaches the Mac from fcvm-arm as `ssh colton-mac` (mac-ssh-client.tf), which is fcvm-arm's own key and Host key pin;
 # --bootstrap-port only points that alias at 127.0.0.1:PORT with no proxy command, for the first run, when the
-# connector is not there yet. On the Mac it installs, in the user's home only:
+# connector is not there yet. First it checks that Remote Login refuses password and keyboard-interactive logins,
+# installing the MacBook's keys-only drop-in (/etc/ssh/sshd_config.d/050-keys-only.conf) when sudo allows it without a
+# password, and stopping with the command to type at the Mac when it does not. Then, in the user's home only:
 #   * ~/.local/bin/cloudflared, pinned by version and sha256 (the pins in scripts/claw-master-mac-setup.sh; a test keeps
 #     them equal) and verified ON the Mac
-#   * ~/.cloudflared/<alias>-ssh.token (0600): the connector token, from the administration-only secret, through ssh
-#     STDIN only: never an argument, never written on fcvm-arm or here
+#   * ~/.cloudflared/<alias>-ssh.token (0600): the connector token, from its administration-only secret, through ssh
+#     STDIN only: never an argument, never written on fcvm-arm or here. On the Mac it belongs to the account every
+#     client logs in as, so any client can read it: a connector run with it can only take this tunnel's traffic and
+#     break connections, never get in (Access still gates every request) nor pass for the Mac (clients pin its host key)
 #   * the LaunchAgent com.ccgames.<alias>-ssh.cloudflared: `cloudflared tunnel --no-autoupdate run --token-file ...`,
 #     started at login and restarted by launchd when it drops
 #   * a managed block in ~/.ssh/authorized_keys with each client's ~/.ssh/to-<alias>.pub, read from the clients' boxes
-#     (fcvm-arm over ssh, nextjs-dev over SSM Run Command); every other line is kept, and a line elsewhere for one of
-#     those keys (the bootstrap tunnel's) is folded into the block
+#     (fcvm-arm over ssh, each nextjs-dev account's own file over its own SSM Run Command) and kept only if it is exactly
+#     one `ssh-ed25519 <blob>`; every other line is kept, and a line elsewhere for one of those keys (the bootstrap
+#     tunnel's) is folded into the block
 # Re-running is safe: it re-verifies cloudflared, rewrites the files and reloads the agent. Reloading the agent ends the
 # sessions that came through it, so the first run should come over the bootstrap tunnel.
 set -euo pipefail
@@ -63,49 +68,88 @@ on_fcvm() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "
 # Run something on the Mac: jumpbox -> fcvm-arm -> the Mac. stdin is passed through.
 on_mac() { on_fcvm "ssh -o BatchMode=yes -o ConnectTimeout=10 $MAC_SSH $*"; }
 
-PUBKEY_RE='^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}( .*)?$'
+# A client's public key as exactly `ssh-ed25519 <blob>`, or nothing. The text comes from another box, so it is refused
+# outright if it holds more than one line (extra keys, a line that ends the heredoc below, terminal escapes); only the
+# type and blob are kept, and the comment written on the Mac is this script's own.
+clean_key() {
+  local raw=$1 key
+  case "$raw" in *$'\n'* | *$'\r'*) return 1 ;; esac
+  key=$(printf '%s' "$raw" | cut -d' ' -f1-2)
+  [[ $key =~ ^ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$ ]] || return 1
+  printf '%s' "$key"
+}
 
-echo "1/5 reaching $ALIAS from fcvm-arm"
+# One nextjs-dev account's key, read from that account's own file in its own Run Command, so one account's file can
+# never stand in for another's.
+nextjs_key() {
+  local user=$1 cmd_id
+  [[ $user =~ ^[a-z][a-z0-9]*$ ]] || return 1
+  cmd_id=$(aws ssm send-command --region "$REGION" --instance-ids "$NEXTJS_ID" --document-name AWS-RunShellScript \
+    --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]]}))' "cat /home/$user/.ssh/to-$ALIAS.pub")" \
+    --query Command.CommandId --output text)
+  aws ssm wait command-executed --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" >/dev/null 2>&1 || true
+  aws ssm get-command-invocation --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" \
+    --query StandardOutputContent --output text
+}
+
+echo "1/6 reaching $ALIAS from fcvm-arm"
 [ "$(on_mac "'uname -sm'")" = "Darwin arm64" ] || { echo "$ALIAS is not reachable, or is not a macOS arm64 Mac" >&2; exit 1; }
 
-echo "2/5 the clients' public keys"
+echo "2/6 Remote Login takes keys only"
+# What Remote Login offers a client with no key, asked on the Mac itself: exactly "publickey" passes. Otherwise this
+# installs the MacBook's keys-only drop-in (README "MacBook: Rebuilding from nothing", step 1) if sudo needs no password,
+# and stops with the command to type at the Mac if it does. macOS starts sshd per connection, so the next check sees it.
+on_mac bash -s <<'REMOTE'
+set -uo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+offered() {
+  ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=0 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 22 "$(id -un)@127.0.0.1" true 2>&1 </dev/null |
+    awk -F': ' '/Authentications that can continue/ { print $NF; exit }'
+}
+methods=$(offered)
+if [ "$methods" != publickey ]; then
+  echo "Remote Login offers: ${methods:-nothing (no answer)}; installing /etc/ssh/sshd_config.d/050-keys-only.conf"
+  if ! printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo -n /usr/bin/tee /etc/ssh/sshd_config.d/050-keys-only.conf >/dev/null 2>&1; then
+    echo "sudo needs a password here. At the Mac, in Terminal, run:" >&2
+    echo "  printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf" >&2
+    echo "then run this script again." >&2
+    exit 1
+  fi
+  methods=$(offered)
+fi
+[ "$methods" = publickey ] || { echo "Remote Login still offers: ${methods:-nothing}" >&2; exit 1; }
+echo "Remote Login: publickey only"
+REMOTE
+
+echo "3/6 the clients' public keys"
 KEYS=""
-NEXTJS_USERS=""
+NEXTJS_ID=""
 for client in $CLIENTS; do
   box=${client%%:*} user=${client#*:}
   case "$box" in
-    fcvm) [ "$user" = ubuntu ] || { echo "only ubuntu on fcvm-arm" >&2; exit 1; }
-          pub=$(on_fcvm "cat ~/.ssh/to-$ALIAS.pub" 2>/dev/null || true)
-          [[ $pub =~ $PUBKEY_RE ]] || { echo "fcvm-arm ubuntu has no ~/.ssh/to-$ALIAS.pub yet (mac-ssh-client.tf makes it)" >&2; exit 1; }
-          KEYS+="$(printf '%s' "$pub" | cut -d' ' -f1-2) fcvm-arm ubuntu -> $ALIAS"$'\n' ;;
-    nextjs) NEXTJS_USERS+=" $user" ;;
+    fcvm)
+      [ "$user" = ubuntu ] || { echo "only ubuntu on fcvm-arm" >&2; exit 1; }
+      key=$(clean_key "$(on_fcvm "cat ~/.ssh/to-$ALIAS.pub" 2>/dev/null || true)") ||
+        { echo "fcvm-arm ubuntu has no single valid ~/.ssh/to-$ALIAS.pub (mac-ssh-client.tf makes it)" >&2; exit 1; }
+      KEYS+="$key fcvm-arm ubuntu -> $ALIAS"$'\n'
+      ;;
+    nextjs)
+      if [ -z "$NEXTJS_ID" ]; then
+        NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=nextjs-dev Name=instance-state-name,Values=running \
+          --query 'Reservations[0].Instances[0].InstanceId' --output text)
+        [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "nextjs-dev is not running" >&2; exit 1; }
+      fi
+      key=$(clean_key "$(nextjs_key "$user" || true)") ||
+        { echo "nextjs-dev $user has no single valid ~/.ssh/to-$ALIAS.pub (setup-sync makes it within 10 minutes of the apply)" >&2; exit 1; }
+      KEYS+="$key nextjs-dev $user -> $ALIAS"$'\n'
+      ;;
     *) echo "unknown box $box" >&2; exit 1 ;;
   esac
 done
-if [ -n "$NEXTJS_USERS" ]; then
-  NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=nextjs-dev Name=instance-state-name,Values=running \
-    --query 'Reservations[0].Instances[0].InstanceId' --output text)
-  [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "nextjs-dev is not running" >&2; exit 1; }
-  CMD=""
-  for user in $NEXTJS_USERS; do
-    [[ $user =~ ^[a-z][a-z0-9]*$ ]] || { echo "bad account $user" >&2; exit 1; }
-    CMD+="printf '$user '; cat /home/$user/.ssh/to-$ALIAS.pub 2>/dev/null || echo MISSING; "
-  done
-  CMD_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$NEXTJS_ID" --document-name AWS-RunShellScript \
-    --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]]}))' "$CMD")" \
-    --query Command.CommandId --output text)
-  aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$NEXTJS_ID" || true
-  OUT=$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$NEXTJS_ID" \
-    --query StandardOutputContent --output text)
-  for user in $NEXTJS_USERS; do
-    pub=$(printf '%s\n' "$OUT" | awk -v u="$user" '$1 == u { $1 = ""; sub(/^ /, ""); print; exit }')
-    [[ $pub =~ $PUBKEY_RE ]] || { echo "nextjs-dev $user has no ~/.ssh/to-$ALIAS.pub yet (setup-sync makes it within 10 minutes of the apply)" >&2; exit 1; }
-    KEYS+="$(printf '%s' "$pub" | cut -d' ' -f1-2) nextjs-dev $user -> $ALIAS"$'\n'
-  done
-fi
 printf '%s' "$KEYS" | sed 's/^/   /'
 
-echo "3/5 cloudflared $CFD_VERSION (verified on the Mac)"
+echo "4/6 cloudflared $CFD_VERSION (verified on the Mac)"
 on_mac bash -s <<REMOTE
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -123,12 +167,12 @@ fi
 "\$HOME/.local/bin/cloudflared" --version | head -1
 REMOTE
 
-echo "4/5 the connector token (from Secrets Manager, through ssh stdin only)"
+echo "5/6 the connector token (from Secrets Manager, through ssh stdin only)"
 { set +x; } 2>/dev/null
 aws secretsmanager get-secret-value --region "$REGION" --secret-id "$TUNNEL_SECRET" --query SecretString --output text |
   on_mac "'umask 077; mkdir -p \$HOME/.cloudflared && cat > \$HOME/$TOKEN_FILE.new && [ -s \$HOME/$TOKEN_FILE.new ] && mv -f \$HOME/$TOKEN_FILE.new \$HOME/$TOKEN_FILE && chmod 600 \$HOME/$TOKEN_FILE'"
 
-echo "5/5 the clients' keys and the connector LaunchAgent"
+echo "6/6 the clients' keys and the connector LaunchAgent"
 on_mac bash -s <<REMOTE
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin

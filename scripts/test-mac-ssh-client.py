@@ -414,12 +414,24 @@ class ConnectorScript(unittest.TestCase):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(root / name)], check=True)
             self.keys[name] = " ".join((root / f"{name}.pub").read_text().split()[:2])
         (self.home / ".ssh/to-colton-mac.pub").write_text(self.keys["fcvm"] + " fcvm-arm ubuntu -> colton-mac\n")
+        self.nextjs = root / "nextjs"  # each nextjs-dev account's ~/.ssh/to-colton-mac.pub
+        self.nextjs.mkdir()
+        (self.nextjs / "colton.pub").write_text(self.keys["colton"] + " nextjs-dev colton -> colton-mac\n")
+        (self.nextjs / "ejc3.pub").write_text(self.keys["ejc3"] + " x\n")
+        self.offered = root / "offered"
+        self.offered.write_text("publickey\n")
+        self.dropin = root / "050-keys-only.conf"
+        self.nosudo = root / "nosudo"
         bin_sum = re.search(r"^CFD_SHA256_DARWIN_ARM64_BIN=(\S+)$", CONNECTOR.read_text(), re.M).group(1)
         self.stub("ssh", f"""#!/usr/bin/env python3
 import os, subprocess, sys
 with open({str(self.argv_log)!r}, "a") as log:
     log.write(repr(sys.argv[1:]) + "\\n")
 args = sys.argv[1:]
+if "PreferredAuthentications=password,keyboard-interactive" in args:
+    # The Remote Login check, run on the Mac: what sshd offers a client with no key.
+    sys.stderr.write("debug1: Authentications that can continue: " + open({str(self.offered)!r}).read().strip() + "\\n")
+    sys.exit(255)
 i = 0
 while args[i].startswith("-"):
     i += 2 if args[i] in ("-o", "-i", "-p") else 1
@@ -427,14 +439,13 @@ data = sys.stdin.buffer.read()
 data = data.replace(b"export PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"export PATH={self.stubs}:/usr/bin:/bin")
 sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).returncode)
 """)
-        nextjs_out = f"colton {self.keys['colton']} nextjs-dev colton -> colton-mac\\nejc3 {self.keys['ejc3']} x\\n"
         self.stub("aws", f"""#!/bin/sh
 echo "$*" >> {self.argv_log}
 case "$1 $2" in
   "ec2 describe-instances") echo i-0123456789abcdef0 ;;
-  "ssm send-command") echo cmd-1 ;;
+  "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
   "ssm wait") ;;
-  "ssm get-command-invocation") printf '{nextjs_out}' ;;
+  "ssm get-command-invocation") u=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); cat "{self.nextjs}/$u.pub" ;;
   "secretsmanager get-secret-value") echo "{self.TOKEN}" ;;
   *) echo "unexpected aws $*" >&2; exit 1 ;;
 esac
@@ -442,6 +453,8 @@ esac
         self.stub("uname", 'echo "Darwin arm64"')
         self.stub("shasum", f'echo "{bin_sum}  $3"')
         self.stub("plutil", "exit 0")
+        self.stub("sudo", f'[ "$1 $2 $3" = "-n /usr/bin/tee /etc/ssh/sshd_config.d/050-keys-only.conf" ] && [ ! -e {self.nosudo} ] '
+                          f'|| exit 1; cat > {self.dropin} && echo publickey > {self.offered}')
         self.stub("sleep", "exit 0")
         self.stub("launchctl", f'echo "launchctl $*" >> {root}/launchctl.log')
         cfd = self.home / ".local/bin/cloudflared"
@@ -495,8 +508,52 @@ esac
         (self.home / ".ssh/to-colton-mac.pub").unlink()
         result = self.run_setup("colton-mac")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("no ~/.ssh/to-colton-mac.pub", result.stderr)
+        self.assertIn("has no single valid ~/.ssh/to-colton-mac.pub", result.stderr)
         self.assertFalse((self.home / ".cloudflared").exists())
+
+    def test_remote_login_that_takes_passwords_gets_the_keys_only_drop_in(self):
+        self.offered.write_text("publickey,password,keyboard-interactive\n")
+        result = self.run_setup("colton-mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.dropin.read_text(), "PasswordAuthentication no\nKbdInteractiveAuthentication no\n")
+        self.assertIn("Remote Login: publickey only", result.stdout)
+
+    def test_a_password_for_sudo_stops_before_the_token_with_the_command_to_type(self):
+        self.offered.write_text("publickey,password\n")
+        self.nosudo.write_text("")
+        result = self.run_setup("colton-mac")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf", result.stderr)
+        self.assertFalse((self.home / ".cloudflared").exists())
+        self.assertFalse((self.home / ".ssh/authorized_keys").exists())
+
+    def test_a_key_file_with_more_than_one_line_is_refused(self):
+        # Security review of #510: a .pub with an extra line could add a key, end the heredoc, or print escapes.
+        bad = [self.keys["fcvm"] + "\n" + self.keys["colton"] + "\n",
+               self.keys["fcvm"] + " a comment\n" + self.keys["colton"] + " second key\n",
+               self.keys["fcvm"] + " c\nKEYS\nrm -rf ~\n",
+               self.keys["fcvm"] + "\nKEYS\nrm -rf ~\n",
+               self.keys["fcvm"] + "\r\n",
+               "restrict " + self.keys["fcvm"] + "\n",
+               self.keys["fcvm"] + "AA\n"]
+        for text in bad:
+            with self.subTest(text=text):
+                (self.home / ".ssh/authorized_keys").unlink(missing_ok=True)
+                (self.home / ".ssh/to-colton-mac.pub").write_text(text)
+                result = self.run_setup("colton-mac")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("fcvm-arm ubuntu has no single valid", result.stderr)
+                self.assertFalse((self.home / ".ssh/authorized_keys").exists())
+
+    def test_one_nextjs_account_cannot_stand_in_for_another(self):
+        # colton's file naming a second key "for ejc3" is colton's file with two lines: refused, whatever it says.
+        (self.nextjs / "colton.pub").write_text(self.keys["colton"] + " colton\nejc3 " + self.keys["fcvm"] + "\n")
+        result = self.run_setup("colton-mac")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nextjs-dev colton has no single valid", result.stderr)
+        log = self.argv_log.read_text()
+        self.assertIn("cat /home/colton/.ssh/to-colton-mac.pub", log)
+        self.assertEqual(log.count("ssm send-command"), 1, "each account is read by its own command; colton's failed first")
 
     def test_bad_arguments(self):
         for args in [(), ("mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:

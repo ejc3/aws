@@ -727,20 +727,32 @@ tunnel.
 | EJ in a browser | the browser-manager owner policy | |
 
 Each account has its own key, `~/.ssh/to-colton-mac`, made on its box by the installer **as that account** when missing
-(only the public half is printed); the private half never leaves the box. The connector token,
-`colton-mac-ssh-tunnel-token`, is administration-only: no dev box can run a connector for this tunnel.
-`scripts/mac-ssh-connector-setup.sh colton-mac`, run on a jumpbox, puts the Mac on the route: the pinned `cloudflared`
-(verified on the Mac), the token through ssh stdin into `~/.cloudflared/colton-mac-ssh.token` (0600), the LaunchAgent
-`com.ccgames.colton-mac-ssh.cloudflared`, and a managed block in the Mac's `~/.ssh/authorized_keys` with the three
-clients' public keys (fcvm-arm's read over ssh, nextjs-dev's over SSM). It reaches the Mac as `ssh colton-mac` from
-fcvm-arm; `--bootstrap-port PORT` points that alias at a temporary reverse tunnel on fcvm-arm's `127.0.0.1:PORT`.
+(only the public half is printed); the private half never leaves the box. The connector token's secret,
+`colton-mac-ssh-tunnel-token`, is readable in AWS by administration only, but **the clients can read the token on the
+Mac**: it is a 0600 file of the one account they all log in as. A connector run with it can only take this tunnel's
+traffic and break connections; it cannot get in (Access gates every request) or pass for the Mac (clients pin its host
+key). `scripts/mac-ssh-connector-setup.sh colton-mac`, run on a jumpbox, puts the Mac on the route:
+
+- it checks that Remote Login offers `publickey` only, and otherwise installs the MacBook's keys-only drop-in
+  (`/etc/ssh/sshd_config.d/050-keys-only.conf`) if `sudo` needs no password, or stops and prints the command to type at
+  the Mac;
+- the pinned `cloudflared` (verified on the Mac), the token through ssh stdin into `~/.cloudflared/colton-mac-ssh.token`
+  (0600), and the LaunchAgent `com.ccgames.colton-mac-ssh.cloudflared`;
+- a managed block in the Mac's `~/.ssh/authorized_keys` with the three clients' public keys (fcvm-arm's over ssh, each
+  nextjs-dev account's own file over its own SSM command), each accepted only as exactly one `ssh-ed25519 <blob>`.
+
+It reaches the Mac as `ssh colton-mac` from fcvm-arm; `--bootstrap-port PORT` points that alias at a temporary reverse
+tunnel on fcvm-arm's `127.0.0.1:PORT`. On the containerized box (`nextjs-ct`), `colton-mac-ssh-access-nextjs-ejc3` is
+the owner's (denied to every member's container) and `colton-mac-ssh-access-nextjs-colton` is denied to every member's
+container but colton's (`nextjs-ct-user-data.tf`).
 
 **First bring-up** (the Mac kept a temporary reverse tunnel to fcvm-arm's `127.0.0.1:2224`, set up by hand on 2026-10-19):
 
 1. Apply. The association rewrites fcvm-arm's `colton-mac` alias to the Cloudflare route at once (the same
    `to-colton-mac` key and host key pin); nextjs-dev makes `colton`'s and `ejc3`'s keys at its next `setup-sync`.
-2. From a jumpbox: `scripts/mac-ssh-connector-setup.sh colton-mac --bootstrap-port 2224`. It stops, changing nothing,
-   if a client's key is not there yet.
+2. From a jumpbox: `scripts/mac-ssh-connector-setup.sh colton-mac --bootstrap-port 2224`. It stops before the token
+   and the connector if a client's key is not there yet or Remote Login still takes passwords (type the printed command at the
+   Mac, then run it again).
 3. Check from each client: `ssh colton-mac true` (fcvm-arm `ubuntu`, nextjs-dev `colton` and `ejc3`).
 4. Retire the temporary tunnel: on the Mac, `launchctl bootout gui/$(id -u)/com.ccgames.fcvm-tunnel` and delete
    `~/Library/LaunchAgents/com.ccgames.fcvm-tunnel.plist`, `~/.ssh/fcvm-tunnel*` and `~/.ssh/known_hosts.fcvm-tunnel`

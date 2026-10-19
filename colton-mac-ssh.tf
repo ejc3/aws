@@ -16,9 +16,12 @@
 # (~/.ssh/to-colton-mac, made on the box by mac-ssh-client.tf as that account; its private half never leaves the box).
 # The clients are mac-ssh-client.tf's installer with alias colton-mac.
 #
-# The connector token is ADMINISTRATION-ONLY (unlike the MacBook's, which fcvm-arm may read): nothing on a dev box can
-# run a connector for this tunnel. scripts/mac-ssh-connector-setup.sh installs it on the Mac from a jumpbox, through
-# ssh stdin. It runs this one tunnel and nothing else; every request still has to pass Access.
+# The connector token's SECRET is administration-only (unlike the MacBook's, which fcvm-arm may read), and
+# scripts/mac-ssh-connector-setup.sh installs it on the Mac from a jumpbox, through ssh stdin. That does not keep it from
+# the clients: on the Mac it is a 0600 file of the one account every client logs in as, so any client can read it there.
+# What that buys a client is a rogue connector for this one tunnel, which can take its traffic and break connections and
+# nothing more: it cannot get in (Access still gates every request) and cannot pass for the Mac (every client pins the
+# Mac's Remote Login host key). A root-owned LaunchDaemon would hide it from the clients; it was not worth a root service.
 
 locals {
   colton_mac_ssh_hostname = "colton-mac-ssh.cc-games.dev"
@@ -127,7 +130,7 @@ data "cloudflare_zero_trust_tunnel_cloudflared_token" "colton_mac_ssh" {
 
 resource "aws_secretsmanager_secret" "colton_mac_ssh_tunnel" {
   name                    = "colton-mac-ssh-tunnel-token"
-  description             = "Connector token for Colton's Mac SSH tunnel only (installed on that Mac by scripts/mac-ssh-connector-setup.sh); administration only"
+  description             = "Connector token for Colton's Mac SSH tunnel only (installed on that Mac by scripts/mac-ssh-connector-setup.sh); readable here by administration only"
   recovery_window_in_days = 30
   tags                    = { Managed = "terraform", Name = "colton-mac-ssh-tunnel-token" }
 }
