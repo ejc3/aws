@@ -422,12 +422,12 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   return 1
 }
 
-# member_attach ID: make sure a member's work volume is attached to instance ID, attaching it if
+# attach_work ID: make sure the box's work volume is attached to instance ID, attaching it if
 # it is not: the same checks for a fresh launch and for a box an earlier `up` left behind (an
 # interrupted launch, a failed first attach), whose boot is waiting for the disk. Two `up`s racing
 # to attach to the same box both succeed. A box that cannot get its disk is terminated: it would
 # only wait for it, at a 192-core price.
-member_attach() {
+attach_work() {
   local id="$1" vol state az att out
   read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
     --query 'Volumes[0].[VolumeId,State,AvailabilityZone,Attachments[0].InstanceId]' --output text 2>/dev/null | grep '^vol-')"
@@ -462,6 +462,23 @@ member_attach() {
   return 1
 }
 
+# wait_volume_free VOL: before a launch, wait until the work volume is free. Right after `down` it is still detaching
+# from the terminated box for a minute or so, and a box launched then would come up without /mnt/work (issue #512).
+# Waiting here, before run-instances, costs nothing; a volume still attached after that is another box's, and the
+# launch is refused loudly instead.
+wait_volume_free() {
+  local vol="$1" state att
+  for _ in $(seq 1 36); do
+    read -r state att <<< "$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$vol" \
+      --query 'Volumes[0].[State,Attachments[0].InstanceId]' --output text 2>/dev/null)"
+    [ "$state" = "available" ] && return 0
+    say "    work volume $vol is ${state:-unknown}${att:+ (attached to $att)}; waiting for it to be free before launching..."
+    sleep 5
+  done
+  say "FAILED: work volume $vol is still ${state:-unknown}${att:+ (attached to $att)} after 3 minutes; nothing was launched. $SELF status"
+  return 1
+}
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -474,11 +491,12 @@ case "$CMD" in
   up)
     member_key
     if locate_box; then
-      if [ -n "$MEMBER" ]; then
-        # Not taken as ready: it may be the box of an interrupted launch, waiting for its volume.
+      # A box on its persistent work volume (a member's, or one of the owner's slots at home) is not taken as ready: it
+      # may be the box of an interrupted launch, waiting for its volume. A fallback box's fresh volume is its own.
+      if [ -n "$MEMBER" ] || [ "$(box_work)" = persistent ]; then
         ID="$(box_id)"
         say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
-        member_attach "$ID" || exit 1
+        attach_work "$ID" || exit 1
         CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
           --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
           --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
@@ -496,6 +514,7 @@ case "$CMD" in
     AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
       --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
     say "Work volume $VOL is in $AZ -- the box launches there (EBS is AZ-locked)."
+    wait_volume_free "$VOL" || exit 1
     MODE_NOW=$(launch_mode)
     case "$MODE_NOW" in
       on-demand)
@@ -541,15 +560,8 @@ case "$CMD" in
       # carry a pre-existing volume -- and EC2 rejects an attach while the instance is
       # still pending. The boot-time mount loop waits for the device, so it is racing this
       # attach and wins as long as we do it promptly.
-      if [ -n "$MEMBER" ]; then
-        member_attach "$ID" || exit 1
-      elif ! { aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null; \
-               aws ec2 attach-volume --region "$REGION" --volume-id "$VOL" \
-                 --instance-id "$ID" --device /dev/sdf >/dev/null 2>&1; }; then
-        say "FAILED to attach $VOL to $ID. The box is up but has no /mnt/work."
-        say "Check: aws ec2 describe-volumes --region $REGION --volume-ids $VOL"
-        exit 1
-      fi
+      # The same routine for every box: wait for the volume, attach it, and terminate a box that cannot get it.
+      attach_work "$ID" || exit 1
 
       say "Waiting for SSH and the work disk to mount..."
       wait_ready persistent

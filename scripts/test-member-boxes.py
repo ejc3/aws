@@ -668,6 +668,15 @@ if op == "describe-instances":
         print("\n".join(iid.split()))
 elif op == "describe-volumes":
     name = tag_name()
+    if not name and opt("--volume-ids").startswith("vol-") and "[State," in opt("--query"):
+        # by id: State and attachment. FAKE_VOL_BUSY=N: the first N answers say it is still detaching from a gone box.
+        busy = int(box("vol-busy-count") or 0)
+        if busy < int(os.environ.get("FAKE_VOL_BUSY", "0")):
+            open(os.path.join(state, "vol-busy-count"), "w").write(str(busy + 1))
+            print("in-use\ti-old")
+        else:
+            print("available\tNone")
+        sys.exit(0)
     if not name:
         print("us-east-2c" if "AvailabilityZone" in opt("--query") else "None")
         sys.exit(0)
@@ -907,6 +916,38 @@ class ScriptRuns(unittest.TestCase):
         self.assertFalse([c for c in calls if "attach-volume" in c or "terminate" in c])
         self.assertIn("running box=pbox-skevh", r.stdout)
 
+    def test_pbox_waits_for_a_detaching_volume_before_launching(self):
+        """#512: right after `pbox down` the work volume is still detaching; `up` waits before it launches anything."""
+        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_VOL_BUSY="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        waits = [i for i, c in enumerate(calls) if c.startswith("ec2 describe-volumes") and "--volume-ids" in c and "[State," in c]
+        runs = [i for i, c in enumerate(calls) if "run-instances" in c]
+        self.assertEqual(len(waits), 4, "three busy answers, then available")
+        self.assertLess(waits[-1], runs[0], "the launch comes only after the volume is free")
+        self.assertIn("waiting for it to be free before launching", r.stderr + r.stdout)
+        self.assertIn("ec2 attach-volume --region us-east-2 --volume-id vol-parallel-box-2-work --instance-id i-new-parallel-box-2 --device /dev/sdf", calls)
+
+    def test_pbox_owner_up_attaches_the_volume_of_an_existing_box(self):
+        # another `up` launched the box but had not attached its volume yet
+        (self.state / "parallel-box-2").write_text("i-9\n")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in calls if "run-instances" in c])
+        self.assertEqual([c for c in calls if "attach-volume" in c],
+                         ["ec2 attach-volume --region us-east-2 --volume-id vol-parallel-box-2-work --instance-id i-9 --device /dev/sdf"])
+
+    def test_pbox_refuses_to_launch_while_the_volume_stays_attached(self):
+        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_VOL_BUSY="1000")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse([c for c in calls if "run-instances" in c], "nothing is launched, so nothing is paid for")
+        self.assertIn("nothing was launched", r.stderr + r.stdout)
+
+    def test_pbox_owner_box_that_cannot_get_its_volume_is_terminated(self):
+        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_ATTACH_FAILS="1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue([c for c in calls if "terminate-instances" in c and "i-new-parallel-box-2" in c],
+                        "a 192-core box without /mnt/work is not left running")
+
     def test_pbox_member_attach_failures_and_races(self):
         (self.state / "pbox-colin").write_text("i-8\n")
         r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_RACE="1")
@@ -931,6 +972,7 @@ class ScriptRuns(unittest.TestCase):
 
     def test_pbox_owner_running_box_is_reported_as_before(self):
         (self.state / "parallel-box").write_text("i-1\n")
+        (self.state / "vol-parallel-box-work.attached").write_text("i-1")  # its volume is on it: nothing to attach
         r, calls = self.run_script("parallel-box.sh", "up", user="ejc3")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
