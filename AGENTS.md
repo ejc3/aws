@@ -1605,7 +1605,10 @@ its address lists (`people.tf`).
 After each production deploy, dolphin-labs' `e2e (Production)` job reads `dolphin-labs-prod`'s Workers Logs with a token that
 can do nothing else (`dolphin-labs-ci-logs.tf`: a secret of the repository's `production-check` environment, main only). It
 reads every Worker's logs in the account, not just dolphin-labs-prod's: Cloudflare cannot scope it to one Worker.
-dolphin-maps had no public production (its Vercel URL was behind Vercel's login); `dolphin-maps-stage` behind Access replaces it.
+Dolphin Maps production (#529, 2026-10-19) is maps.dolphin-labs.dev, served by `dolphin-maps-prod` (`dolphin-labs-zone.tf`): a
+proxied placeholder record and a Workers route, PUBLIC through an Access application for exactly that host with a bypass-everyone
+policy (the `*.dolphin-labs.dev` GitHub gate still covers every other host). Its secrets are `workers-prod/dolphin-maps` in the
+Dolphin account (dolphin-aws `secrets.tf`), loaded by `scripts/workers-prod-secrets.sh dolphin-maps`.
 Every other production hostname (www.cc-games.org and the old domains, which Vercel still redirects) and the multiplayer `play.cc-games.*` entries are DNS-only records
 pointing at Vercel or the games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
 get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees

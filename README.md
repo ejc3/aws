@@ -1090,6 +1090,9 @@ Each zone has its own tunnel, its own credentials, its own registry, and its own
 project's URLs down. Access gates both: `cc-games.dev` through Google or one-time PIN
 against an email allowlist, `dolphin-labs.dev` through GitHub against membership of the
 `dolphin-labs-hq` organization. A separate service token supports non-interactive checks.
+One host there is public on purpose: `maps.dolphin-labs.dev` is Dolphin Maps production, served by the Worker
+`dolphin-maps-prod`, with its own record and an Access application that bypasses the gate for that host only
+(`dolphin-labs-zone.tf`). `ndev` cannot serve that name.
 
 **Two deliberate exceptions, both for the family board** (`ejc3/family`, which shows the
 household's day on the living-room TV, an e-ink tablet and phones):
@@ -2720,6 +2723,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Games multiplayer (ECS match engines, `play.cc-games.org`, `play.cc-games.net` and `play.cc-games.app`) | `games-multiplayer.tf`, `games-multiplayer-bringup.tf`, `games-multiplayer-deploy.tf` (automatic deploys: poller, builds, releases, migrations), `games-multiplayer-edge.tf` (WAF, access logs, router autoscaling, health alarms), `games-multiplayer/` (launch, poller, release and sweeper functions, bring-up steps, buildspecs), `docs/games-multiplayer.md` |
 | Imagine (`ejc3/imagine`: a collaborative editor's backend on ECS, zero tasks while unused, behind a host rule on the games load balancer at `imagine.play.cc-games.app`) | `imagine.tf` (bring-up order in its header), `imagine/scale.py` (the function that wakes, sleeps and rolls the service) |
 | dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site on Vercel with Google sign-in and a Turso store; its credentials per environment, and its CI runners) | `dolphin-films.tf` (secret containers and readers; bring-up order in its header), `runner-repos.tf` and `runner-app.tf` (served under the `dolphin` label) |
+| Dolphin Maps production (`maps.dolphin-labs.dev`, public, served by the Worker `dolphin-maps-prod`; its secrets are `workers-prod/dolphin-maps` in the Dolphin account) | `dolphin-labs-zone.tf`, `scripts/workers-prod-secrets.sh dolphin-maps` |
 | Host access audit (reports opens of registered paths on hosts and any use of registered principals; the registry is private; rollout in "Host access audit" above) | `access-audit.tf`, `scripts/access-audit.py` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 

@@ -171,6 +171,91 @@ resource "cloudflare_zero_trust_access_application" "dolphin_labs" {
   ]
 }
 
+# ---------------------------------------------------------------------------------
+# Dolphin Maps PRODUCTION: maps.dolphin-labs.dev, served by the Worker dolphin-maps-prod (ejc3/aws #529). Not a preview:
+# production left with the dolphin-labs Vercel team (#503), and the owner chose this host on 2026-10-19. The Worker is
+# web/wrangler.jsonc env.production in dolphin-labs-hq/dolphin-maps (workers.dev and previews off, so this route is its
+# only address); its secrets are workers-prod/dolphin-maps in the Dolphin account, loaded by
+# scripts/workers-prod-secrets.sh dolphin-maps.
+#
+# The shape of gamesworthwatching-zone.tf: a proxied record exists only so the route has a hostname to match, and the
+# route answers every request, so the content is never contacted. The record is the Workers-only placeholder, A
+# 192.0.2.1 (TEST-NET-1, routes nowhere). It is a name of its own, so the zone's `*` wildcard (the previews tunnel)
+# no longer answers for it: a wildcard only covers names that have no record.
+#
+# PUBLIC. The iPhone app and visitors reach it with no identity, so it has its own Access application for exactly
+# this host with a bypass-everyone policy; Cloudflare applies the most specific application, so the wildcard
+# application above still gates every other *.dolphin-labs.dev host and is not changed. The same pattern as
+# family_wall_assets in cloudflare.tf. The bypass depends on the record and the route, so it can only exist once the
+# host is the Worker's: without the record the name would fall to the wildcard and reach the previews tunnel, which
+# must never be public. If the route cannot be created the host stays behind the GitHub login (fails closed).
+#
+# Not counted on local.dolphin_enabled: that switch takes the previews down, and production must not go with them.
+#
+# CREDENTIAL: the route needs Workers Routes write on this zone, which the provider token (cloudflare-tunnel-token)
+# carries for cc-games.org, gamesworthwatching.com and yourfantasymovie.com only; add this zone to that policy first,
+# the same one-PUT change. It already has DNS write and Zone Settings write here.
+# ---------------------------------------------------------------------------------
+locals {
+  dolphin_maps_host   = "maps.dolphin-labs.dev"
+  dolphin_maps_worker = "dolphin-maps-prod"
+}
+
+resource "cloudflare_dns_record" "dolphin_maps" {
+  zone_id = var.dolphin_zone_id
+  name    = local.dolphin_maps_host
+  type    = "A"
+  content = "192.0.2.1"
+  proxied = true
+  ttl     = 1
+  comment = "proxied; Worker ${local.dolphin_maps_worker} route serves all; origin unreachable on purpose"
+}
+
+resource "cloudflare_workers_route" "dolphin_maps" {
+  zone_id = var.dolphin_zone_id
+  pattern = "${local.dolphin_maps_host}/*"
+  script  = local.dolphin_maps_worker
+}
+
+resource "cloudflare_zero_trust_access_policy" "dolphin_maps_public" {
+  account_id = var.cloudflare_account_id
+  name       = "Dolphin Maps production (public)"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "dolphin_maps_public" {
+  account_id = var.cloudflare_account_id
+  name       = "Dolphin Maps production (public)"
+  type       = "self_hosted"
+  domain     = local.dolphin_maps_host
+
+  destinations = [
+    { type = "public", uri = local.dolphin_maps_host },
+  ]
+
+  # Declared here, as on every application: an apply drops an attachment that is not, and an application with no
+  # policy refuses everyone, which would take production down.
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.dolphin_maps_public.id
+      precedence = 1
+    },
+  ]
+
+  depends_on = [cloudflare_dns_record.dolphin_maps, cloudflare_workers_route.dolphin_maps]
+}
+
+# Plain http:// is upgraded at the edge for the whole zone (previews included: they are proxied and already https).
+resource "cloudflare_zone_setting" "dolphin_always_use_https" {
+  zone_id    = var.dolphin_zone_id
+  setting_id = "always_use_https"
+  value      = "on"
+}
+
 output "dolphin_labs_status" {
   description = "Whether *.dolphin-labs.dev is stood up, and what is missing if not"
   value = local.dolphin_enabled ? "active: https://<name>.dolphin-labs.dev (GitHub login required)" : join(" ", compact([
