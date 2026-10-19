@@ -7,6 +7,9 @@
 #   workers-prod/SITE             what an administrator put (values Terraform does not hold)
 #   workers-prod/SITE/terraform   what Terraform writes (the same values it writes to Vercel production)
 # The two are merged; a name in both, an empty value or a placeholder refuses the whole load before Cloudflare is called.
+# dolphin-maps has only workers-prod/dolphin-maps, kept in the Dolphin account (dolphin-labs-hq/dolphin-aws, secrets.tf) and
+# read there through OrganizationAccountAccessRole, as workers-stage-secrets.sh reads the Dolphin sites' staging containers;
+# Terraform here holds none of its values.
 # The merged JSON is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this script's
 # output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a deploy is
 # uploading can be lost when that deploy activates.
@@ -20,25 +23,61 @@ SITE=${1:?usage: workers-prod-secrets.sh SITE}
 WORKER="$SITE-prod"
 ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
-# Exactly what each site's out-of-band container must hold (workers-prod-secrets.tf,
-# local.colton_games_prod_worker_out_of_band), so a missing credential is refused here and not found after the cutover.
+DOLPHIN_ACCOUNT_ID=484888470752
+SOURCE_ACCOUNT=""   # empty: this account
+MANAGED_CONTAINER=1 # workers-prod/SITE/terraform exists (Terraform writes it)
+
+# Exactly what each site's out-of-band container must hold (colton-games: workers-prod-secrets.tf,
+# local.colton_games_prod_worker_out_of_band; dolphin-maps: the names its Worker reads, ejc3/aws #529), so a missing
+# credential is refused here and not found after the cutover.
 case "$SITE" in
   colton-games) OUT_OF_BAND_NAMES="SKYHOOK_LEADERBOARD_SECRET SUPABASE_SECRET_KEY SUPABASE_URL" ;;
+  dolphin-maps)
+    SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID
+    MANAGED_CONTAINER=""
+    OUT_OF_BAND_NAMES="ACCOUNT_TOKEN_KEY APPLE_BUNDLE_ID APPLE_KEY_ID APPLE_PRIVATE_KEY APPLE_SERVICES_ID APPLE_TEAM_ID"
+    OUT_OF_BAND_NAMES+=" GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET LEDGER_AUTH_TOKEN LEDGER_DATABASE_URL TURSO_AUTH_TOKEN TURSO_DATABASE_URL"
+    ;;
   *) echo "no production Worker secrets are defined for $SITE (workers-prod-secrets.tf)" >&2; exit 2 ;;
 esac
 
 read_container() {
-  aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null \
-    || { echo "$1 has no value yet: put one first (see workers-prod-secrets.tf)" >&2; return 1; }
+  if [[ -z "$SOURCE_ACCOUNT" ]]; then
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null \
+      || { echo "$1 has no value yet: put one first (see workers-prod-secrets.tf)" >&2; return 1; }
+    return
+  fi
+  # A one-hour session in the Dolphin account, held only in a subshell's environment (never on a command line or on
+  # disk), used for this one read. It fails closed: with no complete session there is no read at all, because the
+  # caller's own credentials would read this account, which does not hold the container.
+  local key secret token
+  read -r key secret token < <(aws sts assume-role --role-arn "arn:aws:iam::$SOURCE_ACCOUNT:role/OrganizationAccountAccessRole" \
+    --role-session-name "workers-prod-secrets-$(id -un)" \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null) || true
+  if [[ -z "${key:-}" || -z "${secret:-}" || -z "${token:-}" || "$key" == None || "$token" == None ]]; then
+    echo "no session in account $SOURCE_ACCOUNT (assume-role of OrganizationAccountAccessRole failed)" >&2
+    return 1
+  fi
+  (
+    export AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_SESSION_TOKEN="$token"
+    # Either profile variable makes the CLI ignore the session in the environment.
+    unset AWS_PROFILE AWS_DEFAULT_PROFILE
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null
+  ) || { echo "$1 in account $SOURCE_ACCOUNT has no value yet: put one first (dolphin-labs-hq/dolphin-aws, secrets.tf)" >&2; return 1; }
 }
 OUT_OF_BAND=$(read_container "workers-prod/$SITE") || exit 1
-MANAGED=$(read_container "workers-prod/$SITE/terraform") || exit 1
+MANAGED=""
+if [[ -n "$MANAGED_CONTAINER" ]]; then
+  MANAGED=$(read_container "workers-prod/$SITE/terraform") || exit 1
+fi
 
 # Merge and check in one place; the merged object goes to stdout, names and refusals to stderr.
-JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" OUT_OF_BAND_NAMES="$OUT_OF_BAND_NAMES" python3 -c '
+JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" MANAGED_CONTAINER="$MANAGED_CONTAINER" OUT_OF_BAND_NAMES="$OUT_OF_BAND_NAMES" python3 -c '
 import json, os, re, sys
 merged = {}
 for label in ("OUT_OF_BAND", "MANAGED"):
+    if label == "MANAGED" and not os.environ["MANAGED_CONTAINER"]:
+        continue
     try:
         d = json.loads(os.environ[label])
     except ValueError:
