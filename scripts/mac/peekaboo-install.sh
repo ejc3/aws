@@ -45,7 +45,8 @@ fetch() { # URL SHA256 FILE
 
 # The CLI for the pinned version.
 cli=$support/cli-$VERSION
-if [ "$(cat "$cli/.release-sha256" 2>/dev/null || true)" = "$CLI_TGZ_SHA256" ] && [ -x "$cli/peekaboo" ]; then
+if [ "$(cat "$cli/.release-sha256" 2>/dev/null || true)" = "$CLI_TGZ_SHA256" ] && [ -x "$cli/peekaboo" ] &&
+  [ "$(team "$cli/peekaboo")" = "$TEAM" ] && codesign --verify --strict "$cli/peekaboo" 2>/dev/null; then
   echo "peekaboo: CLI $VERSION already installed"
 else
   fetch "$BASE/peekaboo-macos-arm64.tar.gz" "$CLI_TGZ_SHA256" "$tmp/cli.tgz"
@@ -64,7 +65,7 @@ fi
 # The app.
 running() { pgrep -f "^$app/Contents/MacOS/Peekaboo" >/dev/null 2>&1; }
 have=$(app_version "$app")
-if [ "$have" = "$VERSION" ] && [ "$(team "$app")" = "$TEAM" ]; then
+if [ "$have" = "$VERSION" ] && [ "$(team "$app")" = "$TEAM" ] && codesign --verify --deep --strict "$app" 2>/dev/null; then
   echo "peekaboo: app $VERSION already installed"
 elif running && [ "$update_running" -eq 0 ]; then
   echo "peekaboo: app ${have:-?} is running; it stays until Peekaboo is quit at the Mac, or rerun with --update-peekaboo" \

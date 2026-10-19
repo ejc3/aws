@@ -604,8 +604,11 @@ esac
 
     def test_the_macbook_is_rewritten_unchanged_and_nothing_reloads(self):
         agent = self.owners_mac()
+        token = self.home / ".cloudflared/macbook-ssh.token"
+        token.chmod(0o644)  # drifted, e.g. after a restore
         result = self.run_setup("mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(token.stat().st_mode & 0o777, 0o600, "an unchanged token still gets its mode back")
         self.assertEqual(agent.read_text(), self.OWNERS_PLIST.replace("HOME", str(self.home)), "its LaunchAgent, byte for byte")
         self.assertIn("connector: unchanged and loaded; not reloaded", result.stdout)
         self.assertIn("token unchanged", result.stdout)

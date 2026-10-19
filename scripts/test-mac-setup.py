@@ -287,7 +287,10 @@ class PeekabooInstall(unittest.TestCase):
         self.stub("curl", f'echo "curl $*" >> {log}\nurl=""; out=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done\n'
                           f'cp "{self.releases}/$(basename "$url")" "$out"')
         self.stub("shasum", 'sha256sum "$3"')
-        self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; *) exit 0;; esac')
+        # --verify fails for any path listed in self.broken (a damaged install), passes otherwise.
+        self.broken = self.temp / "broken"
+        self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; '
+                              f'*) for a; do :; done; grep -qxF "$a" {shlex.quote(str(self.broken))} 2>/dev/null && exit 1; exit 0;; esac')
         self.stub("defaults", '[ -f "$2.plist" ] && head -1 "$2.plist"')
         self.stub("ditto", 'python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$3" "$4"')
         self.stub("pgrep", f'[ -e {shlex.quote(str(self.running))} ]')
@@ -343,6 +346,15 @@ class PeekabooInstall(unittest.TestCase):
         self.assertEqual(self.files(), before, "a rerun changes nothing")
         self.assertEqual(self.calls().count("curl "), 2, "and downloads nothing")
         self.assertNotIn("bootstrap", self.calls()[len(calls):].replace("launchctl print", ""), "nor reloads the agent")
+
+    def test_an_installed_app_or_cli_whose_signature_no_longer_verifies_is_reinstalled(self):
+        self.assertEqual(self.run_().returncode, 0)
+        self.broken.write_text(f"{self.app}\n{self.support / f'cli-{self.version}' / 'peekaboo'}\n")
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"installed CLI {self.version}", r.stdout)
+        self.assertIn(f"installed app {self.version}", r.stdout)
+        self.assertEqual(self.calls().count("curl "), 4, "both downloaded again")
 
     def test_a_running_older_app_is_left_alone_and_the_wrapper_keeps_its_matching_cli(self):
         self.owners_mac()

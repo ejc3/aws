@@ -187,7 +187,7 @@ echo "5/6 the connector token (from Secrets Manager, through ssh stdin only)"
 { set +x; } 2>/dev/null
 # Replaced only when it differs; a new token leaves a flag so step 6 restarts the connector (it reads the file at start).
 aws secretsmanager get-secret-value --region "$REGION" --secret-id "$TUNNEL_SECRET" --query SecretString --output text |
-  on_mac "'umask 077; t=\$HOME/$TOKEN_FILE; mkdir -p \$HOME/.cloudflared && cat > \$t.new && [ -s \$t.new ] || { rm -f \$t.new; exit 1; }; if cmp -s \$t.new \$t; then rm -f \$t.new; echo token unchanged; else mv -f \$t.new \$t && chmod 600 \$t && touch \$t.changed && echo token installed; fi'"
+  on_mac "'umask 077; t=\$HOME/$TOKEN_FILE; mkdir -p \$HOME/.cloudflared && cat > \$t.new && [ -s \$t.new ] || { rm -f \$t.new; exit 1; }; if cmp -s \$t.new \$t; then rm -f \$t.new; echo token unchanged; else mv -f \$t.new \$t && touch \$t.changed && echo token installed; fi; chmod 600 \$t'"
 
 echo "6/6 the clients' keys and the connector LaunchAgent"
 on_mac bash -s <<REMOTE
