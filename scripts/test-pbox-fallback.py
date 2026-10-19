@@ -66,6 +66,8 @@ elif "describe-instances" in a and "Fallback" in a:
     print("true" if here and state[0] + "/" + state[1] != "us-east-2/us-east-2c" else "None")
 elif "describe-instances" in a:
     print("None")
+elif "describe-volumes" in a and "[State," in a:
+    print("available\tNone")
 elif "describe-volumes" in a and "AvailabilityZone" in a:
     print("us-east-2c")
 elif "describe-volumes" in a:

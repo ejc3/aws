@@ -491,8 +491,9 @@ case "$CMD" in
   up)
     member_key
     if locate_box; then
-      if [ -n "$MEMBER" ]; then
-        # Not taken as ready: it may be the box of an interrupted launch, waiting for its volume.
+      # A box on its persistent work volume (a member's, or one of the owner's slots at home) is not taken as ready: it
+      # may be the box of an interrupted launch, waiting for its volume. A fallback box's fresh volume is its own.
+      if [ -n "$MEMBER" ] || [ "$(box_work)" = persistent ]; then
         ID="$(box_id)"
         say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
         attach_work "$ID" || exit 1

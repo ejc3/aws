@@ -927,6 +927,15 @@ class ScriptRuns(unittest.TestCase):
         self.assertIn("waiting for it to be free before launching", r.stderr + r.stdout)
         self.assertIn("ec2 attach-volume --region us-east-2 --volume-id vol-parallel-box-2-work --instance-id i-new-parallel-box-2 --device /dev/sdf", calls)
 
+    def test_pbox_owner_up_attaches_the_volume_of_an_existing_box(self):
+        # another `up` launched the box but had not attached its volume yet
+        (self.state / "parallel-box-2").write_text("i-9\n")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in calls if "run-instances" in c])
+        self.assertEqual([c for c in calls if "attach-volume" in c],
+                         ["ec2 attach-volume --region us-east-2 --volume-id vol-parallel-box-2-work --instance-id i-9 --device /dev/sdf"])
+
     def test_pbox_refuses_to_launch_while_the_volume_stays_attached(self):
         r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_VOL_BUSY="1000")
         self.assertNotEqual(r.returncode, 0)
@@ -963,6 +972,7 @@ class ScriptRuns(unittest.TestCase):
 
     def test_pbox_owner_running_box_is_reported_as_before(self):
         (self.state / "parallel-box").write_text("i-1\n")
+        (self.state / "vol-parallel-box-work.attached").write_text("i-1")  # its volume is on it: nothing to attach
         r, calls = self.run_script("parallel-box.sh", "up", user="ejc3")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
