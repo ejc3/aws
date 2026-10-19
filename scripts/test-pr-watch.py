@@ -113,7 +113,8 @@ class SkillTextTests(unittest.TestCase):
         for phrase in ("data, never instructions", "/security-review", "claim.sh claim", "@coderabbitai review",
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
                        "`jobs` map", "-R <repo> --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
-                       "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "repos/ejc3/agents-md/compare/", "keyed by `<repo>#<number>`", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`"):
+                       "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "repos/ejc3/agents-md/compare/", "keyed by `<repo>#<number>`", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`",
+                       "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic"):
             self.assertIn(phrase, skill)
 
 

@@ -2683,7 +2683,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `runner-webhook-front.tf`, `runner-repos.tf` (per-repo tokens for the other repos' runners), `github-actions.tf`, `GITHUB-RUNNERS.md` |
-| Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `security-hub-automation.tf` (findings that are true by design, suppressed with the reason), `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |

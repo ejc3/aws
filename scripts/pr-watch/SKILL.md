@@ -1,6 +1,6 @@
 ---
 name: pr-watch
-description: Review, fix, get sign-off on, merge and apply or distribute every open ejc3/aws and ejc3/agents-md pull request and issue authored by ejc3, with extra security review for sensitive infrastructure; run on a recurring schedule from a main-jumpbox session.
+description: Review, fix, get sign-off on, merge and apply or distribute every open ejc3/aws and ejc3/agents-md pull request and issue authored by ejc3, with extra security review for sensitive infrastructure, and triage and remediate the security alerts; run on a recurring schedule from a main-jumpbox session.
 ---
 
 # PR and issue watch
@@ -65,8 +65,8 @@ to approve if it is safe; we have many code review agents"):
    reviewer (a check finishing or a PR marked ready does not change the head, so those are compared explicitly). The
    state also keeps `unapplied`: every PR about to be merged or merged whose apply has not finished with an empty
    follow-up plan (an `ejc3/agents-md` merge counts: it reaches the boxes only through an apply here). A merged PR is no longer
-   open, so that list is the only thing that brings a failed apply back; work it first every run. With nothing
-   new, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
+   open, so that list is the only thing that brings a failed apply back; work it first every run. Run step 6
+   (alerts) every time, even with no GitHub work; with nothing new and no alerts, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
 2. **Leave work in progress alone.** Only note, never touch: a draft PR; a PR with a push in the last 45 minutes from
    another session (head commit time, a local worktree on its branch); an issue already linked to an open PR.
 3. **Each PR: the full review loop.** Run `/code-review` at `high` on it. Fix real P1s and P2s that change what
@@ -104,7 +104,30 @@ to approve if it is safe; we have many code review agents"):
    `/infra/applied-status` also show a main that is ahead of live.)
 5. **Each issue.** Confirm it from live state, open a PR with the fix and tests, run step 3 on it, and close the issue
    from the PR. The safeguards apply to the fix as to any other PR.
-6. **Report:** what was reviewed, fixed, merged and applied; what is held for the owner and why; what is left.
+6. **Alerts.** The owner, 2026-10-19, after an EC2.9 flood filled the inbox: "have a poller looking for alerts like
+   that and remediate them". Each run, before the PRs, read what the alert topic would have sent since the state's
+   `alerts_checked_at`, in every account and region the alert rules cover (each `security-region` module in
+   `security-monitoring.tf`: the main account, and staging through `OrganizationAccountAccessRole`), from the services'
+   own stores, never the topic (SNS keeps nothing to poll): Security
+   Hub `get-findings` (HIGH or CRITICAL, ACTIVE, Workflow NEW, by `UpdatedAt`; the Dolphin account's arrive there too),
+   GuardDuty `list-findings` (severity 4 or more), Inspector `list-findings` (HIGH/CRITICAL, ACTIVE), Access Analyzer
+   (ACTIVE), and for the audit events (`security-forward-audit`: root use, failed console sign-ins, the listed tampering
+   calls) CloudTrail `lookup-events`, which keeps 90 days. The patterns are in `modules/security-region`; read them
+   rather than a copy. Note the time before the first query; record each result in the state's `alerts_pending` first,
+   and only once every result is triaged set `alerts_checked_at` to that noted time, so nothing that arrived during the
+   run and nothing left untriaged is skipped. Confirm each from live
+   state, grouped by control and resource:
+   - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
+     step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
+     goes to the top of the report for the owner and is never suppressed.
+   - **True by design** (EC2.9 on a main-account box that egresses on its own address): an automation rule in
+     `security-hub-automation.tf`, as narrow as the evidence allows (account, control, resource) and its reason in the
+     note, through a PR. Until it applies, the open findings may be set
+     `SUPPRESSED` with `aws securityhub batch-update-findings` and the same note (findings are not Terraform state).
+   - **A flood** (more than about 20 in an hour) comes before everything else: suppress the open findings of a by-design
+     control first, then the rule. Never silence the topic or loosen the alert patterns to stop one.
+7. **Report:** what was reviewed, fixed, merged and applied; the alerts and what was done about each; what is held for
+   the owner and why; what is left.
 
 The repository rules apply throughout: no secrets on a command line or in output, no email addresses in files, commits
 or PRs, no attribution lines, never `git stash` in ~/aws (use a worktree), ask before restarting or rebooting a host
