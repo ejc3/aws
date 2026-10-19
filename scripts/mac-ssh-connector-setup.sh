@@ -105,7 +105,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 offered() {
   ssh -v -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=0 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 22 "$(id -un)@127.0.0.1" true 2>&1 </dev/null |
-    awk -F': ' '/Authentications that can continue/ { print $NF; exit }'
+    awk -F': ' '/Authentications that can continue/ { print $NF; exit }' | tr -d '\r[:space:]'
 }
 methods=$(offered)
 if [ "$methods" != publickey ]; then
