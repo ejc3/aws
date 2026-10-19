@@ -142,9 +142,20 @@ def guardduty_resource(resource):
     return (kind + " " + name).strip()
 
 
-def securityhub_matches(finding):
+def native_copy(finding, event_account):
+    """A Security Hub copy of a finding that already alerts through its own branch (the pattern's ProductArn exclusion):
+    every GuardDuty finding (member accounts' arrive natively here too, as their administrator), and Inspector findings of
+    this account. A member account's Inspector finding (the Dolphin account's) reaches here only as this copy, through
+    the dolphin-security-inspector rule, so it is kept."""
+    product = str(finding.get("ProductArn") or "")
+    return product.endswith(":product/aws/guardduty") or \
+        (product.endswith(":product/aws/inspector") and finding.get("AwsAccountId") == event_account)
+
+
+def securityhub_matches(finding, event_account=None):
     """The central rule matches an event if ANY finding in it matches, so re-check each one."""
     return (isinstance(finding, dict) and finding.get("Id")
+            and not native_copy(finding, event_account)
             and (finding.get("Severity") or {}).get("Label") in ("HIGH", "CRITICAL")
             and finding.get("RecordState") == "ACTIVE"
             and (finding.get("Workflow") or {}).get("Status") == "NEW")
@@ -210,7 +221,7 @@ def alerts_from_event(event):
     if source == "aws.securityhub" and kind_name == "Security Hub Findings - Imported":
         found = []
         for finding in detail.get("findings") or []:
-            if not securityhub_matches(finding):
+            if not securityhub_matches(finding, event.get("account")):
                 continue
             reg = finding.get("Region") or region
             inspector = str(finding.get("ProductArn") or "").endswith(":product/aws/inspector")

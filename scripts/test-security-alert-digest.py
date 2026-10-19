@@ -318,12 +318,25 @@ class DigestTests(unittest.TestCase):
         event["detail"]["findings"].append(dict(event["detail"]["findings"][0], Id="f4", RecordState="ARCHIVED"))
         self.assertEqual([a["identity"] for a in digest.alerts_from_event(event)], ["securityhub:f1"])
 
+    def test_native_copies_in_a_securityhub_event_are_dropped_but_a_member_inspector_copy_is_kept(self):
+        event = securityhub("f1")
+        base = event["detail"]["findings"][0]
+        gd = "arn:aws:securityhub:us-west-1::product/aws/guardduty"
+        insp = "arn:aws:securityhub:us-west-1::product/aws/inspector"
+        event["detail"]["findings"] += [dict(base, Id="own-inspector", ProductArn=insp),
+                                        dict(base, Id="member-guardduty", ProductArn=gd, AwsAccountId="222222222222"),
+                                        dict(base, Id="member-inspector", ProductArn=insp, AwsAccountId="222222222222")]
+        self.assertEqual([a["identity"] for a in digest.alerts_from_event(event)],
+                         ["securityhub:f1", "securityhub:member-inspector"])
+
     # --- classification ----------------------------------------------------------------------------------------
 
     def test_immediate_and_digest_classification(self):
         immediate = [guardduty("g"), cloudtrail("c"), access_analyzer("a"),
                      cloudtrail("r", name="ConsoleLogin", source="signin.amazonaws.com", identity_type="Root")]
-        later = [inspector(1), securityhub("s"), securityhub("dolphin-inspector", product="inspector"),
+        member_inspector = securityhub("dolphin-inspector", product="inspector")
+        member_inspector["detail"]["findings"][0]["AwsAccountId"] = "222222222222"  # a member account's copy
+        later = [inspector(1), securityhub("s"), member_inspector,
                  {"id": "e", "source": "aws.health", "detail-type": "AWS Health Event", "account": MAIN, "region": "us-west-1", "detail": {}},
                  guardduty("low", severity=2.0)]
         for event in immediate:
