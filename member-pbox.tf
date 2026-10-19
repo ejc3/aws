@@ -3,7 +3,7 @@
 # EACH MEMBER'S PBOX: one many-core Graviton spot box per person in local.member_box_people
 # (member-boxes.tf), "pbox-<person>", with a persistent 100 GB work volume of its own, in Ohio
 # next to the owner's parallel boxes (ohio-pbox.tf: the VPC, subnet, security group and key
-# pair are shared; nothing of the owner's four slots changes). A member runs `pbox up` /
+# pair are shared; nothing of the owner's eight slots changes). A member runs `pbox up` /
 # `pbox down` / `pbox ssh` from their own account: scripts/parallel-box.sh takes no slot number
 # for a member and acts on their box only.
 #

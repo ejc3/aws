@@ -60,13 +60,13 @@ class PboxMode(unittest.TestCase):
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=60)
         return r.stdout + r.stderr
 
-    def test_four_slots_and_a_fifth_is_refused(self):
-        for n in (1, 3, 4):
+    def test_eight_slots_and_a_ninth_is_refused(self):
+        for n in (1, 3, 5, 8):
             out = self.pbox("status", str(n), running=True)
             self.assertIn(f"parallel-box {n}:", out)
             self.assertEqual(out.count("state:"), 1)
-        out = self.pbox("status", "5")
-        self.assertIn("unknown box '5' (use 1-4)", out)
+        out = self.pbox("status", "9")
+        self.assertIn("unknown box '9' (use 1-8)", out)
         self.assertNotIn("state:", out)
 
     def test_up_on_demand_says_so_and_does_not_present_the_spot_price_as_the_cost(self):
@@ -110,8 +110,8 @@ class PboxMode(unittest.TestCase):
 
     def test_status_of_every_box_labels_each(self):
         out = self.pbox("status", market="none")
-        self.assertEqual(out.count("next launch: ON-DEMAND"), 4)
-        for n in (1, 2, 3, 4):
+        self.assertEqual(out.count("next launch: ON-DEMAND"), 8)
+        for n in range(1, 9):
             self.assertIn(f"parallel-box {n}:", out)
 
 

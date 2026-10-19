@@ -27,13 +27,39 @@ locals {
   parallel_box_region = "us-east-2"
 
   # The persistent volumes, by box number: size and Name tag (scripts/parallel-box.sh finds a volume by its Name tag).
-  # One per slot in local.parallel_boxes (parallel-box-launch.tf); slots 3 and 4 were added on 2026-10-10.
+  # One per slot in local.parallel_boxes (parallel-box-launch.tf); slots 3 and 4 were added on 2026-10-10, 5 to 8 on 2026-10-19.
   ohio_pbox_volumes = {
     "1" = { size = 300, name = "parallel-box-work" }
     "2" = { size = 100, name = "parallel-box-2-work" }
     "3" = { size = 100, name = "parallel-box-3-work" }
     "4" = { size = 100, name = "parallel-box-4-work" }
+    "5" = { size = 100, name = "parallel-box-5-work" }
+    "6" = { size = 100, name = "parallel-box-6-work" }
+    "7" = { size = 100, name = "parallel-box-7-work" }
+    "8" = { size = 100, name = "parallel-box-8-work" }
   }
+
+  # The largest box scripts/parallel-box.sh launches (the .48xlarge and .metal-48xl types).
+  parallel_box_max_vcpus = 192
+}
+
+# ============================================================ spot vCPU quota
+# L-34B43A08 = "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests" in us-east-2, shared by the owner's
+# parallel boxes, the members' pboxes (member-pbox.tf) and the fcvm metal runners (runner-vpc.tf). Ohio's default (640)
+# was exactly full with 8 metal runners on 2026-10-04, and the launcher (no fallback to another region) logged 18
+# MaxSpotInstanceCountExceeded errors an hour, so it went to 1,536 then. With eight slots, 8 x 192 = 1,536 is that
+# whole quota on its own, so it is the 1,536 the runners and members' boxes already had plus every slot at full size
+# (3,072 for eight slots).
+#
+# How the provider handles it: a change is a RequestServiceQuotaIncrease at apply. While AWS (or a support case) has the
+# request open, a refresh reports the requested value, so the plan stays empty; once approved it reads the applied value,
+# also empty. A denied or partly granted request reads back the real quota and shows a diff again (the next apply asks
+# again). A value below the current quota cannot be requested, and destroy only drops it from state.
+resource "aws_servicequotas_service_quota" "ohio_spot_standard" {
+  provider     = aws.ohio
+  service_code = "ec2"
+  quota_code   = "L-34B43A08"
+  value        = 1536 + length(local.parallel_boxes) * local.parallel_box_max_vcpus
 }
 
 variable "parallel_box_ami_ohio" {

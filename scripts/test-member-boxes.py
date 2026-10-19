@@ -88,10 +88,10 @@ class OwnerUnchanged(unittest.TestCase):
     def test_the_owners_slots_and_volumes_are_defined_as_before(self):
         launch = (ROOT / "parallel-box-launch.tf").read_text()
         gpu = (ROOT / "gpu-box.tf").read_text()
-        self.assertIn('parallel_boxes     = { for n in [1, 2, 3, 4] : tostring(n) => { name = n == 1 ? "parallel-box" : "parallel-box-${n}" } }', launch)
+        self.assertIn('parallel_boxes     = { for n in [1, 2, 3, 4, 5, 6, 7, 8] : tostring(n) => { name = n == 1 ? "parallel-box" : "parallel-box-${n}" } }', launch)
         self.assertIn('gpu_box_slots = { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" }', gpu)
-        for n, (size, name) in {"1": (300, "parallel-box-work"), "2": (100, "parallel-box-2-work"),
-                                "3": (100, "parallel-box-3-work"), "4": (100, "parallel-box-4-work")}.items():
+        for n, (size, name) in {"1": (300, "parallel-box-work"),
+                                **{str(k): (100, "parallel-box-%d-work" % k) for k in range(2, 9)}}.items():
             self.assertIn('"%s" = { size = %d, name = "%s" }' % (n, size, name), OHIO)
         # the member boxes are their own resources, never more keys in the owner's for_each maps
         for owner in ("parallel_boxes", "gpu_box_slots", "ohio_pbox_volumes"):
@@ -106,7 +106,7 @@ class OwnerUnchanged(unittest.TestCase):
             self.assertNotRegex(body, r"member_|(wbox|pbox|gbox)-(colton|connor|colin|skevh)")
 
     def test_owner_commands_keep_their_slots(self):
-        self.assertIn('    1|2|3|4) BOX="$1" ;;', PBOX)
+        self.assertIn('    1|2|3|4|5|6|7|8) BOX="$1" ;;', PBOX)
         self.assertIn('SLOTS="1 2 3 4" # the keys of local.gpu_box_slots', GBOX)
         self.assertIn('NAME="wbox"', WBOX)
 
@@ -958,7 +958,7 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual([c for c in calls if "terminate" in c], ["ec2 terminate-instances --region us-east-2 --instance-ids i-7"])
         r, calls = self.run_script("parallel-box.sh", "status", user="ejc3")
         self.assertEqual([l for l in r.stdout.splitlines() if l.endswith(":")],
-                         ["parallel-box 1:", "parallel-box 2:", "parallel-box 3:", "parallel-box 4:"])
+                         ["parallel-box %d:" % n for n in range(1, 9)])
         self.assertTrue([c for c in calls if c.startswith("ssm ")], "the owner still reads the pointer")
 
 
