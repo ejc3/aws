@@ -310,12 +310,22 @@ output "vpc_arn" {
   value = aws_vpc.this.arn
 }
 
+output "vpc_id" {
+  description = "The site's VPC, whose default security group default-security-groups.tf empties"
+  value       = aws_vpc.this.id
+}
+
 output "ami_id" {
   value = data.aws_ami.ubuntu.id
 }
 
 output "security_group_id" {
   value = aws_security_group.this.id
+}
+
+output "security_group_arn" {
+  description = "The box's security group, named by security-hub-automation.tf's open-SSH rule"
+  value       = aws_security_group.this.arn
 }
 
 output "key_name" {
