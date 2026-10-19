@@ -106,12 +106,16 @@ to approve if it is safe; we have many code review agents"):
    from the PR. The safeguards apply to the fix as to any other PR.
 6. **Alerts.** The owner, 2026-10-19, after an EC2.9 flood filled the inbox: "have a poller looking for alerts like
    that and remediate them". Each run, before the PRs, read what the alert topic would have sent since the state's
-   `alerts_checked_at` (then set it), from the services' own stores, never the topic (SNS keeps nothing to poll): Security
+   `alerts_checked_at`, in every account and region the alert rules cover (each `security-region` module in
+   `security-monitoring.tf`: the main account, and staging through `OrganizationAccountAccessRole`), from the services'
+   own stores, never the topic (SNS keeps nothing to poll): Security
    Hub `get-findings` (HIGH or CRITICAL, ACTIVE, Workflow NEW, by `UpdatedAt`; the Dolphin account's arrive there too),
    GuardDuty `list-findings` (severity 4 or more), Inspector `list-findings` (HIGH/CRITICAL, ACTIVE), Access Analyzer
    (ACTIVE), and for the audit events (`security-forward-audit`: root use, failed console sign-ins, the listed tampering
    calls) CloudTrail `lookup-events`, which keeps 90 days. The patterns are in `modules/security-region`; read them
-   rather than a copy. Confirm each from live state, grouped by control and resource:
+   rather than a copy. Record each result in the state's `alerts_pending` first, and move `alerts_checked_at` forward
+   only once every result is triaged, so a run that stops midway leaves the rest for the next. Confirm each from live
+   state, grouped by control and resource:
    - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
      step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
      goes to the top of the report for the owner and is never suppressed.
