@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the PR and issue watch installer and its SessionStart hook (scripts/pr-watch/)."""
 import json
+import sys
+import re
 import os
 import pathlib
 import subprocess
@@ -114,8 +116,66 @@ class SkillTextTests(unittest.TestCase):
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
                        "`jobs` map", "-R <repo> --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
                        "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "repos/ejc3/agents-md/compare/", "keyed by `<repo>#<number>`", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`",
-                       "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic"):
+                       "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "alert-poll.py", "`alerts_seen`", "30 minutes before `alerts_checked_at`", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic"):
             self.assertIn(phrase, skill)
+
+
+class AlertPollTests(unittest.TestCase):
+    """scripts/pr-watch/alert-poll.py, the alert step's reader, with the AWS clients stubbed."""
+
+    def load(self):
+        import datetime as dt
+        import importlib.util
+        import types
+        sys.modules.setdefault("boto3", types.ModuleType("boto3"))
+        bc = sys.modules.setdefault("botocore", types.ModuleType("botocore"))
+        cfg = types.ModuleType("botocore.config")
+        cfg.Config = lambda **kw: None
+        sys.modules["botocore.config"] = cfg
+        bc.config = cfg
+        spec = importlib.util.spec_from_file_location("alert_poll", ROOT / "scripts/pr-watch/alert-poll.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.SINCE = dt.datetime(2026, 10, 19, 4, 0, tzinfo=dt.timezone.utc)
+        return mod, dt
+
+    def test_scopes_are_every_security_region_module(self):
+        mod, _ = self.load()
+        got = mod.scopes(ROOT)
+        self.assertIn(("main", "us-west-1"), got)
+        self.assertIn(("staging", "us-west-1"), got)
+        tf = (ROOT / "security-monitoring.tf").read_text()
+        self.assertEqual(len(got), len(set(re.findall(r'module "security_(?:main|staging)_[a-z0-9_]+"', tf))))
+
+    def test_cloudtrail_reads_from_the_lookback_and_every_result_has_an_id(self):
+        mod, dt = self.load()
+        calls, printed = [], []
+        event = {"eventID": "ev-1", "eventSource": "iam.amazonaws.com", "eventName": "CreateAccessKey",
+                 "userIdentity": {"arn": "arn:aws:sts::111111111111:assumed-role/example/x"}, "eventTime": "t"}
+
+        class Pager:
+            def paginate(self, **kw):
+                calls.append(kw)
+                found = kw.get("LookupAttributes", [{}])[0].get("AttributeValue") == "CreateAccessKey"
+                return [{"Events": [{"CloudTrailEvent": json.dumps(event)}] if found else []}]
+
+        class Client:
+            def __getattr__(self, name):
+                if name == "get_paginator":
+                    return lambda op: Pager()
+                raise RuntimeError("service not stubbed")
+
+        class Sess:
+            def client(self, svc, **kw):
+                return Client()
+
+        mod.out = lambda **kw: printed.append(kw)
+        mod.poll("main", Sess(), "us-east-1")
+        starts = {c["StartTime"] for c in calls if "LookupAttributes" in c}
+        self.assertTrue(starts)
+        self.assertEqual(starts, {mod.SINCE - dt.timedelta(minutes=30)})
+        hits = [p for p in printed if p.get("src") == "cloudtrail" and "kind" in p]
+        self.assertEqual([(h["id"], h["kind"], h["event"]) for h in hits], [("ev-1", "tamper-or-iam", "CreateAccessKey")])
 
 
 if __name__ == "__main__":

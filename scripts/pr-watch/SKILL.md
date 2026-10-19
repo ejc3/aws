@@ -108,12 +108,15 @@ to approve if it is safe; we have many code review agents"):
    that and remediate them". Each run, before the PRs, read what the alert topic would have sent since the state's
    `alerts_checked_at`, in every account and region the alert rules cover (each `security-region` module in
    `security-monitoring.tf`: the main account, and staging through `OrganizationAccountAccessRole`), from the services'
-   own stores, never the topic (SNS keeps nothing to poll): Security
+   own stores, never the topic (SNS keeps nothing to poll), with `python3 -I ~/.local/share/pr-watch/alert-poll.py ~/aws
+   <alerts_checked_at>` (scripts/pr-watch/alert-poll.py; one JSON line per result, each with a stable `id`): Security
    Hub `get-findings` (HIGH or CRITICAL, ACTIVE, Workflow NEW, by `UpdatedAt`; the Dolphin account's arrive there too),
    GuardDuty `list-findings` (severity 4 or more), Inspector `list-findings` (HIGH/CRITICAL, ACTIVE), Access Analyzer
    (ACTIVE), and for the audit events (`security-forward-audit`: root use, failed console sign-ins, the listed tampering
    calls) CloudTrail `lookup-events`, which keeps 90 days. The patterns are in `modules/security-region`; read them
-   rather than a copy. Note the time before the first query; record each result in the state's `alerts_pending` first,
+   rather than a copy. CloudTrail is read from 30 minutes before `alerts_checked_at` (an event can reach
+   `lookup-events` minutes late), so drop any `id` already in the state's `alerts_seen` and add each triaged one
+   (keep a day of them). Note the time before the first query; record each result in the state's `alerts_pending` first,
    and only once every result is triaged set `alerts_checked_at` to that noted time, so nothing that arrived during the
    run and nothing left untriaged is skipped. Confirm each from live
    state, grouped by control and resource:
