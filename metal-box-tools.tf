@@ -43,12 +43,17 @@ resource "aws_ssm_association" "metal_box_tools" {
 
   parameters = {
     executionTimeout = "120"
+    # Every tool is downloaded and checked before any is replaced, so a failed download leaves the old set whole; each
+    # step is its own line, so set -e stops on any failure.
     commands = join("\n", concat(
-      ["set -eu", "export PATH=\"$PATH:/usr/local/bin:/snap/bin\"", "tmp=$(mktemp)", "trap 'rm -f \"$tmp\"' EXIT"],
+      ["set -eu", "export PATH=\"$PATH:/usr/local/bin:/snap/bin\"", "dir=$(mktemp -d)", "trap 'rm -rf \"$dir\"' EXIT"],
       [for name, script in local.metal_box_tools : join("\n", [
-        "aws s3 cp 's3://${aws_s3_bucket.dev_scripts.id}/${aws_s3_object.metal_box_tools[name].key}' \"$tmp\" --region ${var.aws_region} --only-show-errors",
-        "echo '${filesha256("${path.module}/scripts/${script}")}  '\"$tmp\" | sha256sum -c --quiet",
-        "install -m 755 \"$tmp\" /usr/local/bin/${name}.new && mv -f /usr/local/bin/${name}.new /usr/local/bin/${name}",
+        "aws s3 cp 's3://${aws_s3_bucket.dev_scripts.id}/${aws_s3_object.metal_box_tools[name].key}' \"$dir/${name}\" --region ${var.aws_region} --only-show-errors",
+        "echo '${filesha256("${path.module}/scripts/${script}")}  '\"$dir/${name}\" | sha256sum -c --quiet",
+      ])],
+      [for name, script in local.metal_box_tools : join("\n", [
+        "install -m 755 \"$dir/${name}\" /usr/local/bin/${name}.new",
+        "mv -f /usr/local/bin/${name}.new /usr/local/bin/${name}",
         "echo 'metal-box-tools: ${name} ${substr(filesha256("${path.module}/scripts/${script}"), 0, 12)}'",
       ])],
     ))

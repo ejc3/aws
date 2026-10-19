@@ -26,7 +26,10 @@ class MetalBoxTools(unittest.TestCase):
         self.assertIn("values = local.metal_update_guard_instances", assoc)
         self.assertIn('filesha256("${path.module}/scripts/${script}")', assoc)
         self.assertIn("sha256sum -c --quiet", assoc)
-        self.assertIn('install -m 755 \\"$tmp\\" /usr/local/bin/${name}.new && mv -f /usr/local/bin/${name}.new /usr/local/bin/${name}', assoc)
+        install = assoc.index('"install -m 755 \\"$dir/${name}\\" /usr/local/bin/${name}.new"')
+        self.assertLess(assoc.index("sha256sum -c --quiet"), install, "every tool is checked before any is replaced")
+        self.assertIn('"mv -f /usr/local/bin/${name}.new /usr/local/bin/${name}"', assoc)
+        self.assertNotIn("&& mv", assoc, "install and mv are separate lines, so set -e stops on either")
         self.assertNotRegex(assoc, r"systemctl|reboot|restart ", "it writes files only")
 
 
