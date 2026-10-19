@@ -461,6 +461,38 @@ resource "aws_cloudwatch_event_rule" "security_notify" {
   state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"
 }
 
+# The old SNS execution role of security-alerts-notify, unused since the rule delivers into the digest pipeline. Kept for
+# now: deleting it in the same apply that replaces the target (create_before_destroy) made a dependency cycle with the
+# security delivery observer. Remove both blocks in a later change, once the digest path is live.
+resource "aws_iam_role" "security_notify" {
+  name = "security-alerts-notify"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnEquals    = { "aws:SourceArn" = aws_cloudwatch_event_rule.security_notify.arn }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "security_notify" {
+  name = "publish-security-notifications"
+  role = aws_iam_role.security_notify.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = aws_sns_topic.cost_alerts.arn
+    }]
+  })
+}
+
 # The rule delivers into the digest pipeline (security-alert-digest.tf), not straight to the topic: one email per
 # finding update was 3,608 emails in a day and got email on the topic disabled for abuse (2026-10-19). An SQS target
 # is authorized by the queue's policy (pinned to this rule), so the rule needs no execution role.

@@ -525,7 +525,9 @@ class TerraformTests(unittest.TestCase):
         self.assertIn("create_before_destroy = true", target)
         rule = self.block(MONITORING, "aws_cloudwatch_event_rule", "security_notify")
         self.assertIn("event_pattern = jsonencode({ account = concat(local.security_account_ids, [aws_organizations_account.dolphin.id]) })", rule)
-        self.assertNotIn('resource "aws_iam_role" "security_notify"', MONITORING)
+        # The old SNS execution role is kept for one more change (deleting it in the same apply made a cycle), but
+        # nothing delivers through it.
+        self.assertNotIn("role_arn", target)
 
     def test_only_the_rule_may_write_to_the_inbox(self):
         policy = self.block(TF, "aws_sqs_queue_policy", "security_alert_digest_inbox")
