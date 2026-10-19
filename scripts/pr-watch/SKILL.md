@@ -1,6 +1,6 @@
 ---
 name: pr-watch
-description: Review, fix, get sign-off on, merge and apply or distribute every open ejc3/aws and ejc3/agents-md pull request and issue authored by ejc3, with extra security review for sensitive infrastructure; run on a recurring schedule from a main-jumpbox session.
+description: Review, fix, get sign-off on, merge and apply or distribute every open ejc3/aws and ejc3/agents-md pull request and issue authored by ejc3, with extra security review for sensitive infrastructure, and triage and remediate the security alerts; run on a recurring schedule from a main-jumpbox session.
 ---
 
 # PR and issue watch
@@ -104,7 +104,21 @@ to approve if it is safe; we have many code review agents"):
    `/infra/applied-status` also show a main that is ahead of live.)
 5. **Each issue.** Confirm it from live state, open a PR with the fix and tests, run step 3 on it, and close the issue
    from the PR. The safeguards apply to the fix as to any other PR.
-6. **Report:** what was reviewed, fixed, merged and applied; what is held for the owner and why; what is left.
+6. **Alerts.** The owner, 2026-10-19, after an EC2.9 flood filled the inbox: "have a poller looking for alerts like
+   that and remediate them". Each run, before the PRs, read what the alert topic sends: in us-west-1, Security Hub
+   findings that are HIGH or CRITICAL, ACTIVE and Workflow NEW, GuardDuty findings of severity 4 or more, Inspector
+   HIGH/CRITICAL and Access Analyzer ACTIVE (the patterns in `modules/security-region`), updated since the state's
+   `alerts_checked_at`; then set it. Confirm each from live state, grouped by control and resource:
+   - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
+     step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
+     goes to the top of the report for the owner and is never suppressed.
+   - **True by design** (EC2.9 on a box that egresses on its own address): an automation rule in
+     `security-hub-automation.tf`, its reason in the note, through a PR. Until it applies, the open findings may be set
+     `SUPPRESSED` with `aws securityhub batch-update-findings` and the same note (findings are not Terraform state).
+   - **A flood** (more than about 20 in an hour) comes before everything else: suppress the open findings of a by-design
+     control first, then the rule. Never silence the topic or loosen the alert patterns to stop one.
+7. **Report:** what was reviewed, fixed, merged and applied; the alerts and what was done about each; what is held for
+   the owner and why; what is left.
 
 The repository rules apply throughout: no secrets on a command line or in output, no email addresses in files, commits
 or PRs, no attribution lines, never `git stash` in ~/aws (use a worktree), ask before restarting or rebooting a host
