@@ -2700,6 +2700,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |
+| The metal boxes' box tools (pbox, gbox, wbox, codex-restart) kept equal to main daily, not only at boot | `metal-box-tools.tf` |
 | The Macs' agent tools and the pinned Peekaboo | `scripts/mac-setup.sh`, `scripts/mac/` (`peekaboo-install.sh` holds the pin) |
 | The dev accounts' agent instructions: AGENTS.md from ejc3/agents-md, and `~/.claude/local.md` from administration-only secrets (never in git) | `agents-md.tf`, `agent-local-md.tf` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
