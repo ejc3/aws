@@ -2039,8 +2039,11 @@ individually billed workloads. No existing compute, volume or backup resource sh
 be replaced by this rollout.
 
 Security findings, root-account activity (including read-only management calls),
-and high-risk IAM, network, KMS and backup changes forward to the
-existing confirmed `cost-alerts` SNS topic. Inspector and GuardDuty use their native
+and high-risk IAM, network, KMS and backup changes reach the `cost-alerts` SNS topic
+through the digest Lambda in `security-alert-digest.tf` (since 2026-10-19, when one email
+per finding update reached 3,608 in a day and SNS disabled email on the topic): each
+finding is mailed once, immediate sources at once and Security Hub and Inspector in a
+digest, at most one message a minute. Inspector and GuardDuty use their native
 finding events only; their Security Hub imports are excluded from forwarding to avoid
 duplicate notifications. Foundational checks and other Security Hub products retain
 their existing notification path. Normal processing/checkpoint cleanup does
@@ -2048,7 +2051,9 @@ not page the owner; deletion attempts against legacy/final backup history do. Ev
 region has two disjoint forwarding rules sharing one encrypted 14-day dead-letter
 queue; each event pattern stays within AWS's default 2,048-character limit. A
 five-minute read-only watchdog verifies enabled rules, exact event filters and targets
-(destination, execution role, retries and DLQ), and queued events in all 34 pairs.
+(destination, execution role, retries and DLQ), and queued events in all 34 pairs,
+plus the digest pipeline behind the central rule (its event source, its topic, its
+flush schedule and its DLQ).
 It alternates regional failure-metric queries between the two rules: each rule is
 sampled every ten minutes with a fifteen-minute lookback, preserving the approved
 CloudWatch retrieval budget. Central delivery metrics are still sampled every five
@@ -2686,7 +2691,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `runner-webhook-front.tf`, `runner-repos.tf` (per-repo tokens for the other repos' runners), `github-actions.tf`, `GITHUB-RUNNERS.md` |
-| Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `security-hub-automation.tf` (main-account control findings that are true by design, suppressed with the reason: no-NAT public IPs, GuardDuty and Inspector plans off for cost, the custom Config role, the nextjs-ct session policies, and key-only SSH on exactly the named groups until the Cloudflare VPN replaces it), `default-security-groups.tf` (every VPC's default security group, emptied), `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `security-alert-digest.tf` (security alerts reach `cost-alerts` through a digest Lambda: each finding mailed once, GuardDuty, CloudTrail audit and Access Analyzer at once, Security Hub and Inspector in a digest at most every 10 minutes, never more than one message a minute), `security-hub-automation.tf` (main-account control findings that are true by design, suppressed with the reason: no-NAT public IPs, GuardDuty and Inspector plans off for cost, the custom Config role, the nextjs-ct session policies, and key-only SSH on exactly the named groups until the Cloudflare VPN replaces it), `default-security-groups.tf` (every VPC's default security group, emptied), `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |

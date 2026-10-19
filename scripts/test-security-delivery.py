@@ -37,6 +37,9 @@ SNS_TOPIC = "arn:aws:sns:us-west-1:" + MAIN + ":cost-alerts"
 NOW = datetime.datetime(2026, 9, 7, 12, tzinfo=datetime.timezone.utc)
 COUNTERS = ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"]
 REGIONAL_RULES = ("security-forward-findings", "security-forward-audit")
+SCHEDULES = {"security-delivery-health": "rate(5 minutes)", "security-alert-digest-flush": "rate(1 minute)"}
+DIGEST_INBOX = "arn:aws:sqs:us-west-1:" + MAIN + ":security-alert-digest-inbox"
+DIGEST_FUNCTION = "arn:aws:lambda:us-west-1:" + MAIN + ":function:security-alert-digest"
 GUARDDUTY_BASE_FEATURES = {"S3_DATA_EVENTS", "EKS_AUDIT_LOGS", "EBS_MALWARE_PROTECTION",
                          "RDS_LOGIN_EVENTS", "LAMBDA_NETWORK_LOGS", "RUNTIME_MONITORING", "AI_PROTECTION"}
 # AWS GuardDuty Investigation preview availability, reviewed 2026-09-08:
@@ -174,8 +177,8 @@ class Events:
             return override(copy.deepcopy(response)) if override else response
         response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name in ("security-forward-audit", "security-alerts-notify") else "ENABLED",
                     "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
-        if name == "security-delivery-health":
-            response["ScheduleExpression"] = "rate(5 minutes)"
+        if name in SCHEDULES:
+            response["ScheduleExpression"] = SCHEDULES[name]
         else:
             response["EventPattern"] = PATTERNS[name] if name in PATTERNS else json.dumps({"account": [MAIN, STAGING]})
         override = self.factory.rules.get((self.account, self.region, name))
@@ -195,12 +198,15 @@ class Events:
                       "RoleArn": "arn:aws:iam::" + self.account + ":role/security-findings-forward",
                       "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"}}
         elif rule == "security-alerts-notify":
-            target = {"Id": "confirmed-operator-email", "Arn": SNS_TOPIC,
-                      "RoleArn": "arn:aws:iam::" + MAIN + ":role/security-alerts-notify",
+            target = {"Id": "security-alert-digest", "Arn": DIGEST_INBOX,
                       "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"},
                       "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
         elif rule == "security-delivery-health":
             target = {"Id": rule, "Arn": "arn:aws:lambda:us-west-1:" + MAIN + ":function:security-delivery-health",
+                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"},
+                      "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}}
+        elif rule == "security-alert-digest-flush":
+            target = {"Id": rule, "Arn": DIGEST_FUNCTION,
                       "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"},
                       "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}}
         else:
@@ -210,6 +216,32 @@ class Events:
         if isinstance(override, Exception):
             raise override
         return override(copy.deepcopy(response)) if override else response
+
+
+class Lambda:
+    """The digest pipeline's read-only view: its one SQS event source and the topic it sends to."""
+    def __init__(self, factory):
+        self.factory = factory
+
+    def list_event_source_mappings(self, **kwargs):
+        self.factory.lambda_reads.append(("mappings", kwargs))
+        assert kwargs == {"FunctionName": "security-alert-digest", "MaxItems": 2}
+        response = {"EventSourceMappings": [{"UUID": "u", "EventSourceArn": DIGEST_INBOX, "FunctionArn": DIGEST_FUNCTION,
+                                             "State": "Enabled", "BatchSize": 100}]}
+        hook = self.factory.lambda_hooks.get("mappings")
+        if isinstance(hook, Exception):
+            raise hook
+        return hook(response) if hook else response
+
+    def get_function_configuration(self, **kwargs):
+        self.factory.lambda_reads.append(("configuration", kwargs))
+        assert kwargs == {"FunctionName": "security-alert-digest"}
+        response = {"FunctionName": "security-alert-digest", "FunctionArn": DIGEST_FUNCTION, "State": "Active",
+                    "Environment": {"Variables": {"STATE_TABLE": "security-alert-digest", "SNS_TOPIC_ARN": SNS_TOPIC}}}
+        hook = self.factory.lambda_hooks.get("configuration")
+        if isinstance(hook, Exception):
+            raise hook
+        return hook(response) if hook else response
 
 
 class STS:
@@ -241,6 +273,8 @@ class Session:
             return Events(self.factory, self.account, region_name)
         if name == "sts" and self.account == MAIN:
             return STS(self.factory)
+        if name == "lambda" and self.account == MAIN and region_name == "us-west-1":
+            return Lambda(self.factory)
         raise AssertionError("Unexpected AWS capability: " + name)
 
 
@@ -253,6 +287,7 @@ class Factory:
         self.rule_reads, self.target_reads = [], []
         self.assume_error = self.publish_error = False
         self.extra = {}
+        self.lambda_reads, self.lambda_hooks = [], {}
 
     def Session(self, **kwargs):
         if "aws_access_key_id" in kwargs:
@@ -318,7 +353,8 @@ class DeliveryTests(unittest.TestCase):
     def inspect(self, account=MAIN, region="us-east-1", now=NOW):
         return self.module["inspect_region"](CloudWatch(self.factory, account, region),
             SQS(self.factory, account, region), Events(self.factory, account, region), account, region, MAIN, SNS_TOPIC, now,
-            {name: canonical(json.loads(value)) for name, value in PATTERNS.items()})
+            {name: canonical(json.loads(value)) for name, value in PATTERNS.items()},
+            lam=Lambda(self.factory) if (account, region) == (MAIN, "us-west-1") else None)
 
     def test_complete_empty_failure_metrics_are_healthy(self):
         values, log = self.run_handler()
@@ -334,9 +370,12 @@ class DeliveryTests(unittest.TestCase):
         # 72 for the shared rules, plus two for each of the two always-deployed extra rules.
         self.assertEqual(requested, 76)
         self.assertEqual(requested * 288 * 30, 656640)
-        self.assertEqual(len(self.factory.queue_reads), 35)
-        self.assertEqual(len(self.factory.rule_reads), 72)
-        self.assertEqual(len(self.factory.target_reads), 72)
+        # 34 regional DLQs, the central DLQ and the digest's DLQ; 68 regional rules, the notification rule, both
+        # schedules and the two extra rules.
+        self.assertEqual(len(self.factory.queue_reads), 36)
+        self.assertEqual(len(self.factory.rule_reads), 73)
+        self.assertEqual(len(self.factory.target_reads), 73)
+        self.assertEqual(len(self.factory.lambda_reads), 2)
 
     def test_disabled_missing_or_wrong_rule_is_not_a_healthy_quiet_region(self):
         for override in (lambda r: dict(r, State="DISABLED"), lambda r: {},
@@ -383,7 +422,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertGreaterEqual(values["ObserverErrors"], 1)
 
     def test_target_destination_role_dlq_retries_and_payload_are_exact(self):
-        for rule in (*REGIONAL_RULES, "security-alerts-notify", "security-delivery-health"):
+        for rule in (*REGIONAL_RULES, "security-alerts-notify", "security-delivery-health", "security-alert-digest-flush"):
             for key, value in (("Arn", "arn:foreign"), ("RoleArn", "arn:foreign"), ("Id", "other"),
                                ("DeadLetterConfig", {}), ("RetryPolicy", {}), ("Input", "{}"),
                                ("InputTransformer", {})):
@@ -412,7 +451,8 @@ class DeliveryTests(unittest.TestCase):
 
     def test_non_bus_retry_policies_remain_required_and_exact(self):
         for rule, expected in (("security-alerts-notify", {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}),
-                               ("security-delivery-health", {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2})):
+                               ("security-delivery-health", {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}),
+                               ("security-alert-digest-flush", {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2})):
             target = self.module["expected_target"](rule, MAIN, "us-west-1", MAIN, SNS_TOPIC)
             self.assertEqual(target["RetryPolicy"], expected)
             for policy in (None, dict(expected, MaximumEventAgeInSeconds=60), dict(expected, MaximumRetryAttempts=0)):
@@ -427,14 +467,80 @@ class DeliveryTests(unittest.TestCase):
                     self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
 
     def test_central_rules_and_watchdog_schedule_are_independently_checked(self):
-        for rule in ("security-alerts-notify", "security-delivery-health"):
+        for rule in ("security-alerts-notify", "security-delivery-health", "security-alert-digest-flush"):
             with self.subTest(rule=rule):
                 self.factory.rules = {(MAIN, "us-west-1", rule): lambda r: dict(r, State="DISABLED")}
                 self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
-        self.factory.rules = {(MAIN, "us-west-1", "security-delivery-health"): lambda r: dict(r, ScheduleExpression="rate(1 day)")}
-        self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        for rule in ("security-delivery-health", "security-alert-digest-flush"):
+            with self.subTest(rule=rule, schedule="changed"):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda r: dict(r, ScheduleExpression="rate(1 day)")}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+            with self.subTest(rule=rule, schedule="pattern added"):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda r: dict(r, EventPattern='{"source":["x"]}')}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        self.factory.rules = {}
+        self.assertEqual(self.inspect(region="us-west-1")["errors"], 0)
         central = [request for _, _, request in self.factory.rule_reads if request["Name"] == "security-alerts-notify"]
         self.assertTrue(all(request["EventBusName"] == "security-alerts" for request in central))
+
+    def test_the_notification_rule_delivers_into_the_digest_inbox_not_the_topic(self):
+        target = self.module["expected_target"]("security-alerts-notify", MAIN, "us-west-1", MAIN, SNS_TOPIC)
+        self.assertEqual(target["Arn"], DIGEST_INBOX)
+        self.assertNotIn("RoleArn", target)
+        # The old direct SNS target is now a topology error: the flood path must not come back unnoticed.
+        def to_topic(response):
+            response["Targets"][0].update({"Id": "confirmed-operator-email", "Arn": SNS_TOPIC,
+                                           "RoleArn": "arn:aws:iam::" + MAIN + ":role/security-alerts-notify"})
+            return response
+        self.factory.targets = {(MAIN, "us-west-1", "security-alerts-notify"): to_topic}
+        self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_digest_event_source_and_topic_are_checked(self):
+        self.assertEqual(self.inspect(region="us-west-1")["errors"], 0)
+        self.assertEqual([kind for kind, _ in self.factory.lambda_reads], ["mappings", "configuration"])
+        mapping_faults = (
+            lambda r: {"EventSourceMappings": []},
+            lambda r: {"EventSourceMappings": r["EventSourceMappings"] * 2},
+            lambda r: dict(r, NextMarker="do-not-follow"),
+            lambda r: {"EventSourceMappings": [dict(r["EventSourceMappings"][0], State="Disabled")]},
+            lambda r: {"EventSourceMappings": [dict(r["EventSourceMappings"][0], EventSourceArn="arn:aws:sqs:us-west-1:" + MAIN + ":other")]},
+            lambda r: {"EventSourceMappings": [dict(r["EventSourceMappings"][0], FunctionArn=DIGEST_FUNCTION + ":alias")]},
+            lambda r: {},
+            RuntimeError("AccessDenied"),
+        )
+        for fault in mapping_faults:
+            with self.subTest(mappings=fault):
+                self.factory.lambda_hooks = {"mappings": fault}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        config_faults = (
+            lambda r: dict(r, Environment={"Variables": {"SNS_TOPIC_ARN": "arn:aws:sns:us-west-1:" + MAIN + ":other"}}),
+            lambda r: dict(r, Environment={}),
+            lambda r: dict(r, State="Failed"),
+            lambda r: dict(r, FunctionArn="arn:foreign"),
+            RuntimeError("ResourceNotFoundException"),
+        )
+        for fault in config_faults:
+            with self.subTest(configuration=fault):
+                self.factory.lambda_hooks = {"configuration": fault}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_digest_is_checked_only_in_main_us_west_1_and_a_missing_client_is_an_error(self):
+        self.inspect(region="us-east-1")
+        self.inspect(account=STAGING, region="us-west-1")
+        self.assertEqual(self.factory.lambda_reads, [])
+        result = self.module["inspect_region"](CloudWatch(self.factory, MAIN, "us-west-1"),
+            SQS(self.factory, MAIN, "us-west-1"), Events(self.factory, MAIN, "us-west-1"), MAIN, "us-west-1", MAIN, SNS_TOPIC, NOW,
+            {name: canonical(json.loads(value)) for name, value in PATTERNS.items()})
+        self.assertGreaterEqual(result["errors"], 1)
+
+    def test_digest_dead_letters_count_as_queued_events(self):
+        self.factory.queues[(MAIN, "us-west-1", "security-alert-digest-dlq")] = {"ApproximateNumberOfMessages": "3",
+            "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}
+        values, _ = self.run_handler()
+        self.assertEqual(values["QueuedEvents"], 3)
+        self.factory.queues[(MAIN, "us-west-1", "security-alert-digest-dlq")] = RuntimeError("AccessDenied")
+        values, _ = self.run_handler()
+        self.assertGreaterEqual(values["ObserverErrors"], 1)
 
     def test_event_api_failure_does_not_skip_other_read_only_health_checks(self):
         self.factory.rules[(MAIN, "us-east-1", "security-forward-findings")] = TimeoutError("unavailable")
@@ -481,9 +587,9 @@ class DeliveryTests(unittest.TestCase):
                     values, log = self.run_handler()
                 self.assertEqual(values["ObserverErrors"], 0)
                 self.assertEqual(log["checked_regions"], 34)
-                self.assertEqual(len(self.factory.rule_reads), 72)
-                self.assertEqual(len(self.factory.target_reads), 72)
-                self.assertEqual(len(self.factory.queue_reads), 35)
+                self.assertEqual(len(self.factory.rule_reads), 73)
+                self.assertEqual(len(self.factory.target_reads), 73)
+                self.assertEqual(len(self.factory.queue_reads), 36)
                 self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 76)
                 expected_sample = REGIONAL_RULES[int(instant.timestamp()) // 300 % 2]
                 for account, region, call in self.factory.reads:
