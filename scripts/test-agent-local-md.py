@@ -86,6 +86,7 @@ class Install(unittest.TestCase):
             "aws": f'[ "$1 $2" = "s3 cp" ] && cp {shlex.quote(str(self.obj))} "$4"',
             "getent": f'echo "example:x:1000:1000::{self.home}:/bin/sh"',
             "runuser": 'shift 3; exec "$@"',
+            "chown": f'echo "chown $*" >> {shlex.quote(str(self.temp / "chown.log"))}',
         }.items():
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
@@ -110,6 +111,8 @@ class Install(unittest.TestCase):
         r = self.run_()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((self.home / ".claude" / "local.md").read_text(), EXAMPLE)
+        self.assertEqual((self.home / ".claude" / "local.md").stat().st_mode & 0o777, 0o600, "private to the account")
+        self.assertRegex((self.temp / "chown.log").read_text(), r"^chown example /", "the account owns the temporary copy")
         self.assertNotIn("Use the example tool", r.stdout + r.stderr, "the text is never echoed")
 
     def test_a_changed_object_is_refused_and_nothing_written(self):
@@ -135,7 +138,7 @@ class SkillsMirror(unittest.TestCase):
 
     def test_the_documented_command_mirrors_the_skills_and_skips_synced(self):
         agents = (ROOT / "AGENTS.md").read_text()
-        cmd = re.search(r"`(mkdir -p ~/\.agents/skills && for s in ~/\.claude/skills/\*/;.*?done)`", agents).group(1)
+        cmd = re.search(r"`(mkdir -p ~/\.agents/skills && find ~/\.agents/skills .*? && for s in ~/\.claude/skills/\*/;.*?done)`", agents).group(1)
         home = pathlib.Path(tempfile.mkdtemp(prefix="skills-mirror-"))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(home)])
         skills = home / ".claude" / "skills"
@@ -156,6 +159,11 @@ class SkillsMirror(unittest.TestCase):
                 self.assertEqual(os.readlink(mirror / "monid"), str(skills / "monid"))
                 subprocess.run([shell, "-c", cmd], check=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin"})
                 self.assertEqual(sorted(p.name for p in mirror.iterdir()), ["drive-mac", "monid"], "a rerun adds nothing")
+                (skills / "monid").rename(skills / ".trash" / "monid")  # a skill removed from Claude Code
+                (mirror / "own").mkdir()  # something that is not a link is never touched
+                subprocess.run([shell, "-c", cmd], check=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin"})
+                self.assertEqual(sorted(p.name for p in mirror.iterdir()), ["drive-mac", "own"], "and it leaves Codex too")
+                (skills / ".trash" / "monid").rename(skills / "monid")
 
 
 if __name__ == "__main__":

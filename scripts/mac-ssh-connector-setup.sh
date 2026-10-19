@@ -242,11 +242,10 @@ if ! cmp -s "\$PLIST.new" "\$PLIST"; then changed="its LaunchAgent changed"; fi
 [ ! -e "\$HOME/$TOKEN_FILE.changed" ] || changed="\${changed:+\$changed, }its token changed"
 launchctl print "gui/\$uid/$LABEL" >/dev/null 2>&1 || changed="\${changed:+\$changed, }it is not loaded"
 chmod 644 "\$PLIST.new" && mv -f "\$PLIST.new" "\$PLIST"
-rm -f "\$HOME/$TOKEN_FILE.changed"
 if [ -n "\$changed" ]; then
   # Reloading ends every session through this connector, this one too when it came that way: run it detached so the
   # bootstrap still happens after the session is cut.
-  nohup /bin/sh -c "sleep 2; launchctl bootout gui/\$uid/$LABEL 2>/dev/null; launchctl bootstrap gui/\$uid '\$PLIST'" >/dev/null 2>&1 &
+  nohup /bin/sh -c "sleep 2; launchctl bootout gui/\$uid/$LABEL 2>/dev/null; launchctl bootstrap gui/\$uid '\$PLIST' && rm -f '\$HOME/$TOKEN_FILE.changed'" >/dev/null 2>&1 &
   echo "connector: reloading in the background (\$changed); sessions through it will drop"
 else
   echo "connector: unchanged and loaded; not reloaded"

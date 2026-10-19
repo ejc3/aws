@@ -53,6 +53,7 @@ else
   tar -xzf "$tmp/cli.tgz" -C "$tmp"
   [ "$(cat "$tmp/peekaboo-macos-arm64/VERSION")" = "$VERSION" ] || { echo "peekaboo: the CLI release is not $VERSION" >&2; exit 1; }
   [ "$(team "$tmp/peekaboo-macos-arm64/peekaboo")" = "$TEAM" ] || { echo "peekaboo: the CLI is not signed by $TEAM" >&2; exit 1; }
+  codesign --verify --strict "$tmp/peekaboo-macos-arm64/peekaboo" || { echo "peekaboo: the CLI's signature does not verify" >&2; exit 1; }
   echo "$CLI_TGZ_SHA256" > "$tmp/peekaboo-macos-arm64/.release-sha256"
   rm -rf "$support/.cli-$VERSION.new" "$support/.cli-$VERSION.old"
   mv "$tmp/peekaboo-macos-arm64" "$support/.cli-$VERSION.new"
@@ -141,9 +142,9 @@ if ! cmp -s "$tmp/agent.plist" "$plist"; then
   install -m 644 "$tmp/agent.plist" "$plist"
   launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
   # Loading it runs `open -g -a`: it starts Peekaboo if it is not running, and does nothing to a running one.
-  launchctl bootstrap "gui/$uid" "$plist" && echo "peekaboo: LaunchAgent $label loaded"
+  { launchctl bootstrap "gui/$uid" "$plist" || { echo "peekaboo: could not load the LaunchAgent $label (is anyone logged in at the Mac?)" >&2; exit 1; }; } && echo "peekaboo: LaunchAgent $label loaded"
 elif ! launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
-  launchctl bootstrap "gui/$uid" "$plist" && echo "peekaboo: LaunchAgent $label loaded"
+  { launchctl bootstrap "gui/$uid" "$plist" || { echo "peekaboo: could not load the LaunchAgent $label (is anyone logged in at the Mac?)" >&2; exit 1; }; } && echo "peekaboo: LaunchAgent $label loaded"
 fi
 echo "peekaboo: app $(app_version "$app"), $(readlink "$support/cli-current")." \
      "Permissions are granted once at the Mac; check with: peekaboo permissions status"

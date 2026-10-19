@@ -1697,10 +1697,12 @@ Terraform.
 The distributed accounts' agent instructions are `agents-md.tf` (AGENTS.md from ejc3/agents-md) and
 `agent-local-md.tf` (`~/.claude/local.md`, which is kept out of every repository). Each `local.md` is the
 administration-only secret `agent-local-md/<machine>/<account>`, gated by `local.agent_local_md_ready`. On a cold start,
-or to change one: put its value from a 0600 file on a jumpbox, then set its gate to true and apply:
+apply once with its gate false (that creates the secret), put its value from a 0600 file on a jumpbox, then set the gate
+to true and apply again. To change one later, put the new value and apply:
 
 ```bash
-# from the box's live file, copied to a 0600 file here, e.g. over ssh: ssh ... 'cat ~/.claude/local.md' > "$f"
+# from the box's live file, copied to a 0600 file here
+umask 077; f=$(mktemp); ssh ... 'cat ~/.claude/local.md' > "$f"
 aws secretsmanager put-secret-value --region us-west-1 --secret-id agent-local-md/fcvm-metal-arm/ubuntu \
   --secret-string "file://$f"
 ```

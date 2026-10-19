@@ -635,7 +635,25 @@ esac
         self.assertIn("its token changed", result.stdout)
         self.assertTrue(self.reloaded())
         self.assertEqual((self.home / ".cloudflared/macbook-ssh.token").read_text().strip(), self.TOKEN)
-        self.assertFalse((self.home / ".cloudflared/macbook-ssh.token.changed").exists())
+        flag = self.home / ".cloudflared/macbook-ssh.token.changed"
+        for _ in range(50):  # removed by the detached reload, once it has bootstrapped
+            if not flag.exists():
+                break
+            time.sleep(0.1)
+        self.assertFalse(flag.exists())
+
+    def test_a_failed_reload_keeps_the_token_flag_so_the_next_run_retries(self):
+        self.owners_mac()
+        (self.home / ".cloudflared/macbook-ssh.token").write_text("an old token\n")
+        self.stub("launchctl", f'case "$1" in print) [ -e {self.loaded} ] ;; bootstrap) echo "launchctl $*" >> {self.launchctl}; exit 5 ;; '
+                               f'*) echo "launchctl $*" >> {self.launchctl} ;; esac')
+        result = self.run_setup("mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.reloaded(), "the reload was attempted")
+        time.sleep(0.5)
+        self.assertTrue((self.home / ".cloudflared/macbook-ssh.token.changed").exists())
+        result = self.run_setup("mac")
+        self.assertIn("its token changed", result.stdout, "so the next run reloads again")
 
     def test_each_macs_clients_are_the_accounts_terraform_gives_its_alias(self):
         text = CONNECTOR.read_text()

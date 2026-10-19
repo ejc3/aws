@@ -978,8 +978,9 @@ public repository `ejc3/agents-md`, one file per machine and account (`hosts/<ma
 - **Codex's skills mirror Claude Code's.** Codex reads `~/.agents/skills`, Claude Code `~/.claude/skills`. The skill
   checkouts (`~/claude-skills`, on fcvm-arm also `~/src/claude-skills`; github.com/ejc3/claude-skills) and the
   `~/.claude/skills` links are made by hand, by nothing in this repository, so the mirror is a manual step too, done
-  as the account after adding or removing a skill (it skips `synced`, claude-code-sync's own directory):
-  `mkdir -p ~/.agents/skills && for s in ~/.claude/skills/*/; do n=$(basename "$s"); [ "$n" = synced ] || ln -sfn "$(readlink -f "$s")" ~/.agents/skills/"$n"; done`
+  as the account after adding or removing a skill (it replaces every link there, so a removed skill leaves Codex too,
+  and skips `synced`, claude-code-sync's own directory):
+  `mkdir -p ~/.agents/skills && find ~/.agents/skills -maxdepth 1 -type l -delete && for s in ~/.claude/skills/*/; do n=$(basename "$s"); [ "$n" = synced ] || ln -sfn "$(readlink -f "$s")" ~/.agents/skills/"$n"; done`
 
 ### New repositories appear in Claude Code and Codex within seconds
 

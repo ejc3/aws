@@ -389,6 +389,20 @@ class PeekabooInstall(unittest.TestCase):
         self.assertFalse(self.app.exists())
         self.assertEqual(list(self.support.iterdir()), [])
 
+    def test_a_downloaded_cli_whose_signature_does_not_verify_is_refused(self):
+        self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; '
+                              f'*) for a; do :; done; case "$a" in */peekaboo-macos-arm64/peekaboo) exit 1;; esac; exit 0;; esac')
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the CLI's signature does not verify", r.stderr)
+        self.assertFalse((self.support / f"cli-{self.version}").exists())
+
+    def test_a_launchagent_that_cannot_load_fails_the_run(self):
+        self.stub("launchctl", f'echo "launchctl $*" >> {shlex.quote(str(self.log))}; [ "$1" != bootstrap ] || exit 5')
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not load the LaunchAgent com.ccgames.peekaboo", r.stderr)
+
     def test_another_signer_is_refused(self):
         self.team.write_text("ABCDEFGHIJ\n")
         r = self.run_()
