@@ -113,8 +113,9 @@ to approve if it is safe; we have many code review agents"):
    GuardDuty `list-findings` (severity 4 or more), Inspector `list-findings` (HIGH/CRITICAL, ACTIVE), Access Analyzer
    (ACTIVE), and for the audit events (`security-forward-audit`: root use, failed console sign-ins, the listed tampering
    calls) CloudTrail `lookup-events`, which keeps 90 days. The patterns are in `modules/security-region`; read them
-   rather than a copy. Record each result in the state's `alerts_pending` first, and move `alerts_checked_at` forward
-   only once every result is triaged, so a run that stops midway leaves the rest for the next. Confirm each from live
+   rather than a copy. Note the time before the first query; record each result in the state's `alerts_pending` first,
+   and only once every result is triaged set `alerts_checked_at` to that noted time, so nothing that arrived during the
+   run and nothing left untriaged is skipped. Confirm each from live
    state, grouped by control and resource:
    - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
      step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
