@@ -5,7 +5,8 @@
 # MAC_LEASE=<name> for the lease you hold. Looking (see, image, capture, permissions, list) never waits.
 # Installed by ejc3/aws scripts/mac-setup.sh.
 export PEEKABOO_BRIDGE_SOCKET="$HOME/Library/Application Support/Peekaboo/bridge.sock"
-cli=${PEEKABOO_CLI:-"$HOME/Library/Application Support/Peekaboo/cli-4.4.0/peekaboo"}
+# cli-current is the CLI matching the installed app (scripts/mac/peekaboo-install.sh keeps it so).
+cli=${PEEKABOO_CLI:-"$HOME/Library/Application Support/Peekaboo/cli-current/peekaboo"}
 case "${1:-}" in
   click|type|press|hotkey|scroll|drag|move|paste|set-value|action|app|window|menu|menubar|dialog|dock|space|swipe)
     lease=${MAC_LEASE_BIN:-$HOME/.local/bin/mac-lease}

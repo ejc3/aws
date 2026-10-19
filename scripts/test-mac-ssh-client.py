@@ -10,6 +10,7 @@ import pwd
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -456,7 +457,9 @@ esac
         self.stub("sudo", f'[ "$1 $2 $3" = "-n /usr/bin/tee /etc/ssh/sshd_config.d/050-keys-only.conf" ] && [ ! -e {self.nosudo} ] '
                           f'|| exit 1; cat > {self.dropin} && echo publickey > {self.offered}')
         self.stub("sleep", "exit 0")
-        self.stub("launchctl", f'echo "launchctl $*" >> {root}/launchctl.log')
+        self.loaded = root / "loaded"
+        self.stub("launchctl", f'case "$1" in print) [ -e {self.loaded} ] ;; *) echo "launchctl $*" >> {root}/launchctl.log; '
+                               f'[ "$1" != bootstrap ] || touch {self.loaded} ;; esac')
         cfd = self.home / ".local/bin/cloudflared"
         cfd.write_text("#!/bin/sh\necho 'cloudflared version 2026.9.3'\n")
         cfd.chmod(0o755)
@@ -466,6 +469,14 @@ esac
         path = self.stubs / name
         path.write_text(body if body.startswith("#!") else f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
+
+    def reloaded(self):
+        """Whether the connector was reloaded: the reload runs detached, so wait for it a moment."""
+        for _ in range(50):
+            if self.launchctl.exists() and "launchctl bootstrap gui/" in self.launchctl.read_text():
+                return True
+            time.sleep(0.1)
+        return False
 
     def run_setup(self, *args):
         env = {"HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin", "FCVM_KEY": "/nonexistent"}
@@ -491,7 +502,7 @@ esac
                                                      "run", "--token-file", f"{self.home}/.cloudflared/colton-mac-ssh.token"])
         self.assertEqual((plist["Label"], plist["RunAtLoad"], plist["KeepAlive"]),
                          ("com.ccgames.colton-mac-ssh.cloudflared", True, True))
-        self.assertIn("launchctl bootstrap gui/", self.launchctl.read_text())
+        self.assertTrue(self.reloaded())
         lines = authorized.read_text().splitlines()
         self.assertEqual(lines[0].split()[-1], "own", "the Mac's other keys are kept")
         block = lines[lines.index("# >>> colton-mac clients (managed by aws scripts/mac-ssh-connector-setup.sh) >>>") + 1:
@@ -556,9 +567,77 @@ esac
         self.assertEqual(log.count("ssm send-command"), 1, "each account is read by its own command; colton's failed first")
 
     def test_bad_arguments(self):
-        for args in [(), ("mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:
+        for args in [(), ("nobody-mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:
             with self.subTest(args=args):
                 self.assertEqual(self.run_setup(*args).returncode, 2)
+
+    OWNERS_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ejcampbell.macbook-ssh.cloudflared</string>
+  <key>ProgramArguments</key><array>
+    <string>HOME/.local/bin/cloudflared</string><string>tunnel</string><string>--no-autoupdate</string>
+    <string>run</string><string>--token-file</string><string>HOME/.cloudflared/macbook-ssh.token</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>HOME/Library/Logs/macbook-ssh/cloudflared.log</string>
+  <key>StandardErrorPath</key><string>HOME/Library/Logs/macbook-ssh/cloudflared.log</string>
+</dict></plist>
+"""
+
+    def owners_mac(self):
+        """The MacBook as it was set up by hand (README "MacBook: Rebuilding from nothing"), read on 2026-10-19."""
+        (self.home / ".ssh/to-mac.pub").write_text(self.keys["fcvm"] + " aws-fcvm-arm->mac-tunnel\n")
+        (self.nextjs / "ejc3.pub").write_text(self.keys["ejc3"] + " dev->mac-tunnel\n")
+        (self.home / ".ssh/authorized_keys").write_text(self.keys["fcvm"] + " aws-fcvm-arm->mac-tunnel\n"
+                                                        + self.keys["ejc3"] + " dev->mac-tunnel\n")
+        agent = self.home / "Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist"
+        agent.parent.mkdir(parents=True)
+        agent.write_text(self.OWNERS_PLIST.replace("HOME", str(self.home)))
+        (self.home / ".cloudflared").mkdir()
+        (self.home / ".cloudflared/macbook-ssh.token").write_text(self.TOKEN + "\n")
+        self.loaded.write_text("")
+        return agent
+
+    def test_the_macbook_is_rewritten_unchanged_and_nothing_reloads(self):
+        agent = self.owners_mac()
+        result = self.run_setup("mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(agent.read_text(), self.OWNERS_PLIST.replace("HOME", str(self.home)), "its LaunchAgent, byte for byte")
+        self.assertIn("connector: unchanged and loaded; not reloaded", result.stdout)
+        self.assertIn("token unchanged", result.stdout)
+        self.assertFalse(self.reloaded())
+        self.assertFalse((self.home / "Library/LaunchAgents/com.ccgames.mac-ssh.cloudflared.plist").exists())
+        # Who can log in is unchanged: the same two keys, now in the managed block.
+        keys = [l.split()[1] for l in (self.home / ".ssh/authorized_keys").read_text().splitlines() if l.startswith("ssh-")]
+        self.assertEqual(keys, [self.keys["fcvm"].split()[1], self.keys["ejc3"].split()[1]])
+        log = self.argv_log.read_text()
+        self.assertIn("cat /home/ejc3/.ssh/to-mac.pub", log)
+        self.assertNotIn("/home/colton/", log, "colton is no client of the MacBook")
+        self.assertIn("--secret-id macbook-ssh-tunnel-token", log)
+
+    def test_a_new_token_reloads_the_connector_in_the_background(self):
+        self.owners_mac()
+        (self.home / ".cloudflared/macbook-ssh.token").write_text("an old token\n")
+        result = self.run_setup("mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("its token changed", result.stdout)
+        self.assertTrue(self.reloaded())
+        self.assertEqual((self.home / ".cloudflared/macbook-ssh.token").read_text().strip(), self.TOKEN)
+        self.assertFalse((self.home / ".cloudflared/macbook-ssh.token.changed").exists())
+
+    def test_each_macs_clients_are_the_accounts_terraform_gives_its_alias(self):
+        text = CONNECTOR.read_text()
+        mac = text.split("  mac)\n", 1)[1].split(";;", 1)[0]
+        self.assertIn('CLIENTS="fcvm:ubuntu nextjs:ejc3"', mac)
+        self.assertIn("TUNNEL_SECRET=macbook-ssh-tunnel-token", mac)
+        self.assertIn('name                    = "macbook-ssh-tunnel-token"', TUNNEL)
+        nextjs = (ROOT / "nextjs-user-data.tf").read_text()
+        self.assertIn("MAC_USER=ejc3\nMAC_ALIAS=mac\n", nextjs)
+        self.assertIn("for MAC_USER in colton ejc3; do", nextjs)
 
     def test_pins_match_the_other_mac_script(self):
         other = (ROOT / "scripts/claw-master-mac-setup.sh").read_text()

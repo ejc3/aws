@@ -523,8 +523,22 @@ All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (a manage
   `xcrun` send `swift build|test|run`, xcodebuild actions and their `xcrun` forms through it, so every agent's builds
   take a slot without asking; a third waits and says so once. `mac-build --status` shows who holds the slots. Four
   parallel Swift builds once pushed the load average to 62 and timed out even `ssh mac ps`.
-- **`peekaboo`**: the Peekaboo CLI through the app's Bridge, with the lease check above.
+- **`peekaboo`**: the Peekaboo CLI through the app's Bridge, with the lease check above. It runs
+  `~/Library/Application Support/Peekaboo/cli-current/peekaboo`, the CLI matching the installed app.
+- **Peekaboo itself**, pinned by `scripts/mac/peekaboo-install.sh` (openclaw/Peekaboo 4.9.5): the app in
+  `~/Applications/Peekaboo.app`, the CLI release in `.../Peekaboo/cli-<version>`, `cli-current` pointing at the one for
+  the installed app, and the LaunchAgent `com.ccgames.peekaboo` (`open -g -a ~/Applications/Peekaboo.app` at login; it
+  replaces the hand-made `com.ejcampbell.peekaboo`). Both downloads are checked against their pinned sha256 and Team ID
+  (`FWJYW4S8P8`, OpenClaw Foundation) on the Mac before anything is replaced. A running Peekaboo of another version is
+  left alone, and `cli-current` keeps pointing at its own CLI. To update it, quit Peekaboo at the Mac and run the script
+  again, or run `scripts/mac-setup.sh ALIAS --update-peekaboo`, which quits it, swaps it (the old app goes to
+  `~/.local/state/mac-setup/backups`) and reopens it. An update from one release to the next keeps its privacy grants,
+  because it has the same identifier and Team ID.
+- **Peekaboo's permissions are a one-time step at the Mac, never scripted:** System Settings > Privacy & Security >
+  Screen Recording and Accessibility, Peekaboo on. Then from a client, `ssh ALIAS 'peekaboo permissions status'`.
 - `xcode-select` points at `/Applications/Xcode.app` (the Command Line Tools have no platform SDKs and no xcodebuild).
+
+The same script sets up Colton's Mac: `scripts/mac-setup.sh colton-mac` from fcvm-arm.
 
 ##### MacBook: Permission prompts and other dialogs (policy)
 
@@ -557,18 +571,23 @@ API with the `games-worth-watching/app-store-connect` key, not through Chrome.
 
 ##### MacBook: On the Mac
 
+Rows marked *connector setup* come from `scripts/mac-ssh-connector-setup.sh mac` (run on a jumpbox; the same script as
+Colton's Mac), rows marked *mac-setup* from `scripts/mac-setup.sh`. Run against the MacBook as it is, the connector setup
+reloads nothing and changes nobody's access: its names are the ones the connector was set up with by hand, and the
+managed block holds the same two keys.
+
 | What | Where | State |
 |---|---|---|
 | Remote Login | System Settings > General > Sharing > Remote Login | on, Administrators only, "Allow full disk access for remote users" on |
-| Keys only | `/etc/ssh/sshd_config.d/050-keys-only.conf` | `PasswordAuthentication no`, `KbdInteractiveAuthentication no` |
-| Clients' keys | `~/.ssh/authorized_keys` | fcvm-arm's and nextjs-dev `ejc3`'s `to-mac` public keys |
+| Keys only | `/etc/ssh/sshd_config.d/050-keys-only.conf` | `PasswordAuthentication no`, `KbdInteractiveAuthentication no` (connector setup checks it, and installs it when sudo allows) |
+| Clients' keys | `~/.ssh/authorized_keys`, block `# >>> mac clients ...` | fcvm-arm `ubuntu`'s and nextjs-dev `ejc3`'s `to-mac` public keys (connector setup) |
 | Host key | `/etc/ssh/ssh_host_ed25519_key.pub` | `host_key` of `mac` in `local.mac_ssh_macs` |
 | Automation (`sshd-keygen-wrapper`) | System Settings > Privacy & Security > Automation | System Events and Google Chrome on |
 | Agent tools | `~/.local/bin/{mac-gui,mac-lease,mac-build,mac-build-shim,peekaboo}`, shims `swift`, `xcodebuild`, `xcrun` | `scripts/mac-setup.sh` |
-| Peekaboo app | `~/Applications/Peekaboo.app`, LaunchAgent `com.ejcampbell.peekaboo` | Screen Recording, Accessibility |
-| `cloudflared` | `~/.local/bin/cloudflared` (2026.9.3; 2025.4.0 or later for `--token-file`) | pinned in `scripts/claw-master-mac-setup.sh` |
-| Connector token | `~/.cloudflared/macbook-ssh.token`, mode 600 (from `macbook-ssh-tunnel-token`) | |
-| Connector | `~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist` | remotely managed |
+| Peekaboo app and CLI | `~/Applications/Peekaboo.app`, `~/Library/Application Support/Peekaboo/cli-<version>` and `cli-current`, LaunchAgent `com.ccgames.peekaboo` | pinned (mac-setup); Screen Recording and Accessibility granted once at the Mac |
+| `cloudflared` | `~/.local/bin/cloudflared` (2026.9.3; 2025.4.0 or later for `--token-file`) | pinned in `scripts/claw-master-mac-setup.sh` and `scripts/mac-ssh-connector-setup.sh` (connector setup) |
+| Connector token | `~/.cloudflared/macbook-ssh.token`, mode 600 (from `macbook-ssh-tunnel-token`) | connector setup |
+| Connector | `~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`, log `~/Library/Logs/macbook-ssh/cloudflared.log` | remotely managed (connector setup) |
 | Scratch drive | `/Volumes/Scratch` (external APFS, 1.8 TB) | see below |
 
 ##### MacBook: The scratch drive
@@ -649,56 +668,32 @@ else. A build that sits at "mac-build: waiting for one of 2 build slots" is the 
 - **The connector token leaked**: anyone holding it can run a connector for this one tunnel, and nothing more: every
   request still has to pass Access. Rotating it replaces `cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh` (a new
   tunnel id and token), which disconnects the Mac's connector, the only route in. So the new token goes over the
-  temporary bootstrap route in [MacBook: Rebuilding from nothing](#macbook-rebuilding-from-nothing) (step 3), or at
+  temporary bootstrap route in [MacBook: Rebuilding from nothing](#macbook-rebuilding-from-nothing) (step 2), or at
   the Mac. Stop the connector first (`launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared`):
   Cloudflare refuses to delete a tunnel with active connections, and Terraform deletes this one before it creates the
   new one. Then, from a fresh worktree, `terraform apply -replace=cloudflare_zero_trust_tunnel_cloudflared.macbook_ssh`
   (its config and DNS record follow it, and `macbook-ssh-tunnel-token` gets the new token; delete the old tunnel in
-  the API afterwards), install the new token as in step 3 of the rebuild, check `ssh mac`, and take the bootstrap
+  the API afterwards), install the new token as in step 3 of the rebuild (the script sees the token changed and reloads the connector), check `ssh mac`, and take the bootstrap
   route down again.
 
 ##### MacBook: Rebuilding from nothing
 
-1. **Remote Login.** On the Mac: turn on Remote Login (Administrators) and "Allow full disk access for remote users";
-   install the keys-only drop-in:
-   `printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf`.
+1. **Remote Login.** On the Mac: turn on Remote Login (Administrators) and "Allow full disk access for remote users".
    A reinstalled Mac has a new host key: replace the `host_key` of `mac` in `local.mac_ssh_macs` with
    `/etc/ssh/ssh_host_ed25519_key.pub`, read on the Mac.
-2. **The clients' keys** in `~/.ssh/authorized_keys` (mode 600): fcvm-arm's and nextjs-dev `ejc3`'s `to-mac.pub`.
-3. **The connector.** Nothing reaches a wiped Mac, and only fcvm-arm (and administration) can read the connector
-   token. Either do this at the Mac with the token from an administrator, or over a temporary bootstrap route: the
-   Mac dials out to fcvm-arm with a tunnel-only key whose `ubuntu` `authorized_keys` line is
+2. **A way to reach it the first time.** Nothing reaches a wiped Mac. The Mac dials out to fcvm-arm with a tunnel-only
+   key whose `ubuntu` `authorized_keys` line is
    `restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:2223",permitopen="127.0.0.1:9" ssh-ed25519 AAAA... <comment>`
    (`permitopen` pins local forwarding to a closed port), running
    `ssh -NT -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -R 127.0.0.1:2223:127.0.0.1:22 -i <key> ubuntu@<fcvm-arm's Elastic IP>`
-   with fcvm-arm's host key pinned on the Mac from a machine that already trusts it, never accepted blind. Then from
-   fcvm-arm, with `back` meaning `ssh -p 2223 -o HostKeyAlias=ejs-macbook-pro-via-fcvm -o UserKnownHostsFile=~/.ssh/known_hosts.mac -o StrictHostKeyChecking=yes -i ~/.ssh/to-mac -o IdentitiesOnly=yes ejcampbell@127.0.0.1`:
-
-   ```bash
-   # cloudflared in the Mac's ~/.local/bin, checked against the pin in scripts/claw-master-mac-setup.sh
-   # (CFD_VERSION, CFD_SHA256_DARWIN_ARM64_TGZ and _BIN). Then the token, on stdin:
-   aws secretsmanager get-secret-value --region us-west-1 --secret-id macbook-ssh-tunnel-token \
-       --query SecretString --output text \
-     | back 'umask 077; mkdir -p ~/.cloudflared && cat > ~/.cloudflared/macbook-ssh.token'
-   back 'cat > ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist' <<'PLIST'
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0"><dict>
-     <key>Label</key><string>com.ejcampbell.macbook-ssh.cloudflared</string>
-     <key>ProgramArguments</key><array>
-       <string>/Users/ejcampbell/.local/bin/cloudflared</string><string>tunnel</string><string>--no-autoupdate</string>
-       <string>run</string><string>--token-file</string><string>/Users/ejcampbell/.cloudflared/macbook-ssh.token</string>
-     </array>
-     <key>RunAtLoad</key><true/>
-     <key>KeepAlive</key><true/>
-     <key>StandardErrorPath</key><string>/Users/ejcampbell/Library/Logs/macbook-ssh-cloudflared.log</string>
-   </dict></plist>
-   PLIST
-   back 'launchctl bootout gui/$(id -u)/com.ejcampbell.macbook-ssh.cloudflared 2>/dev/null;
-     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist'
-   ```
-
-   Once `ssh mac` works, stop the bootstrap tunnel and remove its key line from fcvm-arm: Cloudflare is the only way in.
+   with fcvm-arm's host key pinned on the Mac from a machine that already trusts it, never accepted blind; and the
+   Mac's `~/.ssh/authorized_keys` holds fcvm-arm `ubuntu`'s `to-mac.pub`.
+3. **Everything else on the route, from a jumpbox:** `scripts/mac-ssh-connector-setup.sh mac --bootstrap-port 2223`.
+   It makes Remote Login keys-only (`050-keys-only.conf`; when sudo needs a password it prints the command to type at
+   the Mac), installs the pinned `cloudflared`, the token (`macbook-ssh-tunnel-token`, through ssh stdin, mode 600), the
+   connector LaunchAgent `com.ejcampbell.macbook-ssh.cloudflared`, and the managed block of the clients' keys (fcvm-arm
+   `ubuntu`'s and nextjs-dev `ejc3`'s `to-mac.pub`). Once `ssh mac` works, stop the bootstrap tunnel and remove its key
+   line from fcvm-arm: Cloudflare is the only way in.
 4. **The clients**: the `dev-user-data.tf` and `nextjs-user-data.tf` setups install `Host mac` (fcvm-arm at its next
    boot through `dev-selfupdate`, nextjs-dev through `setup-sync`).
 5. **The agent tools**: `scripts/mac-setup.sh` from fcvm-arm. Then the first `osascript` to System Events and to
@@ -759,8 +754,10 @@ container but colton's (`nextjs-ct-user-data.tf`).
    (over `ssh colton-mac`); on fcvm-arm, delete the `restrict,...permitlisten="127.0.0.1:2224"...` line from
    `~/.ssh/authorized_keys`. Cloudflare is then the only way in.
 
-Re-run step 2 without `--bootstrap-port` after adding a client or when a client's key changes. Reloading the connector
-ends the sessions through it. Keep the Mac logged in, awake and online, as for the MacBook. Rotation is the MacBook's:
+Re-run step 2 without `--bootstrap-port` after adding a client or when a client's key changes. The script reloads the
+connector only when its LaunchAgent or token changed, detached so the reload completes even though it ends the sessions
+through it (the first run after the LaunchAgent took the MacBook's form, with `ProcessType` and a stdout log, reloads
+it once). The agent tools are `scripts/mac-setup.sh colton-mac`. Keep the Mac logged in, awake and online, as for the MacBook. Rotation is the MacBook's:
 `terraform apply -replace='cloudflare_zero_trust_access_service_token.colton_mac_ssh["nextjs-colton"]'` for one client
 (its secret follows; nothing changes on the box), and a leaked connector token means replacing
 `cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh` with the connector stopped, then step 2 over a temporary route.
@@ -1696,6 +1693,20 @@ for `claude-code-sync`; it must never overwrite a person's GitHub login.
 Next.js users authenticate independently. Jumpboxes intentionally leave interactive
 Claude/Codex login to the operator rather than storing those device credentials in
 Terraform.
+
+The distributed accounts' agent instructions are `agents-md.tf` (AGENTS.md from ejc3/agents-md) and
+`agent-local-md.tf` (`~/.claude/local.md`, which is kept out of every repository). Each `local.md` is the
+administration-only secret `agent-local-md/<machine>/<account>`, gated by `local.agent_local_md_ready`. On a cold start,
+or to change one: put its value from a 0600 file on a jumpbox, then set its gate to true and apply:
+
+```bash
+# from the box's live file, copied to a 0600 file here, e.g. over ssh: ssh ... 'cat ~/.claude/local.md' > "$f"
+aws secretsmanager put-secret-value --region us-west-1 --secret-id agent-local-md/fcvm-metal-arm/ubuntu \
+  --secret-string "file://$f"
+```
+
+Codex's `~/.agents/skills` mirrors `~/.claude/skills` by a manual step (`AGENTS.md`, "Agent instructions come from
+ejc3/agents-md"): nothing here installs the skill checkouts, so nothing installs the mirror either.
 
 The administration agent's own credentials (`github-admin-tokens.tf`) are containers that only the jumpbox role can
 read. Terraform creates them empty and they are filled once by hand, in the owner's browser session, because neither
@@ -2678,6 +2689,8 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |
+| The Macs' agent tools and the pinned Peekaboo | `scripts/mac-setup.sh`, `scripts/mac/` (`peekaboo-install.sh` holds the pin) |
+| The dev accounts' agent instructions: AGENTS.md from ejc3/agents-md, and `~/.claude/local.md` from administration-only secrets (never in git) | `agents-md.tf`, `agent-local-md.tf` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
 | Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |

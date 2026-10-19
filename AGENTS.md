@@ -967,6 +967,19 @@ public repository `ejc3/agents-md`, one file per machine and account (`hosts/<ma
   names) and a `main-pr-required` ruleset with review-thread resolution.
 - `user-agents.tf` still seeds a new account that has no instructions; an account listed in `agents-md.tf` is managed
   from the repository instead.
+- **`~/.claude/local.md` is not in any repository** (`agent-local-md.tf`). Each distributed account's CLAUDE.md imports
+  it with `@~/.claude/local.md`, for what must not be in a public file: fcvm-arm's describes the agent browser and the
+  owner's sessions in it. Its text is the administration-only secret `agent-local-md/<machine>/<account>`
+  (`agent-local-md/fcvm-metal-arm/ubuntu`, `agent-local-md/nextjs-dev/ejc3`). Terraform puts it beside AGENTS.md in the
+  bucket (`agents-md/<machine>/<account>/local.md`, which a bucket policy keeps to administration and that box's own
+  role, and for dev-server-role, fcvm-arm's own instance), and an association installs it the same way, daily. Each is
+  gated by `local.agent_local_md_ready` (checked in, false until its secret has a value). To change one, put a new value
+  from a 0600 file and apply. Never copy its text into this repository, a commit or a pull request.
+- **Codex's skills mirror Claude Code's.** Codex reads `~/.agents/skills`, Claude Code `~/.claude/skills`. The skill
+  checkouts (`~/claude-skills`, on fcvm-arm also `~/src/claude-skills`; github.com/ejc3/claude-skills) and the
+  `~/.claude/skills` links are made by hand, by nothing in this repository, so the mirror is a manual step too, done
+  as the account after adding or removing a skill (it skips `synced`, claude-code-sync's own directory):
+  `mkdir -p ~/.agents/skills && for s in ~/.claude/skills/*/; do n=$(basename "$s"); [ "$n" = synced ] || ln -sfn "$(readlink -f "$s")" ~/.agents/skills/"$n"; done`
 
 ### New repositories appear in Claude Code and Codex within seconds
 
