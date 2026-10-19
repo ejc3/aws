@@ -603,6 +603,11 @@ class MacTests(unittest.TestCase):
         self.assertEqual(clients.count(" = {"), 2)  # nobody else
         self.assertIn("macs       = lookup(local.nextjs_ct_mac_clients, u, {})", TF)
         self.assertNotIn("macbook-ssh.sh", TF + (CT / "provision").read_text())
+        snippet = TF.split("nextjs_ct_mac_ssh = <<-MACSSH", 1)[1].split("\nMACSSH", 1)[0]
+        install = snippet.index("${local.mac_cloudflared_install}")
+        check = snippet.index('/home/$MAC_USER/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1 ||')
+        self.assertLess(install, check, "a cloudflared that did not install fails the snippet before ssh is configured")
+        self.assertLess(check, snippet.index("${local.mac_ssh_client_setup}"))
 
     def test_provision_configures_each_listed_mac_and_nothing_else(self):
         prov = (CT / "provision").read_text()

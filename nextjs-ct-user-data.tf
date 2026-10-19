@@ -249,6 +249,10 @@ MAC_USER="$1"
 MAC_ALIAS="$2"
 MAC_SECRET="$3"
 ${local.mac_cloudflared_install}
+# The shared install only warns (nextjs-dev's setup goes on without it); here a missing or wrong binary fails provision,
+# so the container is not marked ready with an `ssh <alias>` that cannot connect.
+echo "${local.cloudflared_sha256_linux_arm}  /home/$MAC_USER/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1 ||
+  { echo "mac-ssh: cloudflared is missing or does not match its pin" >&2; exit 1; }
 ${local.mac_ssh_client_setup}
 MACSSH
 
