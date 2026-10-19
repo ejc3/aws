@@ -40,7 +40,14 @@ AUDIT = {
                           "DeleteUserPermissionsBoundary"},
     "kms.amazonaws.com": {"DisableKey", "ScheduleKeyDeletion", "PutKeyPolicy", "DisableKeyRotation"},
     "ec2.amazonaws.com": {"AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules"},
+    "backup.amazonaws.com": {"DeleteBackupVault", "DeleteBackupPlan", "DeleteBackupSelection", "UpdateBackupPlan",
+                             "PutBackupVaultAccessPolicy", "DeleteBackupVaultAccessPolicy",
+                             "PutBackupVaultLockConfiguration", "DeleteBackupVaultLockConfiguration",
+                             "UpdateRecoveryPointLifecycle", "UpdateGlobalSettings", "UpdateRegionSettings",
+                             "DeleteRecoveryPoint"},
 }
+# DeleteRecoveryPoint alerts only for these vaults (routine checkpoint cleanup elsewhere does not page the owner).
+PROTECTED_VAULTS = {"ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backup-recovery"}
 
 
 def sessions():
@@ -81,9 +88,10 @@ def poll(acct, sess, region):
         for det in gd.list_detectors()["DetectorIds"]:
             crit = {"Criterion": {"severity": {"Gte": 4}, "service.archived": {"Eq": ["false"]},
                                   "updatedAt": {"Gte": int(SINCE.timestamp() * 1000)}}}
-            ids = gd.list_findings(DetectorId=det, FindingCriteria=crit, MaxResults=50)["FindingIds"]
-            if ids:
-                for x in gd.get_findings(DetectorId=det, FindingIds=ids)["Findings"]:
+            ids = [i for page in gd.get_paginator("list_findings").paginate(DetectorId=det, FindingCriteria=crit)
+                   for i in page["FindingIds"]]
+            for k in range(0, len(ids), 50):  # GetFindings takes at most 50 ids
+                for x in gd.get_findings(DetectorId=det, FindingIds=ids[k:k + 50])["Findings"]:
                     out(src="guardduty", id=x["Id"], acct=acct, region=region, account=x["AccountId"], type=x["Type"],
                         sev=x["Severity"], title=x["Title"], resource=x["Resource"].get("ResourceType"))
     except Exception as e:  # noqa: BLE001
@@ -120,8 +128,7 @@ def poll(acct, sess, region):
             if src == "iam.amazonaws.com" and region != "us-east-1":
                 continue  # IAM is global: its events are logged in us-east-1
             names |= evs
-        if region == "us-east-1":
-            names.add("ConsoleLogin")
+        names.add("ConsoleLogin")  # IAM users' sign-ins are recorded at the regional endpoint they used
         lookups += [("EventName", n) for n in sorted(names)]
         for key, val in lookups:
             for page in ct.get_paginator("lookup_events").paginate(
@@ -137,6 +144,9 @@ def poll(acct, sess, region):
                             continue
                         hit = "console-login-failure"
                     elif name in AUDIT.get(src, ()):
+                        if name == "DeleteRecoveryPoint" and \
+                                (d.get("requestParameters") or {}).get("backupVaultName") not in PROTECTED_VAULTS:
+                            continue
                         hit = "tamper-or-iam"
                     else:
                         continue

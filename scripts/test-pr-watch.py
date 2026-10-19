@@ -177,6 +177,19 @@ class AlertPollTests(unittest.TestCase):
         hits = [p for p in printed if p.get("src") == "cloudtrail" and "kind" in p]
         self.assertEqual([(h["id"], h["kind"], h["event"]) for h in hits], [("ev-1", "tamper-or-iam", "CreateAccessKey")])
 
+    def test_audit_names_match_the_terraform_rule(self):
+        """Every eventName in security-forward-audit is looked up, and nothing else (drift between the two fails)."""
+        mod, _ = self.load()
+        tf = (ROOT / "modules/security-region/main.tf").read_text()
+        audit = tf[tf.index("security-forward-audit = jsonencode"):]
+        audit = audit[:audit.index("\n  }\n}")]
+        names = set()
+        for lst in re.findall(r'eventName\s*=\s*\[([^\]]*)\]', audit):
+            names |= set(re.findall(r'"([A-Za-z]+)"', lst))
+        names.discard("ConsoleLogin")
+        self.assertEqual(set().union(*mod.AUDIT.values()), names)
+        self.assertEqual(mod.PROTECTED_VAULTS, set(re.findall(r'"([a-z0-9-]+)"', audit[audit.index("backupVaultName"):].split("]")[0])))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
