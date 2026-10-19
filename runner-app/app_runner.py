@@ -654,8 +654,11 @@ def runs_oldest_first(repo, status, pat, budget):
         yield from sorted(body.get('workflow_runs') or [], key=lambda r: (r.get('created_at') or '', r['id']))
 
 
-def queued_jobs(repo, cfg, pat):
+def queued_jobs(repo, cfg, pat, running_on=None):
     """[(job_id, size)] for this repo's queued jobs that ask for our labels.
+
+    `running_on`, when given, is filled with the runner names the scanned in-progress jobs name: the runners known to be
+    running some job. ensure_runner() treats only those busy hosts as taken by another job (see there).
 
     Queued and in-progress runs, OLDEST first, each run's jobs read as soon as the run is: a job
     whose delivery was lost or whose first launch was refused is the one most at risk of waiting,
@@ -675,6 +678,8 @@ def queued_jobs(repo, cfg, pat):
                 print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls or its time share')
                 break
             for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
+                if running_on is not None and job.get('status') == 'in_progress' and job.get('runner_name'):
+                    running_on.add(job['runner_name'])
                 if job.get('id') in seen or job.get('status') != 'queued':
                     continue
                 seen.add(job.get('id'))
@@ -960,9 +965,16 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     first (update_bucket), and the mode decided counting the host this job would add. A full cap only makes the job
     wait; running hosts are never touched.
 
-    `busy` names hosts whose runner is running a job. A host tagged for this job cannot serve it
-    if it is busy while the job is still queued: GitHub gave it another job with the same labels,
-    and an ephemeral runner takes only one. The job then needs a host of its own."""
+    A live host tagged for this job covers it, registered or not, idle or busy. `busy` names the hosts known to be
+    running ANOTHER job: busy in the runner listing and named as the runner of an in-progress job. Only those leave the
+    job uncovered (GitHub gave the host another job with the same labels, and an ephemeral runner takes only one). A
+    host that is merely busy is not enough: GitHub's job listing can say "queued" for a job its own host is already
+    running (2026-10-19, issue #531: for up to half an hour), and treating that host as taken launched a duplicate host
+    for the job every round.
+
+    A job that already had a host (one tagged for it is listed, in any state) and none covers it now is launched for
+    again only once GitHub's own record of the job, asked directly, still says it is queued with no runner assigned.
+    Its host may have run a sibling job and exited, which a stale listing cannot tell from this job still waiting."""
     # Claims first, then a fresh listing: every launch whose claim was read is, in that listing,
     # either not yet visible (the claim stands in for it) or visible and counted by its real
     # state. `live`, taken earlier in the invocation, is only added to that, never trusted alone.
@@ -990,6 +1002,8 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
+    if any(tag(i, 'JobId') == job_id for i in listed + live) and not still_waiting(repo, job_id, pat):
+        return 'not queued', token
     max_hosts, max_vcpus, mode = int(cfg['max']), cfg.get('max_vcpus'), ''
     if budget:
         # Refill and drain to now, and decide the mode counting the host this job would add.
@@ -1048,6 +1062,16 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     if definite:
         release(repo, job_id)
     return 'failed', token
+
+
+def still_waiting(repo, job_id, pat):
+    """True when GitHub's record of the job says it is queued and no runner has been assigned to it."""
+    job = github('GET', f'/repos/{repo}/actions/jobs/{job_id}', pat)
+    if job.get('status') == 'queued' and not job.get('runner_name'):
+        return True
+    print(f"{repo}: job {job_id} is listed as queued but its record says {job.get('status')} "
+          f"on {job.get('runner_name') or 'no runner'}; it had a host already, so nothing is launched")
+    return False
 
 
 def throttled_group_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode):
@@ -1167,7 +1191,6 @@ def reconcile_repo(repo, cfg, subnets, result):
         print(f'{repo}: reconcile stopped after the runner listing; its time share is spent')
         return {'repo': repo, 'skipped': 'no time left'}
     live = reap(repo, cfg, pat, app_instances(repo), runners, complete)
-    busy = frozenset(name for name, runner in runners.items() if runner.get('busy'))
     outcomes, token = {}, None
     # From here on, a stop at the deadline still reports these (live grows with each launch).
     result['outcomes'] = outcomes
@@ -1180,10 +1203,13 @@ def reconcile_repo(repo, cfg, subnets, result):
     share_end = DEADLINE[0]
     if share_end != float('inf'):
         DEADLINE[0] = time.monotonic() + max(0.0, share_end - time.monotonic()) / 2
+    running_on = set()
     try:
-        jobs = queued_jobs(repo, cfg, pat)
+        jobs = queued_jobs(repo, cfg, pat, running_on=running_on)
     finally:
         DEADLINE[0] = share_end
+    # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
+    busy = frozenset(name for name, runner in runners.items() if runner.get('busy') and name in running_on)
     for job_id, size in jobs:
         # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
         # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.

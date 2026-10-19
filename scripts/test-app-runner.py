@@ -718,7 +718,7 @@ class LaunchTests(unittest.TestCase):
         app.reap = lambda repo, cfg, pat, instances, runners, complete=True: []
         app.app_instances = lambda repo: []
         app.list_runners = lambda repo, pat: ({}, True)
-        def queued(repo, cfg, pat):
+        def queued(repo, cfg, pat, running_on=None):
             scan_deadline.append(app.DEADLINE[0] - clock[0])
             if scan_uses_its_whole_share:
                 clock[0] = app.DEADLINE[0]
@@ -831,18 +831,101 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(launched, ["11"])
 
     def test_a_busy_host_tagged_for_a_still_queued_job_does_not_cover_it(self):
-        # GitHub gave the host launched for job 11 another job with the same labels. It is busy
-        # while 11 is still queued, and an ephemeral runner takes one job: 11 needs its own host.
+        # GitHub gave the host launched for job 11 another job with the same labels (12 names it as its runner). It is
+        # busy while 11 is still queued, and an ephemeral runner takes one job: 11 needs its own host.
         app, ec2, *_ = load_app()
         gh = app.github
         gh.runs[(COLTON, "in_progress")] = [1]
-        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]},
+                      {"id": 12, "status": "in_progress", "runner_name": "i-tagged11",
+                       "labels": ["self-hosted", "cc-games", "xl"]}]
         ec2.instances.append(instance("i-tagged11", COLTON, "11", 5))
         gh.runners[COLTON] = {"i-tagged11": {"id": 41, "name": "i-tagged11", "busy": True, "status": "online",
                                              "labels": [{"name": "cc-games"}]}}
         app.handler({"reconcile": True}, None)
         launched = [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] for kw in ec2.launched]
         self.assertEqual(launched, ["11"])
+
+    # Issue #531 (2026-10-19): while GitHub's job listing kept saying "queued" for jobs their hosts were already running
+    # or had run, each round launched another host per job ("reconcile {'launched': 4}; 6 live" for dolphin-maps).
+    def idle_runner(self, name, n, busy=False):
+        return {"id": n, "name": name, "busy": busy, "status": "online", "labels": [{"name": "cc-games"}]}
+
+    def launched_jobs(self, ec2):
+        return [{t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] for kw in ec2.launched]
+
+    def test_queued_jobs_whose_hosts_are_registered_and_idle_launch_nothing(self):
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "queued")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]},
+                      {"id": 12, "status": "queued", "labels": ["self-hosted", "cc-games", "l"]}]
+        ec2.instances += [instance("i-for11", COLTON, "11", 5), instance("i-for12", COLTON, "12", 5, size="l")]
+        gh.runners[COLTON] = {"i-for11": self.idle_runner("i-for11", 41), "i-for12": self.idle_runner("i-for12", 42)}
+        for _ in range(3):   # however many rounds the jobs stay queued
+            result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+            self.assertEqual(result["outcomes"], {"exists": 2})
+        self.assertEqual(ec2.launched, [])
+
+    def test_a_busy_host_no_in_progress_job_names_still_covers_its_job(self):
+        # The incident: i-0716507cf83187940 ran job 118150194548 from 15:36:47 while the listing still said queued at
+        # 15:39. Busy, but nothing says it runs ANOTHER job: it covers its own.
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "in_progress")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        ec2.instances.append(instance("i-for11", COLTON, "11", 3))
+        gh.runners[COLTON] = {"i-for11": self.idle_runner("i-for11", 41, busy=True)}
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["outcomes"], {"exists": 1})
+        self.assertEqual(ec2.launched, [], "a busy host running its own still-listed job is not a reason to launch")
+
+    def test_a_job_whose_host_already_ran_it_is_not_relaunched_on_a_stale_listing(self):
+        # The incident's other half: job 118150194526 ran at 15:37 on another host and its own host exited, yet the
+        # listing said queued at 15:39, 15:49 and 16:01. GitHub's record of the job settles it.
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "in_progress")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        gone = instance("i-for11", COLTON, "11", 6)
+        gone["State"]["Name"] = "terminated"
+        ec2.instances.append(gone)
+        gh.job_status[11] = "completed"
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["outcomes"], {"not queued": 1})
+        self.assertEqual(ec2.launched, [])
+        gh.job_status[11] = "queued"   # its host died with the job really still waiting: it gets another
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(self.launched_jobs(ec2), ["11"])
+
+    def test_the_cap_counts_registered_idle_hosts(self):
+        # Colton's cap is 3: three registered, idle hosts (each tagged for another job) fill it.
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "queued")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        ec2.instances += [instance(f"i-{n}", COLTON, str(n), 3) for n in (1, 2, 3)]
+        gh.runners[COLTON] = {f"i-{n}": self.idle_runner(f"i-{n}", n) for n in (1, 2, 3)}
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["outcomes"], {"cap": 1})
+        self.assertEqual(ec2.launched, [])
+
+    def test_a_job_whose_launch_failed_is_retried_without_asking_github_again(self):
+        # Every pool refused: no instance exists, the claim is released, and the next round launches. No host was ever
+        # tagged for the job, so its record is not consulted.
+        app, ec2, *_ = load_app()
+        gh = app.github
+        gh.runs[(COLTON, "queued")] = [1]
+        gh.jobs[1] = [{"id": 11, "status": "queued", "labels": ["self-hosted", "cc-games", "xl"]}]
+        ec2.refuse = set(SIZES["xl"])
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["outcomes"], {"failed": 1})
+        self.assertEqual(app.fake_dynamo.items, {}, "a definite failure leaves no claim")
+        ec2.refuse = set()
+        result = app.reconcile(COLTON, REPOS[COLTON], app.config()[1])
+        self.assertEqual(result["outcomes"], {"launched": 1})
+        self.assertEqual(self.launched_jobs(ec2), ["11"])
+        self.assertFalse([c for c in gh.calls if c[1].endswith("/actions/jobs/11")])
 
     def test_the_cap_counts_hosts_not_job_tags(self):
         # Dolphin's cap is 3: two hosts tagged for job 5 (one busy on another job) and one for 6.
