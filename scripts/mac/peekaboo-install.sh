@@ -92,7 +92,9 @@ else
   fi
   mv "$tmp/app/Peekaboo.app" "$app"
   echo "peekaboo: installed app $VERSION (was ${have:-none}; the old one is in $backup)"
-  [ "$was_running" -eq 0 ] || launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || open -g -a "$app" || true
+  # Start the new app whenever it is not running, whether it was quit for this swap or before it (the documented update
+  # path is to quit Peekaboo first, and the already-loaded one-shot LaunchAgent will not run again until the next login).
+  running || launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || open -g -a "$app" || true
 fi
 
 # cli-current follows the app that is actually installed.

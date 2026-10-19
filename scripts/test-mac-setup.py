@@ -380,6 +380,15 @@ class PeekabooInstall(unittest.TestCase):
         self.assertEqual(os.readlink(self.support / "cli-current"), f"cli-{self.version}")
         self.assertIn("launchctl kickstart gui/", self.calls())
 
+    def test_an_older_app_quit_before_the_update_is_started_after_it(self):
+        self.owners_mac()
+        self.running.unlink()  # the owner quit Peekaboo first, as the update path says
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.app / "Contents" / "Info.plist").read_text().strip(), self.version)
+        self.assertNotIn("pkill", self.calls(), "nothing was running to quit")
+        self.assertIn("launchctl kickstart gui/", self.calls(), "the new app is started")
+
     def test_a_download_that_does_not_match_its_pin_installs_nothing(self):
         with open(self.releases / "peekaboo-macos-arm64.tar.gz", "ab") as f:
             f.write(b"tampered")
