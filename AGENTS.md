@@ -449,8 +449,8 @@ pass. Those reads can convey administrator credentials. Full plans belong on a j
 a successful validation is not an empty live plan. The shared main/staging CI roles are
 retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
 (`imagine.tf`), `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`), `dolphin-labs-news-deploy`
-(`dolphin-labs-news.tf`) and `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`), each trusted for one
-repository's `main` or environment.
+(`dolphin-labs-news.tf`), `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`) and `dolphin-labs-testflight`
+(`dolphin-labs-testflight.tf`), each trusted for one repository's `main` or environment.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing

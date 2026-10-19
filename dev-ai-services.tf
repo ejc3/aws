@@ -240,8 +240,8 @@ resource "aws_iam_role_policy_attachment" "search_fetch_api_keys_read" {
 #     --rawfile p "AuthKey_${KEY_ID}.p8" '{ISSUER_ID: $i, KEY_ID: $k, TEAM_ID: $t, PRIVATE_KEY: $p}' | aws secretsmanager put-secret-value --region us-west-1 \
 #     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin && rm "AuthKey_${KEY_ID}.p8"
 # (with set -o pipefail; the .p8 is the only copy, so it is removed only after the upload succeeds)
-# Readers: the administration set and nextjs-dev-role (the dolphin box, which archives on the Mac
-# build tunnel and uploads). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
+# Readers: the administration set, nextjs-dev-role (the dolphin box, which archives on the Mac
+# build tunnel and uploads), and dolphin-labs-testflight (CI's uploads; dolphin-labs-testflight.tf). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
 # with browserbase/credentials. Not dev-server-role: the metal boxes do not build the apps.
 resource "aws_secretsmanager_secret" "app_store_connect" {
   name                    = "games-worth-watching/app-store-connect"
@@ -255,12 +255,12 @@ resource "aws_secretsmanager_secret_policy" "app_store_connect" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationAndTheDolphinBoxCanRead"
+      Sid       = "OnlyAdministrationTheDolphinBoxAndTestFlightCICanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.app_store_connect.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_testflight.arn]) } }
     }]
   })
 }
