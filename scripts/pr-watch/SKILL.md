@@ -65,8 +65,8 @@ to approve if it is safe; we have many code review agents"):
    reviewer (a check finishing or a PR marked ready does not change the head, so those are compared explicitly). The
    state also keeps `unapplied`: every PR about to be merged or merged whose apply has not finished with an empty
    follow-up plan (an `ejc3/agents-md` merge counts: it reaches the boxes only through an apply here). A merged PR is no longer
-   open, so that list is the only thing that brings a failed apply back; work it first every run. With nothing
-   new, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
+   open, so that list is the only thing that brings a failed apply back; work it first every run. Run step 6
+   (alerts) every time, even with no GitHub work; with nothing new and no alerts, say so in one line. Work items one at a time, oldest ready first; a large backlog is spread over runs.
 2. **Leave work in progress alone.** Only note, never touch: a draft PR; a PR with a push in the last 45 minutes from
    another session (head commit time, a local worktree on its branch); an issue already linked to an open PR.
 3. **Each PR: the full review loop.** Run `/code-review` at `high` on it. Fix real P1s and P2s that change what
