@@ -105,15 +105,19 @@ to approve if it is safe; we have many code review agents"):
 5. **Each issue.** Confirm it from live state, open a PR with the fix and tests, run step 3 on it, and close the issue
    from the PR. The safeguards apply to the fix as to any other PR.
 6. **Alerts.** The owner, 2026-10-19, after an EC2.9 flood filled the inbox: "have a poller looking for alerts like
-   that and remediate them". Each run, before the PRs, read what the alert topic sends: in us-west-1, Security Hub
-   findings that are HIGH or CRITICAL, ACTIVE and Workflow NEW, GuardDuty findings of severity 4 or more, Inspector
-   HIGH/CRITICAL and Access Analyzer ACTIVE (the patterns in `modules/security-region`), updated since the state's
-   `alerts_checked_at`; then set it. Confirm each from live state, grouped by control and resource:
+   that and remediate them". Each run, before the PRs, read what the alert topic would have sent since the state's
+   `alerts_checked_at` (then set it), from the services' own stores, never the topic (SNS keeps nothing to poll): Security
+   Hub `get-findings` (HIGH or CRITICAL, ACTIVE, Workflow NEW, by `UpdatedAt`; the Dolphin account's arrive there too),
+   GuardDuty `list-findings` (severity 4 or more), Inspector `list-findings` (HIGH/CRITICAL, ACTIVE), Access Analyzer
+   (ACTIVE), and for the audit events (`security-forward-audit`: root use, failed console sign-ins, the listed tampering
+   calls) CloudTrail `lookup-events`, which keeps 90 days. The patterns are in `modules/security-region`; read them
+   rather than a copy. Confirm each from live state, grouped by control and resource:
    - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
      step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
      goes to the top of the report for the owner and is never suppressed.
-   - **True by design** (EC2.9 on a box that egresses on its own address): an automation rule in
-     `security-hub-automation.tf`, its reason in the note, through a PR. Until it applies, the open findings may be set
+   - **True by design** (EC2.9 on a main-account box that egresses on its own address): an automation rule in
+     `security-hub-automation.tf`, as narrow as the evidence allows (account, control, resource) and its reason in the
+     note, through a PR. Until it applies, the open findings may be set
      `SUPPRESSED` with `aws securityhub batch-update-findings` and the same note (findings are not Terraform state).
    - **A flood** (more than about 20 in an hour) comes before everything else: suppress the open findings of a by-design
      control first, then the rule. Never silence the topic or loosen the alert patterns to stop one.
