@@ -461,49 +461,23 @@ resource "aws_cloudwatch_event_rule" "security_notify" {
   state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"
 }
 
-# Use an execution role for SNS delivery: its trust pins the exact originating
-# rule, without relying on the legacy SNS service-principal condition behavior.
-resource "aws_iam_role" "security_notify" {
-  name = "security-alerts-notify"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-      Condition = {
-        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
-        ArnEquals    = { "aws:SourceArn" = aws_cloudwatch_event_rule.security_notify.arn }
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "security_notify" {
-  name = "publish-security-notifications"
-  role = aws_iam_role.security_notify.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "sns:Publish"
-      Resource = aws_sns_topic.cost_alerts.arn
-    }]
-  })
-}
-
+# The rule delivers into the digest pipeline (security-alert-digest.tf), not straight to the topic: one email per
+# finding update was 3,608 emails in a day and got email on the topic disabled for abuse (2026-10-19). An SQS target
+# is authorized by the queue's policy (pinned to this rule), so the rule needs no execution role.
 resource "aws_cloudwatch_event_target" "security_notify" {
   event_bus_name = aws_cloudwatch_event_bus.security_alerts.name
   rule           = aws_cloudwatch_event_rule.security_notify.name
-  target_id      = "confirmed-operator-email"
-  arn            = aws_sns_topic.cost_alerts.arn
-  role_arn       = aws_iam_role.security_notify.arn
+  target_id      = "security-alert-digest"
+  arn            = aws_sqs_queue.security_alert_digest_inbox.arn
   retry_policy {
     maximum_event_age_in_seconds = 86400
     maximum_retry_attempts       = 185
   }
   dead_letter_config { arn = aws_sqs_queue.security_delivery_failures.arn }
-  depends_on = [aws_iam_role_policy.security_notify, aws_sqs_queue_policy.security_delivery_failures]
+  depends_on = [aws_sqs_queue_policy.security_alert_digest_inbox, aws_sqs_queue_policy.security_delivery_failures]
+  # The new target id replaces the old SNS target: add the new one first, so an event in between is delivered twice
+  # rather than not at all.
+  lifecycle { create_before_destroy = true }
 }
 
 resource "aws_sqs_queue" "security_delivery_failures" {
@@ -526,6 +500,7 @@ resource "aws_sqs_queue_policy" "security_delivery_failures" {
         Condition = { ArnEquals = { "aws:SourceArn" = [
           aws_cloudwatch_event_rule.security_notify.arn,
           aws_cloudwatch_event_rule.security_delivery_health.arn,
+          aws_cloudwatch_event_rule.security_alert_digest_flush.arn,
           aws_cloudwatch_event_rule.dolphin_security_inspector.arn,
           aws_cloudwatch_event_rule.access_audit_notify.arn,
         ] } }
@@ -577,7 +552,14 @@ locals {
     EXTRA_RULES_FILE = os.path.join(os.path.dirname(os.path.abspath(globals().get("__file__") or "lambda_function.py")), "extra_rules.json")
     EXTRA_RULE_KEYS = {"name", "bus", "region", "state", "pattern", "target"}
     EXTRA_TARGET_KEYS = {"Id", "Arn", "RoleArn", "DeadLetterConfig", "RetryPolicy", "InputTransformer"}
-    RESERVED_RULES = FORWARD_RULES + ["security-alerts-notify", "security-delivery-health"]
+    RESERVED_RULES = FORWARD_RULES + ["security-alerts-notify", "security-delivery-health", "security-alert-digest-flush"]
+    # Scheduled rules this observer checks, with their exact schedule. Neither has an event pattern.
+    SCHEDULES = {"security-delivery-health": "rate(5 minutes)", "security-alert-digest-flush": "rate(1 minute)"}
+    # security-alert-digest.tf: the notification rule delivers into this queue; this function reads it and is the only
+    # thing that publishes security alerts to the topic. Its dead-letter queue must be empty.
+    DIGEST = "security-alert-digest"
+    DIGEST_INBOX = "security-alert-digest-inbox"
+    DIGEST_DLQ = "security-alert-digest-dlq"
     # Always deployed (not gated by a feature switch), so a file without them is a packaging fault, not a quiet account.
     REQUIRED_EXTRA_RULES = {"dolphin-security-inspector", "access-audit-notify"}
 
@@ -588,11 +570,13 @@ locals {
                 "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE}}
         target = {"DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:"+main_account+":security-central-delivery-dlq"}}
         if rule == "security-alerts-notify":
-            target.update({"Id": "confirmed-operator-email", "Arn": sns_topic,
-                "RoleArn": "arn:aws:iam::"+main_account+":role/security-alerts-notify",
+            target.update({"Id": DIGEST, "Arn": "arn:aws:sqs:us-west-1:"+main_account+":"+DIGEST_INBOX,
                 "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}})
         elif rule == "security-delivery-health":
             target.update({"Id": rule, "Arn": "arn:aws:lambda:us-west-1:"+main_account+":function:security-delivery-health",
+                "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}})
+        elif rule == "security-alert-digest-flush":
+            target.update({"Id": rule, "Arn": "arn:aws:lambda:us-west-1:"+main_account+":function:"+DIGEST,
                 "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}})
         else:
             raise ValueError("Unexpected monitored rule")
@@ -661,15 +645,41 @@ locals {
             errors += 1
         return errors
 
-    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns, extra_queues=(), extra_rules=()):
+    def check_digest(lam, main_account, sns_topic):
+        """The rest of the alert path after the rule: inbox -> digest function -> topic. Count topology errors."""
+        errors = 0
+        function_arn = "arn:aws:lambda:us-west-1:"+main_account+":function:"+DIGEST
+        if lam is None:
+            return 1
+        try:
+            response = lam.list_event_source_mappings(FunctionName=DIGEST, MaxItems=2)
+            mappings = response.get("EventSourceMappings")
+            if (response.get("NextMarker") or not isinstance(mappings, list) or len(mappings) != 1
+                    or mappings[0].get("EventSourceArn") != "arn:aws:sqs:us-west-1:"+main_account+":"+DIGEST_INBOX
+                    or mappings[0].get("FunctionArn") != function_arn or mappings[0].get("State") != "Enabled"):
+                errors += 1
+        except Exception:
+            errors += 1
+        try:
+            config = lam.get_function_configuration(FunctionName=DIGEST)
+            if (config.get("FunctionArn") != function_arn or config.get("State", "Active") != "Active"
+                    or ((config.get("Environment") or {}).get("Variables") or {}).get("SNS_TOPIC_ARN") != sns_topic):
+                errors += 1
+        except Exception:
+            errors += 1
+        return errors
+
+    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now, patterns, extra_queues=(), extra_rules=(), lam=None):
+        errors = 0
         rules = [(name, None) for name in FORWARD_RULES]
         queues = [QUEUE]
         # Other features' regional DLQs in this account (access-audit.tf): only their depth is read.
         if account == main_account:
             queues.extend(extra_queues)
         if account == main_account and region == "us-west-1":
-            rules.extend([("security-alerts-notify", "security-alerts"), ("security-delivery-health", None)])
-            queues.append("security-central-delivery-dlq")
+            rules.extend([("security-alerts-notify", "security-alerts"), ("security-delivery-health", None), ("security-alert-digest-flush", None)])
+            queues.extend(["security-central-delivery-dlq", DIGEST_DLQ])
+            errors += check_digest(lam, main_account, sns_topic)
         # Both rules' topology and the shared queue are checked every five
         # minutes. Alternate only failure-metric reads in UTC epoch slots: each
         # rule is revisited every ten minutes with a 15-minute overlap. CloudWatch
@@ -688,7 +698,7 @@ locals {
                 queries.append({"Id": "m" + str(len(queries)), "ReturnData": True, "MetricStat": {
                     "Metric": {"Namespace": "AWS/Events", "MetricName": metric, "Dimensions": dimensions},
                     "Period": 300, "Stat": "Sum"}})
-        failures, depth, errors = 0, 0, 0
+        failures, depth = 0, 0
         # Sparse failure metrics cannot distinguish a quiet rule from a deleted
         # rule/target. Independently verify the enabled, exact delivery topology.
         # Never follow pagination or accept additional/redirected/transformed targets.
@@ -700,9 +710,9 @@ locals {
                 expected_state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if rule in ("security-forward-audit", "security-alerts-notify") else "ENABLED"
                 if state.get("State") != expected_state or state.get("Name") != rule or state.get("Arn") != expected_arn:
                     errors += 1
-                if rule == "security-delivery-health" and state.get("ScheduleExpression") != "rate(5 minutes)":
+                if rule in SCHEDULES and state.get("ScheduleExpression") != SCHEDULES[rule]:
                     errors += 1
-                if rule == "security-delivery-health":
+                if rule in SCHEDULES:
                     if state.get("EventPattern"):
                         errors += 1
                 elif state.get("ScheduleExpression") or parse_pattern(state.get("EventPattern")) != patterns[rule]:
@@ -799,7 +809,8 @@ locals {
                         session.client("sqs", region_name=region, config=CONFIG),
                         session.client("events", region_name=region, config=CONFIG), account, region, main_account, sns_topic, now, patterns,
                         tuple(extra_queues),
-                        tuple(rule for rule in extra_rules if account == main_account and rule["region"] == region)))
+                        tuple(rule for rule in extra_rules if account == main_account and rule["region"] == region),
+                        session.client("lambda", region_name=region, config=CONFIG) if account == main_account and region == "us-west-1" else None))
                 except Exception:
                     errors += 1
         # 34 account/region jobs, six concurrent readers, short SDK timeouts and
@@ -887,7 +898,7 @@ resource "aws_iam_role_policy" "security_delivery_health" {
       },
       {
         Effect = "Allow", Action = "sqs:GetQueueAttributes"
-        Resource = concat([aws_sqs_queue.security_delivery_failures.arn], [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${data.aws_caller_identity.current.account_id}:security-findings-delivery-dlq"],
+        Resource = concat([aws_sqs_queue.security_delivery_failures.arn, aws_sqs_queue.security_alert_digest_dlq.arn], [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${data.aws_caller_identity.current.account_id}:security-findings-delivery-dlq"],
         [for queue in aws_sqs_queue.access_audit_forward_dlq : queue.arn])
       },
       {
@@ -895,9 +906,18 @@ resource "aws_iam_role_policy" "security_delivery_health" {
         Resource = concat([
           aws_cloudwatch_event_rule.security_notify.arn,
           aws_cloudwatch_event_rule.security_delivery_health.arn,
+          aws_cloudwatch_event_rule.security_alert_digest_flush.arn,
           ], flatten([for region in local.security_delivery_regions : [for rule in ["security-forward-findings", "security-forward-audit"] :
             "arn:aws:events:${region}:${data.aws_caller_identity.current.account_id}:rule/${rule}"
         ]]), local.security_delivery_extra_rule_arns)
+      },
+      {
+        # The digest pipeline (security-alert-digest.tf): its event source and the topic it sends to.
+        Effect = "Allow", Action = "lambda:GetFunctionConfiguration", Resource = aws_lambda_function.security_alert_digest.arn
+      },
+      {
+        # ListEventSourceMappings has no resource-level scope.
+        Effect = "Allow", Action = "lambda:ListEventSourceMappings", Resource = "*"
       },
       {
         Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.security_delivery_observer_staging.arn
@@ -1005,7 +1025,12 @@ resource "aws_lambda_function" "security_delivery_health" {
       }))
     }
   }
-  depends_on = [aws_iam_role_policy.security_delivery_health, aws_iam_role_policy.security_delivery_observer_staging]
+  # The new topology is live before the code that checks for it.
+  depends_on = [
+    aws_iam_role_policy.security_delivery_health, aws_iam_role_policy.security_delivery_observer_staging,
+    aws_cloudwatch_event_target.security_notify, aws_lambda_event_source_mapping.security_alert_digest,
+    aws_cloudwatch_event_target.security_alert_digest_flush,
+  ]
 }
 
 resource "aws_cloudwatch_event_rule" "security_delivery_health" {

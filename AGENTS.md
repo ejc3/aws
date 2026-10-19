@@ -1468,7 +1468,8 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   all 17 ran the jumpbox out of memory. This account is the Dolphin account's GuardDuty administrator (those regions) and
   Security Hub administrator (us-west-1) by invitation, so its findings arrive
   in this account's own EventBridge and go out through the existing `security-forward-findings` rules and
-  `security-alerts-notify` (whose pattern lists the Dolphin id); one extra rule, `dolphin-security-inspector`, forwards its
+  `security-alerts-notify` (whose pattern lists the Dolphin id; it delivers into the digest Lambda,
+  `security-alert-digest.tf`, which mails each finding once and at most one message a minute); one extra rule, `dolphin-security-inspector`, forwards its
   Inspector findings, which the shared pattern leaves to Inspector's own events; the security delivery observer checks
   that rule's topology and failure metrics like its own (`security_delivery_extra_rules`). A Config aggregator `dolphin` reads its
   configuration. Not covered: the Dolphin account's CloudTrail control-plane alerts (`security-forward-audit`); the org

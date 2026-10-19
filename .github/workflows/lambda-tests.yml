@@ -73,6 +73,9 @@ jobs:
       - name: Security delivery watchdog
         run: python3 -S -B scripts/test-security-delivery.py
 
+      - name: Security alert digest (dedupe, immediate vs digest, one message a minute, nothing lost on failure)
+        run: python3 -S -B scripts/test-security-alert-digest.py
+
       - name: Regional account-default boundaries
         run: python3 -S -B scripts/test-security-defaults.py
 
