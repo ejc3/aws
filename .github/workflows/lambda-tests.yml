@@ -123,7 +123,7 @@ jobs:
         run: python3 -S -B scripts/test-nextjs-ct-containers.py
       - name: Boot-time Codex thread seeding
         run: python3 -S -B scripts/test-codex-seed.py
-      - name: ssh mac client installer and its Cloudflare route (offline)
+      - name: ssh mac and ssh colton-mac client installer, their Cloudflare routes and the Mac connector setup (offline)
         run: python3 -S -B scripts/test-mac-ssh-client.py
       - name: MacBook agent tools, lease and build cap (offline)
         run: python3 -S -B scripts/test-mac-setup.py

@@ -445,7 +445,9 @@ Peekaboo; `mac-gui <cmd>` runs a command in the logged-in GUI session for what n
 | fcvm-arm, `ubuntu` | `macbook-ssh-access` (fcvm-arm's instance only) | `dev-user-data.tf` |
 | nextjs-dev, `ejc3` only | `macbook-ssh-access-nextjs-ejc3` (`nextjs-dev-role`) | `nextjs-user-data.tf` |
 
-Both run the one installer in `mac-ssh-client.tf`: `~/.ssh/config.d-mac` (`Host mac`: `macbook-ssh.cc-games.dev`
+fcvm-arm also takes it, without a reboot, from the daily `fcvm-mac-ssh-clients` association. Both run the one
+installer in `mac-ssh-client.tf` (entry `mac` of `local.mac_ssh_macs`; [Colton's Mac](#ssh-to-coltons-mac-ssh-colton-mac)
+is the other entry): `~/.ssh/config.d-mac` (`Host mac`: `macbook-ssh.cc-games.dev`
 through `ProxyCommand ~/.ssh/mac-access-proxy %h`, the account's own `~/.ssh/to-mac` key, `HostKeyAlias
 ejs-macbook-pro-via-fcvm` checked against `~/.ssh/known_hosts.mac`), the proxy command, and the pinned `cloudflared`
 in `~/.local/bin`. Terraform never installs or copies the private key; restoring it is a prerequisite on a fresh root.
@@ -560,7 +562,7 @@ API with the `games-worth-watching/app-store-connect` key, not through Chrome.
 | Remote Login | System Settings > General > Sharing > Remote Login | on, Administrators only, "Allow full disk access for remote users" on |
 | Keys only | `/etc/ssh/sshd_config.d/050-keys-only.conf` | `PasswordAuthentication no`, `KbdInteractiveAuthentication no` |
 | Clients' keys | `~/.ssh/authorized_keys` | fcvm-arm's and nextjs-dev `ejc3`'s `to-mac` public keys |
-| Host key | `/etc/ssh/ssh_host_ed25519_key.pub` | `local.mac_tunnel_host_keys` |
+| Host key | `/etc/ssh/ssh_host_ed25519_key.pub` | `host_key` of `mac` in `local.mac_ssh_macs` |
 | Automation (`sshd-keygen-wrapper`) | System Settings > Privacy & Security > Automation | System Events and Google Chrome on |
 | Agent tools | `~/.local/bin/{mac-gui,mac-lease,mac-build,mac-build-shim,peekaboo}`, shims `swift`, `xcodebuild`, `xcrun` | `scripts/mac-setup.sh` |
 | Peekaboo app | `~/Applications/Peekaboo.app`, LaunchAgent `com.ejcampbell.peekaboo` | Screen Recording, Accessibility |
@@ -660,7 +662,7 @@ else. A build that sits at "mac-build: waiting for one of 2 build slots" is the 
 1. **Remote Login.** On the Mac: turn on Remote Login (Administrators) and "Allow full disk access for remote users";
    install the keys-only drop-in:
    `printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf`.
-   A reinstalled Mac has a new host key: replace `local.mac_tunnel_host_keys` with
+   A reinstalled Mac has a new host key: replace the `host_key` of `mac` in `local.mac_ssh_macs` with
    `/etc/ssh/ssh_host_ed25519_key.pub`, read on the Mac.
 2. **The clients' keys** in `~/.ssh/authorized_keys` (mode 600): fcvm-arm's and nextjs-dev `ejc3`'s `to-mac.pub`.
 3. **The connector.** Nothing reaches a wiped Mac, and only fcvm-arm (and administration) can read the connector
@@ -708,6 +710,60 @@ else. A build that sits at "mac-build: waiting for one of 2 build slots" is the 
 from Remote Login to a private desktop-session `sshd` (`127.0.0.1:22222`, for the keychain and Apple Events) and back
 (issue #505): under it every new binary stopped at a removable-volume prompt, and Remote Login with Automation grants
 plus `mac-gui` does everything it did.
+
+### SSH to Colton's Mac: `ssh colton-mac`
+
+The same shape as the MacBook (owner, 2026-10-19: "Colton and I ... from the nextjs server, and just me from fcvm"):
+Cloudflare Access in front of the Mac's Remote Login at `colton-mac-ssh.cc-games.dev` (`colton-mac-ssh.tf`), a connector
+LaunchAgent on the Mac, and the `mac-ssh-client.tf` installer on each client with alias `colton-mac` (entry `colton-mac`
+of `local.mac_ssh_macs`, which pins the Mac's host key under `HostKeyAlias colton-mac`). No inbound port and no reverse
+tunnel.
+
+| From | Service token (Secrets Manager) | Configured by |
+|---|---|---|
+| fcvm-arm, `ubuntu` | `colton-mac-ssh-access-fcvm` (fcvm-arm's instance only) | `dev-user-data.tf` at boot, `fcvm-mac-ssh-clients` association daily |
+| nextjs-dev, `colton` | `colton-mac-ssh-access-nextjs-colton` (`nextjs-dev-role`) | `nextjs-user-data.tf` (`setup-sync`, within 10 minutes) |
+| nextjs-dev, `ejc3` | `colton-mac-ssh-access-nextjs-ejc3` (`nextjs-dev-role`) | `nextjs-user-data.tf` |
+| EJ in a browser | the browser-manager owner policy | |
+
+Each account has its own key, `~/.ssh/to-colton-mac`, made on its box by the installer **as that account** when missing
+(only the public half is printed); the private half never leaves the box. The connector token's secret,
+`colton-mac-ssh-tunnel-token`, is readable in AWS by administration only, but **the clients can read the token on the
+Mac**: it is a 0600 file of the one account they all log in as. A connector run with it can only take this tunnel's
+traffic and break connections; it cannot get in (Access gates every request) or pass for the Mac (clients pin its host
+key). `scripts/mac-ssh-connector-setup.sh colton-mac`, run on a jumpbox, puts the Mac on the route:
+
+- it checks that Remote Login offers `publickey` only, and otherwise installs the MacBook's keys-only drop-in
+  (`/etc/ssh/sshd_config.d/050-keys-only.conf`) if `sudo` needs no password, or stops and prints the command to type at
+  the Mac;
+- the pinned `cloudflared` (verified on the Mac), the token through ssh stdin into `~/.cloudflared/colton-mac-ssh.token`
+  (0600), and the LaunchAgent `com.ccgames.colton-mac-ssh.cloudflared`;
+- a managed block in the Mac's `~/.ssh/authorized_keys` with the three clients' public keys (fcvm-arm's over ssh, each
+  nextjs-dev account's own file over its own SSM command), each accepted only as exactly one `ssh-ed25519 <blob>`.
+
+It reaches the Mac as `ssh colton-mac` from fcvm-arm; `--bootstrap-port PORT` points that alias at a temporary reverse
+tunnel on fcvm-arm's `127.0.0.1:PORT`. On the containerized box (`nextjs-ct`), `colton-mac-ssh-access-nextjs-ejc3` is
+the owner's (denied to every member's container) and `colton-mac-ssh-access-nextjs-colton` is denied to every member's
+container but colton's (`nextjs-ct-user-data.tf`).
+
+**First bring-up** (the Mac kept a temporary reverse tunnel to fcvm-arm's `127.0.0.1:2224`, set up by hand on 2026-10-19):
+
+1. Apply. The association rewrites fcvm-arm's `colton-mac` alias to the Cloudflare route at once (the same
+   `to-colton-mac` key and host key pin); nextjs-dev makes `colton`'s and `ejc3`'s keys at its next `setup-sync`.
+2. From a jumpbox: `scripts/mac-ssh-connector-setup.sh colton-mac --bootstrap-port 2224`. It stops before the token
+   and the connector if a client's key is not there yet or Remote Login still takes passwords (type the printed command at the
+   Mac, then run it again).
+3. Check from each client: `ssh colton-mac true` (fcvm-arm `ubuntu`, nextjs-dev `colton` and `ejc3`).
+4. Retire the temporary tunnel: on the Mac, `launchctl bootout gui/$(id -u)/com.ccgames.fcvm-tunnel` and delete
+   `~/Library/LaunchAgents/com.ccgames.fcvm-tunnel.plist`, `~/.ssh/fcvm-tunnel*` and `~/.ssh/known_hosts.fcvm-tunnel`
+   (over `ssh colton-mac`); on fcvm-arm, delete the `restrict,...permitlisten="127.0.0.1:2224"...` line from
+   `~/.ssh/authorized_keys`. Cloudflare is then the only way in.
+
+Re-run step 2 without `--bootstrap-port` after adding a client or when a client's key changes. Reloading the connector
+ends the sessions through it. Keep the Mac logged in, awake and online, as for the MacBook. Rotation is the MacBook's:
+`terraform apply -replace='cloudflare_zero_trust_access_service_token.colton_mac_ssh["nextjs-colton"]'` for one client
+(its secret follows; nothing changes on the box), and a leaked connector token means replacing
+`cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh` with the connector stopped, then step 2 over a temporary route.
 
 ### macOS VMs on the MacBook (ejc3, skevh)
 
@@ -2621,6 +2677,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
+| SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |
 | Colton Games' production domains on Vercel (`cc-games.org`, canonical; `cc-games.net`, `cc-games.app`, `ccgames.app` and `colton-games.com` redirecting to it) | `vercel.tf`, `vercel-cc-games.tf` |
 | Colton Games accounts (Google sign-in, site admins, browser push): per-environment secret containers, the generated `AUTH_SECRET`s and the Vercel variables written from them | `colton-games-accounts.tf` (keys, gate and bring-up order in its header) |
 | tmux-scroll release pin, tag + sha256 (every aarch64 box; `fcvm-metal-x86` keeps its copy until the release has an x86_64 asset). t-claude is pinned (`local.tclaude_ref`) only on the jumpboxes; the metal boxes and nextjs-dev follow its `main` | `tmux-scroll.tf`, `scripts/admin-tmux-tclaude.sh` |

@@ -83,12 +83,13 @@ locals {
       Sid    = "OwnerOnlySecrets"
       Effect = "Deny"
       Action = "secretsmanager:GetSecretValue"
-      # The hop key, the Google Docs token, the owner's own wbox password and the owner's Cloudflare Access token
-      # for the MacBook (by name: a secret ARN ends in a random suffix).
+      # The hop key, the Google Docs token, the owner's own wbox password and the owner's Cloudflare Access tokens
+      # for the MacBook and for Colton's Mac (by name: a secret ARN ends in a random suffix).
       Resource = concat(
         [aws_secretsmanager_secret.dev_hop.arn, aws_secretsmanager_secret.wbox_admin.arn],
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:macbook-ssh-access-nextjs-ejc3-*"],
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-ejc3-*"],
       )
     },
     {
@@ -176,6 +177,15 @@ locals {
       NotResource = [b.role]
     },
   ] }
+  # Colton's own Cloudflare Access token for Colton's Mac (colton-mac-ssh.tf): denied to every member but colton, with or
+  # without boxes (ejc3's token is in OwnerOnlySecrets above). By name: a secret ARN ends in a random suffix.
+  nextjs_ct_colton_mac_ssh = { for u in local.nextjs_ct_member_users : u => [for s in [{
+    Sid      = "ColtonMacSshColtonOnly"
+    Effect   = "Deny"
+    Action   = "secretsmanager:GetSecretValue"
+    Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-colton-*"
+  }] : s if u != "colton"] }
+
   # A member with no boxes of their own (added to local.nextjs_users, not to local.member_box_people).
   nextjs_ct_no_boxes = [
     {
@@ -555,7 +565,7 @@ resource "aws_iam_policy" "nextjs_ct_member" {
   tags        = { Purpose = "session-policy", AttachedTo = "none", Account = each.key }
   policy = jsonencode({
     Version   = "2012-10-17"
-    Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes))
+    Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes), local.nextjs_ct_colton_mac_ssh[each.key])
   })
 }
 

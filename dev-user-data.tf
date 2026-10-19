@@ -541,12 +541,9 @@ fi
 # Shell setup
 ${local.shell_setup}
 
-# Only ARM gets `ssh mac` (EJ's MacBook Pro through Cloudflare Access, mac-ssh-client.tf), with its own
-# service token; the proxy command needs the pinned cloudflared.
-MAC_USER=ubuntu
-MAC_SECRET=macbook-ssh-access
-${local.mac_cloudflared_install}
-${local.mac_ssh_client_setup}
+# Only ARM gets `ssh mac` (EJ's MacBook Pro) and `ssh colton-mac` (Colton's Mac), through Cloudflare Access
+# (mac-ssh-client.tf), each with fcvm-arm's own service token; the proxy command needs the pinned cloudflared.
+${local.fcvm_mac_ssh_clients}
 
 # Claude Code -- the NATIVE installer, deliberately not npm.
 #

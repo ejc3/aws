@@ -83,6 +83,7 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
         self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
+        self.assertIn(":secret:colton-mac-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for Colton's Mac
         # The owner's `wbox run` output (security review of #502): the bucket (ListBucket) and its objects.
         out = member.split('Sid      = "OwnerOnlyWboxOutput"', 1)[1].split("},", 1)[0]
         self.assertIn('Action   = ["s3:GetObject", "s3:ListBucket"]', out)
@@ -93,7 +94,8 @@ class HostScriptTests(unittest.TestCase):
         # boxes, so each member gets a managed policy, attached to nothing and passed with the member's session only.
         res = TF.split('resource "aws_iam_policy" "nextjs_ct_member" {', 1)[1].split("\n}\n", 1)[0]
         self.assertIn("for_each    = toset(local.nextjs_ct_member_users)", res)
-        self.assertIn("concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes))", res)
+        self.assertIn("concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], "
+                      "local.nextjs_ct_no_boxes), local.nextjs_ct_colton_mac_ssh[each.key])", res)
         self.assertIn("nextjs_ct_member_users = [for u in local.nextjs_users : u if !contains(local.nextjs_ct_owners, u)]", TF)
         self.assertIn("session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }", TF)
         self.assertNotIn("aws_iam_role_policy_attachment\" \"nextjs_ct_member", TF)
@@ -174,7 +176,7 @@ class HostScriptTests(unittest.TestCase):
             {"Sid": "OwnerOnlySecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
                           arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token"),
-                          sp + "macbook-ssh-access-nextjs-ejc3-*"]},
+                          sp + "macbook-ssh-access-nextjs-ejc3-*", sp + "colton-mac-ssh-access-nextjs-ejc3-*"]},
             {"Sid": "OwnerOnlyWboxOutput", "Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
              "Resource": ["arn:aws:s3:::wbox-output-111111111111", "arn:aws:s3:::wbox-output-111111111111/*"]},
             {"Sid": "NoMemberNeedsThese", "Effect": "Deny", "Action": acts("NoMemberNeedsThese"), "Resource": "*"},
@@ -197,6 +199,23 @@ class HostScriptTests(unittest.TestCase):
         self.assertEqual(len(acts("Sid       = \"OwnBoxesOnly\"")), 6)
         size = len(json.dumps({"Version": "2012-10-17", "Statement": managed}, separators=(",", ":")))
         self.assertLess(size, 5500, size)
+        # Every other member also carries the deny on colton's Access token for Colton's Mac.
+        other = managed + [{"Sid": "ColtonMacSshColtonOnly", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
+                            "Resource": sp + "colton-mac-ssh-access-nextjs-colton-*"}]
+        size = len(json.dumps({"Version": "2012-10-17", "Statement": other}, separators=(",", ":")))
+        self.assertLess(size, 5800, size)
+
+    def test_colton_mac_tokens_are_readable_only_from_their_own_containers(self):
+        # Security review of #510: every container's session is nextjs-dev-role, which reads both nextjs tokens for
+        # Colton's Mac. ejc3's is owner-only (above); colton's is denied to every member but colton, boxes or not.
+        stmt = TF.split("nextjs_ct_colton_mac_ssh = {", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for u in local.nextjs_ct_member_users : u =>", stmt)
+        self.assertIn(': s if u != "colton"] }', stmt)
+        self.assertIn('Action   = "secretsmanager:GetSecretValue"', stmt)
+        self.assertIn('Effect   = "Deny"', stmt)
+        self.assertIn(':secret:colton-mac-ssh-access-nextjs-colton-*"', stmt)
+        res = TF.split('resource "aws_iam_policy" "nextjs_ct_member" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("local.nextjs_ct_colton_mac_ssh[each.key])", res)
 
 
 class MigrateTests(unittest.TestCase):
