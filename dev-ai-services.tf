@@ -242,7 +242,10 @@ resource "aws_iam_role_policy_attachment" "search_fetch_api_keys_read" {
 # (with set -o pipefail; the .p8 is the only copy, so it is removed only after the upload succeeds)
 # Readers: the administration set, nextjs-dev-role (the dolphin box, which archives on the Mac
 # build tunnel and uploads), and dolphin-labs-testflight (CI's uploads; dolphin-labs-testflight.tf). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
-# with browserbase/credentials. Not dev-server-role: the metal boxes do not build the apps.
+# with browserbase/credentials. fcvm-arm's role (dev_server) reads it too: dolphin-labs-hq/dolphin-maps'
+# iPhone app is built and uploaded from fcvm-arm (archived on the MacBook over `ssh mac`), and its
+# TestFlight feedback and build status are read through the same API. The grant is pinned to
+# fcvm-arm's instance with ec2:SourceInstanceARN, so fcvm-x86, which shares the role, cannot read it.
 resource "aws_secretsmanager_secret" "app_store_connect" {
   name                    = "games-worth-watching/app-store-connect"
   description             = "App Store Connect API key for Games Worth Watching (JSON: ISSUER_ID, KEY_ID, TEAM_ID, PRIVATE_KEY). Value set out of band; see dev-ai-services.tf."
@@ -260,7 +263,7 @@ resource "aws_secretsmanager_secret_policy" "app_store_connect" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.app_store_connect.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_testflight.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_testflight.arn, aws_iam_role.dev_server.arn]) } }
     }]
   })
 }
@@ -282,6 +285,22 @@ resource "aws_iam_policy" "app_store_connect_read" {
 resource "aws_iam_role_policy_attachment" "app_store_connect_read" {
   role       = aws_iam_role.nextjs_dev.name
   policy_arn = aws_iam_policy.app_store_connect_read.arn
+}
+
+# fcvm-arm only (dev_server is shared with fcvm-x86): the read is allowed from fcvm-arm's instance.
+resource "aws_iam_role_policy" "dev_server_app_store_connect" {
+  count = var.enable_firecracker_instance ? 1 : 0
+  name  = "read-app-store-connect-from-fcvm-arm"
+  role  = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.app_store_connect.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
+    }]
+  })
 }
 
 # Anthropic API key, the final paid backup for claw-master (`--backup-api-key env:CLAW_MASTER_BACKUP_API_KEY`; the
