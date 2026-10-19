@@ -29,6 +29,8 @@ elif "describe-instances" in a and "InstanceType" in a:
     print("c8g.48xlarge")
 elif "describe-instances" in a:
     print("None")
+elif "describe-volumes" in a and "[State," in a:
+    print("available\tNone")
 elif "describe-volumes" in a and "AvailabilityZone" in a:
     print("us-east-2c")
 elif "describe-volumes" in a:
