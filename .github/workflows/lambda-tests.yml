@@ -136,6 +136,8 @@ jobs:
         run: python3 -S -B scripts/test-mac-ssh-client.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: python3 -S -B scripts/test-mac-setup.py
+      - name: Metal boxes keep their box tools (pbox, gbox, wbox, codex-restart) equal to main daily (offline)
+        run: python3 -S -B scripts/test-metal-box-tools.py
       - name: App-repo runners route, launch, cap and reap (offline)
         run: python3 -S -B scripts/test-app-runner.py
       - name: App-repo runner images build weekly, from Canonical's image, and retire only their own (offline)
