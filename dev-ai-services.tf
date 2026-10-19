@@ -289,8 +289,9 @@ resource "aws_iam_role_policy_attachment" "app_store_connect_read" {
 
 # fcvm-arm only (dev_server is shared with fcvm-x86): the read is allowed from fcvm-arm's instance.
 resource "aws_iam_role_policy" "dev_server_app_store_connect" {
-  name = "read-app-store-connect-from-fcvm-arm"
-  role = aws_iam_role.dev_server.id
+  count = var.enable_firecracker_instance ? 1 : 0
+  name  = "read-app-store-connect-from-fcvm-arm"
+  role  = aws_iam_role.dev_server.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
