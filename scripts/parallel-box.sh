@@ -4,32 +4,39 @@
 # boxes (slots 1-8; ohio-pbox.tf, parallel-box-launch.tf), each with its own persistent
 # work volume, so eight parallel jobs can run at once.
 #
-#   pbox up [N]       launch box 1 (or N, 1-8) in the home AZ; tries several instance types
-#   pbox up [N] kvm   same box, METAL pools only: /dev/kvm for hypervisor
-#                     workloads (fcvm/firecracker). Boots in many minutes.
-#   pbox up [N] --fallback
+#   pbox flavors      the menu: each flavor's vCPU, memory, local disk, what it is for, rough price
+#   pbox up [N] FLAVOR
+#                     launch box 1 (or N, 1-8) in the home AZ as FLAVOR (also --flavor FLAVOR).
+#                     A FLAVOR IS REQUIRED: pick the smallest that fits the work's shape (CPU-,
+#                     memory- or local-disk-bound, or general) and size, e.g. compute-48. It tries
+#                     that flavor's instance types in turn. kvm-96 / kvm-192 are bare metal with
+#                     /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
+#   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
 #                     A FALLBACK BOX STARTS WITH AN EMPTY WORK VOLUME, deleted with the box.
-#   pbox up [N] --regions us-east-1,us-west-2
+#   pbox up [N] FLAVOR --regions us-east-1,us-west-2
 #                     the same, searching only these regions' fallback sites
 #   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
-#   pbox status       every box: running where? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
+#   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
 #   pbox status N     just box N
 #   pbox ssh [N]      connect
 #   pbox ip [N]       print the IP
-#   pbox capacity [N] spot placement scores (1-10) for the type list in the home AZ and every
+#   pbox capacity [N] FLAVOR
+#                     spot placement scores (1-10) for the flavor's types in the home AZ and every
 #                     fallback AZ; launches nothing
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
 #   "launched box=N region=R az=Z type=T ip=IP work=persistent|fresh", or "running ..." when it already was),
-#   3 when the home AZ had no capacity and --fallback was not given (retry with it), 4 when no
-#   fallback AZ had capacity either, and 1 for any other failure.
+#   2 when no flavor (or an unknown one) was named, printing the menu and launching nothing, 3 when the home AZ
+#   had no capacity and --fallback was not given (retry with it), 4 when no fallback AZ had capacity either,
+#   and 1 for any other failure.
 #
-# CAPACITY IS THE HARD PART. A 192-core spot request pinned to one AZ and one instance
+# CAPACITY IS THE HARD PART. A big spot request pinned to one AZ and one instance
 # type scores 1/10 for fulfilment; allowing several instance types raises that
-# materially. The persistent volumes are AZ-locked, so a home launch tries every Graviton
-# family in the volume's AZ, which is what the list below does. When that is not enough,
+# materially. The persistent volumes are AZ-locked, so a home launch tries every type of
+# the flavor in the volume's AZ. When that is not enough, a neighbouring flavor (the same
+# shape a size down, or another shape of the same size) is often free, and
 # --fallback goes to the other US AZs, with a fresh, empty work volume instead of the
 # persistent one: the caller decides whether that is acceptable, which is why it is never
 # the default. Each attempt is reported, so a failure is visible rather than a silent
@@ -48,37 +55,99 @@
 # thing terraform cannot know in advance -- which instance type has capacity right now --
 # via ec2:RunInstances against that template. The IAM policy behind it
 # (parallel-box-launch.tf) allows launching ONLY these eight tagged boxes, and passing only
-# the dev-ebs-only role. Terminating was already non-terraform: parallel-box-watchdog.tf
+# the dev-ebs-only role, and pbox-flavor-types (pbox-flavors.tf) only as a flavor's types.
+# Terminating was already non-terraform: parallel-box-watchdog.tf
 # has always reaped these boxes with tag-scoped ec2:TerminateInstances.
 #
 # A MEMBER (member-boxes.tf: the account running this is one of MEMBERS) has one box of their
 # own, pbox-<person> (member-pbox.tf), with its own work volume, and these commands act on it
-# with no box number: `pbox up`, `pbox down`, `pbox status`, `pbox ssh`, `pbox ip`,
-# `pbox capacity`. No kvm mode and no fallback sites for it; it opens with the person's own key
-# (fetched once into ~/.ssh/member-box from Secrets Manager).
+# with no box number: `pbox up FLAVOR`, `pbox down`, `pbox status`, `pbox ssh`, `pbox ip`,
+# `pbox capacity FLAVOR`, `pbox flavors`. No kvm flavors and no fallback sites for it; it opens with the
+# person's own key (fetched once into ~/.ssh/member-box from Secrets Manager).
 set -uo pipefail
 
 
-# Candidate pools, all Graviton (incl. gen-5 c9g/m9g). The floor is "better
-# than the dev box" (c7gd.metal, 64 cores / 128GB Graviton3), so nothing here is under
-# 96 cores.
-#
-# Order matters:
-#   1. 192-core virtualized, cheapest family first (c8g < c8gn < m8g < r8g < r8gd)
-#   2. 96-core virtualized -- half the cores but a much likelier pool
-# Metal is excluded from the DEFAULT list: it boots in many minutes, which defeats fast
-# startup, and there are enough virtualized pools that we should never need it.
-# KVM MODE ("up N kvm") is the deliberate exception: virtualized Graviton has no
-# /dev/kvm (AWS exposes KVM only on *.metal ARM instances), so KVM workloads -- fcvm,
-# firecracker, anything that IS a hypervisor -- get a metal-only pool list and accept
-# the slow boot as the price of admission. Same ordering rules, same >=96-core floor
-# (metal-24xl = 96 cores); all offered where the boxes live (a type a region lacks is skipped as unsupported).
-TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xlarge c9g.48xlarge c9gd.48xlarge m8g.48xlarge m8gd.48xlarge m9g.48xlarge m9gd.48xlarge i8g.48xlarge i8ge.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gb.24xlarge c8gd.24xlarge c8gn.24xlarge c9g.24xlarge c9gd.24xlarge m8g.24xlarge m8gd.24xlarge m9g.24xlarge m9gd.24xlarge i8g.24xlarge i8ge.24xlarge r8g.24xlarge r8gd.24xlarge}"
-# Deliberately a SEPARATE override var: reusing PARALLEL_BOX_TYPES here would let a
-# virtualized-list override silently poison kvm mode with non-metal types, which
-# would burn the full 25-min wait and then fail the /dev/kvm check.
-KVM_TYPES="${PARALLEL_BOX_KVM_TYPES:-c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl}"
+# THE FLAVOR MENU (pbox-flavors.tf has the same lists, which IAM allows exactly; scripts/test-pbox-flavors.py keeps the
+# two equal). One line per flavor: name, vCPU, memory GiB, local NVMe (TB, at least; "-" for none promised), an
+# approximate spot $/hr in us-east-2c (measured 2026-10-19: the launch prints each type's live price), then the
+# instance types, tried in that order. Spot capacity differs from type to type, so each flavor has several, all with
+# the flavor's vCPU and memory. All Graviton (arm64, as the AMI is), all offered in us-east-2c; a fallback AZ skips the
+# types it does not offer. No Graviton c, m or r type has 24 vCPU, so 32 is the smallest size: nothing is under the
+# 24-vCPU floor. The kvm flavors are bare metal (virtualized Graviton has no /dev/kvm) and boot in many minutes.
+FLAVORS='
+compute-32   32   64   -    0.35 c8g.8xlarge c9g.8xlarge c8gn.8xlarge c8gb.8xlarge c8gd.8xlarge c9gd.8xlarge c7g.8xlarge c7gd.8xlarge c7gn.8xlarge
+compute-48   48   96   -    0.50 c8g.12xlarge c9g.12xlarge c8gn.12xlarge c8gb.12xlarge c8gd.12xlarge c9gd.12xlarge c7g.12xlarge c7gd.12xlarge c7gn.12xlarge
+compute-96   96   192  -    0.80 c8g.24xlarge c9g.24xlarge c8gn.24xlarge c8gb.24xlarge c8gd.24xlarge c9gd.24xlarge
+compute-192  192  384  -    1.40 c8g.48xlarge c9g.48xlarge c8gn.48xlarge c8gb.48xlarge c8gd.48xlarge c9gd.48xlarge
+general-32   32   128  -    0.50 m8g.8xlarge m9g.8xlarge m8gd.8xlarge m9gd.8xlarge m7g.8xlarge m7gd.8xlarge
+general-48   48   192  -    0.57 m8g.12xlarge m9g.12xlarge m8gd.12xlarge m9gd.12xlarge m7g.12xlarge m7gd.12xlarge
+general-96   96   384  -    1.00 m8g.24xlarge m9g.24xlarge m8gd.24xlarge m9gd.24xlarge
+general-192  192  768  -    1.50 m8g.48xlarge m9g.48xlarge m8gd.48xlarge m9gd.48xlarge
+memory-32    32   256  -    0.50 r8g.8xlarge r9g.8xlarge r8gd.8xlarge r9gd.8xlarge r7g.8xlarge r7gd.8xlarge
+memory-48    48   384  -    0.67 r8g.12xlarge r9g.12xlarge r8gd.12xlarge r9gd.12xlarge r7g.12xlarge r7gd.12xlarge
+memory-96    96   768  -    1.20 r8g.24xlarge r9g.24xlarge r8gd.24xlarge r9gd.24xlarge
+memory-192   192  1536 -    2.10 r8g.48xlarge r9g.48xlarge r8gd.48xlarge r9gd.48xlarge
+storage-32   32   256  7.5  0.55 i8g.8xlarge i4g.8xlarge
+storage-48   48   384  11   0.85 i8g.12xlarge i8ge.12xlarge
+storage-96   96   768  22   1.70 i8g.24xlarge i8ge.24xlarge
+storage-192  192  1536 45   2.00 i8g.48xlarge i8ge.48xlarge
+kvm-96       96   192+ -    0.70 c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl
+kvm-192      192  384+ -    1.20 c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl
+'
 
+# What each shape is for: the one line an agent reads to choose.
+flavor_use() {
+  case "$1" in
+    compute) echo "CPU-bound work (builds, tests, encoding, simulation): 2 GiB per vCPU, the cheapest per core" ;;
+    general) echo "mixed work that needs more memory than compute gives: 4 GiB per vCPU" ;;
+    memory)  echo "memory-bound work (big in-memory data, large links, caches): 8 GiB per vCPU" ;;
+    storage) echo "local-disk-bound work: fast local NVMe at /mnt/nvme (gone with the box) and 8 GiB per vCPU" ;;
+    kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; not for members" ;;
+  esac
+}
+
+# The flavors this account may launch: a member gets every one but kvm (member-pbox.tf).
+flavor_lines() {
+  printf '%s\n' "$FLAVORS" | awk -v member="$MEMBER" 'NF && !(member != "" && $1 ~ /^kvm-/)'
+}
+
+flavor_types() { flavor_lines | awk -v f="$1" '$1 == f { for (i = 6; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") }'; }
+
+# The flavor an instance type belongs to (each type is in exactly one), or nothing.
+type_flavor() { printf '%s\n' "$FLAVORS" | awk -v t="$1" 'NF { for (i = 6; i <= NF; i++) if ($i == t) print $1 }'; }
+
+# When `up` finds the box already running: say as what, and that a different flavor needs a `down` first.
+flavor_note() {
+  local f
+  f="$(type_flavor "$1")"
+  if [ "$f" != "$FLAVOR" ]; then
+    say "NOTE: $NAME is already running as $1 (flavor ${f:-none}), not $FLAVOR; it is kept. For $FLAVOR: $SELF down ${BOX:-}, then up again."
+  fi
+}
+
+# The menu, to stderr. "all" also lists each flavor's instance types.
+print_menu() {
+  local shape last="" f v m d p rest
+  say "Flavors: pick the SMALLEST that fits the work's shape and size (bigger costs more and finds spot capacity less often)."
+  if [ -n "$MEMBER" ]; then
+    say "  usage: $SELF up FLAVOR        e.g.  $SELF up compute-48"
+  else
+    say "  usage: $SELF up [N] FLAVOR    e.g.  $SELF up 2 compute-48"
+  fi
+  while read -r f v m d p rest; do
+    shape="${f%-*}"
+    if [ "$shape" != "$last" ]; then
+      say ""
+      say "  $shape: $(flavor_use "$shape")"
+      last="$shape"
+    fi
+    if [ "$d" = "-" ]; then d=""; else d="local NVMe ${d} TB+"; fi
+    say "$(printf '    %-12s %3s vCPU  %5s GiB  %-19s ~$%s/hr spot' "$f" "$v" "$m" "$d" "$p")"
+    [ "${1:-}" = "all" ] && say "                 types, in order: $rest"
+  done < <(flavor_lines)
+  say ""
+  say "  Prices are approximate (us-east-2c, 2026-10); each launch prints the live spot price of the type it tries."
+}
 # Which key reaches the box, by what the caller actually holds:
 #   - a dev box holds dev_hop and nothing else that reaches another host (dev-hop-key.tf);
 #     the launch template's user_data authorizes dev_hop for exactly this reason
@@ -116,6 +185,75 @@ member_key() {
   mv "$KEY.tmp" "$KEY"
 }
 
+# ---------------------------------------------------------------------------------
+# The command line, read before anything calls AWS: `flavors` and a missing flavor need no AWS at all.
+# ---------------------------------------------------------------------------------
+ALL_ARGS="$*"
+CMD="${1:-status}"
+[ $# -gt 0 ] && shift
+BOX=""
+MODE=""
+FLAVOR=""
+FALLBACK=""
+ONLY_REGIONS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    1|2|3|4|5|6|7|8) BOX="$1" ;;
+    kvm) say "kvm is a flavor now: kvm-96 or kvm-192 (pbox flavors)"; exit 2 ;;
+    --flavor)
+      shift
+      [ -n "${1:-}" ] || { say "--flavor needs a name (pbox flavors)"; exit 2; }
+      FLAVOR="$1" ;;
+    --flavor=*) FLAVOR="${1#--flavor=}" ;;
+    --fallback) FALLBACK=1 ;;
+    --regions)
+      shift
+      [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
+      ONLY_REGIONS="$1"; FALLBACK=1 ;;
+    --regions=*)
+      ONLY_REGIONS="${1#--regions=}"; FALLBACK=1
+      [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
+    [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
+    [a-z]*-[0-9]*) FLAVOR="$1" ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2)"; exit 1 ;;
+  esac
+  shift
+done
+if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$FALLBACK" ]; }; then
+  say "your pbox is pbox-$MEMBER: run '$SELF $CMD' with no box number or fallback"
+  exit 1
+fi
+if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
+if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
+  say "a flavor only applies to 'up' and 'capacity'"; exit 1
+fi
+
+if [ "$CMD" = "flavors" ]; then
+  print_menu all
+  exit 0
+fi
+# `up` and `capacity` need a flavor, and only one this account may launch: nothing is launched without one.
+if [ "$CMD" = "up" ] || [ "$CMD" = "capacity" ]; then
+  if [ -z "$FLAVOR" ]; then
+    say "pbox $CMD needs a FLAVOR: the shape and size of the work."
+    say ""
+    print_menu
+    exit 2
+  fi
+  TYPES="$(flavor_types "$FLAVOR")"
+  if [ -z "$TYPES" ]; then
+    if [ -n "$MEMBER" ] && printf '%s\n' "$FLAVORS" | awk -v f="$FLAVOR" '$1 == f { found = 1 } END { exit !found }'; then
+      say "the $FLAVOR flavor is not available for pbox-$MEMBER (the kvm flavors are the owner's)."
+    else
+      say "unknown flavor '$FLAVOR'."
+    fi
+    say ""
+    print_menu
+    exit 2
+  fi
+  case "$FLAVOR" in kvm-*) MODE="kvm" ;; esac
+fi
+
 # Which region the boxes live in, and their fallback sites. Terraform publishes both (ohio-pbox.tf, /infra/parallel-box,
 # in us-west-1), so moving them is one apply and never a script edit on every dev box. PARALLEL_BOX_REGION overrides the
 # home region for a one-off.
@@ -139,45 +277,12 @@ if [ -z "$REGION" ]; then
 fi
 if [ -z "$REGION" ]; then
   say "FATAL: cannot read which region the parallel boxes are in (SSM /infra/parallel-box in us-west-1)."
-  say "Retry, or name it yourself:  PARALLEL_BOX_REGION=us-east-2 $SELF $*"
+  say "Retry, or name it yourself:  PARALLEL_BOX_REGION=us-east-2 $SELF $ALL_ARGS"
   exit 1
 fi
 
 HOME_REGION="$REGION"
 
-# ---------------------------------------------------------------------------------
-# Box selection. Box 1 keeps the original, unnumbered names (tag "parallel-box",
-# launch template "parallel-box") so nothing existing moves; boxes 2-8 are suffixed.
-# ---------------------------------------------------------------------------------
-CMD="${1:-status}"
-[ $# -gt 0 ] && shift
-BOX=""
-MODE=""
-FALLBACK=""
-ONLY_REGIONS=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    1|2|3|4|5|6|7|8) BOX="$1" ;;
-    kvm) MODE="kvm" ;; # "up kvm" is shorthand for box 1 in kvm mode
-    --fallback) FALLBACK=1 ;;
-    --regions)
-      shift
-      [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
-      ONLY_REGIONS="$1"; FALLBACK=1 ;;
-    --regions=*)
-      ONLY_REGIONS="${1#--regions=}"; FALLBACK=1
-      [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
-    [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
-    *) say "unknown argument '$1' (a box 1-8, kvm, --fallback, --regions r1,r2)"; exit 1 ;;
-  esac
-  shift
-done
-if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$MODE" ] || [ -n "$FALLBACK" ]; }; then
-  say "your pbox is pbox-$MEMBER: run '$SELF $CMD' with no box number, kvm or fallback"
-  exit 1
-fi
-[ "$MODE" = "kvm" ] && TYPES="$KVM_TYPES"
-if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
 
 # The fallback sites (pbox-fallback.tf): their template name, and region => AZ => subnet.
 FB_TEMPLATE="$(pointer fallback template)"
@@ -196,6 +301,8 @@ if [ -n "$ONLY_REGIONS" ]; then
   SEARCH_REGIONS="${ONLY_REGIONS//,/ }"
 fi
 
+# Box 1 keeps the original, unnumbered names (tag "parallel-box", launch template "parallel-box") so nothing existing
+# moves; boxes 2-8 are suffixed.
 set_box() {
   if [ -n "$MEMBER" ]; then
     NAME="pbox-$MEMBER"
@@ -296,7 +403,8 @@ status_one() {
       --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
       --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
     case "$L" in spot) BOUGHT="spot" ;; None|"") BOUGHT="ON-DEMAND (about 3x spot)" ;; *) BOUGHT="$L" ;; esac
-    echo "  state:  RUNNING at $IP ($T, $BOUGHT)"
+    F="$(type_flavor "$T")"
+    echo "  state:  RUNNING at $IP ($T, flavor ${F:-none}, $BOUGHT)"
     if [ "$(box_work)" = "fresh" ]; then
       echo "  where:  FALLBACK site $(box_az) -- its /mnt/work is a fresh volume, deleted with the box"
     elif [ "$REGION" != "$HOME_REGION" ] || [ -n "$FB_REGIONS" ]; then
@@ -426,7 +534,7 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
 # it is not: the same checks for a fresh launch and for a box an earlier `up` left behind (an
 # interrupted launch, a failed first attach), whose boot is waiting for the disk. Two `up`s racing
 # to attach to the same box both succeed. A box that cannot get its disk is terminated: it would
-# only wait for it, at a 192-core price.
+# only wait for it, at a many-core price.
 attach_work() {
   local id="$1" vol state az att out
   read -r vol state az att <<< "$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
@@ -496,14 +604,18 @@ case "$CMD" in
       if [ -n "$MEMBER" ] || [ "$(box_work)" = persistent ]; then
         ID="$(box_id)"
         say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
-        attach_work "$ID" || exit 1
         CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
           --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
           --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+        flavor_note "$CHOSEN"
+        attach_work "$ID" || exit 1
         CHOSEN_AZ="$(box_az)"
         wait_ready persistent running
       fi
       IP="$(box_ip)"
+      flavor_note "$(aws ec2 describe-instances --region "$REGION" \
+        --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+        --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
       echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
       exit 0
@@ -522,7 +634,7 @@ case "$CMD" in
         say "  This costs about 3x spot, and the \"spot\" figure shown per type below is for reference only, NOT what you pay."
         say "  To go back to spot, an admin applies parallel_box_spot=true; a later apply without the variable also does."
         ;;
-      spot) say "PURCHASE MODE: spot. Spot capacity for 192-core instances is scarce; trying each type in turn." ;;
+      spot) say "PURCHASE MODE: spot. Spot capacity differs from type to type; trying each of $FLAVOR's types in turn." ;;
       *) say "PURCHASE MODE: unknown (could not read the launch template). Trying each type in turn." ;;
     esac
     say ""
@@ -578,16 +690,18 @@ case "$CMD" in
     fi
 
     if [ -n "$MEMBER" ]; then
-      say "Capacity changes hour to hour; try again later (\`$SELF capacity\` shows the spot placement score)."
+      say "Capacity changes hour to hour: try again later, or another flavor that still fits the work"
+      say "  (\`$SELF flavors\`; \`$SELF capacity FLAVOR\` shows the spot placement score)."
       exit 3
     fi
     if [ -z "$FALLBACK" ]; then
       say "Options:"
       say "  - retry later; capacity fluctuates hour to hour"
-      say "  - override the list:  PARALLEL_BOX_TYPES='c8g.16xlarge' $SELF up ${BOX:-1}"
+      say "  - another flavor that still fits the work: the same shape a size down, or another shape of the same size"
+      say "      ($SELF flavors;  $SELF capacity ${BOX:-1} FLAVOR  scores one without launching)"
       say "  - launch in another US AZ with an EMPTY work volume (deleted with the box):"
-      say "      $SELF up ${BOX:-1} --fallback      (or --regions us-east-1,us-west-2)"
-      say "    \`$SELF capacity ${BOX:-1}\` shows which AZs score best."
+      say "      $SELF up ${BOX:-1} $FLAVOR --fallback      (or --regions us-east-1,us-west-2)"
+      say "    \`$SELF capacity ${BOX:-1} $FLAVOR\` shows which AZs score best."
       exit 3
     fi
 
@@ -608,14 +722,23 @@ case "$CMD" in
       REGION="$R"
       SUBNET="$(fb_subnet "$R" "$FAZ")"
       [ -n "$SUBNET" ] || continue
-      # Only the types this AZ offers: a missing type is a quick "Unsupported", but 28 of them per AZ add up.
+      # Only the types this AZ offers (us-west-1 has no storage types, for one). When the lookup itself fails, every
+      # type is tried: a missing one is a quick "Unsupported".
       # shellcheck disable=SC2086 # $TYPES is a list of words on purpose
-      OFFERED=" $(aws ec2 describe-instance-type-offerings --region "$R" --location-type availability-zone \
-        --filters "Name=location,Values=$FAZ" "Name=instance-type,Values=${TYPES// /,}" \
-        --query 'InstanceTypeOfferings[].InstanceType' --output text 2>/dev/null | tr '\t' ' ') "
+      if OFFERED="$(aws ec2 describe-instance-type-offerings --region "$R" --location-type availability-zone \
+          --filters "Name=location,Values=$FAZ" "Name=instance-type,Values=${TYPES// /,}" \
+          --query 'InstanceTypeOfferings[].InstanceType' --output text 2>/dev/null)"; then
+        OFFERED=" $(printf '%s' "$OFFERED" | tr '\t\n' '  ') "
+        if [ -z "${OFFERED// /}" ] || [ "${OFFERED// /}" = "None" ]; then
+          say "--> $FAZ ($R, score $SCORE) offers none of $FLAVOR's types; skipping"
+          continue
+        fi
+      else
+        OFFERED=""
+      fi
       say "--> $FAZ ($R, score $SCORE)"
       for T in $TYPES; do
-        if [ "$OFFERED" != "  " ] && [ "${OFFERED#* "$T" }" = "$OFFERED" ]; then continue; fi
+        if [ -n "$OFFERED" ] && [ "${OFFERED#* "$T" }" = "$OFFERED" ]; then continue; fi
         say "--> trying $T in $FAZ ..."
         # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
@@ -648,7 +771,7 @@ case "$CMD" in
     VOL="$(work_volume)"
     HOME_AZ=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL" \
       --query 'Volumes[0].AvailabilityZone' --output text 2>/dev/null)
-    say "Spot placement scores (1-10) for one instance of any of: $TYPES"
+    say "Spot placement scores (1-10) for one $FLAVOR instance, any of: $TYPES"
     # shellcheck disable=SC2046 # a list of regions
     if ! placement_scores $(all_regions) > "$TMP/all"; then
       say "FAILED to read spot placement scores (ec2:GetSpotPlacementScores)."
@@ -703,12 +826,12 @@ case "$CMD" in
     member_key
     locate_box || true
     IP="$(box_ip)"
-    [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:-1}"; exit 1; }
+    [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:+$BOX }FLAVOR  ($SELF flavors)"; exit 1; }
     exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
     ;;
 
   *)
-    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    awk 'NR >= 3 && /^# CAPACITY IS THE HARD PART/ { exit } NR >= 3' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     exit 1
     ;;
 esac

@@ -2270,7 +2270,7 @@ command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || ec
 ${local.dev_hop_setup}
 
 # ---------------------------------------------------------------- pbox
-# The on-demand 192-core Graviton boxes, launched straight from here. No jumpbox is
+# The on-demand many-core Graviton boxes (a flavor of 32 to 192 cores), launched straight from here. No jumpbox is
 # involved: this box's instance role carries the tag-scoped parallel-box-control policy
 # (parallel-box-launch.tf), so `pbox up` calls ec2:RunInstances itself.
 #

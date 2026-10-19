@@ -225,7 +225,8 @@ class Grants(unittest.TestCase):
 
     def test_types_market_profile_and_imds(self):
         p = statement("RunMemberPboxInstance")
-        self.assertIn("values   = local.member_pbox_types", p)
+        # the pbox's instance types are pbox-flavor-types' (pbox-flavors.tf, tested in test-pbox-flavors.py)
+        self.assertNotIn('"ec2:InstanceType"', p)
         self.assertRegex(p, r'"ec2:InstanceMarketType"\s*\n\s*values\s*=\s*\["spot"\]')
         self.assertRegex(p, r'test     = "Null"\n\s+variable = "ec2:InstanceProfile"\n\s+values   = \["true"\]')
         g = statement("RunMemberGboxInstance")
@@ -238,11 +239,11 @@ class Grants(unittest.TestCase):
         for s in (p, g, w):
             self.assertIn('"ec2:MetadataHttpTokens"', s)
             self.assertIn('values   = ["dedicated", "host"]', s)
-        # the pbox list is exactly the script's default list (no metal: kvm mode is the owner's)
-        script_types = re.search(r'^TYPES="\$\{PARALLEL_BOX_TYPES:-([^}]+)\}"', PBOX, re.M).group(1).split()
-        tf_types = re.findall(r'"([a-z0-9]+\.\w+)"', re.search(r"member_pbox_types = \[(.*?)\]", PTF, re.S).group(1))
-        self.assertEqual(tf_types, script_types)
-        self.assertFalse([t for t in tf_types if "metal" in t])
+        # a member's pbox types are every flavor's but kvm's (no metal: the kvm flavors are the owner's)
+        flavors = (ROOT / "pbox-flavors.tf").read_text()
+        self.assertIn('member_pbox_types = distinct(flatten([for f, types in local.pbox_flavors : types if !startswith(f, "kvm-")]))',
+                      flavors)
+        self.assertNotIn("member_pbox_types =", PTF)
         self.assertEqual(re.search(r'^TYPES="([^"]+)"', WMEMBER, re.M).group(1).split(),
                          re.findall(r'"([^"]+)"', re.search(r"member_wbox_types = \[(.*?)\]", WTF).group(1)))
 
@@ -371,7 +372,10 @@ class Watchdogs(unittest.TestCase):
                 actions, calls = self.run_watchdog([("i-1", "%s-connor" % kind, 90)], {"i-1": self.IDLE_DESKTOP},
                                                    ["%s-connor" % kind], 360)
                 self.assertEqual(actions, {"i-1": "terminated"})
-                self.assertIn("%s up   (run by connor)\n" % kind, calls["body"][0])
+                # a pbox needs a flavor, which the watchdog does not know: it says so
+                cmd = "pbox up FLAVOR" if kind == "pbox" else kind + " up"
+                self.assertIn("%s   (run by connor)\n" % cmd, calls["body"][0])
+                self.assertEqual("pbox flavors" in calls["body"][0], kind == "pbox")
                 self.assertIn(kept, calls["body"][0])
 
     def test_a_game_being_played_keeps_it_but_the_lifetime_still_ends_it(self):
@@ -386,7 +390,7 @@ class Watchdogs(unittest.TestCase):
         _, calls = self.run_watchdog([("i-1", "gpu-box-3", 90)], {"i-1": [1.0, 1.0]}, ["gpu-box-3"], 9999)
         self.assertIn("  gbox up 3\n", calls["body"][0])
         _, calls = self.run_watchdog([("i-2", "parallel-box", 90)], {"i-2": [1.0, 1.0]}, ["parallel-box"], 9999)
-        self.assertIn("  pbox up\n", calls["body"][0])
+        self.assertIn("  pbox up FLAVOR\n  (it ran as ?; `pbox flavors` lists the flavors)\n", calls["body"][0])
 
 
 class OneInstancePerMember(unittest.TestCase):
@@ -886,7 +890,7 @@ class ScriptRuns(unittest.TestCase):
 
     # ---------------------------------------------------------------- pbox
     def test_pbox_member_launches_their_box_with_their_volume_and_key(self):
-        r, calls = self.run_script("parallel-box.sh", "up", user="skevh", FAKE_IP_IN_USE="1")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="skevh", FAKE_IP_IN_USE="1")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse([c for c in calls if c.startswith("ssm ")], "a member reads no pointer")
         runs = [c for c in calls if "run-instances" in c]
@@ -902,7 +906,7 @@ class ScriptRuns(unittest.TestCase):
     def test_pbox_member_up_resumes_an_existing_box_instead_of_trusting_it(self):
         # an interrupted launch left a running box without its work volume
         (self.state / "pbox-skevh").write_text("i-7\n")
-        r, calls = self.run_script("parallel-box.sh", "up", user="skevh")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="skevh")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse([c for c in calls if "run-instances" in c])
         self.assertEqual([c for c in calls if "attach-volume" in c],
@@ -911,14 +915,14 @@ class ScriptRuns(unittest.TestCase):
                          "running box=pbox-skevh region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
         self.assertTrue((self.state / "ssh").exists(), "it waits for SSH as a fresh launch does")
         # now attached: nothing to attach, still a running line
-        r, calls = self.run_script("parallel-box.sh", "up", user="skevh")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="skevh")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse([c for c in calls if "attach-volume" in c or "terminate" in c])
         self.assertIn("running box=pbox-skevh", r.stdout)
 
     def test_pbox_waits_for_a_detaching_volume_before_launching(self):
         """#512: right after `pbox down` the work volume is still detaching; `up` waits before it launches anything."""
-        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_VOL_BUSY="3")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", "compute-192", user="ejc3", FAKE_VOL_BUSY="3")
         self.assertEqual(r.returncode, 0, r.stderr)
         waits = [i for i, c in enumerate(calls) if c.startswith("ec2 describe-volumes") and "--volume-ids" in c and "[State," in c]
         runs = [i for i, c in enumerate(calls) if "run-instances" in c]
@@ -930,42 +934,42 @@ class ScriptRuns(unittest.TestCase):
     def test_pbox_owner_up_attaches_the_volume_of_an_existing_box(self):
         # another `up` launched the box but had not attached its volume yet
         (self.state / "parallel-box-2").write_text("i-9\n")
-        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", "compute-192", user="ejc3")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse([c for c in calls if "run-instances" in c])
         self.assertEqual([c for c in calls if "attach-volume" in c],
                          ["ec2 attach-volume --region us-east-2 --volume-id vol-parallel-box-2-work --instance-id i-9 --device /dev/sdf"])
 
     def test_pbox_refuses_to_launch_while_the_volume_stays_attached(self):
-        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_VOL_BUSY="1000")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", "compute-192", user="ejc3", FAKE_VOL_BUSY="1000")
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse([c for c in calls if "run-instances" in c], "nothing is launched, so nothing is paid for")
         self.assertIn("nothing was launched", r.stderr + r.stdout)
 
     def test_pbox_owner_box_that_cannot_get_its_volume_is_terminated(self):
-        r, calls = self.run_script("parallel-box.sh", "up", "2", user="ejc3", FAKE_ATTACH_FAILS="1")
+        r, calls = self.run_script("parallel-box.sh", "up", "2", "compute-192", user="ejc3", FAKE_ATTACH_FAILS="1")
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue([c for c in calls if "terminate-instances" in c and "i-new-parallel-box-2" in c],
                         "a 192-core box without /mnt/work is not left running")
 
     def test_pbox_member_attach_failures_and_races(self):
         (self.state / "pbox-colin").write_text("i-8\n")
-        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_RACE="1")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="colin", FAKE_ATTACH_RACE="1")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse([c for c in calls if "terminate" in c])
         (self.state / "vol-pbox-colin-work.attached").unlink()
-        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_FAILS="1")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="colin", FAKE_ATTACH_FAILS="1")
         self.assertEqual(r.returncode, 1)
         self.assertIn("ec2 terminate-instances --region us-east-2 --instance-ids i-8", calls)
         # a fresh launch whose attach fails is terminated too
-        r, calls = self.run_script("parallel-box.sh", "up", user="colin", FAKE_ATTACH_FAILS="1")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="colin", FAKE_ATTACH_FAILS="1")
         self.assertEqual(r.returncode, 1)
         self.assertIn("ec2 terminate-instances --region us-east-2 --instance-ids i-new-pbox-colin", calls)
         # held by another instance: not taken, the box is ended rather than left waiting
         (self.state / "pbox-colin").write_text("i-9\n")
         (self.state / "pbox-colin-old").write_text("i-old\n")
         (self.state / "vol-pbox-colin-work.attached").write_text("i-old")
-        r, calls = self.run_script("parallel-box.sh", "up", user="colin")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="colin")
         self.assertEqual(r.returncode, 1)
         self.assertIn("still in-use (attached to i-old)", r.stderr)
         self.assertFalse([c for c in calls if "attach-volume" in c])
@@ -973,21 +977,38 @@ class ScriptRuns(unittest.TestCase):
     def test_pbox_owner_running_box_is_reported_as_before(self):
         (self.state / "parallel-box").write_text("i-1\n")
         (self.state / "vol-parallel-box-work.attached").write_text("i-1")  # its volume is on it: nothing to attach
-        r, calls = self.run_script("parallel-box.sh", "up", user="ejc3")
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="ejc3")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
         self.assertFalse([c for c in calls if "attach-volume" in c])
 
     def test_pbox_member_refuses_slots_kvm_and_fallback(self):
-        for args in (("up", "2"), ("up", "kvm"), ("up", "--fallback"), ("up", "--regions", "us-east-1")):
+        for args, rc in ((("up", "2", "compute-48"), 1), (("up", "kvm"), 2), (("up", "kvm-192"), 2), (("up", "kvm-96"), 2),
+                         (("up", "compute-48", "--fallback"), 1), (("up", "compute-48", "--regions", "us-east-1"), 1)):
             with self.subTest(args=args):
                 r, calls = self.run_script("parallel-box.sh", *args, user="connor")
-                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertEqual(r.returncode, rc, r.stderr)
                 self.assertFalse([c for c in calls if "run-instances" in c])
+        r, _ = self.run_script("parallel-box.sh", "up", "kvm-192", user="connor")
+        self.assertIn("the kvm flavors are the owner's", r.stderr)
+
+    def test_pbox_member_must_pick_a_flavor_and_sees_no_kvm(self):
+        r, calls = self.run_script("parallel-box.sh", "up", user="connor")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(calls, [], "no flavor: not one AWS call, so nothing is launched")
+        self.assertIn("needs a FLAVOR", r.stderr)
+        self.assertIn("compute-32", r.stderr)
+        self.assertNotIn("kvm-", r.stderr)
+        self.assertIn("usage: parallel-box.sh up FLAVOR", r.stderr)
+        r, calls = self.run_script("parallel-box.sh", "up", "general-96", user="connor", FAKE_NO_CAPACITY=" ".join(
+            ["m8g.24xlarge", "m9g.24xlarge", "m8gd.24xlarge", "m9gd.24xlarge"]))
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual([c.split("--instance-type ")[1].split()[0] for c in calls if "run-instances" in c],
+                         ["m8g.24xlarge", "m9g.24xlarge", "m8gd.24xlarge", "m9gd.24xlarge"])
 
     def test_pbox_member_no_capacity_offers_no_fallback(self):
-        types = re.search(r'^TYPES="\$\{PARALLEL_BOX_TYPES:-([^}]+)\}"', PBOX, re.M).group(1)
-        r, calls = self.run_script("parallel-box.sh", "up", user="connor", FAKE_NO_CAPACITY=types)
+        types = "c8g.48xlarge c9g.48xlarge c8gn.48xlarge c8gb.48xlarge c8gd.48xlarge c9gd.48xlarge"
+        r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="connor", FAKE_NO_CAPACITY=types)
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertNotIn("--fallback", r.stderr)
 

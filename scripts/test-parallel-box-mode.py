@@ -57,7 +57,7 @@ class PboxMode(unittest.TestCase):
 
     def pbox(self, *args, market="spot", running=False, lifecycle="None"):
         env = dict(os.environ, PATH=self.tmp + ":" + os.environ["PATH"], FAKE_MARKET=market,
-                   FAKE_RUNNING="1" if running else "0", FAKE_LIFECYCLE=lifecycle, PARALLEL_BOX_TYPES="c8g.48xlarge",
+                   FAKE_RUNNING="1" if running else "0", FAKE_LIFECYCLE=lifecycle,
                    PARALLEL_BOX_REGION="us-east-2", HOME=self.tmp)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=60)
         return r.stdout + r.stderr
@@ -72,24 +72,24 @@ class PboxMode(unittest.TestCase):
         self.assertNotIn("state:", out)
 
     def test_up_on_demand_says_so_and_does_not_present_the_spot_price_as_the_cost(self):
-        out = self.pbox("up", market="none")
+        out = self.pbox("up", "compute-192", market="none")
         self.assertIn("PURCHASE MODE: ON-DEMAND", out)
         self.assertIn("about 3x spot", out)
         self.assertIn("spot reference", out)
         self.assertIn("NOT what you pay", out)
-        self.assertNotIn("Spot capacity for 192-core", out)
+        self.assertNotIn("Spot capacity differs", out)
         self.assertIn("no on-demand capacity", out)
         self.assertNotIn("no spot capacity", out)
 
     def test_up_spot_is_unchanged_in_spirit(self):
-        out = self.pbox("up", market="spot")
+        out = self.pbox("up", "compute-192", market="spot")
         self.assertIn("PURCHASE MODE: spot", out)
         self.assertNotIn("ON-DEMAND", out)
         self.assertIn("no spot capacity", out)
         self.assertNotIn("spot reference", out)
 
     def test_up_says_unknown_rather_than_guessing_when_the_template_cannot_be_read(self):
-        out = self.pbox("up", market="broken")
+        out = self.pbox("up", "compute-192", market="broken")
         self.assertIn("PURCHASE MODE: unknown", out)
         self.assertNotIn("PURCHASE MODE: spot", out)
         # the spot history figure is never presented as the price when the mode is not known to be spot
@@ -98,7 +98,7 @@ class PboxMode(unittest.TestCase):
         self.assertNotIn("no unknown capacity", out)
 
     def test_status_of_a_running_box_says_how_it_was_bought(self):
-        self.assertIn("(c8g.48xlarge, spot)", self.pbox("status", "1", running=True, lifecycle="spot"))
+        self.assertIn("(c8g.48xlarge, flavor compute-192, spot)", self.pbox("status", "1", running=True, lifecycle="spot"))
         out = self.pbox("status", "1", running=True, lifecycle="None", market="none")
         self.assertIn("ON-DEMAND (about 3x spot)", out)
 

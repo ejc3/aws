@@ -53,7 +53,11 @@ elif "describe-availability-zones" in a:
            "us-west-2": "usw2-az2\tus-west-2a\nusw2-az1\tus-west-2b",
            "us-east-2": "use2-az3\tus-east-2c"}.get(region, ""))
 elif "describe-instance-type-offerings" in a:
-    print("c8g.48xlarge\tm8g.48xlarge")
+    # every type asked for, except in the AZs FAKE_NONE_OFFERED names ("region/az"), which offer none of them
+    az = [f for f in args if f.startswith("Name=location,Values=")][0].split("=", 2)[2]
+    asked = [f for f in args if f.startswith("Name=instance-type,Values=")][0].split("=", 2)[2].split(",")
+    if region + "/" + az not in os.environ.get("FAKE_NONE_OFFERED", "").split():
+        print("\t".join(asked))
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "PublicIpAddress" in a:
@@ -108,13 +112,13 @@ class FallbackScript(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
 
-    def pbox(self, *args, capacity="", home_error=False, launched=None, quota=""):
+    def pbox(self, *args, capacity="", home_error=False, launched=None, quota="", none_offered=""):
         if launched:
             (self.tmp / "state").write_text(launched)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp),
                    FAKE_LOG=str(self.log), FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER),
                    FAKE_CAPACITY=capacity, FAKE_HOME_ERROR="1" if home_error else "", FAKE_QUOTA=quota,
-                   PARALLEL_BOX_TYPES="c8g.48xlarge m8g.48xlarge")
+                   FAKE_NONE_OFFERED=none_offered)
         env.pop("PARALLEL_BOX_REGION", None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -125,15 +129,15 @@ class FallbackScript(unittest.TestCase):
         return [c for c in map(json.loads, self.log.read_text().splitlines()) if word in c]
 
     def test_plain_up_stays_home_and_exits_3_naming_the_fallback(self):
-        rc, out, err = self.pbox("up", "4", capacity="us-west-2/us-west-2b")
+        rc, out, err = self.pbox("up", "4", "compute-192", capacity="us-west-2/us-west-2b")
         self.assertEqual(rc, 3, err)
-        self.assertIn("pbox up 4 --fallback", err.replace("parallel-box.sh", "pbox"))
+        self.assertIn("pbox up 4 compute-192 --fallback", err.replace("parallel-box.sh", "pbox"))
         self.assertIn("EMPTY work volume", err)
         self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
         self.assertEqual(out, "")
 
     def test_fallback_tries_the_best_scored_az_first_with_a_fresh_disk(self):
-        rc, out, err = self.pbox("up", "4", "--fallback", capacity="us-west-2/us-west-2b us-east-1/us-east-1a")
+        rc, out, err = self.pbox("up", "4", "compute-192", "--fallback", capacity="us-west-2/us-west-2b us-east-1/us-east-1a")
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.strip().splitlines()[-1],
                          "launched box=4 region=us-west-2 az=us-west-2b type=c8g.48xlarge ip=203.0.113.9 work=fresh")
@@ -153,14 +157,14 @@ class FallbackScript(unittest.TestCase):
         self.assertIn("FRESH, EMPTY work volume", err)
 
     def test_regions_limits_the_search(self):
-        rc, out, err = self.pbox("up", "2", "--regions", "us-east-1", capacity="us-west-2/us-west-2b us-east-1/us-east-1b")
+        rc, out, err = self.pbox("up", "2", "compute-192", "--regions", "us-east-1", capacity="us-west-2/us-west-2b us-east-1/us-east-1b")
         self.assertEqual(rc, 0, err)
         self.assertTrue(out.strip().endswith("region=us-east-1 az=us-east-1b type=c8g.48xlarge ip=203.0.113.9 work=fresh"))
         self.assertFalse(any("subnet-w2b" in c for c in self.calls("run-instances")))
 
     def test_regions_still_finds_a_box_running_outside_them(self):
         # --regions narrows where a new box is searched for, never where an existing one is looked for.
-        rc, out, _ = self.pbox("up", "4", "--regions", "us-east-1", launched="us-west-2 us-west-2b",
+        rc, out, _ = self.pbox("up", "4", "compute-192", "--regions", "us-east-1", launched="us-west-2 us-west-2b",
                                capacity="us-east-1/us-east-1a")
         self.assertEqual(rc, 0)
         self.assertIn("running box=4 region=us-west-2 az=us-west-2b", out)
@@ -174,26 +178,43 @@ class FallbackScript(unittest.TestCase):
         self.assertEqual(self.calls("run-instances"), [])
 
     def test_a_quota_refusal_is_no_capacity_there_not_a_real_error(self):
-        rc, _, err = self.pbox("up", "1", "--fallback", quota="us-west-2", capacity="us-east-1/us-east-1b")
+        rc, _, err = self.pbox("up", "1", "compute-192", "--fallback", quota="us-west-2", capacity="us-east-1/us-east-1b")
         self.assertEqual(rc, 0, err)
         self.assertIn("over the account's quota", err)
         (self.tmp / "state").unlink()  # the fake remembers one launched box, whatever its number
-        rc, _, err = self.pbox("up", "2", "--fallback", quota="us-east-1 us-west-2")
+        rc, _, err = self.pbox("up", "2", "compute-192", "--fallback", quota="us-east-1 us-west-2")
         self.assertEqual(rc, 4, err)
 
     def test_unknown_region_is_refused(self):
-        rc, _, err = self.pbox("up", "2", "--regions=us-east-9")
+        rc, _, err = self.pbox("up", "2", "compute-192", "--regions=us-east-9")
         self.assertEqual(rc, 1)
         self.assertIn("no fallback site in 'us-east-9'", err)
         self.assertEqual(self.calls("run-instances"), [])
 
     def test_no_capacity_anywhere_exits_4(self):
-        rc, out, err = self.pbox("up", "3", "--fallback")
+        rc, out, err = self.pbox("up", "3", "compute-192", "--fallback")
         self.assertEqual(rc, 4, err)
-        self.assertEqual(len([c for c in self.calls("run-instances") if "--subnet-id" in c]), 8)  # 4 AZs x 2 types
+        self.assertEqual(len([c for c in self.calls("run-instances") if "--subnet-id" in c]), 24)  # 4 AZs x 6 types
+
+    def test_an_az_that_offers_none_of_the_flavors_types_is_skipped(self):
+        # us-west-1 offers no storage type, for one: such an AZ costs no launch attempts
+        rc, _, err = self.pbox("up", "3", "compute-192", "--fallback", none_offered="us-west-2/us-west-2b us-east-1/us-east-1a")
+        self.assertEqual(rc, 4, err)
+        tried = {c[c.index("--subnet-id") + 1] for c in self.calls("run-instances") if "--subnet-id" in c}
+        self.assertEqual(tried, {"subnet-w2a", "subnet-e1b"})
+        self.assertIn("us-west-2b (us-west-2, score 9) offers none of compute-192's types; skipping", err)
+
+    def test_fallback_tries_only_the_flavors_types_in_order(self):
+        self.pbox("up", "3", "memory-48", "--fallback")
+        flavor = ["r8g.12xlarge", "r9g.12xlarge", "r8gd.12xlarge", "r9gd.12xlarge", "r7g.12xlarge", "r7gd.12xlarge"]
+        runs = self.calls("run-instances")
+        home = [c[c.index("--instance-type") + 1] for c in runs if "--subnet-id" not in c]
+        w2b = [c[c.index("--instance-type") + 1] for c in runs if "subnet-w2b" in c]
+        self.assertEqual(home, flavor)
+        self.assertEqual(w2b, flavor)
 
     def test_a_real_error_at_home_is_not_a_capacity_failure(self):
-        rc, _, err = self.pbox("up", "1", "--fallback", home_error=True, capacity="us-west-2/us-west-2b")
+        rc, _, err = self.pbox("up", "1", "compute-192", "--fallback", home_error=True, capacity="us-west-2/us-west-2b")
         self.assertEqual(rc, 1)
         self.assertIn("UnauthorizedOperation", err)
         self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
@@ -211,7 +232,7 @@ class FallbackScript(unittest.TestCase):
         self.assertIn("fresh work volume is deleted with it", err)
 
     def test_up_of_a_box_running_elsewhere_launches_nothing(self):
-        rc, out, _ = self.pbox("up", "4", launched="us-west-2 us-west-2b")
+        rc, out, _ = self.pbox("up", "4", "compute-192", launched="us-west-2 us-west-2b")
         self.assertEqual(rc, 0)
         self.assertIn("running box=4 region=us-west-2 az=us-west-2b", out)
         self.assertEqual(self.calls("run-instances"), [])
@@ -222,7 +243,7 @@ class FallbackScript(unittest.TestCase):
         self.assertIn("only apply to 'up'", err)
 
     def test_capacity_marks_home_and_fallback_azs(self):
-        rc, out, _ = self.pbox("capacity")
+        rc, out, _ = self.pbox("capacity", "compute-192")
         self.assertEqual(rc, 0)
         self.assertEqual(out.splitlines()[0], "9 us-west-2 us-west-2b fallback (fresh work volume)")
         self.assertEqual(self.calls("run-instances"), [])

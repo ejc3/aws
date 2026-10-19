@@ -143,6 +143,9 @@ locals {
         apt-get update
         apt-get install -y parallel build-essential git htop
 
+        # Local NVMe, when the type has any (pbox-flavors.tf), at /mnt/nvme.
+        ${local.pbox_local_nvme_setup}
+
         # Shared bulk scratch/cache on the separate i8ge I/O box. This is an automount, so
         # the parallel box still boots cleanly when the I/O box is stopped.
         ${local.io_box_client_setup}
@@ -151,7 +154,7 @@ locals {
         echo "* soft nofile 1048576" >> /etc/security/limits.conf
         echo "* hard nofile 1048576" >> /etc/security/limits.conf
 
-        echo "parallel-box ready: $(nproc) cores, /mnt/work mounted"
+        echo "parallel-box ready: $(nproc) cores, /mnt/work mounted$(mountpoint -q /mnt/nvme && echo ", local NVMe at /mnt/nvme")"
     INIT
     )
   }
@@ -167,9 +170,10 @@ variable "parallel_box_spot" {
 # The launch configuration, moved verbatim from the aws_instance resources that used to
 # live in parallel-box.tf / parallel-box2.tf.
 #
-# instance_type is deliberately ABSENT. It is the one field the caller supplies, because
-# capacity is the hard part: a 192-core spot request pinned to one type scores 1/10 for
-# fulfilment, so scripts/parallel-box.sh walks a list of pools until one answers.
+# instance_type is deliberately ABSENT. It is the one field the caller supplies: the caller names a
+# flavor (pbox-flavors.tf: the work's shape and size), and because a spot request pinned to one
+# type often finds no capacity, scripts/parallel-box.sh walks that flavor's types until one answers.
+# pbox-flavor-types allows those types and no other.
 # ---------------------------------------------------------------------------------
 resource "aws_launch_template" "parallel_box_ohio" {
   provider = aws.ohio
@@ -272,7 +276,8 @@ resource "aws_launch_template" "parallel_box_ohio" {
 
 # ---------------------------------------------------------------------------------
 # What a dev box is allowed to do, which is exactly: launch one of these eight boxes,
-# attach its own work disk, and kill it again.
+# attach its own work disk, and kill it again. Which instance types it may launch them as is
+# pbox-flavor-types' (pbox-flavors.tf), a separate managed policy for lack of room here.
 #
 # The condition structure matters and is easy to get wrong. RunInstances authorizes a
 # LIST of resource types in one call -- image, subnet, security group, key pair, launch
