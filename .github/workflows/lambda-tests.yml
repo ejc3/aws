@@ -40,6 +40,9 @@ jobs:
       - name: Agent instructions distributed from ejc3/agents-md
         run: python3 -S -B scripts/test-agents-md.py
 
+      - name: Machine-local agent instructions from administration-only secrets, and the Codex skills mirror
+        run: python3 -S -B scripts/test-agent-local-md.py
+
       - name: Dolphin relay deploy credentials stay in a main-only environment
         run: python3 -S -B scripts/test-dolphin-relay.py
       - name: dolphin-family (deploy token in a main-only environment, runners behind a closed gate)
@@ -125,7 +128,7 @@ jobs:
         run: python3 -S -B scripts/test-codex-seed.py
       - name: ssh mac and ssh colton-mac client installer, their Cloudflare routes and the Mac connector setup (offline)
         run: python3 -S -B scripts/test-mac-ssh-client.py
-      - name: MacBook agent tools, lease and build cap (offline)
+      - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: python3 -S -B scripts/test-mac-setup.py
       - name: App-repo runners route, launch, cap and reap (offline)
         run: python3 -S -B scripts/test-app-runner.py

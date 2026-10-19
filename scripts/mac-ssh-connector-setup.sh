@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# mac-ssh-connector-setup -- put a kid's Mac on its Cloudflare route (colton-mac-ssh.tf): the pinned cloudflared, the
-# connector LaunchAgent with its token, and the clients' public keys. Run on a jumpbox as an AWS administrator.
+# mac-ssh-connector-setup -- put a Mac on its Cloudflare route (macbook-ssh.tf for `mac`, colton-mac-ssh.tf for
+# `colton-mac`): the pinned cloudflared, the connector LaunchAgent with its token, the clients' public keys and a
+# keys-only Remote Login. Run on a jumpbox as an AWS administrator.
 #
+#   scripts/mac-ssh-connector-setup.sh mac                              EJ's MacBook, over its own route
 #   scripts/mac-ssh-connector-setup.sh colton-mac                       over the Mac's Cloudflare route (a re-run)
 #   scripts/mac-ssh-connector-setup.sh colton-mac --bootstrap-port 2224 over a temporary reverse tunnel the Mac keeps
 #                                                                       to fcvm-arm's 127.0.0.1:2224 (the first run)
 #
-# It reaches the Mac from fcvm-arm as `ssh colton-mac` (mac-ssh-client.tf), which is fcvm-arm's own key and Host key pin;
+# It reaches the Mac from fcvm-arm as `ssh <alias>` (mac-ssh-client.tf), which is fcvm-arm's own key and Host key pin;
 # --bootstrap-port only points that alias at 127.0.0.1:PORT with no proxy command, for the first run, when the
 # connector is not there yet. First it checks that Remote Login refuses password and keyboard-interactive logins,
 # installing the MacBook's keys-only drop-in (/etc/ssh/sshd_config.d/050-keys-only.conf) when sudo allows it without a
@@ -24,8 +26,11 @@
 #     (fcvm-arm over ssh, each nextjs-dev account's own file over its own SSM Run Command) and kept only if it is exactly
 #     one `ssh-ed25519 <blob>`; every other line is kept, and a line elsewhere for one of those keys (the bootstrap
 #     tunnel's) is folded into the block
-# Re-running is safe: it re-verifies cloudflared, rewrites the files and reloads the agent. Reloading the agent ends the
-# sessions that came through it, so the first run should come over the bootstrap tunnel.
+# Re-running is safe: a file whose content is already right is left alone, and the connector is reloaded only when its
+# LaunchAgent or its token changed or it is not loaded. A reload ends every session through the connector, this one too
+# when it came that way, so it runs detached and still completes after the session drops. On a Mac already set up the
+# same way (the MacBook, whose connector was made by hand with these names) a run changes nothing that matters: the
+# clients' keys move into the managed block, the same keys.
 set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
@@ -37,7 +42,7 @@ CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
-usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT]   (ALIAS: colton-mac)" >&2; exit 2; }
+usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT]   (ALIAS: mac, colton-mac)" >&2; exit 2; }
 ALIAS=${1:-}
 shift || true
 BOOTSTRAP_PORT=""
@@ -49,16 +54,27 @@ while [ $# -gt 0 ]; do
 done
 [ -z "$BOOTSTRAP_PORT" ] || [[ $BOOTSTRAP_PORT =~ ^[0-9]{4,5}$ ]] || usage
 
-# Per Mac: its connector-token secret and its clients (box:account), matching colton-mac-ssh.tf and mac-ssh-client.tf.
+# Per Mac: its connector-token secret, its clients (box:account) and the names of its connector's files, matching
+# macbook-ssh.tf / colton-mac-ssh.tf and mac-ssh-client.tf. The clients are exactly the accounts Terraform gives that
+# Mac's alias and service token. The MacBook's names are the ones its connector was set up with by hand (README,
+# "MacBook: Rebuilding from nothing"), so running this against `mac` rewrites them unchanged and reloads nothing.
 case "$ALIAS" in
+  mac)
+    TUNNEL_SECRET=macbook-ssh-tunnel-token
+    CLIENTS="fcvm:ubuntu nextjs:ejc3"
+    LABEL=com.ejcampbell.macbook-ssh.cloudflared
+    TOKEN_FILE=.cloudflared/macbook-ssh.token # relative to the Mac user's home, as LOG_FILE is
+    LOG_FILE=Library/Logs/macbook-ssh/cloudflared.log
+    ;;
   colton-mac)
     TUNNEL_SECRET=colton-mac-ssh-tunnel-token
     CLIENTS="fcvm:ubuntu nextjs:colton nextjs:ejc3"
+    LABEL=com.ccgames.colton-mac-ssh.cloudflared
+    TOKEN_FILE=.cloudflared/colton-mac-ssh.token
+    LOG_FILE=Library/Logs/colton-mac-ssh-cloudflared.log
     ;;
   *) usage ;;
 esac
-LABEL="com.ccgames.$ALIAS-ssh.cloudflared"
-TOKEN_FILE=".cloudflared/$ALIAS-ssh.token" # relative to the Mac user's home
 
 MAC_SSH="$ALIAS"
 if [ -n "$BOOTSTRAP_PORT" ]; then
@@ -169,8 +185,9 @@ REMOTE
 
 echo "5/6 the connector token (from Secrets Manager, through ssh stdin only)"
 { set +x; } 2>/dev/null
+# Replaced only when it differs; a new token leaves a flag so step 6 restarts the connector (it reads the file at start).
 aws secretsmanager get-secret-value --region "$REGION" --secret-id "$TUNNEL_SECRET" --query SecretString --output text |
-  on_mac "'umask 077; mkdir -p \$HOME/.cloudflared && cat > \$HOME/$TOKEN_FILE.new && [ -s \$HOME/$TOKEN_FILE.new ] && mv -f \$HOME/$TOKEN_FILE.new \$HOME/$TOKEN_FILE && chmod 600 \$HOME/$TOKEN_FILE'"
+  on_mac "'umask 077; t=\$HOME/$TOKEN_FILE; mkdir -p \$HOME/.cloudflared && cat > \$t.new && [ -s \$t.new ] || { rm -f \$t.new; exit 1; }; if cmp -s \$t.new \$t; then rm -f \$t.new; echo token unchanged; else mv -f \$t.new \$t && touch \$t.changed && echo token installed; fi; chmod 600 \$t'"
 
 echo "6/6 the clients' keys and the connector LaunchAgent"
 on_mac bash -s <<REMOTE
@@ -195,11 +212,13 @@ awk -v b="\$BEGIN" -v e="\$END" -v whole="\$whole" -v keys="\$AK.keys" '
 { echo "\$BEGIN"; grep -v '^\$' "\$AK.keys"; echo "\$END"; } >> "\$AK.new"
 echo "authorized_keys: \$(grep -c '^ssh-' "\$AK.keys") managed keys"
 rm -f "\$AK.keys"
-chmod 600 "\$AK.new" && mv -f "\$AK.new" "\$AK"
+if cmp -s "\$AK.new" "\$AK"; then rm -f "\$AK.new"; else mv -f "\$AK.new" "\$AK"; fi
+chmod 600 "\$AK"
 
 PLIST="\$HOME/Library/LaunchAgents/$LABEL.plist"
-mkdir -p "\$HOME/Library/LaunchAgents" "\$HOME/Library/Logs"
-cat > "\$PLIST" <<PL
+LOG="\$HOME/$LOG_FILE"
+mkdir -p "\$HOME/Library/LaunchAgents" "\$(dirname "\$LOG")"
+cat > "\$PLIST.new" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -211,16 +230,26 @@ cat > "\$PLIST" <<PL
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>15</integer>
-  <key>StandardErrorPath</key><string>\$HOME/Library/Logs/$ALIAS-ssh-cloudflared.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>\$LOG</string>
+  <key>StandardErrorPath</key><string>\$LOG</string>
 </dict></plist>
 PL
-chmod 644 "\$PLIST"
-plutil -lint "\$PLIST" >/dev/null
+plutil -lint "\$PLIST.new" >/dev/null
 uid=\$(id -u)
-launchctl bootout "gui/\$uid/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/\$uid" "\$PLIST" && echo "connector agent loaded"
-sleep 5
-echo "agent: \$(launchctl print "gui/\$uid/$LABEL" 2>/dev/null | awk '/state =/{print \$3; exit}')"
-tail -3 "\$HOME/Library/Logs/$ALIAS-ssh-cloudflared.log" 2>/dev/null | cut -c1-160 || true
+changed=""
+if ! cmp -s "\$PLIST.new" "\$PLIST"; then changed="its LaunchAgent changed"; fi
+[ ! -e "\$HOME/$TOKEN_FILE.changed" ] || changed="\${changed:+\$changed, }its token changed"
+launchctl print "gui/\$uid/$LABEL" >/dev/null 2>&1 || changed="\${changed:+\$changed, }it is not loaded"
+chmod 644 "\$PLIST.new" && mv -f "\$PLIST.new" "\$PLIST"
+if [ -n "\$changed" ]; then
+  # Reloading ends every session through this connector, this one too when it came that way: run it detached so the
+  # bootstrap still happens after the session is cut.
+  nohup /bin/sh -c "sleep 2; launchctl bootout gui/\$uid/$LABEL 2>/dev/null; launchctl bootstrap gui/\$uid '\$PLIST' && rm -f '\$HOME/$TOKEN_FILE.changed'" >/dev/null 2>&1 &
+  echo "connector: reloading in the background (\$changed); sessions through it will drop"
+else
+  echo "connector: unchanged and loaded; not reloaded"
+  echo "agent: \$(launchctl print "gui/\$uid/$LABEL" 2>/dev/null | awk '/state =/{print \$3; exit}')"
+fi
 REMOTE
 echo "done. From each client: ssh $ALIAS true"

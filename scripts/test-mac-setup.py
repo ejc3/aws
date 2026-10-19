@@ -2,13 +2,17 @@
 """The MacBook's agent tools (scripts/mac/bin), exercised on any POSIX box with perl and sh."""
 
 from pathlib import Path
+import hashlib
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "scripts" / "mac" / "bin"
@@ -236,9 +240,181 @@ class ZshEnv(Base):
         self.assertEqual(self.resolved()[0], str(self.local / "swift"))
 
 
+class PeekabooInstall(unittest.TestCase):
+    """scripts/mac/peekaboo-install.sh with the macOS tools stubbed: pinned, verified, idempotent, never swaps a
+    running app unless asked, and cli-current follows the installed app."""
+
+    SCRIPT = ROOT / "scripts" / "mac" / "peekaboo-install.sh"
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="peekaboo-install-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.home = self.temp / "home"
+        self.home.mkdir()
+        self.stubs = self.temp / "stubs"
+        self.stubs.mkdir()
+        self.releases = self.temp / "releases"
+        self.releases.mkdir()
+        self.log = self.temp / "calls.log"
+        self.running = self.temp / "running"
+        self.team = self.temp / "team"
+        self.team.write_text("FWJYW4S8P8\n")
+        text = self.SCRIPT.read_text()
+        self.version = re.search(r"^VERSION=(\S+)$", text, re.M).group(1)
+        # The release payloads, built here: the app zip and the CLI tarball, laid out as the real ones are.
+        app = self.temp / "build" / "Peekaboo.app" / "Contents"
+        (app / "MacOS").mkdir(parents=True)
+        (app / "MacOS" / "Peekaboo").write_text("app\n")
+        (app / "Info.plist").write_text(self.version + "\n")
+        zip_path = self.releases / f"Peekaboo-{self.version}.app.zip"
+        with zipfile.ZipFile(zip_path, "w") as z:
+            for p in sorted((self.temp / "build").rglob("*")):
+                z.write(p, p.relative_to(self.temp / "build"))
+        cli = self.temp / "cli" / "peekaboo-macos-arm64"
+        cli.mkdir(parents=True)
+        (cli / "peekaboo").write_text("#!/bin/sh\necho cli\n")
+        (cli / "peekaboo").chmod(0o755)
+        (cli / "VERSION").write_text(self.version + "\n")
+        tgz = self.releases / "peekaboo-macos-arm64.tar.gz"
+        subprocess.run(["tar", "-czf", str(tgz), "-C", str(self.temp / "cli"), "peekaboo-macos-arm64"], check=True)
+        # The script, with its pins pointed at those payloads (the real pins are checked in Files below).
+        sums = {n: hashlib.sha256((self.releases / n).read_bytes()).hexdigest() for n in (zip_path.name, tgz.name)}
+        text = re.sub(r"^APP_ZIP_SHA256=\S+$", "APP_ZIP_SHA256=" + sums[zip_path.name], text, flags=re.M)
+        text = re.sub(r"^CLI_TGZ_SHA256=\S+$", "CLI_TGZ_SHA256=" + sums[tgz.name], text, flags=re.M)
+        self.script = self.temp / "peekaboo-install.sh"
+        self.script.write_text(text)
+        log = shlex.quote(str(self.log))
+        self.stub("curl", f'echo "curl $*" >> {log}\nurl=""; out=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done\n'
+                          f'cp "{self.releases}/$(basename "$url")" "$out"')
+        self.stub("shasum", 'sha256sum "$3"')
+        # --verify fails for any path listed in self.broken (a damaged install), passes otherwise.
+        self.broken = self.temp / "broken"
+        self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; '
+                              f'*) for a; do :; done; grep -qxF "$a" {shlex.quote(str(self.broken))} 2>/dev/null && exit 1; exit 0;; esac')
+        self.stub("defaults", '[ -f "$2.plist" ] && head -1 "$2.plist"')
+        self.stub("ditto", 'python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$3" "$4"')
+        self.stub("pgrep", f'[ -e {shlex.quote(str(self.running))} ]')
+        self.stub("pkill", f'echo "pkill $*" >> {log}; rm -f {shlex.quote(str(self.running))}')
+        self.stub("launchctl", f'echo "launchctl $*" >> {log}')
+        self.stub("open", f'echo "open $*" >> {log}')
+        self.support = self.home / "Library" / "Application Support" / "Peekaboo"
+        self.app = self.home / "Applications" / "Peekaboo.app"
+        self.plist = self.home / "Library" / "LaunchAgents" / "com.ccgames.peekaboo.plist"
+
+    def stub(self, name, body):
+        p = self.stubs / name
+        p.write_text("#!/bin/sh\n" + body + "\n")
+        p.chmod(0o755)
+
+    def run_(self, *args):
+        env = {"HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin"}
+        return subprocess.run(["sh", str(self.script), *args], capture_output=True, text=True, timeout=30, env=env)
+
+    def calls(self):
+        return self.log.read_text() if self.log.exists() else ""
+
+    def files(self):
+        return {str(p.relative_to(self.home)): (p.readlink() if p.is_symlink() else p.read_bytes() if p.is_file() else None)
+                for p in sorted(self.home.rglob("*"))}
+
+    def owners_mac(self):
+        """The owner's Mac before this: app 4.4.0 running, its CLI, the hand-made LaunchAgent."""
+        (self.app / "Contents").mkdir(parents=True)
+        (self.app / "Contents" / "Info.plist").write_text("4.4.0\n")
+        (self.support / "cli-4.4.0").mkdir(parents=True)
+        (self.support / "cli-4.4.0" / "peekaboo").write_text("#!/bin/sh\n")
+        (self.support / "cli-4.4.0" / "peekaboo").chmod(0o755)
+        old = self.home / "Library" / "LaunchAgents" / "com.ejcampbell.peekaboo.plist"
+        old.parent.mkdir(parents=True)
+        old.write_text("hand-made\n")
+        self.running.write_text("")
+
+    def test_a_fresh_mac_gets_the_pinned_app_cli_and_agent_and_a_rerun_changes_nothing(self):
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.app / "Contents" / "Info.plist").read_text().strip(), self.version)
+        self.assertTrue((self.support / f"cli-{self.version}" / "peekaboo").is_file())
+        self.assertEqual(os.readlink(self.support / "cli-current"), f"cli-{self.version}")
+        plist = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/open", "-g", "-a", str(self.app)])
+        self.assertEqual((plist["Label"], plist["RunAtLoad"], plist["LimitLoadToSessionType"]), ("com.ccgames.peekaboo", True, "Aqua"))
+        self.assertIn("launchctl bootstrap gui/", self.calls())
+        self.assertEqual(self.calls().count("curl "), 2)
+        before, calls = self.files(), self.calls()
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.files(), before, "a rerun changes nothing")
+        self.assertEqual(self.calls().count("curl "), 2, "and downloads nothing")
+        self.assertNotIn("bootstrap", self.calls()[len(calls):].replace("launchctl print", ""), "nor reloads the agent")
+
+    def test_an_installed_app_or_cli_whose_signature_no_longer_verifies_is_reinstalled(self):
+        self.assertEqual(self.run_().returncode, 0)
+        self.broken.write_text(f"{self.app}\n{self.support / f'cli-{self.version}' / 'peekaboo'}\n")
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"installed CLI {self.version}", r.stdout)
+        self.assertIn(f"installed app {self.version}", r.stdout)
+        self.assertEqual(self.calls().count("curl "), 4, "both downloaded again")
+
+    def test_a_running_older_app_is_left_alone_and_the_wrapper_keeps_its_matching_cli(self):
+        self.owners_mac()
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("is running; it stays", r.stderr)
+        self.assertEqual((self.app / "Contents" / "Info.plist").read_text(), "4.4.0\n")
+        self.assertNotIn("pkill", self.calls())
+        self.assertTrue((self.support / f"cli-{self.version}" / "peekaboo").is_file(), "the new CLI is ready")
+        self.assertEqual(os.readlink(self.support / "cli-current"), "cli-4.4.0", "but the wrapper keeps the app's own")
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.ejcampbell.peekaboo.plist").exists())
+        self.assertIn("launchctl bootout gui/", self.calls())
+        self.assertTrue(self.plist.exists())
+
+    def test_update_running_quits_swaps_and_reopens(self):
+        self.owners_mac()
+        r = self.run_("--update-running")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pkill -f ^" + str(self.app) + "/Contents/MacOS/Peekaboo", self.calls())
+        self.assertEqual((self.app / "Contents" / "Info.plist").read_text().strip(), self.version)
+        backup = self.home / ".local" / "state" / "mac-setup" / "backups" / "Peekaboo.app" / "Contents" / "Info.plist"
+        self.assertEqual(backup.read_text(), "4.4.0\n")
+        self.assertEqual(os.readlink(self.support / "cli-current"), f"cli-{self.version}")
+        self.assertIn("launchctl kickstart gui/", self.calls())
+
+    def test_a_download_that_does_not_match_its_pin_installs_nothing(self):
+        with open(self.releases / "peekaboo-macos-arm64.tar.gz", "ab") as f:
+            f.write(b"tampered")
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("did not match its pinned sha256", r.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertEqual(list(self.support.iterdir()), [])
+
+    def test_a_downloaded_cli_whose_signature_does_not_verify_is_refused(self):
+        self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; '
+                              f'*) for a; do :; done; case "$a" in */peekaboo-macos-arm64/peekaboo) exit 1;; esac; exit 0;; esac')
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the CLI's signature does not verify", r.stderr)
+        self.assertFalse((self.support / f"cli-{self.version}").exists())
+
+    def test_a_launchagent_that_cannot_load_fails_the_run(self):
+        self.stub("launchctl", f'echo "launchctl $*" >> {shlex.quote(str(self.log))}; [ "$1" != bootstrap ] || exit 5')
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not load the LaunchAgent com.ccgames.peekaboo", r.stderr)
+
+    def test_another_signer_is_refused(self):
+        self.team.write_text("ABCDEFGHIJ\n")
+        r = self.run_()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not signed by FWJYW4S8P8", r.stderr)
+        self.assertFalse(self.app.exists())
+
+
 class Files(unittest.TestCase):
     def test_syntax(self):
-        for f in (BIN / "mac-build-shim", BIN / "peekaboo", ROOT / "scripts" / "mac" / "set-zshenv.sh"):
+        for f in (BIN / "mac-build-shim", BIN / "peekaboo", ROOT / "scripts" / "mac" / "set-zshenv.sh",
+                  ROOT / "scripts" / "mac" / "peekaboo-install.sh"):
             subprocess.run(["sh", "-n", str(f)], check=True)
         for f in ("mac-lease", "mac-build"):
             subprocess.run(["perl", "-c", str(BIN / f)], check=True, capture_output=True)
@@ -253,9 +429,24 @@ class Files(unittest.TestCase):
         for f in sorted(p.name for p in BIN.iterdir()):
             self.assertIn(f"bin/{f}", setup)
             self.assertIn(f, install)
-        self.assertIn("set-zshenv.sh bin |", setup, "the zshenv helper travels with the tools")
+        self.assertIn("set-zshenv.sh peekaboo-install.sh bin |", setup, "the helpers travel with the tools")
+        self.assertIn('/bin/sh "$src/peekaboo-install.sh" --update-running', install)
+        self.assertIn('/bin/sh "$src/peekaboo-install.sh"\n', install)
         self.assertIn('"$src/set-zshenv.sh" "$HOME/.zshenv"', install)
         self.assertNotIn("grep -q '\\.local/bin'", install, "no mention-based check decides the PATH")
+
+    def test_peekaboo_is_pinned_to_the_release_and_the_wrapper_follows_cli_current(self):
+        text = (ROOT / "scripts" / "mac" / "peekaboo-install.sh").read_text()
+        pin = lambda name: re.search(rf"^{name}=(\S+)", text, re.M).group(1)
+        # v4.9.5 of openclaw/Peekaboo: its checksums.txt and SIGNING-MANIFEST.json.
+        self.assertEqual(pin("VERSION"), "4.9.5")
+        self.assertEqual(pin("TEAM"), "FWJYW4S8P8")
+        self.assertEqual(pin("APP_ZIP_SHA256"), "d176301b0ef4b695c11cbdb8c0bdbbc71f47f866f76c734ddad8343ab5f93e38")
+        self.assertEqual(pin("CLI_TGZ_SHA256"), "2f435c736459a3d30279835038fc7e67028875be837f467c87521ea14da3a9ee")
+        self.assertIn("BASE=https://github.com/openclaw/Peekaboo/releases/download/v$VERSION", text)
+        wrapper = (BIN / "peekaboo").read_text()
+        self.assertIn('Peekaboo/cli-current/peekaboo"', wrapper)
+        self.assertNotRegex(wrapper, r"cli-\d")
 
     def test_mac_gui_keeps_secrets_off_the_command_line(self):
         gui = (BIN / "mac-gui").read_text()

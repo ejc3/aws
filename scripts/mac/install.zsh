@@ -1,8 +1,10 @@
 #!/bin/zsh
-# Runs ON the MacBook, from scripts/mac-setup.sh, with the unpacked bin/ directory as $1. Idempotent:
-# rerunning puts every file back. Never restarts, kills or relaunches anything.
+# Runs ON the Mac, from scripts/mac-setup.sh, with the unpacked bin/ directory as $1. Idempotent:
+# rerunning puts every file back. Never restarts, kills or relaunches anything, except a running Peekaboo of an
+# older version when the second argument is --update-peekaboo (scripts/mac/peekaboo-install.sh).
 set -euo pipefail
-src=${1:?usage: install.zsh STAGING_DIR}
+src=${1:?usage: install.zsh STAGING_DIR [--update-peekaboo]}
+update_peekaboo=${2:-}
 bin=$HOME/.local/bin
 state=$HOME/.local/state
 backup=$state/mac-setup/backups
@@ -47,6 +49,13 @@ for t in swift xcodebuild xcrun; do
   got=$(env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/zsh -c "command -v $t")
   [ "$got" = "$bin/$t" ] || { echo "mac-setup: a non-interactive zsh finds $t at $got, not $bin/$t" >&2; exit 1; }
 done
+
+# The pinned Peekaboo app and CLI, and its LaunchAgent (the wrapper above runs its CLI).
+if [ "$update_peekaboo" = --update-peekaboo ]; then
+  /bin/sh "$src/peekaboo-install.sh" --update-running
+else
+  /bin/sh "$src/peekaboo-install.sh"
+fi
 
 echo "mac-setup: installed mac-gui, mac-lease, mac-build (+ swift/xcodebuild/xcrun shims), peekaboo into $bin"
 "$bin/mac-lease" status | sed 's/^/mac-setup: desktop lease: /'
