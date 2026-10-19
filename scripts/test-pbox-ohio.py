@@ -115,6 +115,21 @@ class RetiredSiteTests(unittest.TestCase):
         self.assertIn('for n in 1 2 3 4 5 6 7 8; do status_one "$n"; done', SCRIPT)
         self.assertIn('VOLTAG="$NAME-work"', SCRIPT)
 
+    def test_the_spot_quota_fits_every_slot_at_full_size(self):
+        # one resource owns L-34B43A08 in Ohio, next to the slot list, and it grows with the slots
+        tf = "".join(p.read_text() for p in ROOT.glob("*.tf"))
+        self.assertEqual(tf.count('quota_code   = "L-34B43A08"'), 1)
+        q = block(OHIO, 'resource "aws_servicequotas_service_quota" "ohio_spot_standard"')
+        self.assertIn("provider     = aws.ohio", q)
+        self.assertIn('service_code = "ec2"', q)
+        self.assertIn("value        = 1536 + length(local.parallel_boxes) * local.parallel_box_max_vcpus", q)
+        self.assertIn("parallel_box_max_vcpus = 192", OHIO)
+        # the largest types the script tries are 192 vCPU (48xlarge / metal-48xl), and none larger
+        self.assertNotRegex(SCRIPT, r"\.(?:96xlarge|metal-96xl)\b")
+        self.assertIn("c8g.48xlarge", SCRIPT)
+        slots = len(re.search(r"for n in \[([\d, ]+)\]", LAUNCH).group(1).split(","))
+        self.assertEqual(1536 + slots * 192, 3072)
+
     def test_the_script_has_no_stale_copy_check_left(self):
         self.assertNotIn("Live", SCRIPT)
         self.assertNotIn("PARALLEL_BOX_ALLOW_STALE", SCRIPT)
