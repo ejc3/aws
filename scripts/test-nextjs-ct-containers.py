@@ -606,8 +606,8 @@ class MacTests(unittest.TestCase):
 
     def test_provision_configures_each_listed_mac_and_nothing_else(self):
         prov = (CT / "provision").read_text()
-        loop = prov[prov.index("cfg --arg u \"$U\" '.users[$u].macs"):]
-        loop = loop[:loop.index("\ndone\n") + 6]
+        loop = prov[prov.index("while read -r alias secret; do"):]
+        loop = loop[:loop.index("\n", loop.index("done < <(cfg --arg u \"$U\" '.users[$u].macs")) + 1]
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / "config.json").write_text(json.dumps({"users": {
@@ -625,6 +625,21 @@ class MacTests(unittest.TestCase):
         self.assertEqual(got["ejc3"], ["ejc3 colton-mac colton-mac-ssh-access-nextjs-ejc3", "ejc3 mac macbook-ssh-access-nextjs-ejc3"])
         self.assertEqual(got["colton"], ["colton colton-mac colton-mac-ssh-access-nextjs-colton"])
         self.assertEqual(got["connor"], [])
+
+    def test_a_failed_mac_setup_fails_provision(self):
+        """warn's FAILED=1 must reach provision's own shell (no pipeline subshell), so the container is not marked ready."""
+        prov = (CT / "provision").read_text()
+        loop = prov[prov.index("while read -r alias secret; do"):]
+        loop = loop[:loop.index("\n", loop.index("done < <(cfg")) + 1]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"users": {"ejc3": {"macs": {"mac": "s"}}}}))
+            (d / "snippets").mkdir()
+            (d / "snippets" / "mac-ssh.sh").write_text("exit 1\n")
+            script = f'CONFIG={d}/config.json; SHARED={d}; U=ejc3; FAILED=""\nwarn() {{ FAILED=1; }}\n' \
+                + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + loop + 'echo "FAILED=$FAILED"\n'
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        self.assertIn("FAILED=1", r.stdout)
 
     def test_no_reverse_tunnel_relay_is_left(self):
         for f in ("nextjs-ct-machine", "nextjs-ct-sshd", "nextjs-ct-firewall"):

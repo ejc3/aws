@@ -273,9 +273,10 @@ if [ "$OWNER" = true ]; then
 fi
 # The Macs this account reaches (`ssh mac`, `ssh colton-mac`), each through Cloudflare Access with the account's own
 # token (config.json users.<u>.macs; mac-ssh-client.tf). A key for a Mac with make_key is made as the account if missing.
-cfg --arg u "$U" '.users[$u].macs // {} | to_entries[] | "\(.key) \(.value)"' | while read -r alias secret; do
+# Fed by process substitution, not a pipe: warn's FAILED=1 must reach this shell, or a failed Mac setup reads as ready.
+while read -r alias secret; do
   bash "$SHARED/snippets/mac-ssh.sh" "$U" "$alias" "$secret" || warn "ssh $alias config failed"
-done
+done < <(cfg --arg u "$U" '.users[$u].macs // {} | to_entries[] | "\(.key) \(.value)"')
 # pbox, gbox and wbox, in every container: the owner's drive the owner's boxes with the hop key, a member's drive
 # that member's own three (member-boxes.tf), and the session policy admits nothing else.
 bash "$SHARED/snippets/box-tools.sh" || warn "box tools install failed"
