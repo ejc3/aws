@@ -729,10 +729,15 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
   listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
   nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host
-  of the same job never releases the claim of its relaunch. A host covers the job it is tagged
-  for only while it is not busy: GitHub may give it another job with the same labels, and a busy
-  ephemeral host tagged for a still-queued job is running something else, so the job gets its own
-  host. The cap counts hosts, not job tags.
+  of the same job never releases the claim of its relaunch. A live host covers the job it is tagged
+  for, registered or not, idle or busy, unless it is known to be running ANOTHER job: busy and named
+  as the runner of an in-progress job in the same scan. GitHub's job listing can say "queued" for a
+  job its own host is already running (2026-10-19, issue #531, for up to half an hour), and a merely
+  busy host must not count as taken. A job that already had a host (one tagged for it is listed, in
+  any state) and none covers it now is launched for again only if GitHub's record of the job
+  (`GET /actions/jobs/{id}`) still says queued with no runner: its host may have run a sibling job
+  and exited. A launch that created no instance is retried next round without that check. The cap
+  counts hosts, not job tags: every pending or running instance, registered, idle or busy.
   Neither repo can starve fcvm's.
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
