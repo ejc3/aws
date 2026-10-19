@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Bring the on-demand many-core Graviton boxes up and down. There are FOUR independent
-# boxes (slots 1-4; ohio-pbox.tf, parallel-box-launch.tf), each with its own persistent
-# work volume, so four parallel jobs can run at once.
+# Bring the on-demand many-core Graviton boxes up and down. There are EIGHT independent
+# boxes (slots 1-8; ohio-pbox.tf, parallel-box-launch.tf), each with its own persistent
+# work volume, so eight parallel jobs can run at once.
 #
-#   pbox up [N]       launch box 1 (or N, 1-4) in the home AZ; tries several instance types
+#   pbox up [N]       launch box 1 (or N, 1-8) in the home AZ; tries several instance types
 #   pbox up [N] kvm   same box, METAL pools only: /dev/kvm for hypervisor
 #                     workloads (fcvm/firecracker). Boots in many minutes.
 #   pbox up [N] --fallback
@@ -47,7 +47,7 @@
 # TEMPLATE that carries the whole launch configuration), and this script supplies the one
 # thing terraform cannot know in advance -- which instance type has capacity right now --
 # via ec2:RunInstances against that template. The IAM policy behind it
-# (parallel-box-launch.tf) allows launching ONLY these four tagged boxes, and passing only
+# (parallel-box-launch.tf) allows launching ONLY these eight tagged boxes, and passing only
 # the dev-ebs-only role. Terminating was already non-terraform: parallel-box-watchdog.tf
 # has always reaped these boxes with tag-scoped ec2:TerminateInstances.
 #
@@ -147,7 +147,7 @@ HOME_REGION="$REGION"
 
 # ---------------------------------------------------------------------------------
 # Box selection. Box 1 keeps the original, unnumbered names (tag "parallel-box",
-# launch template "parallel-box") so nothing existing moves; boxes 2-4 are suffixed.
+# launch template "parallel-box") so nothing existing moves; boxes 2-8 are suffixed.
 # ---------------------------------------------------------------------------------
 CMD="${1:-status}"
 [ $# -gt 0 ] && shift
@@ -157,7 +157,7 @@ FALLBACK=""
 ONLY_REGIONS=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    1|2|3|4) BOX="$1" ;;
+    1|2|3|4|5|6|7|8) BOX="$1" ;;
     kvm) MODE="kvm" ;; # "up kvm" is shorthand for box 1 in kvm mode
     --fallback) FALLBACK=1 ;;
     --regions)
@@ -167,8 +167,8 @@ while [ $# -gt 0 ]; do
     --regions=*)
       ONLY_REGIONS="${1#--regions=}"; FALLBACK=1
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
-    [0-9]*) say "unknown box '$1' (use 1-4)"; exit 1 ;;
-    *) say "unknown argument '$1' (a box 1-4, kvm, --fallback, --regions r1,r2)"; exit 1 ;;
+    [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, kvm, --fallback, --regions r1,r2)"; exit 1 ;;
   esac
   shift
 done
@@ -681,7 +681,7 @@ case "$CMD" in
     if [ -n "$MEMBER" ]; then
       status_one "$NAME"
     elif [ -z "$BOX" ]; then
-      for n in 1 2 3 4; do status_one "$n"; done
+      for n in 1 2 3 4 5 6 7 8; do status_one "$n"; done
     else
       status_one "$BOX"
     fi

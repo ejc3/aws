@@ -100,16 +100,19 @@ class RetiredSiteTests(unittest.TestCase):
 
     def test_names_and_sizes_are_what_the_script_finds_them_by(self):
         self.assertIn('"1" = { size = 300, name = "parallel-box-work" }', OHIO)
-        for n in (2, 3, 4):
+        for n in range(2, 9):
             self.assertIn(f'"{n}" = {{ size = 100, name = "parallel-box-{n}-work" }}', OHIO)
+        # exactly one volume per slot: no ninth, and no slot without one
+        vols = re.search(r'ohio_pbox_volumes = \{\n(.*?)\n  \}', OHIO, re.S).group(1)
+        self.assertEqual(re.findall(r'^    "(\d)" = ', vols, re.M), [str(n) for n in range(1, 9)])
 
-    def test_four_slots_and_slot_one_keeps_its_name(self):
+    def test_eight_slots_and_slot_one_keeps_its_name(self):
         # the slot list, the volume list and the watchdog's tag list are one thing
-        self.assertRegex(LAUNCH, r'parallel_boxes\s*=\s*\{ for n in \[1, 2, 3, 4\] : tostring\(n\) => \{ name = n == 1 \? "parallel-box" : "parallel-box-\$\{n\}" \} \}')
+        self.assertRegex(LAUNCH, r'parallel_boxes\s*=\s*\{ for n in \[1, 2, 3, 4, 5, 6, 7, 8\] : tostring\(n\) => \{ name = n == 1 \? "parallel-box" : "parallel-box-\$\{n\}" \} \}')
         self.assertRegex(LAUNCH, r'parallel_box_names\s*=\s*\[for k in sort\(keys\(local\.parallel_boxes\)\) : local\.parallel_boxes\[k\]\.name\]')
-        self.assertIn('1|2|3|4) BOX="$1" ;;', SCRIPT)
-        self.assertIn("""[0-9]*) say "unknown box '$1' (use 1-4)"; exit 1 ;;""", SCRIPT)
-        self.assertIn('for n in 1 2 3 4; do status_one "$n"; done', SCRIPT)
+        self.assertIn('1|2|3|4|5|6|7|8) BOX="$1" ;;', SCRIPT)
+        self.assertIn("""[0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;""", SCRIPT)
+        self.assertIn('for n in 1 2 3 4 5 6 7 8; do status_one "$n"; done', SCRIPT)
         self.assertIn('VOLTAG="$NAME-work"', SCRIPT)
 
     def test_the_script_has_no_stale_copy_check_left(self):

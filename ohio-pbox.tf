@@ -27,12 +27,16 @@ locals {
   parallel_box_region = "us-east-2"
 
   # The persistent volumes, by box number: size and Name tag (scripts/parallel-box.sh finds a volume by its Name tag).
-  # One per slot in local.parallel_boxes (parallel-box-launch.tf); slots 3 and 4 were added on 2026-10-10.
+  # One per slot in local.parallel_boxes (parallel-box-launch.tf); slots 3 and 4 were added on 2026-10-10, 5 to 8 on 2026-10-19.
   ohio_pbox_volumes = {
     "1" = { size = 300, name = "parallel-box-work" }
     "2" = { size = 100, name = "parallel-box-2-work" }
     "3" = { size = 100, name = "parallel-box-3-work" }
     "4" = { size = 100, name = "parallel-box-4-work" }
+    "5" = { size = 100, name = "parallel-box-5-work" }
+    "6" = { size = 100, name = "parallel-box-6-work" }
+    "7" = { size = 100, name = "parallel-box-7-work" }
+    "8" = { size = 100, name = "parallel-box-8-work" }
   }
 }
 

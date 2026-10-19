@@ -329,7 +329,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.xlarge` | 400 GB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
-| `parallel-box`, `parallel-box-2` .. `parallel-box-4` | `us-west-2d` or `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
+| `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, normally 96 or 192 vCPU | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number. Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
@@ -979,25 +979,25 @@ not.
 
 ## On-demand parallel compute
 
-Four independent boxes (`parallel-box`, `parallel-box-2` .. `parallel-box-4`), each with its own
-persistent work volume (300 GB for box 1, 100 GB for the others), so four jobs can run at once.
+Eight independent boxes (`parallel-box`, `parallel-box-2` .. `parallel-box-8`), each with its own
+persistent work volume (300 GB for box 1, 100 GB for the others), so eight jobs can run at once.
 From ARM or x86:
 
 ```bash
 pbox status      # every box
 pbox up          # launch box 1 from its launch template, then connect
-pbox up 3        # launch box 3 (independent volume and lifecycle; 1-4)
+pbox up 3        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox ssh [N]
 pbox down [N]    # terminate compute; keep that box's /mnt/work
 ```
 
 The launcher tries several 96/192-vCPU Graviton Spot pools in the availability zone that
 contains the persistent work volumes. One shared watchdog checks every five minutes and
-terminates either box after 30 minutes below 5% CPU.
+terminates any box after 30 minutes below 5% CPU.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security group, key pair and
-the two launch templates -- while the instances themselves are deliberately not in state.
+one launch template per box -- while the instances themselves are deliberately not in state.
 That removes the old hazard entirely: an unrelated full apply can no longer propose
 terminating a box in the middle of a live job.
 

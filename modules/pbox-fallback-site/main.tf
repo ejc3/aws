@@ -190,7 +190,7 @@ resource "aws_key_pair" "this" {
 # ============================================================ launch template
 # The home templates' configuration (parallel-box-launch.tf) with three differences: no network interface block, so the
 # caller's --subnet-id picks the AZ; a second EBS volume, the fresh work disk, created and deleted with the box; and no
-# Name tag, which the caller adds (--tag-specifications) for the box it launches. One template serves all four boxes,
+# Name tag, which the caller adds (--tag-specifications) for the box it launches. One template serves every box,
 # which keeps the IAM policy that pins it short.
 resource "aws_launch_template" "box" {
   name                   = var.template_name
