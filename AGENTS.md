@@ -554,7 +554,8 @@ only. Rules an agent must keep:
   and gboxes only: a member pbox is reached at its public address with SSH open to the internet (the Ohio pbox
   security group), so between members the boundary there is the per-member SSH key, not the network.
 - **Ports are per container**; the host reaches a dev server at `10.88.<uid-1000>.2:<port>`. Only the owner's
-  container has `ssh mac` (Cloudflare Access with ejc3's own token, `mac-ssh-client.tf`); members' policies deny it.
+  container has `ssh mac`; colton's and the owner's have `ssh colton-mac` (`local.nextjs_ct_mac_clients`: Cloudflare
+  Access with each account's own token, `mac-ssh-client.tf`); every other member's policy denies those tokens.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
   --pipe --wait ...`) from `ubuntu`.
 

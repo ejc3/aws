@@ -23,7 +23,7 @@
 #   * the LaunchAgent com.ccgames.<alias>-ssh.cloudflared: `cloudflared tunnel --no-autoupdate run --token-file ...`,
 #     started at login and restarted by launchd when it drops
 #   * a managed block in ~/.ssh/authorized_keys with each client's ~/.ssh/to-<alias>.pub, read from the clients' boxes
-#     (fcvm-arm over ssh, each nextjs-dev account's own file over its own SSM Run Command) and kept only if it is exactly
+#     (fcvm-arm over ssh, each nextjs-ct account's own file over its own SSM Run Command) and kept only if it is exactly
 #     one `ssh-ed25519 <blob>`; every other line is kept, and a line elsewhere for one of those keys (the bootstrap
 #     tunnel's) is folded into the block
 # Re-running is safe: a file whose content is already right is left alone, and the connector is reloaded only when its
@@ -95,7 +95,7 @@ clean_key() {
   printf '%s' "$key"
 }
 
-# One nextjs-dev account's key, read from that account's own file in its own Run Command, so one account's file can
+# One nextjs-ct account's key, read from that account's own file in its own Run Command, so one account's file can
 # never stand in for another's.
 nextjs_key() {
   local user=$1 cmd_id
@@ -152,13 +152,15 @@ for client in $CLIENTS; do
       ;;
     nextjs)
       if [ -z "$NEXTJS_ID" ]; then
-        NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Name,Values=nextjs-dev Name=instance-state-name,Values=running \
+        # The containerized box (nextjs-ct.tf), found by its Box tag, which it keeps through the cutover (its Name
+        # becomes nextjs-dev then). Each account's container home is the host's /home/<account>.
+        NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running \
           --query 'Reservations[0].Instances[0].InstanceId' --output text)
-        [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "nextjs-dev is not running" >&2; exit 1; }
+        [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "the nextjs-ct box is not running" >&2; exit 1; }
       fi
       key=$(clean_key "$(nextjs_key "$user" || true)") ||
-        { echo "nextjs-dev $user has no single valid ~/.ssh/to-$ALIAS.pub (setup-sync makes it within 10 minutes of the apply)" >&2; exit 1; }
-      KEYS+="$key nextjs-dev $user -> $ALIAS"$'\n'
+        { echo "nextjs-ct $user has no single valid ~/.ssh/to-$ALIAS.pub (the container's provision makes it at setup)" >&2; exit 1; }
+      KEYS+="$key nextjs $user -> $ALIAS"$'\n'
       ;;
     *) echo "unknown box $box" >&2; exit 1 ;;
   esac

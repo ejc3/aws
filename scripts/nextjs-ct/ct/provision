@@ -257,8 +257,8 @@ if [ -n "$GH_ID" ] && [ -n "$GH_LOGIN" ]; then
   done
 fi
 
-# Owner-only: the hop key (the owner's pbox and gbox reach their boxes with it) and the
-# MacBook alias. Every other account's AWS session is denied both (nextjs-ct-user-data.tf).
+# Owner-only: the hop key (the owner's pbox and gbox reach their boxes with it). Every other account's AWS session is
+# denied it (nextjs-ct-user-data.tf).
 if [ "$OWNER" = true ]; then
   set +x
   HOPJSON=$(aws secretsmanager get-secret-value --secret-id dev-hop-ssh-key --region us-west-1 --query SecretString --output text 2>/dev/null) || HOPJSON=""
@@ -270,8 +270,12 @@ if [ "$OWNER" = true ]; then
     warn "could not read the hop key for $U"
   fi
   unset HOPJSON
-  bash "$SHARED/snippets/macbook-ssh.sh" "$U" || warn "macbook ssh config failed"
 fi
+# The Macs this account reaches (`ssh mac`, `ssh colton-mac`), each through Cloudflare Access with the account's own
+# token (config.json users.<u>.macs; mac-ssh-client.tf). A key for a Mac with make_key is made as the account if missing.
+cfg --arg u "$U" '.users[$u].macs // {} | to_entries[] | "\(.key) \(.value)"' | while read -r alias secret; do
+  bash "$SHARED/snippets/mac-ssh.sh" "$U" "$alias" "$secret" || warn "ssh $alias config failed"
+done
 # pbox, gbox and wbox, in every container: the owner's drive the owner's boxes with the hop key, a member's drive
 # that member's own three (member-boxes.tf), and the session policy admits nothing else.
 bash "$SHARED/snippets/box-tools.sh" || warn "box tools install failed"

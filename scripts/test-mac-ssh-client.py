@@ -299,10 +299,16 @@ class Wiring(unittest.TestCase):
                       'MAC_SECRET="colton-mac-ssh-access-nextjs-$MAC_USER"\nMAC_HOME="/home/$MAC_USER"\n'
                       "${local.mac_cloudflared_install}\n${local.mac_ssh_client_setup}\nfi\ndone\n", source)
 
-    def test_the_containers_snippet_still_sets_only_user_and_secret(self):
-        # nextjs-ct-user-data.tf is not changed here: its snippet relies on MAC_ALIAS defaulting to mac.
-        body = (ROOT / "nextjs-ct-user-data.tf").read_text().split("nextjs_ct_macbook_ssh = <<-MACBOOK\n", 1)[1].split("\nMACBOOK\n", 1)[0]
-        self.assertNotIn("MAC_ALIAS", body)
+    def test_the_connector_reads_the_nextjs_keys_from_the_containerized_box(self):
+        # The containers' homes are on nextjs-ct, found by a tag it keeps through the cutover (its Name changes then).
+        self.assertIn('Box = "nextjs-ct"', (ROOT / "nextjs-ct.tf").read_text())
+        self.assertIn("--filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running", CONNECTOR.read_text())
+        self.assertNotIn("tag:Name,Values=nextjs-dev", CONNECTOR.read_text())
+
+    def test_the_containers_snippet_sets_user_alias_and_secret_per_call(self):
+        # nextjs-ct (scripts/test-nextjs-ct-containers.py MacTests): provision runs it once per alias in users.<u>.macs.
+        body = (ROOT / "nextjs-ct-user-data.tf").read_text().split("nextjs_ct_mac_ssh = <<-MACSSH\n", 1)[1].split("\nMACSSH\n", 1)[0]
+        self.assertIn('MAC_USER="$1"\nMAC_ALIAS="$2"\nMAC_SECRET="$3"\n', body)
         self.assertIn('MAC_ALIAS="$${MAC_ALIAS:-mac}"', SOURCE)
 
     def test_the_pinned_cloudflared_is_checked_before_and_after_download(self):
@@ -415,7 +421,7 @@ class ConnectorScript(unittest.TestCase):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(root / name)], check=True)
             self.keys[name] = " ".join((root / f"{name}.pub").read_text().split()[:2])
         (self.home / ".ssh/to-colton-mac.pub").write_text(self.keys["fcvm"] + " fcvm-arm ubuntu -> colton-mac\n")
-        self.nextjs = root / "nextjs"  # each nextjs-dev account's ~/.ssh/to-colton-mac.pub
+        self.nextjs = root / "nextjs"  # each nextjs-ct account's ~/.ssh/to-colton-mac.pub
         self.nextjs.mkdir()
         (self.nextjs / "colton.pub").write_text(self.keys["colton"] + " nextjs-dev colton -> colton-mac\n")
         (self.nextjs / "ejc3.pub").write_text(self.keys["ejc3"] + " x\n")
@@ -443,7 +449,7 @@ sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).retu
         self.stub("aws", f"""#!/bin/sh
 echo "$*" >> {self.argv_log}
 case "$1 $2" in
-  "ec2 describe-instances") echo i-0123456789abcdef0 ;;
+  "ec2 describe-instances") case "$*" in *"Name=tag:Box,Values=nextjs-ct "*) echo i-0123456789abcdef0 ;; *) echo None ;; esac ;;
   "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
   "ssm wait") ;;
   "ssm get-command-invocation") u=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); cat "{self.nextjs}/$u.pub" ;;
@@ -507,8 +513,8 @@ esac
         self.assertEqual(lines[0].split()[-1], "own", "the Mac's other keys are kept")
         block = lines[lines.index("# >>> colton-mac clients (managed by aws scripts/mac-ssh-connector-setup.sh) >>>") + 1:
                       lines.index("# <<< colton-mac clients <<<")]
-        self.assertEqual(block, [bootstrap_line, self.keys["colton"] + " nextjs-dev colton -> colton-mac",
-                                 self.keys["ejc3"] + " nextjs-dev ejc3 -> colton-mac"])
+        self.assertEqual(block, [bootstrap_line, self.keys["colton"] + " nextjs colton -> colton-mac",
+                                 self.keys["ejc3"] + " nextjs ejc3 -> colton-mac"])
         self.assertEqual(sum(self.keys["fcvm"].split()[1] in line for line in lines), 1, "the bootstrap line is folded in")
         before = authorized.read_text()
         again = self.run_setup("colton-mac")
@@ -561,7 +567,7 @@ esac
         (self.nextjs / "colton.pub").write_text(self.keys["colton"] + " colton\nejc3 " + self.keys["fcvm"] + "\n")
         result = self.run_setup("colton-mac")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("nextjs-dev colton has no single valid", result.stderr)
+        self.assertIn("nextjs-ct colton has no single valid", result.stderr)
         log = self.argv_log.read_text()
         self.assertIn("cat /home/colton/.ssh/to-colton-mac.pub", log)
         self.assertEqual(log.count("ssm send-command"), 1, "each account is read by its own command; colton's failed first")

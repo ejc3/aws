@@ -109,6 +109,8 @@ resource "aws_instance" "nextjs_ct" {
   tags = {
     Name    = local.nextjs_ct_serving ? "nextjs-dev" : "nextjs-ct"
     Purpose = "Containerized replacement for nextjs-dev (one container per person)"
+    # Unchanged by the cutover, unlike Name: what must find THIS box either side of it (scripts/mac-ssh-connector-setup.sh).
+    Box = "nextjs-ct"
   }
 }
 
