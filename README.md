@@ -734,11 +734,13 @@ key). `scripts/mac-ssh-connector-setup.sh colton-mac`, run on a jumpbox, puts th
 - the pinned `cloudflared` (verified on the Mac), the token through ssh stdin into `~/.cloudflared/colton-mac-ssh.token`
   (0600), and the LaunchAgent `com.ccgames.colton-mac-ssh.cloudflared`;
 - a managed block in the Mac's `~/.ssh/authorized_keys` with the three clients' public keys (fcvm-arm's over ssh, each
-  nextjs-dev account's own file over its own SSM command), each accepted only as exactly one `ssh-ed25519 <blob>`.
+  nextjs account's own file on the containerized box, found by its `Box=nextjs-ct` tag, over its own SSM command), each
+  accepted only as exactly one `ssh-ed25519 <blob>`.
 
 It reaches the Mac as `ssh colton-mac` from fcvm-arm; `--bootstrap-port PORT` points that alias at a temporary reverse
-tunnel on fcvm-arm's `127.0.0.1:PORT`. On the containerized box (`nextjs-ct`), `colton-mac-ssh-access-nextjs-ejc3` is
-the owner's (denied to every member's container) and `colton-mac-ssh-access-nextjs-colton` is denied to every member's
+tunnel on fcvm-arm's `127.0.0.1:PORT`. On the containerized box (`nextjs-ct`), colton's and ejc3's containers have
+`ssh colton-mac` (`local.nextjs_ct_mac_clients`), each with its own token: `colton-mac-ssh-access-nextjs-ejc3` is the
+owner's (denied to every member's container) and `colton-mac-ssh-access-nextjs-colton` is denied to every member's
 container but colton's (`nextjs-ct-user-data.tf`).
 
 **First bring-up** (the Mac kept a temporary reverse tunnel to fcvm-arm's `127.0.0.1:2224`, set up by hand on 2026-10-19):
@@ -1146,8 +1148,9 @@ login.
   which every other member's session is denied. Both the keys and the member wbox passwords are a boundary only
   once they have been rotated at the cutover (below): on nextjs-dev every account has sudo and the role reads all of
   them, so any member could have saved another member's.
-- **The MacBook** is reachable from `ejc3`'s container only, by `ssh mac`: the same Cloudflare route as every other
-  box (`mac-ssh-client.tf`), with ejc3's own Access token, which every member's AWS session is denied.
+- **The Macs**: `ssh mac` (the MacBook) from `ejc3`'s container only, and `ssh colton-mac` from colton's and ejc3's:
+  the same Cloudflare route as every other box (`mac-ssh-client.tf`), each with that account's own Access token, which
+  every other member's AWS session is denied (`local.nextjs_ct_mac_clients`).
 
 What carries over at the cutover, and how: `scripts/nextjs-ct/host/nextjs-ct-migrate` (homes, published
 projects, crontabs, then the SSH host keys at the final pass). Some secrets are rotated at the cutover rather than

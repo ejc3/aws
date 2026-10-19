@@ -27,7 +27,7 @@ locals {
   # added to local.nextjs_users later gets the next free uid; its container address follows from it.
   nextjs_ct_uid_pins = { colton = 1001, connor = 1002, ejc3 = 1003, skevh = 1004, colin = 1005 }
   # The owner. Their container keeps the owner-only grants (the Dolphin apply role, the hop key, the
-  # owner's boxes) and is the only one with `ssh mac`. Everyone else is a member (aws_iam_policy.nextjs_ct_member).
+  # owner's boxes) and is the only one with `ssh mac` (local.nextjs_ct_mac_clients). Everyone else is a member (aws_iam_policy.nextjs_ct_member).
   nextjs_ct_owners = ["ejc3"]
   # Serving the live tunnels. FALSE until the cutover: with the same tunnel credentials on two boxes,
   # Cloudflare would split every hostname's traffic between them.
@@ -230,20 +230,31 @@ locals {
       keys       = lookup(local.nextjs_user_keys, u, [])
       repos      = lookup(local.nextjs_user_repos, u, [])
       box_ips    = try(local.nextjs_ct_member_box[u].ips, [])
+      macs       = lookup(local.nextjs_ct_mac_clients, u, {})
     } }
   }
 
-  # ejc3's one way to the MacBook, inside ejc3's container only: `ssh mac`, the same as every box that has it
-  # (mac-ssh-client.tf): Cloudflare Access with ejc3's own service token (macbook-ssh-access-nextjs-ejc3, read
-  # through the container's own AWS session; every member's session policy denies it) to the Mac's desktop-session
-  # sshd. No reverse tunnel and nothing listening on the box. Run as root in the container by provision.
-  nextjs_ct_macbook_ssh = <<-MACBOOK
+  # The Macs each account reaches, inside its own container only, the same as on nextjs-dev (mac-ssh-client.tf): alias
+  # => that account's own Cloudflare Access service token, read through the container's own AWS session at connect
+  # time. `mac` (the MacBook) is ejc3's alone; `colton-mac` is colton's and ejc3's (owner, 2026-10-19). Every other
+  # member's session policy denies these tokens (above). No reverse tunnel and nothing listening on the box.
+  nextjs_ct_mac_clients = {
+    ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }
+    colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }
+  }
+  # Run as root in the container by provision, once per alias: mac-ssh.sh <account> <alias> <secret>.
+  nextjs_ct_mac_ssh = <<-MACSSH
 set -euo pipefail
 MAC_USER="$1"
-MAC_SECRET=macbook-ssh-access-nextjs-ejc3
+MAC_ALIAS="$2"
+MAC_SECRET="$3"
 ${local.mac_cloudflared_install}
+# The shared install only warns (nextjs-dev's setup goes on without it); here a missing or wrong binary fails provision,
+# so the container is not marked ready with an `ssh <alias>` that cannot connect.
+echo "${local.cloudflared_sha256_linux_arm}  /home/$MAC_USER/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1 ||
+  { echo "mac-ssh: cloudflared is missing or does not match its pin" >&2; exit 1; }
 ${local.mac_ssh_client_setup}
-MACBOOK
+MACSSH
 
   # Plain files: host tools, and the box's shared files every container mounts read-only.
   nextjs_ct_host_files = {
@@ -270,7 +281,7 @@ MACBOOK
     "/var/lib/nextjs-ct/shared/snippets/codex-seed-install.sh"         = "${local.codex_seed_thread_install}\n${local.codex_restart_setup}"
     "/var/lib/nextjs-ct/shared/snippets/user-agents-seed-install.sh"   = local.user_agents_seed_install
     "/var/lib/nextjs-ct/shared/snippets/box-tools.sh"                  = "${local.pbox_setup}\n${local.gbox_setup}\n${local.wbox_setup}\n${local.wbox_member_setup}"
-    "/var/lib/nextjs-ct/shared/snippets/macbook-ssh.sh"                = local.nextjs_ct_macbook_ssh
+    "/var/lib/nextjs-ct/shared/snippets/mac-ssh.sh"                    = local.nextjs_ct_mac_ssh
   }
 
   nextjs_ct_install_files = join("\n", concat(

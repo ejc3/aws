@@ -589,14 +589,62 @@ class HostAccountTests(unittest.TestCase):
 
 
 class MacTests(unittest.TestCase):
-    """ejc3's container reaches the MacBook the way every box does (owner, 2026-10-18: "cloudflare only")."""
+    """Each account's container reaches its Macs the way every box does (owner, 2026-10-18: "cloudflare only"):
+    `mac` for ejc3 alone, `colton-mac` for colton and ejc3 (2026-10-19), each with that account's own token."""
 
-    def test_the_owner_gets_the_shared_cloudflare_client_with_their_own_token(self):
-        body = TF.split("nextjs_ct_macbook_ssh = <<-MACBOOK\n", 1)[1].split("\nMACBOOK\n", 1)[0]
-        self.assertIn('MAC_USER="$1"', body)
-        self.assertIn("MAC_SECRET=macbook-ssh-access-nextjs-ejc3", body)
+    def test_the_shared_cloudflare_client_runs_per_alias_with_the_accounts_own_token(self):
+        body = TF.split("nextjs_ct_mac_ssh = <<-MACSSH\n", 1)[1].split("\nMACSSH\n", 1)[0]
+        for line in ('MAC_USER="$1"', 'MAC_ALIAS="$2"', 'MAC_SECRET="$3"'):
+            self.assertIn(line, body)
         self.assertLess(body.index("${local.mac_cloudflared_install}"), body.index("${local.mac_ssh_client_setup}"))
-        self.assertIn('bash "$SHARED/snippets/macbook-ssh.sh" "$U"', (CT / "provision").read_text().split('if [ "$OWNER" = true ]; then', 1)[1])
+        clients = TF.split("nextjs_ct_mac_clients = {", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn('ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }', clients)
+        self.assertIn('colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }', clients)
+        self.assertEqual(clients.count(" = {"), 2)  # nobody else
+        self.assertIn("macs       = lookup(local.nextjs_ct_mac_clients, u, {})", TF)
+        self.assertNotIn("macbook-ssh.sh", TF + (CT / "provision").read_text())
+        snippet = TF.split("nextjs_ct_mac_ssh = <<-MACSSH", 1)[1].split("\nMACSSH", 1)[0]
+        install = snippet.index("${local.mac_cloudflared_install}")
+        check = snippet.index('/home/$MAC_USER/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1 ||')
+        self.assertLess(install, check, "a cloudflared that did not install fails the snippet before ssh is configured")
+        self.assertLess(check, snippet.index("${local.mac_ssh_client_setup}"))
+
+    def test_provision_configures_each_listed_mac_and_nothing_else(self):
+        prov = (CT / "provision").read_text()
+        loop = prov[prov.index("while read -r alias secret; do"):]
+        loop = loop[:loop.index("\n", loop.index("done < <(cfg --arg u \"$U\" '.users[$u].macs")) + 1]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"users": {
+                "ejc3": {"macs": {"mac": "macbook-ssh-access-nextjs-ejc3", "colton-mac": "colton-mac-ssh-access-nextjs-ejc3"}},
+                "colton": {"macs": {"colton-mac": "colton-mac-ssh-access-nextjs-colton"}}, "connor": {}}}))
+            (d / "snippets").mkdir()
+            (d / "snippets" / "mac-ssh.sh").write_text('echo "$@" >> "$OUT"\n')
+            got = {}
+            for u in ("ejc3", "colton", "connor"):
+                out = d / f"{u}.out"
+                script = f'CONFIG={d}/config.json; SHARED={d}; U={u}; export OUT={out}\nwarn() {{ echo "$*" >&2; }}\n' \
+                    + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + loop
+                subprocess.run(["bash", "-c", script], check=True)
+                got[u] = sorted(out.read_text().splitlines()) if out.exists() else []
+        self.assertEqual(got["ejc3"], ["ejc3 colton-mac colton-mac-ssh-access-nextjs-ejc3", "ejc3 mac macbook-ssh-access-nextjs-ejc3"])
+        self.assertEqual(got["colton"], ["colton colton-mac colton-mac-ssh-access-nextjs-colton"])
+        self.assertEqual(got["connor"], [])
+
+    def test_a_failed_mac_setup_fails_provision(self):
+        """warn's FAILED=1 must reach provision's own shell (no pipeline subshell), so the container is not marked ready."""
+        prov = (CT / "provision").read_text()
+        loop = prov[prov.index("while read -r alias secret; do"):]
+        loop = loop[:loop.index("\n", loop.index("done < <(cfg")) + 1]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"users": {"ejc3": {"macs": {"mac": "s"}}}}))
+            (d / "snippets").mkdir()
+            (d / "snippets" / "mac-ssh.sh").write_text("exit 1\n")
+            script = f'CONFIG={d}/config.json; SHARED={d}; U=ejc3; FAILED=""\nwarn() {{ FAILED=1; }}\n' \
+                + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + loop + 'echo "FAILED=$FAILED"\n'
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        self.assertIn("FAILED=1", r.stdout)
 
     def test_no_reverse_tunnel_relay_is_left(self):
         for f in ("nextjs-ct-machine", "nextjs-ct-sshd", "nextjs-ct-firewall"):
