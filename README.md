@@ -1373,9 +1373,10 @@ TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, 
    The `.p8` file is the only copy (App Store Connect does not offer it again), so it is removed only after the
    upload succeeds; on a failure, fix the cause and run the pipeline again.
 
-Only administration and nextjs-dev's role can read it, and every account on nextjs-dev has sudo, so treat the key as
-readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect and put a new one the
-same way to rotate.
+Only administration, nextjs-dev's role and `dolphin-labs-testflight` (dolphin-labs CI's TestFlight uploads: GitHub
+OIDC for `testflight.yml` on `main` only, `dolphin-labs-testflight.tf`) can read it. Every account on nextjs-dev has
+sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
+and put a new one the same way to rotate.
 
 ### Colton Games accounts: sign-in, site admins and push
 
