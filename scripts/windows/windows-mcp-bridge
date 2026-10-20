@@ -21,14 +21,16 @@ HEADERS="$DIR/windows-mcp-headers"
 # Every message here goes to stderr: stdout is the MCP stream.
 ssh_pc() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$@"; }
 
-if [ ! -s "$HEADERS" ]; then
+fetch_key() {
   umask 077
   mkdir -p "$DIR"
   key=$(ssh_pc "$ALIAS" "powershell -NoProfile -NonInteractive -Command \"[Environment]::GetEnvironmentVariable('WINDOWS_MCP_AUTH_KEY','User')\"" </dev/null | tr -d '\r\n')
   [[ $key =~ ^[A-Za-z0-9_-]{20,}$ ]] || { echo "windows-mcp-bridge: no Windows-MCP key on $ALIAS (scripts/windows-pc-setup.sh sets it)" >&2; exit 1; }
   printf 'Authorization: Bearer %s\n' "$key" > "$HEADERS.new" && mv -f "$HEADERS.new" "$HEADERS"
   unset key
-fi
+}
+FRESH=0
+if [ ! -s "$HEADERS" ]; then fetch_key; FRESH=1; fi
 
 PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 # ssh itself in the background, not the ssh_pc function (that would be a subshell, and $! its pid: killing it would
@@ -44,6 +46,17 @@ for _ in $(seq 1 150); do
 done
 
 # The forward is plain HTTP on loopback: a launcher's HTTPS_PROXY (claw-master tunnels CONNECT only) must not get it.
+noproxy() { env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost "$@"; }
+# A cached key goes stale when the PC regenerates WINDOWS_MCP_AUTH_KEY (a restored profile, a re-run setup): one
+# request decides, and a 401 fetches the key again, once. The header stays in its 0600 file (curl -H @file).
+probe() { noproxy curl -s -o /dev/null -m 15 -w '%{http_code}' -H @"$HEADERS" "http://127.0.0.1:$PORT/mcp" || true; }
+if [ "$(probe)" = 401 ]; then
+  [ "$FRESH" = 1 ] && { echo "windows-mcp-bridge: $ALIAS rejects the key it just gave (401)" >&2; exit 1; }
+  echo "windows-mcp-bridge: the cached key was rejected; fetching it again from $ALIAS" >&2
+  fetch_key
+  [ "$(probe)" = 401 ] && { echo "windows-mcp-bridge: $ALIAS still rejects its key (401)" >&2; exit 1; }
+fi
+
 env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
   NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
   node "$REMOTE" "http://127.0.0.1:$PORT/mcp" --allow-http --transport http-only --header-file "$HEADERS"

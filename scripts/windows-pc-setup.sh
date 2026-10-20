@@ -252,7 +252,15 @@ $exe = "$dir\cloudflared.exe"
 if (-not (Test-Path $exe) -or (Get-FileHash $exe).Hash -ne $CfdSha) {
   Invoke-WebRequest -UseBasicParsing "https://github.com/cloudflare/cloudflared/releases/download/$CfdVersion/cloudflared-windows-amd64.exe" -OutFile "$exe.new"
   if ((Get-FileHash "$exe.new").Hash -ne $CfdSha) { Remove-Item "$exe.new"; throw 'cloudflared did not match its pinned sha256' }
-  Move-Item -Force "$exe.new" $exe
+  if (-not (Test-Path $exe)) {
+    Move-Item -Force "$exe.new" $exe
+  } else {
+    # A running connector holds the old executable (Windows refuses to replace it) and would keep running it: the
+    # verified one waits as cloudflared.exe.new, and step 7 swaps it in while it restarts the connector.
+    New-Item -ItemType File -Force "$dir\cloudflared.changed" | Out-Null
+    'cloudflared ' + (Get-FileHash "$exe.new").Hash.Substring(0, 16) + ' staged; the connector picks it up in step 7'
+    exit 0
+  }
 }
 'cloudflared ' + (Get-FileHash $exe).Hash.Substring(0, 16)
 PS
@@ -337,7 +345,7 @@ PS
 )"
 # Last: restarting the connector ends every session through it, so nothing may follow it.
 echo "7/7 the connector: SYSTEM task 'cloudflared $ALIAS', at boot"
-on_pc "$(ps_vars Alias "$ALIAS")
+on_pc "$(ps_vars Alias "$ALIAS" CfdSha "$CFD_SHA256_WINDOWS_AMD64")
 $(cat <<'PS'
 $ErrorActionPreference = 'Stop'
 $dir = "$env:ProgramData\cloudflared-$Alias"
@@ -352,11 +360,16 @@ $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
 $changed = @()
 if ($null -eq $existing -or $existing.Actions[0].Arguments -ne $cfArgs -or $existing.Actions[0].Execute -ne "$dir\cloudflared.exe") { $changed += 'its task changed' }
 if (Test-Path "$dir\token.changed") { $changed += 'its token changed' }
+if (Test-Path "$dir\cloudflared.changed") {
+  # Checked again here: the staged executable is swapped in by the restart below, as SYSTEM.
+  if (-not (Test-Path "$dir\cloudflared.exe.new") -or (Get-FileHash "$dir\cloudflared.exe.new").Hash -ne $CfdSha) { throw 'the staged cloudflared is missing or does not match its pinned sha256' }
+  $changed += 'its executable changed'
+}
 if ($null -eq $existing -or $existing.State -ne 'Running') { $changed += 'it is not running' }
 if ($changed.Count -eq 0) { 'connector: unchanged and running; not restarted'; exit 0 }
 Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 # Restarting ends every session through this connector, this one too when it came that way: a one-off SYSTEM task.
-$restart = "Stop-ScheduledTask -TaskName '$name'; Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$dir\cloudflared.exe' } | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName '$name'; Remove-Item '$dir\token.changed' -ErrorAction SilentlyContinue"
+$restart = "Stop-ScheduledTask -TaskName '$name'; Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$dir\cloudflared.exe' } | Stop-Process -Force; Start-Sleep 2; if (Test-Path '$dir\cloudflared.exe.new') { Move-Item -Force '$dir\cloudflared.exe.new' '$dir\cloudflared.exe' }; Start-ScheduledTask -TaskName '$name'; Remove-Item '$dir\token.changed', '$dir\cloudflared.changed' -ErrorAction SilentlyContinue"
 $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -Command Start-Sleep 2; $restart"
 Register-ScheduledTask -TaskName "$name restart" -Action $a -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName "$name restart"
