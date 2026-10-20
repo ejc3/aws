@@ -2503,8 +2503,8 @@ dolphin-labs' `NEWS_RUNS_IN_AWS` variable keeps the GitHub job off. Bringing it 
 4. Set `dolphin_labs_news_enabled = true` in `dolphin-labs-news.tf`, merge, and apply. The errors alarm and the
    'not running' alarm (`dolphin-labs-news-pass-not-running`) then watch it.
 
-The X-posts step is its own function, `dolphin-labs-news-x`, on its own 5-minute schedule, off by default
-(`news_x_schedule_enabled = false`). Turning it on, in this order:
+The X-posts step is its own function, `dolphin-labs-news-x`, on its own 5-minute schedule, on since 2026-10-20
+(`news_x_schedule_enabled = true`). Bringing it up from scratch, in this order:
 
 1. Set dolphin-labs' `NEWS_X_LAMBDA_FUNCTION` repository variable (from `terraform output dolphin_labs_news`) so
    `deploy-news.yml` deploys the bundle to it too. Until then it runs a stand-in that fails on purpose.
