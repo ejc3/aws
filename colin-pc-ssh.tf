@@ -15,8 +15,10 @@
 # by mac-ssh-client.tf as that account; its private half never leaves the box). The clients are mac-ssh-client.tf's
 # installer with alias colin-pc.
 #
-# The connector token's SECRET is administration-only, as Colton's Mac's is, and scripts/windows-pc-setup.sh installs it
-# on the PC from a jumpbox, through ssh stdin, into a file only SYSTEM and Administrators can read. The connector runs
+# The connector token's SECRET is administration-only, as Colton's Mac's is, plus the enrollment Lambda (pc-enroll.tf),
+# which hands it to the PC after the owner's Access login there. Until the PC's enrollment script exists,
+# scripts/windows-pc-setup.sh installs it on the PC from a jumpbox, through ssh stdin, into a file only SYSTEM and
+# Administrators can read. The connector runs
 # as a SYSTEM task at boot, so the PC is reachable before anyone logs in. A client that logs in as an administrator can
 # still read that file: what that buys is a rogue connector for this one tunnel, which can take its traffic and break
 # connections and nothing more: it cannot get in (Access still gates every request) and cannot pass for the PC (every
@@ -146,13 +148,15 @@ resource "aws_secretsmanager_secret_policy" "colin_pc_ssh_tunnel" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationCanRead"
+      Sid       = "OnlyAdministrationAndEnrollmentCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.colin_pc_ssh_tunnel.arn
       Condition = {
-        ArnNotEquals = { "aws:PrincipalArn" = local.colin_pc_ssh_admins }
+        # Administration, and the enrollment Lambda that hands the token to the PC after an owner's Access login there
+        # (pc-enroll.tf).
+        ArnNotEquals = { "aws:PrincipalArn" = concat(local.colin_pc_ssh_admins, [aws_iam_role.pc_enroll.arn]) }
       }
     }]
   })
