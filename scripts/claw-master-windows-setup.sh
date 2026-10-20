@@ -155,6 +155,12 @@ PS
 # must answer through it (the token valid, the connector and the server up) before the PC is switched over.
 # The proxy answers CONNECT 200 before it reaches Anthropic and a failed upstream request as 5xx, so the
 # HTTP status must be Anthropic's own: 2xx or 4xx.
+# 127.0.0.1:$Port is cloudflared relaying raw TCP to the server's OPEN listener, which is itself a plain-HTTP
+# CONNECT proxy (what `claw-master connect --open` speaks), so curl uses it directly with `-x http://...`. The
+# TLS inside the tunnel is to api.anthropic.com, terminated by the server's CA: that is the origin's
+# certificate, so `--cacert`, not `--proxy-cacert` (the proxy hop is plain HTTP). Checked 2026-10-20 on the
+# server's own 127.0.0.1:8444: `-x http://127.0.0.1:8444 --cacert ca.pem` gives `200 401`, `--proxy-cacert`
+# fails with curl exit 60.
 echo "6/7 a request to Anthropic through the tunnel and the server, before switching the PC over"
 on_pc "$(ps_vars Port "$PORT")
 $(cat <<'PS'
