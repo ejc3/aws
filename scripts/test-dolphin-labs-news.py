@@ -85,23 +85,66 @@ class WatchTests(unittest.TestCase):
 
 
 class XStepTests(unittest.TestCase):
-    def test_x_schedule_is_created_off_and_invokes_the_pass_with_step_x(self):
-        var = block("variable", "news_x_schedule_enabled")
-        self.assertRegex(var, r"default     = false\b")
+    def test_x_function_is_its_own_from_the_same_bundle(self):
+        fn = block("aws_lambda_function", "dolphin_labs_news_x")
+        self.assertIn('handler       = "index.xHandler"', fn)
+        self.assertIn("role          = aws_iam_role.dolphin_labs_news_x.arn", fn)
+        self.assertIn("filename    = data.archive_file.dolphin_labs_news_placeholder.output_path", fn)
+        self.assertIn("reserved_concurrent_executions = 1", fn)
+        self.assertIn("timeout     = 240", fn)
+        ignored = re.search(r"ignore_changes = \[(.*?)\]", fn).group(1)
+        self.assertNotIn("handler", ignored)
+        self.assertIn("source_code_hash", ignored)
+        self.assertIn("export const xHandler", (ROOT / "dolphin-labs-news/index.mjs").read_text())
+        self.assertIn("maximum_retry_attempts       = 0", block("aws_lambda_function_event_invoke_config", "dolphin_labs_news_x"))
+
+    def test_x_role_reaches_haiku_the_redis_and_monid_secrets_and_its_logs_only(self):
+        pol = block("aws_iam_role_policy", "dolphin_labs_news_x")
+        self.assertIn("Statement = concat(local.bedrock_haiku_statements, [", pol)
+        self.assertIn("Resource = [aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.dolphin_labs_monid.arn]", pol)
+        self.assertEqual(sorted(re.findall(r'"(s3|secretsmanager|logs|lambda):(\w+)"', pol)),
+                         [("logs", "CreateLogStream"), ("logs", "PutLogEvents"), ("secretsmanager", "GetSecretValue")])
+        self.assertNotIn("browserbase", pol)
+        fn = block("aws_lambda_function", "dolphin_labs_news_x")
+        for line in ("NEWS_SECRET_ID      = aws_secretsmanager_secret.dolphin_labs_news.name",
+                     "MONID_SECRET_ID     = aws_secretsmanager_secret.dolphin_labs_monid.name",
+                     "NEWS_BEDROCK_REGION = local.bedrock_haiku_region",
+                     "NEWS_BEDROCK_MODEL  = local.bedrock_haiku_profile",
+                     'NEWS_ENVIRONMENT    = "production"'):
+            self.assertIn(line, fn)
+
+    def test_the_pass_no_longer_reaches_monid(self):
+        self.assertNotIn("dolphin_labs_monid", block("aws_iam_role_policy", "dolphin_labs_news_pass"))
+        self.assertNotIn("MONID", block("aws_lambda_function", "dolphin_labs_news_pass"))
+        self.assertIn("[aws_iam_role.dolphin_labs_news_x.arn]", block("aws_secretsmanager_secret_policy", "dolphin_labs_monid"))
+        self.assertIn("aws_iam_role.dolphin_labs_news_x.arn", block("aws_secretsmanager_secret_policy", "dolphin_labs_news"))
+
+    def test_x_schedule_is_created_off_and_targets_the_x_function(self):
+        self.assertRegex(block("variable", "news_x_schedule_enabled"), r"default     = false\b")
         sch = block("aws_scheduler_schedule", "dolphin_labs_news_x")
         self.assertIn('state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"', sch)
         self.assertIn('schedule_expression          = "rate(5 minutes)"', sch)
-        self.assertIn("arn      = aws_lambda_function.dolphin_labs_news_pass.arn", sch)
+        self.assertIn("arn      = aws_lambda_function.dolphin_labs_news_x.arn", sch)
         self.assertIn("role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn", sch)
-        self.assertIn('input    = jsonencode({ step = "x" })', sch)
+        self.assertIn("Resource = [aws_lambda_function.dolphin_labs_news_pass.arn, aws_lambda_function.dolphin_labs_news_x.arn]",
+                      block("aws_iam_role_policy", "dolphin_labs_news_scheduler"))
 
-    def test_monid_secret_value_is_set_out_of_band_and_read_only_by_the_pass(self):
+    def test_x_has_its_own_errors_alarm_and_the_pass_alarms_watch_the_pass(self):
+        a = block("aws_cloudwatch_metric_alarm", "dolphin_labs_news_x_errors")
+        self.assertIn("dimensions          = { FunctionName = aws_lambda_function.dolphin_labs_news_x.function_name }", a)
+        self.assertIn("alarm_actions       = [aws_sns_topic.cost_alerts.arn]", a)
+        for name in ("dolphin_labs_news_pass_errors", "dolphin_labs_news_pass_not_running"):
+            self.assertIn("FunctionName = aws_lambda_function.dolphin_labs_news_pass.function_name", block("aws_cloudwatch_metric_alarm", name))
+
+    def test_deploy_role_updates_both_functions_code_and_output_names_the_x_function(self):
+        dep = block("aws_iam_role_policy", "dolphin_labs_news_deploy")
+        self.assertIn("Resource = [aws_lambda_function.dolphin_labs_news_pass.arn, aws_lambda_function.dolphin_labs_news_x.arn]", dep)
+        out = block("output", "dolphin_labs_news")
+        self.assertIn("NEWS_X_LAMBDA_FUNCTION    = aws_lambda_function.dolphin_labs_news_x.function_name", out)
+
+    def test_monid_secret_value_is_set_out_of_band(self):
         self.assertIn('name                    = "dolphin-labs/monid"', block("aws_secretsmanager_secret", "dolphin_labs_monid"))
         self.assertNotIn("aws_secretsmanager_secret_version", TF)
-        pol = block("aws_secretsmanager_secret_policy", "dolphin_labs_monid")
-        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn])", pol)
-        self.assertIn("aws_secretsmanager_secret.dolphin_labs_monid.arn", block("aws_iam_role_policy", "dolphin_labs_news_pass"))
-        self.assertIn("MONID_SECRET_ID       = aws_secretsmanager_secret.dolphin_labs_monid.name", TF)
 
     def test_dev_box_may_only_put_the_monid_key(self):
         put = block("aws_iam_role_policy", "box_dolphin_labs_monid_put")

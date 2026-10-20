@@ -8,6 +8,10 @@
 #                                 included; deploy-news.yml (main) of dolphin-labs-hq/dolphin-labs uploads a
 #                                 bundle to code/ and calls UpdateFunctionCode through
 #                                 dolphin-labs-news-deploy, and may change nothing else.
+#   dolphin-labs-news-x           the X-posts step, its own function from the same bundle (handler
+#                                 index.xHandler), on its own 5-minute schedule. Code as for the pass: the
+#                                 stand-in until deploy-news.yml deploys the bundle to it (dolphin-labs'
+#                                 NEWS_X_LAMBDA_FUNCTION variable).
 #   dolphin-labs-news-<account>   the bucket:
 #                                   journal/  one compressed record per pass (its parsed inputs, the
 #                                             schedule, each Haiku prompt without page text and its
@@ -24,7 +28,8 @@
 #                                 (dolphin-redis.tf) the site reads the lists from. Value set out of band.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
 #   dolphin-labs/monid            JSON secret: MONID_API_KEY, for the X-posts step. Value set out of band by
-#                                 the dev box (nextjs-dev may put a value, not read one).
+#                                 the dev box (nextjs-dev may put a value, not read one); only the X function
+#                                 reads it.
 #
 # The schedule starts DISABLED. Switch-over, in order: the first deploy of the bundle; the secret's value;
 # turn OFF refresh-news.yml's schedule in dolphin-labs (both would run every hour, bill Haiku and
@@ -32,13 +37,14 @@
 # before the deploy fails on the stand-in, which the errors alarm reports; once enabled, the 'has not run'
 # alarm watches that the schedule actually fires.
 #
-# The X-posts step is the same function invoked with {"step":"x"} by its own 5-minute schedule
-# (dolphin-labs-news-x). It starts DISABLED; set news_x_schedule_enabled = true once dolphin-labs deploys a
-# bundle that handles the step and the Monid secret has a value.
+# The X-posts schedule (dolphin-labs-news-x) starts DISABLED; set news_x_schedule_enabled = true once
+# deploy-news.yml has deployed the bundle to dolphin-labs-news-x and the Monid secret has a value. A separate
+# function keeps the step out of the pass's one-at-a-time limit and out of the pass's alarms.
 #
 # Who reaches what:
 #   the function            Bedrock Haiku 5.5; journal/ (write); its secrets (read); its own logs
-#   deploy-news.yml (main)  code/ (write); UpdateFunctionCode, GetFunction(Configuration) on this function only
+#   the X function          Bedrock Haiku 5.5; dolphin-labs/news and dolphin-labs/monid (read); its own logs
+#   deploy-news.yml (main)  code/ (write); UpdateFunctionCode, GetFunction(Configuration) on the two functions
 #   refresh-news.yml (main) journal/ (write), through dolphin-labs-news-bedrock, until it is retired
 #   nextjs-dev (the dolphin box, where replays run)
 #                           journal/ and local/ (read); local/ (write). Not dev-ebs-only: that role is the
@@ -52,13 +58,14 @@ variable "dolphin_labs_news_enabled" {
 }
 
 variable "news_x_schedule_enabled" {
-  description = "Invoke the news pass function with {\"step\":\"x\"} every 5 minutes (the X-posts step). false keeps the schedule and stops the runs. Turn on once dolphin-labs deploys a bundle that handles the step and dolphin-labs/monid has a value."
+  description = "Run the X-posts step (dolphin-labs-news-x) every 5 minutes. false keeps the function and its schedule and stops the runs. Turn on once deploy-news.yml has deployed the bundle to it and dolphin-labs/monid has a value."
   type        = bool
   default     = false
 }
 
 locals {
   dolphin_labs_news_name    = "dolphin-labs-news-pass"
+  dolphin_labs_news_x_name  = "dolphin-labs-news-x"
   dolphin_labs_news_bucket  = "dolphin-labs-news-${data.aws_caller_identity.current.account_id}"
   dolphin_labs_news_minutes = 60
   # One number drives the schedule, the function's NEWS_PASS_MINUTES and the alarms' period. Hourly runs
@@ -216,7 +223,7 @@ resource "aws_secretsmanager_secret_policy" "dolphin_labs_news" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.dolphin_labs_news.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn, aws_iam_role.dolphin_labs_news_x.arn]) } }
     }]
   })
 }
@@ -226,12 +233,12 @@ resource "aws_secretsmanager_secret_policy" "dolphin_labs_news" {
 # -------------------------------------------------------------------------------------
 
 # The value is a JSON object {"MONID_API_KEY": "..."}, set out of band by the dev box (nextjs-dev may put a
-# value, below, and cannot read one back), from a 0600 file, never on a command line:
+# value, below, and cannot read one back), from a 0600 file, never on a command line. The X function reads it.
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/monid \
 #     --secret-string file://monid-secret.json     # {"MONID_API_KEY": "..."}
 resource "aws_secretsmanager_secret" "dolphin_labs_monid" {
   name                    = "dolphin-labs/monid"
-  description             = "dolphin-labs news pass, X-posts step: the Monid API key (JSON: MONID_API_KEY). Value set out of band; see dolphin-labs-news.tf."
+  description             = "dolphin-labs news, X-posts step (dolphin-labs-news-x): the Monid API key (JSON: MONID_API_KEY). Value set out of band; see dolphin-labs-news.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "dolphin-labs/monid", Project = "dolphin-labs" }
 }
@@ -241,12 +248,12 @@ resource "aws_secretsmanager_secret_policy" "dolphin_labs_monid" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationAndTheNewsPassCanRead"
+      Sid       = "OnlyAdministrationAndTheXStepCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.dolphin_labs_monid.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_x.arn]) } }
     }]
   })
 }
@@ -295,7 +302,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_pass" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_labs_monid.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -331,7 +338,6 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
     variables = {
       NEWS_SECRET_ID        = aws_secretsmanager_secret.dolphin_labs_news.name
       BROWSERBASE_SECRET_ID = aws_secretsmanager_secret.browserbase.name
-      MONID_SECRET_ID       = aws_secretsmanager_secret.dolphin_labs_monid.name
       DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.search_fetch_api_key["deepseek"].name
       EXA_SECRET_ID         = aws_secretsmanager_secret.search_fetch_api_key["exa"].name
       SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
@@ -385,7 +391,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_scheduler" {
     Statement = [{
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.dolphin_labs_news_pass.arn
+      Resource = [aws_lambda_function.dolphin_labs_news_pass.arn, aws_lambda_function.dolphin_labs_news_x.arn]
     }]
   })
 }
@@ -404,33 +410,6 @@ resource "aws_scheduler_schedule" "dolphin_labs_news_pass" {
     arn      = aws_lambda_function.dolphin_labs_news_pass.arn
     role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn
 
-    retry_policy {
-      maximum_retry_attempts       = 0
-      maximum_event_age_in_seconds = 300
-    }
-  }
-}
-
-# The X-posts step: the same function and scheduler role, every 5 minutes, with {"step":"x"} as its event.
-# Created DISABLED (news_x_schedule_enabled), so turning it on is a variable flip. dolphin-labs' X step
-# spends Monid searches only inside game windows. Its runs share the function's one-at-a-time limit with the
-# hourly pass and count in the Invocations and Errors the alarms below read.
-resource "aws_scheduler_schedule" "dolphin_labs_news_x" {
-  name       = "dolphin-labs-news-x"
-  group_name = "default"
-  state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"
-
-  flexible_time_window { mode = "OFF" }
-
-  schedule_expression          = "rate(5 minutes)"
-  schedule_expression_timezone = "UTC"
-
-  target {
-    arn      = aws_lambda_function.dolphin_labs_news_pass.arn
-    role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn
-    input    = jsonencode({ step = "x" })
-
-    # The next run, 5 minutes on, is the retry.
     retry_policy {
       maximum_retry_attempts       = 0
       maximum_event_age_in_seconds = 300
@@ -478,6 +457,140 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_pass_not_running" {
 }
 
 # -------------------------------------------------------------------------------------
+# X-posts step: its own function, schedule and alarm
+# -------------------------------------------------------------------------------------
+
+resource "aws_cloudwatch_log_group" "dolphin_labs_news_x" {
+  name              = "/aws/lambda/${local.dolphin_labs_news_x_name}"
+  retention_in_days = 30
+}
+
+resource "aws_iam_role" "dolphin_labs_news_x" {
+  name = local.dolphin_labs_news_x_name
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = { Name = local.dolphin_labs_news_x_name, Project = "dolphin-labs" }
+}
+
+# Haiku, the Redis secret and the Monid key, and its logs. No journal, no Browserbase.
+resource "aws_iam_role_policy" "dolphin_labs_news_x" {
+  name = "news-x"
+  role = aws_iam_role.dolphin_labs_news_x.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(local.bedrock_haiku_statements, [
+      {
+        Sid      = "ReadItsSecrets"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = [aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.dolphin_labs_monid.arn]
+      },
+      {
+        Sid      = "WriteOwnLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.dolphin_labs_news_x.arn}:*"
+      },
+    ])
+  })
+}
+
+resource "aws_lambda_function" "dolphin_labs_news_x" {
+  function_name = local.dolphin_labs_news_x_name
+  description   = "dolphin-labs team news, X-posts step: Monid searches of each game's X handles inside game windows, to Redis"
+  role          = aws_iam_role.dolphin_labs_news_x.arn
+  handler       = "index.xHandler"
+  runtime       = "nodejs22.x"
+  architectures = ["arm64"]
+  # The step works within a 3-minute budget; 240 s leaves a minute for the writes.
+  timeout     = 240
+  memory_size = 2048
+  filename    = data.archive_file.dolphin_labs_news_placeholder.output_path
+  # One step at a time. The step also takes a lock in Redis.
+  reserved_concurrent_executions = 1
+
+  logging_config {
+    log_format = "Text"
+    log_group  = aws_cloudwatch_log_group.dolphin_labs_news_x.name
+  }
+
+  environment {
+    variables = {
+      NEWS_SECRET_ID      = aws_secretsmanager_secret.dolphin_labs_news.name
+      MONID_SECRET_ID     = aws_secretsmanager_secret.dolphin_labs_monid.name
+      NEWS_BEDROCK_REGION = local.bedrock_haiku_region
+      NEWS_BEDROCK_MODEL  = local.bedrock_haiku_profile
+      NEWS_ENVIRONMENT    = "production"
+      NODE_OPTIONS        = "--enable-source-maps"
+    }
+  }
+
+  tags = { Name = local.dolphin_labs_news_x_name, Project = "dolphin-labs" }
+
+  # As for the pass: deploy-news.yml owns the code, Terraform everything else, the handler included (the
+  # bundle's index.mjs exports xHandler, as the stand-in's does).
+  lifecycle {
+    ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version]
+  }
+}
+
+# A failed step is not retried by Lambda: the next scheduled step, 5 minutes on, is the retry.
+resource "aws_lambda_function_event_invoke_config" "dolphin_labs_news_x" {
+  function_name                = aws_lambda_function.dolphin_labs_news_x.function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 300
+}
+
+# Every 5 minutes, through the pass's scheduler role. Created DISABLED (news_x_schedule_enabled), so turning
+# it on is a variable flip. The step spends Monid searches only inside game windows.
+resource "aws_scheduler_schedule" "dolphin_labs_news_x" {
+  name       = local.dolphin_labs_news_x_name
+  group_name = "default"
+  state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"
+
+  flexible_time_window { mode = "OFF" }
+
+  schedule_expression          = "rate(5 minutes)"
+  schedule_expression_timezone = "UTC"
+
+  target {
+    arn      = aws_lambda_function.dolphin_labs_news_x.arn
+    role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn
+    input    = jsonencode({ step = "x" })
+
+    retry_policy {
+      maximum_retry_attempts       = 0
+      maximum_event_age_in_seconds = 300
+    }
+  }
+}
+
+# Three failed steps in a row is 15 minutes without X posts: a broken deploy, a missing Monid key or Monid
+# refusing. One failure is covered by the next step.
+resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_x_errors" {
+  alarm_name          = "dolphin-labs-news-x-errors"
+  alarm_description   = "dolphin-labs-news-x failed three steps running: X posts are not refreshing. See /aws/lambda/dolphin-labs-news-x."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_labs_news_x.function_name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
+# -------------------------------------------------------------------------------------
 # Deploy (GitHub OIDC, deploy-news.yml on main)
 # -------------------------------------------------------------------------------------
 
@@ -485,7 +598,7 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_pass_not_running" {
 # dolphin-labs-hq/dolphin-labs, narrowed by job_workflow_ref to the one workflow file.
 resource "aws_iam_role" "dolphin_labs_news_deploy" {
   name                 = "dolphin-labs-news-deploy"
-  description          = "Assumed by dolphin-labs-hq/dolphin-labs deploy-news.yml (main) via GitHub OIDC: upload the news-pass bundle and update the function's code"
+  description          = "Assumed by dolphin-labs-hq/dolphin-labs deploy-news.yml (main) via GitHub OIDC: upload the news bundle and update the news functions' code"
   max_session_duration = 3600
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -522,9 +635,9 @@ resource "aws_iam_role_policy" "dolphin_labs_news_deploy" {
         Effect = "Allow"
         # Code only, and the reads to wait for the update to finish. No UpdateFunctionConfiguration: IAM
         # cannot narrow it to the handler, and it would also reach the environment, layers, runtime and
-        # timeout. Terraform sets the handler (index.handler) that the bundle provides.
+        # timeout. Terraform sets the handlers (index.handler, index.xHandler) that the bundle provides.
         Action   = ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration"]
-        Resource = aws_lambda_function.dolphin_labs_news_pass.arn
+        Resource = [aws_lambda_function.dolphin_labs_news_pass.arn, aws_lambda_function.dolphin_labs_news_x.arn]
       },
     ]
   })
@@ -637,11 +750,12 @@ resource "aws_iam_role_policy" "dolphin_labs_news_bedrock_journal" {
 }
 
 output "dolphin_labs_news" {
-  description = "For dolphin-labs-hq/dolphin-labs: the deploy workflow's repository variables, and where the journal is"
+  description = "For dolphin-labs-hq/dolphin-labs: the deploy workflow's repository variables, and where the journal is. NEWS_X_LAMBDA_FUNCTION is the value for the repository variable of that name: deploy-news.yml deploys the bundle to that function when it is set and skips it while unset."
   value = {
     AWS_REGION                = var.aws_region
     AWS_NEWS_DEPLOY_ROLE_ARN  = aws_iam_role.dolphin_labs_news_deploy.arn
     NEWS_LAMBDA_FUNCTION      = aws_lambda_function.dolphin_labs_news_pass.function_name
+    NEWS_X_LAMBDA_FUNCTION    = aws_lambda_function.dolphin_labs_news_x.function_name
     NEWS_BUCKET               = aws_s3_bucket.dolphin_labs_news.bucket
     NEWS_JOURNAL_PREFIX       = "journal/"
     NEWS_LOCAL_JOURNAL_PREFIX = "local/"
