@@ -717,5 +717,33 @@ class ContainerScriptTests(unittest.TestCase):
             self.assertIn("belongs to alice", r.stderr)
 
 
+
+class NoContainerRestartTests(unittest.TestCase):
+    """A re-run of setup (any change to the published script) must not restart the containers. Every
+    systemd-nspawn@<user> unit Requires= the firewall and its home mount, and restarting a required unit restarts the
+    containers that require it: on 2026-10-20 two routine applies ended every session (13:54, 14:04)."""
+
+    MACHINE = (ROOT / "scripts/nextjs-ct/host/nextjs-ct-machine").read_text()
+
+    def required_units(self):
+        req = re.search(r"^Requires=(.*)$", self.MACHINE, re.M).group(1).split()
+        self.assertIn("nextjs-ct-firewall.service", req)
+        return req
+
+    def test_setup_never_restarts_a_unit_the_containers_require(self):
+        hosts = [TF] + [f.read_text() for f in (ROOT / "scripts/nextjs-ct/host").iterdir() if f.is_file()]
+        for unit in self.required_units():
+            name = unit.replace("$HOME_UNIT", "").strip()
+            if not name:
+                # the home mount unit: only ever enabled/started, never restarted
+                for text in hosts:
+                    self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart)[^\n]*\$HOME_UNIT")
+                continue
+            for text in hosts:
+                self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart|stop)[^\n]*" + re.escape(name))
+
+    def test_firewall_rules_are_reloaded_by_running_the_script(self):
+        self.assertIn("systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall", TF)
+
 if __name__ == "__main__":
     unittest.main()
