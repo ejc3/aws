@@ -129,6 +129,24 @@ class Install(unittest.TestCase):
         self.assertIn("outside", r.stderr)
         self.assertFalse(outside.exists())
 
+    def test_concurrent_copies_leave_one_complete_file_and_no_temporaries(self):
+        # The agents-md and agent-local-md associations run on their own schedules and can overlap; each ends with this
+        # step. Run only the step, many times at once, over a long file so the writes overlap.
+        big = "".join(f"line {i} of the instructions\n" for i in range(3000)) + "@~/.claude/local.md\n## End\n"
+        (self.home / ".claude" / "CLAUDE.md").write_text(big)
+        (self.home / ".claude" / "local.md").write_text(LOCAL)
+        step = "set -eu\nuser=example\nhome=" + shlex.quote(str(self.home)) + "\n" + CODEX_COPY
+        env = {"PATH": self.path, "HOME": str(self.home)}
+        procs = [subprocess.Popen(["sh", "-c", step], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                 for _ in range(12)]
+        results = [(p.wait(timeout=60), p.stderr.read().decode()) for p in procs]
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual([r for r, _ in results], [0] * 12, [e for _, e in results if e])
+        self.assertEqual(self.codex.read_text(), big.replace("@~/.claude/local.md\n", LOCAL))
+        self.assertEqual(sorted(p.name for p in (self.home / ".codex").iterdir()), ["AGENTS.override.md"])
+
     def test_a_changed_object_is_refused_and_nothing_written(self):
         self.obj.write_text(INSTRUCTIONS + "tampered\n")
         self.assertNotEqual(self.run_().returncode, 0)

@@ -29,14 +29,15 @@ locals {
   # not local.md (ejc3/agents-md#10). Both associations (this one and agent-local-md.tf's) therefore end by writing
   # Codex its own copy, AGENTS.override.md: CLAUDE.md with local.md inlined where CLAUDE.md imports it (the import
   # line dropped when there is no local.md), so Codex sees exactly what Claude Code sees. Written by the account,
-  # inside its home, 0600 (it can hold local.md's private text), with a rename.
+  # inside its home, 0600 (it can hold local.md's private text), with a rename from a temporary file of its own: the
+  # two associations run on their own schedules and can overlap.
   agents_md_codex_copy = <<-EOT
     claude="$home/.claude/CLAUDE.md"
     if [ -L "$claude" ]; then claude=$(readlink -f "$claude"); fi
     codex="$home/.codex/AGENTS.override.md"
     if [ -L "$codex" ]; then codex=$(readlink -f "$codex"); fi
     for p in "$claude" "$codex"; do case "$p" in "$home"/*) ;; *) echo "agents-md: $p is outside $home; not writing" >&2; exit 1 ;; esac; done
-    runuser -u "$user" -- sh -c 'set -eu; [ -f "$1" ] || exit 0; mkdir -p "$(dirname "$3")"; umask 077; tmp="$3.agents-md.tmp"; while IFS= read -r line || [ -n "$line" ]; do if [ "$line" = "@~/.claude/local.md" ]; then if [ -f "$2" ]; then cat "$2"; [ -z "$(tail -c 1 "$2")" ] || echo; fi; else printf "%s\n" "$line"; fi; done < "$1" > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$3"' sh "$claude" "$home/.claude/local.md" "$codex"
+    runuser -u "$user" -- sh -c 'set -eu; [ -f "$1" ] || exit 0; mkdir -p "$(dirname "$3")"; umask 077; tmp=$(mktemp "$3.XXXXXX"); trap '"'"'rm -f "$tmp"'"'"' EXIT; while IFS= read -r line || [ -n "$line" ]; do if [ "$line" = "@~/.claude/local.md" ]; then if [ -f "$2" ]; then cat "$2"; [ -z "$(tail -c 1 "$2")" ] || echo; fi; else printf "%s\n" "$line"; fi; done < "$1" > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$3"' sh "$claude" "$home/.claude/local.md" "$codex"
     echo "agents-md: Codex copy at $codex"
   EOT
 }
