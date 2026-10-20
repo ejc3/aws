@@ -143,6 +143,7 @@ resource "aws_ssm_association" "agent_local_md" {
       case "$target" in "$home"/*) ;; *) echo "agent-local-md: $target is outside $home; not writing" >&2; exit 1 ;; esac
       runuser -u "$user" -- sh -c 'set -eu; mkdir -p "$(dirname "$1")"; cp "$2" "$1.agent-local-md.tmp"; chmod 600 "$1.agent-local-md.tmp"; mv "$1.agent-local-md.tmp" "$1"' sh "$target" "$tmp"
       echo "agent-local-md: installed ${each.key} ($sum) at $target"
+      ${local.agents_md_codex_copy}
     EOT
   }
 }
