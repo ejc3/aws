@@ -998,7 +998,8 @@ a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` 
 `kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often. The launcher tries the flavor's Graviton types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
-watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU.
+watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
+activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security group, key pair and
@@ -1029,7 +1030,7 @@ IP only; out only to web, DNS and NTP, so the box cannot reach the fleet's NFS s
 tag-scoped managed policy `gpu-box-control` on `nextjs-dev-role`; the instance is never in
 state. The grant launches only these templates, only those four types, only the template's root
 disk shape, and only terminates the four tagged slots. Each costs money only while it runs: the
-parallel-box watchdog terminates it after 30 minutes below 5% CPU and at `gpu_box_max_hours`
+parallel-box watchdog terminates it after 30 minutes below 5% CPU (and without disk or network activity) and at `gpu_box_max_hours`
 (4) from launch, and the box arms its own shutdown timer as a backup. All slots share the
 us-west-2 "Running On-Demand G and VT instances" quota (`L-DB2E81BA`): four `g4dn.xlarge`
 need 16 vCPUs, and 32 covers four of the largest type (`g4dn.2xlarge`).

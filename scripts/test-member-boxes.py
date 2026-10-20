@@ -337,6 +337,8 @@ class Watchdogs(unittest.TestCase):
 
         class CW:
             def get_metric_statistics(self, **kw):
+                if kw["MetricName"] != "CPUUtilization":
+                    return {"Datapoints": []}  # no disk or network series: no activity
                 return {"Datapoints": [{"Maximum": p} for p in cpu[kw["Dimensions"][0]["Value"]]]}
 
         class SNS:

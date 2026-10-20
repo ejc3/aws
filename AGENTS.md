@@ -254,7 +254,7 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - The dev boxes are the cost. Two metal spot instances dominate; the small boxes are noise
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute and the four GPU test boxes
-  (`gpu-box.tf`, slots `gpu-box` and `gpu-box-2`..`-4`) after 30m CPU idle, and each GPU box
+  (`gpu-box.tf`, slots `gpu-box` and `gpu-box-2`..`-4`) after 30m idle (CPU, disk and network), and each GPU box
   at 4h from launch (its own shutdown timer is only a backup). It and its Ohio copy also reap the members' own gboxes
   and pboxes (`member-gbox.tf`, `member-pbox.tf`: 30m idle, 4h / 6h from launch), and the same code, as
   `member-wbox-watchdog` in us-west-1, terminates the members' Windows spot boxes (`member-wbox.tf`) after one hour below
@@ -1799,7 +1799,8 @@ to the two metal servers.
 The I/O-box invocation of the same Lambda also checks five-minute disk and network sums.
 Returned disk activity of at least 1 MiB or network activity of at least 64 MiB keeps it
 running, but a missing I/O series currently counts as zero. The parallel box uses
-`parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU; the members' Windows spot boxes run
+`parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU with no five-minute window of 512 MiB of EBS or
+instance-store reads or writes or 64 MiB of network either way (#532); the members' Windows spot boxes run
 that code as their own `member-wbox-watchdog` (one hour below 15%, 6h lifetime; `member-wbox.tf`). `nextjs-dev` and
 the jumpboxes never idle-stop.
 

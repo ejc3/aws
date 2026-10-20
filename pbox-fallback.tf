@@ -109,6 +109,7 @@ locals {
       IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
       TAG_NAMES     = join(",", local.parallel_box_names)
+      IO_THRESHOLDS = local.parallel_watchdog_io_thresholds
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }

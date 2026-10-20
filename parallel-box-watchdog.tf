@@ -29,9 +29,29 @@ variable "parallel_box_idle_minutes" {
 }
 
 variable "parallel_box_idle_cpu_pct" {
-  description = "Peak CPU below which the box counts as idle. Embarrassingly parallel work pegs all cores, so idle is unambiguous."
+  description = "Peak CPU below which the box counts as idle. Embarrassingly parallel work pegs all cores; work that does not (one thread, a disk-bound job) is caught by the I/O thresholds below."
   type        = number
   default     = 5
+}
+
+# Disk and network activity that keeps a CPU-idle box alive (#532): one busy thread is about 3% of a 32-vCPU box and
+# 0.5% of a 192, and a disk-bound job on a storage flavor can sit under 5% CPU while it writes gigabytes. Any five-minute
+# window of the idle window at or above a threshold counts as work. Measured on the Ohio parallel boxes reaped
+# 2026-10-18/19: an idle box writes a steady 40-115 MiB per five minutes to EBS (peaks of 176 right after a job) and
+# moves 0.1-3 MiB on the network; the jobs that were reaped as idle moved 1.7-13 GB per window to EBS or the instance
+# store, or 180 MiB and more on the network. So 512 MiB for each disk direction and 64 MiB for each network direction
+# (the I/O box's network bar, dev-auto-stop-lambda.tf), well clear of the idle floor and far under real work. A series
+# that is missing counts as no activity: DiskRead/WriteBytes (the instance store) exist only on types that have one, and
+# CPU already refuses to reap without data. The members' Windows boxes (member-wbox.tf) keep CPU alone.
+locals {
+  parallel_watchdog_io_thresholds = jsonencode({
+    EBSReadBytes   = 512 * 1048576
+    EBSWriteBytes  = 512 * 1048576
+    DiskReadBytes  = 512 * 1048576
+    DiskWriteBytes = 512 * 1048576
+    NetworkIn      = 64 * 1048576
+    NetworkOut     = 64 * 1048576
+  })
 }
 
 locals {
@@ -57,6 +77,9 @@ MAX_AGE      = json.loads(os.environ.get("MAX_AGE_MINUTES", "{}"))
 # cap RunInstances' --count, so a launch of several (or a second `up`) is cut back here to the
 # oldest, and the rest are terminated with an alert.
 SINGLE_NAMES = set(n for n in os.environ.get("SINGLE_NAMES", "").split(",") if n)
+# Bytes per five-minute window, by AWS/EC2 metric, at or above which a CPU-idle box is still working (#532): disk and
+# network. Empty (the members' Windows boxes) keeps CPU alone. A missing series is no activity.
+IO_THRESHOLDS = json.loads(os.environ.get("IO_THRESHOLDS", "{}"))
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -164,6 +187,26 @@ def lambda_handler(event, context):
             results.append({"id": iid, "action": "busy", "peak_cpu": round(peak, 1)})
             continue
 
+        # Under the CPU bar, but a single thread or a disk-bound job looks exactly like that: any window of disk or
+        # network bytes at or above its threshold keeps the box.
+        io_active = {}
+        for metric, threshold in sorted(IO_THRESHOLDS.items()):
+            io = cw.get_metric_statistics(
+                Namespace="AWS/EC2",
+                MetricName=metric,
+                Dimensions=[{"Name": "InstanceId", "Value": iid}],
+                StartTime=now - datetime.timedelta(minutes=IDLE_MINUTES),
+                EndTime=now,
+                Period=300,
+                Statistics=["Sum"],
+            )
+            io_peak = max((p.get("Sum", 0) for p in io.get("Datapoints", [])), default=0)
+            if io_peak >= threshold:
+                io_active[metric] = int(io_peak)
+        if io_active:
+            results.append({"id": iid, "action": "busy_io", "peak_cpu": round(peak, 1), "io_bytes_5m": io_active})
+            continue
+
         if name.split("-", 1)[0] in ("wbox", "pbox", "gbox"):
             # A member's own box (member-boxes.tf), "<kind>-<person>": the person runs the plain
             # command from their own account, which takes no slot.
@@ -188,15 +231,16 @@ def lambda_handler(event, context):
             # A fallback box (pbox-fallback.tf) ran on a fresh volume that dies with it; only the home volume persists.
             kept = ("It was a fallback box: its fresh work volume was deleted with it (the home work volume is untouched)"
                     if fallback else "Its work volume is untouched")
-        print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
+        io_note = " and under its disk and network thresholds" if IO_THRESHOLDS else ""
+        print("terminating idle %s %s (peak CPU %.1f%% over %dmin%s)" % (name, iid, peak, IDLE_MINUTES, io_note))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
             results.append({"id": iid, "action": "terminated", "peak_cpu": round(peak, 1)})
             notify(
                 "%s auto-terminated (idle)" % name,
-                "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%) and was terminated.\n\n"
+                "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%)%s and was terminated.\n\n"
                 "%s -- bring the box back with:\n"
-                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, kept, up_cmd),
+                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, io_note, kept, up_cmd),
             )
         except Exception as e:
             results.append({"id": iid, "action": "terminate_failed", "error": str(e)})
@@ -297,6 +341,7 @@ resource "aws_lambda_function" "parallel_watchdog" {
       MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => var.gpu_box_max_hours * 60 })
       # one instance per member gbox
       SINGLE_NAMES  = join(",", local.member_gbox_names)
+      IO_THRESHOLDS = local.parallel_watchdog_io_thresholds
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
