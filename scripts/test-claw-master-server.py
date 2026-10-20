@@ -722,7 +722,8 @@ class WindowsSetupTests(unittest.TestCase):
     def test_the_pc_is_switched_over_only_after_the_pool_answers_through_its_tunnel(self):
         s6 = self.step(6)
         self.assertIn('-x "http://127.0.0.1:$Port"', s6)
-        self.assertIn("if ($LASTEXITCODE -eq 0 -and $out -like '200 *')", s6)
+        # CONNECT 200 and an HTTP status of Anthropic's own: a 5xx is the proxy's failed upstream request
+        self.assertIn("if ($LASTEXITCODE -eq 0 -and $out -match '^200 [24]\\d\\d$')", s6)
         self.assertRegex(s6, r"the PC was not switched over\"\nexit 1")
         self.assertLess(code(WINSETUP).index('echo "6/7'), code(WINSETUP).index("agent install --listen"))
         self.assertNotIn("agent install --listen", s6)
@@ -730,7 +731,7 @@ class WindowsSetupTests(unittest.TestCase):
     def test_agent_install_and_the_final_check_fail_the_script_when_they_fail(self):
         s7 = self.step(7)
         self.assertIn('if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }', s7)
-        self.assertIn("if ($LASTEXITCODE -ne 0 -or $out -notlike '200 *')", s7)
+        self.assertIn('''if ($LASTEXITCODE -ne 0 -or $out -notmatch '^200 [24]\\d\\d$') { "the agent did not reach the pool (curl exit $LASTEXITCODE, status $out)"; exit 1 }''', s7)
         self.assertNotIn("$ErrorActionPreference = 'Stop'", s7)  # 5.1 ends the script on native stderr
         # the agent's proxy URL (it carries the agent's token) reaches curl only through its environment
         self.assertIn("$env:HTTPS_PROXY = (Get-Content", s7)

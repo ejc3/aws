@@ -153,13 +153,15 @@ PS
 
 # A listening port proves only that cloudflared started: it accepts before reaching anything. The pool
 # must answer through it (the token valid, the connector and the server up) before the PC is switched over.
+# The proxy answers CONNECT 200 before it reaches Anthropic and a failed upstream request as 5xx, so the
+# HTTP status must be Anthropic's own: 2xx or 4xx.
 echo "6/7 a request to Anthropic through the tunnel and the server, before switching the PC over"
 on_pc "$(ps_vars Port "$PORT")
 $(cat <<'PS'
 $d = "$env:USERPROFILE\.config\claw-master"
 for ($i = 0; $i -lt 10; $i++) {
   $out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' -x "http://127.0.0.1:$Port" --cacert "$d\ca.pem" https://api.anthropic.com/v1/models
-  if ($LASTEXITCODE -eq 0 -and $out -like '200 *') { "through the pool: CONNECT and HTTP status $out"; exit 0 }
+  if ($LASTEXITCODE -eq 0 -and $out -match '^200 [24]\d\d$') { "through the pool: CONNECT and HTTP status $out"; exit 0 }
   Start-Sleep -Seconds 3
 }
 "the pool did not answer through the tunnel (curl exit $LASTEXITCODE, status $out); the PC was not switched over"
@@ -178,7 +180,7 @@ if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }
 # and it is never printed.
 $env:HTTPS_PROXY = (Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json).env.HTTPS_PROXY
 $out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' --cacert "$d\ca.pem" https://api.anthropic.com/v1/models
-if ($LASTEXITCODE -ne 0 -or $out -notlike '200 *') { "the agent did not reach the pool (curl exit $LASTEXITCODE, status $out)"; exit 1 }
+if ($LASTEXITCODE -ne 0 -or $out -notmatch '^200 [24]\d\d$') { "the agent did not reach the pool (curl exit $LASTEXITCODE, status $out)"; exit 1 }
 "through the agent: CONNECT and HTTP status $out"
 'tasks: ' + ((Get-ScheduledTask | Where-Object { $_.TaskName -like 'claw-master*' } | ForEach-Object { $_.TaskName + '=' + $_.State }) -join ', ')
 PS
