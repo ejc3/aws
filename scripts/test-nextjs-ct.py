@@ -61,10 +61,10 @@ class BoxTests(unittest.TestCase):
 
 
 class CutoverSwitchTests(unittest.TestCase):
-    """One value, local.nextjs_ct_serving, moves everything keyed to the nextjs box; false until the owner's go."""
+    """One value, local.nextjs_ct_serving, moves everything keyed to the nextjs box; on since the cutover (2026-10-20)."""
 
-    def test_switch_is_off(self):
-        self.assertIn("nextjs_ct_serving = false", (ROOT / "nextjs-ct-user-data.tf").read_text())
+    def test_switch_is_on(self):
+        self.assertIn("nextjs_ct_serving = true", (ROOT / "nextjs-ct-user-data.tf").read_text())
 
     def test_everything_keyed_to_the_box_reads_the_live_instance(self):
         self.assertIn("nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)", CT_TF)

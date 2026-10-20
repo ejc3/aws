@@ -29,9 +29,9 @@ locals {
   # The owner. Their container keeps the owner-only grants (the Dolphin apply role, the hop key, the
   # owner's boxes) and is the only one with `ssh mac` (local.nextjs_ct_mac_clients). Everyone else is a member (aws_iam_policy.nextjs_ct_member).
   nextjs_ct_owners = ["ejc3"]
-  # Serving the live tunnels. FALSE until the cutover: with the same tunnel credentials on two boxes,
+  # Serving the live tunnels. TRUE since the cutover (2026-10-20): with the same tunnel credentials on two boxes,
   # Cloudflare would split every hostname's traffic between them.
-  nextjs_ct_serving = false
+  nextjs_ct_serving = true
 
   # ---- per-container AWS sessions (nextjs-ct.tf explains the self-assume)
   # Denied to every container, the owner's too: what only the host does.

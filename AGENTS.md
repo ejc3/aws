@@ -535,7 +535,7 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
   ports. Its IAM role reads one S3 object and two secrets, can describe instances for hop
   aliases, and has the scoped `DevEBS=true` temporary-volume policy. Don't re-narrow it
 
-### nextjs-ct: the containerized replacement (being built; takes over at the cutover)
+### nextjs-ct: the containerized replacement (serving since the cutover, 2026-10-20)
 
 `nextjs-ct.tf`, `nextjs-ct-user-data.tf`, `scripts/nextjs-ct/` (README, "The containerized replacement"). Every
 account in `local.nextjs_users`, ejc3 included, gets a systemd-nspawn container; the host is admin and routing
@@ -545,7 +545,7 @@ only. Rules an agent must keep:
   (bash would source `~/.bashrc`, which the person writes from inside the container, on the host), `ForceCommand
   nextjs-ct-enter`, `PermitUserRC no`, forwarding only to their own container. Host-side readers of
   container-written files (`nextjs-ct-ndev-sync`) open them without following symlinks and re-check every field.
-- **One switch.** `local.nextjs_ct_serving` (false until the owner's go) moves the Elastic IP, Name tag, alarms,
+- **One switch.** `local.nextjs_ct_serving` (true since the cutover, 2026-10-20; false is the rollback) moves the Elastic IP, Name tag, alarms,
   backup selection and agents-md target, starts this box's tunnels and agents, and stops nextjs-dev. Never run
   `cloudflared` here while it is false: the same tunnel credentials on two boxes split live traffic.
 - **AWS from a container is the role narrowed, never widened.** `nextjs-ct-imds` assumes nextjs-dev-role again with
