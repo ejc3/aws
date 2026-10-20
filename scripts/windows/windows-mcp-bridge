@@ -31,10 +31,12 @@ if [ ! -s "$HEADERS" ]; then
 fi
 
 PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-ssh_pc -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+# ssh itself in the background, not the ssh_pc function (that would be a subshell, and $! its pid: killing it would
+# leave the forward running after every session).
+ssh -o BatchMode=yes -o ConnectTimeout=15 -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
   -L "127.0.0.1:$PORT:127.0.0.1:8000" "$ALIAS" </dev/null >&2 &
 FWD=$!
-trap 'kill "$FWD" 2>/dev/null || true' EXIT
+trap 'kill "$FWD" 2>/dev/null || true; wait "$FWD" 2>/dev/null || true' EXIT
 for _ in $(seq 1 150); do
   (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
   kill -0 "$FWD" 2>/dev/null || { echo "windows-mcp-bridge: the ssh forward to $ALIAS failed" >&2; exit 1; }

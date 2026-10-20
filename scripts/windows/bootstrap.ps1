@@ -27,19 +27,16 @@ if (-not ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal
 }
 
 Step 'OpenSSH server'
+# Windows' own capability only, which installs into System32\OpenSSH, where everything below looks for it.
+$help = 'install "OpenSSH Server" (and "OpenSSH Client") in Settings > System > Optional features, then run this again'
 if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-  try {
-    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
-  } catch {
-    Write-Host "Add-WindowsCapability failed ($($_.Exception.Message)); trying winget."
-    winget install --id Microsoft.OpenSSH.Preview -e --source winget --accept-package-agreements --accept-source-agreements
-  }
+  try { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null } catch { throw "OpenSSH Server did not install ($($_.Exception.Message)): $help" }
 }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { throw 'The OpenSSH server did not install.' }
+if (-not (Test-Path "$env:WINDIR\System32\OpenSSH\sshd.exe")) { throw "OpenSSH Server is not Windows' own (System32\OpenSSH): $help" }
 # The client (ssh, ssh-keygen) is its own capability: usually present, but it can have been removed.
 if (-not (Test-Path "$env:WINDIR\System32\OpenSSH\ssh.exe")) {
   Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
-  if (-not (Test-Path "$env:WINDIR\System32\OpenSSH\ssh.exe")) { throw 'The OpenSSH client did not install.' }
+  if (-not (Test-Path "$env:WINDIR\System32\OpenSSH\ssh.exe")) { throw "OpenSSH Client did not install: $help" }
 }
 # The install opened TCP 22 in the firewall: closed before sshd ever starts.
 Get-NetFirewallRule -Name OpenSSH-Server-In-TCP -ErrorAction SilentlyContinue | Disable-NetFirewallRule

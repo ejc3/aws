@@ -21,10 +21,12 @@
 #   4. cloudflared, pinned by version and sha256 (the pins in scripts/claw-master-windows-setup.sh; a test keeps them
 #      equal) and verified ON the PC, in C:\ProgramData\cloudflared-<alias> (SYSTEM and Administrators only)
 #   5. the connector token, from its administration-only secret, through ssh STDIN only, into a file there
-#   6. the SYSTEM task 'cloudflared <alias>', at boot and restarted when it exits: `cloudflared tunnel run --token-file`
-#   7. Windows-MCP in the user's session: uv and windows-mcp pinned, anonymous telemetry off, a bearer key of its own
+#   6. Windows-MCP in the user's session: uv and windows-mcp pinned, anonymous telemetry off, a bearer key of its own
 #      (WINDOWS_MCP_AUTH_KEY, made on the PC and never printed), serving streamable HTTP on the PC's 127.0.0.1:8000 from
-#      its per-user logon task. Clients reach it with scripts/windows/windows-mcp-bridge.
+#      its per-user logon task, checked to refuse a request without the key. Clients reach it with
+#      scripts/windows/windows-mcp-bridge.
+#   7. last, the SYSTEM task 'cloudflared <alias>', at boot and restarted when it exits: `cloudflared tunnel run
+#      --token-file` (a restart ends the sessions through it, so nothing follows it)
 # Re-running is safe: what is already right is left alone, and the connector restarts only when its task or token
 # changed or it is not running. A restart ends every session through the connector, this one too when it came that
 # way, so it runs from a one-off SYSTEM task that outlives the session.
@@ -91,7 +93,33 @@ ARCH=$(on_pc '$env:PROCESSOR_ARCHITECTURE') || { echo "$ALIAS is not reachable f
 [ "$ARCH" = AMD64 ] || { echo "$ALIAS is not a Windows x64 PC ($ARCH)" >&2; exit 1; }
 
 echo "2/7 OpenSSH Server: keys only, loopback only, no inbound firewall rule"
-on_pc "$(cat <<'PS'
+# Judged by what sshd itself reports (sshd -T, for this account, so a Match block counts), never by the file's text: a
+# ListenAddress 0.0.0.0 or an earlier PasswordAuthentication yes beside the right lines would pass a text check.
+SSHD_CHECK=$(cat <<'PS'
+$svc = Get-CimInstance Win32_Service -Filter "Name = 'sshd'"
+if ($null -eq $svc) { throw 'no sshd service' }
+# The service's own executable: System32\OpenSSH for the Windows capability, Program Files\OpenSSH for the MSI.
+$sshd = if ($svc.PathName -match '^"([^"]+)"') { $Matches[1] } else { ($svc.PathName -split ' ')[0] }
+function Get-Effective {
+  $ErrorActionPreference = 'Continue'
+  $o = @(& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1" 2>&1 | ForEach-Object { "$_" })
+  if ($LASTEXITCODE -ne 0) { throw "sshd -T failed: $($o -join ' ')" }
+  $o
+}
+function Test-KeysOnlyLoopback($o) {
+  $listen = @($o | Where-Object { $_ -match '^listenaddress ' } | ForEach-Object { ($_ -split ' ')[1] })
+  ($listen.Count -gt 0) -and (@($listen | Where-Object { $_ -notmatch '^127\.0\.0\.1:' }).Count -eq 0) -and
+    ($o -contains 'passwordauthentication no') -and
+    (($o -contains 'kbdinteractiveauthentication no') -or ($o -contains 'challengeresponseauthentication no'))
+}
+function Test-Listening {
+  $l = @(Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalAddress })
+  ($l.Count -gt 0) -and (@($l | Where-Object { $_ -ne '127.0.0.1' }).Count -eq 0)
+}
+PS
+)
+on_pc "$SSHD_CHECK
+$(cat <<'PS'
 $ErrorActionPreference = 'Stop'
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -102,17 +130,18 @@ New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
   -Value "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
 $cfg = "$env:ProgramData\ssh\sshd_config"
-$want = @('ListenAddress 127.0.0.1', 'PasswordAuthentication no', 'ChallengeResponseAuthentication no')
-$lines = @(Get-Content $cfg)
-if (@($want | Where-Object { $lines -notcontains $_ }).Count -eq 0) { 'sshd_config: already keys only, loopback only'; exit 0 }
-# Before any Match block: global settings after one would apply only inside it. ChallengeResponseAuthentication, not its
-# newer name, which the OpenSSH 8.1 of older Windows 10 builds rejects.
-$keep = $lines | Where-Object { $_ -notmatch '^\s*(ListenAddress|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)\s' }
-Copy-Item $cfg "$cfg.before-windows-pc-setup" -Force
-Set-Content -Path $cfg -Encoding ascii -Value ($want + $keep)
-$ErrorActionPreference = 'Continue'
-& "$env:WINDIR\System32\OpenSSH\sshd.exe" -t 2>&1 | ForEach-Object { "$_" }
-if ($LASTEXITCODE -ne 0) { Copy-Item "$cfg.before-windows-pc-setup" $cfg -Force; 'sshd_config did not pass sshd -t; restored it'; exit 1 }
+if ((Test-KeysOnlyLoopback (Get-Effective)) -and (Test-Listening)) { 'sshd: already keys only, loopback only'; exit 0 }
+if (-not (Test-KeysOnlyLoopback (Get-Effective))) {
+  # Every such line goes, in a Match block too, and the wanted ones lead, before any Match block (a global setting
+  # after one applies only inside it). ChallengeResponseAuthentication, not its newer name, which the OpenSSH 8.1 of
+  # older Windows 10 builds rejects.
+  $want = @('ListenAddress 127.0.0.1', 'PasswordAuthentication no', 'ChallengeResponseAuthentication no')
+  $keep = @(Get-Content $cfg) | Where-Object { $_ -notmatch '^\s*(ListenAddress|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)\s' }
+  Copy-Item $cfg "$cfg.before-windows-pc-setup" -Force
+  Set-Content -Path $cfg -Encoding ascii -Value ($want + $keep)
+  try { $ok = Test-KeysOnlyLoopback (Get-Effective) } catch { $ok = $false; "$_" }
+  if (-not $ok) { Copy-Item "$cfg.before-windows-pc-setup" $cfg -Force; throw 'sshd_config is still not keys only and loopback only; restored it' }
+}
 # A restart from this session would end with it (Windows ends what an SSH session started): a one-off SYSTEM task.
 $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -Command Start-Sleep 2; Restart-Service sshd -Force'
 Register-ScheduledTask -TaskName 'windows-pc-setup sshd restart' -Action $a -Principal (New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest) -Force | Out-Null
@@ -121,7 +150,18 @@ Start-ScheduledTask -TaskName 'windows-pc-setup sshd restart'
 PS
 )"
 sleep 8
-on_pc "Unregister-ScheduledTask -TaskName 'windows-pc-setup sshd restart' -Confirm:\$false -ErrorAction SilentlyContinue; 'sshd: ' + (Get-Service sshd).Status"
+# The restarted daemon must be the one listening, on loopback only; until then nothing else runs.
+on_pc "$SSHD_CHECK
+$(cat <<'PS'
+$ErrorActionPreference = 'Stop'
+Unregister-ScheduledTask -TaskName 'windows-pc-setup sshd restart' -Confirm:$false -ErrorAction SilentlyContinue
+for ($i = 0; $i -lt 15; $i++) {
+  if ((Get-Service sshd).Status -eq 'Running' -and (Test-Listening)) { 'sshd: running, on 127.0.0.1 only'; exit 0 }
+  Start-Sleep -Seconds 2
+}
+throw 'sshd is not running on 127.0.0.1 only'
+PS
+)"
 
 echo "3/7 the clients' public keys"
 KEYS=""
@@ -203,35 +243,7 @@ New-Item -ItemType File -Force "$t.changed" | Out-Null
 PS
 )"
 
-echo "6/7 the connector: SYSTEM task 'cloudflared $ALIAS', at boot"
-on_pc "$(ps_vars Alias "$ALIAS")
-$(cat <<'PS'
-$ErrorActionPreference = 'Stop'
-$dir = "$env:ProgramData\cloudflared-$Alias"
-$name = "cloudflared $Alias"
-$cfArgs = "tunnel --no-autoupdate --logfile `"$dir\cloudflared.log`" run --token-file `"$dir\token`""
-$action = New-ScheduledTaskAction -Execute "$dir\cloudflared.exe" -Argument $cfArgs
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-  -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-$existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-$changed = @()
-if ($null -eq $existing -or $existing.Actions[0].Arguments -ne $cfArgs -or $existing.Actions[0].Execute -ne "$dir\cloudflared.exe") { $changed += 'its task changed' }
-if (Test-Path "$dir\token.changed") { $changed += 'its token changed' }
-if ($null -eq $existing -or $existing.State -ne 'Running') { $changed += 'it is not running' }
-if ($changed.Count -eq 0) { 'connector: unchanged and running; not restarted'; exit 0 }
-Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-# Restarting ends every session through this connector, this one too when it came that way: a one-off SYSTEM task.
-$restart = "Stop-ScheduledTask -TaskName '$name'; Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$dir\cloudflared.exe' } | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName '$name'; Remove-Item '$dir\token.changed' -ErrorAction SilentlyContinue"
-$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -Command Start-Sleep 2; $restart"
-Register-ScheduledTask -TaskName "$name restart" -Action $a -Principal $principal -Force | Out-Null
-Start-ScheduledTask -TaskName "$name restart"
-"connector: restarting ($($changed -join ', ')); sessions through it will drop"
-PS
-)"
-
-echo "7/7 Windows-MCP $WINDOWS_MCP_VERSION in the user's session (uv $UV_VERSION)"
+echo "6/7 Windows-MCP $WINDOWS_MCP_VERSION in the user's session (uv $UV_VERSION)"
 on_pc "$(ps_vars UvVersion "$UV_VERSION" UvSha "$UV_SHA256_WINDOWS_AMD64_ZIP" McpVersion "$WINDOWS_MCP_VERSION")
 $(cat <<'PS'
 $ErrorActionPreference = 'Stop'
@@ -259,25 +271,65 @@ if (-not [Environment]::GetEnvironmentVariable('WINDOWS_MCP_AUTH_KEY', 'User')) 
 $env:ANONYMIZED_TELEMETRY = 'false'
 $env:WINDOWS_MCP_AUTH_KEY = [Environment]::GetEnvironmentVariable('WINDOWS_MCP_AUTH_KEY', 'User')
 $ErrorActionPreference = 'Continue'
+# Always stopped first: the running server holds its environment's files (uv cannot replace them) and keeps the
+# settings it started with (install --force recreates the task, not the process).
+Stop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object { $_.CommandLine -like '*windows_mcp*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
 if (@(& $uv tool list 2>$null) -contains "windows-mcp v$McpVersion") {
   "windows-mcp ${McpVersion}: already installed"
 } else {
-  # The running server holds its environment's files: stop it first, or uv cannot replace them.
-  Stop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue
-  Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object { $_.CommandLine -like '*windows_mcp*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  Start-Sleep -Seconds 2
   & $uv tool install --python 3.14 "windows-mcp==$McpVersion" 2>&1 | ForEach-Object { "$_" }
   if ($LASTEXITCODE -ne 0) { 'uv tool install failed'; exit 1 }
 }
 & "$bin\windows-mcp.exe" install --transport streamable-http --host 127.0.0.1 --port 8000 --force 2>&1 | ForEach-Object { "$_" }
 if ($LASTEXITCODE -ne 0) { 'windows-mcp install failed'; exit 1 }
 for ($i = 0; $i -lt 30; $i++) {
-  if (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) { 'windows-mcp: listening on 127.0.0.1:8000'; exit 0 }
+  if (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) { break }
   Start-Sleep -Seconds 2
 }
-"windows-mcp did not start listening; see $env:USERPROFILE\.windows-mcp\server.error.log"
-exit 1
+if (-not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue)) {
+  "windows-mcp did not start listening; see $env:USERPROFILE\.windows-mcp\server.error.log"; exit 1
+}
+# The server now running must be the one with the key: a request without it is refused.
+try {
+  Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://127.0.0.1:8000/mcp -Body '{}' -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+  $status = 200
+} catch {
+  $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+}
+if ($status -ne 401) { "windows-mcp answered a request without its key with $status, not 401"; exit 1 }
+'windows-mcp: listening on 127.0.0.1:8000, refusing requests without its key'
 PS
 )"
+# Last: restarting the connector ends every session through it, so nothing may follow it.
+echo "7/7 the connector: SYSTEM task 'cloudflared $ALIAS', at boot"
+on_pc "$(ps_vars Alias "$ALIAS")
+$(cat <<'PS'
+$ErrorActionPreference = 'Stop'
+$dir = "$env:ProgramData\cloudflared-$Alias"
+$name = "cloudflared $Alias"
+$cfArgs = "tunnel --no-autoupdate --logfile `"$dir\cloudflared.log`" run --token-file `"$dir\token`""
+$action = New-ScheduledTaskAction -Execute "$dir\cloudflared.exe" -Argument $cfArgs
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+$existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+$changed = @()
+if ($null -eq $existing -or $existing.Actions[0].Arguments -ne $cfArgs -or $existing.Actions[0].Execute -ne "$dir\cloudflared.exe") { $changed += 'its task changed' }
+if (Test-Path "$dir\token.changed") { $changed += 'its token changed' }
+if ($null -eq $existing -or $existing.State -ne 'Running') { $changed += 'it is not running' }
+if ($changed.Count -eq 0) { 'connector: unchanged and running; not restarted'; exit 0 }
+Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+# Restarting ends every session through this connector, this one too when it came that way: a one-off SYSTEM task.
+$restart = "Stop-ScheduledTask -TaskName '$name'; Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$dir\cloudflared.exe' } | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName '$name'; Remove-Item '$dir\token.changed' -ErrorAction SilentlyContinue"
+$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -Command Start-Sleep 2; $restart"
+Register-ScheduledTask -TaskName "$name restart" -Action $a -Principal $principal -Force | Out-Null
+Start-ScheduledTask -TaskName "$name restart"
+"connector: restarting ($($changed -join ', ')); sessions through it will drop"
+PS
+)"
+
 echo "done. From each client: ssh $ALIAS true; then scripts/windows/windows-mcp-client-setup.sh $ALIAS as that account"

@@ -61,19 +61,27 @@ class Setup(unittest.TestCase):
         self.assertRegex(pin(SETUP, "WINDOWS_MCP_VERSION"), r"^\d+\.\d+\.\d+$")
 
     def test_every_download_is_checked_before_it_is_used(self):
-        s4, s7 = step(4), step(7)
+        s4, s6 = step(4), step(6)
         self.assertLess(s4.index("-ne $CfdSha) { Remove-Item"), s4.index('Move-Item -Force "$exe.new" $exe'))
-        self.assertLess(s7.index("-ne $UvSha) { Remove-Item"), s7.index("Expand-Archive"))
-        self.assertIn('"windows-mcp==$McpVersion"', s7)
+        self.assertLess(s6.index("-ne $UvSha) { Remove-Item"), s6.index("Expand-Archive"))
+        self.assertIn('"windows-mcp==$McpVersion"', s6)
 
-    def test_sshd_is_closed_to_the_network_and_checked_before_restart(self):
+    def test_sshd_is_judged_by_its_effective_settings_and_its_listeners(self):
+        # A text check passed a config that also had ListenAddress 0.0.0.0 or an earlier PasswordAuthentication yes.
         s2 = step(2)
         self.assertIn("Disable-NetFirewallRule", s2)
-        for line in ("ListenAddress 127.0.0.1", "PasswordAuthentication no", "ChallengeResponseAuthentication no"):
-            self.assertIn(line, s2)
-        self.assertLess(s2.index("sshd.exe\" -t"), s2.index("Restart-Service sshd"))
-        self.assertIn("restored it'; exit 1", s2)
+        self.assertIn('& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1"', SETUP)
+        self.assertIn("$_ -notmatch '^127\\.0\\.0\\.1:'", SETUP)
+        self.assertIn("($o -contains 'passwordauthentication no')", SETUP)
+        self.assertNotIn("$lines -notcontains", SETUP)
+        # the early return needs both the effective settings and the running daemon's listeners
+        self.assertIn("if ((Test-KeysOnlyLoopback (Get-Effective)) -and (Test-Listening)) { 'sshd: already", s2)
+        # a rewrite that still fails the check is restored and stops the script
+        self.assertIn("throw 'sshd_config is still not keys only and loopback only; restored it'", s2)
         self.assertIn("-UserId SYSTEM", s2)  # a restart from the session would die with it
+        # and the restarted daemon is checked before anything else runs
+        after = s2[s2.index("Start-ScheduledTask -TaskName 'windows-pc-setup sshd restart'"):]
+        self.assertIn("throw 'sshd is not running on 127.0.0.1 only'", after)
 
     def test_the_token_goes_through_stdin_into_a_system_only_folder(self):
         s4, s5 = step(4), step(5)
@@ -85,8 +93,10 @@ class Setup(unittest.TestCase):
         self.assertNotRegex(code(SETUP), r"ps_vars[^\n]*(TOKEN|SECRET)")
         self.assertNotRegex(code(SETUP), r"--token(?!-file)")
 
-    def test_the_connector_is_a_system_task_at_boot_restarted_out_of_band(self):
-        s6 = step(6)
+    def test_the_connector_is_a_system_task_at_boot_restarted_last(self):
+        s6 = step(7)
+        # nothing runs after the restart that would cut its session
+        self.assertNotIn("on_pc", code(SETUP)[code(SETUP).index("Start-ScheduledTask -TaskName \"$name restart\""):])
         self.assertIn("New-ScheduledTaskTrigger -AtStartup", s6)
         self.assertIn("-UserId SYSTEM -LogonType ServiceAccount", s6)
         self.assertIn("run --token-file", s6)
@@ -94,12 +104,18 @@ class Setup(unittest.TestCase):
         self.assertIn("'connector: unchanged and running; not restarted'; exit 0", s6)
 
     def test_windows_mcp_has_no_telemetry_a_key_and_stays_on_loopback(self):
-        s7 = step(7)
+        s7 = step(6)
         self.assertIn("SetEnvironmentVariable('ANONYMIZED_TELEMETRY', 'false', 'User')", s7)
         self.assertIn("RandomNumberGenerator", s7)
         self.assertIn("--host 127.0.0.1 --port 8000", s7)
         self.assertNotRegex(s7, r'"[^"\n]*\$key')  # the key is never printed
-        self.assertLess(s7.index("Stop-ScheduledTask -TaskName windows-mcp-server"), s7.index("tool install"))
+        # always stopped, installed or not, so the server that runs is the one with today's settings
+        before_check = s7[:s7.index("if (@(& $uv tool list")]
+        self.assertIn("\nStop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue\n", before_check)
+        self.assertRegex(before_check, r"\nGet-CimInstance Win32_Process -Filter \"Name = 'python\.exe'\" \| Where-Object \{ \$_\.CommandLine -like '\*windows_mcp\*' \}")
+        # and it must refuse a request without the key
+        self.assertIn('if ($status -ne 401) {', s7)
+        self.assertLess(s7.index("Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://127.0.0.1:8000/mcp"), s7.index("refusing requests without its key"))
 
     def test_scripts_parse(self):
         for path in ("scripts/windows-pc-setup.sh", "scripts/windows-pc-bootstrap.sh", "scripts/windows/windows-mcp-bridge",
@@ -128,7 +144,8 @@ class Bootstrap(unittest.TestCase):
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 0, r.stderr)
             line = (ssh / "authorized_keys").read_text().strip()
-            self.assertTrue(line.startswith('restrict,port-forwarding,permitlisten="127.0.0.1:21899",permitopen="127.0.0.1:1",command="/bin/false" ssh-ed25519 '))
+            self.assertRegex(line, r'^restrict,port-forwarding,permitlisten="127\.0\.0\.1:21899",permitopen="127\.0\.0\.1:1",'
+                                   r'command="/bin/false",expiry-time="\d{12}" ssh-ed25519 ')
             self.assertNotIn('permitopen="none"', line)
             again = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", (ssh / "to-test-pc.pub").read_text().strip()],
                                    capture_output=True, text=True, env=env)
@@ -145,6 +162,14 @@ class Client(unittest.TestCase):
         self.assertNotRegex(code(BRIDGE), r"--header [^-]")
         self.assertIn("umask 077", BRIDGE)
         self.assertNotRegex(code(BRIDGE), r"echo[^\n]*\$key")
+
+    def test_the_forward_is_ssh_itself_so_it_ends_with_the_session(self):
+        # Backgrounding the ssh_pc function made $! a subshell's pid: the forward outlived every session.
+        self.assertRegex(BRIDGE, r"\nssh -o BatchMode=yes -o ConnectTimeout=15 -N [^\n]*\\\n  -L \"127\.0\.0\.1:\$PORT:127\.0\.0\.1:8000\" \"\$ALIAS\" </dev/null >&2 &\nFWD=\$!")
+        self.assertIn('wait "$FWD"', BRIDGE)
+
+    def test_the_bootstrap_uses_only_windows_own_openssh(self):
+        self.assertNotIn("winget", BOOT_PS)  # a winget install lands outside System32\OpenSSH, where the paste looks
 
     def test_the_forward_is_kept_from_a_launchers_proxy(self):
         self.assertIn("env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy", BRIDGE)
