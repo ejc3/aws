@@ -83,5 +83,32 @@ class WatchTests(unittest.TestCase):
         self.assertIn("two minutes after the deadline", TF)
 
 
+
+class XStepTests(unittest.TestCase):
+    def test_x_schedule_is_created_off_and_invokes_the_pass_with_step_x(self):
+        var = block("variable", "news_x_schedule_enabled")
+        self.assertRegex(var, r"default     = false\b")
+        sch = block("aws_scheduler_schedule", "dolphin_labs_news_x")
+        self.assertIn('state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"', sch)
+        self.assertIn('schedule_expression          = "rate(5 minutes)"', sch)
+        self.assertIn("arn      = aws_lambda_function.dolphin_labs_news_pass.arn", sch)
+        self.assertIn("role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn", sch)
+        self.assertIn('input    = jsonencode({ step = "x" })', sch)
+
+    def test_monid_secret_value_is_set_out_of_band_and_read_only_by_the_pass(self):
+        self.assertIn('name                    = "dolphin-labs/monid"', block("aws_secretsmanager_secret", "dolphin_labs_monid"))
+        self.assertNotIn("aws_secretsmanager_secret_version", TF)
+        pol = block("aws_secretsmanager_secret_policy", "dolphin_labs_monid")
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn])", pol)
+        self.assertIn("aws_secretsmanager_secret.dolphin_labs_monid.arn", block("aws_iam_role_policy", "dolphin_labs_news_pass"))
+        self.assertIn("MONID_SECRET_ID       = aws_secretsmanager_secret.dolphin_labs_monid.name", TF)
+
+    def test_dev_box_may_only_put_the_monid_key(self):
+        put = block("aws_iam_role_policy", "box_dolphin_labs_monid_put")
+        self.assertIn("for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id }", put)
+        self.assertEqual(re.findall(r'"secretsmanager:\w+"', put), ['"secretsmanager:PutSecretValue"'])
+        self.assertIn("Resource = aws_secretsmanager_secret.dolphin_labs_monid.arn", put)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

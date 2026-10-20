@@ -23,6 +23,8 @@
 #   dolphin-labs/news             JSON secret: KV_REST_API_URL and KV_REST_API_TOKEN, the Dolphin Redis
 #                                 (dolphin-redis.tf) the site reads the lists from. Value set out of band.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
+#   dolphin-labs/monid            JSON secret: MONID_API_KEY, for the X-posts step. Value set out of band by
+#                                 the dev box (nextjs-dev may put a value, not read one).
 #
 # The schedule starts DISABLED. Switch-over, in order: the first deploy of the bundle; the secret's value;
 # turn OFF refresh-news.yml's schedule in dolphin-labs (both would run every hour, bill Haiku and
@@ -30,18 +32,29 @@
 # before the deploy fails on the stand-in, which the errors alarm reports; once enabled, the 'has not run'
 # alarm watches that the schedule actually fires.
 #
+# The X-posts step is the same function invoked with {"step":"x"} by its own 5-minute schedule
+# (dolphin-labs-news-x). It starts DISABLED; set news_x_schedule_enabled = true once dolphin-labs deploys a
+# bundle that handles the step and the Monid secret has a value.
+#
 # Who reaches what:
-#   the function            Bedrock Haiku 5.5; journal/ (write); the two secrets (read); its own logs
+#   the function            Bedrock Haiku 5.5; journal/ (write); its secrets (read); its own logs
 #   deploy-news.yml (main)  code/ (write); UpdateFunctionCode, GetFunction(Configuration) on this function only
 #   refresh-news.yml (main) journal/ (write), through dolphin-labs-news-bedrock, until it is retired
 #   nextjs-dev (the dolphin box, where replays run)
 #                           journal/ and local/ (read); local/ (write). Not dev-ebs-only: that role is the
 #                           I/O box's too (io-box.tf), and a persistent NFS server has no business here.
+#                           dolphin-labs/monid: put a value only.
 
 variable "dolphin_labs_news_enabled" {
   description = "Run dolphin-labs' news pass on its schedule. false keeps the function and its data and stops the runs. Turn refresh-news.yml's schedule off in dolphin-labs first (see the file header)."
   type        = bool
   default     = true # on since 2026-10-15; refresh-news.yml is off in dolphin-labs (NEWS_RUNS_IN_AWS)
+}
+
+variable "news_x_schedule_enabled" {
+  description = "Invoke the news pass function with {\"step\":\"x\"} every 5 minutes (the X-posts step). false keeps the schedule and stops the runs. Turn on once dolphin-labs deploys a bundle that handles the step and dolphin-labs/monid has a value."
+  type        = bool
+  default     = false
 }
 
 locals {
@@ -209,6 +222,36 @@ resource "aws_secretsmanager_secret_policy" "dolphin_labs_news" {
 }
 
 # -------------------------------------------------------------------------------------
+# Secret (Monid, for the X-posts step)
+# -------------------------------------------------------------------------------------
+
+# The value is a JSON object {"MONID_API_KEY": "..."}, set out of band by the dev box (nextjs-dev may put a
+# value, below, and cannot read one back), from a 0600 file, never on a command line:
+#   aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/monid \
+#     --secret-string file://monid-secret.json     # {"MONID_API_KEY": "..."}
+resource "aws_secretsmanager_secret" "dolphin_labs_monid" {
+  name                    = "dolphin-labs/monid"
+  description             = "dolphin-labs news pass, X-posts step: the Monid API key (JSON: MONID_API_KEY). Value set out of band; see dolphin-labs-news.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "dolphin-labs/monid", Project = "dolphin-labs" }
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_labs_monid" {
+  secret_arn = aws_secretsmanager_secret.dolphin_labs_monid.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheNewsPassCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.dolphin_labs_monid.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_labs_news_pass.arn]) } }
+    }]
+  })
+}
+
+# -------------------------------------------------------------------------------------
 # Function
 # -------------------------------------------------------------------------------------
 
@@ -252,7 +295,7 @@ resource "aws_iam_role_policy" "dolphin_labs_news_pass" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_labs_monid.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -288,6 +331,7 @@ resource "aws_lambda_function" "dolphin_labs_news_pass" {
     variables = {
       NEWS_SECRET_ID        = aws_secretsmanager_secret.dolphin_labs_news.name
       BROWSERBASE_SECRET_ID = aws_secretsmanager_secret.browserbase.name
+      MONID_SECRET_ID       = aws_secretsmanager_secret.dolphin_labs_monid.name
       DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.search_fetch_api_key["deepseek"].name
       EXA_SECRET_ID         = aws_secretsmanager_secret.search_fetch_api_key["exa"].name
       SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
@@ -360,6 +404,33 @@ resource "aws_scheduler_schedule" "dolphin_labs_news_pass" {
     arn      = aws_lambda_function.dolphin_labs_news_pass.arn
     role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn
 
+    retry_policy {
+      maximum_retry_attempts       = 0
+      maximum_event_age_in_seconds = 300
+    }
+  }
+}
+
+# The X-posts step: the same function and scheduler role, every 5 minutes, with {"step":"x"} as its event.
+# Created DISABLED (news_x_schedule_enabled), so turning it on is a variable flip. dolphin-labs' X step
+# spends Monid searches only inside game windows. Its runs share the function's one-at-a-time limit with the
+# hourly pass and count in the Invocations and Errors the alarms below read.
+resource "aws_scheduler_schedule" "dolphin_labs_news_x" {
+  name       = "dolphin-labs-news-x"
+  group_name = "default"
+  state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"
+
+  flexible_time_window { mode = "OFF" }
+
+  schedule_expression          = "rate(5 minutes)"
+  schedule_expression_timezone = "UTC"
+
+  target {
+    arn      = aws_lambda_function.dolphin_labs_news_pass.arn
+    role_arn = aws_iam_role.dolphin_labs_news_scheduler.arn
+    input    = jsonencode({ step = "x" })
+
+    # The next run, 5 minutes on, is the retry.
     retry_policy {
       maximum_retry_attempts       = 0
       maximum_event_age_in_seconds = 300
@@ -529,6 +600,23 @@ resource "aws_iam_role_policy" "box_dolphin_labs_news_operate" {
         Resource = aws_secretsmanager_secret.dolphin_labs_news.arn
       },
     ]
+  })
+}
+
+# The dev box puts the Monid key (dolphin-labs/monid). Put only: the secret's policy keeps it from reading
+# the value back, and nothing here reaches any other secret.
+resource "aws_iam_role_policy" "box_dolphin_labs_monid_put" {
+  for_each = { nextjs-dev = aws_iam_role.nextjs_dev.id }
+  name     = "dolphin-labs-monid-put"
+  role     = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "PutTheMonidKey"
+      Effect   = "Allow"
+      Action   = "secretsmanager:PutSecretValue"
+      Resource = aws_secretsmanager_secret.dolphin_labs_monid.arn
+    }]
   })
 }
 
