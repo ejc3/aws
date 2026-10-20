@@ -165,17 +165,21 @@ class WatchdogHarness(unittest.TestCase):
     """The real parallel-box-watchdog.tf Lambda body against fake boto3: the LaunchTime lifetime
     is the one bound on the GPU box that nothing on the box can switch off."""
 
-    def run_watchdog(self, instances, cpu, terminate_error=None):
+    def run_watchdog(self, instances, cpu, terminate_error=None, io=None, io_thresholds=None, volumes=None):
         code = re.search(r'parallel_watchdog_code = <<-PY\n(.*?)\n  PY', source('parallel-box-watchdog.tf'), re.S).group(1)
         code = textwrap.dedent(code)
         now = datetime.datetime.now(datetime.timezone.utc)
-        calls = {'terminate': [], 'sns': []}
+        calls = {'terminate': [], 'sns': [], 'metrics': []}
+        io = io or {}
+        volumes = volumes or {}
 
         class EC2:
             def describe_instances(self, Filters):
                 return {'Reservations': [{'Instances': [
                     {'InstanceId': iid, 'LaunchTime': now - datetime.timedelta(minutes=age),
-                     'Tags': [{'Key': 'Name', 'Value': name}] + [{'Key': k, 'Value': v} for k, v in extra]}
+                     'Tags': [{'Key': 'Name', 'Value': name}] + [{'Key': k, 'Value': v} for k, v in extra],
+                     'BlockDeviceMappings': [{'DeviceName': '/dev/sd%s' % chr(97 + n), 'Ebs': {'VolumeId': vol}}
+                                             for n, vol in enumerate(volumes.get(iid, []))]}
                     for iid, name, age, *more in instances for extra in [more[0] if more else {}.items()]]}]}
 
             def terminate_instances(self, InstanceIds):
@@ -185,8 +189,18 @@ class WatchdogHarness(unittest.TestCase):
 
         class CW:
             def get_metric_statistics(self, **kwargs):
-                peak = cpu[kwargs['Dimensions'][0]['Value']]
-                return {'Datapoints': [{'Maximum': peak}, {'Maximum': peak}]}
+                iid, metric = kwargs['Dimensions'][0]['Value'], kwargs['MetricName']
+                calls['metrics'].append((iid, metric, tuple(kwargs['Statistics'])))
+                if kwargs['Namespace'] == 'AWS/EBS':
+                    # A volume's series: windows are keyed by timestamp so the code can sum volumes per window.
+                    assert kwargs['Dimensions'][0]['Name'] == 'VolumeId' and kwargs['Period'] == 300
+                    return {'Datapoints': [{'Timestamp': n, 'Sum': v} for n, v in enumerate(io.get(iid, {}).get(metric, []))]}
+                assert kwargs['Namespace'] == 'AWS/EC2' and kwargs['Dimensions'][0]['Name'] == 'InstanceId'
+                if metric == 'CPUUtilization':
+                    peak = cpu[iid]
+                    return {'Datapoints': [{'Maximum': peak}, {'Maximum': peak}]}
+                # Five-minute byte sums per window; a metric not given has no series at all.
+                return {'Datapoints': [{'Sum': v} for v in io.get(iid, {}).get(metric, [])]}
 
         class SNS:
             def publish(self, **kwargs):
@@ -200,6 +214,8 @@ class WatchdogHarness(unittest.TestCase):
         slots = GpuBoxTests.SLOT_NAMES
         os.environ.update(TAG_NAMES=','.join(['parallel-box'] + ['parallel-box-%d' % n for n in range(2, 9)] + ['pbox-colton'] + slots), IDLE_MINUTES='30',
                           MAX_AGE_MINUTES=json.dumps({n: 240 for n in slots}), SNS_TOPIC_ARN='arn:aws:sns:test')
+        if io_thresholds is not None:
+            os.environ['IO_THRESHOLDS'] = json.dumps(io_thresholds)
         try:
             env = {}
             exec(compile(code, 'index.py', 'exec'), env)
@@ -247,6 +263,106 @@ class WatchdogHarness(unittest.TestCase):
         self.assertIn('fresh work volume was deleted with it', fb)
         self.assertNotIn('Its work volume is untouched', fb)
         self.assertIn('Its work volume is untouched', home)
+
+    # The thresholds Terraform passes, decoded from parallel-box-watchdog.tf's jsonencode (#532).
+    @staticmethod
+    def io_thresholds():
+        body = re.search(r'parallel_watchdog_io_thresholds = jsonencode\(\{\n(.*?)\n  \}\)', source('parallel-box-watchdog.tf'), re.S).group(1)
+        out = {}
+        for line in body.splitlines():
+            name, expr = [x.strip() for x in line.split('=')]
+            a, b = [int(x) for x in expr.split('*')]
+            out[name] = a * b
+        return out
+
+    MIB = 1048576
+    # Measured 2026-10-19 on Ohio parallel boxes the old watchdog reaped as idle (MiB per five minutes, the 30-minute
+    # window before each reap): the first two were idle, the rest were working under 5% CPU.
+    IDLE_EBS = [64.4, 62.9, 68.4, 77.5, 74.6, 80.2]           # i-03ca1cbd42d5ba817, 0.0% CPU
+    IDLE_EBS_AFTER_JOB = [164.7, 39.7, 69.4, 47.8, 9.6, 8.0]  # i-0bc2905f612dcf33c, a job ended just before the window
+    STORAGE_JOB = [10688.9, 10810.8, 10902.9, 10854.6, 8124.3, 8346.3]  # i-0ce383ccaec76e537 instance store, 5-9% CPU
+    EBS_JOB = [1684.9, 25.9, 43.2, 41.7, 41.5, 19.1]          # i-05b6ecccaa04b9fa8, 1.3% CPU
+    NET_JOB = [181.6, 0.0, 0.1, 0.0, 0.0, 0.0]                # i-04e12eff452c3ff63 NetworkIn, 2.6% CPU
+
+    def test_the_thresholds_sit_between_the_measured_idle_floor_and_real_work(self):
+        t = self.io_thresholds()
+        self.assertEqual(sorted(t), ['DiskReadBytes', 'DiskWriteBytes', 'EBSReadBytes', 'EBSWriteBytes', 'NetworkIn', 'NetworkOut'])
+        for disk in ('DiskReadBytes', 'DiskWriteBytes', 'EBSReadBytes', 'EBSWriteBytes'):
+            self.assertGreater(t[disk], max(self.IDLE_EBS + self.IDLE_EBS_AFTER_JOB) * self.MIB)
+            self.assertLess(t[disk], min(max(self.STORAGE_JOB), max(self.EBS_JOB)) * self.MIB)
+        for net in ('NetworkIn', 'NetworkOut'):
+            self.assertGreater(t[net], 3 * self.MIB)
+            self.assertLess(t[net], max(self.NET_JOB) * self.MIB)
+
+    def test_disk_or_network_work_under_the_cpu_bar_keeps_the_box(self):
+        mib = lambda xs: [x * self.MIB for x in xs]
+        actions, calls = self.run_watchdog(
+            [('i-idle', 'parallel-box', 45), ('i-after', 'parallel-box-2', 45), ('i-nvme', 'parallel-box-3', 45),
+             ('i-ebs', 'parallel-box-4', 45), ('i-net', 'pbox-colton', 45), ('i-gpu', 'gpu-box-2', 45),
+             ('i-cpu', 'parallel-box-5', 45)],
+            {'i-idle': 0.0, 'i-after': 1.4, 'i-nvme': 4.9, 'i-ebs': 1.3, 'i-net': 2.6, 'i-gpu': 0.5, 'i-cpu': 50.0},
+            io={'i-idle': {'EBSWriteBytes': mib(self.IDLE_EBS), 'NetworkIn': mib([0.1] * 6)},
+                'i-after': {'EBSWriteBytes': mib(self.IDLE_EBS_AFTER_JOB)},
+                'i-nvme': {'DiskWriteBytes': mib(self.STORAGE_JOB), 'EBSWriteBytes': mib(self.IDLE_EBS)},
+                'i-ebs': {'EBSWriteBytes': mib(self.EBS_JOB)},
+                'i-net': {'NetworkIn': mib(self.NET_JOB)},
+                'i-gpu': {'NetworkOut': mib([70.0, 0, 0, 0, 0, 0])}},
+            io_thresholds=self.io_thresholds())
+        self.assertEqual(actions, {'i-idle': 'terminated', 'i-after': 'terminated', 'i-nvme': 'busy_io', 'i-ebs': 'busy_io',
+                                   'i-net': 'busy_io', 'i-gpu': 'busy_io', 'i-cpu': 'busy'})
+        self.assertEqual(calls['terminate'], ['i-idle', 'i-after'])
+        idle = [b for b in calls['body'] if 'i-idle' in b][0]
+        self.assertIn('and under its disk and network thresholds and was terminated', idle)
+        # Byte metrics are five-minute sums; a box over the CPU bar is never asked about I/O.
+        self.assertTrue(all(st == ('Sum',) for _, m, st in calls['metrics'] if m != 'CPUUtilization'))
+        self.assertEqual([m for i, m, _ in calls['metrics'] if i == 'i-cpu'], ['CPUUtilization'])
+
+    def test_missing_io_series_are_no_activity_and_missing_cpu_still_never_reaps(self):
+        # An EBS-only type has no DiskRead/WriteBytes series at all: that must not keep it alive or crash the check.
+        actions, calls = self.run_watchdog([('i-1', 'parallel-box', 45)], {'i-1': 0.0}, io={},
+                                           io_thresholds=self.io_thresholds())
+        self.assertEqual(actions, {'i-1': 'terminated'})
+        self.assertEqual(len([m for _, m, _ in calls['metrics'] if m != 'CPUUtilization']), 6)
+
+    def test_a_bare_metal_box_with_no_instance_ebs_series_reads_its_volumes(self):
+        # kvm-96/kvm-192 are .metal types: AWS documents EBSRead/WriteBytes only for Nitro instances that are not bare
+        # metal. The attached volumes' AWS/EBS series stand in, summed per window across the volumes.
+        mib = lambda xs: [x * self.MIB for x in xs]
+        actions, calls = self.run_watchdog(
+            [('i-kvm', 'parallel-box', 45), ('i-split', 'parallel-box-2', 45), ('i-quiet', 'parallel-box-3', 45),
+             ('i-novol', 'parallel-box-4', 45), ('i-nitro', 'parallel-box-5', 45)],
+            {'i-kvm': 1.0, 'i-split': 1.0, 'i-quiet': 0.0, 'i-novol': 0.0, 'i-nitro': 0.0},
+            io={'vol-root': {'VolumeWriteBytes': mib([70.0] * 6)}, 'vol-work': {'VolumeWriteBytes': mib(self.EBS_JOB)},
+                # 300 + 300 MiB in one window on two volumes: over 512 only when summed
+                'vol-a': {'VolumeReadBytes': mib([300.0, 10.0])}, 'vol-b': {'VolumeReadBytes': mib([300.0, 10.0])},
+                'vol-q': {'VolumeWriteBytes': mib(self.IDLE_EBS)},
+                # a non-metal box publishes the instance series (idle here): its volumes are never asked
+                'i-nitro': {'EBSWriteBytes': mib(self.IDLE_EBS), 'EBSReadBytes': mib([0.0] * 6)},
+                'vol-n': {'VolumeWriteBytes': mib(self.EBS_JOB)}},
+            io_thresholds=self.io_thresholds(),
+            volumes={'i-kvm': ['vol-root', 'vol-work'], 'i-split': ['vol-a', 'vol-b'], 'i-quiet': ['vol-q'],
+                     'i-nitro': ['vol-n']})
+        self.assertEqual(actions, {'i-kvm': 'busy_io', 'i-split': 'busy_io', 'i-quiet': 'terminated',
+                                   'i-novol': 'terminated', 'i-nitro': 'terminated'})
+        self.assertNotIn('vol-n', [i for i, _, _ in calls['metrics']])
+        self.assertTrue(all(st == ('Sum',) for i, _, st in calls['metrics'] if i.startswith('vol-')))
+
+    def test_without_thresholds_it_is_cpu_alone(self):
+        # The members' Windows boxes pass none (member-wbox.tf): their behaviour and their metric calls are unchanged.
+        actions, calls = self.run_watchdog([('i-1', 'parallel-box', 45)], {'i-1': 0.0},
+                                           io={'i-1': {'EBSWriteBytes': [10 ** 12]}})
+        self.assertEqual(actions, {'i-1': 'terminated'})
+        self.assertEqual([m for _, m, _ in calls['metrics']], ['CPUUtilization'])
+        self.assertNotIn('thresholds', calls['body'][0])
+
+    def test_every_parallel_watchdog_passes_the_thresholds_and_the_windows_one_does_not(self):
+        threshold = 'IO_THRESHOLDS = local.parallel_watchdog_io_thresholds'
+        fn = re.search(r'resource "aws_lambda_function" "parallel_watchdog" \{.*?\n\}', source('parallel-box-watchdog.tf'), re.S).group(0)
+        ohio = re.search(r'resource "aws_lambda_function" "parallel_watchdog_ohio" \{.*?\n\}', source('ohio-pbox.tf'), re.S).group(0)
+        fallback = re.search(r'pbox_fallback_watchdog = \{.*?\n  \}', source('pbox-fallback.tf'), re.S).group(0)
+        for body in (fn, ohio, fallback):
+            self.assertRegex(body, r'IO_THRESHOLDS\s+= local\.parallel_watchdog_io_thresholds')
+        self.assertNotIn('IO_THRESHOLDS', source('member-wbox.tf'))
 
     def test_failed_terminate_alerts(self):
         actions, calls = self.run_watchdog([('i-old', 'gpu-box', 250), ('i-idle', 'gpu-box', 45)],

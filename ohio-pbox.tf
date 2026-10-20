@@ -272,6 +272,7 @@ resource "aws_lambda_function" "parallel_watchdog_ohio" {
       TAG_NAMES       = join(",", concat(local.parallel_box_names, local.member_pbox_names))
       MAX_AGE_MINUTES = jsonencode({ for n in local.member_pbox_names : n => local.member_box_max_hours * 60 })
       SINGLE_NAMES    = join(",", local.member_pbox_names) # one instance per member pbox
+      IO_THRESHOLDS   = local.parallel_watchdog_io_thresholds
       SNS_REGION      = var.aws_region
       SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }
