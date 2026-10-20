@@ -8,8 +8,10 @@
 # suppressed. The PR watch's alert step (scripts/pr-watch/SKILL.md) adds them.
 #
 # Every rule, whatever its list entry says, also requires (in the resource blocks below):
-#   - this account (data.aws_caller_identity): the Dolphin and staging accounts' findings reach this Security Hub as
-#     its members and keep alerting;
+#   - one account exactly: this account for the main rules; the staging account for the rules created there (staging
+#     runs its own Security Hub, with no administrator, in us-west-1 and us-east-1); the Dolphin account for the rules
+#     created here in us-west-1, where this account is its Security Hub administrator and its findings arrive. Each
+#     account's rules list only the controls shown to be by design THERE;
 #   - product "Security Hub": only control findings are ever suppressed. GuardDuty and Inspector findings are threats
 #     and vulnerabilities, never "by design", and no rule can match them;
 #   - an ACTIVE record.
@@ -117,6 +119,47 @@ locals {
     "us-west-2" = [module.pbox_fallback_us_west_2.security_group_arn]
     "us-east-1" = [module.pbox_fallback_us_east_1.security_group_arn]
   }
+
+  # The staging account runs the same modules/security-region, so the same controls are by design there for the same
+  # reasons (the main rules' comments): the GuardDuty protection plans, Inspector's ECR and Lambda code scanning and the
+  # custom Config recorder role. Its default groups are emptied instead (default-security-groups.tf, EC2.2).
+  security_hub_staging_rules = [for r in local.security_hub_rules : merge(r, {
+    description = replace(r.description, "in the main account", "in the staging account")
+    note        = replace(r.note, "security-hub-automation.tf", "staging account. security-hub-automation.tf")
+  }) if contains(["guardduty-protection-plans-off-by-design", "inspector-ecr-lambda-code-off-by-design", "config-custom-recorder-role-by-design"], r.name)]
+
+  # The Dolphin account (dolphin-security.tf, the same modules/security-region): the custom Config recorder role and
+  # Inspector's ECR scanning, plus ECS.2 on exactly its Redis service, which takes a public IP only to egress (its
+  # group allows no inbound and the account has no NAT; dolphin-aws redis.tf). Orders follow this region's main rules.
+  security_hub_dolphin_rules = [
+    {
+      name                = "dolphin-config-custom-recorder-role-by-design"
+      order               = 8
+      description         = "Config.1 in the Dolphin account: its recorder uses our own role and a reviewed set of types (dolphin-security.tf, modules/security-region). Stopping or deleting the recorder is recorded by the organization trail."
+      note                = "Dolphin account: Config recorder uses a custom role by design (dolphin-security.tf). security-hub-automation.tf"
+      controls            = ["Config.1"]
+      resource_comparison = ""
+      resource_ids        = []
+    },
+    {
+      name                = "dolphin-inspector-ecr-lambda-code-off-by-design"
+      order               = 9
+      description         = "Inspector.2 and Inspector.3 in the Dolphin account: ECR and Lambda code scanning are deliberately off (dolphin-security.tf, modules/security-region). Inspector's CVE findings still alert."
+      note                = "Dolphin account: Inspector ECR and Lambda code scanning deliberately off; CVE findings alert. security-hub-automation.tf"
+      controls            = ["Inspector.2", "Inspector.3"]
+      resource_comparison = ""
+      resource_ids        = []
+    },
+    {
+      name                = "dolphin-redis-public-ip-by-design"
+      order               = 10
+      description         = "ECS.2 on the Dolphin Redis service only: it takes a public IP to egress (no NAT in the account) and its security group allows no inbound (dolphin-aws redis.tf). Any other service still alerts."
+      note                = "Dolphin Redis: public IP for egress only, no inbound rule (dolphin-aws redis.tf). security-hub-automation.tf"
+      controls            = ["ECS.2"]
+      resource_comparison = "EQUALS"
+      resource_ids        = ["arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/redis"]
+    },
+  ]
 
   security_hub_rules_by_region = {
     for region, arns in local.security_hub_open_ssh_groups : region => {
@@ -303,6 +346,195 @@ resource "aws_securityhub_automation_rule" "by_design_dr" {
   }
 
   depends_on = [module.security_main_us_east_1]
+}
+
+# ---- the staging account: rules created in its own Security Hub (it has no administrator), us-west-1 and us-east-1.
+data "aws_caller_identity" "staging" {
+  provider = aws.staging
+}
+
+resource "aws_securityhub_automation_rule" "by_design_staging" {
+  provider    = aws.staging
+  for_each    = { for rule in local.security_hub_staging_rules : rule.name => rule if local.security_posture_enabled }
+  rule_name   = each.value.name
+  description = each.value.description
+  rule_order  = each.value.order
+  rule_status = "ENABLED"
+
+  criteria {
+    aws_account_id {
+      comparison = "EQUALS"
+      value      = data.aws_caller_identity.staging.account_id
+    }
+    product_name {
+      comparison = "EQUALS"
+      value      = "Security Hub"
+    }
+    dynamic "compliance_security_control_id" {
+      for_each = each.value.controls
+      content {
+        comparison = "EQUALS"
+        value      = compliance_security_control_id.value
+      }
+    }
+    dynamic "resource_id" {
+      for_each = each.value.resource_ids
+      content {
+        comparison = each.value.resource_comparison
+        value      = resource_id.value
+      }
+    }
+    record_state {
+      comparison = "EQUALS"
+      value      = "ACTIVE"
+    }
+  }
+
+  actions {
+    type = "FINDING_FIELDS_UPDATE"
+    finding_fields_update {
+      workflow {
+        status = "SUPPRESSED"
+      }
+      note {
+        text       = each.value.note
+        updated_by = "terraform"
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(each.value.controls) > 0 && (each.value.resource_comparison == "") == (length(each.value.resource_ids) == 0)
+      error_message = "A Security Hub rule names at least one control, and a resource comparison exactly when it names resources: a scoped rule with no resources would suppress the control account-wide."
+    }
+  }
+
+  depends_on = [module.security_staging_us_west_1]
+}
+
+resource "aws_securityhub_automation_rule" "by_design_staging_dr" {
+  provider    = aws.staging_dr
+  for_each    = { for rule in local.security_hub_staging_rules : rule.name => rule if local.security_posture_enabled }
+  rule_name   = each.value.name
+  description = each.value.description
+  rule_order  = each.value.order
+  rule_status = "ENABLED"
+
+  criteria {
+    aws_account_id {
+      comparison = "EQUALS"
+      value      = data.aws_caller_identity.staging.account_id
+    }
+    product_name {
+      comparison = "EQUALS"
+      value      = "Security Hub"
+    }
+    dynamic "compliance_security_control_id" {
+      for_each = each.value.controls
+      content {
+        comparison = "EQUALS"
+        value      = compliance_security_control_id.value
+      }
+    }
+    dynamic "resource_id" {
+      for_each = each.value.resource_ids
+      content {
+        comparison = each.value.resource_comparison
+        value      = resource_id.value
+      }
+    }
+    record_state {
+      comparison = "EQUALS"
+      value      = "ACTIVE"
+    }
+  }
+
+  actions {
+    type = "FINDING_FIELDS_UPDATE"
+    finding_fields_update {
+      workflow {
+        status = "SUPPRESSED"
+      }
+      note {
+        text       = each.value.note
+        updated_by = "terraform"
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(each.value.controls) > 0 && (each.value.resource_comparison == "") == (length(each.value.resource_ids) == 0)
+      error_message = "A Security Hub rule names at least one control, and a resource comparison exactly when it names resources: a scoped rule with no resources would suppress the control account-wide."
+    }
+  }
+
+  depends_on = [module.security_staging_us_east_1]
+}
+
+# ---- the Dolphin account: rules created here, its Security Hub administrator in us-west-1, applied to its findings.
+data "aws_caller_identity" "dolphin" {
+  provider = aws.dolphin
+}
+
+resource "aws_securityhub_automation_rule" "by_design_dolphin" {
+  for_each    = { for rule in local.security_hub_dolphin_rules : rule.name => rule if local.security_posture_enabled }
+  rule_name   = each.value.name
+  description = each.value.description
+  rule_order  = each.value.order
+  rule_status = "ENABLED"
+
+  criteria {
+    aws_account_id {
+      comparison = "EQUALS"
+      value      = data.aws_caller_identity.dolphin.account_id
+    }
+    product_name {
+      comparison = "EQUALS"
+      value      = "Security Hub"
+    }
+    dynamic "compliance_security_control_id" {
+      for_each = each.value.controls
+      content {
+        comparison = "EQUALS"
+        value      = compliance_security_control_id.value
+      }
+    }
+    dynamic "resource_id" {
+      for_each = each.value.resource_ids
+      content {
+        comparison = each.value.resource_comparison
+        value      = resource_id.value
+      }
+    }
+    record_state {
+      comparison = "EQUALS"
+      value      = "ACTIVE"
+    }
+  }
+
+  actions {
+    type = "FINDING_FIELDS_UPDATE"
+    finding_fields_update {
+      workflow {
+        status = "SUPPRESSED"
+      }
+      note {
+        text       = each.value.note
+        updated_by = "terraform"
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(each.value.controls) > 0 && (each.value.resource_comparison == "") == (length(each.value.resource_ids) == 0)
+      error_message = "A Security Hub rule names at least one control, and a resource comparison exactly when it names resources: a scoped rule with no resources would suppress the control account-wide."
+    }
+  }
+
+  depends_on = [module.dolphin_security_us_west_1]
 }
 
 # #515 created the EC2.9 rule as one counted resource per region; it is now the list's first entry.

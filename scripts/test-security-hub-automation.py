@@ -15,12 +15,20 @@ DEFAULTS = ROOT / "default-security-groups.tf"
 MODULE = ROOT / "modules/pbox-fallback-site/main.tf"
 ACCOUNT = "data.aws_caller_identity.current.account_id"
 
-# Resource name => (provider, region key into security_hub_rules_by_region, the security module it waits for).
+STAGING = "data.aws_caller_identity.staging.account_id"
+DOLPHIN = "data.aws_caller_identity.dolphin.account_id"
+# Resource name => (provider, the for_each source, the security module it waits for, the one account it matches).
 RESOURCES = {
-    "by_design": (None, "us-west-1", "module.security_main_us_west_1"),
-    "by_design_west2": ("aws.west2", "us-west-2", "module.security_main_us_west_2"),
-    "by_design_dr": ("aws.dr", "us-east-1", "module.security_main_us_east_1"),
+    "by_design": (None, 'local.security_hub_rules_by_region["us-west-1"]', "module.security_main_us_west_1", ACCOUNT),
+    "by_design_west2": ("aws.west2", 'local.security_hub_rules_by_region["us-west-2"]', "module.security_main_us_west_2", ACCOUNT),
+    "by_design_dr": ("aws.dr", 'local.security_hub_rules_by_region["us-east-1"]', "module.security_main_us_east_1", ACCOUNT),
+    # staging runs its own Security Hub (no administrator): its rules are created in it, matching only it
+    "by_design_staging": ("aws.staging", "local.security_hub_staging_rules", "module.security_staging_us_west_1", STAGING),
+    "by_design_staging_dr": ("aws.staging_dr", "local.security_hub_staging_rules", "module.security_staging_us_east_1", STAGING),
+    # Dolphin's findings arrive here (its Security Hub administrator, us-west-1): created here, matching only Dolphin
+    "by_design_dolphin": (None, "local.security_hub_dolphin_rules", "module.dolphin_security_us_west_1", DOLPHIN),
 }
+CALLERS = {"staging": "aws.staging", "dolphin": "aws.dolphin"}
 
 # Every rule, its controls and its resource scope. Account-wide rules have ("", []).
 IAM_PREFIX = '"arn:aws:iam::${%s}:policy/nextjs-ct-member-"' % ACCOUNT
@@ -62,6 +70,9 @@ DEFAULT_GROUPS = {
     "pbox_fallback_us_west_2": ("aws.west2", "module.pbox_fallback_us_west_2.vpc_id"),
     "east1_default": ("aws.dr", "data.aws_vpc.east1_default.id"),
     "pbox_fallback_us_east_1": ("aws.dr", "module.pbox_fallback_us_east_1.vpc_id"),
+    "staging_west1_default": ("aws.staging", "data.aws_vpc.staging_west1_default.id"),
+    "staging_east1_default": ("aws.staging_dr", "data.aws_vpc.staging_east1_default.id"),
+    "dolphin_west1_default": ("aws.dolphin", "data.aws_vpc.dolphin_west1_default.id"),
 }
 
 
@@ -190,7 +201,7 @@ class SecurityHubAutomation(unittest.TestCase):
             self.assertEqual(len(criteria), 1, name)
             crit = criteria[0][1]
             fields = {m.group(1): b for m, b in blocks(crit, r"(?m)^    (?:dynamic \")?([a-z_]+)\"?")}
-            self.assertEqual(fields.get("aws_account_id", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", ACCOUNT], name)
+            self.assertEqual(fields.get("aws_account_id", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", RESOURCES[name][3]], name)
             self.assertEqual(fields.get("product_name", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", '"Security', 'Hub"'], name)
             self.assertEqual(fields.get("record_state", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", '"ACTIVE"'], name)
             # Only these fields: nothing that could widen a rule or reach another product's findings.
@@ -203,9 +214,9 @@ class SecurityHubAutomation(unittest.TestCase):
 
     def test_regions_providers_and_preconditions(self):
         for name, body in self.resources().items():
-            provider, region, module = RESOURCES[name]
+            provider, source, module, _ = RESOURCES[name]
             self.assertEqual(attr(body, "provider"), provider, name)
-            self.assertIn('local.security_hub_rules_by_region["%s"]' % region, attr(body, "for_each"), name)
+            self.assertIn(" in %s :" % source, attr(body, "for_each"), name)
             self.assertIn("if local.security_posture_enabled", attr(body, "for_each"), name)
             self.assertIn(module, attr(body, "depends_on"), name)
             self.assertIn("(each.value.resource_comparison == \"\") == (length(each.value.resource_ids) == 0)", body, name)
@@ -215,6 +226,36 @@ class SecurityHubAutomation(unittest.TestCase):
         self.assertEqual(got, EXPECTED_RULES)
         self.assertEqual((self.ssh["name"], self.ssh["controls"], self.ssh["resource_comparison"]), (SSH_RULE, ["EC2.18", "EC2.19"], "EQUALS"))
         self.assertIsNone(self.ssh["resource_ids"])  # filled per region from security_hub_open_ssh_groups
+
+    def test_staging_rules_are_the_three_by_design_main_rules(self):
+        src = local_value(self.text, "security_hub_staging_rules")
+        names = re.findall(r'"([a-z0-9-]+-by-design)"', src)
+        self.assertEqual(names, ["guardduty-protection-plans-off-by-design", "inspector-ecr-lambda-code-off-by-design",
+                                 "config-custom-recorder-role-by-design"])
+        self.assertTrue(src.startswith("[for r in local.security_hub_rules :"), src[:60])
+        for n in names:
+            self.assertEqual(EXPECTED_RULES[n][1:], ("", []), n)  # account-wide controls only; no resource-scoped rule
+
+    def test_dolphin_rules_are_the_reviewed_set(self):
+        rules = [rule_fields(o) for o in items(local_value(self.text, "security_hub_dolphin_rules"))]
+        got = {r["name"]: (r["controls"], r["resource_comparison"], r["resource_ids"], r["order"]) for r in rules}
+        self.assertEqual(got, {
+            "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], 8),
+            "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], 9),
+            "dolphin-redis-public-ip-by-design": (["ECS.2"], "EQUALS",
+                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], 10),
+        })
+        # they share us-west-1 with the main rules: orders and names must not collide
+        main = {r["order"] for r in self.rules} | {self.ssh["order"]}
+        self.assertFalse(main & {r["order"] for r in rules})
+        for r in rules:
+            self.assertIn("security-hub-automation.tf", r["note"])
+
+    def test_account_callers_go_through_the_account_providers(self):
+        for name, provider in CALLERS.items():
+            found = blocks(self.text, r'data "aws_caller_identity" "%s"' % name)
+            self.assertEqual(len(found), 1, name)
+            self.assertEqual(attr(found[0][1], "provider"), provider, name)
 
     def test_iam_prefix_is_exactly_the_session_policies(self):
         rule = next(r for r in self.rules if r["controls"] == ["IAM.1"])

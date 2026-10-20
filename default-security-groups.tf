@@ -63,3 +63,36 @@ resource "aws_default_security_group" "pbox_fallback_us_east_1" {
   provider = aws.dr
   vpc_id   = module.pbox_fallback_us_east_1.vpc_id
 }
+
+# ============================================================ the staging and Dolphin accounts
+# Their default VPCs' default groups, emptied the same way (EC2.2 alerted in both). On 2026-10-20 none was attached to a
+# network interface; the Dolphin Redis service names its own group (dolphin-aws redis.tf), and staging runs nothing.
+data "aws_vpc" "staging_west1_default" {
+  provider = aws.staging
+  default  = true
+}
+
+data "aws_vpc" "staging_east1_default" {
+  provider = aws.staging_dr
+  default  = true
+}
+
+data "aws_vpc" "dolphin_west1_default" {
+  provider = aws.dolphin
+  default  = true
+}
+
+resource "aws_default_security_group" "staging_west1_default" {
+  provider = aws.staging
+  vpc_id   = data.aws_vpc.staging_west1_default.id
+}
+
+resource "aws_default_security_group" "staging_east1_default" {
+  provider = aws.staging_dr
+  vpc_id   = data.aws_vpc.staging_east1_default.id
+}
+
+resource "aws_default_security_group" "dolphin_west1_default" {
+  provider = aws.dolphin
+  vpc_id   = data.aws_vpc.dolphin_west1_default.id
+}
