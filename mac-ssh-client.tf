@@ -226,6 +226,9 @@ Match User pcboot
     AllowTcpForwarding remote
     GatewayPorts no
     PermitUserRC no
+# Close the block: sshd_config pulls this file in with Include near its top, so an open Match would swallow every
+# global directive that follows it there.
+Match all
 PCBOOTSSHD
 if ! cmp -s /etc/ssh/sshd_config.d/60-pcboot.conf.new /etc/ssh/sshd_config.d/60-pcboot.conf; then
   mv /etc/ssh/sshd_config.d/60-pcboot.conf /etc/ssh/sshd_config.d/60-pcboot.conf.old 2>/dev/null || true

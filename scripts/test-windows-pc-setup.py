@@ -200,6 +200,9 @@ class Bootstrap(unittest.TestCase):
                         "AllowTcpForwarding remote", "GatewayPorts no", "PermitUserRC no"):
             self.assertIn("    " + setting if setting != "Match User pcboot" else setting, snippet)
         self.assertIn("if sshd -t; then", snippet)
+        # the drop-in is Included near the top of sshd_config: its last Match must close the block
+        block = snippet[snippet.index("<<'PCBOOTSSHD'"):snippet.index("\nPCBOOTSSHD\n")]
+        self.assertEqual(re.findall(r"^Match .*$", block, re.M)[-1], "Match all")
         # installed with fcvm-arm's clients: at boot and by the daily association
         self.assertIn("fcvm_mac_ssh_clients = <<-FCVMMACS\n${local.pc_bootstrap_account}\n", tf)
 
