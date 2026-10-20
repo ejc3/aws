@@ -59,6 +59,8 @@ locals {
     "trustedadvisor:*",
     "waf:*",
   ]
+  # The one inference profile whose routed requests may land outside the three regions (see DenyOutsideMonitoredRegions).
+  dolphin_haiku_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/${local.bedrock_haiku_profile}"
   dolphin_region_scp = {
     Version = "2012-10-17"
     Statement = [
@@ -69,6 +71,13 @@ locals {
         Resource  = "*"
         Condition = {
           StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }
+          # One routed exception: the US cross-region inference profile for Claude Haiku 5.5, called in us-west-2, routes
+          # each request to us-east-1, us-east-2 or us-west-2, and Bedrock checks the routed request in its destination,
+          # so us-east-2 alone denied every call (measured 2026-10-20: 6 of 6 refused on the us-east-2 foundation model).
+          # The key is set only on requests that came through that exact profile, so nothing else outside the three
+          # regions gains anything: a direct call in us-east-2, any other model or profile, and every other service are
+          # still denied. dolphin-aws's news functions are the caller.
+          ArnNotEquals = { "bedrock:InferenceProfileArn" = local.dolphin_haiku_profile_arn }
         }
       },
       {

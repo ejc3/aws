@@ -113,6 +113,15 @@ class DolphinBootstrapTests(unittest.TestCase):
                 continue
             if path.name == "security-monitoring.tf":  # the trail key's encryption context only, pinned above
                 continue
+            if path.name == "dolphin-region-scp.tf":
+                # The SCP restricts the Dolphin account; its id appears only in the one inference-profile ARN its deny
+                # exempts, which grants the Dolphin account nothing here.
+                text = path.read_text()
+                self.assertEqual(text.count("aws_organizations_account.dolphin"), 1, path.name)
+                self.assertIn('dolphin_haiku_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/', text)
+                self.assertNotIn("local.dolphin_account_id", text, path.name)
+                self.assertNotRegex(text, r'Principal|sts:AssumeRole|"Allow"', path.name)
+                continue
             text = path.read_text()
             self.assertNotIn("aws_organizations_account.dolphin", text, path.name)
             self.assertNotIn("local.dolphin_account_id", text, path.name)
