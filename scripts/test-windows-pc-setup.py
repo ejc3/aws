@@ -148,21 +148,60 @@ class Bootstrap(unittest.TestCase):
             ssh = Path(home) / ".ssh"
             ssh.mkdir()
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "to-test-pc")], check=True)
-            env = dict(os.environ, HOME=home)
+            own = ssh / "authorized_keys"
+            own.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5ownkeyownkeyownkeyownkeyownkeyownkey ubuntu-own\n")
+            keys = Path(home) / "pcboot_authorized_keys"
+            keys.write_text("")
+            env = dict(os.environ, HOME=home, PCBOOT_KEYS=str(keys), PCBOOT_SUDO="")
             r = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", (ssh / "to-test-pc.pub").read_text().strip()],
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 0, r.stderr)
-            line = (ssh / "authorized_keys").read_text().strip()
+            line = keys.read_text().strip()
             self.assertRegex(line, r'^restrict,port-forwarding,permitlisten="127\.0\.0\.1:21899",permitopen="127\.0\.0\.1:1",'
                                    r'command="/bin/false",expiry-time="\d{12}" ssh-ed25519 ')
             self.assertNotIn('permitopen="none"', line)
+            # never ubuntu's (or anyone's) own authorized_keys: the tunnel ends on pcboot
+            self.assertEqual(own.read_text().count("\n"), 1)
+            self.assertNotIn("test-pc-bootstrap-tunnel", own.read_text())
             again = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", (ssh / "to-test-pc.pub").read_text().strip()],
                                    capture_output=True, text=True, env=env)
             self.assertEqual(again.returncode, 0)
-            self.assertEqual((ssh / "authorized_keys").read_text().count("test-pc-bootstrap-tunnel"), 1)
+            self.assertEqual(keys.read_text().count("test-pc-bootstrap-tunnel"), 1)
             bad = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", "ssh-ed25519 AAAA\nssh-rsa x"],
                                  capture_output=True, text=True, env=env)
             self.assertNotEqual(bad.returncode, 0)
+            gone = subprocess.run(["bash", str(BOOT_GEN), "retire", "test-pc"], capture_output=True, text=True, env=env)
+            self.assertEqual(gone.returncode, 0, gone.stderr)
+            self.assertNotIn("test-pc-bootstrap-tunnel", keys.read_text())
+
+    def test_allow_refuses_without_the_pcboot_account(self):
+        with tempfile.TemporaryDirectory() as home:
+            ssh = Path(home) / ".ssh"
+            ssh.mkdir()
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "to-test-pc")], check=True)
+            env = dict(os.environ, HOME=home, PCBOOT_KEYS=str(Path(home) / "missing"), PCBOOT_SUDO="")
+            r = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", (ssh / "to-test-pc.pub").read_text().strip()],
+                               capture_output=True, text=True, env=env)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertFalse((ssh / "authorized_keys").exists())
+
+    def test_no_windows_pc_script_writes_an_accounts_own_authorized_keys(self):
+        for f in [BOOT_GEN, ROOT / "scripts" / "windows-pc-setup.sh"]:
+            code = "\n".join(l for l in f.read_text().splitlines() if not l.lstrip().startswith("#"))
+            self.assertNotRegex(code, r"(~|\$HOME|/home/[a-z]+)/\.ssh/authorized_keys", f.name)
+
+    def test_pcboot_is_a_locked_down_account_installed_on_fcvm_arm(self):
+        tf = (ROOT / "mac-ssh-client.tf").read_text()
+        snippet = tf[tf.index("pc_bootstrap_account = <<-PCBOOT"):tf.index("\nPCBOOT\n")]
+        self.assertIn("--shell /usr/sbin/nologin pcboot", snippet)
+        self.assertIn("install -m 0644 -o root -g root /dev/null /etc/ssh/pcboot/authorized_keys", snippet)
+        for setting in ("Match User pcboot", "AuthorizedKeysFile /etc/ssh/pcboot/authorized_keys", "ForceCommand /bin/false",
+                        "PermitTTY no", "X11Forwarding no", "AllowAgentForwarding no", "AllowStreamLocalForwarding no",
+                        "AllowTcpForwarding remote", "GatewayPorts no", "PermitUserRC no"):
+            self.assertIn("    " + setting if setting != "Match User pcboot" else setting, snippet)
+        self.assertIn("if sshd -t; then", snippet)
+        # installed with fcvm-arm's clients: at boot and by the daily association
+        self.assertIn("fcvm_mac_ssh_clients = <<-FCVMMACS\n${local.pc_bootstrap_account}\n", tf)
 
 
 class BootstrapPrint(unittest.TestCase):
@@ -180,7 +219,7 @@ class BootstrapPrint(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             body = r.stdout[r.stdout.index("& {"):]
             self.assertNotIn("@@", body)
-            self.assertIn("$DevBox     = '%s@203.0.113.7'" % os.environ.get("USER", subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()), body)
+            self.assertIn("$DevBox     = 'pcboot@203.0.113.7'", body)
             self.assertIn("$Port       = 21899", body)
             self.assertIn((ssh / "to-test-pc.pub").read_text().split()[1], body)
 

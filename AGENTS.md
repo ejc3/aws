@@ -1232,7 +1232,9 @@ trusted than the boxes: it may be compromised. So:
 - **If a reverse tunnel is ever needed**, it terminates on a dedicated account with no shell, locked down in
   `sshd_config` (`Match User <it>`: `AllowStreamLocalForwarding no`, `AllowTcpForwarding remote`, `PermitListen` its one
   port, `ForceCommand /bin/false`, `PermitTTY no`, `X11Forwarding no`, `AllowAgentForwarding no`), its key with an
-  `expiry-time`, and the tunnel retired as soon as the machine's own route works.
+  `expiry-time`, and the tunnel retired as soon as the machine's own route works. On fcvm-arm that account is `pcboot`
+  (`pc_bootstrap_account` in `mac-ssh-client.tf`; `scripts/windows-pc-bootstrap.sh allow`/`retire` write its key file),
+  each key pinned to its one port by `permitlisten`.
 - **Nothing of the box reaches the machine**: the client configs (`mac-ssh-client.tf`) set `ForwardAgent no` and
   `ForwardX11 no`.
 - **What comes back is untrusted data**: command output, files, screenshots and Windows-MCP answers from such a machine
