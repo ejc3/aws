@@ -674,6 +674,70 @@ class MacTests(unittest.TestCase):
             r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         self.assertIn("FAILED=1", r.stdout)
 
+    def test_containers_get_the_jumpboxes_terraform(self):
+        """The version main.tf requires (both jumpboxes, drift.yml); a full sha256 of the arm64 zip."""
+        m = re.search(r'nextjs_ct_terraform = \{ version = "([0-9.]+)", sha256 = "([0-9a-f]{64})" \}', TF)
+        self.assertIsNotNone(m)
+        version = m.group(1)
+        self.assertIn('required_version = "= %s"' % version, (ROOT / "main.tf").read_text())
+        self.assertIn('TF_VERSION="%s"' % version, (ROOT / "jumpbox2-user-data.tf").read_text())
+        self.assertIn("terraform_version: %s" % version, (ROOT / ".github/workflows/drift.yml").read_text())
+        self.assertIn("    terraform           = local.nextjs_ct_terraform\n", TF)
+
+    def _provision_terraform(self, d, version="1.10.3", reports="Terraform v1.10.3", sha=None, stamp=None, have=False):
+        """Runs provision's Terraform block against a fake download; returns (installed?, curl calls, FAILED)."""
+        import hashlib, zipfile
+        prov = (CT / "provision").read_text()
+        block = prov[prov.index("# Terraform, the version"):prov.index("# claw-master client")]
+        block = block.replace("/usr/local/bin/", f"{d}/bin/").replace("/var/lib/nextjs-ct", f"{d}/state")
+        (d / "bin").mkdir(exist_ok=True)
+        (d / "fakes").mkdir(exist_ok=True)
+        with zipfile.ZipFile(d / "tf.zip", "w") as z:
+            info = zipfile.ZipInfo("terraform")
+            info.external_attr = 0o755 << 16
+            z.writestr(info, f"#!/bin/bash\necho '{reports}'\necho 'on linux_arm64'\n")
+        real = hashlib.sha256((d / "tf.zip").read_bytes()).hexdigest()
+        if have:
+            fake(d / "bin", "terraform", "echo old\n")
+        if stamp:
+            (d / "state").mkdir(exist_ok=True)
+            (d / "state" / "terraform.sha256").write_text((real if stamp == "real" else stamp) + "\n")
+        (d / "config.json").write_text(json.dumps({"terraform": {"version": version, "sha256": sha or real}}))
+        fake(d / "fakes", "uname", "echo aarch64\n")
+        fake(d / "fakes", "curl", f'echo "$@" >> {d}/curl.log\nfor a; do [ "$prev" = -o ] && cp {d}/tf.zip "$a"; prev=$a; done\n')
+        script = f'PATH={d}/fakes:$PATH; CONFIG={d}/config.json; FAILED=""\nwarn() {{ echo "$*" >&2; FAILED=1; }}\n' \
+            + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + block + 'echo "FAILED=$FAILED"\n'
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        installed = (d / "bin" / "terraform").exists() and "Terraform v" in (d / "bin" / "terraform").read_text()
+        calls = (d / "curl.log").read_text().splitlines() if (d / "curl.log").exists() else []
+        return installed, calls, "FAILED=1" in r.stdout, real
+
+    def test_provision_installs_the_pinned_terraform_only_when_it_verifies(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            installed, calls, failed, real = self._provision_terraform(d)
+            self.assertEqual((installed, failed), (True, False))
+            self.assertEqual(len(calls), 1)
+            self.assertIn("https://releases.hashicorp.com/terraform/1.10.3/terraform_1.10.3_linux_arm64.zip", calls[0])
+            self.assertEqual((d / "state" / "terraform.sha256").read_text().strip(), real)
+        for why, kw in (("zip sha256 differs", {"sha": "0" * 64}),
+                        ("binary is another version", {"reports": "Terraform v1.9.0"})):
+            with self.subTest(why), tempfile.TemporaryDirectory() as d:
+                d = Path(d)
+                installed, calls, failed, _ = self._provision_terraform(d, **kw)
+                self.assertEqual((installed, failed, len(calls)), (False, True, 1))
+                self.assertFalse((d / "state" / "terraform.sha256").exists())
+
+    def test_provision_leaves_a_verified_terraform_alone_and_replaces_a_stale_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            installed, calls, failed, _ = self._provision_terraform(d, have=True, stamp="real")
+            self.assertEqual((installed, calls, failed), (False, [], False))  # the existing binary is kept, no download
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            installed, calls, failed, _ = self._provision_terraform(d, have=True, stamp="f" * 64)
+            self.assertEqual((installed, len(calls), failed), (True, 1, False))
+
     def test_no_reverse_tunnel_relay_is_left(self):
         for f in ("nextjs-ct-machine", "nextjs-ct-sshd", "nextjs-ct-firewall"):
             text = (HOST / f).read_text()

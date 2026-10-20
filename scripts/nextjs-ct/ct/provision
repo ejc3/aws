@@ -99,6 +99,22 @@ if [ "$(uname -m)" = aarch64 ] && [ "$(cat /var/lib/tmux-scroll/sha256 2>/dev/nu
   rm -rf "$T"
 fi
 
+# Terraform, the version and build the jumpboxes run (config.json .terraform; nextjs-ct-user-data.tf).
+TF_VER=$(cfg .terraform.version); TF_SHA=$(cfg .terraform.sha256)
+if [ "$(uname -m)" = aarch64 ] && { ! [ -x /usr/local/bin/terraform ] || [ "$(cat /var/lib/nextjs-ct/terraform.sha256 2>/dev/null)" != "$TF_SHA" ]; }; then
+  T=$(mktemp -d)
+  if curl -fsSL --retry 3 "https://releases.hashicorp.com/terraform/$TF_VER/terraform_${TF_VER}_linux_arm64.zip" -o "$T/tf.zip" \
+     && echo "$TF_SHA  $T/tf.zip" | sha256sum -c --quiet - \
+     && unzip -qo "$T/tf.zip" terraform -d "$T" \
+     && [ "$(CHECKPOINT_DISABLE=1 "$T/terraform" version | head -1)" = "Terraform v$TF_VER" ]; then
+    install -m 0755 "$T/terraform" /usr/local/bin/terraform.new && mv -f /usr/local/bin/terraform.new /usr/local/bin/terraform \
+      && mkdir -p /var/lib/nextjs-ct && echo "$TF_SHA" > /var/lib/nextjs-ct/terraform.sha256
+  else
+    warn "pinned terraform did not download or verify"
+  fi
+  rm -rf "$T"
+fi
+
 # claw-master client, pinned with the server (claw-master-server.tf), and the claude-master link t-claude runs.
 CM_TAG=$(cfg .claw_master.tag); CM_SHA=$(cfg .claw_master.sha256)
 if [ "$(uname -m)" = aarch64 ] && [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" != "$CM_SHA" ]; then
