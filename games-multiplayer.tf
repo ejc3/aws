@@ -1606,6 +1606,10 @@ resource "aws_ecs_task_definition" "games_mp_router" {
     image        = "${aws_ecr_repository.games_mp["games/mp-router"].repository_url}:${local.mp_router_live_tag}"
     essential    = true
     portMappings = [{ containerPort = local.mp_port, protocol = "tcp" }]
+    # Security Hub ECS.5. The router is node:http over sockets and writes no file, so it needs no
+    # writable mount at all (checked by running games/mp-router:live read-only: health, origin
+    # and token refusals, a WebSocket upgrade, SIGTERM).
+    readonlyRootFilesystem = true
     environment = [
       { name = "PORT", value = tostring(local.mp_port) },
       # MP_ENVS is what the router checks a token's `n` against (any listed value);

@@ -88,6 +88,9 @@ jobs:
       - name: Security Hub suppressions stay narrow; default security groups stay empty
         run: python3 -S -B scripts/test-security-hub-automation.py
 
+      - name: ECS task definitions keep read-only root filesystems (ECS.5)
+        run: python3 -S -B scripts/test-ecs-readonly-root.py
+
       - name: Runner user_data IPv6 gate
         run: bash scripts/test-runner-userdata.sh
 
