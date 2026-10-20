@@ -740,10 +740,17 @@ class NoContainerRestartTests(unittest.TestCase):
                     self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart)[^\n]*\$HOME_UNIT")
                 continue
             for text in hosts:
-                self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart|stop)[^\n]*" + re.escape(name))
+                self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart)[^\n]*" + re.escape(name))
+                # stopping it happens only in the fail-closed branch of a rejected reload, in setup itself
+                self.assertLessEqual(len(re.findall(r"systemctl stop[^\n]*" + re.escape(name), text)), 1 if text is TF else 0)
 
     def test_firewall_rules_are_reloaded_by_running_the_script(self):
-        self.assertIn("systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall", TF)
+        self.assertIn("if ! { systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall; }; then", TF)
+
+    def test_a_failed_reload_stops_the_firewall_so_the_containers_fail_closed(self):
+        block = TF.split("if ! { systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall; }; then", 1)[1].split("\nfi", 1)[0]
+        self.assertIn("systemctl stop nextjs-ct-firewall.service", block)
+        self.assertIn("exit 1", block)
 
 if __name__ == "__main__":
     unittest.main()
