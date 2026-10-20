@@ -131,8 +131,8 @@ class XStepTests(unittest.TestCase):
         self.assertIn("[aws_iam_role.dolphin_labs_news_x.arn]", block("aws_secretsmanager_secret_policy", "dolphin_labs_monid"))
         self.assertIn("aws_iam_role.dolphin_labs_news_x.arn", block("aws_secretsmanager_secret_policy", "dolphin_labs_news"))
 
-    def test_x_schedule_is_created_off_and_targets_the_x_function(self):
-        self.assertRegex(block("variable", "news_x_schedule_enabled"), r"default     = false\b")
+    def test_x_schedule_is_on_and_targets_the_x_function(self):
+        self.assertRegex(block("variable", "news_x_schedule_enabled"), r"default     = true\b")
         sch = block("aws_scheduler_schedule", "dolphin_labs_news_x")
         self.assertIn('state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"', sch)
         self.assertIn('schedule_expression          = "rate(5 minutes)"', sch)
@@ -161,6 +161,13 @@ class XStepTests(unittest.TestCase):
         section = readme[readme.index("## dolphin-labs news pass"):readme.index("## Private browser manager")]
         for needle in ("dolphin-labs/monid", "news_x_schedule_enabled", "NEWS_X_LAMBDA_FUNCTION", "dolphin-labs-news-x-not-running"):
             self.assertIn(needle, section)
+
+    def test_the_dev_box_can_see_the_x_step_but_not_its_secret(self):
+        op = block("aws_iam_role_policy", "box_dolphin_labs_news_operate")
+        self.assertIn("aws_lambda_function.dolphin_labs_news_x.arn", op)
+        self.assertIn("aws_cloudwatch_log_group.dolphin_labs_news_x.arn", op)
+        self.assertIn("aws_scheduler_schedule.dolphin_labs_news_x.arn", op)
+        self.assertNotIn("dolphin_labs_monid", op)
 
     def test_deploy_role_updates_both_functions_code_and_output_names_the_x_function(self):
         dep = block("aws_iam_role_policy", "dolphin_labs_news_deploy")

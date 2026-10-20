@@ -63,7 +63,7 @@ variable "dolphin_labs_news_enabled" {
 variable "news_x_schedule_enabled" {
   description = "Run the X-posts step (dolphin-labs-news-x) every 5 minutes. false keeps the function and its schedule and stops the runs. Turn on once deploy-news.yml has deployed the bundle to it and dolphin-labs/monid has a value."
   type        = bool
-  default     = false
+  default     = true # on since 2026-10-20: the bundle is deployed to it and dolphin-labs/monid has a value
 }
 
 locals {
@@ -737,7 +737,19 @@ resource "aws_iam_role_policy" "box_dolphin_labs_news_operate" {
         Sid      = "SeeItsSchedule"
         Effect   = "Allow"
         Action   = ["scheduler:GetSchedule"]
-        Resource = aws_scheduler_schedule.dolphin_labs_news_pass.arn
+        Resource = [aws_scheduler_schedule.dolphin_labs_news_pass.arn, aws_scheduler_schedule.dolphin_labs_news_x.arn]
+      },
+      {
+        Sid      = "InspectAndInvokeTheXStep"
+        Effect   = "Allow"
+        Action   = ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:InvokeFunction"]
+        Resource = aws_lambda_function.dolphin_labs_news_x.arn
+      },
+      {
+        Sid      = "ReadTheXStepsLogs"
+        Effect   = "Allow"
+        Action   = ["logs:DescribeLogStreams", "logs:GetLogEvents", "logs:FilterLogEvents"]
+        Resource = [aws_cloudwatch_log_group.dolphin_labs_news_x.arn, "${aws_cloudwatch_log_group.dolphin_labs_news_x.arn}:*"]
       },
       {
         Sid      = "SeeThatTheSecretIsSet"
