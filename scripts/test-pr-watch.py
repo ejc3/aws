@@ -316,6 +316,18 @@ output "ip" {
 """,
     # Mostly one block that survives a rename, so git would see topics.tf -> sns.tf as a rename.
     "topics.tf": KEPT + "\nresource \"aws_sns_topic\" \"gone\" {\n  name = \"gone\"\n}\n",
+    "eph.tf": """resource "aws_secretsmanager_secret" "tok" {
+  name = "tok"
+}
+
+ephemeral "aws_secretsmanager_secret_version" "tok" {
+  secret_id = aws_secretsmanager_secret.tok.id
+}
+
+resource "aws_ssm_parameter" "uses_tok" {
+  value_wo = ephemeral.aws_secretsmanager_secret_version.tok.secret_string
+}
+""",
     "scripts/s.sh": "echo one\n",
     "scripts/units/a.service": "[Unit]\n",
     "scripts/test-thing.py": "pass\n",
@@ -417,6 +429,22 @@ class TfTargetsTests(unittest.TestCase):
         self.assertEqual(self.edit(".terraform.lock.hcl", "# lock", "# lock 2")[0], 3)
         self.base = self.git("rev-parse", "HEAD").strip()
         self.assertEqual(self.edit("main.tf", "  region = var.region", "  region = \"us-west-2\"")[0], 3)
+
+    def test_a_changed_root_output_needs_a_full_plan(self):
+        # #548: a targeted apply leaves a new or changed output unrecorded (the mapslink output, 2026-10-20).
+        rc, out = self.edit("main.tf", "  value = aws_eip.b.public_ip", "  value = aws_eip.b.private_ip")
+        self.assertEqual(rc, 3)
+        self.assertEqual(" ".join(out[:3]), "FULL: output change:")
+
+    def test_a_change_reaching_readers_through_an_ephemeral_block_targets_them(self):
+        # #548: the walk follows ephemeral.TYPE.NAME, so the parameter reading the changed secret is a target.
+        rc, out = self.edit("eph.tf", '  name = "tok"', '  name = "token"')
+        self.assertEqual((rc, out), (0, ["-target=aws_secretsmanager_secret.tok", "-target=aws_ssm_parameter.uses_tok"]))
+
+    def test_a_changed_ephemeral_block_targets_its_readers_but_not_itself(self):
+        rc, out = self.edit("eph.tf", "  secret_id = aws_secretsmanager_secret.tok.id",
+                            "  secret_id = aws_secretsmanager_secret.tok.arn")
+        self.assertEqual((rc, out), (0, ["-target=aws_ssm_parameter.uses_tok"]))
 
     def test_files_nothing_reads_are_ignored(self):
         self.assertEqual(self.edit("README.md", "readme", "read me"), (0, []))
