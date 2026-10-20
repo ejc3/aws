@@ -22,6 +22,8 @@
 #                                             version for 400 days, and only the administration set may
 #                                             delete a version, so a bad deploy cannot erase history.
 #                                   local/    journals of passes run on a dev box. 30 days.
+#                                   x-journal/ the X-posts step's journal of its Haiku calls (written by
+#                                             dolphin-labs-news-x; put only).
 #                                   code/     deployed bundles. Lambda copies the code at update time,
 #                                             so a bundle is kept 30 days only for a redeploy.
 #   dolphin-labs/news             JSON secret: KV_REST_API_URL and KV_REST_API_TOKEN, the Dolphin Redis
@@ -43,7 +45,8 @@
 #
 # Who reaches what:
 #   the function            Bedrock Haiku 5.5; journal/ (write); its secrets (read); its own logs
-#   the X function          Bedrock Haiku 5.5; dolphin-labs/news and dolphin-labs/monid (read); its own logs
+#   the X function          Bedrock Haiku 5.5; x-journal/ (put); dolphin-labs/news and dolphin-labs/monid
+#                           (read); its own logs
 #   deploy-news.yml (main)  code/ (write); UpdateFunctionCode, GetFunction(Configuration) on the two functions
 #   refresh-news.yml (main) journal/ (write), through dolphin-labs-news-bedrock, until it is retired
 #   nextjs-dev (the dolphin box, where replays run)
@@ -478,13 +481,21 @@ resource "aws_iam_role" "dolphin_labs_news_x" {
   tags = { Name = local.dolphin_labs_news_x_name, Project = "dolphin-labs" }
 }
 
-# Haiku, the Redis secret and the Monid key, and its logs. No journal, no Browserbase.
+# Haiku, its own journal prefix (put only), the Redis secret and the Monid key, and its logs. Nothing under
+# journal/ or local/, no reads or lists in the bucket, no Browserbase. The bucket is SSE-S3 (no KMS key), and
+# its policy refuses only plain HTTP and deletes under journal/, so the put needs nothing more.
 resource "aws_iam_role_policy" "dolphin_labs_news_x" {
   name = "news-x"
   role = aws_iam_role.dolphin_labs_news_x.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = concat(local.bedrock_haiku_statements, [
+      {
+        Sid      = "WriteItsJournal"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.dolphin_labs_news.arn}/x-journal/*"
+      },
       {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
@@ -526,6 +537,7 @@ resource "aws_lambda_function" "dolphin_labs_news_x" {
       MONID_SECRET_ID     = aws_secretsmanager_secret.dolphin_labs_monid.name
       NEWS_BEDROCK_REGION = local.bedrock_haiku_region
       NEWS_BEDROCK_MODEL  = local.bedrock_haiku_profile
+      NEWS_JOURNAL_BUCKET = aws_s3_bucket.dolphin_labs_news.bucket
       NEWS_ENVIRONMENT    = "production"
       NODE_OPTIONS        = "--enable-source-maps"
     }

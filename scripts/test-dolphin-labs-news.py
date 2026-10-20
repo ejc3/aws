@@ -103,7 +103,7 @@ class XStepTests(unittest.TestCase):
         self.assertIn("Statement = concat(local.bedrock_haiku_statements, [", pol)
         self.assertIn("Resource = [aws_secretsmanager_secret.dolphin_labs_news.arn, aws_secretsmanager_secret.dolphin_labs_monid.arn]", pol)
         self.assertEqual(sorted(re.findall(r'"(s3|secretsmanager|logs|lambda):(\w+)"', pol)),
-                         [("logs", "CreateLogStream"), ("logs", "PutLogEvents"), ("secretsmanager", "GetSecretValue")])
+                         [("logs", "CreateLogStream"), ("logs", "PutLogEvents"), ("s3", "PutObject"), ("secretsmanager", "GetSecretValue")])
         self.assertNotIn("browserbase", pol)
         fn = block("aws_lambda_function", "dolphin_labs_news_x")
         for line in ("NEWS_SECRET_ID      = aws_secretsmanager_secret.dolphin_labs_news.name",
@@ -112,6 +112,18 @@ class XStepTests(unittest.TestCase):
                      "NEWS_BEDROCK_MODEL  = local.bedrock_haiku_profile",
                      'NEWS_ENVIRONMENT    = "production"'):
             self.assertIn(line, fn)
+
+    def test_x_journal_goes_to_the_news_bucket_under_x_journal_put_only(self):
+        fn = block("aws_lambda_function", "dolphin_labs_news_x")
+        self.assertIn("NEWS_JOURNAL_BUCKET = aws_s3_bucket.dolphin_labs_news.bucket", fn)
+        self.assertNotIn("NEWS_JOURNAL_PREFIX", fn)  # the step's own default, x-journal/
+        pol = block("aws_iam_role_policy", "dolphin_labs_news_x")
+        s3 = [st for st in re.split(r"\bSid\s+=", pol) if '"s3:' in st]
+        self.assertEqual(len(s3), 1, s3)
+        self.assertIn('Action   = "s3:PutObject"', s3[0])
+        self.assertIn('Resource = "${aws_s3_bucket.dolphin_labs_news.arn}/x-journal/*"', s3[0])
+        self.assertEqual(re.findall(r"aws_s3_bucket\.dolphin_labs_news\.arn[^\"\]]*", pol),
+                         ["aws_s3_bucket.dolphin_labs_news.arn}/x-journal/*"])
 
     def test_the_pass_no_longer_reaches_monid(self):
         self.assertNotIn("dolphin_labs_monid", block("aws_iam_role_policy", "dolphin_labs_news_pass"))
