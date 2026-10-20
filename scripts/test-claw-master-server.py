@@ -723,7 +723,7 @@ class WindowsSetupTests(unittest.TestCase):
         s6 = self.step(6)
         self.assertIn('-x "http://127.0.0.1:$Port"', s6)
         # the open listener is a plain-HTTP CONNECT proxy; the CA verifies the origin (api.anthropic.com), not the proxy
-        self.assertIn('--cacert "$d\\ca.pem" https://api.anthropic.com/v1/models', s6)
+        self.assertIn('--cacert "$d\\ca.pem" --ssl-revoke-best-effort https://api.anthropic.com/v1/models', s6)
         self.assertNotIn("--proxy-cacert", code(WINSETUP))
         # CONNECT 200 and an HTTP status of Anthropic's own: a 5xx is the proxy's failed upstream request
         self.assertIn("if ($LASTEXITCODE -eq 0 -and $out -match '^200 [24]\\d\\d$')", s6)
@@ -739,6 +739,9 @@ class WindowsSetupTests(unittest.TestCase):
         # the agent's proxy URL (it carries the agent's token) reaches curl only through its environment
         self.assertIn("$env:HTTPS_PROXY = (Get-Content", s7)
         self.assertNotRegex(s7, r"curl\.exe[^\n]*(-x|--proxy)")
+        # Schannel fails closed on the private CA's unknown revocation status; both checks pass best-effort
+        self.assertIn('--cacert "$d\\ca.pem" --ssl-revoke-best-effort https://api.anthropic.com/v1/models', s7)
+        self.assertNotIn("--ssl-no-revoke", code(WINSETUP))
         self.assertNotRegex(s7, r'"[^"\n]*\$env:HTTPS_PROXY')
 
     def test_it_parses(self):
