@@ -135,6 +135,11 @@ locals {
       # so unlike the keys above this is a new grant rather than an adoption of something the
       # instance already authorized: SHA256:tsfGYA0b848cRjsAWRAIG59lR7593BA06LaSncfyQOA.
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM3U+Or6AG9kj/94JubpeKkNz7Jo872Piljcom/Gyj2P dolphin",
+      # The owner's own key (the instance key pair, which the owner's phone SSH app uses), declared 2026-10-20.
+      # nextjs-dev's setup put it in every account; nextjs-ct-machine removes it from any account that does not
+      # declare it, so after the cutover the phone could no longer log in to this account. Declared for ejc3
+      # only; the members' accounts stay without it.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2",
     ]
   }
 
