@@ -535,8 +535,12 @@ resource "aws_securityhub_automation_rule" "by_design_dolphin" {
     }
   }
 
-  # The Config.1 suppression goes live only with the alarm that stands in for it.
-  depends_on = [module.dolphin_security_us_west_1, aws_cloudwatch_event_target.dolphin_config_recorder]
+  # The Config.1 suppression goes live only with the alarm that stands in for it, and the alarm on its delivery.
+  depends_on = [
+    module.dolphin_security_us_west_1,
+    aws_cloudwatch_event_target.dolphin_config_recorder,
+    aws_cloudwatch_metric_alarm.dolphin_config_recorder_delivery,
+  ]
 }
 
 # #515 created the EC2.9 rule as one counted resource per region; it is now the list's first entry.

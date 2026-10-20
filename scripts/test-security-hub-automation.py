@@ -265,8 +265,8 @@ class SecurityHubAutomation(unittest.TestCase):
         self.assertIn('"AWS API Call via CloudTrail"', pattern)
         self.assertIn('eventSource = ["config.amazonaws.com"]', pattern)
         names = set(re.findall(r'"(\w+)"', attr(pattern, "eventName") or ""))
-        self.assertLessEqual({"StopConfigurationRecorder", "DeleteConfigurationRecorder", "DeleteDeliveryChannel",
-                              "PutConfigurationRecorder"}, names)
+        self.assertLessEqual({"StopConfigurationRecorder", "DeleteConfigurationRecorder", "PutConfigurationRecorder",
+                              "DeleteDeliveryChannel", "PutDeliveryChannel"}, names)
         self.assertNotIn("account", pattern)  # its own account's calls, whoever makes them
         self.assertNotIn("errorCode", pattern)  # denied attempts alert too
         (_, target), = blocks(dolphin, r'resource "aws_cloudwatch_event_target" "dolphin_config_recorder"')
@@ -293,7 +293,9 @@ class SecurityHubAutomation(unittest.TestCase):
         self.assertEqual(attr(topic, "name"), '"dolphin-alerts"')
         automation = strip_comments(self.text)
         (_, suppression), = blocks(automation, r'resource "aws_securityhub_automation_rule" "by_design_dolphin"')
-        self.assertIn("aws_cloudwatch_event_target.dolphin_config_recorder", attr(suppression, "depends_on"))
+        for dep in ("aws_cloudwatch_event_target.dolphin_config_recorder",
+                    "aws_cloudwatch_metric_alarm.dolphin_config_recorder_delivery"):
+            self.assertIn(dep, attr(suppression, "depends_on"))
 
     def test_account_callers_go_through_the_account_providers(self):
         everything = "\n".join(strip_comments(p.read_text()) for p in tf_files())
