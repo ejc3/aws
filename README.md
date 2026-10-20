@@ -773,6 +773,7 @@ client with alias `colin-pc` (entry `colin-pc` of `local.mac_ssh_macs`, which pi
 | From | Service token (Secrets Manager) | Configured by |
 |---|---|---|
 | fcvm-arm, `ubuntu` | `colin-pc-ssh-access-fcvm` (fcvm-arm's instance only) | `dev-user-data.tf` at boot, `fcvm-mac-ssh-clients` association daily |
+| nextjs-ct, `colin` (his container only) | `colin-pc-ssh-access-nextjs-colin` (`nextjs-dev-role`; denied to every other member's container) | `local.nextjs_ct_mac_clients`, at the container's provision |
 | EJ in a browser | the browser-manager owner policy | |
 
 Unlike the Macs' LaunchAgents, the connector is a **SYSTEM task at boot** (`cloudflared colin-pc`), so the PC is
@@ -786,7 +787,9 @@ typing, shortcuts and app control, served by a per-user logon task in the PC use
 `scripts/windows/windows-mcp-bridge colin-pc`, a stdio MCP server that opens an ssh forward for the session and relays
 with `mcp-remote` (locked in `scripts/windows/mcp-remote/`); the key reaches it in a 0600 header file, read once over ssh,
 never an argument or an environment variable. `scripts/windows/windows-mcp-client-setup.sh colin-pc`, run as the client
-account, installs both and adds the Claude entry.
+account, installs both and adds the Claude entry; a nextjs-ct container's provision runs it for each PC of
+`local.windows_mcp_pcs` the account reaches. The members' own machine tokens (Colton's Mac, Colin's PC) are denied to
+every other member's container in one statement, `MemberMachineTokensOwnOnly`.
 
 `scripts/windows-pc-setup.sh colin-pc`, run on a jumpbox, puts the PC on the route and installs Windows-MCP: OpenSSH keys
 only and on loopback only with its inbound firewall rule off, the clients' keys in a managed block of

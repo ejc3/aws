@@ -177,14 +177,19 @@ locals {
       NotResource = [b.role]
     },
   ] }
-  # Colton's own Cloudflare Access token for Colton's Mac (colton-mac-ssh.tf): denied to every member but colton, with or
-  # without boxes (ejc3's token is in OwnerOnlySecrets above). By name: a secret ARN ends in a random suffix.
-  nextjs_ct_colton_mac_ssh = { for u in local.nextjs_ct_member_users : u => [for s in [{
-    Sid      = "ColtonMacSshColtonOnly"
+  # Each member's own Cloudflare Access token for their own machine (colton-mac-ssh.tf, colin-pc-ssh.tf): denied to every
+  # other member, with or without boxes (ejc3's tokens are in OwnerOnlySecrets above), in one statement so a member's
+  # session policy grows by an ARN per machine, not a statement. By name: a secret ARN ends in a random suffix.
+  nextjs_ct_member_machine_tokens = {
+    colton = "colton-mac-ssh-access-nextjs-colton"
+    colin  = "colin-pc-ssh-access-nextjs-colin"
+  }
+  nextjs_ct_member_machine_ssh = { for u in local.nextjs_ct_member_users : u => [for s in [{
+    Sid      = "MemberMachineTokensOwnOnly"
     Effect   = "Deny"
     Action   = "secretsmanager:GetSecretValue"
-    Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-colton-*"
-  }] : s if u != "colton"] }
+    Resource = [for owner, secret in local.nextjs_ct_member_machine_tokens : "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${secret}-*" if owner != u]
+  }] : s if length(s.Resource) > 0] }
 
   # A member with no boxes of their own (added to local.nextjs_users, not to local.member_box_people).
   nextjs_ct_no_boxes = [
@@ -231,6 +236,9 @@ locals {
       repos      = lookup(local.nextjs_user_repos, u, [])
       box_ips    = try(local.nextjs_ct_member_box[u].ips, [])
       macs       = lookup(local.nextjs_ct_mac_clients, u, {})
+      # Of those, the Windows PCs whose Windows-MCP the account's Claude Code gets (provision runs
+      # windows-mcp-client-setup.sh as the account).
+      windows_mcp = [for a in keys(lookup(local.nextjs_ct_mac_clients, u, {})) : a if contains(local.windows_mcp_pcs, a)]
     } }
   }
 
@@ -241,6 +249,7 @@ locals {
   nextjs_ct_mac_clients = {
     ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }
     colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }
+    colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }
   }
   # Run as root in the container by provision, once per alias: mac-ssh.sh <account> <alias> <secret>.
   nextjs_ct_mac_ssh = <<-MACSSH
@@ -272,6 +281,9 @@ MACSSH
   nextjs_ct_shared_files = merge(
     { for f in fileset(path.module, "scripts/nextjs-ct/ct/*") : "/var/lib/nextjs-ct/shared/ct/${basename(f)}" => f },
     { for f in fileset(path.module, "scripts/nextjs-ct/ct/units/*") : "/var/lib/nextjs-ct/shared/ct/units/${basename(f)}" => f },
+    # Windows-MCP's client side (colin-pc-ssh.tf): the bridge, its setup and mcp-remote's lockfile.
+    # Listed, not globbed: fileset's {a,b} cannot hold a path separator.
+    { for f in ["scripts/windows/windows-mcp-bridge", "scripts/windows/windows-mcp-client-setup.sh", "scripts/windows/mcp-remote/package.json", "scripts/windows/mcp-remote/package-lock.json"] : "/var/lib/nextjs-ct/shared/${trimprefix(f, "scripts/")}" => f },
   )
   # Rendered by Terraform from the snippets the other boxes run, so every box shares one definition.
   nextjs_ct_snippets = {
@@ -576,7 +588,7 @@ resource "aws_iam_policy" "nextjs_ct_member" {
   tags        = { Purpose = "session-policy", AttachedTo = "none", Account = each.key }
   policy = jsonencode({
     Version   = "2012-10-17"
-    Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes), local.nextjs_ct_colton_mac_ssh[each.key])
+    Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], local.nextjs_ct_no_boxes), local.nextjs_ct_member_machine_ssh[each.key])
   })
 }
 

@@ -59,7 +59,7 @@ done
 case "$ALIAS" in
   colin-pc)
     TUNNEL_SECRET=colin-pc-ssh-tunnel-token
-    CLIENTS="fcvm:ubuntu"
+    CLIENTS="fcvm:ubuntu nextjs:colin"
     ;;
   *) usage ;;
 esac
@@ -86,6 +86,20 @@ clean_key() {
   key=$(printf '%s' "$raw" | cut -d' ' -f1-2)
   [[ $key =~ ^ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$ ]] || return 1
   printf '%s' "$key"
+}
+
+# One nextjs-ct account's key, read from that account's own file in its own Run Command (as in
+# mac-ssh-connector-setup.sh), so one account's file can never stand in for another's.
+NEXTJS_ID=""
+nextjs_key() {
+  local user=$1 cmd_id
+  [[ $user =~ ^[a-z][a-z0-9]*$ ]] || return 1
+  cmd_id=$(aws ssm send-command --region "$REGION" --instance-ids "$NEXTJS_ID" --document-name AWS-RunShellScript \
+    --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]]}))' "cat /home/$user/.ssh/to-$ALIAS.pub")" \
+    --query Command.CommandId --output text)
+  aws ssm wait command-executed --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" >/dev/null 2>&1 || true
+  aws ssm get-command-invocation --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" \
+    --query StandardOutputContent --output text
 }
 
 echo "1/7 reaching $ALIAS from fcvm-arm"
@@ -179,6 +193,18 @@ for client in $CLIENTS; do
       key=$(clean_key "$(on_fcvm "cat ~/.ssh/to-$ALIAS.pub" 2>/dev/null || true)") ||
         { echo "fcvm-arm ubuntu has no single valid ~/.ssh/to-$ALIAS.pub (mac-ssh-client.tf makes it)" >&2; exit 1; }
       KEYS+="$key fcvm-arm ubuntu -> $ALIAS"$'\n'
+      ;;
+    nextjs)
+      if [ -z "$NEXTJS_ID" ]; then
+        # The containerized box (nextjs-ct.tf), found by its Box tag; each account's container home is the host's
+        # /home/<account>.
+        NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running \
+          --query 'Reservations[0].Instances[0].InstanceId' --output text)
+        [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "the nextjs-ct box is not running" >&2; exit 1; }
+      fi
+      key=$(clean_key "$(nextjs_key "$user" || true)") ||
+        { echo "nextjs-ct $user has no single valid ~/.ssh/to-$ALIAS.pub (the container's provision makes it)" >&2; exit 1; }
+      KEYS+="$key nextjs $user -> $ALIAS"$'\n'
       ;;
     *) echo "unknown box $box" >&2; exit 1 ;;
   esac

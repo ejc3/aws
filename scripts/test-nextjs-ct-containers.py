@@ -95,7 +95,7 @@ class HostScriptTests(unittest.TestCase):
         res = TF.split('resource "aws_iam_policy" "nextjs_ct_member" {', 1)[1].split("\n}\n", 1)[0]
         self.assertIn("for_each    = toset(local.nextjs_ct_member_users)", res)
         self.assertIn("concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_member, try(local.nextjs_ct_own_boxes[each.key], "
-                      "local.nextjs_ct_no_boxes), local.nextjs_ct_colton_mac_ssh[each.key])", res)
+                      "local.nextjs_ct_no_boxes), local.nextjs_ct_member_machine_ssh[each.key])", res)
         self.assertIn("nextjs_ct_member_users = [for u in local.nextjs_users : u if !contains(local.nextjs_ct_owners, u)]", TF)
         self.assertIn("session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }", TF)
         self.assertNotIn("aws_iam_role_policy_attachment\" \"nextjs_ct_member", TF)
@@ -199,23 +199,28 @@ class HostScriptTests(unittest.TestCase):
         self.assertEqual(len(acts("Sid       = \"OwnBoxesOnly\"")), 6)
         size = len(json.dumps({"Version": "2012-10-17", "Statement": managed}, separators=(",", ":")))
         self.assertLess(size, 5500, size)
-        # Every other member also carries the deny on colton's Access token for Colton's Mac.
-        other = managed + [{"Sid": "ColtonMacSshColtonOnly", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
-                            "Resource": sp + "colton-mac-ssh-access-nextjs-colton-*"}]
+        # Every other member also carries the deny on the members' own machine tokens (Colton's Mac, Colin's PC).
+        other = managed + [{"Sid": "MemberMachineTokensOwnOnly", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
+                            "Resource": [sp + "colton-mac-ssh-access-nextjs-colton-*", sp + "colin-pc-ssh-access-nextjs-colin-*"]}]
         size = len(json.dumps({"Version": "2012-10-17", "Statement": other}, separators=(",", ":")))
         self.assertLess(size, 5800, size)
 
-    def test_colton_mac_tokens_are_readable_only_from_their_own_containers(self):
-        # Security review of #510: every container's session is nextjs-dev-role, which reads both nextjs tokens for
-        # Colton's Mac. ejc3's is owner-only (above); colton's is denied to every member but colton, boxes or not.
-        stmt = TF.split("nextjs_ct_colton_mac_ssh = {", 1)[1].split("\n\n", 1)[0]
+    def test_members_machine_tokens_are_readable_only_from_their_own_containers(self):
+        # Security review of #510: every container's session is nextjs-dev-role, which reads every nextjs token for the
+        # members' machines. ejc3's are owner-only (above); colton's (Colton's Mac) and colin's (Colin's PC) are each
+        # denied to every member but its owner, boxes or not.
+        tokens = TF.split("nextjs_ct_member_machine_tokens = {", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn('colton = "colton-mac-ssh-access-nextjs-colton"', tokens)
+        self.assertIn('colin  = "colin-pc-ssh-access-nextjs-colin"', tokens)
+        stmt = TF.split("nextjs_ct_member_machine_ssh = {", 1)[1].split("\n\n", 1)[0]
         self.assertIn("for u in local.nextjs_ct_member_users : u =>", stmt)
-        self.assertIn(': s if u != "colton"] }', stmt)
+        self.assertIn(':secret:${secret}-*" if owner != u]', stmt)
+        self.assertIn(": s if length(s.Resource) > 0] }", stmt)
         self.assertIn('Action   = "secretsmanager:GetSecretValue"', stmt)
         self.assertIn('Effect   = "Deny"', stmt)
-        self.assertIn(':secret:colton-mac-ssh-access-nextjs-colton-*"', stmt)
         res = TF.split('resource "aws_iam_policy" "nextjs_ct_member" {', 1)[1].split("\n}\n", 1)[0]
-        self.assertIn("local.nextjs_ct_colton_mac_ssh[each.key])", res)
+        self.assertIn("local.nextjs_ct_member_machine_ssh[each.key])", res)
+        self.assertNotIn("nextjs_ct_colton_mac_ssh", TF)
 
 
 class MigrateTests(unittest.TestCase):
@@ -600,7 +605,8 @@ class MacTests(unittest.TestCase):
         clients = TF.split("nextjs_ct_mac_clients = {", 1)[1].split("\n  }\n", 1)[0]
         self.assertIn('ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }', clients)
         self.assertIn('colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }', clients)
-        self.assertEqual(clients.count(" = {"), 2)  # nobody else
+        self.assertIn('colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }', clients)
+        self.assertEqual(clients.count(" = {"), 3)  # nobody else
         self.assertIn("macs       = lookup(local.nextjs_ct_mac_clients, u, {})", TF)
         self.assertNotIn("macbook-ssh.sh", TF + (CT / "provision").read_text())
         snippet = TF.split("nextjs_ct_mac_ssh = <<-MACSSH", 1)[1].split("\nMACSSH", 1)[0]
@@ -608,6 +614,28 @@ class MacTests(unittest.TestCase):
         check = snippet.index('/home/$MAC_USER/.local/bin/cloudflared" | sha256sum -c - >/dev/null 2>&1 ||')
         self.assertLess(install, check, "a cloudflared that did not install fails the snippet before ssh is configured")
         self.assertLess(check, snippet.index("${local.mac_ssh_client_setup}"))
+
+    def test_provision_gives_windows_mcp_for_each_listed_pc_and_nothing_else(self):
+        self.assertIn("windows_mcp = [for a in keys(lookup(local.nextjs_ct_mac_clients, u, {})) : a if contains(local.windows_mcp_pcs, a)]", TF)
+        self.assertIn('"/var/lib/nextjs-ct/shared/${trimprefix(f, "scripts/")}"', TF)
+        prov = (CT / "provision").read_text()
+        loop = prov[prov.index("while read -r alias; do"):]
+        loop = loop[:loop.index("\n", loop.index("done < <(cfg --arg u \"$U\" '.users[$u].windows_mcp")) + 1]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"users": {
+                "colin": {"windows_mcp": ["colin-pc"]}, "colton": {"windows_mcp": []}, "connor": {}}}))
+            (d / "windows").mkdir()
+            (d / "windows" / "windows-mcp-client-setup.sh").write_text('echo "$(whoami-stub) $@" >> "$OUT"\n'.replace("$(whoami-stub)", "$U"))
+            got = {}
+            for u in ("colin", "colton", "connor"):
+                out = d / f"{u}.out"
+                script = ("set -euo pipefail\nSHARED=%s\nU=%s\nOUT=%s\nexport U OUT\nFAILED=0\nwarn() { FAILED=1; }\n"
+                          "as_user() { \"$@\"; }\ncfg() { jq -r \"$@\" \"$SHARED/config.json\"; }\n%s") % (d, u, out, loop)
+                r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                got[u] = out.read_text().split("\n")[:-1] if out.exists() else []
+            self.assertEqual(got, {"colin": ["colin colin-pc"], "colton": [], "connor": []})
 
     def test_provision_configures_each_listed_mac_and_nothing_else(self):
         prov = (CT / "provision").read_text()
