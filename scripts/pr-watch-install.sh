@@ -26,6 +26,7 @@ watcher)
   install -m 0755 "$here/pr-watch/session-start.sh" ~/.local/share/pr-watch/session-start.sh
   install -m 0755 "$here/pr-watch/claim.sh" ~/.local/share/pr-watch/claim.sh
   install -m 0755 "$here/pr-watch/alert-poll.py" ~/.local/share/pr-watch/alert-poll.py
+  install -m 0755 "$here/pr-watch/tf-targets.py" ~/.local/share/pr-watch/tf-targets.py
   # Write through a symlinked settings.json rather than replacing the link.
   settings=$(readlink -f ~/.claude/settings.json 2>/dev/null || echo ~/.claude/settings.json)
   [ -s "$settings" ] || echo '{}' >"$settings"

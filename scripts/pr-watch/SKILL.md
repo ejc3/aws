@@ -92,10 +92,23 @@ to approve if it is safe; we have many code review agents"):
    origin/main contains the merge commit (`git -C ~/aws merge-base --is-ancestor <merge sha> origin/main`): a merge on
    GitHub does not move the local ref, and a worktree from a stale ref would apply the tree before the merge. Then a
    fresh worktree off origin/main (`git -C ~/aws worktree add --detach
-   /tmp/tf-$(date +%s) origin/main`), `umask 002`, `terraform init -input=false -lockfile=readonly`, plan, read the
-   plan, apply the saved plan, require an empty follow-up plan. Check `df -h /` before the init (each worktree's
-   providers take about 1 GB of the 40 GB root), and `git worktree remove --force` the worktree on every way out, a
-   failed or stopped run included. Remove the PR from `unapplied` only after the empty follow-up plan. A merge that
+   /tmp/tf-$(date +%s) origin/main`), `umask 002`, `terraform init -input=false -lockfile=readonly` (seconds: the
+   wrapper links providers from its shared cache), then a **targeted** plan: `python3 -I
+   ~/.local/share/pr-watch/tf-targets.py ~/aws <main before the merge> <merge sha>` prints the `-target=` flags for
+   the blocks the merge changed and every block that reads them (the merge's first parent is the main before it); an
+   `ejc3/agents-md` merge targets `aws_s3_object.agents_md` and `aws_ssm_association.agents_md`. It prints `FULL:
+   <reason>` (exit 3) when only a full plan is safe (a provider, the lock file, a reference it cannot follow, a file
+   read indirectly): then plan everything. Nothing printed with exit 0 means the merge changed nothing Terraform reads
+   (tests, docs, CI): skip the plan and apply, and note `no infrastructure change` on the PR's `unapplied` entry, which
+   the next full plan clears. Any other exit (a missing commit, a traceback) is a failure of the helper, not an answer:
+   plan everything. Read the plan, apply the saved plan, require an empty follow-up plan with the same targets. A full
+   plan of everything takes 10-15 minutes on this box; a targeted one two or three. Check `df -h /` before the init,
+   and `git worktree remove --force` the worktree on every way out, a failed or stopped run included. Stop a run with
+   SIGINT or SIGTERM, never SIGKILL: the wrapper turns either into Terraform's own cancel, which releases the state
+   lock (a killed Terraform leaves it held for the next run). Remove the PR from `unapplied` only after an empty
+   follow-up plan of everything: after a targeted apply, keep it there with `targeted` noted, and run one full plan
+   when nothing else is waiting or once a day (the state's `last_full_plan`), whichever comes first; an empty one
+   clears every `targeted` entry, and anything it shows is applied as any other change. A merge that
    changed `scripts/pr-watch-install.sh` or `scripts/pr-watch/` also re-runs `scripts/pr-watch-install.sh --watcher`
    from that worktree before it is removed, so the running skill, hook and claim script are the merged ones. One Terraform
    run at a time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions

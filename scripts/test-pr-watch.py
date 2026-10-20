@@ -102,6 +102,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(len([c for c in commands if "pr-watch" in c]), 1)
             self.assertTrue((claude / "skills/pr-watch/SKILL.md").is_file())
             self.assertTrue((pathlib.Path(home) / ".local/share/pr-watch/claim.sh").is_file())
+            self.assertTrue((pathlib.Path(home) / ".local/share/pr-watch/tf-targets.py").is_file())
 
     def test_rejects_unknown_usage(self):
         with tempfile.TemporaryDirectory() as home:
@@ -116,7 +117,8 @@ class SkillTextTests(unittest.TestCase):
                        "@greptileai review", "Held for the owner", "--match-head-commit", "--limit 500",
                        "`jobs` map", "-R <repo> --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
                        "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "repos/ejc3/agents-md/compare/", "keyed by `<repo>#<number>`", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`",
-                       "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "alert-poll.py", "`alerts_seen`", "30 minutes before `alerts_checked_at`", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic"):
+                       "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "alert-poll.py", "`alerts_seen`", "30 minutes before `alerts_checked_at`", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic",
+                       "tf-targets.py", "`FULL:", "`last_full_plan`", "never SIGKILL", "with `targeted` noted", "`no infrastructure change`", "is a failure of the helper"):
             self.assertIn(phrase, skill)
 
 
@@ -219,6 +221,205 @@ class AlertPollTests(unittest.TestCase):
         mod.poll("main", Sess(), "us-west-1")
         ids = [p["id"] for p in printed if p.get("src") == "securityhub" and "error" not in p]
         self.assertEqual(ids, ["f-222222222222"], "a polled account's copy is dropped, a member account's is kept")
+
+    def test_scopes_run_concurrently_each_once_and_a_crashed_scope_fails_the_poll(self):
+        mod, _ = self.load()
+        mod.FAILED.clear()
+        seen, lock = [], __import__("threading").Lock()
+
+        def fake_poll(acct, sess, region):
+            time.sleep(0.3)
+            with lock:
+                seen.append((acct, region, sess))
+            if region == "boom-1":
+                raise RuntimeError("scope crashed")
+
+        printed = []
+        orig_out = mod.out
+        mod.out = lambda **kw: (printed.append(kw), orig_out(**kw))
+        mod.poll = fake_poll
+        work = [("main", lambda r=r: f"session-{r}", r) for r in ("us-west-1", "us-west-2", "us-east-1", "boom-1")] + \
+               [("staging", lambda: "staging-session", "us-west-1")]
+        t = time.time()
+        mod.run_all(work, workers=8)
+        self.assertLess(time.time() - t, 1.0, "five 0.3 s scopes in parallel, not 1.5 s in a row")
+        self.assertEqual(sorted((a, r) for a, r, _ in seen), sorted((a, r) for a, _, r in work))
+        self.assertIn(("main", "us-east-1", "session-us-east-1"), seen, "each scope gets a session of its own")
+        self.assertEqual([p["region"] for p in printed if p.get("src") == "scope"], ["boom-1"])
+        self.assertEqual(len(mod.FAILED), 1, "a crashed scope is a failed read: main() exits 1")
+
+
+TF_TARGETS = ROOT / "scripts/pr-watch/tf-targets.py"
+KEPT = "resource \"aws_sns_topic\" \"kept\" {\n  tag0 = \"value-0\"\n  tag1 = \"value-1\"\n  tag2 = \"value-2\"\n  tag3 = \"value-3\"\n  tag4 = \"value-4\"\n  tag5 = \"value-5\"\n  tag6 = \"value-6\"\n  tag7 = \"value-7\"\n  tag8 = \"value-8\"\n  tag9 = \"value-9\"\n  tag10 = \"value-10\"\n  tag11 = \"value-11\"\n}\n"
+FIXTURE = {
+    "main.tf": """variable "region" {
+  type    = string
+  default = "us-west-1"
+}
+
+provider "aws" {
+  region = var.region
+}
+
+locals {
+  size = 1
+
+  # the label every box gets
+  label = "box-${local.size}"
+
+  boot = <<-EOT
+    f() {
+      echo hi
+}
+  name = not-a-local
+EOT
+  user_data = "${local.boot} ${local.label}"
+}
+
+resource "aws_s3_object" "ud" {
+  content = local.user_data
+}
+
+resource "aws_s3_object" "units" {
+  for_each = fileset(path.module, "scripts/units/*")
+  source   = "${path.module}/${each.value}"
+}
+
+resource "aws_instance" "a" {
+  instance_type = local.label
+}
+
+resource "aws_eip" "b" {
+  instance = aws_instance.a.id
+}
+
+resource "aws_ssm_document" "c" {
+  content = file("${path.module}/scripts/s.sh")
+}
+
+resource "aws_sns_topic" "lonely" {
+  name = "lonely"
+}
+
+module "m" {
+  source = "./modules/m"
+}
+
+moved {
+  from = aws_instance.old
+  to   = aws_instance.a
+}
+
+output "ip" {
+  value = aws_eip.b.public_ip
+}
+""",
+    # Mostly one block that survives a rename, so git would see topics.tf -> sns.tf as a rename.
+    "topics.tf": KEPT + "\nresource \"aws_sns_topic\" \"gone\" {\n  name = \"gone\"\n}\n",
+    "scripts/s.sh": "echo one\n",
+    "scripts/units/a.service": "[Unit]\n",
+    "scripts/test-thing.py": "pass\n",
+    "scripts/other.sh": "echo other\n",
+    "modules/m/main.tf": "resource \"aws_sns_topic\" \"t\" {\n  name = \"t\"\n}\n",
+    ".terraform.lock.hcl": "# lock\n",
+    "README.md": "readme\n",
+}
+
+
+class TfTargetsTests(unittest.TestCase):
+    """scripts/pr-watch/tf-targets.py: the addresses a merge changed, with their dependents, or FULL."""
+
+    def setUp(self):
+        self.repo = pathlib.Path(tempfile.mkdtemp())
+        self.git("init", "-q")
+        for path, text in FIXTURE.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(text)
+        self.commit("base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                              capture_output=True, text=True, check=True).stdout
+
+    def commit(self, msg):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+
+    def edit(self, path, old, new):
+        p = self.repo / path
+        text = p.read_text()
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, new, 1))
+        self.commit("change")
+        r = subprocess.run([sys.executable, "-I", str(TF_TARGETS), str(self.repo), self.base, "HEAD"],
+                           capture_output=True, text=True)
+        return r.returncode, r.stdout.split()
+
+    def test_a_changed_resource_and_its_dependents_are_the_targets(self):
+        self.assertEqual(self.edit("main.tf", 'name = "lonely"', 'name = "alone"'), (0, ["-target=aws_sns_topic.lonely"]))
+
+    def test_a_dependency_brings_its_dependents(self):
+        rc, out = self.edit("main.tf", "  instance_type = local.label", "  instance_type = \"t4g.small\"")
+        self.assertEqual((rc, out), (0, ["-target=aws_eip.b", "-target=aws_instance.a"]))  # moved and output ignored
+
+    def test_a_changed_local_targets_its_readers_through_other_locals(self):
+        rc, out = self.edit("main.tf", "  size = 1", "  size = 2")
+        self.assertEqual((rc, out), (0, ["-target=aws_eip.b", "-target=aws_instance.a", "-target=aws_s3_object.ud"]))
+
+    def test_a_column_zero_brace_in_a_heredoc_does_not_end_the_locals_block(self):
+        # Review of #543: user_data, after the heredoc's `}`, must still be seen as a local that reads local.boot.
+        rc, out = self.edit("main.tf", "      echo hi", "      echo hello")
+        self.assertEqual((rc, out), (0, ["-target=aws_s3_object.ud"]))
+
+    def test_a_renamed_file_still_targets_the_block_it_lost(self):
+        # Review of #543: with rename detection, the old path is never read and the deleted block is missed.
+        (self.repo / "topics.tf").unlink()
+        (self.repo / "sns.tf").write_text(KEPT)
+        self.git("add", "-A")
+        self.assertIn("R", self.git("diff", "--cached", "--name-status", "-M").split()[0], "git sees a rename")
+        self.commit("rename and drop one block")
+        r = subprocess.run([sys.executable, "-I", str(TF_TARGETS), str(self.repo), self.base, "HEAD"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("-target=aws_sns_topic.gone", r.stdout.split())
+
+    def test_a_file_read_through_fileset_or_an_unnamed_file_needs_a_full_plan(self):
+        rc, out = self.edit("scripts/units/a.service", "[Unit]", "[Unit]\nDescription=x")
+        self.assertEqual(rc, 3)
+        self.assertIn("scripts/units/*", " ".join(out))
+        self.base = self.git("rev-parse", "HEAD").strip()
+        rc, out = self.edit("scripts/other.sh", "other", "another")
+        self.assertEqual(rc, 3, out)
+
+    def test_tests_and_docs_need_no_plan(self):
+        self.assertEqual(self.edit("scripts/test-thing.py", "pass", "pass  # x"), (0, []))
+
+    def test_a_comment_before_a_local_changes_nothing(self):
+        self.assertEqual(self.edit("main.tf", "# the label every box gets", "# what every box is called"), (0, []))
+
+    def test_a_variable_a_provider_reads_needs_a_full_plan(self):
+        rc, out = self.edit("main.tf", 'default = "us-west-1"', 'default = "us-east-2"')
+        self.assertEqual(rc, 3)
+        self.assertEqual(out[0], "FULL:")
+
+    def test_a_file_read_by_path_targets_its_reader(self):
+        self.assertEqual(self.edit("scripts/s.sh", "one", "two"), (0, ["-target=aws_ssm_document.c"]))
+
+    def test_a_module_source_change_targets_the_module(self):
+        self.assertEqual(self.edit("modules/m/main.tf", 'name = "t"', 'name = "u"'), (0, ["-target=module.m"]))
+
+    def test_a_deleted_block_is_targeted_so_its_destroy_is_planned(self):
+        rc, out = self.edit("main.tf", 'resource "aws_sns_topic" "lonely" {\n  name = "lonely"\n}\n\n', "")
+        self.assertEqual((rc, out), (0, ["-target=aws_sns_topic.lonely"]))
+
+    def test_the_lock_file_and_provider_blocks_need_a_full_plan(self):
+        self.assertEqual(self.edit(".terraform.lock.hcl", "# lock", "# lock 2")[0], 3)
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.assertEqual(self.edit("main.tf", "  region = var.region", "  region = \"us-west-2\"")[0], 3)
+
+    def test_files_nothing_reads_are_ignored(self):
+        self.assertEqual(self.edit("README.md", "readme", "read me"), (0, []))
 
 
 if __name__ == "__main__":
