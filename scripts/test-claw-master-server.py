@@ -11,6 +11,7 @@ TF = (ROOT / "claw-master-server.tf").read_text()
 TUN = (ROOT / "claw-master-tunnel.tf").read_text()
 BUNDLE = (ROOT / "scripts" / "claw-master-mac-bundle.sh").read_text()
 MACSETUP = (ROOT / "scripts" / "claw-master-mac-setup.sh").read_text()
+WINSETUP = (ROOT / "scripts" / "claw-master-windows-setup.sh").read_text()
 ENROLL = (ROOT / "scripts" / "claw-master-enroll.sh").read_text()
 CONVERGE = (ROOT / "scripts" / "ssm-claw-master-server.sh").read_text()
 LOGIN = (ROOT / "scripts" / "claw-master-login.sh").read_text()
@@ -523,6 +524,16 @@ class TunnelTests(unittest.TestCase):
         self.assertIn("http_status:404", cfg)  # anything else gets nothing
         self.assertIn("cloudflare_zero_trust_access_application.claw_master", cfg)  # no routing before Access
 
+    def test_the_windows_pc_has_its_own_token_in_the_one_policy(self):
+        # Revocable on its own; admitted by the same non_identity policy, so the application keeps one.
+        pol = tblock("cloudflare_zero_trust_access_policy", "claw_master_macs")
+        for name in ("claw_master_macs", "claw_master_windows_pc"):
+            self.assertIn("cloudflare_zero_trust_access_service_token.%s.id" % name, pol)
+        self.assertIn('duration   = "8760h"', tblock("cloudflare_zero_trust_access_service_token", "claw_master_windows_pc"))
+        ver = tblock("aws_secretsmanager_secret_version", "claw_master_windows_pc_access")
+        self.assertIn("claw_master_windows_pc.client_secret", ver)
+        self.assertNotIn("claw_master_macs", ver)
+
     def test_only_a_service_token_may_reach_it_no_person_and_no_wildcard(self):
         pol = tblock("cloudflare_zero_trust_access_policy", "claw_master_macs")
         self.assertIn('decision         = "non_identity"', pol)
@@ -538,7 +549,10 @@ class TunnelTests(unittest.TestCase):
         self.assertIn("aws_iam_role.claw_master_server[0].arn", conn)
         mac = tblock("aws_secretsmanager_secret_policy", "claw_master_mac_access")
         self.assertNotIn("claw_master_server", mac)  # the server never needs the Macs' credential
-        for p in (conn, mac):
+        win = tblock("aws_secretsmanager_secret_policy", "claw_master_windows_pc_access")
+        self.assertNotIn("claw_master_server", win)
+        self.assertIn("aws_secretsmanager_secret.claw_master_windows_pc_access.arn", win)
+        for p in (conn, mac, win):
             self.assertIn('Effect    = "Deny"', p)
             self.assertIn("local.games_mp_admin_principals", p)
 
@@ -634,6 +648,71 @@ class MacSetupTests(unittest.TestCase):
         plist = MACSETUP[MACSETUP.index("<?xml"):MACSETUP.index("</dict></plist>")]
         self.assertNotRegex(plist, r"TUNNEL_SERVICE_TOKEN|client_secret")
         self.assertIn("<key>KeepAlive</key><true/>", plist)
+
+
+class WindowsSetupTests(unittest.TestCase):
+    """Setting a Windows PC up over its ssh alias: pinned, gated on the server, token through stdin only."""
+
+    def pin(self, name):
+        return re.search(r"^%s=(\S+)$" % name, WINSETUP, re.M).group(1)
+
+    def test_the_pins_match_the_servers_and_the_tunnels(self):
+        server_tag = re.search(r'claw_master_tag\s+=\s+"([^"]+)"', TF).group(1)
+        self.assertEqual(self.pin("CM_TAG"), server_tag, "bump both together")
+        cfd = re.search(r'cloudflared_version\s+=\s+"([^"]+)"', TUN).group(1)
+        self.assertEqual(self.pin("CFD_VERSION"), cfd)
+        for name in ("CM_SHA256_WINDOWS_AMD64", "CFD_SHA256_WINDOWS_AMD64"):
+            self.assertRegex(self.pin(name), r"^[0-9a-f]{64}$")
+
+    def test_binaries_are_verified_on_the_pc_before_they_are_installed(self):
+        text = code(WINSETUP)
+        self.assertIn('throw "$what did not match its pinned sha256"', text)
+        self.assertLess(text.index("did not match its pinned sha256"), text.index('Move-Item -Force "$dest.new" $dest'))
+        # an installed binary is judged by its hash, never by what it reports
+        self.assertNotRegex(text, r"--version")
+
+    def test_nothing_is_installed_until_the_server_is_serving_its_open_port(self):
+        text = code(WINSETUP)
+        gate = text.index("0/7")
+        self.assertIn("claw-master-status", text[gate:text.index("1/7")])
+        self.assertIn("grep -q '^open listener: listening'", text[gate:text.index("1/7")])
+        for step in ("1/7", "2/7", "3/7", "6/7"):
+            self.assertLess(gate, text.index(step))
+        self.assertLess(gate, text.index("Invoke-WebRequest"))
+        self.assertLess(gate, text.index("TUNNEL_SERVICE_TOKEN_SECRET"))
+
+    def test_the_token_goes_through_stdin_only(self):
+        text = code(WINSETUP)
+        self.assertIn("{ set +x; } 2>/dev/null", text)
+        self.assertIn("--secret-id claude-master/windows-pc-access", text)
+        seg = text[text.index("TUNNEL_SERVICE_TOKEN_SECRET"):text.index("unset SECRET")]
+        self.assertIn("|\n  on_pc", seg)
+        self.assertIn("[Console]::In.ReadToEnd()", seg)
+        # owner-only before the secret is written into the file
+        self.assertLess(seg.index("/inheritance:r"), seg.index("[Console]::In.ReadToEnd()"))
+        self.assertNotRegex(text, r"ssh[^\n]*client_secret")
+        self.assertNotRegex(text, r"echo[^\n]*\$SECRET")
+        self.assertNotRegex(text, r"ps_vars[^\n]*SECRET")
+        # the scripts travel as -EncodedCommand; the secret never does
+        self.assertIn("-EncodedCommand $enc", text)
+
+    def test_the_tunnel_task_reads_the_token_into_its_environment_not_its_arguments(self):
+        task = WINSETUP[WINSETUP.index("@'\n"):WINSETUP.index("'@ | Set-Content")]
+        self.assertIn("SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')", task)
+        self.assertNotRegex(task, r"cloudflared[^\n]*(--service-token|TUNNEL_SERVICE_TOKEN)")
+        self.assertIn("-gt 5242880", task)  # the log rotates at 5 MB
+
+    def test_the_pc_is_switched_to_the_pool_only_once_its_tunnel_listens(self):
+        text = code(WINSETUP)
+        self.assertLess(text.index("Get-NetTCPConnection"), text.index("agent install"))
+        self.assertIn('throw "the tunnel did not start listening', text)
+        # the check never prints the proxy URL, which carries the agent's token
+        check = text[text.index("7/7"):]
+        self.assertNotRegex(check, r'"[^"\n]*\$proxy')
+
+    def test_it_parses(self):
+        r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / "claw-master-windows-setup.sh")], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class IamTests(unittest.TestCase):
