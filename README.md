@@ -1188,7 +1188,8 @@ login.
   container (`ssh -L 3000:10.88.N.2:3000 ...`). An admin enters a container from the `ubuntu` account with
   `sudo machinectl shell <user>@<user>`.
 - **Inside**, the person is root (sudo, no password), installs what they like, and runs the same `ndev`,
-  Claude, Codex and t-claude as before. Their home is the host's `/home/<user>`, mounted in. Ports are the
+  Claude, Codex and t-claude as before, plus the jumpboxes' pinned Terraform (for dolphin-aws's
+  `scripts/apply.sh`). Their home is the host's `/home/<user>`, mounted in. Ports are the
   container's own: two people can both use 3000.
 - **Publishing**: `ndev` records the project in the container; `nextjs-ct-ndev-sync` on the host checks it
   and routes `<label>.<zone>` from that zone's `cloudflared` to `<container address>:<port>`.

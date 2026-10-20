@@ -214,6 +214,12 @@ locals {
   # The inline session policy, the same for every account; a member's session also carries their managed policy.
   nextjs_ct_session_policy = { Version = "2012-10-17", Statement = concat(local.nextjs_ct_allow_all, local.nextjs_ct_deny_host_only) }
 
+  # Terraform in every container, so dolphin-aws's scripts/apply.sh (applied from this box only) runs without a hand
+  # install: the version main.tf requires and both jumpboxes run, and the sha256 of HashiCorp's linux_arm64 zip from
+  # its SHA256SUMS, whose binary is byte for byte the jumpbox's /usr/local/lib/terraform-run-lock/terraform.
+  # A Terraform bump changes this with main.tf, jumpbox2-user-data.tf and drift.yml (scripts/test-nextjs-ct-containers.py).
+  nextjs_ct_terraform = { version = "1.10.3", sha256 = "b92d8245c67d4f7193245bc9d534048a63520302b6edb3c7764277b00c96ed31" }
+
   nextjs_ct_config = {
     role_arn            = local.nextjs_dev_role_arn
     serving             = local.nextjs_ct_serving
@@ -227,6 +233,7 @@ locals {
     retired_keys        = local.nextjs_retired_user_keys
     claw_master         = { tag = local.claw_master_tag, sha256 = local.claw_master_sha256_aarch64, server = "${local.claw_master_server_ip}:${local.claw_master_server_port}" }
     tmux_scroll         = { tag = local.tmux_scroll_tag, sha256 = local.tmux_scroll_sha256_aarch64 }
+    terraform           = local.nextjs_ct_terraform
     users = { for u in local.nextjs_users : u => {
       uid        = lookup(local.nextjs_ct_uid_pins, u, null)
       zone       = lookup(local.nextjs_user_zone, u, null)
