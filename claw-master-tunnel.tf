@@ -94,15 +94,29 @@ resource "cloudflare_zero_trust_access_service_token" "claw_master_macs" {
   }
 }
 
+# The Windows PC's own credential (scripts/claw-master-windows-setup.sh), so it can be revoked without
+# touching the Macs'.
+resource "cloudflare_zero_trust_access_service_token" "claw_master_windows_pc" {
+  account_id = var.cloudflare_account_id
+  name       = "claude-master-windows-pc"
+  duration   = "8760h" # 1 year
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "cloudflare_zero_trust_access_policy" "claw_master_macs" {
   account_id       = var.cloudflare_account_id
-  name             = "claude-master: Macs with the service token"
+  name             = "claude-master: Macs and the Windows PC with their service tokens"
   decision         = "non_identity"
   session_duration = "24h"
 
-  include = [{
-    service_token = { token_id = cloudflare_zero_trust_access_service_token.claw_master_macs.id }
-  }]
+  # Either token: Access ORs the include rules.
+  include = [
+    { service_token = { token_id = cloudflare_zero_trust_access_service_token.claw_master_macs.id } },
+    { service_token = { token_id = cloudflare_zero_trust_access_service_token.claw_master_windows_pc.id } },
+  ]
 }
 
 resource "cloudflare_zero_trust_access_application" "claw_master" {
@@ -155,6 +169,23 @@ resource "aws_secretsmanager_secret_version" "claw_master_mac_access" {
   })
 }
 
+resource "aws_secretsmanager_secret" "claw_master_windows_pc_access" {
+  name                    = "claude-master/windows-pc-access"
+  description             = "Cloudflare Access service token the Windows PC presents to reach the claude-master tunnel (administrators and fcvm-arm; delivered by scripts/claw-master-windows-setup.sh)"
+  recovery_window_in_days = 30
+  tags                    = { Name = "claude-master/windows-pc-access", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "claw_master_windows_pc_access" {
+  secret_id = aws_secretsmanager_secret.claw_master_windows_pc_access.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.claw_master_windows_pc.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.claw_master_windows_pc.client_secret
+    hostname      = local.claw_master_tunnel_hostname
+    local_port    = local.claw_master_open_port
+  })
+}
+
 resource "aws_secretsmanager_secret_policy" "claw_master_tunnel_token" {
   count      = var.enable_claw_master_server ? 1 : 0
   secret_arn = aws_secretsmanager_secret.claw_master_tunnel_token[0].arn
@@ -182,6 +213,39 @@ resource "aws_secretsmanager_secret_policy" "claw_master_mac_access" {
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.claw_master_mac_access.arn
       Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "claw_master_windows_pc_access" {
+  secret_arn = aws_secretsmanager_secret.claw_master_windows_pc_access.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndFcvmArmCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claw_master_windows_pc_access.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+    }]
+  })
+}
+
+# fcvm-arm sets the PC up over its reverse SSH tunnel (scripts/claw-master-windows-setup.sh), so it reads
+# the PC's token; as for the MacBook's SSH token (macbook-ssh.tf), only credentials of its own instance.
+# The token opens only the pool's tunnel, which fcvm-arm already uses with its own certificate.
+resource "aws_iam_role_policy" "dev_server_claw_master_windows_pc" {
+  count = var.enable_firecracker_instance ? 1 : 0
+  name  = "read-claw-master-windows-pc-access"
+  role  = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claw_master_windows_pc_access.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
     }]
   })
 }
