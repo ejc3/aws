@@ -552,6 +552,13 @@ class TunnelTests(unittest.TestCase):
         win = tblock("aws_secretsmanager_secret_policy", "claw_master_windows_pc_access")
         self.assertNotIn("claw_master_server", win)
         self.assertIn("aws_secretsmanager_secret.claw_master_windows_pc_access.arn", win)
+        # fcvm-arm sets the PC up, so it may read the PC's token, and only from its own instance
+        self.assertIn("[aws_iam_role.dev_server.arn]", win)
+        grant = tblock("aws_iam_role_policy", "dev_server_claw_master_windows_pc")
+        self.assertIn("Resource  = aws_secretsmanager_secret.claw_master_windows_pc_access.arn", grant)
+        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', grant)
+        self.assertNotIn("claw_master_mac_access", grant)
+        self.assertNotIn("[aws_iam_role.dev_server.arn]", mac)  # the Macs' token stays administrators only
         for p in (conn, mac, win):
             self.assertIn('Effect    = "Deny"', p)
             self.assertIn("local.games_mp_admin_principals", p)
@@ -651,10 +658,18 @@ class MacSetupTests(unittest.TestCase):
 
 
 class WindowsSetupTests(unittest.TestCase):
-    """Setting a Windows PC up over its ssh alias: pinned, gated on the server, token through stdin only."""
+    """Setting a Windows PC up from fcvm-arm: pinned, owner-only token through stdin, and the PC switched
+    to the pool only once the pool answers through its tunnel."""
 
     def pin(self, name):
         return re.search(r"^%s=(\S+)$" % name, WINSETUP, re.M).group(1)
+
+    def step(self, n):
+        """The text of step n/7, from its echo to the next step's."""
+        text = code(WINSETUP)
+        start = text.index('echo "%d/7' % n)
+        nxt = text.find('echo "%d/7' % (n + 1), start)
+        return text[start:nxt if nxt >= 0 else len(text)]
 
     def test_the_pins_match_the_servers_and_the_tunnels(self):
         server_tag = re.search(r'claw_master_tag\s+=\s+"([^"]+)"', TF).group(1)
@@ -664,51 +679,63 @@ class WindowsSetupTests(unittest.TestCase):
         for name in ("CM_SHA256_WINDOWS_AMD64", "CFD_SHA256_WINDOWS_AMD64"):
             self.assertRegex(self.pin(name), r"^[0-9a-f]{64}$")
 
-    def test_binaries_are_verified_on_the_pc_before_they_are_installed(self):
-        text = code(WINSETUP)
-        self.assertIn('throw "$what did not match its pinned sha256"', text)
-        self.assertLess(text.index("did not match its pinned sha256"), text.index('Move-Item -Force "$dest.new" $dest'))
-        # an installed binary is judged by its hash, never by what it reports
-        self.assertNotRegex(text, r"--version")
+    def test_both_binaries_are_installed_only_through_the_hash_check(self):
+        s2 = self.step(2)
+        fn = s2[s2.index("function Install-Pinned"):s2.index("\n}\n", s2.index("function Install-Pinned"))]
+        # the downloaded file is rejected on a hash mismatch, and moved into place only after the check
+        self.assertIn('if ((Get-FileHash "$dest.new").Hash -ne $sha) { Remove-Item "$dest.new"; throw', fn)
+        self.assertLess(fn.index("-ne $sha"), fn.index('Move-Item -Force "$dest.new" $dest'))
+        self.assertIn('claw-master-windows-amd64.exe" "$bin\\claw-master.exe" $CmSha', s2)
+        self.assertIn('cloudflared-windows-amd64.exe" "$bin\\cloudflared.exe" $CfdSha', s2)
+        self.assertEqual(code(WINSETUP).count("Invoke-WebRequest"), 1, "every download goes through Install-Pinned")
+        self.assertNotRegex(code(WINSETUP), r"--version")
 
-    def test_nothing_is_installed_until_the_server_is_serving_its_open_port(self):
-        text = code(WINSETUP)
-        gate = text.index("0/7")
-        self.assertIn("claw-master-status", text[gate:text.index("1/7")])
-        self.assertIn("grep -q '^open listener: listening'", text[gate:text.index("1/7")])
-        for step in ("1/7", "2/7", "3/7", "6/7"):
-            self.assertLess(gate, text.index(step))
-        self.assertLess(gate, text.index("Invoke-WebRequest"))
-        self.assertLess(gate, text.index("TUNNEL_SERVICE_TOKEN_SECRET"))
+    def test_the_token_goes_through_stdin_into_a_file_checked_owner_only_first(self):
+        s3 = self.step(3)
+        self.assertIn("{ set +x; } 2>/dev/null", s3)
+        self.assertIn("--secret-id claude-master/windows-pc-access", s3)
+        self.assertIn("|\n  on_pc", s3)
+        self.assertIn("unset SECRET", code(WINSETUP))
+        # protected (no inherited rules), the user's one rule, checked, and only then written
+        self.assertIn("SetAccessRuleProtection($true, $false)", s3)
+        check = s3.index("$rules.Count -ne 1")
+        self.assertIn("throw 'cloudflare.env could not be made owner-only; nothing written'", s3[check:])
+        self.assertLess(check, s3.index("[Console]::In.ReadToEnd()"))
+        self.assertNotRegex(code(WINSETUP), r"ssh[^\n]*client_secret")
+        self.assertNotRegex(code(WINSETUP), r"echo[^\n]*\$SECRET")
+        self.assertNotRegex(code(WINSETUP), r"ps_vars[^\n]*SECRET")
+        self.assertIn("-EncodedCommand $enc", code(WINSETUP))
 
-    def test_the_token_goes_through_stdin_only(self):
+    def test_a_failed_step_stops_the_script(self):
         text = code(WINSETUP)
-        self.assertIn("{ set +x; } 2>/dev/null", text)
-        self.assertIn("--secret-id claude-master/windows-pc-access", text)
-        seg = text[text.index("TUNNEL_SERVICE_TOKEN_SECRET"):text.index("unset SECRET")]
-        self.assertIn("|\n  on_pc", seg)
-        self.assertIn("[Console]::In.ReadToEnd()", seg)
-        # owner-only before the secret is written into the file
-        self.assertLess(seg.index("/inheritance:r"), seg.index("[Console]::In.ReadToEnd()"))
-        self.assertNotRegex(text, r"ssh[^\n]*client_secret")
-        self.assertNotRegex(text, r"echo[^\n]*\$SECRET")
-        self.assertNotRegex(text, r"ps_vars[^\n]*SECRET")
-        # the scripts travel as -EncodedCommand; the secret never does
-        self.assertIn("-EncodedCommand $enc", text)
+        self.assertIn("set -euo pipefail", text)
+        # on_pc ends in a pipe; pipefail carries ssh's (so PowerShell's) exit status through it
+        self.assertRegex(text, r'-EncodedCommand \$enc" \| tr -d')
 
     def test_the_tunnel_task_reads_the_token_into_its_environment_not_its_arguments(self):
         task = WINSETUP[WINSETUP.index("@'\n"):WINSETUP.index("'@ | Set-Content")]
         self.assertIn("SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')", task)
         self.assertNotRegex(task, r"cloudflared[^\n]*(--service-token|TUNNEL_SERVICE_TOKEN)")
-        self.assertIn("-gt 5242880", task)  # the log rotates at 5 MB
+        self.assertIn("-gt 5242880", task)
+        self.assertIn("Start-ScheduledTask -TaskName $name", self.step(5))
 
-    def test_the_pc_is_switched_to_the_pool_only_once_its_tunnel_listens(self):
-        text = code(WINSETUP)
-        self.assertLess(text.index("Get-NetTCPConnection"), text.index("agent install"))
-        self.assertIn('throw "the tunnel did not start listening', text)
-        # the check never prints the proxy URL, which carries the agent's token
-        check = text[text.index("7/7"):]
-        self.assertNotRegex(check, r'"[^"\n]*\$proxy')
+    def test_the_pc_is_switched_over_only_after_the_pool_answers_through_its_tunnel(self):
+        s6 = self.step(6)
+        self.assertIn('-x "http://127.0.0.1:$Port"', s6)
+        self.assertIn("if ($LASTEXITCODE -eq 0 -and $out -like '200 *')", s6)
+        self.assertRegex(s6, r"the PC was not switched over\"\nexit 1")
+        self.assertLess(code(WINSETUP).index('echo "6/7'), code(WINSETUP).index("agent install --listen"))
+        self.assertNotIn("agent install --listen", s6)
+
+    def test_agent_install_and_the_final_check_fail_the_script_when_they_fail(self):
+        s7 = self.step(7)
+        self.assertIn('if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }', s7)
+        self.assertIn("if ($LASTEXITCODE -ne 0 -or $out -notlike '200 *')", s7)
+        self.assertNotIn("$ErrorActionPreference = 'Stop'", s7)  # 5.1 ends the script on native stderr
+        # the agent's proxy URL (it carries the agent's token) reaches curl only through its environment
+        self.assertIn("$env:HTTPS_PROXY = (Get-Content", s7)
+        self.assertNotRegex(s7, r"curl\.exe[^\n]*(-x|--proxy)")
+        self.assertNotRegex(s7, r'"[^"\n]*\$env:HTTPS_PROXY')
 
     def test_it_parses(self):
         r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / "claw-master-windows-setup.sh")], capture_output=True, text=True)

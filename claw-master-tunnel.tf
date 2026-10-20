@@ -171,7 +171,7 @@ resource "aws_secretsmanager_secret_version" "claw_master_mac_access" {
 
 resource "aws_secretsmanager_secret" "claw_master_windows_pc_access" {
   name                    = "claude-master/windows-pc-access"
-  description             = "Cloudflare Access service token the Windows PC presents to reach the claude-master tunnel (administrators only; delivered by scripts/claw-master-windows-setup.sh)"
+  description             = "Cloudflare Access service token the Windows PC presents to reach the claude-master tunnel (administrators and fcvm-arm; delivered by scripts/claw-master-windows-setup.sh)"
   recovery_window_in_days = 30
   tags                    = { Name = "claude-master/windows-pc-access", Managed = "terraform" }
 }
@@ -222,12 +222,30 @@ resource "aws_secretsmanager_secret_policy" "claw_master_windows_pc_access" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationCanRead"
+      Sid       = "OnlyAdministrationAndFcvmArmCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.claw_master_windows_pc_access.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+    }]
+  })
+}
+
+# fcvm-arm sets the PC up over its reverse SSH tunnel (scripts/claw-master-windows-setup.sh), so it reads
+# the PC's token; as for the MacBook's SSH token (macbook-ssh.tf), only credentials of its own instance.
+# The token opens only the pool's tunnel, which fcvm-arm already uses with its own certificate.
+resource "aws_iam_role_policy" "dev_server_claw_master_windows_pc" {
+  count = var.enable_firecracker_instance ? 1 : 0
+  name  = "read-claw-master-windows-pc-access"
+  role  = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.claw_master_windows_pc_access.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
     }]
   })
 }
