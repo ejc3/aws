@@ -277,6 +277,12 @@ fi
 while read -r alias secret; do
   bash "$SHARED/snippets/mac-ssh.sh" "$U" "$alias" "$secret" || warn "ssh $alias config failed"
 done < <(cfg --arg u "$U" '.users[$u].macs // {} | to_entries[] | "\(.key) \(.value)"')
+# Of those, the Windows PCs whose Windows-MCP (screenshots, clicks, typing) this account's Claude Code gets
+# (config.json users.<u>.windows_mcp; colin-pc-ssh.tf): mcp-remote from its lockfile, the bridge, and the Claude entry.
+while read -r alias; do
+  [ -n "$alias" ] || continue
+  as_user bash "$SHARED/windows/windows-mcp-client-setup.sh" "$alias" || warn "Windows-MCP for $alias failed"
+done < <(cfg --arg u "$U" '.users[$u].windows_mcp // [] | .[]')
 # pbox, gbox and wbox, in every container: the owner's drive the owner's boxes with the hop key, a member's drive
 # that member's own three (member-boxes.tf), and the session policy admits nothing else.
 bash "$SHARED/snippets/box-tools.sh" || warn "box tools install failed"

@@ -45,12 +45,14 @@ class Route(unittest.TestCase):
         policy = TF[TF.index('resource "aws_secretsmanager_secret_policy" "colin_pc_ssh_tunnel"'):]
         self.assertIn("ArnNotEquals = { \"aws:PrincipalArn\" = local.colin_pc_ssh_admins }", policy.split("\n}\n")[0])
 
-    def test_the_clients_are_exactly_fcvm_arm_for_now(self):
+    def test_the_clients_are_fcvm_arm_and_colins_own_container(self):
         clients = TF[TF.index("colin_pc_ssh_clients = {"):TF.index("\n  }\n", TF.index("colin_pc_ssh_clients = {"))]
-        self.assertEqual(re.findall(r"^\s+([a-z-]+)\s+= \{", clients, re.M), ["fcvm"])
+        self.assertEqual(re.findall(r"^\s+([a-z-]+)\s+= \{", clients, re.M), ["fcvm", "nextjs-colin"])
         self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', TF)
-        self.assertNotIn("nextjs_dev", TF)
-        self.assertIn('CLIENTS="fcvm:ubuntu"', SETUP)
+        grant = TF[TF.index('resource "aws_iam_role_policy" "nextjs_dev_colin_pc_ssh"'):]
+        self.assertIn('Resource = aws_secretsmanager_secret.colin_pc_ssh_access["nextjs-colin"].arn', grant.split("\n}\n")[0])
+        self.assertIn('CLIENTS="fcvm:ubuntu nextjs:colin"', SETUP)
+        self.assertIn('windows_mcp_pcs = ["colin-pc"]', TF)
 
 
 class Setup(unittest.TestCase):

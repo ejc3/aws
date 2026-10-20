@@ -18,6 +18,9 @@ ALIAS=${1:-}
 [[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: windows-mcp-client-setup.sh ALIAS" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 BRIDGE_HOME="$HOME/.local/share/windows-mcp-bridge"
+# Claude Code's native install is in ~/.local/bin, which a provisioning `sudo -u` does not put on PATH.
+CLAUDE=$(command -v claude || echo "$HOME/.local/bin/claude")
+[ -x "$CLAUDE" ] || { echo "windows-mcp-client-setup: no claude for this account" >&2; exit 1; }
 
 echo "1/3 mcp-remote from the lockfile"
 mkdir -p "$BRIDGE_HOME" "$HOME/.local/bin"
@@ -29,9 +32,9 @@ echo "2/3 the bridge"
 install -m 755 "$HERE/windows-mcp-bridge" "$HOME/.local/bin/windows-mcp-bridge"
 
 echo "3/3 Claude Code's entry '$ALIAS'"
-if claude mcp get "$ALIAS" >/dev/null 2>&1; then
+if "$CLAUDE" mcp get "$ALIAS" >/dev/null 2>&1; then
   echo "   already there; left alone (claude mcp remove $ALIAS -s user, then re-run, to replace it)"
 else
-  claude mcp add -s user "$ALIAS" -- "$HOME/.local/bin/windows-mcp-bridge" "$ALIAS"
+  "$CLAUDE" mcp add -s user "$ALIAS" -- "$HOME/.local/bin/windows-mcp-bridge" "$ALIAS"
 fi
-claude mcp get "$ALIAS" 2>&1 | grep -E 'Status|Issue' || true
+"$CLAUDE" mcp get "$ALIAS" 2>&1 | grep -E 'Status|Issue' || true

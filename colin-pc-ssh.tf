@@ -4,10 +4,12 @@
 #
 #   colin-pc-ssh.cc-games.dev  -> OpenSSH Server (ssh://127.0.0.1:22) on Colin's PC
 #
-# Who gets in (owner, 2026-10-20): fcvm-arm's ubuntu, by service token only, plus EJ in a browser through the
-# browser-manager owner policy. Colin's own account on nextjs-ct is a second client, added with its container wiring.
+# Who gets in (owner, 2026-10-20): fcvm-arm's ubuntu and Colin's own account in its nextjs-ct container, by service
+# token only, plus EJ in a browser through the browser-manager owner policy.
 #
 #   fcvm-arm, ubuntu       colin-pc-ssh-access-fcvm             (fcvm-arm's instance only)
+#   nextjs-ct, colin       colin-pc-ssh-access-nextjs-colin     (nextjs-dev-role; denied to every other member's
+#                                                                container, nextjs-ct-user-data.tf)
 #
 # The token opens only the Access gate; the PC still wants that account's own key (~/.ssh/to-colin-pc, made on the box
 # by mac-ssh-client.tf as that account; its private half never leaves the box). The clients are mac-ssh-client.tf's
@@ -28,8 +30,12 @@ locals {
   ]
   # One service token and one secret per client account. `reader` is the one role besides administration that may read it.
   colin_pc_ssh_clients = {
-    fcvm = { token_name = "colin-pc-ssh-fcvm-arm", secret = "colin-pc-ssh-access-fcvm", reader = aws_iam_role.dev_server.arn, who = "fcvm-arm ubuntu" }
+    fcvm         = { token_name = "colin-pc-ssh-fcvm-arm", secret = "colin-pc-ssh-access-fcvm", reader = aws_iam_role.dev_server.arn, who = "fcvm-arm ubuntu" }
+    nextjs-colin = { token_name = "colin-pc-ssh-nextjs-colin", secret = "colin-pc-ssh-access-nextjs-colin", reader = aws_iam_role.nextjs_dev.arn, who = "nextjs colin" }
   }
+  # The PCs in mac-ssh-client.tf's map that serve Windows-MCP (scripts/windows-pc-setup.sh): a client account with one of
+  # these aliases also gets Claude Code's entry for it (scripts/windows/windows-mcp-client-setup.sh).
+  windows_mcp_pcs = ["colin-pc"]
 }
 
 resource "cloudflare_zero_trust_access_service_token" "colin_pc_ssh" {
@@ -201,6 +207,19 @@ resource "aws_iam_role_policy" "dev_server_colin_pc_ssh" {
       Resource = aws_secretsmanager_secret.colin_pc_ssh_access["fcvm"].arn
       # dev_server is fcvm-x86's role too: only credentials issued to fcvm-arm's own instance may read it.
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "nextjs_dev_colin_pc_ssh" {
+  name = "read-colin-pc-ssh"
+  role = aws_iam_role.nextjs_dev.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.colin_pc_ssh_access["nextjs-colin"].arn
     }]
   })
 }
