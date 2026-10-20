@@ -243,14 +243,57 @@ class SecurityHubAutomation(unittest.TestCase):
             "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], 8),
             "dolphin-redis-public-ip-by-design": (["ECS.2"], "EQUALS",
                                                   ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], 9),
+            "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], 10),
         })
         # they share us-west-1 with the main rules: orders and names must not collide
         main = {r["order"] for r in self.rules} | {self.ssh["order"]}
         self.assertFalse(main & {r["order"] for r in rules})
         for r in rules:
             self.assertIn("security-hub-automation.tf", r["note"])
-        # Dolphin has no security-forward-audit path: a Config.1 rule there would also hide a stopped recorder
-        self.assertNotIn("Config.1", local_value(self.text, "security_hub_dolphin_rules"))
+        for r in rules:
+            self.assertLessEqual(len(r["note"]), 512, r["name"])
+            self.assertLessEqual(len(r["description"]), 1024, r["name"])
+
+    def test_dolphin_config_1_rule_stands_on_the_recorder_alarm(self):
+        """Dolphin has no security-forward-audit path, and a Config.1 rule also hides a stopped recorder: the rule is
+        allowed only with the alarm in the Dolphin account that raises a stopped, deleted or changed recorder (#564)."""
+        dolphin = strip_comments((ROOT / "dolphin-security.tf").read_text())
+        (_, rule), = blocks(dolphin, r'resource "aws_cloudwatch_event_rule" "dolphin_config_recorder"')
+        self.assertEqual(attr(rule, "provider"), "aws.dolphin")
+        pattern = rule[rule.index("event_pattern"):]
+        self.assertIn('source        = ["aws.config"]', pattern)
+        self.assertIn('"AWS API Call via CloudTrail"', pattern)
+        self.assertIn('eventSource = ["config.amazonaws.com"]', pattern)
+        names = set(re.findall(r'"(\w+)"', attr(pattern, "eventName") or ""))
+        self.assertLessEqual({"StopConfigurationRecorder", "DeleteConfigurationRecorder", "DeleteDeliveryChannel",
+                              "PutConfigurationRecorder"}, names)
+        self.assertNotIn("account", pattern)  # its own account's calls, whoever makes them
+        self.assertNotIn("errorCode", pattern)  # denied attempts alert too
+        (_, target), = blocks(dolphin, r'resource "aws_cloudwatch_event_target" "dolphin_config_recorder"')
+        self.assertEqual(attr(target, "provider"), "aws.dolphin")
+        self.assertEqual(attr(target, "rule"), "aws_cloudwatch_event_rule.dolphin_config_recorder.name")
+        self.assertEqual(attr(target, "arn"), "data.aws_sns_topic.dolphin_alerts.arn")
+        # the topic lets EventBridge publish for exactly this rule, and keeps the default same-account statement
+        (_, policy), = blocks(dolphin, r'resource "aws_sns_topic_policy" "dolphin_alerts"')
+        self.assertEqual(attr(policy, "provider"), "aws.dolphin")
+        self.assertIn('Principal = { Service = "events.amazonaws.com" }', policy)
+        self.assertIn('ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_config_recorder.arn }', policy)
+        self.assertIn('"AWS:SourceOwner" = data.aws_caller_identity.dolphin.account_id', policy)
+        self.assertIn("aws_sns_topic_policy.dolphin_alerts", attr(target, "depends_on"))
+        # a failed delivery alarms
+        (_, alarm), = blocks(dolphin, r'resource "aws_cloudwatch_metric_alarm" "dolphin_config_recorder_delivery"')
+        self.assertEqual(attr(alarm, "provider"), "aws.dolphin")
+        self.assertIn('"FailedInvocations"', alarm)
+        self.assertIn("aws_cloudwatch_event_rule.dolphin_config_recorder.name", alarm)
+        self.assertIn("data.aws_sns_topic.dolphin_alerts.arn", attr(alarm, "alarm_actions"))
+        # the topic is the owner-subscribed one, read in the Dolphin account; and the suppression waits for the alarm
+        alerts = strip_comments((ROOT / "dolphin-alerts.tf").read_text())
+        (_, topic), = blocks(alerts, r'data "aws_sns_topic" "dolphin_alerts"')
+        self.assertEqual(attr(topic, "provider"), "aws.dolphin")
+        self.assertEqual(attr(topic, "name"), '"dolphin-alerts"')
+        automation = strip_comments(self.text)
+        (_, suppression), = blocks(automation, r'resource "aws_securityhub_automation_rule" "by_design_dolphin"')
+        self.assertIn("aws_cloudwatch_event_target.dolphin_config_recorder", attr(suppression, "depends_on"))
 
     def test_account_callers_go_through_the_account_providers(self):
         everything = "\n".join(strip_comments(p.read_text()) for p in tf_files())

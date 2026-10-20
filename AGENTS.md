@@ -1507,7 +1507,10 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   Inspector findings, which the shared pattern leaves to Inspector's own events; the security delivery observer checks
   that rule's topology and failure metrics like its own (`security_delivery_extra_rules`). A Config aggregator `dolphin` reads its
   configuration. Not covered: the Dolphin account's CloudTrail control-plane alerts (`security-forward-audit`); the org
-  CloudTrail (its key's encryption context lists the Dolphin account) still records every call. The AI-services opt-out
+  CloudTrail (its key's encryption context lists the Dolphin account) still records every call. One exception stays inside
+  the Dolphin account: a rule there (`dolphin-config-recorder-changes`) mails `dolphin-alerts` when its Config recorder or
+  delivery channel is stopped, deleted or changed, which is what lets Security Hub suppress its by-design Config.1 (the
+  recorder's own role) as it does here; a failed delivery alarms. The AI-services opt-out
   at the root covers it. Do not add it to `security_account_ids`: that list admits an account's principals to this
   account's Config bucket and central event bus.
 - **Only the monitored regions work there.** `dolphin-region-scp.tf`: a service control policy on the Dolphin OU (only)

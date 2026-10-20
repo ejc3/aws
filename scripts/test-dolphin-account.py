@@ -130,9 +130,10 @@ class DolphinBootstrapTests(unittest.TestCase):
 class DolphinSecurityTests(unittest.TestCase):
     def test_monitoring_grants_the_dolphin_account_nothing_here(self):
         text = (ROOT / "dolphin-security.tf").read_text()
-        # The only resource policy is the Config bucket's, in the Dolphin account, for its own Config service; the one
-        # role is this account's own, trusted only by this account's EventBridge rule.
-        self.assertEqual(text.count("Principal = "), 4)
+        # The resource policies are in the Dolphin account, for its own services: the Config bucket's, and dolphin-alerts'
+        # (its default same-account statement plus that account's own Config recorder rule, #564); the one role is this
+        # account's own, trusted only by this account's EventBridge rule.
+        self.assertEqual(text.count("Principal = "), 6)
         self.assertEqual(text.count('resource "aws_iam_role" '), 1)
         role = block(text, 'resource "aws_iam_role" "dolphin_security_inspector"')
         self.assertNotIn("provider", role)
@@ -142,7 +143,15 @@ class DolphinSecurityTests(unittest.TestCase):
         policy = block(text, 'resource "aws_s3_bucket_policy" "dolphin_security_config"')
         self.assertIn("provider = aws.dolphin\n", policy)
         self.assertEqual(policy.count("Principal = "), 3)
-        for forbidden in ("aws_cloudwatch_event_bus_policy", "aws_sns_topic_policy",
+        self.assertEqual(text.count('resource "aws_sns_topic_policy"'), 1)
+        topic = block(text, 'resource "aws_sns_topic_policy" "dolphin_alerts"')
+        self.assertIn("provider = aws.dolphin\n", topic)
+        self.assertEqual(topic.count("Principal = "), 2)
+        self.assertIn('"AWS:SourceOwner" = data.aws_caller_identity.dolphin.account_id', topic)
+        self.assertIn('"aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_config_recorder.arn', topic)
+        self.assertNotIn("current", topic)
+        self.assertIn("provider    = aws.dolphin\n", block(text, 'resource "aws_cloudwatch_event_rule" "dolphin_config_recorder"'))
+        for forbidden in ("aws_cloudwatch_event_bus_policy",
                           "aws_sqs_queue_policy", "aws_kms_key", "aws_lambda_permission"):
             self.assertNotIn('resource "' + forbidden, text)
 
