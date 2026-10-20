@@ -128,22 +128,15 @@ locals {
     note        = replace(r.note, "security-hub-automation.tf", "staging account. security-hub-automation.tf")
   }) if contains(["guardduty-protection-plans-off-by-design", "inspector-ecr-lambda-code-off-by-design", "config-custom-recorder-role-by-design"], r.name)]
 
-  # The Dolphin account (dolphin-security.tf, the same modules/security-region): the custom Config recorder role and
-  # Inspector's ECR scanning, plus ECS.2 on exactly its Redis service, which takes a public IP only to egress (its
-  # group allows no inbound and the account has no NAT; dolphin-aws redis.tf). Orders follow this region's main rules.
+  # The Dolphin account (dolphin-security.tf, the same modules/security-region): Inspector's ECR and Lambda code scanning,
+  # plus ECS.2 on exactly its Redis service, which takes a public IP only to egress (its group allows no inbound and the
+  # account has no NAT; dolphin-aws redis.tf). Orders follow this region's main rules. NOT Config.1: a rule cannot match
+  # the finding's status reason, so it would also hide a stopped or deleted recorder, and unlike the main and staging
+  # accounts Dolphin has no security-forward-audit path to alert on that instead (dolphin-security.tf).
   security_hub_dolphin_rules = [
     {
-      name                = "dolphin-config-custom-recorder-role-by-design"
-      order               = 8
-      description         = "Config.1 in the Dolphin account: its recorder uses our own role and a reviewed set of types (dolphin-security.tf, modules/security-region). Stopping or deleting the recorder is recorded by the organization trail."
-      note                = "Dolphin account: Config recorder uses a custom role by design (dolphin-security.tf). security-hub-automation.tf"
-      controls            = ["Config.1"]
-      resource_comparison = ""
-      resource_ids        = []
-    },
-    {
       name                = "dolphin-inspector-ecr-lambda-code-off-by-design"
-      order               = 9
+      order               = 8
       description         = "Inspector.2 and Inspector.3 in the Dolphin account: ECR and Lambda code scanning are deliberately off (dolphin-security.tf, modules/security-region). Inspector's CVE findings still alert."
       note                = "Dolphin account: Inspector ECR and Lambda code scanning deliberately off; CVE findings alert. security-hub-automation.tf"
       controls            = ["Inspector.2", "Inspector.3"]
@@ -152,7 +145,7 @@ locals {
     },
     {
       name                = "dolphin-redis-public-ip-by-design"
-      order               = 10
+      order               = 9
       description         = "ECS.2 on the Dolphin Redis service only: it takes a public IP to egress (no NAT in the account) and its security group allows no inbound (dolphin-aws redis.tf). Any other service still alerts."
       note                = "Dolphin Redis: public IP for egress only, no inbound rule (dolphin-aws redis.tf). security-hub-automation.tf"
       controls            = ["ECS.2"]
@@ -349,9 +342,7 @@ resource "aws_securityhub_automation_rule" "by_design_dr" {
 }
 
 # ---- the staging account: rules created in its own Security Hub (it has no administrator), us-west-1 and us-east-1.
-data "aws_caller_identity" "staging" {
-  provider = aws.staging
-}
+# data.aws_caller_identity.staging (aws.staging) is dev-staging-bootstrap.tf's.
 
 resource "aws_securityhub_automation_rule" "by_design_staging" {
   provider    = aws.staging

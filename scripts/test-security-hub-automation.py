@@ -240,20 +240,22 @@ class SecurityHubAutomation(unittest.TestCase):
         rules = [rule_fields(o) for o in items(local_value(self.text, "security_hub_dolphin_rules"))]
         got = {r["name"]: (r["controls"], r["resource_comparison"], r["resource_ids"], r["order"]) for r in rules}
         self.assertEqual(got, {
-            "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], 8),
-            "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], 9),
+            "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], 8),
             "dolphin-redis-public-ip-by-design": (["ECS.2"], "EQUALS",
-                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], 10),
+                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], 9),
         })
         # they share us-west-1 with the main rules: orders and names must not collide
         main = {r["order"] for r in self.rules} | {self.ssh["order"]}
         self.assertFalse(main & {r["order"] for r in rules})
         for r in rules:
             self.assertIn("security-hub-automation.tf", r["note"])
+        # Dolphin has no security-forward-audit path: a Config.1 rule there would also hide a stopped recorder
+        self.assertNotIn("Config.1", local_value(self.text, "security_hub_dolphin_rules"))
 
     def test_account_callers_go_through_the_account_providers(self):
+        everything = "\n".join(strip_comments(p.read_text()) for p in tf_files())
         for name, provider in CALLERS.items():
-            found = blocks(self.text, r'data "aws_caller_identity" "%s"' % name)
+            found = blocks(everything, r'data "aws_caller_identity" "%s"' % name)
             self.assertEqual(len(found), 1, name)
             self.assertEqual(attr(found[0][1], "provider"), provider, name)
 
