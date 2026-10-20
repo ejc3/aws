@@ -19,6 +19,19 @@
 #   TF_RUN_LOCK_FILE      the lock file (default /var/lib/terraform-run-lock/lock, made by the installer)
 #   TF_RUN_LOCK_REAL      the real terraform (default /usr/local/lib/terraform-run-lock/terraform, else the first
 #                         terraform on PATH that is not this wrapper)
+#   TF_PLUGIN_CACHE_DIR   set to /var/cache/terraform-plugins (TF_RUN_LOCK_PLUGIN_CACHE; made by the installer) when
+#                         unset and that directory is writable: every fresh worktree's `init -lockfile=readonly` then links the providers from one
+#                         cache instead of downloading about 1 GB (Terraform uses a cached provider only when its
+#                         checksum is in the lock file, which records both platforms' h1 hashes)
+#   TF_RUN_LOCK_PARALLELISM  -parallelism added to plan and apply when the caller passed none (default 30; empty
+#                         adds nothing). Refreshing ~1,000 resources is mostly waiting on APIs, not CPU
+#
+# A run is cancelled, never killed. Terraform runs in a session of its own under a small supervisor, so a kill aimed at
+# the caller's process group (a stopped background task, a closed terminal) does not take Terraform down mid-run with its
+# remote state lock still held (2026-10-20: a killed plan left the DynamoDB lock behind and the next run waited on it).
+# SIGINT, SIGTERM or SIGHUP to this wrapper, or the wrapper dying outright, makes the supervisor send Terraform one
+# SIGINT: Terraform stops after its in-flight operations, releases the state lock and exits, and its exit code comes
+# back. A second SIGINT to the wrapper is passed on too, which Terraform treats as "stop now".
 #
 # The lock is held by util-linux flock(1) with -o: flock takes it, closes its descriptor before starting Terraform, and
 # holds it until Terraform exits, so no descendant of Terraform (a provider plugin that outlives a killed Terraform)
@@ -90,8 +103,53 @@ fi
 exec 9<&- # the probe's descriptor (and its lock, if it got one) goes; flock below takes the lock for the run
 [ -n "${TF_RUN_LOCK_NOWAIT:-}" ] && mode=(-n)
 
-flock -o "${mode[@]}" -E 75 "$lock" "$real" "$@"
-rc=$?
+cache=${TF_RUN_LOCK_PLUGIN_CACHE:-/var/cache/terraform-plugins}
+[ -z "${TF_PLUGIN_CACHE_DIR:-}" ] && [ -d "$cache" ] && [ -w "$cache" ] && export TF_PLUGIN_CACHE_DIR=$cache
+
+# -parallelism goes right after the subcommand (options come before a saved plan file), unless the caller chose one.
+args=("$@")
+par=${TF_RUN_LOCK_PARALLELISM-30}
+if [ -n "$par" ] && { [ "$sub" = plan ] || [ "$sub" = apply ]; }; then
+  given=""
+  for a in "$@"; do case "$a" in -parallelism=*) given=1 ;; esac; done
+  if [ -z "$given" ]; then
+    for i in "${!args[@]}"; do
+      if [ "${args[$i]}" = "$sub" ]; then args=("${args[@]:0:i+1}" "-parallelism=$par" "${args[@]:i+1}"); break; fi
+    done
+  fi
+fi
+
+# The supervisor (in the new session, so a group kill of the caller misses it): start Terraform with SIGINT at its
+# default (a background job of a non-interactive shell would start with it ignored) and stdin passed through, send it
+# SIGINT on USR1 from the wrapper or when the wrapper ($1) is gone (dead or a zombie nobody has reaped yet), and exit
+# with Terraform's code.
+supervisor='parent=$1 real=$2; shift 2
+env --default-signal=INT,QUIT "$real" "$@" <&0 &
+tf=$!
+asked=0
+cancel() { asked=$((asked + 1)); kill -INT "$tf" 2>/dev/null; }
+alive() { local s; s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; s=${s##*) }; [ "${s%% *}" != Z ]; }
+trap cancel USR1
+trap "" INT TERM HUP
+while kill -0 "$tf" 2>/dev/null; do
+  if [ "$asked" -eq 0 ] && ! alive "$parent"; then cancel; fi
+  sleep 1 & wait $!
+done
+wait "$tf"'
+
+setsid flock -o "${mode[@]}" -E 75 "$lock" bash -c "$supervisor" terraform-run-lock "$$" "$real" "${args[@]}" <&0 &
+run=$!
+forward() { local s; s=$(pgrep -o -P "$run" 2>/dev/null) && kill -USR1 "$s" 2>/dev/null; }
+trap forward INT TERM HUP
+rc=0
+while :; do
+  wait "$run"; rc=$?
+  kill -0 "$run" 2>/dev/null || break
+done
+if [ "$rc" -gt 128 ]; then # interrupted just as the run ended: its own status is still waiting to be collected
+  wait "$run" 2>/dev/null; r=$?
+  [ "$r" -ne 127 ] && rc=$r
+fi
 if [ "$rc" -eq 75 ] && ! flock -n "$lock" true 2>/dev/null; then
   echo "terraform-run-lock: still busy; giving up" >&2
 fi

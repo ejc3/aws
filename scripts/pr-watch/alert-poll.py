@@ -8,16 +8,24 @@ Scopes are every security-region module in security-monitoring.tf: the main acco
 OrganizationAccountAccessRole. Prints one JSON object per result, each with a stable `id`, and nothing secret.
 CloudTrail is read from LOOKBACK before SINCE, because an event can reach lookup-events minutes after it happened
 (delivery averages about five minutes and is not guaranteed); the watch drops ids it has already triaged.
+
+The scopes are read concurrently (WORKERS threads, each with its own boto3 session: sessions are not thread-safe).
+Read one after another, 34 scopes took minutes, nearly all of it CloudTrail: about 60 lookup-events calls per scope,
+which AWS throttles to 2 a second per account and region, so regions in parallel do not slow each other.
 """
+import concurrent.futures
 import datetime as dt
 import json
 import re
 import sys
+import threading
 
 import boto3
 from botocore.config import Config
 
 LOOKBACK = dt.timedelta(minutes=30)
+WORKERS = 12
+OUT_LOCK = threading.Lock()  # one result per line, never two interleaved
 CFG = Config(retries={"max_attempts": 4, "mode": "standard"}, connect_timeout=10, read_timeout=30)
 
 SINCE = None  # set by main()
@@ -53,21 +61,24 @@ PROTECTED_VAULTS = {"ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backu
 
 
 def sessions():
+    """(account label, a function that makes a fresh boto3 session for it): one session per thread."""
     main = boto3.Session()
-    yield "main", main
+    yield "main", boto3.Session
     org = main.client("organizations", config=CFG)
     staging = [a for a in org.list_accounts()["Accounts"] if a["Name"] in ("dev-staging", "staging") or "staging" in a["Name"]]
     for a in staging:
         c = main.client("sts", config=CFG).assume_role(
             RoleArn=f"arn:aws:iam::{a['Id']}:role/OrganizationAccountAccessRole", RoleSessionName="alert-poll")["Credentials"]
-        yield "staging", boto3.Session(aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"],
-                                       aws_session_token=c["SessionToken"])
+        creds = {"aws_access_key_id": c["AccessKeyId"], "aws_secret_access_key": c["SecretAccessKey"],
+                 "aws_session_token": c["SessionToken"]}
+        yield "staging", lambda creds=creds: boto3.Session(**creds)
 
 
 def out(**kw):
-    if "error" in kw and "kind" not in kw:
-        FAILED.append(kw)
-    print(json.dumps(kw, default=str), flush=True)
+    with OUT_LOCK:
+        if "error" in kw and "kind" not in kw:
+            FAILED.append(kw)
+        print(json.dumps(kw, default=str), flush=True)
 
 
 def poll(acct, sess, region):
@@ -162,15 +173,28 @@ def poll(acct, sess, region):
     except Exception as e:  # noqa: BLE001
         out(src="cloudtrail", acct=acct, region=region, error=type(e).__name__)
 
+def run_all(work, workers=WORKERS):
+    """Poll every (account, session factory, region) concurrently. POLLED is complete before the first poll starts, so
+    Security Hub's copies of a polled account's findings are dropped in every scope. A scope that raises is a failed read."""
+    def one(item):
+        acct, make, region = item
+        try:
+            poll(acct, make(), region)
+        except Exception as e:  # noqa: BLE001 - reported, and main() exits 1
+            out(src="scope", acct=acct, region=region, error=type(e).__name__)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(one, work))
+
+
 def main(argv):
     global SINCE
     root, SINCE = argv[1], dt.datetime.fromisoformat(argv[2].replace("Z", "+00:00"))
     todo = scopes(root)
-    for acct, sess in sessions():
-        POLLED.add(sess.client("sts", config=CFG).get_caller_identity()["Account"])
-        for a, region in todo:
-            if a == acct:
-                poll(acct, sess, region)
+    work = []
+    for acct, make in sessions():
+        POLLED.add(make().client("sts", config=CFG).get_caller_identity()["Account"])
+        work += [(acct, make, region) for a, region in todo if a == acct]
+    run_all(work)
     if FAILED:
         print(f"alert-poll: {len(FAILED)} service reads failed; do not move alerts_checked_at", file=sys.stderr)
         return 1

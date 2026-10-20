@@ -19,10 +19,14 @@ TF = (ROOT / "terraform-run-lock.tf").read_text()
 
 FAKE = """#!/bin/bash
 # A stand-in terraform: records when it ran and with what, sleeps if asked, can leave a child running like a provider.
+# Like Terraform, SIGINT makes it stop (and say so) instead of dying silently.
+trap 'echo "$(date +%s.%N) interrupted $*" >> "$FAKE_LOG"; kill $sp 2>/dev/null; exit 130' INT
 echo $$ > "$FAKE_LOG.pid"
-[ -n "${FAKE_CHILD:-}" ] && { sleep 30 & echo $! > "$FAKE_LOG.child"; }
+[ -n "${FAKE_CHILD:-}" ] && { sleep 30 >/dev/null 2>&1 & echo $! > "$FAKE_LOG.child"; }
 echo "$(date +%s.%N) start $*" >> "$FAKE_LOG"
-[ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
+echo "TF_PLUGIN_CACHE_DIR=${TF_PLUGIN_CACHE_DIR:-}" >> "$FAKE_LOG.env"
+[ -n "${FAKE_READ:-}" ] && { read -r line; echo "$(date +%s.%N) read $line" >> "$FAKE_LOG"; }
+[ -n "${FAKE_SLEEP:-}" ] && { sleep "$FAKE_SLEEP" >/dev/null 2>&1 & sp=$!; wait $sp; }
 echo "$(date +%s.%N) end $*" >> "$FAKE_LOG"
 exit "${FAKE_RC:-0}"
 """
@@ -37,9 +41,12 @@ class WrapperTests(unittest.TestCase):
         self.lock = self.tmp / "lock"
         self.lock.touch()
         self.log = self.tmp / "log"
+        # No added -parallelism and no shared cache unless a test asks: the other tests read the arguments as given.
         self.env = dict(os.environ, TF_RUN_LOCK_REAL=str(self.real), TF_RUN_LOCK_FILE=str(self.lock),
-                        FAKE_LOG=str(self.log))
-        self.env.pop("TF_RUN_LOCK_NOWAIT", None)
+                        FAKE_LOG=str(self.log), TF_RUN_LOCK_PARALLELISM="",
+                        TF_RUN_LOCK_PLUGIN_CACHE=str(self.tmp / "no-cache"))
+        for k in ("TF_RUN_LOCK_NOWAIT", "TF_PLUGIN_CACHE_DIR"):
+            self.env.pop(k, None)
 
     def start(self, *args, **extra):
         # Its own process group, so a test can kill the run with everything it started and nothing else.
@@ -117,15 +124,72 @@ class WrapperTests(unittest.TestCase):
         self.end(a)
         self.assertEqual(b.returncode, 75)
 
-    def test_a_killed_run_releases_the_lock(self):
+    def wait_free(self, timeout=8):
+        """Retry a no-wait plan until the host lock is free; returns its result."""
+        end = time.time() + timeout
+        while True:
+            b = subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
+                               capture_output=True, text=True, timeout=10)
+            if b.returncode != 75 or time.time() > end:
+                return b
+            time.sleep(0.2)
+
+    def test_a_killed_caller_cancels_the_run_and_releases_the_lock(self):
+        # SIGKILL to the caller's whole process group, as a stopped background task does: Terraform is in a session of
+        # its own, so it is not killed mid-run; the supervisor sees the caller gone and interrupts it, Terraform stops
+        # (releasing its remote state lock, for the real one) and the host lock goes with it.
         a = self.start("apply", FAKE_SLEEP="30")
         self.wait_started("apply")
-        os.killpg(a.pid, signal.SIGKILL)  # the run and its child, as a kill of a Terraform run would
+        os.killpg(a.pid, signal.SIGKILL)
         a.wait(timeout=5)
-        time.sleep(0.3)
-        b = subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
-                           capture_output=True, text=True, timeout=10)
+        b = self.wait_free()
         self.assertEqual(b.returncode, 0, b.stderr)
+        self.assertTrue(any("interrupted apply" in line for line in self.lines()), self.lines())
+        self.assertFalse(any("end apply" in line for line in self.lines()))
+
+    def test_sigterm_to_the_wrapper_interrupts_terraform_and_returns_its_exit_code(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig):
+                self.log.unlink(missing_ok=True)
+                a = self.start("plan", FAKE_SLEEP="30")
+                self.wait_started("plan")
+                t = time.time()
+                a.send_signal(sig)  # the wrapper only, not its group
+                a.communicate(timeout=10)
+                self.assertEqual(a.returncode, 130)  # Terraform's own code after its interrupt
+                self.assertLess(time.time() - t, 5)
+                self.assertTrue(any("interrupted plan" in line for line in self.lines()), self.lines())
+
+    def test_stdin_still_reaches_terraform(self):
+        r = subprocess.run(["bash", str(WRAPPER), "apply"], env=dict(self.env, FAKE_READ="1"), input="yes\n",
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(any(line.endswith(" read yes") for line in self.lines()), self.lines())
+
+    def test_plan_and_apply_get_a_default_parallelism_unless_one_is_given(self):
+        env = dict(self.env, TF_RUN_LOCK_PARALLELISM="30")
+        for args, expect in ((["plan", "-out=p"], "start plan -parallelism=30 -out=p"),
+                             (["-chdir=sub", "apply", "p.plan"], "start -chdir=sub apply -parallelism=30 p.plan"),
+                             (["plan", "-parallelism=5"], "start plan -parallelism=5"),
+                             (["init", "-input=false"], "start init -input=false")):
+            self.log.unlink(missing_ok=True)
+            r = subprocess.run(["bash", str(WRAPPER), *args], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+            self.assertEqual([line.split(" ", 1)[1] for line in self.lines() if " start " in line], [expect])
+
+    def test_the_shared_provider_cache_is_used_when_present_and_a_callers_choice_wins(self):
+        cache = self.tmp / "cache"
+        cache.mkdir()
+        envlog = self.tmp / "log.env"
+        for extra, expect in (({}, "TF_PLUGIN_CACHE_DIR="),  # no cache directory on this host: nothing set
+                              ({"TF_RUN_LOCK_PLUGIN_CACHE": str(cache)}, f"TF_PLUGIN_CACHE_DIR={cache}"),
+                              ({"TF_RUN_LOCK_PLUGIN_CACHE": str(cache), "TF_PLUGIN_CACHE_DIR": "/elsewhere"},
+                               "TF_PLUGIN_CACHE_DIR=/elsewhere")):
+            envlog.unlink(missing_ok=True)
+            r = subprocess.run(["bash", str(WRAPPER), "init"], env=dict(self.env, **extra), capture_output=True,
+                               text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(envlog.read_text().strip(), expect, extra)
 
     def test_a_provider_that_outlives_a_killed_terraform_does_not_keep_the_lock(self):
         a = self.start("apply", FAKE_SLEEP="30", FAKE_CHILD="1")
@@ -135,10 +199,8 @@ class WrapperTests(unittest.TestCase):
         try:
             os.kill(tf_pid, signal.SIGKILL)  # Terraform alone dies (an OOM kill); its "provider" keeps running
             a.wait(timeout=5)
-            time.sleep(0.3)
             os.kill(child, 0)  # still alive
-            b = subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_NOWAIT="1"),
-                               capture_output=True, text=True, timeout=10)
+            b = self.wait_free()
             self.assertEqual(b.returncode, 0, b.stderr)
         finally:
             for pid in (child,):
@@ -182,7 +244,7 @@ class WrapperTests(unittest.TestCase):
         self.assertIn("start version", self.log.read_text())
 
     def test_without_the_host_lock_file_it_uses_a_per_user_lock(self):
-        env = dict(self.env, XDG_RUNTIME_DIR=str(self.tmp))
+        env = dict(self.env, XDG_RUNTIME_DIR=str(self.tmp), TF_RUN_LOCK_NOWAIT="1")  # never wait on a host's real lock
         env.pop("TF_RUN_LOCK_FILE")
         r = subprocess.run(["bash", str(WRAPPER), "plan"], env=env, capture_output=True, text=True, timeout=10)
         # /var/lib/terraform-run-lock/lock may exist on a jumpbox; only check the fallback where it does not.
@@ -220,11 +282,11 @@ def render_association_script():
 class InstallTests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
-        self.dirs = {k: self.tmp / k for k in ("bin", "lib", "lockdir")}
+        self.dirs = {k: self.tmp / k for k in ("bin", "lib", "lockdir", "cache")}
         self.dirs["bin"].mkdir()
         # PATH without any real terraform, so nothing can stand in for the binary under test (a clean CI runner).
         self.env = dict(os.environ, BIN_DIR=str(self.dirs["bin"]), LIB_DIR=str(self.dirs["lib"]),
-                        LOCK_DIR=str(self.dirs["lockdir"]), PATH="/usr/bin:/bin")
+                        LOCK_DIR=str(self.dirs["lockdir"]), CACHE_DIR=str(self.dirs["cache"]), PATH="/usr/bin:/bin")
         self.script = self.tmp / "association.sh"
         self.script.write_text(render_association_script())
 
@@ -250,6 +312,8 @@ class InstallTests(unittest.TestCase):
         lock = self.dirs["lockdir"] / "lock"
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o666)
         self.assertIn("Terraform v9.9.1", r.stdout)  # the wrapper's passthrough reached the moved binary
+        # The shared provider cache: group-writable and setgid, so every administrator's runs share one copy.
+        self.assertEqual(stat.S_IMODE(self.dirs["cache"].stat().st_mode), 0o2775)
 
     def test_a_rerun_changes_nothing_and_an_upgrade_is_repaired(self):
         self.put_real("9.9.1")

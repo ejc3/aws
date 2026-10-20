@@ -7,10 +7,11 @@
 # /usr/local/lib/terraform-run-lock/terraform. Whatever real binary is found at /usr/local/bin/terraform (a first install,
 # or an upgrade that overwrote the wrapper) is moved there first, so the daily run repairs an upgrade on its own.
 # Idempotent; every replacement is a rename, so a running Terraform keeps the file it started from. Restarts nothing.
-# BIN_DIR, LIB_DIR and LOCK_DIR exist for the tests.
+# BIN_DIR, LIB_DIR, LOCK_DIR and CACHE_DIR exist for the tests.
 set -euo pipefail
 src=${1:?usage: terraform-run-lock-install.sh WRAPPER_FILE}
 bin=${BIN_DIR:-/usr/local/bin} lib=${LIB_DIR:-/usr/local/lib/terraform-run-lock} lockdir=${LOCK_DIR:-/var/lib/terraform-run-lock}
+cache=${CACHE_DIR:-/var/cache/terraform-plugins}
 marker=TERRAFORM-RUN-LOCK-WRAPPER
 
 grep -q "$marker" "$src" || { echo "terraform-run-lock: $src is not the wrapper" >&2; exit 1; }
@@ -20,6 +21,11 @@ install -d -m 0755 "$lib" "$lockdir"
 # create a file.
 [ -e "$lockdir/lock" ] || install -m 0666 /dev/null "$lockdir/lock"
 chmod 0666 "$lockdir/lock"
+# The shared provider cache the wrapper points TF_PLUGIN_CACHE_DIR at: the administrators' group (adm on Ubuntu) may write
+# it, setgid so new entries keep the group. Terraform checks a cached provider against the lock file's checksums before
+# using it, so a tampered entry is refused, not run.
+install -d -m 2775 "$cache"
+chgrp adm "$cache" 2>/dev/null || true
 
 if [ -f "$bin/terraform" ] && ! grep -aq "$marker" "$bin/terraform"; then
   install -m 0755 "$bin/terraform" "$lib/terraform.new" && mv -f "$lib/terraform.new" "$lib/terraform"
