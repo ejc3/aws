@@ -184,8 +184,25 @@ on_pc "$(ps_vars Port "$PORT" Listen "$AGENT_LISTEN")
 $(cat <<'PS'
 $d = "$env:USERPROFILE\.config\claw-master"
 # Not 'Stop' here: in Windows PowerShell 5.1 a native program's redirected stderr would end the script.
-& "$env:USERPROFILE\.local\bin\claw-master.exe" agent install --listen $Listen --open "127.0.0.1:$Port" --ca "$d\ca.pem" 2>&1 | ForEach-Object { "$_" }
+# An administrator's SSH session runs elevated, so the files claw-master creates are owned by
+# Administrators, and the agent (started at logon, not elevated) refuses a token it does not own. Each
+# file goes to the user, and an install the agent refused for that is tried once more.
+function Set-UserOwner {
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $files = @("$env:USERPROFILE\.claude\settings.json", "$env:USERPROFILE\.claude\settings.json.before-claw-master") +
+    @(Get-ChildItem $d, "$env:LOCALAPPDATA\claw-master" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+  foreach ($f in $files) {
+    if ((Test-Path $f) -and (Get-Acl $f).Owner -ne $me) { & icacls $f /setowner $me | Out-Null }
+  }
+}
+$cm = "$env:USERPROFILE\.local\bin\claw-master.exe"
+& $cm agent install --listen $Listen --open "127.0.0.1:$Port" --ca "$d\ca.pem" 2>&1 | ForEach-Object { "$_" }
+if ($LASTEXITCODE -ne 0 -and (Get-Content "$env:LOCALAPPDATA\claw-master\agent.log" -Tail 5 -ErrorAction SilentlyContinue) -match 'can be read by others') {
+  Set-UserOwner
+  & $cm agent install --listen $Listen --open "127.0.0.1:$Port" --ca "$d\ca.pem" 2>&1 | ForEach-Object { "$_" }
+}
 if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }
+Set-UserOwner
 # The proxy URL carries the agent's token: curl reads it from the environment, never its arguments,
 # and it is never printed.
 $env:HTTPS_PROXY = (Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json).env.HTTPS_PROXY

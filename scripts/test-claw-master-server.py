@@ -736,6 +736,9 @@ class WindowsSetupTests(unittest.TestCase):
         self.assertIn('if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }', s7)
         self.assertIn('''if ($LASTEXITCODE -ne 0 -or $out -notmatch '^200 [24]\\d\\d$') { "the agent did not reach the pool (curl exit $LASTEXITCODE, status $out)"; exit 1 }''', s7)
         self.assertNotIn("$ErrorActionPreference = 'Stop'", s7)  # 5.1 ends the script on native stderr
+        # files made from the elevated session go to the user, before a retry and after the install
+        self.assertRegex(s7, r"can be read by others'\) \{\n  Set-UserOwner\n  & \$cm agent install")
+        self.assertRegex(s7, r'"agent install failed \(\$LASTEXITCODE\)"; exit 1 \}\nSet-UserOwner\n')
         # the agent's proxy URL (it carries the agent's token) reaches curl only through its environment
         self.assertIn("$env:HTTPS_PROXY = (Get-Content", s7)
         self.assertNotRegex(s7, r"curl\.exe[^\n]*(-x|--proxy)")
