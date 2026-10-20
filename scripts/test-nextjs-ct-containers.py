@@ -63,7 +63,7 @@ class HostScriptTests(unittest.TestCase):
         # way in (Eternal Terminal), and the tunnels stay down until the cutover.
         for gone in ("NOPASSWD", "etserver", "claude-rc@", "codex-rc@", "ndev@", "agents-enable"):
             self.assertNotIn(gone, SCRIPT, gone)
-        self.assertIn("nextjs_ct_serving = false", TF)
+        self.assertIn("nextjs_ct_serving = true", TF)
         self.assertIn("systemctl disable --now cloudflared@${z}.service", SCRIPT)
 
     def test_every_account_gets_a_container_including_the_owner(self):
