@@ -14,18 +14,22 @@ What maps to targets, and how:
   - a changed file that a block reads by path (`file()`, `templatefile()`, `filesha256()`, ...): the blocks naming it;
   - a changed file under `modules/NAME/`: every `module` block whose source is `./modules/NAME`;
   - then every block that reads one of those addresses (its dependents), since -target takes only dependencies.
-Anything else Terraform reads is FULL: `provider`, `terraform`, `moved`, `import`, `removed` and `check` blocks, the lock
-file, a change outside any block, a reference the parser cannot follow, and a changed file that fileset(), a source_dir
-or an interpolated path may read, or that no block names literally (NEVER_READ lists the tests, docs and CI files that
-need no plan). Outputs are ignored. A file named in a module block's own directory (modules/NAME/...) targets that module.
+An `ephemeral` block is walked like a resource (a changed one, or one reading a changed address, brings every block that
+reads `ephemeral.TYPE.NAME`) but is never printed itself: it has no state, and targeting its readers plans it.
+Anything else Terraform reads is FULL: `provider`, `terraform`, `moved`, `import`, `removed` and `check` blocks, a root
+`output` block (a targeted apply would leave its value in state as it was), the lock file, a change outside any block, a
+reference the parser cannot follow, and a changed file that fileset(), a source_dir or an interpolated path may read, or
+that no block names literally (NEVER_READ lists the tests, docs and CI files that need no plan). A file named in a module
+block's own directory (modules/NAME/...) targets that module.
 """
 import re
 import subprocess
 import sys
 
-BLOCK = re.compile(r'^(resource|data|module|locals|variable|output|provider|terraform|moved|import|removed|check)\b'
+BLOCK = re.compile(r'^(resource|data|ephemeral|module|locals|variable|output|provider|terraform|moved|import|removed|check)\b'
                    r'(?:\s+"([^"]+)")?(?:\s+"([^"]+)")?\s*\{\s*$')
 FULL_KINDS = {"provider", "terraform", "moved", "import", "removed", "check"}
+NODE_KINDS = ("resource", "data", "ephemeral", "module")  # blocks with an address that others read
 READS_FULL = {"provider", "terraform", "check"}  # a reader of this kind makes the change a full plan; moved, import and
 # removed blocks only name addresses (from, to, id), they do not read them
 MAX_TARGETS = 80  # past this a targeted plan is no longer the quick path; plan everything
@@ -114,7 +118,8 @@ def blocks(text):
 
 
 def address(kind, a, b):
-    return {"resource": f"{a}.{b}", "data": f"data.{a}.{b}", "module": f"module.{a}"}.get(kind)
+    return {"resource": f"{a}.{b}", "data": f"data.{a}.{b}", "ephemeral": f"ephemeral.{a}.{b}",
+            "module": f"module.{a}"}.get(kind)
 
 
 def local_names(text, first, last):
@@ -182,7 +187,7 @@ def targets(root, base, head):
                 if kind in FULL_KINDS:
                     raise Full(f"a {kind} block changed ({f})")
                 if kind == "output":
-                    continue
+                    raise Full(f"output change: output.{a} ({f}); a targeted apply would not record it")
                 if kind == "variable":
                     vars_hit.add(a)
                 elif kind == "locals":
@@ -216,7 +221,7 @@ def targets(root, base, head):
             for kind, a, b, first, last in blocks(text):
                 if not pat.search("\n".join(text.splitlines()[first - 1:last])):
                     continue
-                if kind in ("resource", "data", "module"):
+                if kind in NODE_KINDS:
                     found.add(address(kind, a, b))
                 elif kind == "locals":
                     names = [name for name, (s, e) in local_names(text, first, last).items()
@@ -243,7 +248,7 @@ def targets(root, base, head):
                     for name, (s, e) in local_names(text, first, last).items():
                         if pat.search("\n".join(text.splitlines()[s - 1:e])):
                             pending.append(("local", name))
-                elif kind in ("resource", "data", "module"):
+                elif kind in NODE_KINDS:
                     found.add(address(kind, a, b))
                 elif kind in READS_FULL:
                     raise Full(f"{ref[0]}.{ref[1]} is read by a {kind} block ({f})")
@@ -261,7 +266,7 @@ def targets(root, base, head):
                 body = "\n".join(text.splitlines()[first:last - 1])  # the body, not the block's own header
                 if not pat.search(body):
                     continue
-                if kind in ("resource", "data", "module"):
+                if kind in NODE_KINDS:
                     dep = address(kind, a, b)
                     if dep not in found:
                         found.add(dep)
@@ -277,7 +282,7 @@ def targets(root, base, head):
                     raise Full(f"{addr} is read by a {kind} block ({f})")
         if len(found) > MAX_TARGETS:
             raise Full(f"more than {MAX_TARGETS} addresses depend on the change")
-    return sorted(found)
+    return sorted(a for a in found if not a.startswith("ephemeral."))
 
 
 def readers(tree, ref, done=None):
@@ -295,7 +300,7 @@ def readers(tree, ref, done=None):
                 for name, (s, e) in local_names(text, first, last).items():
                     if pat.search("\n".join(text.splitlines()[s - 1:e])):
                         out |= readers(tree, ("local", name), done)
-            elif kind in ("resource", "data", "module"):
+            elif kind in NODE_KINDS:
                 out.add(address(kind, a, b))
             elif kind in READS_FULL:
                 raise Full(f"{ref[0]}.{ref[1]} is read by a {kind} block ({f})")
