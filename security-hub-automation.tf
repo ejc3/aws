@@ -130,9 +130,10 @@ locals {
 
   # The Dolphin account (dolphin-security.tf, the same modules/security-region): Inspector's ECR and Lambda code scanning,
   # plus ECS.2 on exactly its Redis service, which takes a public IP only to egress (its group allows no inbound and the
-  # account has no NAT; dolphin-aws redis.tf). Orders follow this region's main rules. NOT Config.1: a rule cannot match
-  # the finding's status reason, so it would also hide a stopped or deleted recorder, and unlike the main and staging
-  # accounts Dolphin has no security-forward-audit path to alert on that instead (dolphin-security.tf).
+  # account has no NAT; dolphin-aws redis.tf), and Config.1, which fails by design on the recorder's own role. A rule cannot
+  # match the finding's status reason, so that one would also hide a stopped or deleted recorder: Dolphin has no
+  # security-forward-audit path, so the alarm in its own account (dolphin_config_recorder, dolphin-security.tf) raises
+  # that instead. Orders follow this region's main rules.
   security_hub_dolphin_rules = [
     {
       name                = "dolphin-inspector-ecr-lambda-code-off-by-design"
@@ -151,6 +152,15 @@ locals {
       controls            = ["ECS.2"]
       resource_comparison = "EQUALS"
       resource_ids        = ["arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/redis"]
+    },
+    {
+      name                = "dolphin-config-custom-recorder-role-by-design"
+      order               = 10
+      description         = "Config.1 in the Dolphin account: the recorder uses its own role and records a reviewed set of types (dolphin-security.tf, modules/security-region). Stopping, deleting or changing the recorder alerts dolphin-alerts instead."
+      note                = "Dolphin account: Config recorder uses a custom role by design; recorder stop/delete/change alerts dolphin-alerts (dolphin-security.tf). security-hub-automation.tf"
+      controls            = ["Config.1"]
+      resource_comparison = ""
+      resource_ids        = []
     },
   ]
 
@@ -525,7 +535,12 @@ resource "aws_securityhub_automation_rule" "by_design_dolphin" {
     }
   }
 
-  depends_on = [module.dolphin_security_us_west_1]
+  # The Config.1 suppression goes live only with the alarm that stands in for it, and the alarm on its delivery.
+  depends_on = [
+    module.dolphin_security_us_west_1,
+    aws_cloudwatch_event_target.dolphin_config_recorder,
+    aws_cloudwatch_metric_alarm.dolphin_config_recorder_delivery,
+  ]
 }
 
 # #515 created the EC2.9 rule as one counted resource per region; it is now the list's first entry.

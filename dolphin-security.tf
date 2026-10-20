@@ -24,7 +24,8 @@
 #
 # What it does not cover: the Dolphin account's CloudTrail control-plane alerts (root sign-in, StopLogging, IAM
 # changes) that security-forward-audit raises for the other two accounts; they need an event path into this account.
-# The organization trail still records every call there.
+# The organization trail still records every call there. One exception stays inside the Dolphin account: its Config
+# recorder being stopped, deleted or changed alerts dolphin-alerts (dolphin_config_recorder, at the end).
 
 locals {
   # Workload region of the Dolphin account: posture, Security Hub administration and the Config aggregator.
@@ -376,4 +377,89 @@ resource "aws_iam_role_policy" "dolphin_security_inspector" {
       Resource = aws_cloudwatch_event_bus.security_alerts.arn
     }]
   })
+}
+
+# ---- the Dolphin Config recorder: stopping, deleting or reconfiguring it alerts (#564).
+# Config.1 fails there by design (the recorder uses its own role, security-config-us-west-1), and a Security Hub rule
+# cannot tell that apart from a recorder that stopped, so the suppression (dolphin-config-custom-recorder-role-by-design,
+# security-hub-automation.tf) leans on this alarm. It stays inside the Dolphin account, as security-forward-audit does
+# for the main account's recorder: an EventBridge rule on the Config calls that switch recording off, recorded by the
+# organization trail, publishing to dolphin-alerts (dolphin-alerts.tf subscribes the owner). Nothing reaches this
+# account from there. Denied attempts alert too. The recorder exists in us-west-1 only, so one rule covers it.
+resource "aws_cloudwatch_event_rule" "dolphin_config_recorder" {
+  provider    = aws.dolphin
+  name        = "dolphin-config-recorder-changes"
+  description = "Alert dolphin-alerts when the Config recorder or its delivery channel is stopped, deleted or changed"
+  event_pattern = jsonencode({
+    source        = ["aws.config"]
+    "detail-type" = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventSource = ["config.amazonaws.com"]
+      eventName   = ["StopConfigurationRecorder", "DeleteConfigurationRecorder", "PutConfigurationRecorder", "DeleteDeliveryChannel", "PutDeliveryChannel"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "dolphin_config_recorder" {
+  provider  = aws.dolphin
+  rule      = aws_cloudwatch_event_rule.dolphin_config_recorder.name
+  target_id = "dolphin-alerts"
+  arn       = data.aws_sns_topic.dolphin_alerts.arn
+  input_transformer {
+    input_paths = {
+      event  = "$.detail.eventName"
+      who    = "$.detail.userIdentity.arn"
+      at     = "$.time"
+      region = "$.region"
+    }
+    input_template = "\"Dolphin account Config recorder: <event> by <who> in <region> at <at> (a denied attempt alerts too: see its CloudTrail record). Config.1 is suppressed on the strength of this alert (security-hub-automation.tf); check the recorder with aws configservice describe-configuration-recorder-status.\""
+  }
+  depends_on = [aws_sns_topic_policy.dolphin_alerts]
+}
+
+# dolphin-aws creates dolphin-alerts with no policy (ecs.tf), so the default one applied; this keeps its statement as it
+# was (same-account use, which the platform's CloudWatch alarms rely on) and adds EventBridge, for exactly the rule above.
+resource "aws_sns_topic_policy" "dolphin_alerts" {
+  provider = aws.dolphin
+  arn      = data.aws_sns_topic.dolphin_alerts.arn
+  policy = jsonencode({
+    Version = "2008-10-17"
+    Id      = "__default_policy_ID"
+    Statement = [
+      {
+        Sid       = "__default_statement_ID"
+        Effect    = "Allow"
+        Principal = { AWS = "*" }
+        Action    = ["SNS:GetTopicAttributes", "SNS:SetTopicAttributes", "SNS:AddPermission", "SNS:RemovePermission", "SNS:DeleteTopic", "SNS:Subscribe", "SNS:ListSubscriptionsByTopic", "SNS:Publish"]
+        Resource  = data.aws_sns_topic.dolphin_alerts.arn
+        Condition = { StringEquals = { "AWS:SourceOwner" = data.aws_caller_identity.dolphin.account_id } }
+      },
+      {
+        Sid       = "ConfigRecorderAlarm"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = data.aws_sns_topic.dolphin_alerts.arn
+        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_config_recorder.arn } }
+      },
+    ]
+  })
+}
+
+# A delivery that fails (a changed topic policy, a deleted topic) would otherwise leave the suppression with no alert
+# behind it. CloudWatch alarms publish under the default statement, not the EventBridge one.
+resource "aws_cloudwatch_metric_alarm" "dolphin_config_recorder_delivery" {
+  provider            = aws.dolphin
+  alarm_name          = "dolphin-config-recorder-alert-delivery-failed"
+  alarm_description   = "The Config recorder alert rule could not deliver to dolphin-alerts (ejc3/aws dolphin-security.tf)"
+  namespace           = "AWS/Events"
+  metric_name         = "FailedInvocations"
+  dimensions          = { RuleName = aws_cloudwatch_event_rule.dolphin_config_recorder.name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [data.aws_sns_topic.dolphin_alerts.arn]
 }
