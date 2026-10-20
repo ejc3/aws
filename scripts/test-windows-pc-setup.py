@@ -70,14 +70,21 @@ class Setup(unittest.TestCase):
         # A text check passed a config that also had ListenAddress 0.0.0.0 or an earlier PasswordAuthentication yes.
         s2 = step(2)
         self.assertIn("Disable-NetFirewallRule", s2)
-        self.assertIn('& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1"', SETUP)
-        self.assertIn("$_ -notmatch '^127\\.0\\.0\\.1:'", SETUP)
+        # every connection field, so a Match LocalAddress/LocalPort block is evaluated too
+        self.assertIn('& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22"', SETUP)
+        # every listen address must be loopback, and both password paths off
+        self.assertIn("(@($listen | Where-Object { $_ -notmatch '^127\\.0\\.0\\.1:' }).Count -eq 0)", SETUP)
         self.assertIn("($o -contains 'passwordauthentication no')", SETUP)
+        self.assertIn("(($o -contains 'kbdinteractiveauthentication no') -or ($o -contains 'challengeresponseauthentication no'))", SETUP)
+        self.assertIn("@(Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalAddress })", SETUP)
+        self.assertIn("(@($l | Where-Object { $_ -ne '127.0.0.1' }).Count -eq 0)", SETUP)
+        # a config changed after the daemon started is not in force: restart
+        self.assertIn("$p.CreationDate -gt (Get-Item \"$env:ProgramData\\ssh\\sshd_config\").LastWriteTime", SETUP)
         self.assertNotIn("$lines -notcontains", SETUP)
         # the early return needs both the effective settings and the running daemon's listeners
-        self.assertIn("if ((Test-KeysOnlyLoopback (Get-Effective)) -and (Test-Listening)) { 'sshd: already", s2)
         # a rewrite that still fails the check is restored and stops the script
-        self.assertIn("throw 'sshd_config is still not keys only and loopback only; restored it'", s2)
+        self.assertIn("if (-not $ok) { Copy-Item \"$cfg.before-windows-pc-setup\" $cfg -Force; throw 'sshd_config is still not keys only and loopback only; restored it' }", s2)
+        self.assertIn("(Test-Listening) -and (Test-StartedAfterConfig)) { 'sshd: already", s2)
         self.assertIn("-UserId SYSTEM", s2)  # a restart from the session would die with it
         # and the restarted daemon is checked before anything else runs
         after = s2[s2.index("Start-ScheduledTask -TaskName 'windows-pc-setup sshd restart'"):]
@@ -154,6 +161,26 @@ class Bootstrap(unittest.TestCase):
             bad = subprocess.run(["bash", str(BOOT_GEN), "allow", "test-pc", "21899", "ssh-ed25519 AAAA\nssh-rsa x"],
                                  capture_output=True, text=True, env=env)
             self.assertNotEqual(bad.returncode, 0)
+
+
+class BootstrapPrint(unittest.TestCase):
+    def test_print_fills_every_value_from_the_box_with_no_metadata_lookup(self):
+        gen = BOOT_GEN.read_text()
+        # the IMDS token used to reach curl's arguments: the box's address is FCVM_HOST, as in the other scripts
+        self.assertNotIn("169.254.169.254", gen)
+        self.assertNotIn("curl", gen)
+        with tempfile.TemporaryDirectory() as home:
+            ssh = Path(home) / ".ssh"
+            ssh.mkdir()
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "to-test-pc")], check=True)
+            r = subprocess.run(["bash", str(BOOT_GEN), "print", "test-pc", "21899"], capture_output=True, text=True,
+                               env=dict(os.environ, HOME=home, FCVM_HOST="203.0.113.7"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            body = r.stdout[r.stdout.index("& {"):]
+            self.assertNotIn("@@", body)
+            self.assertIn("$DevBox     = '%s@203.0.113.7'" % os.environ.get("USER", subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()), body)
+            self.assertIn("$Port       = 21899", body)
+            self.assertIn((ssh / "to-test-pc.pub").read_text().split()[1], body)
 
 
 class Client(unittest.TestCase):

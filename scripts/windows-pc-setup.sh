@@ -102,7 +102,8 @@ if ($null -eq $svc) { throw 'no sshd service' }
 $sshd = if ($svc.PathName -match '^"([^"]+)"') { $Matches[1] } else { ($svc.PathName -split ' ')[0] }
 function Get-Effective {
   $ErrorActionPreference = 'Continue'
-  $o = @(& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1" 2>&1 | ForEach-Object { "$_" })
+  # Every connection field: Windows OpenSSH skips a Match LocalAddress/LocalPort block when its field is absent.
+  $o = @(& $sshd -T -C "user=$env:USERNAME,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" 2>&1 | ForEach-Object { "$_" })
   if ($LASTEXITCODE -ne 0) { throw "sshd -T failed: $($o -join ' ')" }
   $o
 }
@@ -111,6 +112,11 @@ function Test-KeysOnlyLoopback($o) {
   ($listen.Count -gt 0) -and (@($listen | Where-Object { $_ -notmatch '^127\.0\.0\.1:' }).Count -eq 0) -and
     ($o -contains 'passwordauthentication no') -and
     (($o -contains 'kbdinteractiveauthentication no') -or ($o -contains 'challengeresponseauthentication no'))
+}
+# The running daemon read its file when it started: a file changed since then is not yet in force.
+function Test-StartedAfterConfig {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-CimInstance Win32_Service -Filter "Name = 'sshd'").ProcessId)"
+  $p -and $p.CreationDate -gt (Get-Item "$env:ProgramData\ssh\sshd_config").LastWriteTime
 }
 function Test-Listening {
   $l = @(Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalAddress })
@@ -130,7 +136,7 @@ New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
   -Value "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
 $cfg = "$env:ProgramData\ssh\sshd_config"
-if ((Test-KeysOnlyLoopback (Get-Effective)) -and (Test-Listening)) { 'sshd: already keys only, loopback only'; exit 0 }
+if ((Test-KeysOnlyLoopback (Get-Effective)) -and (Test-Listening) -and (Test-StartedAfterConfig)) { 'sshd: already keys only, loopback only'; exit 0 }
 if (-not (Test-KeysOnlyLoopback (Get-Effective))) {
   # Every such line goes, in a Match block too, and the wanted ones lead, before any Match block (a global setting
   # after one applies only inside it). ChallengeResponseAuthentication, not its newer name, which the OpenSSH 8.1 of
@@ -156,7 +162,7 @@ $(cat <<'PS'
 $ErrorActionPreference = 'Stop'
 Unregister-ScheduledTask -TaskName 'windows-pc-setup sshd restart' -Confirm:$false -ErrorAction SilentlyContinue
 for ($i = 0; $i -lt 15; $i++) {
-  if ((Get-Service sshd).Status -eq 'Running' -and (Test-Listening)) { 'sshd: running, on 127.0.0.1 only'; exit 0 }
+  if ((Get-Service sshd).Status -eq 'Running' -and (Test-Listening) -and (Test-StartedAfterConfig)) { 'sshd: running, on 127.0.0.1 only'; exit 0 }
   Start-Sleep -Seconds 2
 }
 throw 'sshd is not running on 127.0.0.1 only'
