@@ -100,6 +100,9 @@ Host $MAC_ALIAS
     StrictHostKeyChecking yes
     ServerAliveInterval 30
     ServerAliveCountMax 3
+    # Nothing of this box reaches the machine: a compromised Mac or PC must not borrow this account's agent or display.
+    ForwardAgent no
+    ForwardX11 no
 MACCONFIG
 
 # ProxyCommand for Host <alias>. The Access service token reaches cloudflared through its environment,

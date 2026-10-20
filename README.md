@@ -797,6 +797,11 @@ only and on loopback only with its inbound firewall rule off, the clients' keys 
 connector task, and Windows-MCP. A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
 since it ends the sessions through it.
 
+**Never a key of the PC's on `ubuntu`** (AGENTS.md, "Machines outside AWS"): the bootstrap below authorizes one for a
+temporary reverse tunnel, which is the reason it is being replaced by an enrollment that needs none; until then, keep
+the tunnel's life short (its key expires after two days) and retire it as soon as the Cloudflare route works. The
+clients' configs set `ForwardAgent no` and `ForwardX11 no`, and whatever comes back from a PC is untrusted data.
+
 **A new PC** (Colin's was set up this way on 2026-10-20):
 
 1. Add its row to `local.mac_ssh_macs` and a `<alias>-ssh.tf` like `colin-pc-ssh.tf`; claim a port block for it

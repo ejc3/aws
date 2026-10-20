@@ -202,6 +202,17 @@ class MacSshClient(unittest.TestCase):
         self.assertEqual(self.config.read_text(), f"Include {self.ssh}/config.d-mac\n\nHost *\n    User wrong-user\n")
         self.check_mac()
 
+    def test_a_users_forward_everything_default_does_not_reach_the_machines(self):
+        # ssh's defaults are already no; what matters is an account's own `Host *` turning them on. The machine's block
+        # comes first (its Include leads the config), and ssh takes the first value it reads.
+        self.config.write_text("Host *\n    ForwardAgent yes\n    ForwardX11 yes\n")
+        self.install()
+        mac = self.effective("mac")
+        self.assertEqual((mac["forwardagent"], mac["forwardx11"]), ("no", "no"))
+        self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
+        colton = self.effective("colton-mac")
+        self.assertEqual((colton["forwardagent"], colton["forwardx11"]), ("no", "no"))
+
     def test_colton_mac_makes_the_accounts_own_key_and_prints_only_its_public_half(self):
         result = self.install(secret="colton-mac-ssh-access-fcvm", alias="colton-mac")
         self.check_colton()
