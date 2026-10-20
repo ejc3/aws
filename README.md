@@ -797,10 +797,12 @@ only and on loopback only with its inbound firewall rule off, the clients' keys 
 connector task, and Windows-MCP. A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
 since it ends the sessions through it.
 
-**Never a key of the PC's on `ubuntu`** (AGENTS.md, "Machines outside AWS"): the bootstrap below authorizes one for a
-temporary reverse tunnel, which is the reason it is being replaced by an enrollment that needs none; until then, keep
-the tunnel's life short (its key expires after two days) and retire it as soon as the Cloudflare route works. The
-clients' configs set `ForwardAgent no` and `ForwardX11 no`, and whatever comes back from a PC is untrusted data.
+**Never a key of the PC's on `ubuntu`** (AGENTS.md, "Machines outside AWS"). The first-contact reverse tunnel below ends
+on `pcboot`, a system account on fcvm-arm with no shell (`pc_bootstrap_account` in `mac-ssh-client.tf`, installed with
+fcvm-arm's ssh clients at boot and daily): its keys are in the root-owned `/etc/ssh/pcboot/authorized_keys`, each pinned
+to its one port and expiring after two days, and its sshd `Match` block refuses Unix-socket and local forwards, agent,
+X11 and a TTY. The tunnel is retired as soon as the Cloudflare route works. The clients' configs set `ForwardAgent no`
+and `ForwardX11 no`, and whatever comes back from a PC is untrusted data.
 
 **A new PC** (Colin's was set up this way on 2026-10-20):
 
@@ -809,12 +811,14 @@ clients' configs set `ForwardAgent no` and `ForwardX11 no`, and whatever comes b
 2. On fcvm-arm: `scripts/windows-pc-bootstrap.sh print <alias> PORT` prints the one script the person at the PC pastes
    into PowerShell opened with **Run as administrator** (`scripts/windows/bootstrap.ps1` with this PC's values; publish
    it behind a Copy button). It installs OpenSSH closed to the network, authorizes fcvm-arm's key, and keeps a reverse
-   tunnel to fcvm-arm's `127.0.0.1:PORT`. It ends by printing the PC's own key: authorize it for that tunnel only with
-   `scripts/windows-pc-bootstrap.sh allow <alias> PORT '<key line>'`.
+   tunnel, as `pcboot`, to fcvm-arm's `127.0.0.1:PORT`. It ends by printing the PC's own key: authorize it for that
+   tunnel only with `scripts/windows-pc-bootstrap.sh allow <alias> PORT '<key line>'` (it writes pcboot's key file, with sudo).
 3. From a jumpbox: `scripts/windows-pc-setup.sh <alias> --bootstrap-port PORT`. Then, on each client account,
    `ssh <alias> true` and `scripts/windows/windows-mcp-client-setup.sh <alias>`.
-4. Retire the tunnel: on the PC `Unregister-ScheduledTask 'devbox tunnel'` (over `ssh <alias>`); on fcvm-arm delete the
-   `<alias>-bootstrap-tunnel` line from `~/.ssh/authorized_keys`.
+4. Retire the tunnel: on fcvm-arm `scripts/windows-pc-bootstrap.sh retire <alias>`, and on the PC
+   `Unregister-ScheduledTask 'devbox tunnel'` (over `ssh <alias>`). colin-pc was bootstrapped on 2026-10-20 before
+   pcboot existed: its key is a line in fcvm-arm `ubuntu`'s `~/.ssh/authorized_keys` (comment `windows-pc-BLD`, no
+   expiry), to be deleted there by hand once its Cloudflare route works (ejc3/aws #557).
 
 ### macOS VMs on the MacBook (ejc3, skevh)
 

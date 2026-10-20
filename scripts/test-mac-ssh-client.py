@@ -290,7 +290,7 @@ class Wiring(unittest.TestCase):
         self.assertIn("\n${local.fcvm_mac_ssh_clients}\n", arm)
         self.assertNotIn("mac_ssh_client", x86)
         snippet = re.search(r"fcvm_mac_ssh_clients = <<-FCVMMACS\n(.*?)\nFCVMMACS", SOURCE, re.S).group(1)
-        self.assertEqual(snippet, "MAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
+        self.assertEqual(snippet, "${local.pc_bootstrap_account}\nMAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
                                   "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}")

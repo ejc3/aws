@@ -204,9 +204,54 @@ chmod 600 "$MAC_HOME/.ssh/config" "$MAC_HOME/.ssh/config.d-$MAC_ALIAS" "$MAC_HOM
 chmod 700 "$MAC_HOME/.ssh/$MAC_ALIAS-access-proxy"
 MACSETUP
 
-  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac` and `ssh colin-pc`, each with fcvm-arm's own service token. The arm setup script runs
-  # it at boot (dev-user-data.tf) and the association below runs it on the running box, daily.
+  # The one account a machine outside AWS may tunnel into for first contact (scripts/windows-pc-bootstrap.sh, AGENTS.md
+  # "Machines outside AWS"): never ubuntu. No shell, its keys in a root-owned file only `allow` writes (each key pinned to
+  # its one port by permitlisten and expiring), and sshd keeps it to a remote TCP forward: no Unix-socket forward (the one
+  # thing a per-key option cannot refuse), no local forward, agent, X11, TTY or rc file. Idempotent; sshd is reloaded only
+  # when the block changes, after `sshd -t`.
+  pc_bootstrap_account = <<-PCBOOT
+id pcboot >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin pcboot
+install -d -m 0755 -o root -g root /etc/ssh/pcboot
+[ -e /etc/ssh/pcboot/authorized_keys ] || install -m 0644 -o root -g root /dev/null /etc/ssh/pcboot/authorized_keys
+cat > /etc/ssh/sshd_config.d/60-pcboot.conf.new <<'PCBOOTSSHD'
+# First-contact reverse tunnels from machines outside AWS (mac-ssh-client.tf, pc_bootstrap_account). Managed: do not edit.
+Match User pcboot
+    AuthorizedKeysFile /etc/ssh/pcboot/authorized_keys
+    AuthenticationMethods publickey
+    ForceCommand /bin/false
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    AllowTcpForwarding remote
+    GatewayPorts no
+    PermitUserRC no
+# Close the block: sshd_config pulls this file in with Include near its top, so an open Match would swallow every
+# global directive that follows it there.
+Match all
+PCBOOTSSHD
+if ! cmp -s /etc/ssh/sshd_config.d/60-pcboot.conf.new /etc/ssh/sshd_config.d/60-pcboot.conf; then
+  mv /etc/ssh/sshd_config.d/60-pcboot.conf /etc/ssh/sshd_config.d/60-pcboot.conf.old 2>/dev/null || true
+  mv /etc/ssh/sshd_config.d/60-pcboot.conf.new /etc/ssh/sshd_config.d/60-pcboot.conf
+  if sshd -t; then
+    rm -f /etc/ssh/sshd_config.d/60-pcboot.conf.old
+    systemctl reload ssh 2>/dev/null || true
+  else
+    echo "pcboot: sshd -t refused the block; kept the previous one" >&2
+    rm -f /etc/ssh/sshd_config.d/60-pcboot.conf
+    mv /etc/ssh/sshd_config.d/60-pcboot.conf.old /etc/ssh/sshd_config.d/60-pcboot.conf 2>/dev/null || true
+    exit 1
+  fi
+else
+  rm -f /etc/ssh/sshd_config.d/60-pcboot.conf.new
+fi
+PCBOOT
+
+  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac` and `ssh colin-pc`, each with fcvm-arm's own service token, and the pcboot
+  # account above. The arm setup script runs it at boot (dev-user-data.tf) and the association below runs it on the running
+  # box, daily.
   fcvm_mac_ssh_clients = <<-FCVMMACS
+${local.pc_bootstrap_account}
 MAC_USER=ubuntu
 ${local.mac_cloudflared_install}
 MAC_ALIAS=mac
