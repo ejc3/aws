@@ -722,6 +722,9 @@ class WindowsSetupTests(unittest.TestCase):
     def test_the_pc_is_switched_over_only_after_the_pool_answers_through_its_tunnel(self):
         s6 = self.step(6)
         self.assertIn('-x "http://127.0.0.1:$Port"', s6)
+        # the open listener is a plain-HTTP CONNECT proxy; the CA verifies the origin (api.anthropic.com), not the proxy
+        self.assertIn('--cacert "$d\\ca.pem" https://api.anthropic.com/v1/models', s6)
+        self.assertNotIn("--proxy-cacert", code(WINSETUP))
         # CONNECT 200 and an HTTP status of Anthropic's own: a 5xx is the proxy's failed upstream request
         self.assertIn("if ($LASTEXITCODE -eq 0 -and $out -match '^200 [24]\\d\\d$')", s6)
         self.assertRegex(s6, r"the PC was not switched over\"\nexit 1")
