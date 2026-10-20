@@ -112,6 +112,22 @@ class Setup(unittest.TestCase):
         self.assertIn('Start-ScheduledTask -TaskName "$name restart"', s6)
         self.assertIn("'connector: unchanged and running; not restarted'; exit 0", s6)
 
+    def test_a_new_cloudflared_reaches_a_running_connector_through_step_7(self):
+        s4, s7 = step(4), step(7)
+        # an installed (maybe running) executable is not overwritten: the verified one is staged with a marker
+        staged = s4[s4.index("} else {"):]
+        self.assertIn('New-Item -ItemType File -Force "$dir\\cloudflared.changed"', staged)
+        self.assertNotIn('Move-Item -Force "$exe.new" $exe', staged.split("}", 1)[0])
+        # step 7 counts it as a change, checks the staged file again, and the restart swaps it in before starting
+        self.assertIn('CfdSha "$CFD_SHA256_WINDOWS_AMD64"', s7)
+        self.assertIn("if (Test-Path \"$dir\\cloudflared.changed\")", s7)
+        self.assertIn('(Get-FileHash "$dir\\cloudflared.exe.new").Hash -ne $CfdSha) { throw', s7)
+        self.assertIn("$changed += 'its executable changed'", s7)
+        restart = s7[s7.index("$restart = "):].split("\n", 1)[0]
+        self.assertLess(restart.index("Stop-Process -Force"), restart.index("Move-Item -Force '$dir\\cloudflared.exe.new' '$dir\\cloudflared.exe'"))
+        self.assertLess(restart.index("Move-Item -Force '$dir\\cloudflared.exe.new'"), restart.index("Start-ScheduledTask -TaskName '$name'"))
+        self.assertIn("'$dir\\cloudflared.changed'", restart)
+
     def test_windows_mcp_has_no_telemetry_a_key_and_stays_on_loopback(self):
         s7 = step(6)
         self.assertIn("SetEnvironmentVariable('ANONYMIZED_TELEMETRY', 'false', 'User')", s7)
@@ -191,6 +207,20 @@ class Client(unittest.TestCase):
         self.assertNotRegex(code(BRIDGE), r"--header [^-]")
         self.assertIn("umask 077", BRIDGE)
         self.assertNotRegex(code(BRIDGE), r"echo[^\n]*\$key")
+
+    def test_a_rejected_cached_key_is_fetched_again_once(self):
+        b = code(BRIDGE)
+        self.assertIn("fetch_key() {", b)
+        self.assertIn('if [ ! -s "$HEADERS" ]; then fetch_key; FRESH=1; fi', b)
+        # one probe through the forward, with the header from its file, decides
+        self.assertIn('-H @"$HEADERS" "http://127.0.0.1:$PORT/mcp"', b)
+        block = b[b.index('if [ "$(probe)" = 401 ]; then'):].split("\nfi", 1)[0]
+        self.assertEqual(block.count("fetch_key"), 1)
+        self.assertIn('[ "$FRESH" = 1 ] && {', block)  # a key just fetched is not fetched twice
+        self.assertIn('[ "$(probe)" = 401 ] && {', block)
+        self.assertIn("exit 1", block)
+        # the probe happens before mcp-remote takes stdio
+        self.assertLess(b.index('if [ "$(probe)" = 401 ]'), b.index('node "$REMOTE"'))
 
     def test_the_forward_is_ssh_itself_so_it_ends_with_the_session(self):
         # Backgrounding the ssh_pc function made $! a subshell's pid: the forward outlived every session.
