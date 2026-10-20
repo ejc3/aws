@@ -161,12 +161,16 @@ PS
 # certificate, so `--cacert`, not `--proxy-cacert` (the proxy hop is plain HTTP). Checked 2026-10-20 on the
 # server's own 127.0.0.1:8444: `-x http://127.0.0.1:8444 --cacert ca.pem` gives `200 401`, `--proxy-cacert`
 # fails with curl exit 60.
+# Windows' curl.exe is built on Schannel, which also checks the certificate's revocation and fails closed when
+# it cannot ("schannel: the revocation status is unknown", exit 60): the server's private CA publishes no CRL
+# or OCSP. --ssl-revoke-best-effort keeps the check where a certificate names a revocation source and skips
+# it only where none exists. Checked 2026-10-20 on the PC: without it exit 60, with it `200 401`.
 echo "6/7 a request to Anthropic through the tunnel and the server, before switching the PC over"
 on_pc "$(ps_vars Port "$PORT")
 $(cat <<'PS'
 $d = "$env:USERPROFILE\.config\claw-master"
 for ($i = 0; $i -lt 10; $i++) {
-  $out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' -x "http://127.0.0.1:$Port" --cacert "$d\ca.pem" https://api.anthropic.com/v1/models
+  $out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' -x "http://127.0.0.1:$Port" --cacert "$d\ca.pem" --ssl-revoke-best-effort https://api.anthropic.com/v1/models
   if ($LASTEXITCODE -eq 0 -and $out -match '^200 [24]\d\d$') { "through the pool: CONNECT and HTTP status $out"; exit 0 }
   Start-Sleep -Seconds 3
 }
@@ -185,7 +189,7 @@ if ($LASTEXITCODE -ne 0) { "agent install failed ($LASTEXITCODE)"; exit 1 }
 # The proxy URL carries the agent's token: curl reads it from the environment, never its arguments,
 # and it is never printed.
 $env:HTTPS_PROXY = (Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json).env.HTTPS_PROXY
-$out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' --cacert "$d\ca.pem" https://api.anthropic.com/v1/models
+$out = & curl.exe -s -m 30 -o NUL -w '%{http_connect} %{http_code}' --cacert "$d\ca.pem" --ssl-revoke-best-effort https://api.anthropic.com/v1/models
 if ($LASTEXITCODE -ne 0 -or $out -notmatch '^200 [24]\d\d$') { "the agent did not reach the pool (curl exit $LASTEXITCODE, status $out)"; exit 1 }
 "through the agent: CONNECT and HTTP status $out"
 'tasks: ' + ((Get-ScheduledTask | Where-Object { $_.TaskName -like 'claw-master*' } | ForEach-Object { $_.TaskName + '=' + $_.State }) -join ', ')
