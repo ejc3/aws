@@ -57,13 +57,13 @@
 variable "dolphin_labs_news_enabled" {
   description = "Run dolphin-labs' news pass on its schedule. false keeps the function and its data and stops the runs. Turn refresh-news.yml's schedule off in dolphin-labs first (see the file header)."
   type        = bool
-  default     = true # on since 2026-10-15; refresh-news.yml is off in dolphin-labs (NEWS_RUNS_IN_AWS)
+  default     = false # off since 2026-10-20: the news functions run in the Dolphin account (dolphin-aws news.tf); kept here a week as the rollback
 }
 
 variable "news_x_schedule_enabled" {
   description = "Run the X-posts step (dolphin-labs-news-x) every 5 minutes. false keeps the function and its schedule and stops the runs. Turn on once deploy-news.yml has deployed the bundle to it and dolphin-labs/monid has a value."
   type        = bool
-  default     = true # on since 2026-10-20: the bundle is deployed to it and dolphin-labs/monid has a value
+  default     = false # off since 2026-10-20: runs in the Dolphin account (dolphin-aws news.tf); kept here a week as the rollback
 }
 
 locals {

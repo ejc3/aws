@@ -1292,6 +1292,10 @@ Available if a task needs them; neither needs a key on disk.
   other workflow, branch or pull request (the trust pins GitHub's immutable `sub` and `job_workflow_ref`).
   Same grant as the boxes. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
   workflow needs.
+- **dolphin-labs' news functions moved to the Dolphin account (2026-10-20).** `dolphin-labs-news-pass` and `dolphin-labs-news-x`
+  run in the Dolphin account from dolphin-aws `news.tf` (its own journal bucket, secrets copied there, deploy role for
+  `deploy-news.yml`, alarms on `dolphin-alerts`). This account's copies below are kept for a week with both schedules off as
+  the rollback (`dolphin_labs_news_enabled`, `news_x_schedule_enabled`), then removed.
 - **dolphin-labs' news pass in AWS** (`dolphin-labs-news.tf`). Lambda `dolphin-labs-news-pass` on an
   EventBridge schedule (on; `dolphin_labs_news_enabled`), with Haiku 5.5, the Dolphin Redis's
   production URL and token (`dolphin-redis.tf`) in `dolphin-labs/news` and Browserbase from `browserbase/credentials`. Each pass writes a
