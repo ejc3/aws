@@ -42,7 +42,10 @@ variable "parallel_box_idle_cpu_pct" {
 # store, or 180 MiB and more on the network. So 512 MiB for each disk direction and 64 MiB for each network direction
 # (the I/O box's network bar, dev-auto-stop-lambda.tf), well clear of the idle floor and far under real work. A series
 # that is missing counts as no activity: DiskRead/WriteBytes (the instance store) exist only on types that have one, and
-# CPU already refuses to reap without data. The members' Windows boxes (member-wbox.tf) keep CPU alone.
+# CPU already refuses to reap without data. EBSRead/WriteBytes are documented only for Nitro instances that are not bare
+# metal, so where either is missing the code reads the attached volumes' AWS/EBS VolumeRead/WriteBytes instead (the role's
+# cloudwatch:GetMetricStatistics on * and DescribeInstances' block device mappings already cover it). The members'
+# Windows boxes (member-wbox.tf) keep CPU alone.
 locals {
   parallel_watchdog_io_thresholds = jsonencode({
     EBSReadBytes   = 512 * 1048576
@@ -189,7 +192,7 @@ def lambda_handler(event, context):
 
         # Under the CPU bar, but a single thread or a disk-bound job looks exactly like that: any window of disk or
         # network bytes at or above its threshold keeps the box.
-        io_active = {}
+        io_active, ebs_missing = {}, set()
         for metric, threshold in sorted(IO_THRESHOLDS.items()):
             io = cw.get_metric_statistics(
                 Namespace="AWS/EC2",
@@ -200,9 +203,35 @@ def lambda_handler(event, context):
                 Period=300,
                 Statistics=["Sum"],
             )
-            io_peak = max((p.get("Sum", 0) for p in io.get("Datapoints", [])), default=0)
+            points = io.get("Datapoints", [])
+            if metric.startswith("EBS") and not points:
+                ebs_missing.add(metric)
+            io_peak = max((p.get("Sum", 0) for p in points), default=0)
             if io_peak >= threshold:
                 io_active[metric] = int(io_peak)
+        # AWS publishes the instance-level EBS series only for Nitro instances that are not bare metal (the kvm
+        # flavors are all .metal): where one is missing, read the attached volumes' own AWS/EBS series instead,
+        # summed across the volumes per window, against the same threshold.
+        volumes = [m["Ebs"]["VolumeId"] for m in inst.get("BlockDeviceMappings", []) if m.get("Ebs", {}).get("VolumeId")]
+        for metric in sorted(ebs_missing):
+            if io_active or not volumes:
+                break
+            per_window = {}
+            for vol in volumes:
+                io = cw.get_metric_statistics(
+                    Namespace="AWS/EBS",
+                    MetricName=metric.replace("EBS", "Volume", 1),
+                    Dimensions=[{"Name": "VolumeId", "Value": vol}],
+                    StartTime=now - datetime.timedelta(minutes=IDLE_MINUTES),
+                    EndTime=now,
+                    Period=300,
+                    Statistics=["Sum"],
+                )
+                for p in io.get("Datapoints", []):
+                    per_window[p.get("Timestamp")] = per_window.get(p.get("Timestamp"), 0) + p.get("Sum", 0)
+            io_peak = max(per_window.values(), default=0)
+            if io_peak >= IO_THRESHOLDS[metric]:
+                io_active[metric.replace("EBS", "Volume", 1)] = int(io_peak)
         if io_active:
             results.append({"id": iid, "action": "busy_io", "peak_cpu": round(peak, 1), "io_bytes_5m": io_active})
             continue

@@ -165,18 +165,21 @@ class WatchdogHarness(unittest.TestCase):
     """The real parallel-box-watchdog.tf Lambda body against fake boto3: the LaunchTime lifetime
     is the one bound on the GPU box that nothing on the box can switch off."""
 
-    def run_watchdog(self, instances, cpu, terminate_error=None, io=None, io_thresholds=None):
+    def run_watchdog(self, instances, cpu, terminate_error=None, io=None, io_thresholds=None, volumes=None):
         code = re.search(r'parallel_watchdog_code = <<-PY\n(.*?)\n  PY', source('parallel-box-watchdog.tf'), re.S).group(1)
         code = textwrap.dedent(code)
         now = datetime.datetime.now(datetime.timezone.utc)
         calls = {'terminate': [], 'sns': [], 'metrics': []}
         io = io or {}
+        volumes = volumes or {}
 
         class EC2:
             def describe_instances(self, Filters):
                 return {'Reservations': [{'Instances': [
                     {'InstanceId': iid, 'LaunchTime': now - datetime.timedelta(minutes=age),
-                     'Tags': [{'Key': 'Name', 'Value': name}] + [{'Key': k, 'Value': v} for k, v in extra]}
+                     'Tags': [{'Key': 'Name', 'Value': name}] + [{'Key': k, 'Value': v} for k, v in extra],
+                     'BlockDeviceMappings': [{'DeviceName': '/dev/sd%s' % chr(97 + n), 'Ebs': {'VolumeId': vol}}
+                                             for n, vol in enumerate(volumes.get(iid, []))]}
                     for iid, name, age, *more in instances for extra in [more[0] if more else {}.items()]]}]}
 
             def terminate_instances(self, InstanceIds):
@@ -188,6 +191,11 @@ class WatchdogHarness(unittest.TestCase):
             def get_metric_statistics(self, **kwargs):
                 iid, metric = kwargs['Dimensions'][0]['Value'], kwargs['MetricName']
                 calls['metrics'].append((iid, metric, tuple(kwargs['Statistics'])))
+                if kwargs['Namespace'] == 'AWS/EBS':
+                    # A volume's series: windows are keyed by timestamp so the code can sum volumes per window.
+                    assert kwargs['Dimensions'][0]['Name'] == 'VolumeId' and kwargs['Period'] == 300
+                    return {'Datapoints': [{'Timestamp': n, 'Sum': v} for n, v in enumerate(io.get(iid, {}).get(metric, []))]}
+                assert kwargs['Namespace'] == 'AWS/EC2' and kwargs['Dimensions'][0]['Name'] == 'InstanceId'
                 if metric == 'CPUUtilization':
                     peak = cpu[iid]
                     return {'Datapoints': [{'Maximum': peak}, {'Maximum': peak}]}
@@ -315,6 +323,29 @@ class WatchdogHarness(unittest.TestCase):
                                            io_thresholds=self.io_thresholds())
         self.assertEqual(actions, {'i-1': 'terminated'})
         self.assertEqual(len([m for _, m, _ in calls['metrics'] if m != 'CPUUtilization']), 6)
+
+    def test_a_bare_metal_box_with_no_instance_ebs_series_reads_its_volumes(self):
+        # kvm-96/kvm-192 are .metal types: AWS documents EBSRead/WriteBytes only for Nitro instances that are not bare
+        # metal. The attached volumes' AWS/EBS series stand in, summed per window across the volumes.
+        mib = lambda xs: [x * self.MIB for x in xs]
+        actions, calls = self.run_watchdog(
+            [('i-kvm', 'parallel-box', 45), ('i-split', 'parallel-box-2', 45), ('i-quiet', 'parallel-box-3', 45),
+             ('i-novol', 'parallel-box-4', 45), ('i-nitro', 'parallel-box-5', 45)],
+            {'i-kvm': 1.0, 'i-split': 1.0, 'i-quiet': 0.0, 'i-novol': 0.0, 'i-nitro': 0.0},
+            io={'vol-root': {'VolumeWriteBytes': mib([70.0] * 6)}, 'vol-work': {'VolumeWriteBytes': mib(self.EBS_JOB)},
+                # 300 + 300 MiB in one window on two volumes: over 512 only when summed
+                'vol-a': {'VolumeReadBytes': mib([300.0, 10.0])}, 'vol-b': {'VolumeReadBytes': mib([300.0, 10.0])},
+                'vol-q': {'VolumeWriteBytes': mib(self.IDLE_EBS)},
+                # a non-metal box publishes the instance series (idle here): its volumes are never asked
+                'i-nitro': {'EBSWriteBytes': mib(self.IDLE_EBS), 'EBSReadBytes': mib([0.0] * 6)},
+                'vol-n': {'VolumeWriteBytes': mib(self.EBS_JOB)}},
+            io_thresholds=self.io_thresholds(),
+            volumes={'i-kvm': ['vol-root', 'vol-work'], 'i-split': ['vol-a', 'vol-b'], 'i-quiet': ['vol-q'],
+                     'i-nitro': ['vol-n']})
+        self.assertEqual(actions, {'i-kvm': 'busy_io', 'i-split': 'busy_io', 'i-quiet': 'terminated',
+                                   'i-novol': 'terminated', 'i-nitro': 'terminated'})
+        self.assertNotIn('vol-n', [i for i, _, _ in calls['metrics']])
+        self.assertTrue(all(st == ('Sum',) for i, _, st in calls['metrics'] if i.startswith('vol-')))
 
     def test_without_thresholds_it_is_cpu_alone(self):
         # The members' Windows boxes pass none (member-wbox.tf): their behaviour and their metric calls are unchanged.
