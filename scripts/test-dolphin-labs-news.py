@@ -148,6 +148,20 @@ class XStepTests(unittest.TestCase):
         for name in ("dolphin_labs_news_pass_errors", "dolphin_labs_news_pass_not_running"):
             self.assertIn("FunctionName = aws_lambda_function.dolphin_labs_news_pass.function_name", block("aws_cloudwatch_metric_alarm", name))
 
+    def test_x_not_running_alarm_exists_only_while_its_schedule_is_on(self):
+        a = block("aws_cloudwatch_metric_alarm", "dolphin_labs_news_x_not_running")
+        self.assertIn("count               = var.news_x_schedule_enabled ? 1 : 0", a)
+        self.assertIn('metric_name         = "Invocations"', a)
+        self.assertIn("dimensions          = { FunctionName = aws_lambda_function.dolphin_labs_news_x.function_name }", a)
+        self.assertIn('treat_missing_data  = "breaching"', a)
+        self.assertIn('comparison_operator = "LessThanThreshold"', a)
+
+    def test_readme_runbook_covers_the_x_step(self):
+        readme = (ROOT / "README.md").read_text()
+        section = readme[readme.index("## dolphin-labs news pass"):readme.index("## Private browser manager")]
+        for needle in ("dolphin-labs/monid", "news_x_schedule_enabled", "NEWS_X_LAMBDA_FUNCTION", "dolphin-labs-news-x-not-running"):
+            self.assertIn(needle, section)
+
     def test_deploy_role_updates_both_functions_code_and_output_names_the_x_function(self):
         dep = block("aws_iam_role_policy", "dolphin_labs_news_deploy")
         self.assertIn("Resource = [aws_lambda_function.dolphin_labs_news_pass.arn, aws_lambda_function.dolphin_labs_news_x.arn]", dep)

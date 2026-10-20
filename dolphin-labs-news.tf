@@ -602,6 +602,27 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_x_errors" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
+# The schedule or its role failing before Lambda accepts an invocation publishes no Errors datapoint, so the errors
+# alarm alone stays green while X posts stop refreshing. While the schedule is on it invokes every 5 minutes (the step
+# decides inside the function whether a game window is open), so three empty 5-minute periods mean it is not firing.
+resource "aws_cloudwatch_metric_alarm" "dolphin_labs_news_x_not_running" {
+  count               = var.news_x_schedule_enabled ? 1 : 0
+  alarm_name          = "dolphin-labs-news-x-not-running"
+  alarm_description   = "dolphin-labs-news-x has not been invoked for 15 minutes: the schedule, its role or the target is broken. X posts are not refreshing."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_labs_news_x.function_name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+}
+
 # -------------------------------------------------------------------------------------
 # Deploy (GitHub OIDC, deploy-news.yml on main)
 # -------------------------------------------------------------------------------------
