@@ -541,7 +541,7 @@ fi
 # Shell setup
 ${local.shell_setup}
 
-# Only ARM gets `ssh mac` (EJ's MacBook Pro) and `ssh colton-mac` (Colton's Mac), through Cloudflare Access
+# Only ARM gets `ssh mac` (EJ's MacBook Pro), `ssh colton-mac` (Colton's Mac) and `ssh colin-pc` (Colin's PC), through Cloudflare Access
 # (mac-ssh-client.tf), each with fcvm-arm's own service token; the proxy command needs the pinned cloudflared.
 ${local.fcvm_mac_ssh_clients}
 

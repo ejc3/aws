@@ -137,6 +137,8 @@ jobs:
         run: python3 -S -B scripts/test-codex-seed.py
       - name: ssh mac and ssh colton-mac client installer, their Cloudflare routes and the Mac connector setup (offline)
         run: python3 -S -B scripts/test-mac-ssh-client.py
+      - name: ssh colin-pc's Cloudflare route, the Windows PC setup, its bootstrap and the Windows-MCP bridge (offline)
+        run: python3 -S -B scripts/test-windows-pc-setup.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: python3 -S -B scripts/test-mac-setup.py
       - name: Metal boxes keep their box tools (pbox, gbox, wbox, codex-restart) equal to main daily (offline)
