@@ -717,5 +717,40 @@ class ContainerScriptTests(unittest.TestCase):
             self.assertIn("belongs to alice", r.stderr)
 
 
+
+class NoContainerRestartTests(unittest.TestCase):
+    """A re-run of setup (any change to the published script) must not restart the containers. Every
+    systemd-nspawn@<user> unit Requires= the firewall and its home mount, and restarting a required unit restarts the
+    containers that require it: on 2026-10-20 two routine applies ended every session (13:54, 14:04)."""
+
+    MACHINE = (ROOT / "scripts/nextjs-ct/host/nextjs-ct-machine").read_text()
+
+    def required_units(self):
+        req = re.search(r"^Requires=(.*)$", self.MACHINE, re.M).group(1).split()
+        self.assertIn("nextjs-ct-firewall.service", req)
+        return req
+
+    def test_setup_never_restarts_a_unit_the_containers_require(self):
+        hosts = [TF] + [f.read_text() for f in (ROOT / "scripts/nextjs-ct/host").iterdir() if f.is_file()]
+        for unit in self.required_units():
+            name = unit.replace("$HOME_UNIT", "").strip()
+            if not name:
+                # the home mount unit: only ever enabled/started, never restarted
+                for text in hosts:
+                    self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart)[^\n]*\$HOME_UNIT")
+                continue
+            for text in hosts:
+                self.assertNotRegex(text, r"systemctl (restart|try-restart|reload-or-restart)[^\n]*" + re.escape(name))
+                # stopping it happens only in the fail-closed branch of a rejected reload, in setup itself
+                self.assertLessEqual(len(re.findall(r"systemctl stop[^\n]*" + re.escape(name), text)), 1 if text is TF else 0)
+
+    def test_firewall_rules_are_reloaded_by_running_the_script(self):
+        self.assertIn("if ! { systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall; }; then", TF)
+
+    def test_a_failed_reload_stops_the_firewall_so_the_containers_fail_closed(self):
+        block = TF.split("if ! { systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall; }; then", 1)[1].split("\nfi", 1)[0]
+        self.assertIn("systemctl stop nextjs-ct-firewall.service", block)
+        self.assertIn("exit 1", block)
+
 if __name__ == "__main__":
     unittest.main()

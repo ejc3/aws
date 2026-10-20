@@ -535,7 +535,16 @@ WantedBy=paths.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now nextjs-ct-firewall.service >/dev/null 2>&1
-systemctl restart nextjs-ct-firewall.service || { echo "ERROR: the containers' firewall did not load"; exit 1; }
+# Reload the rules by running the script, never by restarting the unit: every container's systemd-nspawn@ unit
+# Requires= it (nextjs-ct-machine), and restarting a required unit restarts all of them, ending every session.
+# That is what a routine apply did on 2026-10-20 (13:54 and 14:04), since any change to this script re-runs setup.
+# A rejected ruleset (nft -c fails) leaves the old rules loaded, so on failure the unit is stopped: every container
+# Requires= it and stops with it, failing closed exactly as the old restart did, and setup-sync retries.
+if ! { systemctl start nextjs-ct-firewall.service && /usr/local/sbin/nextjs-ct-firewall; }; then
+  echo "ERROR: the containers' firewall did not load; stopping it, and with it every container"
+  systemctl stop nextjs-ct-firewall.service
+  exit 1
+fi
 systemctl enable nextjs-ct-imds.service nextjs-ct-ndev-sync.timer nextjs-ct-ndev-sync.path machines.target >/dev/null 2>&1
 systemctl restart nextjs-ct-imds.service
 systemctl start nextjs-ct-ndev-sync.timer nextjs-ct-ndev-sync.path
