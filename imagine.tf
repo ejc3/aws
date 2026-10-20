@@ -514,11 +514,41 @@ resource "aws_ecs_task_definition" "imagine" {
     cpu_architecture        = "ARM64"
   }
 
+  # Security Hub ECS.5: both containers run with a read-only root filesystem. The release needs one
+  # writable directory, a temporary one (runtime.exs calls System.tmp_dir!, and the VM refuses to boot
+  # without it), so /tmp is the task's own scratch volume. Fargate creates that volume owned by root
+  # with mode 0755 and the server runs as uid 10001, so a short first container (the same image, as
+  # root, nothing else) opens it to 1777, as /tmp is in the image, and the server starts only once it
+  # has succeeded. Checked by running imagine/server:live read-only with that one writable /tmp: it
+  # boots, names its node from env.sh, answers /healthz, takes `bin/imagine rpc` and stops cleanly.
+  volume {
+    name = "tmp"
+  }
+
   container_definitions = jsonencode([{
-    name         = "server"
-    image        = "${aws_ecr_repository.imagine.repository_url}:${local.imagine_live_tag}"
-    essential    = true
-    portMappings = [{ containerPort = local.imagine_port, protocol = "tcp" }]
+    name                   = "tmp"
+    image                  = "${aws_ecr_repository.imagine.repository_url}:${local.imagine_live_tag}"
+    essential              = false
+    user                   = "0"
+    command                = ["chmod", "1777", "/tmp"]
+    readonlyRootFilesystem = true
+    mountPoints            = [{ sourceVolume = "tmp", containerPath = "/tmp", readOnly = false }]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.imagine_server.name
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "tmp"
+      }
+    }
+    }, {
+    name                   = "server"
+    image                  = "${aws_ecr_repository.imagine.repository_url}:${local.imagine_live_tag}"
+    essential              = true
+    portMappings           = [{ containerPort = local.imagine_port, protocol = "tcp" }]
+    readonlyRootFilesystem = true
+    mountPoints            = [{ sourceVolume = "tmp", containerPath = "/tmp", readOnly = false }]
+    dependsOn              = [{ containerName = "tmp", condition = "SUCCESS" }]
     environment = [
       { name = "PORT", value = tostring(local.imagine_port) },
       # The token audience: the web app signs tokens for this value and no other.
