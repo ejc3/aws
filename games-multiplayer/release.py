@@ -314,6 +314,15 @@ def register(channel, commit, game, image):
             "image": "%s:%s" % (image["repositoryUrl"], tag),
             "essential": True,
             "portMappings": [{"containerPort": ENGINE_PORT, "protocol": "tcp"}],
+            # Security Hub ECS.5. The engines serve sockets and write no file they need: the one
+            # write is starfall-arena's crash tape (os.tmpdir()), which already catches the failure
+            # and logs it with the match's error, and which nothing could read back from a stopped
+            # Fargate task anyway. No writable mount, so the revision stays one container
+            # (launch.py and bringup.py's releases-bootstrap accept only that). Checked by running
+            # mptest, starfall and starfall-arena read-only with no tmpfs, as the images' own user,
+            # against a fake lobby: health, spec, ready, two signed seats exchanging frames, an
+            # unsigned socket refused, a heartbeat, exit 0 on SIGTERM; the tape writer throws there.
+            "readonlyRootFilesystem": True,
             "environment": [
                 {"name": "GAME_ID", "value": game},
                 {"name": "PORT", "value": str(ENGINE_PORT)},
