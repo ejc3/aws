@@ -2511,7 +2511,8 @@ The X-posts step is its own function, `dolphin-labs-news-x`, on its own 5-minute
 2. Put the Monid key in `dolphin-labs/monid` from a 0600 file, never on a command line (nextjs-dev may put it, not
    read it): `aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/monid --secret-string
    file://monid-secret.json` with `{"MONID_API_KEY": "..."}`; then shred the file.
-3. Set `news_x_schedule_enabled = true` in `dolphin-labs-news.tf`, merge, and apply. Its errors alarm
+3. Set `news_x_schedule_enabled = true` in `dolphin-labs-news.tf`, merge, and apply (done 2026-10-20; nextjs-dev
+   can read its logs and schedule and invoke it by hand, as for the pass). Its errors alarm
    (`dolphin-labs-news-x-errors`) and 'not running' alarm (`dolphin-labs-news-x-not-running`) then watch it. Its runs
    journal under `x-journal/` in the same bucket.
 
