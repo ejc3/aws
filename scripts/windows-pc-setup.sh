@@ -268,7 +268,12 @@ PS
 
 echo "5/7 the connector token (from Secrets Manager, through ssh stdin only)"
 { set +x; } 2>/dev/null
-aws secretsmanager get-secret-value --region "$REGION" --secret-id "$TUNNEL_SECRET" --query SecretString --output text |
+# Read first, then pipe: a PowerShell reached through Windows' OpenSSH never sees stdin that arrives after its session
+# has started (measured 2026-10-20: printf piped at once is read; the same text 3 s later hangs ReadToEnd for good), and
+# Secrets Manager answers after the session is up. The value stays in this shell's memory, never on a command line.
+TUNNEL_TOKEN=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$TUNNEL_SECRET" --query SecretString --output text)
+[ -n "$TUNNEL_TOKEN" ] || { echo "$TUNNEL_SECRET is empty" >&2; exit 1; }
+printf '%s' "$TUNNEL_TOKEN" |
   on_pc "$(ps_vars Alias "$ALIAS")
 $(cat <<'PS'
 $ErrorActionPreference = 'Stop'
@@ -282,6 +287,8 @@ New-Item -ItemType File -Force "$t.changed" | Out-Null
 'token installed'
 PS
 )"
+
+unset TUNNEL_TOKEN
 
 echo "6/7 Windows-MCP $WINDOWS_MCP_VERSION in the user's session (uv $UV_VERSION)"
 on_pc "$(ps_vars UvVersion "$UV_VERSION" UvSha "$UV_SHA256_WINDOWS_AMD64_ZIP" McpVersion "$WINDOWS_MCP_VERSION")

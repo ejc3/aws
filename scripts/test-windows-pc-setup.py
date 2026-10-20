@@ -99,6 +99,14 @@ class Setup(unittest.TestCase):
         self.assertIn('--secret-id "$TUNNEL_SECRET"', s5)
         self.assertIn("|\n  on_pc", s5)
         self.assertIn("[Console]::In.ReadToEnd()", s5)
+        # read before the session starts, piped at once: stdin arriving after a Windows OpenSSH session is up is never
+        # read, so a slow command piped straight into on_pc hangs it (2026-10-20)
+        self.assertIn('TUNNEL_TOKEN=$(aws secretsmanager get-secret-value', s5)
+        self.assertIn('printf \'%s\' "$TUNNEL_TOKEN" |\n  on_pc', s5)
+        self.assertIn("unset TUNNEL_TOKEN", code(SETUP))
+        # nothing but an already-buffered printf ever feeds on_pc
+        for m in re.finditer(r"^(.*)\|\s*\n?\s*on_pc", code(SETUP), re.M):
+            self.assertRegex(m.group(1), r"^\s*printf '%s' \"\$[A-Z_]+\"\s*$", m.group(0))
         self.assertNotRegex(code(SETUP), r"ps_vars[^\n]*(TOKEN|SECRET)")
         self.assertNotRegex(code(SETUP), r"--token(?!-file)")
 
