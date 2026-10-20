@@ -984,6 +984,12 @@ public repository `ejc3/agents-md`, one file per machine and account (`hosts/<ma
   role, and for dev-server-role, fcvm-arm's own instance), and an association installs it the same way, daily. Each is
   gated by `local.agent_local_md_ready` (checked in, false until its secret has a value). To change one, put a new value
   from a 0600 file and apply. Never copy its text into this repository, a commit or a pull request.
+- **Codex gets its own copy, `~/.codex/AGENTS.override.md`** (`local.agents_md_codex_copy`, the last step of both
+  associations). Codex reads only its own home (that file if it exists, else `~/.codex/AGENTS.md`, whole: the 32 KiB
+  `project_doc_max_bytes` budget is for repository files, not these) and does not follow `@` imports. So the copy is
+  CLAUDE.md with local.md inlined at the import line (the line dropped when there is no local.md), 0600, written by the
+  account. Before it, fcvm-arm's Codex read none of the instructions (its CLAUDE.md is a file of its own, with no
+  `~/.codex/AGENTS.md`) and nextjs-dev's read them without local.md (ejc3/agents-md#10).
 - **Codex's skills mirror Claude Code's.** Codex reads `~/.agents/skills`, Claude Code `~/.claude/skills`. The skill
   checkouts (`~/claude-skills`, on fcvm-arm also `~/src/claude-skills`; github.com/ejc3/claude-skills) and the
   `~/.claude/skills` links are made by hand, by nothing in this repository, so the mirror is a manual step too, done

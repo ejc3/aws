@@ -8,6 +8,8 @@
 #   hosts/fcvm-metal-arm/ubuntu/AGENTS.md  ->  fcvm-metal-arm, ubuntu, ~/.claude/CLAUDE.md
 #   hosts/nextjs-dev/ejc3/AGENTS.md        ->  nextjs-dev, ejc3, ~/.claude/CLAUDE.md (a link to ~/.codex/AGENTS.md)
 #
+# and, for Codex, ~/.codex/AGENTS.override.md: the same text with ~/.claude/local.md inlined (agents_md_codex_copy).
+#
 # A merged change reaches its box at the next apply here (the PR watch applies after merging in ejc3/agents-md); the
 # association also runs daily, so an edit made on the box is put back. The jumpbox's own file is in the repository but
 # is not distributed from here: a jumpbox never takes its instructions from a path a dev box can propose to unattended.
@@ -20,6 +22,24 @@ locals {
     "nextjs-dev/ejc3"       = { user = "ejc3", instance_ids = var.enable_nextjs_dev ? [local.nextjs_live_instance.id] : [] }
   }
   agents_md_github_app = jsondecode(ephemeral.aws_secretsmanager_secret_version.agents_md_github_app.secret_string)
+
+  # Codex reads its instructions from its own home only (~/.codex/AGENTS.override.md if it exists, else
+  # ~/.codex/AGENTS.md, the whole file) and does not follow Claude Code's `@~/.claude/local.md` import. On fcvm-arm
+  # ~/.claude/CLAUDE.md is a file of its own, so Codex read none of the instructions; on nextjs-dev it read them but
+  # not local.md (ejc3/agents-md#10). Both associations (this one and agent-local-md.tf's) therefore end by writing
+  # Codex its own copy, AGENTS.override.md: CLAUDE.md with local.md inlined where CLAUDE.md imports it (the import
+  # line dropped when there is no local.md), so Codex sees exactly what Claude Code sees. Written by the account,
+  # inside its home, 0600 (it can hold local.md's private text), with a rename from a temporary file of its own: the
+  # two associations run on their own schedules and can overlap.
+  agents_md_codex_copy = <<-EOT
+    claude="$home/.claude/CLAUDE.md"
+    if [ -L "$claude" ]; then claude=$(readlink -f "$claude"); fi
+    codex="$home/.codex/AGENTS.override.md"
+    if [ -L "$codex" ]; then codex=$(readlink -f "$codex"); fi
+    for p in "$claude" "$codex"; do case "$p" in "$home"/*) ;; *) echo "agents-md: $p is outside $home; not writing" >&2; exit 1 ;; esac; done
+    runuser -u "$user" -- sh -c 'set -eu; [ -f "$1" ] || exit 0; mkdir -p "$(dirname "$3")"; umask 077; tmp=$(mktemp "$3.XXXXXX"); trap '"'"'rm -f "$tmp"'"'"' EXIT; while IFS= read -r line || [ -n "$line" ]; do if [ "$line" = "@~/.claude/local.md" ]; then if [ -f "$2" ]; then cat "$2"; [ -z "$(tail -c 1 "$2")" ] || echo; fi; else printf "%s\n" "$line"; fi; done < "$1" > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$3"' sh "$claude" "$home/.claude/local.md" "$codex"
+    echo "agents-md: Codex copy at $codex"
+  EOT
 }
 
 # The administration agent's GitHub App (github-admin-tokens.tf), installed on the ejc3 account, reads the
@@ -108,6 +128,7 @@ resource "aws_ssm_association" "agents_md" {
       case "$target" in "$home"/*) ;; *) echo "agents-md: $target is outside $home; not writing" >&2; exit 1 ;; esac
       runuser -u "$user" -- sh -c 'set -eu; mkdir -p "$(dirname "$1")"; cp "$2" "$1.agents-md.tmp"; mv "$1.agents-md.tmp" "$1"' sh "$target" "$tmp"
       echo "agents-md: installed ${each.key} ($sum) at $target"
+      ${local.agents_md_codex_copy}
     EOT
   }
 }

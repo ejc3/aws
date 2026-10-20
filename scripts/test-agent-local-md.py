@@ -13,6 +13,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TF = (ROOT / "agent-local-md.tf").read_text()
+CODEX_COPY = re.search(r"^  agents_md_codex_copy = <<-EOT\n(.*?)^  EOT\n", (ROOT / "agents-md.tf").read_text(), re.M | re.S).group(1)
+CODEX_COPY = "\n".join(l[4:] if l.startswith("    ") else l for l in CODEX_COPY.splitlines())
 EXAMPLE = "# Machine-local instructions (example-box, example-account)\n\nUse the example tool at 127.0.0.1:0.\n"
 
 
@@ -100,7 +102,8 @@ class Install(unittest.TestCase):
                        .replace("${aws_s3_bucket.dev_scripts.id}", "example-bucket")
                        .replace("${aws_s3_object.agent_local_md[each.key].key}", "agents-md/example/local.md")
                        .replace("${var.aws_region}", "us-west-1")
-                       .replace("${each.key}", "example-box/example"))
+                       .replace("${each.key}", "example-box/example")
+                       .replace("${local.agents_md_codex_copy}", CODEX_COPY))
         self.assertNotIn("${", self.script)
 
     def run_(self):
@@ -114,6 +117,20 @@ class Install(unittest.TestCase):
         self.assertEqual((self.home / ".claude" / "local.md").stat().st_mode & 0o777, 0o600, "private to the account")
         self.assertRegex((self.temp / "chown.log").read_text(), r"^chown example /", "the account owns the temporary copy")
         self.assertNotIn("Use the example tool", r.stdout + r.stderr, "the text is never echoed")
+
+    def test_codex_gets_its_copy_with_the_file_inlined(self):
+        (self.home / ".claude" / "CLAUDE.md").write_text("# Instructions\n\n@~/.claude/local.md\n\n## After\n")
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        copy = self.home / ".codex" / "AGENTS.override.md"
+        self.assertEqual(copy.read_text(), "# Instructions\n\n" + EXAMPLE + "\n## After\n")
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("Use the example tool", r.stdout + r.stderr, "the text is never echoed")
+
+    def test_no_claude_md_means_no_codex_copy(self):
+        r = self.run_()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.home / ".codex" / "AGENTS.override.md").exists())
 
     def test_a_changed_object_is_refused_and_nothing_written(self):
         self.obj.write_text(EXAMPLE + "tampered\n")
