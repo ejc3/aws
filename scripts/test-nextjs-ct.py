@@ -302,5 +302,16 @@ class AdminKeyTests(unittest.TestCase):
         self.assertIn("removed the admin key", machine)
 
 
+class ProvisionMetadataTimeoutTests(unittest.TestCase):
+    """setup restarts nextjs-ct-imds right before provision runs; the CLI's default one-second, one-try metadata
+    timeout then misses the first credentials, so provision raises it before its first AWS call."""
+
+    def test_timeout_is_raised_before_the_first_aws_call(self):
+        provision = (SCRIPTS / "ct" / "provision").read_text()
+        export = provision.index("export AWS_METADATA_SERVICE_TIMEOUT=5 AWS_METADATA_SERVICE_NUM_ATTEMPTS=3")
+        first_call = re.search(r"\$\(aws |^\s*aws ", provision, re.M).start()
+        self.assertLess(export, first_call)
+
+
 if __name__ == "__main__":
     unittest.main()
