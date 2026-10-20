@@ -131,6 +131,7 @@ export function makeHandler(deps) {
     } catch {
       return json(400, { error: 'body is not JSON' });
     }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return json(400, { error: 'body must be a JSON object' });
     const hostKey = parseEd25519(body.host_key);
     if (!hostKey) return json(400, { error: 'host_key must be one ssh-ed25519 public key' });
 

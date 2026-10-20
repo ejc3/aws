@@ -69,7 +69,10 @@ function setup({ params = {}, secret = CONNECTOR, beforePut = () => {} } = {}) {
       headers: assertion === null ? {} : { 'cf-access-jwt-assertion': assertion }, // null: no header at all
       body: body === undefined ? undefined : JSON.stringify(body),
     }).then((r) => ({ status: r.statusCode, body: JSON.parse(r.body), headers: r.headers }));
-  return { call, store, logs, writes };
+  const raw = (body, path) =>
+    handler({ requestContext: { http: { method: 'POST' } }, rawPath: path, headers: { 'cf-access-jwt-assertion': token() }, body })
+      .then((r) => ({ status: r.statusCode, body: JSON.parse(r.body) }));
+  return { call, raw, store, logs, writes };
 }
 
 test('a valid Access token passes; every malformed or foreign one is refused', async () => {
@@ -159,7 +162,7 @@ test('nothing is written until every prerequisite is there', async () => {
 });
 
 test('inputs are validated: names, keys, users, routes', async () => {
-  const { call, writes } = setup();
+  const { call, raw: handlerCall, writes } = setup();
   assert.equal((await call('POST', '/pcs/other-pc/enroll', { host_key: PC_KEY, user: 'colin' })).status, 404);
   assert.equal((await call('POST', '/pcs/Test_PC/enroll', { host_key: PC_KEY, user: 'colin' })).status, 404);
   assert.equal((await call('GET', '/pcs/test-pc/enroll')).status, 404);
@@ -168,6 +171,13 @@ test('inputs are validated: names, keys, users, routes', async () => {
   }
   for (const user of ['', 'a b', 'x'.repeat(33), 'colin\nProxyCommand evil']) {
     assert.equal((await call('POST', '/pcs/test-pc/enroll', { host_key: PC_KEY, user })).status, 400, user);
+  }
+  // A body that parses but is not an object is a 400, not a crash.
+  for (const raw of ['null', '"x"', '[]', '7']) {
+    for (const path of ['/pcs/test-pc/enroll', '/pcs/test-pc/host-key/replace']) {
+      const r = await handlerCall(raw, path);
+      assert.equal(r.status, 400, `${path} ${raw}`);
+    }
   }
   assert.deepEqual(writes, []);
 });
@@ -183,7 +193,8 @@ test('parseEd25519 accepts exactly one well-formed key, and fingerprints match s
   assert.equal(parseEd25519(`${PC_KEY} comment here`), PC_KEY);
   assert.equal(parseEd25519('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA'), null);
   assert.equal(parseEd25519(`${PC_KEY}\r`), null);
-  assert.match(fingerprint(PC_KEY), /^SHA256:[A-Za-z0-9+/]{43}$/);
+  // ssh-keygen -lf on PC_KEY prints SHA256:X5+k35+nAbCWS6ftWpA41NPZZyY3RrJGalQiz1BR4WU.
+  assert.equal(fingerprint(PC_KEY), 'SHA256:X5+k35+nAbCWS6ftWpA41NPZZyY3RrJGalQiz1BR4WU');
 });
 
 test('the JWKS is cached and refetched for an unknown kid at most once a minute', async () => {

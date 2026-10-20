@@ -74,7 +74,10 @@ class Origin(unittest.TestCase):
         self.assertIn('runtime                        = "nodejs22.x"', fn)
         self.assertIn('source_file = "${path.module}/scripts/pc-enroll.mjs"', TF)
         self.assertIn("export const handler", LAMBDA)
-        self.assertNotRegex(LAMBDA, r"^import .* from '(?!node:)", "a dependency the zip would not carry")
+        imports = re.findall(r"^import .* from '([^']+)';$", LAMBDA, re.M)
+        self.assertEqual(imports, ["node:crypto"])  # nothing the zip would not carry
+        self.assertEqual(sorted(re.findall(r"await import\('([^']+)'\)", LAMBDA)),
+                         ["@aws-sdk/client-secrets-manager", "@aws-sdk/client-ssm"])  # the runtime's own SDK
 
 
 class Grants(unittest.TestCase):
