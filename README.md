@@ -804,6 +804,18 @@ to its one port and expiring after two days, and its sshd `Match` block refuses 
 X11 and a TTY. The tunnel is retired as soon as the Cloudflare route works. The clients' configs set `ForwardAgent no`
 and `ForwardX11 no`, and whatever comes back from a PC is untrusted data.
 
+**The enrollment service** (`pc-enroll.tf`, `scripts/pc-enroll.mjs`) is what replaces that bootstrap: at
+`https://enroll.cc-games.dev`, behind Cloudflare Access for the owner only, a Lambda hands a PC listed in
+`local.pc_enroll_pcs` its connector token and its clients' public keys after the owner logs in to Access on the PC. The
+Lambda checks the Access token itself (the API Gateway origin is public; that check is the boundary), pins the PC's host
+key at `/pc-ssh/<pc>/host-key` only when none is pinned (seeded from `local.mac_ssh_macs`), and lets only an owner
+replace a pin (`POST /pcs/<pc>/host-key/replace`). It reads client keys from `/pc-ssh/<pc>/clients/<box>-<account>` and
+refuses a PC until every slot holds one. The PC's script, the client keys' publishers and the bootstrap's removal come in
+the next change; until then the steps below still apply. **Revoking a PC's connector**: rotate the tunnel's token first
+(Cloudflare's "Rotate a compromised token"), then delete its connections (`cloudflared tunnel cleanup <tunnel>`, or the
+tunnel connections DELETE API), or delete the tunnel. A rotation alone leaves a running connector connected; a cleanup
+alone lets it reconnect.
+
 **A new PC** (Colin's was set up this way on 2026-10-20):
 
 1. Add its row to `local.mac_ssh_macs` and a `<alias>-ssh.tf` like `colin-pc-ssh.tf`; claim a port block for it

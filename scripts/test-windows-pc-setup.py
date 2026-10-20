@@ -43,7 +43,11 @@ class Route(unittest.TestCase):
         self.assertIn("required  = true", TF)  # the connector refuses a request without an Access token
         self.assertIn('decision         = "non_identity"', TF)
         policy = TF[TF.index('resource "aws_secretsmanager_secret_policy" "colin_pc_ssh_tunnel"'):]
-        self.assertIn("ArnNotEquals = { \"aws:PrincipalArn\" = local.colin_pc_ssh_admins }", policy.split("\n}\n")[0])
+        # Administration and the enrollment Lambda (pc-enroll.tf), nobody else.
+        self.assertIn(
+            'ArnNotEquals = { "aws:PrincipalArn" = concat(local.colin_pc_ssh_admins, [aws_iam_role.pc_enroll.arn]) }',
+            policy.split("\n}\n")[0],
+        )
 
     def test_the_clients_are_fcvm_arm_and_colins_own_container(self):
         clients = TF[TF.index("colin_pc_ssh_clients = {"):TF.index("\n  }\n", TF.index("colin_pc_ssh_clients = {"))]
