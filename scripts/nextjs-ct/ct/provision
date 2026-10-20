@@ -16,6 +16,10 @@
 # run. It exists so the container starts out with everything the old shared box gave each account.
 set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# The container's credentials come from the host's nextjs-ct-imds, which the host setup restarts just before it runs
+# this; its first answer after a restart (it assumes the role) takes longer than the CLI's default one-second, one-try
+# metadata timeout, so the first AWS call here (the owner's hop key) failed every setup run since the cutover.
+export AWS_METADATA_SERVICE_TIMEOUT=5 AWS_METADATA_SERVICE_NUM_ATTEMPTS=3
 SHARED=/opt/nextjs-ct
 CONFIG=$SHARED/config.json
 ME=/opt/nextjs-ct-user
