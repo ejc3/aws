@@ -296,6 +296,9 @@ jobs:
       - name: "gamesworthwatching.com: proxied records and routes to dolphin-labs-prod, no switch; http and www redirected at the edge"
         run: python3 -S -B scripts/test-gww-redirects.py
 
+      - name: "mapslink.app: every request a 302 to the Dolphin Maps car page, proxied with no origin, no Access gate"
+        run: python3 -S -B scripts/test-mapslink.py
+
       - name: "Dolphin Maps production: maps.dolphin-labs.dev routed to dolphin-maps-prod, public through its own bypass application after the route, wildcard gate unchanged; the loader reads the Dolphin account"
         run: python3 -S -B scripts/test-dolphin-maps-prod.py
 
