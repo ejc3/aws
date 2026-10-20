@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# windows-mcp-bridge ALIAS -- a stdio MCP server for Claude Code that reaches Windows-MCP on a Windows PC: the server
+# runs in the PC user's own session (scripts/windows-pc-setup.sh installs it) on the PC's 127.0.0.1:8000, behind a
+# bearer key. This opens an ssh forward to it over `ssh ALIAS` (the PC's Cloudflare Access route, mac-ssh-client.tf),
+# on a port the kernel picks, and relays stdio to it with mcp-remote, for as long as Claude keeps the server open.
+#
+#   claude mcp add -s user ALIAS -- ~/.local/bin/windows-mcp-bridge ALIAS
+#
+# The key is read once over ssh from the PC (the user's WINDOWS_MCP_AUTH_KEY) into ~/.config/ALIAS/windows-mcp-headers
+# (0600), which mcp-remote reads with --header-file: never an argument or an environment variable. mcp-remote is pinned
+# and installed by scripts/windows-mcp-client-setup.sh into ~/.local/share/windows-mcp-bridge.
+set -euo pipefail
+
+ALIAS=${1:-}
+[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: windows-mcp-bridge ALIAS" >&2; exit 2; }
+REMOTE=${WINDOWS_MCP_BRIDGE_HOME:-$HOME/.local/share/windows-mcp-bridge}/node_modules/mcp-remote/dist/proxy.js
+[ -f "$REMOTE" ] || { echo "windows-mcp-bridge: mcp-remote is not installed ($REMOTE); run windows-mcp-client-setup.sh" >&2; exit 1; }
+DIR="$HOME/.config/$ALIAS"
+HEADERS="$DIR/windows-mcp-headers"
+# Every message here goes to stderr: stdout is the MCP stream.
+ssh_pc() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$@"; }
+
+if [ ! -s "$HEADERS" ]; then
+  umask 077
+  mkdir -p "$DIR"
+  key=$(ssh_pc "$ALIAS" "powershell -NoProfile -NonInteractive -Command \"[Environment]::GetEnvironmentVariable('WINDOWS_MCP_AUTH_KEY','User')\"" </dev/null | tr -d '\r\n')
+  [[ $key =~ ^[A-Za-z0-9_-]{20,}$ ]] || { echo "windows-mcp-bridge: no Windows-MCP key on $ALIAS (scripts/windows-pc-setup.sh sets it)" >&2; exit 1; }
+  printf 'Authorization: Bearer %s\n' "$key" > "$HEADERS.new" && mv -f "$HEADERS.new" "$HEADERS"
+  unset key
+fi
+
+PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+ssh_pc -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -L "127.0.0.1:$PORT:127.0.0.1:8000" "$ALIAS" </dev/null >&2 &
+FWD=$!
+trap 'kill "$FWD" 2>/dev/null || true' EXIT
+for _ in $(seq 1 150); do
+  (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
+  kill -0 "$FWD" 2>/dev/null || { echo "windows-mcp-bridge: the ssh forward to $ALIAS failed" >&2; exit 1; }
+  sleep 0.1
+done
+
+# The forward is plain HTTP on loopback: a launcher's HTTPS_PROXY (claw-master tunnels CONNECT only) must not get it.
+env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  node "$REMOTE" "http://127.0.0.1:$PORT/mcp" --allow-http --transport http-only --header-file "$HEADERS"

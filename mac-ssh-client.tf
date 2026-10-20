@@ -1,6 +1,7 @@
-# `ssh mac` and `ssh colton-mac`: the ONE way to each Mac, the same on every box that has it. Each client goes through
-# Cloudflare Access (macbook-ssh.tf, colton-mac-ssh.tf) with ITS OWN service token, to the Mac's connector, and ends at
-# macOS Remote Login (127.0.0.1:22). No inbound port anywhere, and no reverse tunnel.
+# `ssh mac`, `ssh colton-mac` and `ssh colin-pc`: the ONE way to each Mac (and Colin's Windows PC), the same on every box
+# that has it. Each client goes through Cloudflare Access (macbook-ssh.tf, colton-mac-ssh.tf, colin-pc-ssh.tf) with ITS
+# OWN service token, to the machine's connector, and ends at its SSH server (macOS Remote Login, or OpenSSH Server on
+# Windows; 127.0.0.1:22). No inbound port anywhere, and no reverse tunnel.
 #
 #   alias        box, account          service token (Secrets Manager)          configured by
 #   mac          fcvm-arm, ubuntu      macbook-ssh-access                       dev-user-data.tf (fcvm_mac_ssh_clients)
@@ -8,10 +9,12 @@
 #   colton-mac   fcvm-arm, ubuntu      colton-mac-ssh-access-fcvm               dev-user-data.tf (fcvm_mac_ssh_clients)
 #                nextjs-dev, colton    colton-mac-ssh-access-nextjs-colton      nextjs-user-data.tf
 #                nextjs-dev, ejc3      colton-mac-ssh-access-nextjs-ejc3        nextjs-user-data.tf
+#   colin-pc     fcvm-arm, ubuntu      colin-pc-ssh-access-fcvm                 dev-user-data.tf (fcvm_mac_ssh_clients)
 #
 # The private key (~/.ssh/to-<alias>) never leaves its box. EJ's `to-mac` is never installed or made by anything: it
 # stays where the owner put it. For a Mac with make_key, the installer makes the account's key AS that account when it
-# is missing and prints only its public half, which then goes on the Mac (scripts/mac-ssh-connector-setup.sh).
+# is missing and prints only its public half, which then goes on the Mac (scripts/mac-ssh-connector-setup.sh) or the PC
+# (scripts/windows-pc-setup.sh).
 locals {
   # One entry per Mac, keyed by its ssh alias. Every value is public. host_key is the Mac's Remote Login host key
   # (/etc/ssh/ssh_host_ed25519_key.pub, read on the Mac itself), pinned under host_key_alias in ~/.ssh/known_hosts.<alias>;
@@ -29,6 +32,14 @@ locals {
       user           = "colton"
       host_key_alias = "colton-mac"
       host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
+      make_key       = true
+    }
+    # Colin's Windows PC: OpenSSH Server's host key (C:\ProgramData\ssh\ssh_host_ed25519_key.pub, read on the PC).
+    colin-pc = {
+      hostname       = "colin-pc-ssh.cc-games.dev"
+      user           = "colin"
+      host_key_alias = "colin-pc"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++RvLicN7v0rY9Nxvr9lEmp4"
       make_key       = true
     }
   }
@@ -190,7 +201,7 @@ chmod 600 "$MAC_HOME/.ssh/config" "$MAC_HOME/.ssh/config.d-$MAC_ALIAS" "$MAC_HOM
 chmod 700 "$MAC_HOME/.ssh/$MAC_ALIAS-access-proxy"
 MACSETUP
 
-  # fcvm-arm's ubuntu: `ssh mac` and `ssh colton-mac`, each with fcvm-arm's own service token. The arm setup script runs
+  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac` and `ssh colin-pc`, each with fcvm-arm's own service token. The arm setup script runs
   # it at boot (dev-user-data.tf) and the association below runs it on the running box, daily.
   fcvm_mac_ssh_clients = <<-FCVMMACS
 MAC_USER=ubuntu
@@ -200,6 +211,9 @@ MAC_SECRET=macbook-ssh-access
 ${local.mac_ssh_client_setup}
 MAC_ALIAS=colton-mac
 MAC_SECRET=colton-mac-ssh-access-fcvm
+${local.mac_ssh_client_setup}
+MAC_ALIAS=colin-pc
+MAC_SECRET=colin-pc-ssh-access-fcvm
 ${local.mac_ssh_client_setup}
 FCVMMACS
 }

@@ -764,6 +764,50 @@ it once). The agent tools are `scripts/mac-setup.sh colton-mac`. Keep the Mac lo
 (its secret follows; nothing changes on the box), and a leaked connector token means replacing
 `cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh` with the connector stopped, then step 2 over a temporary route.
 
+### SSH to Colin's PC, and its screen: `ssh colin-pc`, Windows-MCP
+
+Colton's Mac's shape on a Windows PC (owner, 2026-10-20): Cloudflare Access in front of the PC's OpenSSH Server at
+`colin-pc-ssh.cc-games.dev` (`colin-pc-ssh.tf`), a connector on the PC, and the `mac-ssh-client.tf` installer on each
+client with alias `colin-pc` (entry `colin-pc` of `local.mac_ssh_macs`, which pins the PC's host key). No inbound port.
+
+| From | Service token (Secrets Manager) | Configured by |
+|---|---|---|
+| fcvm-arm, `ubuntu` | `colin-pc-ssh-access-fcvm` (fcvm-arm's instance only) | `dev-user-data.tf` at boot, `fcvm-mac-ssh-clients` association daily |
+| EJ in a browser | the browser-manager owner policy | |
+
+Unlike the Macs' LaunchAgents, the connector is a **SYSTEM task at boot** (`cloudflared colin-pc`), so the PC is
+reachable before anyone logs in. Its token (`colin-pc-ssh-tunnel-token`, administration only) is in
+`C:\ProgramData\cloudflared-colin-pc`, readable by SYSTEM and Administrators only; a client logs in as an administrator,
+so it could read it there, with the same consequence as on the Macs (a rogue connector for this tunnel, never a way in).
+
+**The screen** is [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) (pinned): screenshots, the UI tree, clicks,
+typing, shortcuts and app control, served by a per-user logon task in the PC user's own session on the PC's
+`127.0.0.1:8000`, with anonymous telemetry off and a bearer key made on the PC. A client's Claude Code reaches it through
+`scripts/windows/windows-mcp-bridge colin-pc`, a stdio MCP server that opens an ssh forward for the session and relays
+with `mcp-remote` (locked in `scripts/windows/mcp-remote/`); the key reaches it in a 0600 header file, read once over ssh,
+never an argument or an environment variable. `scripts/windows/windows-mcp-client-setup.sh colin-pc`, run as the client
+account, installs both and adds the Claude entry.
+
+`scripts/windows-pc-setup.sh colin-pc`, run on a jumpbox, puts the PC on the route and installs Windows-MCP: OpenSSH keys
+only and on loopback only with its inbound firewall rule off, the clients' keys in a managed block of
+`administrators_authorized_keys`, the pinned `cloudflared` (verified on the PC), the token through ssh stdin, the
+connector task, and Windows-MCP. A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
+since it ends the sessions through it.
+
+**A new PC** (Colin's was set up this way on 2026-10-20):
+
+1. Add its row to `local.mac_ssh_macs` and a `<alias>-ssh.tf` like `colin-pc-ssh.tf`; claim a port block for it
+   (`ports claim <alias>`). After apply, fcvm-arm has `~/.ssh/to-<alias>`.
+2. On fcvm-arm: `scripts/windows-pc-bootstrap.sh print <alias> PORT` prints the one script the person at the PC pastes
+   into PowerShell opened with **Run as administrator** (`scripts/windows/bootstrap.ps1` with this PC's values; publish
+   it behind a Copy button). It installs OpenSSH closed to the network, authorizes fcvm-arm's key, and keeps a reverse
+   tunnel to fcvm-arm's `127.0.0.1:PORT`. It ends by printing the PC's own key: authorize it for that tunnel only with
+   `scripts/windows-pc-bootstrap.sh allow <alias> PORT '<key line>'`.
+3. From a jumpbox: `scripts/windows-pc-setup.sh <alias> --bootstrap-port PORT`. Then, on each client account,
+   `ssh <alias> true` and `scripts/windows/windows-mcp-client-setup.sh <alias>`.
+4. Retire the tunnel: on the PC `Unregister-ScheduledTask 'devbox tunnel'` (over `ssh <alias>`); on fcvm-arm delete the
+   `<alias>-bootstrap-tunnel` line from `~/.ssh/authorized_keys`.
+
 ### macOS VMs on the MacBook (ejc3, skevh)
 
 The MacBook runs two [Tart](https://tart.run) macOS VMs, `ejc3` for EJ and `skevh` for

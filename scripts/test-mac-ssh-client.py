@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "mac-ssh-client.tf").read_text()
 TUNNEL = (ROOT / "macbook-ssh.tf").read_text()
 COLTON = (ROOT / "colton-mac-ssh.tf").read_text()
+COLIN_PC = (ROOT / "colin-pc-ssh.tf").read_text()
+COLIN_PC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++RvLicN7v0rY9Nxvr9lEmp4"
 CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
 REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
 COLTON_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
@@ -255,9 +257,9 @@ class MacSshClient(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    def test_the_map_pins_both_macs(self):
+    def test_the_map_pins_both_macs_and_colins_pc(self):
         macs = mac_map()
-        self.assertEqual(sorted(macs), ["colton-mac", "mac"])
+        self.assertEqual(sorted(macs), ["colin-pc", "colton-mac", "mac"])
         self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
                                        "host_key_alias": "ejs-macbook-pro-via-fcvm",
                                        "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
@@ -265,10 +267,13 @@ class Wiring(unittest.TestCase):
                                               "host_key_alias": "colton-mac", "host_key": COLTON_HOST_KEY, "make_key": True})
         self.assertIn('macbook_ssh_hostname = "macbook-ssh.cc-games.dev"', TUNNEL)
         self.assertIn('colton_mac_ssh_hostname = "colton-mac-ssh.cc-games.dev"', COLTON)
+        self.assertEqual(macs["colin-pc"], {"hostname": "colin-pc-ssh.cc-games.dev", "user": "colin",
+                                            "host_key_alias": "colin-pc", "host_key": COLIN_PC_HOST_KEY, "make_key": True})
+        self.assertIn('colin_pc_ssh_hostname = "colin-pc-ssh.cc-games.dev"', COLIN_PC)
         self.assertIn('mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} '
                       '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n"])', SOURCE)
 
-    def test_fcvm_arm_gets_both_macs_as_ubuntu_with_its_tokens_and_x86_does_not(self):
+    def test_fcvm_arm_gets_the_macs_and_colins_pc_as_ubuntu_with_its_tokens_and_x86_does_not(self):
         source = (ROOT / "dev-user-data.tf").read_text()
         arm, x86 = source.split("  arm_user_data = <<-SCRIPT", 1)[1].split("  x86_user_data = <<-SCRIPT", 1)
         self.assertIn("\n${local.fcvm_mac_ssh_clients}\n", arm)
@@ -276,7 +281,8 @@ class Wiring(unittest.TestCase):
         snippet = re.search(r"fcvm_mac_ssh_clients = <<-FCVMMACS\n(.*?)\nFCVMMACS", SOURCE, re.S).group(1)
         self.assertEqual(snippet, "MAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
                                   "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
-                                  "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
+                                  "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
 
     def test_a_daily_association_converges_the_running_fcvm_arm(self):
         assoc = SOURCE[SOURCE.index('resource "aws_ssm_association" "fcvm_mac_ssh_clients"'):]
