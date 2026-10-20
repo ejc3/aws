@@ -76,9 +76,10 @@ class WatchTests(unittest.TestCase):
         self.assertIn('NEWS_PASS_MINUTES     = tostring(local.dolphin_labs_news_minutes)', TF)
         self.assertRegex(TF, r'dolphin_labs_news_schedule = local\.dolphin_labs_news_minutes == 60 \?')
 
-    def test_is_on_and_says_to_retire_the_github_job_first(self):
+    def test_is_off_here_since_the_move_to_the_dolphin_account(self):
         var = block("variable", "dolphin_labs_news_enabled")
-        self.assertRegex(var, r"default     = true\b")
+        self.assertRegex(var, r"default     = false\b")
+        self.assertIn("dolphin-aws news.tf", var)
         self.assertIn("refresh-news.yml", var)
         self.assertIn("two minutes after the deadline", TF)
 
@@ -131,8 +132,8 @@ class XStepTests(unittest.TestCase):
         self.assertIn("[aws_iam_role.dolphin_labs_news_x.arn]", block("aws_secretsmanager_secret_policy", "dolphin_labs_monid"))
         self.assertIn("aws_iam_role.dolphin_labs_news_x.arn", block("aws_secretsmanager_secret_policy", "dolphin_labs_news"))
 
-    def test_x_schedule_is_on_and_targets_the_x_function(self):
-        self.assertRegex(block("variable", "news_x_schedule_enabled"), r"default     = true\b")
+    def test_x_schedule_is_off_here_and_targets_the_x_function(self):
+        self.assertRegex(block("variable", "news_x_schedule_enabled"), r"default     = false\b")
         sch = block("aws_scheduler_schedule", "dolphin_labs_news_x")
         self.assertIn('state      = var.news_x_schedule_enabled ? "ENABLED" : "DISABLED"', sch)
         self.assertIn('schedule_expression          = "rate(5 minutes)"', sch)
