@@ -554,6 +554,7 @@ class ReleaseTests(unittest.TestCase):
         container = td["containerDefinitions"][0]
         self.assertEqual(container["image"], REGISTRY + "/games-preview/engines:mptest_mptest-1-" + BRANCH[:12])
         self.assertIn({"name": "MP_ENV", "value": "preview"}, container["environment"])
+        self.assertIs(container["readonlyRootFilesystem"], True)
         record = self.ddb.get("build#preview#" + BRANCH)
         self.assertEqual(record["status"], "released")
         self.assertEqual(record["games"]["mptest"]["taskDefinition"], TD_PREFIX + "games-preview-mptest:1")
@@ -674,6 +675,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(c["image"], REGISTRY + "/games/engines:mptest_mptest-1-" + MAIN[:12])
         self.assertEqual([e["name"] for e in c["environment"]], ["GAME_ID", "PORT", "MP_ENV", "MP_TOKEN_VERIFIER"])
         self.assertIn({"name": "MP_TOKEN_VERIFIER", "value": "ed25519-v2"}, c["environment"])
+        # Security Hub ECS.5: a read-only root, and still exactly one container (launch.py
+        # launches nothing else) with no mount.
+        self.assertIs(c["readonlyRootFilesystem"], True)
+        self.assertEqual(len(td["containerDefinitions"]), 1)
+        self.assertNotIn("mountPoints", c)
+        self.assertNotIn("volumes", td)
         self.assertEqual((td["executionRoleArn"], td["taskRoleArn"]),
                          (TEMPLATE["executionRoleArn"], TEMPLATE["taskRoleArn"]))
         self.assertIn({"key": "Project", "value": "games-multiplayer"}, td["tags"])
