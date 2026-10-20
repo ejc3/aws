@@ -23,14 +23,15 @@
 #                         unset and that directory is writable: every fresh worktree's `init -lockfile=readonly` then links the providers from one
 #                         cache instead of downloading about 1 GB (Terraform uses a cached provider only when its
 #                         checksum is in the lock file, which records both platforms' h1 hashes)
-#   TF_RUN_LOCK_PARALLELISM  -parallelism added to plan and apply when the caller passed none (default 30; empty
-#                         adds nothing). Refreshing ~1,000 resources is mostly waiting on APIs, not CPU
+#   TF_RUN_LOCK_PARALLELISM  -parallelism added to plan and apply when the caller passed none, on the command line
+#                         or in TF_CLI_ARGS / TF_CLI_ARGS_<sub> (default 30; empty adds nothing). Refreshing ~1,000 resources is mostly waiting on APIs, not CPU
 #
 # A run is cancelled, never killed. Terraform runs in a session of its own under a small supervisor, so a kill aimed at
 # the caller's process group (a stopped background task, a closed terminal) does not take Terraform down mid-run with its
 # remote state lock still held (2026-10-20: a killed plan left the DynamoDB lock behind and the next run waited on it).
-# SIGINT, SIGTERM or SIGHUP to this wrapper, or the wrapper dying outright, makes the supervisor send Terraform one
-# SIGINT: Terraform stops after its in-flight operations, releases the state lock and exits, and its exit code comes
+# A signal while the run is still queued for the host lock abandons it (exit 130, 143 or 129; Terraform never starts).
+# Once it runs, SIGINT, SIGTERM or SIGHUP to this wrapper, or the wrapper dying outright, makes the supervisor send
+# Terraform one SIGINT: Terraform stops after its in-flight operations, releases the state lock and exits, and its exit code comes
 # back. A second SIGINT to the wrapper is passed on too, which Terraform treats as "stop now".
 #
 # The lock is held by util-linux flock(1) with -o: flock takes it, closes its descriptor before starting Terraform, and
@@ -73,6 +74,11 @@ case "$sub $sub2" in
   *) exec "$real" "$@" ;;
 esac
 
+# Until flock is started below, a signal simply ends the wrapper: nothing has run yet.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 lock=${TF_RUN_LOCK_FILE:-/var/lib/terraform-run-lock/lock}
 # Not installed host-wide (a laptop, a fresh box): fall back to a per-user lock, still one run at a time per account.
 [ -e "$lock" ] || [ -n "${TF_RUN_LOCK_FILE:-}" ] || lock="${XDG_RUNTIME_DIR:-/tmp}/terraform-run-lock-$(id -u)"
@@ -111,7 +117,11 @@ args=("$@")
 par=${TF_RUN_LOCK_PARALLELISM-30}
 if [ -n "$par" ] && { [ "$sub" = plan ] || [ "$sub" = apply ]; }; then
   given=""
-  for a in "$@"; do case "$a" in -parallelism=*) given=1 ;; esac; done
+  # The caller's own choice wins, on the command line or through TF_CLI_ARGS / TF_CLI_ARGS_plan / TF_CLI_ARGS_apply
+  # (Terraform puts those before the command line's arguments, so a value added here would override them).
+  envargs="${TF_CLI_ARGS:-} $(printenv "TF_CLI_ARGS_$sub" 2>/dev/null)"
+  case " $envargs " in *" -parallelism="* | *" --parallelism="*) given=1 ;; esac
+  for a in "$@"; do case "$a" in -parallelism=* | --parallelism=*) given=1 ;; esac; done
   if [ -z "$given" ]; then
     for i in "${!args[@]}"; do
       if [ "${args[$i]}" = "$sub" ]; then args=("${args[@]:0:i+1}" "-parallelism=$par" "${args[@]:i+1}"); break; fi
@@ -139,13 +149,31 @@ wait "$tf"'
 
 setsid flock -o "${mode[@]}" -E 75 "$lock" bash -c "$supervisor" terraform-run-lock "$$" "$real" "${args[@]}" <&0 &
 run=$!
-forward() { local s; s=$(pgrep -o -P "$run" 2>/dev/null) && kill -USR1 "$s" 2>/dev/null; }
-trap forward INT TERM HUP
+# While Terraform runs, a signal becomes the supervisor's cancel. While flock is still waiting for the lock there is no
+# supervisor yet: the queued run is abandoned instead (flock, the session leader, is killed before it can start one;
+# should it start one in that instant, the supervisor sees this wrapper gone and cancels Terraform at once).
+cancelled=""
+forward() {
+  local s
+  if s=$(pgrep -o -P "$run" 2>/dev/null); then
+    kill -USR1 "$s" 2>/dev/null
+  elif [ -z "$cancelled" ]; then
+    cancelled=$1
+    kill -TERM "$run" 2>/dev/null
+  fi
+}
+trap 'forward 130' INT
+trap 'forward 143' TERM
+trap 'forward 129' HUP
 rc=0
 while :; do
   wait "$run"; rc=$?
   kill -0 "$run" 2>/dev/null || break
 done
+if [ -n "$cancelled" ]; then
+  echo "terraform-run-lock: cancelled while waiting for the lock; Terraform did not run" >&2
+  exit "$cancelled"
+fi
 if [ "$rc" -gt 128 ]; then # interrupted just as the run ended: its own status is still waiting to be collected
   wait "$run" 2>/dev/null; r=$?
   [ "$r" -ne 127 ] && rc=$r

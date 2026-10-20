@@ -97,7 +97,10 @@ to approve if it is safe; we have many code review agents"):
    ~/.local/share/pr-watch/tf-targets.py ~/aws <main before the merge> <merge sha>` prints the `-target=` flags for
    the blocks the merge changed and every block that reads them (the merge's first parent is the main before it); an
    `ejc3/agents-md` merge targets `aws_s3_object.agents_md` and `aws_ssm_association.agents_md`. It prints `FULL:
-   <reason>` (exit 3) when only a full plan is safe (a provider, the lock file, a reference it cannot follow): then
+   <reason>` (exit 3) when only a full plan is safe (a provider, the lock file, a reference it cannot follow, a file
+   read indirectly): then plan everything. Nothing printed with exit 0 means the merge changed nothing Terraform reads
+   (tests, docs, CI): skip the plan and apply, and note `no infrastructure change` on the PR's `unapplied` entry, which
+   the next full plan clears. Any other exit (a missing commit, a traceback) is a failure of the helper, not an answer:
    plan everything. Read the plan, apply the saved plan, require an empty follow-up plan with the same targets. A full
    plan of everything takes 10-15 minutes on this box; a targeted one two or three. Check `df -h /` before the init,
    and `git worktree remove --force` the worktree on every way out, a failed or stopped run included. Stop a run with

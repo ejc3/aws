@@ -15,8 +15,9 @@ What maps to targets, and how:
   - a changed file under `modules/NAME/`: every `module` block whose source is `./modules/NAME`;
   - then every block that reads one of those addresses (its dependents), since -target takes only dependencies.
 Anything else Terraform reads is FULL: `provider`, `terraform`, `moved`, `import`, `removed` and `check` blocks, the lock
-file, a change outside any block, or a reference the parser cannot follow. Outputs, and files nothing reads by path, are
-ignored. A file named in a module block's own directory (modules/NAME/...) targets that module.
+file, a change outside any block, a reference the parser cannot follow, and a changed file that fileset(), a source_dir
+or an interpolated path may read, or that no block names literally (NEVER_READ lists the tests, docs and CI files that
+need no plan). Outputs are ignored. A file named in a module block's own directory (modules/NAME/...) targets that module.
 """
 import re
 import subprocess
@@ -30,18 +31,78 @@ READS_FULL = {"provider", "terraform", "check"}  # a reader of this kind makes t
 MAX_TARGETS = 80  # past this a targeted plan is no longer the quick path; plan everything
 
 
+# Files Terraform never reads, by this repository's layout: tests, documentation, CI and review settings. A changed file
+# that is neither named literally by a block nor on this list makes the plan FULL rather than a guess.
+# Checked after a literal match and before the indirect patterns (metal-box-tools.tf's `scripts/${each.value}` would
+# otherwise cover every test). A file that matches neither is FULL.
+NEVER_READ = [r"scripts/test-[^/]*\.py", r"[^/]*\.md", r"\.github/.*", r"\.greptile/.*", r"\.claude/.*",
+              r"\.gitignore", r"LICENSE"]
+
+
 class Full(Exception):
     pass
+
+
+def glob_regex(glob):
+    """A path glob as a regex: `**` crosses directories, `*` and `?` do not."""
+    out, i = "", 0
+    while i < len(glob):
+        if glob.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif glob[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif glob[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(glob[i]), i + 1
+    return re.compile(out)
+
+
+def indirect_patterns(tree):
+    """Paths read through fileset(), a source_dir, or a path with an interpolation in it, as (glob, regex). A path with
+    no literal part (`${path.module}/${src}`) is skipped: its value comes from another of these patterns."""
+    globs = set()
+    for text in tree.values():
+        for m in re.finditer(r'fileset\(\s*(?:path\.module|"\$\{path\.module\}(?:/([^"]*))?")\s*,\s*"([^"]+)"', text):
+            globs.add(((m.group(1) + "/") if m.group(1) else "") + m.group(2))
+        for m in re.finditer(r'source_dir\s*=\s*"\$\{path\.module\}/([^"]+)"', text):
+            globs.add(m.group(1).rstrip("/") + "/**")
+        for m in re.finditer(r'"\$\{path\.module\}/([^"]*\$\{[^"]*)"', text):
+            g = re.sub(r"\$\{[^}]*\}", "*", m.group(1))
+            if g.strip("*/"):
+                globs.add(g)
+    return [(g, glob_regex(g)) for g in sorted(globs)]
 
 
 def git(root, *args):
     return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, check=True).stdout
 
 
+HEREDOC = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+
+def heredoc_lines(lines):
+    """1-based numbers of the lines inside heredocs (their end marker included): a column-zero `}` or `  name =` there is
+    text, not Terraform (nextjs-ct-user-data.tf's user data closes shell functions at column zero inside a locals block)."""
+    inside, marker = set(), None
+    for n, line in enumerate(lines, 1):
+        if marker is not None:
+            inside.add(n)
+            if line.strip() == marker:
+                marker = None
+        elif (m := HEREDOC.search(line)):
+            marker = m.group(1)
+    return inside
+
+
 def blocks(text):
     """Top-level blocks of a terraform-fmt'ed file: (kind, label1, label2, first line, last line), 1-based."""
     out, cur = [], None
-    for n, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    skip = heredoc_lines(lines)
+    for n, line in enumerate(lines, 1):
+        if n in skip:
+            continue
         if cur is None:
             m = BLOCK.match(line)
             if m:
@@ -60,8 +121,9 @@ def local_names(text, first, last):
     """Each attribute of a locals block with its line range: {name: (start, end)}. A range stops at its last line of
     value: the blank lines and attribute-level comments (`  # ...`) after it introduce the next local, not this one."""
     lines = text.splitlines()
+    skip = heredoc_lines(lines)
     starts = [(n, m.group(1)) for n in range(first + 1, last)
-              if (m := re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*=", lines[n - 1]))]
+              if n not in skip and (m := re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*=", lines[n - 1]))]
     out = {}
     for i, (n, name) in enumerate(starts):
         end = (starts[i + 1][0] - 1) if i + 1 < len(starts) else last - 1
@@ -74,7 +136,7 @@ def local_names(text, first, last):
 def changed_lines(root, base, head, path):
     """Old-side and new-side changed line numbers of one file."""
     old, new = set(), set()
-    for line in git(root, "diff", "-U0", base, head, "--", path).splitlines():
+    for line in git(root, "diff", "--no-renames", "-U0", base, head, "--", path).splitlines():
         m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
         if m:
             o, oc, nn, nc = int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1)
@@ -93,7 +155,7 @@ def show(root, rev, path):
 
 
 def targets(root, base, head):
-    files = [f for f in git(root, "diff", "--name-only", base, head).splitlines() if f]
+    files = [f for f in git(root, "diff", "--no-renames", "--name-only", base, head).splitlines() if f]
     found, locals_hit, vars_hit, paths_hit = set(), set(), set(), set()
     for f in files:
         if f == ".terraform.lock.hcl":
@@ -136,12 +198,20 @@ def targets(root, base, head):
                     found.add(address(kind, a, b))
     # Follow references in the merged tree: files to the blocks naming them, then locals and variables to their readers.
     tree = {f: show(root, head, f) for f in git(root, "ls-tree", "--name-only", head).splitlines() if f.endswith(".tf")}
+    indirect = indirect_patterns(tree)
     for p in paths_hit:
         if p.startswith("module:"):
             name = p.split(":", 1)[1]
             pat = re.compile(r'source\s*=\s*"\./modules/%s"' % re.escape(name))
         else:
             pat = re.compile(r'[/"]%s"' % re.escape(p))
+            if not any(pat.search(text) for text in tree.values()):
+                if any(re.fullmatch(rx, p) for rx in NEVER_READ):
+                    continue
+                hits = [glob for glob, rx in indirect if rx.fullmatch(p)]
+                if hits:
+                    raise Full(f"{p} may be read through a computed path or fileset ({hits[0]})")
+                raise Full(f"{p} changed and no block names it literally; it may be read indirectly")
         for f, text in tree.items():
             for kind, a, b, first, last in blocks(text):
                 if not pat.search("\n".join(text.splitlines()[first - 1:last])):

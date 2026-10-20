@@ -3,6 +3,7 @@
 import os
 import pathlib
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -160,6 +161,31 @@ class WrapperTests(unittest.TestCase):
                 self.assertLess(time.time() - t, 5)
                 self.assertTrue(any("interrupted plan" in line for line in self.lines()), self.lines())
 
+    def test_a_signal_while_queued_abandons_the_run(self):
+        # Review of #543: with the lock held, flock is still waiting and there is no supervisor; a Ctrl-C or TERM must
+        # end the queued run, not be swallowed so that Terraform starts once the lock frees.
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)):
+            with self.subTest(sig=sig):
+                self.log.unlink(missing_ok=True)
+                a = self.start("apply", "-first", FAKE_SLEEP="15")  # the holder probe alone can take seconds on a busy host
+                self.wait_started("apply -first")
+                b = self.start("apply", "-queued")
+                end = time.time() + 10  # until b's flock is queued on the lock
+                while not subprocess.run(["ps", "-o", "args=", "--ppid", str(b.pid)], capture_output=True,
+                                         text=True).stdout.startswith("flock -o"):
+                    self.assertLess(time.time(), end, "the queued run never reached flock")
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                t = time.time()
+                b.send_signal(sig)
+                _, err = b.communicate(timeout=10)
+                self.assertEqual(b.returncode, code, err)
+                self.assertLess(time.time() - t, 3)
+                self.assertIn("cancelled while waiting", err)
+                self.end(a)  # the lock frees: the abandoned run must not start now
+                time.sleep(1)
+                self.assertFalse(any("start apply -queued" in line for line in self.lines()), self.lines())
+
     def test_stdin_still_reaches_terraform(self):
         r = subprocess.run(["bash", str(WRAPPER), "apply"], env=dict(self.env, FAKE_READ="1"), input="yes\n",
                            capture_output=True, text=True, timeout=10)
@@ -171,11 +197,26 @@ class WrapperTests(unittest.TestCase):
         for args, expect in ((["plan", "-out=p"], "start plan -parallelism=30 -out=p"),
                              (["-chdir=sub", "apply", "p.plan"], "start -chdir=sub apply -parallelism=30 p.plan"),
                              (["plan", "-parallelism=5"], "start plan -parallelism=5"),
+                             (["plan", "--parallelism=5"], "start plan --parallelism=5"),
                              (["init", "-input=false"], "start init -input=false")):
             self.log.unlink(missing_ok=True)
             r = subprocess.run(["bash", str(WRAPPER), *args], env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, 0, (args, r.stderr))
             self.assertEqual([line.split(" ", 1)[1] for line in self.lines() if " start " in line], [expect])
+
+    def test_parallelism_from_tf_cli_args_is_respected(self):
+        for extra in ({"TF_CLI_ARGS": "-parallelism=4"}, {"TF_CLI_ARGS_plan": "-no-color -parallelism=4"}):
+            self.log.unlink(missing_ok=True)
+            r = subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_PARALLELISM="30", **extra),
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([line.split(" ", 1)[1] for line in self.lines() if " start " in line], ["start plan"], extra)
+        # TF_CLI_ARGS_apply says nothing about a plan: the default still goes on.
+        self.log.unlink(missing_ok=True)
+        subprocess.run(["bash", str(WRAPPER), "plan"], env=dict(self.env, TF_RUN_LOCK_PARALLELISM="30",
+                                                                TF_CLI_ARGS_apply="-parallelism=4"),
+                       capture_output=True, text=True, timeout=10)
+        self.assertEqual([line.split(" ", 1)[1] for line in self.lines() if " start " in line], ["start plan -parallelism=30"])
 
     def test_the_shared_provider_cache_is_used_when_present_and_a_callers_choice_wins(self):
         cache = self.tmp / "cache"
@@ -314,6 +355,11 @@ class InstallTests(unittest.TestCase):
         self.assertIn("Terraform v9.9.1", r.stdout)  # the wrapper's passthrough reached the moved binary
         # The shared provider cache: group-writable and setgid, so every administrator's runs share one copy.
         self.assertEqual(stat.S_IMODE(self.dirs["cache"].stat().st_mode), 0o2775)
+        if shutil.which("getfacl"):  # the default ACL that keeps provider directories group-writable (review of #543)
+            acl = subprocess.run(["getfacl", "-p", str(self.dirs["cache"])], capture_output=True, text=True).stdout
+            self.assertIn("default:group:adm:rwx", acl)
+        else:
+            self.assertIn("no setfacl", r.stderr)
 
     def test_a_rerun_changes_nothing_and_an_upgrade_is_repaired(self):
         self.put_real("9.9.1")

@@ -24,8 +24,22 @@ chmod 0666 "$lockdir/lock"
 # The shared provider cache the wrapper points TF_PLUGIN_CACHE_DIR at: the administrators' group (adm on Ubuntu) may write
 # it, setgid so new entries keep the group. Terraform checks a cached provider against the lock file's checksums before
 # using it, so a tampered entry is refused, not run.
+# Setgid keeps the group but not group write: Terraform makes each provider's directories 0755, so the next administrator
+# could not add a version beside the first one's. A default ACL keeps everything made in the cache group-writable, and the
+# wrapper's umask stays as it is (plan files must not become group-readable). setfacl comes from the acl package, which
+# the Ubuntu jumpbox image lacks; root installs it here.
 install -d -m 2775 "$cache"
 chgrp adm "$cache" 2>/dev/null || true
+if ! command -v setfacl >/dev/null && [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q acl >/dev/null 2>&1 || echo "terraform-run-lock: could not install acl" >&2
+fi
+if command -v setfacl >/dev/null; then
+  chgrp -R adm "$cache" 2>/dev/null || true
+  setfacl -R -m g:adm:rwX,m::rwX "$cache" && find "$cache" -type d -exec setfacl -d -m g:adm:rwx,m::rwx {} + ||
+    echo "terraform-run-lock: could not set the cache's ACL; other administrators may not add providers to it" >&2
+else
+  echo "terraform-run-lock: no setfacl; the provider cache is shared only as far as setgid and modes allow" >&2
+fi
 
 if [ -f "$bin/terraform" ] && ! grep -aq "$marker" "$bin/terraform"; then
   install -m 0755 "$bin/terraform" "$lib/terraform.new" && mv -f "$lib/terraform.new" "$lib/terraform"

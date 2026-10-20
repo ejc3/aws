@@ -118,7 +118,7 @@ class SkillTextTests(unittest.TestCase):
                        "`jobs` map", "-R <repo> --squash --match-head-commit", "df -h /", "Never run a PR's own code on this jumpbox", "merge-base --is-ancestor",
                        "unapplied", "before every push, merge or apply", "answer `standby` in one line", "focus on aws repo only", "ejc3/agents-md", "repos/ejc3/agents-md/compare/", "keyed by `<repo>#<number>`", "went from draft to ready", "BEFORE the merge", "re-runs `scripts/pr-watch-install.sh --watcher`",
                        "`alerts_checked_at`", "never the topic", "lookup-events", "`alerts_pending`", "only once every result is triaged", "Note the time before the first query", "Run step 6\n   (alerts) every time", "alert-poll.py", "`alerts_seen`", "30 minutes before `alerts_checked_at`", "OrganizationAccountAccessRole", "security-hub-automation.tf", "never suppressed", "Never silence the topic",
-                       "tf-targets.py", "`FULL:", "`last_full_plan`", "never SIGKILL", "with `targeted` noted"):
+                       "tf-targets.py", "`FULL:", "`last_full_plan`", "never SIGKILL", "with `targeted` noted", "`no infrastructure change`", "is a failure of the helper"):
             self.assertIn(phrase, skill)
 
 
@@ -250,6 +250,7 @@ class AlertPollTests(unittest.TestCase):
 
 
 TF_TARGETS = ROOT / "scripts/pr-watch/tf-targets.py"
+KEPT = "resource \"aws_sns_topic\" \"kept\" {\n  tag0 = \"value-0\"\n  tag1 = \"value-1\"\n  tag2 = \"value-2\"\n  tag3 = \"value-3\"\n  tag4 = \"value-4\"\n  tag5 = \"value-5\"\n  tag6 = \"value-6\"\n  tag7 = \"value-7\"\n  tag8 = \"value-8\"\n  tag9 = \"value-9\"\n  tag10 = \"value-10\"\n  tag11 = \"value-11\"\n}\n"
 FIXTURE = {
     "main.tf": """variable "region" {
   type    = string
@@ -265,6 +266,23 @@ locals {
 
   # the label every box gets
   label = "box-${local.size}"
+
+  boot = <<-EOT
+    f() {
+      echo hi
+}
+  name = not-a-local
+EOT
+  user_data = "${local.boot} ${local.label}"
+}
+
+resource "aws_s3_object" "ud" {
+  content = local.user_data
+}
+
+resource "aws_s3_object" "units" {
+  for_each = fileset(path.module, "scripts/units/*")
+  source   = "${path.module}/${each.value}"
 }
 
 resource "aws_instance" "a" {
@@ -296,7 +314,12 @@ output "ip" {
   value = aws_eip.b.public_ip
 }
 """,
+    # Mostly one block that survives a rename, so git would see topics.tf -> sns.tf as a rename.
+    "topics.tf": KEPT + "\nresource \"aws_sns_topic\" \"gone\" {\n  name = \"gone\"\n}\n",
     "scripts/s.sh": "echo one\n",
+    "scripts/units/a.service": "[Unit]\n",
+    "scripts/test-thing.py": "pass\n",
+    "scripts/other.sh": "echo other\n",
     "modules/m/main.tf": "resource \"aws_sns_topic\" \"t\" {\n  name = \"t\"\n}\n",
     ".terraform.lock.hcl": "# lock\n",
     "README.md": "readme\n",
@@ -342,7 +365,35 @@ class TfTargetsTests(unittest.TestCase):
 
     def test_a_changed_local_targets_its_readers_through_other_locals(self):
         rc, out = self.edit("main.tf", "  size = 1", "  size = 2")
-        self.assertEqual((rc, out), (0, ["-target=aws_eip.b", "-target=aws_instance.a"]))
+        self.assertEqual((rc, out), (0, ["-target=aws_eip.b", "-target=aws_instance.a", "-target=aws_s3_object.ud"]))
+
+    def test_a_column_zero_brace_in_a_heredoc_does_not_end_the_locals_block(self):
+        # Review of #543: user_data, after the heredoc's `}`, must still be seen as a local that reads local.boot.
+        rc, out = self.edit("main.tf", "      echo hi", "      echo hello")
+        self.assertEqual((rc, out), (0, ["-target=aws_s3_object.ud"]))
+
+    def test_a_renamed_file_still_targets_the_block_it_lost(self):
+        # Review of #543: with rename detection, the old path is never read and the deleted block is missed.
+        (self.repo / "topics.tf").unlink()
+        (self.repo / "sns.tf").write_text(KEPT)
+        self.git("add", "-A")
+        self.assertIn("R", self.git("diff", "--cached", "--name-status", "-M").split()[0], "git sees a rename")
+        self.commit("rename and drop one block")
+        r = subprocess.run([sys.executable, "-I", str(TF_TARGETS), str(self.repo), self.base, "HEAD"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("-target=aws_sns_topic.gone", r.stdout.split())
+
+    def test_a_file_read_through_fileset_or_an_unnamed_file_needs_a_full_plan(self):
+        rc, out = self.edit("scripts/units/a.service", "[Unit]", "[Unit]\nDescription=x")
+        self.assertEqual(rc, 3)
+        self.assertIn("scripts/units/*", " ".join(out))
+        self.base = self.git("rev-parse", "HEAD").strip()
+        rc, out = self.edit("scripts/other.sh", "other", "another")
+        self.assertEqual(rc, 3, out)
+
+    def test_tests_and_docs_need_no_plan(self):
+        self.assertEqual(self.edit("scripts/test-thing.py", "pass", "pass  # x"), (0, []))
 
     def test_a_comment_before_a_local_changes_nothing(self):
         self.assertEqual(self.edit("main.tf", "# the label every box gets", "# what every box is called"), (0, []))
