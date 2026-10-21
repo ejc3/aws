@@ -289,16 +289,16 @@ PODMANSYS
   # the script's docstring). Tested offline by scripts/test-atuin-agent-hooks.py.
   atuin_agent_hooks_py = file("${path.module}/scripts/atuin-agent-hooks.py")
 
-  # opencode with DeepSeek on Amazon Bedrock, for ubuntu on the metal boxes. dev-server-role grants
-  # exactly deepseek.v3.2 and deepseek.r1-v1:0 (dev-instance-common.tf); the opencode() function
-  # in ~/.zshrc (user_shell_env) points opencode at the instance role. The pinned release goes to
+  # opencode with DeepSeek on Amazon Bedrock, for ubuntu on the metal boxes and every account in the nextjs-ct
+  # containers (nextjs-ct-user-data.tf runs opencode_user_setup as each one). dev-server-role grants exactly
+  # deepseek.v3.2 and deepseek.r1-v1:0 (dev-instance-common.tf), nextjs-dev-role the same two (dev-ai-services.tf);
+  # the opencode() function in ~/.zshrc (user_shell_env) points opencode at the instance role. The pinned release goes to
   # ~/.opencode/bin, which the managed PATH puts ahead of any other copy (ARM also has a
-  # pnpm-managed one, on PATH only through its hand-written ~/.zshenv), so every metal box runs
+  # pnpm-managed one, on PATH only through its hand-written ~/.zshenv), so every box runs
   # this version. A default config is written only where none exists: an existing one may carry
-  # other settings (remote-claw's).
-  opencode_version = "1.18.33"
-  opencode_setup   = <<-OPENCODE
-sudo -u ubuntu -H bash <<'OPENCODESETUP' || echo "WARNING: opencode setup failed"
+  # other settings (remote-claw's). opencode_user_setup is user-agnostic: it runs as whichever account it sets up.
+  opencode_version    = "1.18.33"
+  opencode_user_setup = <<-OPENCODE
 set -e
 # Only ~/.opencode/bin ahead of the system dirs, so the installer's own version check looks at
 # the copy it manages, never at another one elsewhere on PATH.
@@ -312,8 +312,8 @@ if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/openc
   cat > ~/.config/opencode/opencode.jsonc <<'JSON'
 {
   "$schema": "https://opencode.ai/config.json",
-  // DeepSeek on Amazon Bedrock through this box's instance role (ejc3/aws dev-instance-common.tf
-  // grants deepseek.v3.2 and deepseek.r1-v1:0). deepseek.v3.2 invokes in us-west-2. The opencode()
+  // DeepSeek on Amazon Bedrock through this box's instance role (ejc3/aws grants deepseek.v3.2 and
+  // deepseek.r1-v1:0 to the metal boxes and nextjs). deepseek.v3.2 invokes in us-west-2. The opencode()
   // function in ~/.zshrc supplies the AWS profile that makes opencode use the instance role.
   "provider": { "amazon-bedrock": { "options": { "region": "us-west-2" } } },
   "model": "amazon-bedrock/deepseek.v3.2",
@@ -322,8 +322,8 @@ if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/openc
 }
 JSON
 fi
-OPENCODESETUP
 OPENCODE
+  opencode_setup      = "sudo -u ubuntu -H bash <<'OPENCODESETUP' || echo \"WARNING: opencode setup failed\"\n${local.opencode_user_setup}OPENCODESETUP\n"
 
   # Per-user interactive shell environment: starship, fzf, atuin, zsh plugins, .zshrc,
   # .tmux.conf and t-claude. Deliberately user-AGNOSTIC -- every path is ~-relative, so

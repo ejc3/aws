@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opencode with DeepSeek on Bedrock on the metal boxes (dev-user-data.tf).
+"""opencode with DeepSeek on Bedrock on the metal boxes and in the nextjs-ct containers (dev-user-data.tf).
 
 opencode's Bedrock provider walks the AWS credential chain only when it sees a profile, keys, a
 bearer token, a web identity or container credentials -- never for an EC2 instance role -- so on
@@ -18,6 +18,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 USER_DATA = (ROOT / "dev-user-data.tf").read_text()
 IAM = (ROOT / "dev-instance-common.tf").read_text()
+AI = (ROOT / "dev-ai-services.tf").read_text()
+CT = (ROOT / "nextjs-ct-user-data.tf").read_text()
+PROVISION = (ROOT / "scripts/nextjs-ct/ct/provision").read_text()
+
+
+def user_setup():
+    return USER_DATA.split("opencode_user_setup = <<-OPENCODE", 1)[1].split("\nOPENCODE\n", 1)[0]
 
 
 def function_text():
@@ -67,8 +74,8 @@ class OpencodeSetupTests(unittest.TestCase):
             self.assertEqual(body.count("${local.opencode_setup}"), 1, name)
 
     def test_the_pinned_install_is_the_one_on_path(self):
-        setup = USER_DATA.split("opencode_setup   = <<-OPENCODE", 1)[1].split("\nOPENCODE\n", 1)[0]
-        self.assertRegex(USER_DATA, r'opencode_version = "\d+\.\d+\.\d+"')
+        setup = user_setup()
+        self.assertRegex(USER_DATA, r'opencode_version +=  *"\d+\.\d+\.\d+"')
         # Installed (or kept) at exactly the pinned version in ~/.opencode/bin...
         self.assertIn('[ "$(~/.opencode/bin/opencode --version 2>/dev/null || true)" = "${local.opencode_version}" ] ||\n'
                       "  curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} "
@@ -83,9 +90,32 @@ class OpencodeSetupTests(unittest.TestCase):
                       setup, "an existing config must never be overwritten")
 
     def test_the_default_model_is_one_the_role_may_invoke(self):
-        setup = USER_DATA.split("opencode_setup   = <<-OPENCODE", 1)[1].split("\nOPENCODE\n", 1)[0]
-        for model in re.findall(r'"(?:small_)?model": "amazon-bedrock/([^"]+)"', setup):
+        nextjs = AI.split('resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek"', 1)[1].split("\n}\n", 1)[0]
+        models = re.findall(r'"(?:small_)?model": "amazon-bedrock/([^"]+)"', user_setup())
+        self.assertTrue(models)
+        for model in models:
             self.assertIn('"arn:aws:bedrock:*::foundation-model/%s"' % model, IAM, model)
+            self.assertIn('"arn:aws:bedrock:*::foundation-model/%s"' % model, nextjs, model)
+
+    def test_the_metal_boxes_run_it_as_ubuntu(self):
+        line = re.search(r"^  opencode_setup += (.*)$", USER_DATA, re.M).group(1)
+        self.assertTrue(line.startswith('"sudo -u ubuntu -H bash <<\'OPENCODESETUP\' ||'), line)
+        self.assertIn("\\n${local.opencode_user_setup}OPENCODESETUP\\n\"", line)
+
+    def test_every_nextjs_container_account_runs_it_as_itself(self):
+        self.assertIn('"/var/lib/nextjs-ct/shared/snippets/opencode-setup.sh"             = local.opencode_user_setup', CT)
+        self.assertIn('as_user bash < "$SHARED/snippets/opencode-setup.sh"', PROVISION)
+        # After the shell env, which carries the opencode() function that points it at the credentials.
+        self.assertLess(PROVISION.index("snippets/user-shell-env.sh"), PROVISION.index("snippets/opencode-setup.sh"))
+        self.assertNotIn("sudo", user_setup(), "the shared body runs as the account, never escalates")
+
+    def test_the_nextjs_grant_is_deepseek_only(self):
+        nextjs = AI.split('resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek"', 1)[1].split("\n}\n", 1)[0]
+        resources = re.findall(r'"(arn:aws:bedrock:[^"]+)"', nextjs)
+        self.assertEqual(len(resources), 3)
+        for r in resources:
+            self.assertRegex(r, r"(foundation-model/deepseek\.(v3\.2|r1-v1:0)|inference-profile/us\.deepseek\.\*)$")
+        self.assertIn("role       = aws_iam_role.nextjs_dev.name", AI.split('"nextjs_dev_bedrock_deepseek" {', 2)[2])
 
 
 if __name__ == "__main__":

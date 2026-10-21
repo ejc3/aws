@@ -299,6 +299,7 @@ MACSSH
   nextjs_ct_snippets = {
     "/var/lib/nextjs-ct/shared/config.json"                            = jsonencode(local.nextjs_ct_config)
     "/var/lib/nextjs-ct/shared/snippets/user-shell-env.sh"             = local.user_shell_env
+    "/var/lib/nextjs-ct/shared/snippets/opencode-setup.sh"             = local.opencode_user_setup
     "/var/lib/nextjs-ct/shared/snippets/agent-session-sync-install.sh" = local.agent_session_sync_install
     "/var/lib/nextjs-ct/shared/snippets/codex-seed-install.sh"         = "${local.codex_seed_thread_install}\n${local.codex_restart_setup}"
     "/var/lib/nextjs-ct/shared/snippets/user-agents-seed-install.sh"   = local.user_agents_seed_install

@@ -1299,12 +1299,14 @@ GH_TOKEN=$(aws secretsmanager get-secret-value \
 
 Available if a task needs them; neither needs a key on disk.
 
-- **DeepSeek (opencode), metal boxes only.** `opencode` on fcvm-metal-arm/x86 runs DeepSeek on
+- **DeepSeek (opencode), metal boxes and the nextjs containers.** `opencode` on fcvm-metal-arm/x86 runs DeepSeek on
   Amazon Bedrock (`deepseek.v3.2`, us-west-2; `deepseek.r1-v1:0` also granted) through the
   instance role. The managed `~/.zshrc` wraps `opencode` so it names the `[default]` profile when
   nothing else supplies credentials: opencode does not use an instance role on its own, and
-  asked for a key. The pinned release is `local.opencode_version` in `dev-user-data.tf`. Not on
-  nextjs-dev: DeepSeek and the other Anthropic models stay on the metal boxes.
+  asked for a key. The pinned release is `local.opencode_version` in `dev-user-data.tf`. **Also in every
+  nextjs-ct container** (owner, 2026-10-21): provision runs the same `opencode_user_setup` as each account, and
+  nextjs-dev-role may invoke exactly those two DeepSeek models (`nextjs-dev-bedrock-deepseek`, `dev-ai-services.tf`);
+  the other Anthropic models stay on the metal boxes.
 - **Claude Haiku 5.5 on Bedrock, on every box** (`bedrock-haiku.tf`). The kids' box and the other
   non-metal boxes had no Bedrock until the owner, 2026-10-10: "I am fine if this box has haiku access. All
   boxes can be." `nextjs-dev-role`, `dev-ebs-only-role` (I/O and parallel boxes), `wbox-role`, each member wbox's `wbox-<person>-role`,
