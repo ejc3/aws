@@ -54,20 +54,17 @@ class ConstellationAccountTests(unittest.TestCase):
                     self.assertNotIn("arn:aws:iam::*", body)
         self.assertNotIn("organizations:CreateAccount", TF)
 
-    def test_ci_plans_only_this_repositorys_pull_requests_without_secret_values(self):
-        ci = block('resource "aws_iam_role" "constellation_ci_plan"')
-        self.assertIn('"token.actions.githubusercontent.com:sub" = "repo:ejc3/${local.constellation_repository}:pull_request"', ci)
-        self.assertIn("StringEquals", ci)
-        self.assertNotIn("StringLike", ci)
-        state = block('resource "aws_iam_role_policy" "constellation_ci_plan_state"')
-        self.assertIn('"secretsmanager:GetSecretValue"', state)
-        self.assertIn('Effect   = "Deny"', state)
+    def test_github_holds_no_aws_credential_for_this_account(self):
+        # State and configuration reads can carry secret values; a same-repository pull request could read them.
+        for forbidden in ("aws_iam_openid_connect_provider", "AssumeRoleWithWebIdentity", "token.actions.githubusercontent.com",
+                          "github_actions_variable", "ReadOnlyAccess"):
+            self.assertNotIn(forbidden, TF)
 
-    def test_state_writes_are_for_the_appliers_only(self):
+    def test_state_objects_are_for_the_appliers_only(self):
         policy = block('resource "aws_s3_bucket_policy" "constellation_terraform_state"')
-        self.assertIn("StateWritesForAppliersOnly", policy)
-        writes = policy[policy.index("StateWritesForAppliersOnly"):policy.index("StateReadsForAppliersAndCiPlan")]
-        self.assertNotIn("constellation-ci-plan", writes)
+        self.assertIn("StateObjectsForAppliersOnly", policy)
+        self.assertIn('"s3:GetObject"', policy)
+        self.assertIn("local.constellation_terraform_role_arn", policy)
 
 
 if __name__ == "__main__":

@@ -1541,10 +1541,10 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   trusts dev-server-role pinned to fcvm-arm's instance (`ec2:SourceInstanceARN`; fcvm-x86 shares the role and cannot), and
   dev-server-role's one grant (`assume-constellation-terraform`) names exactly that ARN with the same pin. A dev box never
   gets `organizations:*` or OrganizationAccountAccessRole, in any account: that is admin of every member account.
-- **State:** `constellation-terraform-state-<id>` in that account, versioned, private, writes for the apply role only.
-- **CI plans read-only:** `constellation-ci-plan` trusts GitHub OIDC for that repository's `pull_request` workflows only
-  (ReadOnlyAccess, state readable, secret values denied); Terraform sets its `AWS_CI_PLAN_ROLE_ARN` and `AWS_STATE_BUCKET`
-  repository variables. Not yet covered: security monitoring and a region SCP like the Dolphin account's.
+- **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
+- **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
+  secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
+  fcvm-arm. Not yet covered: security monitoring and a region SCP like the Dolphin account's.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
