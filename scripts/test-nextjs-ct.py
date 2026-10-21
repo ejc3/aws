@@ -313,5 +313,21 @@ class ProvisionMetadataTimeoutTests(unittest.TestCase):
         self.assertLess(export, first_call)
 
 
+class BoxAgentNotesTests(unittest.TestCase):
+    """Every account's Claude Code gets the box-wide notes (/etc/claude-code/CLAUDE.md): the claw-master proxy is not a
+    firewall, the host-side limits are, and a cause is named only once seen. A member's agent once unset HTTPS_PROXY and
+    blamed it for a failure it never showed."""
+
+    def test_provision_installs_the_notes_for_claude_code(self):
+        provision = (SCRIPTS / "ct" / "provision").read_text()
+        self.assertIn('install -m 644 "$SHARED/ct/box-agents.md" /etc/claude-code/CLAUDE.md', provision)
+
+    def test_the_notes_say_what_the_proxy_is_and_what_limits_you(self):
+        notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
+        for phrase in ("`HTTPS_PROXY` is not a firewall", "127.0.0.1", "Do not unset it",
+                       "nothing you run inside can change them", "Name a cause only after you have seen it"):
+            self.assertIn(phrase, notes)
+
+
 if __name__ == "__main__":
     unittest.main()

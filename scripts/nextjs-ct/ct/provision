@@ -260,6 +260,10 @@ grep -q '^\[sandbox_workspace_write\]' "$CFG" || printf '\n[sandbox_workspace_wr
 chown "$U:$U" "$CFG"
 install -d -o "$U" -g "$U" -m 755 "$H/Documents/Codex"
 /usr/local/bin/kid-agents-refresh "$U" || warn "AGENTS.md generation failed for $U"
+# Box-wide notes for every account's Claude Code (the container, its network, the claw-master proxy). Claude Code reads
+# /etc/claude-code/CLAUDE.md for every user, on top of the person's own ~/.claude/CLAUDE.md, which stays theirs.
+install -d -m 755 /etc/claude-code && install -m 644 "$SHARED/ct/box-agents.md" /etc/claude-code/CLAUDE.md \
+  || warn "box agent notes not installed"
 
 # Shell environment (t-claude, atuin, starship, fzf, tmux.conf): the same body every box runs.
 as_user bash < "$SHARED/snippets/user-shell-env.sh" >/dev/null 2>&1 || warn "shell env for $U had errors"

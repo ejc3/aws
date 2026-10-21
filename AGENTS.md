@@ -559,6 +559,11 @@ only. Rules an agent must keep:
 - **Ports are per container**; the host reaches a dev server at `10.88.<uid-1000>.2:<port>`. Only the owner's
   container has `ssh mac`; colton's and the owner's have `ssh colton-mac` (`local.nextjs_ct_mac_clients`: Cloudflare
   Access with each account's own token, `mac-ssh-client.tf`); every other member's policy denies those tokens.
+- **Box-wide agent notes** (`scripts/nextjs-ct/ct/box-agents.md`): provision installs them as `/etc/claude-code/CLAUDE.md` in
+  every container, so every account's Claude Code reads them on top of the person's own file (which stays theirs: the
+  starter file is create-only). They say the claw-master `HTTPS_PROXY` is a forwarder, not a firewall (an agent unset it
+  and blamed it, 2026-10-21), that the host-side firewall and the narrowed role are the limits, and to name a cause only
+  once seen. Codex has no machine-wide file, so these reach Claude Code only.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
   --pipe --wait ...`) from `ubuntu`.
 
