@@ -17,8 +17,10 @@ there. It does not block or filter anything.
 
 The limits are on the host, outside your container, and nothing you run inside can change them:
 
-- a firewall that stops your container reaching the host itself, other people's containers, other people's machines,
-  the shared scratch box, and the real instance metadata service;
+- a firewall that stops your container reaching the host itself, other people's containers, other people's Windows and
+  GPU boxes, the shared scratch box, and the real instance metadata service. Each person's Ohio pbox is the exception:
+  it has a public address that anyone can reach, and what keeps you out of someone else's is that you do not have their
+  SSH key;
 - AWS through your own narrowed role (`nextjs-dev-role/ct-<you>`): it can read only what your account is meant to have.
 
 A connection those rules refuse is refused on purpose. Report it to the person you are working for and stop. Do not
