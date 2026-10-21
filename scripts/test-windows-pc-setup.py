@@ -64,13 +64,28 @@ class Setup(unittest.TestCase):
         for name in ("CFD_VERSION", "CFD_SHA256_WINDOWS_AMD64"):
             self.assertEqual(pin(SETUP, name), pin(CLAW_WIN, name))
         self.assertRegex(pin(SETUP, "UV_SHA256_WINDOWS_AMD64_ZIP"), r"^[0-9a-f]{64}$")
-        self.assertRegex(pin(SETUP, "WINDOWS_MCP_VERSION"), r"^\d+\.\d+\.\d+$")
+        self.assertRegex(pin(SETUP, "WINDOWS_MCP_COMMIT"), r"^[0-9a-f]{40}$")
+        self.assertRegex(pin(SETUP, "WINDOWS_MCP_ZIP_SHA256"), r"^[0-9a-f]{64}$")
+        self.assertNotIn("windows-mcp==", SETUP)  # not PyPI 0.8.8, whose control gate latches (upstream #456)
 
     def test_every_download_is_checked_before_it_is_used(self):
         s4, s6 = step(4), step(6)
         self.assertLess(s4.index("-ne $CfdSha) { Remove-Item"), s4.index('Move-Item -Force "$exe.new" $exe'))
         self.assertLess(s6.index("-ne $UvSha) { Remove-Item"), s6.index("Expand-Archive"))
-        self.assertIn('"windows-mcp==$McpVersion"', s6)
+        # The source zip of the pinned commit is checked before uv builds it, and the commit is what is recorded.
+        self.assertIn('/archive/$McpCommit.zip"', s6)
+        self.assertLess(s6.index("-ne $McpZipSha) { throw"), s6.index("& $uv tool install"))
+        # Each source step stops at its first error, so a partly extracted tree is never built; cleanup always runs.
+        for cmd in ("Invoke-WebRequest -UseBasicParsing \"https://github.com/CursorTouch", "Expand-Archive $zip -DestinationPath $src"):
+            line = next(l for l in s6.splitlines() if cmd in l)
+            self.assertIn("-ErrorAction Stop", line, cmd)
+        self.assertIn("} finally {\n    Remove-Item -Recurse -Force $zip, $src", s6)
+        # The marker is removed before an install and written only after the server passed the 401 check, so a
+        # broken install is never recorded and a re-run repairs it.
+        self.assertLess(s6.index("Remove-Item $marker -Force"), s6.index("& $uv tool install"))
+        self.assertLess(s6.index("if ($status -ne 401)"), s6.index("Set-Content -Path $marker -Value $McpCommit"))
+        self.assertEqual(s6.count("Set-Content -Path $marker"), 1)
+        self.assertIn("if ($installed -eq $McpCommit", s6)
 
     def test_sshd_is_judged_by_its_effective_settings_and_its_listeners(self):
         # A text check passed a config that also had ListenAddress 0.0.0.0 or an earlier PasswordAuthentication yes.
@@ -147,7 +162,7 @@ class Setup(unittest.TestCase):
         self.assertIn("--host 127.0.0.1 --port 8000", s7)
         self.assertNotRegex(s7, r'"[^"\n]*\$key')  # the key is never printed
         # always stopped, installed or not, so the server that runs is the one with today's settings
-        before_check = s7[:s7.index("if (@(& $uv tool list")]
+        before_check = s7[:s7.index("if ($installed -eq $McpCommit")]
         self.assertIn("\nStop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue\n", before_check)
         self.assertRegex(before_check, r"\nGet-CimInstance Win32_Process -Filter \"Name = 'python\.exe'\" \| Where-Object \{ \$_\.CommandLine -like '\*windows_mcp\*' \}")
         # and it must refuse a request without the key

@@ -791,6 +791,12 @@ account, installs both and adds the Claude entry; a nextjs-ct container's provis
 `local.windows_mcp_pcs` the account reaches. The members' own machine tokens (Colton's Mac, Colin's PC) are denied to
 every other member's container in one statement, `MemberMachineTokensOwnOnly`.
 
+Windows-MCP is pinned to an upstream commit (`WINDOWS_MCP_COMMIT`, its source zip's sha256 checked on the PC), not PyPI
+0.8.8. It keeps the PC user in charge: while they use the mouse or keyboard (and 10 seconds after), direct input
+(Click, Type, Move, Scroll, Shortcut, switching windows) is refused with `USER_CONTROL`, and background tools
+(PowerShell, screenshots, launching an app) still run. 0.8.8 instead latched in `USER_CONTROL` whenever its hook
+missed a key-up (Win+L, an elevated window in front), refusing every tool until the server restarted.
+
 `scripts/windows-pc-setup.sh colin-pc`, run on a jumpbox, puts the PC on the route and installs Windows-MCP: OpenSSH keys
 only and on loopback only with its inbound firewall rule off, the clients' keys in a managed block of
 `administrators_authorized_keys`, the pinned `cloudflared` (verified on the PC), the token through ssh stdin, the
