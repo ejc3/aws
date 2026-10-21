@@ -329,23 +329,29 @@ Stop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object { $_.CommandLine -like '*windows_mcp*' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
+# The marker names the commit of a server that passed the checks below: removed before an install, written after them.
 $marker = "$env:USERPROFILE\.windows-mcp\installed-commit"
 $installed = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '' }
 if ($installed -eq $McpCommit -and (Test-Path "$bin\windows-mcp.exe")) {
   "windows-mcp $($McpCommit.Substring(0, 10)): already installed"
 } else {
+  Remove-Item $marker -Force -ErrorAction SilentlyContinue
   $zip = "$env:TEMP\windows-mcp-$McpCommit.zip"
   $src = "$env:TEMP\windows-mcp-$McpCommit"
-  Invoke-WebRequest -UseBasicParsing "https://github.com/CursorTouch/Windows-MCP/archive/$McpCommit.zip" -OutFile $zip
-  if ((Get-FileHash $zip).Hash -ne $McpZipSha) { Remove-Item $zip; 'windows-mcp source did not match its pinned sha256'; exit 1 }
-  if (Test-Path $src) { Remove-Item -Recurse -Force $src }
-  Expand-Archive $zip -DestinationPath $src -Force
-  & $uv tool install --force --python 3.14 "$src\Windows-MCP-$McpCommit" 2>&1 | ForEach-Object { "$_" }
-  $rc = $LASTEXITCODE
-  Remove-Item -Recurse -Force $zip, $src
-  if ($rc -ne 0) { 'uv tool install failed'; exit 1 }
-  New-Item -ItemType Directory -Force (Split-Path $marker) | Out-Null
-  Set-Content -Path $marker -Value $McpCommit -Encoding ascii
+  # Every step of the source stops at its first error (uv's own stderr is why this block is otherwise 'Continue'):
+  # a partly extracted tree must never be built.
+  try {
+    Invoke-WebRequest -UseBasicParsing "https://github.com/CursorTouch/Windows-MCP/archive/$McpCommit.zip" -OutFile $zip -ErrorAction Stop
+    if ((Get-FileHash $zip -ErrorAction Stop).Hash -ne $McpZipSha) { throw 'windows-mcp source did not match its pinned sha256' }
+    if (Test-Path $src) { Remove-Item -Recurse -Force $src -ErrorAction Stop }
+    Expand-Archive $zip -DestinationPath $src -Force -ErrorAction Stop
+    & $uv tool install --force --python 3.14 "$src\Windows-MCP-$McpCommit" 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -ne 0) { throw 'uv tool install failed' }
+  } catch {
+    "windows-mcp install failed: $_"; exit 1
+  } finally {
+    Remove-Item -Recurse -Force $zip, $src -ErrorAction SilentlyContinue
+  }
 }
 & "$bin\windows-mcp.exe" install --transport streamable-http --host 127.0.0.1 --port 8000 --force 2>&1 | ForEach-Object { "$_" }
 if ($LASTEXITCODE -ne 0) { 'windows-mcp install failed'; exit 1 }
@@ -364,6 +370,8 @@ try {
   $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
 }
 if ($status -ne 401) { "windows-mcp answered a request without its key with $status, not 401"; exit 1 }
+New-Item -ItemType Directory -Force (Split-Path $marker) | Out-Null
+Set-Content -Path $marker -Value $McpCommit -Encoding ascii
 'windows-mcp: listening on 127.0.0.1:8000, refusing requests without its key'
 PS
 )"

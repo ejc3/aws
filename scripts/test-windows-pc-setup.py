@@ -74,8 +74,17 @@ class Setup(unittest.TestCase):
         self.assertLess(s6.index("-ne $UvSha) { Remove-Item"), s6.index("Expand-Archive"))
         # The source zip of the pinned commit is checked before uv builds it, and the commit is what is recorded.
         self.assertIn('/archive/$McpCommit.zip"', s6)
-        self.assertLess(s6.index("-ne $McpZipSha) { Remove-Item $zip"), s6.index("& $uv tool install"))
-        self.assertLess(s6.index("if ($rc -ne 0)"), s6.index("Set-Content -Path $marker -Value $McpCommit"))
+        self.assertLess(s6.index("-ne $McpZipSha) { throw"), s6.index("& $uv tool install"))
+        # Each source step stops at its first error, so a partly extracted tree is never built; cleanup always runs.
+        for cmd in ("Invoke-WebRequest -UseBasicParsing \"https://github.com/CursorTouch", "Expand-Archive $zip -DestinationPath $src"):
+            line = next(l for l in s6.splitlines() if cmd in l)
+            self.assertIn("-ErrorAction Stop", line, cmd)
+        self.assertIn("} finally {\n    Remove-Item -Recurse -Force $zip, $src", s6)
+        # The marker is removed before an install and written only after the server passed the 401 check, so a
+        # broken install is never recorded and a re-run repairs it.
+        self.assertLess(s6.index("Remove-Item $marker -Force"), s6.index("& $uv tool install"))
+        self.assertLess(s6.index("if ($status -ne 401)"), s6.index("Set-Content -Path $marker -Value $McpCommit"))
+        self.assertEqual(s6.count("Set-Content -Path $marker"), 1)
         self.assertIn("if ($installed -eq $McpCommit", s6)
 
     def test_sshd_is_judged_by_its_effective_settings_and_its_listeners(self):
