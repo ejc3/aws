@@ -41,7 +41,9 @@ class ConstellationAccountTests(unittest.TestCase):
         self.assertIn(":instance/fcvm-arm-not-running", TF)
 
     def test_the_dev_box_grant_names_exactly_that_role(self):
-        grant = block('resource "aws_iam_role_policy" "dev_server_constellation_terraform"')
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"')
+        attach = block('resource "aws_iam_role_policy_attachment" "dev_server_constellation_terraform"')
+        self.assertIn("role       = aws_iam_role.dev_server.name", attach)
         self.assertIn('Action    = "sts:AssumeRole"', grant)
         self.assertIn("Resource  = aws_iam_role.constellation_terraform.arn", grant)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', grant)
@@ -50,7 +52,7 @@ class ConstellationAccountTests(unittest.TestCase):
         # The options refused in constellation's own notes: organizations:CreateAccount for a dev box, and AssumeRole on
         # OrganizationAccountAccessRole in any account (admin of every member account).
         for role in ("aws_iam_role.dev_server", "aws_iam_role.nextjs_dev"):
-            for m in re.finditer(r'resource "aws_iam_role_policy" "(\w+)" \{', TF):
+            for m in re.finditer(r'resource "aws_iam_(?:role_policy|policy)" "(\w+)" \{', TF):
                 body = block(m.group(0)[:-2])
                 if f"role = {role}.id" in body.replace("  ", " ") or f"role = {role}.id" in body:
                     self.assertNotIn("organizations:", body)

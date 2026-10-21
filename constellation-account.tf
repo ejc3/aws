@@ -172,10 +172,12 @@ resource "aws_iam_role_policy_attachment" "constellation_terraform_admin" {
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
-# The one grant on the management-account side: fcvm-arm may assume exactly that role, and nothing else.
-resource "aws_iam_role_policy" "dev_server_constellation_terraform" {
-  name = "assume-constellation-terraform"
-  role = aws_iam_role.dev_server.id
+# The one grant on the management-account side: fcvm-arm may assume exactly that role, and nothing else. A managed policy,
+# not an inline one: dev-server-role's inline policies are at IAM's 10,240-byte total (the first apply was refused with
+# LimitExceeded), and managed policies count against a separate limit (20 per role here).
+resource "aws_iam_policy" "dev_server_constellation_terraform" {
+  name        = "assume-constellation-terraform"
+  description = "fcvm-arm may assume constellation-terraform in the constellation account, and nothing else (constellation-account.tf)."
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -186,6 +188,12 @@ resource "aws_iam_role_policy" "dev_server_constellation_terraform" {
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
+  tags = { Name = "assume-constellation-terraform", Managed = "terraform" }
+}
+
+resource "aws_iam_role_policy_attachment" "dev_server_constellation_terraform" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.dev_server_constellation_terraform.arn
 }
 
 output "constellation_terraform" {
