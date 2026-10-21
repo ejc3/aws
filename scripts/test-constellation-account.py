@@ -34,13 +34,17 @@ class ConstellationAccountTests(unittest.TestCase):
     def test_the_apply_role_trusts_only_fcvm_arm(self):
         role = block('resource "aws_iam_role" "constellation_terraform"')
         self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", role)
-        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', role)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', role)
+
+    def test_the_pin_is_fcvm_arm_or_an_arn_no_instance_has(self):
+        self.assertIn("try(aws_instance.firecracker_dev[0].arn, ", TF)
+        self.assertIn(":instance/fcvm-arm-not-running", TF)
 
     def test_the_dev_box_grant_names_exactly_that_role(self):
         grant = block('resource "aws_iam_role_policy" "dev_server_constellation_terraform"')
         self.assertIn('Action    = "sts:AssumeRole"', grant)
         self.assertIn("Resource  = aws_iam_role.constellation_terraform.arn", grant)
-        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', grant)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', grant)
 
     def test_nothing_gives_a_dev_box_the_organization_or_other_accounts(self):
         # The options refused in constellation's own notes: organizations:CreateAccount for a dev box, and AssumeRole on

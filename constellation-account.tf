@@ -54,6 +54,9 @@ provider "aws" {
 locals {
   constellation_account_id         = aws_organizations_account.constellation.id
   constellation_terraform_role_arn = "arn:aws:iam::${aws_organizations_account.constellation.id}:role/constellation-terraform"
+  # fcvm-arm's instance, the one box that may apply constellation. fcvm-arm is optional (enable_firecracker_instance); while
+  # it is off this is an ARN no instance has, so the role cannot be assumed at all rather than the plan failing.
+  constellation_applier_instance_arn = try(aws_instance.firecracker_dev[0].arn, "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/fcvm-arm-not-running")
 }
 
 resource "aws_s3_account_public_access_block" "constellation" {
@@ -157,7 +160,7 @@ resource "aws_iam_role" "constellation_terraform" {
       Effect    = "Allow"
       Principal = { AWS = aws_iam_role.dev_server.arn }
       Action    = "sts:AssumeRole"
-      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
   tags = { Name = "constellation-terraform", Managed = "terraform" }
@@ -180,7 +183,7 @@ resource "aws_iam_role_policy" "dev_server_constellation_terraform" {
       Effect    = "Allow"
       Action    = "sts:AssumeRole"
       Resource  = aws_iam_role.constellation_terraform.arn
-      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
 }
