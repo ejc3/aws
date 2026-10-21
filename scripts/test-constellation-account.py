@@ -94,7 +94,10 @@ class LatticeStageTests(unittest.TestCase):
         app = block('resource "cloudflare_zero_trust_access_application" "lattice_stage"', LATTICE)
         self.assertIn("domain           = local.lattice_stage_hostname", app)
         self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+)\.id", app),
-                         ["cloudflare_zero_trust_access_policy.browser_manager_owner"])
+                         ["cloudflare_zero_trust_access_policy.lattice_stage_owner"])
+        owner = block('resource "cloudflare_zero_trust_access_policy" "lattice_stage_owner"', LATTICE)
+        self.assertIn('decision         = "allow"', owner)
+        self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", owner)
         self.assertNotIn("everyone", app)
 
     def test_only_the_two_bearer_token_paths_skip_access(self):
@@ -104,6 +107,7 @@ class LatticeStageTests(unittest.TestCase):
         bypass = block('resource "cloudflare_zero_trust_access_application" "lattice_stage_bearer_paths"', LATTICE)
         self.assertIn("for uri in local.lattice_stage_bypass_paths", bypass)
         self.assertIn("domain       = local.lattice_stage_bypass_paths[0]", bypass)
+        self.assertIn("cloudflare_zero_trust_access_policy.lattice_stage_bearer_paths.id", bypass)
         # The only bypass-everyone policy in the file is the one attached to those paths.
         self.assertEqual(LATTICE.count('decision   = "bypass"'), 1)
         self.assertEqual(LATTICE.count("everyone = {}"), 1)
@@ -116,8 +120,24 @@ class LatticeStageTests(unittest.TestCase):
 
     def test_the_tunnel_reaches_only_the_task_local_api(self):
         config = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "lattice_stage"', LATTICE)
-        self.assertEqual(re.findall(r'service  = "([^"]+)"', config), ["http://localhost:${local.lattice_stage_api_port}"])
+        self.assertEqual(set(re.findall(r'service  = "([^"]+)"', config)), {"http://localhost:${local.lattice_stage_api_port}"})
         self.assertIn('{ service = "http_status:404" }', config)
+
+    def test_the_connector_requires_access_except_on_the_bypassed_paths(self):
+        config = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "lattice_stage"', LATTICE)
+        rules = config[config.index("ingress = ["):]
+        first, second = rules.split("      {\n        hostname")[1:3]
+        self.assertIn("path     = local.lattice_stage_bypass_regex", first)
+        self.assertNotIn("origin_request", first)
+        self.assertNotIn("path", second)
+        self.assertIn("required  = true", second)
+        self.assertIn("aud_tag   = [cloudflare_zero_trust_access_application.lattice_stage.aud]", second)
+        # The connector's regex lets through exactly what Access bypasses, and no more.
+        rx = re.compile(re.search(r'lattice_stage_bypass_regex = "([^"]+)"', LATTICE).group(1))
+        for path in ("/lattice/live", "/lattice/v1/accounts", "/lattice/v1/a/b"):
+            self.assertTrue(rx.search(path), path)
+        for path in ("/lattice/native/login", "/lattice/live/x", "/lattice/livex", "/lattice/v1", "/lattice/v1x", "/", "/x/lattice/v1/a"):
+            self.assertFalse(rx.search(path), path)
 
     def test_the_connector_token_goes_to_the_constellation_account_only(self):
         secret = block('resource "aws_secretsmanager_secret" "lattice_stage_tunnel"', LATTICE)
@@ -125,6 +145,8 @@ class LatticeStageTests(unittest.TestCase):
         self.assertIn("provider                = aws.constellation", secret)
         self.assertIn('name                    = "constellation/nonprod/tunnel"', secret)
         self.assertIn("provider      = aws.constellation", version)
+        self.assertIn("secret_id     = aws_secretsmanager_secret.lattice_stage_tunnel.id", version)
+        self.assertIn("secret_string = jsonencode({ TUNNEL_TOKEN = data.cloudflare_zero_trust_tunnel_cloudflared_token.lattice_stage.token })", version)
         self.assertEqual(LATTICE.count("cloudflared_token.lattice_stage.token"), 1)
         self.assertNotIn("aws_iam_", LATTICE)
 

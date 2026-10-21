@@ -18,25 +18,39 @@
 #     opening a draft to the internet is the owner's call, so this starts owner-only.
 #   - /lattice/live and /lattice/v1/*: bypassed. The iOS and macOS apps and the MCP server send the API's own signed
 #     Bearer token there, which the API verifies; those tokens are minted only at /lattice/native/login, which stays
-#     behind Access. So the connector cannot require an Access token itself (a bypassed request carries none): the
-#     edge enforces Access on every other path, and the API checks the Access JWT (ACCESS_AUD) on them as well.
+#     behind Access. A bypassed request carries no Access token, so the connector requires one on every path EXCEPT
+#     exactly those two (its first ingress rule): if the host application were ever dropped, the rest of the host,
+#     /lattice/native/login above all, still refuses a request without a valid token for it. The API checks the Access
+#     JWT (ACCESS_AUD) as well. The live path is exact on both sides: anything the API later adds under /lattice/live/
+#     stays behind the connector's check until it is listed here.
 
 locals {
   lattice_stage_hostname = "lattice-stage.dolphin-labs.dev"
   # The API's port inside the task (API_PORT): the sidecar shares the task's network namespace, so localhost reaches it.
   lattice_stage_api_port = 8080
+  # The paths Access skips, and the same set as the connector's regex below. Change both together (a test checks).
   lattice_stage_bypass_paths = [
     "${local.lattice_stage_hostname}/lattice/live",
     "${local.lattice_stage_hostname}/lattice/v1/*",
   ]
+  lattice_stage_bypass_regex = "^/lattice/(live$|v1/)"
   lattice_stage_pointer = {
     hostname           = local.lattice_stage_hostname
     api_port           = local.lattice_stage_api_port
-    access_team_domain = "https://ejc3.cloudflareaccess.com"
+    access_team_domain = local.browser_manager_issuer
     access_aud         = cloudflare_zero_trust_access_application.lattice_stage.aud
     tunnel_secret_name = aws_secretsmanager_secret.lattice_stage_tunnel.name
     tunnel_secret_key  = "TUNNEL_TOKEN"
   }
+}
+
+# Its own policy rather than browser-manager's, so someone added there never lands here by the way.
+resource "cloudflare_zero_trust_access_policy" "lattice_stage_owner" {
+  account_id       = var.cloudflare_account_id
+  name             = "Lattice staging: owner"
+  decision         = "allow"
+  session_duration = "12h"
+  include          = [{ email = { email = local.browser_manager_owner } }]
 }
 
 resource "cloudflare_zero_trust_access_application" "lattice_stage" {
@@ -54,7 +68,7 @@ resource "cloudflare_zero_trust_access_application" "lattice_stage" {
   # The policy attachment MUST be declared here; see cc_games_dev in cloudflare.tf.
   policies = [
     {
-      id         = cloudflare_zero_trust_access_policy.browser_manager_owner.id
+      id         = cloudflare_zero_trust_access_policy.lattice_stage_owner.id
       precedence = 1
     },
   ]
@@ -96,7 +110,19 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "lattice_stage" {
     ingress = [
       {
         hostname = local.lattice_stage_hostname
+        path     = local.lattice_stage_bypass_regex
         service  = "http://localhost:${local.lattice_stage_api_port}"
+      },
+      {
+        hostname = local.lattice_stage_hostname
+        service  = "http://localhost:${local.lattice_stage_api_port}"
+        origin_request = {
+          access = {
+            required  = true
+            team_name = "ejc3"
+            aud_tag   = [cloudflare_zero_trust_access_application.lattice_stage.aud]
+          }
+        }
       },
       { service = "http_status:404" },
     ]

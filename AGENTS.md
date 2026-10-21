@@ -1551,7 +1551,8 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   to a cloudflared sidecar in constellation's ECS task (`http://localhost:8080`). The connector token is written into the
   constellation account as `constellation/nonprod/tunnel` (key `TUNNEL_TOKEN`). Access: owner-only on the host (GitHub,
   Google or one-time PIN); `/lattice/live` and `/lattice/v1/*` bypass, where the API's own Bearer token (minted only at
-  the Access-protected `/lattice/native/login`) is the gate. Opening the host to anyone who signs in, as constellation's
+  the Access-protected `/lattice/native/login`) is the gate; the connector itself requires an Access token on every
+  other path. Opening the host to anyone who signs in, as constellation's
   design intends, is the owner's decision.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
