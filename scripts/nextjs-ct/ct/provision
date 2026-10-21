@@ -151,7 +151,7 @@ curl -fsSL --retry 3 https://raw.githubusercontent.com/ejc3/t-claude/main/nosync
 # Helpers and units, the same in every container.
 for f in "$SHARED"/ct/*; do
   [ -f "$f" ] || continue
-  case "$f" in *.rules) continue ;; esac
+  case "$f" in *.rules|*.md) continue ;; esac   # policy rules and notes are installed by name below, not as helpers
   install -m 755 "$f" "/usr/local/bin/$(basename "$f")"
 done
 install -m 644 "$SHARED"/ct/units/* /etc/systemd/system/

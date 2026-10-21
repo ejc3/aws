@@ -321,6 +321,8 @@ class BoxAgentNotesTests(unittest.TestCase):
     def test_provision_installs_the_notes_for_claude_code(self):
         provision = (SCRIPTS / "ct" / "provision").read_text()
         self.assertIn('install -m 644 "$SHARED/ct/box-agents.md" /etc/claude-code/CLAUDE.md', provision)
+        # Not also installed as an executable helper by the loop over ct/*.
+        self.assertIn('case "$f" in *.rules|*.md) continue ;; esac', provision)
 
     def test_the_notes_say_what_the_proxy_is_and_what_limits_you(self):
         notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
