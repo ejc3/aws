@@ -303,6 +303,9 @@ install -d -m 755 /etc/claude-code && install -m 644 "$SHARED/ct/box-agents.md" 
 
 # Shell environment (t-claude, atuin, starship, fzf, tmux.conf): the same body every box runs.
 as_user bash < "$SHARED/snippets/user-shell-env.sh" >/dev/null 2>&1 || warn "shell env for $U had errors"
+# opencode with DeepSeek on Bedrock, the pinned release and default config the metal boxes get (dev-user-data.tf); the
+# shell env above carries the opencode() function that points it at the container's credentials.
+as_user bash < "$SHARED/snippets/opencode-setup.sh" >/dev/null 2>&1 || warn "opencode setup for $U had errors"
 /usr/local/bin/user-agents-seed "$U" || warn "user-agents-seed failed for $U"
 
 # git identity from the account's own gh login (GitHub's noreply address, never a real one).

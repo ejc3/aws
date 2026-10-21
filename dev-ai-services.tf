@@ -7,7 +7,7 @@
 #     --secret-string file://<a 0600 file>
 # Readers: the administration set, dev-server-role (the metal boxes) and nextjs-dev-role (where
 # the games are built). Agents fetch it when they need it; nothing writes it to disk on the
-# boxes. (DeepSeek, by contrast, is on the metal boxes only: dev-instance-common.tf.)
+# boxes.
 
 resource "aws_secretsmanager_secret" "elevenlabs_api_key" {
   name                    = "games/elevenlabs-api-key"
@@ -413,4 +413,32 @@ resource "aws_iam_policy" "turso_api_token_read" {
 resource "aws_iam_role_policy_attachment" "turso_api_token_read" {
   role       = aws_iam_role.dev_server.name
   policy_arn = aws_iam_policy.turso_api_token_read.arn
+}
+
+# DeepSeek on Amazon Bedrock for nextjs-dev-role (every nextjs-ct container), the same two models dev-server-role has
+# (BedrockRuntimeInvoke in dev-instance-common.tf), for opencode (dev-user-data.tf's opencode_user_setup, run in every
+# container). Owner, 2026-10-21: "get deepseek working on the nextjs box ... fcvm has it". The account is already
+# subscribed (fcvm's first use), so there is no Marketplace grant. A managed policy: nextjs-dev-role's inline policies are
+# near IAM's 10,240-character total. Box-wide, as every grant on that role is: every container may invoke them.
+resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek" {
+  name        = "nextjs-dev-bedrock-deepseek"
+  description = "nextjs-dev-role: invoke DeepSeek v3.2 and R1 on Bedrock (opencode), nothing else (dev-ai-services.tf)"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "InvokeDeepSeekForOpencode"
+      Effect = "Allow"
+      Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:Converse", "bedrock:ConverseStream"]
+      Resource = [
+        "arn:aws:bedrock:*::foundation-model/deepseek.v3.2",
+        "arn:aws:bedrock:*::foundation-model/deepseek.r1-v1:0",
+        "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/us.deepseek.*",
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "nextjs_dev_bedrock_deepseek" {
+  role       = aws_iam_role.nextjs_dev.name
+  policy_arn = aws_iam_policy.nextjs_dev_bedrock_deepseek.arn
 }
