@@ -1544,6 +1544,15 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   trusts dev-server-role pinned to fcvm-arm's instance (`ec2:SourceInstanceARN`; fcvm-x86 shares the role and cannot), and
   dev-server-role's one grant (`assume-constellation-terraform`) names exactly that ARN with the same pin. A dev box never
   gets `organizations:*` or OrganizationAccountAccessRole, in any account: that is admin of every member account.
+- **What fcvm-arm reads: `/infra/constellation`** (an SSM String, the same grant and pin): account id, region, state bucket,
+  apply role, and Lattice staging's hostname, API port, Access team domain and audience tag. No credentials; it exists
+  because a dev box cannot read this repository's state.
+- **Lattice staging** (`constellation-lattice-stage.tf`): `lattice-stage.dolphin-labs.dev` through tunnel `lattice-stage`
+  to a cloudflared sidecar in constellation's ECS task (`http://localhost:8080`). The connector token is written into the
+  constellation account as `constellation/nonprod/tunnel` (key `TUNNEL_TOKEN`). Access: owner-only on the host (GitHub,
+  Google or one-time PIN); `/lattice/live` and `/lattice/v1/*` bypass, where the API's own Bearer token (minted only at
+  the Access-protected `/lattice/native/login`) is the gate. Opening the host to anyone who signs in, as constellation's
+  design intends, is the owner's decision.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
