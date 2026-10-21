@@ -41,7 +41,12 @@ CFD_VERSION=2026.9.3
 CFD_SHA256_WINDOWS_AMD64=f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2
 UV_VERSION=0.13.0
 UV_SHA256_WINDOWS_AMD64_ZIP=088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c
-WINDOWS_MCP_VERSION=0.8.8
+# Windows-MCP from an exact upstream commit, not PyPI 0.8.8: 0.8.8's control gate latches in USER_CONTROL when the
+# hook misses a key-up (Win+L, an elevated window) and refuses every tool until a restart (upstream #456, fixed in #460),
+# and gates background tools too (#457; main's default "relaxed" policy gates only direct input). Main still calls
+# itself 0.8.8, so the commit, not the version, says what is installed. The source zip is checked on the PC.
+WINDOWS_MCP_COMMIT=5b24a8ab5c453e691feb6402cf455d83cf10998e
+WINDOWS_MCP_ZIP_SHA256=b077f424a19d87ee6e71063263e080bdd7baa2bd27bf93c1355882b0cd75697c
 
 usage() { echo "usage: windows-pc-setup.sh ALIAS [--bootstrap-port PORT]   (ALIAS: colin-pc)" >&2; exit 2; }
 ALIAS=${1:-}
@@ -290,8 +295,8 @@ PS
 
 unset TUNNEL_TOKEN
 
-echo "6/7 Windows-MCP $WINDOWS_MCP_VERSION in the user's session (uv $UV_VERSION)"
-on_pc "$(ps_vars UvVersion "$UV_VERSION" UvSha "$UV_SHA256_WINDOWS_AMD64_ZIP" McpVersion "$WINDOWS_MCP_VERSION")
+echo "6/7 Windows-MCP ${WINDOWS_MCP_COMMIT:0:10} in the user's session (uv $UV_VERSION)"
+on_pc "$(ps_vars UvVersion "$UV_VERSION" UvSha "$UV_SHA256_WINDOWS_AMD64_ZIP" McpCommit "$WINDOWS_MCP_COMMIT" McpZipSha "$WINDOWS_MCP_ZIP_SHA256")
 $(cat <<'PS'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
@@ -324,11 +329,23 @@ Stop-ScheduledTask -TaskName windows-mcp-server -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object { $_.CommandLine -like '*windows_mcp*' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
-if (@(& $uv tool list 2>$null) -contains "windows-mcp v$McpVersion") {
-  "windows-mcp ${McpVersion}: already installed"
+$marker = "$env:USERPROFILE\.windows-mcp\installed-commit"
+$installed = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '' }
+if ($installed -eq $McpCommit -and (Test-Path "$bin\windows-mcp.exe")) {
+  "windows-mcp $($McpCommit.Substring(0, 10)): already installed"
 } else {
-  & $uv tool install --python 3.14 "windows-mcp==$McpVersion" 2>&1 | ForEach-Object { "$_" }
-  if ($LASTEXITCODE -ne 0) { 'uv tool install failed'; exit 1 }
+  $zip = "$env:TEMP\windows-mcp-$McpCommit.zip"
+  $src = "$env:TEMP\windows-mcp-$McpCommit"
+  Invoke-WebRequest -UseBasicParsing "https://github.com/CursorTouch/Windows-MCP/archive/$McpCommit.zip" -OutFile $zip
+  if ((Get-FileHash $zip).Hash -ne $McpZipSha) { Remove-Item $zip; 'windows-mcp source did not match its pinned sha256'; exit 1 }
+  if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+  Expand-Archive $zip -DestinationPath $src -Force
+  & $uv tool install --force --python 3.14 "$src\Windows-MCP-$McpCommit" 2>&1 | ForEach-Object { "$_" }
+  $rc = $LASTEXITCODE
+  Remove-Item -Recurse -Force $zip, $src
+  if ($rc -ne 0) { 'uv tool install failed'; exit 1 }
+  New-Item -ItemType Directory -Force (Split-Path $marker) | Out-Null
+  Set-Content -Path $marker -Value $McpCommit -Encoding ascii
 }
 & "$bin\windows-mcp.exe" install --transport streamable-http --host 127.0.0.1 --port 8000 --force 2>&1 | ForEach-Object { "$_" }
 if ($LASTEXITCODE -ne 0) { 'windows-mcp install failed'; exit 1 }
