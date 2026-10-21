@@ -175,6 +175,11 @@ class FakeDDB:
             response["LastEvaluatedKey"] = {"pk": page[-1][1]["pk"], "sk": page[-1][1]["sk"]}
         return response
 
+    def put_item(self, TableName, Item):
+        self._maybe_fail("put_item")
+        self.items[self._key(Item)] = copy.deepcopy(Item)
+        return {}
+
     def batch_write_item(self, RequestItems):
         self._maybe_fail("batch_write_item")
         (requests,) = RequestItems.values()
@@ -507,6 +512,128 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(len(self.sns.messages), 2)
 
 
+SNAP = "snap-0123456789abcdef0"
+POOL = "905400001560"
+
+
+class FakeCloudTrail:
+    def __init__(self, adds):
+        self.adds = adds  # [(principal, invokedBy)]
+
+    def get_paginator(self, name):
+        assert name == "lookup_events"
+        adds = self.adds
+
+        class Pager:
+            def paginate(self, **kwargs):
+                assert kwargs["LookupAttributes"] == [{"AttributeKey": "ResourceName", "AttributeValue": SNAP}]
+                events = [{"EventName": "ModifySnapshotAttribute", "CloudTrailEvent": json.dumps({
+                    "userIdentity": {"invokedBy": by} if by else {"arn": "arn:aws:iam::111111111111:user/someone"},
+                    "requestParameters": {"snapshotId": SNAP, "createVolumePermission": {"add": {"items": [{"userId": who}]}}}})}
+                    for who, by in adds]
+                events.append({"EventName": "CopySnapshot", "CloudTrailEvent": "{}"})
+                return [{"Events": events}]
+        return Pager()
+
+
+class FakeEC2:
+    def __init__(self, snapshot, shares):
+        self.snapshot, self.shares = snapshot, shares
+
+    def describe_snapshots(self, SnapshotIds, OwnerIds):
+        if self.snapshot is None:
+            raise AwsError("InvalidSnapshot.NotFound")
+        return {"Snapshots": [self.snapshot]}
+
+    def describe_snapshot_attribute(self, SnapshotId, Attribute):
+        return {"CreateVolumePermissions": [{"UserId": u} for u in self.shares]}
+
+
+def backup_copy(**over):
+    snap = {"SnapshotId": SNAP, "Description": "This snapshot is copied by the AWS Backup service.",
+            "Tags": [{"Key": "aws:backup:source-resource", "Value": "x"}, {"Key": "BackupPipeline", "Value": "fleet-processing-v2"}]}
+    snap.update(over)
+    return snap
+
+
+def snapshot_finding(principal=POOL, region="us-east-1", account=MAIN, public=False, fid="aa-1"):
+    return {"source": "aws.access-analyzer", "detail-type": "Access Analyzer Finding", "id": fid, "account": account,
+            "region": region, "detail": {"id": fid, "accountId": account, "region": region, "isPublic": public,
+                                         "resourceType": "AWS::EC2::Snapshot", "principal": {"AWS": principal},
+                                         "resource": "arn:aws:ec2:%s::snapshot/%s" % (region, SNAP), "status": "ACTIVE"}}
+
+
+class BackupCopyShareTests(DigestTests):
+    """#577: AWS Backup's own air-gapped-copy snapshot share is held, proven and dropped; anything else is mailed."""
+
+    def setUp(self):
+        super().setUp()
+        digest.BACKUP_COPY_ACCOUNT, digest.BACKUP_COPY_REGIONS = MAIN, {"us-west-1", "us-east-1"}
+        self.use(FakeCloudTrail([(POOL, "backup.amazonaws.com")]), FakeEC2(backup_copy(), [POOL]))
+
+    def use(self, trail, ec2):
+        digest.boto3.client = lambda name, region_name=None: {"cloudtrail": trail, "ec2": ec2}[name]
+
+    def mailed_after_hold(self):
+        self.deliver([snapshot_finding()])
+        before = len(self.sns.messages)
+        self.tick(digest.HOLD + 60)
+        return len(self.sns.messages) - before
+
+    def test_held_not_mailed_at_once(self):
+        self.deliver([snapshot_finding()])
+        self.tick(60)
+        self.assertEqual(self.sns.messages, [])
+
+    def test_aws_backups_own_share_is_dropped(self):
+        self.assertEqual(self.mailed_after_hold(), 0)
+        self.assertTrue(any("aws-backup-copy-share" in line for line in self.logs))
+
+    def test_a_snapshot_already_deleted_after_the_copy_is_dropped(self):
+        self.use(FakeCloudTrail([(POOL, "backup.amazonaws.com")]), FakeEC2(None, []))
+        self.assertEqual(self.mailed_after_hold(), 0)
+
+    def test_a_share_made_by_a_person_is_mailed(self):
+        self.use(FakeCloudTrail([(POOL, None)]), FakeEC2(backup_copy(), [POOL]))
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_a_person_adding_the_same_principal_after_aws_backup_is_mailed(self):
+        self.use(FakeCloudTrail([(POOL, "backup.amazonaws.com"), (POOL, None)]), FakeEC2(backup_copy(), [POOL]))
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_no_cloudtrail_evidence_is_mailed(self):
+        self.use(FakeCloudTrail([]), FakeEC2(backup_copy(), [POOL]))
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_a_snapshot_that_is_not_a_backup_copy_is_mailed(self):
+        self.use(FakeCloudTrail([(POOL, "backup.amazonaws.com")]), FakeEC2(backup_copy(Description="mine", Tags=[]), [POOL]))
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_an_extra_share_to_another_account_is_mailed(self):
+        self.use(FakeCloudTrail([(POOL, "backup.amazonaws.com")]), FakeEC2(backup_copy(), [POOL, "222222222222"]))
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_a_failing_check_is_mailed(self):
+        def boom(name, region_name=None):
+            raise AwsError("AccessDenied")
+        digest.boto3.client = boom
+        self.assertEqual(self.mailed_after_hold(), 1)
+
+    def test_public_other_region_other_account_and_other_types_are_not_held(self):
+        for event in (snapshot_finding(public=True, fid="p"), snapshot_finding(region="eu-west-1", fid="r"),
+                      snapshot_finding(account="222222222222", fid="a")):
+            self.assertEqual(digest.alerts_from_event(event)[0]["kind"], digest.IMMEDIATE)
+        other = snapshot_finding(fid="b"); other["detail"]["resourceType"] = "AWS::S3::Bucket"
+        self.assertEqual(digest.alerts_from_event(other)[0]["kind"], digest.IMMEDIATE)
+
+    def test_a_hold_past_its_limit_is_mailed_whatever_the_check(self):
+        self.deliver([snapshot_finding()])
+        CLOCK[0] += digest.HOLD_MAX + 60
+        before = len(self.sns.messages)
+        self.tick(60)
+        self.assertEqual(len(self.sns.messages) - before, 1)
+
+
 class TerraformTests(unittest.TestCase):
     def block(self, source, kind, name):
         start = source.index('resource "%s" "%s" {' % (kind, name))
@@ -549,8 +676,12 @@ class TerraformTests(unittest.TestCase):
         policy = self.block(TF, "aws_iam_role_policy", "security_alert_digest")
         resources = re.findall(r"Resource = (.+)", policy)
         self.assertEqual(resources, ["aws_dynamodb_table.security_alert_digest.arn", "aws_sqs_queue.security_alert_digest_inbox.arn",
-                                     "aws_sns_topic.cost_alerts.arn", '"${aws_cloudwatch_log_group.security_alert_digest.arn}:*"'])
-        self.assertNotIn('"*"', policy)
+                                     "aws_sns_topic.cost_alerts.arn", '"*"', '"${aws_cloudwatch_log_group.security_alert_digest.arn}:*"'])
+        # The one "*" is the read-only backup-copy check (#577): exactly these three actions, nothing that writes.
+        star = policy[policy.index('Sid      = "CheckBackupCopyShares"'):]
+        star = star[:star.index("}")]
+        self.assertIn('Action   = ["ec2:DescribeSnapshots", "ec2:DescribeSnapshotAttribute", "cloudtrail:LookupEvents"]', star)
+        self.assertEqual(policy.count('"*"'), 1)
         function = self.block(TF, "aws_lambda_function", "security_alert_digest")
         self.assertIn('architectures    = ["arm64"]', function)
         self.assertIn('runtime          = "python3.12"', function)

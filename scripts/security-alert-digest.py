@@ -53,7 +53,18 @@ MAX_ITEMS = 3000              # pending items read per kind per run; the rest go
 TOP_N = 25
 FIELD_LIMIT = 300
 
-IMMEDIATE, DIGEST = "i#", "d#"
+IMMEDIATE, DIGEST, HELD = "i#", "d#", "h#"
+
+# AWS Backup's air-gapped copy (#577). For each nightly copy into the logically air-gapped vault, AWS Backup itself shares
+# the EBS snapshot with one of a pool of AWS-owned accounts and unshares it minutes later, and Access Analyzer reports each
+# share as external access. Such a finding is HELD for HOLD seconds (CloudTrail's lookup lags by up to ~15 minutes), then
+# dropped only when backup_copy_share() proves the share was AWS Backup's own; anything unproven is mailed as before.
+HOLD = 20 * 60
+HOLD_MAX = 2 * 3600                       # still unresolved after this: mailed, whatever the check says
+BACKUP_COPY_ACCOUNT = os.environ.get("BACKUP_COPY_ACCOUNT", "")
+BACKUP_COPY_REGIONS = set(filter(None, os.environ.get("BACKUP_COPY_REGIONS", "").split(",")))
+BACKUP_COPY_DESCRIPTION = "This snapshot is copied by the AWS Backup service."
+BACKUP_PIPELINE = "fleet-processing-v2"
 CONTROL = {"pk": {"S": "control"}, "sk": {"S": "send"}}
 
 _ddb = _sns = None
@@ -200,7 +211,10 @@ def alerts_from_event(event):
     if source == "aws.access-analyzer" and kind_name == "Access Analyzer Finding":
         acct, reg = detail.get("accountId") or account, detail.get("region") or region
         public = detail.get("isPublic") is True
-        return [alert("access-analyzer:%s:%s:%s" % (acct, reg, detail.get("id") or event.get("id")), IMMEDIATE,
+        principal = (detail.get("principal") or {}).get("AWS") if isinstance(detail.get("principal"), dict) else None
+        held = (not public and detail.get("resourceType") == "AWS::EC2::Snapshot" and isinstance(principal, str)
+                and acct == BACKUP_COPY_ACCOUNT and reg in BACKUP_COPY_REGIONS)
+        return [alert("access-analyzer:%s:%s:%s" % (acct, reg, detail.get("id") or event.get("id")), HELD if held else IMMEDIATE,
                       "Access Analyzer", ("Public" if public else "External") + " access to " + str(detail.get("resourceType") or "a resource"),
                       acct, reg, "public" if public else "", detail.get("resource"), detail.get("resourceType"),
                       "principal " + json.dumps(detail.get("principal"), sort_keys=True) if detail.get("principal") else "",
@@ -410,6 +424,75 @@ def compose(immediate, digest, more_immediate, more_digest, t):
     return subject_line("Security alerts: " + ", ".join(parts)), body
 
 
+def principal_of(item):
+    detail = item.get("detail") or ""
+    try:
+        return json.loads(detail[len("principal "):]).get("AWS") if detail.startswith("principal ") else None
+    except Exception:
+        return None
+
+
+def backup_copy_share(region, snapshot_arn, principal):
+    """True only when the snapshot's shares to `principal` were all made by AWS Backup itself (CloudTrail invokedBy
+    backup.amazonaws.com, at least one such share, none by anyone else) and, if the snapshot still exists, it is an AWS
+    Backup copy of this pipeline shared with nobody else. Any error or missing evidence: False (the alert is mailed)."""
+    snapshot_id = str(snapshot_arn).rsplit("/", 1)[-1]
+    if not snapshot_id.startswith("snap-") or not principal:
+        return False
+    adds = []
+    pages = boto3.client("cloudtrail", region_name=region).get_paginator("lookup_events").paginate(
+        LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": snapshot_id}],
+        StartTime=datetime.datetime.fromtimestamp(now() - HOLD_MAX - 3600, datetime.timezone.utc))
+    for page in pages:
+        for event in page.get("Events", []):
+            if event.get("EventName") != "ModifySnapshotAttribute":
+                continue
+            record = json.loads(event.get("CloudTrailEvent") or "{}")
+            items = (((record.get("requestParameters") or {}).get("createVolumePermission") or {}).get("add") or {}).get("items") or []
+            if any(i.get("userId") == principal or i.get("group") for i in items):
+                adds.append((record.get("userIdentity") or {}).get("invokedBy"))
+    if not adds or any(by != "backup.amazonaws.com" for by in adds):
+        return False
+    ec2 = boto3.client("ec2", region_name=region)
+    try:
+        snapshot = ec2.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])["Snapshots"][0]
+    except Exception as exc:
+        # AWS Backup deletes the processing copy once it is copied: gone is fine, anything else is unproven.
+        return error_code(exc) == "InvalidSnapshot.NotFound"
+    tags = {tag.get("Key"): tag.get("Value") for tag in snapshot.get("Tags") or []}
+    if snapshot.get("Description") != BACKUP_COPY_DESCRIPTION or tags.get("BackupPipeline") != BACKUP_PIPELINE \
+            or "aws:backup:source-resource" not in tags:
+        return False
+    shared = ec2.describe_snapshot_attribute(SnapshotId=snapshot_id, Attribute="createVolumePermission")
+    return all(p.get("UserId") == principal and not p.get("Group") for p in shared.get("CreateVolumePermissions") or [])
+
+
+def resolve_held(t):
+    """Each held snapshot finding older than HOLD: dropped if it is AWS Backup's own copy share, else mailed."""
+    dropped = promoted = 0
+    held, _ = pending(HELD)
+    for item in held:
+        age = t - item["received"]
+        if age < HOLD:
+            continue
+        body = item["alert"]
+        try:
+            ours = age < HOLD_MAX and backup_copy_share(body.get("region"), body.get("resource"), principal_of(body))
+        except Exception as exc:
+            print(json.dumps({"held_check_failed": body.get("identity"), "error": type(exc).__name__}))
+            ours = False
+        if ours:
+            print(json.dumps({"dropped": "aws-backup-copy-share", "resource": body.get("resource"), "principal": principal_of(body)}))
+            dropped += 1
+        else:
+            body = dict(body, kind=IMMEDIATE)
+            ddb().put_item(TableName=TABLE, Item={"pk": S("pending"), "sk": S(IMMEDIATE + body["identity"]),
+                                                  "received": N(t), "alert": S(json.dumps(body, sort_keys=True))})
+            promoted += 1
+        delete([item])
+    return dropped, promoted
+
+
 def release(sent_at=None, digest_sent=False):
     expression, values = "SET lease_until = :zero", {":zero": N(0)}
     if sent_at is not None:
@@ -434,6 +517,7 @@ def flush(t):
         raise
     sent_at, digest = None, []
     try:
+        resolve_held(t)
         immediate, more_immediate = pending(IMMEDIATE)
         more_digest = False
         if t >= int(number(control.get("next_digest", {}).get("N"))):
