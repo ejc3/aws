@@ -274,6 +274,8 @@ jobs:
 
       - name: "The Dolphin account: its own OU, root address from people/addresses, never closed by Terraform"
         run: python3 -S -B scripts/test-dolphin-account.py
+      - name: constellation account (fcvm-arm only, one exact role, no organization path; offline)
+        run: python3 -S -B scripts/test-constellation-account.py
 
       - name: Turso API token is readable by the metal boxes and administration only
         run: python3 -S -B scripts/test-turso-token.py

@@ -9,8 +9,10 @@
 #     --secret-id people/addresses --secret-string file:///dev/stdin; unset T
 #   {"owner": "...", "family": ["...", "..."], "staging_account": "...", "colton_games_site_admins": {"prod": [...], "nonprod": [...]},
 #    "dolphin_films": {"prod": {"seeds": [...], "admins": [...]}, "nonprod": {"seeds": [...], "admins": [...]}},
-#    "claude_master_dashboard": ["...", "..."], "dolphin_account": "...", "dolphin_steve": "..."}
-#   (dolphin_account is the root address of the Dolphin member account, dolphin-account.tf. dolphin_steve is optional: Steve's
+#    "claude_master_dashboard": ["...", "..."], "dolphin_account": "...", "constellation_account": "...",
+#    "dolphin_steve": "..."}
+#   (dolphin_account and constellation_account are the root addresses of the Dolphin and constellation member accounts,
+#   dolphin-account.tf and constellation-account.tf. dolphin_steve is optional: Steve's
 #   address, which creates his Identity Center user and read-only assignment, dolphin-identity-center.tf. dolphin_films is
 #   read by no Terraform: an administrator loads its lists into the Worker dolphin-films-prod as FILMS_SEED_EMAILS and
 #   FILMS_ADMIN_EMAILS. claude_master_dashboard is optional: the people besides the
@@ -57,10 +59,11 @@ locals {
   # in-place "update" for the mark alone, and the dev-staging account's update makes every value that depends on its id unknown
   # (one such plan wanted to replace the security modules' IAM roles). Unmarked, an unchanged address plans no change at all.
   # The cost: if an address DOES change, the plan prints it. Plans stay on the jumpbox and in the Stop hook's log.
-  dev_allowed_emails    = nonsensitive(local.people.family)          # Cloudflare Access: who may reach every *.cc-games.dev host
-  browser_manager_owner = nonsensitive(local.people.owner)           # the browser manager's single owner
-  dev_staging_email     = nonsensitive(local.people.staging_account) # root email of the dev-staging member account
-  dolphin_account_email = nonsensitive(local.people.dolphin_account) # root email of the Dolphin member account
+  dev_allowed_emails          = nonsensitive(local.people.family)                # Cloudflare Access: who may reach every *.cc-games.dev host
+  browser_manager_owner       = nonsensitive(local.people.owner)                 # the browser manager's single owner
+  dev_staging_email           = nonsensitive(local.people.staging_account)       # root email of the dev-staging member account
+  dolphin_account_email       = nonsensitive(local.people.dolphin_account)       # root email of the Dolphin member account
+  constellation_account_email = nonsensitive(local.people.constellation_account) # root email of the constellation member account
 }
 
 # Fail the plan, naming the key and never the value, if the secret is missing, empty, or still lacks a key. An empty Access
@@ -70,12 +73,12 @@ resource "terraform_data" "people_shape" {
 
   lifecycle {
     precondition {
-      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account) && can(local.people.dolphin_account) && can(local.people.colton_games_site_admins.prod) && can(local.people.colton_games_site_admins.nonprod)
-      error_message = "The people/addresses secret must be JSON with the keys owner, family, staging_account, dolphin_account and colton_games_site_admins {prod, nonprod} (see people.tf)."
+      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account) && can(local.people.dolphin_account) && can(local.people.constellation_account) && can(local.people.colton_games_site_admins.prod) && can(local.people.colton_games_site_admins.nonprod)
+      error_message = "The people/addresses secret must be JSON with the keys owner, family, staging_account, dolphin_account, constellation_account and colton_games_site_admins {prod, nonprod} (see people.tf)."
     }
     precondition {
-      condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.dolphin_account))
-      error_message = "people/addresses: owner, staging_account and dolphin_account must each be one email address."
+      condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.dolphin_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.constellation_account))
+      error_message = "people/addresses: owner, staging_account, dolphin_account and constellation_account must each be one email address."
     }
     precondition {
       condition     = length(local.people.family) > 0 && alltrue([for e in local.people.family : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", e))])
