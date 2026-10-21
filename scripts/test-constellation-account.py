@@ -9,18 +9,20 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "constellation-account.tf").read_text()
+LATTICE = (ROOT / "constellation-lattice-stage.tf").read_text()
 
 
-def block(header):
-    start = TF.index(header)
+def block(header, text=None):
+    text = TF if text is None else text
+    start = text.index(header)
     depth = 0
-    for i in range(TF.index("{", start), len(TF)):
-        if TF[i] == "{":
+    for i in range(text.index("{", start), len(text)):
+        if text[i] == "{":
             depth += 1
-        elif TF[i] == "}":
+        elif text[i] == "}":
             depth -= 1
             if depth == 0:
-                return TF[start:i + 1]
+                return text[start:i + 1]
     raise AssertionError(header)
 
 
@@ -71,6 +73,82 @@ class ConstellationAccountTests(unittest.TestCase):
         self.assertIn("StateObjectsForAppliersOnly", policy)
         self.assertIn('"s3:GetObject"', policy)
         self.assertIn("local.constellation_terraform_role_arn", policy)
+
+    def test_the_pointer_is_readable_by_fcvm_arm_only_and_holds_no_credential(self):
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"')
+        read = grant[grant.index("ReadTheConstellationPointerOnly"):]
+        self.assertIn('Action    = "ssm:GetParameter"', read)
+        self.assertIn("Resource  = aws_ssm_parameter.constellation.arn", read)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', read)
+        param = block('resource "aws_ssm_parameter" "constellation"')
+        self.assertIn('name        = "/infra/constellation"', param)
+        self.assertIn('type        = "String"', param)
+        self.assertIn("value       = jsonencode(local.constellation_pointer)", param)
+        pointer = block("lattice_stage_pointer = {", LATTICE)
+        for leak in ("token", "secret_string", "secret_version", "client_secret"):
+            self.assertNotIn(leak, pointer.replace("tunnel_secret_name", "").replace("tunnel_secret_key", "").replace('"TUNNEL_TOKEN"', ""))
+
+
+class LatticeStageTests(unittest.TestCase):
+    def test_the_host_is_owner_only(self):
+        app = block('resource "cloudflare_zero_trust_access_application" "lattice_stage"', LATTICE)
+        self.assertIn("domain           = local.lattice_stage_hostname", app)
+        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+)\.id", app),
+                         ["cloudflare_zero_trust_access_policy.lattice_stage_owner"])
+        owner = block('resource "cloudflare_zero_trust_access_policy" "lattice_stage_owner"', LATTICE)
+        self.assertIn('decision         = "allow"', owner)
+        self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", owner)
+        self.assertNotIn("everyone", app)
+
+    def test_only_the_two_bearer_token_paths_skip_access(self):
+        paths = re.search(r"lattice_stage_bypass_paths = \[(.*?)\n  \]", LATTICE, re.S).group(1)
+        self.assertEqual(re.findall(r'"\$\{local\.lattice_stage_hostname\}(/[^"]*)"', paths), ["/lattice/live", "/lattice/v1/*"])
+        self.assertNotIn("native", paths)
+        bypass = block('resource "cloudflare_zero_trust_access_application" "lattice_stage_bearer_paths"', LATTICE)
+        self.assertIn("for uri in local.lattice_stage_bypass_paths", bypass)
+        self.assertIn("domain       = local.lattice_stage_bypass_paths[0]", bypass)
+        self.assertIn("cloudflare_zero_trust_access_policy.lattice_stage_bearer_paths.id", bypass)
+        # The only bypass-everyone policy in the file is the one attached to those paths.
+        self.assertEqual(LATTICE.count('decision   = "bypass"'), 1)
+        self.assertEqual(LATTICE.count("everyone = {}"), 1)
+
+    def test_the_hostname_appears_only_after_access_covers_it(self):
+        dns = block('resource "cloudflare_dns_record" "lattice_stage"', LATTICE)
+        self.assertIn("cloudflare_zero_trust_access_application.lattice_stage,", dns)
+        self.assertIn("cloudflare_zero_trust_access_application.lattice_stage_bearer_paths,", dns)
+        self.assertIn("proxied = true", dns)
+
+    def test_the_tunnel_reaches_only_the_task_local_api(self):
+        config = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "lattice_stage"', LATTICE)
+        self.assertEqual(set(re.findall(r'service  = "([^"]+)"', config)), {"http://localhost:${local.lattice_stage_api_port}"})
+        self.assertIn('{ service = "http_status:404" }', config)
+
+    def test_the_connector_requires_access_except_on_the_bypassed_paths(self):
+        config = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "lattice_stage"', LATTICE)
+        rules = config[config.index("ingress = ["):]
+        first, second = rules.split("      {\n        hostname")[1:3]
+        self.assertIn("path     = local.lattice_stage_bypass_regex", first)
+        self.assertNotIn("origin_request", first)
+        self.assertNotIn("path", second)
+        self.assertIn("required  = true", second)
+        self.assertIn("aud_tag   = [cloudflare_zero_trust_access_application.lattice_stage.aud]", second)
+        # The connector's regex lets through exactly what Access bypasses, and no more.
+        rx = re.compile(re.search(r'lattice_stage_bypass_regex = "([^"]+)"', LATTICE).group(1))
+        for path in ("/lattice/live", "/lattice/v1/accounts", "/lattice/v1/a/b"):
+            self.assertTrue(rx.search(path), path)
+        for path in ("/lattice/native/login", "/lattice/live/x", "/lattice/livex", "/lattice/v1", "/lattice/v1x", "/", "/x/lattice/v1/a"):
+            self.assertFalse(rx.search(path), path)
+
+    def test_the_connector_token_goes_to_the_constellation_account_only(self):
+        secret = block('resource "aws_secretsmanager_secret" "lattice_stage_tunnel"', LATTICE)
+        version = block('resource "aws_secretsmanager_secret_version" "lattice_stage_tunnel"', LATTICE)
+        self.assertIn("provider                = aws.constellation", secret)
+        self.assertIn('name                    = "constellation/nonprod/tunnel"', secret)
+        self.assertIn("provider      = aws.constellation", version)
+        self.assertIn("secret_id     = aws_secretsmanager_secret.lattice_stage_tunnel.id", version)
+        self.assertIn("secret_string = jsonencode({ TUNNEL_TOKEN = data.cloudflare_zero_trust_tunnel_cloudflared_token.lattice_stage.token })", version)
+        self.assertEqual(LATTICE.count("cloudflared_token.lattice_stage.token"), 1)
+        self.assertNotIn("aws_iam_", LATTICE)
 
 
 if __name__ == "__main__":
