@@ -64,7 +64,8 @@ locals {
     # repository: NODE_MAJOR the node-version (or .nvmrc) of its actions/setup-node steps, PYTHON_VERSIONS the
     # python-version of its actions/setup-python steps, PLAYWRIGHT_VERSION the @playwright/test version in the
     # package-lock.json its e2e jobs install from and PLAYWRIGHT_BROWSERS the browsers they install, APT_PACKAGES what
-    # its jobs apt-get install. A pin that falls behind costs time, never correctness.
+    # its jobs apt-get install, RUST_* its rust-toolchain.toml (channel, components, targets) and WASM_BINDGEN_VERSION
+    # the exact wasm-bindgen its Cargo.toml pins. A pin that falls behind costs time, never correctness.
     "dolphin-labs-runner" = {
       repo   = "dolphin-labs-hq/dolphin-labs"
       script = "node-web-runner.sh"
@@ -90,10 +91,15 @@ locals {
     "dolphin-maps-runner" = {
       repo   = "dolphin-labs-hq/dolphin-maps"
       script = "node-web-runner.sh"
-      # .github/workflows/ci.yml, scrape-live.yml (Python's Playwright drives a remote browser: nothing to install).
+      # .github/workflows/ci.yml, scrape-live.yml (Python's Playwright drives a remote browser: nothing to install);
+      # engine-rs/rust-toolchain.toml and engine-rs/Cargo.toml (built natively and to WebAssembly).
       versions = {
-        NODE_MAJOR      = "22"
-        PYTHON_VERSIONS = "3.12"
+        NODE_MAJOR           = "22"
+        PYTHON_VERSIONS      = "3.12"
+        RUST_TOOLCHAIN       = "1.93.0"
+        RUST_COMPONENTS      = "rustfmt,clippy"
+        RUST_TARGETS         = "wasm32-unknown-unknown"
+        WASM_BINDGEN_VERSION = "0.2.129"
       }
     }
     "colton-games-runner" = {
