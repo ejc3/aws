@@ -969,9 +969,12 @@ builds images of everything a repo's jobs install, and a repo opts in by naming 
   with each repo's pins: the newest Node of its major (checked against nodejs.org's SHASUMS256) and the newest build of
   each Python minor from actions/python-versions (installed by that build's own `setup.sh`), both in the tool cache where
   `actions/setup-node` and `actions/setup-python` look before they download; Playwright's system libraries and its
-  browsers in the runner's `~/.cache/ms-playwright` for the version in the repo's lockfile; and any packages a job
-  `apt-get install`s (colton-games: PostgreSQL 16). Nothing goes on `PATH`: the setup steps put the tool-cache copies
-  there. Each repo boots its image (`image = "<name>"` in its entry); the first builds were on 2026-10-17.
+  browsers in the runner's `~/.cache/ms-playwright` for the version in the repo's lockfile; any packages a job
+  `apt-get install`s (colton-games: PostgreSQL 16); and, where an image pins `RUST_TOOLCHAIN` (dolphin-maps), rustup in
+  the runner's home with that toolchain, its components and targets, and `wasm-bindgen-cli` at `WASM_BINDGEN_VERSION`,
+  with `~/.cargo/bin` first on every job's `PATH` (as in `imagine-runner`). Nothing else goes on `PATH`: the setup
+  steps put the tool-cache copies there. Each repo boots its image (`image = "<name>"` in its entry); the first builds
+  were on 2026-10-17.
 - **The pipeline.** Lambda `github-app-runner-image` (`runner-app/image_builder.py`), the shape of fcvm's builder
   (Pattern A) without a GitHub identity: weekly (Monday 09:00 UTC, `{"build": true}`) and on demand it launches one
   on-demand `github-app-runner-image-builder` host from Canonical's image into the runner subnets with

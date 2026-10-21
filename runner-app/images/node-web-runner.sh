@@ -10,9 +10,15 @@
 #   PLAYWRIGHT_VERSION   optional, with PLAYWRIGHT_BROWSERS (comma-separated: chromium,webkit); those
 #                        browsers' system libraries, and the browsers in the runner's ~/.cache/ms-playwright
 #   APT_PACKAGES         optional, comma-separated Ubuntu packages a job installs with apt-get
+#   RUST_TOOLCHAIN       optional, with RUST_COMPONENTS and RUST_TARGETS (comma-separated, either may
+#                        be left out): rustup in the runner's home with that toolchain as its
+#                        default, as the repo's rust-toolchain.toml names it, and ~/.cargo/bin first
+#                        on a job's PATH (bootstrap.sh reads /etc/github-app-runner/path)
+#   WASM_BINDGEN_VERSION optional, with RUST_TOOLCHAIN: wasm-bindgen-cli at exactly that version in
+#                        ~/.cargo/bin, as the repo's Cargo.toml pins the wasm-bindgen crate
 #
-# Each goes where the repo's own setup step looks before it downloads, so a job finds it and skips
-# that download. A job that does not find what it asks for (an image built before a version changed)
+# Each goes where the repo's own setup step looks before it downloads (rustup and wasm-bindgen: on
+# the job's PATH), so a job finds it and skips that download. A job that does not find what it asks for (an image built before a version changed)
 # installs it as on Canonical's image: an image that falls behind is only slower, never different.
 set -euo pipefail
 
@@ -22,6 +28,8 @@ NODE_MIRROR=${NODE_MIRROR:-https://nodejs.org/dist}
 PYTHON_MANIFEST=${PYTHON_MANIFEST:-https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json}
 UBUNTU_RELEASE=${UBUNTU_RELEASE:-24.04}
 RUNNER_HOME=${RUNNER_HOME:-/home/runner}
+RUSTUP_INIT_URL=${RUSTUP_INIT_URL:-https://sh.rustup.rs}
+RUNNER_PATH_FILE=${RUNNER_PATH_FILE:-/etc/github-app-runner/path}  # bootstrap.sh reads it
 
 get() { curl -fsSL --retry 3 --retry-all-errors "$@"; }
 
@@ -88,16 +96,39 @@ install_playwright() {
   sudo -u runner -H env PATH="$NODE_BIN:$PATH" npx -y "playwright@$PLAYWRIGHT_VERSION" install $browsers
 }
 
+install_rust() {
+  # rustup in the runner's home, as a job's own setup would put it (as imagine-runner.sh does), the
+  # pinned toolchain its default with its components and targets; then wasm-bindgen-cli, built by
+  # that toolchain. ~/.cargo/bin goes first on every job's PATH.
+  local cargo_bin=$RUNNER_HOME/.cargo/bin
+  get -o "$TMPDIR/rustup-init.sh" "$RUSTUP_INIT_URL"
+  chmod a+r "$TMPDIR/rustup-init.sh"
+  sudo -u runner -H sh "$TMPDIR/rustup-init.sh" -y --profile minimal --default-toolchain none --no-modify-path
+  rm -f "$TMPDIR/rustup-init.sh"
+  sudo -u runner -H "$cargo_bin/rustup" toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+    ${RUST_COMPONENTS:+--component "$RUST_COMPONENTS"} ${RUST_TARGETS:+--target "$RUST_TARGETS"}
+  sudo -u runner -H "$cargo_bin/rustup" default "$RUST_TOOLCHAIN"
+  if [ -n "${WASM_BINDGEN_VERSION:-}" ]; then
+    sudo -u runner -H "$cargo_bin/cargo" install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+  fi
+  mkdir -p "$(dirname "$RUNNER_PATH_FILE")"
+  printf '%s\n' "$cargo_bin" > "$RUNNER_PATH_FILE"
+}
+
 main() {
   : "${NODE_MAJOR:?}"
   if [ -n "${PLAYWRIGHT_VERSION:-}" ] || [ -n "${PLAYWRIGHT_BROWSERS:-}" ]; then
     : "${PLAYWRIGHT_VERSION:?set with PLAYWRIGHT_BROWSERS}" "${PLAYWRIGHT_BROWSERS:?set with PLAYWRIGHT_VERSION}"
+  fi
+  if [ -n "${RUST_COMPONENTS:-}${RUST_TARGETS:-}${WASM_BINDGEN_VERSION:-}" ]; then
+    : "${RUST_TOOLCHAIN:?set with RUST_COMPONENTS, RUST_TARGETS or WASM_BINDGEN_VERSION}"
   fi
   TMPDIR=${TMPDIR:-/tmp}
   [ -z "${APT_PACKAGES:-}" ] || install_apt_packages
   install_node
   [ -z "${PYTHON_VERSIONS:-}" ] || install_python
   [ -z "${PLAYWRIGHT_VERSION:-}" ] || install_playwright
+  [ -z "${RUST_TOOLCHAIN:-}" ] || install_rust
   chown -R runner:runner "$TOOL_CACHE"
 }
 

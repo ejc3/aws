@@ -547,10 +547,41 @@ class NodeWebImageScriptTests(unittest.TestCase):
             self.assertNotEqual(out.returncode, 0, pins)
             self.assertIn("set with PLAYWRIGHT_", out.stderr)
 
+    def test_rust_is_rustup_in_the_runners_home_at_the_pins_with_cargo_bin_on_the_path(self):
+        tmp = self.fixture()
+        home, log = tmp / "home", tmp / "rust.log"
+        # rustup-init, as sh.rustup.rs serves it: here it writes a rustup and a cargo that log their arguments.
+        (tmp / "served" / "rustup-init.sh").write_text(
+            'mkdir -p "$HOME/.cargo/bin"\necho "init $*" >> "$LOG"\n'
+            'for t in rustup cargo; do printf \'#!/bin/sh\\necho "%s $*" >> "$LOG"\\n\' "$t" > "$HOME/.cargo/bin/$t"; '
+            'chmod +x "$HOME/.cargo/bin/$t"; done\n')
+        (tmp / "bin" / "sudo").write_text('#!/bin/bash\nwhile [[ $1 == -* ]]; do [ "$1" = -u ] && shift; shift; done\nexec "$@"\n')
+        (tmp / "bin" / "sudo").chmod(0o755)
+        out = self.run_steps(tmp, "install_rust", RUST_TOOLCHAIN="1.93.0", RUST_COMPONENTS="rustfmt,clippy",
+                             RUST_TARGETS="wasm32-unknown-unknown", WASM_BINDGEN_VERSION="0.2.129",
+                             RUSTUP_INIT_URL="https://mirror.example/rustup-init.sh", RUNNER_HOME=str(home), HOME=str(home),
+                             LOG=str(log), RUNNER_PATH_FILE=str(tmp / "etc" / "path"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(log.read_text().splitlines(), [
+            "init -y --profile minimal --default-toolchain none --no-modify-path",
+            "rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown",
+            "rustup default 1.93.0",
+            "cargo install wasm-bindgen-cli --version 0.2.129 --locked",
+        ])
+        self.assertEqual((tmp / "etc" / "path").read_text(), f"{home}/.cargo/bin\n", "bootstrap.sh puts it first on a job's PATH")
+
+    def test_rust_pins_need_the_toolchain(self):
+        tmp = self.fixture()
+        for pins in ({"RUST_TARGETS": "wasm32-unknown-unknown"}, {"WASM_BINDGEN_VERSION": "0.2.129"}):
+            out = self.run_steps(tmp, "main", NODE_MAJOR="22", **pins)
+            self.assertNotEqual(out.returncode, 0, pins)
+            self.assertIn("RUST_TOOLCHAIN", out.stderr)
+
     def test_the_script_is_valid_and_every_image_using_it_pins_only_what_it_reads(self):
         subprocess.run(["bash", "-n", str(NODE_WEB_SCRIPT)], check=True)
         text = NODE_WEB_SCRIPT.read_text()
-        known = {"NODE_MAJOR", "PYTHON_VERSIONS", "PLAYWRIGHT_VERSION", "PLAYWRIGHT_BROWSERS", "APT_PACKAGES"}
+        known = {"NODE_MAJOR", "PYTHON_VERSIONS", "PLAYWRIGHT_VERSION", "PLAYWRIGHT_BROWSERS", "APT_PACKAGES",
+                 "RUST_TOOLCHAIN", "RUST_COMPONENTS", "RUST_TARGETS", "WASM_BINDGEN_VERSION"}
         for pin in known:
             self.assertIn("${" + pin, text, "the script reads every pin an image may set")
         entries = re.findall(r'^    "([a-z0-9-]+)" = \{\n      repo\s+= "([^"]+)"\n      script = "node-web-runner\.sh"\n'
@@ -563,6 +594,8 @@ class NodeWebImageScriptTests(unittest.TestCase):
             self.assertIn("NODE_MAJOR", pins, name)
             self.assertLessEqual(set(pins), known, name)
             self.assertEqual("PLAYWRIGHT_VERSION" in pins, "PLAYWRIGHT_BROWSERS" in pins, name)
+            if {"RUST_COMPONENTS", "RUST_TARGETS", "WASM_BINDGEN_VERSION"} & set(pins):
+                self.assertIn("RUST_TOOLCHAIN", pins, name)
             self.assertIn(repo, repos, f"{name} is for an app runner repo")
             for value in pins.values():
                 self.assertRegex(value, r"^[A-Za-z0-9][A-Za-z0-9._:/@+,-]{0,199}$", "image_builder.py's VERSION_VALUE")
