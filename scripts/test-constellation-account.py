@@ -41,21 +41,23 @@ class ConstellationAccountTests(unittest.TestCase):
         self.assertIn(":instance/fcvm-arm-not-running", TF)
 
     def test_the_dev_box_grant_names_exactly_that_role(self):
-        grant = block('resource "aws_iam_role_policy" "dev_server_constellation_terraform"')
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"')
+        attach = block('resource "aws_iam_role_policy_attachment" "dev_server_constellation_terraform"')
+        self.assertIn("role       = aws_iam_role.dev_server.name", attach)
         self.assertIn('Action    = "sts:AssumeRole"', grant)
         self.assertIn("Resource  = aws_iam_role.constellation_terraform.arn", grant)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', grant)
 
     def test_nothing_gives_a_dev_box_the_organization_or_other_accounts(self):
         # The options refused in constellation's own notes: organizations:CreateAccount for a dev box, and AssumeRole on
-        # OrganizationAccountAccessRole in any account (admin of every member account).
-        for role in ("aws_iam_role.dev_server", "aws_iam_role.nextjs_dev"):
-            for m in re.finditer(r'resource "aws_iam_role_policy" "(\w+)" \{', TF):
-                body = block(m.group(0)[:-2])
-                if f"role = {role}.id" in body.replace("  ", " ") or f"role = {role}.id" in body:
-                    self.assertNotIn("organizations:", body)
-                    self.assertNotIn("OrganizationAccountAccessRole", body)
-                    self.assertNotIn("arn:aws:iam::*", body)
+        # OrganizationAccountAccessRole in any account (admin of every member account). Every IAM policy in this file,
+        # inline or managed, whoever it is attached to, is screened: a managed policy's body does not name its role.
+        policies = [block(m.group(0)[:-2]) for m in re.finditer(r'resource "aws_iam_(?:role_policy|policy)" "\w+" \{', TF)]
+        self.assertTrue(any("aws_iam_role.constellation_terraform.arn" in b for b in policies))
+        for body in policies:
+            self.assertNotIn("organizations:", body)
+            self.assertNotIn("OrganizationAccountAccessRole", body)
+            self.assertNotIn("arn:aws:iam::*", body)
         self.assertNotIn("organizations:CreateAccount", TF)
 
     def test_github_holds_no_aws_credential_for_this_account(self):
