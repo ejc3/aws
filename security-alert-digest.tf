@@ -150,6 +150,14 @@ resource "aws_iam_role_policy" "security_alert_digest" {
         Resource = aws_sns_topic.cost_alerts.arn
       },
       {
+        # #577: to tell AWS Backup's own air-gapped-copy snapshot share from any other, a held Access Analyzer snapshot
+        # finding is checked against the snapshot and CloudTrail. Read-only; these calls take no resource-level scope.
+        Sid      = "CheckBackupCopyShares"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeSnapshots", "ec2:DescribeSnapshotAttribute", "cloudtrail:LookupEvents"]
+        Resource = "*"
+      },
+      {
         Sid      = "ItsLogs"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
@@ -174,6 +182,9 @@ resource "aws_lambda_function" "security_alert_digest" {
     variables = {
       STATE_TABLE   = aws_dynamodb_table.security_alert_digest.name
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
+      # #577: where AWS Backup copies into the air-gapped vault (backup-security.tf); only those snapshot findings are held.
+      BACKUP_COPY_ACCOUNT = data.aws_caller_identity.current.account_id
+      BACKUP_COPY_REGIONS = "us-west-1,us-east-1"
       # Shown next to account ids in the emails. The Dolphin account is left out on purpose (test-dolphin-account.py:
       # nothing here references it); its alerts show the bare id.
       ACCOUNT_NAMES = jsonencode({
