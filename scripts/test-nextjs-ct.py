@@ -331,5 +331,22 @@ class BoxAgentNotesTests(unittest.TestCase):
             self.assertIn(phrase, notes)
 
 
+class EternalTerminalTests(unittest.TestCase):
+    """The phone connects with Eternal Terminal: nextjs-dev ran etserver on 2022, the containers did not, and the phone's
+    `etterminal` over ssh exited 127. One container, the owner's, gets the pinned build and the host's port."""
+
+    def test_the_build_is_pinned_and_checked_and_only_the_owner_gets_the_port(self):
+        self.assertRegex(CT_USER_DATA, r'eternal_terminal = \{ url = "https://github.com/ejc3/EternalTerminal/releases/download/binaries-7\.x/et-aarch64\.tar\.gz", sha256 = "[0-9a-f]{64}", user = "ejc3", port = 2022 \}')
+        provision = (SCRIPTS / "ct" / "provision").read_text()
+        self.assertIn('echo "$ET_SHA  $ET_TMP/et.tgz" | sha256sum -c -', provision)
+        self.assertIn('[ "$ET_USER" = "$U" ]', provision)
+
+    def test_the_firewall_forwards_the_port_from_outside_to_that_container_only(self):
+        fw = (SCRIPTS / "host" / "nextjs-ct-firewall").read_text()
+        self.assertIn('[ "$U" = "$ET_USER" ]', fw)
+        self.assertIn('iifname != \\"ve-*\\" fib daddr type local tcp dport $ET_PORT dnat to 10.88.$N.2:$ET_PORT', fw)
+        self.assertIn('iifname != \\"ve-*\\" oifname \\"$IF\\" ip daddr 10.88.$N.2 tcp dport $ET_PORT ct status dnat accept', fw)
+
+
 if __name__ == "__main__":
     unittest.main()

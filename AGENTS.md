@@ -564,6 +564,9 @@ only. Rules an agent must keep:
   starter file is create-only). They say the claw-master `HTTPS_PROXY` is a forwarder, not a firewall (an agent unset it
   and blamed it, 2026-10-21), that the host-side firewall and the narrowed role are the limits, and to name a cause only
   once seen. Codex has no machine-wide file, so these reach Claude Code only.
+- **Eternal Terminal** (the phone's Prompt connects with it): `eternal_terminal` in config.json pins the 7.x build nextjs-dev
+  ran; provision installs it and runs etserver in that one account's container (`ejc3`), and the host firewall forwards the
+  public 2022 (open in the security group, as on nextjs-dev) there only. Without it Prompt's `etterminal` exits 127.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
   --pipe --wait ...`) from `ubuntu`.
 
