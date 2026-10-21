@@ -97,9 +97,14 @@ class ElevenLabsSecretTests(unittest.TestCase):
                                    "pricing:ListPriceLists", "pricing:GetPriceListFileUrl"})
         self.assertNotRegex(TF, r'"(ce|cur|billing|budgets|aws-portal|account):', "no account spend or billing")
 
-    def test_no_bedrock_here(self):
-        # DeepSeek stays on the metal boxes (dev-instance-common.tf); the kids' box does not get it.
-        self.assertNotIn("bedrock:", TF)
+    def test_the_only_bedrock_here_is_deepseek_for_nextjs(self):
+        # Owner, 2026-10-21: DeepSeek on the nextjs box too, as fcvm has it (opencode). That one policy is the only
+        # Bedrock grant in this file, and it names DeepSeek's two models and nothing else.
+        policy = TF.split('resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek"', 1)[1].split("\n}\n", 1)[0]
+        rest = TF.replace(policy, "")
+        self.assertNotIn("bedrock:", rest)
+        self.assertNotRegex(policy, r"foundation-model/(?!deepseek\.(v3\.2|r1-v1:0)\")")
+        self.assertNotIn("anthropic", policy)
 
 
 if __name__ == "__main__":
