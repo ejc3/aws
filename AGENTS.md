@@ -1531,6 +1531,21 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   DynamoDB replicas). A new Dolphin region is added to `local.dolphin_security_regions`, which
   extends monitoring and the policy together.
 
+### The constellation account (constellation-account.tf)
+
+ejc3/constellation (private) gets a member account of its own, `constellation`, in OU `Constellation` at the org root, built
+here the way the Dolphin account is, never by that repository's own bootstrap. Its root address is the `constellation_account`
+key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
+
+- **Applied from fcvm-metal-arm only.** `constellation-terraform` (AdministratorAccess in that account, one-hour sessions)
+  trusts dev-server-role pinned to fcvm-arm's instance (`ec2:SourceInstanceARN`; fcvm-x86 shares the role and cannot), and
+  dev-server-role's one grant (`assume-constellation-terraform`) names exactly that ARN with the same pin. A dev box never
+  gets `organizations:*` or OrganizationAccountAccessRole, in any account: that is admin of every member account.
+- **State:** `constellation-terraform-state-<id>` in that account, versioned, private, writes for the apply role only.
+- **CI plans read-only:** `constellation-ci-plan` trusts GitHub OIDC for that repository's `pull_request` workflows only
+  (ReadOnlyAccess, state readable, secret values denied); Terraform sets its `AWS_CI_PLAN_ROLE_ARN` and `AWS_STATE_BUCKET`
+  repository variables. Not yet covered: security monitoring and a region SCP like the Dolphin account's.
+
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
