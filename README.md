@@ -2390,7 +2390,9 @@ This reports supported resource-policy access from outside the account, includin
 public and cross-account sharing. It is not an access-control enforcement or proof
 that all identity-policy escalation paths are closed. Intentional sharing between
 the main and recovery accounts can generate findings because each account is its
-own trust boundary. No findings are automatically archived; inspect their resource,
+own trust boundary. One finding shape is archived automatically: AWS Backup's own temporary share of an EBS
+snapshot with its service account while it copies into the air-gapped vault (us-west-1 and us-east-1; #577).
+No other finding is archived; inspect their resource,
 principal and policy before deciding whether access is intended. Creating an analyzer
 does not change public SSH, Cloudflare service-token access, disks or backup sharing.
 

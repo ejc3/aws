@@ -14,9 +14,10 @@ class ExternalAccess(unittest.TestCase):
         self.analyzers = [(kind, name, body) for kind, name, body in self.resources if kind == "aws_accessanalyzer_analyzer"]
 
     def test_only_external_analyzer_resources_are_created(self):
-        self.assertEqual(len(self.resources), 36)
+        self.assertEqual(len(self.resources), 38)
         self.assertEqual(len(self.analyzers), 34)
-        self.assertEqual({kind for kind, _, _ in self.resources}, {"aws_accessanalyzer_analyzer", "aws_iam_service_linked_role"})
+        self.assertEqual({kind for kind, _, _ in self.resources},
+                         {"aws_accessanalyzer_analyzer", "aws_iam_service_linked_role", "aws_accessanalyzer_archive_rule"})
         self.assertEqual(len({name for _, name, _ in self.analyzers}), 34)
 
     def test_exact_existing_account_region_routes_are_reused(self):
@@ -40,12 +41,25 @@ class ExternalAccess(unittest.TestCase):
     def test_no_paid_configuration_suppression_or_workload_mutation(self):
         code = "\n".join(line for line in self.source.splitlines() if not line.lstrip().startswith("#"))
         for forbidden in ["UNUSED_ACCESS", "INTERNAL_ACCESS", "ORGANIZATION", "configuration",
-                          "archive_rule", "aws_iam_role", "aws_iam_policy", "aws_cloudwatch_", "aws_sns_", "provisioner", "command"]:
+                          "aws_iam_role", "aws_iam_policy", "aws_cloudwatch_", "aws_sns_", "provisioner", "command"]:
             self.assertNotIn(forbidden, code)
+
+    def test_the_only_archive_rules_are_aws_backups_snapshot_copy_share(self):
+        # #577: AWS Backup's own temporary share of an EBS snapshot with its service account while it copies into the
+        # air-gapped vault. Both filters must hold: an EBS snapshot AND that one principal, in the two copy regions only.
+        rules = re.findall(r'resource "aws_accessanalyzer_archive_rule" "(\w+)" \{(.*?)\n\}', self.source, re.S)
+        self.assertEqual(sorted(n for n, _ in rules), ["backup_lag_copy_us_east_1", "backup_lag_copy_us_west_1"])
+        for name, body in rules:
+            self.assertEqual(body.count("filter {"), 2, name)
+            self.assertIn('criteria = "resourceType"\n    eq       = ["AWS::EC2::Snapshot"]', body)
+            self.assertIn('criteria = "principal.AWS"\n    eq       = [local.access_analyzer_backup_lag_principal]', body)
+            self.assertNotIn("contains", body)
+            self.assertNotIn("exists", body)
+        self.assertRegex(self.source, r'access_analyzer_backup_lag_principal = "\d{12}"')
 
     def test_no_extra_or_hidden_configuration_blocks(self):
         headers = re.findall(r'^([a-z_]+) ', self.source, re.M)
-        self.assertEqual(headers, ["resource"] * 36)
+        self.assertEqual(headers, ["resource"] * 36 + ["locals"] + ["resource"] * 2)
         self.assertNotRegex(self.source, r'\bcount\s*=')
 
     def test_only_two_service_owned_read_roles_and_account_local_dependencies(self):
@@ -69,7 +83,7 @@ class ExternalAccess(unittest.TestCase):
     def test_documentation_does_not_claim_remediation_or_delivery(self):
         readme = (ROOT / "README.md").read_text()
         for phrase in ["34 external-access analyzers", "no additional charge", "AWSServiceRoleForAccessAnalyzer",
-                       "not an access-control enforcement", "No findings are automatically archived", "does not add email delivery"]:
+                       "not an access-control enforcement", "No other finding is archived", "does not add email delivery"]:
             self.assertIn(phrase, readme)
 
 
