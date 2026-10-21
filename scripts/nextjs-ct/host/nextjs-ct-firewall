@@ -11,6 +11,8 @@
 #   169.254.169.253:53                  the VPC resolver (forwarded like any other traffic)
 # A member's container (not the owner's) is also refused the io-box NFS scratch (config.json io_box_ip) and
 # every other member's boxes (config.json member_box_ips, less users.<u>.box_ips).
+# One way in from outside: the host's Eternal Terminal port (config.json eternal_terminal), forwarded to that one
+# account's container, as nextjs-dev served ET itself (its etserver checks a passkey the ssh-authenticated session set).
 # and nothing else: no other container, no other host port (sshd, the metadata service itself, any
 # loopback listener), no address but its own as the source, and no IPv6.
 set -euo pipefail
@@ -20,6 +22,9 @@ PORT=8169
 
 IO_BOX=$(jq -r '.io_box_ip // empty' "$CONFIG")
 nat="" input="" fwd=""
+# Eternal Terminal: the host's ET port, from outside only, goes to one container (config.json eternal_terminal.user).
+ET_USER=$(jq -r '.eternal_terminal.user // empty' "$CONFIG"); ET_PORT=$(jq -r '.eternal_terminal.port // empty' "$CONFIG")
+et_in=""
 for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   id -u "$U" >/dev/null 2>&1 || continue
   N=$(( $(id -u "$U") - 1000 ))
@@ -39,6 +44,10 @@ for U in $(jq -r '.users | keys[]' "$CONFIG"); do
   # A second bound under the credential server's own per-container cap: at most 16 connections at once.
   input+="    iifname \"$IF\" tcp dport $PORT ct count over 16 drop"$'\n'
   input+="    iifname \"$IF\" ip saddr 10.88.$N.2 ip daddr 10.88.$N.1 tcp dport $PORT ct status dnat accept"$'\n'
+  if [ -n "$ET_USER" ] && [ "$U" = "$ET_USER" ] && [ -n "$ET_PORT" ]; then
+    nat+="    iifname != \"ve-*\" fib daddr type local tcp dport $ET_PORT dnat to 10.88.$N.2:$ET_PORT"$'\n'
+    et_in+="    iifname != \"ve-*\" oifname \"$IF\" ip daddr 10.88.$N.2 tcp dport $ET_PORT ct status dnat accept"$'\n'
+  fi
 done
 
 cat > "$OUT.new" <<EOF
@@ -71,7 +80,7 @@ $input    drop
     # that was open when a rule was added (an NFS mount to the io-box, say), not only new ones.
     iifname "ve-*" meta nfproto ipv6 drop
 $fwd    ct state established,related accept
-    iifname "ve-*" oifname "ve-*" drop
+$et_in    iifname "ve-*" oifname "ve-*" drop
     iifname "ve-*" ip daddr 169.254.169.254 drop
     iifname "ve-*" accept
   }

@@ -234,6 +234,9 @@ locals {
     claw_master         = { tag = local.claw_master_tag, sha256 = local.claw_master_sha256_aarch64, server = "${local.claw_master_server_ip}:${local.claw_master_server_port}" }
     tmux_scroll         = { tag = local.tmux_scroll_tag, sha256 = local.tmux_scroll_sha256_aarch64 }
     terraform           = local.nextjs_ct_terraform
+    # Eternal Terminal for the phone (Prompt connects with it): the vendored 7.x build nextjs-dev ran, pinned. The host's
+    # 2022 (open in the security group, as on nextjs-dev) is forwarded to one container only, the owner's.
+    eternal_terminal = { url = "https://github.com/ejc3/EternalTerminal/releases/download/binaries-7.x/et-aarch64.tar.gz", sha256 = "adb5e91ff25c0fea435971f8f06fd5f771cb33adff07e0bbf05c3fbc3a541d60", user = "ejc3", port = 2022 }
     users = { for u in local.nextjs_users : u => {
       uid        = lookup(local.nextjs_ct_uid_pins, u, null)
       zone       = lookup(local.nextjs_user_zone, u, null)

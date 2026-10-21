@@ -184,6 +184,42 @@ echo "$U" > /etc/nextjs-ct/user
 if [ "$(cfg --arg u "$U" '.users[$u].codex_seed')" = true ]; then touch /etc/nextjs-ct/codex-seed; else rm -f /etc/nextjs-ct/codex-seed; fi
 OWNER=$(cfg --arg u "$U" '.users[$u].owner')
 
+# Eternal Terminal, for the one account the host forwards its ET port to (config.json eternal_terminal.user): the phone's
+# client runs `etterminal` over ssh, which registers with this container's etserver, then connects to the port.
+ET_USER=$(cfg '.eternal_terminal.user // empty')
+if [ -n "$ET_USER" ] && [ "$ET_USER" = "$U" ]; then
+  ET_URL=$(cfg '.eternal_terminal.url'); ET_SHA=$(cfg '.eternal_terminal.sha256'); ET_PORT=$(cfg '.eternal_terminal.port')
+  apt-get install -y -q libprotobuf32t64 libsodium23 >/dev/null 2>&1 || warn "Eternal Terminal runtime libraries failed"
+  if ! [ -f /usr/local/lib/et-installed ] || [ "$(cat /usr/local/lib/et-installed)" != "$ET_SHA" ]; then
+    ET_TMP=$(mktemp -d)
+    if curl -fsSL --retry 3 "$ET_URL" -o "$ET_TMP/et.tgz" && echo "$ET_SHA  $ET_TMP/et.tgz" | sha256sum -c - >/dev/null 2>&1 \
+       && tar xzf "$ET_TMP/et.tgz" -C "$ET_TMP" et etserver etterminal; then
+      install -m 755 "$ET_TMP/et" "$ET_TMP/etserver" "$ET_TMP/etterminal" /usr/bin/ && echo "$ET_SHA" > /usr/local/lib/et-installed
+    else
+      warn "Eternal Terminal download or checksum failed"
+    fi
+    rm -rf "$ET_TMP"
+  fi
+  cat > /etc/systemd/system/etserver.service <<UNIT
+[Unit]
+Description=Eternal Terminal server (the host forwards its port $ET_PORT here)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/etserver --port $ET_PORT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now etserver.service >/dev/null 2>&1 || warn "etserver not started"
+elif [ -f /etc/systemd/system/etserver.service ]; then
+  systemctl disable --now etserver.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/etserver.service
+fi
+
 # Network: a fixed address on the host's point-to-point link, the VPC resolver, the host by name.
 cat > /etc/systemd/network/10-host0.network <<NET
 [Match]
