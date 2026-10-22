@@ -54,7 +54,8 @@ class GuardrailTests(unittest.TestCase):
     def test_nothing_here_trusts_the_fleet_account(self):
         # No principal in this repository names the fleet account except its own roles' providers and the state bucket.
         for f in ROOT.glob("*.tf"):
-            if f.name == "fcvm-fleet-account.tf":
+            # The files that build inside the fleet account itself (fcvm-fleet.tf) name its id for its own resources.
+            if f.name.startswith("fcvm-fleet"):
                 continue
             text = f.read_text()
             self.assertNotIn("aws_organizations_account.fcvm_fleet", text, f.name)
