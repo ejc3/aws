@@ -310,6 +310,9 @@ jobs:
       - name: "pbox up --lease: the instance is tagged with the lease end, the watchdog keeps an owner's box until then (12h cap), status shows it"
         run: python3 -S -B scripts/test-pbox-lease.py
 
+      - name: "pbox acts on the instance it launched: id= on up, --instance on ip/ssh/down, PboxLaunchedBy (#621)"
+        run: python3 -S -B scripts/test-pbox-instance.py
+
       - name: "pbox up needs a flavor; each flavor tries only its own types; IAM allows exactly the flavors' types (pbox-flavors.tf)"
         run: python3 -S -B scripts/test-pbox-flavors.py
 

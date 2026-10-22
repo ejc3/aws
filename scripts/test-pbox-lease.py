@@ -151,10 +151,12 @@ class LeaseScript(unittest.TestCase):
                 self.assertIn("costs money", err)
                 self.assertIn("  lease: until ", err)
 
-    def test_plain_up_passes_no_tags(self):
+    def test_plain_up_passes_no_lease_tag(self):
         rc, _, err = self.pbox("up", "3", "compute-32")
         self.assertEqual(rc, 0, err)
-        self.assertIsNone(self.instance_tags(self.runs()[0]))
+        tags = self.instance_tags(self.runs()[0])
+        self.assertNotIn("PboxLeaseUntil", tags)
+        self.assertEqual({k: v for k, v in tags.items() if k != "PboxLaunchedBy"}, {"Name": "parallel-box-3", "DevEBS": "true"})
         self.assertNotIn("LEASE:", err)
         self.assertNotIn("  lease:", err)
 
@@ -165,7 +167,7 @@ class LeaseScript(unittest.TestCase):
         fb = [r for r in self.runs() if "--subnet-id" in r]
         self.assertEqual(len(fb), 1)
         tags = self.instance_tags(fb[0])
-        self.assertEqual({k: v for k, v in tags.items() if k != "PboxLeaseUntil"},
+        self.assertEqual({k: v for k, v in tags.items() if k not in ("PboxLeaseUntil", "PboxLaunchedBy")},
                          {"Name": "parallel-box-3", "Fallback": "true", "DevEBS": "true"})
         self.assertTrue(before + 7200 <= int(tags["PboxLeaseUntil"]) <= int(time.time()) + 7200)
         # without --lease the fallback tags are as before
@@ -173,7 +175,8 @@ class LeaseScript(unittest.TestCase):
         (self.tmp / "state").unlink()
         self.pbox("up", "3", "compute-32", "--fallback", FAKE_HOME_FULL="1")
         fb = [r for r in self.runs() if "--subnet-id" in r]
-        self.assertEqual(self.instance_tags(fb[0]), {"Name": "parallel-box-3", "Fallback": "true", "DevEBS": "true"})
+        self.assertEqual({k: v for k, v in self.instance_tags(fb[0]).items() if k != "PboxLaunchedBy"},
+                         {"Name": "parallel-box-3", "Fallback": "true", "DevEBS": "true"})
 
     def refused(self, *args, member=None):
         extra = {"MEMBER_BOX_USER": member} if member else {}
