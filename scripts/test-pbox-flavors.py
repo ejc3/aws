@@ -400,10 +400,28 @@ class GpuVfio(unittest.TestCase):
         self.assertIn("ubuntu hard memlock unlimited", g)
         self.assertNotRegex(g, r"nvidia-(driver|utils|dkms)|cuda")  # the host never drives the GPUs
 
+    def test_every_apt_call_in_a_pbox_boot_waits_for_the_dpkg_lock(self):
+        # ejc3/aws#609: the boot-time package run held the dpkg lock, driverctl failed to install, every GPU stayed on nouveau.
+        import re as _re
+        for f in ("parallel-box-launch.tf", "pbox-fallback.tf", "member-pbox.tf", "pbox-flavors.tf"):
+            checked = 0
+            for line in (ROOT / f).read_text().splitlines():
+                # Options may sit between apt-get and the subcommand (-o ..., -y), so match any words before it.
+                if _re.search(r"\bapt-get(?:\s+\S+)*?\s+(update|install)\b", line) and not line.lstrip().startswith("#"):
+                    checked += 1
+                    self.assertIn("-o DPkg::Lock::Timeout=300", line, f"{f}: {line.strip()}")
+            self.assertGreater(checked, 0, f"{f}: no apt-get update/install command found")
+
+    def test_a_missing_driverctl_stops_the_gpu_step_loudly(self):
+        gpu = (ROOT / "pbox-flavors.tf").read_text().split("pbox_gpu_vfio_setup = <<-GPU", 1)[1].split("\n  GPU\n", 1)[0]
+        self.assertIn("if ! command -v driverctl >/dev/null; then", gpu)
+        self.assertIn("pbox GPU setup FAILED: driverctl is not installed", gpu)
+        self.assertLess(gpu.index("command -v driverctl"), gpu.index("driverctl set-override"))
+
     def test_the_home_and_fallback_boots_run_it_once_after_apt_and_the_members_do_not(self):
         for text in (LAUNCH, FALLBACK):
             self.assertEqual(text.count("${local.pbox_gpu_vfio_setup}"), 1)
-            self.assertLess(text.index("apt-get update"), text.index("${local.pbox_gpu_vfio_setup}"))
+            self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 update"), text.index("${local.pbox_gpu_vfio_setup}"))
         self.assertNotIn("pbox_gpu_vfio_setup", MEMBER)
 
     def test_up_checks_the_gpus_are_vfio_pcis_on_a_gpu_type_after_the_boot_script(self):
@@ -516,7 +534,7 @@ class GpuIommuReboot(unittest.TestCase):
             at = text.index("${local.pbox_gpu_iommu_reboot}")
             # after the dev-hop key (idempotent), before anything that is not: the work volume, apt, NVMe, vfio
             self.assertLess(text.index("chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys"), at)
-            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get update", "${local.pbox_local_nvme_setup}",
+            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get -o DPkg::Lock::Timeout=300 update", "${local.pbox_local_nvme_setup}",
                           "${local.pbox_gpu_vfio_setup}"):
                 self.assertLess(at, text.index(later), later)
         self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
@@ -535,7 +553,7 @@ class LocalNvme(unittest.TestCase):
         for text in (LAUNCH, MEMBER, FALLBACK):
             self.assertEqual(text.count("${local.pbox_local_nvme_setup}"), 1)
             # after apt-get update (mdadm), after the work volume is mounted
-            self.assertLess(text.index("apt-get update"), text.index("${local.pbox_local_nvme_setup}"))
+            self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 update"), text.index("${local.pbox_local_nvme_setup}"))
             self.assertLess(text.index("mount \"$DEV\" /mnt/work"), text.index("${local.pbox_local_nvme_setup}"))
 
 

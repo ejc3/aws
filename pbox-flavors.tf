@@ -81,7 +81,7 @@ if [ -n "$NVME_DISKS" ]; then
     set -- $NVME_DISKS
     NVME_DEV="$1"
     if [ "$#" -gt 1 ]; then
-      command -v mdadm >/dev/null || apt-get install -y mdadm
+      command -v mdadm >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y mdadm
       mdadm --create /dev/md/nvme --level=0 --raid-devices="$#" --run "$@" && NVME_DEV=/dev/md/nvme
     fi
     if [ "$NVME_DEV" = /dev/md/nvme ] || [ "$#" -eq 1 ]; then
@@ -107,13 +107,19 @@ done
 if [ -n "$GPU_DEVS" ]; then
   echo vfio-pci > /etc/modules-load.d/vfio-pci.conf
   modprobe vfio-pci
-  apt-get install -y driverctl
+  # The boot-time package run can hold the dpkg lock: wait for it (ejc3/aws#609, a fallback g4dn.metal whose install lost
+  # the race and left every GPU on nouveau), and stop here, loudly, if driverctl is still missing.
+  apt-get -o DPkg::Lock::Timeout=300 install -y driverctl
+  if ! command -v driverctl >/dev/null; then
+    echo "pbox GPU setup FAILED: driverctl is not installed, so no GPU was bound to vfio-pci" | tee /etc/pbox-gpu >&2
+    GPU_DEVS=""
+  fi
   echo 'SUBSYSTEM=="vfio", GROUP="kvm", MODE="0660"' > /etc/udev/rules.d/70-vfio-kvm.rules
   printf 'ubuntu soft memlock unlimited\nubuntu hard memlock unlimited\n' > /etc/security/limits.d/90-vfio-memlock.conf
   udevadm control --reload
   for dev in $GPU_DEVS; do driverctl set-override "$dev" vfio-pci; done
   udevadm settle
-  for dev in $GPU_DEVS; do
+  [ -z "$GPU_DEVS" ] || for dev in $GPU_DEVS; do
     drv=$(readlink "/sys/bus/pci/devices/$dev/driver")
     grp=$(readlink "/sys/bus/pci/devices/$dev/iommu_group")
     echo "$dev driver=$${drv##*/} iommu_group=$${grp##*/}"
