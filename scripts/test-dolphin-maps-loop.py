@@ -50,7 +50,7 @@ class AccessTests(unittest.TestCase):
 
     def test_the_function_reads_its_secrets_and_writes_only_the_journal(self):
         policy = block("aws_iam_role_policy", "dolphin_maps_loop")
-        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
+        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
         self.assertIn('Resource = "${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"', policy)
         self.assertNotIn("code/", policy)
         self.assertIn("aws_iam_role.dolphin_maps_loop.arn", re.search(r"browserbase_readers = \[[^\]]*\]", AI).group())
@@ -90,6 +90,26 @@ class AccessTests(unittest.TestCase):
         statement = re.search(r'Sid       = "JournalIsNotDeletedByHand".*?\}\s*\}', policy, re.S).group()
         self.assertIn('"${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"', statement)
         self.assertIn("local.games_mp_admin_principals", statement)
+
+
+class PemsTests(unittest.TestCase):
+    def test_the_metal_boxes_read_and_put_it_through_one_managed_policy(self):
+        doc = block("aws_iam_policy_document", "dolphin_maps_pems_dev")
+        self.assertEqual(re.findall(r"resources = \[([^\]]+)\]", doc), ["aws_secretsmanager_secret.dolphin_maps_pems.arn"] * 2)
+        self.assertEqual(sorted(re.findall(r'"(secretsmanager:\w+)"', doc)),
+                         ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"])
+        attach = block("aws_iam_role_policy_attachment", "dolphin_maps_pems_dev")
+        self.assertIn("role       = aws_iam_role.dev_server.name", attach)
+        # dev-server-role's inline policies are at IAM's size limit: nothing here may add one for this secret.
+        for m in re.finditer(r'resource "aws_iam_role_policy" "(\w+)"', TF):
+            inline = block("aws_iam_role_policy", m.group(1))
+            if "aws_iam_role.dev_server." in inline:
+                self.assertNotIn("dolphin_maps_pems", inline, m.group(1))
+
+    def test_only_administration_the_metal_boxes_and_the_loop_read_it(self):
+        policy = block("aws_secretsmanager_secret_policy", "dolphin_maps_pems")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn])", policy)
 
 
 class ReplayTests(unittest.TestCase):

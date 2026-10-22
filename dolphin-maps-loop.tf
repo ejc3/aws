@@ -226,39 +226,31 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_pems" {
   })
 }
 
-data "aws_iam_policy_document" "dolphin_maps_pems_read" {
+# The metal boxes read it and store it (the login starts on a dev box, which puts it here and rotates it later):
+# GetSecretValue, PutSecretValue and DescribeSecret (a value is set, without reading it back) on this one secret. One
+# managed policy, not an inline one: dev-server-role's inline policies are at IAM's 10,240-character total (#574).
+data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
   statement {
     sid       = "ReadThePemsLogin"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
   }
+  statement {
+    sid       = "PutThePemsLogin"
+    actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
+  }
 }
 
-resource "aws_iam_policy" "dolphin_maps_pems_read" {
-  name        = "dev-dolphin-maps-pems-read"
-  description = "Metal dev boxes: read the dolphin-maps PeMS login (dolphin-maps/pems) and nothing else"
-  policy      = data.aws_iam_policy_document.dolphin_maps_pems_read.json
+resource "aws_iam_policy" "dolphin_maps_pems_dev" {
+  name        = "dev-dolphin-maps-pems"
+  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and nothing else"
+  policy      = data.aws_iam_policy_document.dolphin_maps_pems_dev.json
 }
 
-resource "aws_iam_role_policy_attachment" "dolphin_maps_pems_read" {
+resource "aws_iam_role_policy_attachment" "dolphin_maps_pems_dev" {
   role       = aws_iam_role.dev_server.name
-  policy_arn = aws_iam_policy.dolphin_maps_pems_read.arn
-}
-
-# The box stores the login and rotates it. Put and describe only, on this one secret: DescribeSecret lets the box see
-# that a value is set without reading it back (reading is the attachment above).
-resource "aws_iam_role_policy" "dev_server_dolphin_maps_pems_put" {
-  name = "dolphin-maps-pems-put"
-  role = aws_iam_role.dev_server.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid      = "PutThePemsLogin"
-      Effect   = "Allow"
-      Action   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
-      Resource = aws_secretsmanager_secret.dolphin_maps_pems.arn
-    }]
-  })
+  policy_arn = aws_iam_policy.dolphin_maps_pems_dev.arn
 }
 
 # -------------------------------------------------------------------------------------
