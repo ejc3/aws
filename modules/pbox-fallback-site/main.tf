@@ -37,6 +37,11 @@ variable "ami_name" {
   type        = string
 }
 
+variable "ami_name_x86" {
+  description = "Exact name of the x86_64 build of that image, which pbox passes with --image-id for an x86 flavor"
+  type        = string
+}
+
 variable "template_name" {
   description = "The site's one launch template; every box launches from it and is named by the caller"
   type        = string
@@ -98,6 +103,20 @@ data "aws_ami" "ubuntu" {
   filter {
     name   = "architecture"
     values = ["arm64"]
+  }
+}
+
+# The x86_64 build, for the x86 flavor (kvm-gpu-96). Not in the template: the caller passes it with --image-id, and the
+# fallback IAM policy allows it by exact ARN.
+data "aws_ami" "ubuntu_x86" {
+  owners = ["099720109477"] # Canonical
+  filter {
+    name   = "name"
+    values = [var.ami_name_x86]
+  }
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
   }
 }
 
@@ -317,6 +336,11 @@ output "vpc_id" {
 
 output "ami_id" {
   value = data.aws_ami.ubuntu.id
+}
+
+output "ami_id_x86" {
+  description = "The x86_64 image, for pbox's --image-id on an x86 flavor"
+  value       = data.aws_ami.ubuntu_x86.id
 }
 
 output "security_group_id" {

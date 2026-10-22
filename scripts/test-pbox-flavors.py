@@ -4,7 +4,8 @@ tries only its own instance types in order, nothing is under 24 vCPU, and IAM al
 
 Offline: reads the Terraform and the script, and runs the real script against a fake `aws` and `ssh` on PATH. Live proof
 is `aws ec2 describe-instance-type-offerings` in us-east-2c (every type but g5g.metal offered, checked 2026-10-19; g5g.metal
-in us-west-2a/b/c, checked 2026-10-22) and `aws iam simulate-principal-policy` against nextjs-dev-role after the apply."""
+in us-west-2a/b/c, checked 2026-10-22; g4dn.metal in us-east-2a/b/c, checked 2026-10-22), `aws ec2 describe-images` for the
+x86_64 Ubuntu build in each site's region, and `aws iam simulate-principal-policy` against nextjs-dev-role after the apply."""
 import json
 import os
 import re
@@ -22,9 +23,24 @@ LAUNCH = (ROOT / "parallel-box-launch.tf").read_text()
 MEMBER = (ROOT / "member-pbox.tf").read_text()
 FALLBACK = (ROOT / "pbox-fallback.tf").read_text()
 OHIO = (ROOT / "ohio-pbox.tf").read_text()
+MODULE = (ROOT / "modules" / "pbox-fallback-site" / "main.tf").read_text()
 
-# vCPU of each size suffix the flavors use
-SIZE_VCPU = {"8xlarge": 32, "12xlarge": 48, "24xlarge": 96, "48xlarge": 192, "metal-24xl": 96, "metal-48xl": 192, "metal": 64}
+# vCPU of each size suffix the flavors use; a plain .metal is the whole host, so it is per type
+SIZE_VCPU = {"8xlarge": 32, "12xlarge": 48, "24xlarge": 96, "48xlarge": 192, "metal-24xl": 96, "metal-48xl": 192}
+METAL_VCPU = {"g5g.metal": 64, "g4dn.metal": 96}
+X86_TYPES = {"g4dn.metal"}  # the one x86_64 type; every other is Graviton
+
+
+def type_vcpu(t):
+    return METAL_VCPU[t] if t.endswith(".metal") else SIZE_VCPU[t.split(".", 1)[1]]
+
+
+def script_type_arch(types):
+    """The script's own type_arch() for each type."""
+    fn = re.search(r"^type_arch\(\) \{\n.*?\n\}\n", PBOX, re.S | re.M).group(0)
+    out = subprocess.run(["bash", "-c", fn + 'for t in "$@"; do echo "$t $(type_arch "$t")"; done', "x", *types],
+                         capture_output=True, text=True, check=True).stdout
+    return dict(line.split() for line in out.splitlines())
 
 
 def script_menu():
@@ -67,7 +83,7 @@ class Menu(unittest.TestCase):
         for shape in ("compute", "general", "memory", "storage"):
             self.assertEqual([n for n in names if n.startswith(shape + "-")],
                              [f"{shape}-{s}" for s in (32, 48, 96, 192)])
-        self.assertEqual([n for n in names if n.startswith("kvm-")], ["kvm-96", "kvm-192", "kvm-gpu-64"])
+        self.assertEqual([n for n in names if n.startswith("kvm-")], ["kvm-96", "kvm-192", "kvm-gpu-64", "kvm-gpu-96"])
 
     def test_no_flavor_is_under_24_vcpu_and_every_type_has_the_flavors_size(self):
         for f, (vcpu, mem, _, _, types) in script_menu().items():
@@ -75,20 +91,34 @@ class Menu(unittest.TestCase):
                 self.assertGreaterEqual(int(vcpu), 24)
                 self.assertEqual(int(f.rsplit("-", 1)[1]), int(vcpu))  # the name is the size
                 for t in types:
-                    self.assertEqual(SIZE_VCPU[t.split(".", 1)[1]], int(vcpu), t)
+                    self.assertEqual(type_vcpu(t), int(vcpu), t)
 
-    def test_every_type_is_graviton_and_in_exactly_one_flavor(self):
+    def test_every_type_but_the_x86_gpu_one_is_graviton_and_each_is_in_exactly_one_flavor(self):
         seen = {}
         for f, (_, _, _, _, types) in script_menu().items():
-            # spot capacity varies by type: never one alone, but for g5g.metal, the only Graviton metal type with a GPU
-            if f != "kvm-gpu-64":
+            # spot capacity varies by type: never one alone, but for the GPU metal types, one per flavor
+            if not f.startswith("kvm-gpu-"):
                 self.assertGreaterEqual(len(types), 2, f)
             for t in types:
-                # Graviton names: family letter(s), generation, "g", options -- the AMI is arm64
-                self.assertRegex(t, r"^[a-z]+\d+g[a-z]*\.", t)
+                # Graviton names: family letter(s), generation, "g", options -- the templates' AMI is arm64
+                if t in X86_TYPES:
+                    self.assertNotRegex(t, r"^[a-z]+\d+g[a-z]*\.", t)
+                else:
+                    self.assertRegex(t, r"^[a-z]+\d+g[a-z]*\.", t)
                 self.assertNotIn(t, seen, "%s is in %s and %s" % (t, seen.get(t), f))
                 seen[t] = f
         self.assertNotIn("i7ie", " ".join(seen))  # x86
+        # the only x86 type is the x86 GPU flavor, alone
+        self.assertEqual({t: seen[t] for t in X86_TYPES}, {"g4dn.metal": "kvm-gpu-96"})
+
+    def test_the_scripts_type_arch_says_x86_64_only_for_the_x86_type(self):
+        types = [t for v in script_menu().values() for t in v[4]]
+        arch = script_type_arch(types)
+        self.assertEqual({t for t, a in arch.items() if a == "x86_64"}, X86_TYPES)
+        self.assertEqual({a for t, a in arch.items() if t not in X86_TYPES}, {"arm64"})
+        # every flavor is one architecture
+        for f, v in script_menu().items():
+            self.assertEqual(len({arch[t] for t in v[4]}), 1, f)
 
     def test_metal_only_in_kvm_and_kvm_only_metal(self):
         for f, (_, _, _, _, types) in script_menu().items():
@@ -104,12 +134,15 @@ class Menu(unittest.TestCase):
             self.assertEqual(nvme != "-", shape == "storage", f)
             self.assertRegex(price, r"^\d+\.\d\d$", f)
 
-    def test_the_gpu_flavor_is_g5g_metal_and_the_owners_only(self):
+    def test_the_gpu_flavors_are_g5g_metal_and_g4dn_metal_and_the_owners_only(self):
         self.assertEqual(script_menu()["kvm-gpu-64"], ("64", "128", "-", "0.60", ["g5g.metal"]))
+        self.assertEqual(script_menu()["kvm-gpu-96"], ("96", "384", "-", "4.12", ["g4dn.metal"]))
         gpu_types = {t for f, v in script_menu().items() if f.startswith("kvm-gpu-") for t in v[4]}
-        self.assertEqual(gpu_types, {"g5g.metal"})
+        self.assertEqual(gpu_types, {"g5g.metal", "g4dn.metal"})
         self.assertIn('kvm-gpu) echo "GPU passthrough into fcvm', PBOX)
         self.assertIn("--regions us-west-2", PBOX)
+        self.assertEqual(tf_flavors()["kvm-gpu-96"], ["g4dn.metal"])
+        self.assertNotIn("g4dn.metal", (ROOT / "member-pbox.tf").read_text())
 
     def test_no_type_override_is_left(self):
         self.assertNotIn("PARALLEL_BOX_TYPES", PBOX)
@@ -179,32 +212,102 @@ class Iam(unittest.TestCase):
         self.assertIn("parallel_box_max_vcpus = 192", OHIO)
 
 
+class X86Image(unittest.TestCase):
+    """The x86 flavor boots the x86_64 build of the arm64 image, passed by `pbox` with --image-id, and every image a dev box
+    may launch is pinned by exact ARN in both launch grants."""
+
+    def test_the_home_x86_image_is_the_same_ubuntu_build_and_pinned_by_arn(self):
+        arm = re.search(r'variable "parallel_box_ami_ohio" \{.*?default\s+= "(ami-[0-9a-f]+)" # (\S+)\n', OHIO, re.S)
+        x86 = re.search(r'variable "parallel_box_ami_ohio_x86" \{.*?default\s+= "(ami-[0-9a-f]+)" # (\S+)\n', OHIO, re.S)
+        self.assertIsNotNone(arm)
+        self.assertIsNotNone(x86)
+        self.assertNotEqual(arm.group(1), x86.group(1))
+        self.assertEqual(x86.group(2), arm.group(2).replace("-arm64-", "-amd64-"))
+        sites = re.search(r"parallel_box_sites = \{.*?\n  \}\n", LAUNCH, re.S).group(0)
+        self.assertIn("ami_x86           = var.parallel_box_ami_ohio_x86", sites)
+        referenced = re.search(r"parallel_box_referenced_arns = flatten\(\[.*?\n  \]\)", LAUNCH, re.S).group(0)
+        self.assertIn('"arn:aws:ec2:${r}::image/${site.ami}",', referenced)
+        self.assertIn('"arn:aws:ec2:${r}::image/${site.ami_x86}",', referenced)
+        # the referenced statement lists exactly those ARNs, still pinned to the templates
+        stmt = statement("RunInstancesReferencedResources", LAUNCH)
+        self.assertIn("resources = concat(local.parallel_box_referenced_arns, local.parallel_box_template_arns)", stmt)
+        self.assertIn("values   = local.parallel_box_template_arns", stmt)
+
+    def test_each_fallback_site_has_the_x86_build_by_name_and_it_is_pinned_by_arn(self):
+        arm = re.search(r'pbox_fallback_ami_name\s+= "([^"]+)"', FALLBACK).group(1)
+        x86 = re.search(r'pbox_fallback_ami_name_x86 = "([^"]+)"', FALLBACK).group(1)
+        self.assertEqual(x86, arm.replace("-arm64-", "-amd64-"))
+        self.assertEqual(FALLBACK.count("ami_name_x86          = local.pbox_fallback_common.ami_name_x86"), 4)
+        ami = block(MODULE, 'data "aws_ami" "ubuntu_x86"')
+        self.assertIn('owners = ["099720109477"]', ami)
+        self.assertIn("values = [var.ami_name_x86]", ami)
+        self.assertIn('values = ["x86_64"]', ami)
+        self.assertIn("value       = data.aws_ami.ubuntu_x86.id", block(MODULE, 'output "ami_id_x86"'))
+        self.assertNotIn("ubuntu_x86", block(MODULE, 'resource "aws_launch_template" "box"'))  # passed by pbox, not booted by default
+        referenced = re.search(r"pbox_fallback_referenced_arns = flatten\(\[.*?\n  \]\)", FALLBACK, re.S).group(0)
+        self.assertIn('"arn:aws:ec2:${r}::image/${s.ami_id}",', referenced)
+        self.assertIn('"arn:aws:ec2:${r}::image/${s.ami_id_x86}",', referenced)
+
+    def test_no_launch_grant_wildcards_an_image(self):
+        for text in (LAUNCH, FALLBACK, MEMBER):
+            self.assertNotRegex(text, r"image/\*")
+            self.assertNotRegex(text, r"::image/\$\{[^}]*\}\*")
+
+    def test_the_images_are_published_for_pbox(self):
+        self.assertIn("x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86", OHIO)
+        self.assertIn("r => { subnets = s.subnets, x86_image = s.ami_id_x86 }", FALLBACK)
+
+    def test_the_members_box_never_gets_the_x86_image(self):
+        for word in ("ami_x86", "parallel_box_ami_ohio_x86", "ami_id_x86", "--image-id"):
+            self.assertNotIn(word, MEMBER)
+
+    def test_the_script_passes_the_image_only_for_an_x86_type(self):
+        self.assertEqual(len(re.findall(r'IMG_OUT="\$\(image_args "\$T" ', PBOX)), 2)  # home and fallback
+        fn = re.search(r"^image_args\(\) \{\n.*?\n\}\n", PBOX, re.S | re.M).group(0)
+        self.assertIn('[ "$(type_arch "$1")" = x86_64 ] || return 0', fn)
+        self.assertIn("printf '%s\\n' --image-id \"$2\"", fn)
+
+
 class GpuQuota(unittest.TestCase):
-    def test_the_g_spot_quota_in_us_west_2_covers_one_gpu_box_and_never_asks_below_the_current_value(self):
-        self.assertIn("pbox_gpu_spot_vcpus = 64", FLAVORS_TF)
-        self.assertEqual(int(script_menu()["kvm-gpu-64"][0]), 64)
-        for kind in ("data", "resource"):
-            b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "west2_spot_g"' % kind)
-            self.assertIn("provider     = aws.west2", b)
-            self.assertIn('quota_code   = "L-3819A6DF"', b)
-        b = block(FLAVORS_TF, 'resource "aws_servicequotas_service_quota" "west2_spot_g"')
-        self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.west2_spot_g.value)", b)
+    def test_the_g_spot_quota_where_the_gpu_flavors_launch_covers_the_largest_and_never_asks_below_the_current_value(self):
+        # one box of the largest GPU flavor, derived from the flavor names (kvm-gpu-96 = 96)
+        self.assertIn('pbox_gpu_spot_vcpus = max([for f in keys(local.pbox_flavors) : tonumber(trimprefix(f, "kvm-gpu-")) '
+                      'if startswith(f, "kvm-gpu-")]...)', FLAVORS_TF)
+        self.assertEqual(max(int(v[0]) for f, v in script_menu().items() if f.startswith("kvm-gpu-")), 96)
+        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer
+        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2")):
+            with self.subTest(quota=name):
+                for kind in ("data", "resource"):
+                    b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "%s"' % (kind, name))
+                    self.assertIn("provider     = %s" % provider, b)
+                    self.assertIn('quota_code   = "L-3819A6DF"', b)
+                b = block(FLAVORS_TF, 'resource "aws_servicequotas_service_quota" "%s"' % name)
+                self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.%s.value)" % name, b)
+        self.assertIn('parallel_box_region = "us-east-2"', OHIO)
+        # nothing else owns the G spot quota
+        tf = "".join(p.read_text() for p in ROOT.glob("*.tf"))
+        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 2)
 
 
 class GpuCheckRuns(unittest.TestCase):
     """The script's GPU_CHECK, run against a fake sysfs: ready only when every GPU is vfio-pci's with its group node, and
     its whole IOMMU group is unbound or vfio-pci, pci-stub or pcieport."""
 
-    def run_check(self, members):
-        import os, subprocess, tempfile
+    def run_check(self, members, arch="aarch64", cmdline="ro console=ttyS0", marker=None, boot_id="boot-2"):
         script = (Path(__file__).resolve().parent / "parallel-box.sh").read_text()
         check = re.search(r"^GPU_CHECK='(.*?)'$", script, re.S | re.M).group(1)
         with tempfile.TemporaryDirectory() as root:
             r = Path(root)
             (r / "bin").mkdir()
-            for tool in ("timeout", "cloud-init"):
-                (r / "bin" / tool).write_text("#!/bin/sh\nexit 0\n")
+            for tool, body in (("timeout", "exit 0"), ("cloud-init", "exit 0"), ("uname", "echo " + arch)):
+                (r / "bin" / tool).write_text("#!/bin/sh\n" + body + "\n")
                 (r / "bin" / tool).chmod(0o755)
+            (r / "proc/sys/kernel/random").mkdir(parents=True)
+            (r / "proc/cmdline").write_text(cmdline + "\n")
+            (r / "proc/sys/kernel/random/boot_id").write_text(boot_id + "\n")
+            (r / "var/lib").mkdir(parents=True)
+            if marker is not None:
+                (r / "var/lib/pbox-iommu-reboot").write_text(marker + "\n")
             (r / "dev/vfio").mkdir(parents=True)
             (r / "dev/vfio/7").write_text("")
             grp = r / "sys/kernel/iommu_groups/7/devices"
@@ -218,9 +321,31 @@ class GpuCheckRuns(unittest.TestCase):
                     (d / "driver").symlink_to(r / "sys/bus/pci/drivers" / driver)
                 (d / "iommu_group").symlink_to(r / "sys/kernel/iommu_groups/7")
                 (grp / addr).symlink_to(d)
-            body = check.replace("/sys/", root + "/sys/").replace('[ -c "/dev/vfio/', '[ -e "' + root + "/dev/vfio/")
+            body = re.sub(r"(?<!/proc)/sys/", root + "/sys/", check)
+            body = body.replace("/proc/", root + "/proc/").replace("/var/lib/pbox-iommu-reboot", root + "/var/lib/pbox-iommu-reboot")
+            body = body.replace('[ -c "/dev/vfio/', '[ -e "' + root + "/dev/vfio/")
             env = dict(os.environ, PATH=str(r / "bin") + ":/usr/bin:/bin")
             return subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True).returncode
+
+    def test_an_x86_box_waiting_for_its_iommu_reboot_says_so_with_75(self):
+        # the boot script asked for the reboot in THIS boot (the marker names it): the caller waits and asks again
+        gpu = [("0000:00:1f.0", "0x10de", "nvidia")]
+        self.assertEqual(self.run_check(gpu, arch="x86_64", marker="boot-2", boot_id="boot-2"), 75)
+
+    def test_an_x86_box_that_rebooted_without_the_iommu_parameter_fails(self):
+        on_vfio = [("0000:00:1f.0", "0x10de", "vfio-pci")]
+        for marker in (None, "boot-1"):  # never asked, or asked in an earlier boot and it did not take
+            with self.subTest(marker=marker):
+                self.assertEqual(self.run_check(on_vfio, arch="x86_64", marker=marker, boot_id="boot-2"), 1)
+
+    def test_an_x86_box_booted_with_intel_iommu_on_is_checked_like_any_other(self):
+        on_vfio = [("0000:00:1f.0", "0x10de", "vfio-pci")]
+        cmd = "ro console=ttyS0 intel_iommu=on iommu=pt"
+        self.assertEqual(self.run_check(on_vfio, arch="x86_64", cmdline=cmd, marker="boot-1"), 0)
+        self.assertNotEqual(self.run_check([("0000:00:1f.0", "0x10de", "nvidia")], arch="x86_64", cmdline=cmd), 0)
+
+    def test_an_arm64_box_needs_no_kernel_parameter(self):
+        self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci")], arch="aarch64", marker="boot-2"), 0)
 
     def test_a_gpu_alone_in_its_group_on_vfio_is_ready(self):
         self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci")]), 0)
@@ -267,8 +392,111 @@ class GpuVfio(unittest.TestCase):
         self.assertIn('[ "$n" -gt 0 ] && [ "$bad" -eq 0 ]', check)
         wait = re.search(r"^wait_ready\(\) \{\n(.*?)\n\}\n", PBOX, re.S | re.M).group(1)
         self.assertIn('case "$(type_flavor "$CHOSEN")" in kvm-gpu-*)', wait)
-        self.assertIn('"ubuntu@$IP" "$GPU_CHECK" >&2; then', wait)
+        self.assertIn('if on_box "$GPU_CHECK"; then', wait)
+        self.assertIn("if on_box 'test -c /dev/kvm && sudo usermod -aG kvm ubuntu'; then", wait)
         self.assertLess(wait.index("test -c /dev/kvm"), wait.index("$GPU_CHECK"))
+        # on_box asks again while the box reboots (ssh 255, or GPU_CHECK's 75), and gives up after 20 minutes
+        on_box = re.search(r"^on_box\(\) \{\n(.*?)\n\}\n", PBOX, re.S | re.M).group(1)
+        self.assertIn("for tries in $(seq 1 120); do", on_box)
+        self.assertIn('case "$rc" in 255|75) ;; *) return "$rc" ;; esac', on_box)
+        self.assertIn("-o ConnectTimeout=5", on_box)
+
+
+def iommu_snippet():
+    m = re.search(r"pbox_gpu_iommu_reboot = <<-IOMMU\n(.*?)\n  IOMMU\n", FLAVORS_TF, re.S)
+    assert m, "pbox_gpu_iommu_reboot"
+    return m.group(1)
+
+
+class GpuIommuReboot(unittest.TestCase):
+    """The x86 GPU box's one reboot for intel_iommu=on (pbox_gpu_iommu_reboot): x86 with an NVIDIA function only, once,
+    and first in the boot scripts, so the boot script that runs again after it has done nothing twice."""
+
+    def test_everything_is_inside_one_guard_x86_nvidia_not_yet_on_and_no_marker(self):
+        s = iommu_snippet()
+        guard = s.splitlines()[0]
+        for cond in ('[ "$(uname -m)" = x86_64 ]', "grep -qx 0x10de /sys/bus/pci/devices/*/vendor",
+                     "! grep -qw intel_iommu=on /proc/cmdline", "[ ! -e /var/lib/pbox-iommu-reboot ]"):
+            self.assertIn(cond, guard)
+        self.assertTrue(guard.startswith("if ") and guard.endswith("; then"), guard)
+        self.assertEqual(s.rstrip().splitlines()[-1], "fi")
+        self.assertEqual(s.count("\nfi"), 1)
+        body = s[s.index("then\n"):]
+        self.assertIn('"$GRUB_CMDLINE_LINUX_DEFAULT intel_iommu=on iommu=pt"', body)
+        self.assertIn("> /etc/default/grub.d/90-pbox-iommu.cfg", body)
+        # the marker (this boot's id) and the re-run of the boot script are in place before the reboot
+        for step in ("update-grub", "cat /proc/sys/kernel/random/boot_id > /var/lib/pbox-iommu-reboot",
+                     "rm -f /var/lib/cloud/instance/sem/config_scripts_user"):
+            self.assertLess(body.index(step), body.index("systemctl reboot"), step)
+        self.assertLess(body.index("systemctl reboot"), body.index("exit 0"))
+        self.assertEqual(s.count("systemctl reboot"), 1)
+
+    def run_snippet(self, arch, vendors, cmdline="ro console=ttyS0", marker=False):
+        with tempfile.TemporaryDirectory() as root:
+            r = Path(root)
+            (r / "bin").mkdir()
+            for tool, body in (("uname", "echo " + arch), ("update-grub", 'echo update-grub >> "$LOG"'),
+                               ("systemctl", 'echo "systemctl $*" >> "$LOG"'), ("sleep", "exit 0")):
+                (r / "bin" / tool).write_text("#!/bin/sh\n" + body + "\n")
+                (r / "bin" / tool).chmod(0o755)
+            for i, v in enumerate(vendors):
+                d = r / "sys/bus/pci/devices" / ("0000:00:%02x.0" % i)
+                d.mkdir(parents=True)
+                (d / "vendor").write_text(v + "\n")
+            (r / "proc/sys/kernel/random").mkdir(parents=True)
+            (r / "proc/cmdline").write_text(cmdline + "\n")
+            (r / "proc/sys/kernel/random/boot_id").write_text("boot-1\n")
+            (r / "etc/default/grub.d").mkdir(parents=True)
+            (r / "var/lib/cloud/instance/sem").mkdir(parents=True)
+            (r / "var/lib/cloud/instance/sem/config_scripts_user").write_text("")
+            if marker:
+                (r / "var/lib/pbox-iommu-reboot").write_text("boot-0\n")
+            body = iommu_snippet()
+            for p in ("/sys/bus/", "/proc/", "/etc/default/grub.d/", "/var/lib/"):
+                body = body.replace(p, root + p)
+            script = body + "\necho after-the-step\n"
+            log = r / "log"
+            env = dict(os.environ, PATH=str(r / "bin") + ":/usr/bin:/bin", LOG=str(log))
+            out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            dropin = r / "etc/default/grub.d/90-pbox-iommu.cfg"
+            return {"rc": out.returncode, "continued": "after-the-step" in out.stdout,
+                    "calls": log.read_text().splitlines() if log.exists() else [],
+                    "dropin": dropin.read_text() if dropin.exists() else None,
+                    "marker": (r / "var/lib/pbox-iommu-reboot").read_text().strip() if (r / "var/lib/pbox-iommu-reboot").exists() else None,
+                    "sem": (r / "var/lib/cloud/instance/sem/config_scripts_user").exists()}
+
+    def test_an_x86_gpu_box_writes_the_drop_in_marks_the_boot_rearms_the_script_and_reboots(self):
+        res = self.run_snippet("x86_64", ["0x1d0f", "0x10de"])
+        self.assertEqual(res["rc"], 0)
+        self.assertFalse(res["continued"])  # nothing after the step runs in this boot
+        self.assertEqual(res["calls"], ["update-grub", "systemctl reboot"])
+        self.assertIn("intel_iommu=on iommu=pt", res["dropin"])
+        self.assertEqual(res["marker"], "boot-1")
+        self.assertFalse(res["sem"])
+
+    def test_it_is_inert_on_arm64_without_a_gpu_after_the_reboot_and_once_marked(self):
+        for name, kw in (("arm64 with a GPU", dict(arch="aarch64", vendors=["0x10de"])),
+                         ("x86 without a GPU", dict(arch="x86_64", vendors=["0x1d0f", "0x8086"])),
+                         ("x86 booted with it", dict(arch="x86_64", vendors=["0x10de"], cmdline="ro intel_iommu=on iommu=pt")),
+                         ("x86 already rebooted once", dict(arch="x86_64", vendors=["0x10de"], marker=True))):
+            with self.subTest(name):
+                res = self.run_snippet(**kw)
+                self.assertEqual(res["rc"], 0)
+                self.assertTrue(res["continued"])
+                self.assertEqual(res["calls"], [])
+                self.assertIsNone(res["dropin"])
+                self.assertTrue(res["sem"])
+
+    def test_the_home_and_fallback_boots_run_it_first_and_the_members_do_not(self):
+        for text in (LAUNCH, FALLBACK):
+            self.assertEqual(text.count("${local.pbox_gpu_iommu_reboot}"), 1)
+            at = text.index("${local.pbox_gpu_iommu_reboot}")
+            # after the dev-hop key (idempotent), before anything that is not: the work volume, apt, NVMe, vfio
+            self.assertLess(text.index("chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys"), at)
+            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get update", "${local.pbox_local_nvme_setup}",
+                          "${local.pbox_gpu_vfio_setup}"):
+                self.assertLess(at, text.index(later), later)
+        self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
 
 
 class LocalNvme(unittest.TestCase):
@@ -295,7 +523,7 @@ args = sys.argv[1:]
 a = " ".join(args)
 open(os.environ["FAKE_LOG"], "a").write(json.dumps(args) + "\n")
 if "get-parameter" in a:
-    print('{"region": "us-east-2", "fallback": {}}')
+    print(os.environ.get("FAKE_POINTER") or '{"region": "us-east-2", "x86_image": "ami-0x86home", "fallback": {}}')
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "PublicIpAddress" in a:
@@ -335,11 +563,11 @@ class ScriptRuns(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
 
-    def pbox(self, *args, user="ejc3", running=""):
+    def pbox(self, *args, user="ejc3", running="", pointer=""):
         if self.log.exists():
             self.log.unlink()
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
-                   MEMBER_BOX_USER=user, FAKE_RUNNING=running)
+                   MEMBER_BOX_USER=user, FAKE_RUNNING=running, FAKE_POINTER=pointer)
         env.pop("PARALLEL_BOX_REGION", None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -381,6 +609,34 @@ class ScriptRuns(unittest.TestCase):
                 self.assertEqual(self.launched_types(), v[4])
                 runs = [c for c in self.calls() if "run-instances" in c]
                 self.assertTrue(all("LaunchTemplateName=parallel-box-5,Version=$Latest" in c for c in runs))
+
+    def test_only_an_x86_type_gets_the_published_x86_image(self):
+        rc, _, err = self.pbox("up", "2", "kvm-gpu-96")
+        self.assertEqual(rc, 3, err)
+        runs = [c for c in self.calls() if "run-instances" in c]
+        self.assertEqual([c[c.index("--instance-type") + 1] for c in runs], ["g4dn.metal"])
+        self.assertEqual(runs[0][runs[0].index("--image-id") + 1], "ami-0x86home")
+        self.assertIn("LaunchTemplateName=parallel-box-2,Version=$Latest", runs[0])
+        for f in ("kvm-gpu-64", "kvm-96", "compute-32"):
+            with self.subTest(flavor=f):
+                self.pbox("up", "2", f)
+                runs = [c for c in self.calls() if "run-instances" in c]
+                self.assertTrue(runs)
+                self.assertFalse(any("--image-id" in c for c in runs))
+
+    def test_an_x86_type_with_no_published_image_is_refused_not_launched_on_the_arm64_image(self):
+        for pointer in ('{"region": "us-east-2", "fallback": {}}', '{"region": "us-east-2", "x86_image": "", "fallback": {}}'):
+            with self.subTest(pointer=pointer):
+                rc, _, err = self.pbox("up", "2", "kvm-gpu-96", pointer=pointer)
+                self.assertEqual(rc, 1, err)  # a real error, not "no capacity"
+                self.assertEqual(self.launched_types(), [])
+                self.assertIn("g4dn.metal is x86_64 and /infra/parallel-box names no x86_64 image for us-east-2", err)
+        # a region override is not the published home site: its image is not used there
+        env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
+                   MEMBER_BOX_USER="ejc3", FAKE_RUNNING="", FAKE_POINTER="", PARALLEL_BOX_REGION="us-west-2")
+        r = subprocess.run(["bash", str(SCRIPT), "up", "2", "kvm-gpu-96"], capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("no x86_64 image for us-west-2", r.stderr)
 
     def test_the_flavor_option_and_the_positional_flavor_are_the_same(self):
         self.pbox("up", "2", "--flavor", "storage-48")

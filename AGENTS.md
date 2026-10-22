@@ -282,8 +282,12 @@ from a snapshot copy of each work volume (no fresh snapshot, as the owner accept
 the old volumes, the move snapshots, the launch templates and the security group are deleted, so the Ohio volumes are the
 only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `/infra/parallel-box`, published from
 `local.parallel_box_region`. `pbox up N FLAVOR` needs a flavor (`pbox-flavors.tf`: compute, general, memory or storage at 32,
-48, 96 or 192 vCPU, kvm-96/kvm-192, or kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
-only the fallback sites offer: `--regions us-west-2`, against the G spot quota there; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
+48, 96 or 192 vCPU, kvm-96/kvm-192, kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
+only the fallback sites offer: `--regions us-west-2`, or kvm-gpu-96, an x86 g4dn.metal with eight T4, at home: the one x86
+type, launched with `--image-id` set to the site's x86_64 build of the same Ubuntu image (published in `/infra/parallel-box`,
+pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=on iommu=pt` and reboots once
+(`pbox_gpu_iommu_reboot`, marker `/var/lib/pbox-iommu-reboot`); both GPU flavors against the G spot quota, 96 vCPU in us-east-2
+and us-west-2; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
 test keeps them equal); with none it exits 2 and prints the menu. An agent picks the smallest flavor that fits the work's
 shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
 --fallback` (or `--regions us-east-1,us-west-2`) then launches at a fallback site (`pbox-fallback.tf`: one per US region,

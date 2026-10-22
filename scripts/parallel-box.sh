@@ -13,6 +13,8 @@
 #                     /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
 #                     kvm-gpu-64 is the same plus two NVIDIA T4G bound to vfio-pci, for GPU
 #                     passthrough; the home AZ does not offer it: pbox up N kvm-gpu-64 --regions us-west-2
+#                     kvm-gpu-96 is an x86 g4dn.metal with eight NVIDIA T4 (about $4/hr spot), launched
+#                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -73,10 +75,12 @@ set -uo pipefail
 # two equal). One line per flavor: name, vCPU, memory GiB, local NVMe (TB, at least; "-" for none promised), an
 # approximate spot $/hr in us-east-2c (measured 2026-10-19: the launch prints each type's live price), then the
 # instance types, tried in that order. Spot capacity differs from type to type, so each flavor has several, all with
-# the flavor's vCPU and memory. All Graviton (arm64, as the AMI is), all offered in us-east-2c; a fallback AZ skips the
-# types it does not offer. No Graviton c, m or r type has 24 vCPU, so 32 is the smallest size: nothing is under the
-# 24-vCPU floor. The kvm flavors are bare metal (virtualized Graviton has no /dev/kvm) and boot in many minutes.
-# kvm-gpu-64 is g5g.metal, the one Graviton metal type with GPUs; us-east-2 does not offer it, so its price is us-west-2's.
+# the flavor's vCPU and memory. All Graviton (arm64, as the launch templates' AMI is) but g4dn.metal (type_arch), all
+# offered in us-east-2c but g5g.metal; a fallback AZ skips the types it does not offer. No Graviton c, m or r type has 24
+# vCPU, so 32 is the smallest size: nothing is under the 24-vCPU floor. The kvm flavors are bare metal (virtualized
+# Graviton has no /dev/kvm) and boot in many minutes. kvm-gpu-64 is g5g.metal, the one Graviton metal type with GPUs;
+# us-east-2 does not offer it, so its price is us-west-2's. kvm-gpu-96 is g4dn.metal, x86_64: launched with the site's
+# x86_64 image (--image-id, from /infra/parallel-box), and its first boot reboots once for intel_iommu=on.
 FLAVORS='
 compute-32   32   64   -    0.35 c8g.8xlarge c9g.8xlarge c8gn.8xlarge c8gb.8xlarge c8gd.8xlarge c9gd.8xlarge c7g.8xlarge c7gd.8xlarge c7gn.8xlarge
 compute-48   48   96   -    0.50 c8g.12xlarge c9g.12xlarge c8gn.12xlarge c8gb.12xlarge c8gd.12xlarge c9gd.12xlarge c7g.12xlarge c7gd.12xlarge c7gn.12xlarge
@@ -97,6 +101,7 @@ storage-192  192  1536 45   2.00 i8g.48xlarge i8ge.48xlarge
 kvm-96       96   192+ -    0.70 c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl
 kvm-192      192  384+ -    1.20 c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl
 kvm-gpu-64   64   128  -    0.60 g5g.metal
+kvm-gpu-96   96   384  -    4.12 g4dn.metal
 '
 
 # What each shape is for: the one line an agent reads to choose.
@@ -107,8 +112,15 @@ flavor_use() {
     memory)  echo "memory-bound work (big in-memory data, large links, caches): 8 GiB per vCPU" ;;
     storage) echo "local-disk-bound work: fast local NVMe at /mnt/nvme (gone with the box) and 8 GiB per vCPU" ;;
     kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; not for members" ;;
-    kvm-gpu) echo "GPU passthrough into fcvm: kvm plus 2x NVIDIA T4G on vfio-pci; not in the home AZ: add --regions us-west-2 (its price is there)" ;;
+    kvm-gpu) echo "GPU passthrough into fcvm: kvm plus NVIDIA GPUs on vfio-pci. kvm-gpu-64: 2x T4G, arm64, not in the home AZ: add --regions us-west-2 (its price is there). kvm-gpu-96: 8x T4, x86_64, reboots once at first boot" ;;
   esac
+}
+
+# The architecture of an instance type: arm64 for Graviton (family, generation, then "g": c8g, i8ge, g5g), else x86_64
+# (g4dn). The launch templates boot an arm64 image; an x86_64 type is launched with the site's x86_64 image (x86_image).
+type_arch() {
+  local graviton='^[a-z]+[0-9]+g[a-z]*\.'
+  if [[ "$1" =~ $graviton ]]; then echo arm64; else echo x86_64; fi
 }
 
 # The flavors this account may launch: a member gets every one but kvm (member-pbox.tf).
@@ -294,6 +306,21 @@ FB_TEMPLATE="$(pointer fallback template)"
 FB_REGIONS="$(pointer fallback regions)"
 fb_subnet() { pointer fallback regions "$1" subnets "$2"; } # fb_subnet REGION AZ
 fb_azs() { pointer fallback regions "$1" subnets; }        # fb_azs REGION
+fb_x86_image() { pointer fallback regions "$1" x86_image; } # fb_x86_image REGION
+# The home site's x86_64 image, for an x86 type (type_arch); none when PARALLEL_BOX_REGION names another region.
+HOME_X86_IMAGE=""
+[ "$HOME_REGION" != "$(pointer region)" ] || HOME_X86_IMAGE="$(pointer x86_image)"
+
+# image_args TYPE IMAGE REGION: the --image-id an x86_64 type needs (the templates boot arm64), one word per line; nothing
+# for an arm64 type. Fails, naming what is missing, when an x86_64 type has no published image there.
+image_args() {
+  [ "$(type_arch "$1")" = x86_64 ] || return 0
+  if [ -z "$2" ]; then
+    say "    $1 is x86_64 and /infra/parallel-box names no x86_64 image for $3 (x86_image): not launching it"
+    return 1
+  fi
+  printf '%s\n' --image-id "$2"
+}
 # FB_REGIONS stays every site, so a box is found (and not launched twice) wherever it runs; --regions narrows only
 # where a new launch is searched for.
 SEARCH_REGIONS="$FB_REGIONS"
@@ -463,9 +490,18 @@ fallback_order() {
 # Run on a GPU box: wait for the boot script, then list each NVIDIA function and fail unless every one is vfio-pci's,
 # has its /dev/vfio group node, and its whole IOMMU group is usable: VFIO opens a group only when every device in it is
 # unbound or on vfio-pci, pci-stub or pcieport (a bridge), so a GPU sharing a group with the NIC or a disk would report
-# ready here and then fail in fcvm. Single-quoted: it expands on the box.
+# ready here and then fail in fcvm. An x86 box needs the Intel IOMMU on its kernel command line, which its first boot
+# adds before rebooting once (pbox_gpu_iommu_reboot, pbox-flavors.tf): caught between that reboot request and the
+# reboot (the marker names this boot), the check exits 75 so the caller waits and asks again. Single-quoted: it expands
+# on the box.
 # shellcheck disable=SC2016
 GPU_CHECK='timeout 900 cloud-init status --wait >/dev/null 2>&1; n=0; bad=0
+if [ "$(uname -m)" = x86_64 ] && ! grep -qw intel_iommu=on /proc/cmdline; then
+  if [ -s /var/lib/pbox-iommu-reboot ] && [ "$(cat /var/lib/pbox-iommu-reboot)" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+    echo "  gpu:   rebooting for intel_iommu=on"; exit 75
+  fi
+  echo "  gpu:   this x86 box did not boot with intel_iommu=on (see /etc/default/grub.d/90-pbox-iommu.cfg)"; bad=1
+fi
 for d in /sys/bus/pci/devices/*; do
   [ "$(cat "$d/vendor")" = 0x10de ] || continue
   n=$((n + 1)); drv=$(readlink "$d/driver"); grp=$(readlink "$d/iommu_group")
@@ -477,6 +513,22 @@ for d in /sys/bus/pci/devices/*; do
   done
 done
 [ "$n" -gt 0 ] && [ "$bad" -eq 0 ]'
+
+# on_box CMD: run CMD on the box over SSH (stdout to stderr) and return its status, waiting while the box reboots: an x86
+# GPU box reboots once during its first boot (see GPU_CHECK), so a dropped or refused connection (255), or GPU_CHECK's 75,
+# is asked again every 10 s for up to 20 minutes.
+on_box() {
+  local rc tries
+  for tries in $(seq 1 120); do
+    ssh -i "$KEY" -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o StrictHostKeyChecking=no \
+      -o BatchMode=yes "ubuntu@$IP" "$1" >&2 2>/dev/null
+    rc=$?
+    case "$rc" in 255|75) ;; *) return "$rc" ;; esac
+    [ "$tries" -eq 1 ] && say "    the box is rebooting or not answering (an x86 GPU box reboots once at first boot); waiting..."
+    sleep 10
+  done
+  return "$rc"
+}
 
 # Wait until the box answers SSH, then report it. $1: what the work volume is ("persistent" or "fresh").
 wait_ready() {
@@ -494,8 +546,7 @@ wait_ready() {
       if [ "$MODE" = "kvm" ]; then
         # The entire point of metal: prove /dev/kvm exists and make it usable by
         # ubuntu (group change applies from the next SSH session on).
-        if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" \
-             'test -c /dev/kvm && sudo usermod -aG kvm ubuntu' 2>/dev/null; then
+        if on_box 'test -c /dev/kvm && sudo usermod -aG kvm ubuntu'; then
           say "  kvm:   /dev/kvm present; ubuntu in kvm group (applies on next login)"
         else
           say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
@@ -505,8 +556,9 @@ wait_ready() {
       fi
       case "$(type_flavor "$CHOSEN")" in kvm-gpu-*)
         # The other point of a GPU flavor: every NVIDIA function bound to vfio-pci, in an IOMMU group with its
-        # /dev/vfio node. The boot script binds them (pbox_gpu_vfio_setup, pbox-flavors.tf), so wait for it first.
-        if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" "$GPU_CHECK" >&2; then
+        # /dev/vfio node. The boot script binds them (pbox_gpu_vfio_setup, pbox-flavors.tf), so wait for it first, and
+        # on x86 for its one reboot (on_box waits it out).
+        if on_box "$GPU_CHECK"; then
           say "  gpu:   every NVIDIA function is on vfio-pci with its /dev/vfio group (list: /etc/pbox-gpu)"
         else
           say "FAILED: $CHOSEN came up without its GPUs on vfio-pci (above; the boot log is /var/log/cloud-init-output.log)."
@@ -694,8 +746,11 @@ case "$CMD" in
 
       # Everything except the instance type comes from the launch template, so a typo
       # here cannot land the box in the wrong subnet, on the wrong AMI, or without the
-      # Name tag its IAM policy and its idle watchdog both depend on.
-      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest"; then
+      # Name tag its IAM policy and its idle watchdog both depend on. The one exception is
+      # an x86_64 type's image (image_args), which IAM pins by exact ARN like the template's.
+      if ! IMG_OUT="$(image_args "$T" "$HOME_X86_IMAGE" "$REGION")"; then REAL_ERROR=1; say ""; continue; fi
+      read -r -d '' -a IMG <<< "$IMG_OUT"
+      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"}; then
         ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"; break
       fi
     done
@@ -776,10 +831,12 @@ case "$CMD" in
       for T in $TYPES; do
         if [ -n "$OFFERED" ] && [ "${OFFERED#* "$T" }" = "$OFFERED" ]; then continue; fi
         say "--> trying $T in $FAZ ..."
+        if ! IMG_OUT="$(image_args "$T" "$(fb_x86_image "$R")" "$R")"; then REAL_ERROR=1; say ""; continue; fi
+        read -r -d '' -a IMG <<< "$IMG_OUT"
         # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
         if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
-             --subnet-id "$SUBNET" \
+             --subnet-id "$SUBNET" ${IMG[@]+"${IMG[@]}"} \
              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}]" \
                                   "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
                                   "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then

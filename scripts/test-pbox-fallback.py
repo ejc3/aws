@@ -21,14 +21,28 @@ LAUNCH = (ROOT / "parallel-box-launch.tf").read_text()
 
 POINTER = {
     "region": "us-east-2",
+    "x86_image": "ami-x86-home",
     "fallback": {
         "template": "parallel-box-fallback",
         "regions": {
-            "us-east-1": {"subnets": {"us-east-1a": "subnet-e1a", "us-east-1b": "subnet-e1b"}},
-            "us-west-2": {"subnets": {"us-west-2a": "subnet-w2a", "us-west-2b": "subnet-w2b"}},
+            "us-east-1": {"subnets": {"us-east-1a": "subnet-e1a", "us-east-1b": "subnet-e1b"}, "x86_image": "ami-x86-e1"},
+            "us-west-2": {"subnets": {"us-west-2a": "subnet-w2a", "us-west-2b": "subnet-w2b"}, "x86_image": "ami-x86-w2"},
         },
     },
 }
+
+# The script's GPU check on a box, for a fake ssh: its answers in order, one per call (255 = the connection dropped while
+# the box rebooted, 75 = GPU_CHECK caught it between the reboot request and the reboot); every other ssh call exits 0.
+FAKE_SSH = r'''#!/bin/sh
+case "$*" in
+  *"cloud-init status"*)
+    echo gpu >> "$FAKE_SSH_LOG"
+    n=$(wc -l < "$FAKE_SSH_LOG")
+    rc=$(echo "$FAKE_GPU_RCS" | cut -d' ' -f"$n")
+    exit "${rc:-0}" ;;
+esac
+exit 0
+'''
 
 # Calls are appended to $FAKE_LOG. FAKE_CAPACITY lists the "region/az" pools that have capacity (home is
 # us-east-2/us-east-2c); FAKE_HOME_ERROR replaces the home failure with another error; a launched box is remembered in
@@ -112,13 +126,13 @@ class FallbackScript(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
 
-    def pbox(self, *args, capacity="", home_error=False, launched=None, quota="", none_offered=""):
+    def pbox(self, *args, capacity="", home_error=False, launched=None, quota="", none_offered="", pointer=None, **extra):
         if launched:
             (self.tmp / "state").write_text(launched)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp),
-                   FAKE_LOG=str(self.log), FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER),
+                   FAKE_LOG=str(self.log), FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(pointer or POINTER),
                    FAKE_CAPACITY=capacity, FAKE_HOME_ERROR="1" if home_error else "", FAKE_QUOTA=quota,
-                   FAKE_NONE_OFFERED=none_offered)
+                   FAKE_NONE_OFFERED=none_offered, **extra)
         env.pop("PARALLEL_BOX_REGION", None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -155,6 +169,47 @@ class FallbackScript(unittest.TestCase):
         self.assertIn("{Key=Fallback,Value=true}", tags[0])
         self.assertEqual(self.calls("attach-volume"), [])  # never the home volume
         self.assertIn("FRESH, EMPTY work volume", err)
+
+    def test_an_x86_gpu_flavor_launches_with_each_sites_x86_image_and_waits_out_its_reboot(self):
+        p = self.tmp / "ssh"
+        p.write_text(FAKE_SSH)
+        p.chmod(p.stat().st_mode | stat.S_IXUSR)
+        ssh_log = self.tmp / "ssh-calls"
+        rc, out, err = self.pbox("up", "4", "kvm-gpu-96", "--fallback", capacity="us-west-2/us-west-2b",
+                                 FAKE_SSH_LOG=str(ssh_log), FAKE_GPU_RCS="255 75 0")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip().splitlines()[-1],
+                         "launched box=4 region=us-west-2 az=us-west-2b type=g4dn.metal ip=203.0.113.9 work=fresh")
+        runs = self.calls("run-instances")
+        home = [c for c in runs if "--subnet-id" not in c]
+        fb = [c for c in runs if "--subnet-id" in c]
+        self.assertEqual([c[c.index("--image-id") + 1] for c in home], ["ami-x86-home"])
+        self.assertEqual([c[c.index("--image-id") + 1] for c in fb], ["ami-x86-w2"])
+        self.assertEqual(fb[0][fb[0].index("--region") + 1], "us-west-2")
+        # asked three times: dropped by the reboot, caught before it, then ready; the wait is said once
+        self.assertEqual(len(ssh_log.read_text().split()), 3)
+        self.assertEqual(err.count("the box is rebooting or not answering"), 1)
+        self.assertIn("every NVIDIA function is on vfio-pci", err)
+
+    def test_a_gpu_check_that_fails_on_the_box_is_not_retried(self):
+        p = self.tmp / "ssh"
+        p.write_text(FAKE_SSH)
+        p.chmod(p.stat().st_mode | stat.S_IXUSR)
+        ssh_log = self.tmp / "ssh-calls"
+        rc, _, err = self.pbox("up", "4", "kvm-gpu-96", "--fallback", capacity="us-west-2/us-west-2b",
+                               FAKE_SSH_LOG=str(ssh_log), FAKE_GPU_RCS="1 0")
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(len(ssh_log.read_text().split()), 1)
+        self.assertIn("came up without its GPUs on vfio-pci", err)
+
+    def test_an_x86_type_is_not_launched_in_a_fallback_region_without_its_x86_image(self):
+        pointer = json.loads(json.dumps(POINTER))
+        del pointer["fallback"]["regions"]["us-west-2"]["x86_image"]
+        rc, _, err = self.pbox("up", "4", "kvm-gpu-96", "--fallback", capacity="us-west-2/us-west-2b", pointer=pointer)
+        self.assertEqual(rc, 1, err)
+        self.assertFalse(any("us-west-2" in c for c in self.calls("run-instances")))
+        self.assertIn("no x86_64 image for us-west-2", err)
+        self.assertEqual({c[c.index("--image-id") + 1] for c in self.calls("run-instances")}, {"ami-x86-home", "ami-x86-e1"})
 
     def test_regions_limits_the_search(self):
         rc, out, err = self.pbox("up", "2", "compute-192", "--regions", "us-east-1", capacity="us-west-2/us-west-2b us-east-1/us-east-1b")
@@ -305,7 +360,7 @@ class FallbackTerraform(unittest.TestCase):
         self.assertIn('TAG_NAMES     = join(",", local.parallel_box_names)', FALLBACK)
 
     def test_the_pointer_publishes_the_sites_and_pbox_may_score_them(self):
-        self.assertIn("jsonencode({ region = local.parallel_box_region, fallback = local.pbox_fallback_pointer })", OHIO)
+        self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, fallback = local.pbox_fallback_pointer })", OHIO)
         describe = re.search(r'sid    = "DescribeForPbox".*?\]', LAUNCH, re.S).group(0)
         for action in ("ec2:GetSpotPlacementScores", "ec2:DescribeAvailabilityZones", "ec2:DescribeInstanceTypeOfferings"):
             self.assertIn(action, describe)
