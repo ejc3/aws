@@ -231,7 +231,7 @@ class LeaseScript(unittest.TestCase):
 
     def test_status_caps_the_lease_at_12_hours_from_launch(self):
         now = int(time.time())
-        launch = now - 3600
+        launch = now - 3600 + 30  # 30 s of margin, so the script's own clock still reads 11h 0m left
         cap = launch + 12 * 3600
         hhmm = datetime.datetime.fromtimestamp(cap, datetime.timezone.utc).strftime("%H:%M")
         self.assertEqual(self.status(f"{self.iso(launch)}\t{now + 20 * 3600}"), [f"  lease:  until {hhmm} UTC (11h 0m left)"])
