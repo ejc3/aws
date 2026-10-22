@@ -13,7 +13,8 @@
 #   and fcvm's own Terraform, if it has any, from fcvm-metal-arm through `fcvm-fleet-terraform` (AdministratorAccess inside
 #   this account only, one-hour sessions), which trusts dev-server-role pinned to fcvm-arm's instance, as constellation's.
 # - No CI credential: GitHub holds no AWS role for this account (state and configuration reads can carry secret values).
-# - Quotas (ejc3/aws#605): 192 vCPU of G spot in each region (one metal host, its replacement and the EC2 tiles).
+# - Quotas (ejc3/aws#605): 192 vCPU of G spot in us-east-1 (one metal host, its replacement and the EC2 tiles); one
+#   region is enough.
 #
 # First apply: the provider aliases need the account id, so apply the account first
 # (-target=aws_organizations_account.fcvm_fleet), then everything.
@@ -252,30 +253,21 @@ resource "aws_ssm_parameter" "fcvm_fleet" {
 }
 
 # ------------------------------------------------------------------------------------------------ quotas (#605)
-data "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_east2" {
-  provider     = aws.fcvm_fleet
-  service_code = "ec2"
-  quota_code   = "L-3819A6DF"
+# us-east-1 only (owner, 2026-10-22: "I am good as long as there is one"). The new account started at 0 in every region;
+# us-east-1 granted 192, us-west-2's case closed at 0 and us-east-2's was still open. The other two requests are dropped from
+# Terraform without touching AWS (a quota cannot be lowered or a request withdrawn here), so plans stop re-filing them.
+removed {
+  from = aws_servicequotas_service_quota.fcvm_fleet_spot_g_east2
+  lifecycle {
+    destroy = false
+  }
 }
 
-resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_east2" {
-  provider     = aws.fcvm_fleet
-  service_code = "ec2"
-  quota_code   = "L-3819A6DF"
-  value        = max(local.fcvm_fleet_spot_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_spot_g_east2.value)
-}
-
-data "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_west2" {
-  provider     = aws.fcvm_fleet_west2
-  service_code = "ec2"
-  quota_code   = "L-3819A6DF"
-}
-
-resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_west2" {
-  provider     = aws.fcvm_fleet_west2
-  service_code = "ec2"
-  quota_code   = "L-3819A6DF"
-  value        = max(local.fcvm_fleet_spot_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_spot_g_west2.value)
+removed {
+  from = aws_servicequotas_service_quota.fcvm_fleet_spot_g_west2
+  lifecycle {
+    destroy = false
+  }
 }
 
 data "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_east1" {
