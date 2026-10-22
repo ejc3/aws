@@ -84,7 +84,7 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn('Action   = "sts:AssumeRole"', member)
         self.assertIn("aws_secretsmanager_secret.dev_hop.arn", member)
         self.assertIn("data.aws_secretsmanager_secret.nextjs_gdocs", member)
-        for action in ("ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"):
+        for action in ("ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume", "ec2:CancelSpotInstanceRequests"):
             self.assertIn(f'"{action}"', member, action)
         self.assertIn("data.aws_secretsmanager_secret.nextjs_connector", host)
         self.assertIn("ssmmessages:*", host)

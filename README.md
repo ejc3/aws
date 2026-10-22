@@ -1077,11 +1077,18 @@ work: a smaller box costs less and finds Spot capacity more often.
 `/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent
 `driverctl` override (no NVIDIA driver on the host). `ubuntu` may open `/dev/vfio/*` (group `kvm`) and has an unlimited
 memlock, so a rootless fcvm can use them; `/etc/pbox-gpu` lists each GPU and its IOMMU group, and `up` fails unless every
-one is on `vfio-pci`. us-east-2 does not offer the type, so it launches at a fallback site with a fresh work volume:
+one is on `vfio-pci`. us-east-2 does not offer the type, so it launches at a fallback site with a fresh work volume. A GPU
+flavor implies `--fallback`: home first, then every fallback region that offers the type (us-east-1 and us-west-2 for
+this one), best spot placement score first:
 
 ```bash
-pbox up 3 kvm-gpu-64 --regions us-west-2
+pbox up 3 kvm-gpu-64
 ```
+
+When a region refuses on a quota, `pbox` names the limit (`MaxSpotInstanceCountExceeded` and the spot vCPU quota code,
+`VcpuLimitExceeded` and the on-demand one, or `InstanceLimitExceeded`) with its value, first cancels any spot request in
+that region still open or active after its instance is gone (they count against the spot quota for up to half an hour
+after a terminate) and retries once, then moves on to the next region.
 
 `kvm-gpu-96` is a `g4dn.metal` (x86_64 Intel, 96 vCPU, 384 GiB, eight NVIDIA T4, 1.8 TB of local NVMe at `/mnt/nvme`, about
 $4/hr spot) set up the same way. us-east-2c offers it, so `pbox up 3 kvm-gpu-96` launches at home on the persistent work
