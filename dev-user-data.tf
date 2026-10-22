@@ -297,14 +297,18 @@ PODMANSYS
   # pnpm-managed one, on PATH only through its hand-written ~/.zshenv), so every box runs
   # this version. A default config is written only where none exists: an existing one may carry
   # other settings (remote-claw's). opencode_user_setup is user-agnostic: it runs as whichever account it sets up.
-  opencode_version    = "1.18.33"
+  # OpenCode 2 (owner, 2026-10-22): its own installer (opencode.ai/v2/install; the v1 one refuses 2.x) into the same
+  # ~/.opencode/bin, and the same config works unchanged. `opencode --version` prints "opencode v2.1.2", so the check
+  # compares the last word without its "v".
+  opencode_version    = "2.1.2"
   opencode_user_setup = <<-OPENCODE
 set -e
 # Only ~/.opencode/bin ahead of the system dirs, so the installer's own version check looks at
 # the copy it manages, never at another one elsewhere on PATH.
 export PATH="$HOME/.opencode/bin:/usr/local/bin:/usr/bin:/bin"
-[ "$(~/.opencode/bin/opencode --version 2>/dev/null || true)" = "${local.opencode_version}" ] ||
-  curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} --no-modify-path
+have=$(~/.opencode/bin/opencode --version 2>/dev/null || true); have=$${have##* }
+[ "$${have#v}" = "${local.opencode_version}" ] ||
+  curl -fsSL https://opencode.ai/v2/install | bash -s -- --version ${local.opencode_version} --no-modify-path
 mkdir -p ~/.aws
 grep -qs '^\[default\]' ~/.aws/config || printf '[default]\nregion = us-west-1\n' >> ~/.aws/config
 if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/opencode.json ]; then
