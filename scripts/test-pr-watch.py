@@ -179,6 +179,83 @@ class AlertPollTests(unittest.TestCase):
         hits = [p for p in printed if p.get("src") == "cloudtrail" and "kind" in p]
         self.assertEqual([(h["id"], h["kind"], h["event"]) for h in hits], [("ev-1", "tamper-or-iam", "CreateAccessKey")])
 
+    def aa_poll(self, invoked_by, snapshot):
+        """Run poll() for one Access Analyzer snapshot finding, with CloudTrail showing one share made by `invoked_by` and
+        describe_snapshots answering `snapshot` (an exception means the snapshot is gone)."""
+        mod, _ = self.load()
+        printed = []
+        mod.out = lambda **kw: printed.append(kw)
+        share = {"eventName": "ModifySnapshotAttribute", "userIdentity": {"invokedBy": invoked_by},
+                 "requestParameters": {"createVolumePermission": {"add": {"items": [{"userId": "058264422536"}]}}}}
+
+        class Gone(Exception):
+            response = {"Error": {"Code": "InvalidSnapshot.NotFound"}}
+
+        class Pages:
+            def __init__(self, pages):
+                self.pages = pages
+
+            def paginate(self, **kw):
+                return self.pages
+
+        class AA:
+            def list_analyzers(self):
+                return {"analyzers": [{"arn": "arn:analyzer"}]}
+
+            def get_paginator(self, op):
+                return Pages([{"findings": [{"id": "f-1", "resourceType": "AWS::EC2::Snapshot", "findingType": "ExternalAccess",
+                                             "resource": "arn:aws:ec2:us-east-1::snapshot/snap-0abc",
+                                             "updatedAt": mod.SINCE}]}])
+
+            def get_finding_v2(self, **kw):
+                return {"findingDetails": [{"externalAccessDetails": {"principal": {"AWS": "058264422536"}}}]}
+
+        test = self
+
+        class CTPages(Pages):
+            def paginate(self, **kw):
+                # the whole 90-day lookup history, so an older share by anyone else cannot hide behind a recent one
+                age = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) - kw["StartTime"]
+                test.assertGreaterEqual(age.days, 89)
+                return self.pages
+
+        class CT:
+            def get_paginator(self, op):
+                return CTPages([{"Events": [{"EventName": "ModifySnapshotAttribute", "CloudTrailEvent": json.dumps(share)}]}])
+
+        class EC2:
+            def describe_snapshots(self, **kw):
+                if snapshot is None:
+                    raise Gone()
+                return {"Snapshots": [snapshot]}
+
+            def describe_snapshot_attribute(self, **kw):
+                return {"CreateVolumePermissions": [{"UserId": "058264422536"}]}
+
+        class Sess:
+            def client(self, svc, **kw):
+                if svc == "accessanalyzer":
+                    return AA()
+                if svc == "cloudtrail" and "region_name" in kw:
+                    return CT()
+                if svc == "ec2":
+                    return EC2()
+                raise RuntimeError("not stubbed")
+
+        mod.poll("main", Sess(), "us-east-1")
+        return [p for p in printed if p.get("src") == "access-analyzer" and "error" not in p]
+
+    def test_aws_backups_own_copy_share_is_marked_by_design_and_nothing_else_is(self):
+        pipeline = {"Description": "This snapshot is copied by the AWS Backup service.",
+                    "Tags": [{"Key": "BackupPipeline", "Value": "fleet-processing-v2"}, {"Key": "aws:backup:source-resource", "Value": "x"}]}
+        # gone after the copy, or still there as this pipeline's copy shared with that one account: by design
+        for snap in (None, pipeline):
+            hits = self.aa_poll("backup.amazonaws.com", snap)
+            self.assertEqual([h.get("by_design") for h in hits], ["aws-backup-copy-share"], snap)
+        # a share anyone else made, or a snapshot outside the pipeline, is reported as before
+        self.assertNotIn("by_design", self.aa_poll(None, None)[0])
+        self.assertNotIn("by_design", self.aa_poll("backup.amazonaws.com", {"Description": "mine", "Tags": []})[0])
+
     def test_audit_names_match_the_terraform_rule(self):
         """Every eventName in security-forward-audit is looked up, and nothing else (drift between the two fails)."""
         mod, _ = self.load()
