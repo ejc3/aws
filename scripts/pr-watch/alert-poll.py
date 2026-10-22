@@ -60,6 +60,55 @@ AUDIT = {
 PROTECTED_VAULTS = {"ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backup-recovery"}
 
 
+# AWS Backup's own temporary share of an EBS snapshot while it copies a recovery point (another region, the air-gapped vault,
+# the dev-staging recovery vault). It shares with whichever of its service accounts serves that route (950509372133,
+# 975050365828 and 058264422536 seen on 2026-10-22), so no fixed principal list keeps up: a finding is marked by_design only
+# on CloudTrail's evidence, the same test security-alert-digest.py's backup_copy_share applies (#579).
+BACKUP_COPY_DESCRIPTIONS = {"This snapshot is copied by the AWS Backup service.", "This snapshot is created by the AWS Backup service."}
+BACKUP_PIPELINE = "fleet-processing-v2"
+
+
+def _code(exc):
+    return str(((getattr(exc, "response", None) or {}).get("Error") or {}).get("Code") or "")
+
+
+def backup_copy_share(sess, region, snapshot_arn, principal):
+    """True only when every share of the snapshot to `principal` was added by AWS Backup itself (CloudTrail invokedBy
+    backup.amazonaws.com, at least one), and the snapshot is gone (AWS Backup deletes its processing copy) or is still an
+    AWS Backup snapshot of this pipeline shared with nobody else. Any error or missing evidence: False (it is reported)."""
+    snapshot_id = str(snapshot_arn).rsplit("/", 1)[-1]
+    if not snapshot_id.startswith("snap-") or not principal:
+        return False
+    try:
+        adds = []
+        pages = sess.client("cloudtrail", region_name=region, config=CFG).get_paginator("lookup_events").paginate(
+            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": snapshot_id}],
+            StartTime=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2))
+        for page in pages:
+            for event in page.get("Events", []):
+                if event.get("EventName") != "ModifySnapshotAttribute":
+                    continue
+                record = json.loads(event.get("CloudTrailEvent") or "{}")
+                items = (((record.get("requestParameters") or {}).get("createVolumePermission") or {}).get("add") or {}).get("items") or []
+                if any(i.get("userId") == principal or i.get("group") for i in items):
+                    adds.append((record.get("userIdentity") or {}).get("invokedBy"))
+        if not adds or any(by != "backup.amazonaws.com" for by in adds):
+            return False
+        ec2 = sess.client("ec2", region_name=region, config=CFG)
+        try:
+            snap = ec2.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])["Snapshots"][0]
+        except Exception as exc:  # noqa: BLE001
+            return _code(exc) == "InvalidSnapshot.NotFound"
+        tags = {t.get("Key"): t.get("Value") for t in snap.get("Tags") or []}
+        if snap.get("Description") not in BACKUP_COPY_DESCRIPTIONS or tags.get("BackupPipeline") != BACKUP_PIPELINE \
+                or "aws:backup:source-resource" not in tags:
+            return False
+        perms = ec2.describe_snapshot_attribute(SnapshotId=snapshot_id, Attribute="createVolumePermission")
+        return all(q.get("UserId") == principal and not q.get("Group") for q in perms.get("CreateVolumePermissions") or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def sessions():
     """(account label, a function that makes a fresh boto3 session for it): one session per thread."""
     main = boto3.Session()
@@ -133,8 +182,15 @@ def poll(acct, sess, region):
                                                                        filter={"status": {"eq": ["ACTIVE"]}}):
                 for x in page["findings"]:
                     if x.get("updatedAt") and x["updatedAt"] >= SINCE:
+                        extra = {}
+                        if x.get("resourceType") == "AWS::EC2::Snapshot":
+                            detail = aa.get_finding_v2(analyzerArn=an["arn"], id=x["id"])
+                            principals = [((d.get("externalAccessDetails") or {}).get("principal") or {}).get("AWS")
+                                          for d in detail.get("findingDetails") or []]
+                            if principals and all(backup_copy_share(sess, region, x.get("resource"), p) for p in principals):
+                                extra["by_design"] = "aws-backup-copy-share"
                         out(src="access-analyzer", id=x.get("id"), acct=acct, region=region, type=x.get("findingType"),
-                            resource=x.get("resource"))
+                            resource=x.get("resource"), **extra)
     except Exception as e:  # noqa: BLE001
         out(src="access-analyzer", acct=acct, region=region, error=type(e).__name__)
     try:

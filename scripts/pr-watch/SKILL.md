@@ -131,7 +131,9 @@ to approve if it is safe; we have many code review agents"):
    `lookup-events` minutes late), so drop any `id` already in the state's `alerts_seen` and add each triaged one
    (keep a day of them). Note the time before the first query; record each result in the state's `alerts_pending` first,
    and only once every result is triaged set `alerts_checked_at` to that noted time, so nothing that arrived during the
-   run and nothing left untriaged is skipped. Confirm each from live
+   run and nothing left untriaged is skipped. A result marked `by_design` (the poller's own evidence check: an Access
+   Analyzer snapshot share that CloudTrail shows AWS Backup made, as its copies do nightly) is recorded as seen and needs
+   no action. Confirm each other one from live
    state, grouped by control and resource:
    - **Real** (an open port, a public bucket, a leaked key, a root sign-in, a GuardDuty threat): fix it through a PR,
      step 3, and apply; a security hole ships first and is hardened after. A GuardDuty or audit alert nobody can explain
