@@ -52,10 +52,12 @@ class ExternalAccess(unittest.TestCase):
         for name, body in rules:
             self.assertEqual(body.count("filter {"), 2, name)
             self.assertIn('criteria = "resourceType"\n    eq       = ["AWS::EC2::Snapshot"]', body)
-            self.assertIn('criteria = "principal.AWS"\n    eq       = [local.access_analyzer_backup_lag_principal]', body)
+            self.assertIn('criteria = "principal.AWS"\n    eq       = local.access_analyzer_backup_lag_principals', body)
             self.assertNotIn("contains", body)
             self.assertNotIn("exists", body)
-        self.assertRegex(self.source, r'access_analyzer_backup_lag_principal = "\d{12}"')
+        # exactly AWS Backup's two service accounts seen sharing the copy snapshots, each a 12-digit account id
+        principals = re.search(r'access_analyzer_backup_lag_principals = \[([^\]]*)\]', self.source).group(1)
+        self.assertEqual(re.findall(r'"(\d{12})"', principals), ["950509372133", "975050365828"])
 
     def test_no_extra_or_hidden_configuration_blocks(self):
         headers = re.findall(r'^([a-z_]+) ', self.source, re.M)
