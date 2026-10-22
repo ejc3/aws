@@ -211,6 +211,19 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Action    = "sts:AssumeRole"
       Resource  = aws_iam_role.dolphin_terraform.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      # Apply in the fcvm-fleet account (fcvm-fleet-account.tf), and read where it is (/infra/fcvm-fleet). Same pin.
+      Sid       = "AssumeTheFcvmFleetApplyRoleOnly"
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Resource  = aws_iam_role.fcvm_fleet_terraform.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      Sid       = "ReadTheFcvmFleetPointerOnly"
+      Effect    = "Allow"
+      Action    = "ssm:GetParameter"
+      Resource  = aws_ssm_parameter.fcvm_fleet.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
   tags = { Name = "assume-constellation-terraform", Managed = "terraform" }

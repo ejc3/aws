@@ -307,8 +307,8 @@ class GpuQuota(unittest.TestCase):
                 b = block(FLAVORS_TF, 'resource "aws_servicequotas_service_quota" "%s"' % name)
                 self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.%s.value)" % name, b)
         self.assertIn('parallel_box_region = "us-east-2"', OHIO)
-        # nothing else owns the G spot quota
-        tf = "".join(p.read_text() for p in ROOT.glob("*.tf"))
+        # nothing else in this account owns the G spot quota (fcvm-fleet-account.tf sets its own account's, #605)
+        tf = "".join(p.read_text() for p in ROOT.glob("*.tf") if p.name != "fcvm-fleet-account.tf")
         self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 2)
 
 
