@@ -1062,6 +1062,7 @@ pbox flavors               # the menu: vCPU, memory, local disk, what each is fo
 pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
+pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox ssh [N]
 pbox down [N]              # terminate compute; keep that box's /mnt/work
 ```
@@ -1097,10 +1098,29 @@ watchdog checks every five minutes and terminates any box after 30 minutes below
 activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
-lifecycle. Terraform owns the durable half -- work volumes, security group, key pair and
+lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and
 one launch template per box -- while the instances themselves are deliberately not in state.
 That removes the old hazard entirely: an unrelated full apply can no longer propose
 terminating a box in the middle of a live job.
+
+### A box open to the internet, with public IPv6 for fcvm VMs
+
+```bash
+pbox up 3 kvm-192 --open   # prints:  ipv6:  <prefix>/80 (fcvm --network routed --ipv6-prefix <prefix>/80)
+pbox ssh 3
+sudo fcvm podman run --name web --network routed --ipv6-prefix <prefix>/80 nginx:alpine
+```
+
+`--open` gives the box a second security group, `parallel-box-open` (`ohio-pbox.tf`), that lets every protocol and port in
+from `0.0.0.0/0` and `::/0`, and asks EC2 for one delegated IPv6 /80 on its primary interface. fcvm's routed mode gives each
+VM an address in that /80, so each VM can be reached from the internet on its own public IPv6. **Everything is exposed, not
+only the VMs**: the group applies to the box's own public IPv4 and IPv6 addresses, so any port anything on the box listens on
+is reachable by anyone. A plain `pbox up` never attaches the group. `up` prints the /80 and adds `ipv6_prefix=<the /80>` to
+its last line; `pbox status` shows it while the box runs.
+
+`--open` launches only in the home AZ: the fallback sites' VPCs have no IPv6, so it is refused with `--fallback` and
+`--regions` (and when home has no capacity, exits 3 without offering them). It is refused for every command but `up`, and
+for a member's pbox. A box already running without it is kept as it is: `pbox down N`, then `pbox up N FLAVOR --open`.
 
 ## On-demand GPU box
 

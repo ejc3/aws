@@ -224,7 +224,7 @@ class X86Image(unittest.TestCase):
         self.assertNotEqual(arm.group(1), x86.group(1))
         self.assertEqual(x86.group(2), arm.group(2).replace("-arm64-", "-amd64-"))
         sites = re.search(r"parallel_box_sites = \{.*?\n  \}\n", LAUNCH, re.S).group(0)
-        self.assertIn("ami_x86           = var.parallel_box_ami_ohio_x86", sites)
+        self.assertRegex(sites, r"\n      ami_x86 += var\.parallel_box_ami_ohio_x86\n")
         referenced = re.search(r"parallel_box_referenced_arns = flatten\(\[.*?\n  \]\)", LAUNCH, re.S).group(0)
         self.assertIn('"arn:aws:ec2:${r}::image/${site.ami}",', referenced)
         self.assertIn('"arn:aws:ec2:${r}::image/${site.ami_x86}",', referenced)

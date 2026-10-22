@@ -168,6 +168,42 @@ resource "aws_security_group" "ohio_pbox" {
   }
 }
 
+# The second group a box gets when it is launched with `pbox up N FLAVOR --open` (scripts/parallel-box.sh), next to the
+# SSH group above: everything in, from anywhere, over IPv4 and IPv6. An --open launch also asks for a delegated IPv6 /80
+# on the box's primary interface, so fcvm VMs on it (`--network routed --ipv6-prefix <the /80>`) each get a public
+# address that can be reached on any port. The group applies to the box's own addresses as well, so every port the box
+# itself listens on is public too. A plain `pbox up` never attaches it. us-east-2 runs no Security Hub
+# (security-hub-automation.tf), so the group raises no EC2.18/EC2.19 finding.
+resource "aws_security_group" "ohio_pbox_open" {
+  provider    = aws.ohio
+  name_prefix = "parallel-box-open-"
+  description = "Parallel box launched with pbox up --open: all traffic in from anywhere, IPv4 and IPv6"
+  vpc_id      = aws_vpc.ohio_pbox.id
+
+  ingress {
+    description      = "Everything, from anywhere (pbox up --open only)"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = { Name = "parallel-box-open" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 # The security design logs every VPC's traffic to the audit bucket (security-monitoring.tf).
 resource "aws_flow_log" "security_ohio_pbox" {
   provider                 = aws.ohio
@@ -318,11 +354,19 @@ resource "aws_lambda_permission" "parallel_watchdog_ohio" {
 # parameter holds no secret; the policy that lets a dev box read it is in applied-status.tf. "x86_image" is the home site's
 # x86_64 image, which `pbox up` passes with --image-id for an x86 flavor (pbox-flavors.tf). "fallback" is where
 # `pbox up N FLAVOR --fallback` may launch instead (pbox-fallback.tf): the template name and region => AZ => subnet, and
-# each region's x86 image.
+# each region's x86 image. "open" is the network interface `pbox up N FLAVOR --open` launches with in place of the
+# template's: the home subnet and both security groups, the SSH one first.
+locals {
+  parallel_box_open_pointer = {
+    subnet          = local.parallel_box_sites[local.parallel_box_region].subnet_id
+    security_groups = [local.parallel_box_sites[local.parallel_box_region].security_group_id, local.parallel_box_sites[local.parallel_box_region].open_security_group_id]
+  }
+}
+
 resource "aws_ssm_parameter" "parallel_box_region" {
   name        = "/infra/parallel-box"
   description = "Which region the parallel boxes launch in (see ohio-pbox.tf) and their fallback sites (pbox-fallback.tf); read by scripts/parallel-box.sh"
   type        = "String"
   tier        = "Standard"
-  value       = jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, fallback = local.pbox_fallback_pointer })
+  value       = jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, open = local.parallel_box_open_pointer, fallback = local.pbox_fallback_pointer })
 }

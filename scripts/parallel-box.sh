@@ -21,8 +21,18 @@
 #                     A FALLBACK BOX STARTS WITH AN EMPTY WORK VOLUME, deleted with the box.
 #   pbox up [N] FLAVOR --regions us-east-1,us-west-2
 #                     the same, searching only these regions' fallback sites
+#   pbox up [N] FLAVOR --open
+#                     launch it OPEN to the internet: besides the SSH-only security group it gets one that lets
+#                     everything in, from anywhere, over IPv4 and IPv6, and a delegated public IPv6 /80 on its
+#                     interface, printed as "ipv6: <prefix>/80". Each fcvm VM started on it with
+#                       sudo fcvm podman run --network routed --ipv6-prefix <prefix>/80 ...
+#                     gets its own public IPv6 address in that /80. EVERY PORT IS PUBLIC: the VMs' addresses and the
+#                     box's own IPv4 and IPv6 addresses alike, so anything listening on the box is reachable. Home AZ
+#                     only (the fallback sites have no IPv6; --fallback and --regions are refused with it), and not for
+#                     a member's box. A box already running without it stays as it is: down, then up --open.
 #   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
-#   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? and how the NEXT launch is bought
+#   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? open, with which IPv6 /80?
+#                     and how the NEXT launch is bought
 #   pbox status N     just box N
 #   pbox ssh [N]      connect
 #   pbox ip [N]       print the IP
@@ -31,10 +41,11 @@
 #                     fallback AZ; launches nothing
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
-#   "launched box=N region=R az=Z type=T ip=IP work=persistent|fresh", or "running ..." when it already was),
+#   "launched box=N region=R az=Z type=T ip=IP work=persistent|fresh", or "running ..." when it already was, with
+#   " ipv6_prefix=<prefix>/80" at the end for a box launched with --open),
 #   2 when no flavor (or an unknown one) was named, printing the menu and launching nothing, 3 when the home AZ
-#   had no capacity and --fallback was not given (retry with it), 4 when no fallback AZ had capacity either,
-#   and 1 for any other failure.
+#   had no capacity and --fallback was not given (retry with it, unless --open), 4 when no fallback AZ had capacity
+#   either, and 1 for any other failure.
 #
 # CAPACITY IS THE HARD PART. A big spot request pinned to one AZ and one instance
 # type scores 1/10 for fulfilment; allowing several instance types raises that
@@ -213,6 +224,7 @@ MODE=""
 FLAVOR=""
 FALLBACK=""
 ONLY_REGIONS=""
+OPEN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
@@ -223,6 +235,7 @@ while [ $# -gt 0 ]; do
       FLAVOR="$1" ;;
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
     --fallback) FALLBACK=1 ;;
+    --open) OPEN=1 ;;
     --regions)
       shift
       [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
@@ -232,7 +245,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open)"; exit 1 ;;
   esac
   shift
 done
@@ -241,6 +254,18 @@ if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$FALLBACK" ]; }; then
   exit 1
 fi
 if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
+# --open: the owner's boxes, `up`, and the home AZ only. The members' pboxes launch with their SSH-only group, which is
+# also all their IAM grant allows (member-pbox.tf). The fallback sites' VPCs have no IPv6, so there is no /80 to delegate.
+if [ -n "$OPEN" ]; then
+  if [ -n "$MEMBER" ]; then
+    say "--open is not available for pbox-$MEMBER: it always launches with its SSH-only security group"; exit 1
+  fi
+  if [ "$CMD" != "up" ]; then say "--open only applies to 'up'"; exit 1; fi
+  if [ -n "$FALLBACK" ]; then
+    say "--open launches only in the home AZ: the fallback sites have no IPv6 to delegate. Drop --fallback / --regions."
+    exit 1
+  fi
+fi
 if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
@@ -277,7 +302,7 @@ fi
 # A member's box is always in its own region and has no fallback sites, so it reads no pointer.
 POINTER=""
 [ -n "$MEMBER" ] || POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)"
-pointer() { # pointer KEY...: the value at that path in the pointer (an object's keys, space-separated), or nothing
+pointer() { # pointer KEY...: the value at that path in the pointer (an object's keys or a list, space-separated), or nothing
   printf '%s' "$POINTER" | python3 -c 'import json, sys
 try:
     v = json.load(sys.stdin)
@@ -285,7 +310,7 @@ try:
         v = v[k]
 except Exception:
     sys.exit(0)
-print(" ".join(v) if isinstance(v, dict) else v if isinstance(v, str) else "")' "$@" 2>/dev/null
+print(" ".join(v) if isinstance(v, (dict, list)) else v if isinstance(v, str) else "")' "$@" 2>/dev/null
 }
 REGION="${PARALLEL_BOX_REGION:-}"
 [ -z "$MEMBER" ] || REGION="$MEMBER_PBOX_REGION"
@@ -310,6 +335,30 @@ fb_x86_image() { pointer fallback regions "$1" x86_image; } # fb_x86_image REGIO
 # The home site's x86_64 image, for an x86 type (type_arch); none when PARALLEL_BOX_REGION names another region.
 HOME_X86_IMAGE=""
 [ "$HOME_REGION" != "$(pointer region)" ] || HOME_X86_IMAGE="$(pointer x86_image)"
+
+# The network interface an --open launch passes in place of the template's (ohio-pbox.tf, "open" in the pointer): the
+# home subnet, the SSH group and the open group, a public IPv4, one IPv6 address and one delegated IPv6 prefix (a /80).
+# Every field the template's interface sets is given here too, so the box gets the same interface whether EC2 merges
+# this into the template's interface 0 or replaces it. Read only for the home site: PARALLEL_BOX_REGION naming another
+# region has no open interface.
+NIC=()
+if [ -n "$OPEN" ]; then
+  OPEN_SUBNET=""
+  OPEN_GROUPS=""
+  if [ "$HOME_REGION" = "$(pointer region)" ]; then
+    OPEN_SUBNET="$(pointer open subnet)"
+    OPEN_GROUPS="$(pointer open security_groups)"
+  fi
+  # shellcheck disable=SC2086 # the two group ids, one argument each
+  if [ -z "$OPEN_SUBNET" ] || [ "$(set -- $OPEN_GROUPS; echo $#)" != 2 ]; then
+    say "FATAL: /infra/parallel-box names no open network interface for $HOME_REGION (ohio-pbox.tf not applied yet?); nothing was launched."
+    exit 1
+  fi
+  # shellcheck disable=SC2086 # the two group ids, one argument each
+  NIC=(--network-interfaces "$(python3 -c 'import json, sys
+print(json.dumps([{"DeviceIndex": 0, "SubnetId": sys.argv[1], "Groups": sys.argv[2:], "AssociatePublicIpAddress": True,
+                   "DeleteOnTermination": True, "Ipv6AddressCount": 1, "Ipv6PrefixCount": 1}]))' "$OPEN_SUBNET" $OPEN_GROUPS)")
+fi
 
 # image_args TYPE IMAGE REGION: the --image-id an x86_64 type needs (the templates boot arm64), one word per line; nothing
 # for an arm64 type. Fails, naming what is missing, when an x86_64 type has no published image there.
@@ -410,6 +459,24 @@ box_work() {
   [ "$f" = "true" ] && echo fresh || echo persistent
 }
 
+# The IPv6 prefix delegated to the box's primary interface (a /80, only on a box launched with --open), or nothing.
+# A member's box never has one, so it is not looked up.
+box_ipv6_prefix() {
+  [ -z "$MEMBER" ] || return 0
+  # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+  aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[0].Instances[0].NetworkInterfaces[?Attachment.DeviceIndex==`0`].Ipv6Prefixes[].Ipv6Prefix | [0]' \
+    --output text 2>/dev/null | grep -v '^None$' || true
+}
+
+# When `up --open` finds the box already running without a prefix: it was not launched open, and is kept as it is.
+open_note() {
+  if [ -n "$OPEN" ] && [ -z "$(box_ipv6_prefix)" ]; then
+    say "NOTE: $NAME is already running without --open (no open security group, no IPv6 /80); it is kept. For --open: $SELF down ${BOX:-}, then up again with --open."
+  fi
+}
+
 box_az() {
   aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
@@ -437,6 +504,11 @@ status_one() {
     case "$L" in spot) BOUGHT="spot" ;; None|"") BOUGHT="ON-DEMAND (about 3x spot)" ;; *) BOUGHT="$L" ;; esac
     F="$(type_flavor "$T")"
     echo "  state:  RUNNING at $IP ($T, flavor ${F:-none}, $BOUGHT)"
+    P="$(box_ipv6_prefix)"
+    if [ -n "$P" ]; then
+      echo "  open:   launched with --open: every port of the box and its VMs is reachable from the internet"
+      echo "  ipv6:   $P (fcvm --network routed --ipv6-prefix $P)"
+    fi
     if [ "$(box_work)" = "fresh" ]; then
       echo "  where:  FALLBACK site $(box_az) -- its /mnt/work is a fresh volume, deleted with the box"
     elif [ "$REGION" != "$HOME_REGION" ] || [ -n "$FB_REGIONS" ]; then
@@ -566,10 +638,19 @@ wait_ready() {
         fi
         ;;
       esac
+      # An --open box: its delegated IPv6 /80, which fcvm's routed mode takes as --ipv6-prefix.
+      P="$(box_ipv6_prefix)"
+      if [ -n "$P" ]; then
+        say "  open:  every port of this box and its VMs is reachable from the internet (IPv4 and IPv6)"
+        say "  ipv6:  $P (fcvm --network routed --ipv6-prefix $P)"
+      elif [ -n "$OPEN" ] && [ "${2:-}" != "running" ]; then
+        say "FAILED: $NAME was launched with --open but EC2 reports no IPv6 prefix on its interface. It is running: $SELF status ${BOX:-}, $SELF down ${BOX:-}"
+        exit 1
+      fi
       if [ "${2:-}" = "running" ]; then
-        echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1"
+        echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1${P:+ ipv6_prefix=$P}"
       else
-        echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1"
+        echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1${P:+ ipv6_prefix=$P}"
       fi
       exit 0
     fi
@@ -696,6 +777,7 @@ case "$CMD" in
           --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
           --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
         flavor_note "$CHOSEN"
+        open_note
         attach_work "$ID" || exit 1
         CHOSEN_AZ="$(box_az)"
         wait_ready persistent running
@@ -704,8 +786,10 @@ case "$CMD" in
       flavor_note "$(aws ec2 describe-instances --region "$REGION" \
         --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
         --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+      open_note
+      P="$(box_ipv6_prefix)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
-      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)"
+      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)${P:+ ipv6_prefix=$P}"
       exit 0
     fi
 
@@ -725,6 +809,9 @@ case "$CMD" in
       spot) say "PURCHASE MODE: spot. Spot capacity differs from type to type; trying each of $FLAVOR's types in turn." ;;
       *) say "PURCHASE MODE: unknown (could not read the launch template). Trying each type in turn." ;;
     esac
+    if [ -n "$OPEN" ]; then
+      say "OPEN: the box gets the open security group (everything in, from anywhere) and a delegated IPv6 /80."
+    fi
     say ""
 
     ID=""
@@ -750,7 +837,8 @@ case "$CMD" in
       # an x86_64 type's image (image_args), which IAM pins by exact ARN like the template's.
       if ! IMG_OUT="$(image_args "$T" "$HOME_X86_IMAGE" "$REGION")"; then REAL_ERROR=1; say ""; continue; fi
       read -r -d '' -a IMG <<< "$IMG_OUT"
-      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"}; then
+      # --open replaces the template's interface 0 with the open one (NIC, above); IAM allows only this subnet and these groups.
+      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"} ${NIC[@]+"${NIC[@]}"}; then
         ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"; break
       fi
     done
@@ -783,6 +871,13 @@ case "$CMD" in
     if [ -n "$MEMBER" ]; then
       say "Capacity changes hour to hour: try again later, or another flavor that still fits the work"
       say "  (\`$SELF flavors\`; \`$SELF capacity FLAVOR\` shows the spot placement score)."
+      exit 3
+    fi
+    if [ -n "$OPEN" ]; then
+      say "Options:"
+      say "  - retry later; capacity fluctuates hour to hour"
+      say "  - another flavor that still fits the work ($SELF flavors;  $SELF capacity ${BOX:-1} FLAVOR  scores one without launching)"
+      say "  --open launches only in the home AZ (the fallback sites have no IPv6), so --fallback is not an option with it."
       exit 3
     fi
     if [ -z "$FALLBACK" ]; then

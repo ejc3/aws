@@ -668,8 +668,8 @@ if op == "describe-instances":
         print("spot")
     elif "AvailabilityZone" in q:
         print("us-east-2c")
-    elif "Fallback" in q:
-        print("None")
+    elif "Fallback" in q or "Ipv6Prefixes" in q:
+        print("None")  # no box here was launched at a fallback site or with --open
     else:
         print("\n".join(iid.split()))
 elif op == "describe-volumes":

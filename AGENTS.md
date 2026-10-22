@@ -292,7 +292,13 @@ test keeps them equal); with none it exits 2 and prints the menu. An agent picks
 shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
 --fallback` (or `--regions us-east-1,us-west-2`) then launches at a fallback site (`pbox-fallback.tf`: one per US region,
 every AZ but the home one, best spot placement score first) **with a fresh, empty work volume** that is deleted with the
-box, and no NFS scratch. `pbox capacity FLAVOR` shows the scores; `ip`, `ssh`, `status` and `down` find a box wherever it runs. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+box, and no NFS scratch. `pbox capacity FLAVOR` shows the scores; `ip`, `ssh`, `status` and `down` find a box wherever it runs.
+`pbox up N FLAVOR --open` launches at home with interface 0 replaced (`--network-interfaces`, the subnet and both groups
+from the pointer's `open` entry): the SSH group plus `aws_security_group.ohio_pbox_open`, which lets every protocol and
+port in from `0.0.0.0/0` and `::/0`, and one delegated IPv6 /80 (`Ipv6PrefixCount=1`). `up` and `status` print the /80;
+`sudo fcvm podman run --network routed --ipv6-prefix <the /80>` gives each VM a public IPv6 in it. The open group covers
+the box's own addresses too, so every port the box listens on is public. `--open` is refused for other commands, with
+`--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).

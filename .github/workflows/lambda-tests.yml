@@ -295,6 +295,9 @@ jobs:
       - name: "pbox up --fallback: other US AZs with a fresh work volume; plain up exits 3 naming it (pbox-fallback.tf)"
         run: python3 -S -B scripts/test-pbox-fallback.py
 
+      - name: "pbox up --open: the open security group and a delegated IPv6 /80, home only, never a member's box"
+        run: python3 -S -B scripts/test-pbox-open.py
+
       - name: "pbox up needs a flavor; each flavor tries only its own types; IAM allows exactly the flavors' types (pbox-flavors.tf)"
         run: python3 -S -B scripts/test-pbox-flavors.py
 
