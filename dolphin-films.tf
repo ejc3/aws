@@ -74,7 +74,7 @@ locals {
   dolphin_films_turso_keys = ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"]
 
   # Who may read a non-production secret besides the administration set.
-  dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn]
+  dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
 
   # <environment>/<kind> => the variable names its JSON holds and who else may read it.
   dolphin_films_secrets = {

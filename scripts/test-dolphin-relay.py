@@ -56,8 +56,8 @@ class DeployTokenTests(unittest.TestCase):
 
 
 class SignupTokenTests(unittest.TestCase):
-    def test_signup_token_readers_are_administration_and_the_metal_boxes(self):
-        self.assertIn("dolphin_relay_signup_readers = [aws_iam_role.dev_server.arn]", TF)
+    def test_signup_token_readers_are_administration_the_metal_boxes_and_nextjs(self):
+        self.assertIn("dolphin_relay_signup_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]", TF)
         pol = block("aws_secretsmanager_secret_policy", "dolphin_relay_signup")
         self.assertIn("concat(local.games_mp_admin_principals, local.dolphin_relay_signup_readers)", pol)
         self.assertIn("role       = aws_iam_role.dev_server.name", block("aws_iam_role_policy_attachment", "dolphin_relay_signup_read"))

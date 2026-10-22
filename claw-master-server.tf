@@ -214,8 +214,8 @@ resource "aws_cloudwatch_log_group" "claw_master_server" {
 
 # The metal boxes may READ this one log group (owner, 2026-10-10: "give fcvm access to logs for the claude master"),
 # so an agent there can see what the pool did (moves, rate limits, upstream errors, reloads) without a person. The log
-# never holds tokens, bodies, URLs, account ids or upstream text (see the Logs bullet in AGENTS.md). Not nextjs-dev:
-# every account there has sudo, and nothing there debugs the pool.
+# never holds tokens, bodies, URLs, account ids or upstream text (see the Logs bullet in AGENTS.md). The owner's nextjs-ct
+# container may read it too (nextjs-dev-fcvm-parity.tf); member containers are denied it.
 resource "aws_iam_role_policy" "dev_server_claw_master_logs_read" {
   name = "claude-master-logs-read"
   role = aws_iam_role.dev_server.id

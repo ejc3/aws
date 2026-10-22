@@ -33,10 +33,13 @@ class ConstellationAccountTests(unittest.TestCase):
         self.assertIn("prevent_destroy = true", account)
         self.assertIn("local.constellation_account_email", account)
 
-    def test_the_apply_role_trusts_only_fcvm_arm(self):
+    def test_the_apply_role_trusts_only_fcvm_arm_and_nextjs(self):
         role = block('resource "aws_iam_role" "constellation_terraform"')
         self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", role)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', role)
+        # The owner's nextjs-ct container: unpinned (a chained session has no instance ARN); members deny AssumeRole.
+        self.assertIn("Principal = { AWS = aws_iam_role.nextjs_dev.arn }", role)
+        self.assertEqual(role.count("Principal ="), 2)
 
     def test_the_pin_is_fcvm_arm_or_an_arn_no_instance_has(self):
         self.assertIn("try(aws_instance.firecracker_dev[0].arn, ", TF)

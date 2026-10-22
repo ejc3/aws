@@ -76,9 +76,8 @@ class SecretTests(unittest.TestCase):
         for name, (_, readers) in secrets().items():
             if name.startswith("nonprod/"):
                 self.assertEqual(readers, "local.dolphin_films_nonprod_readers", name)
-        self.assertIn("dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn]", TF)
-        # Every account on nextjs-dev has sudo, so a grant to its role would be box-wide.
-        self.assertNotIn("aws_iam_role.nextjs_dev", TF)
+        # nextjs-dev-role for the owner's container only: members are denied it (nextjs-dev-fcvm-parity.tf).
+        self.assertIn("dolphin_films_nonprod_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]", TF)
 
     def test_the_resource_policy_denies_everyone_but_admins_and_that_environments_readers(self):
         policy = block("aws_secretsmanager_secret_policy", "dolphin_films")

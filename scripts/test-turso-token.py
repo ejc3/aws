@@ -24,12 +24,12 @@ class TursoTokenTests(unittest.TestCase):
         self.assertNotIn("aws_secretsmanager_secret_version\" \"turso", AI)
         self.assertNotRegex(AI, r"eyJ[A-Za-z0-9_-]{20,}")  # no JWT-shaped value anywhere
 
-    def test_only_admins_and_the_metal_role_may_read_it(self):
-        self.assertIn("turso_api_token_readers = [aws_iam_role.dev_server.arn]", AI)
+    def test_only_admins_the_metal_role_and_nextjs_may_read_it(self):
+        # nextjs-dev-role for the owner's container only: members are denied it (nextjs-dev-fcvm-parity.tf).
+        self.assertIn("turso_api_token_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]", AI)
         policy = block('resource "aws_secretsmanager_secret_policy" "turso_api_token"')
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn("concat(local.games_mp_admin_principals, local.turso_api_token_readers)", policy)
-        self.assertNotIn("nextjs_dev", policy)
 
     def test_the_identity_grant_is_one_managed_policy_on_the_metal_role_only(self):
         read = block('data "aws_iam_policy_document" "turso_api_token_read"')
@@ -41,7 +41,7 @@ class TursoTokenTests(unittest.TestCase):
 
     def test_agents_md_says_where_it_lives_and_who_cannot_read_it(self):
         self.assertIn("`turso/api-token`", AGENTS)
-        self.assertRegex(AGENTS, r"Turso API token\*\*, metal boxes only")
+        self.assertRegex(AGENTS, r"Turso API token\*\*, metal boxes and the owner's nextjs-ct container")
 
 
 if __name__ == "__main__":

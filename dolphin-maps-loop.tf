@@ -221,7 +221,7 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_pems" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.dolphin_maps_pems.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_maps_loop.arn]) } }
     }]
   })
 }

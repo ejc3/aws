@@ -85,7 +85,7 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('concat(local.games_mp_admin_principals, local.claw_master_backup_key_readers)', policy)
         self.assertIn(
-            "claw_master_backup_key_readers = concat([aws_iam_role.dev_server.arn], aws_iam_role.claw_master_server[*].arn)", TF)
+            "claw_master_backup_key_readers = concat([aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn], aws_iam_role.claw_master_server[*].arn)", TF)
         doc = block("aws_iam_policy_document", "claw_master_backup_key_read")
         self.assertIn("resources = [aws_secretsmanager_secret.claw_master_backup_key.arn]", doc)
         attach = block("aws_iam_role_policy_attachment", "claw_master_backup_key_read")
