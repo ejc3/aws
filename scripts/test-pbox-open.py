@@ -48,6 +48,10 @@ if "get-parameter" in a:
     print(os.environ["FAKE_POINTER"])
 elif "describe-launch-template-versions" in a:
     print("spot")
+elif "describe-instances" in a and "NetworkInterfaceId" in a:
+    print("eni-0open")
+elif "assign-ipv6-addresses" in a:
+    print("2001:db8:0:1::5")
 elif "describe-instances" in a and "Ipv6Prefixes" in a:
     print(state[2] if here and state[2] != "-" else "None")
 elif "describe-instances" in a and "PublicIpAddress" in a:
@@ -114,6 +118,31 @@ class OpenScript(unittest.TestCase):
             return []
         return [c for c in map(json.loads, self.log.read_text().splitlines()) if "run-instances" in c]
 
+    def test_open_launch_asks_for_the_prefix_only_then_gives_the_box_its_own_address(self):
+        # EC2 creates an interface with an address count OR a prefix count, never both (checked live 2026-10-22).
+        rc, out, err = self.pbox("up", "3", "kvm-192", "--open")
+        self.assertEqual(rc, 0, err)
+        nic = json.loads(self.runs()[0][self.runs()[0].index("--network-interfaces") + 1])
+        self.assertNotIn("Ipv6AddressCount", nic[0])
+        calls = [c for c in map(json.loads, self.log.read_text().splitlines()) if "assign-ipv6-addresses" in c]
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        self.assertEqual(c[c.index("--network-interface-id") + 1], "eni-0open")
+        self.assertEqual(c[c.index("--ipv6-address-count") + 1], "1")
+        self.assertIn("the box's own IPv6 address: 2001:db8:0:1::5", err)
+
+    def test_plain_up_assigns_no_ipv6(self):
+        rc, out, err = self.pbox("up", "3", "kvm-192")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("assign-ipv6-addresses", self.log.read_text())
+
+    def test_a_gpu_flavor_with_open_stays_at_home(self):
+        # A GPU flavor implies --fallback, except with --open, which launches only in the home AZ (kvm-gpu-96 is offered there).
+        rc, out, err = self.pbox("up", "3", "kvm-gpu-96", "--open")
+        self.assertNotIn("Drop --fallback", err)
+        for run in self.runs():
+            self.assertEqual(run[run.index("--region") + 1], "us-east-2")
+
     def test_open_launch_replaces_interface_0_with_both_groups_and_a_prefix(self):
         rc, out, err = self.pbox("up", "3", "kvm-192", "--open")
         self.assertEqual(rc, 0, err)
@@ -127,7 +156,7 @@ class OpenScript(unittest.TestCase):
         nic = json.loads(run[run.index("--network-interfaces") + 1])
         self.assertEqual(nic, [{"DeviceIndex": 0, "SubnetId": "subnet-home", "Groups": ["sg-ssh", "sg-open"],
                                 "AssociatePublicIpAddress": True, "DeleteOnTermination": True,
-                                "Ipv6AddressCount": 1, "Ipv6PrefixCount": 1}])
+                                "Ipv6PrefixCount": 1}])
         self.assertEqual(out.strip().splitlines()[-1],
                          "launched box=3 region=us-east-2 az=us-east-2c type=c8g.metal-48xl ip=203.0.113.9 "
                          "work=persistent ipv6_prefix=" + PREFIX)

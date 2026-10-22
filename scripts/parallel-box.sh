@@ -254,7 +254,8 @@ done
 # A GPU flavor searches every region on its own (owner, 2026-10-22: "i don't care what region any of this runs in"):
 # kvm-gpu-64's g5g.metal is not offered in the home AZ at all, and a GPU box is for fcvm passthrough, not for the work
 # volume. A member's box has one site and never falls back.
-case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac
+# Not with --open, which launches only at home (below): a kvm-gpu-96 --open box is an x86 g4dn.metal in the home AZ.
+case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ -z "$OPEN" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac
 if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$FALLBACK" ]; }; then
   say "your pbox is pbox-$MEMBER: run '$SELF $CMD' with no box number or fallback"
   exit 1
@@ -363,7 +364,7 @@ if [ -n "$OPEN" ]; then
   # shellcheck disable=SC2086 # the two group ids, one argument each
   NIC=(--network-interfaces "$(python3 -c 'import json, sys
 print(json.dumps([{"DeviceIndex": 0, "SubnetId": sys.argv[1], "Groups": sys.argv[2:], "AssociatePublicIpAddress": True,
-                   "DeleteOnTermination": True, "Ipv6AddressCount": 1, "Ipv6PrefixCount": 1}]))' "$OPEN_SUBNET" $OPEN_GROUPS)")
+                   "DeleteOnTermination": True, "Ipv6PrefixCount": 1}]))' "$OPEN_SUBNET" $OPEN_GROUPS)")
 fi
 
 # image_args TYPE IMAGE REGION: the --image-id an x86_64 type needs (the templates boot arm64), one word per line; nothing
@@ -474,6 +475,23 @@ box_ipv6_prefix() {
     --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
     --query 'Reservations[0].Instances[0].NetworkInterfaces[?Attachment.DeviceIndex==`0`].Ipv6Prefixes[].Ipv6Prefix | [0]' \
     --output text 2>/dev/null | grep -v '^None$' || true
+}
+
+# open_host_ipv6 ID: give an --open box's primary interface one IPv6 address of its own, besides its delegated /80. EC2
+# takes only one of Ipv6AddressCount and Ipv6PrefixCount when it creates an interface ("You can specify one and only one
+# of ipv6AddressCount or ipv6Addresses or ipv6Prefixes or ipv6PrefixCount", checked 2026-10-22), so the launch asks for the
+# prefix and the address is assigned here. A failure is reported, not fatal: the /80 is what fcvm's VMs use.
+open_host_ipv6() {
+  local id="$1" eni out
+  eni=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].NetworkInterfaces[?Attachment.DeviceIndex==`0`].NetworkInterfaceId | [0]' \
+    --output text 2>/dev/null)
+  if [ -n "$eni" ] && [ "$eni" != "None" ] && out=$(aws ec2 assign-ipv6-addresses --region "$REGION" \
+       --network-interface-id "$eni" --ipv6-address-count 1 --query 'AssignedIpv6Addresses[0]' --output text 2>&1); then
+    say "    the box's own IPv6 address: $out"
+  else
+    say "    could not give $id its own IPv6 address (its /80 is unaffected): ${out:-no primary interface found}"
+  fi
 }
 
 # When `up --open` finds the box already running without a prefix: it was not launched open, and is kept as it is.
@@ -917,7 +935,9 @@ case "$CMD" in
       read -r -d '' -a IMG <<< "$IMG_OUT"
       # --open replaces the template's interface 0 with the open one (NIC, above); IAM allows only this subnet and these groups.
       if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"} ${NIC[@]+"${NIC[@]}"}; then
-        ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"; break
+        ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"
+        [ -z "$OPEN" ] || open_host_ipv6 "$ID"
+        break
       fi
     done
 

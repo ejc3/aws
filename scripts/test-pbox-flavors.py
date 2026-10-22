@@ -140,7 +140,7 @@ class Menu(unittest.TestCase):
         gpu_types = {t for f, v in script_menu().items() if f.startswith("kvm-gpu-") for t in v[4]}
         self.assertEqual(gpu_types, {"g5g.metal", "g4dn.metal"})
         self.assertIn('kvm-gpu) echo "GPU passthrough into fcvm', PBOX)
-        self.assertIn('case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac', PBOX)
+        self.assertIn('case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ -z "$OPEN" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac', PBOX)
         self.assertEqual(tf_flavors()["kvm-gpu-96"], ["g4dn.metal"])
         self.assertNotIn("g4dn.metal", (ROOT / "member-pbox.tf").read_text())
 
@@ -165,7 +165,12 @@ class Iam(unittest.TestCase):
                 self.assertIn(':instance/*"]', s)
                 self.assertRegex(s, r'test     = "StringEquals"\n\s+variable = "aws:RequestTag/Name"\n\s+values   = %s\n' % re.escape(names))
                 self.assertRegex(s, r'test     = "StringNotEquals"\n\s+variable = "ec2:InstanceType"\n\s+values   = %s\n' % re.escape(types))
-        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 4)
+        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 5)
+        # --open's own IPv6 address on the owner's parallel boxes' interfaces only (by their Name tag).
+        s = statement("AssignIpv6ToOpenParallelBoxes", doc)
+        self.assertIn('actions   = ["ec2:AssignIpv6Addresses"]', s)
+        self.assertIn("resources = local.parallel_box_eni_arns", s)
+        self.assertIn('variable = "ec2:ResourceTag/Name"', s)
         # Stale spot requests: pbox may cancel any of the account's, never a persistent dev box's (their own ids).
         s = statement("CancelStaleSpotRequests", doc)
         self.assertIn('actions   = ["ec2:CancelSpotInstanceRequests"]', s)
