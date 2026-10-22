@@ -49,6 +49,8 @@ class GpuBoxTests(unittest.TestCase):
         types = hcl_list(self.tf, 'gpu_box_types')
         subnets = hcl_list(self.tf, 'gpu_box_subnets')
         self.assertEqual(re.search(r'GPU_BOX_TYPES:-([^}"]+)', self.script).group(1).split(), types)
+        self.assertEqual(re.search(r'GPU_BOX_METAL_TYPES:-([^}"]+)', self.script).group(1).split(),
+                         hcl_list(self.tf, 'gpu_box_metal_types'))
         self.assertEqual(re.search(r'^SUBNETS="([^"]+)"', self.script, re.M).group(1).split(), subnets)
 
     RUN_SIDS = ('RunGpuBoxInstanceOnly', 'RunGpuBoxRootVolume', 'RunGpuBoxEni', 'RunGpuBoxReferencedResources')
@@ -64,6 +66,18 @@ class GpuBoxTests(unittest.TestCase):
         for sid in ('RunTaggedParallelBoxOnly', 'RunInstancesReferencedResources'):
             with self.subTest(sid=sid):
                 self.assertIn('"ec2:LaunchTemplate"', statement(pbox, sid))
+
+    def test_the_metal_type_launches_only_from_the_metal_slot(self):
+        metal = statement(self.tf, 'RunGpuBoxMetalInstanceOnly')
+        self.assertRegex(metal, r'"ec2:LaunchTemplate"\s*\n\s*values\s*=\s*\[aws_launch_template\.gpu_box\["metal"\]\.arn\]\n')
+        self.assertRegex(metal, r'"aws:RequestTag/Name"\s*\n\s*values\s*=\s*\[local\.gpu_box_slots\["metal"\]\]\n')
+        self.assertRegex(metal, r'"ec2:InstanceType"\s*\n\s*values\s*=\s*local\.gpu_box_metal_types\n')
+        for key in ('"aws:TagKeys"', '"ec2:Tenancy"', '"ec2:MetadataHttpTokens"', '"ec2:InstanceProfile"'):
+            self.assertIn(key, metal)
+        self.assertEqual(hcl_list(self.tf, 'gpu_box_metal_types'), ['g4dn.metal'])
+        # the small slots' statement never names a metal type
+        self.assertFalse(any(t.endswith('.metal') for t in hcl_list(self.tf, 'gpu_box_types')))
+        self.assertNotIn('gpu_box_metal_types', statement(self.tf, 'RunGpuBoxInstanceOnly'))
 
     def test_instance_launch_is_tag_type_and_shape_scoped(self):
         run = statement(self.tf, 'RunGpuBoxInstanceOnly')
@@ -141,8 +155,9 @@ class GpuBoxTests(unittest.TestCase):
 
     def test_four_slots_and_slot_one_keeps_its_name(self):
         self.assertRegex(self.tf, r'gpu_box_name\s*=\s*"gpu-box"\n')
-        self.assertIn('gpu_box_slots = { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" }', self.tf)
-        self.assertEqual(re.search(r'^SLOTS="([^"]+)"', self.script, re.M).group(1).split(), ['1', '2', '3', '4'])
+        self.assertIn('{ for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" },', self.tf)
+        self.assertIn('{ metal = "${local.gpu_box_name}-metal" },', self.tf)
+        self.assertEqual(re.search(r'^SLOTS="([^"]+)"', self.script, re.M).group(1).split(), ['1', '2', '3', '4', 'metal'])
         lt = re.search(r'resource "aws_launch_template" "gpu_box" \{.*?\n\}', self.tf, re.S).group()
         self.assertRegex(lt, r'for_each\s*=\s*local\.gpu_box_slots')
         self.assertRegex(lt, r'\n  name\s*=\s*each\.value')
@@ -402,6 +417,7 @@ elif op == 'describe-subnets':
         print('%s\tus-west-2a' % s)
 elif op == 'describe-instance-type-offerings':
     print('g4dn.xlarge\tus-west-2a')
+    print('g4dn.metal\tus-west-2a')
 elif op == 'run-instances':
     name = opt('--launch-template').split(',')[0].split('=', 1)[1]
     with open(os.path.join(state, name), 'a') as f:
@@ -471,6 +487,18 @@ class GboxScript(unittest.TestCase):
         r, calls = self.gbox('up')
         self.assertIn('LaunchTemplateName=gpu-box,Version=$Latest', [c for c in calls if c.startswith('ec2 run-instances')][0])
 
+    def test_up_metal_launches_the_metal_template_as_g4dn_metal(self):
+        r, calls = self.gbox('up', 'metal')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        runs = [c for c in calls if c.startswith('ec2 run-instances')]
+        self.assertEqual(len(runs), 1, calls)
+        self.assertIn('LaunchTemplateName=gpu-box-metal,Version=$Latest', runs[0])
+        self.assertIn('--instance-type g4dn.metal', runs[0])
+        self.assertNotIn('xlarge', runs[0])
+        r, calls = self.gbox('down', 'metal')
+        self.assertEqual([c for c in calls if c.startswith('ec2 terminate-instances')],
+                         ['ec2 terminate-instances --region us-west-2 --instance-ids i-new-gpu-box-metal'])
+
     def test_status_ip_and_status_all(self):
         self.running(gpu_box_2='i-222')
         r, _ = self.gbox('status')
@@ -482,7 +510,7 @@ class GboxScript(unittest.TestCase):
         lines = [l for l in r.stdout.splitlines() if l.startswith('gpu-box')]  # minus the fake ssh's detail
         self.assertEqual(lines, ['gpu-box: down ($0)', 'gpu-box-2: RUNNING at 198.51.100.2 (g4dn.xlarge); the watchdog '
                                  'terminates it at its lifetime or after 30 idle minutes',
-                                 'gpu-box-3: down ($0)', 'gpu-box-4: down ($0)'])
+                                 'gpu-box-3: down ($0)', 'gpu-box-4: down ($0)', 'gpu-box-metal: down ($0)'])
 
     def test_unknown_slot_is_refused_before_any_aws_call(self):
         for args in (('up', '5'), ('down', '0'), ('ssh', 'all'), ('down', 'all')):

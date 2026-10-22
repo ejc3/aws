@@ -26,6 +26,10 @@
 #
 # Nothing on it persists. Tests copy their build in over SSH, run, and copy results out.
 #
+# THE METAL SLOT (`gbox up metal`, "gpu-box-metal"): a whole g4dn.metal -- 8 NVIDIA T4s, 96 vCPUs, no hypervisor -- for
+# Firecracker microVMs that each get a GPU through VFIO, which needs bare metal. Same template, grant shape, watchdog
+# and lifetime as the small slots; its type is allowed only from its own template.
+#
 # FOUR SLOTS, so several projects' GPU jobs stop queueing behind one box. Each slot is its own
 # box with its own Name tag -- slot 1 keeps the original "gpu-box", slots 2-4 are "gpu-box-2"
 # .. "gpu-box-4" -- and its own launch template of the same name, exactly as the parallel
@@ -51,8 +55,14 @@ variable "gpu_box_max_hours" {
 locals {
   # Slot 1 keeps the original name, so every existing `gbox` caller and the box already
   # running are untouched; the others are suffixed, as parallel-box-2 is.
-  gpu_box_name  = "gpu-box"
-  gpu_box_slots = { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" }
+  gpu_box_name = "gpu-box"
+  gpu_box_slots = merge(
+    { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" },
+    # The bare-metal slot (owner, 2026-10-22: "make a gbox option for bare metal"): a whole g4dn.metal, 8 NVIDIA T4s
+    # with no hypervisor in between, so Firecracker can run on its KVM and hand each GPU to a microVM (VFIO). The
+    # same template, watchdog and lifetime as the others; only its type differs (gpu_box_metal_types).
+    { metal = "${local.gpu_box_name}-metal" },
+  )
   gpu_box_names = [for k in sort(keys(local.gpu_box_slots)) : local.gpu_box_slots[k]]
 
   gpu_box_template_arns = [for k in sort(keys(local.gpu_box_slots)) : aws_launch_template.gpu_box[k].arn]
@@ -70,6 +80,11 @@ locals {
   # The smallest NVIDIA sizes, cheapest first. gbox tries them in this order across every
   # default-VPC subnet until one launches; the IAM policy below allows exactly these.
   gpu_box_types = ["g4dn.xlarge", "g5.xlarge", "g6.xlarge", "g4dn.2xlarge"]
+
+  # The metal slot's type, and only from the metal slot's template (RunGpuBoxMetalInstanceOnly): $7.82/hr on demand in
+  # us-west-2, so at most about $31 a launch under the lifetime below. g4dn.metal is the only x86 bare-metal GPU type
+  # (g5g.metal, 2 T4g, is arm64 and would need its own AMI), and it shares the G-instance vCPU quota (96 of 768 here).
+  gpu_box_metal_types = ["g4dn.metal"]
 
   # The four default-VPC subnets in us-west-2 (a, b, c, d). Unlike the parallel boxes
   # there is no AZ-locked work volume, so any AZ with capacity will do.
@@ -275,6 +290,57 @@ data "aws_iam_policy_document" "gpu_box_control" {
 
     # NotEquals rather than Equals: it holds whether or not EC2 fills ec2:Tenancy in when the
     # template leaves tenancy unset, and still refuses a dedicated or host override.
+    condition {
+      test     = "StringNotEquals"
+      variable = "ec2:Tenancy"
+      values   = ["dedicated", "host"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:MetadataHttpTokens"
+      values   = ["required"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "ec2:InstanceProfile"
+      values   = ["true"]
+    }
+  }
+
+  # The metal slot's instance: the same conditions as above, but its one bare-metal type, and only from its own
+  # template with its own Name, so slots 1-4 can never launch a metal host.
+  statement {
+    sid       = "RunGpuBoxMetalInstanceOnly"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:instance/*"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.gpu_box["metal"].arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Name"
+      values   = [local.gpu_box_slots["metal"]]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.gpu_box_tag_keys.instance
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:InstanceType"
+      values   = local.gpu_box_metal_types
+    }
+
     condition {
       test     = "StringNotEquals"
       variable = "ec2:Tenancy"
