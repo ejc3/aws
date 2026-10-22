@@ -100,9 +100,11 @@ locals {
       Resource = [aws_s3_bucket.wbox_output.arn, "${aws_s3_bucket.wbox_output.arn}/*"]
     },
     {
-      Sid      = "NoMemberNeedsThese"
-      Effect   = "Deny"
-      Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"]
+      Sid    = "NoMemberNeedsThese"
+      Effect = "Deny"
+      # CancelSpotInstanceRequests: pbox-flavor-types allows it account-wide for stale requests; a member could cancel
+      # another member's or the owner's pending launch with it (a member's pbox only reports a stale request it cannot clear).
+      Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume", "ec2:CancelSpotInstanceRequests"]
       Resource = "*"
     },
     # What nextjs-dev-fcvm-parity.tf gives the owner's container (fcvm's abilities), denied to every member again.
