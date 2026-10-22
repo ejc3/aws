@@ -140,7 +140,7 @@ Account id: `12ea67fb7ced068de03f35c22688e436`.
 
 **Domains registered here so far** (all Cloudflare Registrar, auto-renew off unless stated): `cc-games.dev`, `cc-games.app`,
 `cc-games.net`, `cc-games.org`, `ccgames.app`, `dolphin-labs.dev`, `yourfantasymovie.com` (2026-10-05, $10.46, the Fantasy
-Films site; DNS in `yourfantasymovie.tf`), and `mapslink.app` (2026-10-20, $8.20, a 302 to the Dolphin Maps car page; `mapslink-zone.tf`). Registration via API needs a short-lived Registrar Domains Admin token, a `domain-check`
+Films site; DNS in `yourfantasymovie.tf`), `mapslink.app` (2026-10-20, $8.20, a 302 to the Dolphin Maps car page; `mapslink-zone.tf`), and `fcvm.dev` (2026-10-22, $8.20, the fcvm GPU VM wall; `fcvm-dev.tf`). Registration via API needs a short-lived Registrar Domains Admin token, a `domain-check`
 immediately before, exactly one `registrations` call, and revoking the token after.
 
 **September 8, 2026 check:** `/home/ubuntu/aws/.env` was absent, and Secrets Manager
@@ -1598,6 +1598,12 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
   another policy. No CI credential.
 - **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in each region.
+- **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
+  on, SSL Full (strict). Staging only, owner-only behind Access: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
+  to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
+  agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm). Written into the
+  fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
+  `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
