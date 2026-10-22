@@ -89,7 +89,7 @@ class OwnerUnchanged(unittest.TestCase):
         launch = (ROOT / "parallel-box-launch.tf").read_text()
         gpu = (ROOT / "gpu-box.tf").read_text()
         self.assertIn('parallel_boxes     = { for n in [1, 2, 3, 4, 5, 6, 7, 8] : tostring(n) => { name = n == 1 ? "parallel-box" : "parallel-box-${n}" } }', launch)
-        self.assertIn('gpu_box_slots = { for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" }', gpu)
+        self.assertIn('{ for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" },', gpu)
         for n, (size, name) in {"1": (300, "parallel-box-work"),
                                 **{str(k): (100, "parallel-box-%d-work" % k) for k in range(2, 9)}}.items():
             self.assertIn('"%s" = { size = %d, name = "%s" }' % (n, size, name), OHIO)
@@ -107,7 +107,7 @@ class OwnerUnchanged(unittest.TestCase):
 
     def test_owner_commands_keep_their_slots(self):
         self.assertIn('    1|2|3|4|5|6|7|8) BOX="$1" ;;', PBOX)
-        self.assertIn('SLOTS="1 2 3 4" # the keys of local.gpu_box_slots', GBOX)
+        self.assertIn('SLOTS="1 2 3 4 metal" # the keys of local.gpu_box_slots', GBOX)
         self.assertIn('NAME="wbox"', WBOX)
 
 
@@ -888,7 +888,7 @@ class ScriptRuns(unittest.TestCase):
 
     def test_gbox_owner_is_unchanged(self):
         r, calls = self.run_script("gpu-box.sh", "status", "all", user="ejc3")
-        self.assertEqual(r.stdout.splitlines(), ["gpu-box: down ($0)", "gpu-box-2: down ($0)", "gpu-box-3: down ($0)", "gpu-box-4: down ($0)"])
+        self.assertEqual(r.stdout.splitlines(), ["gpu-box: down ($0)", "gpu-box-2: down ($0)", "gpu-box-3: down ($0)", "gpu-box-4: down ($0)", "gpu-box-metal: down ($0)"])
 
     # ---------------------------------------------------------------- pbox
     def test_pbox_member_launches_their_box_with_their_volume_and_key(self):

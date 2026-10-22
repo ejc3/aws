@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Bring the on-demand GPU test boxes up and down (gpu-box.tf). There are FOUR independent
-# slots, so four GPU jobs can run at once; N is 1-4 and defaults to 1.
+# slots, so four GPU jobs can run at once; N is 1-4 and defaults to 1. N may also be "metal": a whole
+# g4dn.metal (8 NVIDIA T4s, no hypervisor) for Firecracker microVMs with GPUs, $7.82/hr while it runs.
 #
 #   gbox up [N]        launch slot N: tries each small NVIDIA type in each us-west-2 AZ
 #   gbox down [N]      terminate slot N only (nothing on it persists)
@@ -32,8 +33,10 @@
 set -uo pipefail
 
 REGION="us-west-2"
-SLOTS="1 2 3 4" # the keys of local.gpu_box_slots
+SLOTS="1 2 3 4 metal" # the keys of local.gpu_box_slots
 TYPES="${GPU_BOX_TYPES:-g4dn.xlarge g5.xlarge g6.xlarge g4dn.2xlarge}"
+METAL_TYPES="${GPU_BOX_METAL_TYPES:-g4dn.metal}" # local.gpu_box_metal_types
+SSH_WAIT_TRIES=60 # x10 s; a metal host boots slower (set_slot)
 # The four default-VPC subnets, in the same order as local.gpu_box_subnets.
 SUBNETS="subnet-047683926b94c92c7 subnet-00844231e2667deec subnet-0346a0cc9fe6b928f subnet-095349c0fcef8c47f"
 
@@ -57,6 +60,7 @@ set_slot() {
   SLOT="$1"
   if [ "$SLOT" = "1" ]; then NAME="gpu-box"; SUF=""; else NAME="gpu-box-$SLOT"; SUF=" $SLOT"; fi
   LT="$NAME"
+  if [ "$SLOT" = "metal" ]; then TYPES="$METAL_TYPES"; SSH_WAIT_TRIES=120; fi
 }
 
 box_ip() {
@@ -106,7 +110,7 @@ fi
 if [ -z "$MEMBER" ]; then
   case " $SLOTS " in
     *" ${ARG:-1} "*) set_slot "${ARG:-1}" ;;
-    *) say "unknown slot '$ARG' (use 1-4, or 'status all')"; exit 1 ;;
+    *) say "unknown slot '$ARG' (use 1-4 or metal, or 'status all')"; exit 1 ;;
   esac
 fi
 
@@ -197,7 +201,7 @@ case "$CMD" in
 
     say "Launched $CHOSEN as $ID. Waiting for SSH..."
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$ID" 2>/dev/null
-    for i in $(seq 1 60); do
+    for i in $(seq 1 "$SSH_WAIT_TRIES"); do
       IP="$(box_ip)"
       if [ -n "$IP" ] && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$IP" \
            'test -s /etc/gpu-box-ready' 2>/dev/null; then
@@ -207,7 +211,7 @@ case "$CMD" in
       [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
       sleep 10
     done
-    say "Launched but SSH did not come up in 10 min; check: $SELF status$SUF"
+    say "Launched but SSH did not come up in $((SSH_WAIT_TRIES / 6)) min; check: $SELF status$SUF"
     exit 1
     ;;
 
@@ -245,7 +249,7 @@ case "$CMD" in
     ;;
 
   *)
-    sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     exit 1
     ;;
 esac
