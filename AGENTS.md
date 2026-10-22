@@ -1603,7 +1603,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
   another policy. No CI credential.
-- **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in each region.
+- **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in us-east-1, granted 2026-10-22; one region is enough (owner).
+  us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, owner-only behind Access: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
