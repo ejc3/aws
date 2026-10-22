@@ -32,9 +32,15 @@
 #                     box's own IPv4 and IPv6 addresses alike, so anything listening on the box is reachable. Home AZ
 #                     only (the fallback sites have no IPv6; --fallback and --regions are refused with it), and not for
 #                     a member's box. A box already running without it stays as it is: down, then up --open.
+#   pbox up [N] FLAVOR --lease DURATION
+#                     keep the box from the idle watchdog until DURATION after launch (90m, 2h, 1h30m; 30m to 12h): it
+#                     is not terminated for idleness before then, and is checked as usual after. For interactive and
+#                     GPU work with idle stretches. A LEASED BOX COSTS MONEY FOR THE WHOLE LEASE, busy or not (a
+#                     kvm-gpu-96 is about $4/hr spot, so a 12h lease is about $50). Set only at launch: a box already
+#                     running keeps what it has (down, then up --lease). Not for a member's box.
 #   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
 #   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? open, with which IPv6 /80?
-#                     and how the NEXT launch is bought
+#                     leased until when? and how the NEXT launch is bought
 #   pbox status N     just box N
 #   pbox ssh [N]      connect
 #   pbox ip [N]       print the IP
@@ -227,6 +233,7 @@ FLAVOR=""
 FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
+LEASE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
@@ -238,6 +245,13 @@ while [ $# -gt 0 ]; do
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
     --fallback) FALLBACK=1 ;;
     --open) OPEN=1 ;;
+    --lease)
+      shift
+      [ -n "${1:-}" ] || { say "--lease needs a duration (90m, 2h, 1h30m)"; exit 1; }
+      LEASE="$1" ;;
+    --lease=*)
+      LEASE="${1#--lease=}"
+      [ -n "$LEASE" ] || { say "--lease needs a duration (90m, 2h, 1h30m)"; exit 1; } ;;
     --regions)
       shift
       [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
@@ -247,7 +261,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --lease DURATION)"; exit 1 ;;
   esac
   shift
 done
@@ -273,6 +287,44 @@ if [ -n "$OPEN" ]; then
     exit 1
   fi
 fi
+# --lease: the owner's boxes and `up` only. The watchdog honours a lease only on the owner's boxes (LEASE_NAMES,
+# parallel-box-watchdog.tf): a member's box keeps the idle rule and its hard lifetime, and its grant allows no such tag.
+LEASE_MAX_HOURS=12 # the watchdog's LEASE_MAX_HOURS
+LEASE_SECS=""
+if [ -n "$LEASE" ]; then
+  if [ -n "$MEMBER" ]; then
+    say "--lease is not available for pbox-$MEMBER: it keeps the 30-minute idle rule and its hard lifetime"; exit 1
+  fi
+  if [ "$CMD" != "up" ]; then say "--lease only applies to 'up'"; exit 1; fi
+  if ! [[ "$LEASE" =~ ^(([0-9]{1,4})h)?(([0-9]{1,5})m)?$ ]]; then
+    say "--lease takes a duration like 90m, 2h or 1h30m (got '$LEASE')"; exit 1
+  fi
+  LEASE_SECS=$(( (10#${BASH_REMATCH[2]:-0} * 60 + 10#${BASH_REMATCH[4]:-0}) * 60 ))
+  if [ "$LEASE_SECS" -lt 1800 ]; then
+    say "--lease $LEASE is under 30 minutes, which the idle watchdog already gives every box; launch without --lease"; exit 1
+  fi
+  if [ "$LEASE_SECS" -gt $((LEASE_MAX_HOURS * 3600)) ]; then
+    say "--lease $LEASE is over the ${LEASE_MAX_HOURS}-hour maximum (the watchdog would end it at ${LEASE_MAX_HOURS}h from launch)"; exit 1
+  fi
+fi
+LEASE_UNTIL="" # the lease's end in epoch seconds, set just before each launch attempt (start_lease)
+start_lease() { [ -z "$LEASE_SECS" ] || LEASE_UNTIL=$(( $(date +%s) + LEASE_SECS )); }
+# lease_line LAUNCH_TIME UNTIL: the lease as status prints it ("until HH:MM UTC (Xh Ym left)" or "ended"), capped at
+# LaunchTime + LEASE_MAX_HOURS as the watchdog caps it; nothing for no lease or an unparseable tag.
+lease_line() {
+  local launch until now left
+  [[ "${2:-}" =~ ^[0-9]{1,12}$ ]] || return 0
+  until="$2"
+  if [ -n "$1" ] && [ "$1" != None ] && launch=$(date -u -d "$1" +%s 2>/dev/null) \
+     && [ $((launch + LEASE_MAX_HOURS * 3600)) -lt "$until" ]; then
+    until=$((launch + LEASE_MAX_HOURS * 3600))
+  fi
+  now=$(date +%s)
+  if [ "$now" -ge "$until" ]; then echo "ended"; return 0; fi
+  left=$(( (until - now) / 60 ))
+  echo "until $(date -u -d "@$until" +%H:%M) UTC ($((left / 60))h $((left % 60))m left)"
+}
+
 if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
@@ -494,6 +546,14 @@ open_host_ipv6() {
   fi
 }
 
+# When `up --lease` finds the box already running: a lease is set at launch only (the launch grant tags at RunInstances and
+# nowhere else), so it is not applied.
+lease_note() {
+  if [ -n "$LEASE" ]; then
+    say "NOTE: $NAME is already running; --lease applies only to a new launch, so its lease is unchanged. For a lease: $SELF down ${BOX:-}, then up again with --lease."
+  fi
+}
+
 # When `up --open` finds the box already running without a prefix: it was not launched open, and is kept as it is.
 open_note() {
   if [ -n "$OPEN" ] && [ -z "$(box_ipv6_prefix)" ]; then
@@ -533,6 +593,11 @@ status_one() {
       echo "  open:   launched with --open: every port of the box and its VMs is reachable from the internet"
       echo "  ipv6:   $P (fcvm --network routed --ipv6-prefix $P)"
     fi
+    # shellcheck disable=SC2016,SC2046 # a JMESPath literal; the two text fields are lease_line's two arguments
+    LZ="$(lease_line $(aws ec2 describe-instances --region "$REGION" \
+      --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[0].Instances[0].[LaunchTime,Tags[?Key==`PboxLeaseUntil`].Value | [0]]' --output text 2>/dev/null))"
+    [ -z "$LZ" ] || echo "  lease:  $LZ"
     if [ "$(box_work)" = "fresh" ]; then
       echo "  where:  FALLBACK site $(box_az) -- its /mnt/work is a fresh volume, deleted with the box"
     elif [ "$REGION" != "$HOME_REGION" ] || [ -n "$FB_REGIONS" ]; then
@@ -670,6 +735,9 @@ wait_ready() {
       elif [ -n "$OPEN" ] && [ "${2:-}" != "running" ]; then
         say "FAILED: $NAME was launched with --open but EC2 reports no IPv6 prefix on its interface. It is running: $SELF status ${BOX:-}, $SELF down ${BOX:-}"
         exit 1
+      fi
+      if [ -n "$LEASE_UNTIL" ] && [ "${2:-}" != "running" ]; then
+        say "  lease: $(lease_line "" "$LEASE_UNTIL"): the idle watchdog leaves it running until then, and it costs money until then"
       fi
       if [ "${2:-}" = "running" ]; then
         echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1${P:+ ipv6_prefix=$P}"
@@ -874,6 +942,7 @@ case "$CMD" in
           --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
         flavor_note "$CHOSEN"
         open_note
+        lease_note
         attach_work "$ID" || exit 1
         CHOSEN_AZ="$(box_az)"
         wait_ready persistent running
@@ -883,6 +952,7 @@ case "$CMD" in
         --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
         --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
       open_note
+      lease_note
       P="$(box_ipv6_prefix)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
       echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)${P:+ ipv6_prefix=$P}"
@@ -907,6 +977,9 @@ case "$CMD" in
     esac
     if [ -n "$OPEN" ]; then
       say "OPEN: the box gets the open security group (everything in, from anywhere) and a delegated IPv6 /80."
+    fi
+    if [ -n "$LEASE" ]; then
+      say "LEASE: $LEASE from launch. The idle watchdog leaves the box running until then, and it costs money the whole time."
     fi
     say ""
 
@@ -934,7 +1007,13 @@ case "$CMD" in
       if ! IMG_OUT="$(image_args "$T" "$HOME_X86_IMAGE" "$REGION")"; then REAL_ERROR=1; say ""; continue; fi
       read -r -d '' -a IMG <<< "$IMG_OUT"
       # --open replaces the template's interface 0 with the open one (NIC, above); IAM allows only this subnet and these groups.
-      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"} ${NIC[@]+"${NIC[@]}"}; then
+      # A lease is one more instance tag. EC2 adds a launch's tags to the template's; Name and DevEBS (which the IAM grants
+      # read) are repeated so they hold whichever way the two combine. The launch grant allows any tag key at RunInstances
+      # (parallel-box-launch.tf).
+      TAGS=()
+      start_lease
+      [ -z "$LEASE" ] || TAGS=(--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=DevEBS,Value=true},{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}]")
+      if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"} ${NIC[@]+"${NIC[@]}"} ${TAGS[@]+"${TAGS[@]}"}; then
         ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"
         [ -z "$OPEN" ] || open_host_ipv6 "$ID"
         break
@@ -1026,11 +1105,12 @@ case "$CMD" in
         say "--> trying $T in $FAZ ..."
         if ! IMG_OUT="$(image_args "$T" "$(fb_x86_image "$R")" "$R")"; then REAL_ERROR=1; say ""; continue; fi
         read -r -d '' -a IMG <<< "$IMG_OUT"
+        start_lease
         # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
         if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
              --subnet-id "$SUBNET" ${IMG[@]+"${IMG[@]}"} \
-             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}]" \
+             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}${LEASE:+,{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}}]" \
                                   "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
                                   "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then
           ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$FAZ"; break 2

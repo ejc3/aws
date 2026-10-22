@@ -304,6 +304,9 @@ jobs:
       - name: "pbox up --open: the open security group and a delegated IPv6 /80, home only, never a member's box"
         run: python3 -S -B scripts/test-pbox-open.py
 
+      - name: "pbox up --lease: the instance is tagged with the lease end, the watchdog keeps an owner's box until then (12h cap), status shows it"
+        run: python3 -S -B scripts/test-pbox-lease.py
+
       - name: "pbox up needs a flavor; each flavor tries only its own types; IAM allows exactly the flavors' types (pbox-flavors.tf)"
         run: python3 -S -B scripts/test-pbox-flavors.py
 
