@@ -287,9 +287,13 @@ resource "aws_accessanalyzer_analyzer" "external_staging_us_west_2" {
 # The one archived finding shape (owner, 2026-10-21, #577): AWS Backup's own temporary share of an EBS snapshot with its
 # service account while it copies a recovery point into the logically air-gapped vault (backup-security.tf). CloudTrail shows
 # backup.amazonaws.com adding the share, copying and removing it within minutes, every night, in the two regions the copies
-# run in. Archived only for EBS snapshots AND that one principal; any other resource type, account or region still alerts.
+# run in. Archived only for EBS snapshots AND those principals; any other resource type, account or region still alerts.
+# AWS Backup uses a second service account for the cross-account copy into ejc3-backup-recovery (the dev-staging account,
+# us-east-1): on 2026-10-22 CloudTrail showed backup.amazonaws.com (AWSBackupDefaultServiceRole) share the jumpbox-home
+# recovery snapshot with 975050365828, an account outside the organization, 13 minutes after creating it; the copy job
+# completed and the temporary snapshot, with its share, was gone minutes later.
 locals {
-  access_analyzer_backup_lag_principal = "950509372133"
+  access_analyzer_backup_lag_principals = ["950509372133", "975050365828"]
 }
 
 resource "aws_accessanalyzer_archive_rule" "backup_lag_copy_us_west_1" {
@@ -302,7 +306,7 @@ resource "aws_accessanalyzer_archive_rule" "backup_lag_copy_us_west_1" {
   }
   filter {
     criteria = "principal.AWS"
-    eq       = [local.access_analyzer_backup_lag_principal]
+    eq       = local.access_analyzer_backup_lag_principals
   }
 }
 
@@ -316,6 +320,6 @@ resource "aws_accessanalyzer_archive_rule" "backup_lag_copy_us_east_1" {
   }
   filter {
     criteria = "principal.AWS"
-    eq       = [local.access_analyzer_backup_lag_principal]
+    eq       = local.access_analyzer_backup_lag_principals
   }
 }
