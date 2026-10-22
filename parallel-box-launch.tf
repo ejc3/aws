@@ -151,8 +151,8 @@ locals {
 
         # Parallel-work basics. GNU parallel is the usual driver for this shape of job.
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y parallel build-essential git htop
+        apt-get -o DPkg::Lock::Timeout=300 update
+        apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop
 
         # Local NVMe, when the type has any (pbox-flavors.tf), at /mnt/nvme.
         ${local.pbox_local_nvme_setup}

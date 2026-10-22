@@ -155,8 +155,8 @@ locals {
       grep -q "$DEV" /etc/fstab || echo "$DEV /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
 
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y parallel build-essential git htop
+      apt-get -o DPkg::Lock::Timeout=300 update
+      apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop
       ${local.pbox_local_nvme_setup}
       echo "* soft nofile 1048576" >> /etc/security/limits.conf
       echo "* hard nofile 1048576" >> /etc/security/limits.conf
