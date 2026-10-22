@@ -103,6 +103,35 @@ class SecretTests(unittest.TestCase):
 
 
 
+
+class CoordinatorLaunchSplit(unittest.TestCase):
+    TF = (ROOT / "fcvm-fleet.tf").read_text()
+
+    def stmt(self, sid):
+        return re.split(r'Sid +="%s"' % sid, self.TF.replace('= "', '="'), maxsplit=1)[1].split("\n      },", 1)[0].replace('="', '= "')
+
+    def test_created_and_referenced_resources_are_split_and_pinned(self):
+        created = self.stmt("LaunchTilesFromTheirTemplates")
+        self.assertIn("Resource  = local.fcvm_fleet_tile_created_arns", created)
+        referenced = self.stmt("LaunchTilesWithTheirOwnResources")
+        self.assertIn("Resource  = local.fcvm_fleet_tile_referenced_arns", referenced)
+        for s in (created, referenced):
+            self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition', s)
+        self.assertNotIn('Action    = "ec2:RunInstances"\n        Resource  = "*"', self.TF)
+        refs = self.TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        for part in (":image/${ami}", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_tile_template_arns"):
+            self.assertIn(part, refs, part)
+        self.assertIn('"instance", "volume", "network-interface", "spot-instances-request"', self.TF)
+
+    def test_state_object_secrets_and_spot_role(self):
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', self.TF)
+        secrets = self.stmt("FleetSecrets")
+        self.assertIn('cloudflare-dns-token', secrets)
+        self.assertIn('tls-wildcard', secrets)
+        self.assertNotIn('coordinator-tunnel-token', secrets)
+        self.assertNotIn('agent-access-token', secrets)
+        self.assertIn('aws_service_name = "spot.amazonaws.com"', self.TF)
+
 class ModuleDependencies(unittest.TestCase):
     def test_no_module_level_depends_on(self):
         # A module-level depends_on defers the module's data sources (the AZ list) to apply time, and the subnets'

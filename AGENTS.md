@@ -1614,8 +1614,11 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - **Two gates, both off**: `local.fcvm_fleet_hosts_enabled` (one spot metal GPU host per region, also needing the fleet AMI
   in `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled` (also needing `var.fcvm_fleet_coordinator_image`).
   Nothing billed by the hour runs until the owner turns one on. The AMI build is a follow-up.
-- The coordinator's task role may launch EC2 only from the tile templates, only tagged `Purpose=fcvm-fleet-tile`, terminate
-  only instances so tagged, and pass only the tile role. Hosts read the certificate, the agent token and the asset bucket.
+- The coordinator's task role may launch EC2 only from the tile templates, referencing only the tile AMIs and the fleet's
+  subnets and group (by exact ARN), only as the two tile types and tagged `Purpose=fcvm-fleet-tile`; terminate only
+  instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate
+  and store the certificate it issues. The fleet account has EC2's spot service-linked role. Hosts read the certificate,
+  the agent token and the asset bucket.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)

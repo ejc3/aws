@@ -329,6 +329,35 @@ module "fcvm_fleet_east1" {
 
 locals {
   fcvm_fleet_tile_template_arns = concat(module.fcvm_fleet_east2.tile_template_arns, module.fcvm_fleet_west2.tile_template_arns, module.fcvm_fleet_east1.tile_template_arns)
+
+  # What a tile launch may reference, by exact ARN (the split of parallel-box-launch.tf): the tile AMIs, the fleet's
+  # subnets and security group in each region, and the tile templates. A launch that names any other image, subnet or
+  # group is refused even through a tile template. A placeholder keeps the list non-empty before any tile AMI exists.
+  fcvm_fleet_regional = {
+    "us-east-2" = module.fcvm_fleet_east2
+    "us-west-2" = module.fcvm_fleet_west2
+    "us-east-1" = module.fcvm_fleet_east1
+  }
+  fcvm_fleet_tile_referenced_arns = concat(
+    flatten([for r, amis in var.fcvm_fleet_tile_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}"]]),
+    flatten([for r, m in local.fcvm_fleet_regional : [for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]]),
+    [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"],
+    local.fcvm_fleet_tile_template_arns,
+    ["arn:aws:ec2:us-east-1::image/ami-none"],
+  )
+  # What a tile launch creates: the instance, its volume, its network interface and its one-time spot request.
+  fcvm_fleet_tile_created_arns = flatten([for r in local.fcvm_fleet_regions : [
+    for kind in ["instance", "volume", "network-interface", "spot-instances-request"] :
+    "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:${kind}/*"
+  ]])
+  fcvm_fleet_tile_template_condition = length(local.fcvm_fleet_tile_template_arns) > 0 ? local.fcvm_fleet_tile_template_arns : ["arn:aws:ec2:*:*:launch-template/none"]
+}
+
+# Spot launches (the tile templates are one-time spot) need EC2's spot service-linked role, which a fresh account lacks
+# and the coordinator may not create.
+resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
+  provider         = aws.fcvm_fleet
+  aws_service_name = "spot.amazonaws.com"
 }
 
 # ------------------------------------------------------------------------------------------------ the coordinator (us-east-2)
@@ -396,20 +425,37 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Sid      = "StateObject"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/*"
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
       },
       {
+        # The DNS token (slot records and the ACME challenge) and the wildcard certificate it issues and renews. Not the
+        # tunnel token (cloudflared gets it through the execution role) nor the agents' Access token.
         Sid      = "FleetSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = values(local.fcvm_fleet_secret_arn)
+        Resource = [local.fcvm_fleet_secret_arn["cloudflare-dns-token"], local.fcvm_fleet_secret_arn["tls-wildcard"]]
       },
       {
+        Sid      = "StoreTheIssuedCertificate"
+        Effect   = "Allow"
+        Action   = "secretsmanager:PutSecretValue"
+        Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]
+      },
+      {
+        # Created resources: only through a tile template, in the fleet regions.
         Sid       = "LaunchTilesFromTheirTemplates"
         Effect    = "Allow"
         Action    = "ec2:RunInstances"
-        Resource  = "*"
-        Condition = { ArnLike = { "ec2:LaunchTemplate" = length(local.fcvm_fleet_tile_template_arns) > 0 ? local.fcvm_fleet_tile_template_arns : ["arn:aws:ec2:*:*:launch-template/none"] }, StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+        Resource  = local.fcvm_fleet_tile_created_arns
+        Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition } }
+      },
+      {
+        # Referenced resources: exactly the tile AMIs, the fleet's subnets and group, and the tile templates.
+        Sid       = "LaunchTilesWithTheirOwnResources"
+        Effect    = "Allow"
+        Action    = "ec2:RunInstances"
+        Resource  = local.fcvm_fleet_tile_referenced_arns
+        Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition } }
       },
       {
         # A launch from a template can still override the instance type: only the two tile types, whatever the request says.
