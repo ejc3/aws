@@ -128,6 +128,19 @@ resource "aws_iam_policy" "nextjs_dev_fcvm_parity" {
         Resource = aws_ssm_parameter.constellation.arn
       },
       {
+        # Apply ejc3/astryx-infra (astryx-account.tf): its apply role trusts nextjs-dev-role too.
+        Sid      = "AstryxApply"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = aws_iam_role.astryx_terraform.arn
+      },
+      {
+        Sid      = "AstryxPointer"
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = aws_ssm_parameter.astryx.arn
+      },
+      {
         # EC2 service quotas and their request history (dev-instance-common.tf's dev-service-quotas-read).
         Sid      = "ReadEc2Quotas"
         Effect   = "Allow"

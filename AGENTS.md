@@ -1612,6 +1612,32 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - Not yet covered: security monitoring like the Dolphin account's.
 
+### The astryx account (astryx-account.tf)
+
+Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the sync API) gets a member account of its own,
+`astryx`, in OU `Astryx`, built here as the constellation account is. Its Terraform is the private repository
+`ejc3/astryx-infra`, which applies inside that account only. Root address: the `astryx_account` key of `people/addresses`.
+`close_on_deletion = false` and `prevent_destroy`.
+
+- **Guardrails** (`astryx-guardrails`, an SCP on the OU only), as on the fcvm-fleet OU: every regional action outside
+  us-west-1 is denied (global services exempt, the Dolphin policy's list), as are leaving the organization, buckets in other
+  regions, and IAM users, access keys and console passwords (roles only).
+- **Applied from fcvm-metal-arm and the owner's nextjs-ct container only**, as constellation is. `astryx-terraform`
+  (AdministratorAccess in that account, one-hour sessions) trusts dev-server-role pinned to fcvm-arm's instance, granted
+  by two statements in `assume-constellation-terraform` (assume the role, read `/infra/astryx`) with the same pin, because
+  dev-server-role has no room for another policy; and nextjs-dev-role, unpinned, granted by `nextjs-dev-fcvm-parity.tf`
+  (members' sessions deny `sts:AssumeRole` and the pointer). No CI credential.
+- **What the appliers read: `/infra/astryx`** (an SSM String): account id, region, state bucket, apply role, and `stage`
+  (hostname, Access team domain and audience tag, the tunnel secret's name). No credentials.
+- **Staging** (`astryx-stage.tf`): `astryx-stage.dolphin-labs.dev` through tunnel `astryx-stage` to a cloudflared sidecar in
+  astryx-infra's ECS task: `/api/*`, `/native/*` and `/healthz` to the sync API (`localhost:8080`), everything else to
+  zero-cache (`localhost:4848`). The connector token is written into the astryx account as `astryx/nonprod/tunnel` (key
+  `TUNNEL_TOKEN`). Access covers `/native/login` only, open to anyone who signs in with GitHub, Google or a one-time PIN
+  (owner's request: TestFlight testers sign in there); the connector also requires an Access token on that path. The rest
+  of the host has no Access application: the API checks its own Bearer tokens, which are minted only at `/native/login`.
+- **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
+- Not yet covered: security monitoring like the Dolphin account's.
+
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which

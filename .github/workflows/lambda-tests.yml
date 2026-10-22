@@ -280,6 +280,9 @@ jobs:
       - name: "fcvm-fleet member account: guardrails, fcvm-arm-only apply role, G spot quotas (fcvm-fleet-account.tf)"
         run: python3 -S -B scripts/test-fcvm-fleet-account.py
 
+      - name: "astryx member account and staging: us-west-1 guardrails, one exact apply role, Access on /native/login only (astryx-account.tf, astryx-stage.tf)"
+        run: python3 -S -B scripts/test-astryx-account.py
+
       - name: "fcvm.dev: DNSSEC, DNS-only token, coordinator tunnel behind Access, staging only (fcvm-dev.tf)"
         run: python3 -S -B scripts/test-fcvm-dev.py
 
