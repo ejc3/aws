@@ -366,4 +366,4 @@ class ProductionDomainTests(unittest.TestCase):
         self.assertIn('api_base = "^https://cc-games\\\\.(org|net|app)$"', GAMES)
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

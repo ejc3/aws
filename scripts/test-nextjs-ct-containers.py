@@ -817,4 +817,4 @@ class NoContainerRestartTests(unittest.TestCase):
         self.assertIn("exit 1", block)
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

@@ -17,8 +17,10 @@
 #   TF_RUN_LOCK_NOWAIT=1  do not wait: exit 75 at once if another run holds the lock (the Stop hook uses this)
 #   TF_RUN_LOCK_WAIT=N    seconds to wait before giving up with 75 (default 1800)
 #   TF_RUN_LOCK_FILE      the lock file (default /var/lib/terraform-run-lock/lock, made by the installer)
-#   TF_RUN_LOCK_REAL      the real terraform (default /usr/local/lib/terraform-run-lock/terraform, else the first
-#                         terraform on PATH that is not this wrapper)
+#   TF_RUN_LOCK_REAL      the real terraform (default $TF_RUN_LOCK_DEFAULT_REAL, else the first terraform on PATH that
+#                         is not this wrapper)
+#   TF_RUN_LOCK_DEFAULT_REAL  where the installer moves the real binary (default /usr/local/lib/terraform-run-lock/terraform;
+#                         the tests point it at a path that does not exist, so a jumpbox's real one never stands in)
 #   TF_PLUGIN_CACHE_DIR   set to /var/cache/terraform-plugins (TF_RUN_LOCK_PLUGIN_CACHE; made by the installer) when
 #                         unset and that directory is writable: every fresh worktree's `init -lockfile=readonly` then links the providers from one
 #                         cache instead of downloading about 1 GB (Terraform uses a cached provider only when its
@@ -43,7 +45,8 @@ set -u
 self=$(readlink -f "${BASH_SOURCE[0]}")
 
 real=${TF_RUN_LOCK_REAL:-}
-[ -z "$real" ] && [ -x /usr/local/lib/terraform-run-lock/terraform ] && real=/usr/local/lib/terraform-run-lock/terraform
+default_real=${TF_RUN_LOCK_DEFAULT_REAL:-/usr/local/lib/terraform-run-lock/terraform}
+[ -z "$real" ] && [ -x "$default_real" ] && real=$default_real
 if [ -z "$real" ]; then
   IFS=: read -r -a dirs <<<"${PATH:-}"
   for d in "${dirs[@]}"; do
@@ -92,13 +95,12 @@ mode=(-w "$wait")
 if ! flock -n 9; then
   holder=""
   target=$(readlink -f "$lock")
-  for fd in /proc/[0-9]*/fd/*; do
-    [ "$(readlink "$fd" 2>/dev/null)" = "$target" ] || continue
-    pid=${fd#/proc/}; pid=${pid%%/*}
-    [ "$pid" = "$$" ] && continue
-    holder="pid $pid ($(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120))"
-    break
-  done
+  # One find over every process's descriptors (about 20 ms on a jumpbox), not a readlink per descriptor (over a second,
+  # long enough for a short run to end first and the holder to read "another process"). The target is escaped for
+  # -lname's pattern.
+  pid=$(find /proc/[0-9]*/fd -maxdepth 1 -lname "$(printf '%s' "$target" | sed 's/[][*?\\]/\\&/g')" 2>/dev/null |
+    awk -F/ -v me="$$" '$3 != me { print $3; exit }')
+  [ -n "$pid" ] && holder="pid $pid ($(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120))"
   holder=${holder:-another process}
   if [ -n "${TF_RUN_LOCK_NOWAIT:-}" ]; then
     echo "terraform-run-lock: a Terraform run is in progress, by $holder; not waiting (TF_RUN_LOCK_NOWAIT)" >&2

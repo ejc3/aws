@@ -222,4 +222,4 @@ class DevCredentialBoundaryTests(unittest.TestCase):
         self.assertIn('token_id = cloudflare_zero_trust_access_service_token.cc_games_automation.id', cf)
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, buffer=True)
