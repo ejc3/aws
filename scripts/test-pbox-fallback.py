@@ -403,7 +403,7 @@ class FallbackTerraform(unittest.TestCase):
         self.assertIn('TAG_NAMES     = join(",", local.parallel_box_names)', FALLBACK)
 
     def test_the_pointer_publishes_the_sites_and_pbox_may_score_them(self):
-        self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, fallback = local.pbox_fallback_pointer })", OHIO)
+        self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, open = local.parallel_box_open_pointer, fallback = local.pbox_fallback_pointer })", OHIO)
         describe = re.search(r'sid    = "DescribeForPbox".*?\]', LAUNCH, re.S).group(0)
         for action in ("ec2:GetSpotPlacementScores", "ec2:DescribeAvailabilityZones", "ec2:DescribeInstanceTypeOfferings"):
             self.assertIn(action, describe)

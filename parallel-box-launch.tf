@@ -49,15 +49,18 @@ locals {
   # the boxes moved from us-west-2 on 2026-10-05 (30% cheaper for the 192-core spot pool); the us-west-2 site, its volumes and
   # its templates are retired. The map form stays so a second site is an entry here, not a rewrite of the IAM below.
   # ami is the templates' arm64 image; ami_x86 the x86_64 build of it, which `pbox up` passes with --image-id for an x86
-  # flavor (kvm-gpu-96, pbox-flavors.tf). Both are allowed by exact ARN below.
+  # flavor (kvm-gpu-96, pbox-flavors.tf). Both are allowed by exact ARN below. security_group_id is the SSH group the
+  # templates attach; open_security_group_id the all-open group `pbox up --open` adds to it (ohio-pbox.tf), also allowed
+  # by exact ARN, so an --open launch can name it in its network interface.
   parallel_box_sites = {
     "us-east-2" = {
-      ami               = var.parallel_box_ami_ohio
-      ami_x86           = var.parallel_box_ami_ohio_x86
-      subnet_id         = aws_subnet.ohio_pbox.id
-      security_group_id = aws_security_group.ohio_pbox.id
-      key_name          = aws_key_pair.ohio_pbox.key_name
-      volumes           = { for k, v in aws_ebs_volume.ohio_parallel_work : k => v.id }
+      ami                    = var.parallel_box_ami_ohio
+      ami_x86                = var.parallel_box_ami_ohio_x86
+      subnet_id              = aws_subnet.ohio_pbox.id
+      security_group_id      = aws_security_group.ohio_pbox.id
+      open_security_group_id = aws_security_group.ohio_pbox_open.id
+      key_name               = aws_key_pair.ohio_pbox.key_name
+      volumes                = { for k, v in aws_ebs_volume.ohio_parallel_work : k => v.id }
     }
   }
 
@@ -75,6 +78,7 @@ locals {
       "arn:aws:ec2:${r}::image/${site.ami_x86}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:subnet/${site.subnet_id}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:security-group/${site.security_group_id}",
+      "arn:aws:ec2:${r}:${local.parallel_box_account}:security-group/${site.open_security_group_id}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:key-pair/${site.key_name}",
     ]
   ])
@@ -230,6 +234,8 @@ resource "aws_launch_template" "parallel_box_ohio" {
   # The subnet pins the AZ, and the AZ is pinned by the work volume: EBS is AZ-locked, so
   # the box must launch where its disk already is. Set here rather than passed by the
   # caller so a mistyped --subnet-id cannot strand an instance away from its disk.
+  # `pbox up --open` is the one launch that passes its own interface 0: this subnet (read from /infra/parallel-box, and
+  # the only subnet IAM allows), this group plus the open one, and a delegated IPv6 /80 (ohio-pbox.tf).
   network_interfaces {
     subnet_id                   = aws_subnet.ohio_pbox.id # us-east-2c, the pbox VPC in ohio-pbox.tf
     security_groups             = [aws_security_group.ohio_pbox.id]

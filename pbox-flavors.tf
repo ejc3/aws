@@ -204,6 +204,22 @@ data "aws_iam_policy_document" "pbox_flavor_types" {
     resources = ["arn:aws:ec2:*:${local.parallel_box_account}:spot-instances-request/*"]
   }
 
+  # `pbox up --open` gives the box's primary interface its own IPv6 address after launch: EC2 creates an interface with an
+  # address count OR a prefix count, never both, and the launch asks for the /80 (scripts/parallel-box.sh, ohio-pbox.tf).
+  # Only on the owner's parallel boxes' interfaces, by the Name tag every box's interface is launched with.
+  statement {
+    sid       = "AssignIpv6ToOpenParallelBoxes"
+    effect    = "Allow"
+    actions   = ["ec2:AssignIpv6Addresses"]
+    resources = local.parallel_box_eni_arns
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Name"
+      values   = [for b in local.parallel_boxes : b.name]
+    }
+  }
+
   # Except the persistent dev boxes' requests: a persistent request cancelled while its box runs leaves a box that cannot
   # start again after its next stop. Unconditional (a placeholder keeps the list non-empty with every box off), so a box
   # being replaced, whose new request id is unknown at plan time, cannot make the statement's existence unknown.

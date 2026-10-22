@@ -26,7 +26,7 @@ class PointerTests(unittest.TestCase):
 
     def test_the_pointer_is_published_for_the_dev_boxes_and_they_may_read_it(self):
         self.assertIn('name        = "/infra/parallel-box"', OHIO)
-        self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, fallback = local.pbox_fallback_pointer })", OHIO)
+        self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, open = local.parallel_box_open_pointer, fallback = local.pbox_fallback_pointer })", OHIO)
         self.assertIn("aws_ssm_parameter.parallel_box_region.arn", STATUS)
         # read only, and only that one parameter
         stmt = re.search(r'Sid\s+= "ReadParallelBoxRegion".*?\n    \},', STATUS, re.S).group(0)
@@ -45,8 +45,8 @@ class SiteTests(unittest.TestCase):
     def test_there_is_one_site_us_east_2_with_everything_regional(self):
         sites = re.search(r"parallel_box_sites = \{.*?\n  \}\n", LAUNCH, re.S).group(0)
         self.assertEqual(re.findall(r'^    "(us-[a-z]+-\d)" = \{', sites, re.M), ["us-east-2"])
-        for field in ("ami", "ami_x86", "subnet_id", "security_group_id", "key_name", "volumes"):
-            self.assertEqual(sites.count(field + " "), 1, field)
+        for field in ("ami", "ami_x86", "subnet_id", "security_group_id", "open_security_group_id", "key_name", "volumes"):
+            self.assertEqual(len(re.findall(r"^\s+%s\s+=" % field, sites, re.M)), 1, field)
 
     def test_no_launch_policy_pins_a_literal_region(self):
         policy = re.search(r'data "aws_iam_policy_document" "parallel_box_control" \{.*?\n\}\n', LAUNCH, re.S).group(0)

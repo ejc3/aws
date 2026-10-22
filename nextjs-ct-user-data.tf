@@ -104,7 +104,8 @@ locals {
       Effect = "Deny"
       # CancelSpotInstanceRequests: pbox-flavor-types allows it account-wide for stale requests; a member could cancel
       # another member's or the owner's pending launch with it (a member's pbox only reports a stale request it cannot clear).
-      Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume", "ec2:CancelSpotInstanceRequests"]
+      # AssignIpv6Addresses: the owner's `pbox up --open` boxes only (pbox-flavor-types).
+      Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume", "ec2:CancelSpotInstanceRequests", "ec2:AssignIpv6Addresses"]
       Resource = "*"
     },
     # What nextjs-dev-fcvm-parity.tf gives the owner's container (fcvm's abilities), denied to every member again.
