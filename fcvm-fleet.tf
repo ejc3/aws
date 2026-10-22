@@ -289,42 +289,42 @@ resource "aws_iam_instance_profile" "fcvm_fleet_tile" {
 
 # ------------------------------------------------------------------------------------------------ the three regions
 module "fcvm_fleet_east2" {
-  source               = "./modules/fcvm-fleet-region"
-  providers            = { aws = aws.fcvm_fleet }
-  cidr_block           = local.fcvm_fleet_cidrs["us-east-2"]
-  gpu_amis             = lookup(var.fcvm_fleet_host_amis, "us-east-2", {})
-  tile_amis            = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
-  hosts_enabled        = local.fcvm_fleet_hosts_enabled
-  host_profile_name    = aws_iam_instance_profile.fcvm_fleet_host.name
-  tile_profile_name    = aws_iam_instance_profile.fcvm_fleet_tile.name
-  flow_log_destination = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
-  depends_on           = [aws_s3_bucket_policy.fcvm_fleet_flow_logs]
+  source                    = "./modules/fcvm-fleet-region"
+  providers                 = { aws = aws.fcvm_fleet }
+  cidr_block                = local.fcvm_fleet_cidrs["us-east-2"]
+  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-2", {})
+  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
+  hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
+  tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
+  flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
+  flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
 }
 
 module "fcvm_fleet_west2" {
-  source               = "./modules/fcvm-fleet-region"
-  providers            = { aws = aws.fcvm_fleet_west2 }
-  cidr_block           = local.fcvm_fleet_cidrs["us-west-2"]
-  gpu_amis             = lookup(var.fcvm_fleet_host_amis, "us-west-2", {})
-  tile_amis            = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
-  hosts_enabled        = local.fcvm_fleet_hosts_enabled
-  host_profile_name    = aws_iam_instance_profile.fcvm_fleet_host.name
-  tile_profile_name    = aws_iam_instance_profile.fcvm_fleet_tile.name
-  flow_log_destination = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
-  depends_on           = [aws_s3_bucket_policy.fcvm_fleet_flow_logs]
+  source                    = "./modules/fcvm-fleet-region"
+  providers                 = { aws = aws.fcvm_fleet_west2 }
+  cidr_block                = local.fcvm_fleet_cidrs["us-west-2"]
+  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-west-2", {})
+  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
+  hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
+  tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
+  flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
+  flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
 }
 
 module "fcvm_fleet_east1" {
-  source               = "./modules/fcvm-fleet-region"
-  providers            = { aws = aws.fcvm_fleet_east1 }
-  cidr_block           = local.fcvm_fleet_cidrs["us-east-1"]
-  gpu_amis             = lookup(var.fcvm_fleet_host_amis, "us-east-1", {})
-  tile_amis            = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
-  hosts_enabled        = local.fcvm_fleet_hosts_enabled
-  host_profile_name    = aws_iam_instance_profile.fcvm_fleet_host.name
-  tile_profile_name    = aws_iam_instance_profile.fcvm_fleet_tile.name
-  flow_log_destination = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
-  depends_on           = [aws_s3_bucket_policy.fcvm_fleet_flow_logs]
+  source                    = "./modules/fcvm-fleet-region"
+  providers                 = { aws = aws.fcvm_fleet_east1 }
+  cidr_block                = local.fcvm_fleet_cidrs["us-east-1"]
+  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-1", {})
+  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
+  hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
+  tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
+  flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
+  flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
 }
 
 locals {

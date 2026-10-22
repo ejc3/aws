@@ -37,7 +37,7 @@ class NetworkTests(unittest.TestCase):
     def test_three_regions_three_existing_aliases_no_new_provider(self):
         self.assertNotIn('provider "aws"', TF)
         for name, alias in (("east2", "fcvm_fleet"), ("west2", "fcvm_fleet_west2"), ("east1", "fcvm_fleet_east1")):
-            self.assertIn("providers            = { aws = aws.%s }" % alias, block('module "fcvm_fleet_%s"' % name))
+            self.assertRegex(block('module "fcvm_fleet_%s"' % name), r"providers += \{ aws = aws\.%s \}" % alias)
 
 
 class HostTests(unittest.TestCase):
@@ -101,6 +101,18 @@ class SecretTests(unittest.TestCase):
         self.assertIn('Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]', tile)
 
 
+
+
+class ModuleDependencies(unittest.TestCase):
+    def test_no_module_level_depends_on(self):
+        # A module-level depends_on defers the module's data sources (the AZ list) to apply time, and the subnets'
+        # for_each over them then fails to plan; the flow log waits for the bucket policy through an input instead.
+        tf = (ROOT / "fcvm-fleet.tf").read_text()
+        for name in ("east2", "west2", "east1"):
+            start = tf.index('module "fcvm_fleet_%s"' % name)
+            body = tf[start:tf.index("\n}\n", start)]
+            self.assertNotIn("depends_on", body, name)
+            self.assertIn("flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id", body, name)
 
 class CoordinatorTileTypes(unittest.TestCase):
     def test_the_coordinator_launches_only_the_two_tile_types(self):

@@ -58,6 +58,13 @@ variable "flow_log_destination" {
   type        = string
 }
 
+# The bucket policy that lets VPC flow logs write there: the flow log waits for it through this value, not through a
+# module-level depends_on, which would defer the module's data sources (the AZ list) to apply time.
+variable "flow_log_bucket_policy_id" {
+  description = "Id of the flow-log bucket's policy; the flow log is created after it"
+  type        = string
+}
+
 data "aws_region" "current" {}
 
 data "aws_availability_zones" "available" {
@@ -165,7 +172,7 @@ resource "aws_flow_log" "this" {
   log_destination_type     = "s3"
   log_destination          = var.flow_log_destination
   max_aggregation_interval = 600
-  tags                     = { Name = "fcvm-fleet-${local.region}-flow-log" }
+  tags                     = { Name = "fcvm-fleet-${local.region}-flow-log", BucketPolicy = var.flow_log_bucket_policy_id }
 }
 
 # ------------------------------------------------------------------------------------------------ GPU hosts
