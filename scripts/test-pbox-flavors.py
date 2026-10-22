@@ -165,7 +165,11 @@ class Iam(unittest.TestCase):
                 self.assertIn(':instance/*"]', s)
                 self.assertRegex(s, r'test     = "StringEquals"\n\s+variable = "aws:RequestTag/Name"\n\s+values   = %s\n' % re.escape(names))
                 self.assertRegex(s, r'test     = "StringNotEquals"\n\s+variable = "ec2:InstanceType"\n\s+values   = %s\n' % re.escape(types))
-        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 5)
+        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 8)
+        # Moved unchanged from parallel-box-control, which has no room once it pins every box's on-demand template too.
+        for sid in ("AttachWorkVolume", "AttachWorkVolumeToTaggedInstance", "DescribeForPbox"):
+            self.assertIn('sid    = "%s"' % sid, doc)
+            self.assertNotIn('sid    = "%s"' % sid, LAUNCH)
         # --open's own IPv6 address on the owner's parallel boxes' interfaces only (by their Name tag).
         s = statement("AssignIpv6ToOpenParallelBoxes", doc)
         self.assertIn('actions   = ["ec2:AssignIpv6Addresses"]', s)

@@ -61,7 +61,7 @@ variable "instance_profile_name" {
 }
 
 variable "spot" {
-  description = "Spot (true) or on-demand, as var.parallel_box_spot"
+  description = "Spot (true) or on-demand, as var.parallel_box_spot, for the site's template; its \"-ondemand\" sibling is always on-demand"
   type        = bool
 }
 
@@ -206,13 +206,28 @@ resource "aws_key_pair" "this" {
   tags       = { Name = var.key_name }
 }
 
-# ============================================================ launch template
+# ============================================================ launch templates
 # The home templates' configuration (parallel-box-launch.tf) with three differences: no network interface block, so the
 # caller's --subnet-id picks the AZ; a second EBS volume, the fresh work disk, created and deleted with the box; and no
 # Name tag, which the caller adds (--tag-specifications) for the box it launches. One template serves every box,
-# which keeps the IAM policy that pins it short.
+# which keeps the IAM policy that pins it short. Its sibling "<template_name>-ondemand" is the same template without spot
+# options, for `pbox up --on-demand`, as at home.
+locals {
+  templates = {
+    default  = { name = var.template_name, spot = var.spot }
+    ondemand = { name = "${var.template_name}-ondemand", spot = false }
+  }
+}
+
+moved {
+  from = aws_launch_template.box
+  to   = aws_launch_template.box["default"]
+}
+
 resource "aws_launch_template" "box" {
-  name                   = var.template_name
+  for_each = local.templates
+
+  name                   = each.value.name
   image_id               = data.aws_ami.ubuntu.id
   key_name               = aws_key_pair.this.key_name
   vpc_security_group_ids = [aws_security_group.this.id]
@@ -223,7 +238,7 @@ resource "aws_launch_template" "box" {
   }
 
   dynamic "instance_market_options" {
-    for_each = var.spot ? [1] : []
+    for_each = each.value.spot ? [1] : []
     content {
       market_type = "spot"
       spot_options {
@@ -271,7 +286,7 @@ resource "aws_launch_template" "box" {
     }
   }
 
-  tags = { Name = var.template_name }
+  tags = { Name = each.value.name }
 
   user_data = var.user_data_b64
 }
@@ -357,5 +372,14 @@ output "key_name" {
 }
 
 output "template_arn" {
-  value = aws_launch_template.box.arn
+  value = aws_launch_template.box["default"].arn
+}
+
+output "ondemand_template_arn" {
+  description = "The always on-demand sibling of the site's template, for `pbox up --on-demand`"
+  value       = aws_launch_template.box["ondemand"].arn
+}
+
+output "ondemand_template_name" {
+  value = aws_launch_template.box["ondemand"].name
 }

@@ -299,7 +299,19 @@ from the pointer's `open` entry): the SSH group plus `aws_security_group.ohio_pb
 port in from `0.0.0.0/0` and `::/0`, and one delegated IPv6 /80 (`Ipv6PrefixCount=1`). `up` and `status` print the /80;
 `sudo fcvm podman run --network routed --ipv6-prefix <the /80>` gives each VM a public IPv6 in it. The open group covers
 the box's own addresses too, so every port the box listens on is public. `--open` is refused for other commands, with
-`--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+`--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group.
+`pbox up N FLAVOR --on-demand` buys that one launch on-demand (about 3x spot) while every other launch stays spot: each box
+has a second launch template, `<box>-ondemand`, and each fallback site `parallel-box-fallback-ondemand` (pointer
+`fallback.ondemand_template`), made by the same resource with no `instance_market_options` and pinned by exact ARN beside
+the spot ones. RunInstances is not used to override the market: the launch-template guide merges a nested structure given at
+launch into the template's, and the API's newer `MarketType` value `on-demand` documents nothing beside a template's
+`SpotOptions`. The launch prints the on-demand list price (Price List API, `dev-pricing-read`) and counts against the on-demand
+vCPU quota ("Running On-Demand G and VT instances", `L-DB2E81BA`, for the GPU flavors; "Running On-Demand Standard",
+`L-1216C47A`, for the rest), which a refusal names; it cancels no spot request. `status` shows the box ON-DEMAND, and the
+idle watchdog reaps it like any other (it finds boxes by Name). It combines with `--fallback`, `--regions`, `--open` and the
+GPU flavors' implied fallback; it is refused for other commands and for a member's pbox, whose grant allows spot only. To fit
+`parallel-box-control` under 6,144 characters with both templates of every box, its `AttachWorkVolume`,
+`AttachWorkVolumeToTaggedInstance` and `DescribeForPbox` statements moved unchanged to `pbox-flavor-types` (same two roles). The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).

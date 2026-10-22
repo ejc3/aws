@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OHIO = (ROOT / "ohio-pbox.tf").read_text()
 LAUNCH = (ROOT / "parallel-box-launch.tf").read_text()
+FLAVORS = (ROOT / "pbox-flavors.tf").read_text()
 SCRIPT = (ROOT / "scripts" / "parallel-box.sh").read_text()
 IO = (ROOT / "io-box.tf").read_text()
 STATUS = (ROOT / "applied-status.tf").read_text()
@@ -53,8 +54,12 @@ class SiteTests(unittest.TestCase):
         self.assertNotIn("arn:aws:ec2:us-west-2", policy)
         self.assertNotIn("arn:aws:ec2:us-east-2", policy)
         for local in ("parallel_box_instance_arns", "parallel_box_eni_arns", "parallel_box_new_volume_arns",
-                      "parallel_box_referenced_arns", "parallel_box_template_arns", "parallel_box_volume_arns"):
+                      "parallel_box_referenced_arns", "parallel_box_template_arns"):
             self.assertIn("local." + local, policy, local)
+        # The work volumes' attach grant moved to pbox-flavor-types (pbox-flavors.tf) for room, region-free all the same.
+        flavor_types = re.search(r'data "aws_iam_policy_document" "pbox_flavor_types" \{.*?\n\}\n', FLAVORS, re.S).group(0)
+        self.assertNotIn("arn:aws:ec2:us-east-2", flavor_types)
+        self.assertIn("resources = local.parallel_box_volume_arns", flavor_types)
 
     def test_the_one_template_per_box_is_pinned_in_the_policy(self):
         self.assertIn("parallel_box_template_arns = [for lt in aws_launch_template.parallel_box_ohio : lt.arn]", LAUNCH)
@@ -64,7 +69,7 @@ class SiteTests(unittest.TestCase):
     def test_one_boot_script_never_formats_a_disk_with_data(self):
         self.assertEqual(LAUNCH.count("mkfs.ext4"), 1)
         self.assertIn("mkfs.ext4 -L parallel-work", LAUNCH)
-        self.assertIn('user_data = local.parallel_box_user_data["us-east-2/${each.key}"]', LAUNCH)
+        self.assertIn('user_data = local.parallel_box_user_data["us-east-2/${each.value.box}"]', LAUNCH)
         self.assertNotIn("us-west-2/", LAUNCH)
         self.assertNotIn("each.value.volume_id", LAUNCH)
 

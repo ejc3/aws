@@ -40,6 +40,18 @@ locals {
   parallel_boxes     = { for n in [1, 2, 3, 4, 5, 6, 7, 8] : tostring(n) => { name = n == 1 ? "parallel-box" : "parallel-box-${n}" } }
   parallel_box_names = [for k in sort(keys(local.parallel_boxes)) : local.parallel_boxes[k].name]
 
+  # Two launch templates per box, from the one resource below. The box's own ("1".."8", named as the box) is bought as
+  # var.parallel_box_spot says. Its sibling ("1-ondemand", named "<box>-ondemand") is the same template with no spot
+  # options, so it is always on-demand: `pbox up N FLAVOR --on-demand` launches from it, and buys that one box on-demand
+  # while every other launch stays spot. RunInstances cannot be relied on to turn a spot template on-demand: the
+  # launch-template guide says a nested structure given at launch is merged into the template's, and the API's newer
+  # MarketType "on-demand" has no documented meaning beside a template's SpotOptions. Both instances carry the box's Name
+  # tag, so IAM, `pbox status`, `pbox down` and the idle watchdog treat them alike.
+  parallel_box_templates = merge(
+    { for k, b in local.parallel_boxes : k => { box = k, name = b.name, template = b.name, spot = var.parallel_box_spot } },
+    { for k, b in local.parallel_boxes : "${k}-ondemand" => { box = k, name = b.name, template = "${b.name}-ondemand", spot = false } },
+  )
+
   parallel_box_volume_arns = flatten([for r, site in local.parallel_box_sites : [for id in values(site.volumes) : "arn:aws:ec2:${r}:${local.parallel_box_account}:volume/${id}"]])
 }
 
@@ -83,6 +95,7 @@ locals {
     ]
   ])
 
+  # Both templates of every box (local.parallel_box_templates): the spot one and its on-demand sibling.
   parallel_box_template_arns = [for lt in aws_launch_template.parallel_box_ohio : lt.arn]
 
   # The boot script of one box: authorize the dev hop key, find the work volume by its EBS serial and mount it
@@ -191,9 +204,9 @@ variable "parallel_box_spot" {
 # ---------------------------------------------------------------------------------
 resource "aws_launch_template" "parallel_box_ohio" {
   provider = aws.ohio
-  for_each = local.parallel_boxes
+  for_each = local.parallel_box_templates
 
-  name                   = each.value.name
+  name                   = each.value.template
   image_id               = var.parallel_box_ami_ohio # Ubuntu 24.04 arm64, us-east-2; an x86 flavor overrides it with --image-id
   key_name               = aws_key_pair.ohio_pbox.key_name
   update_default_version = true
@@ -206,8 +219,9 @@ resource "aws_launch_template" "parallel_box_ohio" {
   # cannot tolerate reclaim roulette (e.g. multi-hour benchmark sweeps that lose an
   # hour per interruption): on-demand c8g.48xlarge is ~$7.25/hr vs ~$2.4 spot, so
   # flip it back when the job finishes. The idle watchdog still reaps either kind.
+  # The "-ondemand" sibling never has spot options (local.parallel_box_templates): `pbox up --on-demand` for one box.
   dynamic "instance_market_options" {
-    for_each = var.parallel_box_spot ? [1] : []
+    for_each = each.value.spot ? [1] : []
     content {
       market_type = "spot"
       spot_options {
@@ -285,14 +299,14 @@ resource "aws_launch_template" "parallel_box_ohio" {
     }
   }
 
-  tags = { Name = each.value.name }
+  tags = { Name = each.value.template }
 
-  user_data = local.parallel_box_user_data["us-east-2/${each.key}"]
+  user_data = local.parallel_box_user_data["us-east-2/${each.value.box}"]
 }
 
 # ---------------------------------------------------------------------------------
 # What a dev box is allowed to do, which is exactly: launch one of these eight boxes,
-# attach its own work disk, and kill it again. Which instance types it may launch them as is
+# attach its own work disk (that grant is in pbox-flavor-types, below), and kill it again. Which instance types it may launch them as is
 # pbox-flavor-types' (pbox-flavors.tf), a separate managed policy for lack of room here.
 #
 # The condition structure matters and is easy to get wrong. RunInstances authorizes a
@@ -382,35 +396,10 @@ data "aws_iam_policy_document" "parallel_box_control" {
     }
   }
 
-  # Attaching the work disk. Scoped to the work volume ARNs by IDENTITY, not by a DevEBS
-  # tag: tagging them DevEBS=true would have swept them into local.dev_ebs_policy, which
-  # grants ec2:DeleteVolume. These volumes carry prevent_destroy precisely because losing
-  # one loses real work, so they must not be reachable by a delete grant.
-  statement {
-    sid    = "AttachWorkVolume"
-    effect = "Allow"
-    actions = [
-      "ec2:AttachVolume",
-      "ec2:DetachVolume",
-    ]
-    resources = local.parallel_box_volume_arns
-  }
-
-  statement {
-    sid    = "AttachWorkVolumeToTaggedInstance"
-    effect = "Allow"
-    actions = [
-      "ec2:AttachVolume",
-      "ec2:DetachVolume",
-    ]
-    resources = local.parallel_box_instance_arns
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:ResourceTag/Name"
-      values   = [for b in local.parallel_boxes : b.name]
-    }
-  }
+  # The work volumes' attach grants and the read-only lookups (AttachWorkVolume, AttachWorkVolumeToTaggedInstance,
+  # DescribeForPbox) are in pbox-flavor-types (pbox-flavors.tf), unchanged: with both templates of every box in its three
+  # template lists, this policy would be about 6,900 characters, over the 6,144 IAM allows a managed policy, and both roles
+  # already hold 20 managed policies. pbox-flavor-types is attached to the same two roles, so what they may do is the same.
 
   # The instance profile the box boots with. PassRole is the permission that most needs
   # pinning -- a wildcard here would let this role hand ANY role to a new instance and
@@ -428,29 +417,6 @@ data "aws_iam_policy_document" "parallel_box_control" {
     }
   }
 
-  # Read-only lookups the script makes: find the running box, price the pools, locate the
-  # volume's AZ, and (for --fallback and `pbox capacity`) score the spot pools of every US
-  # AZ and list which types each AZ offers. None of these accept resource-level scoping in IAM.
-  statement {
-    sid    = "DescribeForPbox"
-    effect = "Allow"
-    actions = [
-      "ec2:GetSpotPlacementScores",
-      "ec2:DescribeAvailabilityZones",
-      "ec2:DescribeInstanceTypeOfferings",
-      "ec2:DescribeInstances",
-      "ec2:DescribeInstanceTypes",
-      "ec2:DescribeInstanceStatus",
-      "ec2:DescribeVolumes",
-      "ec2:DescribeSpotPriceHistory",
-      "ec2:DescribeLaunchTemplates",
-      "ec2:DescribeLaunchTemplateVersions",
-      "ec2:DescribeImages",
-      "ec2:DescribeSubnets",
-      "ec2:DescribeSecurityGroups",
-    ]
-    resources = ["*"]
-  }
 }
 
 # ONE managed policy for both roles, not an inline policy on each. dev-server-role's inline policies total about 10,060 of the

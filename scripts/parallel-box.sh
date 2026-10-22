@@ -32,6 +32,15 @@
 #                     box's own IPv4 and IPv6 addresses alike, so anything listening on the box is reachable. Home AZ
 #                     only (the fallback sites have no IPv6; --fallback and --regions are refused with it), and not for
 #                     a member's box. A box already running without it stays as it is: down, then up --open.
+#   pbox up [N] FLAVOR --on-demand
+#                     buy THIS launch on-demand instead of spot, about 3x the spot price; every other launch stays spot.
+#                     For work a spot reclaim would lose, or when spot capacity for the type is short (bare-metal GPU
+#                     types). It launches from the box's "<name>-ondemand" launch template (at a fallback site, the site's
+#                     "parallel-box-fallback-ondemand"), prints the on-demand list price, and counts against the region's
+#                     on-demand vCPU quota ("Running On-Demand G and VT instances" for the GPU flavors, "Running
+#                     On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" for the rest), not the spot one. Combines
+#                     with --fallback, --regions and --open. The idle watchdog terminates it like a spot box. Not for a
+#                     member's box (its grant allows spot only).
 #   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
 #   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? open, with which IPv6 /80?
 #                     and how the NEXT launch is bought
@@ -227,6 +236,7 @@ FLAVOR=""
 FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
+ONDEMAND=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
@@ -238,6 +248,7 @@ while [ $# -gt 0 ]; do
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
     --fallback) FALLBACK=1 ;;
     --open) OPEN=1 ;;
+    --on-demand) ONDEMAND=1 ;;
     --regions)
       shift
       [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
@@ -247,7 +258,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --on-demand)"; exit 1 ;;
   esac
   shift
 done
@@ -272,6 +283,17 @@ if [ -n "$OPEN" ]; then
     say "--open launches only in the home AZ: the fallback sites have no IPv6 to delegate. Drop --fallback / --regions."
     exit 1
   fi
+fi
+# --on-demand: this one launch is bought on-demand, from the box's "-ondemand" sibling launch template
+# (parallel-box-launch.tf, pbox-fallback.tf). `up` only, and not for a member's box: member-pbox-control allows only spot
+# launches (ec2:InstanceMarketType = spot), so an on-demand member box would need a new grant.
+if [ -n "$ONDEMAND" ]; then
+  if [ -n "$MEMBER" ]; then
+    say "--on-demand is not available for pbox-$MEMBER: its IAM grant (member-pbox.tf) allows spot launches only."
+    say "  An on-demand member box needs that grant widened by the owner; nothing was launched."
+    exit 1
+  fi
+  if [ "$CMD" != "up" ]; then say "--on-demand only applies to 'up'"; exit 1; fi
 fi
 if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
@@ -335,6 +357,14 @@ HOME_REGION="$REGION"
 
 # The fallback sites (pbox-fallback.tf): their template name, and region => AZ => subnet.
 FB_TEMPLATE="$(pointer fallback template)"
+# --on-demand launches at a fallback site from the site's always on-demand sibling template, named in the pointer.
+if [ -n "$ONDEMAND" ]; then
+  FB_TEMPLATE="$(pointer fallback ondemand_template)"
+  if [ -n "$FALLBACK" ] && [ -z "$FB_TEMPLATE" ]; then
+    say "FATAL: /infra/parallel-box names no on-demand fallback template (pbox-fallback.tf not applied yet?); nothing was launched."
+    exit 1
+  fi
+fi
 FB_REGIONS="$(pointer fallback regions)"
 fb_subnet() { pointer fallback regions "$1" subnets "$2"; } # fb_subnet REGION AZ
 fb_azs() { pointer fallback regions "$1" subnets; }        # fb_azs REGION
@@ -401,6 +431,7 @@ set_box() {
   fi
   VOLTAG="$NAME-work" # the volume's Name tag (ohio-pbox.tf)
   LT="$NAME" # launch template name matches the box name (parallel-box-launch.tf)
+  [ -z "$ONDEMAND" ] || LT="$NAME-ondemand" # its always on-demand sibling, for --on-demand
 }
 set_box "${BOX:-1}"
 BOX_LABEL="${BOX:-1}"
@@ -501,6 +532,47 @@ open_note() {
   fi
 }
 
+# When `up --on-demand` finds the box already running as spot: it is kept as it is.
+ondemand_note() {
+  [ -n "$ONDEMAND" ] || return 0
+  local l
+  l=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
+  if [ "$l" = spot ]; then
+    say "NOTE: $NAME is already running as spot; it is kept. For on-demand: $SELF down ${BOX:-}, then up again with --on-demand."
+  fi
+}
+
+# od_price TYPE REGION: the type's on-demand Linux list price in $/hr from the AWS Price List API (served from us-east-1;
+# dev-pricing-read in dev-ai-services.tf grants it to both roles that run pbox), or nothing when it cannot be read.
+od_price() {
+  aws pricing get-products --region us-east-1 --service-code AmazonEC2 --max-results 1 \
+    --filters "Type=TERM_MATCH,Field=instanceType,Value=$1" "Type=TERM_MATCH,Field=regionCode,Value=$2" \
+    Type=TERM_MATCH,Field=operatingSystem,Value=Linux Type=TERM_MATCH,Field=tenancy,Value=Shared \
+    Type=TERM_MATCH,Field=preInstalledSw,Value=NA Type=TERM_MATCH,Field=capacitystatus,Value=Used \
+    Type=TERM_MATCH,Field=marketoption,Value=OnDemand \
+    --query 'PriceList[0]' --output text 2>/dev/null | head -1 | python3 -c 'import json, sys
+try:
+    p = json.loads(sys.stdin.read())
+    for term in p["terms"]["OnDemand"].values():
+        for d in term["priceDimensions"].values():
+            if d.get("unit") == "Hrs":
+                print("%.3f" % float(d["pricePerUnit"]["USD"]))
+                sys.exit(0)
+except Exception:
+    pass' 2>/dev/null
+}
+
+# od_quota_name FAMILY: the on-demand vCPU quota's name in the Service Quotas console, for a family quota_codes names.
+od_quota_name() {
+  case "$1" in
+    G-and-VT) echo "Running On-Demand G and VT instances" ;;
+    Standard) echo "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" ;;
+    *) echo "Running On-Demand $1 instances" ;;
+  esac
+}
+
 box_az() {
   aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
@@ -551,6 +623,9 @@ status_one() {
   NEXT=$(launch_mode)
   case "$NEXT" in
     on-demand) echo "  next launch: ON-DEMAND, about 3x the spot price (launch template: parallel_box_spot=false). Apply parallel_box_spot=true to go back to spot." ;;
+    spot)
+      if [ -n "$MEMBER" ]; then echo "  next launch: spot (launch template)"
+      else echo "  next launch: spot (launch template; \`$SELF up ${1} FLAVOR --on-demand\` buys that one launch on-demand)"; fi ;;
     *) echo "  next launch: $NEXT (launch template)" ;;
   esac
 }
@@ -755,10 +830,11 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
     if [ "$rc" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
       return 0
     fi
-    # A quota refusal may be a stale spot request's doing: clear those once and try the same type again.
+    # A quota refusal may be a stale spot request's doing: clear those once and try the same type again. Not for an
+    # --on-demand launch: spot requests do not count against the on-demand quota.
     case "$OUT" in
       *MaxSpotInstanceCountExceeded*|*VcpuLimitExceeded*)
-        if [ -z "$retried" ]; then
+        if [ -z "$retried" ] && [ -z "$ONDEMAND" ]; then
           retried=1
           if [ "$(clear_stale_spot_requests)" -gt 0 ]; then
             say "    retrying $t in $az"
@@ -782,7 +858,7 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
       say "    MaxSpotInstanceCountExceeded: $t would put $REGION over its spot vCPU quota for $fam instances"
       say "      ($spot_q = $(quota_value "$spot_q") vCPU, counting running spot instances AND open or active spot requests) -- trying the next one" ;;
     *VcpuLimitExceeded*)
-      say "    VcpuLimitExceeded: $t would put $REGION over its on-demand vCPU quota for $fam instances"
+      say "    VcpuLimitExceeded: $t would put $REGION over its on-demand vCPU quota for $fam instances (\"$(od_quota_name "$fam")\")"
       say "      ($od_q = $(quota_value "$od_q") vCPU) -- trying the next one" ;;
     *InstanceLimitExceeded*)
       say "    InstanceLimitExceeded: $REGION's on-demand instance-count limit for $t (an older per-type limit, not a vCPU quota) -- trying the next one" ;;
@@ -874,6 +950,7 @@ case "$CMD" in
           --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
         flavor_note "$CHOSEN"
         open_note
+        ondemand_note
         attach_work "$ID" || exit 1
         CHOSEN_AZ="$(box_az)"
         wait_ready persistent running
@@ -883,6 +960,7 @@ case "$CMD" in
         --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
         --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
       open_note
+      ondemand_note
       P="$(box_ipv6_prefix)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
       echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)${P:+ ipv6_prefix=$P}"
@@ -896,15 +974,32 @@ case "$CMD" in
     say "Work volume $VOL is in $AZ -- the box launches there (EBS is AZ-locked)."
     wait_volume_free "$VOL" || exit 1
     MODE_NOW=$(launch_mode)
-    case "$MODE_NOW" in
-      on-demand)
-        say "PURCHASE MODE: ON-DEMAND (the launch template says parallel_box_spot=false)."
-        say "  This costs about 3x spot, and the \"spot\" figure shown per type below is for reference only, NOT what you pay."
-        say "  To go back to spot, an admin applies parallel_box_spot=true; a later apply without the variable also does."
-        ;;
-      spot) say "PURCHASE MODE: spot. Spot capacity differs from type to type; trying each of $FLAVOR's types in turn." ;;
-      *) say "PURCHASE MODE: unknown (could not read the launch template). Trying each type in turn." ;;
-    esac
+    if [ -n "$ONDEMAND" ]; then
+      # The sibling template must exist and carry no spot options; otherwise nothing is launched.
+      if [ "$MODE_NOW" != on-demand ]; then
+        if [ "$MODE_NOW" = unknown ]; then
+          say "FATAL: --on-demand launches from the launch template $LT, which cannot be read (parallel-box-launch.tf not applied yet?); nothing was launched."
+        else
+          say "FATAL: --on-demand launches from the launch template $LT, which is $MODE_NOW, not on-demand; nothing was launched."
+        fi
+        exit 1
+      fi
+      read -r _ OD_Q OD_FAM <<< "$(quota_codes "${TYPES%% *}")"
+      say "PURCHASE MODE: ON-DEMAND for this launch only (--on-demand, launch template $LT). It costs about 3x spot;"
+      say "  the price shown per type is the on-demand list price. It counts against $REGION's on-demand vCPU quota for"
+      say "  $OD_FAM instances (\"$(od_quota_name "$OD_FAM")\": $OD_Q = $(quota_value "$OD_Q") vCPU), not the spot quota."
+      say "  The idle watchdog terminates it like a spot box."
+    else
+      case "$MODE_NOW" in
+        on-demand)
+          say "PURCHASE MODE: ON-DEMAND (the launch template says parallel_box_spot=false)."
+          say "  This costs about 3x spot, and the \"spot\" figure shown per type below is for reference only, NOT what you pay."
+          say "  To go back to spot, an admin applies parallel_box_spot=true; a later apply without the variable also does."
+          ;;
+        spot) say "PURCHASE MODE: spot. Spot capacity differs from type to type; trying each of $FLAVOR's types in turn." ;;
+        *) say "PURCHASE MODE: unknown (could not read the launch template). Trying each type in turn." ;;
+      esac
+    fi
     if [ -n "$OPEN" ]; then
       say "OPEN: the box gets the open security group (everything in, from anywhere) and a delegated IPv6 /80."
     fi
@@ -915,12 +1010,18 @@ case "$CMD" in
     for T in $TYPES; do
       CORES=$(aws ec2 describe-instance-types --region "$REGION" --instance-types "$T" \
         --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null)
-      # head -1: --max-items makes the CLI emit a pagination token on a SECOND line, which
-      # otherwise lands in the price and prints as "$2.219800\nNone/hr".
-      PRICE=$(aws ec2 describe-spot-price-history --region "$REGION" --instance-types "$T" \
-        --product-descriptions "Linux/UNIX" --availability-zone "$AZ" --max-items 1 \
-        --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
-      if [ "$MODE_NOW" = "spot" ]; then
+      if [ -n "$ONDEMAND" ]; then
+        PRICE="$(od_price "$T" "$REGION")"
+      else
+        # head -1: --max-items makes the CLI emit a pagination token on a SECOND line, which
+        # otherwise lands in the price and prints as "$2.219800\nNone/hr".
+        PRICE=$(aws ec2 describe-spot-price-history --region "$REGION" --instance-types "$T" \
+          --product-descriptions "Linux/UNIX" --availability-zone "$AZ" --max-items 1 \
+          --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
+      fi
+      if [ -n "$ONDEMAND" ]; then
+        say "--> trying $T (${CORES:-?} cores, on-demand \$${PRICE:-?}/hr) in $AZ ..."
+      elif [ "$MODE_NOW" = "spot" ]; then
         say "--> trying $T (${CORES:-?} cores, \$${PRICE:-?}/hr) in $AZ ..."
       else
         # on-demand, or unknown because the template could not be read: the spot figure is a reference, never the price
@@ -999,6 +1100,7 @@ case "$CMD" in
     say "  nothing from the home volume ($VOL) is on it, and /srv/io is not mounted."
     fallback_order > "$TMP/order"
     say "AZs by spot placement score (10 = most likely), for any of the types:"
+    [ -z "$ONDEMAND" ] || say "  (--on-demand: these are spot scores, used only to order the AZs; each launch uses $FB_TEMPLATE)"
     sed 's/^/    /' "$TMP/order" >&2
     say ""
 
@@ -1023,7 +1125,12 @@ case "$CMD" in
       say "--> $FAZ ($R, score $SCORE)"
       for T in $TYPES; do
         if [ -n "$OFFERED" ] && [ "${OFFERED#* "$T" }" = "$OFFERED" ]; then continue; fi
-        say "--> trying $T in $FAZ ..."
+        if [ -n "$ONDEMAND" ]; then
+          PRICE="$(od_price "$T" "$R")"
+          say "--> trying $T (on-demand \$${PRICE:-?}/hr) in $FAZ ..."
+        else
+          say "--> trying $T in $FAZ ..."
+        fi
         if ! IMG_OUT="$(image_args "$T" "$(fb_x86_image "$R")" "$R")"; then REAL_ERROR=1; say ""; continue; fi
         read -r -d '' -a IMG <<< "$IMG_OUT"
         # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces

@@ -126,8 +126,10 @@ class LaunchTemplateSwitch(unittest.TestCase):
         self.assertRegex(self.TF, r'variable "parallel_box_spot" \{[^}]*default\s*=\s*true')
 
     def test_only_the_switch_decides_whether_the_template_carries_spot_options(self):
+        # Each box's own template follows the switch; its "-ondemand" sibling (pbox up --on-demand) never has spot options.
         self.assertIn('dynamic "instance_market_options"', self.TF)
-        self.assertIn("for_each = var.parallel_box_spot ? [1] : []", self.TF)
+        self.assertIn("for_each = each.value.spot ? [1] : []", self.TF)
+        self.assertIn('{ for k, b in local.parallel_boxes : k => { box = k, name = b.name, template = b.name, spot = var.parallel_box_spot } }', self.TF)
         self.assertIn('market_type = "spot"', self.TF)
         self.assertIn('spot_instance_type             = "one-time"', self.TF)  # a reclaimed box is not restarted
 
