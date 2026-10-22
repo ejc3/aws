@@ -300,6 +300,9 @@ install -d -o "$U" -g "$U" -m 755 "$H/Documents/Codex"
 # /etc/claude-code/CLAUDE.md for every user, on top of the person's own ~/.claude/CLAUDE.md, which stays theirs.
 install -d -m 755 /etc/claude-code && install -m 644 "$SHARED/ct/box-agents.md" /etc/claude-code/CLAUDE.md \
   || warn "box agent notes not installed"
+# /tmp is a host directory on disk (nextjs-ct-machine), not a tmpfs that empties itself: clear it at boot as before, and
+# age out anything untouched for 7 days (systemd-tmpfiles-clean runs daily). Overrides the distribution's tmp.conf.
+printf 'D /tmp 1777 root root 7d\n' > /etc/tmpfiles.d/tmp.conf || warn "/tmp cleanup rule not written"
 
 # Shell environment (t-claude, atuin, starship, fzf, tmux.conf): the same body every box runs.
 as_user bash < "$SHARED/snippets/user-shell-env.sh" >/dev/null 2>&1 || warn "shell env for $U had errors"

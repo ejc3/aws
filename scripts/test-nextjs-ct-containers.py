@@ -592,6 +592,22 @@ class HostAccountTests(unittest.TestCase):
     def test_sshd_never_runs_the_persons_rc(self):
         self.assertIn('echo "    PermitUserRC no"', (HOST / "nextjs-ct-sshd").read_text())
 
+    def test_tmp_is_a_disk_directory_per_container_not_nspawns_small_tmpfs(self):
+        # nspawn's default /tmp is a tmpfs at 10% of RAM (1.6 GB); agents filled it in a day and opencode could not start.
+        machine = (HOST / "nextjs-ct-machine").read_text()
+        files = machine.split("[Files]", 1)[1].split("[Network]", 1)[0]
+        self.assertIn("Bind=$TD:/tmp\n", files)
+        self.assertNotIn("Bind=$TD:/tmp:idmap", files)
+        self.assertIn('TD=/var/lib/nextjs-ct/tmp/$U', machine)
+        self.assertIn('install -d -m 1777 -o "$SHIFT" -g "$SHIFT" "$TD"', machine)
+        # its parent is nosuid,nodev on the host, and exec stays allowed (native code is loaded from /tmp)
+        unit = machine.split("What=/var/lib/nextjs-ct/tmp", 1)[1].split("[Install]", 1)[0]
+        self.assertIn("Options=bind,nosuid,nodev\n", unit)
+        self.assertNotIn("noexec", unit)
+        # cleared at boot and aged out after 7 days by the container's own tmpfiles rule
+        provision = (CT / "provision").read_text()
+        self.assertIn("printf 'D /tmp 1777 root root 7d\\n' > /etc/tmpfiles.d/tmp.conf", provision)
+
     def test_home_is_nosuid_on_the_host_and_idmapped_in_the_container(self):
         machine = (HOST / "nextjs-ct-machine").read_text()
         self.assertIn("Options=bind,nosuid,nodev", machine)
