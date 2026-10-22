@@ -61,9 +61,9 @@ class GrantTests(unittest.TestCase):
         self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "member_wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
         # is an administrator (jumpbox_admin), is a CI machine, is the Mac (its own resource above), or is in the
-        # Dolphin account (dolphin_redis, which calls no model).
+        # Dolphin account (dolphin_redis, which calls no model), or is in the fcvm-fleet account (its hosts and tiles call none).
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "runner_app_image_builder",
-                    "mac_instance", "dolphin_redis"}
+                    "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile"}
         profile_roles = set()
         for tf in ROOT.glob("*.tf"):
             for m in re.finditer(r'^resource "aws_iam_instance_profile" "\w+" \{\n.*?^\}', tf.read_text(), re.S | re.M):

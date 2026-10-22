@@ -1611,6 +1611,21 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm). Written into the
   fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
+- **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
+  a public subnet per AZ, one security group admitting TCP 443 from anywhere and nothing else, no SSH: SSM only, flow logs
+  to `fcvm-fleet-flow-logs-<id>`); a spot GPU host group per region over g4dn.metal and g5g.metal (launch template per
+  architecture, `Ipv6PrefixCount = 1` only, IMDSv2 hop 1); EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
+  coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
+  `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/tls-wildcard` secret. The
+  Cloudflare-fed secrets (DNS token, tunnel token, agent Access token) come from `fcvm-dev.tf`.
+- **Two gates, both off**: `local.fcvm_fleet_hosts_enabled` (one spot metal GPU host per region, also needing the fleet AMI
+  in `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled` (also needing `var.fcvm_fleet_coordinator_image`).
+  Nothing billed by the hour runs until the owner turns one on. The AMI build is a follow-up.
+- The coordinator's task role may launch EC2 only from the tile templates, referencing only the tile AMIs and the fleet's
+  subnets and group (by exact ARN), only as the two tile types and tagged `Purpose=fcvm-fleet-tile`; terminate only
+  instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate
+  and store the certificate it issues. The fleet account has EC2's spot service-linked role. Hosts read the certificate,
+  the agent token and the asset bucket.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
