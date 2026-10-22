@@ -205,15 +205,13 @@ data "aws_iam_policy_document" "pbox_flavor_types" {
   }
 
   # Except the persistent dev boxes' requests: a persistent request cancelled while its box runs leaves a box that cannot
-  # start again after its next stop.
-  dynamic "statement" {
-    for_each = length(local.pbox_persistent_spot_requests) > 0 ? [1] : []
-    content {
-      sid       = "NeverThePersistentBoxesRequests"
-      effect    = "Deny"
-      actions   = ["ec2:CancelSpotInstanceRequests"]
-      resources = local.pbox_persistent_spot_requests
-    }
+  # start again after its next stop. Unconditional (a placeholder keeps the list non-empty with every box off), so a box
+  # being replaced, whose new request id is unknown at plan time, cannot make the statement's existence unknown.
+  statement {
+    sid       = "NeverThePersistentBoxesRequests"
+    effect    = "Deny"
+    actions   = ["ec2:CancelSpotInstanceRequests"]
+    resources = concat(local.pbox_persistent_spot_requests, ["arn:aws:ec2:*:${local.parallel_box_account}:spot-instances-request/sir-none"])
   }
 
   statement {

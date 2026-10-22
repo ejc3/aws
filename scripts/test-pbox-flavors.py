@@ -165,13 +165,18 @@ class Iam(unittest.TestCase):
                 self.assertIn(':instance/*"]', s)
                 self.assertRegex(s, r'test     = "StringEquals"\n\s+variable = "aws:RequestTag/Name"\n\s+values   = %s\n' % re.escape(names))
                 self.assertRegex(s, r'test     = "StringNotEquals"\n\s+variable = "ec2:InstanceType"\n\s+values   = %s\n' % re.escape(types))
-        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 3)
+        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 4)
         # Stale spot requests: pbox may cancel any of the account's, never a persistent dev box's (their own ids).
         s = statement("CancelStaleSpotRequests", doc)
         self.assertIn('actions   = ["ec2:CancelSpotInstanceRequests"]', s)
         self.assertIn(':spot-instances-request/*"]', s)
         self.assertIn('sid       = "NeverThePersistentBoxesRequests"', doc)
-        self.assertIn('effect    = "Deny"\n      actions   = ["ec2:CancelSpotInstanceRequests"]\n      resources = local.pbox_persistent_spot_requests', doc)
+        deny = statement("NeverThePersistentBoxesRequests", doc)
+        self.assertIn('effect    = "Deny"', deny)
+        self.assertIn('actions   = ["ec2:CancelSpotInstanceRequests"]', deny)
+        # Unconditional, never a dynamic block: a replacement's unknown request id cannot make the statement unknown.
+        self.assertIn("resources = concat(local.pbox_persistent_spot_requests, [", deny)
+        self.assertNotIn('dynamic "statement"', doc)
         for ref in ("aws_instance.firecracker_dev[*].spot_instance_request_id", "aws_instance.x86_dev[*].spot_instance_request_id",
                     "[aws_instance.io_box.spot_instance_request_id]"):
             self.assertIn(ref, FLAVORS_TF, ref)
