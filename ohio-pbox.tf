@@ -68,6 +68,15 @@ variable "parallel_box_ami_ohio" {
   default     = "ami-0dcc74e3bca0f40dc" # ubuntu-noble-24.04-arm64-server-20260923
 }
 
+# The x86_64 build of the same Ubuntu image, for the one x86 flavor (kvm-gpu-96 = g4dn.metal, pbox-flavors.tf). The launch
+# templates boot the arm64 image; `pbox up` passes this one with --image-id for an x86 type, and parallel-box-control allows
+# it by exact ARN. Bump it together with var.parallel_box_ami_ohio and pbox-fallback.tf's image names.
+variable "parallel_box_ami_ohio_x86" {
+  description = "Ubuntu 24.04 amd64 in us-east-2 (the x86_64 build of var.parallel_box_ami_ohio), for x86 pbox flavors"
+  type        = string
+  default     = "ami-0fa99aa8f97f9e30b" # ubuntu-noble-24.04-amd64-server-20260923
+}
+
 # ============================================================ network
 # 10.12.0.0/16: not the main VPC (10.0), the runner VPCs (10.1, 10.11) or the us-west-2 default VPC (172.31).
 resource "aws_vpc" "ohio_pbox" {
@@ -306,12 +315,14 @@ resource "aws_lambda_permission" "parallel_watchdog_ohio" {
 
 # ============================================================ which region `pbox` uses
 # Read by scripts/parallel-box.sh on every dev box (a plain SSM read, the same way /infra/applied-status is). The
-# parameter holds no secret; the policy that lets a dev box read it is in applied-status.tf. "fallback" is where
-# `pbox up N FLAVOR --fallback` may launch instead (pbox-fallback.tf): the template name and region => AZ => subnet.
+# parameter holds no secret; the policy that lets a dev box read it is in applied-status.tf. "x86_image" is the home site's
+# x86_64 image, which `pbox up` passes with --image-id for an x86 flavor (pbox-flavors.tf). "fallback" is where
+# `pbox up N FLAVOR --fallback` may launch instead (pbox-fallback.tf): the template name and region => AZ => subnet, and
+# each region's x86 image.
 resource "aws_ssm_parameter" "parallel_box_region" {
   name        = "/infra/parallel-box"
   description = "Which region the parallel boxes launch in (see ohio-pbox.tf) and their fallback sites (pbox-fallback.tf); read by scripts/parallel-box.sh"
   type        = "String"
   tier        = "Standard"
-  value       = jsonencode({ region = local.parallel_box_region, fallback = local.pbox_fallback_pointer })
+  value       = jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, fallback = local.pbox_fallback_pointer })
 }

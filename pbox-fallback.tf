@@ -27,6 +27,9 @@ locals {
 
   # The same Ubuntu build as var.parallel_box_ami_ohio, by name, so every region boots the same image.
   pbox_fallback_ami_name = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20260923"
+  # Its x86_64 build (var.parallel_box_ami_ohio_x86 at home), which `pbox up` passes with --image-id for an x86 flavor
+  # (kvm-gpu-96, pbox-flavors.tf). Present in all four regions (checked 2026-10-22 with describe-images).
+  pbox_fallback_ami_name_x86 = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260923"
 
   # Every box launches from the site's one template, named by the caller. The fresh work disk is as big as the largest
   # home volume: it exists only while the box does, so the size costs cents.
@@ -47,6 +50,9 @@ locals {
       echo "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
     chmod 600 /home/ubuntu/.ssh/authorized_keys
     chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+
+    # An x86 GPU box (kvm-gpu-96, pbox-flavors.tf) reboots here once, for intel_iommu=on, and this script runs again.
+    ${local.pbox_gpu_iommu_reboot}
 
     # The fresh work volume: the EBS disk that is not the root disk. Instance-store NVMe (the *gd types) has another
     # model name and is left alone.
@@ -89,6 +95,7 @@ locals {
 
   pbox_fallback_common = {
     ami_name              = local.pbox_fallback_ami_name
+    ami_name_x86          = local.pbox_fallback_ami_name_x86
     template_name         = local.pbox_fallback_template_name
     work_size             = local.pbox_fallback_work_size
     user_data_b64         = local.pbox_fallback_user_data
@@ -125,6 +132,7 @@ module "pbox_fallback_us_east_1" {
   cidr_block            = local.pbox_fallback_regions["us-east-1"].cidr
   availability_zones    = local.pbox_fallback_regions["us-east-1"].azs
   ami_name              = local.pbox_fallback_common.ami_name
+  ami_name_x86          = local.pbox_fallback_common.ami_name_x86
   template_name         = local.pbox_fallback_common.template_name
   work_size             = local.pbox_fallback_common.work_size
   user_data_b64         = local.pbox_fallback_common.user_data_b64
@@ -144,6 +152,7 @@ module "pbox_fallback_us_east_2" {
   cidr_block            = local.pbox_fallback_regions["us-east-2"].cidr
   availability_zones    = local.pbox_fallback_regions["us-east-2"].azs
   ami_name              = local.pbox_fallback_common.ami_name
+  ami_name_x86          = local.pbox_fallback_common.ami_name_x86
   template_name         = local.pbox_fallback_common.template_name
   work_size             = local.pbox_fallback_common.work_size
   user_data_b64         = local.pbox_fallback_common.user_data_b64
@@ -162,6 +171,7 @@ module "pbox_fallback_us_west_1" {
   cidr_block            = local.pbox_fallback_regions["us-west-1"].cidr
   availability_zones    = local.pbox_fallback_regions["us-west-1"].azs
   ami_name              = local.pbox_fallback_common.ami_name
+  ami_name_x86          = local.pbox_fallback_common.ami_name_x86
   template_name         = local.pbox_fallback_common.template_name
   work_size             = local.pbox_fallback_common.work_size
   user_data_b64         = local.pbox_fallback_common.user_data_b64
@@ -181,6 +191,7 @@ module "pbox_fallback_us_west_2" {
   cidr_block            = local.pbox_fallback_regions["us-west-2"].cidr
   availability_zones    = local.pbox_fallback_regions["us-west-2"].azs
   ami_name              = local.pbox_fallback_common.ami_name
+  ami_name_x86          = local.pbox_fallback_common.ami_name_x86
   template_name         = local.pbox_fallback_common.template_name
   work_size             = local.pbox_fallback_common.work_size
   user_data_b64         = local.pbox_fallback_common.user_data_b64
@@ -202,10 +213,10 @@ locals {
   }
 
   # What `pbox` needs to launch at a fallback site, published in /infra/parallel-box (ohio-pbox.tf): the template name,
-  # and region => AZ => subnet.
+  # and per region its AZ => subnet and its x86_64 image (--image-id for an x86 flavor).
   pbox_fallback_pointer = {
     template = local.pbox_fallback_template_name
-    regions  = { for r, s in local.pbox_fallback_sites : r => { subnets = s.subnets } }
+    regions  = { for r, s in local.pbox_fallback_sites : r => { subnets = s.subnets, x86_image = s.ami_id_x86 } }
   }
 
   pbox_fallback_template_arns = [for s in values(local.pbox_fallback_sites) : s.template_arn]
@@ -223,6 +234,7 @@ locals {
     for r, s in local.pbox_fallback_sites : concat(
       [
         "arn:aws:ec2:${r}::image/${s.ami_id}",
+        "arn:aws:ec2:${r}::image/${s.ami_id_x86}",
         "arn:aws:ec2:${r}:${local.parallel_box_account}:security-group/${s.security_group_id}",
         "arn:aws:ec2:${r}:${local.parallel_box_account}:key-pair/${s.key_name}",
       ],
@@ -257,7 +269,8 @@ data "aws_iam_policy_document" "parallel_box_fallback" {
     }
   }
 
-  # The AMI, subnets, security group and key pair a launch references, by exact ARN.
+  # The AMIs (the template's arm64 one and the x86_64 one an x86 flavor passes), subnets, security group and key pair a
+  # launch references, by exact ARN.
   statement {
     sid       = "RunFallbackReferencedResources"
     effect    = "Allow"

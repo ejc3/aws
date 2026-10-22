@@ -13,14 +13,22 @@
 #   kvm-gpu   bare metal with NVIDIA GPUs bound to vfio-pci, for GPU passthrough into fcvm microVMs; the owner's only
 #
 # Sizes are 32, 48, 96 and 192 vCPU. No Graviton c, m or r type has 24 vCPU (there is no 6xlarge), so 32 is the smallest
-# and nothing is under the 24-vCPU floor. Everything is Graviton (arm64), because every pbox AMI is arm64. Every type but
-# g5g.metal is offered in us-east-2c, the home AZ (checked 2026-10-19 with describe-instance-type-offerings); a fallback AZ
-# that does not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
+# and nothing is under the 24-vCPU floor. Everything is Graviton (arm64), the launch templates' AMI, except kvm-gpu-96.
+# Every type but g5g.metal is offered in us-east-2c, the home AZ (checked 2026-10-19 with describe-instance-type-offerings);
+# a fallback AZ that does not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
 #
 # kvm-gpu-64 is g5g.metal alone: 64 vCPU, 128 GiB, two NVIDIA T4G, and the only Graviton metal type with a GPU. It is not
 # offered in us-east-2 at all (us-west-2a/b/c and us-east-1a-d offer it, checked 2026-10-22), so it launches only at a
-# fallback site, with a fresh work volume: `pbox up N kvm-gpu-64 --regions us-west-2`. It counts against the G spot quota,
-# not the Standard one (west2_spot_g below). x86 GPU metal (g4dn.metal) needs an x86 AMI, which no pbox site has.
+# fallback site, with a fresh work volume: `pbox up N kvm-gpu-64 --regions us-west-2`.
+#
+# kvm-gpu-96 is g4dn.metal alone: 96 vCPU, 384 GiB, eight NVIDIA T4 and 1.8 TB of local NVMe, x86_64 (Intel), offered in
+# us-east-2a/b/c (checked 2026-10-22), so it launches at home on the persistent volume. It is the one x86 type: the
+# templates boot arm64, so `pbox` launches it with --image-id set to the site's x86_64 build of the same Ubuntu image
+# (var.parallel_box_ami_ohio_x86 at home, each fallback site's x86 image elsewhere), published in /infra/parallel-box and
+# pinned by exact ARN in parallel-box-control and parallel-box-fallback. Intel needs intel_iommu=on for VFIO, so its first
+# boot puts that on the kernel command line and reboots once (pbox_gpu_iommu_reboot below).
+#
+# Both GPU flavors count against the G spot quota, not the Standard one (pbox_gpu_spot_vcpus below).
 #
 # scripts/parallel-box.sh carries the same menu (FLAVORS), and scripts/test-pbox-flavors.py keeps the two equal. The
 # instance types a pbox may be launched as are exactly these: pbox-flavor-types below denies every other type to a
@@ -47,6 +55,7 @@ locals {
     "kvm-96"      = ["c8g.metal-24xl", "c8gd.metal-24xl", "m8g.metal-24xl", "m8gd.metal-24xl"]
     "kvm-192"     = ["c8g.metal-48xl", "c8gd.metal-48xl", "c9g.metal-48xl", "c9gd.metal-48xl", "m8g.metal-48xl", "m8gd.metal-48xl"]
     "kvm-gpu-64"  = ["g5g.metal"]
+    "kvm-gpu-96"  = ["g4dn.metal"]
   }
 
   # The owner's slots and fallback boxes may be any flavor; a member's box any but kvm.
@@ -82,9 +91,10 @@ fi
   # GPU passthrough host (the kvm-gpu flavors): every NVIDIA PCI function (vendor 0x10de) goes to vfio-pci, so fcvm can hand
   # it to a microVM. A box without one skips all of it. The host never gets an NVIDIA driver: driverctl's override binds
   # vfio-pci now and again at every boot (its udev rule sets driver_override before a driver can probe), and vfio-pci is
-  # loaded at boot. Graviton metal has an SMMUv3 the arm64 kernel enables by default, so no kernel parameter is needed (on
-  # x86 metal it would be intel_iommu=on iommu=pt). For a rootless fcvm, ubuntu may open the VFIO groups (group kvm, which
-  # `pbox up` adds it to on a kvm flavor) and pin a guest's memory for DMA (memlock). /etc/pbox-gpu lists each function,
+  # loaded at boot. Graviton metal has an SMMUv3 the arm64 kernel enables by default, so no kernel parameter is needed; x86
+  # metal gets intel_iommu=on iommu=pt from pbox_gpu_iommu_reboot, which runs earlier in the boot. For a rootless fcvm,
+  # ubuntu may open the VFIO groups (group kvm, which `pbox up` adds it to on a kvm flavor) and pin a guest's memory for
+  # DMA (memlock). /etc/pbox-gpu lists each function,
   # its driver and its IOMMU group. Runs after apt-get update (driverctl).
   pbox_gpu_vfio_setup = <<-GPU
 GPU_DEVS=""
@@ -107,17 +117,55 @@ if [ -n "$GPU_DEVS" ]; then
   done > /etc/pbox-gpu
 fi
   GPU
+
+  # The x86 GPU host's one reboot (kvm-gpu-96). VFIO needs the Intel IOMMU, which the Ubuntu kernel leaves off. So on an
+  # x86_64 box with an NVIDIA PCI function, whose kernel was not booted with intel_iommu=on: put it (and iommu=pt, so the
+  # host's own devices skip translation) in a GRUB drop-in, run update-grub and reboot. cloud-init runs user data once per
+  # instance, so its semaphore is removed first: the whole boot script runs again after the reboot, and this step then
+  # finds intel_iommu=on and does nothing. It runs FIRST in the boot script, before the work volume, apt, the local NVMe and
+  # pbox_gpu_vfio_setup, so nothing that is not idempotent has run when the box reboots. Once only: the marker records the
+  # boot that asked for the reboot, and a box with a marker never reboots again (if the parameter did not take, the GPU
+  # check in `pbox up` fails instead of the box rebooting in a loop). `pbox up` reads the marker to tell "rebooting now"
+  # from "failed". An arm64 box, or one without an NVIDIA function, skips all of it.
+  pbox_gpu_iommu_reboot = <<-IOMMU
+if [ "$(uname -m)" = x86_64 ] && grep -qx 0x10de /sys/bus/pci/devices/*/vendor 2>/dev/null && ! grep -qw intel_iommu=on /proc/cmdline && [ ! -e /var/lib/pbox-iommu-reboot ]; then
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT intel_iommu=on iommu=pt"' > /etc/default/grub.d/90-pbox-iommu.cfg
+  update-grub
+  cat /proc/sys/kernel/random/boot_id > /var/lib/pbox-iommu-reboot
+  rm -f /var/lib/cloud/instance/sem/config_scripts_user
+  echo "pbox: rebooting once for intel_iommu=on iommu=pt (GPU passthrough); this boot script runs again after it"
+  systemctl reboot
+  sleep 600
+  exit 0
+fi
+  IOMMU
 }
 
 # ---------------------------------------------------------------------------------
-# The G spot quota for kvm-gpu-64 in us-west-2, where it launches. L-3819A6DF = "All G and VT Spot Instance Requests", in
-# vCPU; g5g.metal needs 64 for one box. The current value is read here at plan time (the metal boxes can read it too since
-# ejc3/aws#588, but only an administrator may request more): when it already covers one box nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease
-# (see ohio_spot_standard in ohio-pbox.tf for how the provider reports a pending request). A launch past the quota fails
-# with MaxSpotInstanceCountExceeded and pbox moves on to the next AZ or region.
+# The G spot quota where the GPU flavors launch: us-east-2, the home site (kvm-gpu-96; the default there is 64 vCPU, too few
+# for one g4dn.metal), and us-west-2 (kvm-gpu-64, which us-east-2 does not offer). L-3819A6DF = "All G and VT Spot Instance
+# Requests", in vCPU; one box of the largest GPU flavor needs 96. The current value is read here at plan time (the metal
+# boxes can read it too since ejc3/aws#588, but only an administrator may request more): when it already covers one box
+# nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease (see ohio_spot_standard in ohio-pbox.tf for
+# how the provider reports a pending request). A launch past the quota fails with MaxSpotInstanceCountExceeded and pbox
+# moves on to the next AZ or region. On demand (parallel_box_spot = false) is another quota, L-DB2E81BA, not raised here.
 # ---------------------------------------------------------------------------------
 locals {
-  pbox_gpu_spot_vcpus = 64 # one kvm-gpu-64 box
+  # One box of the largest GPU flavor: the size in its kvm-gpu-N name.
+  pbox_gpu_spot_vcpus = max([for f in keys(local.pbox_flavors) : tonumber(trimprefix(f, "kvm-gpu-")) if startswith(f, "kvm-gpu-")]...)
+}
+
+data "aws_servicequotas_service_quota" "ohio_spot_g" {
+  provider     = aws.ohio
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+}
+
+resource "aws_servicequotas_service_quota" "ohio_spot_g" {
+  provider     = aws.ohio
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+  value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.ohio_spot_g.value)
 }
 
 data "aws_servicequotas_service_quota" "west2_spot_g" {

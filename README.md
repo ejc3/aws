@@ -1082,9 +1082,16 @@ one is on `vfio-pci`. us-east-2 does not offer the type, so it launches at a fal
 pbox up 3 kvm-gpu-64 --regions us-west-2
 ```
 
-It counts against the us-west-2 "All G and VT Spot Instance Requests" quota (`L-3819A6DF`), 64 vCPU per box, which
-`pbox-flavors.tf` requests at apply when the current quota is lower. There is no x86 GPU flavor (`g4dn.metal`): no pbox
-site has an x86 AMI. The launcher tries the flavor's Graviton types in
+`kvm-gpu-96` is a `g4dn.metal` (x86_64 Intel, 96 vCPU, 384 GiB, eight NVIDIA T4, 1.8 TB of local NVMe at `/mnt/nvme`, about
+$4/hr spot) set up the same way. us-east-2c offers it, so `pbox up 3 kvm-gpu-96` launches at home on the persistent work
+volume. It is the one x86 type: the launch templates boot arm64 Ubuntu, so `pbox` passes the x86_64 build of the same image
+with `--image-id` (`var.parallel_box_ami_ohio_x86` at home, each fallback site's by name, published in
+`/infra/parallel-box`; IAM allows each by exact ARN). Its first boot puts `intel_iommu=on iommu=pt` in a GRUB drop-in and
+reboots once, and `up` waits through that reboot before checking the GPUs.
+
+Both GPU flavors count against the "All G and VT Spot Instance Requests" quota (`L-3819A6DF`) where they launch:
+`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2 and us-west-2 at apply when the current
+quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
 activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).

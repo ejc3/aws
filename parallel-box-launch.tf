@@ -48,9 +48,12 @@ locals {
   # regional: AMI, subnet, security group, key pair and the volume of each box. There is one, us-east-2 (ohio-pbox.tf), where
   # the boxes moved from us-west-2 on 2026-10-05 (30% cheaper for the 192-core spot pool); the us-west-2 site, its volumes and
   # its templates are retired. The map form stays so a second site is an entry here, not a rewrite of the IAM below.
+  # ami is the templates' arm64 image; ami_x86 the x86_64 build of it, which `pbox up` passes with --image-id for an x86
+  # flavor (kvm-gpu-96, pbox-flavors.tf). Both are allowed by exact ARN below.
   parallel_box_sites = {
     "us-east-2" = {
       ami               = var.parallel_box_ami_ohio
+      ami_x86           = var.parallel_box_ami_ohio_x86
       subnet_id         = aws_subnet.ohio_pbox.id
       security_group_id = aws_security_group.ohio_pbox.id
       key_name          = aws_key_pair.ohio_pbox.key_name
@@ -69,6 +72,7 @@ locals {
   parallel_box_referenced_arns = flatten([
     for r, site in local.parallel_box_sites : [
       "arn:aws:ec2:${r}::image/${site.ami}",
+      "arn:aws:ec2:${r}::image/${site.ami_x86}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:subnet/${site.subnet_id}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:security-group/${site.security_group_id}",
       "arn:aws:ec2:${r}:${local.parallel_box_account}:key-pair/${site.key_name}",
@@ -96,6 +100,9 @@ locals {
           echo "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
         chmod 600 /home/ubuntu/.ssh/authorized_keys
         chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+
+        # An x86 GPU box (kvm-gpu-96, pbox-flavors.tf) reboots here once, for intel_iommu=on, and this script runs again.
+        ${local.pbox_gpu_iommu_reboot}
 
         # Mount the persistent work volume.
         #
@@ -183,7 +190,7 @@ resource "aws_launch_template" "parallel_box_ohio" {
   for_each = local.parallel_boxes
 
   name                   = each.value.name
-  image_id               = var.parallel_box_ami_ohio # Ubuntu 24.04 arm64, us-east-2
+  image_id               = var.parallel_box_ami_ohio # Ubuntu 24.04 arm64, us-east-2; an x86 flavor overrides it with --image-id
   key_name               = aws_key_pair.ohio_pbox.key_name
   update_default_version = true
 
