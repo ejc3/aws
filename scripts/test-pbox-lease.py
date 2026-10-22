@@ -125,6 +125,10 @@ class LeaseScript(unittest.TestCase):
             return None
         inst = [s for s in specs[0] if s.startswith("ResourceType=instance,")]
         self.assertEqual(len(inst), 1, run)
+        # The whole value must be well-formed AWS CLI shorthand, or the CLI refuses the launch
+        # ("Error parsing parameter '--tag-specifications'"); a stray brace once broke every fallback launch.
+        tag = r"\{Key=[^,{}\[\]]+,Value=[^,{}\[\]]*\}"
+        self.assertRegex(inst[0], rf"\AResourceType=instance,Tags=\[{tag}(,{tag})*\]\Z", run)
         return dict(re.findall(r"\{Key=([^,]+),Value=([^}]*)\}", inst[0]))
 
     def test_valid_durations_tag_the_instance_with_the_lease_end(self):
