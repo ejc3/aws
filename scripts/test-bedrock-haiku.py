@@ -42,7 +42,7 @@ class GrantTests(unittest.TestCase):
         self.assertIn('"aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"]', subscribe.group())
 
     def test_every_role_gets_exactly_the_shared_statements(self):
-        for name in ("box_bedrock_haiku", "mac_bedrock_haiku", "dolphin_labs_news_bedrock"):
+        for name in ("box_bedrock_haiku", "mac_bedrock_haiku"):
             policy = block("aws_iam_role_policy", name)
             self.assertIn("Statement = local.bedrock_haiku_statements", policy)
         self.assertIn("for_each = local.bedrock_haiku_box_roles", block("aws_iam_role_policy", "box_bedrock_haiku"))
@@ -72,25 +72,11 @@ class GrantTests(unittest.TestCase):
         self.assertEqual(profile_roles - not_here, attached)
 
 
-class TrustTests(unittest.TestCase):
-    def test_trust_is_one_workflow_on_main_by_immutable_subject(self):
-        trust = block("aws_iam_role", "dolphin_labs_news_bedrock")
-        self.assertIn("Federated = aws_iam_openid_connect_provider.github.arn", trust)
-        self.assertIn('"sts:AssumeRoleWithWebIdentity"', trust)
-        self.assertNotIn("StringLike", trust)
-        conditions = dict(re.findall(r'"token\.actions\.githubusercontent\.com:(\w+)"\s*=\s*"([^"]+)"', trust))
-        self.assertEqual(conditions, {
-            "aud": "sts.amazonaws.com",
-            "job_workflow_ref": "dolphin-labs-hq/dolphin-labs/.github/workflows/refresh-news.yml@refs/heads/main",
-        })
-        # sub comes from the one local both dolphin-labs roles use, pinned to GitHub's immutable ids.
-        self.assertRegex(trust, r'"token\.actions\.githubusercontent\.com:sub"\s*=\s*local\.dolphin_labs_main_sub')
+class RetiredTests(unittest.TestCase):
+    def test_no_github_role_for_the_news_pass_here(self):
+        # The news pass runs in the Dolphin account (dolphin-aws news.tf); refresh-news.yml's role here was never used.
+        self.assertNotIn("dolphin_labs_news_bedrock", TF)
         self.assertIn('dolphin_labs_main_sub = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"', TF)
-
-    def test_output_names_what_the_workflow_needs(self):
-        out = block("output", "dolphin_labs_news_bedrock")
-        self.assertIn("AWS_BEDROCK_ROLE_ARN = aws_iam_role.dolphin_labs_news_bedrock.arn", out)
-        self.assertIn("BEDROCK_MODEL_ID     = local.bedrock_haiku_profile", out)
         self.assertIn('bedrock_haiku_region  = "us-west-2"', TF)
 
 

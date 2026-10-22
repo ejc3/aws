@@ -2586,37 +2586,9 @@ host from the registry and applying deletes its principal, reporter, stream and 
 
 ## dolphin-labs news pass
 
-`dolphin-labs-news.tf` runs dolphin-labs' team-news pass as a Lambda on a schedule, in place of the hourly GitHub job
-(`refresh-news.yml` in dolphin-labs-hq/dolphin-labs). It is on (`dolphin_labs_news_enabled = true`) and
-dolphin-labs' `NEWS_RUNS_IN_AWS` variable keeps the GitHub job off. Bringing it up from scratch, in this order:
-
-1. Merge dolphin-labs' `deploy-news.yml` and let it deploy the bundle (it reads the role ARN and names from
-   `terraform output dolphin_labs_news`). Until then the function runs a stand-in that fails on purpose.
-2. Put the Dolphin Redis's production URL and token (`prod` in `dolphin-redis/clients`, Dolphin account) in the
-   `dolphin-labs/news` secret, from a 0600 file, never on a command line:
-   `aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/news --secret-string
-   file://news-secret.json` with `{"KV_REST_API_URL": "...", "KV_REST_API_TOKEN": "..."}`; then shred the file.
-3. Turn off `refresh-news.yml`'s schedule in dolphin-labs. Both running would bill Haiku and Browserbase twice and
-   journal two passes an hour.
-4. Set `dolphin_labs_news_enabled = true` in `dolphin-labs-news.tf`, merge, and apply. The errors alarm and the
-   'not running' alarm (`dolphin-labs-news-pass-not-running`) then watch it.
-
-The X-posts step is its own function, `dolphin-labs-news-x`, on its own 5-minute schedule, on since 2026-10-20
-(`news_x_schedule_enabled = true`). Bringing it up from scratch, in this order:
-
-1. Set dolphin-labs' `NEWS_X_LAMBDA_FUNCTION` repository variable (from `terraform output dolphin_labs_news`) so
-   `deploy-news.yml` deploys the bundle to it too. Until then it runs a stand-in that fails on purpose.
-2. Put the Monid key in `dolphin-labs/monid` from a 0600 file, never on a command line (nextjs-dev may put it, not
-   read it): `aws secretsmanager put-secret-value --region us-west-1 --secret-id dolphin-labs/monid --secret-string
-   file://monid-secret.json` with `{"MONID_API_KEY": "..."}`; then shred the file.
-3. Set `news_x_schedule_enabled = true` in `dolphin-labs-news.tf`, merge, and apply (done 2026-10-20; nextjs-dev
-   can read its logs and schedule and invoke it by hand, as for the pass). Its errors alarm
-   (`dolphin-labs-news-x-errors`) and 'not running' alarm (`dolphin-labs-news-x-not-running`) then watch it. Its runs
-   journal under `x-journal/` in the same bucket.
-
-Each pass journals to `s3://dolphin-labs-news-<account>/journal/` for 400 days. The bucket is versioned and only the
-administration set may delete a version, so a bad deploy cannot erase the history; nextjs-dev can read every
-version for replays.
+dolphin-labs' team-news pass and its X-posts step run in the Dolphin account, from `dolphin-labs-hq/dolphin-aws`
+(`news.tf`): the functions `dolphin-labs-news-pass` and `dolphin-labs-news-x`, their journal bucket, secrets, deploy
+role and alarms. This account held the first copies until 2026-10-22; nothing of them is left here.
 
 ## Private browser manager
 

@@ -124,10 +124,10 @@ resource "aws_secretsmanager_secret" "browserbase" {
   tags                    = { Name = "browserbase/credentials", Project = "dev" }
 }
 
-# dolphin-labs' news pass reads it for the pages it opens in a browser (dolphin-labs-news.tf); its role
-# grants itself the read, so it is a reader here but takes no attachment below.
+# The dolphin-maps loops read it (dolphin-maps-loop.tf); their role grants itself the read, so it is a reader here but
+# takes no attachment below. dolphin-labs' news pass runs in the Dolphin account with its own copy (dolphin-aws news.tf).
 locals {
-  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn, aws_iam_role.dolphin_maps_loop.arn, aws_iam_role.search_fetch_usage.arn]
+  browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_maps_loop.arn, aws_iam_role.search_fetch_usage.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "browserbase" {
@@ -173,8 +173,8 @@ resource "aws_iam_role_policy_attachment" "browserbase_read" {
 #     --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"
 # Terraform owns the containers and who may read them; values are set out of band (put-secret-value from a 0600 file)
 # and never enter git. Readers are Browserbase's: the administration set, dev-server-role (the metal boxes),
-# nextjs-dev-role (the dolphin box), and the two scraping jobs, the dolphin-labs news pass and the dolphin-maps loops,
-# whose roles grant themselves the read and get `<PROVIDER>_SECRET_ID` (dolphin-labs-news.tf, dolphin-maps-loop.tf).
+# nextjs-dev-role (the dolphin box), and the dolphin-maps loops, whose role grants itself the read and gets
+# `<PROVIDER>_SECRET_ID` (dolphin-maps-loop.tf). dolphin-labs' news pass has its own copies in the Dolphin account.
 # Not dev-ebs-only-role (the I/O box's role too). Every account on nextjs-dev has full sudo, so the grant is box-wide,
 # as with Browserbase.
 locals {
