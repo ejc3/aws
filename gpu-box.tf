@@ -102,7 +102,9 @@ locals {
 resource "aws_security_group" "gpu_box" {
   provider    = aws.west2
   name_prefix = "gpu-box-"
-  description = "On-demand GPU test box: SSH from nextjs-dev and the metal boxes only"
+  # Immutable: changing a group's description replaces it, and a running gbox (made outside Terraform) would keep the
+  # old group. The ingress below is what admits the metal boxes too.
+  description = "On-demand GPU test box: SSH from nextjs-dev only"
   vpc_id      = "vpc-0376811912470fdbe" # default VPC in us-west-2
 
   # SSH from the boxes that hold the grant below: nextjs-dev, and the two metal boxes (owner, 2026-10-22: "fcvm please
@@ -115,7 +117,7 @@ resource "aws_security_group" "gpu_box" {
       { for i, e in aws_eip.x86_dev : "fcvm-metal-x86" => e.public_ip },
     )
     content {
-      description = "SSH from ${ingress.key}"
+      description = "SSH from a box holding the gbox grant"
       from_port   = 22
       to_port     = 22
       protocol    = "tcp"

@@ -133,6 +133,8 @@ class GpuBoxTests(unittest.TestCase):
         # exactly the boxes holding the grant, each a /32 of its own Elastic IP
         self.assertEqual(re.findall(r'aws_eip\.(\w+) :', ingress), ['nextjs_dev', 'firecracker_dev', 'x86_dev'])
         self.assertIn('cidr_blocks = ["${ingress.value}/32"]', ingress)
+        # the group's description is immutable (a change replaces the group under any running gbox)
+        self.assertIn('description = "On-demand GPU test box: SSH from nextjs-dev only"', sg)
         # web, DNS and NTP only: io-box exports NFS (2049) read-write to us-west-2d, a gbox subnet
         self.assertNotRegex(egress, r'protocol\s*=\s*"-1"')
         self.assertNotIn('2049', egress)
