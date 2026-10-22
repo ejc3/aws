@@ -16,7 +16,10 @@ def block(header):
 
 class ZoneTests(unittest.TestCase):
     def test_dnssec_on_and_ssl_full_strict(self):
-        self.assertIn('status  = "active"', block('resource "cloudflare_zone_dnssec" "fcvm_dev"'))
+        dnssec = block('resource "cloudflare_zone_dnssec" "fcvm_dev"')
+        self.assertIn('status  = "active"', dnssec)
+        # Temporary: the registry had no DS record yet (add period); remove once Cloudflare reports active.
+        self.assertIn("ignore_changes = [status]", dnssec)
         self.assertIn('value      = "strict"', block('resource "cloudflare_zone_setting" "fcvm_dev_ssl"'))
         self.assertIn('value      = "on"', block('resource "cloudflare_zone_setting" "fcvm_dev_always_use_https"'))
 

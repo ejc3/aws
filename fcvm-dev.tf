@@ -41,9 +41,18 @@ locals {
 }
 
 # ------------------------------------------------------------------------------------------------ the zone
+# Cloudflare reports "pending" until the DS record is at the .dev registry, and every plan then wants "pending" ->
+# "active", which a re-apply does not change. On 2026-10-22 the registrar still had no DS record hours after the
+# registration (the domain is in the registry's add period), so the status is ignored until Cloudflare reports
+# "active"; then remove the ignore so a disabled DNSSEC shows as drift again. Checked from the jumpbox with:
+#   dig +norec +short DS fcvm.dev @ns-tld1.charlestonroadregistry.com
 resource "cloudflare_zone_dnssec" "fcvm_dev" {
   zone_id = var.fcvm_dev_zone_id
   status  = "active"
+
+  lifecycle {
+    ignore_changes = [status]
+  }
 }
 
 # Every proxied origin presents the fleet's wildcard certificate, so Cloudflare verifies it (ARCHITECTURE.md). .dev is on
