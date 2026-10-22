@@ -109,8 +109,14 @@ locals {
     {
       Sid      = "OwnerOnlyFcvmSecrets"
       Effect   = "Deny"
-      Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+      Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
       Resource = local.nextjs_dev_parity_secrets
+    },
+    {
+      Sid      = "OwnerOnlyConstellationPointer"
+      Effect   = "Deny"
+      Action   = "ssm:GetParameter"
+      Resource = aws_ssm_parameter.constellation.arn
     },
     {
       # Members keep Haiku 5.5 and opencode's DeepSeek, as before; every other model is the owner's.

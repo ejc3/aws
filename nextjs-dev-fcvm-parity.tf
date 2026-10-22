@@ -182,7 +182,11 @@ resource "aws_iam_policy" "nextjs_dev_fcvm_parity" {
   tags = { Name = "nextjs-dev-fcvm-parity", Managed = "terraform" }
 }
 
+# Attached only while nextjs-ct serves (nextjs-ct.tf's one switch). The rollback starts the retired nextjs-dev, where
+# every account has sudo and so holds the role's own credentials, with no session policy to narrow them: there the
+# role goes back to what it had before this file.
 resource "aws_iam_role_policy_attachment" "nextjs_dev_fcvm_parity" {
+  count      = local.nextjs_ct_serving ? 1 : 0
   role       = aws_iam_role.nextjs_dev.name
   policy_arn = aws_iam_policy.nextjs_dev_fcvm_parity.arn
 }

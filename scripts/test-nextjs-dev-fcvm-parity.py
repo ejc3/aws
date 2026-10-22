@@ -18,6 +18,8 @@ class ParityTests(unittest.TestCase):
     def test_one_managed_policy_attached_to_nextjs_dev_role(self):
         self.assertEqual(TF.count('resource "aws_iam_policy"'), 1)
         self.assertIn("role       = aws_iam_role.nextjs_dev.name", TF)
+        # Never on the retired shared box, where every account has sudo and the role's raw credentials (the rollback).
+        self.assertIn("count      = local.nextjs_ct_serving ? 1 : 0", TF)
         self.assertNotIn('resource "aws_iam_role_policy" ', TF)  # inline space is near IAM's limit
 
     def test_every_parity_secret_admits_nextjs_dev_in_its_own_policy(self):
@@ -38,7 +40,8 @@ class ParityTests(unittest.TestCase):
     def test_members_are_denied_everything_the_policy_adds(self):
         member = CT.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
         self.assertIn("Resource = local.nextjs_dev_parity_secrets", member)
-        self.assertIn('"secretsmanager:PutSecretValue"', member)
+        self.assertIn('"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]', member)
+        self.assertIn("Resource = aws_ssm_parameter.constellation.arn", member)  # the pointer too
         self.assertIn("NotResource = local.nextjs_ct_member_bedrock", member)
         for action in ("bedrock-mantle:*", "aws-marketplace:Subscribe", "ses:*", "codeartifact:*", "sts:GetServiceBearerToken"):
             self.assertIn(f'"{action}"', member, action)

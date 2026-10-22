@@ -583,6 +583,7 @@ only. Rules an agent must keep:
   dolphin-films non-production pair, the relay invite, the PeMS login), claw-master's logs, the dolphin-maps journal,
   constellation's apply role, EC2 quotas, SES and CodeArtifact. One managed policy on nextjs-dev-role, each secret's readers
   list naming the role, and `nextjs_ct_deny_member` denying all of it to members again (they keep Haiku 5.5 and DeepSeek).
+  Attached only while `local.nextjs_ct_serving`: the rollback box gives every account sudo and the role's raw credentials.
   A new fcvm grant meant for the owner's container goes the same three places. Not carried over: the GitHub runners, the
   browser-manager and Windows PC connector tokens (one host each) and fcvm's own network interfaces.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
