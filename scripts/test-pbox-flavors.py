@@ -404,9 +404,13 @@ class GpuVfio(unittest.TestCase):
         # ejc3/aws#609: the boot-time package run held the dpkg lock, driverctl failed to install, every GPU stayed on nouveau.
         import re as _re
         for f in ("parallel-box-launch.tf", "pbox-fallback.tf", "member-pbox.tf", "pbox-flavors.tf"):
+            checked = 0
             for line in (ROOT / f).read_text().splitlines():
-                if _re.search(r"\bapt-get (update|install)\b", line) and not line.lstrip().startswith("#"):
+                # Options may sit between apt-get and the subcommand (-o ..., -y), so match any words before it.
+                if _re.search(r"\bapt-get(?:\s+\S+)*?\s+(update|install)\b", line) and not line.lstrip().startswith("#"):
+                    checked += 1
                     self.assertIn("-o DPkg::Lock::Timeout=300", line, f"{f}: {line.strip()}")
+            self.assertGreater(checked, 0, f"{f}: no apt-get update/install command found")
 
     def test_a_missing_driverctl_stops_the_gpu_step_loudly(self):
         gpu = (ROOT / "pbox-flavors.tf").read_text().split("pbox_gpu_vfio_setup = <<-GPU", 1)[1].split("\n  GPU\n", 1)[0]
