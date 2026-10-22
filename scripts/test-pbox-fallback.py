@@ -72,6 +72,17 @@ elif "describe-instance-type-offerings" in a:
     asked = [f for f in args if f.startswith("Name=instance-type,Values=")][0].split("=", 2)[2].split(",")
     if region + "/" + az not in os.environ.get("FAKE_NONE_OFFERED", "").split():
         print("\t".join(asked))
+elif "describe-spot-instance-requests" in a:
+    # FAKE_SIRS: "sir-id instance-id;..." for the requests still open or active
+    for row in filter(None, os.environ.get("FAKE_SIRS", "").split(";")):
+        print("\t".join(row.split()))
+elif "describe-instances" in a and "State.Name" in a:
+    states = dict(kv.split("=") for kv in filter(None, os.environ.get("FAKE_INSTANCE_STATES", "").split(",")))
+    print(states.get(opt("--instance-ids"), "None"))
+elif "cancel-spot-instance-requests" in a:
+    open(os.environ["FAKE_STATE"] + ".cancelled", "a").write(opt("--spot-instance-request-ids") + "\n")
+elif "get-service-quota" in a:
+    print("96.0")
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "PublicIpAddress" in a:
@@ -100,6 +111,9 @@ elif "run-instances" in a:
           "subnet-w2b": "us-west-2b", "": "us-east-2c"}[subnet]
     if not subnet and os.environ.get("FAKE_HOME_ERROR"):
         print("An error occurred (UnauthorizedOperation) when calling the RunInstances operation")
+        sys.exit(254)
+    if subnet and region in os.environ.get("FAKE_MAXSPOT", "").split() and not os.path.exists(os.environ["FAKE_STATE"] + ".cancelled"):
+        print("An error occurred (MaxSpotInstanceCountExceeded) when calling the RunInstances operation: Max spot instance count exceeded")
         sys.exit(254)
     if subnet and region in os.environ.get("FAKE_QUOTA", "").split():
         print("An error occurred (VcpuLimitExceeded) when calling the RunInstances operation")
@@ -235,10 +249,39 @@ class FallbackScript(unittest.TestCase):
     def test_a_quota_refusal_is_no_capacity_there_not_a_real_error(self):
         rc, _, err = self.pbox("up", "1", "compute-192", "--fallback", quota="us-west-2", capacity="us-east-1/us-east-1b")
         self.assertEqual(rc, 0, err)
-        self.assertIn("over the account's quota", err)
+        self.assertIn("VcpuLimitExceeded: c8g.48xlarge would put us-west-2 over its on-demand vCPU quota for Standard instances", err)
+        self.assertIn("(L-1216C47A = 96 vCPU) -- trying the next one", err)
         (self.tmp / "state").unlink()  # the fake remembers one launched box, whatever its number
         rc, _, err = self.pbox("up", "2", "compute-192", "--fallback", quota="us-east-1 us-west-2")
         self.assertEqual(rc, 4, err)
+
+    def test_a_spot_quota_refusal_cancels_stale_requests_and_retries_once(self):
+        # us-west-2 refuses on its spot quota until the stale request (its instance terminated) is cancelled; the one whose
+        # instance still runs, and the one with no instance yet, are left alone.
+        rc, _, err = self.pbox("up", "1", "kvm-gpu-64", capacity="us-west-2/us-west-2b", FAKE_MAXSPOT="us-west-2",
+                               FAKE_SIRS="sir-stale i-gone;sir-live i-live;sir-pending None",
+                               FAKE_INSTANCE_STATES="i-gone=terminated,i-live=running")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.tmp / "state.cancelled").read_text().split(), ["sir-stale"])
+        self.assertIn("cancelled sir-stale, a stale spot request (its instance i-gone is terminated)", err)
+        self.assertIn("retrying g5g.metal in us-west-2b", err)
+        self.assertNotIn("MaxSpotInstanceCountExceeded: g5g.metal", err)
+
+    def test_a_spot_quota_refusal_with_nothing_stale_names_the_g_spot_quota_and_moves_on(self):
+        rc, _, err = self.pbox("up", "1", "kvm-gpu-64", capacity="us-east-1/us-east-1b", FAKE_MAXSPOT="us-west-2",
+                               FAKE_SIRS="sir-live i-live", FAKE_INSTANCE_STATES="i-live=running")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse((self.tmp / "state.cancelled").exists())
+        self.assertIn("MaxSpotInstanceCountExceeded: g5g.metal would put us-west-2 over its spot vCPU quota for G-and-VT instances", err)
+        self.assertIn("(L-3819A6DF = 96 vCPU, counting running spot instances AND open or active spot requests)", err)
+        self.assertIn("Launched g5g.metal as i-0fallback in us-east-1b", err)
+
+    def test_a_gpu_flavor_searches_every_region_without_the_flag(self):
+        # owner, 2026-10-22: the region does not matter for these; home first, then every fallback site
+        rc, out, err = self.pbox("up", "1", "kvm-gpu-64", capacity="us-west-2/us-west-2a")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("region=us-west-2 az=us-west-2a type=g5g.metal", out)
+        self.assertIn("FALLBACK: trying the other US AZs", err)
 
     def test_unknown_region_is_refused(self):
         rc, _, err = self.pbox("up", "2", "compute-192", "--regions=us-east-9")
