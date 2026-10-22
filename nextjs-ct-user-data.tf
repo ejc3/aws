@@ -105,6 +105,43 @@ locals {
       Action   = ["ec2:GetPasswordData", "ssm:SendCommand", "ec2:CreateVolume", "ec2:DeleteVolume"]
       Resource = "*"
     },
+    # What nextjs-dev-fcvm-parity.tf gives the owner's container (fcvm's abilities), denied to every member again.
+    {
+      Sid      = "OwnerOnlyFcvmSecrets"
+      Effect   = "Deny"
+      Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+      Resource = local.nextjs_dev_parity_secrets
+    },
+    {
+      Sid      = "OwnerOnlyConstellationPointer"
+      Effect   = "Deny"
+      Action   = "ssm:GetParameter"
+      Resource = aws_ssm_parameter.constellation.arn
+    },
+    {
+      # Members keep Haiku 5.5 and opencode's DeepSeek, as before; every other model is the owner's.
+      Sid         = "MemberModelsOnly"
+      Effect      = "Deny"
+      Action      = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:Converse", "bedrock:ConverseStream"]
+      NotResource = local.nextjs_ct_member_bedrock
+    },
+    {
+      # The account is already subscribed to the models members use, so they need no Subscribe either.
+      Sid      = "OwnerOnlyFcvmServices"
+      Effect   = "Deny"
+      Action   = ["bedrock-mantle:*", "aws-marketplace:Subscribe", "ses:*", "codeartifact:*", "sts:GetServiceBearerToken"]
+      Resource = "*"
+    },
+    {
+      # claw-master's log group and the dolphin-maps loop's bucket.
+      Sid    = "OwnerOnlyFcvmData"
+      Effect = "Deny"
+      Action = ["logs:*", "s3:*"]
+      Resource = [
+        aws_cloudwatch_log_group.claw_master_server.arn, "${trimsuffix(aws_cloudwatch_log_group.claw_master_server.arn, ":*")}:*",
+        aws_s3_bucket.dolphin_maps_loop.arn, "${aws_s3_bucket.dolphin_maps_loop.arn}/*",
+      ]
+    },
   ]
 
   # Each member's own three boxes (member-boxes.tf): wbox-<p>, pbox-<p>, gbox-<p>.

@@ -577,6 +577,14 @@ only. Rules an agent must keep:
 - **Eternal Terminal** (the phone's Prompt connects with it): `eternal_terminal` in config.json pins the 7.x build nextjs-dev
   ran; provision installs it and runs etserver in that one account's container (`ejc3`), and the host firewall forwards the
   public 2022 (open in the security group, as on nextjs-dev) there only. Without it Prompt's `etterminal` exits 127.
+- **The owner's container can do what fcvm-metal-arm can** (owner, 2026-10-22; `nextjs-dev-fcvm-parity.tf`): every Claude
+  model on Bedrock and Mantle, the metal boxes' secrets (Turso, the claw-master backup key and dashboard token, the
+  dolphin-films non-production pair, the relay invite, the PeMS login), claw-master's logs, the dolphin-maps journal,
+  constellation's apply role, EC2 quotas, SES and CodeArtifact. One managed policy on nextjs-dev-role, each secret's readers
+  list naming the role, and `nextjs_ct_deny_member` denying all of it to members again (they keep Haiku 5.5 and DeepSeek).
+  Attached only while `local.nextjs_ct_serving`: the rollback box gives every account sudo and the role's raw credentials.
+  A new fcvm grant meant for the owner's container goes the same three places. Not carried over: the GitHub runners, the
+  browser-manager and Windows PC connector tokens (one host each) and fcvm's own network interfaces.
 - Admin entry into a container: `sudo machinectl shell <user>@<user>` (or `sudo systemd-run -M <user> --uid=<user>
   --pipe --wait ...`) from `ubuntu`.
 
@@ -876,7 +884,7 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   connection, refused handshakes; plus a per-profile quota snapshot and routing summary every 5 minutes.
   It never contains tokens, bodies, URLs, account ids or upstream text. For `debug` (every routing
   decision) run `claw-master serve` by hand with `--log-level debug`; do not change the unit to it. The
-  journal is capped at 200M. The metal boxes (dev-server-role) may read the log group, and only it:
+  journal is capped at 200M. The metal boxes (dev-server-role) and the owner's nextjs-ct container may read the log group, and only it:
   `aws logs filter-log-events --region us-west-1 --log-group-name /claude-master/server --filter-pattern '"rate limited"'`,
   or a Logs Insights query (`aws logs start-query`).
 - **Metrics.** The proxy exports OpenTelemetry metrics (`--otlp-endpoint`) to the CloudWatch agent on
@@ -1380,7 +1388,7 @@ Available if a task needs them; neither needs a key on disk.
   (dev-server-role pinned by `ec2:SourceInstanceARN`; fcvm-metal-x86 cannot), the CI role `dolphin-labs-testflight` and
   admins may read it (`dev-ai-services.tf`). Load it into the environment with the same `eval "$(... | jq -r 'to_entries[] | ...')"`
   as Browserbase; a tool that needs the key as a file gets a 0600 temporary file it deletes after use.
-- **claw-master backup API key**, metal boxes only. `claude-master/backup-api-key` (us-west-1) holds
+- **claw-master backup API key**, metal boxes and the owner's nextjs-ct container. `claude-master/backup-api-key` (us-west-1) holds
   the paid Anthropic API key that claw-master uses only after every subscription profile is out of
   quota (`dev-ai-services.tf`). From `claude-master-e356d0a` the server checks every 5 minutes that it can pay
   (a token count with the key, which is free) and skips it while it cannot: on 2026-10-10 its organization had no
@@ -1392,8 +1400,8 @@ Available if a task needs them; neither needs a key on disk.
   profile on its own phase after the round starts, and a 429 from the usage endpoint holds that profile back for its
   `Retry-After` (else one more interval, at most 15 minutes). Polled every minute all at once, about half the polls on
   every profile were refused with 429 (2026-10-10). Where Claude Code is the caller, a 429 is relayed to it as sent,
-  `retry-after` included, and it backs off itself. Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide
-  grant on a box where every account has sudo). Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
+  `retry-after` included, and it backs off itself. Readable by dev-server-role, nextjs-dev-role (the owner's container: every
+  member container's session denies it) and admins. Export it as `CLAUDE_MASTER_BACKUP_API_KEY` from
   `get-secret-value`; never into a file in a repo, a command line or a commit.
 - **Cloudflare logs and metrics**, metal boxes and nextjs-dev. `cloudflare-observability-token` (us-west-1) is a
   long-lived READ-ONLY Cloudflare token (`cloudflare-observability.tf`): Workers Logs and the telemetry query API, live
@@ -1402,16 +1410,16 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
-- **The claw-master dashboard, as an agent**, metal boxes only. `claude-master-dashboard/agent-access` (us-west-1) holds a
+- **The claw-master dashboard, as an agent**, metal boxes and the owner's nextjs-ct container. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
   (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
   `curl -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET" <dashboard>/api/claude-master/snapshot`, the two
-  values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role and
-  admins, not nextjs-dev-role. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
+  values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role,
+  nextjs-dev-role (the owner's container; members are denied it) and admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
   then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claw_master_dashboard`.
-- **Turso API token**, metal boxes only. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
-  and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role and admins, not nextjs-dev-role (a box-wide grant
-  on a box where every account has sudo). Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
+- **Turso API token**, metal boxes and the owner's nextjs-ct container. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
+  and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
+  container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
   repo, a command line or a commit.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
@@ -1541,9 +1549,11 @@ ejc3/constellation (private) gets a member account of its own, `constellation`, 
 here the way the Dolphin account is, never by that repository's own bootstrap. Its root address is the `constellation_account`
 key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
 
-- **Applied from fcvm-metal-arm only.** `constellation-terraform` (AdministratorAccess in that account, one-hour sessions)
-  trusts dev-server-role pinned to fcvm-arm's instance (`ec2:SourceInstanceARN`; fcvm-x86 shares the role and cannot), and
-  dev-server-role's one grant (`assume-constellation-terraform`) names exactly that ARN with the same pin. A dev box never
+- **Applied from fcvm-metal-arm and the owner's nextjs-ct container only.** `constellation-terraform` (AdministratorAccess in
+  that account, one-hour sessions) trusts dev-server-role pinned to fcvm-arm's instance (`ec2:SourceInstanceARN`; fcvm-x86
+  shares the role and cannot), and dev-server-role's one grant (`assume-constellation-terraform`) names exactly that ARN with
+  the same pin. It also trusts nextjs-dev-role, unpinned (a container session is that role assumed again, with no instance
+  ARN), granted by `nextjs-dev-fcvm-parity.tf`; every member container's session denies `sts:AssumeRole`. A dev box never
   gets `organizations:*` or OrganizationAccountAccessRole, in any account: that is admin of every member account.
 - **What fcvm-arm reads: `/infra/constellation`** (an SSM String, the same grant and pin): account id, region, state bucket,
   apply role, and Lattice staging's hostname, API port, Access team domain and audience tag. No credentials; it exists
@@ -1598,7 +1608,8 @@ split by environment so that production and non-production share nothing:
 
 - `dolphin-films/nonprod/auth` (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`) and
   `dolphin-films/nonprod/turso` (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`): local development and
-  non-production. Readable by dev-server-role (the metal boxes) and admins; not nextjs-dev-role. Export one
+  non-production. Readable by dev-server-role (the metal boxes), nextjs-dev-role (the owner's nextjs-ct container;
+  members are denied it) and admins. Export one
   without printing it:
   `eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-films/nonprod/auth
   --query SecretString --output text | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"')"`.

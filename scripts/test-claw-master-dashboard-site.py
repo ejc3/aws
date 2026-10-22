@@ -36,8 +36,7 @@ class AccessTests(unittest.TestCase):
     def test_only_administration_and_the_metal_boxes_read_the_token(self):
         pol = block('resource "aws_secretsmanager_secret_policy"', "claw_master_dashboard_agent_access")
         self.assertIn('Effect    = "Deny"', pol)
-        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn])", pol)
-        self.assertNotIn("nextjs_dev", TF)
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn])", pol)
         grant = block('resource "aws_iam_role_policy"', "dev_server_claw_master_dashboard_access")
         self.assertIn("Resource = aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn", grant)
 

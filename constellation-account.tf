@@ -151,7 +151,7 @@ resource "aws_s3_bucket_policy" "constellation_terraform_state" {
 resource "aws_iam_role" "constellation_terraform" {
   provider             = aws.constellation
   name                 = "constellation-terraform"
-  description          = "Applies ejc3/constellation. Assumable only from fcvm-metal-arm's instance (see ejc3/aws constellation-account.tf)."
+  description          = "Applies ejc3/constellation. Assumable only from fcvm-metal-arm's instance and the owner's nextjs-ct container (see ejc3/aws constellation-account.tf)."
   max_session_duration = 3600
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -161,6 +161,14 @@ resource "aws_iam_role" "constellation_terraform" {
       Principal = { AWS = aws_iam_role.dev_server.arn }
       Action    = "sts:AssumeRole"
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      # The owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf). Its session is nextjs-dev-role assumed again by
+      # nextjs-ct-imds, which carries no ec2:SourceInstanceARN; every member container's session denies sts:AssumeRole
+      # (nextjs-ct-user-data.tf's OwnerOnlyRoles), as for the Dolphin apply role.
+      Sid       = "OwnersNextjsContainer"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.nextjs_dev.arn }
+      Action    = "sts:AssumeRole"
     }]
   })
   tags = { Name = "constellation-terraform", Managed = "terraform" }

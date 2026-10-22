@@ -333,7 +333,8 @@ resource "aws_secretsmanager_secret_policy" "claw_master_dashboard_agent_access"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+      # nextjs-dev-role for the owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf); members are denied it.
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]) } }
     }]
   })
 }

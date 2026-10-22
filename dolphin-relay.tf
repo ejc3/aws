@@ -83,7 +83,7 @@ resource "aws_secretsmanager_secret" "dolphin_relay_signup" {
 }
 
 locals {
-  dolphin_relay_signup_readers = [aws_iam_role.dev_server.arn]
+  dolphin_relay_signup_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "dolphin_relay_signup" {

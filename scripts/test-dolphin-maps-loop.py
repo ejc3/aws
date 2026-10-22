@@ -109,7 +109,7 @@ class PemsTests(unittest.TestCase):
     def test_only_administration_the_metal_boxes_and_the_loop_read_it(self):
         policy = block("aws_secretsmanager_secret_policy", "dolphin_maps_pems")
         self.assertIn('Effect    = "Deny"', policy)
-        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn])", policy)
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_maps_loop.arn])", policy)
 
 
 class ReplayTests(unittest.TestCase):

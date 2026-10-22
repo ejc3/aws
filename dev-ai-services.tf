@@ -307,9 +307,8 @@ resource "aws_iam_role_policy" "dev_server_app_store_connect" {
 # binary still reads CLAUDE_MASTER_BACKUP_API_KEY, its name before the rename), used only after every subscription
 # profile is out of quota. It lived in ~/claude_api.txt on fcvm;
 # the value is set out of band (put-secret-value from a 0600 file) and never enters git. Readers: the
-# administration set, dev-server-role (the metal boxes) and the shared claw-master server's role.
-# Not nextjs-dev-role: every account there has full sudo, so a grant would be box-wide, and this key
-# is billed per token.
+# administration set, dev-server-role (the metal boxes), the shared claw-master server's role and nextjs-dev-role
+# for the owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf; every member container is denied it).
 #   export CLAW_MASTER_BACKUP_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id claude-master/backup-api-key --query SecretString --output text)
 resource "aws_secretsmanager_secret" "claw_master_backup_key" {
@@ -320,7 +319,7 @@ resource "aws_secretsmanager_secret" "claw_master_backup_key" {
 }
 
 locals {
-  claw_master_backup_key_readers = concat([aws_iam_role.dev_server.arn], aws_iam_role.claw_master_server[*].arn)
+  claw_master_backup_key_readers = concat([aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn], aws_iam_role.claw_master_server[*].arn)
 }
 
 resource "aws_secretsmanager_secret_policy" "claw_master_backup_key" {
@@ -366,8 +365,8 @@ resource "aws_iam_role_policy_attachment" "claw_master_backup_key_read_server" {
 
 # Turso platform API token (create and delete databases and groups, mint database tokens), for the metal dev boxes.
 # The value is set out of band (put-secret-value from stdin) and never enters git or Terraform state. Readers: the
-# administration set and dev-server-role (the metal boxes). Not nextjs-dev-role: every account there has full sudo, so a grant
-# would be box-wide, and this token can create and delete databases.
+# administration set, dev-server-role (the metal boxes) and nextjs-dev-role for the owner's nextjs-ct container
+# (nextjs-dev-fcvm-parity.tf; every member container is denied it: this token can create and delete databases).
 #   export TURSO_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id turso/api-token --query SecretString --output text)
 resource "aws_secretsmanager_secret" "turso_api_token" {
@@ -378,7 +377,7 @@ resource "aws_secretsmanager_secret" "turso_api_token" {
 }
 
 locals {
-  turso_api_token_readers = [aws_iam_role.dev_server.arn]
+  turso_api_token_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
 }
 
 resource "aws_secretsmanager_secret_policy" "turso_api_token" {
