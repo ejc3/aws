@@ -38,19 +38,25 @@
 #                     GPU work with idle stretches. A LEASED BOX COSTS MONEY FOR THE WHOLE LEASE, busy or not (a
 #                     kvm-gpu-96 is about $4/hr spot, so a 12h lease is about $50). Set only at launch: a box already
 #                     running keeps what it has (down, then up --lease). Not for a member's box.
-#   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT.
+#   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT. A box launched in the last hour
+#                     by another caller (its PboxLaunchedBy tag) is refused unless --force or --instance names it.
 #   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? open, with which IPv6 /80?
 #                     leased until when? and how the NEXT launch is bought
 #   pbox status N     just box N
 #   pbox ssh [N]      connect
 #   pbox ip [N]       print the IP
+#   pbox ip|ssh|down [N] --instance i-...
+#                     act only if the slot still holds that instance (the id= field of `up`'s last line); refused when
+#                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
 #                     fallback AZ; launches nothing
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
-#   "launched box=N region=R az=Z type=T ip=IP work=persistent|fresh", or "running ..." when it already was, with
-#   " ipv6_prefix=<prefix>/80" at the end for a box launched with --open),
+#   "launched box=N region=R az=Z type=T ip=IP id=i-... work=persistent|fresh", or "running ..." when it already was,
+#   with " ipv6_prefix=<prefix>/80" at the end for a box launched with --open). When the box was launched but did not
+#   come up (SSH timeout, no /dev/kvm, GPUs not on vfio-pci, no IPv6 prefix), the last line is the same with
+#   " failed=<reason>" at the end and the exit is 1, so a caller always learns the instance id it launched,
 #   2 when no flavor (or an unknown one) was named, printing the menu and launching nothing, 3 when the home AZ
 #   had no capacity and --fallback was not given (retry with it, unless --open), 4 when no fallback AZ had capacity
 #   either, and 1 for any other failure.
@@ -234,6 +240,8 @@ FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
 LEASE=""
+INSTANCE=""
+FORCE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
@@ -252,6 +260,12 @@ while [ $# -gt 0 ]; do
     --lease=*)
       LEASE="${1#--lease=}"
       [ -n "$LEASE" ] || { say "--lease needs a duration (90m, 2h, 1h30m)"; exit 1; } ;;
+    --instance)
+      shift
+      [ -n "${1:-}" ] || { say "--instance needs an instance id (i-...)"; exit 1; }
+      INSTANCE="$1" ;;
+    --instance=*) INSTANCE="${1#--instance=}" ;;
+    --force) FORCE=1 ;;
     --regions)
       shift
       [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
@@ -261,7 +275,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --lease DURATION)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
   esac
   shift
 done
@@ -275,6 +289,16 @@ if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$FALLBACK" ]; }; then
   exit 1
 fi
 if [ -n "$FALLBACK" ] && [ "$CMD" != "up" ]; then say "--fallback and --regions only apply to 'up'"; exit 1; fi
+# --instance: ip, ssh and down act only on the instance the caller launched, never on whatever holds the slot now (#621).
+if [ -n "$INSTANCE" ]; then
+  case "$CMD" in ip|ssh|down) ;; *) say "--instance only applies to ip, ssh and down"; exit 1 ;; esac
+  [[ "$INSTANCE" =~ ^i-[0-9a-f]{8,17}$ ]] || { say "--instance takes an instance id like i-0123456789abcdef0 (got '$INSTANCE')"; exit 1; }
+fi
+if [ -n "$FORCE" ] && [ "$CMD" != "down" ]; then say "--force only applies to 'down'"; exit 1; fi
+# Who launches: PboxLaunchedBy on the owner's boxes (members' grants pin their tag keys). PBOX_CALLER names a session or
+# job; by default it is this host, so `down` from another host within the first hour asks for --force or --instance.
+PBOX_CALLER="${PBOX_CALLER:-$(hostname -s 2>/dev/null || echo unknown)}"
+PBOX_CALLER="$(printf '%s' "$PBOX_CALLER" | tr -c 'A-Za-z0-9 _.:/=+@-' '_' | cut -c1-200)"
 # --open: the owner's boxes, `up`, and the home AZ only. The members' pboxes launch with their SSH-only group, which is
 # also all their IAM grant allows (member-pbox.tf). The fallback sites' VPCs have no IPv6, so there is no /80 to delegate.
 if [ -n "$OPEN" ]; then
@@ -484,6 +508,23 @@ box_id() {
     --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v '^None$' || true
 }
 
+# instance_ip ID: the public IP of that exact instance while it runs, never of whatever holds the slot now.
+instance_ip() {
+  aws ec2 describe-instances --region "$REGION" --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null | grep -v '^None$' || true
+}
+
+# check_instance: with --instance, refuse unless the slot (as located) still holds that instance (#621).
+check_instance() {
+  [ -n "$INSTANCE" ] || return 0
+  local cur
+  cur="$(box_id)"
+  if [ "$cur" != "$INSTANCE" ]; then
+    say "refusing: $NAME holds ${cur:-no running instance} now, not $INSTANCE (the slot was taken down or relaunched since); nothing was done"
+    exit 1
+  fi
+}
+
 # Point REGION at wherever the box runs: home first, then the fallback regions. A box that is not running anywhere
 # leaves REGION at home, where `up` launches it first.
 locate_box() {
@@ -691,14 +732,26 @@ on_box() {
   return "$rc"
 }
 
+# The machine-readable last line of `up`, always with the instance id (#621). $1 work, $2 "running" or empty, $3 a
+# failure reason (then the caller exits 1).
+up_line() {
+  if [ "${2:-}" = "running" ]; then
+    echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=${IP:-none} id=$ID work=$1${P:+ ipv6_prefix=$P}${3:+ failed=$3}"
+  else
+    echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=${IP:-none} id=$ID work=$1${P:+ ipv6_prefix=$P}${3:+ failed=$3}"
+  fi
+}
+
 # Wait until the box answers SSH, then report it. $1: what the work volume is ("persistent" or "fresh").
 wait_ready() {
+  P=""
   # Metal firmware init takes many minutes on top of the normal boot -- give kvm
   # mode 25 min before declaring failure (virtualized boxes keep the 10 min bound).
   WAIT_TRIES=60
   [ "$MODE" = "kvm" ] && WAIT_TRIES=150
   for i in $(seq 1 "$WAIT_TRIES"); do
-    IP="$(box_ip)"
+    # By the instance it launched (or found), not by the slot's name: another job can relaunch the slot meanwhile.
+    IP="$(instance_ip "$ID")"
     if [ -n "$IP" ] && ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
          -o BatchMode=yes "ubuntu@$IP" true 2>/dev/null; then
       say "Ready at $IP"
@@ -712,6 +765,7 @@ wait_ready() {
         else
           say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
           say "That should be impossible on a *.metal type -- investigate before using."
+          up_line "$1" "${2:-}" no-kvm
           exit 1
         fi
       fi
@@ -723,6 +777,7 @@ wait_ready() {
           say "  gpu:   every NVIDIA function is on vfio-pci with its /dev/vfio group (list: /etc/pbox-gpu)"
         else
           say "FAILED: $CHOSEN came up without its GPUs on vfio-pci (above; the boot log is /var/log/cloud-init-output.log)."
+          up_line "$1" "${2:-}" gpu-not-vfio
           exit 1
         fi
         ;;
@@ -733,23 +788,21 @@ wait_ready() {
         say "  open:  every port of this box and its VMs is reachable from the internet (IPv4 and IPv6)"
         say "  ipv6:  $P (fcvm --network routed --ipv6-prefix $P)"
       elif [ -n "$OPEN" ] && [ "${2:-}" != "running" ]; then
-        say "FAILED: $NAME was launched with --open but EC2 reports no IPv6 prefix on its interface. It is running: $SELF status ${BOX:-}, $SELF down ${BOX:-}"
+        say "FAILED: $NAME was launched with --open but EC2 reports no IPv6 prefix on its interface. It is running: $SELF status ${BOX:-}, $SELF down ${BOX:-} --instance $ID"
+        up_line "$1" "${2:-}" no-ipv6-prefix
         exit 1
       fi
       if [ -n "$LEASE_UNTIL" ] && [ "${2:-}" != "running" ]; then
         say "  lease: $(lease_line "" "$LEASE_UNTIL"): the idle watchdog leaves it running until then, and it costs money until then"
       fi
-      if [ "${2:-}" = "running" ]; then
-        echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1${P:+ ipv6_prefix=$P}"
-      else
-        echo "launched box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ type=$CHOSEN ip=$IP work=$1${P:+ ipv6_prefix=$P}"
-      fi
+      up_line "$1" "${2:-}"
       exit 0
     fi
     [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
     sleep 10
   done
-  say "Launched but SSH did not come up in $((WAIT_TRIES / 6)) min; check: $SELF status"
+  say "Launched but SSH did not come up in $((WAIT_TRIES / 6)) min; check: $SELF status ${BOX:-} (act on it with --instance $ID)"
+  up_line "$1" "${2:-}" ssh-timeout
   exit 1
 }
 
@@ -926,7 +979,8 @@ trap 'rm -rf "$TMP"' EXIT
 case "$CMD" in
   ip)
     locate_box || true
-    box_ip
+    check_instance
+    if [ -n "$INSTANCE" ]; then instance_ip "$INSTANCE"; else box_ip; fi
     ;;
 
   up)
@@ -955,7 +1009,7 @@ case "$CMD" in
       lease_note
       P="$(box_ipv6_prefix)"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
-      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP work=$(box_work)${P:+ ipv6_prefix=$P}"
+      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP id=$(box_id) work=$(box_work)${P:+ ipv6_prefix=$P}"
       exit 0
     fi
 
@@ -1010,9 +1064,15 @@ case "$CMD" in
       # A lease is one more instance tag. EC2 adds a launch's tags to the template's; Name and DevEBS (which the IAM grants
       # read) are repeated so they hold whichever way the two combine. The launch grant allows any tag key at RunInstances
       # (parallel-box-launch.tf).
+      # The owner's boxes also carry PboxLaunchedBy (who launched it, for `down`); a member's grant pins its tag keys
+      # (member-pbox.tf), so a member's launch passes no extra tags.
       TAGS=()
       start_lease
-      [ -z "$LEASE" ] || TAGS=(--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=DevEBS,Value=true},{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}]")
+      if [ -z "$MEMBER" ]; then
+        EXTRA_TAGS="{Key=PboxLaunchedBy,Value=$PBOX_CALLER}"
+        [ -z "$LEASE" ] || EXTRA_TAGS="$EXTRA_TAGS,{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}"
+        TAGS=(--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=DevEBS,Value=true},$EXTRA_TAGS]")
+      fi
       if try_launch "$T" "$AZ" --launch-template "LaunchTemplateName=$LT,Version=\$Latest" ${IMG[@]+"${IMG[@]}"} ${NIC[@]+"${NIC[@]}"} ${TAGS[@]+"${TAGS[@]}"}; then
         ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$AZ"
         [ -z "$OPEN" ] || open_host_ipv6 "$ID"
@@ -1113,7 +1173,7 @@ case "$CMD" in
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
         if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
              --subnet-id "$SUBNET" ${IMG[@]+"${IMG[@]}"} \
-             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}$LEASE_TAG]" \
+             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true},{Key=PboxLaunchedBy,Value=$PBOX_CALLER}$LEASE_TAG]" \
                                   "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
                                   "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then
           ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$FAZ"; break 2
@@ -1157,10 +1217,25 @@ case "$CMD" in
 
   down)
     locate_box || true
+    check_instance
     ID="$(box_id)"
     if [ -z "$ID" ]; then
       say "$NAME is already down."
       exit 0
+    fi
+    # A box another caller launched in the last hour is probably someone's work in progress (#621): refuse unless the
+    # caller names it (--instance) or insists (--force).
+    if [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then
+      read -r BY LT_AT <<< "$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
+        --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' --output text 2>/dev/null)"
+      if [ -n "$BY" ] && [ "$BY" != "None" ] && [ "$BY" != "$PBOX_CALLER" ]; then
+        AGE_MIN=$(( ( $(date +%s) - $(date -d "$LT_AT" +%s 2>/dev/null || echo 0) ) / 60 ))
+        if [ "$AGE_MIN" -lt 60 ]; then
+          say "refusing: $NAME ($ID) was launched ${AGE_MIN} min ago by $BY, not by $PBOX_CALLER; it is probably someone else's."
+          say "If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
+          exit 1
+        fi
+      fi
     fi
     WORK="$(box_work)"
     say "Terminating $NAME ($ID) in $REGION."
@@ -1194,7 +1269,8 @@ case "$CMD" in
   ssh)
     member_key
     locate_box || true
-    IP="$(box_ip)"
+    check_instance
+    if [ -n "$INSTANCE" ]; then IP="$(instance_ip "$INSTANCE")"; else IP="$(box_ip)"; fi
     [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:+$BOX }FLAVOR  ($SELF flavors)"; exit 1; }
     exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
     ;;

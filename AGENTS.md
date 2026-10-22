@@ -305,7 +305,13 @@ the box's own addresses too, so every port the box listens on is public. `--open
 check until then and applies it as usual after. A tag that does not parse is no lease, and a lease past LaunchTime + 12 h
 ends there. `status` prints `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. A leased box costs money for the whole
 lease (a kvm-gpu-96 is about $4/hr spot). It is set at launch only: the grants tag at RunInstances and nowhere else, so
-there is no `pbox lease` for a running box. Members' boxes and the GPU test boxes take no lease. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+there is no `pbox lease` for a running box. Members' boxes and the GPU test boxes take no lease. Several jobs share the
+eight slots, so a slot name can point at another instance minutes later (#621): `up`'s last line carries `id=i-...` (also,
+with `failed=<reason>`, when the box was launched but did not come up), scripts carry that id and pass `--instance i-...` to
+`ip`, `ssh` and `down`, which refuse when the slot holds another instance, and they never re-resolve a slot by name. The
+owner's launches tag `PboxLaunchedBy` (`PBOX_CALLER`, default the host); `down` without `--instance` refuses a box another
+caller launched in the last hour unless `--force`. Members' grants pin their tag keys, so their boxes carry no such tag.
+The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).

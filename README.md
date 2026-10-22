@@ -1113,6 +1113,12 @@ busy or not: a `kvm-gpu-96` is about $4/hr spot, so a 12-hour lease is about $50
 `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. The lease is set at launch only; a running box keeps what it has
 (`pbox down N`, then `up` again with `--lease`). Members' boxes take no lease.
 
+Several jobs share the eight slots, and a slot can hold a different instance minutes after a script looked it up. `pbox up`
+ends with `launched box=N ... id=i-...` (with ` failed=<reason>` and exit 1 when the box was launched but did not come up),
+so scripts carry that id and use `pbox ip|ssh|down N --instance i-...`, which refuse when the slot holds another instance;
+they never re-resolve a slot by name. `pbox down N` without `--instance` also refuses a box another caller launched in the
+last hour (its `PboxLaunchedBy` tag, set from `PBOX_CALLER`, by default the host) unless `--force`.
+
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and
 one launch template per box -- while the instances themselves are deliberately not in state.
