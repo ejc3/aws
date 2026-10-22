@@ -652,7 +652,10 @@ def vol_of(name):
 
 if op == "describe-instances":
     name = tag_name()
-    iid = box(name)
+    iid = box(name) if name else ""
+    if not name and opt("--instance-ids"):  # by instance id (pbox waits on the instance it launched, #621)
+        want = opt("--instance-ids")
+        iid = next((box(n) for n in boxes() if box(n) == want), "")
     q = opt("--query")
     if not iid:
         print("None\tNone\tNone\tNone\tNone" if "[InstanceId,InstanceType" in q else "None")
@@ -902,7 +905,7 @@ class ScriptRuns(unittest.TestCase):
         self.assertIn("--instance-type c8g.48xlarge", runs[-1])
         self.assertIn("ec2 attach-volume --region us-east-2 --volume-id vol-pbox-skevh-work --instance-id i-new-pbox-skevh --device /dev/sdf", calls)
         self.assertEqual(r.stdout.strip().splitlines()[-1],
-                         "launched box=pbox-skevh region=us-east-2 az=us-east-2c type=c8g.48xlarge ip=203.0.113.7 work=persistent")
+                         "launched box=pbox-skevh region=us-east-2 az=us-east-2c type=c8g.48xlarge ip=203.0.113.7 id=i-new-pbox-skevh work=persistent")
         self.assertIn("-i %s" % (self.home / ".ssh" / "member-box"), (self.state / "ssh").read_text())
 
     def test_pbox_member_up_resumes_an_existing_box_instead_of_trusting_it(self):
@@ -914,7 +917,7 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual([c for c in calls if "attach-volume" in c],
                          ["ec2 attach-volume --region us-east-2 --volume-id vol-pbox-skevh-work --instance-id i-7 --device /dev/sdf"])
         self.assertEqual(r.stdout.strip().splitlines()[-1],
-                         "running box=pbox-skevh region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
+                         "running box=pbox-skevh region=us-east-2 az=us-east-2c ip=203.0.113.7 id=i-7 work=persistent")
         self.assertTrue((self.state / "ssh").exists(), "it waits for SSH as a fresh launch does")
         # now attached: nothing to attach, still a running line
         r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="skevh")
@@ -981,7 +984,7 @@ class ScriptRuns(unittest.TestCase):
         (self.state / "vol-parallel-box-work.attached").write_text("i-1")  # its volume is on it: nothing to attach
         r, calls = self.run_script("parallel-box.sh", "up", "compute-192", user="ejc3")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 work=persistent")
+        self.assertEqual(r.stdout.strip(), "running box=1 region=us-east-2 az=us-east-2c ip=203.0.113.7 id=i-1 work=persistent")
         self.assertFalse([c for c in calls if "attach-volume" in c])
 
     def test_pbox_member_refuses_slots_kvm_and_fallback(self):
