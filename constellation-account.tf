@@ -184,7 +184,8 @@ resource "aws_iam_role_policy_attachment" "constellation_terraform_admin" {
 # not an inline one: dev-server-role's inline policies are at IAM's 10,240-byte total (the first apply was refused with
 # LimitExceeded), and managed policies count against a separate limit (20 per role here).
 resource "aws_iam_policy" "dev_server_constellation_terraform" {
-  name        = "assume-constellation-terraform"
+  name = "assume-constellation-terraform"
+  # The description is immutable (a change replaces the attached policy); it also grants dolphin-terraform (below).
   description = "fcvm-arm may assume constellation-terraform in the constellation account and read /infra/constellation, and nothing else (constellation-account.tf)."
   policy = jsonencode({
     Version = "2012-10-17"
@@ -201,6 +202,14 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Effect    = "Allow"
       Action    = "ssm:GetParameter"
       Resource  = aws_ssm_parameter.constellation.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      # Apply dolphin-labs-hq/dolphin-aws (dolphin-bootstrap.tf). Here because dev-server-role has no room for another
+      # policy: its inline policies are at IAM's 10,240-character total and it holds 20 of 20 managed ones.
+      Sid       = "AssumeTheDolphinApplyRoleOnly"
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Resource  = aws_iam_role.dolphin_terraform.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })

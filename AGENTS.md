@@ -1491,13 +1491,16 @@ Terraform must never close it. Nothing in this account becomes reachable from it
   `dolphin-terraform-state-<account id>` (versioned, encrypted, public access blocked, `prevent_destroy`) with S3 native
   locking (`use_lockfile`, no DynamoDB). This repository builds that bucket and the apply role (`dolphin-bootstrap.tf`,
   provider `aws.dolphin` through OrganizationAccountAccessRole); dolphin-aws must never manage either.
-- **Applied from nextjs-dev only, never CI.** Role `dolphin-terraform` in the Dolphin account (AdministratorAccess there,
-  one-hour sessions) trusts exactly `nextjs-dev-role`, which has one inline policy (`assume-dolphin-terraform`) allowing
-  `sts:AssumeRole` on exactly that role. dolphin-aws's provider and backend both `assume_role` it from the instance role, so
+- **Applied from nextjs-dev and fcvm-metal-arm only, never CI.** Role `dolphin-terraform` in the Dolphin account
+  (AdministratorAccess there, one-hour sessions) trusts exactly `nextjs-dev-role`, which has one inline policy
+  (`assume-dolphin-terraform`) allowing `sts:AssumeRole` on exactly that role, and dev-server-role pinned to fcvm-arm's
+  instance (`ec2:SourceInstanceARN`; fcvm-x86 shares the role and cannot), granted in `assume-constellation-terraform`
+  because dev-server-role has no room for another policy (owner, 2026-10-22). dolphin-aws's provider and backend both `assume_role` it from the instance role, so
   there is no login step; `scripts/apply.sh` there plans and applies origin/main from a throwaway worktree. GitHub holds no
   AWS credential for it.
 - **That grant is box-wide.** Every account on nextjs-dev has full sudo and agents run there, so anyone on that box can
-  apply in the Dolphin account. The account boundary is what bounds it: nothing in this account trusts the Dolphin account.
+  apply in the Dolphin account (member containers' session policies deny `sts:AssumeRole`); on fcvm-arm every agent runs
+  as `ubuntu` with the instance role. The account boundary is what bounds it: nothing in this account trusts the Dolphin account.
   Do not grant the Dolphin account any path back into this one.
 - **Sign-in is Identity Center** (`dolphin-identity-center.tf`, portal in output `dolphin_sign_in_url`). The owner's user
   gets the existing AdministratorAccess permission set (read as data, not managed). Steve gets `DolphinReadOnly` on the
