@@ -1580,6 +1580,26 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
   fcvm-arm. Not yet covered: security monitoring and a region SCP like the Dolphin account's.
 
+### The fcvm-fleet account (fcvm-fleet-account.tf)
+
+fcvm's GPU VM wall (ejc3/fcvm#1136) gets a member account of its own, `fcvm-fleet`, in OU `FcvmFleet` (ejc3/aws#604; owner,
+2026-10-22: "its good make it so"). Its hosts are always-on spot GPU instances serving the public internet with workloads
+viewers can steer, so the account boundary is the containment: nothing in this account or any other member account
+trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource policy names it. Root address: the
+`fcvm_fleet_account` key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
+
+- **Guardrails** (`fcvm-fleet-guardrails`, an SCP on the OU only): every regional action outside us-east-2, us-west-2 and
+  us-east-1 (`local.fcvm_fleet_regions`, one provider alias each) is denied, as are leaving the organization, buckets in
+  other regions, and IAM users, access keys and console passwords (roles only). Global services are exempt (the Dolphin
+  policy's list).
+- **Applied from here** for the fleet's infrastructure (through OrganizationAccountAccessRole), and from fcvm-metal-arm
+  through `fcvm-fleet-terraform` (AdministratorAccess in that account, one-hour sessions), which trusts dev-server-role
+  pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
+  role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
+  another policy. No CI credential.
+- **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in each region.
+- Not yet covered: security monitoring like the Dolphin account's.
+
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
