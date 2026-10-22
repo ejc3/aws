@@ -433,9 +433,13 @@ systemctl restart earlyoom.service || echo "WARNING: earlyoom did not start"
 # ---------------------------------------------------------------- kernel settings
 # Forwarding for the containers' links (the firewall decides what is forwarded), and unprivileged user
 # namespaces for Codex's bwrap sandbox inside the containers (Ubuntu restricts them through AppArmor).
+# inotify instances: every container's user namespace is created by root (systemd-nspawn), so each instance made inside
+# any container is charged to host root as well, against this one limit. Ubuntu's 128 was used up by five containers'
+# Claude, Codex, dev servers and systemd (135 on 2026-10-22), and OpenCode 2's server then hung on EMFILE at start.
 cat > /etc/sysctl.d/60-nextjs-ct.conf <<'SYSCTL'
 net.ipv4.ip_forward = 1
 kernel.apparmor_restrict_unprivileged_userns = 0
+fs.inotify.max_user_instances = 8192
 SYSCTL
 sysctl -q --system || true
 

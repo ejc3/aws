@@ -564,6 +564,9 @@ only. Rules an agent must keep:
   starter file is create-only). They say the claw-master `HTTPS_PROXY` is a forwarder, not a firewall (an agent unset it
   and blamed it, 2026-10-21), that the host-side firewall and the narrowed role are the limits, and to name a cause only
   once seen. Codex has no machine-wide file, so these reach Claude Code only.
+- **inotify instances are one host-wide pool.** Every container's user namespace is root's, so each inotify instance made
+  in any container also counts against the host's `fs.inotify.max_user_instances`. Ubuntu's 128 ran out at five
+  containers (2026-10-22) and OpenCode 2's server hung on `EMFILE` at start; the host setup sets 8192.
 - **Eternal Terminal** (the phone's Prompt connects with it): `eternal_terminal` in config.json pins the 7.x build nextjs-dev
   ran; provision installs it and runs etserver in that one account's container (`ejc3`), and the host firewall forwards the
   public 2022 (open in the security group, as on nextjs-dev) there only. Without it Prompt's `etterminal` exits 127.

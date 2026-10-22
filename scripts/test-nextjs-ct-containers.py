@@ -58,6 +58,14 @@ class HostScriptTests(unittest.TestCase):
         text = re.sub(r"(?<!\$)\$\{(local|var)\.[^}]*\}|\$\{join\([^\n]*\)\}|\$\{[uz]\}", "PLACEHOLDER", text)
         subprocess.run(["bash", "-n"], input=text, text=True, check=True)
 
+    def test_the_host_allows_enough_inotify_instances_for_every_container(self):
+        # Every container's user namespace is root's, so all their inotify instances count against the host's one
+        # limit; 128 ran out at five containers and OpenCode 2's server hung on EMFILE (2026-10-22).
+        conf = SCRIPT.split("cat > /etc/sysctl.d/60-nextjs-ct.conf <<'SYSCTL'\n", 1)[1].split("\nSYSCTL\n", 1)[0]
+        value = int(re.search(r"^fs\.inotify\.max_user_instances = (\d+)$", conf, re.M).group(1))
+        self.assertGreaterEqual(value, 1024)
+        self.assertIn("sysctl -q --system", SCRIPT.split("60-nextjs-ct.conf", 1)[1].split("\n# ----", 1)[0])
+
     def test_nobody_gets_a_host_shell_or_host_sudo(self):
         # The host is an admin and routing layer: no per-person sudo, no per-person agent units, no second
         # way in (Eternal Terminal), and the tunnels stay down until the cutover.
