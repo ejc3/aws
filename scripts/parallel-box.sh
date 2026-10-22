@@ -1106,11 +1106,14 @@ case "$CMD" in
         if ! IMG_OUT="$(image_args "$T" "$(fb_x86_image "$R")" "$R")"; then REAL_ERROR=1; say ""; continue; fi
         read -r -d '' -a IMG <<< "$IMG_OUT"
         start_lease
+        # The lease tag is built apart: a `}` inside ${LEASE:+...} ends the expansion early and leaves a stray brace.
+        LEASE_TAG=""
+        [ -z "$LEASE" ] || LEASE_TAG=",{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}"
         # The full tag set is passed, not only Name: whether EC2 merges these with the template's tags or replaces
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
         if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
              --subnet-id "$SUBNET" ${IMG[@]+"${IMG[@]}"} \
-             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}${LEASE:+,{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}}]" \
+             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true}$LEASE_TAG]" \
                                   "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
                                   "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then
           ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$FAZ"; break 2
