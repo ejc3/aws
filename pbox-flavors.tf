@@ -10,11 +10,17 @@
 #   memory    8 GiB per vCPU: memory-bound work
 #   storage   8 GiB per vCPU plus large local NVMe (/mnt/nvme, gone with the box): local-disk-bound work
 #   kvm       bare metal, for /dev/kvm (fcvm, firecracker); the owner's slots only, never a member's
+#   kvm-gpu   bare metal with NVIDIA GPUs bound to vfio-pci, for GPU passthrough into fcvm microVMs; the owner's only
 #
 # Sizes are 32, 48, 96 and 192 vCPU. No Graviton c, m or r type has 24 vCPU (there is no 6xlarge), so 32 is the smallest
-# and nothing is under the 24-vCPU floor. Everything is Graviton (arm64), because every pbox AMI is arm64. Every type is
-# offered in us-east-2c, the home AZ (checked 2026-10-19 with describe-instance-type-offerings); a fallback AZ that does
-# not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
+# and nothing is under the 24-vCPU floor. Everything is Graviton (arm64), because every pbox AMI is arm64. Every type but
+# g5g.metal is offered in us-east-2c, the home AZ (checked 2026-10-19 with describe-instance-type-offerings); a fallback AZ
+# that does not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
+#
+# kvm-gpu-64 is g5g.metal alone: 64 vCPU, 128 GiB, two NVIDIA T4G, and the only Graviton metal type with a GPU. It is not
+# offered in us-east-2 at all (us-west-2a/b/c and us-east-1a-d offer it, checked 2026-10-22), so it launches only at a
+# fallback site, with a fresh work volume: `pbox up N kvm-gpu-64 --regions us-west-2`. It counts against the G spot quota,
+# not the Standard one (west2_spot_g below). x86 GPU metal (g4dn.metal) needs an x86 AMI, which no pbox site has.
 #
 # scripts/parallel-box.sh carries the same menu (FLAVORS), and scripts/test-pbox-flavors.py keeps the two equal. The
 # instance types a pbox may be launched as are exactly these: pbox-flavor-types below denies every other type to a
@@ -40,9 +46,11 @@ locals {
     "storage-192" = ["i8g.48xlarge", "i8ge.48xlarge"]
     "kvm-96"      = ["c8g.metal-24xl", "c8gd.metal-24xl", "m8g.metal-24xl", "m8gd.metal-24xl"]
     "kvm-192"     = ["c8g.metal-48xl", "c8gd.metal-48xl", "c9g.metal-48xl", "c9gd.metal-48xl", "m8g.metal-48xl", "m8gd.metal-48xl"]
+    "kvm-gpu-64"  = ["g5g.metal"]
   }
 
   # The owner's slots and fallback boxes may be any flavor; a member's box any but kvm.
+  # The kvm-gpu flavors start with "kvm-" too, so the member exclusions below and in scripts/parallel-box.sh cover them.
   pbox_flavor_types = distinct(flatten(values(local.pbox_flavors)))
   member_pbox_types = distinct(flatten([for f, types in local.pbox_flavors : types if !startswith(f, "kvm-")]))
 
@@ -70,6 +78,59 @@ if [ -n "$NVME_DISKS" ]; then
   fi
 fi
   NVME
+
+  # GPU passthrough host (the kvm-gpu flavors): every NVIDIA PCI function (vendor 0x10de) goes to vfio-pci, so fcvm can hand
+  # it to a microVM. A box without one skips all of it. The host never gets an NVIDIA driver: driverctl's override binds
+  # vfio-pci now and again at every boot (its udev rule sets driver_override before a driver can probe), and vfio-pci is
+  # loaded at boot. Graviton metal has an SMMUv3 the arm64 kernel enables by default, so no kernel parameter is needed (on
+  # x86 metal it would be intel_iommu=on iommu=pt). For a rootless fcvm, ubuntu may open the VFIO groups (group kvm, which
+  # `pbox up` adds it to on a kvm flavor) and pin a guest's memory for DMA (memlock). /etc/pbox-gpu lists each function,
+  # its driver and its IOMMU group. Runs after apt-get update (driverctl).
+  pbox_gpu_vfio_setup = <<-GPU
+GPU_DEVS=""
+for d in /sys/bus/pci/devices/*; do
+  [ "$(cat "$d/vendor")" = 0x10de ] && GPU_DEVS="$GPU_DEVS $(basename "$d")"
+done
+if [ -n "$GPU_DEVS" ]; then
+  echo vfio-pci > /etc/modules-load.d/vfio-pci.conf
+  modprobe vfio-pci
+  apt-get install -y driverctl
+  echo 'SUBSYSTEM=="vfio", GROUP="kvm", MODE="0660"' > /etc/udev/rules.d/70-vfio-kvm.rules
+  printf 'ubuntu soft memlock unlimited\nubuntu hard memlock unlimited\n' > /etc/security/limits.d/90-vfio-memlock.conf
+  udevadm control --reload
+  for dev in $GPU_DEVS; do driverctl set-override "$dev" vfio-pci; done
+  udevadm settle
+  for dev in $GPU_DEVS; do
+    drv=$(readlink "/sys/bus/pci/devices/$dev/driver")
+    grp=$(readlink "/sys/bus/pci/devices/$dev/iommu_group")
+    echo "$dev driver=$${drv##*/} iommu_group=$${grp##*/}"
+  done > /etc/pbox-gpu
+fi
+  GPU
+}
+
+# ---------------------------------------------------------------------------------
+# The G spot quota for kvm-gpu-64 in us-west-2, where it launches. L-3819A6DF = "All G and VT Spot Instance Requests", in
+# vCPU; g5g.metal needs 64 for one box. The dev boxes cannot read quotas (ejc3/aws#587), so the current value is read here at
+# plan time: when it already covers one box nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease
+# (see ohio_spot_standard in ohio-pbox.tf for how the provider reports a pending request). A launch past the quota fails
+# with MaxSpotInstanceCountExceeded and pbox moves on to the next AZ or region.
+# ---------------------------------------------------------------------------------
+locals {
+  pbox_gpu_spot_vcpus = 64 # one kvm-gpu-64 box
+}
+
+data "aws_servicequotas_service_quota" "west2_spot_g" {
+  provider     = aws.west2
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+}
+
+resource "aws_servicequotas_service_quota" "west2_spot_g" {
+  provider     = aws.west2
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+  value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.west2_spot_g.value)
 }
 
 # ---------------------------------------------------------------------------------

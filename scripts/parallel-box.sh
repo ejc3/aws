@@ -11,6 +11,8 @@
 #                     memory- or local-disk-bound, or general) and size, e.g. compute-48. It tries
 #                     that flavor's instance types in turn. kvm-96 / kvm-192 are bare metal with
 #                     /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
+#                     kvm-gpu-64 is the same plus two NVIDIA T4G bound to vfio-pci, for GPU
+#                     passthrough; the home AZ does not offer it: pbox up N kvm-gpu-64 --regions us-west-2
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -74,6 +76,7 @@ set -uo pipefail
 # the flavor's vCPU and memory. All Graviton (arm64, as the AMI is), all offered in us-east-2c; a fallback AZ skips the
 # types it does not offer. No Graviton c, m or r type has 24 vCPU, so 32 is the smallest size: nothing is under the
 # 24-vCPU floor. The kvm flavors are bare metal (virtualized Graviton has no /dev/kvm) and boot in many minutes.
+# kvm-gpu-64 is g5g.metal, the one Graviton metal type with GPUs; us-east-2 does not offer it, so its price is us-west-2's.
 FLAVORS='
 compute-32   32   64   -    0.35 c8g.8xlarge c9g.8xlarge c8gn.8xlarge c8gb.8xlarge c8gd.8xlarge c9gd.8xlarge c7g.8xlarge c7gd.8xlarge c7gn.8xlarge
 compute-48   48   96   -    0.50 c8g.12xlarge c9g.12xlarge c8gn.12xlarge c8gb.12xlarge c8gd.12xlarge c9gd.12xlarge c7g.12xlarge c7gd.12xlarge c7gn.12xlarge
@@ -93,6 +96,7 @@ storage-96   96   768  22   1.70 i8g.24xlarge i8ge.24xlarge
 storage-192  192  1536 45   2.00 i8g.48xlarge i8ge.48xlarge
 kvm-96       96   192+ -    0.70 c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl
 kvm-192      192  384+ -    1.20 c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl
+kvm-gpu-64   64   128  -    0.60 g5g.metal
 '
 
 # What each shape is for: the one line an agent reads to choose.
@@ -103,6 +107,7 @@ flavor_use() {
     memory)  echo "memory-bound work (big in-memory data, large links, caches): 8 GiB per vCPU" ;;
     storage) echo "local-disk-bound work: fast local NVMe at /mnt/nvme (gone with the box) and 8 GiB per vCPU" ;;
     kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; not for members" ;;
+    kvm-gpu) echo "GPU passthrough into fcvm: kvm plus 2x NVIDIA T4G on vfio-pci; not in the home AZ: add --regions us-west-2 (its price is there)" ;;
   esac
 }
 
@@ -455,6 +460,18 @@ fallback_order() {
   done | sort -s -t' ' -k1,1nr
 }
 
+# Run on a GPU box: wait for the boot script, then list each NVIDIA function and fail unless every one is vfio-pci's and
+# has its /dev/vfio group node. Single-quoted: it expands on the box.
+# shellcheck disable=SC2016
+GPU_CHECK='timeout 900 cloud-init status --wait >/dev/null 2>&1; n=0; bad=0
+for d in /sys/bus/pci/devices/*; do
+  [ "$(cat "$d/vendor")" = 0x10de ] || continue
+  n=$((n + 1)); drv=$(readlink "$d/driver"); grp=$(readlink "$d/iommu_group")
+  echo "  gpu:   ${d##*/} driver=${drv##*/} iommu_group=${grp##*/}"
+  [ "${drv##*/}" = vfio-pci ] && [ -n "$grp" ] && [ -c "/dev/vfio/${grp##*/}" ] || bad=1
+done
+[ "$n" -gt 0 ] && [ "$bad" -eq 0 ]'
+
 # Wait until the box answers SSH, then report it. $1: what the work volume is ("persistent" or "fresh").
 wait_ready() {
   # Metal firmware init takes many minutes on top of the normal boot -- give kvm
@@ -480,6 +497,17 @@ wait_ready() {
           exit 1
         fi
       fi
+      case "$(type_flavor "$CHOSEN")" in kvm-gpu-*)
+        # The other point of a GPU flavor: every NVIDIA function bound to vfio-pci, in an IOMMU group with its
+        # /dev/vfio node. The boot script binds them (pbox_gpu_vfio_setup, pbox-flavors.tf), so wait for it first.
+        if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" "$GPU_CHECK" >&2; then
+          say "  gpu:   every NVIDIA function is on vfio-pci with its /dev/vfio group (list: /etc/pbox-gpu)"
+        else
+          say "FAILED: $CHOSEN came up without its GPUs on vfio-pci (above; the boot log is /var/log/cloud-init-output.log)."
+          exit 1
+        fi
+        ;;
+      esac
       if [ "${2:-}" = "running" ]; then
         echo "running box=$BOX_LABEL region=$REGION az=$CHOSEN_AZ ip=$IP work=$1"
       else
@@ -516,7 +544,9 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
   # (a bad policy, a deleted template) -- otherwise a permissions bug looks exactly
   # like a busy afternoon and gets retried 28 times.
   case "$OUT" in
-    *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*Unsupported*|*capacity-not-available*)
+    *Unsupported*)
+      say "    $t is Unsupported in $az (usually: not offered there) -- trying the next one" ;;
+    *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*capacity-not-available*)
       say "    no capacity for $t in $az -- trying the next one" ;;
     *VcpuLimitExceeded*|*MaxSpotInstanceCountExceeded*|*InstanceLimitExceeded*)
       # A regional quota is as final for this region as missing capacity: try elsewhere, not "fix that first".

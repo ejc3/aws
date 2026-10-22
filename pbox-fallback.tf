@@ -78,6 +78,7 @@ locals {
     apt-get update
     apt-get install -y parallel build-essential git htop
     ${local.pbox_local_nvme_setup}
+    ${local.pbox_gpu_vfio_setup}
 
     echo "* soft nofile 1048576" >> /etc/security/limits.conf
     echo "* hard nofile 1048576" >> /etc/security/limits.conf
