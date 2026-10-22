@@ -360,6 +360,35 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
   aws_service_name = "spot.amazonaws.com"
 }
 
+# ------------------------------------------------------------------------------------------------ the coordinator's image
+# The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
+# execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
+# cannot change under it; the 20 newest are kept, which outlasts any one rollout.
+resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
+  provider             = aws.fcvm_fleet
+  name                 = "fcvm-fleet/coordinator"
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = { Name = "fcvm-fleet/coordinator", Project = "fcvm-fleet" }
+}
+
+resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
+  provider   = aws.fcvm_fleet
+  repository = aws_ecr_repository.fcvm_fleet_coordinator.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep the 20 newest images"
+      selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
+      action       = { type = "expire" }
+    }]
+  })
+}
+
 # ------------------------------------------------------------------------------------------------ the coordinator (us-east-2)
 resource "aws_ecs_cluster" "fcvm_fleet" {
   provider = aws.fcvm_fleet
@@ -593,6 +622,7 @@ output "fcvm_fleet_infra" {
     asset_bucket       = aws_s3_bucket.fcvm_fleet_assets.bucket
     state_bucket       = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket
     cluster            = aws_ecs_cluster.fcvm_fleet.name
+    coordinator_repo   = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
     hosts_desired      = { "us-east-2" = module.fcvm_fleet_east2.host_group_desired, "us-west-2" = module.fcvm_fleet_west2.host_group_desired, "us-east-1" = module.fcvm_fleet_east1.host_group_desired }
     coordinator_on     = local.fcvm_fleet_coordinator_running
     tile_template_arns = local.fcvm_fleet_tile_template_arns
