@@ -191,6 +191,51 @@ class GpuQuota(unittest.TestCase):
         self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.west2_spot_g.value)", b)
 
 
+class GpuCheckRuns(unittest.TestCase):
+    """The script's GPU_CHECK, run against a fake sysfs: ready only when every GPU is vfio-pci's with its group node, and
+    its whole IOMMU group is unbound or vfio-pci, pci-stub or pcieport."""
+
+    def run_check(self, members):
+        import os, subprocess, tempfile
+        script = (Path(__file__).resolve().parent / "parallel-box.sh").read_text()
+        check = re.search(r"^GPU_CHECK='(.*?)'$", script, re.S | re.M).group(1)
+        with tempfile.TemporaryDirectory() as root:
+            r = Path(root)
+            (r / "bin").mkdir()
+            for tool in ("timeout", "cloud-init"):
+                (r / "bin" / tool).write_text("#!/bin/sh\nexit 0\n")
+                (r / "bin" / tool).chmod(0o755)
+            (r / "dev/vfio").mkdir(parents=True)
+            (r / "dev/vfio/7").write_text("")
+            grp = r / "sys/kernel/iommu_groups/7/devices"
+            grp.mkdir(parents=True)
+            for addr, vendor, driver in members:
+                d = r / "sys/bus/pci/devices" / addr
+                d.mkdir(parents=True)
+                (d / "vendor").write_text(vendor + "\n")
+                if driver:
+                    (r / "sys/bus/pci/drivers" / driver).mkdir(parents=True, exist_ok=True)
+                    (d / "driver").symlink_to(r / "sys/bus/pci/drivers" / driver)
+                (d / "iommu_group").symlink_to(r / "sys/kernel/iommu_groups/7")
+                (grp / addr).symlink_to(d)
+            body = check.replace("/sys/", root + "/sys/").replace('[ -c "/dev/vfio/', '[ -e "' + root + "/dev/vfio/")
+            env = dict(os.environ, PATH=str(r / "bin") + ":/usr/bin:/bin")
+            return subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True).returncode
+
+    def test_a_gpu_alone_in_its_group_on_vfio_is_ready(self):
+        self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci")]), 0)
+
+    def test_a_bridge_or_an_unbound_device_in_the_group_is_fine(self):
+        self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci"), ("0000:00:1c.0", "0x1d0f", "pcieport"),
+                                         ("0000:00:1d.0", "0x1d0f", None)]), 0)
+
+    def test_a_group_shared_with_a_bound_nic_is_not_ready(self):
+        self.assertNotEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci"), ("0000:00:05.0", "0x1d0f", "ena")]), 0)
+
+    def test_a_gpu_still_on_nvidia_is_not_ready(self):
+        self.assertNotEqual(self.run_check([("0000:00:1f.0", "0x10de", "nvidia")]), 0)
+
+
 class GpuVfio(unittest.TestCase):
     def test_every_nvidia_function_goes_to_vfio_pci_and_nothing_happens_without_one(self):
         m = re.search(r"pbox_gpu_vfio_setup = <<-GPU\n(.*?)\n  GPU\n", FLAVORS_TF, re.S)

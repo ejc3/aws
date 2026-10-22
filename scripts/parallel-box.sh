@@ -460,8 +460,10 @@ fallback_order() {
   done | sort -s -t' ' -k1,1nr
 }
 
-# Run on a GPU box: wait for the boot script, then list each NVIDIA function and fail unless every one is vfio-pci's and
-# has its /dev/vfio group node. Single-quoted: it expands on the box.
+# Run on a GPU box: wait for the boot script, then list each NVIDIA function and fail unless every one is vfio-pci's,
+# has its /dev/vfio group node, and its whole IOMMU group is usable: VFIO opens a group only when every device in it is
+# unbound or on vfio-pci, pci-stub or pcieport (a bridge), so a GPU sharing a group with the NIC or a disk would report
+# ready here and then fail in fcvm. Single-quoted: it expands on the box.
 # shellcheck disable=SC2016
 GPU_CHECK='timeout 900 cloud-init status --wait >/dev/null 2>&1; n=0; bad=0
 for d in /sys/bus/pci/devices/*; do
@@ -469,6 +471,10 @@ for d in /sys/bus/pci/devices/*; do
   n=$((n + 1)); drv=$(readlink "$d/driver"); grp=$(readlink "$d/iommu_group")
   echo "  gpu:   ${d##*/} driver=${drv##*/} iommu_group=${grp##*/}"
   [ "${drv##*/}" = vfio-pci ] && [ -n "$grp" ] && [ -c "/dev/vfio/${grp##*/}" ] || bad=1
+  for m in "/sys/kernel/iommu_groups/${grp##*/}/devices"/*; do
+    [ -e "$m" ] || continue; md=$(readlink "$m/driver"); md=${md##*/}
+    case "$md" in ""|vfio-pci|pci-stub|pcieport) ;; *) echo "  group ${grp##*/} also holds ${m##*/} on $md: not passable"; bad=1 ;; esac
+  done
 done
 [ "$n" -gt 0 ] && [ "$bad" -eq 0 ]'
 

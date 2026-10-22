@@ -111,8 +111,8 @@ fi
 
 # ---------------------------------------------------------------------------------
 # The G spot quota for kvm-gpu-64 in us-west-2, where it launches. L-3819A6DF = "All G and VT Spot Instance Requests", in
-# vCPU; g5g.metal needs 64 for one box. The dev boxes cannot read quotas (ejc3/aws#587), so the current value is read here at
-# plan time: when it already covers one box nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease
+# vCPU; g5g.metal needs 64 for one box. The current value is read here at plan time (the metal boxes can read it too since
+# ejc3/aws#588, but only an administrator may request more): when it already covers one box nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease
 # (see ohio_spot_standard in ohio-pbox.tf for how the provider reports a pending request). A launch past the quota fails
 # with MaxSpotInstanceCountExceeded and pbox moves on to the next AZ or region.
 # ---------------------------------------------------------------------------------
