@@ -264,7 +264,9 @@ while [ $# -gt 0 ]; do
       shift
       [ -n "${1:-}" ] || { say "--instance needs an instance id (i-...)"; exit 1; }
       INSTANCE="$1" ;;
-    --instance=*) INSTANCE="${1#--instance=}" ;;
+    --instance=*)
+      INSTANCE="${1#--instance=}"
+      [ -n "$INSTANCE" ] || { say "--instance needs an instance id (i-...)"; exit 1; } ;;
     --force) FORCE=1 ;;
     --regions)
       shift
@@ -298,7 +300,7 @@ if [ -n "$FORCE" ] && [ "$CMD" != "down" ]; then say "--force only applies to 'd
 # Who launches: PboxLaunchedBy on the owner's boxes (members' grants pin their tag keys). PBOX_CALLER names a session or
 # job; by default it is this host, so `down` from another host within the first hour asks for --force or --instance.
 PBOX_CALLER="${PBOX_CALLER:-$(hostname -s 2>/dev/null || echo unknown)}"
-PBOX_CALLER="$(printf '%s' "$PBOX_CALLER" | tr -c 'A-Za-z0-9 _.:/=+@-' '_' | cut -c1-200)"
+PBOX_CALLER="$(printf '%s' "$PBOX_CALLER" | tr -c 'A-Za-z0-9_.:/=+@-' '_' | cut -c1-200)"
 # --open: the owner's boxes, `up`, and the home AZ only. The members' pboxes launch with their SSH-only group, which is
 # also all their IAM grant allows (member-pbox.tf). The fallback sites' VPCs have no IPv6, so there is no /80 to delegate.
 if [ -n "$OPEN" ]; then
@@ -561,11 +563,13 @@ box_work() {
 
 # The IPv6 prefix delegated to the box's primary interface (a /80, only on a box launched with --open), or nothing.
 # A member's box never has one, so it is not looked up.
-box_ipv6_prefix() {
+box_ipv6_prefix() { # box_ipv6_prefix [ID]: that exact instance's /80, else the slot's
   [ -z "$MEMBER" ] || return 0
+  local -a sel=(--filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running")
+  [ -z "${1:-}" ] || sel=(--instance-ids "$1")
   # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
   aws ec2 describe-instances --region "$REGION" \
-    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    "${sel[@]}" \
     --query 'Reservations[0].Instances[0].NetworkInterfaces[?Attachment.DeviceIndex==`0`].Ipv6Prefixes[].Ipv6Prefix | [0]' \
     --output text 2>/dev/null | grep -v '^None$' || true
 }
@@ -782,8 +786,8 @@ wait_ready() {
         fi
         ;;
       esac
-      # An --open box: its delegated IPv6 /80, which fcvm's routed mode takes as --ipv6-prefix.
-      P="$(box_ipv6_prefix)"
+      # An --open box: its delegated IPv6 /80, which fcvm's routed mode takes as --ipv6-prefix (the launched instance's).
+      P="$(box_ipv6_prefix "$ID")"
       if [ -n "$P" ]; then
         say "  open:  every port of this box and its VMs is reachable from the internet (IPv4 and IPv6)"
         say "  ipv6:  $P (fcvm --network routed --ipv6-prefix $P)"
@@ -1001,15 +1005,16 @@ case "$CMD" in
         CHOSEN_AZ="$(box_az)"
         wait_ready persistent running
       fi
-      IP="$(box_ip)"
-      flavor_note "$(aws ec2 describe-instances --region "$REGION" \
-        --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+      # One lookup of the instance, then its address, type and prefix by that id: the slot can change in between.
+      ID="${ID:-$(box_id)}"
+      IP="$(instance_ip "$ID")"
+      flavor_note "$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
         --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
       open_note
       lease_note
-      P="$(box_ipv6_prefix)"
+      P="$(box_ipv6_prefix "$ID")"
       say "Already running at ${IP:-(no IP yet)} in $REGION"
-      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP id=$(box_id) work=$(box_work)${P:+ ipv6_prefix=$P}"
+      echo "running box=$BOX_LABEL region=$REGION az=$(box_az) ip=$IP id=$ID work=$(box_work)${P:+ ipv6_prefix=$P}"
       exit 0
     fi
 
@@ -1218,7 +1223,8 @@ case "$CMD" in
   down)
     locate_box || true
     check_instance
-    ID="$(box_id)"
+    # With --instance the target is that instance, validated above, never a second lookup of the slot.
+    if [ -n "$INSTANCE" ]; then ID="$INSTANCE"; else ID="$(box_id)"; fi
     if [ -z "$ID" ]; then
       say "$NAME is already down."
       exit 0
@@ -1226,10 +1232,20 @@ case "$CMD" in
     # A box another caller launched in the last hour is probably someone's work in progress (#621): refuse unless the
     # caller names it (--instance) or insists (--force).
     if [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then
-      read -r BY LT_AT <<< "$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
-        --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' --output text 2>/dev/null)"
+      # Fails closed: an unreadable answer or launch time refuses, as a recent box of another caller does.
+      if ! LAUNCHER="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
+          --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' --output text 2>/dev/null)" \
+          || [ -z "$LAUNCHER" ]; then
+        say "refusing: could not read who launched $NAME ($ID). If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
+        exit 1
+      fi
+      IFS=$'\t' read -r BY LT_AT <<< "$LAUNCHER"
       if [ -n "$BY" ] && [ "$BY" != "None" ] && [ "$BY" != "$PBOX_CALLER" ]; then
-        AGE_MIN=$(( ( $(date +%s) - $(date -d "$LT_AT" +%s 2>/dev/null || echo 0) ) / 60 ))
+        if ! LT_S=$(date -d "$LT_AT" +%s 2>/dev/null); then
+          say "refusing: $NAME ($ID) has an unreadable launch time; If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
+          exit 1
+        fi
+        AGE_MIN=$(( ( $(date +%s) - LT_S ) / 60 ))
         if [ "$AGE_MIN" -lt 60 ]; then
           say "refusing: $NAME ($ID) was launched ${AGE_MIN} min ago by $BY, not by $PBOX_CALLER; it is probably someone else's."
           say "If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"

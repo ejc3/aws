@@ -34,6 +34,8 @@ if "get-parameter" in a:
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "--instance-ids" in a and "PboxLaunchedBy" in a:
+    if os.environ.get("FAKE_BY_FAIL"):
+        sys.exit(255)
     print(os.environ.get("FAKE_BY", "None") + "\t" + os.environ.get("FAKE_LT", "2020-01-01T00:00:00+00:00"))
 elif "describe-instances" in a and "--instance-ids" in a and "PublicIpAddress" in a:
     print("203.0.113.9" if opt("--instance-ids") == cur and here else "None")
@@ -86,7 +88,8 @@ class InstanceScoped(unittest.TestCase):
         if current is not None:
             (self.tmp / "state").write_text(current)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
-                   FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER), PBOX_CALLER="job-a", **extra)
+                   FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER), PBOX_CALLER="job-a")
+        env.update(extra)
         env.pop("PARALLEL_BOX_REGION", None)
         env.setdefault("MEMBER_BOX_USER", "example-owner")
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
@@ -151,6 +154,9 @@ class InstanceScoped(unittest.TestCase):
                 rc, _, err = self.pbox(*args)
                 self.assertEqual(rc, 1, err)
                 self.assertIn("--instance only applies to ip, ssh and down", err)
+        rc, _, err = self.pbox("ip", "3", "--instance=")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("--instance needs an instance id", err)
         rc, _, err = self.pbox("ip", "3", "--instance", "box3")
         self.assertEqual(rc, 1, err)
         self.assertIn("--instance takes an instance id", err)
@@ -191,6 +197,26 @@ class InstanceScoped(unittest.TestCase):
                 rc, _, err = self.pbox("down", "3", *extra, current="i-0bbbbbbbbbbbbbbbb", **env)
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(len(self.calls("terminate-instances")), 1)
+
+    def test_down_fails_closed_when_the_launcher_cannot_be_read(self):
+        cases = (
+            ({"FAKE_BY_FAIL": "1"}, "could not read who launched"),
+            ({"FAKE_BY": "job-b", "FAKE_LT": "not-a-time"}, "unreadable launch time"),
+        )
+        for env, msg in cases:
+            with self.subTest(env=env):
+                rc, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", **env)
+                self.assertEqual(rc, 1, err)
+                self.assertIn(msg, err)
+                self.assertIn("--instance i-0bbbbbbbbbbbbbbbb", err)
+        self.assertEqual(self.calls("terminate-instances"), [])
+
+    def test_a_caller_name_with_a_space_is_one_field(self):
+        # The tag is read back tab-separated, so a space in it must not split the launcher from the launch time.
+        self.pbox("up", "3", "compute-192", PBOX_CALLER="job a")
+        spec = [s for s in self.calls("run-instances")[0] if s.startswith("ResourceType=instance,")][0]
+        self.assertIn("{Key=PboxLaunchedBy,Value=job_a}", spec)
+        self.assertIn("IFS=$'\\t' read -r BY LT_AT", SCRIPT.read_text())
 
     def test_docs_say_to_carry_the_id(self):
         for f in ("AGENTS.md", "README.md"):
