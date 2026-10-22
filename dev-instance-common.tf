@@ -40,6 +40,37 @@ resource "aws_iam_instance_profile" "dev_server" {
   role = aws_iam_role.dev_server.name
 }
 
+# Read-only Service Quotas for the metal boxes, so an agent can check the GPU vCPU quotas (L-DB2E81BA, L-417A185B,
+# L-3819A6DF, L-7212CCBC) before planning GPU work (#587). The two reads about one quota are scoped to EC2's quotas; the
+# two listings take no resource. Nothing that requests an increase: those stay with the owner. A managed policy, as
+# dev-server-role's inline policies are at IAM's 10,240-character total (#574).
+resource "aws_iam_policy" "dev_server_service_quotas_read" {
+  name        = "dev-service-quotas-read"
+  description = "Metal dev boxes: read EC2 service quotas and their request history; no increases (dev-instance-common.tf)"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadEc2Quotas"
+        Effect   = "Allow"
+        Action   = ["servicequotas:GetServiceQuota", "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"]
+        Resource = "arn:aws:servicequotas:*:${data.aws_caller_identity.current.account_id}:ec2/*"
+      },
+      {
+        Sid      = "ListQuotasAndDefaults"
+        Effect   = "Allow"
+        Action   = ["servicequotas:ListServiceQuotas", "servicequotas:GetAWSDefaultServiceQuota"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "dev_server_service_quotas_read" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.dev_server_service_quotas_read.arn
+}
+
 # Preserve agent/session connectivity without account-wide Parameter Store reads.
 resource "aws_iam_role_policy_attachment" "dev_server_ssm" {
   role       = aws_iam_role.dev_server.name

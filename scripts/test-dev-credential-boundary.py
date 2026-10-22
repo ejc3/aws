@@ -182,6 +182,18 @@ class DevCredentialBoundaryTests(unittest.TestCase):
                        'narrow, resource/tag-scoped IAM directly, never an admin-host hop']:
             self.assertIn(phrase, readme)
 
+    def test_service_quotas_are_read_only_and_scoped_to_ec2(self):
+        # #587: the metal boxes read the GPU quotas; requesting an increase stays with the owner.
+        policy = block('dev-instance-common.tf', 'resource', 'dev_server_service_quotas_read', 'aws_iam_policy')
+        actions = set(re.findall(r'"(servicequotas:\w+)"', policy))
+        self.assertEqual(actions, {'servicequotas:GetServiceQuota', 'servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota',
+                                   'servicequotas:ListServiceQuotas', 'servicequotas:GetAWSDefaultServiceQuota'})
+        self.assertNotRegex(policy, r'servicequotas:(Request|Put|Delete|Associate|Disassociate|Tag|Untag|Create|Update)')
+        self.assertNotIn('"servicequotas:*"', policy)
+        self.assertIn('Resource = "arn:aws:servicequotas:*:${data.aws_caller_identity.current.account_id}:ec2/*"', policy)
+        attach = block('dev-instance-common.tf', 'resource', 'dev_server_service_quotas_read', 'aws_iam_role_policy_attachment')
+        self.assertIn('role       = aws_iam_role.dev_server.name', attach)
+
     def test_bedrock_invoke_allows_only_claude_and_the_two_named_deepseek_models(self):
         policy = block('dev-instance-common.tf', 'resource', 'dev_server', 'aws_iam_role_policy')
         bedrock = re.search(r'Sid\s*=\s*"BedrockRuntimeInvoke".*?Resource\s*=\s*\[(.*?)\]', policy, re.S)
