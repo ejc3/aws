@@ -254,7 +254,7 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - The dev boxes are the cost. Two metal spot instances dominate; the small boxes are noise
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute and the four GPU test boxes
-  (`gpu-box.tf`, slots `gpu-box` and `gpu-box-2`..`-4`, plus `gpu-box-metal`: `gbox up metal`, a whole g4dn.metal with 8 T4s for Firecracker microVMs with GPUs, $7.82/hr, its type allowed only from its own template) after 30m idle (CPU, disk and network), and each GPU box
+  (`gpu-box.tf`, slots `gpu-box` and `gpu-box-2`..`-4`, plus `gpu-box-metal`: `gbox up metal`, a whole g4dn.metal with 8 T4s for Firecracker microVMs with GPUs, $7.82/hr, its type allowed only from its own template; launchable from nextjs-dev and both metal boxes) after 30m idle (CPU, disk and network), and each GPU box
   at 4h from launch (its own shutdown timer is only a backup). It and its Ohio copy also reap the members' own gboxes
   and pboxes (`member-gbox.tf`, `member-pbox.tf`: 30m idle, 4h / 6h from launch), and the same code, as
   `member-wbox-watchdog` in us-west-1, terminates the members' Windows spot boxes (`member-wbox.tf`) after one hour below

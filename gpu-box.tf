@@ -102,19 +102,26 @@ locals {
 resource "aws_security_group" "gpu_box" {
   provider    = aws.west2
   name_prefix = "gpu-box-"
+  # Immutable: changing a group's description replaces it, and a running gbox (made outside Terraform) would keep the
+  # old group. The ingress below is what admits the metal boxes too.
   description = "On-demand GPU test box: SSH from nextjs-dev only"
   vpc_id      = "vpc-0376811912470fdbe" # default VPC in us-west-2
 
-  # aws_eip.nextjs_dev is counted on var.enable_nextjs_dev; with the box disabled there is
-  # nobody to let in, and an ingress rule with no source would be invalid.
+  # SSH from the boxes that hold the grant below: nextjs-dev, and the two metal boxes (owner, 2026-10-22: "fcvm please
+  # too", for `gbox up metal` from where Firecracker work happens). Each EIP is counted on its box's enable flag; a
+  # disabled box contributes no rule, and an ingress rule with no source would be invalid.
   dynamic "ingress" {
-    for_each = aws_eip.nextjs_dev
+    for_each = merge(
+      { for i, e in aws_eip.nextjs_dev : "nextjs-dev" => e.public_ip },
+      { for i, e in aws_eip.firecracker_dev : "fcvm-metal-arm" => e.public_ip },
+      { for i, e in aws_eip.x86_dev : "fcvm-metal-x86" => e.public_ip },
+    )
     content {
-      description = "SSH from nextjs-dev"
+      description = "SSH from a box holding the gbox grant"
       from_port   = 22
       to_port     = 22
       protocol    = "tcp"
-      cidr_blocks = ["${ingress.value.public_ip}/32"]
+      cidr_blocks = ["${ingress.value}/32"]
     }
   }
 
@@ -519,6 +526,15 @@ resource "aws_iam_policy" "gpu_box_control" {
 
 resource "aws_iam_role_policy_attachment" "nextjs_dev_gpu_box" {
   role       = aws_iam_role.nextjs_dev.name
+  policy_arn = aws_iam_policy.gpu_box_control.arn
+}
+
+# The metal boxes too (owner, 2026-10-22), so `gbox up metal` runs where Firecracker work happens. dev-server-role is
+# shared by fcvm-metal-arm and fcvm-x86, and every agent there runs with full permissions: the same bounds hold (the
+# slots' types and tags, the metal type only from the metal template, the watchdog and the lifetime). This is the role's
+# 20th managed policy, IAM's default limit; its inline policies are full.
+resource "aws_iam_role_policy_attachment" "dev_server_gpu_box" {
+  role       = aws_iam_role.dev_server.name
   policy_arn = aws_iam_policy.gpu_box_control.arn
 }
 

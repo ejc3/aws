@@ -111,9 +111,9 @@ class GpuBoxTests(unittest.TestCase):
         self.assertIn('"ec2:ResourceTag/Name"', down)
         self.assertFalse('StartInstances' in self.tf, 'down means terminate; nothing to restart')
 
-    def test_grant_goes_to_nextjs_dev_only(self):
+    def test_grant_goes_to_nextjs_dev_and_the_metal_boxes_only(self):
         attachments = re.findall(r'role\s*=\s*(aws_iam_role\.[a-z_]+)\.(?:id|name)', self.tf)
-        self.assertEqual(attachments, ['aws_iam_role.nextjs_dev'])
+        self.assertEqual(attachments, ['aws_iam_role.nextjs_dev', 'aws_iam_role.dev_server'])
         self.assertIn('resource "aws_iam_policy" "gpu_box_control"', self.tf,
                       'managed, not inline: the role\'s inline policies share one 10,240-char limit')
 
@@ -126,11 +126,15 @@ class GpuBoxTests(unittest.TestCase):
         for kind in ('instance', 'volume', 'network-interface'):
             self.assertRegex(self.tf, r'resource_type = "' + kind + r'"\s*\n\s*tags = \{\s*\n\s*Name\s*=\s*each\.value')
 
-    def test_ssh_only_from_nextjs_dev_and_no_fleet_egress(self):
+    def test_ssh_only_from_the_granted_boxes_and_no_fleet_egress(self):
         sg = re.search(r'resource "aws_security_group" "gpu_box" \{.*?\n\}', self.tf, re.S).group()
         ingress, egress = sg.split('dynamic "egress"')
         self.assertNotIn('0.0.0.0/0', ingress)
-        self.assertIn('aws_eip.nextjs_dev', ingress)
+        # exactly the boxes holding the grant, each a /32 of its own Elastic IP
+        self.assertEqual(re.findall(r'aws_eip\.(\w+) :', ingress), ['nextjs_dev', 'firecracker_dev', 'x86_dev'])
+        self.assertIn('cidr_blocks = ["${ingress.value}/32"]', ingress)
+        # the group's description is immutable (a change replaces the group under any running gbox)
+        self.assertIn('description = "On-demand GPU test box: SSH from nextjs-dev only"', sg)
         # web, DNS and NTP only: io-box exports NFS (2049) read-write to us-west-2d, a gbox subnet
         self.assertNotRegex(egress, r'protocol\s*=\s*"-1"')
         self.assertNotIn('2049', egress)
