@@ -32,6 +32,11 @@ locals {
   # Serving the live tunnels. TRUE since the cutover (2026-10-20): with the same tunnel credentials on two boxes,
   # Cloudflare would split every hostname's traffic between them.
   nextjs_ct_serving = true
+  # The retired shared box (aws_instance.nextjs_dev), kept stopped as the rollback after the cutover. FALSE since
+  # 2026-10-22 (owner: "you can terminate retired nextjs"): it is terminated, and its root volume is kept (it was never
+  # delete_on_termination) with its AWS Backup snapshots. With it gone there is no rollback, so nextjs_ct_serving must stay
+  # true (a precondition on the Elastic IP's association says so).
+  nextjs_dev_retired_box = false
 
   # ---- per-container AWS sessions (nextjs-ct.tf explains the self-assume)
   # Denied to every container, the owner's too: what only the host does.

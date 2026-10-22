@@ -66,6 +66,16 @@ class CutoverSwitchTests(unittest.TestCase):
     def test_switch_is_on(self):
         self.assertIn("nextjs_ct_serving = true", (ROOT / "nextjs-ct-user-data.tf").read_text())
 
+    def test_the_retired_box_is_terminated_and_the_switch_cannot_roll_back(self):
+        # Owner, 2026-10-22: "you can terminate retired nextjs". Its root volume is kept (never delete_on_termination).
+        self.assertIn("nextjs_dev_retired_box = false", CT_USER_DATA)
+        inst = block(NEXTJS_DEV_TF, 'resource "aws_instance" "nextjs_dev"')
+        self.assertIn("count = var.enable_nextjs_dev && local.nextjs_dev_retired_box ? 1 : 0", inst)
+        self.assertIn("delete_on_termination = false", inst)
+        self.assertIn("local.nextjs_dev_retired_box ? 1 : 0", block(CT_TF, 'resource "aws_ec2_instance_state" "nextjs_dev"'))
+        assoc = block(NEXTJS_DEV_TF, 'resource "aws_eip_association" "nextjs_dev"')
+        self.assertIn("condition     = local.nextjs_ct_serving || local.nextjs_dev_retired_box", assoc)
+
     def test_everything_keyed_to_the_box_reads_the_live_instance(self):
         self.assertIn("nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)", CT_TF)
         assoc = block(NEXTJS_DEV_TF, 'resource "aws_eip_association" "nextjs_dev"')
