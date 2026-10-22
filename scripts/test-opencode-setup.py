@@ -77,8 +77,9 @@ class OpencodeSetupTests(unittest.TestCase):
         setup = user_setup()
         self.assertRegex(USER_DATA, r'opencode_version +=  *"\d+\.\d+\.\d+"')
         # Installed (or kept) at exactly the pinned version in ~/.opencode/bin...
-        self.assertIn('[ "$(~/.opencode/bin/opencode --version 2>/dev/null || true)" = "${local.opencode_version}" ] ||\n'
-                      "  curl -fsSL https://opencode.ai/install | bash -s -- --version ${local.opencode_version} "
+        self.assertIn('have=$(~/.opencode/bin/opencode --version 2>/dev/null || true); have=$${have##* }\n'
+                      '[ "$${have#v}" = "${local.opencode_version}" ] ||\n'
+                      "  curl -fsSL https://opencode.ai/v2/install | bash -s -- --version ${local.opencode_version} "
                       "--no-modify-path", setup)
         self.assertNotIn("command -v opencode", setup, "another copy on PATH must not stand in for the pinned one")
         # ...and that directory precedes every other copy on the managed PATH.
@@ -88,6 +89,20 @@ class OpencodeSetupTests(unittest.TestCase):
         self.assertIn("grep -qs '^\\[default\\]' ~/.aws/config || printf '[default]", setup)
         self.assertIn("if [ ! -e ~/.config/opencode/opencode.jsonc ] && [ ! -e ~/.config/opencode/opencode.json ]",
                       setup, "an existing config must never be overwritten")
+
+    def test_the_version_check_matches_what_opencode_prints(self):
+        # OpenCode 2 prints "opencode v2.1.2" (v1 printed "1.18.33"): the check takes the last word and drops the "v",
+        # so an installed pinned release is kept rather than reinstalled on every run. Runs the check's two lines.
+        version = re.search(r'opencode_version += "([^"]+)"', USER_DATA).group(1)
+        lines = [l for l in user_setup().splitlines() if l.startswith("have=") or l.startswith('[ "$${have')]
+        self.assertEqual(len(lines), 2, lines)
+        check = "\n".join(lines).replace("$${", "${").replace("${local.opencode_version}", version)
+        check = check.replace("$(~/.opencode/bin/opencode --version 2>/dev/null || true)", '"$1"')
+        self.assertTrue(check.endswith(" ||"), check)
+        check = check[:-3] + " && echo keep || echo install"
+        for printed, want in ((f"opencode v{version}", "keep"), (version, "keep"), ("opencode v1.18.33", "install"), ("", "install")):
+            out = subprocess.run(["bash", "-c", check, "x", printed], capture_output=True, text=True).stdout.strip()
+            self.assertEqual(out, want, printed)
 
     def test_the_default_model_is_one_the_role_may_invoke(self):
         nextjs = AI.split('resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek"', 1)[1].split("\n}\n", 1)[0]
