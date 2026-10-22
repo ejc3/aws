@@ -1063,6 +1063,7 @@ pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
+pbox up 3 kvm-gpu-96 --lease 3h   # not terminated for idleness for 3 hours (30m to 12h; below)
 pbox ssh [N]
 pbox down [N]              # terminate compute; keep that box's /mnt/work
 ```
@@ -1103,6 +1104,14 @@ quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
 activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).
+
+Interactive and GPU work has idle stretches: between a finished setup and the next test, or while a failed test is read.
+`pbox up N FLAVOR --lease DURATION` (`90m`, `2h`, `1h30m`; 30 minutes to 12 hours) tags the box `PboxLeaseUntil` with the
+lease's end, and the watchdog does not terminate it for idleness until then; after that the normal rule applies. The
+watchdog ends any lease at 12 hours from launch, whatever the tag says. **A leased box costs money for the whole lease**,
+busy or not: a `kvm-gpu-96` is about $4/hr spot, so a 12-hour lease is about $50. `pbox status` shows
+`lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. The lease is set at launch only; a running box keeps what it has
+(`pbox down N`, then `up` again with `--lease`). Members' boxes take no lease.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and

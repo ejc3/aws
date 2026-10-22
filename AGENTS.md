@@ -299,7 +299,13 @@ from the pointer's `open` entry): the SSH group plus `aws_security_group.ohio_pb
 port in from `0.0.0.0/0` and `::/0`, and one delegated IPv6 /80 (`Ipv6PrefixCount=1`). `up` and `status` print the /80;
 `sudo fcvm podman run --network routed --ipv6-prefix <the /80>` gives each VM a public IPv6 in it. The open group covers
 the box's own addresses too, so every port the box listens on is public. `--open` is refused for other commands, with
-`--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+`--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group.
+`pbox up N FLAVOR --lease 2h` (30m to 12h; `90m`, `1h30m`) tags the instance `PboxLeaseUntil=<UTC epoch seconds>` at launch
+(both launch grants allow any tag key at RunInstances), and every watchdog of the owner's boxes (`LEASE_NAMES`) skips the idle
+check until then and applies it as usual after. A tag that does not parse is no lease, and a lease past LaunchTime + 12 h
+ends there. `status` prints `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. A leased box costs money for the whole
+lease (a kvm-gpu-96 is about $4/hr spot). It is set at launch only: the grants tag at RunInstances and nowhere else, so
+there is no `pbox lease` for a running box. Members' boxes and the GPU test boxes take no lease. The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).
@@ -1888,7 +1894,8 @@ The I/O-box invocation of the same Lambda also checks five-minute disk and netwo
 Returned disk activity of at least 1 MiB or network activity of at least 64 MiB keeps it
 running, but a missing I/O series currently counts as zero. The parallel box uses
 `parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU with no five-minute window of 512 MiB of EBS or
-instance-store reads or writes or 64 MiB of network either way (#532); the members' Windows spot boxes run
+instance-store reads or writes or 64 MiB of network either way (#532), unless it was launched with `pbox up --lease` and
+the lease (at most 12 hours from launch) has not ended; the members' Windows spot boxes run
 that code as their own `member-wbox-watchdog` (one hour below 15%, 6h lifetime; `member-wbox.tf`). `nextjs-dev` and
 the jumpboxes never idle-stop.
 

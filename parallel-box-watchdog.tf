@@ -83,6 +83,12 @@ SINGLE_NAMES = set(n for n in os.environ.get("SINGLE_NAMES", "").split(",") if n
 # Bytes per five-minute window, by AWS/EC2 metric, at or above which a CPU-idle box is still working (#532): disk and
 # network. Empty (the members' Windows boxes) keeps CPU alone. A missing series is no activity.
 IO_THRESHOLDS = json.loads(os.environ.get("IO_THRESHOLDS", "{}"))
+# Names whose PboxLeaseUntil tag counts: the owner's parallel boxes (`pbox up ... --lease`, scripts/parallel-box.sh). Until
+# the lease ends such a box is not terminated for idleness; then the normal rule applies. Empty (the members' boxes, the
+# GPU test boxes) means no box has a lease. A missing or unparseable tag is no lease, and a lease past LaunchTime +
+# LEASE_MAX_HOURS ends there, so a tag edited by hand cannot keep a box forever.
+LEASE_NAMES = set(n for n in os.environ.get("LEASE_NAMES", "").split(",") if n)
+LEASE_MAX_HOURS = 12
 
 ec2 = boto3.client("ec2")
 cw  = boto3.client("cloudwatch")
@@ -95,6 +101,18 @@ def notify(subject, body):
         boto3.client("sns", region_name=SNS_REGION).publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=body)
     except Exception as e:
         print("sns publish failed: %s" % e)
+
+
+def lease_until(inst):
+    """When the box's lease ends (aware UTC datetime), capped at LaunchTime + LEASE_MAX_HOURS, or None for no lease."""
+    raw = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "PboxLeaseUntil"), "")
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 12:
+        return None
+    try:
+        until = datetime.datetime.fromtimestamp(int(raw), datetime.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return min(until, inst["LaunchTime"] + datetime.timedelta(hours=LEASE_MAX_HOURS))
 
 
 def lambda_handler(event, context):
@@ -160,6 +178,15 @@ def lambda_handler(event, context):
                 notify("%s FAILED to terminate (lifetime)" % name,
                        "Instance %s (%s) is past its %d-minute lifetime but TerminateInstances failed: %s\n"
                        "It keeps costing money until someone terminates it." % (iid, name, max_age, e))
+            continue
+
+        # A lease (`pbox up ... --lease`) keeps the box from the idle rule until it ends. The lifetime above still applies.
+        lease = lease_until(inst) if name in LEASE_NAMES else None
+        if lease is not None and now < lease:
+            left = (lease - now).total_seconds() / 60.0
+            print("keeping %s %s: leased until %s UTC (%.0f min left), not checked for idleness until then"
+                  % (name, iid, lease.strftime("%Y-%m-%d %H:%M"), left))
+            results.append({"id": iid, "action": "leased", "until": lease.isoformat(), "left_min": round(left, 1)})
             continue
 
         # Grace period: never reap a box that has not yet had a full idle window to
@@ -261,15 +288,16 @@ def lambda_handler(event, context):
             kept = ("It was a fallback box: its fresh work volume was deleted with it (the home work volume is untouched)"
                     if fallback else "Its work volume is untouched")
         io_note = " and under its disk and network thresholds" if IO_THRESHOLDS else ""
-        print("terminating idle %s %s (peak CPU %.1f%% over %dmin%s)" % (name, iid, peak, IDLE_MINUTES, io_note))
+        lease_note = " Its lease ended at %s UTC." % lease.strftime("%Y-%m-%d %H:%M") if lease is not None else ""
+        print("terminating idle %s %s (peak CPU %.1f%% over %dmin%s)%s" % (name, iid, peak, IDLE_MINUTES, io_note, lease_note))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
             results.append({"id": iid, "action": "terminated", "peak_cpu": round(peak, 1)})
             notify(
                 "%s auto-terminated (idle)" % name,
-                "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%)%s and was terminated.\n\n"
+                "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%)%s and was terminated.%s\n\n"
                 "%s -- bring the box back with:\n"
-                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, io_note, kept, up_cmd),
+                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, io_note, lease_note, kept, up_cmd),
             )
         except Exception as e:
             results.append({"id": iid, "action": "terminate_failed", "error": str(e)})
@@ -371,6 +399,8 @@ resource "aws_lambda_function" "parallel_watchdog" {
       # one instance per member gbox
       SINGLE_NAMES  = join(",", local.member_gbox_names)
       IO_THRESHOLDS = local.parallel_watchdog_io_thresholds
+      # Only the owner's parallel boxes honour a lease (`pbox up --lease`): not the GPU test boxes or the members' boxes.
+      LEASE_NAMES   = join(",", local.parallel_box_names)
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
