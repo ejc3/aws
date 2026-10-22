@@ -1070,7 +1070,21 @@ pbox down [N]              # terminate compute; keep that box's /mnt/work
 a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` (8 GiB, memory-bound work), `storage`
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and
 `kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
-work: a smaller box costs less and finds Spot capacity more often. The launcher tries the flavor's Graviton types in
+work: a smaller box costs less and finds Spot capacity more often.
+
+`kvm-gpu-64` is a `g5g.metal` (Graviton2, 64 vCPU, 128 GiB, two NVIDIA T4G) for GPU passthrough into fcvm microVMs:
+`/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent
+`driverctl` override (no NVIDIA driver on the host). `ubuntu` may open `/dev/vfio/*` (group `kvm`) and has an unlimited
+memlock, so a rootless fcvm can use them; `/etc/pbox-gpu` lists each GPU and its IOMMU group, and `up` fails unless every
+one is on `vfio-pci`. us-east-2 does not offer the type, so it launches at a fallback site with a fresh work volume:
+
+```bash
+pbox up 3 kvm-gpu-64 --regions us-west-2
+```
+
+It counts against the us-west-2 "All G and VT Spot Instance Requests" quota (`L-3819A6DF`), 64 vCPU per box, which
+`pbox-flavors.tf` requests at apply when the current quota is lower. There is no x86 GPU flavor (`g4dn.metal`): no pbox
+site has an x86 AMI. The launcher tries the flavor's Graviton types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
 activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).

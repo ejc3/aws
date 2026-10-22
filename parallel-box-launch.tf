@@ -146,6 +146,9 @@ locals {
         # Local NVMe, when the type has any (pbox-flavors.tf), at /mnt/nvme.
         ${local.pbox_local_nvme_setup}
 
+        # NVIDIA GPUs, when the type has any (the kvm-gpu flavors, pbox-flavors.tf), handed to vfio-pci for passthrough.
+        ${local.pbox_gpu_vfio_setup}
+
         # Shared bulk scratch/cache on the separate i8ge I/O box. This is an automount, so
         # the parallel box still boots cleanly when the I/O box is stopped.
         ${local.io_box_client_setup}

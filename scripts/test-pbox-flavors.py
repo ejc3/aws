@@ -3,8 +3,8 @@
 tries only its own instance types in order, nothing is under 24 vCPU, and IAM allows exactly the flavors' types.
 
 Offline: reads the Terraform and the script, and runs the real script against a fake `aws` and `ssh` on PATH. Live proof
-is `aws ec2 describe-instance-type-offerings` in us-east-2c (every type offered, checked 2026-10-19) and
-`aws iam simulate-principal-policy` against nextjs-dev-role after the apply."""
+is `aws ec2 describe-instance-type-offerings` in us-east-2c (every type but g5g.metal offered, checked 2026-10-19; g5g.metal
+in us-west-2a/b/c, checked 2026-10-22) and `aws iam simulate-principal-policy` against nextjs-dev-role after the apply."""
 import json
 import os
 import re
@@ -24,7 +24,7 @@ FALLBACK = (ROOT / "pbox-fallback.tf").read_text()
 OHIO = (ROOT / "ohio-pbox.tf").read_text()
 
 # vCPU of each size suffix the flavors use
-SIZE_VCPU = {"8xlarge": 32, "12xlarge": 48, "24xlarge": 96, "48xlarge": 192, "metal-24xl": 96, "metal-48xl": 192}
+SIZE_VCPU = {"8xlarge": 32, "12xlarge": 48, "24xlarge": 96, "48xlarge": 192, "metal-24xl": 96, "metal-48xl": 192, "metal": 64}
 
 
 def script_menu():
@@ -40,7 +40,7 @@ def script_menu():
 def tf_flavors():
     body = re.search(r"pbox_flavors = \{\n(.*?)\n  \}\n", FLAVORS_TF, re.S).group(1)
     return {m.group(1): re.findall(r'"([^"]+)"', m.group(2))
-            for m in re.finditer(r'^\s+"([a-z]+-\d+)"\s+= \[(.*?)\]$', body, re.M)}
+            for m in re.finditer(r'^\s+"([a-z]+(?:-[a-z]+)?-\d+)"\s+= \[(.*?)\]$', body, re.M)}
 
 
 def block(text, header):
@@ -67,7 +67,7 @@ class Menu(unittest.TestCase):
         for shape in ("compute", "general", "memory", "storage"):
             self.assertEqual([n for n in names if n.startswith(shape + "-")],
                              [f"{shape}-{s}" for s in (32, 48, 96, 192)])
-        self.assertEqual([n for n in names if n.startswith("kvm-")], ["kvm-96", "kvm-192"])
+        self.assertEqual([n for n in names if n.startswith("kvm-")], ["kvm-96", "kvm-192", "kvm-gpu-64"])
 
     def test_no_flavor_is_under_24_vcpu_and_every_type_has_the_flavors_size(self):
         for f, (vcpu, mem, _, _, types) in script_menu().items():
@@ -80,7 +80,9 @@ class Menu(unittest.TestCase):
     def test_every_type_is_graviton_and_in_exactly_one_flavor(self):
         seen = {}
         for f, (_, _, _, _, types) in script_menu().items():
-            self.assertGreaterEqual(len(types), 2, f)  # spot capacity varies by type: never one alone
+            # spot capacity varies by type: never one alone, but for g5g.metal, the only Graviton metal type with a GPU
+            if f != "kvm-gpu-64":
+                self.assertGreaterEqual(len(types), 2, f)
             for t in types:
                 # Graviton names: family letter(s), generation, "g", options -- the AMI is arm64
                 self.assertRegex(t, r"^[a-z]+\d+g[a-z]*\.", t)
@@ -101,6 +103,13 @@ class Menu(unittest.TestCase):
                 self.assertEqual(int(mem), int(vcpu) * per_vcpu[shape], f)
             self.assertEqual(nvme != "-", shape == "storage", f)
             self.assertRegex(price, r"^\d+\.\d\d$", f)
+
+    def test_the_gpu_flavor_is_g5g_metal_and_the_owners_only(self):
+        self.assertEqual(script_menu()["kvm-gpu-64"], ("64", "128", "-", "0.60", ["g5g.metal"]))
+        gpu_types = {t for f, v in script_menu().items() if f.startswith("kvm-gpu-") for t in v[4]}
+        self.assertEqual(gpu_types, {"g5g.metal"})
+        self.assertIn('kvm-gpu) echo "GPU passthrough into fcvm', PBOX)
+        self.assertIn("--regions us-west-2", PBOX)
 
     def test_no_type_override_is_left(self):
         self.assertNotIn("PARALLEL_BOX_TYPES", PBOX)
@@ -168,6 +177,98 @@ class Iam(unittest.TestCase):
     def test_the_spot_quota_is_still_sized_for_the_largest_flavor(self):
         self.assertEqual(max(int(v[0]) for v in script_menu().values()), 192)
         self.assertIn("parallel_box_max_vcpus = 192", OHIO)
+
+
+class GpuQuota(unittest.TestCase):
+    def test_the_g_spot_quota_in_us_west_2_covers_one_gpu_box_and_never_asks_below_the_current_value(self):
+        self.assertIn("pbox_gpu_spot_vcpus = 64", FLAVORS_TF)
+        self.assertEqual(int(script_menu()["kvm-gpu-64"][0]), 64)
+        for kind in ("data", "resource"):
+            b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "west2_spot_g"' % kind)
+            self.assertIn("provider     = aws.west2", b)
+            self.assertIn('quota_code   = "L-3819A6DF"', b)
+        b = block(FLAVORS_TF, 'resource "aws_servicequotas_service_quota" "west2_spot_g"')
+        self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.west2_spot_g.value)", b)
+
+
+class GpuCheckRuns(unittest.TestCase):
+    """The script's GPU_CHECK, run against a fake sysfs: ready only when every GPU is vfio-pci's with its group node, and
+    its whole IOMMU group is unbound or vfio-pci, pci-stub or pcieport."""
+
+    def run_check(self, members):
+        import os, subprocess, tempfile
+        script = (Path(__file__).resolve().parent / "parallel-box.sh").read_text()
+        check = re.search(r"^GPU_CHECK='(.*?)'$", script, re.S | re.M).group(1)
+        with tempfile.TemporaryDirectory() as root:
+            r = Path(root)
+            (r / "bin").mkdir()
+            for tool in ("timeout", "cloud-init"):
+                (r / "bin" / tool).write_text("#!/bin/sh\nexit 0\n")
+                (r / "bin" / tool).chmod(0o755)
+            (r / "dev/vfio").mkdir(parents=True)
+            (r / "dev/vfio/7").write_text("")
+            grp = r / "sys/kernel/iommu_groups/7/devices"
+            grp.mkdir(parents=True)
+            for addr, vendor, driver in members:
+                d = r / "sys/bus/pci/devices" / addr
+                d.mkdir(parents=True)
+                (d / "vendor").write_text(vendor + "\n")
+                if driver:
+                    (r / "sys/bus/pci/drivers" / driver).mkdir(parents=True, exist_ok=True)
+                    (d / "driver").symlink_to(r / "sys/bus/pci/drivers" / driver)
+                (d / "iommu_group").symlink_to(r / "sys/kernel/iommu_groups/7")
+                (grp / addr).symlink_to(d)
+            body = check.replace("/sys/", root + "/sys/").replace('[ -c "/dev/vfio/', '[ -e "' + root + "/dev/vfio/")
+            env = dict(os.environ, PATH=str(r / "bin") + ":/usr/bin:/bin")
+            return subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True).returncode
+
+    def test_a_gpu_alone_in_its_group_on_vfio_is_ready(self):
+        self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci")]), 0)
+
+    def test_a_bridge_or_an_unbound_device_in_the_group_is_fine(self):
+        self.assertEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci"), ("0000:00:1c.0", "0x1d0f", "pcieport"),
+                                         ("0000:00:1d.0", "0x1d0f", None)]), 0)
+
+    def test_a_group_shared_with_a_bound_nic_is_not_ready(self):
+        self.assertNotEqual(self.run_check([("0000:00:1f.0", "0x10de", "vfio-pci"), ("0000:00:05.0", "0x1d0f", "ena")]), 0)
+
+    def test_a_gpu_still_on_nvidia_is_not_ready(self):
+        self.assertNotEqual(self.run_check([("0000:00:1f.0", "0x10de", "nvidia")]), 0)
+
+
+class GpuVfio(unittest.TestCase):
+    def test_every_nvidia_function_goes_to_vfio_pci_and_nothing_happens_without_one(self):
+        m = re.search(r"pbox_gpu_vfio_setup = <<-GPU\n(.*?)\n  GPU\n", FLAVORS_TF, re.S)
+        self.assertIsNotNone(m, "pbox_gpu_vfio_setup")
+        g = m.group(1)
+        self.assertIn('[ "$(cat "$d/vendor")" = 0x10de ]', g)
+        self.assertIn('if [ -n "$GPU_DEVS" ]; then', g)
+        # everything that changes the box is inside the guard
+        self.assertLess(g.index('if [ -n "$GPU_DEVS" ]; then'), g.index("modprobe vfio-pci"))
+        self.assertTrue(g.rstrip().endswith("fi"))
+        self.assertIn("echo vfio-pci > /etc/modules-load.d/vfio-pci.conf", g)
+        self.assertIn('for dev in $GPU_DEVS; do driverctl set-override "$dev" vfio-pci; done', g)
+        self.assertIn('SUBSYSTEM=="vfio", GROUP="kvm", MODE="0660"', g)
+        self.assertIn("ubuntu hard memlock unlimited", g)
+        self.assertNotRegex(g, r"nvidia-(driver|utils|dkms)|cuda")  # the host never drives the GPUs
+
+    def test_the_home_and_fallback_boots_run_it_once_after_apt_and_the_members_do_not(self):
+        for text in (LAUNCH, FALLBACK):
+            self.assertEqual(text.count("${local.pbox_gpu_vfio_setup}"), 1)
+            self.assertLess(text.index("apt-get update"), text.index("${local.pbox_gpu_vfio_setup}"))
+        self.assertNotIn("pbox_gpu_vfio_setup", MEMBER)
+
+    def test_up_checks_the_gpus_are_vfio_pcis_on_a_gpu_type_after_the_boot_script(self):
+        m = re.search(r"^GPU_CHECK='(.*?)'$", PBOX, re.S | re.M)
+        self.assertIsNotNone(m, "GPU_CHECK")
+        check = m.group(1)
+        self.assertTrue(check.startswith("timeout 900 cloud-init status --wait"))
+        self.assertIn('[ "${drv##*/}" = vfio-pci ] && [ -n "$grp" ] && [ -c "/dev/vfio/${grp##*/}" ] || bad=1', check)
+        self.assertIn('[ "$n" -gt 0 ] && [ "$bad" -eq 0 ]', check)
+        wait = re.search(r"^wait_ready\(\) \{\n(.*?)\n\}\n", PBOX, re.S | re.M).group(1)
+        self.assertIn('case "$(type_flavor "$CHOSEN")" in kvm-gpu-*)', wait)
+        self.assertIn('"ubuntu@$IP" "$GPU_CHECK" >&2; then', wait)
+        self.assertLess(wait.index("test -c /dev/kvm"), wait.index("$GPU_CHECK"))
 
 
 class LocalNvme(unittest.TestCase):
@@ -297,9 +398,10 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertEqual(self.calls(), [])
         self.assertNotIn("kvm-", err)
-        rc, _, err = self.pbox("up", "kvm-96", user="colin")
-        self.assertEqual(rc, 2, err)
-        self.assertEqual(self.launched_types(), [])
+        for f in ("kvm-96", "kvm-gpu-64"):
+            rc, _, err = self.pbox("up", f, user="colin")
+            self.assertEqual(rc, 2, err)
+            self.assertEqual(self.launched_types(), [])
         rc, _, err = self.pbox("up", "memory-32", user="colin")
         self.assertEqual(rc, 3, err)
         self.assertEqual(self.launched_types(), script_menu()["memory-32"][4])
