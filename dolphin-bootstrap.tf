@@ -4,11 +4,13 @@
 # `terraform init`: a state bucket in the Dolphin account and the role it applies with. Both are built from here, through
 # OrganizationAccountAccessRole, because something has to exist first. dolphin-aws must not manage either of them.
 #
-# Applying dolphin-aws happens on nextjs-dev only, never in CI: nextjs-dev's instance role may assume `dolphin-terraform`
-# (AdministratorAccess inside the Dolphin account, one-hour sessions) and nothing else in that account.
+# Applying dolphin-aws happens on nextjs-dev and fcvm-metal-arm, never in CI: nextjs-dev's instance role, and dev-server-role
+# from fcvm-arm's instance only (owner, 2026-10-22: "i want fcvm to have rights and ejc3 on dolphin"), may assume
+# `dolphin-terraform` (AdministratorAccess inside the Dolphin account, one-hour sessions) and nothing else in that account.
 #
 # BOX-WIDE GRANT. An instance-role grant is a grant to the whole box. Every account on nextjs-dev has full passwordless
-# sudo and agents run there, so ANYONE ON THAT BOX CAN APPLY IN THE DOLPHIN ACCOUNT. What bounds it is the account
+# sudo and agents run there, so ANYONE ON THAT BOX CAN APPLY IN THE DOLPHIN ACCOUNT (the member containers' session policies
+# deny sts:AssumeRole, but the host and the retired box hold the raw role); on fcvm-arm every agent runs as ubuntu. What bounds it is the account
 # boundary: the role is admin of the Dolphin account only, and nothing in this (management) account trusts anything in
 # the Dolphin account. See AGENTS.md, "The Dolphin account".
 
@@ -119,7 +121,7 @@ resource "aws_s3_bucket_policy" "dolphin_terraform_state" {
 resource "aws_iam_role" "dolphin_terraform" {
   provider             = aws.dolphin
   name                 = "dolphin-terraform"
-  description          = "Applies dolphin-labs-hq/dolphin-aws. Assumable only by nextjs-dev's instance role (box-wide; see ejc3/aws dolphin-bootstrap.tf)."
+  description          = "Applies dolphin-labs-hq/dolphin-aws. Assumable only by nextjs-dev's instance role and fcvm-metal-arm's (box-wide; see ejc3/aws dolphin-bootstrap.tf)."
   max_session_duration = 3600
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -128,6 +130,13 @@ resource "aws_iam_role" "dolphin_terraform" {
       Effect    = "Allow"
       Principal = { AWS = aws_iam_role.nextjs_dev.arn }
       Action    = "sts:AssumeRole"
+      }, {
+      # dev-server-role is fcvm-x86's too: pinned to fcvm-arm's instance, as constellation-terraform's trust is.
+      Sid       = "FcvmArmOnly"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.dev_server.arn }
+      Action    = "sts:AssumeRole"
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
   tags = { Name = "dolphin-terraform", Managed = "terraform" }

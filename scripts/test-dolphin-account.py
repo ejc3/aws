@@ -88,16 +88,26 @@ class DolphinBootstrapTests(unittest.TestCase):
         self.assertIn("local.dolphin_sso_admin_role_arns", pol)
         self.assertNotIn("ReadOnly", pol)
 
-    def test_the_apply_role_trusts_exactly_nextjs_dev_and_lasts_an_hour(self):
+    def test_the_apply_role_trusts_exactly_nextjs_dev_and_fcvm_arm_and_lasts_an_hour(self):
         role = block(BOOT, 'resource "aws_iam_role" "dolphin_terraform"')
         self.assertIn('name                 = "dolphin-terraform"', role)
         self.assertIn("max_session_duration = 3600", role)
-        self.assertEqual(role.count("Principal"), 1)
+        self.assertEqual(role.count("Principal"), 2)
         self.assertIn("Principal = { AWS = aws_iam_role.nextjs_dev.arn }", role)
+        # dev-server-role is fcvm-x86's too: only fcvm-arm's instance (owner, 2026-10-22).
+        fcvm = role.split('Sid       = "FcvmArmOnly"', 1)[1]
+        self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", fcvm)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', fcvm)
         self.assertIn('Action    = "sts:AssumeRole"', role)
         self.assertNotIn("Federated", role)  # no CI identity: GitHub never applies
         self.assertIn('policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"',
                       block(BOOT, 'resource "aws_iam_role_policy_attachment" "dolphin_terraform_admin"'))
+
+    def test_fcvm_arm_may_assume_it_from_its_own_instance_only(self):
+        grant = (ROOT / "constellation-account.tf").read_text().split('resource "aws_iam_policy" "dev_server_constellation_terraform"', 1)[1].split("\n}\n", 1)[0]
+        stmt = grant.split('Sid       = "AssumeTheDolphinApplyRoleOnly"', 1)[1].split("}]", 1)[0]
+        self.assertIn("Resource  = aws_iam_role.dolphin_terraform.arn", stmt)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
 
     def test_nextjs_dev_may_assume_that_role_and_nothing_else(self):
         pol = block(BOOT, 'resource "aws_iam_role_policy" "nextjs_dev_dolphin_terraform"')
