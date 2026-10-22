@@ -140,7 +140,7 @@ class Menu(unittest.TestCase):
         gpu_types = {t for f, v in script_menu().items() if f.startswith("kvm-gpu-") for t in v[4]}
         self.assertEqual(gpu_types, {"g5g.metal", "g4dn.metal"})
         self.assertIn('kvm-gpu) echo "GPU passthrough into fcvm', PBOX)
-        self.assertIn("--regions us-west-2", PBOX)
+        self.assertIn('case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac', PBOX)
         self.assertEqual(tf_flavors()["kvm-gpu-96"], ["g4dn.metal"])
         self.assertNotIn("g4dn.metal", (ROOT / "member-pbox.tf").read_text())
 
@@ -165,7 +165,21 @@ class Iam(unittest.TestCase):
                 self.assertIn(':instance/*"]', s)
                 self.assertRegex(s, r'test     = "StringEquals"\n\s+variable = "aws:RequestTag/Name"\n\s+values   = %s\n' % re.escape(names))
                 self.assertRegex(s, r'test     = "StringNotEquals"\n\s+variable = "ec2:InstanceType"\n\s+values   = %s\n' % re.escape(types))
-        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 2)
+        self.assertEqual(len(re.findall(r"^  statement \{", doc, re.M)), 4)
+        # Stale spot requests: pbox may cancel any of the account's, never a persistent dev box's (their own ids).
+        s = statement("CancelStaleSpotRequests", doc)
+        self.assertIn('actions   = ["ec2:CancelSpotInstanceRequests"]', s)
+        self.assertIn(':spot-instances-request/*"]', s)
+        self.assertIn('sid       = "NeverThePersistentBoxesRequests"', doc)
+        deny = statement("NeverThePersistentBoxesRequests", doc)
+        self.assertIn('effect    = "Deny"', deny)
+        self.assertIn('actions   = ["ec2:CancelSpotInstanceRequests"]', deny)
+        # Unconditional, never a dynamic block: a replacement's unknown request id cannot make the statement unknown.
+        self.assertIn("resources = concat(local.pbox_persistent_spot_requests, [", deny)
+        self.assertNotIn('dynamic "statement"', doc)
+        for ref in ("aws_instance.firecracker_dev[*].spot_instance_request_id", "aws_instance.x86_dev[*].spot_instance_request_id",
+                    "[aws_instance.io_box.spot_instance_request_id]"):
+            self.assertIn(ref, FLAVORS_TF, ref)
         # the same union, computed here from the script's menu
         menu = script_menu()
         owner = {t for v in menu.values() for t in v[4]}
@@ -193,7 +207,7 @@ class Iam(unittest.TestCase):
         self.assertIn("role       = aws_iam_role.nextjs_dev.name\n  policy_arn = aws_iam_policy.member_pbox_control.arn", MEMBER)
 
     def test_the_policy_fits_iams_managed_policy_limit(self):
-        # rendered with ARN-length placeholders: about 3,300 of the 6,144 characters
+        # rendered with ARN-length placeholders: about 3,700 of the 6,144 characters
         menu = script_menu()
         owner = list(dict.fromkeys(t for v in menu.values() for t in v[4]))
         member = list(dict.fromkeys(t for f, v in menu.items() if not f.startswith("kvm-") for t in v[4]))
@@ -204,7 +218,11 @@ class Iam(unittest.TestCase):
                            "StringNotEquals": {"ec2:InstanceType": owner}}},
             {"Sid": "MemberPboxFlavorTypesOnly", "Effect": "Deny", "Action": "ec2:RunInstances", "Resource": arn,
              "Condition": {"StringEquals": {"aws:RequestTag/Name": ["pbox-colton", "pbox-connor", "pbox-colin", "pbox-skevh"]},
-                           "StringNotEquals": {"ec2:InstanceType": member}}}]}
+                           "StringNotEquals": {"ec2:InstanceType": member}}},
+            {"Sid": "CancelStaleSpotRequests", "Effect": "Allow", "Action": "ec2:CancelSpotInstanceRequests",
+             "Resource": "arn:aws:ec2:*:123456789012:spot-instances-request/*"},
+            {"Sid": "NeverThePersistentBoxesRequests", "Effect": "Deny", "Action": "ec2:CancelSpotInstanceRequests",
+             "Resource": ["arn:aws:ec2:*:123456789012:spot-instances-request/sir-%08d" % n for n in range(3)]}]}
         self.assertLess(len(json.dumps(doc, separators=(",", ":"))), 5000)
 
     def test_the_spot_quota_is_still_sized_for_the_largest_flavor(self):
@@ -605,14 +623,15 @@ class ScriptRuns(unittest.TestCase):
         for f, v in script_menu().items():
             with self.subTest(flavor=f):
                 rc, _, err = self.pbox("up", "5", f)
-                self.assertEqual(rc, 3, err)  # no capacity anywhere in the fake
+                # no capacity anywhere in the fake; a GPU flavor goes on to the fallback sites, none published here
+                self.assertEqual(rc, 4 if f.startswith("kvm-gpu-") else 3, err)
                 self.assertEqual(self.launched_types(), v[4])
                 runs = [c for c in self.calls() if "run-instances" in c]
                 self.assertTrue(all("LaunchTemplateName=parallel-box-5,Version=$Latest" in c for c in runs))
 
     def test_only_an_x86_type_gets_the_published_x86_image(self):
         rc, _, err = self.pbox("up", "2", "kvm-gpu-96")
-        self.assertEqual(rc, 3, err)
+        self.assertEqual(rc, 4, err)  # home, then the (unpublished) fallback sites
         runs = [c for c in self.calls() if "run-instances" in c]
         self.assertEqual([c[c.index("--instance-type") + 1] for c in runs], ["g4dn.metal"])
         self.assertEqual(runs[0][runs[0].index("--image-id") + 1], "ami-0x86home")

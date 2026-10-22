@@ -19,7 +19,10 @@
 #
 # kvm-gpu-64 is g5g.metal alone: 64 vCPU, 128 GiB, two NVIDIA T4G, and the only Graviton metal type with a GPU. It is not
 # offered in us-east-2 at all (us-west-2a/b/c and us-east-1a-d offer it, checked 2026-10-22), so it launches only at a
-# fallback site, with a fresh work volume: `pbox up N kvm-gpu-64 --regions us-west-2`.
+# fallback site, with a fresh work volume. Both GPU flavors imply --fallback (scripts/parallel-box.sh): home first, then
+# every fallback region that offers the type, best spot placement score first. The G spot quota decides where one fits:
+# 96 vCPU in us-east-2 and us-west-2 (below), 640 in us-west-1 and 64 in us-east-1 (checked 2026-10-22), so us-east-1 takes
+# a kvm-gpu-64 but not a kvm-gpu-96, and us-west-1 offers only g4dn.metal.
 #
 # kvm-gpu-96 is g4dn.metal alone: 96 vCPU, 384 GiB, eight NVIDIA T4 and 1.8 TB of local NVMe, x86_64 (Intel), offered in
 # us-east-2a/b/c (checked 2026-10-22), so it launches at home on the persistent volume. It is the one x86 type: the
@@ -190,6 +193,27 @@ resource "aws_servicequotas_service_quota" "west2_spot_g" {
 # whatever else the role is allowed. Its own managed policy, attached to both roles that launch pboxes.
 # ---------------------------------------------------------------------------------
 data "aws_iam_policy_document" "pbox_flavor_types" {
+  # pbox cancels a spot request that is still open or active after its instance is gone: EC2 can leave a one-time request
+  # active for half an hour after a terminate, counting against the spot quota (2026-10-22, MaxSpotInstanceCountExceeded on
+  # the next GPU box). Cancelling a request never stops its instance. Here because both roles that launch pboxes hold this
+  # policy and have no room for another (20 of 20 managed policies, inline at IAM's total).
+  statement {
+    sid       = "CancelStaleSpotRequests"
+    effect    = "Allow"
+    actions   = ["ec2:CancelSpotInstanceRequests"]
+    resources = ["arn:aws:ec2:*:${local.parallel_box_account}:spot-instances-request/*"]
+  }
+
+  # Except the persistent dev boxes' requests: a persistent request cancelled while its box runs leaves a box that cannot
+  # start again after its next stop. Unconditional (a placeholder keeps the list non-empty with every box off), so a box
+  # being replaced, whose new request id is unknown at plan time, cannot make the statement's existence unknown.
+  statement {
+    sid       = "NeverThePersistentBoxesRequests"
+    effect    = "Deny"
+    actions   = ["ec2:CancelSpotInstanceRequests"]
+    resources = concat(local.pbox_persistent_spot_requests, ["arn:aws:ec2:*:${local.parallel_box_account}:spot-instances-request/sir-none"])
+  }
+
   statement {
     sid       = "OwnerPboxFlavorTypesOnly"
     effect    = "Deny"
@@ -227,6 +251,18 @@ data "aws_iam_policy_document" "pbox_flavor_types" {
       values   = local.member_pbox_types
     }
   }
+}
+
+locals {
+  # The persistent spot boxes' requests (fcvm-metal-arm and fcvm-metal-x86 in us-west-1, the I/O box in us-west-2), which no
+  # dev box may cancel. Region-wildcarded: the request id alone names it.
+  pbox_persistent_spot_requests = [
+    for id in compact(concat(
+      aws_instance.firecracker_dev[*].spot_instance_request_id,
+      aws_instance.x86_dev[*].spot_instance_request_id,
+      [aws_instance.io_box.spot_instance_request_id],
+    )) : "arn:aws:ec2:*:${local.parallel_box_account}:spot-instances-request/${id}"
+  ]
 }
 
 resource "aws_iam_policy" "pbox_flavor_types" {

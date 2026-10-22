@@ -12,9 +12,11 @@
 #                     that flavor's instance types in turn. kvm-96 / kvm-192 are bare metal with
 #                     /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
 #                     kvm-gpu-64 is the same plus two NVIDIA T4G bound to vfio-pci, for GPU
-#                     passthrough; the home AZ does not offer it: pbox up N kvm-gpu-64 --regions us-west-2
+#                     passthrough; the home AZ does not offer it.
 #                     kvm-gpu-96 is an x86 g4dn.metal with eight NVIDIA T4 (about $4/hr spot), launched
-#                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on
+#                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on.
+#                     A GPU flavor implies --fallback: home first, then every fallback region that offers
+#                     the type (owner, 2026-10-22: the region does not matter for these).
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -112,7 +114,7 @@ flavor_use() {
     memory)  echo "memory-bound work (big in-memory data, large links, caches): 8 GiB per vCPU" ;;
     storage) echo "local-disk-bound work: fast local NVMe at /mnt/nvme (gone with the box) and 8 GiB per vCPU" ;;
     kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; not for members" ;;
-    kvm-gpu) echo "GPU passthrough into fcvm: kvm plus NVIDIA GPUs on vfio-pci. kvm-gpu-64: 2x T4G, arm64, not in the home AZ: add --regions us-west-2 (its price is there). kvm-gpu-96: 8x T4, x86_64, reboots once at first boot" ;;
+    kvm-gpu) echo "GPU passthrough into fcvm: kvm plus NVIDIA GPUs on vfio-pci. kvm-gpu-64: 2x T4G, arm64, not in the home AZ (its price is us-west-2's). kvm-gpu-96: 8x T4, x86_64, reboots once at first boot. Both search every fallback region on their own (an implied --fallback)" ;;
   esac
 }
 
@@ -236,6 +238,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# A GPU flavor searches every region on its own (owner, 2026-10-22: "i don't care what region any of this runs in"):
+# kvm-gpu-64's g5g.metal is not offered in the home AZ at all, and a GPU box is for fcvm passthrough, not for the work
+# volume. A member's box has one site and never falls back.
+case "$FLAVOR" in kvm-gpu-*) [ -z "$MEMBER" ] && [ "$CMD" = "up" ] && FALLBACK=1 ;; esac
 if [ -n "$MEMBER" ] && { [ -n "$BOX" ] || [ -n "$FALLBACK" ]; }; then
   say "your pbox is pbox-$MEMBER: run '$SELF $CMD' with no box number or fallback"
   exit 1
@@ -580,24 +586,89 @@ wait_ready() {
   exit 1
 }
 
+# The EC2 quotas an instance type counts against, by its family (the letters before the generation digit): its spot vCPU
+# quota, its on-demand vCPU quota and the family's name in the Service Quotas console. Every type pbox launches is G or
+# Standard; the rest are here so a new flavor is not misreported.
+quota_codes() { # quota_codes TYPE -> "SPOT_CODE ON_DEMAND_CODE FAMILY"
+  case "${1%%[0-9]*}" in
+    g|vt) echo "L-3819A6DF L-DB2E81BA G-and-VT" ;;
+    p) echo "L-7212CCBC L-417A185B P" ;;
+    inf) echo "L-B5D1601B L-1945791B Inf" ;;
+    dl) echo "L-85EED4F7 L-6E869C2A DL" ;;
+    trn) echo "L-6B0D517C L-2C3B7624 Trn" ;;
+    f) echo "L-88CF9481 L-74FC7D96 F" ;;
+    x) echo "L-E3A00192 L-7295265B X" ;;
+    *) echo "L-34B43A08 L-1216C47A Standard" ;;
+  esac
+}
+
+# quota_value CODE: the quota's value in $REGION ("?" when it cannot be read).
+quota_value() {
+  local v
+  v=$(aws service-quotas get-service-quota --region "$REGION" --service-code ec2 --quota-code "$1" \
+    --query 'Quota.Value' --output text 2>/dev/null) || v=""
+  printf '%s' "${v%.0}" | grep -E '^[0-9]+$' || printf '?'
+}
+
+# clear_stale_spot_requests: cancel this region's spot requests that are still open or active although their instance
+# is gone (terminated, shutting down, or no longer listed). EC2 can leave a one-time request "active" for half an hour
+# after its instance terminates (2026-10-22: parallel-box-4's g5g.metal), and until then it counts against the spot
+# quota, so the next box is refused with MaxSpotInstanceCountExceeded. A request whose instance is running or stopped,
+# or that has no instance yet (a launch in progress), is left alone; IAM also denies the persistent dev boxes' requests
+# (pbox-flavors.tf). Prints how many were cancelled.
+clear_stale_spot_requests() {
+  local n=0 sir iid st
+  while read -r sir iid; do
+    [ -n "$sir" ] && [ -n "$iid" ] && [ "$iid" != "None" ] || continue
+    st=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$iid" \
+      --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null) || st="missing"
+    case "$st" in
+      terminated|shutting-down|missing|None|"")
+        if aws ec2 cancel-spot-instance-requests --region "$REGION" --spot-instance-request-ids "$sir" >/dev/null 2>&1; then
+          say "    cancelled $sir, a stale spot request (its instance $iid is ${st:-gone}) still counting against the quota"
+          n=$((n + 1))
+        else
+          say "    could not cancel the stale spot request $sir (instance $iid is ${st:-gone})"
+        fi ;;
+    esac
+  done <<< "$(aws ec2 describe-spot-instance-requests --region "$REGION" --filters Name=state,Values=open,active \
+      --query 'SpotInstanceRequests[].[SpotInstanceRequestId,InstanceId]' --output text 2>/dev/null)"
+  echo "$n"
+}
+
 # One launch attempt. Sets OUT and returns 0 with the instance id in OUT, or 1; a failure that is not about capacity
 # also sets REAL_ERROR, so a permissions bug is not reported as a busy afternoon.
 try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
-  local t="$1" az="$2" rc
+  local t="$1" az="$2" rc spot_q od_q fam retried=""
   shift 2
-  for _ in $(seq 1 "$IP_WAIT_TRIES"); do
-    OUT=$(aws ec2 run-instances --region "$REGION" --instance-type "$t" --count 1 "$@" \
-      --query 'Instances[0].InstanceId' --output text 2>&1)
-    rc=$?
-    # Only a member's box has a fixed address, which a just-terminated box may hold for a minute.
+  read -r spot_q od_q fam <<< "$(quota_codes "$t")"
+  while :; do
+    for _ in $(seq 1 "$IP_WAIT_TRIES"); do
+      OUT=$(aws ec2 run-instances --region "$REGION" --instance-type "$t" --count 1 "$@" \
+        --query 'Instances[0].InstanceId' --output text 2>&1)
+      rc=$?
+      # Only a member's box has a fixed address, which a just-terminated box may hold for a minute.
+      case "$OUT" in
+        *InvalidIPAddress.InUse*) say "    the previous $NAME still holds its fixed address; waiting..."; sleep 10 ;;
+        *) break ;;
+      esac
+    done
+    if [ "$rc" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
+      return 0
+    fi
+    # A quota refusal may be a stale spot request's doing: clear those once and try the same type again.
     case "$OUT" in
-      *InvalidIPAddress.InUse*) say "    the previous $NAME still holds its fixed address; waiting..."; sleep 10 ;;
-      *) break ;;
+      *MaxSpotInstanceCountExceeded*|*VcpuLimitExceeded*)
+        if [ -z "$retried" ]; then
+          retried=1
+          if [ "$(clear_stale_spot_requests)" -gt 0 ]; then
+            say "    retrying $t in $az"
+            continue
+          fi
+        fi ;;
     esac
+    break
   done
-  if [ "$rc" -eq 0 ] && [ -n "$OUT" ] && [ "${OUT#i-}" != "$OUT" ]; then
-    return 0
-  fi
   # Capacity is the expected failure and is worth distinguishing from a real error
   # (a bad policy, a deleted template) -- otherwise a permissions bug looks exactly
   # like a busy afternoon and gets retried 28 times.
@@ -606,9 +677,16 @@ try_launch() { # try_launch TYPE AZ RUN-INSTANCES-ARGS...
       say "    $t is Unsupported in $az (usually: not offered there) -- trying the next one" ;;
     *InsufficientInstanceCapacity*|*InsufficientHostCapacity*|*capacity-not-available*)
       say "    no capacity for $t in $az -- trying the next one" ;;
-    *VcpuLimitExceeded*|*MaxSpotInstanceCountExceeded*|*InstanceLimitExceeded*)
-      # A regional quota is as final for this region as missing capacity: try elsewhere, not "fix that first".
-      say "    over the account's quota for $t in $REGION -- trying the next one" ;;
+    # A regional quota is as final for this region as missing capacity: try elsewhere, not "fix that first". Each names
+    # its limit, so nobody has to guess which of the three it was.
+    *MaxSpotInstanceCountExceeded*)
+      say "    MaxSpotInstanceCountExceeded: $t would put $REGION over its spot vCPU quota for $fam instances"
+      say "      ($spot_q = $(quota_value "$spot_q") vCPU, counting running spot instances AND open or active spot requests) -- trying the next one" ;;
+    *VcpuLimitExceeded*)
+      say "    VcpuLimitExceeded: $t would put $REGION over its on-demand vCPU quota for $fam instances"
+      say "      ($od_q = $(quota_value "$od_q") vCPU) -- trying the next one" ;;
+    *InstanceLimitExceeded*)
+      say "    InstanceLimitExceeded: $REGION's on-demand instance-count limit for $t (an older per-type limit, not a vCPU quota) -- trying the next one" ;;
     *)
       REAL_ERROR=1
       say "    launch failed for $t in $az:"
