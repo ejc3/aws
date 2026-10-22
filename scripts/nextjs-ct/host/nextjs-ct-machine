@@ -88,6 +88,35 @@ ND=/var/lib/nextjs-ct/ndev/$U
 install -d -m 755 /var/lib/nextjs-ct/ndev
 install -d -m 755 -o "$SHIFT" -g "$SHIFT" "$ND"
 
+# ---- the container's /tmp: a host directory on the root disk, owned by the container's root and sticky like any /tmp.
+# systemd-nspawn otherwise mounts a tmpfs there at 10% of the host's RAM (1.6 GB), which agents filled within a day
+# (2026-10-22: opencode could not start), and a larger tmpfs would only add to a box already deep in swap. The parent is a
+# nosuid,nodev mount (below), as /home is; exec stays allowed, since tools load native code from /tmp (opencode does).
+# The container's tmpfiles rule (provision) clears it at boot and ages files out after 7 days.
+TD=/var/lib/nextjs-ct/tmp/$U
+install -d -m 755 /var/lib/nextjs-ct/tmp
+install -d -m 1777 -o "$SHIFT" -g "$SHIFT" "$TD"
+TMP_UNIT=$(systemd-escape -p --suffix=mount /var/lib/nextjs-ct/tmp)
+cat > "/etc/systemd/system/$TMP_UNIT.new" <<EOF
+[Unit]
+Description=The containers' /tmp directories without setuid or devices (each container's root can write its own)
+
+[Mount]
+What=/var/lib/nextjs-ct/tmp
+Where=/var/lib/nextjs-ct/tmp
+Type=none
+Options=bind,nosuid,nodev
+
+[Install]
+WantedBy=local-fs.target
+EOF
+if ! cmp -s "/etc/systemd/system/$TMP_UNIT.new" "/etc/systemd/system/$TMP_UNIT"; then
+  mv -f "/etc/systemd/system/$TMP_UNIT.new" "/etc/systemd/system/$TMP_UNIT"
+  systemctl daemon-reload && systemctl enable --now "$TMP_UNIT" >/dev/null 2>&1 || echo "nextjs-ct-machine: $TMP_UNIT did not start" >&2
+else
+  rm -f "/etc/systemd/system/$TMP_UNIT.new"
+fi
+
 # ---- the root filesystem: a copy of the template, made once
 M=/var/lib/machines/$U
 if [ ! -d "$M" ]; then
@@ -133,6 +162,7 @@ LinkJournal=no
 PrivateUsersOwnership=chown
 Bind=/home/$U:/home/$U:idmap
 Bind=$ND:/var/lib/ndev
+Bind=$TD:/tmp
 BindReadOnly=/var/lib/nextjs-ct/shared:/opt/nextjs-ct
 BindReadOnly=$ID:/opt/nextjs-ct-user:idmap
 

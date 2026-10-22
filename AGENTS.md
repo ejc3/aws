@@ -565,6 +565,9 @@ only. Rules an agent must keep:
   starter file is create-only). They say the claw-master `HTTPS_PROXY` is a forwarder, not a firewall (an agent unset it
   and blamed it, 2026-10-21), that the host-side firewall and the narrowed role are the limits, and to name a cause only
   once seen. Codex has no machine-wide file, so these reach Claude Code only.
+- **`/tmp` is on disk** (`/var/lib/nextjs-ct/tmp/<user>`, bound by `nextjs-ct-machine`), not nspawn's default tmpfs at 10% of
+  RAM (1.6 GB), which agents filled in a day (2026-10-22). The container clears it at boot and ages files out after 7 days
+  (`/etc/tmpfiles.d/tmp.conf`). A changed `.nspawn` file takes effect at the container's next start.
 - **inotify instances are one host-wide pool.** Every container's user namespace is root's, so each inotify instance made
   in any container also counts against the host's `fs.inotify.max_user_instances`. Ubuntu's 128 ran out at five
   containers (2026-10-22) and OpenCode 2's server hung on `EMFILE` at start; the host setup sets 8192.
