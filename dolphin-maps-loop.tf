@@ -27,15 +27,18 @@
 #                                 repository and contents:write, which expires within the hour. Value stored
 #                                 from GitHub's app-manifest conversion, never printed.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
+#   dolphin-maps/pems             JSON: PEMS_USERNAME, PEMS_PASSWORD. The PeMS login (Caltrans' traffic data
+#                                 service) for the scheduled PeMS refresh. Value set out of band, never in git. The
+#                                 function and the administration set read it; dev-server-role reads and puts it.
 #
 # Both schedules start DISABLED. Turn on dolphin_maps_loop_enabled after the first deploy and after the app's
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
-#   the two functions          journal/ (write); the two secrets (read); their own logs
+#   the two functions          journal/ (write); the secrets above (read); their own logs
 #   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these two
 #                              functions only (no UpdateFunctionConfiguration: the handler is Terraform's)
-#   dev-server-role            journal/ (read, list): replays on the metal boxes
+#   dev-server-role            journal/ (read, list): replays on the metal boxes; dolphin-maps/pems (read, put)
 
 variable "dolphin_maps_loop_enabled" {
   description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep). false keeps the function and its data and stops the runs."
@@ -194,6 +197,63 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_loop_github_app" {
 }
 
 # -------------------------------------------------------------------------------------
+# The PeMS login
+# -------------------------------------------------------------------------------------
+
+# Caltrans' PeMS (traffic data) login for dolphin-maps' scheduled PeMS refresh: a weekly GitHub Actions job now, a
+# loop Lambda later. Terraform owns the container and who may read it; the value (JSON: PEMS_USERNAME, PEMS_PASSWORD)
+# is set out of band and never enters git. The metal boxes (dev-server-role) read it and put it: the login starts on a
+# dev box, which stores it here and rotates it later.
+resource "aws_secretsmanager_secret" "dolphin_maps_pems" {
+  name                    = "dolphin-maps/pems"
+  description             = "dolphin-maps' PeMS (Caltrans traffic data) login (JSON: PEMS_USERNAME, PEMS_PASSWORD). Value set out of band; see dolphin-maps-loop.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "dolphin-maps/pems", Project = "dolphin-maps" }
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_maps_pems" {
+  secret_arn = aws_secretsmanager_secret.dolphin_maps_pems.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationTheMetalBoxesAndTheLoopCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.dolphin_maps_pems.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn]) } }
+    }]
+  })
+}
+
+# The metal boxes read it and store it (the login starts on a dev box, which puts it here and rotates it later):
+# GetSecretValue, PutSecretValue and DescribeSecret (a value is set, without reading it back) on this one secret. One
+# managed policy, not an inline one: dev-server-role's inline policies are at IAM's 10,240-character total (#574).
+data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
+  statement {
+    sid       = "ReadThePemsLogin"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
+  }
+  statement {
+    sid       = "PutThePemsLogin"
+    actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
+  }
+}
+
+resource "aws_iam_policy" "dolphin_maps_pems_dev" {
+  name        = "dev-dolphin-maps-pems"
+  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and nothing else"
+  policy      = data.aws_iam_policy_document.dolphin_maps_pems_dev.json
+}
+
+resource "aws_iam_role_policy_attachment" "dolphin_maps_pems_dev" {
+  role       = aws_iam_role.dev_server.name
+  policy_arn = aws_iam_policy.dolphin_maps_pems_dev.arn
+}
+
+# -------------------------------------------------------------------------------------
 # Function
 # -------------------------------------------------------------------------------------
 
@@ -238,7 +298,7 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -278,6 +338,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
       DEEPSEEK_SECRET_ID    = aws_secretsmanager_secret.search_fetch_api_key["deepseek"].name
       EXA_SECRET_ID         = aws_secretsmanager_secret.search_fetch_api_key["exa"].name
       SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
+      PEMS_SECRET_ID        = aws_secretsmanager_secret.dolphin_maps_pems.name
       GITHUB_APP_SECRET_ID  = aws_secretsmanager_secret.dolphin_maps_loop_github_app.name
       LOOP_REPO             = "dolphin-labs-hq/dolphin-maps"
       LOOP_BRANCH           = "main"

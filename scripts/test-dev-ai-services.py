@@ -72,7 +72,9 @@ class ElevenLabsSecretTests(unittest.TestCase):
                       block("aws_iam_role_policy_attachment", "search_fetch_api_keys_read"))
         for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
             src = (ROOT / f).read_text()
-            self.assertIn("aws_secretsmanager_secret.browserbase.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", src)
+            # The job reads Browserbase and the search-fetch keys together (its own other secrets may sit between).
+            self.assertRegex(src, r"aws_secretsmanager_secret\.browserbase\.arn(, aws_secretsmanager_secret\.\w+\.arn)*\], "
+                                  r"\[for s in aws_secretsmanager_secret\.search_fetch_api_key : s\.arn\]\)")
             for key, env in (("deepseek", "DEEPSEEK"), ("exa", "EXA"), ("scrapingdog", "SCRAPINGDOG")):
                 self.assertRegex(src, rf'{env}_SECRET_ID += aws_secretsmanager_secret.search_fetch_api_key\["{key}"\].name')
 

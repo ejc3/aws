@@ -1365,6 +1365,10 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **dolphin-maps' PeMS login** (Caltrans' traffic data service). `dolphin-maps/pems` (us-west-1; JSON, `PEMS_USERNAME` and
+  `PEMS_PASSWORD`) is the dolphin-maps PeMS login; dev-server-role may read and put it, the dolphin-maps loop Lambdas' role
+  and admins read it (`dolphin-maps-loop.tf`; the functions get `PEMS_SECRET_ID`). Export it with the same `eval "$(aws secretsmanager
+  get-secret-value ... | jq -r 'to_entries[] | ...')"` as Browserbase. Never onto a command line, into a file in a repo or a commit.
 - **Search and fetch APIs: DeepSeek, Exa, ScrapingDog**, metal boxes, nextjs-dev and the scraping jobs: alternatives to
   Browserbase and to the Bedrock models (DeepSeek: chat and reasoning plus its fetch and search tools; Exa: web search and
   page contents; ScrapingDog: scraping API with rendering and proxies). One JSON secret each in us-west-1,
