@@ -42,13 +42,13 @@ class ElevenLabsSecretTests(unittest.TestCase):
         attach = block("aws_iam_role_policy_attachment", "elevenlabs_read")
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
 
-    def test_browserbase_is_for_the_two_dev_roles_the_news_pass_and_the_maps_loop(self):
+    def test_browserbase_is_for_the_two_dev_roles_and_the_maps_loop(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "browserbase"', TF)
         self.assertNotRegex(TF, r"bb_live_[A-Za-z0-9]{6,}")
         policy = block("aws_secretsmanager_secret_policy", "browserbase")
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.browserbase_readers)', policy)
-        self.assertIn("browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_news_pass.arn, aws_iam_role.dolphin_maps_loop.arn, aws_iam_role.search_fetch_usage.arn]", TF)
+        self.assertIn("browserbase_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_maps_loop.arn, aws_iam_role.search_fetch_usage.arn]", TF)
         # dev-ebs-only is the I/O box's role too (io-box.tf): never a reader.
         self.assertNotIn("dev_ebs_only", TF[TF.index("browserbase_readers"):TF.index("browserbase_readers") + 300])
         doc = block("aws_iam_policy_document", "browserbase_read")
@@ -70,7 +70,7 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertIn("resources = [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn]", doc)
         self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }",
                       block("aws_iam_role_policy_attachment", "search_fetch_api_keys_read"))
-        for f in ("dolphin-labs-news.tf", "dolphin-maps-loop.tf"):
+        for f in ("dolphin-maps-loop.tf",):
             src = (ROOT / f).read_text()
             # The job reads Browserbase and the search-fetch keys together (its own other secrets may sit between).
             self.assertRegex(src, r"aws_secretsmanager_secret\.browserbase\.arn(, aws_secretsmanager_secret\.\w+\.arn)*\], "

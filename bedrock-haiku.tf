@@ -10,8 +10,6 @@
 #     (BedrockRuntimeInvoke in dev-instance-common.tf); this file leaves them alone. Not here: the GPU boxes
 #     run with no instance profile at all (gpu-box.tf), the jumpboxes are administrators, and runners and
 #     the AMI builder are CI machines, not boxes.
-#   - dolphin-labs-news-bedrock: the hourly news pass of dolphin-labs-hq/dolphin-labs
-#     (.github/workflows/refresh-news.yml on main), through GitHub OIDC. No AWS key is stored in GitHub.
 #
 # The model, from AWS's model card (docs.aws.amazon.com/bedrock/latest/userguide/
 # model-card-anthropic-claude-haiku-5-5.html, checked 2026-10-10; launched on Bedrock 2026-10-07):
@@ -27,8 +25,8 @@
 #   - us-west-2, as opencode's DeepSeek (dev-user-data.tf): callers set the region explicitly.
 
 locals {
-  # GitHub's immutable subject for main of dolphin-labs-hq/dolphin-labs (owner and repository ids), shared by
-  # the two roles its workflows assume: this file's and dolphin-labs-news.tf's deploy role.
+  # GitHub's immutable subject for main of dolphin-labs-hq/dolphin-labs (owner and repository ids), for the role
+  # its TestFlight workflow assumes (dolphin-labs-testflight.tf).
   dolphin_labs_main_sub = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:ref:refs/heads/main"
 
   bedrock_haiku_region  = "us-west-2"
@@ -98,49 +96,3 @@ resource "aws_iam_role_policy" "mac_bedrock_haiku" {
   policy   = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
 }
 
-# TRUST: workflow refresh-news.yml, on the main branch of dolphin-labs-hq/dolphin-labs, and nothing else.
-#   - sub is GitHub's immutable form (owner and repository ids as well as names), as imagine-deploy's in
-#     imagine.tf: GitHub's API (repos/dolphin-labs-hq/dolphin-labs/actions/oidc/customization/sub) reported
-#     use_immutable_subject true with this prefix on 2026-10-10, so a trust on the plain name would never
-#     match, and a repository that later takes the name cannot meet it. ref main admits the schedule and a
-#     manual dispatch on main; a pull request (refs/pull/N/merge) or another branch cannot assume it.
-#   - job_workflow_ref narrows main to the one workflow file: another workflow on main gets nothing. IAM
-#     has accepted this GitHub claim as a trust condition since 2026-05-12 (IAM user guide, document history).
-#   - The job declares no GitHub environment; adding one changes sub and needs this trust changed with it.
-resource "aws_iam_role" "dolphin_labs_news_bedrock" {
-  name        = "dolphin-labs-news-bedrock"
-  description = "Assumed by dolphin-labs-hq/dolphin-labs refresh-news.yml (main) via GitHub OIDC: invoke Claude Haiku 5.5 on Bedrock"
-  # A pass is capped at 10 minutes; one hour is the minimum and plenty.
-  max_session_duration = 3600
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
-      Action    = "sts:AssumeRoleWithWebIdentity"
-      Condition = {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub"              = local.dolphin_labs_main_sub
-          "token.actions.githubusercontent.com:job_workflow_ref" = "dolphin-labs-hq/dolphin-labs/.github/workflows/refresh-news.yml@refs/heads/main"
-        }
-      }
-    }]
-  })
-  tags = { Name = "dolphin-labs-news-bedrock", Project = "dolphin-labs" }
-}
-
-resource "aws_iam_role_policy" "dolphin_labs_news_bedrock" {
-  name   = "invoke-claude-haiku-5-5"
-  role   = aws_iam_role.dolphin_labs_news_bedrock.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
-}
-
-output "dolphin_labs_news_bedrock" {
-  description = "Actions variables for dolphin-labs-hq/dolphin-labs's news workflow (refresh-news.yml)"
-  value = {
-    AWS_REGION           = local.bedrock_haiku_region
-    AWS_BEDROCK_ROLE_ARN = aws_iam_role.dolphin_labs_news_bedrock.arn
-    BEDROCK_MODEL_ID     = local.bedrock_haiku_profile
-  }
-}

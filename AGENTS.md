@@ -456,8 +456,7 @@ state, secret-payload, Lambda-environment, or log-read access to make a GitHub f
 pass. Those reads can convey administrator credentials. Full plans belong on a jumpbox;
 a successful validation is not an empty live plan. The shared main/staging CI roles are
 retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
-(`imagine.tf`), `dolphin-labs-news-bedrock` (`bedrock-haiku.tf`), `dolphin-labs-news-deploy`
-(`dolphin-labs-news.tf`), `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`) and `dolphin-labs-testflight`
+(`imagine.tf`), `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`) and `dolphin-labs-testflight`
 (`dolphin-labs-testflight.tf`), each trusted for one repository's `main` or environment.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
@@ -1328,29 +1327,14 @@ Available if a task needs them; neither needs a key on disk.
   inference profile; Haiku 5.5 has no in-Region endpoint and is not on bedrock-mantle outside GovCloud, so
   the Mantle URL Claude Code uses on the metal boxes does not serve it). Credentials come from the
   instance role; there is no key.
-- **Haiku 5.5 for dolphin-labs' news pass** (`bedrock-haiku.tf`). Role `dolphin-labs-news-bedrock`,
-  assumed through GitHub OIDC by `refresh-news.yml` on `main` of `dolphin-labs-hq/dolphin-labs` and no
-  other workflow, branch or pull request (the trust pins GitHub's immutable `sub` and `job_workflow_ref`).
-  Same grant as the boxes. Output `dolphin_labs_news_bedrock` holds the region, role ARN and model id the
-  workflow needs.
-- **dolphin-labs' news functions moved to the Dolphin account (2026-10-20).** `dolphin-labs-news-pass` and `dolphin-labs-news-x`
-  run in the Dolphin account from dolphin-aws `news.tf` (its own journal bucket, secrets copied there, deploy role for
-  `deploy-news.yml`, alarms on `dolphin-alerts`). This account's copies below are kept for a week with both schedules off as
-  the rollback (`dolphin_labs_news_enabled`, `news_x_schedule_enabled`), then removed.
-- **dolphin-labs' news pass in AWS** (`dolphin-labs-news.tf`). Lambda `dolphin-labs-news-pass` on an
-  EventBridge schedule (on; `dolphin_labs_news_enabled`), with Haiku 5.5, the Dolphin Redis's
-  production URL and token (`dolphin-redis.tf`) in `dolphin-labs/news` and Browserbase from `browserbase/credentials`. Each pass writes a
-  journal record to `s3://dolphin-labs-news-<account>/journal/` (400 days; deletes there are refused
-  outside the administration set, and the bucket is versioned, so an overwrite keeps the original for 400
-  days) so ranking changes can be replayed. nextjs-dev's role reads `journal/` and `local/` and writes
-  `local/` (not dev-ebs-only: the I/O box shares that role); it can also read the function, its logs,
-  its schedule and the secret's metadata (never its value), and invoke it by hand to check a pass before
-  switch-over. Code arrives from `deploy-news.yml` on `main`
-  through role `dolphin-labs-news-deploy` (GitHub OIDC, code only: no UpdateFunctionConfiguration);
-  Terraform owns the configuration, the handler `index.handler` included. Switch-over: deploy, set the
-  secret, turn refresh-news.yml's schedule off in dolphin-labs, then `dolphin_labs_news_enabled = true`
-  (both running would bill Haiku and Browserbase twice); an Errors alarm and, once enabled, a 'not running'
-  alarm watch it. Output `dolphin_labs_news` holds the deploy workflow's variables.
+- **dolphin-labs' news functions are in the Dolphin account only** (moved 2026-10-20; this account's copies,
+  `dolphin-labs-news.tf` and refresh-news.yml's never-used Bedrock role, were removed on 2026-10-22). `dolphin-labs-news-pass`
+  and `dolphin-labs-news-x`, their journal bucket `dolphin-labs-news-<Dolphin account id>`, their secrets
+  (`dolphin-labs/news`, `dolphin-labs/monid`, the provider keys), the deploy role for `deploy-news.yml` and the alarms on
+  `dolphin-alerts` are dolphin-aws `news.tf`. A `lambda`, `logs` or `s3` call with this account's credentials finds no news
+  function at all: an agent on nextjs-dev reaches them as `dolphin-terraform` (the owner's container only), from a jumpbox
+  through `OrganizationAccountAccessRole` in the Dolphin account. Changes are dolphin-aws pull requests, applied from
+  nextjs-dev.
 - **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live` and
   `dolphin-maps-loop-sweep` (one bundle) on EventBridge schedules in America/Los_Angeles time (live samples
   every 5 minutes on weekday mornings, the sweep and refit on Sunday night; both off until
