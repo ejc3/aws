@@ -83,7 +83,9 @@ def backup_copy_share(sess, region, snapshot_arn, principal):
         adds = []
         pages = sess.client("cloudtrail", region_name=region, config=CFG).get_paginator("lookup_events").paginate(
             LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": snapshot_id}],
-            StartTime=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2))
+            # CloudTrail's whole lookup history (90 days), so an older share by anyone else is never hidden behind a recent
+            # AWS Backup one; these snapshots are hours old, so it costs a page or two.
+            StartTime=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90))
         for page in pages:
             for event in page.get("Events", []):
                 if event.get("EventName") != "ModifySnapshotAttribute":

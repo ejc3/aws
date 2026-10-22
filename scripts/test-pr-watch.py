@@ -210,9 +210,18 @@ class AlertPollTests(unittest.TestCase):
             def get_finding_v2(self, **kw):
                 return {"findingDetails": [{"externalAccessDetails": {"principal": {"AWS": "058264422536"}}}]}
 
+        test = self
+
+        class CTPages(Pages):
+            def paginate(self, **kw):
+                # the whole 90-day lookup history, so an older share by anyone else cannot hide behind a recent one
+                age = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) - kw["StartTime"]
+                test.assertGreaterEqual(age.days, 89)
+                return self.pages
+
         class CT:
             def get_paginator(self, op):
-                return Pages([{"Events": [{"EventName": "ModifySnapshotAttribute", "CloudTrailEvent": json.dumps(share)}]}])
+                return CTPages([{"Events": [{"EventName": "ModifySnapshotAttribute", "CloudTrailEvent": json.dumps(share)}]}])
 
         class EC2:
             def describe_snapshots(self, **kw):
