@@ -217,4 +217,4 @@ class ReaderKeyTests(unittest.TestCase):
         self.assertNotRegex(pol, r"cloudwatch:(Put|Delete|Set|Enable|Disable)")
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

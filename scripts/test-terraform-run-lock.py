@@ -45,6 +45,9 @@ class WrapperTests(unittest.TestCase):
         # No added -parallelism and no shared cache unless a test asks: the other tests read the arguments as given.
         self.env = dict(os.environ, TF_RUN_LOCK_REAL=str(self.real), TF_RUN_LOCK_FILE=str(self.lock),
                         FAKE_LOG=str(self.log), TF_RUN_LOCK_PARALLELISM="",
+                        # Never the host's real binary: on a jumpbox the default path exists, and a test that drops
+                        # TF_RUN_LOCK_REAL would run real Terraform instead of the fake (and fail reading its log).
+                        TF_RUN_LOCK_DEFAULT_REAL=str(self.tmp / "no-default-real"),
                         TF_RUN_LOCK_PLUGIN_CACHE=str(self.tmp / "no-cache"))
         for k in ("TF_RUN_LOCK_NOWAIT", "TF_PLUGIN_CACHE_DIR"):
             self.env.pop(k, None)
@@ -380,4 +383,4 @@ class InstallTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, buffer=True)

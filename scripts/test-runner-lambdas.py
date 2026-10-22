@@ -4398,11 +4398,14 @@ def main():
 
     failures = 0
     for case in CASES:
+        # Each case's own output (the Lambdas' logs) is held and shown only when the case fails, as unittest's buffer does.
+        held = io.StringIO()
         try:
-            case()
-            print(f"ok   {case.__name__}")
+            with contextlib.redirect_stdout(held), contextlib.redirect_stderr(held):
+                case()
         except Exception as e:
             failures += 1
+            print(held.getvalue(), end="")
             print(f"FAIL {case.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(CASES) - failures}/{len(CASES)} passed")
     return 1 if failures else 0

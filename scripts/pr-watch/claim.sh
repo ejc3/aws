@@ -19,7 +19,7 @@ now=$(date +%s)
 
 fresh_owner() { # prints the owner if the heartbeat is fresh
   local t o
-  read -r t o <"$beat" 2>/dev/null || return 1
+  { read -r t o <"$beat"; } 2>/dev/null || return 1 # braces: a missing file (the first claim) is quiet too
   [[ "$t" =~ ^[0-9]+$ ]] && ((now - t < stale_after)) && printf '%s' "$o"
 }
 

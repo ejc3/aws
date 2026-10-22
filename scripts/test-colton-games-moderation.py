@@ -69,4 +69,4 @@ class AiServicesOptOutTests(unittest.TestCase):
         self.assertIn("target_id = aws_organizations_organization.security.roots[0].id", self.ORG)
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

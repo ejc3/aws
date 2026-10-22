@@ -37,6 +37,9 @@ jobs:
       - name: PR and issue watch installer and hook
         run: python3 -B scripts/test-pr-watch.py
 
+      - name: Tests are quiet when they pass (unittest buffer, the custom runner holds each case's output)
+        run: python3 -S -B scripts/test-tests-quiet.py
+
       - name: Agent instructions distributed from ejc3/agents-md
         run: python3 -S -B scripts/test-agents-md.py
 
