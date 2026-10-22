@@ -118,7 +118,8 @@ resource "aws_instance" "nextjs_ct" {
 # The cutover switch: local.nextjs_ct_serving (nextjs-ct-user-data.tf). Everything keyed to "the nextjs
 # box" reads local.nextjs_live_instance, so flipping that one value moves the Elastic IP, the Name tag,
 # the memory and disk alarms, the backup selection and the agents-md target together, starts this
-# box's tunnels and agents, and stops (never terminates) nextjs-dev. Flipping it back is the rollback.
+# box's tunnels and agents, and stops (never terminates) nextjs-dev. Flipping it back was the rollback until nextjs-dev was
+# terminated (local.nextjs_dev_retired_box, 2026-10-22); now it stays true.
 # ---------------------------------------------------------------------------------
 locals {
   nextjs_live_instance = local.nextjs_ct_serving ? one(aws_instance.nextjs_ct) : one(aws_instance.nextjs_dev)
@@ -144,7 +145,7 @@ resource "terraform_data" "nextjs_ct_converge" {
 }
 
 resource "aws_ec2_instance_state" "nextjs_dev" {
-  count       = var.enable_nextjs_dev && var.enable_nextjs_ct ? 1 : 0
+  count       = var.enable_nextjs_dev && var.enable_nextjs_ct && local.nextjs_dev_retired_box ? 1 : 0
   instance_id = aws_instance.nextjs_dev[0].id
   state       = local.nextjs_ct_serving ? "stopped" : "running"
 

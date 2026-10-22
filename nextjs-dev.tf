@@ -230,7 +230,8 @@ resource "aws_security_group" "nextjs_dev" {
 }
 
 resource "aws_instance" "nextjs_dev" {
-  count = var.enable_nextjs_dev ? 1 : 0
+  # Terminated since 2026-10-22 (local.nextjs_dev_retired_box, nextjs-ct-user-data.tf): nextjs-ct is the nextjs box.
+  count = var.enable_nextjs_dev && local.nextjs_dev_retired_box ? 1 : 0
 
   ami                    = var.firecracker_ami # Ubuntu 24.04 arm64, same as the ARM dev box
   instance_type          = var.nextjs_instance_type
@@ -326,6 +327,13 @@ resource "aws_eip_association" "nextjs_dev" {
 
   # Moves only after nextjs-ct has applied the switch (nextjs-ct.tf, terraform_data.nextjs_ct_converge).
   depends_on = [terraform_data.nextjs_ct_converge]
+
+  lifecycle {
+    precondition {
+      condition     = local.nextjs_ct_serving || local.nextjs_dev_retired_box
+      error_message = "nextjs-dev was terminated (local.nextjs_dev_retired_box = false): there is no box to roll back to, so local.nextjs_ct_serving must stay true."
+    }
+  }
 }
 
 output "nextjs_dev_public_ip" {

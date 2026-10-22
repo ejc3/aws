@@ -550,7 +550,7 @@ only. Rules an agent must keep:
   (bash would source `~/.bashrc`, which the person writes from inside the container, on the host), `ForceCommand
   nextjs-ct-enter`, `PermitUserRC no`, forwarding only to their own container. Host-side readers of
   container-written files (`nextjs-ct-ndev-sync`) open them without following symlinks and re-check every field.
-- **One switch.** `local.nextjs_ct_serving` (true since the cutover, 2026-10-20; false is the rollback) moves the Elastic IP, Name tag, alarms,
+- **One switch.** `local.nextjs_ct_serving` (true since the cutover, 2026-10-20; it was the rollback until nextjs-dev was terminated on 2026-10-22, `local.nextjs_dev_retired_box = false`, root volume and backups kept, so it stays true) moves the Elastic IP, Name tag, alarms,
   backup selection and agents-md target, starts this box's tunnels and agents, and stops nextjs-dev. Never run
   `cloudflared` here while it is false: the same tunnel credentials on two boxes split live traffic.
 - **AWS from a container is the role narrowed, never widened.** `nextjs-ct-imds` assumes nextjs-dev-role again with
