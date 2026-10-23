@@ -297,8 +297,9 @@ class GpuQuota(unittest.TestCase):
         self.assertIn('pbox_gpu_spot_vcpus = max([for f in keys(local.pbox_flavors) : tonumber(trimprefix(f, "kvm-gpu-")) '
                       'if startswith(f, "kvm-gpu-")]...)', FLAVORS_TF)
         self.assertEqual(max(int(v[0]) for f, v in script_menu().items() if f.startswith("kvm-gpu-")), 96)
-        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer
-        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2")):
+        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer;
+        # us-east-1: a kvm-gpu-96 fallback site whose default 64 vCPU fits no g4dn.metal (#630)
+        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2"), ("east1_spot_g", "aws.dr")):
             with self.subTest(quota=name):
                 for kind in ("data", "resource"):
                     b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "%s"' % (kind, name))
@@ -309,7 +310,7 @@ class GpuQuota(unittest.TestCase):
         self.assertIn('parallel_box_region = "us-east-2"', OHIO)
         # nothing else in this account owns the G spot quota (fcvm-fleet-account.tf sets its own account's, #605)
         tf = "".join(p.read_text() for p in ROOT.glob("*.tf") if p.name != "fcvm-fleet-account.tf")
-        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 2)
+        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 3)
 
 
 class GpuCheckRuns(unittest.TestCase):
