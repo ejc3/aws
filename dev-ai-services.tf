@@ -414,6 +414,64 @@ resource "aws_iam_role_policy_attachment" "turso_api_token_read" {
   policy_arn = aws_iam_policy.turso_api_token_read.arn
 }
 
+# abliteration.ai (owner, 2026-10-23), for opencode on the owner's boxes: opencode's built-in `abliteration-ai` provider
+# (models.dev; https://api.abliteration.ai/v1, OpenAI-compatible) reads its key from ABLIT_KEY, and the opencode() function
+# in the managed ~/.zshrc (dev-user-data.tf) reads it from here at each launch, into opencode's environment only. Two
+# secrets, both raw strings set out of band (put-secret-value from a 0600 file), never in git or state:
+# - abliteration/admin-api-key: the organization's Admin API key (projects, project keys, spend limits). Administration
+#   only. It made the inference key: project `opencode-dev-boxes`, key `opencode` (permission model.invoke).
+# - abliteration/api-key: that inference key. Readers: administration, dev-server-role (both metal boxes; granted in
+#   assume-constellation-terraform, constellation-account.tf, since dev-server-role holds 20 of 20 managed policies) and
+#   nextjs-dev-role for the owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf; every member container is denied it).
+# Rotate: mint a new project key with the admin key, put it here, revoke the old one.
+resource "aws_secretsmanager_secret" "abliteration_admin_api_key" {
+  name                    = "abliteration/admin-api-key"
+  description             = "abliteration.ai organization Admin API key (raw string). Administration only; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "abliteration/admin-api-key", Project = "dev" }
+}
+
+resource "aws_secretsmanager_secret_policy" "abliteration_admin_api_key" {
+  secret_arn = aws_secretsmanager_secret.abliteration_admin_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.abliteration_admin_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret" "abliteration_api_key" {
+  name                    = "abliteration/api-key"
+  description             = "abliteration.ai project API key for opencode (raw string; ABLIT_KEY). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "abliteration/api-key", Project = "dev" }
+}
+
+locals {
+  abliteration_api_key_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
+}
+
+resource "aws_secretsmanager_secret_policy" "abliteration_api_key" {
+  secret_arn = aws_secretsmanager_secret.abliteration_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheOwnersBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.abliteration_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.abliteration_api_key_readers) } }
+    }]
+  })
+}
+
 # DeepSeek on Amazon Bedrock for nextjs-dev-role (every nextjs-ct container), the same two models dev-server-role has
 # (BedrockRuntimeInvoke in dev-instance-common.tf), for opencode (dev-user-data.tf's opencode_user_setup, run in every
 # container). Owner, 2026-10-21: "get deepseek working on the nextjs box ... fcvm has it". The account is already

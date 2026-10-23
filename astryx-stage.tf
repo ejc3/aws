@@ -18,9 +18,11 @@
 #     the one place a session token is minted: the API reads the Access JWT (ACCESS_AUD) there and hands the app its own
 #     signed token. The connector also requires a valid Access token on that path (its first ingress rule), so if the
 #     application were ever dropped the path still refuses a request without one.
-#   - the rest of the host: no Access application. The apps call /api/* and zero-cache's socket with the API's own Bearer
-#     token, which the API verifies (zero-cache forwards it to /api/zero/query and /api/zero/mutate); a request without one
-#     reads and writes nothing. /healthz says whether sync is on.
+#   - the rest of the host: an exact-host BYPASS application (astryx_stage_public), because the dolphin_labs wildcard
+#     (*.dolphin-labs.dev, GitHub organization members only) would otherwise answer the apps' API and sync calls with a
+#     login page. Access picks the most specific application, so /native/login keeps its own. The apps call /api/* and
+#     zero-cache's socket with the API's own Bearer token, which the API verifies (zero-cache forwards it to
+#     /api/zero/query and /api/zero/mutate); a request without one reads and writes nothing. /healthz says whether sync is on.
 
 locals {
   astryx_stage_hostname   = "astryx-stage.dolphin-labs.dev"
@@ -66,6 +68,36 @@ resource "cloudflare_zero_trust_access_application" "astryx_stage_login" {
   policies = [
     {
       id         = cloudflare_zero_trust_access_policy.astryx_stage_anyone_signed_in.id
+      precedence = 1
+    },
+  ]
+}
+
+# The rest of the host past the *.dolphin-labs.dev wildcard (as constellation_mcp_stage_public and the Lattice API paths).
+resource "cloudflare_zero_trust_access_policy" "astryx_stage_public" {
+  account_id = var.cloudflare_account_id
+  name       = "Astryx staging (public; the API's own token)"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "astryx_stage_public" {
+  account_id = var.cloudflare_account_id
+  name       = "Astryx staging (public; the API's own token)"
+  type       = "self_hosted"
+  domain     = local.astryx_stage_hostname
+
+  destinations = [
+    { type = "public", uri = local.astryx_stage_hostname },
+  ]
+
+  # Declared here, as on every application: an apply drops an attachment that is not.
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.astryx_stage_public.id
       precedence = 1
     },
   ]
@@ -120,6 +152,7 @@ resource "cloudflare_dns_record" "astryx_stage" {
   comment = "Astryx sync staging (astryx account); /native/login behind Access"
   depends_on = [
     cloudflare_zero_trust_access_application.astryx_stage_login,
+    cloudflare_zero_trust_access_application.astryx_stage_public,
     cloudflare_zero_trust_tunnel_cloudflared_config.astryx_stage,
   ]
 }

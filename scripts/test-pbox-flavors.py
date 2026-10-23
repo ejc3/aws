@@ -297,8 +297,9 @@ class GpuQuota(unittest.TestCase):
         self.assertIn('pbox_gpu_spot_vcpus = max([for f in keys(local.pbox_flavors) : tonumber(trimprefix(f, "kvm-gpu-")) '
                       'if startswith(f, "kvm-gpu-")]...)', FLAVORS_TF)
         self.assertEqual(max(int(v[0]) for f, v in script_menu().items() if f.startswith("kvm-gpu-")), 96)
-        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer
-        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2")):
+        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer;
+        # us-east-1: a kvm-gpu-96 fallback site whose default 64 vCPU fits no g4dn.metal (#630)
+        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2"), ("east1_spot_g", "aws.dr")):
             with self.subTest(quota=name):
                 for kind in ("data", "resource"):
                     b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "%s"' % (kind, name))
@@ -309,7 +310,7 @@ class GpuQuota(unittest.TestCase):
         self.assertIn('parallel_box_region = "us-east-2"', OHIO)
         # nothing else in this account owns the G spot quota (fcvm-fleet-account.tf sets its own account's, #605)
         tf = "".join(p.read_text() for p in ROOT.glob("*.tf") if p.name != "fcvm-fleet-account.tf")
-        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 2)
+        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 3)
 
 
 class GpuCheckRuns(unittest.TestCase):
@@ -538,6 +539,26 @@ class GpuIommuReboot(unittest.TestCase):
                           "${local.pbox_gpu_vfio_setup}"):
                 self.assertLess(at, text.index(later), later)
         self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
+
+
+class SecurityUpdatesAtBoot(unittest.TestCase):
+    # Owner, 2026-10-23: install security updates at every pbox boot, so a launch does not bring the stock image's fixable
+    # package findings back to Inspector. The security pocket only, never a reboot, and a box that cannot update still boots.
+    def test_the_snippet_installs_security_updates_only_and_retries_a_busy_lock(self):
+        sec = FLAVORS_TF.split("pbox_security_updates = <<-SEC", 1)[1].split("\n  SEC\n", 1)[0]
+        self.assertIn("unattended-upgrade -v && break", sec)
+        self.assertIn("for _ in $(seq 1 10); do", sec)
+        self.assertIn("command -v unattended-upgrade >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y unattended-upgrades", sec)
+        for forbidden in ("reboot", "dist-upgrade", "full-upgrade", "apt-get upgrade", "exit 1"):
+            self.assertNotIn(forbidden, sec, forbidden)
+
+    def test_every_pbox_boot_runs_it_once_after_apt_install(self):
+        for name, text in (("home", LAUNCH), ("fallback", FALLBACK), ("member", MEMBER)):
+            with self.subTest(boot=name):
+                self.assertEqual(text.count("${local.pbox_security_updates}"), 1)
+                at = text.index("${local.pbox_security_updates}")
+                self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop"), at)
+                self.assertLess(at, text.index("${local.pbox_local_nvme_setup}"))
 
 
 class LocalNvme(unittest.TestCase):

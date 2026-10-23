@@ -599,6 +599,15 @@ external drive, one folder per project: `/Volumes/Scratch/<project>/`. For examp
 Simulator devices still live on the internal disk (CoreSimulator), so delete a tour's
 simulator after use. Never write a project's files into `~/src` loose.
 
+Temporary files follow the same rule. Anything a session creates with `mktemp` (a test
+run's DerivedData, a build's intermediates) lands in `TMPDIR`, which by default is on
+the internal disk; one week of UI-test runs left 18 GB there and stopped every build
+at the 12 GB floor. The managed `~/.zshenv` block (`scripts/mac/set-zshenv.sh`) points
+`TMPDIR` at the folder named in `~/.config/mac-setup/tmpdir` when that file exists and
+its disk is mounted, for every zsh, non-interactive SSH sessions included; with no file,
+or the drive unplugged, the system default stays. On this Mac:
+`ssh mac 'mkdir -p ~/.config/mac-setup && echo /Volumes/Scratch/tmp > ~/.config/mac-setup/tmpdir'`.
+
 ##### MacBook: Checks
 
 ```bash
@@ -1099,7 +1108,7 @@ with `--image-id` (`var.parallel_box_ami_ohio_x86` at home, each fallback site's
 reboots once, and `up` waits through that reboot before checking the GPUs.
 
 Both GPU flavors count against the "All G and VT Spot Instance Requests" quota (`L-3819A6DF`) where they launch:
-`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2 and us-west-2 at apply when the current
+`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2, us-west-2 and us-east-1 at apply when the current
 quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
@@ -1112,6 +1121,12 @@ watchdog ends any lease at 12 hours from launch, whatever the tag says. **A leas
 busy or not: a `kvm-gpu-96` is about $4/hr spot, so a 12-hour lease is about $50. `pbox status` shows
 `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. The lease is set at launch only; a running box keeps what it has
 (`pbox down N`, then `up` again with `--lease`). Members' boxes take no lease.
+
+Several jobs share the eight slots, and a slot can hold a different instance minutes after a script looked it up. `pbox up`
+ends with `launched box=N ... id=i-...` (with ` failed=<reason>` and exit 1 when the box was launched but did not come up),
+so scripts carry that id and use `pbox ip|ssh|down N --instance i-...`, which refuse when the slot holds another instance;
+they never re-resolve a slot by name. `pbox down N` without `--instance` also refuses a box another caller launched in the
+last hour (its `PboxLaunchedBy` tag, set from `PBOX_CALLER`, by default the host) unless `--force`.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and
@@ -1519,6 +1534,43 @@ so fcvm-metal-x86 cannot) and `dolphin-labs-testflight` (dolphin-labs CI's TestF
 `testflight.yml` on `main` only, `dolphin-labs-testflight.tf`) can read it. Every account on nextjs-dev has
 sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
 and put a new one the same way to rotate.
+
+### Astryx Swift: self-serve TestFlight invitations
+
+`https://astryx-join.dolphin-labs.dev` (`astryx-join.tf`) is a public form: anyone types an @meta.com address, passes
+Cloudflare Turnstile, and the Worker adds the address to the Astryx Swift beta group "Meta (self-serve)" through the App
+Store Connect API. There is no sign-in (an Access gate would cost a Zero Trust seat per person), so an address is not
+proven when it is typed; the invitation can only be accepted from that inbox, and 5 requests per IP an hour and 500 a
+day bound abuse. Nothing is built until the key's secret exists; the first apply after that builds the whole host. Once:
+
+1. In App Store Connect, Users and Access, Integrations, App Store Connect API, Team Keys, create a key named for this
+   use with the **App Manager** role (the lowest that manages testers; not Admin, and never the Games Worth Watching
+   key). Download its `.p8` file (`AuthKey_<KEY_ID>.p8`) into the current directory and note the Issuer ID and Key ID.
+2. On a jumpbox, create the secret with the three values as one JSON object without echoing them, then delete the file:
+
+   ```bash
+   read -rs ISSUER; read -rs KEY_ID
+   set -o pipefail
+   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --rawfile p "AuthKey_${KEY_ID}.p8" \
+     '{ISSUER_ID: $i, KEY_ID: $k, PRIVATE_KEY: $p}' \
+     | aws secretsmanager create-secret --region us-west-1 --name astryx/testflight-asc-key \
+         --description "App Manager key for Astryx Swift TestFlight invitations (astryx-join.tf)" \
+         --secret-string file:///dev/stdin >/dev/null \
+     && rm "AuthKey_${KEY_ID}.p8"
+   unset ISSUER KEY_ID
+   ```
+
+3. Apply. Terraform puts an administration-only read policy on the secret and builds, in order, the record, the KV
+   namespace for the limits, the Turnstile widget (managed, this host only), the Worker with the key and the widget's
+   secret as its secrets, the route, and last the Access bypass for exactly this host. The widget needs Turnstile write
+   on the provider token `cloudflare-tunnel-token` (AGENTS.md, "Astryx Swift TestFlight invitations").
+
+Rotate: create a new App Manager key, `put-secret-value` the same JSON to `astryx/testflight-asc-key`, apply, then
+revoke the old key. Stop: revoke the key in App Store Connect (invitations fail at once); to remove the host too,
+`aws secretsmanager delete-secret --force-delete-without-recovery --secret-id astryx/testflight-asc-key` and apply.
+
+Limits: Apple allows 10,000 external testers per app; a new build version needs Beta App Review before the group's
+testers get it.
 
 ### Colton Games accounts: sign-in, site admins and push
 

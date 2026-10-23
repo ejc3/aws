@@ -28,6 +28,7 @@ locals {
       aws_secretsmanager_secret.dolphin_relay_signup.arn,
       aws_secretsmanager_secret.dolphin_maps_pems.arn,
       aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn,
+      aws_secretsmanager_secret.abliteration_api_key.arn,
     ],
     [for k, s in aws_secretsmanager_secret.dolphin_films : s.arn if startswith(k, "nonprod/")],
   )

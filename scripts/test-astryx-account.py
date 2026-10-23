@@ -160,7 +160,7 @@ class StateAndPointerTests(unittest.TestCase):
 
 class StageTests(unittest.TestCase):
     def test_access_covers_only_the_login_path_and_admits_anyone_who_signs_in(self):
-        self.assertEqual(STAGE.count('resource "cloudflare_zero_trust_access_application"'), 1)
+        self.assertEqual(STAGE.count('resource "cloudflare_zero_trust_access_application"'), 2)  # login + host bypass
         app = block('resource "cloudflare_zero_trust_access_application" "astryx_stage_login"', STAGE)
         self.assertIn('astryx_stage_login_path = "${local.astryx_stage_hostname}/native/login"', STAGE)
         self.assertIn("domain           = local.astryx_stage_login_path", app)
@@ -172,10 +172,21 @@ class StageTests(unittest.TestCase):
         policy = block('resource "cloudflare_zero_trust_access_policy" "astryx_stage_anyone_signed_in"', STAGE)
         self.assertIn('decision         = "allow"', policy)
         self.assertIn("include          = [{ everyone = {} }]", policy)
-        # Nothing on this host is bypassed or opened by a policy: the rest has no application, and the API checks tokens.
-        self.assertNotIn('"bypass"', STAGE)
         self.assertNotIn("non_identity", STAGE)
-        self.assertEqual(STAGE.count("everyone = {}"), 1)
+        self.assertEqual(STAGE.count("everyone = {}"), 2)  # the sign-in policy and the host bypass
+        self.assertEqual(STAGE.count('"bypass"'), 1)
+
+    def test_the_rest_of_the_host_bypasses_the_wildcard_and_the_login_path_does_not(self):
+        pol = block('resource "cloudflare_zero_trust_access_policy" "astryx_stage_public"', STAGE)
+        app = block('resource "cloudflare_zero_trust_access_application" "astryx_stage_public"', STAGE)
+        self.assertIn('decision   = "bypass"', pol)
+        # The exact host, never a wildcard or the login path: Access picks the more specific /native/login application.
+        self.assertIn("domain     = local.astryx_stage_hostname", app)
+        self.assertIn('{ type = "public", uri = local.astryx_stage_hostname }', app)
+        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+)\.id", app),
+                         ["cloudflare_zero_trust_access_policy.astryx_stage_public"])
+        login = block('resource "cloudflare_zero_trust_access_application" "astryx_stage_login"', STAGE)
+        self.assertNotIn("astryx_stage_public", login)
 
     def test_the_connector_requires_access_on_the_login_path_and_routes_the_rest(self):
         config = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "astryx_stage"', STAGE)
@@ -212,6 +223,7 @@ class StageTests(unittest.TestCase):
         dns = block('resource "cloudflare_dns_record" "astryx_stage"', STAGE)
         self.assertIn('astryx_stage_hostname   = "astryx-stage.dolphin-labs.dev"', STAGE)
         self.assertIn("cloudflare_zero_trust_access_application.astryx_stage_login,", dns)
+        self.assertIn("cloudflare_zero_trust_access_application.astryx_stage_public,", dns)
         self.assertIn("cloudflare_zero_trust_tunnel_cloudflared_config.astryx_stage,", dns)
         self.assertIn("proxied = true", dns)
         self.assertIn('name       = "astryx-stage"', block('resource "cloudflare_zero_trust_tunnel_cloudflared" "astryx_stage"', STAGE))

@@ -54,7 +54,8 @@ class GuardrailTests(unittest.TestCase):
     def test_nothing_here_trusts_the_fleet_account(self):
         # No principal in this repository names the fleet account except its own roles' providers and the state bucket.
         for f in ROOT.glob("*.tf"):
-            if f.name == "fcvm-fleet-account.tf":
+            # The files that build inside the fleet account itself (fcvm-fleet.tf) name its id for its own resources.
+            if f.name in {"fcvm-fleet-account.tf", "fcvm-fleet.tf"}:
                 continue
             text = f.read_text()
             self.assertNotIn("aws_organizations_account.fcvm_fleet", text, f.name)
@@ -93,13 +94,18 @@ class ApplyRoleTests(unittest.TestCase):
 
 
 class QuotaTests(unittest.TestCase):
-    def test_g_spot_is_192_in_each_fleet_region_and_never_lowered(self):
+    def test_g_spot_is_192_in_us_east_1_and_never_lowered(self):
         self.assertIn("fcvm_fleet_spot_g_vcpus = 192", TF)
-        for suffix, alias in (("east2", "fcvm_fleet"), ("west2", "fcvm_fleet_west2"), ("east1", "fcvm_fleet_east1")):
+        for suffix, alias in (("east1", "fcvm_fleet_east1"),):
             q = block(f'resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_{suffix}"')
             self.assertIn(f"provider     = aws.{alias}", q)
             self.assertIn('quota_code   = "L-3819A6DF"', q)
             self.assertIn(f"max(local.fcvm_fleet_spot_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_spot_g_{suffix}.value)", q)
+        # One region is enough (owner, 2026-10-22): the other two are forgotten, never destroyed.
+        for gone in ("east2", "west2"):
+            self.assertNotIn(f'resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_{gone}"', TF)
+            self.assertIn(f"from = aws_servicequotas_service_quota.fcvm_fleet_spot_g_{gone}", TF)
+        self.assertEqual(TF.count("destroy = false"), 2)
 
 
 if __name__ == "__main__":
