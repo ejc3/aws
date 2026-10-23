@@ -1603,7 +1603,8 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   at `lattice-mcp-stage.dolphin-labs.dev/mcp`. It is its own OAuth server for MCP clients and signs people in through an
   owner-only Access for SaaS (OIDC) application, so it has no self-hosted Access gate. Its runtime secrets
   (`workers-stage/constellation-mcp`, administration only) are written by Terraform, including the Lattice service secret,
-  whose other copy goes to the API's `constellation/nonprod/lattice-service`. Order: apply; the first deploy creates the
+  whose other copy is the API's `constellation/nonprod/lattice-service`, written once on 2026-10-23 and not managed here (that
+  secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
   Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
   constellation-mcp`.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
