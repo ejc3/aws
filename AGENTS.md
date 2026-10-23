@@ -1837,23 +1837,32 @@ no Cloudflare deploy token on the dev boxes, and invite-only signup.
 ### Astryx Swift TestFlight invitations (astryx-join.tf)
 
 `astryx-join.dolphin-labs.dev`: anyone with an @meta.com address adds themselves as an external TestFlight tester of
-Astryx Swift (owner, 2026-10-23). Access (its own application, one-time PIN only, policy `email_domain = meta.com`)
-proves the address; the Worker `astryx-join` (`scripts/astryx-join.mjs`) verifies the Access token itself, requires
-@meta.com again, and calls App Store Connect with a dedicated **App Manager** key.
+Astryx Swift (owner, 2026-10-23). A public form, no sign-in (owner: "Turnstile please. Qr code will stay quiet, and I
+trust meta engineers"; Access would take a Zero Trust seat per person). The Worker `astryx-join`
+(`scripts/astryx-join.mjs`) checks, in order: a same-origin form post; the Turnstile token with siteverify (the widget's
+secret, the visitor's IP, an idempotency key); an address at exactly meta.com (trimmed, lower-cased); 5 requests per IP
+an hour and 500 a day (KV `astryx-join-limits`; a KV failure refuses); then App Store Connect with a dedicated **App
+Manager** key.
 
-- **Terraform deploys this Worker's code**, unlike the site Workers: the key is a `secret_text` binding, which only an
-  upload of the code can set with the pinned provider. A change to the `.mjs` is a reviewed change that the next apply
-  deploys (`content_sha256`).
+- **Public through a bypass for exactly this host** (`astryx_join_public`, the `dolphin_maps_public` pattern), created
+  after the record and the route: before the record the name falls to the `*.dolphin-labs.dev` previews tunnel.
+- **Terraform deploys this Worker's code**, unlike the site Workers: the App Store Connect key and the Turnstile secret
+  are `secret_text` bindings, which only an upload of the code can set with the pinned provider. A change to the `.mjs`
+  is a reviewed change that the next apply deploys (`content_sha256`).
 - **The switch is the secret** `astryx/testflight-asc-key` (us-west-1; JSON `ISSUER_ID`, `KEY_ID`, `PRIVATE_KEY`). Until
-  it exists nothing is created and the name stays behind the `*.dolphin-labs.dev` GitHub gate. The owner creates it
-  (README, "Astryx Swift: self-serve TestFlight invitations"); Terraform adds an administration-only read policy.
+  it exists nothing is created and the name stays behind the GitHub gate. The owner creates it (README, "Astryx Swift:
+  self-serve TestFlight invitations"); Terraform adds an administration-only read policy. The Turnstile site key and
+  secret come from `cloudflare_turnstile_widget.astryx_join`.
+- **Turnstile write on the provider token.** No resource used Turnstile before this one: add the account permission
+  Turnstile Sites Write to `cloudflare-tunnel-token` with one PUT of the token's definition, as Workers KV Storage Write
+  was (its id from `GET /accounts/<id>/tokens/permission_groups`).
 - **Never bind `games-worth-watching/app-store-connect`** (Admin, cloud signing) into a Worker; `scripts/test-astryx-join.py`
   fails on it.
-- **No address in a log line the Worker writes**: outcome, HTTP status and Apple's error code only. The node test fails
-  on an `@` in any log line.
+- **No address or IP in a log line the Worker writes**: outcome, HTTP status and Apple's or Turnstile's error code only.
+  The KV keys hold a hash of the IP, never an address. The node test fails on an `@` or a test IP in any log line.
 - **The main module may export only functions** besides `default`: workerd refuses to start on any other named export.
-- Limits: 10,000 external testers per app (the page says so); one Zero Trust seat per person who signs in (the Free plan
-  has 50); Beta App Review for each new build version.
+- **Why not the rate-limiting binding:** its period is 10 or 60 seconds, so it cannot say 5 an hour or 500 a day.
+- Limits: 10,000 external testers per app (the page says so); Beta App Review for each new build version.
 
 ### Colton Games production on Cloudflare (switched 2026-10-11)
 

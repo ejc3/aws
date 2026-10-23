@@ -1,41 +1,49 @@
 # astryx-join.tf
 #
-# Self-serve TestFlight invitations for Astryx Swift: anyone with an @meta.com address scans a QR code, proves they own
-# the address, and is added as an external tester of the app (owner, 2026-10-23: "I want anyone with a meta.com email
+# Self-serve TestFlight invitations for Astryx Swift: anyone with an @meta.com address scans a QR code, types the
+# address, and is added as an external tester of the app (owner, 2026-10-23: "I want anyone with a meta.com email
 # address to get a TestFlight invite").
 #
-#   astryx-join.dolphin-labs.dev -> Cloudflare Access (@meta.com, one-time PIN) -> Worker astryx-join -> App Store Connect
+#   astryx-join.dolphin-labs.dev -> Worker astryx-join (Turnstile, @meta.com, rate limits) -> App Store Connect
 #
-#   GET  /      who you are signed in as, and one button
+#   GET  /      a form: "Your @meta.com email", the Turnstile widget, one button
 #   POST /join  creates the tester in the beta group "Meta (self-serve)" (or adds an existing tester to it)
 #
-# The address is never typed. Access mails a one-time PIN to it (which proves ownership) and admits only an address at
-# meta.com; the Worker (scripts/astryx-join.mjs, tests in scripts/test-astryx-join.mjs) verifies the Access token itself
-# (the team's keys, this application's audience, the team issuer) and requires @meta.com again before it calls Apple.
+# PUBLIC, with no sign-in (owner, 2026-10-23: "Turnstile please. Qr code will stay quiet, and I trust meta engineers").
+# An Access gate would take a Zero Trust seat per person, about $7 a user a month past the Free plan's 50. An address
+# is therefore not proven when it is typed; the invitation goes to that inbox and can only be accepted from it. What
+# bounds abuse (scripts/astryx-join.mjs, tests in scripts/test-astryx-join.mjs): a same-origin form post; a Turnstile
+# token verified server-side (siteverify with the widget's secret, the visitor's IP and an idempotency key) before
+# anything else; an address at exactly meta.com; 5 requests per IP an hour and 500 a day overall (counters in the KV
+# namespace below); then App Store Connect with a dedicated App Manager key.
 #
-# Unlike the site Workers (workers-stage.tf), Terraform deploys this Worker's code too: it is one file with no build, and
-# its App Store Connect key is a secret binding that only an upload of the code can set (the pinned provider has no
-# resource that sets a Worker secret on its own; claw-master-dashboard-site.tf). So Cloudflare credentials and the key
-# both stay on the jumpbox. The shape of the host is Dolphin Maps' (dolphin-labs-zone.tf): a proxied placeholder record
-# and a Workers route, and an Access application of its own for exactly this host, which wins over *.dolphin-labs.dev.
+# Terraform deploys this Worker's code too, unlike the site Workers (workers-stage.tf): it is one file with no build,
+# and its secrets (the App Store Connect key, the Turnstile secret) are secret bindings that only an upload of the code
+# can set (the pinned provider has no resource that sets a Worker secret on its own; claw-master-dashboard-site.tf).
+# The shape of the host is Dolphin Maps' (dolphin-labs-zone.tf): a proxied placeholder record, a Workers route, and an
+# Access application of its own for exactly this host with a bypass-everyone policy, which wins over the
+# *.dolphin-labs.dev GitHub gate for this one name and no other.
 #
 # THE KEY: a dedicated App Store Connect API key with the App Manager role (the lowest role that manages testers), in
 # Secrets Manager as astryx/testflight-asc-key (JSON: ISSUER_ID, KEY_ID, PRIVATE_KEY). Never the broader Admin key
-# (games-worth-watching/app-store-connect, dev-ai-services.tf): a Worker holds this one, and it can do no more than
-# testers and builds. The owner creates the secret with its value (README, "Astryx Swift: self-serve TestFlight
-# invitations"); Terraform adopts it here with an administration-only read policy and binds it to the Worker.
+# (games-worth-watching/app-store-connect, dev-ai-services.tf). The owner creates the secret with its value (README,
+# "Astryx Swift: self-serve TestFlight invitations"); Terraform adopts it with an administration-only read policy.
+# The Turnstile widget's site key and secret come from the widget resource: no step of the owner's.
 #
 # A SWITCH THAT IS THE SECRET. Nothing below exists until that secret does: an apply before it creates nothing, and the
 # first apply after it builds the whole host. Until then astryx-join.dolphin-labs.dev falls to the * wildcard, behind
-# the GitHub organization gate, so it never answers anyone outside it.
+# the GitHub organization gate.
 #
-# ORDER, inside the one apply: the record (so the name stops reaching the previews tunnel), then the Access application
-# (a @meta.com sign-in must never be admitted to the previews tunnel), then the Worker (it needs the application's
-# audience), then the route. The Worker's workers.dev and preview URLs stay off: the route is its only address.
+# ORDER, inside the one apply: the record (so the name stops reaching the previews tunnel), the Worker, its workers.dev
+# and preview URLs off, the route, and only then the bypass: a bypass that came before the record would make the
+# previews tunnel public under this name. Until the bypass exists the name stays behind the GitHub gate (fails closed).
 #
-# LIMITS: Apple allows 10,000 external testers per app (the page says so when Apple refuses on it). Each person who
-# signs in takes a Cloudflare Zero Trust seat until removed (the Free plan has 50). New build versions for external
-# testers need Beta App Review before this group sees them.
+# CREDENTIAL: the Turnstile widget needs Turnstile write on the provider token (cloudflare-tunnel-token), which no
+# resource here used before; add it with one PUT of the token's definition, as Workers KV Storage Write was. It already
+# has Workers Scripts, Workers KV Storage, Access, DNS and this zone's Workers Routes write.
+#
+# LIMITS: Apple allows 10,000 external testers per app (the page says so when Apple refuses on it). New build versions
+# for external testers need Beta App Review before this group sees them.
 
 locals {
   astryx_join_hostname = "astryx-join.dolphin-labs.dev"
@@ -43,8 +51,6 @@ locals {
   astryx_join_module   = "${path.module}/scripts/astryx-join.mjs"
   # The App Manager key's secret (above). Its existence is the switch.
   astryx_join_asc_secret = "astryx/testflight-asc-key"
-  # Who may sign in: an address at exactly this domain (Access's email_domain rule; the Worker checks it again).
-  astryx_join_email_domain = "meta.com"
   # The beta group "Meta (self-serve)" of the app Astryx Swift (an external group, created in App Store Connect). Not a
   # secret: the key is what grants access to it.
   astryx_join_beta_group_id = "56c54804-5285-40de-8206-1553a0c43898"
@@ -104,46 +110,21 @@ resource "cloudflare_dns_record" "astryx_join" {
   comment = "proxied; Worker ${local.astryx_join_worker} route serves all; origin unreachable on purpose"
 }
 
-resource "cloudflare_zero_trust_access_policy" "astryx_join_meta" {
-  count            = local.astryx_join_ready ? 1 : 0
-  account_id       = var.cloudflare_account_id
-  name             = "Astryx Swift TestFlight invitations: @meta.com"
-  decision         = "allow"
-  session_duration = "1h"
-
-  include = [{
-    email_domain = { domain = local.astryx_join_email_domain }
-  }]
+# The two counters (per IP an hour, all of them a day) the Worker keeps; its LIMITS binding. Holds no address: an IP
+# hash and a count per key, each expiring.
+resource "cloudflare_workers_kv_namespace" "astryx_join_limits" {
+  count      = local.astryx_join_ready ? 1 : 0
+  account_id = var.cloudflare_account_id
+  title      = "astryx-join-limits"
 }
 
-resource "cloudflare_zero_trust_access_application" "astryx_join" {
-  count            = local.astryx_join_ready ? 1 : 0
-  account_id       = var.cloudflare_account_id
-  name             = "Astryx Swift TestFlight invitations"
-  type             = "self_hosted"
-  domain           = local.astryx_join_hostname
-  destinations     = [{ type = "public", uri = local.astryx_join_hostname }]
-  session_duration = "1h"
-
-  # The one-time PIN only, straight to it: the PIN mailed to the address is the proof of ownership. Not Google or
-  # GitHub, whose addresses this host has no use for.
-  allowed_idps               = [cloudflare_zero_trust_access_identity_provider.onetimepin.id]
-  auto_redirect_to_identity  = true
-  app_launcher_visible       = false
-  http_only_cookie_attribute = true
-  same_site_cookie_attribute = "lax"
-
-  # The policy attachment MUST be declared here; see cc_games_dev in cloudflare.tf. A person only: no service token.
-  policies = [
-    {
-      id         = cloudflare_zero_trust_access_policy.astryx_join_meta[0].id
-      precedence = 1
-    },
-  ]
-
-  # After the record: while the name still fell to the * wildcard, this application would admit a @meta.com sign-in
-  # to the previews tunnel.
-  depends_on = [cloudflare_dns_record.astryx_join]
+# Managed mode: Cloudflare decides whether a visitor sees a checkbox. Only this hostname may use the widget.
+resource "cloudflare_turnstile_widget" "astryx_join" {
+  count      = local.astryx_join_ready ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Astryx Swift TestFlight invitations"
+  domains    = [local.astryx_join_hostname]
+  mode       = "managed"
 }
 
 resource "cloudflare_workers_script" "astryx_join" {
@@ -156,8 +137,9 @@ resource "cloudflare_workers_script" "astryx_join" {
   compatibility_date = "2026-10-01"
 
   bindings = [
-    { name = "ACCESS_TEAM_DOMAIN", type = "plain_text", text = local.browser_manager_issuer },
-    { name = "ACCESS_AUD", type = "plain_text", text = cloudflare_zero_trust_access_application.astryx_join[0].aud },
+    { name = "TURNSTILE_SITE_KEY", type = "plain_text", text = cloudflare_turnstile_widget.astryx_join[0].sitekey },
+    { name = "TURNSTILE_SECRET", type = "secret_text", text = cloudflare_turnstile_widget.astryx_join[0].secret },
+    { name = "LIMITS", type = "kv_namespace", namespace_id = cloudflare_workers_kv_namespace.astryx_join_limits[0].id },
     { name = "ASC_BETA_GROUP_ID", type = "plain_text", text = local.astryx_join_beta_group_id },
     { name = "ASC_ISSUER_ID", type = "secret_text", text = local.astryx_join_asc["ISSUER_ID"] },
     { name = "ASC_KEY_ID", type = "secret_text", text = local.astryx_join_asc["KEY_ID"] },
@@ -190,14 +172,51 @@ resource "cloudflare_workers_route" "astryx_join" {
   pattern = "${local.astryx_join_hostname}/*"
   script  = cloudflare_workers_script.astryx_join[0].script_name
 
-  depends_on = [cloudflare_zero_trust_access_application.astryx_join, cloudflare_workers_script_subdomain.astryx_join]
+  depends_on = [cloudflare_workers_script_subdomain.astryx_join]
+}
+
+# Public: this one host is exempt from the *.dolphin-labs.dev GitHub gate. The same pattern as dolphin_maps_public in
+# dolphin-labs-zone.tf, its own policy and application for exactly this host.
+resource "cloudflare_zero_trust_access_policy" "astryx_join_public" {
+  count      = local.astryx_join_ready ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Astryx Swift TestFlight invitations (public)"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "astryx_join_public" {
+  count      = local.astryx_join_ready ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Astryx Swift TestFlight invitations (public)"
+  type       = "self_hosted"
+  domain     = local.astryx_join_hostname
+
+  destinations = [
+    { type = "public", uri = local.astryx_join_hostname },
+  ]
+
+  # Declared here, as on every application: an apply drops an attachment that is not.
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.astryx_join_public[0].id
+      precedence = 1
+    },
+  ]
+
+  # After the record and the route: without the record the name falls to the * wildcard, the previews tunnel, which a
+  # bypass would make public.
+  depends_on = [cloudflare_dns_record.astryx_join, cloudflare_workers_route.astryx_join]
 }
 
 output "astryx_join" {
   description = "Astryx Swift's self-serve TestFlight invitations (no credentials)"
   value = {
     url    = "https://${local.astryx_join_hostname}"
-    status = local.astryx_join_ready ? "live: @meta.com addresses sign in with a one-time PIN" : "off: put the App Manager key in ${local.astryx_join_asc_secret}, then apply"
+    status = local.astryx_join_ready ? "live: public form, Turnstile, @meta.com only, 5 an hour per IP, 500 a day" : "off: put the App Manager key in ${local.astryx_join_asc_secret}, then apply"
     secret = local.astryx_join_asc_secret
   }
 }

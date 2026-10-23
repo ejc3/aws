@@ -143,9 +143,9 @@ jobs:
         run: node --version && node --test scripts/test-pc-enroll.mjs
       - name: PC enrollment Terraform (owner-only Access, strict TLS, no default endpoint, exact grants)
         run: python3 -S -B scripts/test-pc-enroll-terraform.py
-      - name: Astryx Swift TestFlight invitations Worker (Access token check, @meta.com only, App Store Connect outcomes, no address logged; offline)
+      - name: Astryx Swift TestFlight invitations Worker (Turnstile first, @meta.com only, per-IP and daily limits, App Store Connect outcomes, no address logged; offline)
         run: node --version && node --test scripts/test-astryx-join.mjs
-      - name: "Astryx Swift TestFlight invitations Terraform (@meta.com one-time PIN Access, the App Manager key only, off until its secret exists)"
+      - name: "Astryx Swift TestFlight invitations Terraform (public through a bypass for exactly its host, a managed Turnstile widget, KV limits, the App Manager key only, off until its secret exists)"
         run: python3 -S -B scripts/test-astryx-join.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: python3 -S -B scripts/test-mac-setup.py

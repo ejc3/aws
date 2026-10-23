@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Astryx Swift's self-serve TestFlight invitations (astryx-join.tf): astryx-join.dolphin-labs.dev is gated by an Access
-application of its own that admits only @meta.com addresses through the one-time PIN; the Worker is deployed by
-Terraform from scripts/astryx-join.mjs with the dedicated App Manager key as secret bindings, never the broader key; the
-whole host exists only once that key's secret does, and is built record, Access, Worker, route, with workers.dev off.
+"""Astryx Swift's self-serve TestFlight invitations (astryx-join.tf): astryx-join.dolphin-labs.dev is public through a
+bypass application for exactly that host (after its record and route; the *.dolphin-labs.dev gate unchanged); a managed
+Turnstile widget for exactly that host gives the Worker its site key and secret; a KV namespace holds the rate limits;
+the Worker is deployed by Terraform from scripts/astryx-join.mjs with the dedicated App Manager key as secret bindings,
+never the broader key; the whole host exists only once that key's secret does, with workers.dev off.
 Offline: reads the sources. The Worker's own logic is tested by scripts/test-astryx-join.mjs (node --test)."""
 import re
 import unittest
@@ -30,8 +31,10 @@ GATED = [
     ("data", "aws_secretsmanager_secret_version", "astryx_join_asc_key"),
     ("data", "aws_secretsmanager_secret", "astryx_join_asc_key"),
     ("resource", "cloudflare_dns_record", "astryx_join"),
-    ("resource", "cloudflare_zero_trust_access_policy", "astryx_join_meta"),
-    ("resource", "cloudflare_zero_trust_access_application", "astryx_join"),
+    ("resource", "cloudflare_workers_kv_namespace", "astryx_join_limits"),
+    ("resource", "cloudflare_turnstile_widget", "astryx_join"),
+    ("resource", "cloudflare_zero_trust_access_policy", "astryx_join_public"),
+    ("resource", "cloudflare_zero_trust_access_application", "astryx_join_public"),
     ("resource", "cloudflare_workers_script", "astryx_join"),
     ("resource", "cloudflare_workers_script_subdomain", "astryx_join"),
     ("resource", "cloudflare_workers_route", "astryx_join"),
@@ -62,38 +65,59 @@ class TheSwitch(unittest.TestCase):
         self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }', policy)
 
 
-class Access(unittest.TestCase):
-    def test_the_policy_admits_exactly_the_meta_com_domain_and_nothing_else(self):
-        self.assertIn('astryx_join_email_domain = "meta.com"', TF)
-        policy = block("cloudflare_zero_trust_access_policy", "astryx_join_meta")
-        self.assertIn('decision         = "allow"', policy)
-        include = re.search(r"include = (\[.*?\])\n", policy, re.S).group(1)
-        self.assertEqual(re.sub(r"\s+", "", include), "[{email_domain={domain=local.astryx_join_email_domain}}]")
-        self.assertNotRegex(policy, r"\b(exclude|require|everyone|service_token|non_identity|bypass)\b")
+class PublicHost(unittest.TestCase):
+    def test_the_bypass_policy_lets_everyone_in_and_does_nothing_else(self):
+        policy = block("cloudflare_zero_trust_access_policy", "astryx_join_public")
+        self.assertIn('decision   = "bypass"', policy)
+        self.assertEqual(re.sub(r"\s+", "", re.search(r"include = (\[.*?\])", policy, re.S).group(1)), "[{everyone={}}]")
+        self.assertNotRegex(policy, r"\b(exclude|require)\b")
 
-    def test_the_application_covers_exactly_the_host_with_the_one_time_pin_only(self):
-        app = block("cloudflare_zero_trust_access_application", "astryx_join")
-        self.assertIn("domain           = local.astryx_join_hostname\n", app)
-        self.assertIn('destinations     = [{ type = "public", uri = local.astryx_join_hostname }]', app)
-        self.assertIn("allowed_idps               = [cloudflare_zero_trust_access_identity_provider.onetimepin.id]", app)
-        self.assertIn("auto_redirect_to_identity  = true", app)
-        self.assertIn("http_only_cookie_attribute = true", app)
+    def test_the_bypass_application_covers_exactly_this_host(self):
+        app = block("cloudflare_zero_trust_access_application", "astryx_join_public")
+        self.assertIn('type       = "self_hosted"', app)
+        self.assertIn("domain     = local.astryx_join_hostname\n", app)
+        dests = re.search(r"destinations = \[(.*?)\n  \]", app, re.S).group(1)
+        self.assertEqual(re.sub(r"\s+", "", dests), '{type="public",uri=local.astryx_join_hostname},')
         self.assertEqual(re.findall(r"id\s+= (cloudflare_zero_trust_access_policy\.[\w\[\]0-9]+)\.id", app),
-                         ["cloudflare_zero_trust_access_policy.astryx_join_meta[0]"])
-        self.assertNotIn("google", app)
-        self.assertNotIn("github", app)
-        self.assertEqual(code(TF).count("astryx_join_meta[0].id"), 1)
+                         ["cloudflare_zero_trust_access_policy.astryx_join_public[0]"])
+        self.assertNotIn("*", app.replace("/*", ""))
+        self.assertEqual(code(TF).count("astryx_join_public[0].id"), 1)
+        everywhere = "\n".join(code(p.read_text()) for p in ROOT.glob("*.tf"))
+        self.assertEqual(everywhere.count("astryx_join_public[0].id"), 1)
 
-    def test_the_application_exists_only_after_the_record(self):
-        # Before the record the name falls to the * wildcard, the previews tunnel: a @meta.com sign-in must never reach it.
-        app = block("cloudflare_zero_trust_access_application", "astryx_join")
-        self.assertIn("depends_on = [cloudflare_dns_record.astryx_join]", app)
+    def test_no_sign_in_gate_of_its_own(self):
+        self.assertEqual(len(re.findall(r'decision\s+= "(allow|non_identity)"', code(TF))), 0)
+        self.assertNotIn("email_domain", code(TF))
+        self.assertNotIn("onetimepin", code(TF))
+
+    def test_the_bypass_exists_only_after_the_host_is_the_workers(self):
+        # Without the record the name falls to the * wildcard, the previews tunnel, which a bypass would make public.
+        app = block("cloudflare_zero_trust_access_application", "astryx_join_public")
+        self.assertIn("depends_on = [cloudflare_dns_record.astryx_join, cloudflare_workers_route.astryx_join]", app)
 
     def test_the_wildcard_gate_is_unchanged(self):
         app = block("cloudflare_zero_trust_access_application", "dolphin_labs", ZONE)
         self.assertIn('domain           = "*.dolphin-labs.dev"', app)
         self.assertEqual(re.findall(r"id\s+= (cloudflare_zero_trust_access_policy\.[\w\[\]0-9]+)\.id", app),
                          ["cloudflare_zero_trust_access_policy.dolphin_allowed[0]"])
+
+
+class TurnstileAndLimits(unittest.TestCase):
+    def test_a_managed_widget_for_exactly_this_host(self):
+        w = block("cloudflare_turnstile_widget", "astryx_join")
+        self.assertIn("domains    = [local.astryx_join_hostname]", w)
+        self.assertIn('mode       = "managed"', w)
+
+    def test_its_site_key_is_plain_and_its_secret_is_a_secret_both_from_the_widget(self):
+        w = block("cloudflare_workers_script", "astryx_join")
+        self.assertIn('{ name = "TURNSTILE_SITE_KEY", type = "plain_text", text = cloudflare_turnstile_widget.astryx_join[0].sitekey }', w)
+        self.assertIn('{ name = "TURNSTILE_SECRET", type = "secret_text", text = cloudflare_turnstile_widget.astryx_join[0].secret }', w)
+
+    def test_the_limits_namespace_is_bound_as_limits(self):
+        w = block("cloudflare_workers_script", "astryx_join")
+        self.assertIn('{ name = "LIMITS", type = "kv_namespace", namespace_id = cloudflare_workers_kv_namespace.astryx_join_limits[0].id }', w)
+        self.assertIn("const PER_IP_PER_HOUR = 5;", WORKER)
+        self.assertIn("const DAILY_CAP = 500;", WORKER)
 
 
 class Serving(unittest.TestCase):
@@ -112,12 +136,11 @@ class Serving(unittest.TestCase):
         # Cloudflare's Free plan caps a record comment at 100 characters.
         self.assertLessEqual(len(comment.replace("${local.astryx_join_worker}", "astryx-join")), 100)
 
-    def test_the_route_is_the_workers_only_address_and_comes_last(self):
+    def test_the_route_is_the_workers_only_address(self):
         route = block("cloudflare_workers_route", "astryx_join")
         self.assertIn('pattern = "${local.astryx_join_hostname}/*"', route)
         self.assertIn("script  = cloudflare_workers_script.astryx_join[0].script_name", route)
-        self.assertIn("cloudflare_zero_trust_access_application.astryx_join", route.split("depends_on")[1])
-        self.assertIn("cloudflare_workers_script_subdomain.astryx_join", route.split("depends_on")[1])
+        self.assertIn("depends_on = [cloudflare_workers_script_subdomain.astryx_join]", route)
         sub = block("cloudflare_workers_script_subdomain", "astryx_join")
         self.assertIn("enabled          = false", sub)
         self.assertIn("previews_enabled = false", sub)
@@ -137,15 +160,13 @@ class TheWorker(unittest.TestCase):
 
     def test_the_bindings_are_exactly_the_ones_the_worker_reads(self):
         w = block("cloudflare_workers_script", "astryx_join")
-        bindings = dict(re.findall(r'\{ name = "(\w+)", type = "(\w+)", text = [^}]+\}', w))
+        bindings = dict(re.findall(r'\{ name = "(\w+)", type = "(\w+)", (?:text|namespace_id) = [^}]+\}', w))
         self.assertEqual(bindings, {
-            "ACCESS_TEAM_DOMAIN": "plain_text", "ACCESS_AUD": "plain_text", "ASC_BETA_GROUP_ID": "plain_text",
-            "ASC_ISSUER_ID": "secret_text", "ASC_KEY_ID": "secret_text", "ASC_PRIVATE_KEY": "secret_text",
+            "TURNSTILE_SITE_KEY": "plain_text", "TURNSTILE_SECRET": "secret_text", "LIMITS": "kv_namespace",
+            "ASC_BETA_GROUP_ID": "plain_text", "ASC_ISSUER_ID": "secret_text", "ASC_KEY_ID": "secret_text",
+            "ASC_PRIVATE_KEY": "secret_text",
         })
         self.assertEqual(sorted(set(re.findall(r"env\.([A-Z_]+)", WORKER))), sorted(bindings))
-        self.assertIn('text = cloudflare_zero_trust_access_application.astryx_join[0].aud', w)
-        self.assertIn("text = local.browser_manager_issuer", w)
-        self.assertIn('browser_manager_issuer   = "https://ejc3.cloudflareaccess.com"', (ROOT / "browser-manager.tf").read_text())
         for k in ("ISSUER_ID", "KEY_ID", "PRIVATE_KEY"):
             self.assertIn('type = "secret_text", text = local.astryx_join_asc["%s"]' % k, w)
         self.assertIn("jsondecode(data.aws_secretsmanager_secret_version.astryx_join_asc_key[0].secret_string)", TF)
@@ -168,15 +189,17 @@ class TheWorker(unittest.TestCase):
         msg = re.search(r'error_message = "(.*)"', w).group(1)
         self.assertNotIn("${", msg)
 
-    def test_the_worker_checks_the_token_and_domain_itself_and_logs_no_address(self):
-        self.assertIn("claims.iss !== teamDomain", WORKER)
-        self.assertIn("auds.includes(aud)", WORKER)
+    def test_the_worker_checks_turnstile_then_the_domain_and_logs_no_address(self):
+        self.assertIn("const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';", WORKER)
         self.assertIn("const EMAIL_DOMAIN = '@meta.com';", WORKER)
-        self.assertIn("request.headers.get('cf-access-jwt-assertion')", WORKER)
+        handler = WORKER[WORKER.index("export function makeHandler"):]
+        self.assertLess(handler.index("deps.turnstile("), handler.index("metaEmail(typed)"))
+        self.assertLess(handler.index("metaEmail(typed)"), handler.index("deps.limits(ip)"))
+        self.assertLess(handler.index("deps.limits(ip)"), handler.index("inviteTester("))
         # The one log call site is the injected log; the handler never passes the address to it.
         self.assertEqual(WORKER.count("console."), 1)
         for call in re.findall(r"log\(\{[^}]*\}\)", WORKER):
-            self.assertNotRegex(call, r"\bemail\b", call)
+            self.assertNotRegex(call, r"\b(email|typed|ip)\b", call)
 
     def test_the_app_store_connect_token_is_es256_for_twenty_minutes(self):
         self.assertIn("const ASC_TOKEN_SECONDS = 20 * 60;", WORKER)
