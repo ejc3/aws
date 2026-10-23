@@ -1365,10 +1365,10 @@ Available if a task needs them; neither needs a key on disk.
   function at all: an agent on nextjs-dev reaches them as `dolphin-terraform` (the owner's container only), from a jumpbox
   through `OrganizationAccountAccessRole` in the Dolphin account. Changes are dolphin-aws pull requests, applied from
   nextjs-dev.
-- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live` and
-  `dolphin-maps-loop-sweep` (one bundle) on EventBridge schedules in America/Los_Angeles time (live samples
-  every 5 minutes on weekday mornings, the sweep and refit on Sunday night; both off until
-  `dolphin_maps_loop_enabled`; one failed sweep alarms), reading `browserbase/credentials`
+- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
+  `dolphin-maps-loop-sweep` and `dolphin-maps-loop-refit` (one bundle) on EventBridge schedules in America/Los_Angeles
+  time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night, the refit an hour later; all off
+  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.

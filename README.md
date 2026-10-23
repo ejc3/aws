@@ -1940,13 +1940,13 @@ switch-over in a fixed order so the loops never run in both places:
    The loops commit straight to dolphin-maps' main, which has no ruleset today; if it ever gets one, add this app
    as a bypass actor first or every pass fails.
 2. **The first deploy.** Set dolphin-maps' repository variables from output `dolphin_maps_loop` and run its
-   `deploy-loop.yml` on main; it uploads the bundle and updates both functions' code (the handler stays
-   `index.handler`). Invoke each once by hand and read its journal: `{"mode": "sweep"}` any time, `{"mode": "live"}`
+   `deploy-loop.yml` on main; it uploads the bundle and updates the three functions' code (the handler stays
+   `index.handler`). Invoke each once by hand and read its journal: `{"mode": "sweep"}` any time, `{"mode": "refit"}` any time (it reads no page; its journal record is the refit's log, and its duration is the number to check against the 12-minute guard deadline), `{"mode": "live"}`
    only inside a route's morning window (weekdays 06:00-08:55 Los Angeles time): outside one the live handler returns
    before reading a secret or writing a record, so it proves nothing.
 3. **The switch-over, back to back:** set dolphin-maps' repository variable `LOOPS_RUN_IN_AWS` to `true` (its
    `scrape-live.yml` and `scrape-weekly.yml` then stand down), then set `dolphin_maps_loop_enabled = true` here and
-   apply (the two schedules and the not-running alarms come on). To go back, the reverse order: the gate false and
+   apply (the three schedules and the not-running alarms come on). To go back, the reverse order: the gate false and
    apply first (the schedules stop), then the variable false (the GitHub loops resume).
 
 Every setup script also gives an account that has no user-level agent instructions a
