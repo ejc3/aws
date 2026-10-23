@@ -91,6 +91,20 @@ if [ -n "$NVME_DISKS" ]; then
 fi
   NVME
 
+  # Security updates at every pbox boot (owner, 2026-10-23): the stock Ubuntu image is weeks old, and each launch otherwise
+  # brings its fixable package findings back to Inspector. unattended-upgrade installs from the security pocket only
+  # (Ubuntu's default origins) and does not reboot, so a new kernel waits for the next boot. It refuses while another apt
+  # holds the lock (apt-daily-upgrade also runs at first boot), hence the retries; a failure is logged and the box still
+  # comes up. Runs after the boot's apt-get update.
+  pbox_security_updates = <<-SEC
+command -v unattended-upgrade >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y unattended-upgrades
+for _ in $(seq 1 10); do
+  unattended-upgrade -v && break
+  echo "pbox security updates: unattended-upgrade failed (apt lock busy?), retrying in 30 s" >&2
+  sleep 30
+done
+  SEC
+
   # GPU passthrough host (the kvm-gpu flavors): every NVIDIA PCI function (vendor 0x10de) goes to vfio-pci, so fcvm can hand
   # it to a microVM. A box without one skips all of it. The host never gets an NVIDIA driver: driverctl's override binds
   # vfio-pci now and again at every boot (its udev rule sets driver_override before a driver can probe), and vfio-pci is

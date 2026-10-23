@@ -311,6 +311,9 @@ with `failed=<reason>`, when the box was launched but did not come up), scripts 
 `ip`, `ssh` and `down`, which refuse when the slot holds another instance, and they never re-resolve a slot by name. The
 owner's launches tag `PboxLaunchedBy` (`PBOX_CALLER`, default the host); `down` without `--instance` refuses a box another
 caller launched in the last hour unless `--force`. Members' grants pin their tag keys, so their boxes carry no such tag.
+Every pbox boot (home, fallback and member) installs the security updates after its packages (`pbox_security_updates`
+in `pbox-flavors.tf`, owner 2026-10-23): `unattended-upgrade`, the security pocket only, retried while apt is busy, never a
+reboot, so a new kernel waits for the next boot and a failed update still leaves a usable box.
 The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:

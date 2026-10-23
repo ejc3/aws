@@ -541,6 +541,26 @@ class GpuIommuReboot(unittest.TestCase):
         self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
 
 
+class SecurityUpdatesAtBoot(unittest.TestCase):
+    # Owner, 2026-10-23: install security updates at every pbox boot, so a launch does not bring the stock image's fixable
+    # package findings back to Inspector. The security pocket only, never a reboot, and a box that cannot update still boots.
+    def test_the_snippet_installs_security_updates_only_and_retries_a_busy_lock(self):
+        sec = FLAVORS_TF.split("pbox_security_updates = <<-SEC", 1)[1].split("\n  SEC\n", 1)[0]
+        self.assertIn("unattended-upgrade -v && break", sec)
+        self.assertIn("for _ in $(seq 1 10); do", sec)
+        self.assertIn("command -v unattended-upgrade >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y unattended-upgrades", sec)
+        for forbidden in ("reboot", "dist-upgrade", "full-upgrade", "apt-get upgrade", "exit 1"):
+            self.assertNotIn(forbidden, sec, forbidden)
+
+    def test_every_pbox_boot_runs_it_once_after_apt_install(self):
+        for name, text in (("home", LAUNCH), ("fallback", FALLBACK), ("member", MEMBER)):
+            with self.subTest(boot=name):
+                self.assertEqual(text.count("${local.pbox_security_updates}"), 1)
+                at = text.index("${local.pbox_security_updates}")
+                self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop"), at)
+                self.assertLess(at, text.index("${local.pbox_local_nvme_setup}"))
+
+
 class LocalNvme(unittest.TestCase):
     def test_every_pbox_boot_mounts_local_nvme_found_by_model_and_never_formats_a_used_disk(self):
         nvme = re.search(r"pbox_local_nvme_setup = <<-NVME\n(.*?)\n  NVME\n", FLAVORS_TF, re.S).group(1)
