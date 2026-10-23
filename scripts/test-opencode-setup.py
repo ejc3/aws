@@ -30,26 +30,34 @@ def user_setup():
 def function_text():
     m = re.search(r"^opencode\(\) \{\n.*?^\}\n", USER_DATA, re.S | re.M)
     assert m, "opencode() missing from the managed ~/.zshrc"
-    return m.group()
+    return m.group().replace("$${", "${")  # Terraform's escape: the managed ~/.zshrc gets ${
 
 
 class OpencodeFunctionTests(unittest.TestCase):
-    def run_function(self, env_extra, config="[default]\nregion = us-west-1\n"):
-        """AWS_PROFILE as the fake opencode saw it ('' when unset)."""
+    def run_function(self, env_extra, config="[default]\nregion = us-west-1\n", aws=None, full=False):
+        """AWS_PROFILE as the fake opencode saw it ('' when unset); with full=True, (profile, ABLIT_KEY, aws calls)."""
         with tempfile.TemporaryDirectory() as home:
             bindir = Path(home, "bin")
             bindir.mkdir()
             fake = bindir / "opencode"
-            fake.write_text('#!/bin/sh\nprintf "%s|%s" "${AWS_PROFILE-}" "$*"\n')
+            fake.write_text('#!/bin/sh\nprintf "%s|%s|%s" "${AWS_PROFILE-}" "${ABLIT_KEY-}" "$*"\n')
             fake.chmod(0o755)
+            # A fake aws: logs its profile and arguments, prints the key (or fails, as for a member's container).
+            calls = Path(home, "aws-calls")
+            fake_aws = bindir / "aws"
+            fake_aws.write_text('#!/bin/sh\necho "${AWS_PROFILE-}|$*" >> %s\n%s\n' % (
+                calls, 'echo ak_test_key' if aws is None else aws))
+            fake_aws.chmod(0o755)
             if config is not None:
                 Path(home, ".aws").mkdir()
                 Path(home, ".aws", "config").write_text(config)
             env = {"PATH": "%s:/usr/bin:/bin" % bindir, "HOME": home, **env_extra}
             out = subprocess.run(["bash", "-c", function_text() + 'opencode run "hi there"'],
                                  env=env, capture_output=True, text=True, check=True).stdout
-            profile, args = out.split("|", 1)
+            profile, key, args = out.split("|", 2)
             self.assertEqual(args, "run hi there", "arguments pass through unchanged")
+            if full:
+                return profile, key, calls.read_text().splitlines() if calls.exists() else []
             return profile
 
     def test_a_clean_environment_gets_the_default_profile(self):
@@ -65,6 +73,25 @@ class OpencodeFunctionTests(unittest.TestCase):
         # The aws CLI refuses AWS_PROFILE=default when [default] does not exist.
         self.assertEqual(self.run_function({}, config="[profile other]\nregion = us-west-2\n"), "")
         self.assertEqual(self.run_function({}, config=None), "")
+
+
+    def test_the_abliteration_key_is_read_at_launch_into_opencode_only(self):
+        profile, key, calls = self.run_function({}, full=True)
+        self.assertEqual((profile, key), ("default", "ak_test_key"))
+        self.assertEqual(calls, ["default|secretsmanager get-secret-value --region us-west-1 --secret-id abliteration/api-key "
+                                 "--query SecretString --output text"])
+        self.assertNotIn("export ABLIT_KEY", function_text(), "the key stays out of the shell's environment")
+
+    def test_a_key_already_set_is_kept_and_a_refused_read_runs_without(self):
+        _, key, calls = self.run_function({"ABLIT_KEY": "mine"}, full=True)
+        self.assertEqual((key, calls), ("mine", []))
+        _, key, calls = self.run_function({}, aws="exit 255", full=True)  # a member container: AccessDenied
+        self.assertEqual(key, "")
+        self.assertEqual(len(calls), 1)
+        # No [default] profile: the read uses whatever credentials there are, with no empty AWS_PROFILE.
+        profile, key, calls = self.run_function({}, config=None, full=True)
+        self.assertEqual((profile, key), ("", "ak_test_key"))
+        self.assertTrue(calls[0].startswith("|"), calls)
 
 
 class OpencodeSetupTests(unittest.TestCase):

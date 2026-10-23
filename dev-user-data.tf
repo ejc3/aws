@@ -387,11 +387,21 @@ export TCLAUDE_ARGS="--remote-control"
 # credentials (exported keys still win), only when [default] exists (the aws CLI refuses a
 # missing one), and only for opencode: nothing else gets AWS_PROFILE.
 opencode() {
+  local profile=
   if [[ -z "$AWS_PROFILE$AWS_ACCESS_KEY_ID$AWS_BEARER_TOKEN_BEDROCK$AWS_WEB_IDENTITY_TOKEN_FILE$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI$AWS_CONTAINER_CREDENTIALS_FULL_URI" ]] &&
     grep -qs '^\[default\]' ~/.aws/config; then
-    AWS_PROFILE=default command opencode "$@"
+    profile=default
+  fi
+  # abliteration.ai: opencode's built-in abliteration-ai provider reads ABLIT_KEY. Read at each launch from Secrets
+  # Manager (ejc3/aws dev-ai-services.tf) into opencode's environment only; an account that may not read it runs without.
+  local ablit=$${ABLIT_KEY-}
+  [[ -n "$ablit" ]] || ablit=$([[ -z "$profile" ]] || export AWS_PROFILE=$profile
+    aws secretsmanager get-secret-value --region us-west-1 --secret-id abliteration/api-key \
+      --query SecretString --output text 2>/dev/null) || ablit=
+  if [[ -n "$profile" ]]; then
+    ABLIT_KEY=$ablit AWS_PROFILE=$profile command opencode "$@"
   else
-    command opencode "$@"
+    ABLIT_KEY=$ablit command opencode "$@"
   fi
 }
 ZSH

@@ -1440,6 +1440,14 @@ Available if a task needs them; neither needs a key on disk.
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
   container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
   repo, a command line or a commit.
+- **abliteration.ai for opencode**, metal boxes and the owner's nextjs-ct container (owner, 2026-10-23). opencode's built-in
+  `abliteration-ai` provider (OpenAI-compatible, `https://api.abliteration.ai/v1`; models `abliterated-model`,
+  `-large`, `-large-v2`, `-large-flash`) reads `ABLIT_KEY`, which the `opencode()` function in the managed `~/.zshrc` reads from
+  `abliteration/api-key` (us-west-1) at each launch, into opencode's environment only: pick a model with `/models`.
+  `abliteration/api-key` is a project key (project `opencode-dev-boxes`, permission `model.invoke`), readable by
+  dev-server-role (through `assume-constellation-terraform`), nextjs-dev-role for the owner's container (members are denied
+  it) and admins. `abliteration/admin-api-key` is the organization's Admin API key (projects, keys, spend limits, balance):
+  administration only. Rotate by minting a new project key with it, putting it in `abliteration/api-key` and revoking the old.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
