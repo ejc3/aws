@@ -254,6 +254,12 @@ resource "aws_autoscaling_group" "hosts" {
     value               = "fcvm-fleet-host"
     propagate_at_launch = true
   }
+
+  # The coordinator owns the desired capacity once the gate is on (0 with no viewer, back up for the next one); an apply
+  # must not reset it. max_size above is the gate.
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
 }
 
 # ------------------------------------------------------------------------------------------------ EC2 tiles
@@ -298,6 +304,42 @@ resource "aws_launch_template" "tile" {
   tags = { Name = "fcvm-fleet-tile-${each.key}" }
 }
 
+# The same tile on demand: the coordinator's fallback when EC2 has no spot capacity for a tile in any fleet region
+# (fcvm fleet coord --ec2-on-demand-template fcvm-fleet-tile-on-demand-<arch>). Everything but the market is the spot
+# template's.
+resource "aws_launch_template" "tile_on_demand" {
+  for_each      = toset(local.tile_archs)
+  name          = "fcvm-fleet-tile-on-demand-${each.key}"
+  description   = "fcvm fleet EC2 comparison tile on demand, ${each.key} (${local.tile_types[each.key]}): the coordinator's fallback"
+  image_id      = var.tile_amis[each.key]
+  instance_type = local.tile_types[each.key]
+
+  iam_instance_profile {
+    name = var.tile_profile_name
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  network_interfaces {
+    device_index                = 0
+    security_groups             = [aws_security_group.fleet.id]
+    associate_public_ip_address = true
+    ipv6_address_count          = 1
+    delete_on_termination       = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+  }
+
+  tags = { Name = "fcvm-fleet-tile-on-demand-${each.key}" }
+}
+
 output "vpc_id" {
   value = aws_vpc.this.id
 }
@@ -310,8 +352,9 @@ output "security_group_id" {
   value = aws_security_group.fleet.id
 }
 
+# Both markets: the coordinator's RunInstances is limited to these templates.
 output "tile_template_arns" {
-  value = [for t in aws_launch_template.tile : t.arn]
+  value = concat([for t in aws_launch_template.tile : t.arn], [for t in aws_launch_template.tile_on_demand : t.arn])
 }
 
 output "host_group_desired" {

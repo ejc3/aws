@@ -457,6 +457,30 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
       },
       {
+        # Without ListBucket, S3 answers a read of a missing object with 403, which the coordinator must treat as an error;
+        # with it, a fresh fleet's first read is a 404 and it starts empty. The bucket holds only the state object.
+        Sid      = "StateObjectMissingReadsAs404"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
+      },
+      {
+        # Scale to zero: with no viewer the coordinator sets the host groups' desired capacity to 0 and wakes them for the
+        # next one (fcvm fleet coord --scale-group <region>:fcvm-fleet-hosts). Only those groups; their max_size stays the
+        # gate (0 while local.fcvm_fleet_hosts_enabled is false), so the coordinator cannot start a host the gate holds off.
+        Sid      = "ScaleTheHostGroups"
+        Effect   = "Allow"
+        Action   = "autoscaling:SetDesiredCapacity"
+        Resource = [for r in local.fcvm_fleet_regions : "arn:aws:autoscaling:${r}:${local.fcvm_fleet_account_id}:autoScalingGroup:*:autoScalingGroupName/fcvm-fleet-hosts"]
+      },
+      {
+        # Reading the groups' instances while waking. DescribeAutoScalingGroups takes no resource-level permission.
+        Sid      = "DescribeTheHostGroups"
+        Effect   = "Allow"
+        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Resource = "*"
+      },
+      {
         # The DNS token (slot records and the ACME challenge) and the wildcard certificate it issues and renews. Not the
         # tunnel token (cloudflared gets it through the execution role) nor the agents' Access token.
         Sid      = "FleetSecrets"
