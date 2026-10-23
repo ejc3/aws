@@ -33,6 +33,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("arn      = aws_lambda_function.dolphin_maps_loop[each.key].arn", schedule)
         self.assertIn('live  = { schedule = "cron(*/5 6-8 ? * MON-FRI *)", timeout = 300, memory = 1024 }', TF)
         self.assertIn('sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }', TF)
+        # The refit is its own function with its own 15 minutes, an hour after the sweep (dolphin-maps #198).
+        self.assertIn('refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }', TF)
 
     def test_a_failed_pass_is_not_retried(self):
         self.assertIn("maximum_retry_attempts       = 0", block("aws_lambda_function_event_invoke_config", "dolphin_maps_loop"))
@@ -132,6 +134,9 @@ class AlarmTests(unittest.TestCase):
         self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["sweep"].function_name }', sweep)
         self.assertIn("evaluation_periods  = 1", sweep)
         self.assertNotIn("aws_cloudwatch_log_metric_filter", TF)
+        refit = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_refit_failed")
+        self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["refit"].function_name }', refit)
+        self.assertIn("evaluation_periods  = 1", refit)
         live = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_errors")
         self.assertIn('aws_lambda_function.dolphin_maps_loop["live"].function_name', live)
         self.assertIn("evaluation_periods  = 6", live)
@@ -144,7 +149,7 @@ class AlarmTests(unittest.TestCase):
 
     def test_a_loop_that_stops_running_alarms_while_its_schedule_is_on(self):
         idle = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_not_running")
-        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7 } : {}", idle)
+        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7 } : {}", idle)
         self.assertIn('metric_name         = "Invocations"', idle)
         self.assertIn('treat_missing_data  = "breaching"', idle)
         self.assertIn("datapoints_to_alarm = each.value", idle)
