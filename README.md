@@ -1535,6 +1535,43 @@ so fcvm-metal-x86 cannot) and `dolphin-labs-testflight` (dolphin-labs CI's TestF
 sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
 and put a new one the same way to rotate.
 
+### Astryx Swift: self-serve TestFlight invitations
+
+`https://astryx-join.dolphin-labs.dev` (`astryx-join.tf`) is a public form: anyone types an @meta.com address, passes
+Cloudflare Turnstile, and the Worker adds the address to the Astryx Swift beta group "Meta (self-serve)" through the App
+Store Connect API. There is no sign-in (an Access gate would cost a Zero Trust seat per person), so an address is not
+proven when it is typed; the invitation can only be accepted from that inbox, and 5 requests per IP an hour and 500 a
+day bound abuse. Nothing is built until the key's secret exists; the first apply after that builds the whole host. Once:
+
+1. In App Store Connect, Users and Access, Integrations, App Store Connect API, Team Keys, create a key named for this
+   use with the **App Manager** role (the lowest that manages testers; not Admin, and never the Games Worth Watching
+   key). Download its `.p8` file (`AuthKey_<KEY_ID>.p8`) into the current directory and note the Issuer ID and Key ID.
+2. On a jumpbox, create the secret with the three values as one JSON object without echoing them, then delete the file:
+
+   ```bash
+   read -rs ISSUER; read -rs KEY_ID
+   set -o pipefail
+   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --rawfile p "AuthKey_${KEY_ID}.p8" \
+     '{ISSUER_ID: $i, KEY_ID: $k, PRIVATE_KEY: $p}' \
+     | aws secretsmanager create-secret --region us-west-1 --name astryx/testflight-asc-key \
+         --description "App Manager key for Astryx Swift TestFlight invitations (astryx-join.tf)" \
+         --secret-string file:///dev/stdin >/dev/null \
+     && rm "AuthKey_${KEY_ID}.p8"
+   unset ISSUER KEY_ID
+   ```
+
+3. Apply. Terraform puts an administration-only read policy on the secret and builds, in order, the record, the KV
+   namespace for the limits, the Turnstile widget (managed, this host only), the Worker with the key and the widget's
+   secret as its secrets, the route, and last the Access bypass for exactly this host. The widget needs Turnstile write
+   on the provider token `cloudflare-tunnel-token` (AGENTS.md, "Astryx Swift TestFlight invitations").
+
+Rotate: create a new App Manager key, `put-secret-value` the same JSON to `astryx/testflight-asc-key`, apply, then
+revoke the old key. Stop: revoke the key in App Store Connect (invitations fail at once); to remove the host too,
+`aws secretsmanager delete-secret --force-delete-without-recovery --secret-id astryx/testflight-asc-key` and apply.
+
+Limits: Apple allows 10,000 external testers per app; a new build version needs Beta App Review before the group's
+testers get it.
+
 ### Colton Games accounts: sign-in, site admins and push
 
 `colton-games-accounts.tf` holds what the site's accounts features need outside the games
