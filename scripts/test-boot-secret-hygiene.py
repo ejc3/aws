@@ -55,6 +55,10 @@ JUSTIFIED = {
     "mac-dev.tf:user_data:traced-fetch:PW":
         "the macOS user data never enables xtrace and runs once under ec2-macos-init; the "
         "instance is disabled by default (enable_mac_dev) and ignores user_data changes",
+    "dev-user-data.tf:user_shell_env:traced-fetch:ablit":
+        "inside the opencode() function the boot script writes into ~/.zshrc as text (a quoted heredoc): it runs "
+        "later in the account's interactive zsh, never under the boot's xtrace, and the key goes to opencode's "
+        "environment, never onto a command line",
 }
 
 # --------------------------------------------------------------------------------- scanner
