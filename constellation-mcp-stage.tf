@@ -32,8 +32,9 @@
 locals {
   constellation_mcp_stage_worker   = "constellation-mcp-stage" # ejc3/constellation apps/mcp/wrangler.jsonc, top level
   constellation_mcp_stage_hostname = "lattice-mcp-stage.dolphin-labs.dev"
-  # Step 3 above. Leave false until the Worker exists (GET /accounts/<id>/workers/scripts/constellation-mcp-stage).
-  constellation_mcp_stage_deployed = false
+  # Step 3 above: true since the Worker exists (first deploy 2026-10-23, ejc3/constellation deploy-mcp). Set it false
+  # before deleting the Worker, so the hostname goes first.
+  constellation_mcp_stage_deployed = true
 
   # Access for SaaS (OIDC) endpoints are per application, under the team domain and the application's client id.
   constellation_mcp_oidc_base = "${local.browser_manager_issuer}/cdn-cgi/access/sso/oidc/${cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc.saas_app.client_id}"
@@ -178,5 +179,39 @@ resource "cloudflare_workers_custom_domain" "constellation_mcp_stage" {
   depends_on = [
     cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc,
     aws_secretsmanager_secret_version.constellation_mcp_stage,
+  ]
+}
+
+# MCP clients reach the Worker with no Access session: it is its own OAuth server, and people sign in through the
+# owner-only OIDC application above. So its host must not sit behind the *.dolphin-labs.dev GitHub login: an exact-host
+# bypass, as dolphin_maps_public (dolphin-labs-zone.tf), only while the hostname exists. Owner's go-ahead, 2026-10-23.
+resource "cloudflare_zero_trust_access_policy" "constellation_mcp_stage_public" {
+  count      = local.constellation_mcp_stage_deployed ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Lattice MCP staging (public; the Worker's own OAuth)"
+  decision   = "bypass"
+
+  include = [{
+    everyone = {}
+  }]
+}
+
+resource "cloudflare_zero_trust_access_application" "constellation_mcp_stage_public" {
+  count      = local.constellation_mcp_stage_deployed ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Lattice MCP staging (public; the Worker's own OAuth)"
+  type       = "self_hosted"
+  domain     = local.constellation_mcp_stage_hostname
+
+  destinations = [
+    { type = "public", uri = local.constellation_mcp_stage_hostname },
+  ]
+
+  # Declared here, as on every application: an apply drops an attachment that is not.
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.constellation_mcp_stage_public[0].id
+      precedence = 1
+    },
   ]
 }
