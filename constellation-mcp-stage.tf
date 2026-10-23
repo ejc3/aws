@@ -32,8 +32,9 @@
 locals {
   constellation_mcp_stage_worker   = "constellation-mcp-stage" # ejc3/constellation apps/mcp/wrangler.jsonc, top level
   constellation_mcp_stage_hostname = "lattice-mcp-stage.dolphin-labs.dev"
-  # Step 3 above. Leave false until the Worker exists (GET /accounts/<id>/workers/scripts/constellation-mcp-stage).
-  constellation_mcp_stage_deployed = false
+  # Step 3 above: true since the Worker exists (first deploy 2026-10-23, ejc3/constellation deploy-mcp). Set it false
+  # before deleting the Worker, so the hostname goes first.
+  constellation_mcp_stage_deployed = true
 
   # Access for SaaS (OIDC) endpoints are per application, under the team domain and the application's client id.
   constellation_mcp_oidc_base = "${local.browser_manager_issuer}/cdn-cgi/access/sso/oidc/${cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc.saas_app.client_id}"

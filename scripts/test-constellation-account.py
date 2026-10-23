@@ -179,7 +179,9 @@ class McpStageTests(unittest.TestCase):
         self.assertIn("count      = local.constellation_mcp_stage_deployed ? 1 : 0", domain)
         self.assertIn("service    = local.constellation_mcp_stage_worker", domain)
         self.assertIn("cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc,", domain)
-        self.assertIn("constellation_mcp_stage_deployed = false", MCP)
+        # The flag is one plain boolean that alone decides the count (step 3 of the file's order).
+        self.assertEqual(len(re.findall(r"^  constellation_mcp_stage_deployed = (?:true|false)$", MCP, re.M)), 1)
+        self.assertEqual(MCP.count("local.constellation_mcp_stage_deployed"), 1)
 
     def test_the_service_secret_goes_to_the_worker_container_and_the_apis_only(self):
         uses = re.findall(r"random_password\.constellation_lattice_service\.result", MCP)
