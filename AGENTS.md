@@ -286,8 +286,8 @@ only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `
 only the fallback sites offer (a GPU flavor implies `--fallback`: every region that offers the type), or kvm-gpu-96, an x86 g4dn.metal with eight T4, at home: the one x86
 type, launched with `--image-id` set to the site's x86_64 build of the same Ubuntu image (published in `/infra/parallel-box`,
 pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=on iommu=pt` and reboots once
-(`pbox_gpu_iommu_reboot`, marker `/var/lib/pbox-iommu-reboot`); both GPU flavors against the G spot quota, 96 vCPU in us-east-2
-and us-west-2; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
+(`pbox_gpu_iommu_reboot`, marker `/var/lib/pbox-iommu-reboot`); both GPU flavors against the G spot quota, 96 vCPU in us-east-2,
+us-west-2 and us-east-1; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
 after their instance is gone (`ec2:CancelSpotInstanceRequests` in `pbox-flavor-types`, never the persistent boxes') and retries once; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
 test keeps them equal); with none it exits 2 and prints the menu. An agent picks the smallest flavor that fits the work's
 shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR

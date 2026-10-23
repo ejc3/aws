@@ -1099,7 +1099,7 @@ with `--image-id` (`var.parallel_box_ami_ohio_x86` at home, each fallback site's
 reboots once, and `up` waits through that reboot before checking the GPUs.
 
 Both GPU flavors count against the "All G and VT Spot Instance Requests" quota (`L-3819A6DF`) where they launch:
-`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2 and us-west-2 at apply when the current
+`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2, us-west-2 and us-east-1 at apply when the current
 quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
