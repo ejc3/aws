@@ -1834,6 +1834,27 @@ no Cloudflare deploy token on the dev boxes, and invite-only signup.
 - Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_relay_deploy` or
   `-replace=random_password.dolphin_relay_signup`; the next deploy uses the new values.
 
+### Astryx Swift TestFlight invitations (astryx-join.tf)
+
+`astryx-join.dolphin-labs.dev`: anyone with an @meta.com address adds themselves as an external TestFlight tester of
+Astryx Swift (owner, 2026-10-23). Access (its own application, one-time PIN only, policy `email_domain = meta.com`)
+proves the address; the Worker `astryx-join` (`scripts/astryx-join.mjs`) verifies the Access token itself, requires
+@meta.com again, and calls App Store Connect with a dedicated **App Manager** key.
+
+- **Terraform deploys this Worker's code**, unlike the site Workers: the key is a `secret_text` binding, which only an
+  upload of the code can set with the pinned provider. A change to the `.mjs` is a reviewed change that the next apply
+  deploys (`content_sha256`).
+- **The switch is the secret** `astryx/testflight-asc-key` (us-west-1; JSON `ISSUER_ID`, `KEY_ID`, `PRIVATE_KEY`). Until
+  it exists nothing is created and the name stays behind the `*.dolphin-labs.dev` GitHub gate. The owner creates it
+  (README, "Astryx Swift: self-serve TestFlight invitations"); Terraform adds an administration-only read policy.
+- **Never bind `games-worth-watching/app-store-connect`** (Admin, cloud signing) into a Worker; `scripts/test-astryx-join.py`
+  fails on it.
+- **No address in a log line the Worker writes**: outcome, HTTP status and Apple's error code only. The node test fails
+  on an `@` in any log line.
+- **The main module may export only functions** besides `default`: workerd refuses to start on any other named export.
+- Limits: 10,000 external testers per app (the page says so); one Zero Trust seat per person who signs in (the Free plan
+  has 50); Beta App Review for each new build version.
+
 ### Colton Games production on Cloudflare (switched 2026-10-11)
 
 The owner decided on 2026-10-11 to move colton-games production from Vercel to Cloudflare Workers so that the zone's WAF,
