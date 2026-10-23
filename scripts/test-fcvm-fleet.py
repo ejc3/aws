@@ -132,6 +132,39 @@ class CoordinatorLaunchSplit(unittest.TestCase):
         self.assertNotIn('agent-access-token', secrets)
         self.assertIn('aws_service_name = "spot.amazonaws.com"', self.TF)
 
+class CoordinatorScaleStateAndFallback(unittest.TestCase):
+    TF = CoordinatorLaunchSplit.TF
+    stmt = CoordinatorLaunchSplit.stmt
+
+    def test_a_missing_state_object_reads_as_404(self):
+        s = self.stmt("StateObjectMissingReadsAs404")
+        self.assertIn('Action   = "s3:ListBucket"', s)
+        self.assertIn("Resource = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", s + "\n")
+
+    def test_the_coordinator_scales_only_the_host_groups(self):
+        s = self.stmt("ScaleTheHostGroups")
+        self.assertIn('Action   = "autoscaling:SetDesiredCapacity"', s)
+        self.assertIn(":autoScalingGroup:*:autoScalingGroupName/fcvm-fleet-hosts", s)
+        self.assertNotIn('Resource = "*"', s)
+        d = self.stmt("DescribeTheHostGroups")
+        self.assertIn('Action   = "autoscaling:DescribeAutoScalingGroups"', d)
+        self.assertNotRegex(self.TF, r'"autoscaling:\*"')
+        group = block('resource "aws_autoscaling_group" "hosts"', MOD)
+        self.assertIn("ignore_changes = [desired_capacity]", group)
+        self.assertIn("max_size                  = local.host_desired == 0 ? 0 : 2", group)
+
+    def test_an_on_demand_tile_template_is_a_launchable_template(self):
+        od = block('resource "aws_launch_template" "tile_on_demand"', MOD)
+        spot = block('resource "aws_launch_template" "tile"', MOD)
+        self.assertNotIn("instance_market_options", od)
+        self.assertIn("instance_market_options", spot)
+        self.assertIn('name          = "fcvm-fleet-tile-on-demand-${each.key}"', od)
+        self.assertIn('tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }', od)
+        for part in ("iam_instance_profile", "http_tokens                 = \"required\"", "ipv6_address_count          = 1"):
+            self.assertIn(part, od, part)
+        self.assertIn("[for t in aws_launch_template.tile_on_demand : t.arn]", block('output "tile_template_arns"', MOD))
+
+
 class ModuleDependencies(unittest.TestCase):
     def test_no_module_level_depends_on(self):
         # A module-level depends_on defers the module's data sources (the AZ list) to apply time, and the subnets'
