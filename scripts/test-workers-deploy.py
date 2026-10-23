@@ -92,7 +92,7 @@ class InstallScriptTests(unittest.TestCase):
         env = dict(os.environ, PATH="/nonexistent")
         # GitHub resolves repository names case-insensitively, so every spelling is refused.
         for repo in ("dolphin-labs-hq/dolphin-labs", "Dolphin-Labs-HQ/Dolphin-Labs", "dolphin-labs-hq/dolphin-films",
-                     "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "EJC3/Remote-Claw"):
+                     "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "EJC3/Remote-Claw", "ejc3/FCVM"):
             r = subprocess.run(["/bin/bash", str(ROOT / "scripts" / "workers-deploy-secret.sh"), repo],
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 3, (repo, r.stderr))
@@ -103,7 +103,7 @@ class InstallScriptTests(unittest.TestCase):
         # ejc3/aws#466: imagine, remote-claw and dolphin-maps take the token from a `cloudflare-deploy` environment
         # admitted to main only, each with the deploy token as its CLOUDFLARE_API_TOKEN.
         src = code(TF)
-        self.assertIn('workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw"])', src)
+        self.assertIn('workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw", "fcvm"])', src)
         for env, policy, secret, provider in (
                 ("workers_deploy_ejc3", "workers_deploy_ejc3_main", "workers_deploy_ejc3", "github.agents_md"),
                 ("workers_deploy_dolphin_maps", "workers_deploy_dolphin_maps_main", "workers_deploy_dolphin_maps",
@@ -119,7 +119,7 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn('secret_name     = "CLOUDFLARE_API_TOKEN"', s)
             self.assertIn("plaintext_value = cloudflare_account_token.workers_deploy.value", s)
             # Every repo here is refused by the install script, so nobody puts the repository secret back.
-        for repo in ("ejc3/imagine", "ejc3/remote-claw", "dolphin-labs-hq/dolphin-maps"):
+        for repo in ("ejc3/imagine", "ejc3/remote-claw", "ejc3/fcvm", "dolphin-labs-hq/dolphin-maps"):
             self.assertIn(repo, INSTALL.split("case", 1)[1].split("esac", 1)[0])
 
     def test_codercolton_sites_get_their_environment_secret_not_a_repository_secret(self):

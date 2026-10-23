@@ -1767,7 +1767,7 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   account. There is deliberately no mint script (issue #16: no curl or local-exec for Cloudflare resources). Rotate with
   `terraform apply -replace=cloudflare_account_token.workers_deploy`, then `scripts/workers-deploy-secret.sh OWNER/REPO [account]`
   for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied),
-  except dolphin-labs, dolphin-films, dolphin-maps, imagine and remote-claw: their deploy jobs read the token from main-only
+  except dolphin-labs, dolphin-films, dolphin-maps, imagine, remote-claw and fcvm (the fcvm-fleet-stage Worker): their deploy jobs read the token from main-only
   `cloudflare-deploy` environments, which the same apply rewrites (`dolphin-labs-ci-logs.tf`, `workers-deploy.tf`), and the
   script refuses to set a repository secret there. The CoderColton sites (colton-games, nest-step) also deploy from a main-only
   `cloudflare-deploy` environment, outside Terraform's GitHub owners: the script writes their token there, never to the repository.
