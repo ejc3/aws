@@ -242,13 +242,14 @@ resource "aws_iam_role_policy_attachment" "dev_server_constellation_terraform" {
 
 locals {
   # What ejc3/constellation's backend and provider name, and what its Lattice staging service is given by
-  # constellation-lattice-stage.tf. No credentials: ids, names and Access's audience tag, which is not a secret.
+  # constellation-lattice-stage.tf, and its remote MCP Worker by constellation-mcp-stage.tf. No credentials: ids, names and Access's audience tag, which is not a secret.
   constellation_pointer = {
     account_id     = local.constellation_account_id
     region         = var.aws_region
     state_bucket   = aws_s3_bucket.constellation_terraform_state.bucket
     terraform_role = aws_iam_role.constellation_terraform.arn
     lattice_stage  = local.lattice_stage_pointer
+    mcp_stage      = local.constellation_mcp_stage_pointer
   }
 }
 

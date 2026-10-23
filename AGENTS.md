@@ -1598,6 +1598,14 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   the Access-protected `/lattice/native/login`) is the gate; the connector itself requires an Access token on every
   other path. Opening the host to anyone who signs in, as constellation's
   design intends, is the owner's decision.
+- **Lattice's remote MCP on staging** (`constellation-mcp-stage.tf`): the Worker `constellation-mcp-stage`, deployed by
+  ejc3/constellation from its main-only `cloudflare-deploy` environment (token, `CLOUDFLARE_ACCOUNT_ID`, `MCP_STAGE_KV_ID`),
+  at `lattice-mcp-stage.dolphin-labs.dev/mcp`. It is its own OAuth server for MCP clients and signs people in through an
+  owner-only Access for SaaS (OIDC) application, so it has no self-hosted Access gate. Its runtime secrets
+  (`workers-stage/constellation-mcp`, administration only) are written by Terraform, including the Lattice service secret,
+  whose other copy goes to the API's `constellation/nonprod/lattice-service`. Order: apply; the first deploy creates the
+  Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
+  constellation-mcp`.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
