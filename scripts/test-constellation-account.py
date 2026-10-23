@@ -10,6 +10,8 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "constellation-account.tf").read_text()
 LATTICE = (ROOT / "constellation-lattice-stage.tf").read_text()
+MCP = (ROOT / "constellation-mcp-stage.tf").read_text()
+DEPLOY = (ROOT / "workers-deploy.tf").read_text()
 
 
 def block(header, text=None):
@@ -152,6 +154,67 @@ class LatticeStageTests(unittest.TestCase):
         self.assertIn("secret_string = jsonencode({ TUNNEL_TOKEN = data.cloudflare_zero_trust_tunnel_cloudflared_token.lattice_stage.token })", version)
         self.assertEqual(LATTICE.count("cloudflared_token.lattice_stage.token"), 1)
         self.assertNotIn("aws_iam_", LATTICE)
+
+
+class McpStageTests(unittest.TestCase):
+    def test_the_sign_in_is_owner_only(self):
+        app = block('resource "cloudflare_zero_trust_access_application" "constellation_mcp_stage_oidc"', MCP)
+        self.assertIn('type       = "saas"', app)
+        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+)\.id", app),
+                         ["cloudflare_zero_trust_access_policy.constellation_mcp_stage_owner"])
+        owner = block('resource "cloudflare_zero_trust_access_policy" "constellation_mcp_stage_owner"', MCP)
+        self.assertIn('decision         = "allow"', owner)
+        self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", owner)
+        self.assertNotIn("everyone", MCP)
+        self.assertNotIn("bypass", MCP.split("locals {", 1)[1])
+
+    def test_codes_go_only_to_the_workers_callback(self):
+        app = block('resource "cloudflare_zero_trust_access_application" "constellation_mcp_stage_oidc"', MCP)
+        uris = re.search(r"redirect_uris = \[(.*?)\]", app).group(1)
+        self.assertEqual(uris, '"https://${local.constellation_mcp_stage_hostname}/callback"')
+        self.assertIn('grant_types   = ["authorization_code_with_pkce"]', app)
+
+    def test_the_hostname_waits_for_the_worker_and_its_sign_in(self):
+        domain = block('resource "cloudflare_workers_custom_domain" "constellation_mcp_stage"', MCP)
+        self.assertIn("count      = local.constellation_mcp_stage_deployed ? 1 : 0", domain)
+        self.assertIn("service    = local.constellation_mcp_stage_worker", domain)
+        self.assertIn("cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc,", domain)
+        self.assertIn("constellation_mcp_stage_deployed = false", MCP)
+
+    def test_the_service_secret_goes_to_the_worker_container_and_the_apis_only(self):
+        uses = re.findall(r"random_password\.constellation_lattice_service\.result", MCP)
+        self.assertEqual(len(uses), 2)
+        api = block('resource "aws_secretsmanager_secret_version" "constellation_lattice_service"', MCP)
+        self.assertIn("provider      = aws.constellation", api)
+        self.assertIn("random_password.constellation_lattice_service.result", api)
+        lookup = block('data "aws_secretsmanager_secret" "constellation_lattice_service"', MCP)
+        self.assertIn("provider = aws.constellation", lookup)
+        self.assertIn('name     = "constellation/nonprod/lattice-service"', lookup)
+        worker = block('resource "aws_secretsmanager_secret_version" "constellation_mcp_stage"', MCP)
+        self.assertIn("random_password.constellation_lattice_service.result", worker)
+        self.assertNotIn("provider", worker)
+        self.assertNotIn("aws_iam_", MCP)
+
+    def test_the_worker_container_is_for_administration_only(self):
+        policy = block('resource "aws_secretsmanager_secret_policy" "constellation_mcp_stage"', MCP)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }', policy)
+
+    def test_constellation_deploys_from_main_only(self):
+        envs = re.search(r"workers_deploy_environments_ejc3 = toset\(\[(.*?)\]\)", DEPLOY).group(1)
+        self.assertIn('"constellation"', envs)
+        rule = block('resource "github_repository_environment_deployment_policy" "workers_deploy_ejc3_main"', DEPLOY)
+        self.assertIn('branch_pattern = "main"', rule)
+        variables = block('resource "github_actions_environment_variable" "constellation_mcp_stage"', MCP)
+        self.assertIn('github_repository_environment.workers_deploy_ejc3["constellation"].environment', variables)
+        self.assertNotIn("secret", variables.replace("github_actions_environment_variable", ""))
+
+    def test_the_pointer_holds_no_credential(self):
+        pointer = block("constellation_mcp_stage_pointer = {", MCP)
+        for leak in ("client_secret", "secret_string", "random_password", "token"):
+            self.assertNotIn(leak, pointer)
+        self.assertIn("mcp_stage      = local.constellation_mcp_stage_pointer", TF)
 
 
 if __name__ == "__main__":
