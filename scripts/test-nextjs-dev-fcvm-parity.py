@@ -41,7 +41,7 @@ class ParityTests(unittest.TestCase):
         member = CT.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
         self.assertIn("Resource = local.nextjs_dev_parity_secrets", member)
         self.assertIn('"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]', member)
-        self.assertIn("Resource = aws_ssm_parameter.constellation.arn", member)  # the pointer too
+        self.assertIn("Resource = [aws_ssm_parameter.constellation.arn, aws_ssm_parameter.astryx.arn]", member)  # the pointers too
         self.assertIn("NotResource = local.nextjs_ct_member_bedrock", member)
         for action in ("bedrock-mantle:*", "aws-marketplace:Subscribe", "ses:*", "codeartifact:*", "sts:GetServiceBearerToken"):
             self.assertIn(f'"{action}"', member, action)
@@ -66,6 +66,14 @@ class ParityTests(unittest.TestCase):
         self.assertIn("Principal = { AWS = aws_iam_role.nextjs_dev.arn }", role)
         stmt = TF.split('Sid      = "ConstellationApply"', 1)[1].split("},", 1)[0]
         self.assertIn("Resource = aws_iam_role.constellation_terraform.arn", stmt)
+
+    def test_astryx_trusts_nextjs_dev_and_the_grant_names_only_that_role(self):
+        role = read("astryx-account.tf").split('resource "aws_iam_role" "astryx_terraform" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("Principal = { AWS = aws_iam_role.nextjs_dev.arn }", role)
+        stmt = TF.split('Sid      = "AstryxApply"', 1)[1].split("},", 1)[0]
+        self.assertIn("Resource = aws_iam_role.astryx_terraform.arn", stmt)
+        stmt = TF.split('Sid      = "AstryxPointer"', 1)[1].split("},", 1)[0]
+        self.assertIn("Resource = aws_ssm_parameter.astryx.arn", stmt)
 
 
 if __name__ == "__main__":

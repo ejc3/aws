@@ -225,6 +225,19 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Resource  = aws_ssm_parameter.fcvm_fleet.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
       }, {
+      # Apply ejc3/astryx-infra in the astryx account (astryx-account.tf), and read where it is (/infra/astryx). Same pin.
+      Sid       = "AssumeTheAstryxApplyRoleOnly"
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Resource  = aws_iam_role.astryx_terraform.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      Sid       = "ReadTheAstryxPointerOnly"
+      Effect    = "Allow"
+      Action    = "ssm:GetParameter"
+      Resource  = aws_ssm_parameter.astryx.arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
       # opencode's abliteration.ai key (dev-ai-services.tf), on both metal boxes: no instance pin.
       Sid      = "ReadTheAbliterationApiKey"
       Effect   = "Allow"

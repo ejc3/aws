@@ -201,7 +201,7 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
 
 People's email addresses are not in this repository. `people/addresses` (us-west-1, from `people.tf`) holds them as JSON:
 `owner` (the browser manager's owner), `family` (the Cloudflare Access allowlist for every `*.cc-games.dev` host) and
-`staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email) and, optionally,
+`staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email), `astryx_account` (the astryx account's root email) and, optionally,
 `dolphin_steve` (Steve's Identity Center sign-in to the Dolphin account). To add someone to the allowlist, put the whole JSON again with the
 new address in `family` (a plan on a jumpbox then shows the Access policies changing; apply it). Terraform fails a plan,
 naming the key, if the secret is missing a key or `family` is empty. The optional `claude_master_dashboard` list names who,
@@ -2878,6 +2878,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
+| The astryx member account (Astryx sync): account and OU with a us-west-1 SCP, its Terraform state bucket, the `astryx-terraform` apply role (fcvm-arm pinned, and the owner's nextjs-ct container), `/infra/astryx`, and staging's hostname, tunnel and Access on `/native/login`. Its own resources live in `ejc3/astryx-infra` | `astryx-account.tf`, `astryx-stage.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |

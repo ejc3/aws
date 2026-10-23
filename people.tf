@@ -10,9 +10,10 @@
 #   {"owner": "...", "family": ["...", "..."], "staging_account": "...", "colton_games_site_admins": {"prod": [...], "nonprod": [...]},
 #    "dolphin_films": {"prod": {"seeds": [...], "admins": [...]}, "nonprod": {"seeds": [...], "admins": [...]}},
 #    "claude_master_dashboard": ["...", "..."], "dolphin_account": "...", "constellation_account": "...", "fcvm_fleet_account": "...",
-#    "dolphin_steve": "..."}
-#   (dolphin_account, constellation_account and fcvm_fleet_account are the root addresses of the Dolphin, constellation and
-#   fcvm-fleet member accounts, dolphin-account.tf, constellation-account.tf and fcvm-fleet-account.tf. dolphin_steve is optional: Steve's
+#    "astryx_account": "...", "dolphin_steve": "..."}
+#   (dolphin_account, constellation_account, fcvm_fleet_account and astryx_account are the root addresses of the Dolphin,
+#   constellation, fcvm-fleet and astryx member accounts, dolphin-account.tf, constellation-account.tf, fcvm-fleet-account.tf
+#   and astryx-account.tf. dolphin_steve is optional: Steve's
 #   address, which creates his Identity Center user and read-only assignment, dolphin-identity-center.tf. dolphin_films is
 #   read by no Terraform: an administrator loads its lists into the Worker dolphin-films-prod as FILMS_SEED_EMAILS and
 #   FILMS_ADMIN_EMAILS. claude_master_dashboard is optional: the people besides the
@@ -65,6 +66,7 @@ locals {
   dolphin_account_email       = nonsensitive(local.people.dolphin_account)       # root email of the Dolphin member account
   constellation_account_email = nonsensitive(local.people.constellation_account) # root email of the constellation member account
   fcvm_fleet_account_email    = nonsensitive(local.people.fcvm_fleet_account)    # root email of the fcvm-fleet member account
+  astryx_account_email        = nonsensitive(local.people.astryx_account)        # root email of the astryx member account
 }
 
 # Fail the plan, naming the key and never the value, if the secret is missing, empty, or still lacks a key. An empty Access
@@ -74,12 +76,12 @@ resource "terraform_data" "people_shape" {
 
   lifecycle {
     precondition {
-      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account) && can(local.people.dolphin_account) && can(local.people.constellation_account) && can(local.people.fcvm_fleet_account) && can(local.people.colton_games_site_admins.prod) && can(local.people.colton_games_site_admins.nonprod)
-      error_message = "The people/addresses secret must be JSON with the keys owner, family, staging_account, dolphin_account, constellation_account, fcvm_fleet_account and colton_games_site_admins {prod, nonprod} (see people.tf)."
+      condition     = can(local.people.owner) && can(local.people.family) && can(local.people.staging_account) && can(local.people.dolphin_account) && can(local.people.constellation_account) && can(local.people.fcvm_fleet_account) && can(local.people.astryx_account) && can(local.people.colton_games_site_admins.prod) && can(local.people.colton_games_site_admins.nonprod)
+      error_message = "The people/addresses secret must be JSON with the keys owner, family, staging_account, dolphin_account, constellation_account, fcvm_fleet_account, astryx_account and colton_games_site_admins {prod, nonprod} (see people.tf)."
     }
     precondition {
-      condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.dolphin_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.constellation_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.fcvm_fleet_account))
-      error_message = "people/addresses: owner, staging_account, dolphin_account and constellation_account must each be one email address."
+      condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.owner)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.staging_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.dolphin_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.constellation_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.fcvm_fleet_account)) && can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", local.people.astryx_account))
+      error_message = "people/addresses: owner, staging_account, dolphin_account, constellation_account, fcvm_fleet_account and astryx_account must each be one email address."
     }
     precondition {
       condition     = length(local.people.family) > 0 && alltrue([for e in local.people.family : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", e))])
