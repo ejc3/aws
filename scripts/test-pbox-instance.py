@@ -202,6 +202,8 @@ class InstanceScoped(unittest.TestCase):
         cases = (
             ({"FAKE_BY_FAIL": "1"}, "could not read who launched"),
             ({"FAKE_BY": "job-b", "FAKE_LT": "not-a-time"}, "unreadable launch time"),
+            ({"FAKE_BY": "job-b", "FAKE_LT": ""}, "unreadable launch time"),  # `date -d ""` is today's midnight
+            ({"FAKE_BY": "job-b", "FAKE_LT": "None"}, "unreadable launch time"),
         )
         for env, msg in cases:
             with self.subTest(env=env):
@@ -210,6 +212,11 @@ class InstanceScoped(unittest.TestCase):
                 self.assertIn(msg, err)
                 self.assertIn("--instance i-0bbbbbbbbbbbbbbbb", err)
         self.assertEqual(self.calls("terminate-instances"), [])
+
+    def test_a_members_down_skips_the_launcher_check(self):
+        # A member's box carries no PboxLaunchedBy (their grant pins the tag keys) and is only ever theirs; the
+        # members' own test only fails on this before 01:00 UTC, so pin the condition here.
+        self.assertIn('if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then', SCRIPT.read_text())
 
     def test_a_caller_name_with_a_space_is_one_field(self):
         # The tag is read back tab-separated, so a space in it must not split the launcher from the launch time.
