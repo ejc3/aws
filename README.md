@@ -599,6 +599,15 @@ external drive, one folder per project: `/Volumes/Scratch/<project>/`. For examp
 Simulator devices still live on the internal disk (CoreSimulator), so delete a tour's
 simulator after use. Never write a project's files into `~/src` loose.
 
+Temporary files follow the same rule. Anything a session creates with `mktemp` (a test
+run's DerivedData, a build's intermediates) lands in `TMPDIR`, which by default is on
+the internal disk; one week of UI-test runs left 18 GB there and stopped every build
+at the 12 GB floor. The managed `~/.zshenv` block (`scripts/mac/set-zshenv.sh`) points
+`TMPDIR` at the folder named in `~/.config/mac-setup/tmpdir` when that file exists and
+its disk is mounted, for every zsh, non-interactive SSH sessions included; with no file,
+or the drive unplugged, the system default stays. On this Mac:
+`ssh mac 'mkdir -p ~/.config/mac-setup && echo /Volumes/Scratch/tmp > ~/.config/mac-setup/tmpdir'`.
+
 ##### MacBook: Checks
 
 ```bash
