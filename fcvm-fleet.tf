@@ -11,35 +11,42 @@
 #   wildcard TLS certificate's secret container. The Cloudflare-fed secrets (the DNS token, the coordinator's tunnel token,
 #   the agents' Access service token) are fcvm-dev.tf's, written there with their values; here they are named by ARN.
 #
-# TWO GATES, both off: nothing that bills by the hour runs until the owner turns it on.
-# - local.fcvm_fleet_hosts_enabled: one spot GPU metal host per region (about $2-4 an hour each). Also needs the fleet AMI
-#   in var.fcvm_fleet_host_amis; a region and architecture without one is left out of the group.
-# - local.fcvm_fleet_coordinator_enabled: the coordinator service (one small Fargate task). Also needs
-#   var.fcvm_fleet_coordinator_image.
-# The AMIs come in through the variable maps; an image build (EC2 Image Builder or a Packer job from fcvm-arm) is a follow-up.
+# TWO GATES, both ON since ejc3/fcvm's fleet AMIs exist (built by fcvm's fleet/ami/build-ami.sh from fcvm-arm):
+# - local.fcvm_fleet_hosts_enabled: one spot GPU metal host per region that has a fleet AMI in var.fcvm_fleet_host_amis. Only
+#   us-east-1 has one (and the only G spot quota), so one g4dn.metal: $4.76-5.44 an hour spot there on 2026-10-22, about
+#   $3,600 a month always on. A region and architecture without an AMI is left out of the group.
+# - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
+#   month), running fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag> unless var.fcvm_fleet_coordinator_image names
+#   another image.
 
 variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
-  default     = {}
+  # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only.
+  default = { "us-east-1" = { x86_64 = "ami-0ad5d9347e1f7030f" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
-  default     = {}
+  # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
+  # (fcvm fleet/ami/tile).
+  default = { "us-east-1" = { x86_64 = "ami-0c25b9d6674c3892f" } }
 }
 
 variable "fcvm_fleet_coordinator_image" {
-  description = "The coordinator's container image (an ECR or public registry reference); empty keeps the service at 0"
+  description = "Another coordinator image than fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag> (an ECR or public registry reference)"
   type        = string
   default     = ""
 }
 
 locals {
-  # The two switches (see the header). Both false until the owner turns the fleet on.
-  fcvm_fleet_hosts_enabled       = false
-  fcvm_fleet_coordinator_enabled = false
+  # The two switches (see the header).
+  fcvm_fleet_hosts_enabled       = true
+  fcvm_fleet_coordinator_enabled = true
+  # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
+  fcvm_fleet_coordinator_tag = "f32ae4ad"
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
@@ -53,7 +60,8 @@ locals {
   # ECS takes a secret's full ARN with a JSON key: arn:key:version-stage:version-id.
   fcvm_fleet_tunnel_token_ref = "${aws_secretsmanager_secret.fcvm_fleet_coordinator_tunnel.arn}:TUNNEL_TOKEN::"
 
-  fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && var.fcvm_fleet_coordinator_image != ""
+  fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"
+  fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
 }
 
 # ------------------------------------------------------------------------------------------------ buckets
@@ -569,7 +577,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   container_definitions = jsonencode([
     {
       name      = "coordinator"
-      image     = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "public.ecr.aws/docker/library/busybox:stable"
+      image     = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_image : "public.ecr.aws/docker/library/busybox:stable"
       essential = true
       # Its state is an S3 object, not a file (ECS.5: no writable root; a task volume where something must write).
       readonlyRootFilesystem = true

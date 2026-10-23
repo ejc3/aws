@@ -56,7 +56,14 @@ class HostTests(unittest.TestCase):
         self.assertIn("capacity_rebalance        = true", asg)
         self.assertIn("desired_capacity          = local.host_desired", asg)
         self.assertIn("host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0", MOD)
-        self.assertIn("fcvm_fleet_hosts_enabled       = false", TF)
+        self.assertIn("fcvm_fleet_hosts_enabled       = true", TF)
+
+    def test_hosts_and_tiles_have_amis_only_where_there_is_g_spot_quota(self):
+        # One g4dn.metal is the main cost and us-east-1 holds the account's only G spot quota: an AMI elsewhere would start a
+        # second always-on host (or a group that can never launch).
+        for var in ("fcvm_fleet_host_amis", "fcvm_fleet_tile_amis"):
+            default = re.search(r"default = (\{.*\})\n", block('variable "%s"' % var)).group(1)
+            self.assertRegex(default, r'^\{ "us-east-1" = \{ x86_64 = "ami-[0-9a-f]{17}" \} \}$')
 
     def test_only_architectures_with_an_ami_are_in_the_group(self):
         self.assertIn('host_archs = [for a in sort(keys(local.host_types)) : a if try(var.gpu_amis[a], "") != ""]', MOD)
@@ -64,9 +71,12 @@ class HostTests(unittest.TestCase):
 
 
 class CoordinatorTests(unittest.TestCase):
-    def test_the_service_is_off_until_enabled_and_given_an_image(self):
-        self.assertIn("fcvm_fleet_coordinator_enabled = false", TF)
-        self.assertIn('fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && var.fcvm_fleet_coordinator_image != ""', TF)
+    def test_the_service_runs_the_tagged_image_from_the_fleet_repository(self):
+        self.assertIn("fcvm_fleet_coordinator_enabled = true", TF)
+        self.assertRegex(TF, r'fcvm_fleet_coordinator_tag = "[0-9a-f]{8,40}"')
+        self.assertIn('fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"', TF)
+        self.assertIn('fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""', TF)
+        self.assertIn("image     = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_image", TF)
         self.assertIn("desired_count                      = local.fcvm_fleet_coordinator_running ? 1 : 0", block('resource "aws_ecs_service" "fcvm_fleet_coordinator"'))
 
     def test_the_task_role_reaches_tiles_only(self):
