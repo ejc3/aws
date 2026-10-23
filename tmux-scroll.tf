@@ -9,10 +9,10 @@
 # running boxes had never moved: nextjs-dev installed only when the binary was missing, and the
 # two jumpboxes had no Terraform path at all.
 #
-# The build is ejc3/tmux branch menu/reference @ a843d544 (tmux next-3.9), published as
-# release tmux-scroll-a843d54 from a clean checkout and verified before publishing (tmux regress
-# and render-parity suites, the memory gym on a sanitizer build, the real-terminal checks; all
-# t-claude tests/*.zsh pass against it). aarch64 only for now:
+# The build is ejc3/tmux branch daily/a07-v3 @ dda1ed32 (tmux next-3.9; the client lifetime
+# fixes on top of a843d544), published as release tmux-scroll-dda1ed3 from a clean checkout and
+# verified before publishing (tmux regress, the real-terminal checks, lost-client checks on a
+# sanitizer build; all t-claude tests/*.zsh pass against it). aarch64 only for now:
 # every running box is Ubuntu 24.04 aarch64. The x86 dev box keeps its current copy until an x86_64 asset is
 # added to the release (the metal updater logs "no asset ... keeping current").
 #
@@ -22,8 +22,8 @@
 #
 # To roll forward: publish a new release, change the tag and sha256 below, apply.
 locals {
-  tmux_scroll_tag            = "tmux-scroll-a843d54"
-  tmux_scroll_sha256_aarch64 = "02d218b9a84cf79cc6bb91a604ccbe6604b5e84f79657431729d819b8257f272"
+  tmux_scroll_tag            = "tmux-scroll-dda1ed3"
+  tmux_scroll_sha256_aarch64 = "2080a73337820846a387904c05fe9fd1b180e5a47efa212b2cc604d980d6fb88"
 
   # t-claude (github.com/ejc3/t-claude). The dev boxes and nextjs-dev follow its main branch
   # on every setup run by design (claude-remote-control.tf, dev-user-data.tf). The jumpboxes
