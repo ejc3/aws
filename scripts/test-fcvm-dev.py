@@ -66,6 +66,30 @@ class AccessTests(unittest.TestCase):
             self.assertIn(f"cloudflare_zero_trust_access_application.{dep}", rec)
 
 
+class StageWorkerTests(unittest.TestCase):
+    """ejc3/aws#627: the fcvm-fleet-stage Worker's envelope. Its only URL is stage.fcvm.dev, behind the owner-only
+    application; workers.dev and previews stay off, and the custom domain is created after Access covers the host."""
+
+    def test_workers_dev_and_previews_stay_off(self):
+        sub = block('resource "cloudflare_workers_script_subdomain" "fcvm_fleet_stage"')
+        self.assertIn("script_name      = local.fcvm_fleet_stage_worker", sub)
+        self.assertIn("enabled          = false", sub)
+        self.assertIn("previews_enabled = false", sub)
+        self.assertIn('fcvm_fleet_stage_worker = "fcvm-fleet-stage"', TF)
+        self.assertIn('id = "${var.cloudflare_account_id}/${local.fcvm_fleet_stage_worker}"', TF)
+
+    def test_the_custom_domain_is_the_owner_only_stage_host_and_waits_for_access(self):
+        dom = block('resource "cloudflare_workers_custom_domain" "fcvm_fleet_stage"')
+        self.assertIn("zone_id    = var.fcvm_dev_zone_id", dom)
+        self.assertIn("hostname   = local.fcvm_dev_site_stage_host", dom)
+        self.assertIn("service    = local.fcvm_fleet_stage_worker", dom)
+        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_site_stage,", dom)
+        self.assertIn("cloudflare_workers_script_subdomain.fcvm_fleet_stage,", dom)
+        self.assertIn('fcvm_dev_site_stage_host    = "stage.fcvm.dev"', TF)
+        self.assertIn("domain           = local.fcvm_dev_site_stage_host", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"'))
+        self.assertEqual(TF.count('resource "cloudflare_workers_custom_domain"'), 1)
+
+
 class FleetSecretTests(unittest.TestCase):
     def test_the_three_secrets_live_in_the_fleet_account(self):
         for name, path in (("fcvm_fleet_dns_token", "fcvm-fleet/cloudflare-dns-token"),
