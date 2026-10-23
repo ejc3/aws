@@ -165,8 +165,20 @@ class McpStageTests(unittest.TestCase):
         owner = block('resource "cloudflare_zero_trust_access_policy" "constellation_mcp_stage_owner"', MCP)
         self.assertIn('decision         = "allow"', owner)
         self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", owner)
-        self.assertNotIn("everyone", MCP)
-        self.assertNotIn("bypass", MCP.split("locals {", 1)[1])
+        # The one bypass-everyone policy is the hostname's own (below), attached to nothing but the host application.
+        self.assertEqual(MCP.count("everyone = {}"), 1)
+        self.assertEqual(MCP.count('decision   = "bypass"'), 1)
+
+    def test_the_host_bypasses_the_wildcard_login_only_while_it_exists(self):
+        pol = block('resource "cloudflare_zero_trust_access_policy" "constellation_mcp_stage_public"', MCP)
+        app = block('resource "cloudflare_zero_trust_access_application" "constellation_mcp_stage_public"', MCP)
+        for b in (pol, app):
+            self.assertIn("count      = local.constellation_mcp_stage_deployed ? 1 : 0", b)
+        self.assertIn('decision   = "bypass"', pol)
+        self.assertIn("domain     = local.constellation_mcp_stage_hostname", app)
+        self.assertIn('{ type = "public", uri = local.constellation_mcp_stage_hostname }', app)
+        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+)", app),
+                         ["cloudflare_zero_trust_access_policy.constellation_mcp_stage_public"])
 
     def test_codes_go_only_to_the_workers_callback(self):
         app = block('resource "cloudflare_zero_trust_access_application" "constellation_mcp_stage_oidc"', MCP)
@@ -181,7 +193,7 @@ class McpStageTests(unittest.TestCase):
         self.assertIn("cloudflare_zero_trust_access_application.constellation_mcp_stage_oidc,", domain)
         # The flag is one plain boolean that alone decides the count (step 3 of the file's order).
         self.assertEqual(len(re.findall(r"^  constellation_mcp_stage_deployed = (?:true|false)$", MCP, re.M)), 1)
-        self.assertEqual(MCP.count("local.constellation_mcp_stage_deployed"), 1)
+        self.assertEqual(MCP.count("local.constellation_mcp_stage_deployed"), 3)  # the domain and its bypass
 
     def test_the_service_secret_goes_to_the_worker_container_and_the_apis_is_written_once(self):
         uses = re.findall(r"random_password\.constellation_lattice_service\.result", MCP)
