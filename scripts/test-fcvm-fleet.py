@@ -89,7 +89,7 @@ class CoordinatorTests(unittest.TestCase):
 
 class SecretTests(unittest.TestCase):
     def test_only_the_certificate_container_is_created_here(self):
-        names = re.findall(r'name\s+= "(fcvm-fleet/[^"]+)"', TF)
+        names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= "([^"]+)"', TF, re.S)
         self.assertEqual(names, ["fcvm-fleet/tls-wildcard"])
         self.assertNotIn("aws_secretsmanager_secret_version", TF)
 
@@ -150,6 +150,18 @@ class CoordinatorTileTypes(unittest.TestCase):
         self.assertIn('Effect    = "Deny"', s)
         self.assertIn('Action    = "ec2:RunInstances"', s)
         self.assertIn('"ec2:InstanceType" = ["g4dn.xlarge", "g5g.xlarge"]', s)
+
+class RegistryTests(unittest.TestCase):
+    def test_the_coordinator_image_has_an_immutable_scanned_repository_in_the_fleet_account(self):
+        repo = block('resource "aws_ecr_repository" "fcvm_fleet_coordinator"')
+        self.assertIn("provider             = aws.fcvm_fleet", repo)
+        self.assertIn('name                 = "fcvm-fleet/coordinator"', repo)
+        self.assertIn('image_tag_mutability = "IMMUTABLE"', repo)
+        self.assertIn("scan_on_push = true", repo)
+        life = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator"')
+        self.assertIn("countNumber = 20", life)
+        self.assertIn("coordinator_repo   = aws_ecr_repository.fcvm_fleet_coordinator.repository_url", TF)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
