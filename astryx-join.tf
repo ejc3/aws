@@ -25,9 +25,11 @@
 # *.dolphin-labs.dev GitHub gate for this one name and no other.
 #
 # THE KEY: a dedicated App Store Connect API key with the App Manager role (the lowest role that manages testers), in
-# Secrets Manager as astryx/testflight-asc-key (JSON: ISSUER_ID, KEY_ID, PRIVATE_KEY). Never the broader Admin key
-# (games-worth-watching/app-store-connect, dev-ai-services.tf). The owner creates the secret with its value (README,
-# "Astryx Swift: self-serve TestFlight invitations"); Terraform adopts it with an administration-only read policy.
+# Secrets Manager as astryx/testflight-asc-key (JSON: ISSUER_ID, KEY_ID, PRIVATE_KEY), in the astryx account (the app's
+# own, astryx-account.tf), where the owner's container administers through astryx-terraform; no grant on a shared role.
+# Never the broader Admin key (games-worth-watching/app-store-connect, dev-ai-services.tf). The owner creates the
+# secret with its value (README, "Astryx Swift: self-serve TestFlight invitations"); Terraform adopts it with a read
+# policy for the account's administration only (its access role and astryx-terraform).
 # The Turnstile widget's site key and secret come from the widget resource: no step of the owner's.
 #
 # A SWITCH THAT IS THE SECRET. Nothing below exists until that secret does: an apply before it creates nothing, and the
@@ -58,6 +60,7 @@ locals {
 
 # A list, not a single-secret lookup: a missing secret leaves it empty instead of failing every plan.
 data "aws_secretsmanager_secrets" "astryx_join_asc_key" {
+  provider = aws.astryx
   filter {
     name   = "name"
     values = [local.astryx_join_asc_secret]
@@ -72,17 +75,20 @@ locals {
 
 data "aws_secretsmanager_secret_version" "astryx_join_asc_key" {
   count     = local.astryx_join_ready ? 1 : 0
+  provider  = aws.astryx
   secret_id = local.astryx_join_asc_secret
 }
 
 data "aws_secretsmanager_secret" "astryx_join_asc_key" {
-  count = local.astryx_join_ready ? 1 : 0
-  name  = local.astryx_join_asc_secret
+  count    = local.astryx_join_ready ? 1 : 0
+  provider = aws.astryx
+  name     = local.astryx_join_asc_secret
 }
 
 # Administration only: the Worker gets the key through Terraform, and no box needs it.
 resource "aws_secretsmanager_secret_policy" "astryx_join_asc_key" {
   count      = local.astryx_join_ready ? 1 : 0
+  provider   = aws.astryx
   secret_arn = data.aws_secretsmanager_secret.astryx_join_asc_key[0].arn
   policy = jsonencode({
     Version = "2012-10-17"
@@ -92,7 +98,7 @@ resource "aws_secretsmanager_secret_policy" "astryx_join_asc_key" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = data.aws_secretsmanager_secret.astryx_join_asc_key[0].arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = [local.astryx_access_role_arn, local.astryx_terraform_role_arn] } }
     }]
   })
 }

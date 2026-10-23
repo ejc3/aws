@@ -74,7 +74,8 @@ class GuardrailTests(unittest.TestCase):
 
     def test_nothing_else_names_the_astryx_account(self):
         # Trust runs one way, into the account: no other file names it, so nothing here can come to trust it by the way.
-        allowed = {"astryx-account.tf", "astryx-stage.tf"}
+        # astryx-join.tf reads and guards its App Store Connect key in the account (#644): a read into it, never a trust.
+        allowed = {"astryx-account.tf", "astryx-stage.tf", "astryx-join.tf"}
         for f in ROOT.glob("*.tf"):
             if f.name in allowed:
                 continue
