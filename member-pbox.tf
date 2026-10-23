@@ -157,6 +157,7 @@ locals {
       export DEBIAN_FRONTEND=noninteractive
       apt-get -o DPkg::Lock::Timeout=300 update
       apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop
+      ${local.pbox_security_updates}
       ${local.pbox_local_nvme_setup}
       echo "* soft nofile 1048576" >> /etc/security/limits.conf
       echo "* hard nofile 1048576" >> /etc/security/limits.conf
