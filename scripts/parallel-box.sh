@@ -1231,7 +1231,8 @@ case "$CMD" in
     fi
     # A box another caller launched in the last hour is probably someone's work in progress (#621): refuse unless the
     # caller names it (--instance) or insists (--force).
-    if [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then
+    # A member's box is only ever that member's (their grant pins the tag keys, so it carries no PboxLaunchedBy).
+    if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then
       # Fails closed: an unreadable answer or launch time refuses, as a recent box of another caller does.
       if ! LAUNCHER="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
           --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' --output text 2>/dev/null)" \
@@ -1241,7 +1242,8 @@ case "$CMD" in
       fi
       IFS=$'\t' read -r BY LT_AT <<< "$LAUNCHER"
       if [ -n "$BY" ] && [ "$BY" != "None" ] && [ "$BY" != "$PBOX_CALLER" ]; then
-        if ! LT_S=$(date -d "$LT_AT" +%s 2>/dev/null); then
+        # An empty time is unreadable too: `date -d ""` answers today's midnight, which would make the age the time of day.
+        if [ -z "$LT_AT" ] || [ "$LT_AT" = "None" ] || ! LT_S=$(date -d "$LT_AT" +%s 2>/dev/null); then
           say "refusing: $NAME ($ID) has an unreadable launch time; If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
           exit 1
         fi
