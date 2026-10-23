@@ -183,15 +183,15 @@ class McpStageTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"^  constellation_mcp_stage_deployed = (?:true|false)$", MCP, re.M)), 1)
         self.assertEqual(MCP.count("local.constellation_mcp_stage_deployed"), 1)
 
-    def test_the_service_secret_goes_to_the_worker_container_and_the_apis_only(self):
+    def test_the_service_secret_goes_to_the_worker_container_and_the_apis_is_written_once(self):
         uses = re.findall(r"random_password\.constellation_lattice_service\.result", MCP)
-        self.assertEqual(len(uses), 2)
-        api = block('resource "aws_secretsmanager_secret_version" "constellation_lattice_service"', MCP)
-        self.assertIn("provider      = aws.constellation", api)
-        self.assertIn("random_password.constellation_lattice_service.result", api)
-        lookup = block('data "aws_secretsmanager_secret" "constellation_lattice_service"', MCP)
-        self.assertIn("provider = aws.constellation", lookup)
-        self.assertIn('name     = "constellation/nonprod/lattice-service"', lookup)
+        self.assertEqual(len(uses), 1)
+        # The API's copy cannot be a managed version: its policy denies reads to everyone but constellation's roles, and
+        # a version resource reads its value back on every refresh (every plan failed after the first apply).
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "constellation_lattice_service"', MCP)
+        removed = MCP.split("removed {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("from = aws_secretsmanager_secret_version.constellation_lattice_service", removed)
+        self.assertIn("destroy = false", removed)
         worker = block('resource "aws_secretsmanager_secret_version" "constellation_mcp_stage"', MCP)
         self.assertIn("random_password.constellation_lattice_service.result", worker)
         self.assertNotIn("provider", worker)

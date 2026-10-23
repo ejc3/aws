@@ -141,17 +141,18 @@ resource "aws_secretsmanager_secret_version" "constellation_mcp_stage" {
   })
 }
 
-# The API's side of the same secret, in the constellation account (constellation's infra/aws secrets.tf made the
-# container; the staging task injects LATTICE_SERVICE_SECRET from it).
-data "aws_secretsmanager_secret" "constellation_lattice_service" {
-  provider = aws.constellation
-  name     = "constellation/nonprod/lattice-service"
-}
-
-resource "aws_secretsmanager_secret_version" "constellation_lattice_service" {
-  provider      = aws.constellation
-  secret_id     = data.aws_secretsmanager_secret.constellation_lattice_service.id
-  secret_string = jsonencode({ LATTICE_SERVICE_SECRET = random_password.constellation_lattice_service.result })
+# The API's side of the same secret is constellation/nonprod/lattice-service in the constellation account (constellation's
+# infra/aws secrets.tf made the container; the staging task injects LATTICE_SERVICE_SECRET from it). Its resource policy
+# lets only constellation's own roles read it, so Terraform here cannot manage a version of it: a version resource reads
+# its value back on every refresh, and the first apply (2026-10-23) wrote the value and then failed every later plan with
+# AccessDenied. The value written then (version terraform-Gtz4..., AWSCURRENT) stays; Terraform forgets it below. To
+# rotate, replace random_password.constellation_lattice_service, apply, and put the new value there with a session in
+# constellation-terraform (fcvm-arm) or OrganizationAccountAccessRole (jumpbox): PutSecretValue is not denied.
+removed {
+  from = aws_secretsmanager_secret_version.constellation_lattice_service
+  lifecycle {
+    destroy = false
+  }
 }
 
 # What constellation's deploy job needs besides the token (workers-deploy.tf): the account and the KV namespace id. Neither
