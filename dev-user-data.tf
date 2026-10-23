@@ -387,6 +387,8 @@ export TCLAUDE_ARGS="--remote-control"
 # credentials (exported keys still win), only when [default] exists (the aws CLI refuses a
 # missing one), and only for opencode: nothing else gets AWS_PROFILE.
 opencode() {
+  # No xtrace in here, even in a traced shell: it would print the key. Local to the function (zsh).
+  [[ -z "$${ZSH_VERSION-}" ]] || setopt localoptions noxtrace
   local profile=
   if [[ -z "$AWS_PROFILE$AWS_ACCESS_KEY_ID$AWS_BEARER_TOKEN_BEDROCK$AWS_WEB_IDENTITY_TOKEN_FILE$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI$AWS_CONTAINER_CREDENTIALS_FULL_URI" ]] &&
     grep -qs '^\[default\]' ~/.aws/config; then

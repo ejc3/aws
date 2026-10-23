@@ -81,6 +81,8 @@ class OpencodeFunctionTests(unittest.TestCase):
         self.assertEqual(calls, ["default|secretsmanager get-secret-value --region us-west-1 --secret-id abliteration/api-key "
                                  "--query SecretString --output text"])
         self.assertNotIn("export ABLIT_KEY", function_text(), "the key stays out of the shell's environment")
+        # A traced zsh would print the key: the function turns xtrace off for itself only.
+        self.assertIn('[[ -z "${ZSH_VERSION-}" ]] || setopt localoptions noxtrace', function_text().splitlines()[2])
 
     def test_a_key_already_set_is_kept_and_a_refused_read_runs_without(self):
         _, key, calls = self.run_function({"ABLIT_KEY": "mine"}, full=True)
