@@ -224,6 +224,12 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Action    = "ssm:GetParameter"
       Resource  = aws_ssm_parameter.fcvm_fleet.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      # opencode's abliteration.ai key (dev-ai-services.tf), on both metal boxes: no instance pin.
+      Sid      = "ReadTheAbliterationApiKey"
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.abliteration_api_key.arn
     }]
   })
   tags = { Name = "assume-constellation-terraform", Managed = "terraform" }
