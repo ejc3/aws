@@ -206,5 +206,37 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("coordinator_repo   = aws_ecr_repository.fcvm_fleet_coordinator.repository_url", TF)
 
 
+class StageWallTests(unittest.TestCase):
+    """The staging wall runs end to end: the host agent dials the coordinator, and the coordinator owns the host group's
+    capacity (scale to zero with no viewer) and the EC2 side."""
+
+    def test_the_host_agent_dials_the_coordinator_with_its_secrets_in_the_home_region(self):
+        args = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ])\n", 1)[0]
+        for a in ['"--dial wss://${local.fcvm_dev_agent_path}"',
+                  '"--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}"',
+                  '"--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}"',
+                  '"--secret-region ${local.fcvm_fleet_home_region}"',
+                  '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone fcvm.dev"']:
+            self.assertIn(a, args)
+        self.assertEqual(TF.count("host_agent_args           = local.fcvm_fleet_host_agent_args"), 3)
+
+    def test_boot_writes_the_agent_env_and_starts_the_unit_only_with_arguments(self):
+        self.assertIn('%{if var.host_agent_args != ""~}', MOD)
+        self.assertIn("> /etc/fcvm-fleet/agent.env", MOD)
+        self.assertIn("systemctl enable fcvm-fleet-agent.service", MOD)
+        # Not a blocking start from cloud-init: the unit waits for the GPUs and the store.
+        self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", MOD)
+        self.assertNotIn("systemctl enable --now fcvm-fleet-agent", MOD)
+
+    def test_the_coordinator_scales_the_host_groups_it_has_an_ami_for(self):
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--scale-group", "${r}:fcvm-fleet-hosts"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0', cmd)
+        self.assertIn('"--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"', cmd)
+        self.assertIn('"--ec2-regions", "us-east-1"', cmd)
+        self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

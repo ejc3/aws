@@ -45,6 +45,12 @@ variable "hosts_enabled" {
   type        = bool
 }
 
+variable "host_agent_args" {
+  description = "The host agent's arguments (fcvm fleet agent, FLEET_AGENT_ARGS in /etc/fcvm-fleet/agent.env); empty leaves the agent off"
+  type        = string
+  default     = ""
+}
+
 variable "host_profile_name" {
   type = string
 }
@@ -86,10 +92,18 @@ locals {
   # One host while enabled and an AMI exists; 0 otherwise. max 2 lets a capacity-rebalance replacement start before the old
   # host is gone.
   host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0
-  # The AMI carries the agent as a systemd unit; boot only records that it ran (fcvm#1136, "Hosts and capacity").
+  # The AMI carries the agent as a systemd unit, installed disabled and conditional on /etc/fcvm-fleet/agent.env (fcvm
+  # fleet/ami/host/fcvm-fleet-agent.service; its arguments are fcvm fleet/PROTOCOL.md, "Agent", "Running it"). Boot writes
+  # that file and starts the unit without waiting for it: the unit itself waits for the GPUs on vfio-pci and the store.
   user_data = base64encode(<<-EOT
     #!/bin/bash
     echo "fcvm-fleet host booted $(date -u +%FT%TZ)" > /var/log/fcvm-fleet-boot.log
+    %{if var.host_agent_args != ""~}
+    install -d -m 0755 /etc/fcvm-fleet
+    printf 'FLEET_AGENT_ARGS=%s\n' '${var.host_agent_args}' > /etc/fcvm-fleet/agent.env
+    systemctl enable fcvm-fleet-agent.service
+    systemctl start --no-block fcvm-fleet-agent.service
+    %{endif~}
   EOT
   )
 }
