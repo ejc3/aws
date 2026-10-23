@@ -1546,7 +1546,9 @@ day bound abuse. Nothing is built until the key's secret exists; the first apply
 1. In App Store Connect, Users and Access, Integrations, App Store Connect API, Team Keys, create a key named for this
    use with the **App Manager** role (the lowest that manages testers; not Admin, and never the Games Worth Watching
    key). Download its `.p8` file (`AuthKey_<KEY_ID>.p8`) into the current directory and note the Issuer ID and Key ID.
-2. On a jumpbox, create the secret with the three values as one JSON object without echoing them, then delete the file:
+2. With credentials for the **astryx account** (from the owner's container, the `terraform_role` in SSM `/infra/astryx`;
+   from a jumpbox, the account's OrganizationAccountAccessRole), create the secret with the three values as one JSON
+   object without echoing them, then delete the file:
 
    ```bash
    read -rs ISSUER; read -rs KEY_ID
@@ -1565,7 +1567,7 @@ day bound abuse. Nothing is built until the key's secret exists; the first apply
    secret as its secrets, the route, and last the Access bypass for exactly this host. The widget needs Turnstile write
    on the provider token `cloudflare-tunnel-token` (AGENTS.md, "Astryx Swift TestFlight invitations").
 
-Rotate: create a new App Manager key, `put-secret-value` the same JSON to `astryx/testflight-asc-key`, apply, then
+Rotate: create a new App Manager key, `put-secret-value` the same JSON to `astryx/testflight-asc-key` (astryx account), apply, then
 revoke the old key. Stop: revoke the key in App Store Connect (invitations fail at once); to remove the host too,
 `aws secretsmanager delete-secret --force-delete-without-recovery --secret-id astryx/testflight-asc-key` and apply.
 

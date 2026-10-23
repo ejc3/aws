@@ -1897,7 +1897,8 @@ Manager** key.
 - **Terraform deploys this Worker's code**, unlike the site Workers: the App Store Connect key and the Turnstile secret
   are `secret_text` bindings, which only an upload of the code can set with the pinned provider. A change to the `.mjs`
   is a reviewed change that the next apply deploys (`content_sha256`).
-- **The switch is the secret** `astryx/testflight-asc-key` (us-west-1; JSON `ISSUER_ID`, `KEY_ID`, `PRIVATE_KEY`). Until
+- **The switch is the secret** `astryx/testflight-asc-key` (us-west-1, in the astryx account, read through `aws.astryx`;
+  JSON `ISSUER_ID`, `KEY_ID`, `PRIVATE_KEY`). Until
   it exists nothing is created and the name stays behind the GitHub gate. The owner creates it (README, "Astryx Swift:
   self-serve TestFlight invitations"); Terraform adds an administration-only read policy. The Turnstile site key and
   secret come from `cloudflare_turnstile_widget.astryx_join`.

@@ -62,7 +62,12 @@ class TheSwitch(unittest.TestCase):
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('Principal = "*"', policy)
         self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
-        self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }', policy)
+        self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = [local.astryx_access_role_arn, local.astryx_terraform_role_arn] } }', policy)
+
+    def test_the_key_lives_in_the_astryx_account(self):
+        for kind, name in [("aws_secretsmanager_secrets", "astryx_join_asc_key"), ("aws_secretsmanager_secret_version", "astryx_join_asc_key"),
+                           ("aws_secretsmanager_secret", "astryx_join_asc_key"), ("aws_secretsmanager_secret_policy", "astryx_join_asc_key")]:
+            self.assertIn("provider = aws.astryx", re.sub(r" +", " ", block(kind, name)), kind)
 
 
 class PublicHost(unittest.TestCase):
