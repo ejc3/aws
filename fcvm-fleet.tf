@@ -23,16 +23,17 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only.
-  default = { "us-east-1" = { x86_64 = "ami-0ad5d9347e1f7030f" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from fcvm 88d2860d:
+  # the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator (host_agent_args).
+  default = { "us-east-1" = { x86_64 = "ami-0f71533f7d6ec48d5" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile).
-  default = { "us-east-1" = { x86_64 = "ami-0c25b9d6674c3892f" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's (fcvm 88d2860d).
+  default = { "us-east-1" = { x86_64 = "ami-0c138010875dc23fb" } }
 }
 
 variable "fcvm_fleet_coordinator_image" {
@@ -46,7 +47,7 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "f32ae4ad"
+  fcvm_fleet_coordinator_tag = "0d3d299b"
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
