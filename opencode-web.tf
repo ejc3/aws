@@ -2,9 +2,10 @@
 # overrides the family's wildcard application. Publish the container setup only after this gate exists.
 locals {
   opencode_web = {
-    hostname = "opencode.${local.nextjs_domain}"
-    user     = one(local.nextjs_ct_owners)
-    port     = 49374 # OpenCode 2's Linux shared-service port
+    hostname   = "opencode.${local.nextjs_domain}"
+    user       = one(local.nextjs_ct_owners)
+    port       = 49374 # OpenCode 2's Linux shared-service port, loopback only
+    proxy_port = 49375 # The container's authenticated Cloudflare-facing proxy
   }
 }
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Cloudflare-authenticated browser connection to OpenCode for %i
+Requires=opencode-web@%i.service
+After=opencode-web@%i.service
+PartOf=opencode-web@%i.service
+StartLimitIntervalSec=0
+
+[Service]
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+RuntimeDirectory=opencode-web-proxy-%i
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/bin/opencode-web-proxy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

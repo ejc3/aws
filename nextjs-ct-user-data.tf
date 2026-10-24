@@ -267,12 +267,17 @@ locals {
   nextjs_ct_terraform = { version = "1.10.3", sha256 = "b92d8245c67d4f7193245bc9d534048a63520302b6edb3c7764277b00c96ed31" }
 
   nextjs_ct_config = {
-    role_arn            = local.nextjs_dev_role_arn
-    serving             = local.nextjs_ct_serving
-    zones               = local.nextjs_zone_tunnel
-    ssh_hostnames       = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
-    pinned_routes       = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
-    opencode_web        = local.opencode_web
+    role_arn      = local.nextjs_dev_role_arn
+    serving       = local.nextjs_ct_serving
+    zones         = local.nextjs_zone_tunnel
+    ssh_hostnames = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
+    pinned_routes = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
+    opencode_web  = local.opencode_web
+    route_access = {
+      (local.opencode_web.hostname) = {
+        required = true, teamName = "ejc3", audTag = [cloudflare_zero_trust_access_application.opencode_web.aud]
+      }
+    }
     session_policy      = local.nextjs_ct_session_policy
     session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }
     member_box_ips      = local.nextjs_ct_member_box_ips

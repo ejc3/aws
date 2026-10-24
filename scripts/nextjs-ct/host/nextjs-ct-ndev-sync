@@ -132,6 +132,11 @@ def render(config, zone, routes):
         if host == reserved:
             continue
         lines += [f"  - hostname: {host}", f"    service: {routes[host]}"]
+        access = config.get("route_access", {}).get(host)
+        if access:
+            lines += ["    originRequest:", "      access:", "        required: true",
+                      f"        teamName: {json.dumps(access['teamName'])}", "        audTag:"]
+            lines += [f"          - {json.dumps(aud)}" for aud in access["audTag"]]
     lines.append("  - service: http_status:404")
     return "\n".join(lines) + "\n"
 

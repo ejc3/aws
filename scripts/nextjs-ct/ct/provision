@@ -309,18 +309,9 @@ as_user bash < "$SHARED/snippets/user-shell-env.sh" >/dev/null 2>&1 || warn "she
 # opencode with DeepSeek on Bedrock, the pinned release and default config the metal boxes get (dev-user-data.tf); the
 # shell env above carries the opencode() function that points it at the container's credentials.
 as_user bash < "$SHARED/snippets/opencode-setup.sh" >/dev/null 2>&1 || warn "opencode setup for $U had errors"
-# The phone's browser reaches only the owner's shared OpenCode server. Preserve its personal model/auth config and
-# existing server password; changing a service setting stops the native server, so set only values that differ.
+# The phone's browser reaches only the owner's shared OpenCode server, through the Access-authenticated proxy.
 if [ "$OWNER" = true ] && [ "$(cfg '.opencode_web.user // empty')" = "$U" ]; then
-  OPENCODE_PORT=$(cfg '.opencode_web.port')
-  OPENCODE_BIN="$H/.opencode/bin/opencode"
-  if [ "$(as_user "$OPENCODE_BIN" service get hostname)" != "0.0.0.0" ]; then
-    as_user "$OPENCODE_BIN" service set hostname 0.0.0.0 || warn "OpenCode hostname not set"
-  fi
-  if [ "$(as_user "$OPENCODE_BIN" service get port)" != "$OPENCODE_PORT" ]; then
-    as_user "$OPENCODE_BIN" service set port "$OPENCODE_PORT" || warn "OpenCode port not set"
-  fi
-  systemctl enable --now "opencode-web@$U.service" >/dev/null 2>&1 || warn "OpenCode web not started"
+  /usr/local/bin/opencode-web-setup "$U" || warn "OpenCode web not configured"
 fi
 /usr/local/bin/user-agents-seed "$U" || warn "user-agents-seed failed for $U"
 

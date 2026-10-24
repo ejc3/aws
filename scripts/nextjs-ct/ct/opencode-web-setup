@@ -1,0 +1,24 @@
+#!/bin/bash
+# Root inside the owner's container, never on the host. Keep this out of provision's template-build stamp.
+set -euo pipefail
+CONFIG=/opt/nextjs-ct/config.json
+U="$1"
+[ "$(jq -r '.opencode_web.user' "$CONFIG")" = "$U" ] &&
+  [ "$(jq -r --arg u "$U" '.users[$u].owner' "$CONFIG")" = true ] || exit 1
+if ! command -v nginx >/dev/null 2>&1; then
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nginx
+  # This service uses its own private, unprivileged nginx, not the package's port-80 server.
+  systemctl disable --now nginx.service
+fi
+BIN="/home/$U/.opencode/bin/opencode"
+PORT=$(jq -r '.opencode_web.port' "$CONFIG")
+as_user() { sudo -u "$U" -H env HOME="/home/$U" "$@"; }
+if [ "$(as_user "$BIN" service get hostname)" != 127.0.0.1 ]; then
+  as_user "$BIN" service set hostname 127.0.0.1
+fi
+if [ "$(as_user "$BIN" service get port)" != "$PORT" ]; then
+  as_user "$BIN" service set port "$PORT"
+fi
+systemctl daemon-reload
+systemctl enable --now "opencode-web@$U.service" "opencode-web-proxy@$U.service"
