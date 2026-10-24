@@ -23,16 +23,17 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only.
-  default = { "us-east-1" = { x86_64 = "ami-0ad5d9347e1f7030f" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from fcvm 88d2860d:
+  # the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator (host_agent_args).
+  default = { "us-east-1" = { x86_64 = "ami-0f71533f7d6ec48d5" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile).
-  default = { "us-east-1" = { x86_64 = "ami-0c25b9d6674c3892f" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's (fcvm 88d2860d).
+  default = { "us-east-1" = { x86_64 = "ami-0c138010875dc23fb" } }
 }
 
 variable "fcvm_fleet_coordinator_image" {
@@ -46,7 +47,7 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "f32ae4ad"
+  fcvm_fleet_coordinator_tag = "0d3d299b"
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
@@ -59,6 +60,35 @@ locals {
   }
   # ECS takes a secret's full ARN with a JSON key: arn:key:version-stage:version-id.
   fcvm_fleet_tunnel_token_ref = "${aws_secretsmanager_secret.fcvm_fleet_coordinator_tunnel.arn}:TUNNEL_TOKEN::"
+
+  # The host agent's arguments (fcvm fleet/PROTOCOL.md, "Agent", "Running it"): it dials the coordinator through Access with
+  # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
+  # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
+  # are in the home region, not the host's.
+  fcvm_fleet_host_agent_args = join(" ", [
+    "--dial wss://${local.fcvm_dev_agent_path}",
+    "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
+    "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}",
+    "--secret-region ${local.fcvm_fleet_home_region}",
+    "--host-from-imds",
+    "--image localhost/fcvm-renderer:fleet",
+    "--base-port 20100",
+    "--publish-ip 0.0.0.0",
+    "--ipv6-prefix-from-imds",
+    "--frame-zone fcvm.dev",
+    "--spot-notice-url http://169.254.169.254",
+    "--store-ready-file /var/lib/fcvm-fleet/store-ready",
+  ])
+
+  # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key come from
+  # the task's environment. It owns the host groups' desired capacity: 0 after 10 minutes with no viewer, 1 for the next
+  # one. The EC2 side runs its tiles in us-east-1, the one region with a tile AMI, and only while the fleet is awake.
+  fcvm_fleet_coordinator_command = concat(
+    ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    flatten([for r in local.fcvm_fleet_regions : ["--scale-group", "${r}:fcvm-fleet-hosts"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0]),
+    ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
+    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
+  )
 
   fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -303,6 +333,7 @@ module "fcvm_fleet_east2" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-2", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_agent_args           = local.fcvm_fleet_host_agent_args
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -316,6 +347,7 @@ module "fcvm_fleet_west2" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-west-2", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_agent_args           = local.fcvm_fleet_host_agent_args
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -329,6 +361,7 @@ module "fcvm_fleet_east1" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-1", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  host_agent_args           = local.fcvm_fleet_host_agent_args
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -603,6 +636,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       name      = "coordinator"
       image     = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_image : "public.ecr.aws/docker/library/busybox:stable"
       essential = true
+      command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null
       # Its state is an S3 object, not a file (ECS.5: no writable root; a task volume where something must write).
       readonlyRootFilesystem = true
       environment = [
