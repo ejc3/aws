@@ -357,6 +357,17 @@ us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
 
 ## Access and trust boundaries
 
+The fcvm staging coordinator has a main-only CI release path (`fcvm-fleet-ci.tf`). CI builds
+and tests its ARM64 image, publishes an immutable commit tag, and invokes an image-only release
+function. That function takes Terraform's backend lock, rolls out the new image and records
+its digest in `/fcvm-fleet/stage/coordinator-image`; Terraform still checks the task's roles,
+commands, networking and other infrastructure. The CI job then checks Access, relaunches one
+tile in each half, and receives renderer frames over IPv4 under fresh DNS names. This can wake
+the GPU fleet; a capacity shortage fails the live check. CI has no Terraform-state access,
+administrator role or direct ECS permissions. Its deployed code has the coordinator's existing
+fleet-account runtime permissions. Environment variables and the staging-only Access token
+are provisioned by Terraform, with no manual CI setup.
+
 List current connection commands:
 
 ```bash

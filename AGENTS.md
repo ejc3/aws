@@ -492,6 +492,11 @@ a successful validation is not an empty live plan. The shared main/staging CI ro
 retired with Deny `*`. GitHub OIDC is used by the owner-approved AMI publisher, `imagine-deploy`
 (`imagine.tf`), `dolphin-maps-loop-deploy` (`dolphin-maps-loop.tf`) and `dolphin-labs-testflight`
 (`dolphin-labs-testflight.tf`), each trusted for one repository's `main` or environment.
+The main-only `fcvm-stage-ci` role (`fcvm-fleet-ci.tf`) publishes the coordinator image and
+invokes its image-only release function. It cannot call ECS, read state or assume another role.
+The function serializes against this backend's DynamoDB lock and changes only the staging
+coordinator image. CI owns that code and therefore its fleet-only runtime capabilities;
+the fleet account still has no path into this account.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
@@ -1650,11 +1655,12 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   through `fcvm-fleet-terraform` (AdministratorAccess in that account, one-hour sessions), which trusts dev-server-role
   pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
-  another policy. No CI credential.
+  another policy. CI itself cannot assume a fleet role; its main-only management-account
+  role can publish the coordinator image and invoke the scoped release function.
 - **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in us-east-1, granted 2026-10-22; one region is enough (owner).
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
-  on, SSL Full (strict). Staging only, owner-only behind Access: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
+  on, SSL Full (strict). Staging only, behind Access for the owner and the main-only CI service token: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
   agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm). Written into the
   fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
@@ -1666,9 +1672,14 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/tls-wildcard` secret. The
   Cloudflare-fed secrets (DNS token, tunnel token, agent Access token) come from `fcvm-dev.tf`.
-- **Two gates, both off**: `local.fcvm_fleet_hosts_enabled` (one spot metal GPU host per region, also needing the fleet AMI
-  in `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled` (also needing `var.fcvm_fleet_coordinator_image`).
-  Nothing billed by the hour runs until the owner turns one on. The AMI build is a follow-up.
+- **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
+  `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts scale to zero
+  when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
+  immutable tag, then invokes `fcvm-coordinator-release`. That function holds the same DynamoDB
+  backend lock as Terraform, clones the running task definition changing only its image, and
+  records the successful digest in `/fcvm-fleet/stage/coordinator-image`. Terraform reads that
+  software release pointer and tracks the latest active task revision; no task/service fields
+  are ignored. Infrastructure still changes only through Terraform from a jumpbox.
 - **On-demand fallback** (`fcvm-fleet-hosts-on-demand`, beside each spot group): Auto Scaling does not move a spot group's
   capacity to on demand by itself, so the coordinator does (`--on-demand-group`, `--spot-wait`): a wake whose spot group
   stays short gives the on-demand group the shortfall, and sleep sets both groups to 0. `max_size` is

@@ -134,9 +134,10 @@ class CoordinatorTests(unittest.TestCase):
     def test_the_service_runs_the_tagged_image_from_the_fleet_repository(self):
         self.assertIn("fcvm_fleet_coordinator_enabled = true", TF)
         self.assertRegex(TF, r'fcvm_fleet_coordinator_tag = "[0-9a-f]{8,40}"')
-        self.assertIn('fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"', TF)
+        self.assertIn('track_latest = true', TF)
+        self.assertNotIn('ignore_changes', block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"'))
         self.assertIn('fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""', TF)
-        self.assertIn("image     = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_image", TF)
+        self.assertIn("image     = local.fcvm_fleet_coordinator_running ? nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value)", TF)
         self.assertIn("desired_count                      = local.fcvm_fleet_coordinator_running ? 1 : 0", block('resource "aws_ecs_service" "fcvm_fleet_coordinator"'))
 
     def test_the_task_role_reaches_tiles_only(self):
