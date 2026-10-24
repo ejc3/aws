@@ -377,7 +377,7 @@ class FakeLambdaClient:
 
         The cleanup poll sends one invocation per architecture whose payload
         carries the whole deficit as launch_count (a burst of single-launch
-        invocations could overshoot MAX_RUNNERS: DescribeInstances is eventually
+        invocations could overshoot the cap: DescribeInstances is eventually
         consistent, so each invocation can miss the instance the previous one
         just launched). Summing launch_count keeps these assertions about
         demand, and invocations_per_arch() below asserts the one-invoke shape.
@@ -591,7 +591,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
         "REUSE_FUNCTION": "github-runner-reuse",
-        "MAX_RUNNERS": "4",
+        "MAX_RUNNERS_ARM64": "4",
+        "MAX_RUNNERS_X86_64": "4",
         "REGISTRATION_TABLE": "github-runner-registration",
         "RUNNER_ACCOUNT_ID": ACCOUNT_ID,
         **(env or {}),
@@ -4280,7 +4281,7 @@ def case_queue_deeper_than_the_pool_launches_up_to_the_cap():
     And the whole deficit must travel in a SINGLE invocation per architecture:
     a burst of single-launch invocations, even serialized by reserved
     concurrency 1, can each miss the instance the previous one just launched
-    (DescribeInstances is eventually consistent) and overshoot MAX_RUNNERS.
+    (DescribeInstances is eventually consistent) and overshoot the cap.
     """
     busy = run(7, "queued")
     github = FakeGitHub(runs=[busy], jobs={busy["id"]: [job("queued", "arm64") for _ in range(7)]})
@@ -4365,7 +4366,7 @@ def case_scan_stops_once_both_architectures_are_saturated():
     jobs = {r["id"]: [job("queued", "arm64")] * 4 + [job("queued", "x86_64")] * 4 for r in runs}
     github = FakeGitHub(runs=runs, jobs=jobs)
     module = cleanup(FakeEC2(), github)
-    demand = module["queued_demand"]("ghp_test", 4)
+    demand = module["queued_demand"]("ghp_test", {"arm64": 4, "x86_64": 4})
     assert demand == {"arm64": 4, "x86_64": 4}, demand
     job_calls = [u for u in github.requests if "/jobs" in u]
     assert len(job_calls) == 1, f"scanned {len(job_calls)} runs after saturation"
@@ -4376,8 +4377,87 @@ def case_only_self_hosted_jobs_count():
     github = FakeGitHub(runs=[hosted], jobs={hosted["id"]: [
         {"name": "Lint", "status": "queued", "labels": ["ubuntu-latest"]},
     ]})
-    demand = cleanup(FakeEC2(), github)["queued_demand"]("ghp_test", 4)
+    demand = cleanup(FakeEC2(), github)["queued_demand"]("ghp_test", {"arm64": 4, "x86_64": 4})
     assert demand == {"arm64": 0, "x86_64": 0}, demand
+
+
+# --------------------------------------------------------------------------
+# Cases: each architecture has its own cap (local.runner_max_by_arch)
+# --------------------------------------------------------------------------
+
+SPLIT_CAPS = {"MAX_RUNNERS_ARM64": "8", "MAX_RUNNERS_X86_64": "4"}
+
+
+def case_each_architecture_launches_up_to_its_own_cap():
+    """A poll request for more than either pool holds fills each pool to its own cap."""
+    for arch, cap in (("arm64", 8), ("x86_64", 4)):
+        ec2 = FakeEC2([])
+        labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
+        event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": labels},
+                                     "launch_count": 10})}
+        result = webhook(ec2, env=SPLIT_CAPS)["handler"](event, None)
+        assert f"Launched {cap} {arch} runner(s)" in result["body"], (arch, result)
+        assert len(launched_types(ec2)) == cap, (arch, launched_types(ec2))
+
+
+def case_a_full_x86_pool_does_not_stop_arm64_below_its_cap():
+    """Five counted arm64 runners are under a cap of 8; four x86 runners fill a cap of 4."""
+    for arch, counted, expected in (("arm64", 5, "Launched 1 arm64 runner(s)"),
+                                    ("x86_64", 4, "Max x86_64 runners (4) reached")):
+        module = webhook(FakeEC2([]), env=SPLIT_CAPS)
+        module["get_capacity"] = lambda a, counted=counted: {
+            "counted": counted, "instances": counted, "online": counted, "idle": 0,
+            "booting": 0, "degraded": False, "available": []}
+        result = module["handler"](queued_event(arch), None)
+        assert expected in result["body"], (arch, result)
+
+
+def case_the_poll_asks_each_architecture_for_up_to_its_own_cap():
+    busy = run(7, "queued")
+    github = FakeGitHub(runs=[busy], jobs={busy["id"]: [job("queued", "arm64") for _ in range(10)]
+                                           + [job("queued", "x86_64") for _ in range(10)]})
+    invoker = FakeLambdaClient()
+    cleanup(FakeEC2(), github, invoker, env=SPLIT_CAPS)["handler"]({}, None)
+    assert invoker.arch_invokes() == {"arm64": 8, "x86_64": 4}, invoker.arch_invokes()
+    assert invoker.invocations_per_arch() == {"arm64": 1, "x86_64": 1}, invoker.invocations_per_arch()
+
+
+def case_scan_keeps_counting_an_architecture_below_its_own_cap():
+    """x86 saturates at 4 after one run; arm64 needs a second run to reach 8."""
+    runs = [run(900 - i, "queued") for i in range(20)]
+    jobs = {r["id"]: [job("queued", "arm64")] * 4 + [job("queued", "x86_64")] * 4 for r in runs}
+    github = FakeGitHub(runs=runs, jobs=jobs)
+    demand = cleanup(FakeEC2(), github)["queued_demand"]("ghp_test", {"arm64": 8, "x86_64": 4})
+    assert demand == {"arm64": 8, "x86_64": 8}, demand
+    job_calls = [u for u in github.requests if "/jobs" in u]
+    assert len(job_calls) == 2, f"scanned {len(job_calls)} runs, expected 2"
+
+
+def case_reuse_asks_for_a_claim_while_its_architecture_is_under_its_own_cap():
+    """github-runner-reuse reads the same per-architecture cap as the webhook."""
+    for counted, cap_env, asks in ((5, SPLIT_CAPS, True),
+                                   (4, {"MAX_RUNNERS_ARM64": "4", "MAX_RUNNERS_X86_64": "8"}, False)):
+        dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+        module = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
+                       github=FakeGitHub(**queue_of(queued=2)), lambda_client=back, env=cap_env)
+        module["get_capacity"] = lambda arch, counted=counted: {
+            "counted": counted, "instances": counted, "online": counted, "idle": 0,
+            "booting": 0, "degraded": False, "available": []}
+        result = module["reuse_handler"](as_handoff(completed_event()), None)
+        assert (result["statusCode"] == 202) is asks, (counted, cap_env, result)
+        assert (len(back.calls) == 1) is asks, (counted, cap_env, back.calls)
+
+
+def case_every_runner_lambda_gets_both_caps_from_one_map():
+    """The webhook, reuse and cleanup functions read the caps from local.runner_max_by_arch."""
+    tf = TF_FILE.read_text()
+    for name in ("runner_webhook", "runner_reuse", "runner_cleanup"):
+        start = tf.index(f'resource "aws_lambda_function" "{name}" {{')
+        body = tf[start:tf.index("\n}\n", start)]
+        for arch in ("arm64", "x86_64"):
+            assert re.search(rf"MAX_RUNNERS_{arch.upper()}\s*=\s*tostring\(local\.runner_max_by_arch\.{arch}\)",
+                             body), (name, arch)
+        assert not re.search(r"\bMAX_RUNNERS\s*=", body), name
 
 
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]

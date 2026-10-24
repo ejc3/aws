@@ -332,7 +332,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number (`pbox up FLAVOR`: any flavor but kvm). Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
-| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
+| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. At most eight healthy ARM64 and four x86 runners; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
@@ -1765,9 +1765,9 @@ and completely, until 2026-08-07. That ownership takes effect at the one-time ho
 and the first apply after it (see Prerequisites); a state that has not run them yet still
 has the pre-Terraform secret live on the hook.
 
-The maximum is four runners per architecture, counted as runners GitHub can actually hand a
-job to rather than instances that merely exist, so a wedged box cannot hold a slot. Each
-scale-up decision emits a `GitHubRunners` metric and a structured log line. Two alarms
+The maximum is eight arm64 and four x86 runners (`local.runner_max_by_arch`), counted as
+runners GitHub can actually hand a job to rather than instances that merely exist, so a
+wedged box cannot hold a slot. Each scale-up decision emits a `GitHubRunners` metric and a structured log line. Two alarms
 watch them: `runner-scale-up-starved` fires when queued work goes unserved for two hours
 (a wedged pool, or one genuinely that far behind — a single poll cannot tell them apart,
 because a host that wedges mid-job keeps reporting `busy` to GitHub), and

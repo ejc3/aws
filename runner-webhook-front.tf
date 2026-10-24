@@ -2,7 +2,7 @@
 #
 # The webhook runs one execution at a time (reserved_concurrent_executions = 1 since
 # 60f3782): concurrent invocations each read the same runner count before launching and put
-# up more instances than MAX_RUNNERS. Straight behind API Gateway, a delivery that arrived
+# up more instances than the cap. Straight behind API Gateway, a delivery that arrived
 # while that execution was busy was throttled, API Gateway answered GitHub
 # {"message":"Service Unavailable"}, and GitHub does not redeliver. From 2026-09-11 04:15Z
 # to 2026-09-13 16:20Z, 69 of the 80 queued deliveries GitHub retained were lost that way or
