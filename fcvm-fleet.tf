@@ -29,10 +29,10 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from fcvm 96545c3a
-  # (ejc3/fcvm#1146 at 8c96e28e with #1197, which keeps a GPU guest's NIC eth0 so its routed address is on it): the agent
-  # unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator (host_agent_args).
-  default = { "us-east-1" = { x86_64 = "ami-04d44a7ed34201877" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
+  # c93a01d9 with main's recipe (fleet/ami, ejc3/fcvm#1217): a GPU guest's NIC stays eth0 so its routed address is on it
+  # (#1197), the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator.
+  default = { "us-east-1" = { x86_64 = "ami-048e3b227fb7924d5" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -54,13 +54,13 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "8c96e28e"
+  fcvm_fleet_coordinator_tag = "c93a01d9"
   # Most on-demand GPU hosts per region (the fallback group's max_size; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max = 8
   # Whether the coordinator gives a short spot group's capacity to the region's on-demand group (--on-demand-group,
-  # --spot-wait, ejc3/fcvm#1215). Off until fcvm_fleet_coordinator_tag names a build with those flags: the image at
-  # 8c96e28e refuses an unknown argument and would not start.
-  fcvm_fleet_coordinator_falls_back = false
+  # --spot-wait, ejc3/fcvm#1215). On with the image at c93a01d9 (ejc3/fcvm main, which has those flags); the image at
+  # 8c96e28e refuses an unknown argument and would not start, so the two change together.
+  fcvm_fleet_coordinator_falls_back = true
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
