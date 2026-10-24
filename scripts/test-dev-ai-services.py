@@ -78,6 +78,20 @@ class ElevenLabsSecretTests(unittest.TestCase):
             for key, env in (("deepseek", "DEEPSEEK"), ("exa", "EXA"), ("scrapingdog", "SCRAPINGDOG")):
                 self.assertRegex(src, rf'{env}_SECRET_ID += aws_secretsmanager_secret.search_fetch_api_key\["{key}"\].name')
 
+    def test_balldontlie_is_for_the_two_dev_roles_only(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "balldontlie', TF)
+        secret = block("aws_secretsmanager_secret", "balldontlie_api_key")
+        self.assertIn('name                    = "balldontlie/api-key"', secret)
+        policy = block("aws_secretsmanager_secret_policy", "balldontlie_api_key")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.balldontlie_readers)', policy)
+        self.assertIn("balldontlie_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]", TF)
+        doc = block("aws_iam_policy_document", "balldontlie_read")
+        self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', doc)
+        self.assertIn("resources = [aws_secretsmanager_secret.balldontlie_api_key.arn]", doc)
+        attach = block("aws_iam_role_policy_attachment", "balldontlie_read")
+        self.assertIn("{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }", attach)
+
     def test_claw_master_backup_key_is_for_the_metal_role_only(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "claw_master_backup_key"', TF)
         self.assertNotRegex(TF, r"sk-ant-[A-Za-z0-9_-]{6,}")

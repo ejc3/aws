@@ -1400,6 +1400,11 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **Ball Don't Lie** (sports data: scores, schedules, rosters, injuries, stats; the paid tier), metal boxes and
+  nextjs-dev, for a sports-data adapter. One JSON secret, `balldontlie/api-key` (us-west-1), holds
+  `BALLDONTLIE_API_KEY`; only dev-server-role, nextjs-dev-role and admins may read it (`dev-ai-services.tf`). Export it with
+  the same `eval "$(aws secretsmanager get-secret-value ... | jq -r 'to_entries[] | ...')"` as Browserbase. dolphin-labs'
+  news functions read their own copy in the Dolphin account. Never onto a command line, into a file in a repo or a commit.
 - **dolphin-maps' PeMS login** (Caltrans' traffic data service). `dolphin-maps/pems` (us-west-1; JSON, `PEMS_USERNAME` and
   `PEMS_PASSWORD`) is the dolphin-maps PeMS login; dev-server-role may read and put it, the dolphin-maps loop Lambdas' role
   and admins read it (`dolphin-maps-loop.tf`; the functions get `PEMS_SECRET_ID`). Export it with the same `eval "$(aws secretsmanager

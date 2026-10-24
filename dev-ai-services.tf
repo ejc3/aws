@@ -230,6 +230,59 @@ resource "aws_iam_role_policy_attachment" "search_fetch_api_keys_read" {
   policy_arn = aws_iam_policy.search_fetch_api_keys_read.arn
 }
 
+# Ball Don't Lie (balldontlie.io: scores, schedules, rosters, injuries and stats; the paid tier) for a
+# sports-data adapter developed on the metal boxes. One JSON secret,
+# `balldontlie/api-key`, holds `BALLDONTLIE_API_KEY`; export it as for the search and fetch keys above.
+# The same key's copy for dolphin-labs' news functions is in the Dolphin account (dolphin-aws news.tf) and is
+# not this one: the owner or a jumpbox copies the value in out of band (put-secret-value from a 0600 file),
+# and it never enters git. Readers: the administration set, dev-server-role and nextjs-dev-role, as for the
+# other vendor keys here. Every call the adapter makes to the API is a GET.
+resource "aws_secretsmanager_secret" "balldontlie_api_key" {
+  name                    = "balldontlie/api-key"
+  description             = "Ball Don't Lie sports-data API key (JSON: BALLDONTLIE_API_KEY). Value set out of band; see dev-ai-services.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "balldontlie/api-key", Project = "dev" }
+}
+
+locals {
+  balldontlie_readers = [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]
+}
+
+resource "aws_secretsmanager_secret_policy" "balldontlie_api_key" {
+  secret_arn = aws_secretsmanager_secret.balldontlie_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.balldontlie_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.balldontlie_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "balldontlie_read" {
+  statement {
+    sid       = "ReadTheBallDontLieKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.balldontlie_api_key.arn]
+  }
+}
+
+resource "aws_iam_policy" "balldontlie_read" {
+  name        = "dev-balldontlie-read"
+  description = "Dev boxes: read the Ball Don't Lie API key (balldontlie/api-key) and nothing else"
+  policy      = data.aws_iam_policy_document.balldontlie_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "balldontlie_read" {
+  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
+  role       = each.value
+  policy_arn = aws_iam_policy.balldontlie_read.arn
+}
+
 # App Store Connect API key for Games Worth Watching's Apple apps (dolphin-labs, apps/native): the
 # key that creates the app record and uploads builds to TestFlight for internal testers. One JSON
 # secret holds ISSUER_ID, KEY_ID, PRIVATE_KEY (the .p8 text) and TEAM_ID (the developer team that
