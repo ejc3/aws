@@ -214,14 +214,17 @@ locals {
     "us-west-2" = module.pbox_fallback_us_west_2
   }
 
-  # What `pbox` needs to launch at a fallback site, published in /infra/parallel-box (ohio-pbox.tf): the template name,
-  # and per region its AZ => subnet and its x86_64 image (--image-id for an x86 flavor).
+  # What `pbox` needs to launch at a fallback site, published in /infra/parallel-box (ohio-pbox.tf): the template name, its
+  # always on-demand sibling's (`pbox up --on-demand`; the same name at every site, which one() checks), and per region its
+  # AZ => subnet and its x86_64 image (--image-id for an x86 flavor).
   pbox_fallback_pointer = {
-    template = local.pbox_fallback_template_name
-    regions  = { for r, s in local.pbox_fallback_sites : r => { subnets = s.subnets, x86_image = s.ami_id_x86 } }
+    template          = local.pbox_fallback_template_name
+    ondemand_template = one(distinct([for s in values(local.pbox_fallback_sites) : s.ondemand_template_name]))
+    regions           = { for r, s in local.pbox_fallback_sites : r => { subnets = s.subnets, x86_image = s.ami_id_x86 } }
   }
 
-  pbox_fallback_template_arns = [for s in values(local.pbox_fallback_sites) : s.template_arn]
+  # Both templates of every site: the spot one and its on-demand sibling.
+  pbox_fallback_template_arns = flatten([for s in values(local.pbox_fallback_sites) : [s.template_arn, s.ondemand_template_arn]])
 
   # The resources a launch creates, in any US region: the launch-template pin (only the four fallback templates, which
   # exist only at the fallback sites) is what confines them, and listing each region separately would cost about a

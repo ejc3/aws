@@ -314,6 +314,9 @@ jobs:
       - name: "pbox up --open: the open security group and a delegated IPv6 /80, home only, never a member's box"
         run: python3 -S -B scripts/test-pbox-open.py
 
+      - name: "pbox up --on-demand: one launch bought on-demand from each box's -ondemand template, the on-demand price and quota, never a member's box"
+        run: python3 -S -B scripts/test-pbox-on-demand.py
+
       - name: "pbox up --lease: the instance is tagged with the lease end, the watchdog keeps an owner's box until then (12h cap), status shows it"
         run: python3 -S -B scripts/test-pbox-lease.py
 

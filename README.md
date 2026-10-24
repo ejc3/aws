@@ -1078,6 +1078,8 @@ pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
+pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
+
 pbox up 3 kvm-gpu-96 --lease 3h   # not terminated for idleness for 3 hours (30m to 12h; below)
 pbox ssh [N]
 pbox down [N]              # terminate compute; keep that box's /mnt/work
@@ -1119,6 +1121,18 @@ quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
 activity (512 MiB of EBS or instance-store reads or writes, or 64 MiB of network, in any five minutes keeps it).
+
+`pbox up N FLAVOR --on-demand` buys that one launch on-demand; every other launch stays spot. Use it for work a spot
+reclaim would lose, or when spot capacity for the type is short, as it often is for the bare-metal GPU types. It costs about
+3x spot: `up` prints each type's on-demand list price (`kvm-gpu-96`, a `g4dn.metal`, is about $7.82/hr on-demand in us-east-2
+against about $4 spot). It counts against the region's on-demand vCPU quota, "Running On-Demand G and VT instances"
+(`L-DB2E81BA`) for the GPU flavors and "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" (`L-1216C47A`) for
+the rest, not the spot quota; `up` names it with its value, and a `VcpuLimitExceeded` refusal moves on to the next type or
+region. The box launches from its own on-demand launch template (`parallel-box-3-ondemand`; `parallel-box-fallback-ondemand`
+at a fallback site), which Terraform makes from the same definition as the spot one, without spot options. `pbox status`
+shows it as ON-DEMAND, and the idle watchdog terminates it after 30 idle minutes like a spot box. It works with `--fallback`,
+`--regions`, `--open` and the GPU flavors; it is refused for other commands and for a member's pbox, whose grant allows spot
+only. `parallel_box_spot = false` still switches every launch to on-demand at once, with an apply.
 
 Interactive and GPU work has idle stretches: between a finished setup and the next test, or while a failed test is read.
 `pbox up N FLAVOR --lease DURATION` (`90m`, `2h`, `1h30m`; 30 minutes to 12 hours) tags the box `PboxLeaseUntil` with the

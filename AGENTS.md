@@ -300,6 +300,18 @@ port in from `0.0.0.0/0` and `::/0`, and one delegated IPv6 /80 (`Ipv6PrefixCoun
 `sudo fcvm podman run --network routed --ipv6-prefix <the /80>` gives each VM a public IPv6 in it. The open group covers
 the box's own addresses too, so every port the box listens on is public. `--open` is refused for other commands, with
 `--fallback`/`--regions` (the fallback VPCs have no IPv6) and for a member's pbox, whose grant names only the SSH group.
+`pbox up N FLAVOR --on-demand` buys that one launch on-demand (about 3x spot) while every other launch stays spot: each box
+has a second launch template, `<box>-ondemand`, and each fallback site `parallel-box-fallback-ondemand` (pointer
+`fallback.ondemand_template`), made by the same resource with no `instance_market_options` and pinned by exact ARN beside
+the spot ones. RunInstances is not used to override the market: the launch-template guide merges a nested structure given at
+launch into the template's, and the API's newer `MarketType` value `on-demand` documents nothing beside a template's
+`SpotOptions`. The launch prints the on-demand list price (Price List API, `dev-pricing-read`) and counts against the on-demand
+vCPU quota ("Running On-Demand G and VT instances", `L-DB2E81BA`, for the GPU flavors; "Running On-Demand Standard",
+`L-1216C47A`, for the rest), which a refusal names; it cancels no spot request. `status` shows the box ON-DEMAND, and the
+idle watchdog reaps it like any other (it finds boxes by Name). It combines with `--fallback`, `--regions`, `--open` and the
+GPU flavors' implied fallback; it is refused for other commands and for a member's pbox, whose grant allows spot only. To fit
+`parallel-box-control` under 6,144 characters with both templates of every box, its `AttachWorkVolume`,
+`AttachWorkVolumeToTaggedInstance` and `DescribeForPbox` statements moved unchanged to `pbox-flavor-types` (same two roles).
 `pbox up N FLAVOR --lease 2h` (30m to 12h; `90m`, `1h30m`) tags the instance `PboxLeaseUntil=<UTC epoch seconds>` at launch
 (both launch grants allow any tag key at RunInstances), and every watchdog of the owner's boxes (`LEASE_NAMES`) skips the idle
 check until then and applies it as usual after. A tag that does not parse is no lease, and a lease past LaunchTime + 12 h

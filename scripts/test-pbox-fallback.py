@@ -18,6 +18,7 @@ FALLBACK = (ROOT / "pbox-fallback.tf").read_text()
 MODULE = (ROOT / "modules" / "pbox-fallback-site" / "main.tf").read_text()
 OHIO = (ROOT / "ohio-pbox.tf").read_text()
 LAUNCH = (ROOT / "parallel-box-launch.tf").read_text()
+FLAVORS_TF = (ROOT / "pbox-flavors.tf").read_text()
 
 POINTER = {
     "region": "us-east-2",
@@ -404,7 +405,7 @@ class FallbackTerraform(unittest.TestCase):
 
     def test_the_pointer_publishes_the_sites_and_pbox_may_score_them(self):
         self.assertIn("jsonencode({ region = local.parallel_box_region, x86_image = local.parallel_box_sites[local.parallel_box_region].ami_x86, open = local.parallel_box_open_pointer, fallback = local.pbox_fallback_pointer })", OHIO)
-        describe = re.search(r'sid    = "DescribeForPbox".*?\]', LAUNCH, re.S).group(0)
+        describe = re.search(r'sid    = "DescribeForPbox".*?\]', FLAVORS_TF, re.S).group(0)
         for action in ("ec2:GetSpotPlacementScores", "ec2:DescribeAvailabilityZones", "ec2:DescribeInstanceTypeOfferings"):
             self.assertIn(action, describe)
 

@@ -172,7 +172,9 @@ fi
 # boxes can read it too since ejc3/aws#588, but only an administrator may request more): when it already covers one box
 # nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease (see ohio_spot_standard in ohio-pbox.tf for
 # how the provider reports a pending request). A launch past the quota fails with MaxSpotInstanceCountExceeded and pbox
-# moves on to the next AZ or region. On demand (parallel_box_spot = false) is another quota, L-DB2E81BA, not raised here.
+# moves on to the next AZ or region. On demand (`pbox up --on-demand`, or parallel_box_spot = false) is another quota,
+# L-DB2E81BA ("Running On-Demand G and VT instances"), not raised here: a refusal (VcpuLimitExceeded) names it, and a GPU
+# flavor moves on to the next fallback region.
 # ---------------------------------------------------------------------------------
 locals {
   # One box of the largest GPU flavor: the size in its kvm-gpu-N name.
@@ -224,7 +226,8 @@ resource "aws_servicequotas_service_quota" "east1_spot_g" {
 # the launch's Name tag rather than a condition in each Allow: an ec2:InstanceType condition exists only on the instance,
 # so in an Allow it would need the instance split from its volume and ENI in each of the three policies, and the lists
 # (about 1,500 characters) do not fit in parallel-box-control or member-pbox-control under IAM's 6,144. A Deny also holds
-# whatever else the role is allowed. Its own managed policy, attached to both roles that launch pboxes.
+# whatever else the role is allowed. Its own managed policy, attached to both roles that launch pboxes. It also carries
+# grants that no longer fit in parallel-box-control or have no other room (the statements before and after the Denies).
 # ---------------------------------------------------------------------------------
 data "aws_iam_policy_document" "pbox_flavor_types" {
   # pbox cancels a spot request that is still open or active after its instance is gone: EC2 can leave a one-time request
@@ -300,6 +303,64 @@ data "aws_iam_policy_document" "pbox_flavor_types" {
       variable = "ec2:InstanceType"
       values   = local.member_pbox_types
     }
+  }
+
+  # Moved here unchanged from parallel-box-control (parallel-box-launch.tf), which has no room for them once it lists both
+  # launch templates of every box (the spot one and the "-ondemand" sibling): attaching each box's work volume, and the
+  # read-only lookups pbox makes. Both policies are attached to the same two roles.
+  #
+  # Attaching the work disk. Scoped to the work volume ARNs by IDENTITY, not by a DevEBS
+  # tag: tagging them DevEBS=true would have swept them into local.dev_ebs_policy, which
+  # grants ec2:DeleteVolume. These volumes carry prevent_destroy precisely because losing
+  # one loses real work, so they must not be reachable by a delete grant.
+  statement {
+    sid    = "AttachWorkVolume"
+    effect = "Allow"
+    actions = [
+      "ec2:AttachVolume",
+      "ec2:DetachVolume",
+    ]
+    resources = local.parallel_box_volume_arns
+  }
+
+  statement {
+    sid    = "AttachWorkVolumeToTaggedInstance"
+    effect = "Allow"
+    actions = [
+      "ec2:AttachVolume",
+      "ec2:DetachVolume",
+    ]
+    resources = local.parallel_box_instance_arns
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Name"
+      values   = [for b in local.parallel_boxes : b.name]
+    }
+  }
+
+  # Read-only lookups the script makes: find the running box, price the pools, locate the
+  # volume's AZ, and (for --fallback and `pbox capacity`) score the spot pools of every US
+  # AZ and list which types each AZ offers. None of these accept resource-level scoping in IAM.
+  statement {
+    sid    = "DescribeForPbox"
+    effect = "Allow"
+    actions = [
+      "ec2:GetSpotPlacementScores",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInstanceTypeOfferings",
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceTypes",
+      "ec2:DescribeInstanceStatus",
+      "ec2:DescribeVolumes",
+      "ec2:DescribeSpotPriceHistory",
+      "ec2:DescribeLaunchTemplates",
+      "ec2:DescribeLaunchTemplateVersions",
+      "ec2:DescribeImages",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeSecurityGroups",
+    ]
+    resources = ["*"]
   }
 }
 
