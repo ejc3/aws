@@ -6,13 +6,22 @@
 # - Network: a VPC with an Amazon-provided IPv6 /56, one public subnet per AZ (IPv4 /20 and IPv6 /64), an internet gateway,
 #   and one security group that admits TCP 443 from anywhere and nothing else. No SSH: hosts are reached with SSM Session
 #   Manager.
-# - GPU hosts: a launch template per architecture (x86_64 for g4dn.metal, arm64 for g5g.metal) and one spot auto scaling
-#   group over both. The primary interface asks for a delegated IPv6 /80 (Ipv6PrefixCount = 1) for the host's VMs and no
+# - GPU hosts: a launch template per architecture (x86_64 for g4dn.metal, arm64 for g5g.metal), one spot auto scaling
+#   group over both, and an on-demand group over the same templates that stays at 0 unless the coordinator falls back to it
+#   (below, "On-demand fallback"). The primary interface asks for a delegated IPv6 /80 (Ipv6PrefixCount = 1) for the host's VMs and no
 #   single address: EC2 creates an interface with one of an address count or a prefix count, never both (checked
 #   2026-10-22). IMDSv2 with hop limit 1, so no VM or container on the host reaches the metadata service.
 # - GATE: the group's capacity is 0 unless var.hosts_enabled and at least one architecture has an AMI. The fleet AMI does
 #   not exist yet, and an always-on metal GPU host is the account's main cost; only types whose architecture has an AMI are
 #   in the group's overrides.
+# - On-demand fallback: Auto Scaling never moves a spot group's capacity to on demand by itself (a mixed instances policy
+#   keeps its configured split and keeps retrying spot), so the fallback is a second group, fcvm-fleet-hosts-on-demand,
+#   100% on demand, max_size var.host_on_demand_max, desired 0. The coordinator owns both groups' desired capacity
+#   (fcvm fleet coord --on-demand-group): when a wake leaves the spot group short for --spot-wait, it gives the
+#   on-demand group the shortfall and holds the spot group at what it has; asleep, both are 0. max_size caps what any
+#   caller can ask for. Its one alarm mails the owner while any on-demand host is in service.
+# - Host AZs: both host groups launch only in AZs that offer a host type. us-east-1e has no g4dn.metal, and a spot launch
+#   there failed with InvalidFleetConfiguration (2026-10-24).
 # - EC2 tiles: a launch template per architecture (g4dn.xlarge, g5g.xlarge) with one IPv6 address; no group, since the
 #   coordinator launches and terminates tiles itself (its task role is limited to these templates).
 
@@ -43,6 +52,20 @@ variable "tile_amis" {
 variable "hosts_enabled" {
   description = "Run one spot GPU host here (fcvm-fleet.tf's local.fcvm_fleet_hosts_enabled); false keeps the group at 0"
   type        = bool
+}
+
+variable "host_on_demand_max" {
+  description = "Most on-demand GPU hosts the fallback group may run here (its max_size while hosts are enabled)"
+  type        = number
+  validation {
+    condition     = var.host_on_demand_max >= 0 && var.host_on_demand_max <= 8
+    error_message = "At most 8 on-demand GPU hosts (owner, 2026-10-24)."
+  }
+}
+
+variable "alert_email" {
+  description = "Address the on-demand host alarm mails (its subscription waits for a click on AWS's confirmation link)"
+  type        = string
 }
 
 variable "host_agent_args" {
@@ -81,6 +104,15 @@ data "aws_availability_zones" "available" {
   }
 }
 
+data "aws_ec2_instance_type_offerings" "host" {
+  for_each      = toset(local.host_archs)
+  location_type = "availability-zone"
+  filter {
+    name   = "instance-type"
+    values = [local.host_types[each.key]]
+  }
+}
+
 locals {
   region = data.aws_region.current.region
   azs    = sort(data.aws_availability_zones.available.names)
@@ -89,6 +121,9 @@ locals {
   tile_types = { x86_64 = "g4dn.xlarge", arm64 = "g5g.xlarge" }
   host_archs = [for a in sort(keys(local.host_types)) : a if try(var.gpu_amis[a], "") != ""]
   tile_archs = [for a in sort(keys(local.tile_types)) : a if try(var.tile_amis[a], "") != ""]
+  # The AZs that offer a host type of an architecture with an AMI, and their subnets: both host groups launch there only.
+  host_azs     = sort(distinct(flatten([for o in data.aws_ec2_instance_type_offerings.host : o.locations])))
+  host_subnets = [for az in local.host_azs : aws_subnet.public[az].id if contains(local.azs, az)]
   # One host while enabled and an AMI exists; 0 otherwise. max 2 lets a capacity-rebalance replacement start before the old
   # host is gone.
   host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0
@@ -233,7 +268,7 @@ resource "aws_autoscaling_group" "hosts" {
   count = length(local.host_archs) > 0 ? 1 : 0
 
   name                      = "fcvm-fleet-hosts"
-  vpc_zone_identifier       = [for s in aws_subnet.public : s.id]
+  vpc_zone_identifier       = local.host_subnets
   min_size                  = 0
   max_size                  = local.host_desired == 0 ? 0 : 2
   desired_capacity          = local.host_desired
@@ -278,6 +313,98 @@ resource "aws_autoscaling_group" "hosts" {
   lifecycle {
     ignore_changes = [desired_capacity]
   }
+}
+
+# The spot group's fallback (header, "On-demand fallback"): the same templates on demand, 0 until the coordinator gives it a
+# spot group's shortfall. max_size is the cap, and 0 while the gate is off.
+resource "aws_autoscaling_group" "hosts_on_demand" {
+  count = length(local.host_archs) > 0 ? 1 : 0
+
+  name                      = "fcvm-fleet-hosts-on-demand"
+  vpc_zone_identifier       = local.host_subnets
+  min_size                  = 0
+  max_size                  = local.host_desired == 0 ? 0 : var.host_on_demand_max
+  desired_capacity          = 0
+  health_check_type         = "EC2"
+  wait_for_capacity_timeout = "0"
+  # Group metrics (free at 1-minute granularity) for the alarm below.
+  metrics_granularity = "1Minute"
+  enabled_metrics     = ["GroupDesiredCapacity", "GroupInServiceInstances", "GroupPendingInstances"]
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = 0
+      on_demand_percentage_above_base_capacity = 100
+      on_demand_allocation_strategy            = "prioritized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.host[local.host_archs[0]].id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = local.host_archs
+        content {
+          instance_type = local.host_types[override.value]
+          launch_template_specification {
+            launch_template_id = aws_launch_template.host[override.value].id
+            version            = "$Latest"
+          }
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Purpose"
+    value               = "fcvm-fleet-host"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Market"
+    value               = "on-demand"
+    propagate_at_launch = true
+  }
+
+  # The coordinator owns the desired capacity, as the spot group's.
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+
+# An on-demand host is $7.824 an hour in us-east-1 (g4dn.metal), and nothing else reports one: the coordinator keeps it until
+# the fleet sleeps, so a viewer that never leaves, or a coordinator that dies while it is up, keeps it running. Mail on the
+# first in-service minute of any fallback, and again (OK) when the group is back at 0.
+resource "aws_sns_topic" "alerts" {
+  count = length(local.host_archs) > 0 ? 1 : 0
+  name  = "fcvm-fleet-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  count     = length(local.host_archs) > 0 ? 1 : 0
+  topic_arn = aws_sns_topic.alerts[0].arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_cloudwatch_metric_alarm" "on_demand_hosts" {
+  count               = length(local.host_archs) > 0 ? 1 : 0
+  alarm_name          = "fcvm-fleet-on-demand-hosts"
+  alarm_description   = "fcvm fleet on-demand GPU hosts in service in ${local.region}: spot had no capacity and the coordinator fell back ($7.824/h per g4dn.metal; modules/fcvm-fleet-region)."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  namespace           = "AWS/AutoScaling"
+  metric_name         = "GroupInServiceInstances"
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.hosts_on_demand[0].name }
+  statistic           = "Maximum"
+  period              = 300
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts[0].arn]
+  ok_actions          = [aws_sns_topic.alerts[0].arn]
 }
 
 # ------------------------------------------------------------------------------------------------ EC2 tiles
@@ -379,4 +506,8 @@ output "tile_template_arns" {
 
 output "host_group_desired" {
   value = local.host_desired
+}
+
+output "host_on_demand_max" {
+  value = length(local.host_archs) > 0 ? aws_autoscaling_group.hosts_on_demand[0].max_size : 0
 }
