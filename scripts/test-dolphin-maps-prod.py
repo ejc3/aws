@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "dolphin-labs-zone.tf").read_text()
 SCRIPT = ROOT / "scripts" / "workers-prod-secrets.sh"
 DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
-# The names dolphin-maps-prod reads (issue #529; web/lib/server/db.ts and auth.ts in dolphin-labs-hq/dolphin-maps).
+# The names dolphin-maps-prod reads (issue #529 and the arrival page's server-side place lookups).
 # APP_ORIGIN is a wrangler.jsonc var, not a secret.
 NAMES = ["ACCOUNT_TOKEN_KEY", "APPLE_BUNDLE_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_SERVICES_ID", "APPLE_TEAM_ID",
-         "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "TURSO_AUTH_TOKEN",
+         "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "EXA_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+         "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "SCRAPINGDOG_API_KEY", "TURSO_AUTH_TOKEN",
          "TURSO_DATABASE_URL"]
 
 
@@ -218,6 +219,14 @@ class LoaderTests(unittest.TestCase):
             r, out = self.run_loader(oob)
             self.assertNotEqual(r.returncode, 0, oob)
         self.assertFalse(self.log.exists())
+
+    def test_each_place_lookup_credential_is_required_before_loading(self):
+        for name in ("BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "EXA_API_KEY", "SCRAPINGDOG_API_KEY"):
+            with self.subTest(name=name):
+                r, out = self.run_loader({k: v for k, v in self.VALUES.items() if k != name})
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("must hold exactly", out)
+                self.assertFalse(self.log.exists(), "a missing credential must not reach Wrangler")
 
     def test_the_loader_names_are_the_workers(self):
         text = SCRIPT.read_text()
