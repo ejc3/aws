@@ -435,14 +435,15 @@ interactive launch attaches to the same work when run from that repository root.
 
 ### OpenCode from a phone or tablet
 
-Open [opencode.cc-games.dev](https://opencode.cc-games.dev/) in your browser. Cloudflare Access admits only the owner,
-then OpenCode requires its own pairing or password. To sign in without typing the server password, run
-`opencode pair --url https://opencode.cc-games.dev` in the owner's Next.js container and open its one-time link within
-five minutes. The browser remembers the OpenCode connection for 30 days. Add the site to your home screen if desired.
+Open [opencode.cc-games.dev](https://opencode.cc-games.dev/) in your browser and sign in through Cloudflare Access.
+The connection is automatic: no server address, pairing link or OpenCode password. Add the site to your home screen
+if desired. Only the owner is admitted; the tunnel also validates the Access token before reaching the container.
 
 `opencode-web@` starts the existing OpenCode 2 shared server at boot inside the owner's container. It keeps the personal
 model configuration and sessions; the inference key is read from `abliteration/api-key` into the process environment
-at startup. The tunnel routes to the container only; there is no public web port or OpenTunnel endpoint. Restart
+at startup. `opencode-web-proxy@` supplies the private upstream credential after Cloudflare login, so it never reaches
+the browser; the native server stays on loopback. The tunnel routes to the container only; there is no public web port
+or OpenTunnel endpoint. Restart
 `opencode-web@<account>.service` inside that container after rotating the inference key.
 
 ### From the MacBook to the Next.js server

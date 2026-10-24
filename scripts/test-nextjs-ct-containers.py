@@ -500,6 +500,15 @@ class NdevSyncTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("  - hostname: opencode.cc-games.dev\n    service: http://10.88.3.2:49374", games)
 
+    def test_protected_routes_require_their_access_audience_at_the_connector(self):
+        self.config["pinned_routes"]["opencode.cc-games.dev"] = {
+            "zone": "cc-games.dev", "port": 49375, "user": "boss", "dir": str(self.d / "home/boss"),
+        }
+        self.config["route_access"] = {"opencode.cc-games.dev": {"teamName": "example-team", "audTag": ["owner-audience"]}}
+        result, games, _ = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('    originRequest:\n      access:\n        required: true\n        teamName: "example-team"\n        audTag:\n          - "owner-audience"', games)
+
     def test_untrusted_records_are_not_routed(self):
         home = self.d / "home/alice/app"
         self.env_file("alice", "boss", "boss.cc-games.dev", 3000, home)              # another account's label

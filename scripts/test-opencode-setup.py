@@ -10,6 +10,7 @@ config. Offline.
 """
 import os
 import json
+import types
 import re
 import subprocess
 import tempfile
@@ -68,7 +69,10 @@ class OpencodeWebTests(unittest.TestCase):
         web = PROVISION.split("# The phone's browser reaches", 1)[1].split("/usr/local/bin/user-agents-seed", 1)[0]
         self.assertIn('[ "$OWNER" = true ]', web)
         self.assertIn('.opencode_web.user // empty', web)
-        self.assertIn('systemctl enable --now "opencode-web@$U.service"', web)
+        self.assertIn('/usr/local/bin/opencode-web-setup "$U"', web)
+        setup = (ROOT / "scripts/nextjs-ct/ct/opencode-web-setup").read_text()
+        self.assertIn('systemctl enable --now "opencode-web@$U.service" "opencode-web-proxy@$U.service"', setup)
+        self.assertIn('service set hostname 127.0.0.1', setup)
         self.assertNotIn("service set password", web)
         self.assertNotIn("opencode.json", web)
         unit = (ROOT / "scripts/nextjs-ct/ct/units/opencode-web@.service").read_text()
@@ -78,14 +82,41 @@ class OpencodeWebTests(unittest.TestCase):
 
     def test_the_exact_host_has_an_owner_only_gate_before_setup_is_published(self):
         web = (ROOT / "opencode-web.tf").read_text()
-        self.assertIn('hostname = "opencode.${local.nextjs_domain}"', web)
-        self.assertIn("user     = one(local.nextjs_ct_owners)", web)
+        self.assertRegex(web, r'hostname\s*= "opencode\.\$\{local.nextjs_domain\}"')
+        self.assertRegex(web, r'user\s*= one\(local.nextjs_ct_owners\)')
         self.assertIn("domain           = local.opencode_web.hostname", web)
         self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", web)
         self.assertIn("policies = [{ id = cloudflare_zero_trust_access_policy.opencode_web_owner.id, precedence = 1 }]", web)
         self.assertNotIn('decision         = "bypass"', web)
         obj = CT.split('resource "aws_s3_object" "nextjs_ct_user_data" {', 1)[1]
         self.assertIn("depends_on   = [cloudflare_zero_trust_access_application.opencode_web]", obj)
+
+
+class OpencodeProxyTests(unittest.TestCase):
+    def setUp(self):
+        path = ROOT / "scripts/nextjs-ct/ct/opencode-web-proxy"
+        self.proxy = types.ModuleType("opencode_web_proxy")
+        exec(compile(path.read_text(), str(path), "exec"), self.proxy.__dict__)
+        self.spec = {"hostname": "opencode.example.com", "port": 49374, "proxy_port": 49375}
+
+    def test_browser_access_uses_the_private_upstream_and_rejects_other_origins_and_sources(self):
+        conf = self.proxy.configuration(self.spec, "example-password", "10.88.3.1", Path("/run/private-proxy"))
+        self.assertIn("proxy_pass http://127.0.0.1:49374;", conf)
+        self.assertIn('proxy_set_header Authorization "Basic ', conf)
+        self.assertIn('map $http_origin $origin_allowed { default 0; \'\' 1; "https://opencode.example.com" 1; }', conf)
+        self.assertIn("allow 10.88.3.1;", conf)
+        self.assertIn("deny all;", conf)
+        self.assertIn("proxy_buffering off;", conf)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade;", conf)
+        self.assertNotIn("auth_token", conf)
+        self.assertNotIn("sub_filter", conf)
+
+    def test_invalid_configuration_never_becomes_nginx_directives(self):
+        for change in ({"hostname": 'example.com;bad'}, {"port": 80}, {"proxy_port": 49374}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.proxy.configuration({**self.spec, **change}, "example-password", "10.88.3.1", Path("/run/private"))
+        with self.assertRaises(ValueError):
+            self.proxy.configuration(self.spec, "", "10.88.3.1", Path("/run/private"))
 
 
 class OpencodeFunctionTests(unittest.TestCase):
