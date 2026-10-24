@@ -492,6 +492,14 @@ class NdevSyncTests(unittest.TestCase):
         self.assertTrue(dolphin.index("ssh.dolphin-labs.dev") < dolphin.index("boss-site"))
         self.assertTrue(games.endswith("  - service: http_status:404\n"))
 
+    def test_a_pinned_service_routes_to_its_owner_without_a_project_record(self):
+        self.config["pinned_routes"]["opencode.cc-games.dev"] = {
+            "zone": "cc-games.dev", "port": 49374, "user": "boss", "dir": str(self.d / "home/boss"),
+        }
+        result, games, _ = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("  - hostname: opencode.cc-games.dev\n    service: http://10.88.3.2:49374", games)
+
     def test_untrusted_records_are_not_routed(self):
         home = self.d / "home/alice/app"
         self.env_file("alice", "boss", "boss.cc-games.dev", 3000, home)              # another account's label

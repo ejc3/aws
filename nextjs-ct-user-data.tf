@@ -272,6 +272,7 @@ locals {
     zones               = local.nextjs_zone_tunnel
     ssh_hostnames       = local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = "ssh.${local.dolphin_domain}" }
     pinned_routes       = { for h, r in local.nextjs_pinned_routes : h => r if contains(keys(local.nextjs_zone_tunnel), r.zone) }
+    opencode_web        = local.opencode_web
     session_policy      = local.nextjs_ct_session_policy
     session_policy_arns = { for u, pol in aws_iam_policy.nextjs_ct_member : u => [pol.arn] }
     member_box_ips      = local.nextjs_ct_member_box_ips
@@ -669,4 +670,5 @@ resource "aws_s3_object" "nextjs_ct_user_data" {
   content      = local.nextjs_ct_user_data
   content_type = "text/x-shellscript"
   tags         = { Name = "nextjs-ct-user-data" }
+  depends_on   = [cloudflare_zero_trust_access_application.opencode_web]
 }

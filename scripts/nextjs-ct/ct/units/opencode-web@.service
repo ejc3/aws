@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenCode web and shared server for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+UMask=0077
+# Adopt the shared server once, rather than starting a second server against the same database. Later CLI commands
+# discover this service through OpenCode's own registration file.
+ExecStartPre=/home/%i/.opencode/bin/opencode service stop
+ExecStart=/usr/local/bin/opencode-web
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

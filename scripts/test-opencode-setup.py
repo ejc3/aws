@@ -9,6 +9,7 @@ text (it is bash-compatible) against a fake `opencode`, and pins the install and
 config. Offline.
 """
 import os
+import json
 import re
 import subprocess
 import tempfile
@@ -31,6 +32,60 @@ def function_text():
     m = re.search(r"^opencode\(\) \{\n.*?^\}\n", USER_DATA, re.S | re.M)
     assert m, "opencode() missing from the managed ~/.zshrc"
     return m.group().replace("$${", "${")  # Terraform's escape: the managed ~/.zshrc gets ${
+
+
+class OpencodeWebTests(unittest.TestCase):
+    def launch(self, aws_body="printf test-inference-key"):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            (root / ".local/bin").mkdir(parents=True)
+            (root / ".opencode/bin").mkdir(parents=True)
+            aws = root / ".local/bin/aws"
+            aws.write_text("#!/bin/bash\n" + aws_body + "\n")
+            aws.chmod(0o755)
+            binary = root / ".opencode/bin/opencode"
+            binary.write_text('#!/bin/bash\npython3 -c \'import os,json,sys; print(json.dumps({"key":os.environ.get("ABLIT_KEY"), "profile":os.environ.get("AWS_PROFILE"), "args":sys.argv[1:]}))\' "$@"\n')
+            binary.chmod(0o755)
+            result = subprocess.run(["bash", str(ROOT / "scripts/nextjs-ct/ct/opencode-web")],
+                                    env={"HOME": home}, capture_output=True, text=True)
+            return result
+
+    def test_the_shared_server_gets_the_key_only_through_its_environment(self):
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data, {"key": "test-inference-key", "profile": "default", "args": ["serve", "--service"]})
+        self.assertNotIn("test-inference-key", result.stderr)
+
+    def test_a_failed_or_empty_secret_read_never_starts_a_server(self):
+        for body in ("exit 42", "true", "printf None"):
+            with self.subTest(body=body):
+                result = self.launch(body)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_only_the_owner_enables_the_service_without_overwriting_model_or_password(self):
+        web = PROVISION.split("# The phone's browser reaches", 1)[1].split("/usr/local/bin/user-agents-seed", 1)[0]
+        self.assertIn('[ "$OWNER" = true ]', web)
+        self.assertIn('.opencode_web.user // empty', web)
+        self.assertIn('systemctl enable --now "opencode-web@$U.service"', web)
+        self.assertNotIn("service set password", web)
+        self.assertNotIn("opencode.json", web)
+        unit = (ROOT / "scripts/nextjs-ct/ct/units/opencode-web@.service").read_text()
+        self.assertIn("User=%i", unit)
+        self.assertIn("ExecStartPre=/home/%i/.opencode/bin/opencode service stop", unit)
+        self.assertIn("Restart=on-failure", unit)
+
+    def test_the_exact_host_has_an_owner_only_gate_before_setup_is_published(self):
+        web = (ROOT / "opencode-web.tf").read_text()
+        self.assertIn('hostname = "opencode.${local.nextjs_domain}"', web)
+        self.assertIn("user     = one(local.nextjs_ct_owners)", web)
+        self.assertIn("domain           = local.opencode_web.hostname", web)
+        self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", web)
+        self.assertIn("policies = [{ id = cloudflare_zero_trust_access_policy.opencode_web_owner.id, precedence = 1 }]", web)
+        self.assertNotIn('decision         = "bypass"', web)
+        obj = CT.split('resource "aws_s3_object" "nextjs_ct_user_data" {', 1)[1]
+        self.assertIn("depends_on   = [cloudflare_zero_trust_access_application.opencode_web]", obj)
 
 
 class OpencodeFunctionTests(unittest.TestCase):

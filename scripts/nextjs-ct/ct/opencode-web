@@ -1,0 +1,14 @@
+#!/bin/bash
+# Run inside the owner's container only. Keep the inference key in the server environment, never service.json or argv.
+set -euo pipefail
+set +x
+umask 077
+export PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export AWS_PROFILE="${AWS_PROFILE:-default}"
+export ABLIT_KEY
+ABLIT_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id abliteration/api-key \
+  --query SecretString --output text)
+[ -n "$ABLIT_KEY" ] && [ "$ABLIT_KEY" != None ] || { echo "OpenCode: inference key unavailable" >&2; exit 1; }
+# Shared-service mode uses the existing private password, session database and model configuration, and registers itself
+# for the CLI and pairing. This address is inside the container's network namespace; the host has no public web listener.
+exec "$HOME/.opencode/bin/opencode" serve --service
