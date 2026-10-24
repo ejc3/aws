@@ -60,7 +60,11 @@ def main():
     os.umask(0o077)
     spec = json.loads(Path("/opt/nextjs-ct/config.json").read_text())["opencode_web"]
     password = json.loads((Path.home() / ".config/opencode/service.json").read_text())["password"]
-    gateway = Path("/opt/nextjs-ct-user/gateway").read_text().strip()
+    # Identity files under /opt/nextjs-ct-user are root-only. Use the same UID-derived address as the host router.
+    uid = os.getuid()
+    if not 1001 <= uid <= 1254:
+        raise ValueError("OpenCode proxy must run as a container account")
+    gateway = f"10.88.{uid - 1000}.1"
     runtime = Path(os.environ["RUNTIME_DIRECTORY"])
     path = runtime / "nginx.conf"
     path.write_text(configuration(spec, password, gateway, runtime))
