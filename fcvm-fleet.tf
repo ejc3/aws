@@ -47,7 +47,7 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "0d3d299b"
+  fcvm_fleet_coordinator_tag = "8c96e28e"
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
@@ -643,6 +643,8 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = "state.json" },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
+        # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
+        { name = "RUST_LOG", value = "info" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
