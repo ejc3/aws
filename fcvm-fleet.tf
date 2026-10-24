@@ -47,7 +47,7 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "0d3d299b"
+  fcvm_fleet_coordinator_tag = "8c96e28e"
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
