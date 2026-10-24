@@ -643,6 +643,8 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = "state.json" },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
+        # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
+        { name = "RUST_LOG", value = "info" },
       ]
       logConfiguration = {
         logDriver = "awslogs"

@@ -238,5 +238,13 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
 
+class TileSubnetTests(unittest.TestCase):
+    def test_both_tile_templates_name_a_fleet_subnet(self):
+        # Without one, a launch from the template lands in the default VPC's subnet, which the coordinator may not use.
+        for name in ('resource "aws_launch_template" "tile"', 'resource "aws_launch_template" "tile_on_demand"'):
+            self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
+        self.assertIn("tile_az = local.azs[0]", MOD)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
