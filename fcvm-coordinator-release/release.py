@@ -115,7 +115,8 @@ def deploy(event, ddb, ecs, ssm, ecr, *, remaining_ms=lambda: 850_000):
     finally:
         # The exact Info value is the ownership token; a stale invocation cannot unlock another owner.
         ddb.delete_item(TableName=table, Key={"LockID": {"S": lock_id}},
-                        ConditionExpression="Info = :owner", ExpressionAttributeValues={":owner": {"S": info}})
+                        ConditionExpression="#info = :owner", ExpressionAttributeNames={"#info": "Info"},
+                        ExpressionAttributeValues={":owner": {"S": info}})
 
 
 def lambda_handler(event, context):

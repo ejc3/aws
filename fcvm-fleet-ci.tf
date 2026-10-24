@@ -4,7 +4,7 @@
 locals {
   fcvm_stage_environment = "fleet-stage-deploy"
   fcvm_stage_lock_id     = "ejc3-terraform-state/aws-infrastructure/terraform.tfstate"
-  fcvm_stage_family_arn  = "arn:aws:ecs:us-east-2:${local.fcvm_fleet_account_id}:task-definition/fcvm-fleet-coordinator:*"
+  fcvm_stage_family_arn  = "${aws_ecs_task_definition.fcvm_fleet_coordinator.arn_without_revision}:*"
 }
 
 data "aws_ecr_image" "fcvm_coordinator_bootstrap" {
@@ -166,7 +166,14 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet" {
           StringEqualsIfExists = { "ecs:enable-execute-command" = "false" }
         }
       },
-      { Effect = "Allow", Action = ["ecs:DescribeTaskDefinition", "ecs:ListTagsForResource", "ecs:DeregisterTaskDefinition"], Resource = local.fcvm_stage_family_arn },
+      # These two APIs have no resource-level authorization. Only the release
+      # function can assume this role; its code checks the service's exact family.
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"]
+        Resource = "*"
+      },
+      { Effect = "Allow", Action = "ecs:ListTagsForResource", Resource = local.fcvm_stage_family_arn },
       {
         Effect = "Allow", Action = "ecs:RegisterTaskDefinition", Resource = local.fcvm_stage_family_arn
         Condition = {

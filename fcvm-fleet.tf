@@ -456,7 +456,19 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
   repository = aws_ecr_repository.fcvm_fleet_coordinator.name
   policy = jsonencode({
     rules = [{
+      # A higher-priority tag match excludes the immutable bootstrap image from
+      # the rolling rule, even after many releases. Exactly one image has this tag.
       rulePriority = 1
+      description  = "Retain the bootstrap image used by infrastructure initialization"
+      selection = {
+        tagStatus      = "tagged"
+        tagPatternList = [local.fcvm_fleet_coordinator_tag]
+        countType      = "imageCountMoreThan"
+        countNumber    = 1
+      }
+      action = { type = "expire" }
+      }, {
+      rulePriority = 2
       description  = "Keep the 20 newest images"
       selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
       action       = { type = "expire" }

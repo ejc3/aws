@@ -257,6 +257,15 @@ class CoordinatorTileTypes(unittest.TestCase):
         self.assertIn('"ec2:InstanceType" = ["g4dn.xlarge", "g5g.xlarge"]', s)
 
 class RegistryTests(unittest.TestCase):
+    def test_the_bootstrap_image_is_protected_from_the_rolling_retention_rule(self):
+        policy = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator"')
+        self.assertIn('tagPatternList = [local.fcvm_fleet_coordinator_tag]', policy)
+        protected, rolling = policy.split('description  = "Keep the 20 newest images"', 1)
+        self.assertIn('rulePriority = 1', protected)
+        self.assertRegex(protected, r'\bcountNumber\s*=\s*1\b')
+        self.assertIn('rulePriority = 2', protected)
+        self.assertIn('countNumber = 20', rolling)
+
     def test_the_coordinator_image_has_an_immutable_scanned_repository_in_the_fleet_account(self):
         repo = block('resource "aws_ecr_repository" "fcvm_fleet_coordinator"')
         self.assertIn("provider             = aws.fcvm_fleet", repo)

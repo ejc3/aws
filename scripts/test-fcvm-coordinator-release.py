@@ -62,7 +62,7 @@ class AWS:
         self.calls.append("lock")
 
     def delete_item(self, **kwargs):
-        if (kwargs.get("ConditionExpression") == "Info = :owner"
+        if (kwargs.get("ConditionExpression") == "#info = :owner"
                 and kwargs["ExpressionAttributeValues"][":owner"]["S"] != self.lock):
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}})
         self.lock = None
@@ -155,6 +155,12 @@ class ReleaseTests(unittest.TestCase):
     def test_inconsistent_release_state_refuses_to_overwrite_and_unlocks(self):
         self.aws.image = "unrecorded"
         with self.assertRaisesRegex(RuntimeError, "disagree"):
+            self.run_release()
+        self.assertEqual(self.aws.calls, ["lock", "unlock"])
+
+    def test_another_task_family_cannot_be_released(self):
+        self.aws.old["taskDefinition"]["family"] = "another-service"
+        with self.assertRaisesRegex(ValueError, "task family"):
             self.run_release()
         self.assertEqual(self.aws.calls, ["lock", "unlock"])
 
