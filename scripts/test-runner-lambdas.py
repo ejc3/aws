@@ -4460,6 +4460,97 @@ def case_every_runner_lambda_gets_both_caps_from_one_map():
         assert not re.search(r"\bMAX_RUNNERS\s*=", body), name
 
 
+# --------------------------------------------------------------------------
+# Cases: root volume initialization rate (local.runner_root_volume_initialization_rate)
+# --------------------------------------------------------------------------
+
+def terraform_initialization_rates():
+    """The rates Terraform hands the webhook, as its environment renders them."""
+    tf = TF_FILE.read_text()
+    block = re.search(r"runner_root_volume_initialization_rate = \{\n(.*?)\n  \}", tf, re.S).group(1)
+    rates = dict(re.findall(r"^\s*(arm64|x86_64)\s*=\s*(\d+)\s*$", block, re.M))
+    assert set(rates) == {"arm64", "x86_64"}, block
+    start = tf.index('resource "aws_lambda_function" "runner_webhook" {')
+    body = tf[start:tf.index("\n}\n", start)]
+    for arch in rates:
+        assert re.search(rf"ROOT_VOLUME_INIT_RATE_{arch.upper()}\s*=\s*"
+                         rf"tostring\(local\.runner_root_volume_initialization_rate\.{arch}\)", body), arch
+    return {f"ROOT_VOLUME_INIT_RATE_{arch.upper()}": value for arch, value in rates.items()}
+
+
+def root_volume(call):
+    return call["BlockDeviceMappings"][0]["Ebs"]
+
+
+def case_x86_root_volume_is_filled_at_the_terraform_rate_and_arm64s_is_not():
+    """x64 runners ask EBS to fill the root volume at a rate in its 100 to 300 MiB/s range."""
+    env = terraform_initialization_rates()
+    rate = int(env["ROOT_VOLUME_INIT_RATE_X86_64"])
+    assert 100 <= rate <= 300, rate
+    assert env["ROOT_VOLUME_INIT_RATE_ARM64"] == "0", env
+    ec2 = FakeEC2()
+    webhook(ec2, env=env)["launch_runner"]("x86_64")
+    assert root_volume(ec2.ops("run_instances")[0])["VolumeInitializationRate"] == rate, ec2.calls
+    ec2 = FakeEC2()
+    webhook(ec2, env=env)["launch_runner"]("arm64")
+    assert "VolumeInitializationRate" not in root_volume(ec2.ops("run_instances")[0]), ec2.calls
+    # A Lambda environment without the variable launches as before.
+    ec2 = FakeEC2()
+    webhook(ec2)["launch_runner"]("x86_64")
+    assert "VolumeInitializationRate" not in root_volume(ec2.ops("run_instances")[0]), ec2.calls
+
+
+class RateRefusingEC2(FakeEC2):
+    """Refuses every launch that carries an initialization rate, as EBS does past its quota."""
+
+    def run_instances(self, **kw):
+        if "VolumeInitializationRate" in root_volume(kw):
+            self.calls.append(("run_instances", json.loads(json.dumps(kw))))
+            raise Exception("An error occurred (InvalidParameterValue) when calling the RunInstances "
+                            "operation: The requested volume initialization rate cannot be delivered")
+        return super().run_instances(**kw)
+
+
+def case_a_refused_initialization_rate_launches_the_same_pool_without_it():
+    """A rate EBS will not deliver costs the runner its fast volume, never its launch."""
+    env = terraform_initialization_rates()
+    ec2 = RateRefusingEC2()
+    instance_id, instance_type = webhook(ec2, env=env)["launch_runner"]("x86_64")
+    calls = ec2.ops("run_instances")
+    assert len(calls) == 2, calls
+    assert "VolumeInitializationRate" in root_volume(calls[0]), calls
+    assert "VolumeInitializationRate" not in root_volume(calls[1]), calls
+    assert launched_pools(ec2) == [(SUBNET_C, type_order()[0])] * 2, launched_pools(ec2)
+    assert instance_type == type_order()[0], instance_type
+
+
+def case_a_refused_initialization_rate_stays_off_for_the_rest_of_the_batch():
+    """After one refusal, the other launches of the same poll do not ask again."""
+    class UniqueRateRefusingEC2(RateRefusingEC2):
+        def run_instances(self, **kw):
+            response = super().run_instances(**kw)
+            response["Instances"][0]["InstanceId"] = f"i-{len(self.calls):017x}"
+            return response
+
+    ec2 = UniqueRateRefusingEC2()
+    result = webhook(ec2, env=terraform_initialization_rates())["handler"](poll_request(4, "x86_64"), None)
+    assert result["statusCode"] == 200, result
+    rates = [root_volume(call).get("VolumeInitializationRate") for call in ec2.ops("run_instances")]
+    rate = int(terraform_initialization_rates()["ROOT_VOLUME_INIT_RATE_X86_64"])
+    assert rates == [rate, None, None, None, None], rates
+
+
+def case_a_capacity_refusal_keeps_the_initialization_rate_for_the_next_pool():
+    """Only a refusal of the rate drops it; a spot capacity error moves on with it."""
+    env = terraform_initialization_rates()
+    head, second = type_order()[:2]
+    ec2 = FakeEC2(run_instances_errors={head: "InsufficientInstanceCapacity: no spot capacity"})
+    webhook(ec2, env=env)["launch_runner"]("x86_64")
+    calls = ec2.ops("run_instances")
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second)], launched_pools(ec2)
+    assert all("VolumeInitializationRate" in root_volume(c) for c in calls), calls
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
 
 
