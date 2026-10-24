@@ -23,9 +23,10 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from fcvm 88d2860d:
-  # the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator (host_agent_args).
-  default = { "us-east-1" = { x86_64 = "ami-0f71533f7d6ec48d5" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from fcvm 96545c3a
+  # (ejc3/fcvm#1146 at 8c96e28e with #1197, which keeps a GPU guest's NIC eth0 so its routed address is on it): the agent
+  # unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator (host_agent_args).
+  default = { "us-east-1" = { x86_64 = "ami-04d44a7ed34201877" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
