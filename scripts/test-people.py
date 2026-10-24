@@ -31,6 +31,9 @@ def is_mailbox(address):
     domain = domain.lower()
     if user in SYSTEMD_TEMPLATES or domain == "users.noreply.github.com":  # unit instances; GitHub's noreply placeholder
         return False
+    # OpenSSH security-key algorithm identifiers contain an @ but are not mailboxes.
+    if domain == "openssh.com" and user in {"sk-ecdsa-sha2-nistp256", "sk-ssh-ed25519"}:
+        return False
     if domain == "github.com":
         return user.lower() != "git"
     return not any(rule.search(domain) for rule in NOT_A_MAILBOX)
@@ -97,12 +100,14 @@ class PeopleTests(unittest.TestCase):
     def test_the_scan_flags_any_provider_and_our_own_domains_but_not_the_known_forms(self):
         at = "@"  # the examples are assembled, so this file holds no address literal itself
         for bad in ("a.b" + at + "gmail.com", "x" + at + "acme-corp.com", "y" + at + "school.k12.ca.us", "z" + at + "dolphin-labs.dev",
-                    "w" + at + "cc-games.dev", "n" + at + "github.com", "q" + at + "mail.yahoo.co.uk"):
+                    "w" + at + "cc-games.dev", "n" + at + "github.com", "q" + at + "mail.yahoo.co.uk",
+                    "person" + at + "openssh.com"):
             self.assertTrue(is_mailbox(bad), bad)
         for ok in ("admin" + at + "example.com", "o" + at + "owner.example.test", "agent-session-sync" + at + "ubuntu.service",
                    "git" + at + "github.com", "admin" + at + "skevh-mac-ssh.cc-games.dev", "ejc3" + at + "ssh.dolphin-labs.dev",
                    "u" + at + "Some-Mac.local", "%s" + at + "aws-0-us-east-1.pooler.supabase.com", "cloudflared" + at + "cc-games.dev",
-                   "GH_LOGIN" + at + "users.noreply.github.com"):
+                   "GH_LOGIN" + at + "users.noreply.github.com", "sk-ecdsa-sha2-nistp256" + at + "openssh.com",
+                   "sk-ssh-ed25519" + at + "openssh.com"):
             self.assertFalse(is_mailbox(ok), ok)
 
 
