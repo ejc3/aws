@@ -15,6 +15,12 @@
 # - local.fcvm_fleet_hosts_enabled: one spot GPU metal host per region that has a fleet AMI in var.fcvm_fleet_host_amis. Only
 #   us-east-1 has one (and the only G spot quota), so one g4dn.metal: $4.76-5.44 an hour spot there on 2026-10-22, about
 #   $3,600 a month always on. A region and architecture without an AMI is left out of the group.
+#   ON-DEMAND FALLBACK: each region with an AMI also has fcvm-fleet-hosts-on-demand, 0 unless a wake finds no spot capacity
+#   (modules/fcvm-fleet-region, "On-demand fallback"), capped at local.fcvm_fleet_on_demand_max = 8 hosts (owner,
+#   2026-10-24: "Up to 8 on-demand max"). A g4dn.metal on demand is $7.824 an hour in us-east-1, so 8 is $62.59 an hour.
+#   The account's on-demand G and VT quota there (L-DB2E81BA) is 384 vCPU, 4 hosts at 96 each, less any on-demand EC2
+#   tiles (4 vCPU each); the group's cap is 8, and launches beyond the quota fail. The coordinator only falls back with
+#   local.fcvm_fleet_coordinator_falls_back, which needs a coordinator image that has --on-demand-group.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
 #   month), running fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag> unless var.fcvm_fleet_coordinator_image names
 #   another image.
@@ -49,6 +55,12 @@ locals {
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
   fcvm_fleet_coordinator_tag = "8c96e28e"
+  # Most on-demand GPU hosts per region (the fallback group's max_size; owner, 2026-10-24: "Up to 8 on-demand max").
+  fcvm_fleet_on_demand_max = 8
+  # Whether the coordinator gives a short spot group's capacity to the region's on-demand group (--on-demand-group,
+  # --spot-wait, ejc3/fcvm#1215). Off until fcvm_fleet_coordinator_tag names a build with those flags: the image at
+  # 8c96e28e refuses an unknown argument and would not start.
+  fcvm_fleet_coordinator_falls_back = false
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
@@ -83,10 +95,14 @@ locals {
 
   # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key come from
   # the task's environment. It owns the host groups' desired capacity: 0 after 10 minutes with no viewer, 1 for the next
-  # one. The EC2 side runs its tiles in us-east-1, the one region with a tile AMI, and only while the fleet is awake.
+  # one, moved to the on-demand group when the spot group has no instance 120 s into a wake. The EC2 side runs its tiles in us-east-1, the one region with a tile AMI, and only while the fleet is awake.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
     flatten([for r in local.fcvm_fleet_regions : ["--scale-group", "${r}:fcvm-fleet-hosts"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0]),
+    local.fcvm_fleet_coordinator_falls_back ? concat(
+      flatten([for r in local.fcvm_fleet_regions : ["--on-demand-group", "${r}:fcvm-fleet-hosts-on-demand"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0]),
+      ["--spot-wait", "120"],
+    ) : [],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
   )
@@ -335,6 +351,8 @@ module "fcvm_fleet_east2" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  host_on_demand_max        = local.fcvm_fleet_on_demand_max
+  alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -349,6 +367,8 @@ module "fcvm_fleet_west2" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  host_on_demand_max        = local.fcvm_fleet_on_demand_max
+  alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -363,6 +383,8 @@ module "fcvm_fleet_east1" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  host_on_demand_max        = local.fcvm_fleet_on_demand_max
+  alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -508,12 +530,15 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
       {
         # Scale to zero: with no viewer the coordinator sets the host groups' desired capacity to 0 and wakes them for the
-        # next one (fcvm fleet coord --scale-group <region>:fcvm-fleet-hosts). Only those groups; their max_size stays the
-        # gate (0 while local.fcvm_fleet_hosts_enabled is false), so the coordinator cannot start a host the gate holds off.
-        Sid      = "ScaleTheHostGroups"
-        Effect   = "Allow"
-        Action   = "autoscaling:SetDesiredCapacity"
-        Resource = [for r in local.fcvm_fleet_regions : "arn:aws:autoscaling:${r}:${local.fcvm_fleet_account_id}:autoScalingGroup:*:autoScalingGroupName/fcvm-fleet-hosts"]
+        # next one (fcvm fleet coord --scale-group <region>:fcvm-fleet-hosts), and falls back to the on-demand group when
+        # spot has no capacity (--on-demand-group <region>:fcvm-fleet-hosts-on-demand). Only those groups; their max_size
+        # stays the gate (0 while local.fcvm_fleet_hosts_enabled is false, at most 8 on demand), so the coordinator cannot
+        # start a host the gate holds off or more on-demand hosts than the cap.
+        Sid    = "ScaleTheHostGroups"
+        Effect = "Allow"
+        Action = "autoscaling:SetDesiredCapacity"
+        Resource = flatten([for r in local.fcvm_fleet_regions : [for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"] :
+        "arn:aws:autoscaling:${r}:${local.fcvm_fleet_account_id}:autoScalingGroup:*:autoScalingGroupName/${g}"]])
       },
       {
         # Reading the groups' instances while waking. DescribeAutoScalingGroups takes no resource-level permission.
@@ -693,6 +718,7 @@ output "fcvm_fleet_infra" {
     cluster            = aws_ecs_cluster.fcvm_fleet.name
     coordinator_repo   = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
     hosts_desired      = { "us-east-2" = module.fcvm_fleet_east2.host_group_desired, "us-west-2" = module.fcvm_fleet_west2.host_group_desired, "us-east-1" = module.fcvm_fleet_east1.host_group_desired }
+    on_demand_max      = { "us-east-2" = module.fcvm_fleet_east2.host_on_demand_max, "us-west-2" = module.fcvm_fleet_west2.host_on_demand_max, "us-east-1" = module.fcvm_fleet_east1.host_on_demand_max }
     coordinator_on     = local.fcvm_fleet_coordinator_running
     tile_template_arns = local.fcvm_fleet_tile_template_arns
   }

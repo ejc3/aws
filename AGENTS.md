@@ -1660,6 +1660,13 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - **Two gates, both off**: `local.fcvm_fleet_hosts_enabled` (one spot metal GPU host per region, also needing the fleet AMI
   in `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled` (also needing `var.fcvm_fleet_coordinator_image`).
   Nothing billed by the hour runs until the owner turns one on. The AMI build is a follow-up.
+- **On-demand fallback** (`fcvm-fleet-hosts-on-demand`, beside each spot group): Auto Scaling does not move a spot group's
+  capacity to on demand by itself, so the coordinator does (`--on-demand-group`, `--spot-wait`): a wake whose spot group
+  stays short gives the on-demand group the shortfall, and sleep sets both groups to 0. `max_size` is
+  `local.fcvm_fleet_on_demand_max` = 8 (owner, 2026-10-24: "Up to 8 on-demand max"); the us-east-1 on-demand G and VT
+  quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal. `local.fcvm_fleet_coordinator_falls_back` passes the flags; it stays
+  false until the coordinator tag has them. Alarm `fcvm-fleet-on-demand-hosts` (fleet account, the group's region) mails
+  the owner while any on-demand host is in service.
 - The coordinator's task role may launch EC2 only from the tile templates, referencing only the tile AMIs and the fleet's
   subnets and group (by exact ARN), only as the two tile types and tagged `Purpose=fcvm-fleet-tile`; terminate only
   instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate

@@ -70,6 +70,64 @@ class HostTests(unittest.TestCase):
         self.assertIn('host_types = { x86_64 = "g4dn.metal", arm64 = "g5g.metal" }', MOD)
 
 
+class OnDemandFallbackTests(unittest.TestCase):
+    """The spot group's on-demand fallback: a second group, 0 until the coordinator gives it a short spot group's capacity,
+    capped at 8 hosts (owner, 2026-10-24: "Up to 8 on-demand max")."""
+
+    def test_the_fallback_group_is_on_demand_capped_and_starts_at_zero(self):
+        od = block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD)
+        self.assertIn('name                      = "fcvm-fleet-hosts-on-demand"', od)
+        self.assertIn("on_demand_percentage_above_base_capacity = 100", od)
+        self.assertIn("min_size                  = 0", od)
+        self.assertIn("desired_capacity          = 0", od)
+        self.assertIn("max_size                  = local.host_desired == 0 ? 0 : var.host_on_demand_max", od)
+        self.assertIn("ignore_changes = [desired_capacity]", od)
+        self.assertNotIn("capacity_rebalance", od)  # a spot-only setting
+        self.assertIn("var.host_on_demand_max >= 0 && var.host_on_demand_max <= 8", block('variable "host_on_demand_max"', MOD))
+        self.assertIn("fcvm_fleet_on_demand_max = 8", TF)
+        self.assertEqual(TF.count("host_on_demand_max        = local.fcvm_fleet_on_demand_max"), 3)
+
+    def test_eight_is_the_cap_for_the_whole_fleet(self):
+        # The cap is per region, so it is the fleet's cap only while one region has a host AMI (and so a group).
+        default = re.search(r"default = (\{.*\})\n", block('variable "fcvm_fleet_host_amis"')).group(1)
+        self.assertEqual(default.count("ami-"), 1)
+        self.assertIn("count = length(local.host_archs) > 0 ? 1 : 0", block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD))
+
+    def test_both_host_groups_launch_only_where_a_host_type_is_offered(self):
+        for name in ('resource "aws_autoscaling_group" "hosts"', 'resource "aws_autoscaling_group" "hosts_on_demand"'):
+            self.assertIn("vpc_zone_identifier       = local.host_subnets", block(name, MOD), name)
+        offerings = block('data "aws_ec2_instance_type_offerings" "host"', MOD)
+        self.assertIn('location_type = "availability-zone"', offerings)
+        self.assertIn("values = [local.host_types[each.key]]", offerings)
+
+    def test_the_coordinator_falls_back_only_with_an_image_that_has_the_flags(self):
+        # The image at 8c96e28e has no --on-demand-group; clap refuses an unknown argument and the coordinator would not
+        # start. The flag may only be turned on together with a newer tag.
+        tag = re.search(r'fcvm_fleet_coordinator_tag = "([0-9a-f]+)"', TF).group(1)
+        on = re.search(r"fcvm_fleet_coordinator_falls_back = (true|false)", TF).group(1)
+        if tag == "8c96e28e":
+            self.assertEqual(on, "false")
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn("local.fcvm_fleet_coordinator_falls_back ? concat(", cmd)
+        self.assertIn('["--on-demand-group", "${r}:fcvm-fleet-hosts-on-demand"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0', cmd)
+
+    def test_the_coordinator_may_scale_the_on_demand_group(self):
+        tf = TF.split('Sid    = "ScaleTheHostGroups"', 1)[1].split("},", 1)[0]
+        self.assertIn('for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"]', tf)
+        self.assertIn('Action = "autoscaling:SetDesiredCapacity"', tf)
+
+    def test_an_on_demand_host_in_service_mails_the_owner(self):
+        alarm = block('resource "aws_cloudwatch_metric_alarm" "on_demand_hosts"', MOD)
+        self.assertIn('metric_name         = "GroupInServiceInstances"', alarm)
+        self.assertIn("AutoScalingGroupName = aws_autoscaling_group.hosts_on_demand[0].name", alarm)
+        self.assertIn("threshold           = 1", alarm)
+        self.assertIn("alarm_actions       = [aws_sns_topic.alerts[0].arn]", alarm)
+        self.assertIn('"GroupInServiceInstances"', block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD))
+        sub = block('resource "aws_sns_topic_subscription" "alerts_email"', MOD)
+        self.assertIn('protocol  = "email"', sub)
+        self.assertEqual(TF.count("alert_email               = local.browser_manager_owner"), 3)
+
+
 class CoordinatorTests(unittest.TestCase):
     def test_the_service_runs_the_tagged_image_from_the_fleet_repository(self):
         self.assertIn("fcvm_fleet_coordinator_enabled = true", TF)
@@ -153,8 +211,9 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
 
     def test_the_coordinator_scales_only_the_host_groups(self):
         s = self.stmt("ScaleTheHostGroups")
-        self.assertIn('Action   = "autoscaling:SetDesiredCapacity"', s)
-        self.assertIn(":autoScalingGroup:*:autoScalingGroupName/fcvm-fleet-hosts", s)
+        self.assertIn('Action = "autoscaling:SetDesiredCapacity"', s)
+        self.assertIn(':autoScalingGroup:*:autoScalingGroupName/${g}"', s)
+        self.assertIn('[for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"] :', s)
         self.assertNotIn('Resource = "*"', s)
         d = self.stmt("DescribeTheHostGroups")
         self.assertIn('Action   = "autoscaling:DescribeAutoScalingGroups"', d)
