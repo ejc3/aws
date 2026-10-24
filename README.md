@@ -433,6 +433,12 @@ during that period, or its worktree has uncommitted changes. Only `github.com/ej
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
 
+### From the MacBook to the Next.js server
+
+On the owner's Mac, `ssh nextjs` opens the owner's `ejc3` container on the Next.js server. It uses the Mac's existing
+Touch ID SSH key; approve its authentication prompt when connecting. The public key is declared in
+`local.nextjs_user_keys.ejc3` so access survives a rebuild. The Mac's SSH entry uses the server's stable Elastic IP.
+
 ### SSH to the MacBook: `ssh mac`
 
 There is one way into EJ's MacBook Pro, the same from every box, and one alias for it, `mac`: Cloudflare Access in
