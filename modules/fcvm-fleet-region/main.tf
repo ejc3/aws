@@ -74,6 +74,11 @@ variable "host_agent_args" {
   default     = ""
 }
 
+variable "slot_tls_ports" {
+  description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
+  type        = object({ from = number, to = number })
+}
+
 variable "host_profile_name" {
   type = string
 }
@@ -205,6 +210,16 @@ resource "aws_security_group" "fleet" {
     protocol         = "tcp"
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
+  }
+
+  # IPv4 viewers reach a GPU host's slots on its one public IPv4 address, each slot's renderer TLS forwarded on its own
+  # port. IPv4 only: over IPv6 every slot has its own address and serves 443.
+  ingress {
+    description = "Slot renderer TLS over IPv4, a port per slot"
+    from_port   = var.slot_tls_ports.from
+    to_port     = var.slot_tls_ports.to
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {

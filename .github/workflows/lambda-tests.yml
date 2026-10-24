@@ -293,7 +293,7 @@ jobs:
       - name: "fcvm.dev: DNSSEC, DNS-only token, coordinator tunnel behind Access, staging only (fcvm-dev.tf)"
         run: python3 -S -B scripts/test-fcvm-dev.py
 
-      - name: "fcvm-fleet infrastructure: 443-only network, gated GPU hosts and coordinator, tile-only coordinator role (fcvm-fleet.tf)"
+      - name: "fcvm-fleet infrastructure: 443 plus the slot ports over IPv4, gated GPU hosts and coordinator, tile-only coordinator role (fcvm-fleet.tf)"
         run: python3 -S -B scripts/test-fcvm-fleet.py
 
       - name: Turso API token is readable by the metal boxes and administration only

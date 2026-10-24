@@ -17,9 +17,11 @@ def block(header, text=TF):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_the_security_group_admits_tcp_443_and_nothing_else(self):
+    def test_the_security_group_admits_tcp_443_and_the_slot_ports_and_nothing_else(self):
+        # 443 from anywhere, and the slots' IPv4 TLS ports (SlotV4Tests pins that rule).
         sg = block('resource "aws_security_group" "fleet"', MOD)
-        self.assertEqual(sg.count("ingress {"), 1)
+        self.assertEqual(sg.count("ingress {"), 2)
+        self.assertEqual(sg.count('protocol    = "tcp"') + sg.count('protocol         = "tcp"'), 2)
         self.assertIn("from_port        = 443", sg)
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
@@ -303,6 +305,34 @@ class TileSubnetTests(unittest.TestCase):
         for name in ('resource "aws_launch_template" "tile"', 'resource "aws_launch_template" "tile_on_demand"'):
             self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
         self.assertIn("tile_az = local.azs[0]", MOD)
+
+
+class SlotV4Tests(unittest.TestCase):
+    """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
+
+    def test_the_slot_ports_are_admitted_over_ipv4_and_nothing_wider(self):
+        base = int(re.search(r"fcvm_fleet_slot_tls_port_base = (\d+)", TF).group(1))
+        slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
+        self.assertEqual((base, slots), (20200, 8))
+        self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
+        self.assertIn("to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
+        # The agent forwards from the same base.
+        self.assertIn('"--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}"', TF)
+        self.assertIn('"--public-ipv4-from-imds"', TF)
+        sg = block('resource "aws_security_group" "fleet"', MOD)
+        rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
+        self.assertEqual(len(rules), 2, rules)
+        slot = [r for r in rules if "var.slot_tls_ports" in r]
+        self.assertEqual(len(slot), 1, rules)
+        self.assertIn("from_port   = var.slot_tls_ports.from", slot[0])
+        self.assertIn("to_port     = var.slot_tls_ports.to", slot[0])
+        self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slot[0])
+        self.assertNotIn("ipv6_cidr_blocks", slot[0])
+        self.assertEqual(TF.count("slot_tls_ports            = local.fcvm_fleet_slot_tls_ports"), 3)
+
+    def test_the_coordinator_confirms_names_at_the_zones_nameservers(self):
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('"--dns-nameservers", join(",", local.fcvm_dev_nameservers)', cmd)
 
 
 if __name__ == "__main__":

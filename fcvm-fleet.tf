@@ -3,8 +3,8 @@
 # The infrastructure of fcvm's GPU VM wall (ejc3/aws#606; design ejc3/fcvm#1136, docs/fleet/ARCHITECTURE.md), all inside the
 # fcvm-fleet member account (fcvm-fleet-account.tf) through its three provider aliases, applied from a jumpbox.
 #
-# - modules/fcvm-fleet-region, once per region (us-east-2, us-west-2, us-east-1): the network (TCP 443 in, nothing else), the
-#   spot GPU host group and the EC2 tiles' launch templates.
+# - modules/fcvm-fleet-region, once per region (us-east-2, us-west-2, us-east-1): the network (TCP 443 in, and the GPU
+#   hosts' slot ports over IPv4), the spot GPU host group and the EC2 tiles' launch templates.
 # - The coordinator, in us-east-2: a dedicated ECS cluster and one Fargate service (the coordinator and a cloudflared
 #   container), its S3 state object, and the task role that may launch and terminate EC2 tiles from the tile templates only.
 # - Instance roles for the hosts and the tiles, the asset bucket for fcvm release artifacts, the flow-log bucket, and the
@@ -30,9 +30,10 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # c93a01d9 with main's recipe (fleet/ami, ejc3/fcvm#1217): a GPU guest's NIC stays eth0 so its routed address is on it
-  # (#1197), the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator.
-  default = { "us-east-1" = { x86_64 = "ami-048e3b227fb7924d5" } }
+  # bdaa0003 with main's recipe (fleet/ami, ejc3/fcvm#1217): a GPU guest's NIC stays eth0 so its routed address is on it
+  # (#1197), the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator and takes
+  # --public-ipv4-from-imds (ejc3/fcvm#1229).
+  default = { "us-east-1" = { x86_64 = "ami-0913aacc80394e1bd" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -54,7 +55,7 @@ locals {
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
   # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
-  fcvm_fleet_coordinator_tag = "c93a01d9"
+  fcvm_fleet_coordinator_tag = "bdaa0003"
   # Most on-demand GPU hosts per region (the fallback group's max_size; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max = 8
   # Whether the coordinator gives a short spot group's capacity to the region's on-demand group (--on-demand-group,
@@ -78,6 +79,17 @@ locals {
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
   # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
   # are in the home region, not the host's.
+  # The IPv4 path to a GPU host's slots: its one public IPv4 address, slot i's renderer TLS forwarded on port base + i.
+  # The agent's --tls-publish-base and the fleet security group's port range both come from these two numbers.
+  fcvm_fleet_slot_tls_port_base = 20200
+  fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
+  fcvm_fleet_slot_tls_ports = {
+    from = local.fcvm_fleet_slot_tls_port_base
+    to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+  }
+  # The zone's authoritative nameservers: the coordinator publishes a launch's names only once both answer with them.
+  fcvm_dev_nameservers = ["cullen.ns.cloudflare.com", "lilyana.ns.cloudflare.com"]
+
   fcvm_fleet_host_agent_args = join(" ", [
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
@@ -89,6 +101,8 @@ locals {
     "--publish-ip 0.0.0.0",
     "--ipv6-prefix-from-imds",
     "--frame-zone fcvm.dev",
+    "--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}",
+    "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
     "--store-ready-file /var/lib/fcvm-fleet/store-ready",
   ])
@@ -104,7 +118,7 @@ locals {
       ["--spot-wait", "120"],
     ) : [],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
-    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
+    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region, "--dns-nameservers", join(",", local.fcvm_dev_nameservers)],
   )
 
   fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"
@@ -351,6 +365,7 @@ module "fcvm_fleet_east2" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_on_demand_max        = local.fcvm_fleet_on_demand_max
   alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -367,6 +382,7 @@ module "fcvm_fleet_west2" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_on_demand_max        = local.fcvm_fleet_on_demand_max
   alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -383,6 +399,7 @@ module "fcvm_fleet_east1" {
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_on_demand_max        = local.fcvm_fleet_on_demand_max
   alert_email               = local.browser_manager_owner
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
