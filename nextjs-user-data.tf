@@ -60,6 +60,9 @@ locals {
   # other project's domain by accident.
   nextjs_pinned_routes = {
     "family.cc-games.dev" = { zone = local.nextjs_domain, port = 3722, user = "ejc3", dir = "/home/ejc3/family" }
+    (local.opencode_web.hostname) = {
+      zone = local.nextjs_domain, port = local.opencode_web.port, user = local.opencode_web.user, dir = "/home/${local.opencode_web.user}"
+    }
   }
   nextjs_pinned_rows = join("\n", [
     for h, r in local.nextjs_pinned_routes :

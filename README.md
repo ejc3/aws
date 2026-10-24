@@ -433,6 +433,18 @@ during that period, or its worktree has uncommitted changes. Only `github.com/ej
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
 
+### OpenCode from a phone or tablet
+
+Open [opencode.cc-games.dev](https://opencode.cc-games.dev/) in your browser. Cloudflare Access admits only the owner,
+then OpenCode requires its own pairing or password. To sign in without typing the server password, run
+`opencode pair --url https://opencode.cc-games.dev` in the owner's Next.js container and open its one-time link within
+five minutes. The browser remembers the OpenCode connection for 30 days. Add the site to your home screen if desired.
+
+`opencode-web@` starts the existing OpenCode 2 shared server at boot inside the owner's container. It keeps the personal
+model configuration and sessions; the inference key is read from `abliteration/api-key` into the process environment
+at startup. The tunnel routes to the container only; there is no public web port or OpenTunnel endpoint. Restart
+`opencode-web@<account>.service` inside that container after rotating the inference key.
+
 ### From the MacBook to the Next.js server
 
 On the owner's Mac, `ssh nextjs` opens the owner's `ejc3` container on the Next.js server. It uses the Mac's existing
