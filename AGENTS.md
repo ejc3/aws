@@ -1273,7 +1273,8 @@ ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
 The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-pc`) is less
 trusted than the boxes: it may be compromised. So:
 
-- **No key of such a machine is ever authorized for `ubuntu`** (or any account an agent runs as) on a dev box. Not for a
+- **No key of such a machine is authorized for `ubuntu`** (or any account an agent runs as) on a dev box, except the
+  owner's explicitly approved Mac Touch ID key for `ejc3` on the Next.js server (`local.nextjs_user_keys.ejc3`). Not for a
   reverse tunnel either: `restrict,port-forwarding,permitlisten=...` still allows remote Unix-socket forwards (OpenSSH has
   no per-key option against them), and a mistake in those options is a foothold on the box that holds the agents' AWS
   role. The machines are reached outward, through their own Cloudflare route (`colin-pc-ssh.tf`, `colton-mac-ssh.tf`).
