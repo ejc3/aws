@@ -146,6 +146,41 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
   policies     = [{ id = cloudflare_zero_trust_access_policy.fcvm_fleet_agents.id, precedence = 1 }]
 }
 
+# ------------------------------------------------------------------------------------------------ the stage.fcvm.dev Worker
+# ejc3/fcvm's fleet-web-deploy workflow (push to main, cloudflare-deploy environment) deploys fcvm-fleet-stage with
+# workers_dev and preview_urls false (fleet/web/wrangler.jsonc). Terraform owns its envelope, as workers-stage.tf does for
+# the other staging Workers (ejc3/aws#627): both URL switches held off, and the stage.fcvm.dev custom domain, created after
+# the owner-only Access application above already covers the host. The custom domain needs the Worker to exist, so this
+# was added after the first deploy. Wrangler never routes the host: the deploy token has no DNS or routes.
+locals {
+  fcvm_fleet_stage_worker = "fcvm-fleet-stage" # ejc3/fcvm fleet/web/wrangler.jsonc
+}
+
+import {
+  to = cloudflare_workers_script_subdomain.fcvm_fleet_stage
+  id = "${var.cloudflare_account_id}/${local.fcvm_fleet_stage_worker}"
+}
+
+# Not in workers-stage.tf's map: that Access application admits the cc-games family, and this Worker is owner-only. With
+# workers.dev and previews off, the custom domain is its only URL, and Access gates that host.
+resource "cloudflare_workers_script_subdomain" "fcvm_fleet_stage" {
+  account_id       = var.cloudflare_account_id
+  script_name      = local.fcvm_fleet_stage_worker
+  enabled          = false
+  previews_enabled = false
+}
+
+resource "cloudflare_workers_custom_domain" "fcvm_fleet_stage" {
+  account_id = var.cloudflare_account_id
+  zone_id    = var.fcvm_dev_zone_id
+  hostname   = local.fcvm_dev_site_stage_host
+  service    = local.fcvm_fleet_stage_worker
+  depends_on = [
+    cloudflare_zero_trust_access_application.fcvm_dev_site_stage,
+    cloudflare_workers_script_subdomain.fcvm_fleet_stage,
+  ]
+}
+
 # ------------------------------------------------------------------------------------------------ the coordinator tunnel
 resource "cloudflare_zero_trust_tunnel_cloudflared" "fcvm_fleet_coordinator" {
   account_id = var.cloudflare_account_id
