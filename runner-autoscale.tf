@@ -2,10 +2,27 @@
 # Launches spot instances when jobs are queued, stops when idle
 
 locals {
-  # Runner pool size per architecture. The webhook Lambda enforces it; the cleanup
-  # Lambda bounds its queue scan and its per-poll launch count by it. One value so
-  # the two can never disagree about how large the pool is.
-  runner_max_per_arch            = 4
+  # Runner pool size, one cap per architecture. The webhook Lambda enforces it, the reuse
+  # Lambda checks it before asking for a claim, and the cleanup Lambda bounds its queue scan
+  # and its per-poll launch count by it. All three get it from this map (MAX_RUNNERS_ARM64,
+  # MAX_RUNNERS_X86_64), so they cannot disagree about how large a pool is. too-many-runners
+  # (cost-alerts.tf) alarms above the sum.
+  #
+  # The caps differ because the demand does. An ejc3/fcvm PR whose files reach the VM matrix
+  # runs four arm64 jobs and one x64 job, and every merge to main runs the matrix again. At
+  # four arm64 runners the arm64 pool served one PR at a time, and on 2026-10-24 PR runs
+  # waited 3+ hours behind each other and behind main. Eight runs two PRs' arm64 jobs at
+  # once. A larger cap runs the same jobs sooner; it does not add jobs, so the cost per job
+  # is unchanged and only the peak concurrency rises.
+  #
+  # Each pool can hold LAUNCH_HEADROOM (2) more instances than its cap, so the spot vCPU
+  # these can take in the primary runner region is (8 + 2) x 64 for arm64 (c7gd, m7gd and
+  # r7gd.metal are all 64 vCPU) plus (4 + 2) x 96 for x86 (128 when m6id.metal is the type
+  # that launched). That shares the Standard spot quota with the parallel boxes (ohio-pbox.tf).
+  runner_max_by_arch = {
+    arm64  = 8
+    x86_64 = 4
+  }
   runner_registration_table_name = "github-runner-registration"
 }
 
@@ -629,6 +646,13 @@ data "archive_file" "runner_webhook" {
           # Default to arm64 (cheaper, faster for most workloads)
           return 'arm64'
 
+      def max_runners_for(arch):
+          """This architecture's runner cap, from local.runner_max_by_arch in Terraform.
+
+          4, the cap both pools had before they were split, if the variable is absent.
+          """
+          return int(os.environ.get(f'MAX_RUNNERS_{arch.upper()}', '4'))
+
       # A launch that has not reached `running` by now is never going to. AWS accepts
       # run_instances for a metal spot instance it cannot place, hands back an
       # instance ID, and only reports the failure much later: on 2026-08-07 three
@@ -1186,7 +1210,7 @@ data "archive_file" "runner_webhook" {
               return {'statusCode': 200,
                       'body': f'Not reusing {name}: its registration moved on or is already held'}
 
-          max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
+          max_runners = max_runners_for(arch)
           capacity = get_capacity(arch)
           absorbable = capacity['idle'] + capacity['booting']
           wanted = None
@@ -1272,7 +1296,7 @@ data "archive_file" "runner_webhook" {
 
           # Check per-architecture capacity. queued_jobs is supplied by the cleanup
           # Lambda's poll (it counts them); a real GitHub delivery is one job.
-          max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
+          max_runners = max_runners_for(arch)
           try:
               # Coerce: a non-numeric value would make the EMF line invalid and
               # silently drop every metric on it, including ScaleUpStarved.
@@ -1432,8 +1456,10 @@ resource "aws_lambda_function" "runner_webhook" {
       # active before the parameter begins requesting broker credentials.
       USER_DATA_PARAM   = "/github-runner/user-data"
       RUNNER_ACCOUNT_ID = data.aws_caller_identity.current.account_id
-      MAX_RUNNERS       = tostring(local.runner_max_per_arch) # Per architecture
-      WEBHOOK_SECRET    = random_password.github_webhook[0].result
+      # Per architecture, from local.runner_max_by_arch.
+      MAX_RUNNERS_ARM64  = tostring(local.runner_max_by_arch.arm64)
+      MAX_RUNNERS_X86_64 = tostring(local.runner_max_by_arch.x86_64)
+      WEBHOOK_SECRET     = random_password.github_webhook[0].result
     }
   }
 
@@ -2495,7 +2521,7 @@ data "archive_file" "runner_cleanup" {
       # unkillable D-state processes) keeps its assigned job forever, so GitHub keeps
       # reporting busy=true and the renewal loop below never lets the lease expire -
       # the broken instance becomes immortal and permanently occupies one of
-      # MAX_RUNNERS slots per architecture (ejc3/fcvm#871).
+      # its architecture's MAX_RUNNERS_<ARCH> slots (ejc3/fcvm#871).
       #
       # 12h is a deliberate LOCAL policy, not a platform limit. GitHub allows a
       # self-hosted job to run for up to 5 days (the 6h cap is for GitHub-hosted
@@ -2672,7 +2698,7 @@ data "archive_file" "runner_cleanup" {
           return None
 
       # How many pages of the runner roster one poll will follow, and how big a
-      # page it asks for. The repo holds at most MAX_RUNNERS per architecture
+      # page it asks for. The repo holds at most MAX_RUNNERS_<ARCH> per architecture
       # plus whatever registrations the orphan phase has not cleaned up yet, so
       # one page is the steady state; the bound is here so a runaway list cannot
       # walk this Lambda into its timeout.
@@ -3359,12 +3385,17 @@ data "archive_file" "runner_cleanup" {
                   if j.get('status') == 'queued'
                   and 'self-hosted' in [l.lower() for l in j.get('labels', [])]]
 
-      def queued_demand(pat, cap, scan=None):
+      def max_runners_for(arch):
+          """This architecture's runner cap, as the webhook reads it (local.runner_max_by_arch)."""
+          return int(os.environ.get(f'MAX_RUNNERS_{arch.upper()}', '4'))
+
+      def queued_demand(pat, caps, scan=None):
           """Count queued self-hosted jobs per architecture.
 
           Three bounds, each reported when it fires: the saturation exit (both
-          architectures already want at least as many runners as the pool holds,
-          so more scanning cannot change what gets launched), QUEUE_SCAN_MAX_RUNS
+          architectures already want at least as many runners as their pool holds,
+          `caps` by architecture, so more scanning cannot change what gets
+          launched), QUEUE_SCAN_MAX_RUNS
           per status (per status so phantom queued runs can never evict the
           in_progress runs from the scan), and a wall-clock budget (a Lambda
           timeout is not catchable and would kill the whole poll). Truncation
@@ -3384,7 +3415,7 @@ data "archive_file" "runner_cleanup" {
           complete = (len(queued_runs) < QUEUE_SCAN_MAX_RUNS
                       and len(in_progress_runs) < QUEUE_SCAN_MAX_RUNS)
           for scanned, run_id in enumerate(run_ids):
-              if all(count >= cap for count in demand.values()):
+              if all(demand[arch] >= caps[arch] for arch in demand):
                   print(f'Queue scan satisfied after {scanned} of {len(run_ids)} runs')
                   complete = False
                   break
@@ -4104,7 +4135,7 @@ data "archive_file" "runner_cleanup" {
           # Phase 5: Reap launches that never came up
           # A spot metal launch AWS cannot place sits in `pending`, where the lease
           # phase above cannot see it - that phase only walks `running` instances.
-          # Left alone the husk holds one of MAX_RUNNERS slots and, worse, takes the
+          # Left alone the husk holds one of MAX_RUNNERS_<ARCH> slots and, worse, takes the
           # record of which instance type failed to the grave with it.
           stalled_launches = []
           pending_response = ec2.describe_instances(
@@ -4134,8 +4165,8 @@ data "archive_file" "runner_cleanup" {
           demand_scan = {}
           if pat:
               try:
-                  max_runners = int(os.environ.get('MAX_RUNNERS', '4'))
-                  demand = queued_demand(pat, max_runners, demand_scan)
+                  caps = {arch: max_runners_for(arch) for arch in ('arm64', 'x86_64')}
+                  demand = queued_demand(pat, caps, demand_scan)
                   print(f'Queued self-hosted jobs by architecture: {demand}')
                   webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
                   # Architectures this poll asked runners for, or that had nothing queued.
@@ -4152,8 +4183,8 @@ data "archive_file" "runner_cleanup" {
                       # single-launch invocations, even serialized by reserved
                       # concurrency 1, can each miss the instance the previous one
                       # just launched (DescribeInstances is eventually consistent)
-                      # and overshoot MAX_RUNNERS.
-                      count = min(queued_jobs, max_runners)
+                      # and overshoot the cap.
+                      count = min(queued_jobs, caps[arch])
                       if count <= 0:
                           covered.append(arch)
                           continue
@@ -4247,8 +4278,10 @@ resource "aws_lambda_function" "runner_cleanup" {
     variables = {
       # The webhook function's name as a literal: the webhook now depends on
       # this function (see its depends_on), so this one cannot reference it.
-      WEBHOOK_FUNCTION   = "github-runner-webhook"
-      MAX_RUNNERS        = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
+      WEBHOOK_FUNCTION = "github-runner-webhook"
+      # Bound the queue scan and the per-poll launches, per architecture.
+      MAX_RUNNERS_ARM64  = tostring(local.runner_max_by_arch.arm64)
+      MAX_RUNNERS_X86_64 = tostring(local.runner_max_by_arch.x86_64)
       REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
       RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
       RUNNER_REGIONS     = jsonencode(local.runner_regions)
@@ -4309,7 +4342,8 @@ resource "aws_lambda_function" "runner_reuse" {
       WEBHOOK_FUNCTION   = "github-runner-webhook"
       REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
       RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
-      MAX_RUNNERS        = tostring(local.runner_max_per_arch)
+      MAX_RUNNERS_ARM64  = tostring(local.runner_max_by_arch.arm64)
+      MAX_RUNNERS_X86_64 = tostring(local.runner_max_by_arch.x86_64)
       RUNNER_REGIONS     = jsonencode(local.runner_regions)
     }
   }

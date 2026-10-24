@@ -33,7 +33,7 @@ locals {
   runner_app_size_vcpus = { xl = 64, l = 32, s = 8 }
 
   # One entry per served repo. `max` bounds that repo's concurrent hosts; it is separate from
-  # fcvm's four per architecture, so these repos can never take fcvm's metal.
+  # fcvm's per-architecture caps, so these repos can never take fcvm's metal.
   #
   # `max_vcpus` (optional) bounds the vCPUs of a repo's concurrent hosts as well: a launch waits
   # when the vCPUs in use (live hosts, and launches not listed yet, each by its own size) plus

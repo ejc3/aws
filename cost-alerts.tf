@@ -282,10 +282,10 @@ resource "aws_cloudwatch_metric_alarm" "too_many_runners" {
   alarm_name          = "too-many-runners"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 6 # 30 minutes (6 x 5min periods)
-  # LiveRunners counts both architecture pools (arm64 and x86_64), each capped at
-  # local.runner_max_per_arch, so the fleet's cap is twice that.
-  threshold          = 2 * local.runner_max_per_arch
-  alarm_description  = "More runners than both architecture pools' caps (${2 * local.runner_max_per_arch}) for 30+ minutes - check for stuck jobs or a runaway controller"
+  # LiveRunners counts both architecture pools (arm64 and x86_64), each capped by its entry
+  # in local.runner_max_by_arch, so the fleet's cap is their sum.
+  threshold          = sum(values(local.runner_max_by_arch))
+  alarm_description  = "More runners than both architecture pools' caps (${sum(values(local.runner_max_by_arch))}) for 30+ minutes - check for stuck jobs or a runaway controller"
   alarm_actions      = [aws_sns_topic.cost_alerts.arn]
   ok_actions         = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data = "notBreaching"

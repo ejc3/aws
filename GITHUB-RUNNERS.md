@@ -83,8 +83,9 @@ are the only ones whose `launch_count` or `claim_only` it honours. It acts on
 `action == "queued"` (and hands `completed` on, below), reads the job labels to pick
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
-self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
-per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
+self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **8 arm64 and
+4 x86 runners** (`local.runner_max_by_arch`, shared with the reuse and cleanup Lambdas as
+`MAX_RUNNERS_ARM64` and `MAX_RUNNERS_X86_64`). ARM tries
 `c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
 in the us-west-1c runner subnet first and then in us-west-1a (see
 [Network posture](#network-posture)), with any type that recently failed for capacity in an
@@ -96,7 +97,7 @@ price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with
 **One execution at a time, and what it costs.** The webhook Lambda has run with
 `reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent
 invocations all read the same runner count before any launch and put up more instances than
-`MAX_RUNNERS`. A delivery that arrives while that one execution is busy is throttled, and
+the cap. A delivery that arrives while that one execution is busy is throttled, and
 GitHub never redelivers it. Of the 236 deliveries GitHub retained on 2026-09-13 (back to
 2026-09-11 04:15Z), 62 of 80 `queued`, 36 of 71 `in_progress` and 30 of 85 `completed` got a
 503 after about 0.2 seconds, and 7 more `queued` hit GitHub's 10-second limit; the function's
@@ -186,8 +187,8 @@ and counts an instance only if GitHub has `runner-<instance-id>` **online**, or 
 is younger than **`BOOT_GRACE_MINUTES` (15)** and no registration is due yet — a `*.metal`
 box spends minutes in POST before user_data starts, and without that window every poll would
 launch another instance on top of a booting one. Because booting instances still count, the
-cap still binds during a cold start and the herd can never exceed `MAX_RUNNERS` in flight.
-A second ceiling, `MAX_RUNNERS + LAUNCH_HEADROOM (2)` **instances** per architecture
+cap still binds during a cold start and the herd can never exceed the architecture's cap in
+flight. A second ceiling, the cap `+ LAUNCH_HEADROOM (2)` **instances** per architecture
 regardless of health, caps the blast radius if the health signal is ever wrong in the
 "nothing is healthy" direction. If GitHub cannot be reached the Lambda **degrades to the
 plain instance count**: over-counting only delays CI and self-heals next poll, while
@@ -222,7 +223,7 @@ it is suppressed while GitHub is unreachable, where `online` is 0 by constructio
 
 The cleanup poll (every 5 minutes) publishes the fleet itself: `GitHubRunners/LiveRunners`
 (running `Role=github-runner` hosts) and `OldestRunnerAgeMinutes`. `too-many-runners` fires
-above 8 (both architecture pools' caps, `2 * runner_max_per_arch`) for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
+above 12 (both architecture pools' caps, `sum(values(local.runner_max_by_arch))`) for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
 legitimately reach that on a heavy day), and `runner-cleanup-silent` when no count arrives for
 15 minutes, because then nothing is enforcing leases or age ceilings. These replace alarms
 that counted instances by tag through EC2 Metrics Insights, which cannot work (a tag is not a
