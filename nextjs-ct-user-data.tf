@@ -121,10 +121,11 @@ locals {
       Resource = local.nextjs_dev_parity_secrets
     },
     {
-      Sid      = "OwnerOnlyConstellationPointer"
+      # One statement for both pointers: this policy is near IAM's 6,144 characters.
+      Sid      = "OwnerOnlyApplyPointers"
       Effect   = "Deny"
       Action   = "ssm:GetParameter"
-      Resource = aws_ssm_parameter.constellation.arn
+      Resource = [aws_ssm_parameter.constellation.arn, aws_ssm_parameter.astryx.arn]
     },
     {
       # Members keep Haiku 5.5 and opencode's DeepSeek, as before; every other model is the owner's.

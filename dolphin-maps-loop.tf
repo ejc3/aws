@@ -1,4 +1,4 @@
-# dolphin-maps' scheduled loops, run in AWS: two Lambdas from one bundle on two EventBridge schedules, a journal of every pass
+# dolphin-maps' scheduled loops, run in AWS: three Lambdas from one bundle on three EventBridge schedules, a journal of every pass
 # in S3, and a GitHub App for its commits. It replaces the GitHub Actions loops in dolphin-labs-hq/dolphin-maps
 # (scrape-live.yml, scrape-weekly.yml and the dev box's crontab trigger), which stand down when that repository's
 # variable LOOPS_RUN_IN_AWS is true.
@@ -7,8 +7,14 @@
 #                                 It samples only the routes inside their own morning window; the rest of the
 #                                 invocations return at once without reading a secret.
 #   dolphin-maps-loop-sweep       Sunday 23:00 America/Los_Angeles: {"mode": "sweep"}, the coming school week's
-#                                 "typically" ranges, then each area's calibration refit.
-#                                 One bundle, two functions: each loop has its own limits, and Lambda's own Errors
+#                                 "typically" ranges.
+#   dolphin-maps-loop-refit       Monday 00:00 America/Los_Angeles, an hour after the sweep: {"mode": "refit"}, each
+#                                 area's calibration refit on the ranges main holds. No browser. Its own function
+#                                 because the refit's routing guard runs gyms for most of the 15 minutes (it starts
+#                                 none after the 12th), which the sweep's pages leave no room for (dolphin-maps #198).
+#                                 A schedule, not an invocation by the sweep: the sweep's role needs no
+#                                 lambda:InvokeFunction, and a refit can be rerun by hand.
+#                                 One bundle, three functions: each loop has its own limits, and Lambda's own Errors
 #                                 metric (timeouts, running out of memory and failed starts included) is that
 #                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a
 #                                 stand-in handler (dolphin-maps-loop/index.mjs, index.handler like the bundle) and then leaves their code
@@ -31,12 +37,12 @@
 #                                 service) for the scheduled PeMS refresh. Value set out of band, never in git. The
 #                                 function and the administration set read it; dev-server-role reads and puts it.
 #
-# Both schedules start DISABLED. Turn on dolphin_maps_loop_enabled after the first deploy and after the app's
+# All three schedules start DISABLED. Turn on dolphin_maps_loop_enabled after the first deploy and after the app's
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
-#   the two functions          journal/ (write); the secrets above (read); their own logs
-#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these two
+#   the three functions        journal/ (write); the secrets above (read); their own logs
+#   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these three
 #                              functions only (no UpdateFunctionConfiguration: the handler is Terraform's)
 #   dev-server-role            journal/ (read, list): replays on the metal boxes; dolphin-maps/pems (read, put)
 
@@ -50,11 +56,14 @@ locals {
   dolphin_maps_loop_name   = "dolphin-maps-loop"
   dolphin_maps_loop_bucket = "dolphin-maps-loop-${data.aws_caller_identity.current.account_id}"
   dolphin_maps_loop_sub    = "repo:dolphin-labs-hq@316189183/dolphin-maps@1409029367:ref:refs/heads/main"
-  # A live pass is a page or two (minutes at most); a sweep is about six minutes of pages and two of refit,
-  # whose memory is set for its CPU share, not its footprint (about 250 MB).
+  # A live pass is a page or two (minutes at most); a sweep is about six minutes of pages; a refit is the routing
+  # guard's gyms (8:43 on a dev box, not yet measured here): it starts no gym after the 12th minute and keeps the
+  # committed calibration for a stage it has not checked. Memory is set for the CPU share, not the footprint
+  # (about 250 MB).
   dolphin_maps_loop_modes = {
     live  = { schedule = "cron(*/5 6-8 ? * MON-FRI *)", timeout = 300, memory = 1024 }
     sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }
+    refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }
   }
 }
 
@@ -313,8 +322,12 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
 resource "aws_lambda_function" "dolphin_maps_loop" {
   for_each      = local.dolphin_maps_loop_modes
   function_name = "${local.dolphin_maps_loop_name}-${each.key}"
-  description   = each.key == "live" ? "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3" : "dolphin-maps weekly loop: the school week's typical ranges and the calibration refit, committed to the repository, journal to S3"
-  role          = aws_iam_role.dolphin_maps_loop.arn
+  description = {
+    live  = "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3"
+    sweep = "dolphin-maps weekly loop: the school week's typical ranges, committed to the repository, journal to S3"
+    refit = "dolphin-maps weekly refit: each area's calibration on the ranges in the repository, committed to it, journal to S3"
+  }[each.key]
+  role = aws_iam_role.dolphin_maps_loop.arn
   # The bundle deploy-loop.yml uploads exports index.handler too, so the handler never changes and the deploy
   # role needs no UpdateFunctionConfiguration (which IAM cannot narrow to the handler).
   handler       = "index.handler"
@@ -435,14 +448,31 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_errors" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
-# Sweep: it runs once a week, so one failure is a week without new ranges or a refit. Lambda's Errors metric for
+# Sweep: it runs once a week, so one failure is a week without new ranges. Lambda's Errors metric for
 # the sweep's own function counts every failure: a thrown error, a timeout, running out of memory, a failed start.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_sweep_failed" {
   alarm_name          = "dolphin-maps-loop-sweep-failed"
-  alarm_description   = "dolphin-maps' weekly sweep failed: no new typical ranges or refit this week. See /aws/lambda/dolphin-maps-loop-sweep and journal/sweep/ in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"sweep\"}."
+  alarm_description   = "dolphin-maps' weekly sweep failed: no new typical ranges this week. See /aws/lambda/dolphin-maps-loop-sweep and journal/sweep/ in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"sweep\"}."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
   dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["sweep"].function_name }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+}
+
+# Refit: the same, for the week's calibration. A refit that keeps every committed calibration (the guard refused them
+# all, or ran out of time) is a pass that did its job; the journal's log says which.
+resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_refit_failed" {
+  alarm_name          = "dolphin-maps-loop-refit-failed"
+  alarm_description   = "dolphin-maps' weekly refit failed: the calibrations were not refit or committed this week. See /aws/lambda/dolphin-maps-loop-refit and journal/refit/ (the guard's verdicts) in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"refit\"}."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["refit"].function_name }
   statistic           = "Sum"
   period              = 3600
   evaluation_periods  = 1
@@ -476,7 +506,7 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_dropped" {
 # days without an invocation spans any weekend; the sweep runs once a week, so seven daily periods always hold
 # one run. Missing data is a breach: no invocations publish no datapoint.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_not_running" {
-  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7 } : {}
+  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7 } : {}
   alarm_name          = "dolphin-maps-loop-${each.key}-not-running"
   alarm_description   = "dolphin-maps-loop-${each.key} has not been invoked for ${each.value} days although its schedule is on. Check the scheduler schedule dolphin-maps-loop-${each.key} and the dolphin-maps-loop-scheduler role."
   namespace           = "AWS/Lambda"

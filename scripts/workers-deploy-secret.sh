@@ -18,7 +18,7 @@ AS=${2:-}
 # (dolphin-labs-ci-logs.tf, workers-deploy.tf): a repository secret there would hand it to a run on
 # any branch again.
 case "${REPO,,}" in
-  dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films|dolphin-labs-hq/dolphin-maps|ejc3/imagine|ejc3/remote-claw)
+  dolphin-labs-hq/dolphin-labs|dolphin-labs-hq/dolphin-films|dolphin-labs-hq/dolphin-maps|ejc3/imagine|ejc3/remote-claw|ejc3/fcvm|ejc3/constellation)
     echo "$REPO takes the token from main-only environments written by terraform apply" >&2
     echo "(dolphin-labs-ci-logs.tf, workers-deploy.tf); not setting a repository secret" >&2
     exit 3 ;;

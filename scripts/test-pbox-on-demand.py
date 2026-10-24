@@ -239,6 +239,15 @@ class OnDemandScript(unittest.TestCase):
         self.assertIn("LaunchTemplateName=parallel-box-3-ondemand,Version=$Latest", run)
         self.assertIn("--network-interfaces", run)
 
+    def test_lease_and_on_demand_together(self):
+        rc, _, err = self.pbox("up", "3", "compute-48", "--on-demand", "--lease", "2h")
+        self.assertEqual(rc, 0, err)
+        run = self.calls("run-instances")[0]
+        self.assertIn("LaunchTemplateName=parallel-box-3-ondemand,Version=$Latest", run)
+        tags = run[run.index("--tag-specifications") + 1]
+        self.assertIn("Key=PboxLeaseUntil,Value=", tags)
+        self.assertIn("Key=PboxLaunchedBy,Value=", tags)
+
     def test_no_ondemand_fallback_template_in_the_pointer_launches_nothing(self):
         pointer = json.loads(json.dumps(POINTER))
         del pointer["fallback"]["ondemand_template"]

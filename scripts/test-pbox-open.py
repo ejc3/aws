@@ -159,7 +159,7 @@ class OpenScript(unittest.TestCase):
                                 "Ipv6PrefixCount": 1}])
         self.assertEqual(out.strip().splitlines()[-1],
                          "launched box=3 region=us-east-2 az=us-east-2c type=c8g.metal-48xl ip=203.0.113.9 "
-                         "work=persistent ipv6_prefix=" + PREFIX)
+                         "id=i-0open work=persistent ipv6_prefix=" + PREFIX)
         self.assertIn(f"  ipv6:  {PREFIX} (fcvm --network routed --ipv6-prefix {PREFIX})", err)
         self.assertIn("every port of this box and its VMs is reachable from the internet", err)
 
@@ -169,14 +169,15 @@ class OpenScript(unittest.TestCase):
         run = self.runs()[0]
         self.assertNotIn("--network-interfaces", run)
         self.assertEqual(out.strip().splitlines()[-1],
-                         "launched box=3 region=us-east-2 az=us-east-2c type=c8g.metal-48xl ip=203.0.113.9 work=persistent")
+                         "launched box=3 region=us-east-2 az=us-east-2c type=c8g.metal-48xl ip=203.0.113.9 id=i-0open work=persistent")
         self.assertNotIn("ipv6", err)
 
     def test_an_open_launch_without_a_prefix_fails_loudly(self):
         rc, out, err = self.pbox("up", "3", "kvm-192", "--open", FAKE_NO_PREFIX="1")
         self.assertEqual(rc, 1, err)
         self.assertIn("EC2 reports no IPv6 prefix", err)
-        self.assertNotIn("launched box=", out)
+        # The caller still learns the instance it launched (#621), marked failed.
+        self.assertTrue(out.strip().splitlines()[-1].endswith("id=i-0open work=persistent failed=no-ipv6-prefix"), out)
 
     def test_open_is_refused_with_fallback_and_regions(self):
         for extra in (("--fallback",), ("--regions", "us-west-2"), ("--regions=us-west-2",)):

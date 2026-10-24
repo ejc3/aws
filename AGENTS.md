@@ -140,7 +140,7 @@ Account id: `12ea67fb7ced068de03f35c22688e436`.
 
 **Domains registered here so far** (all Cloudflare Registrar, auto-renew off unless stated): `cc-games.dev`, `cc-games.app`,
 `cc-games.net`, `cc-games.org`, `ccgames.app`, `dolphin-labs.dev`, `yourfantasymovie.com` (2026-10-05, $10.46, the Fantasy
-Films site; DNS in `yourfantasymovie.tf`), and `mapslink.app` (2026-10-20, $8.20, a 302 to the Dolphin Maps car page; `mapslink-zone.tf`). Registration via API needs a short-lived Registrar Domains Admin token, a `domain-check`
+Films site; DNS in `yourfantasymovie.tf`), `mapslink.app` (2026-10-20, $8.20, a 302 to the Dolphin Maps car page; `mapslink-zone.tf`), and `fcvm.dev` (2026-10-22, $8.20, the fcvm GPU VM wall; `fcvm-dev.tf`). Registration via API needs a short-lived Registrar Domains Admin token, a `domain-check`
 immediately before, exactly one `registrations` call, and revoking the token after.
 
 **September 8, 2026 check:** `/home/ubuntu/aws/.env` was absent, and Secrets Manager
@@ -286,8 +286,8 @@ only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `
 only the fallback sites offer (a GPU flavor implies `--fallback`: every region that offers the type), or kvm-gpu-96, an x86 g4dn.metal with eight T4, at home: the one x86
 type, launched with `--image-id` set to the site's x86_64 build of the same Ubuntu image (published in `/infra/parallel-box`,
 pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=on iommu=pt` and reboots once
-(`pbox_gpu_iommu_reboot`, marker `/var/lib/pbox-iommu-reboot`); both GPU flavors against the G spot quota, 96 vCPU in us-east-2
-and us-west-2; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
+(`pbox_gpu_iommu_reboot`, marker `/var/lib/pbox-iommu-reboot`); both GPU flavors against the G spot quota, 96 vCPU in us-east-2,
+us-west-2 and us-east-1; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
 after their instance is gone (`ec2:CancelSpotInstanceRequests` in `pbox-flavor-types`, never the persistent boxes') and retries once; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
 test keeps them equal); with none it exits 2 and prints the menu. An agent picks the smallest flavor that fits the work's
 shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
@@ -311,7 +311,22 @@ vCPU quota ("Running On-Demand G and VT instances", `L-DB2E81BA`, for the GPU fl
 idle watchdog reaps it like any other (it finds boxes by Name). It combines with `--fallback`, `--regions`, `--open` and the
 GPU flavors' implied fallback; it is refused for other commands and for a member's pbox, whose grant allows spot only. To fit
 `parallel-box-control` under 6,144 characters with both templates of every box, its `AttachWorkVolume`,
-`AttachWorkVolumeToTaggedInstance` and `DescribeForPbox` statements moved unchanged to `pbox-flavor-types` (same two roles). The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
+`AttachWorkVolumeToTaggedInstance` and `DescribeForPbox` statements moved unchanged to `pbox-flavor-types` (same two roles).
+`pbox up N FLAVOR --lease 2h` (30m to 12h; `90m`, `1h30m`) tags the instance `PboxLeaseUntil=<UTC epoch seconds>` at launch
+(both launch grants allow any tag key at RunInstances), and every watchdog of the owner's boxes (`LEASE_NAMES`) skips the idle
+check until then and applies it as usual after. A tag that does not parse is no lease, and a lease past LaunchTime + 12 h
+ends there. `status` prints `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. A leased box costs money for the whole
+lease (a kvm-gpu-96 is about $4/hr spot). It is set at launch only: the grants tag at RunInstances and nowhere else, so
+there is no `pbox lease` for a running box. Members' boxes and the GPU test boxes take no lease. Several jobs share the
+eight slots, so a slot name can point at another instance minutes later (#621): `up`'s last line carries `id=i-...` (also,
+with `failed=<reason>`, when the box was launched but did not come up), scripts carry that id and pass `--instance i-...` to
+`ip`, `ssh` and `down`, which refuse when the slot holds another instance, and they never re-resolve a slot by name. The
+owner's launches tag `PboxLaunchedBy` (`PBOX_CALLER`, default the host); `down` without `--instance` refuses a box another
+caller launched in the last hour unless `--force`. Members' grants pin their tag keys, so their boxes carry no such tag.
+Every pbox boot (home, fallback and member) installs the security updates after its packages (`pbox_security_updates`
+in `pbox-flavors.tf`, owner 2026-10-23): `unattended-upgrade`, the security pocket only, retried while apt is busy, never a
+reboot, so a new kernel waits for the next boot and a failed update still leaves a usable box.
+The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
 `runner-bootstrap.tf` (RequestedRegion us-west-1) and `dev-ebs.tf` (west-1/west-2 only).
@@ -1270,7 +1285,8 @@ ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
 The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-pc`) is less
 trusted than the boxes: it may be compromised. So:
 
-- **No key of such a machine is ever authorized for `ubuntu`** (or any account an agent runs as) on a dev box. Not for a
+- **No key of such a machine is authorized for `ubuntu`** (or any account an agent runs as) on a dev box, except the
+  owner's explicitly approved Mac Touch ID key for `ejc3` on the Next.js server (`local.nextjs_user_keys.ejc3`). Not for a
   reverse tunnel either: `restrict,port-forwarding,permitlisten=...` still allows remote Unix-socket forwards (OpenSSH has
   no per-key option against them), and a mistake in those options is a foothold on the box that holds the agents' AWS
   role. The machines are reached outward, through their own Cloudflare route (`colin-pc-ssh.tf`, `colton-mac-ssh.tf`).
@@ -1362,10 +1378,10 @@ Available if a task needs them; neither needs a key on disk.
   function at all: an agent on nextjs-dev reaches them as `dolphin-terraform` (the owner's container only), from a jumpbox
   through `OrganizationAccountAccessRole` in the Dolphin account. Changes are dolphin-aws pull requests, applied from
   nextjs-dev.
-- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live` and
-  `dolphin-maps-loop-sweep` (one bundle) on EventBridge schedules in America/Los_Angeles time (live samples
-  every 5 minutes on weekday mornings, the sweep and refit on Sunday night; both off until
-  `dolphin_maps_loop_enabled`; one failed sweep alarms), reading `browserbase/credentials`
+- **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
+  `dolphin-maps-loop-sweep` and `dolphin-maps-loop-refit` (one bundle) on EventBridge schedules in America/Los_Angeles
+  time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night, the refit an hour later; all off
+  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.
@@ -1440,6 +1456,14 @@ Available if a task needs them; neither needs a key on disk.
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
   container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
   repo, a command line or a commit.
+- **abliteration.ai for opencode**, metal boxes and the owner's nextjs-ct container (owner, 2026-10-23). opencode's built-in
+  `abliteration-ai` provider (OpenAI-compatible, `https://api.abliteration.ai/v1`; models `abliterated-model`,
+  `-large`, `-large-v2`, `-large-flash`) reads `ABLIT_KEY`, which the `opencode()` function in the managed `~/.zshrc` reads from
+  `abliteration/api-key` (us-west-1) at each launch, into opencode's environment only: pick a model with `/models`.
+  `abliteration/api-key` is a project key (project `opencode-dev-boxes`, permission `model.invoke`), readable by
+  dev-server-role (through `assume-constellation-terraform`), nextjs-dev-role for the owner's container (members are denied
+  it) and admins. `abliteration/admin-api-key` is the organization's Admin API key (projects, keys, spend limits, balance):
+  administration only. Rotate by minting a new project key with it, putting it in `abliteration/api-key` and revoking the old.
 - **AWS list prices**, on the metal boxes and nextjs-dev: the Price List API (`aws pricing
   get-products --region us-east-1 --service-code AmazonEC2 ...`), public prices only. Account
   spend (Cost Explorer, billing) is not granted (`dev-ai-services.tf`).
@@ -1587,10 +1611,89 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   the Access-protected `/lattice/native/login`) is the gate; the connector itself requires an Access token on every
   other path. Opening the host to anyone who signs in, as constellation's
   design intends, is the owner's decision.
+- **Lattice's remote MCP on staging** (`constellation-mcp-stage.tf`): the Worker `constellation-mcp-stage`, deployed by
+  ejc3/constellation from its main-only `cloudflare-deploy` environment (token, `CLOUDFLARE_ACCOUNT_ID`, `MCP_STAGE_KV_ID`),
+  at `lattice-mcp-stage.dolphin-labs.dev/mcp`. It is its own OAuth server for MCP clients and signs people in through an
+  owner-only Access for SaaS (OIDC) application, so it has no self-hosted Access gate. Its runtime secrets
+  (`workers-stage/constellation-mcp`, administration only) are written by Terraform, including the Lattice service secret,
+  whose other copy is the API's `constellation/nonprod/lattice-service`, written once on 2026-10-23 and not managed here (that
+  secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
+  Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
+  constellation-mcp`.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
   fcvm-arm. Not yet covered: security monitoring and a region SCP like the Dolphin account's.
+
+### The fcvm-fleet account (fcvm-fleet-account.tf)
+
+fcvm's GPU VM wall (ejc3/fcvm#1136) gets a member account of its own, `fcvm-fleet`, in OU `FcvmFleet` (ejc3/aws#604; owner,
+2026-10-22: "its good make it so"). Its hosts are always-on spot GPU instances serving the public internet with workloads
+viewers can steer, so the account boundary is the containment: nothing in this account or any other member account
+trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource policy names it. Root address: the
+`fcvm_fleet_account` key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
+
+- **Guardrails** (`fcvm-fleet-guardrails`, an SCP on the OU only): every regional action outside us-east-2, us-west-2 and
+  us-east-1 (`local.fcvm_fleet_regions`, one provider alias each) is denied, as are leaving the organization, buckets in
+  other regions, and IAM users, access keys and console passwords (roles only). Global services are exempt (the Dolphin
+  policy's list).
+- **Applied from here** for the fleet's infrastructure (through OrganizationAccountAccessRole), and from fcvm-metal-arm
+  through `fcvm-fleet-terraform` (AdministratorAccess in that account, one-hour sessions), which trusts dev-server-role
+  pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
+  role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
+  another policy. No CI credential.
+- **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in us-east-1, granted 2026-10-22; one region is enough (owner).
+  us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
+- **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
+  on, SSL Full (strict). Staging only, owner-only behind Access: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
+  to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
+  agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm). Written into the
+  fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
+  `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
+- **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
+  a public subnet per AZ, one security group admitting TCP 443 from anywhere and nothing else, no SSH: SSM only, flow logs
+  to `fcvm-fleet-flow-logs-<id>`); a spot GPU host group per region over g4dn.metal and g5g.metal (launch template per
+  architecture, `Ipv6PrefixCount = 1` only, IMDSv2 hop 1); EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
+  coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
+  `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/tls-wildcard` secret. The
+  Cloudflare-fed secrets (DNS token, tunnel token, agent Access token) come from `fcvm-dev.tf`.
+- **Two gates, both off**: `local.fcvm_fleet_hosts_enabled` (one spot metal GPU host per region, also needing the fleet AMI
+  in `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled` (also needing `var.fcvm_fleet_coordinator_image`).
+  Nothing billed by the hour runs until the owner turns one on. The AMI build is a follow-up.
+- The coordinator's task role may launch EC2 only from the tile templates, referencing only the tile AMIs and the fleet's
+  subnets and group (by exact ARN), only as the two tile types and tagged `Purpose=fcvm-fleet-tile`; terminate only
+  instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate
+  and store the certificate it issues. The fleet account has EC2's spot service-linked role. Hosts read the certificate,
+  the agent token and the asset bucket.
+- Not yet covered: security monitoring like the Dolphin account's.
+
+### The astryx account (astryx-account.tf)
+
+Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the sync API) gets a member account of its own,
+`astryx`, in OU `Astryx`, built here as the constellation account is. Its Terraform is the private repository
+`ejc3/astryx-infra`, which applies inside that account only. Root address: the `astryx_account` key of `people/addresses`.
+`close_on_deletion = false` and `prevent_destroy`.
+
+- **Guardrails** (`astryx-guardrails`, an SCP on the OU only), as on the fcvm-fleet OU: every regional action outside
+  us-west-1 is denied (global services exempt, the Dolphin policy's list), as are leaving the organization, buckets in other
+  regions, and IAM users, access keys and console passwords (roles only).
+- **Applied from fcvm-metal-arm and the owner's nextjs-ct container only**, as constellation is. `astryx-terraform`
+  (AdministratorAccess in that account, one-hour sessions) trusts dev-server-role pinned to fcvm-arm's instance, granted
+  by two statements in `assume-constellation-terraform` (assume the role, read `/infra/astryx`) with the same pin, because
+  dev-server-role has no room for another policy; and nextjs-dev-role, unpinned, granted by `nextjs-dev-fcvm-parity.tf`
+  (members' sessions deny `sts:AssumeRole` and the pointer). No CI credential.
+- **What the appliers read: `/infra/astryx`** (an SSM String): account id, region, state bucket, apply role, and `stage`
+  (hostname, Access team domain and audience tag, the tunnel secret's name). No credentials.
+- **Staging** (`astryx-stage.tf`): `astryx-stage.dolphin-labs.dev` through tunnel `astryx-stage` to a cloudflared sidecar in
+  astryx-infra's ECS task: `/api/*`, `/native/*` and `/healthz` to the sync API (`localhost:8080`), everything else to
+  zero-cache (`localhost:4848`). The connector token is written into the astryx account as `astryx/nonprod/tunnel` (key
+  `TUNNEL_TOKEN`). Access covers `/native/login` only, open to anyone who signs in with GitHub, Google or a one-time PIN
+  (owner's request: TestFlight testers sign in there); the connector also requires an Access token on that path. The rest
+  of the host is a bypass for exactly that hostname (`astryx_stage_public`), since the `*.dolphin-labs.dev` GitHub gate would
+  otherwise answer the apps' API and sync calls with a login page; Access picks the more specific `/native/login`
+  application there. The API checks its own Bearer tokens, which are minted only at `/native/login`.
+- **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
+- Not yet covered: security monitoring like the Dolphin account's.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
@@ -1725,7 +1828,7 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   account. There is deliberately no mint script (issue #16: no curl or local-exec for Cloudflare resources). Rotate with
   `terraform apply -replace=cloudflare_account_token.workers_deploy`, then `scripts/workers-deploy-secret.sh OWNER/REPO [account]`
   for each site repo (as `colton` on nextjs-dev for the CoderColton repos, through that account's own gh login; nothing is copied),
-  except dolphin-labs, dolphin-films, dolphin-maps, imagine and remote-claw: their deploy jobs read the token from main-only
+  except dolphin-labs, dolphin-films, dolphin-maps, imagine, remote-claw and fcvm (the fcvm-fleet-stage Worker): their deploy jobs read the token from main-only
   `cloudflare-deploy` environments, which the same apply rewrites (`dolphin-labs-ci-logs.tf`, `workers-deploy.tf`), and the
   script refuses to set a repository secret there. The CoderColton sites (colton-games, nest-step) also deploy from a main-only
   `cloudflare-deploy` environment, outside Terraform's GitHub owners: the script writes their token there, never to the repository.
@@ -1791,6 +1894,37 @@ no Cloudflare deploy token on the dev boxes, and invite-only signup.
   `SIGNUP_TOKEN`, so each deploy sets the Worker secret: no dev box takes part in a deploy.
 - Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_relay_deploy` or
   `-replace=random_password.dolphin_relay_signup`; the next deploy uses the new values.
+
+### Astryx Swift TestFlight invitations (astryx-join.tf)
+
+`astryx-join.dolphin-labs.dev`: anyone with an @meta.com address adds themselves as an external TestFlight tester of
+Astryx Swift (owner, 2026-10-23). A public form, no sign-in (owner: "Turnstile please. Qr code will stay quiet, and I
+trust meta engineers"; Access would take a Zero Trust seat per person). The Worker `astryx-join`
+(`scripts/astryx-join.mjs`) checks, in order: a same-origin form post; the Turnstile token with siteverify (the widget's
+secret, the visitor's IP, an idempotency key); an address at exactly meta.com (trimmed, lower-cased); 5 requests per IP
+an hour and 500 a day (KV `astryx-join-limits`; a KV failure refuses); then App Store Connect with a dedicated **App
+Manager** key.
+
+- **Public through a bypass for exactly this host** (`astryx_join_public`, the `dolphin_maps_public` pattern), created
+  after the record and the route: before the record the name falls to the `*.dolphin-labs.dev` previews tunnel.
+- **Terraform deploys this Worker's code**, unlike the site Workers: the App Store Connect key and the Turnstile secret
+  are `secret_text` bindings, which only an upload of the code can set with the pinned provider. A change to the `.mjs`
+  is a reviewed change that the next apply deploys (`content_sha256`).
+- **The switch is the secret** `astryx/testflight-asc-key` (us-west-1, in the astryx account, read through `aws.astryx`;
+  JSON `ISSUER_ID`, `KEY_ID`, `PRIVATE_KEY`). Until
+  it exists nothing is created and the name stays behind the GitHub gate. The owner creates it (README, "Astryx Swift:
+  self-serve TestFlight invitations"); Terraform adds an administration-only read policy. The Turnstile site key and
+  secret come from `cloudflare_turnstile_widget.astryx_join`.
+- **Turnstile write on the provider token.** No resource used Turnstile before this one: add the account permission
+  Turnstile Sites Write to `cloudflare-tunnel-token` with one PUT of the token's definition, as Workers KV Storage Write
+  was (its id from `GET /accounts/<id>/tokens/permission_groups`).
+- **Never bind `games-worth-watching/app-store-connect`** (Admin, cloud signing) into a Worker; `scripts/test-astryx-join.py`
+  fails on it.
+- **No address or IP in a log line the Worker writes**: outcome, HTTP status and Apple's or Turnstile's error code only.
+  The KV keys hold a hash of the IP, never an address. The node test fails on an `@` or a test IP in any log line.
+- **The main module may export only functions** besides `default`: workerd refuses to start on any other named export.
+- **Why not the rate-limiting binding:** its period is 10 or 60 seconds, so it cannot say 5 an hour or 500 a day.
+- Limits: 10,000 external testers per app (the page says so); Beta App Review for each new build version.
 
 ### Colton Games production on Cloudflare (switched 2026-10-11)
 
@@ -1900,7 +2034,8 @@ The I/O-box invocation of the same Lambda also checks five-minute disk and netwo
 Returned disk activity of at least 1 MiB or network activity of at least 64 MiB keeps it
 running, but a missing I/O series currently counts as zero. The parallel box uses
 `parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU with no five-minute window of 512 MiB of EBS or
-instance-store reads or writes or 64 MiB of network either way (#532); the members' Windows spot boxes run
+instance-store reads or writes or 64 MiB of network either way (#532), unless it was launched with `pbox up --lease` and
+the lease (at most 12 hours from launch) has not ended; the members' Windows spot boxes run
 that code as their own `member-wbox-watchdog` (one hour below 15%, 6h lifetime; `member-wbox.tf`). `nextjs-dev` and
 the jumpboxes never idle-stop.
 

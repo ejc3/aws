@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TASK_DEFS = {"games_mp_router": "games-multiplayer.tf", "imagine": "imagine.tf"}
+TASK_DEFS = {"games_mp_router": "games-multiplayer.tf", "imagine": "imagine.tf", "fcvm_fleet_coordinator": "fcvm-fleet.tf"}
 
 
 def resource(path, name):

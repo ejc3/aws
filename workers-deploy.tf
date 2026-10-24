@@ -96,12 +96,14 @@ output "cloudflare_workers_deploy_token_secret" {
 # Each site repo's deploy job takes this token from a `cloudflare-deploy` environment admitted to `main` only, never
 # from a repository secret: a repository secret is readable by a workflow run on any branch, and Workers Scripts Write
 # reaches every Worker in the account, production included (dolphin-relay.tf), so the branch rule is the control.
-# dolphin-labs and dolphin-films are in dolphin-labs-ci-logs.tf (#452, #455); these are the rest (ejc3/aws#466). Once a
+# dolphin-labs and dolphin-films are in dolphin-labs-ci-logs.tf (#452, #455); these are the rest (ejc3/aws#466; fcvm, for
+# the fcvm-fleet-stage Worker at stage.fcvm.dev, ejc3/aws#627: main only, like the others, never a feature branch;
+# constellation, for the constellation-mcp-stage Worker, constellation-mcp-stage.tf). Once a
 # repo's deploy job names the environment, its repository secret is deleted. Rotating workers_deploy rewrites every one
 # on the next apply. ts-api is not here: it deploys to its own Cloudflare account with its own token.
 locals {
   # repo name => the ejc3 repos, through the administration agent's GitHub App on ejc3 (agents-md.tf's provider).
-  workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw"])
+  workers_deploy_environments_ejc3 = toset(["imagine", "remote-claw", "fcvm", "constellation"])
 }
 
 resource "github_repository_environment" "workers_deploy_ejc3" {

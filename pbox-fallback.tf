@@ -81,8 +81,9 @@ locals {
     echo "fallback site: /mnt/work is a fresh volume that is deleted with this box; /srv/io is not mounted" > /mnt/work/FALLBACK-BOX-README
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y parallel build-essential git htop
+    apt-get -o DPkg::Lock::Timeout=300 update
+    apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop
+    ${local.pbox_security_updates}
     ${local.pbox_local_nvme_setup}
     ${local.pbox_gpu_vfio_setup}
 
@@ -118,6 +119,7 @@ locals {
       IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
       TAG_NAMES     = join(",", local.parallel_box_names)
       IO_THRESHOLDS = local.parallel_watchdog_io_thresholds
+      LEASE_NAMES   = join(",", local.parallel_box_names) # `pbox up --lease`
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }

@@ -123,6 +123,8 @@ locals {
     # survive. If a key here is no longer wanted, move it to nextjs_retired_user_keys
     # rather than deleting the line, or the append-only installer leaves it authorized.
     ejc3 = [
+      # The owner's Mac Touch ID key for direct SSH to this personal account.
+      "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBEkvZoiNFWwF1jGRNq8a7OtoeF8HlZRJfDLO+RmYXIH+l4bdU8H1kJtfC8fHX/IcCl4CLOikim/HxTOuEiQcEdkAAAAEc3NoOg== owner-mac-touchid",
       # The fleet hop key, so `ssh dolphin` from the metal boxes lands in ejc3's account where
       # the dolphin-labs checkout lives. Not an escalation: the same key already reaches ubuntu
       # on this box, and ubuntu has passwordless sudo here. Dev boxes still hold no key that

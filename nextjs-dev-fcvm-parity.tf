@@ -28,6 +28,7 @@ locals {
       aws_secretsmanager_secret.dolphin_relay_signup.arn,
       aws_secretsmanager_secret.dolphin_maps_pems.arn,
       aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn,
+      aws_secretsmanager_secret.abliteration_api_key.arn,
     ],
     [for k, s in aws_secretsmanager_secret.dolphin_films : s.arn if startswith(k, "nonprod/")],
   )
@@ -126,6 +127,19 @@ resource "aws_iam_policy" "nextjs_dev_fcvm_parity" {
         Effect   = "Allow"
         Action   = "ssm:GetParameter"
         Resource = aws_ssm_parameter.constellation.arn
+      },
+      {
+        # Apply ejc3/astryx-infra (astryx-account.tf): its apply role trusts nextjs-dev-role too.
+        Sid      = "AstryxApply"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = aws_iam_role.astryx_terraform.arn
+      },
+      {
+        Sid      = "AstryxPointer"
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = aws_ssm_parameter.astryx.arn
       },
       {
         # EC2 service quotas and their request history (dev-instance-common.tf's dev-service-quotas-read).

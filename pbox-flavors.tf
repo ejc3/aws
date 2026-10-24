@@ -81,7 +81,7 @@ if [ -n "$NVME_DISKS" ]; then
     set -- $NVME_DISKS
     NVME_DEV="$1"
     if [ "$#" -gt 1 ]; then
-      command -v mdadm >/dev/null || apt-get install -y mdadm
+      command -v mdadm >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y mdadm
       mdadm --create /dev/md/nvme --level=0 --raid-devices="$#" --run "$@" && NVME_DEV=/dev/md/nvme
     fi
     if [ "$NVME_DEV" = /dev/md/nvme ] || [ "$#" -eq 1 ]; then
@@ -90,6 +90,20 @@ if [ -n "$NVME_DISKS" ]; then
   fi
 fi
   NVME
+
+  # Security updates at every pbox boot (owner, 2026-10-23): the stock Ubuntu image is weeks old, and each launch otherwise
+  # brings its fixable package findings back to Inspector. unattended-upgrade installs from the security pocket only
+  # (Ubuntu's default origins) and does not reboot, so a new kernel waits for the next boot. It refuses while another apt
+  # holds the lock (apt-daily-upgrade also runs at first boot), hence the retries; a failure is logged and the box still
+  # comes up. Runs after the boot's apt-get update.
+  pbox_security_updates = <<-SEC
+command -v unattended-upgrade >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y unattended-upgrades
+for _ in $(seq 1 10); do
+  unattended-upgrade -v && break
+  echo "pbox security updates: unattended-upgrade failed (apt lock busy?), retrying in 30 s" >&2
+  sleep 30
+done
+  SEC
 
   # GPU passthrough host (the kvm-gpu flavors): every NVIDIA PCI function (vendor 0x10de) goes to vfio-pci, so fcvm can hand
   # it to a microVM. A box without one skips all of it. The host never gets an NVIDIA driver: driverctl's override binds
@@ -107,13 +121,19 @@ done
 if [ -n "$GPU_DEVS" ]; then
   echo vfio-pci > /etc/modules-load.d/vfio-pci.conf
   modprobe vfio-pci
-  apt-get install -y driverctl
+  # The boot-time package run can hold the dpkg lock: wait for it (ejc3/aws#609, a fallback g4dn.metal whose install lost
+  # the race and left every GPU on nouveau), and stop here, loudly, if driverctl is still missing.
+  apt-get -o DPkg::Lock::Timeout=300 install -y driverctl
+  if ! command -v driverctl >/dev/null; then
+    echo "pbox GPU setup FAILED: driverctl is not installed, so no GPU was bound to vfio-pci" | tee /etc/pbox-gpu >&2
+    GPU_DEVS=""
+  fi
   echo 'SUBSYSTEM=="vfio", GROUP="kvm", MODE="0660"' > /etc/udev/rules.d/70-vfio-kvm.rules
   printf 'ubuntu soft memlock unlimited\nubuntu hard memlock unlimited\n' > /etc/security/limits.d/90-vfio-memlock.conf
   udevadm control --reload
   for dev in $GPU_DEVS; do driverctl set-override "$dev" vfio-pci; done
   udevadm settle
-  for dev in $GPU_DEVS; do
+  [ -z "$GPU_DEVS" ] || for dev in $GPU_DEVS; do
     drv=$(readlink "/sys/bus/pci/devices/$dev/driver")
     grp=$(readlink "/sys/bus/pci/devices/$dev/iommu_group")
     echo "$dev driver=$${drv##*/} iommu_group=$${grp##*/}"
@@ -146,7 +166,8 @@ fi
 
 # ---------------------------------------------------------------------------------
 # The G spot quota where the GPU flavors launch: us-east-2, the home site (kvm-gpu-96; the default there is 64 vCPU, too few
-# for one g4dn.metal), and us-west-2 (kvm-gpu-64, which us-east-2 does not offer). L-3819A6DF = "All G and VT Spot Instance
+# for one g4dn.metal), us-west-2 (kvm-gpu-64, which us-east-2 does not offer), and us-east-1, a fallback site for kvm-gpu-96
+# whose 64 vCPU could never fit one g4dn.metal (ejc3/aws#630; aws.dr is this account's us-east-1 provider). L-3819A6DF = "All G and VT Spot Instance
 # Requests", in vCPU; one box of the largest GPU flavor needs 96. The current value is read here at plan time (the metal
 # boxes can read it too since ejc3/aws#588, but only an administrator may request more): when it already covers one box
 # nothing is requested, otherwise the apply files a RequestServiceQuotaIncrease (see ohio_spot_standard in ohio-pbox.tf for
@@ -184,6 +205,19 @@ resource "aws_servicequotas_service_quota" "west2_spot_g" {
   service_code = "ec2"
   quota_code   = "L-3819A6DF"
   value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.west2_spot_g.value)
+}
+
+data "aws_servicequotas_service_quota" "east1_spot_g" {
+  provider     = aws.dr
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+}
+
+resource "aws_servicequotas_service_quota" "east1_spot_g" {
+  provider     = aws.dr
+  service_code = "ec2"
+  quota_code   = "L-3819A6DF"
+  value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.east1_spot_g.value)
 }
 
 # ---------------------------------------------------------------------------------

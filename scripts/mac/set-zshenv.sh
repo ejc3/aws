@@ -1,7 +1,7 @@
 #!/bin/sh
 # set-zshenv.sh FILE: make FILE (~/.zshenv) end with the managed block that puts ~/.local/bin first on
 # PATH, so every zsh, non-interactive SSH sessions included, finds the swift/xcodebuild/xcrun shims and
-# the other agent tools before /usr/bin. The block is authoritative: whatever FILE does to PATH before it,
+# the other agent tools before /usr/bin, and that puts TMPDIR on the disk ~/.config/mac-setup/tmpdir names, if any. The block is authoritative: whatever FILE does to PATH before it,
 # the block runs last. An earlier copy of the block is removed and the current one appended, so a rerun
 # leaves an up-to-date FILE unchanged. Installed by ejc3/aws scripts/mac-setup.sh (scripts/mac/install.zsh).
 set -eu
@@ -12,6 +12,13 @@ block="$begin (ejc3/aws scripts/mac-setup.sh; rewritten on every run, keep it la
 typeset -U path
 path=(\"\$HOME/.local/bin\" \$path)
 export PATH
+# Temporary files (build products, a test run's DerivedData) on the disk named in
+# ~/.config/mac-setup/tmpdir, when that file exists and the disk is mounted; else the system default.
+if [[ -r \$HOME/.config/mac-setup/tmpdir ]]; then
+  _mac_tmp=\$(<\$HOME/.config/mac-setup/tmpdir)
+  if [[ -n \$_mac_tmp && -d \${_mac_tmp:h} ]] && mkdir -p -m 700 \$_mac_tmp 2>/dev/null; then export TMPDIR=\$_mac_tmp/; fi
+  unset _mac_tmp
+fi
 $end"
 [ -e "$f" ] || : > "$f"
 tmp="$f.mac-setup.$$"

@@ -201,7 +201,7 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
 
 People's email addresses are not in this repository. `people/addresses` (us-west-1, from `people.tf`) holds them as JSON:
 `owner` (the browser manager's owner), `family` (the Cloudflare Access allowlist for every `*.cc-games.dev` host) and
-`staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email) and, optionally,
+`staging_account` (the dev-staging account's root email), `dolphin_account` (the Dolphin account's root email), `astryx_account` (the astryx account's root email) and, optionally,
 `dolphin_steve` (Steve's Identity Center sign-in to the Dolphin account). To add someone to the allowlist, put the whole JSON again with the
 new address in `family` (a plan on a jumpbox then shows the Access policies changing; apply it). Terraform fails a plan,
 naming the key, if the secret is missing a key or `family` is empty. The optional `claude_master_dashboard` list names who,
@@ -332,7 +332,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number (`pbox up FLAVOR`: any flavor but kvm). Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
-| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
+| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. At most eight healthy ARM64 and four x86 runners; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
@@ -432,6 +432,12 @@ repository on this host during the preceding 30 days, its local Git checkout has
 during that period, or its worktree has uncommitted changes. Only `github.com/ejc3/*`
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
+
+### From the MacBook to the Next.js server
+
+On the owner's Mac, `ssh nextjs` opens the owner's `ejc3` container on the Next.js server. It uses the Mac's existing
+Touch ID SSH key; approve its authentication prompt when connecting. The public key is declared in
+`local.nextjs_user_keys.ejc3` so access survives a rebuild. The Mac's SSH entry uses the server's stable Elastic IP.
 
 ### SSH to the MacBook: `ssh mac`
 
@@ -598,6 +604,15 @@ external drive, one folder per project: `/Volumes/Scratch/<project>/`. For examp
 `BUILD_DIR` in its scripts), `tours/` (screenshots) and `scratch/` (logs, helpers).
 Simulator devices still live on the internal disk (CoreSimulator), so delete a tour's
 simulator after use. Never write a project's files into `~/src` loose.
+
+Temporary files follow the same rule. Anything a session creates with `mktemp` (a test
+run's DerivedData, a build's intermediates) lands in `TMPDIR`, which by default is on
+the internal disk; one week of UI-test runs left 18 GB there and stopped every build
+at the 12 GB floor. The managed `~/.zshenv` block (`scripts/mac/set-zshenv.sh`) points
+`TMPDIR` at the folder named in `~/.config/mac-setup/tmpdir` when that file exists and
+its disk is mounted, for every zsh, non-interactive SSH sessions included; with no file,
+or the drive unplugged, the system default stays. On this Mac:
+`ssh mac 'mkdir -p ~/.config/mac-setup && echo /Volumes/Scratch/tmp > ~/.config/mac-setup/tmpdir'`.
 
 ##### MacBook: Checks
 
@@ -1064,6 +1079,8 @@ pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
+
+pbox up 3 kvm-gpu-96 --lease 3h   # not terminated for idleness for 3 hours (30m to 12h; below)
 pbox ssh [N]
 pbox down [N]              # terminate compute; keep that box's /mnt/work
 ```
@@ -1099,7 +1116,7 @@ with `--image-id` (`var.parallel_box_ami_ohio_x86` at home, each fallback site's
 reboots once, and `up` waits through that reboot before checking the GPUs.
 
 Both GPU flavors count against the "All G and VT Spot Instance Requests" quota (`L-3819A6DF`) where they launch:
-`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2 and us-west-2 at apply when the current
+`pbox-flavors.tf` requests 96 vCPU (one box of the largest GPU flavor) in us-east-2, us-west-2 and us-east-1 at apply when the current
 quota is lower. The launcher tries the flavor's types in
 turn in the availability zone of the persistent work volumes, and IAM allows exactly the flavors' types. One shared
 watchdog checks every five minutes and terminates any box after 30 minutes below 5% CPU with no disk or network
@@ -1116,6 +1133,20 @@ at a fallback site), which Terraform makes from the same definition as the spot 
 shows it as ON-DEMAND, and the idle watchdog terminates it after 30 idle minutes like a spot box. It works with `--fallback`,
 `--regions`, `--open` and the GPU flavors; it is refused for other commands and for a member's pbox, whose grant allows spot
 only. `parallel_box_spot = false` still switches every launch to on-demand at once, with an apply.
+
+Interactive and GPU work has idle stretches: between a finished setup and the next test, or while a failed test is read.
+`pbox up N FLAVOR --lease DURATION` (`90m`, `2h`, `1h30m`; 30 minutes to 12 hours) tags the box `PboxLeaseUntil` with the
+lease's end, and the watchdog does not terminate it for idleness until then; after that the normal rule applies. The
+watchdog ends any lease at 12 hours from launch, whatever the tag says. **A leased box costs money for the whole lease**,
+busy or not: a `kvm-gpu-96` is about $4/hr spot, so a 12-hour lease is about $50. `pbox status` shows
+`lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. The lease is set at launch only; a running box keeps what it has
+(`pbox down N`, then `up` again with `--lease`). Members' boxes take no lease.
+
+Several jobs share the eight slots, and a slot can hold a different instance minutes after a script looked it up. `pbox up`
+ends with `launched box=N ... id=i-...` (with ` failed=<reason>` and exit 1 when the box was launched but did not come up),
+so scripts carry that id and use `pbox ip|ssh|down N --instance i-...`, which refuse when the slot holds another instance;
+they never re-resolve a slot by name. `pbox down N` without `--instance` also refuses a box another caller launched in the
+last hour (its `PboxLaunchedBy` tag, set from `PBOX_CALLER`, by default the host) unless `--force`.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and
@@ -1524,6 +1555,45 @@ so fcvm-metal-x86 cannot) and `dolphin-labs-testflight` (dolphin-labs CI's TestF
 sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
 and put a new one the same way to rotate.
 
+### Astryx Swift: self-serve TestFlight invitations
+
+`https://astryx-join.dolphin-labs.dev` (`astryx-join.tf`) is a public form: anyone types an @meta.com address, passes
+Cloudflare Turnstile, and the Worker adds the address to the Astryx Swift beta group "Meta (self-serve)" through the App
+Store Connect API. There is no sign-in (an Access gate would cost a Zero Trust seat per person), so an address is not
+proven when it is typed; the invitation can only be accepted from that inbox, and 5 requests per IP an hour and 500 a
+day bound abuse. Nothing is built until the key's secret exists; the first apply after that builds the whole host. Once:
+
+1. In App Store Connect, Users and Access, Integrations, App Store Connect API, Team Keys, create a key named for this
+   use with the **App Manager** role (the lowest that manages testers; not Admin, and never the Games Worth Watching
+   key). Download its `.p8` file (`AuthKey_<KEY_ID>.p8`) into the current directory and note the Issuer ID and Key ID.
+2. With credentials for the **astryx account** (from the owner's container, the `terraform_role` in SSM `/infra/astryx`;
+   from a jumpbox, the account's OrganizationAccountAccessRole), create the secret with the three values as one JSON
+   object without echoing them, then delete the file:
+
+   ```bash
+   read -rs ISSUER; read -rs KEY_ID
+   set -o pipefail
+   jq -n --arg i "$ISSUER" --arg k "$KEY_ID" --rawfile p "AuthKey_${KEY_ID}.p8" \
+     '{ISSUER_ID: $i, KEY_ID: $k, PRIVATE_KEY: $p}' \
+     | aws secretsmanager create-secret --region us-west-1 --name astryx/testflight-asc-key \
+         --description "App Manager key for Astryx Swift TestFlight invitations (astryx-join.tf)" \
+         --secret-string file:///dev/stdin >/dev/null \
+     && rm "AuthKey_${KEY_ID}.p8"
+   unset ISSUER KEY_ID
+   ```
+
+3. Apply. Terraform puts an administration-only read policy on the secret and builds, in order, the record, the KV
+   namespace for the limits, the Turnstile widget (managed, this host only), the Worker with the key and the widget's
+   secret as its secrets, the route, and last the Access bypass for exactly this host. The widget needs Turnstile write
+   on the provider token `cloudflare-tunnel-token` (AGENTS.md, "Astryx Swift TestFlight invitations").
+
+Rotate: create a new App Manager key, `put-secret-value` the same JSON to `astryx/testflight-asc-key` (astryx account), apply, then
+revoke the old key. Stop: revoke the key in App Store Connect (invitations fail at once); to remove the host too,
+`aws secretsmanager delete-secret --force-delete-without-recovery --secret-id astryx/testflight-asc-key` and apply.
+
+Limits: Apple allows 10,000 external testers per app; a new build version needs Beta App Review before the group's
+testers get it.
+
 ### Colton Games accounts: sign-in, site admins and push
 
 `colton-games-accounts.tf` holds what the site's accounts features need outside the games
@@ -1709,9 +1779,9 @@ and completely, until 2026-08-07. That ownership takes effect at the one-time ho
 and the first apply after it (see Prerequisites); a state that has not run them yet still
 has the pre-Terraform secret live on the hook.
 
-The maximum is four runners per architecture, counted as runners GitHub can actually hand a
-job to rather than instances that merely exist, so a wedged box cannot hold a slot. Each
-scale-up decision emits a `GitHubRunners` metric and a structured log line. Two alarms
+The maximum is eight arm64 and four x86 runners (`local.runner_max_by_arch`), counted as
+runners GitHub can actually hand a job to rather than instances that merely exist, so a
+wedged box cannot hold a slot. Each scale-up decision emits a `GitHubRunners` metric and a structured log line. Two alarms
 watch them: `runner-scale-up-starved` fires when queued work goes unserved for two hours
 (a wedged pool, or one genuinely that far behind — a single poll cannot tell them apart,
 because a host that wedges mid-job keeps reporting `busy` to GitHub), and
@@ -1892,13 +1962,13 @@ switch-over in a fixed order so the loops never run in both places:
    The loops commit straight to dolphin-maps' main, which has no ruleset today; if it ever gets one, add this app
    as a bypass actor first or every pass fails.
 2. **The first deploy.** Set dolphin-maps' repository variables from output `dolphin_maps_loop` and run its
-   `deploy-loop.yml` on main; it uploads the bundle and updates both functions' code (the handler stays
-   `index.handler`). Invoke each once by hand and read its journal: `{"mode": "sweep"}` any time, `{"mode": "live"}`
+   `deploy-loop.yml` on main; it uploads the bundle and updates the three functions' code (the handler stays
+   `index.handler`). Invoke each once by hand and read its journal: `{"mode": "sweep"}` any time, `{"mode": "refit"}` any time (it reads no page; its journal record is the refit's log, and its duration is the number to check against the 12-minute guard deadline), `{"mode": "live"}`
    only inside a route's morning window (weekdays 06:00-08:55 Los Angeles time): outside one the live handler returns
    before reading a secret or writing a record, so it proves nothing.
 3. **The switch-over, back to back:** set dolphin-maps' repository variable `LOOPS_RUN_IN_AWS` to `true` (its
    `scrape-live.yml` and `scrape-weekly.yml` then stand down), then set `dolphin_maps_loop_enabled = true` here and
-   apply (the two schedules and the not-running alarms come on). To go back, the reverse order: the gate false and
+   apply (the three schedules and the not-running alarms come on). To go back, the reverse order: the gate false and
    apply first (the schedules stop), then the variable false (the GitHub loops resume).
 
 Every setup script also gives an account that has no user-level agent instructions a
@@ -2830,6 +2900,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | Free external-access findings | `security-external-access.tf` |
 | Global S3 public-access defaults | `security-s3-account.tf` |
 | The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
+| The astryx member account (Astryx sync): account and OU with a us-west-1 SCP, its Terraform state bucket, the `astryx-terraform` apply role (fcvm-arm pinned, and the owner's nextjs-ct container), `/infra/astryx`, and staging's hostname, tunnel and Access on `/native/login`. Its own resources live in `ejc3/astryx-infra` | `astryx-account.tf`, `astryx-stage.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |

@@ -301,8 +301,9 @@ class GpuQuota(unittest.TestCase):
         self.assertIn('pbox_gpu_spot_vcpus = max([for f in keys(local.pbox_flavors) : tonumber(trimprefix(f, "kvm-gpu-")) '
                       'if startswith(f, "kvm-gpu-")]...)', FLAVORS_TF)
         self.assertEqual(max(int(v[0]) for f, v in script_menu().items() if f.startswith("kvm-gpu-")), 96)
-        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer
-        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2")):
+        # us-east-2: the home site, where kvm-gpu-96 launches; us-west-2: kvm-gpu-64, which us-east-2 does not offer;
+        # us-east-1: a kvm-gpu-96 fallback site whose default 64 vCPU fits no g4dn.metal (#630)
+        for name, provider in (("ohio_spot_g", "aws.ohio"), ("west2_spot_g", "aws.west2"), ("east1_spot_g", "aws.dr")):
             with self.subTest(quota=name):
                 for kind in ("data", "resource"):
                     b = block(FLAVORS_TF, '%s "aws_servicequotas_service_quota" "%s"' % (kind, name))
@@ -311,9 +312,9 @@ class GpuQuota(unittest.TestCase):
                 b = block(FLAVORS_TF, 'resource "aws_servicequotas_service_quota" "%s"' % name)
                 self.assertIn("value        = max(local.pbox_gpu_spot_vcpus, data.aws_servicequotas_service_quota.%s.value)" % name, b)
         self.assertIn('parallel_box_region = "us-east-2"', OHIO)
-        # nothing else owns the G spot quota
-        tf = "".join(p.read_text() for p in ROOT.glob("*.tf"))
-        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 2)
+        # nothing else in this account owns the G spot quota (fcvm-fleet-account.tf sets its own account's, #605)
+        tf = "".join(p.read_text() for p in ROOT.glob("*.tf") if p.name != "fcvm-fleet-account.tf")
+        self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 3)
 
 
 class GpuCheckRuns(unittest.TestCase):
@@ -404,10 +405,28 @@ class GpuVfio(unittest.TestCase):
         self.assertIn("ubuntu hard memlock unlimited", g)
         self.assertNotRegex(g, r"nvidia-(driver|utils|dkms)|cuda")  # the host never drives the GPUs
 
+    def test_every_apt_call_in_a_pbox_boot_waits_for_the_dpkg_lock(self):
+        # ejc3/aws#609: the boot-time package run held the dpkg lock, driverctl failed to install, every GPU stayed on nouveau.
+        import re as _re
+        for f in ("parallel-box-launch.tf", "pbox-fallback.tf", "member-pbox.tf", "pbox-flavors.tf"):
+            checked = 0
+            for line in (ROOT / f).read_text().splitlines():
+                # Options may sit between apt-get and the subcommand (-o ..., -y), so match any words before it.
+                if _re.search(r"\bapt-get(?:\s+\S+)*?\s+(update|install)\b", line) and not line.lstrip().startswith("#"):
+                    checked += 1
+                    self.assertIn("-o DPkg::Lock::Timeout=300", line, f"{f}: {line.strip()}")
+            self.assertGreater(checked, 0, f"{f}: no apt-get update/install command found")
+
+    def test_a_missing_driverctl_stops_the_gpu_step_loudly(self):
+        gpu = (ROOT / "pbox-flavors.tf").read_text().split("pbox_gpu_vfio_setup = <<-GPU", 1)[1].split("\n  GPU\n", 1)[0]
+        self.assertIn("if ! command -v driverctl >/dev/null; then", gpu)
+        self.assertIn("pbox GPU setup FAILED: driverctl is not installed", gpu)
+        self.assertLess(gpu.index("command -v driverctl"), gpu.index("driverctl set-override"))
+
     def test_the_home_and_fallback_boots_run_it_once_after_apt_and_the_members_do_not(self):
         for text in (LAUNCH, FALLBACK):
             self.assertEqual(text.count("${local.pbox_gpu_vfio_setup}"), 1)
-            self.assertLess(text.index("apt-get update"), text.index("${local.pbox_gpu_vfio_setup}"))
+            self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 update"), text.index("${local.pbox_gpu_vfio_setup}"))
         self.assertNotIn("pbox_gpu_vfio_setup", MEMBER)
 
     def test_up_checks_the_gpus_are_vfio_pcis_on_a_gpu_type_after_the_boot_script(self):
@@ -520,10 +539,30 @@ class GpuIommuReboot(unittest.TestCase):
             at = text.index("${local.pbox_gpu_iommu_reboot}")
             # after the dev-hop key (idempotent), before anything that is not: the work volume, apt, NVMe, vfio
             self.assertLess(text.index("chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys"), at)
-            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get update", "${local.pbox_local_nvme_setup}",
+            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get -o DPkg::Lock::Timeout=300 update", "${local.pbox_local_nvme_setup}",
                           "${local.pbox_gpu_vfio_setup}"):
                 self.assertLess(at, text.index(later), later)
         self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
+
+
+class SecurityUpdatesAtBoot(unittest.TestCase):
+    # Owner, 2026-10-23: install security updates at every pbox boot, so a launch does not bring the stock image's fixable
+    # package findings back to Inspector. The security pocket only, never a reboot, and a box that cannot update still boots.
+    def test_the_snippet_installs_security_updates_only_and_retries_a_busy_lock(self):
+        sec = FLAVORS_TF.split("pbox_security_updates = <<-SEC", 1)[1].split("\n  SEC\n", 1)[0]
+        self.assertIn("unattended-upgrade -v && break", sec)
+        self.assertIn("for _ in $(seq 1 10); do", sec)
+        self.assertIn("command -v unattended-upgrade >/dev/null || apt-get -o DPkg::Lock::Timeout=300 install -y unattended-upgrades", sec)
+        for forbidden in ("reboot", "dist-upgrade", "full-upgrade", "apt-get upgrade", "exit 1"):
+            self.assertNotIn(forbidden, sec, forbidden)
+
+    def test_every_pbox_boot_runs_it_once_after_apt_install(self):
+        for name, text in (("home", LAUNCH), ("fallback", FALLBACK), ("member", MEMBER)):
+            with self.subTest(boot=name):
+                self.assertEqual(text.count("${local.pbox_security_updates}"), 1)
+                at = text.index("${local.pbox_security_updates}")
+                self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 install -y parallel build-essential git htop"), at)
+                self.assertLess(at, text.index("${local.pbox_local_nvme_setup}"))
 
 
 class LocalNvme(unittest.TestCase):
@@ -539,7 +578,7 @@ class LocalNvme(unittest.TestCase):
         for text in (LAUNCH, MEMBER, FALLBACK):
             self.assertEqual(text.count("${local.pbox_local_nvme_setup}"), 1)
             # after apt-get update (mdadm), after the work volume is mounted
-            self.assertLess(text.index("apt-get update"), text.index("${local.pbox_local_nvme_setup}"))
+            self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 update"), text.index("${local.pbox_local_nvme_setup}"))
             self.assertLess(text.index("mount \"$DEV\" /mnt/work"), text.index("${local.pbox_local_nvme_setup}"))
 
 

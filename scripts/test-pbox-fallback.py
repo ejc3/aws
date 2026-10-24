@@ -169,7 +169,7 @@ class FallbackScript(unittest.TestCase):
         rc, out, err = self.pbox("up", "4", "compute-192", "--fallback", capacity="us-west-2/us-west-2b us-east-1/us-east-1a")
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.strip().splitlines()[-1],
-                         "launched box=4 region=us-west-2 az=us-west-2b type=c8g.48xlarge ip=203.0.113.9 work=fresh")
+                         "launched box=4 region=us-west-2 az=us-west-2b type=c8g.48xlarge ip=203.0.113.9 id=i-0fallback work=fresh")
         runs = self.calls("run-instances")
         self.assertNotIn("--subnet-id", runs[0])  # home first
         fb = [c for c in runs if "--subnet-id" in c]
@@ -194,7 +194,7 @@ class FallbackScript(unittest.TestCase):
                                  FAKE_SSH_LOG=str(ssh_log), FAKE_GPU_RCS="255 75 0")
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.strip().splitlines()[-1],
-                         "launched box=4 region=us-west-2 az=us-west-2b type=g4dn.metal ip=203.0.113.9 work=fresh")
+                         "launched box=4 region=us-west-2 az=us-west-2b type=g4dn.metal ip=203.0.113.9 id=i-0fallback work=fresh")
         runs = self.calls("run-instances")
         home = [c for c in runs if "--subnet-id" not in c]
         fb = [c for c in runs if "--subnet-id" in c]
@@ -229,7 +229,7 @@ class FallbackScript(unittest.TestCase):
     def test_regions_limits_the_search(self):
         rc, out, err = self.pbox("up", "2", "compute-192", "--regions", "us-east-1", capacity="us-west-2/us-west-2b us-east-1/us-east-1b")
         self.assertEqual(rc, 0, err)
-        self.assertTrue(out.strip().endswith("region=us-east-1 az=us-east-1b type=c8g.48xlarge ip=203.0.113.9 work=fresh"))
+        self.assertTrue(out.strip().endswith("region=us-east-1 az=us-east-1b type=c8g.48xlarge ip=203.0.113.9 id=i-0fallback work=fresh"))
         self.assertFalse(any("subnet-w2b" in c for c in self.calls("run-instances")))
 
     def test_regions_still_finds_a_box_running_outside_them(self):
