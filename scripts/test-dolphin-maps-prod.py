@@ -211,6 +211,18 @@ class LoaderTests(unittest.TestCase):
             self.assertNotIn(secret, out)
         self.assertFalse(self.log.exists())
 
+    def test_all_moderation_names_are_required_and_other_managed_names_are_preserved(self):
+        for name in self.MANAGED:
+            with self.subTest(name=name):
+                r, out = self.run_loader(self.VALUES, managed={k: v for k, v in self.MANAGED.items() if k != name})
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name, out)
+                self.assertFalse(self.log.exists(), "a missing moderation binding must not reach Wrangler")
+        extra = {**self.MANAGED, "EXTRA_MANAGED": "extra-managed-value-0123"}
+        r, out = self.run_loader(self.VALUES, managed=extra)
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.VALUES, **extra})
+
     def test_it_prints_names_never_values_or_credentials(self):
         r, out = self.run_loader(self.VALUES)
         self.assertIn("APPLE_PRIVATE_KEY", out)

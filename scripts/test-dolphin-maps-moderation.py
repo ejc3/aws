@@ -103,7 +103,8 @@ class KeyTests(unittest.TestCase):
         self.assertIn("dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;", stage)
         self.assertIn('read_or_say "workers-stage/$SITE/terraform"', stage)
         for name in NAMES:
-            self.assertNotIn(name, prod)  # never an out-of-band name: the loader would refuse it in both
+            out_of_band = " ".join(re.findall(r'OUT_OF_BAND_NAMES\+?="([^"]+)"', case))
+            self.assertNotIn(name, out_of_band)  # required managed names are never also out of band
 
 
 class AlarmTests(unittest.TestCase):

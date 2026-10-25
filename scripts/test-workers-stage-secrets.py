@@ -198,6 +198,20 @@ class LoaderTests(unittest.TestCase):
         self.assertIn("ResourceNotFoundException", out)
         self.assertFalse(self.log.exists(), "wrangler must not run")
 
+    def test_all_moderation_names_are_required_and_other_managed_names_are_preserved(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        for name in self.MANAGED:
+            with self.subTest(name=name):
+                partial = {k: v for k, v in self.MANAGED.items() if k != name}
+                r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), managed_json=json.dumps(partial))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name, out)
+                self.assertFalse(self.log.exists(), "a missing moderation binding must not reach Wrangler")
+        extra = {**self.MANAGED, "EXTRA_MANAGED": "extra-managed-value-0123"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), managed_json=json.dumps(extra))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **extra})
+
     def test_other_sites_never_assume_a_role(self):
         r, out = self.run_loader("imagine", stage_json=json.dumps({"A": "b"}))
         self.assertEqual(r.returncode, 0, out)

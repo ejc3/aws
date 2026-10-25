@@ -91,6 +91,12 @@ for label in ("OUT_OF_BAND", "MANAGED"):
         if k in merged:
             sys.exit("%s is in both containers: each name has one owner (workers-stage-secrets.tf)" % k)
         merged[k] = v
+if sys.argv[1] == "dolphin-maps":
+    required = {"MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_SECRET_ACCESS_KEY",
+                "MODERATION_AWS_REGION", "MODERATION_TEXT_REGION"}
+    missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
+    if missing:
+        sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
 print("workers-stage/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")

@@ -99,6 +99,12 @@ for label in ("OUT_OF_BAND", "MANAGED"):
         merged[k] = v
     if label == "OUT_OF_BAND" and sorted(d) != sorted(os.environ["OUT_OF_BAND_NAMES"].split()):
         sys.exit("workers-prod/%s must hold exactly: %s (it holds: %s)" % (sys.argv[1], os.environ["OUT_OF_BAND_NAMES"], " ".join(sorted(d))))
+if sys.argv[1] == "dolphin-maps":
+    required = {"MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_SECRET_ACCESS_KEY",
+                "MODERATION_AWS_REGION", "MODERATION_TEXT_REGION"}
+    missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
+    if missing:
+        sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
 print("workers-prod/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")
