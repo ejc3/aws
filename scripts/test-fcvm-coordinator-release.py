@@ -37,6 +37,7 @@ class AWS:
     def __init__(self):
         self.lock = None
         self.image = REPO + "@sha256:" + "c" * 64
+        self.version = 1
         self.arn = OLD
         self.calls = []
         self.fail_rollout = False
@@ -77,11 +78,12 @@ class AWS:
         return copy.deepcopy(self.old)
 
     def get_parameter(self, **kwargs):
-        return {"Parameter": {"Value": self.image}}
+        return {"Parameter": {"Value": self.image, "Version": self.version}}
 
     def put_parameter(self, **kwargs):
         assert self.lock, "pointer write outside the Terraform backend lock"
         self.image = kwargs["Value"]
+        self.version += 1
         self.calls.append("pointer")
 
     def register_task_definition(self, **kwargs):
@@ -143,7 +145,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result["status"], "deployed")
         self.assertEqual(self.aws.arn, NEW)
         self.assertEqual(self.aws.image, REPO + "@" + DIGEST)
-        self.assertEqual(self.aws.calls, ["lock", "register", NEW, "pointer", "unlock"])
+        self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, "pointer", "unlock"])
         self.assertIsNone(self.aws.lock)
 
     def test_an_already_deployed_digest_is_idempotent(self):
@@ -162,7 +164,18 @@ class ReleaseTests(unittest.TestCase):
         self.aws.old["taskDefinition"]["family"] = "another-service"
         with self.assertRaisesRegex(ValueError, "task family"):
             self.run_release()
-        self.assertEqual(self.aws.calls, ["lock", "unlock"])
+        self.assertNotIn("register", self.aws.calls)
+        self.assertEqual(self.aws.calls[-1], "unlock")
+
+    def test_a_failed_registration_still_invalidates_earlier_saved_plans(self):
+        old_image, old_version = self.aws.image, self.aws.version
+        def failed(**kwargs):
+            raise RuntimeError("registration failed")
+        self.aws.register_task_definition = failed
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            self.run_release()
+        self.assertEqual(self.aws.image, old_image)
+        self.assertGreater(self.aws.version, old_version)
 
     def test_a_failed_rollout_restores_the_previous_task_and_pointer(self):
         self.aws.fail_rollout = True
@@ -171,7 +184,7 @@ class ReleaseTests(unittest.TestCase):
             self.run_release()
         self.assertEqual(self.aws.arn, OLD)
         self.assertEqual(self.aws.image, old)
-        self.assertEqual(self.aws.calls, ["lock", "register", NEW, OLD, "pointer", "deregister:" + NEW, "unlock"])
+        self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, OLD, "pointer", "deregister:" + NEW, "unlock"])
 
     def test_the_lock_delete_checks_the_unique_owner(self):
         real = self.aws.update_service

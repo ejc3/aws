@@ -37,3 +37,6 @@ jobs:
 
       - name: Verify CI privilege boundaries
         run: python3 scripts/test-ci-security.py
+
+      - name: Saved plans reject intervening coordinator releases (synthetic SSM only)
+        run: python3 -S -B scripts/test-fcvm-stale-plan.py

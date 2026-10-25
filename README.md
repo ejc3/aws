@@ -366,7 +366,9 @@ tile in each half, and receives renderer frames over IPv4 under fresh DNS names.
 the GPU fleet; a capacity shortage fails the live check. CI has no Terraform-state access,
 administrator role or direct ECS permissions. Its deployed code has the coordinator's existing
 fleet-account runtime permissions. Environment variables and the staging-only Access token
-are provisioned by Terraform, with no manual CI setup.
+are provisioned by Terraform, with no manual CI setup. If CI releases between a saved
+plan and its apply, an apply-time parameter-version check rejects the stale plan; run
+a fresh plan. This check also detects a release attempt that rolled back to the same image.
 
 List current connection commands:
 

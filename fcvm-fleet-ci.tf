@@ -31,6 +31,20 @@ data "aws_ssm_parameter" "fcvm_coordinator_release" {
   with_decryption = false
 }
 
+# Saved plans freeze data-source reads. Re-open this parameter at apply time,
+# under the backend lock, so a CI release between plan and apply invalidates it.
+ephemeral "aws_ssm_parameter" "fcvm_coordinator_release_guard" {
+  provider        = aws.fcvm_fleet
+  arn             = aws_ssm_parameter.fcvm_coordinator_release.arn
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition     = self.version == data.aws_ssm_parameter.fcvm_coordinator_release.version
+      error_message = "The staging coordinator release changed after this plan; create a fresh plan before applying."
+    }
+  }
+}
+
 resource "github_repository_environment" "fcvm_stage" {
   provider          = github.agents_md
   repository        = "fcvm"

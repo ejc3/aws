@@ -1679,7 +1679,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   backend lock as Terraform, clones the running task definition changing only its image, and
   records the successful digest in `/fcvm-fleet/stage/coordinator-image`. Terraform reads that
   software release pointer and tracks the latest active task revision; no task/service fields
-  are ignored. Infrastructure still changes only through Terraform from a jumpbox.
+  are ignored. Before its first ECS mutation the function increments the pointer's parameter
+  version. An ephemeral apply-time check rejects a saved plan made before that increment,
+  including when a failed release restores the previous image. Infrastructure still changes
+  only through Terraform from a jumpbox.
 - **On-demand fallback** (`fcvm-fleet-hosts-on-demand`, beside each spot group): Auto Scaling does not move a spot group's
   capacity to on demand by itself, so the coordinator does (`--on-demand-group`, `--spot-wait`): a wake whose spot group
   stays short gives the on-demand group the shortfall, and sleep sets both groups to 0. `max_size` is

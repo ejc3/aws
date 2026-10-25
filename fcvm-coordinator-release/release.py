@@ -97,7 +97,12 @@ def deploy(event, ddb, ecs, ssm, ecr, *, remaining_ms=lambda: 850_000):
         if previous == image:
             wait_for(ecs, old_arn, time.monotonic() + 60)
             return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest}
-        new_arn = ecs.register_task_definition(**task_input(old, image))["taskDefinition"]["taskDefinitionArn"]
+        definition = task_input(old, image)
+        # Bump the parameter version BEFORE the first ECS change. The ephemeral
+        # Terraform guard then rejects older saved plans, even after rollback or
+        # a failed registration that leaves the image value unchanged.
+        ssm.put_parameter(Name=parameter, Value=previous, Type="String", Overwrite=True)
+        new_arn = ecs.register_task_definition(**definition)["taskDefinition"]["taskDefinitionArn"]
         ecs.update_service(cluster="fcvm-fleet", service="fcvm-fleet-coordinator", taskDefinition=new_arn)
         # Reserve time for a rollback and releasing the backend lock on every invocation.
         wait_for(ecs, new_arn, time.monotonic() + min(480, max(5, remaining_ms() / 1000 - 240)))

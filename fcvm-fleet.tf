@@ -438,7 +438,7 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
 # execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
-# cannot change under it; the 20 newest are kept, which outlasts any one rollout.
+# cannot change under it; the bootstrap image and the 20 newest are kept.
 resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
   provider             = aws.fcvm_fleet
   name                 = "fcvm-fleet/coordinator"
@@ -666,6 +666,7 @@ resource "aws_security_group" "fcvm_fleet_coordinator" {
 }
 
 resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
+  depends_on               = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard]
   provider                 = aws.fcvm_fleet
   family                   = "fcvm-fleet-coordinator"
   requires_compatibilities = ["FARGATE"]
@@ -729,6 +730,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
 }
 
 resource "aws_ecs_service" "fcvm_fleet_coordinator" {
+  depends_on      = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard]
   provider        = aws.fcvm_fleet
   name            = "fcvm-fleet-coordinator"
   cluster         = aws_ecs_cluster.fcvm_fleet.id
