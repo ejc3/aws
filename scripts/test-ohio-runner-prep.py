@@ -134,7 +134,7 @@ class TerraformTests(unittest.TestCase):
         app = (ROOT / "runner-app.tf").read_text()
         self.assertEqual(rules(TF, "ohio_runner_app")[1], 0, "app runners run other people's code: no inbound")
         self.assertEqual(rules(TF, "ohio_runner_app"), rules(app, "runner_app"))
-        ops = ["aws_eip.jumpbox[0]", "aws_eip.firecracker_dev[0]", "aws_eip.x86_dev[0]"]
+        ops = ["aws_eip.jumpbox[0]", "aws_eip.firecracker_dev[0]", "aws_eip.firecracker_dev_next[0]", "aws_eip.x86_dev[0]"]
         for op in ops:
             self.assertIn(op, re.search(r'resource "aws_security_group" "ohio_runner" \{.*?^\}', TF, re.S | re.M).group())
 
