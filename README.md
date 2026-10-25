@@ -357,6 +357,14 @@ us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
 
 ## Access and trust boundaries
 
+The Next.js containers share one memory pool in `machine.slice`: reclaim starts at 80% of
+host RAM, with bursts allowed up to an 85% hard limit and 1 GiB of combined swap. Any one
+person can still use their existing 75% allowance when the others are quiet. If the pool
+cannot reclaim enough memory, the kernel kills a process inside the containers; host SSH,
+networking and Cloudflare tunnels are outside that pool. Setup applies and persists these
+limits without restarting containers or the host. The remaining 15% is headroom for host
+services, not an allocation guarantee against memory consumed by other host processes.
+
 List current connection commands:
 
 ```bash

@@ -184,6 +184,10 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:DescribeSpotInstanceRequests",
           "ec2:DescribeInstanceTypes",
           "ec2:DescribeInstanceTypeOfferings",
+          # Reservation availability and start dates, plus existing reservations. These
+          # reads neither reserve capacity nor authorize a purchase.
+          "ec2:DescribeCapacityBlockOfferings",
+          "ec2:DescribeCapacityReservations",
           "ec2:DescribeAvailabilityZones"
         ]
         Resource = "*"
