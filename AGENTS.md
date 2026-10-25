@@ -1765,6 +1765,24 @@ Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the 
 - **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - Not yet covered: security monitoring like the Dolphin account's.
 
+### Sending as the Dolphin Labs work address (dolphin-labs-email-send.tf)
+
+The ej alias on dolphin-labs.dev receives through Cloudflare Email Routing (`dolphin-labs-email.tf`) and sends through
+Amazon SES in the Dolphin account (us-west-1), from the owner's Gmail ("Send mail as" over SMTP). Inbound is unchanged:
+the apex MX, SPF TXT and Cloudflare's DKIM key stay Email Routing's.
+
+- **Alignment:** Easy DKIM signs as dolphin-labs.dev (three `_domainkey` CNAMEs); the envelope sender is the custom MAIL
+  FROM `bounce.dolphin-labs.dev` (MX to SES feedback, its own SPF), so SPF aligns without an SES include on the apex;
+  `_dmarc` is `p=none` with aggregate reports to the ej alias.
+- **Sender:** IAM user `dolphin-labs-ej-smtp`, `ses:SendRawEmail` on that identity with `ses:FromAddress` the ej alias
+  only. Its SMTP user name and derived password are written only to `dolphin-labs/ej-smtp` in the Dolphin account
+  (administration only; never an output). Alarm `dolphin-labs-ej-send-volume` (on `dolphin-alerts`) fires above 100 sends
+  an hour. Rotate with `terraform apply -replace='aws_iam_access_key.dolphin_labs_ej_smtp[0]'`, then the new password
+  into Gmail.
+- **Once, by hand:** SES production access for the Dolphin account in us-west-1 (no Terraform resource exists:
+  `aws sesv2 put-account-details --production-access-enabled ...` in an OrganizationAccountAccessRole session there; AWS
+  reviews it), then the Gmail setting. Until then the account is in the SES sandbox and sends only to verified addresses.
+
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
