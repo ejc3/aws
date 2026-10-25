@@ -224,7 +224,7 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn('[for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"] :', s)
         self.assertNotIn('Resource = "*"', s)
         d = self.stmt("DescribeTheHostGroups")
-        self.assertIn('Action   = "autoscaling:DescribeAutoScalingGroups"', d)
+        self.assertIn('Action   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"]', d)
         self.assertNotRegex(self.TF, r'"autoscaling:\*"')
         group = block('resource "aws_autoscaling_group" "hosts"', MOD)
         self.assertIn("ignore_changes = [desired_capacity]", group)
