@@ -78,14 +78,25 @@ locals {
   # The agent's --tls-publish-base and the fleet security group's port range both come from these two numbers.
   fcvm_fleet_slot_tls_port_base = 20200
   fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
+
+  # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
+  # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
+  # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
+  # stack); an image without them refuses the argument and does not start, so the switch moves with the images.
+  fcvm_fleet_aggregated = false
+  # A host aggregator's IPv4 path: the port after the slots', on the host's public IPv4 address (one address per host, a
+  # port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
+  # on fcvm_fleet_aggregate_port, which the security group does not admit.
+  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots
+  fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
   # The zone's authoritative nameservers: the coordinator publishes a launch's names only once both answer with them.
   fcvm_dev_nameservers = ["cullen.ns.cloudflare.com", "lilyana.ns.cloudflare.com"]
 
-  fcvm_fleet_host_agent_args = join(" ", [
+  fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
     "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}",
@@ -100,7 +111,10 @@ locals {
     "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
     "--store-ready-file /var/lib/fcvm-fleet/store-ready",
-  ])
+    ], local.fcvm_fleet_aggregated ? [
+    "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
+    "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
+  ] : []))
 
   # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key come from
   # the task's environment. It owns the host groups' desired capacity: 0 after 10 minutes with no viewer, 1 for the next
@@ -114,6 +128,8 @@ locals {
     ) : [],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region, "--dns-nameservers", join(",", local.fcvm_dev_nameservers)],
+    # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
+    local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:${local.fcvm_fleet_aggregate_port}", "--ec2-aggregate-tls", "--ec2-aggregate-tls-dir", "/run/fcvm-fleet/tls"] : [],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -653,6 +669,20 @@ resource "aws_security_group" "fcvm_fleet_coordinator" {
   description = "fcvm fleet coordinator task: nothing in (browsers and agents arrive through its Cloudflare tunnel), all out"
   vpc_id      = module.fcvm_fleet_east2.vpc_id
 
+  # With aggregated streaming, browsers read the EC2 half's aggregator on 443 of the task's own addresses, not through the
+  # tunnel (which Access gates and which would put Cloudflare in the media path). The coordinator's own port stays closed.
+  dynamic "ingress" {
+    for_each = local.fcvm_fleet_aggregated ? [1] : []
+    content {
+      description      = "EC2 half aggregator, TLS"
+      from_port        = 443
+      to_port          = 443
+      protocol         = "tcp"
+      cidr_blocks      = ["0.0.0.0/0"]
+      ipv6_cidr_blocks = ["::/0"]
+    }
+  }
+
   egress {
     description      = "All outbound"
     from_port        = 0
@@ -685,8 +715,15 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
     cpu_architecture        = "ARM64"
   }
 
+  dynamic "volume" {
+    for_each = local.fcvm_fleet_aggregated ? ["fleet-run"] : []
+    content {
+      name = volume.value
+    }
+  }
+
   container_definitions = jsonencode([
-    {
+    merge({
       name      = "coordinator"
       image     = local.fcvm_fleet_coordinator_running ? nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value) : "public.ecr.aws/docker/library/busybox:stable"
       essential = true
@@ -704,7 +741,14 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         logDriver = "awslogs"
         options   = { awslogs-group = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name, awslogs-region = local.fcvm_fleet_home_region, awslogs-stream-prefix = "coordinator" }
       }
-    },
+      },
+      # The EC2 half's aggregator: the image runs as 65534 and binds 443 (ip_unprivileged_port_start covers IPv6 too),
+      # and its certificate file goes on a task volume (the root file system is read-only). Absent when off, so the
+      # task definition is the same as before.
+      [for _ in(local.fcvm_fleet_aggregated ? [1] : []) : {
+        systemControls = [{ namespace = "net.ipv4.ip_unprivileged_port_start", value = "443" }]
+        mountPoints    = [{ sourceVolume = "fleet-run", containerPath = "/run/fcvm-fleet", readOnly = false }]
+    }]...),
     {
       name                   = "cloudflared"
       image                  = "cloudflare/cloudflared:${local.cloudflared_version}" # the pin claw-master-tunnel.tf keeps
@@ -727,6 +771,15 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       error_message = "The coordinator release must be an immutable digest in its own ECR repository."
     }
   }
+}
+
+# A Fargate task gets an IPv6 address in a dual-stack subnet only with this account setting; the EC2 half's aggregator is
+# named at it (agg-ec2-<token> AAAA). Without it the aggregator has its A record only.
+resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack" {
+  count    = local.fcvm_fleet_aggregated ? 1 : 0
+  provider = aws.fcvm_fleet
+  name     = "dualStackIPv6"
+  value    = "enabled"
 }
 
 resource "aws_ecs_service" "fcvm_fleet_coordinator" {
