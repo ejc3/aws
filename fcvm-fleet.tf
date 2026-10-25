@@ -78,11 +78,22 @@ locals {
   # The agent's --tls-publish-base and the fleet security group's port range both come from these two numbers.
   fcvm_fleet_slot_tls_port_base = 20200
   fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
+
+  # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
+  # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
+  # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
+  # stack); an image without them refuses the argument and does not start, so the switch moves with the images.
+  fcvm_fleet_aggregated = false
+  # A host aggregator's IPv4 path: the port after the slots', on the host's public IPv4 address (one address per host, a
+  # port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
+  # on fcvm_fleet_aggregate_port, which the security group does not admit.
+  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots
+  fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
-  fcvm_fleet_host_agent_args = join(" ", [
+  fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
     "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}",
@@ -97,7 +108,10 @@ locals {
     "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
     "--store-ready-file /var/lib/fcvm-fleet/store-ready",
-  ])
+    ], local.fcvm_fleet_aggregated ? [
+    "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
+    "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
+  ] : []))
 
   # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key come from
   # the task's environment. It owns the host groups' desired capacity: 0 after 10 minutes with no viewer, 1 for the next
@@ -113,6 +127,8 @@ locals {
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
     # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
+    # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
+    local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:${local.fcvm_fleet_aggregate_port}", "--ec2-aggregate-tls", "--ec2-aggregate-tls-dir", "/run/fcvm-fleet/tls"] : [],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -563,10 +579,13 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         "arn:aws:autoscaling:${r}:${local.fcvm_fleet_account_id}:autoScalingGroup:*:autoScalingGroupName/${g}"]])
       },
       {
-        # Reading the groups' instances while waking. DescribeAutoScalingGroups takes no resource-level permission.
+        # Reading the groups' instances while they come up, and their scaling activities: a failed spot launch (Auto
+        # Scaling records UnfulfillableCapacity or MaxSpotInstanceCountExceeded about 10 s after the raise) moves the
+        # wake to the on-demand group at once instead of after --spot-wait (ejc3/fcvm#1263). Neither Describe takes a
+        # resource-level permission.
         Sid      = "DescribeTheHostGroups"
         Effect   = "Allow"
-        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Action   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"]
         Resource = "*"
       },
       {
@@ -648,9 +667,11 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
 }
 
 resource "aws_security_group" "fcvm_fleet_coordinator" {
-  provider    = aws.fcvm_fleet
-  name        = "fcvm-fleet-coordinator"
-  description = "fcvm fleet coordinator task: DNS from its load balancer (browsers and agents arrive through its tunnel), all out"
+  provider = aws.fcvm_fleet
+  name     = "fcvm-fleet-coordinator"
+  # The description is the group's original one, kept on purpose: it is ForceNew, and replacing the group would try to
+  # delete it while the running task's interface still uses it (DependencyViolation). The ingress below is current.
+  description = "fcvm fleet coordinator task: nothing in (browsers and agents arrive through its Cloudflare tunnel), all out"
   vpc_id      = module.fcvm_fleet_east2.vpc_id
 
   # The launch names' subzone (fcvm-fleet-dns.tf): UDP arrives with the resolver's own address, and TCP and the health
@@ -669,6 +690,20 @@ resource "aws_security_group" "fcvm_fleet_coordinator" {
     to_port     = local.fcvm_fleet_dns_port
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # With aggregated streaming, browsers read the EC2 half's aggregator on 443 of the task's own addresses, not through the
+  # tunnel (which Access gates and which would put Cloudflare in the media path). The coordinator's own port stays closed.
+  dynamic "ingress" {
+    for_each = local.fcvm_fleet_aggregated ? [1] : []
+    content {
+      description      = "EC2 half aggregator, TLS"
+      from_port        = 443
+      to_port          = 443
+      protocol         = "tcp"
+      cidr_blocks      = ["0.0.0.0/0"]
+      ipv6_cidr_blocks = ["::/0"]
+    }
   }
 
   egress {
@@ -703,8 +738,15 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
     cpu_architecture        = "ARM64"
   }
 
+  dynamic "volume" {
+    for_each = local.fcvm_fleet_aggregated ? ["fleet-run"] : []
+    content {
+      name = volume.value
+    }
+  }
+
   container_definitions = jsonencode([
-    {
+    merge({
       name      = "coordinator"
       image     = local.fcvm_fleet_coordinator_running ? nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value) : "public.ecr.aws/docker/library/busybox:stable"
       essential = true
@@ -717,6 +759,11 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = "state.json" },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
+        # Each region's fleet subnets (one per AZ) and security group: a tile launch tries every AZ of a region, in this
+        # order, before the next region (ejc3/fcvm#1284), instead of only the template's subnet. An image without it
+        # ignores both variables and launches in the template's subnet.
+        { name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${join(",", m.subnet_ids)}"]) },
+        { name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${m.security_group_id}"]) },
         # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
         { name = "RUST_LOG", value = "info" },
       ]
@@ -724,7 +771,14 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         logDriver = "awslogs"
         options   = { awslogs-group = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name, awslogs-region = local.fcvm_fleet_home_region, awslogs-stream-prefix = "coordinator" }
       }
-    },
+      },
+      # The EC2 half's aggregator: the image runs as 65534 and binds 443 (ip_unprivileged_port_start covers IPv6 too),
+      # and its certificate file goes on a task volume (the root file system is read-only). Absent when off, so the
+      # task definition is the same as before.
+      [for _ in(local.fcvm_fleet_aggregated ? [1] : []) : {
+        systemControls = [{ namespace = "net.ipv4.ip_unprivileged_port_start", value = "443" }]
+        mountPoints    = [{ sourceVolume = "fleet-run", containerPath = "/run/fcvm-fleet", readOnly = false }]
+    }]...),
     {
       name                   = "cloudflared"
       image                  = "cloudflare/cloudflared:${local.cloudflared_version}" # the pin claw-master-tunnel.tf keeps
@@ -749,8 +803,18 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   }
 }
 
+# A Fargate task gets an IPv6 address in a dual-stack subnet only with this account setting; the EC2 half's aggregator is
+# named at it (agg-ec2-<token> AAAA). Without it the aggregator has its A record only.
+resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack" {
+  count    = local.fcvm_fleet_aggregated ? 1 : 0
+  provider = aws.fcvm_fleet
+  name     = "dualStackIPv6"
+  value    = "enabled"
+}
+
 resource "aws_ecs_service" "fcvm_fleet_coordinator" {
-  depends_on      = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard]
+  # The listener too: ECS refuses a target group that no load balancer uses yet, and the listener is what attaches it.
+  depends_on      = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard, aws_lb_listener.fcvm_fleet_dns]
   provider        = aws.fcvm_fleet
   name            = "fcvm-fleet-coordinator"
   cluster         = aws_ecs_cluster.fcvm_fleet.id
@@ -762,7 +826,9 @@ resource "aws_ecs_service" "fcvm_fleet_coordinator" {
   deployment_maximum_percent         = 100
 
   network_configuration {
-    subnets          = module.fcvm_fleet_east2.subnet_ids
+    # Only the DNS load balancer's two AZs (fcvm-fleet-dns.tf): a target in an AZ the load balancer does not enable is
+    # unused even with cross-zone load balancing, which would leave the subzone without its server.
+    subnets          = local.fcvm_fleet_dns_subnets
     security_groups  = [aws_security_group.fcvm_fleet_coordinator.id]
     assign_public_ip = true
   }

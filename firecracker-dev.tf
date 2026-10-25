@@ -128,6 +128,8 @@ resource "aws_network_interface" "firecracker_dev" {
   subnet_id         = local.subnet_ids_by_az[var.firecracker_availability_zone]
   security_groups   = [aws_security_group.firecracker_dev[0].id]
   ipv6_prefix_count = 1
+  # One secondary private IPv4 address, for the second public address (aws_eip.firecracker_dev_next).
+  private_ips_count = 1
 
   # The host also gets its own IPv6 address, not just the /80 its VMs route, but CreateNetworkInterface
   # takes only one of the four IPv6 parameters (address count, addresses, prefix count, prefixes), so
@@ -301,6 +303,59 @@ resource "aws_eip_association" "firecracker_dev" {
   allocation_id = aws_eip.firecracker_dev[0].id
 }
 
+# A second public address, to move the box to (owner, 2026-10-25: "add a second ip to this box and we will
+# switch over"). It maps to the ENI's secondary private address, so inbound traffic reaches the box on either
+# address while outbound traffic still leaves from the primary private address, through aws_eip.firecracker_dev.
+# Every allowlist of the box's address (fcvm-dns-test.tf, gpu-box.tf, ohio.tf, runner-vpc.tf) admits both. The switch is a
+# later change: associate this address with the primary private address and release the old one.
+resource "aws_eip" "firecracker_dev_next" {
+  count  = var.enable_firecracker_instance ? 1 : 0
+  domain = "vpc"
+
+  tags = {
+    Name = "fcvm-metal-arm-eip-next"
+  }
+}
+
+resource "aws_eip_association" "firecracker_dev_next" {
+  count                = var.enable_firecracker_instance ? 1 : 0
+  allocation_id        = aws_eip.firecracker_dev_next[0].id
+  network_interface_id = aws_network_interface.firecracker_dev[0].id
+  private_ip_address   = one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))
+}
+
+# Persist the address in netplan for ordinary reboots and add it live without reconfiguring
+# the primary interface. State Manager also restores it if the managed file is removed.
+resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
+  count = var.enable_firecracker_instance ? 1 : 0
+
+  name                             = "AWS-RunShellScript"
+  association_name                 = "fcvm-arm-secondary-ipv4"
+  schedule_expression              = "rate(1 day)"
+  wait_for_success_timeout_seconds = 300
+
+  targets {
+    key    = "InstanceIds"
+    values = [aws_instance.firecracker_dev[0].id]
+  }
+
+  parameters = {
+    commands = templatefile("${path.module}/scripts/fcvm-secondary-ipv4-command.tftpl", {
+      address = one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))
+      script  = chomp(file("${path.module}/scripts/fcvm-secondary-ipv4.py"))
+    })
+    executionTimeout = "120"
+  }
+}
+
+locals {
+  # Both public addresses of fcvm-metal-arm, current first. Allowlists of the box use this list.
+  firecracker_dev_public_ips = concat(
+    [for e in aws_eip.firecracker_dev : e.public_ip],
+    [for e in aws_eip.firecracker_dev_next : e.public_ip],
+  )
+}
+
 # Output the instance ID and connection command
 output "firecracker_dev_instance_id" {
   description = "Instance ID of Firecracker dev instance"
@@ -315,6 +370,11 @@ output "firecracker_dev_availability_zone" {
 output "firecracker_dev_public_ip" {
   description = "Public IP of Firecracker dev instance (Elastic IP)"
   value       = var.enable_firecracker_instance ? aws_eip.firecracker_dev[0].public_ip : null
+}
+
+output "firecracker_dev_public_ip_next" {
+  description = "Second public IP of Firecracker dev instance (Elastic IP on the secondary private address)"
+  value       = var.enable_firecracker_instance ? aws_eip.firecracker_dev_next[0].public_ip : null
 }
 
 output "firecracker_dev_ssh_command" {

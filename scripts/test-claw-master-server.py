@@ -19,6 +19,13 @@ TUNNEL = (ROOT / "scripts" / "claw-master-tunnel.sh").read_text()
 DASH = (ROOT / "claw-master-dashboard.tf").read_text()
 
 
+def without_routing_env():
+    """The caller's environment without the routing variables the zshenv block sets: on a box where the block already
+    ran (a metal box or nextjs-dev), an inherited value would read as the block's own output (ejc3/aws#678)."""
+    import os
+    return {k: v for k, v in os.environ.items() if not k.startswith("TCLAUDE_")}
+
+
 def code(text):
     """The script without its comment lines: assertions are about what runs, not what is explained."""
     return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
@@ -835,7 +842,7 @@ class ScriptTests(unittest.TestCase):
             # The block is plain POSIX shell (zsh reads it unchanged), so bash is enough to run it: the CI runner has no zsh.
             def server_for(home):
                 out = subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s|%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}" "${{TCLAUDE_CLAUDE_MASTER-unset}}"'],
-                                     capture_output=True, text=True, timeout=30)
+                                     capture_output=True, text=True, timeout=30, env=without_routing_env())
                 return out.stdout.strip()
             enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
             open(enrolled + "/.config/claude-master/client.pem", "w").write("x")
@@ -879,7 +886,7 @@ class ScriptTests(unittest.TestCase):
             self.assertTrue(text.startswith("# stock\nexport PATH=$PATH\n"))
             def server_for(home):
                 return subprocess.run(["bash", "-c", f'HOME={home}; . {ze}; printf "%s|%s\\n" "${{TCLAUDE_INFERENCE_SERVER-unset}}" "${{TCLAUDE_CLAUDE_MASTER-unset}}"'],
-                                      capture_output=True, text=True, timeout=30).stdout.strip()
+                                      capture_output=True, text=True, timeout=30, env=without_routing_env()).stdout.strip()
             enrolled = os.path.join(d, "enrolled"); os.makedirs(enrolled + "/.config/claude-master")
             with open(enrolled + "/.config/claude-master/client.pem", "w") as f: f.write("x")
             plain = os.path.join(d, "plain"); os.makedirs(plain)

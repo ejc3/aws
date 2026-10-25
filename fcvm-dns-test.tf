@@ -37,7 +37,7 @@ locals {
 
   fcvm_dns_test_client_cidrs = concat(
     [for s in local.dev_fleet_subnets : s.ipv6_cidr_block],
-    [for e in aws_eip.firecracker_dev : "${e.public_ip}/32"],
+    [for ip in local.firecracker_dev_public_ips : "${ip}/32"],
     [for e in aws_eip.x86_dev : "${e.public_ip}/32"],
   )
 }

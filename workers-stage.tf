@@ -24,6 +24,7 @@ locals {
     "dolphin-films-stage" = { id = "46a606b362ff46ffa1dbfc926e4ea7a2", urls = true }
     "dolphin-labs-stage"  = { id = "cec7e26a37314345922f483adc05c1bd", urls = true }
     "dolphin-maps-stage"  = { id = "2ba16e42744a46c892720dfeafeccfd4", urls = true }
+    "fantasy-stage"       = { id = "0e46bd44b3934b79a73d16d711efd131", urls = true }
     "imagine-stage"       = { id = "2b8755b7ba1f4845bae8d18ced8fafef", urls = true }
     "nest-step-stage"     = { id = "d31376c75b8247f7b0a8e8a7e0fc7dba", urls = true }
     "remote-claw-stage"   = { id = "54a603228ad24345b518a9c10cfb3e26", urls = true }
@@ -62,7 +63,76 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
       id         = cloudflare_zero_trust_access_policy.cc_games_service.id
       precedence = 2
     },
+    {
+      id         = cloudflare_zero_trust_access_policy.workers_stage_agents.id
+      precedence = 3
+    },
   ]
+}
+
+# Agents on the metal boxes: a service token of their own, so an agent can open a staging Worker it just deployed and
+# check it, as the owner does in a browser. Admitted by a non_identity policy on this application only, so it opens the
+# staging Workers and nothing else (not *.cc-games.dev, unlike the cc-games automation token). Readers: dev-server-role
+# (the metal boxes) and the administration set. Not nextjs-dev-role: every account there has sudo. Revoking it touches
+# no other token. The grant is the secret's own resource policy, not one on the role: dev-server-role's inline policies
+# are at IAM's 10,240-character limit. The secret is outside workers-stage/, which holds the Workers' own runtime secrets
+# (scripts/workers-stage-secrets.sh), and its Terraform names avoid the workers_stage prefix that
+# scripts/test-workers-stage-secrets.py keeps free of Terraform-held values.
+resource "cloudflare_zero_trust_access_service_token" "workers_stage_agents" {
+  account_id = var.cloudflare_account_id
+  name       = "workers-stage-agents"
+  duration   = "8760h"
+}
+
+resource "cloudflare_zero_trust_access_policy" "workers_stage_agents" {
+  account_id       = var.cloudflare_account_id
+  name             = "staging Workers: metal-box agents"
+  decision         = "non_identity"
+  session_duration = "24h"
+
+  include = [{
+    service_token = {
+      token_id = cloudflare_zero_trust_access_service_token.workers_stage_agents.id
+    }
+  }]
+}
+
+resource "aws_secretsmanager_secret" "stage_workers_agent_access" {
+  name        = "workers-stage-agents/access"
+  description = "Cloudflare Access service token for metal-box agents to open the staging Workers (client_id, client_secret)"
+  tags        = { Name = "workers-stage-agents/access", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "stage_workers_agent_access" {
+  secret_id = aws_secretsmanager_secret.stage_workers_agent_access.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.workers_stage_agents.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.workers_stage_agents.client_secret
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "stage_workers_agent_access" {
+  secret_arn = aws_secretsmanager_secret.stage_workers_agent_access.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "MetalBoxesRead"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.dev_server.arn }
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
+      },
+      {
+        Sid       = "OnlyAdministrationAndMetalBoxes"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
+        Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+      },
+    ]
+  })
 }
 
 # Terraform owns only each Worker's two URL switches, through the narrow script-subdomain resource,

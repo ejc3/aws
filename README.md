@@ -223,6 +223,20 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
+The Stability AI key for offline asset creation is `games/stability-api-key` in the same
+region. Terraform creates its container and grants the same two dev roles as ElevenLabs;
+populate it with `put-secret-value` on stdin after applying. Tools fetch it when needed as
+`STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
+The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
+
+The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
+as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
+session, not an official API key. Terraform manages only its empty container and grants;
+populate or renew the value out of band over stdin after the owner signs in. Never put it
+in a file, command argument, log, state or deployed-game environment. Keep the adapter
+optional until real authentication, generation and renewal checks pass; do not assume a
+website subscription provides an official or unattended API.
+
 The claw-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
@@ -393,6 +407,12 @@ ssh fcvm-x86
 ssh nextjs
 ssh io
 ```
+
+The ARM host's second inbound address is reported by
+`firecracker_dev_public_ip_next`. Terraform persists its secondary private
+address in netplan and adds it live without restarting networking. The original
+address remains the outbound address until a separate cutover.
+
 
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
 address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, not the

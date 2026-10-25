@@ -258,8 +258,6 @@ resource "cloudflare_zero_trust_access_policy" "fcvm_stage_ci" {
 resource "github_actions_environment_variable" "fcvm_stage" {
   provider = github.agents_md
   for_each = {
-    AWS_ROLE_ARN        = aws_iam_role.fcvm_stage_ci.arn
-    COORDINATOR_REPO    = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
     COORDINATOR_RELEASE = aws_lambda_function.fcvm_coordinator_release.function_name
     STAGING_API_URL     = "https://${local.fcvm_dev_api_stage_hostname}"
     STAGING_ORIGIN      = "https://${local.fcvm_dev_site_stage_host}"
@@ -270,14 +268,18 @@ resource "github_actions_environment_variable" "fcvm_stage" {
   value         = each.value
 }
 
+# The role ARN and the repository URL carry AWS account ids. A workflow step header prints vars.* values as
+# typed and Actions masks only secrets, so these two are secrets although neither is a credential.
 resource "github_actions_environment_secret" "fcvm_stage" {
   provider    = github.agents_md
-  for_each    = toset(["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"])
+  for_each    = toset(["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "AWS_ROLE_ARN", "COORDINATOR_REPO"])
   repository  = "fcvm"
   environment = github_repository_environment.fcvm_stage.environment
   secret_name = each.key
   plaintext_value = {
     CF_ACCESS_CLIENT_ID     = cloudflare_zero_trust_access_service_token.fcvm_stage_ci.client_id
     CF_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.fcvm_stage_ci.client_secret
+    AWS_ROLE_ARN            = aws_iam_role.fcvm_stage_ci.arn
+    COORDINATOR_REPO        = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
   }[each.key]
 }

@@ -27,7 +27,8 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
         self.assertNotIn("22", sg)
-        # The coordinator admits its DNS port and nothing else (DnsTests).
+        # The coordinator admits its DNS port (DnsTests) and, with aggregated streaming on, 443 for the EC2 half's
+        # aggregator (AggregatedTests); nothing else.
         coord = block('resource "aws_security_group" "fcvm_fleet_coordinator"')
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", coord, re.S)
         self.assertEqual(len(rules), 2, rules)
@@ -35,6 +36,10 @@ class NetworkTests(unittest.TestCase):
             self.assertIn("from_port   = local.fcvm_fleet_dns_port", rule)
             self.assertIn("to_port     = local.fcvm_fleet_dns_port", rule)
         self.assertEqual(sorted(re.findall(r'protocol    = "(\w+)"', coord)), ["tcp", "udp"])
+        self.assertEqual(coord.count('dynamic "ingress"'), 1, coord)
+        self.assertIn("for_each = local.fcvm_fleet_aggregated ? [1] : []", coord)
+        self.assertIn("from_port        = 443", coord)
+        self.assertIn("to_port          = 443", coord)
 
     def test_every_az_gets_a_public_ipv6_subnet_and_flow_logs(self):
         sub = block('resource "aws_subnet" "public"', MOD)
@@ -56,6 +61,15 @@ class HostTests(unittest.TestCase):
         self.assertNotIn("ipv6_address_count", lt)  # EC2 refuses a prefix count and an address count together
         self.assertIn('http_tokens                 = "required"', lt)
         self.assertIn("http_put_response_hop_limit = 1", lt)
+
+    def test_the_host_root_volume_is_filled_at_the_highest_initialization_rate(self):
+        # A lazily loaded root volume put 32.3 s between kernel start and the store unit on a host's first boot, against
+        # 11.1 s on a volume already read (ejc3/fcvm#1257); EBS takes 100 to 300 MiB/s.
+        lt = block('resource "aws_launch_template" "host"', MOD)
+        bdm = re.search(r"block_device_mappings \{\n(.*?)\n  \}\n", lt, re.S)
+        self.assertIsNotNone(bdm, lt)
+        self.assertIn('device_name = "/dev/sda1"', bdm.group(1))
+        self.assertIn("volume_initialization_rate = 300", bdm.group(1))
 
     def test_the_host_group_is_spot_price_capacity_optimized_and_gated(self):
         asg = block('resource "aws_autoscaling_group" "hosts"', MOD)
@@ -226,7 +240,7 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn('[for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"] :', s)
         self.assertNotIn('Resource = "*"', s)
         d = self.stmt("DescribeTheHostGroups")
-        self.assertIn('Action   = "autoscaling:DescribeAutoScalingGroups"', d)
+        self.assertIn('Action   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"]', d)
         self.assertNotRegex(self.TF, r'"autoscaling:\*"')
         group = block('resource "aws_autoscaling_group" "hosts"', MOD)
         self.assertIn("ignore_changes = [desired_capacity]", group)
@@ -323,6 +337,18 @@ class TileSubnetTests(unittest.TestCase):
             self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
         self.assertIn("tile_az = local.azs[0]", MOD)
 
+    def test_the_coordinator_gets_every_fleet_subnet_and_group_for_tile_launches(self):
+        # A tile launch tries each AZ's subnet of a region, in order, before the next region (ejc3/fcvm#1284). The
+        # launch names the subnet and the group, which the role may reference by ARN.
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${join(",", m.subnet_ids)}"]) }', task)
+        self.assertIn('{ name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${m.security_group_id}"]) }', task)
+        refs = TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('[for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]', refs)
+        self.assertIn('"arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"', refs)
+
 
 class SlotV4Tests(unittest.TestCase):
     """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
@@ -332,7 +358,10 @@ class SlotV4Tests(unittest.TestCase):
         slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
         self.assertEqual((base, slots), (20200, 8))
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        self.assertIn("to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
+        # The slots' ports, and with aggregated streaming the host aggregator's port after them.
+        self.assertIn(
+            "to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
+            "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
         # The agent forwards from the same base.
         self.assertIn('"--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}"', TF)
         self.assertIn('"--public-ipv4-from-imds"', TF)
@@ -392,6 +421,19 @@ class DnsTests(unittest.TestCase):
         self.assertIn("container_port   = local.fcvm_fleet_dns_port", svc)
         self.assertIn('portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]', TF)
 
+    def test_the_task_runs_only_where_the_load_balancer_listens_and_after_its_listener(self):
+        # A target in an AZ the load balancer does not enable is unused even across zones, and ECS refuses a target
+        # group no listener attaches yet.
+        svc = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        self.assertIn("subnets          = local.fcvm_fleet_dns_subnets", svc)
+        self.assertRegex(svc, r"depends_on\s*=\s*\[[^\]]*aws_lb_listener\.fcvm_fleet_dns")
+
+    def test_the_coordinator_group_keeps_its_original_description(self):
+        # The description is ForceNew, and the running task's interface keeps the group from being deleted.
+        coord = block('resource "aws_security_group" "fcvm_fleet_coordinator"')
+        self.assertIn('description = "fcvm fleet coordinator task: nothing in (browsers and agents arrive through its '
+                      'Cloudflare tunnel), all out"', coord)
+
     def test_the_delegation_is_ns_records_with_unproxied_addresses_and_no_ds(self):
         addr = block('resource "cloudflare_dns_record" "fcvm_fleet_names_ns_address"', DNS)
         self.assertIn('type    = "A"', addr)
@@ -402,6 +444,36 @@ class DnsTests(unittest.TestCase):
         self.assertIn("name       = local.fcvm_fleet_names_zone", ns)
         self.assertNotRegex(DNS, r'type\s*=\s*"(DS|AAAA)"')
 
+
+
+class AggregatedTests(unittest.TestCase):
+    """Aggregated streaming (ejc3/fcvm#1232) is one switch, off, and off changes nothing staging runs."""
+
+    def test_the_switch_is_off(self):
+        self.assertRegex(TF, r"\n  fcvm_fleet_aggregated = false\n")
+
+    def test_everything_it_adds_is_gated_by_it(self):
+        agent = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('], local.fcvm_fleet_aggregated ? [', agent)
+        self.assertIn('"--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}"', agent)
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:', cmd)
+        self.assertIn('"--ec2-aggregate-tls"', cmd)
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('for_each = local.fcvm_fleet_aggregated ? ["fleet-run"] : []', task)
+        self.assertIn("[for _ in(local.fcvm_fleet_aggregated ? [1] : []) : {", task)
+        self.assertIn('namespace = "net.ipv4.ip_unprivileged_port_start", value = "443"', task)
+        self.assertIn('containerPath = "/run/fcvm-fleet"', task)
+        self.assertIn('"/run/fcvm-fleet/tls"', cmd)
+        dual = block('resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack"')
+        self.assertIn("count    = local.fcvm_fleet_aggregated ? 1 : 0", dual)
+
+    def test_the_host_aggregator_port_follows_the_slots(self):
+        self.assertIn(
+            "fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots", TF)
+        priv = int(re.search(r"fcvm_fleet_aggregate_port\s+= (\d+)", TF).group(1))
+        # The private listener is outside the admitted range.
+        self.assertFalse(20200 <= priv <= 20208, priv)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

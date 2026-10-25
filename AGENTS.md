@@ -1386,7 +1386,9 @@ Available if a task needs them; neither needs a key on disk.
 - **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
   `dolphin-maps-loop-sweep` and `dolphin-maps-loop-refit` (one bundle) on EventBridge schedules in America/Los_Angeles
   time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night, the refit an hour later; all off
-  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms), reading `browserbase/credentials`
+  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms; the sweep function also runs the week passes
+  on the month's first Saturday from 20:00, one a day of the week 20 minutes apart, and the weekend pass on
+  Thursday 23:00, on the same switch), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.
@@ -1398,6 +1400,19 @@ Available if a task needs them; neither needs a key on disk.
   or into a file or a commit:
   `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+- **Stability AI** (offline audio, artwork and 3D assets). `games/stability-api-key` in
+  us-west-1 has the same admin/dev-role read boundary as ElevenLabs. Fetch it only when
+  generating assets as `STABILITY_API_KEY`; no key in app bundles, profiles or logs.
+  Terraform owns only the container and grants. Pricing and capabilities must come from
+  the current official API documentation; the web subscription and API credits differ.
+
+- **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
+  uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
+  SUNO_COOKIE at use time only. It is a full website session: never in files, command
+  arguments, logs, Terraform state or app environments. Terraform owns the container and
+  grants only. Do not call the utility verified until real login, generation and renewal
+  checks pass; a paid website account is not an official API.
+
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
@@ -1466,6 +1481,13 @@ Available if a task needs them; neither needs a key on disk.
   values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role,
   nextjs-dev-role (the owner's container; members are denied it) and admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
   then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claw_master_dashboard`.
+- **The staging Workers, as an agent**, metal boxes. `workers-stage-agents/access` (us-west-1) holds a Cloudflare Access
+  service token (`client_id`, `client_secret`) admitted only by the staging-Workers Access application (`workers-stage.tf`),
+  so an agent can open a `<site>-stage` Worker it deployed. Send the headers on curl's stdin, never as arguments (an argument
+  is readable in `/proc/<pid>/cmdline`): `printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$ID" "$SECRET" |
+  curl -H @- https://<site>-stage.<subdomain>.workers.dev/`, the two values from `get-secret-value` in the environment, never
+  in a file. It opens nothing else. Readable by dev-server-role (the secret's own resource policy) and
+  admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.workers_stage_agents`.
 - **Turso API token**, metal boxes and the owner's nextjs-ct container. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
   container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
@@ -1661,6 +1683,10 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
   Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
   constellation-mcp`.
+- **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
+  script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
+  of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
+  covers it.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
@@ -1759,6 +1785,24 @@ Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the 
   application there. The API checks its own Bearer tokens, which are minted only at `/native/login`.
 - **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - Not yet covered: security monitoring like the Dolphin account's.
+
+### Sending as the Dolphin Labs work address (dolphin-labs-email-send.tf)
+
+The ej alias on dolphin-labs.dev receives through Cloudflare Email Routing (`dolphin-labs-email.tf`) and sends through
+Amazon SES in the Dolphin account (us-west-1), from the owner's Gmail ("Send mail as" over SMTP). Inbound is unchanged:
+the apex MX, SPF TXT and Cloudflare's DKIM key stay Email Routing's.
+
+- **Alignment:** Easy DKIM signs as dolphin-labs.dev (three `_domainkey` CNAMEs); the envelope sender is the custom MAIL
+  FROM `bounce.dolphin-labs.dev` (MX to SES feedback, its own SPF), so SPF aligns without an SES include on the apex;
+  `_dmarc` is `p=none` with aggregate reports to the ej alias.
+- **Sender:** IAM user `dolphin-labs-ej-smtp`, `ses:SendRawEmail` on that identity with `ses:FromAddress` the ej alias
+  only. Its SMTP user name and derived password are written only to `dolphin-labs/ej-smtp` in the Dolphin account
+  (administration only; never an output). Alarm `dolphin-labs-ej-send-volume` (on `dolphin-alerts`) fires above 100 sends
+  an hour. Rotate with `terraform apply -replace='aws_iam_access_key.dolphin_labs_ej_smtp[0]'`, then the new password
+  into Gmail.
+- **Once, by hand:** SES production access for the Dolphin account in us-west-1 (no Terraform resource exists:
+  `aws sesv2 put-account-details --production-access-enabled ...` in an OrganizationAccountAccessRole session there; AWS
+  reviews it), then the Gmail setting. Until then the account is in the SES sandbox and sends only to verified addresses.
 
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
