@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for fcvm-fleet.tf and modules/fcvm-fleet-region (ejc3/aws#606): the fleet's network admits TCP 443 only,
-the GPU hosts and the coordinator stay off until their gates and inputs exist, and the coordinator's role reaches EC2 tiles
-only."""
+the GPU hosts and the coordinator stay off until their gates and inputs exist, and the coordinator's role reaches GPU hosts
+and EC2 tiles from their templates only."""
 import re
 import unittest
 from pathlib import Path
@@ -55,14 +55,14 @@ class HostTests(unittest.TestCase):
         self.assertIn('http_tokens                 = "required"', lt)
         self.assertIn("http_put_response_hop_limit = 1", lt)
 
-    def test_the_host_group_is_spot_price_capacity_optimized_and_gated(self):
-        asg = block('resource "aws_autoscaling_group" "hosts"', MOD)
-        self.assertIn("on_demand_base_capacity                  = 0", asg)
-        self.assertIn("on_demand_percentage_above_base_capacity = 0", asg)
-        self.assertIn('spot_allocation_strategy                 = "price-capacity-optimized"', asg)
-        self.assertIn("capacity_rebalance        = true", asg)
-        self.assertIn("desired_capacity          = local.host_desired", asg)
-        self.assertIn("host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0", MOD)
+    def test_the_coordinator_launches_the_hosts_and_no_group_does(self):
+        # Auto Scaling took 6 to 14 s to start a launch after a raise (ejc3/fcvm#1257); the coordinator launches the hosts
+        # itself from the templates, which it gets only while the gate is on.
+        self.assertNotIn("aws_autoscaling_group", MOD)
+        self.assertNotIn("aws_autoscaling_group", TF)
+        self.assertIn("hosts_on = var.hosts_enabled && length(local.host_archs) > 0", MOD)
+        names = block('output "host_template_names"', MOD)
+        self.assertIn("value = local.hosts_on ? [for a in local.host_archs : aws_launch_template.host[a].name] : []", names)
         self.assertIn("fcvm_fleet_hosts_enabled       = true", TF)
 
     def test_hosts_and_tiles_have_amis_only_where_there_is_g_spot_quota(self):
@@ -72,67 +72,41 @@ class HostTests(unittest.TestCase):
             default = re.search(r"default = (\{.*\})\n", block('variable "%s"' % var)).group(1)
             self.assertRegex(default, r'^\{ "us-east-1" = \{ x86_64 = "ami-[0-9a-f]{17}" \} \}$')
 
-    def test_only_architectures_with_an_ami_are_in_the_group(self):
+    def test_only_architectures_with_an_ami_get_a_template(self):
         self.assertIn('host_archs = [for a in sort(keys(local.host_types)) : a if try(var.gpu_amis[a], "") != ""]', MOD)
         self.assertIn('host_types = { x86_64 = "g4dn.metal", arm64 = "g5g.metal" }', MOD)
 
 
 class OnDemandFallbackTests(unittest.TestCase):
-    """The spot group's on-demand fallback: a second group, 0 until the coordinator gives it a short spot group's capacity,
-    capped at 8 hosts (owner, 2026-10-24: "Up to 8 on-demand max")."""
+    """Spot first, on demand in the same pass when spot is refused, at most 8 on-demand hosts across the fleet (owner,
+    2026-10-24: "Up to 8 on-demand max"): the coordinator's cap, handed to it in its environment."""
 
-    def test_the_fallback_group_is_on_demand_capped_and_starts_at_zero(self):
-        od = block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD)
-        self.assertIn('name                      = "fcvm-fleet-hosts-on-demand"', od)
-        self.assertIn("on_demand_percentage_above_base_capacity = 100", od)
-        self.assertIn("min_size                  = 0", od)
-        self.assertIn("desired_capacity          = 0", od)
-        self.assertIn("max_size                  = local.host_desired == 0 ? 0 : var.host_on_demand_max", od)
-        self.assertIn("ignore_changes = [desired_capacity]", od)
-        self.assertNotIn("capacity_rebalance", od)  # a spot-only setting
-        self.assertIn("var.host_on_demand_max >= 0 && var.host_on_demand_max <= 8", block('variable "host_on_demand_max"', MOD))
+    def test_the_on_demand_cap_is_eight_for_the_whole_fleet(self):
         self.assertIn("fcvm_fleet_on_demand_max = 8", TF)
-        self.assertEqual(TF.count("host_on_demand_max        = local.fcvm_fleet_on_demand_max"), 3)
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_HOST_ON_DEMAND_MAX", value = tostring(local.fcvm_fleet_on_demand_max) }', td)
+        self.assertNotIn("host_on_demand_max", MOD)
 
-    def test_eight_is_the_cap_for_the_whole_fleet(self):
-        # The cap is per region, so it is the fleet's cap only while one region has a host AMI (and so a group).
-        default = re.search(r"default = (\{.*\})\n", block('variable "fcvm_fleet_host_amis"')).group(1)
-        self.assertEqual(default.count("ami-"), 1)
-        self.assertIn("count = length(local.host_archs) > 0 ? 1 : 0", block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD))
-
-    def test_both_host_groups_launch_only_where_a_host_type_is_offered(self):
-        for name in ('resource "aws_autoscaling_group" "hosts"', 'resource "aws_autoscaling_group" "hosts_on_demand"'):
-            self.assertIn("vpc_zone_identifier       = local.host_subnets", block(name, MOD), name)
+    def test_hosts_launch_only_where_a_host_type_is_offered(self):
+        self.assertIn("value = local.host_subnets", block('output "host_subnet_ids"', MOD))
         offerings = block('data "aws_ec2_instance_type_offerings" "host"', MOD)
         self.assertIn('location_type = "availability-zone"', offerings)
         self.assertIn("values = [local.host_types[each.key]]", offerings)
+        subnets = TF.split("fcvm_fleet_host_subnets = flatten(", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('[for s in m.host_subnet_ids : "${r}:${s}"]', subnets)
+        self.assertIn("if length(m.host_template_names) > 0", subnets)
 
-    def test_the_coordinator_falls_back_only_with_an_image_that_has_the_flags(self):
-        # The image at 8c96e28e has no --on-demand-group; clap refuses an unknown argument and the coordinator would not
-        # start. The flag may only be turned on together with a newer tag.
-        tag = re.search(r'fcvm_fleet_coordinator_tag = "([0-9a-f]+)"', TF).group(1)
-        on = re.search(r"fcvm_fleet_coordinator_falls_back = (true|false)", TF).group(1)
-        if tag == "8c96e28e":
-            self.assertEqual(on, "false")
+    def test_the_host_templates_reach_the_coordinator_in_its_environment(self):
+        # An image from before ejc3/fcvm#1257 refuses an unknown argument and does not start, and the image after it has no
+        # --scale-group: the templates go in the environment, which the older image ignores, so either image starts.
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_HOST_TEMPLATES", value = join(",", local.fcvm_fleet_host_templates) }', td)
+        self.assertIn('{ name = "FLEET_HOST_SUBNETS", value = join(",", local.fcvm_fleet_host_subnets) }', td)
+        self.assertIn('[for t in m.host_template_names : "${r}:${t}"]', TF)
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
-        self.assertIn("local.fcvm_fleet_coordinator_falls_back ? concat(", cmd)
-        self.assertIn('["--on-demand-group", "${r}:fcvm-fleet-hosts-on-demand"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0', cmd)
-
-    def test_the_coordinator_may_scale_the_on_demand_group(self):
-        tf = TF.split('Sid    = "ScaleTheHostGroups"', 1)[1].split("},", 1)[0]
-        self.assertIn('for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"]', tf)
-        self.assertIn('Action = "autoscaling:SetDesiredCapacity"', tf)
-
-    def test_an_on_demand_host_in_service_mails_the_owner(self):
-        alarm = block('resource "aws_cloudwatch_metric_alarm" "on_demand_hosts"', MOD)
-        self.assertIn('metric_name         = "GroupInServiceInstances"', alarm)
-        self.assertIn("AutoScalingGroupName = aws_autoscaling_group.hosts_on_demand[0].name", alarm)
-        self.assertIn("threshold           = 1", alarm)
-        self.assertIn("alarm_actions       = [aws_sns_topic.alerts[0].arn]", alarm)
-        self.assertIn('"GroupInServiceInstances"', block('resource "aws_autoscaling_group" "hosts_on_demand"', MOD))
-        sub = block('resource "aws_sns_topic_subscription" "alerts_email"', MOD)
-        self.assertIn('protocol  = "email"', sub)
-        self.assertEqual(TF.count("alert_email               = local.browser_manager_owner"), 3)
+        self.assertIn('["--sleep-when-idle"]', cmd)
+        for gone in ("--scale-group", "--on-demand-group", "--spot-wait", "--host-template"):
+            self.assertNotIn(gone, cmd)
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -145,13 +119,13 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn("image     = local.fcvm_fleet_coordinator_running ? nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value)", TF)
         self.assertIn("desired_count                      = local.fcvm_fleet_coordinator_running ? 1 : 0", block('resource "aws_ecs_service" "fcvm_fleet_coordinator"'))
 
-    def test_the_task_role_reaches_tiles_only(self):
+    def test_the_task_role_reaches_hosts_and_tiles_only(self):
         pol = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
         self.assertIn('"ec2:LaunchTemplate"', pol)
-        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-tile" } }', pol)
-        self.assertIn('Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" } }', pol)
-        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', pol)
-        self.assertIn("Resource  = aws_iam_role.fcvm_fleet_tile.arn", pol)
+        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"] } }', pol)
+        self.assertIn('Condition = { StringEquals = { "ec2:CreateAction" = ["RunInstances", "CreateFleet"] } }', pol)
+        self.assertIn('"ec2:ResourceTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"]', pol)
+        self.assertIn("Resource  = [aws_iam_role.fcvm_fleet_host.arn, aws_iam_role.fcvm_fleet_tile.arn]", pol)
         self.assertIn('"iam:PassedToService" = "ec2.amazonaws.com"', pol)
         self.assertNotRegex(pol, r'Action\s*=\s*"(ec2|iam|s3):\*"')
 
@@ -217,18 +191,26 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn('Action   = "s3:ListBucket"', s)
         self.assertIn("Resource = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", s + "\n")
 
-    def test_the_coordinator_scales_only_the_host_groups(self):
-        s = self.stmt("ScaleTheHostGroups")
-        self.assertIn('Action = "autoscaling:SetDesiredCapacity"', s)
-        self.assertIn(':autoScalingGroup:*:autoScalingGroupName/${g}"', s)
-        self.assertIn('[for g in ["fcvm-fleet-hosts", "fcvm-fleet-hosts-on-demand"] :', s)
-        self.assertNotIn('Resource = "*"', s)
-        d = self.stmt("DescribeTheHostGroups")
-        self.assertIn('Action   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"]', d)
-        self.assertNotRegex(self.TF, r'"autoscaling:\*"')
-        group = block('resource "aws_autoscaling_group" "hosts"', MOD)
-        self.assertIn("ignore_changes = [desired_capacity]", group)
-        self.assertIn("max_size                  = local.host_desired == 0 ? 0 : 2", group)
+    def test_the_coordinator_launches_hosts_only_from_their_templates(self):
+        fleet = self.stmt("LaunchHostsAsInstantFleets")
+        self.assertIn('Action    = "ec2:CreateFleet"', fleet)
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', fleet)
+        created = self.stmt("LaunchHostsFromTheirTemplates")
+        referenced = self.stmt("LaunchHostsWithTheirOwnResources")
+        self.assertIn("Resource  = local.fcvm_fleet_host_referenced_arns", referenced)
+        for s in (created, referenced):
+            self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition', s)
+        refs = self.TF.split("fcvm_fleet_host_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        for part in ("var.fcvm_fleet_host_amis", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_host_template_arns"):
+            self.assertIn(part, refs, part)
+        # A host template launches host types only, and EC2 Fleet's service-linked role exists.
+        deny = self.stmt("HostTemplatesLaunchHostTypesOnly")
+        self.assertIn('Effect   = "Deny"', deny)
+        self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }', deny)
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_host_types }', deny)
+        self.assertIn('fcvm_fleet_host_types              = ["g4dn.metal", "g5g.metal"]', self.TF)
+        self.assertIn('aws_service_name = "ec2fleet.amazonaws.com"', self.TF)
+        self.assertNotIn("autoscaling:", self.TF)
 
     def test_an_on_demand_tile_template_is_a_launchable_template(self):
         od = block('resource "aws_launch_template" "tile_on_demand"', MOD)
@@ -254,12 +236,16 @@ class ModuleDependencies(unittest.TestCase):
             self.assertIn("flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id", body, name)
 
 class CoordinatorTileTypes(unittest.TestCase):
-    def test_the_coordinator_launches_only_the_two_tile_types(self):
-        tf = (ROOT / "fcvm-fleet.tf").read_text()
-        s = tf.split('Sid       = "TileTypesOnly"', 1)[1].split("},", 1)[0]
+    def test_the_coordinator_launches_only_the_fleet_types_and_tile_templates_only_tile_types(self):
+        stmt = CoordinatorLaunchSplit.stmt
+        s = stmt(CoordinatorLaunchSplit, "FleetTypesOnly")
         self.assertIn('Effect    = "Deny"', s)
         self.assertIn('Action    = "ec2:RunInstances"', s)
-        self.assertIn('"ec2:InstanceType" = ["g4dn.xlarge", "g5g.xlarge"]', s)
+        self.assertIn('"ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types)', s)
+        t = stmt(CoordinatorLaunchSplit, "TileTemplatesLaunchTileTypesOnly")
+        self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition }', t)
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_tile_types }', t)
+        self.assertIn('fcvm_fleet_tile_types              = ["g4dn.xlarge", "g5g.xlarge"]', CoordinatorLaunchSplit.TF)
 
 class RegistryTests(unittest.TestCase):
     def test_the_bootstrap_image_is_protected_from_the_rolling_retention_rule(self):
@@ -304,9 +290,9 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", MOD)
         self.assertNotIn("systemctl enable --now fcvm-fleet-agent", MOD)
 
-    def test_the_coordinator_scales_the_host_groups_it_has_an_ami_for(self):
+    def test_the_coordinator_sleeps_and_runs_the_ec2_side(self):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
-        self.assertIn('["--scale-group", "${r}:fcvm-fleet-hosts"] if length(lookup(var.fcvm_fleet_host_amis, r, {})) > 0', cmd)
+        self.assertIn('["--sleep-when-idle"]', cmd)
         self.assertIn('"--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"', cmd)
         self.assertIn('"--ec2-regions", "us-east-1"', cmd)
         self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
