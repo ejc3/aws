@@ -50,9 +50,11 @@ data "aws_iam_policy_document" "elevenlabs_read" {
   }
 }
 
+# Keep the existing immutable name/description to avoid replacing this live policy.
+# Its exact-ARN statements above now cover both creative providers.
 resource "aws_iam_policy" "elevenlabs_read" {
   name        = "dev-elevenlabs-read"
-  description = "Dev boxes: read only the ElevenLabs and Stability creative-assets keys"
+  description = "Dev boxes: read the ElevenLabs API key (games/elevenlabs-api-key) and nothing else"
   policy      = data.aws_iam_policy_document.elevenlabs_read.json
 }
 
