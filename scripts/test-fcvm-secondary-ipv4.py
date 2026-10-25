@@ -2,6 +2,8 @@
 """The added address survives boot and never restarts the live primary interface."""
 import importlib.util
 import json
+import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -59,6 +61,22 @@ class SecondaryAddress(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.configure('10.0.1.42; reboot', config, run)
             self.assertFalse(config.exists())
+
+    def test_managed_shell_command_passes_unindented_python_on_stdin(self):
+        template = ROOT / 'scripts/fcvm-secondary-ipv4-command.tftpl'
+        command = template.read_text().replace('${address}', '10.0.1.42').replace(
+            '${script}', (ROOT / 'scripts/fcvm-secondary-ipv4.py').read_text().rstrip())
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = Path(directory) / 'python3'
+            interpreter.write_text(f'#!{sys.executable}\nimport sys\n'
+                                   'assert sys.argv[1:] == ["-", "10.0.1.42"]\n'
+                                   'compile(sys.stdin.read(), "<secondary-ipv4>", "exec")\n')
+            interpreter.chmod(0o700)
+            subprocess.run(['/bin/sh', '-ec', command], check=True, capture_output=True,
+                           text=True, env={**os.environ, 'PATH': directory})
+        association = (ROOT / 'firecracker-dev.tf').read_text().split(
+            'resource "aws_ssm_association" "firecracker_dev_secondary_ipv4"', 1)[1]
+        self.assertIn('templatefile("${path.module}/scripts/fcvm-secondary-ipv4-command.tftpl"', association)
 
     def test_managed_association_runs_the_script_on_the_arm_host(self):
         tf = (ROOT / 'firecracker-dev.tf').read_text()

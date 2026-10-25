@@ -340,11 +340,10 @@ resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
   }
 
   parameters = {
-    commands         = <<-EOT
-      python3 - '${one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))}' <<'PYSECONDARY'
-      ${indent(6, chomp(file("${path.module}/scripts/fcvm-secondary-ipv4.py")))}
-      PYSECONDARY
-    EOT
+    commands = templatefile("${path.module}/scripts/fcvm-secondary-ipv4-command.tftpl", {
+      address = one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))
+      script  = chomp(file("${path.module}/scripts/fcvm-secondary-ipv4.py"))
+    })
     executionTimeout = "120"
   }
 }
