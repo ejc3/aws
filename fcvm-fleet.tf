@@ -564,10 +564,13 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         "arn:aws:autoscaling:${r}:${local.fcvm_fleet_account_id}:autoScalingGroup:*:autoScalingGroupName/${g}"]])
       },
       {
-        # Reading the groups' instances while waking. DescribeAutoScalingGroups takes no resource-level permission.
+        # Reading the groups' instances while they come up, and their scaling activities: a failed spot launch (Auto
+        # Scaling records UnfulfillableCapacity or MaxSpotInstanceCountExceeded about 10 s after the raise) moves the
+        # wake to the on-demand group at once instead of after --spot-wait (ejc3/fcvm#1263). Neither Describe takes a
+        # resource-level permission.
         Sid      = "DescribeTheHostGroups"
         Effect   = "Allow"
-        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Action   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"]
         Resource = "*"
       },
       {
