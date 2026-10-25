@@ -1661,6 +1661,10 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
   Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
   constellation-mcp`.
+- **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
+  script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
+  of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
+  covers it.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
