@@ -82,9 +82,6 @@ locals {
     from = local.fcvm_fleet_slot_tls_port_base
     to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
-  # The zone's authoritative nameservers: the coordinator publishes a launch's names only once both answer with them.
-  fcvm_dev_nameservers = ["cullen.ns.cloudflare.com", "lilyana.ns.cloudflare.com"]
-
   fcvm_fleet_host_agent_args = join(" ", [
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
@@ -113,7 +110,9 @@ locals {
       ["--spot-wait", "120"],
     ) : [],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
-    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region, "--dns-nameservers", join(",", local.fcvm_dev_nameservers)],
+    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
+    # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
+    ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -571,7 +570,8 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource = "*"
       },
       {
-        # The DNS token (slot records and the ACME challenge) and the wildcard certificate it issues and renews. Not the
+        # The DNS token (the ACME challenge, and one sweep of launch names written to fcvm.dev before the subzone) and the
+        # wildcard certificate it issues and renews. Not the
         # tunnel token (cloudflared gets it through the execution role) nor the agents' Access token.
         Sid      = "FleetSecrets"
         Effect   = "Allow"
@@ -650,8 +650,26 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
 resource "aws_security_group" "fcvm_fleet_coordinator" {
   provider    = aws.fcvm_fleet
   name        = "fcvm-fleet-coordinator"
-  description = "fcvm fleet coordinator task: nothing in (browsers and agents arrive through its Cloudflare tunnel), all out"
+  description = "fcvm fleet coordinator task: DNS from its load balancer (browsers and agents arrive through its tunnel), all out"
   vpc_id      = module.fcvm_fleet_east2.vpc_id
+
+  # The launch names' subzone (fcvm-fleet-dns.tf): UDP arrives with the resolver's own address, and TCP and the health
+  # check from the load balancer. Nothing else comes in.
+  ingress {
+    description = "DNS over UDP"
+    from_port   = local.fcvm_fleet_dns_port
+    to_port     = local.fcvm_fleet_dns_port
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "DNS over TCP"
+    from_port   = local.fcvm_fleet_dns_port
+    to_port     = local.fcvm_fleet_dns_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   egress {
     description      = "All outbound"
@@ -693,6 +711,8 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null
       # Its state is an S3 object, not a file (ECS.5: no writable root; a task volume where something must write).
       readonlyRootFilesystem = true
+      # The subzone's DNS server (fcvm-fleet-dns.tf). One protocol per port mapping; TCP reaches the same port.
+      portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]
       environment = [
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = "state.json" },
@@ -746,6 +766,15 @@ resource "aws_ecs_service" "fcvm_fleet_coordinator" {
     security_groups  = [aws_security_group.fcvm_fleet_coordinator.id]
     assign_public_ip = true
   }
+
+  # The DNS load balancer (fcvm-fleet-dns.tf) registers the task's address; its TCP health check replaces a task whose
+  # server stops answering.
+  load_balancer {
+    target_group_arn = aws_lb_target_group.fcvm_fleet_dns.arn
+    container_name   = "coordinator"
+    container_port   = local.fcvm_fleet_dns_port
+  }
+  health_check_grace_period_seconds = 60
 }
 
 output "fcvm_fleet_infra" {

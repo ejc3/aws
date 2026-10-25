@@ -1722,6 +1722,14 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate
   and store the certificate it issues. The fleet account has EC2's spot service-linked role. Hosts read the certificate,
   the agent token and the asset bucket.
+- **Launch names** (`fcvm-fleet-dns.tf`, ejc3/fcvm#1256): the coordinator is the authoritative DNS server of
+  `tiles-stage.fcvm.dev` (`--dns-subzone`) and names every launch there, answering from its own state, so a name resolves
+  as soon as it is published. A network load balancer on two Elastic IPs in two us-east-2 AZs (cross-zone on) forwards
+  UDP and TCP 53 to the task's port 5353; `ns1-`/`ns2-tiles-stage.fcvm.dev` A records and the NS delegation are in
+  fcvm.dev, with no DS (an insecure delegation; fcvm.dev stays signed). IPv4 only: UDP over IPv6 through a dualstack
+  load balancer needs an IPv6 target group, which an ECS service does not fill for a dual-stack task. The certificate
+  gains `*.tiles-stage.fcvm.dev`; its DNS-01 records stay at `_acme-challenge.fcvm.dev`, which the coordinator's
+  `_acme-challenge.tiles-stage.fcvm.dev` CNAME points to.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)
