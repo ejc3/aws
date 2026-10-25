@@ -35,7 +35,7 @@ ACCOUNT, OTHER = "123456789012", "210987654321"
 PURPOSE, BUILDER = "github-app-runner-image", "github-app-runner-image-builder"
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
 VERSIONS = {"RUST_TOOLCHAIN": "1.93.0", "RUST_COMPONENTS": "rustfmt,clippy", "RUST_TARGETS": "wasm32-unknown-unknown",
-            "NODE_VERSION": "22.23.3", "PNPM_VERSION": "10.29.1", "OTP_VERSION": "29.1.1", "ELIXIR_VERSION": "1.20.4",
+            "NODE_VERSION": "22.23.3", "PNPM_VERSION": "12.15.0", "OTP_VERSION": "29.1.1", "ELIXIR_VERSION": "1.20.4",
             "PLAYWRIGHT_VERSION": "1.63.0", "LIBSQL_IMAGE": "ghcr.io/tursodatabase/libsql-server:v0.24.32"}
 IMAGES = {"imagine-runner": {"repo": "ejc3/imagine", "script": "imagine-runner.sh", "versions": VERSIONS,
                              "builder_types": ["c7a.2xlarge", "c7i.2xlarge"]}}
@@ -428,13 +428,13 @@ class ImageScriptTests(unittest.TestCase):
         for f in ("curl", "npm"):
             (tmp / "bin" / f).chmod(0o755)
         script = (f"set -euo pipefail\nexport IMAGE_SCRIPT_FUNCTIONS_ONLY=1 NODE_DIR={tmp}/opt-node\nsource {IMAGINE_SCRIPT}\n"
-                  "NODE_VERSION=22.23.3 NODE_MAJOR=22 PNPM_VERSION=10.29.1 install_node\n")
+                  "NODE_VERSION=22.23.3 NODE_MAJOR=22 PNPM_VERSION=12.15.0 install_node\n")
         out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                              env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin", "TMPDIR": str(tmp)})
         self.assertEqual(out.returncode, 0, out.stderr)
         node = subprocess.run([str(tmp / "opt-node/bin/node")], capture_output=True, text=True).stdout.strip()
         self.assertEqual(node, "v22.23.3", "the pin, not v22.99.0, the newest 22 listed")
-        self.assertIn("pnpm@10.29.1", (tmp / "npm").read_text())
+        self.assertIn("pnpm@12.15.0", (tmp / "npm").read_text())
 
     def test_the_script_is_valid_and_needs_every_pin_runner_app_image_tf_gives_it(self):
         subprocess.run(["bash", "-n", str(IMAGINE_SCRIPT)], check=True)

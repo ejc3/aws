@@ -55,6 +55,15 @@ class HostTests(unittest.TestCase):
         self.assertIn('http_tokens                 = "required"', lt)
         self.assertIn("http_put_response_hop_limit = 1", lt)
 
+    def test_the_host_root_volume_is_filled_at_the_highest_initialization_rate(self):
+        # A lazily loaded root volume put 32.3 s between kernel start and the store unit on a host's first boot, against
+        # 11.1 s on a volume already read (ejc3/fcvm#1257); EBS takes 100 to 300 MiB/s.
+        lt = block('resource "aws_launch_template" "host"', MOD)
+        bdm = re.search(r"block_device_mappings \{\n(.*?)\n  \}\n", lt, re.S)
+        self.assertIsNotNone(bdm, lt)
+        self.assertIn('device_name = "/dev/sda1"', bdm.group(1))
+        self.assertIn("volume_initialization_rate = 300", bdm.group(1))
+
     def test_the_coordinator_launches_the_hosts_and_no_group_does(self):
         # Auto Scaling took 6 to 14 s to start a launch after a raise (ejc3/fcvm#1257); the coordinator launches the hosts
         # itself from the templates, which it gets only while the gate is on.
@@ -306,6 +315,18 @@ class TileSubnetTests(unittest.TestCase):
         for name in ('resource "aws_launch_template" "tile"', 'resource "aws_launch_template" "tile_on_demand"'):
             self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
         self.assertIn("tile_az = local.azs[0]", MOD)
+
+    def test_the_coordinator_gets_every_fleet_subnet_and_group_for_tile_launches(self):
+        # A tile launch tries each AZ's subnet of a region, in order, before the next region (ejc3/fcvm#1284). The
+        # launch names the subnet and the group, which the role may reference by ARN.
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${join(",", m.subnet_ids)}"]) }', task)
+        self.assertIn('{ name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${m.security_group_id}"]) }', task)
+        refs = TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('[for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]', refs)
+        self.assertIn('"arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"', refs)
 
 
 class SlotV4Tests(unittest.TestCase):
