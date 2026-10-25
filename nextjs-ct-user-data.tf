@@ -467,10 +467,18 @@ CWACONF
   rm -f "$CWA_TMP"
 fi
 
+# ---- shared container memory
+# All people share machine.slice. Reclaim above 80%, allow bursts up to 85%, then
+# let the kernel select an OOM victim inside that slice. Host networking, SSH and
+# tunnels live outside it. Bound swap too, before paging can starve the host.
+# set-property persists these settings and applies them to running containers.
+systemctl set-property machine.slice MemoryHigh=80% MemoryMax=85% MemorySwapMax=1G \
+  || { echo "ERROR: shared container memory budget did not install" >&2; exit 1; }
+
 # ---------------------------------------------------------------- memory
 # A 4 GB swapfile absorbs compile spikes; earlyoom kills the biggest offender at 4% available memory so
 # the box never pages itself unreachable (nextjs-dev, 2026-10-10). Each container is also capped at 75%
-# of memory (systemd-nspawn@<user>.service), so one person's runaway dies inside their own container.
+# of memory (systemd-nspawn@<user>.service); the shared parent above also contains their combined usage.
 if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
