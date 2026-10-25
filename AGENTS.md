@@ -1468,6 +1468,12 @@ Available if a task needs them; neither needs a key on disk.
   values from `get-secret-value` in the environment, never on a command line or in a file. Readable by dev-server-role,
   nextjs-dev-role (the owner's container; members are denied it) and admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
   then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claw_master_dashboard`.
+- **The staging Workers, as an agent**, metal boxes. `workers-stage/agent-access` (us-west-1) holds a Cloudflare Access
+  service token (`client_id`, `client_secret`) admitted only by the staging-Workers Access application (`workers-stage.tf`),
+  so an agent can open a `<site>-stage` Worker it deployed: `curl -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret:
+  $SECRET" https://<site>-stage.<subdomain>.workers.dev/`, the two values from `get-secret-value` in the environment, never on
+  a command line or in a file. It opens nothing else. Readable by dev-server-role (the secret's own resource policy) and
+  admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.workers_stage_agents`.
 - **Turso API token**, metal boxes and the owner's nextjs-ct container. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
   container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
