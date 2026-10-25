@@ -43,11 +43,16 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.elevenlabs_api_key.arn]
   }
+  statement {
+    sid       = "ReadTheStabilityKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.stability_api_key.arn]
+  }
 }
 
 resource "aws_iam_policy" "elevenlabs_read" {
   name        = "dev-elevenlabs-read"
-  description = "Dev boxes: read the ElevenLabs API key (games/elevenlabs-api-key) and nothing else"
+  description = "Dev boxes: read only the ElevenLabs and Stability creative-assets keys"
   policy      = data.aws_iam_policy_document.elevenlabs_read.json
 }
 
@@ -76,6 +81,35 @@ resource "vercel_project_environment_variable" "elevenlabs_api_key" {
   sensitive  = true
   comment    = "ElevenLabs; managed by ejc3/aws dev-ai-services.tf from Secrets Manager games/elevenlabs-api-key"
 }
+
+# Stability generates build-time audio, artwork and 3D assets. Match the ElevenLabs
+# development-role boundary. Only the secret container and access policy are managed
+# here; the owner supplies its value through Secrets Manager. Finished assets, not
+# this key, go into apps. No deployed-game environment variable is needed.
+resource "aws_secretsmanager_secret" "stability_api_key" {
+  name                    = "games/stability-api-key"
+  description             = "Stability AI API key for build-time creative assets; value supplied out of band."
+  recovery_window_in_days = 7
+  tags                    = { Name = "games/stability-api-key", Project = "games" }
+}
+
+resource "aws_secretsmanager_secret_policy" "stability_api_key" {
+  secret_arn = aws_secretsmanager_secret.stability_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.stability_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
+    }]
+  })
+}
+
+# Reuse elevenlabs_read above: dev-server-role is already at its managed-policy
+# attachment limit. Its existing two-role attachment is also the Stability boundary.
 
 # AWS Price List API for the dev boxes (metal and nextjs-dev, the "dolphin" box): public list
 # prices only, so agents can price an instance, a volume or a model call themselves. Nothing
