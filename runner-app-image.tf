@@ -51,7 +51,7 @@ locals {
         RUST_COMPONENTS    = "rustfmt,clippy"
         RUST_TARGETS       = "wasm32-unknown-unknown"
         NODE_VERSION       = "22.23.3"
-        PNPM_VERSION       = "10.29.1"
+        PNPM_VERSION       = "12.15.0"
         OTP_VERSION        = "29.1.1"
         ELIXIR_VERSION     = "1.20.4"
         PLAYWRIGHT_VERSION = "1.63.0"
