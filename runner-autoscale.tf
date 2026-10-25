@@ -23,6 +23,27 @@ locals {
     arm64  = 8
     x86_64 = 4
   }
+
+  # MiB/s at which EBS fills a new runner's root volume from its AMI snapshot (provisioned
+  # rate for volume initialization, 100 to 300), or 0 to leave it lazily loaded. The webhook
+  # Lambda passes it in the launch's block device mapping as VolumeInitializationRate.
+  #
+  # Lazily loaded, each block comes from S3 on its first read. The x64 AMI snapshot holds
+  # 92 GiB of data, including podman image layers that the first host-root test reads: those
+  # reads ran at about 10 ms each and 4 to 6 MB/s with the volume 87 to 98% busy, and the first
+  # podman image export of every fresh x64 Host-Root job took about 107 s (median) against 3 to
+  # 8 s on arm64, so tests started together timed out together. At 200 MiB/s the 92 GiB is
+  # written in about 8 minutes from launch; the first job starts about 5 minutes after launch
+  # and reaches that export about 24 minutes later. The volume is usable throughout, so
+  # registration does not wait for it.
+  #
+  # Billing is per GiB of snapshot data, once per volume: 0.0024 USD from 100 to 200 MiB/s and
+  # 0.0036 USD from 201 to 300 in us-east-2, so 200 MiB/s is the fastest rate of the cheaper
+  # tier and costs about 0.22 USD per x64 launch. arm64 stays at 0: its exports take 3 to 8 s.
+  runner_root_volume_initialization_rate = {
+    arm64  = 0
+    x86_64 = 200
+  }
   runner_registration_table_name = "github-runner-registration"
 }
 
@@ -808,6 +829,24 @@ data "archive_file" "runner_webhook" {
           return ([c for c in ordered if not recently_failed(c[1], c[2])]
                   + [c for c in ordered if recently_failed(c[1], c[2])])
 
+      def root_volume_initialization_rate(arch):
+          """MiB/s at which EBS fills this architecture's root volume from its AMI snapshot.
+
+          From local.runner_root_volume_initialization_rate in Terraform, which says
+          why. 0, or the variable absent, leaves the volume lazily loaded.
+          """
+          return int(os.environ.get(f'ROOT_VOLUME_INIT_RATE_{arch.upper()}', '0'))
+
+      def initialization_refused(error, root_volume):
+          """Whether run_instances refused the root volume's initialization rate.
+
+          EBS refuses a rate it cannot deliver (capacity, or the per-region quota on
+          the sum of rates in flight), and a botocore older than the parameter
+          refuses it before sending. Either way the instance can still launch with
+          a lazily loaded volume, which is what every runner did before the rate.
+          """
+          return 'VolumeInitializationRate' in root_volume and 'initializ' in str(error).lower()
+
       # Lease duration in minutes - runners auto-terminate after this unless renewed
       LEASE_DURATION_MINUTES = 60
 
@@ -815,7 +854,7 @@ data "archive_file" "runner_webhook" {
           """Calculate lease expiry time (now + LEASE_DURATION_MINUTES)"""
           return (datetime.now(timezone.utc) + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
 
-      def launch_runner(arch='arm64', failed_here=None):
+      def launch_runner(arch='arm64', failed_here=None, rate_refused=None):
           """Launch a new spot runner instance, trying each subnet and instance type.
 
           failed_here holds the (AZ, type) pairs whose run_instances raised in this
@@ -823,6 +862,8 @@ data "archive_file" "runner_webhook" {
           refusal raised by run_instances leaves no instance record for the next
           launch to read, so without it each launch in a batch would retry every
           pair that had just refused, inside the 30-second function timeout.
+          rate_refused, shared the same way, holds the architectures whose root
+          volume initialization rate run_instances refused in this invocation.
           """
           ami_id = get_latest_runner_ami(arch)
           if not ami_id:
@@ -830,6 +871,8 @@ data "archive_file" "runner_webhook" {
           subnets = get_launch_subnets()
           if failed_here is None:
               failed_here = set()
+          if rate_refused is None:
+              rate_refused = set()
 
           # Which pools just failed decides where this attempt starts. Without it
           # every retry re-picks the head of the list: on 2026-08-07 the poll
@@ -844,6 +887,10 @@ data "archive_file" "runner_webhook" {
 
           # x86 AMI is from 300GB dev instance, ARM is smaller
           volume_size = 300 if arch == 'x86_64' else 100
+          root_volume = {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
+          initialization_rate = root_volume_initialization_rate(arch)
+          if initialization_rate and arch not in rate_refused:
+              root_volume['VolumeInitializationRate'] = initialization_rate
 
           # Set initial lease - runner will auto-terminate if not renewed
           lease_expiry = get_lease_expiry()
@@ -856,7 +903,7 @@ data "archive_file" "runner_webhook" {
 
           for subnet_id, az, instance_type in candidates:
               try:
-                  response = launch_ec2.run_instances(
+                  request = dict(
                       MinCount=1,
                       MaxCount=1,
                       ImageId=ami_id,
@@ -872,7 +919,7 @@ data "archive_file" "runner_webhook" {
                       IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
                       BlockDeviceMappings=[{
                           'DeviceName': '/dev/sda1',
-                          'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
+                          'Ebs': root_volume
                       }],
                       UserData=user_data,
                       # InstanceMetadataTags lets Inspector's SSM plugin read
@@ -909,6 +956,17 @@ data "archive_file" "runner_webhook" {
                           'Tags': [{'Key': 'Role', 'Value': 'github-runner'}]
                       }]
                   )
+                  try:
+                      response = launch_ec2.run_instances(**request)
+                  except Exception as e:
+                      if not initialization_refused(e, root_volume):
+                          raise
+                      # A slow root volume beats no runner: launch this pool again
+                      # without the rate, and the rest of this invocation too.
+                      print(f'Root volume initialization rate refused for {instance_type} in {az or subnet_id}: {e}; launching without it')
+                      del root_volume['VolumeInitializationRate']
+                      rate_refused.add(arch)
+                      response = launch_ec2.run_instances(**request)
               except Exception as e:
                   last_error = e
                   failed_here.add((az, instance_type))
@@ -1371,9 +1429,10 @@ data "archive_file" "runner_webhook" {
           reused_here = []
           launched_here = []
           instance_type = None
-          # (AZ, type) pairs run_instances refused in this invocation, shared by
-          # every launch in the batch so none of them retries a refusal.
-          failed_here = set()
+          # (AZ, type) pairs and initialization rates run_instances refused in this
+          # invocation, shared by every launch in the batch so none of them
+          # retries a refusal.
+          failed_here, rate_refused = set(), set()
           try:
               for _ in range(slots):
                   host = None
@@ -1392,7 +1451,7 @@ data "archive_file" "runner_webhook" {
                       continue
                   if len(launched_here) >= launch_room:
                       break
-                  spot_id, instance_type = launch_runner(arch, failed_here)
+                  spot_id, instance_type = launch_runner(arch, failed_here, rate_refused)
                   launched_here.append(spot_id)
           except RunnerBootstrapError as e:
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
@@ -1460,6 +1519,9 @@ resource "aws_lambda_function" "runner_webhook" {
       MAX_RUNNERS_ARM64  = tostring(local.runner_max_by_arch.arm64)
       MAX_RUNNERS_X86_64 = tostring(local.runner_max_by_arch.x86_64)
       WEBHOOK_SECRET     = random_password.github_webhook[0].result
+      # Per architecture, from local.runner_root_volume_initialization_rate.
+      ROOT_VOLUME_INIT_RATE_ARM64  = tostring(local.runner_root_volume_initialization_rate.arm64)
+      ROOT_VOLUME_INIT_RATE_X86_64 = tostring(local.runner_root_volume_initialization_rate.x86_64)
     }
   }
 
