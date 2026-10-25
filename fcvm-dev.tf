@@ -100,7 +100,10 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
     cloudflare_zero_trust_access_identity_provider.google[*].id,
     [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
   )
-  policies = [{ id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 }]
+  policies = [
+    { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
+    { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
+  ]
 }
 
 resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
@@ -114,7 +117,10 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
     cloudflare_zero_trust_access_identity_provider.google[*].id,
     [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
   )
-  policies = [{ id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 }]
+  policies = [
+    { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
+    { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
+  ]
 }
 
 # The GPU hosts' agents: a service token, never a person (non_identity). A year long, as claw-master's.

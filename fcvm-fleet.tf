@@ -22,8 +22,8 @@
 #   tiles (4 vCPU each); the group's cap is 8, and launches beyond the quota fail. The coordinator only falls back with
 #   local.fcvm_fleet_coordinator_falls_back, which needs a coordinator image that has --on-demand-group.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
-#   month), running fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag> unless var.fcvm_fleet_coordinator_image names
-#   another image.
+#   month). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
+#   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
 
 variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
@@ -44,17 +44,12 @@ variable "fcvm_fleet_tile_amis" {
   default = { "us-east-1" = { x86_64 = "ami-08f3cc41395353a2f" } }
 }
 
-variable "fcvm_fleet_coordinator_image" {
-  description = "Another coordinator image than fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag> (an ECR or public registry reference)"
-  type        = string
-  default     = ""
-}
-
 locals {
   # The two switches (see the header).
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
-  # The ejc3/fcvm commit the coordinator image in fcvm-fleet/coordinator is tagged with.
+  # The bootstrap image, before main-only CI's first release. Active releases are
+  # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
   # Most on-demand GPU hosts per region (the fallback group's max_size; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max = 8
@@ -121,7 +116,6 @@ locals {
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region, "--dns-nameservers", join(",", local.fcvm_dev_nameservers)],
   )
 
-  fcvm_fleet_coordinator_image   = var.fcvm_fleet_coordinator_image != "" ? var.fcvm_fleet_coordinator_image : "${aws_ecr_repository.fcvm_fleet_coordinator.repository_url}:${local.fcvm_fleet_coordinator_tag}"
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
 }
 
@@ -444,7 +438,7 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
 # execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
-# cannot change under it; the 20 newest are kept, which outlasts any one rollout.
+# cannot change under it; the bootstrap image and the 20 newest are kept.
 resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
   provider             = aws.fcvm_fleet
   name                 = "fcvm-fleet/coordinator"
@@ -462,7 +456,19 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
   repository = aws_ecr_repository.fcvm_fleet_coordinator.name
   policy = jsonencode({
     rules = [{
+      # A higher-priority tag match excludes the immutable bootstrap image from
+      # the rolling rule, even after many releases. Exactly one image has this tag.
       rulePriority = 1
+      description  = "Retain the bootstrap image used by infrastructure initialization"
+      selection = {
+        tagStatus      = "tagged"
+        tagPatternList = [local.fcvm_fleet_coordinator_tag]
+        countType      = "imageCountMoreThan"
+        countNumber    = 1
+      }
+      action = { type = "expire" }
+      }, {
+      rulePriority = 2
       description  = "Keep the 20 newest images"
       selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
       action       = { type = "expire" }
@@ -660,6 +666,7 @@ resource "aws_security_group" "fcvm_fleet_coordinator" {
 }
 
 resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
+  depends_on               = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard]
   provider                 = aws.fcvm_fleet
   family                   = "fcvm-fleet-coordinator"
   requires_compatibilities = ["FARGATE"]
@@ -668,6 +675,10 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   memory                   = "1024"
   execution_role_arn       = aws_iam_role.fcvm_fleet_coordinator_execution.arn
   task_role_arn            = aws_iam_role.fcvm_fleet_coordinator_task.arn
+  # The release function changes only the image and records its digest in the
+  # release parameter. Track that revision without ignoring infrastructure drift.
+  track_latest = true
+  tags         = { Project = "fcvm-fleet" }
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -677,7 +688,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   container_definitions = jsonencode([
     {
       name      = "coordinator"
-      image     = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_image : "public.ecr.aws/docker/library/busybox:stable"
+      image     = local.fcvm_fleet_coordinator_running ? nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value) : "public.ecr.aws/docker/library/busybox:stable"
       essential = true
       command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null
       # Its state is an S3 object, not a file (ECS.5: no writable root; a task volume where something must write).
@@ -707,9 +718,19 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       }
     },
   ])
+  lifecycle {
+    precondition {
+      condition = can(regex(
+        "^${replace(aws_ecr_repository.fcvm_fleet_coordinator.repository_url, ".", "\\.")}@sha256:[0-9a-f]{64}$",
+        nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value),
+      ))
+      error_message = "The coordinator release must be an immutable digest in its own ECR repository."
+    }
+  }
 }
 
 resource "aws_ecs_service" "fcvm_fleet_coordinator" {
+  depends_on      = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard]
   provider        = aws.fcvm_fleet
   name            = "fcvm-fleet-coordinator"
   cluster         = aws_ecs_cluster.fcvm_fleet.id

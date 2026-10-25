@@ -365,6 +365,19 @@ networking and Cloudflare tunnels are outside that pool. Setup applies and persi
 limits without restarting containers or the host. The remaining 15% is headroom for host
 services, not an allocation guarantee against memory consumed by other host processes.
 
+The fcvm staging coordinator has a main-only CI release path (`fcvm-fleet-ci.tf`). CI builds
+and tests its ARM64 image, publishes an immutable commit tag, and invokes an image-only release
+function. That function takes Terraform's backend lock, rolls out the new image and records
+its digest in `/fcvm-fleet/stage/coordinator-image`; Terraform still checks the task's roles,
+commands, networking and other infrastructure. The CI job then checks Access, relaunches one
+tile in each half, and receives renderer frames over IPv4 under fresh DNS names. This can wake
+the GPU fleet; a capacity shortage fails the live check. CI has no Terraform-state access,
+administrator role or direct ECS permissions. Its deployed code has the coordinator's existing
+fleet-account runtime permissions. Environment variables and the staging-only Access token
+are provisioned by Terraform, with no manual CI setup. If CI releases between a saved
+plan and its apply, an apply-time parameter-version check rejects the stale plan; run
+a fresh plan. This check also detects a release attempt that rolled back to the same image.
+
 List current connection commands:
 
 ```bash

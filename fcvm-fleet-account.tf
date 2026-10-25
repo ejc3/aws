@@ -12,7 +12,9 @@
 # - Applied two ways: the fleet's infrastructure from here (fcvm-fleet.tf, a jumpbox through OrganizationAccountAccessRole),
 #   and fcvm's own Terraform, if it has any, from fcvm-metal-arm through `fcvm-fleet-terraform` (AdministratorAccess inside
 #   this account only, one-hour sessions), which trusts dev-server-role pinned to fcvm-arm's instance, as constellation's.
-# - No CI credential: GitHub holds no AWS role for this account (state and configuration reads can carry secret values).
+# - CI cannot assume a role in this account. Its management-account role may publish to the coordinator's ECR repository
+#   and invoke the image-only release function (fcvm-fleet-ci.tf). Only that function assumes the scoped release role;
+#   neither has Terraform-state or reusable-credential access.
 # - Quotas (ejc3/aws#605): 192 vCPU of G spot in us-east-1 (one metal host, its replacement and the EC2 tiles); one
 #   region is enough.
 #

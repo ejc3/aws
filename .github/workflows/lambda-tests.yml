@@ -298,6 +298,9 @@ jobs:
       - name: "fcvm-fleet infrastructure: 443 plus the slot ports over IPv4, gated GPU hosts and coordinator, tile-only coordinator role (fcvm-fleet.tf)"
         run: python3 -S -B scripts/test-fcvm-fleet.py
 
+      - name: "Coordinator releases: image-only changes, Terraform backend lock ownership and rollback"
+        run: python3 -S -B scripts/test-fcvm-coordinator-release.py
+
       - name: Turso API token is readable by the metal boxes and administration only
         run: python3 -S -B scripts/test-turso-token.py
 
