@@ -48,10 +48,15 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.stability_api_key.arn]
   }
+  statement {
+    sid       = "ReadTheSunoSessionCookie"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.suno_cookie.arn]
+  }
 }
 
 # Keep the existing immutable name/description to avoid replacing this live policy.
-# Its exact-ARN statements above now cover both creative providers.
+# Its exact-ARN statements above cover the shared creative-service credentials.
 resource "aws_iam_policy" "elevenlabs_read" {
   name        = "dev-elevenlabs-read"
   description = "Dev boxes: read the ElevenLabs API key (games/elevenlabs-api-key) and nothing else"
@@ -110,8 +115,33 @@ resource "aws_secretsmanager_secret_policy" "stability_api_key" {
   })
 }
 
+# Suno's unofficial offline utility uses an authenticated session, not an API key.
+# The owner supplies the cookie through Secrets Manager after login; Terraform must
+# never read its value. Its read boundary matches the other creative credentials.
+resource "aws_secretsmanager_secret" "suno_cookie" {
+  name                    = "games/suno-cookie"
+  description             = "Authenticated Suno session for the offline asset utility; value supplied out of band."
+  recovery_window_in_days = 7
+  tags                    = { Name = "games/suno-cookie", Project = "games" }
+}
+
+resource "aws_secretsmanager_secret_policy" "suno_cookie" {
+  secret_arn = aws_secretsmanager_secret.suno_cookie.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.suno_cookie.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
+    }]
+  })
+}
+
 # Reuse elevenlabs_read above: dev-server-role is already at its managed-policy
-# attachment limit. Its existing two-role attachment is also the Stability boundary.
+# attachment limit. Its existing two-role attachment serves all credentials above.
 
 # AWS Price List API for the dev boxes (metal and nextjs-dev, the "dolphin" box): public list
 # prices only, so agents can price an instance, a volume or a model call themselves. Nothing

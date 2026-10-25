@@ -229,6 +229,14 @@ populate it with `put-secret-value` on stdin after applying. Tools fetch it when
 `STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
 The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
 
+The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
+as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
+session, not an official API key. Terraform manages only its empty container and grants;
+populate or renew the value out of band over stdin after the owner signs in. Never put it
+in a file, command argument, log, state or deployed-game environment. Keep the adapter
+optional until real authentication, generation and renewal checks pass; do not assume a
+website subscription provides an official or unattended API.
+
 The claw-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
