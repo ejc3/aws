@@ -109,5 +109,27 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertNotIn("anthropic", policy)
 
 
+
+class StabilitySecretTests(unittest.TestCase):
+    def test_value_is_out_of_band_and_not_in_deployed_apps(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "stability_api_key"', TF)
+        self.assertNotIn('data "aws_secretsmanager_secret_version" "stability_api_key"', TF)
+        self.assertNotIn('resource "vercel_project_environment_variable" "stability_api_key"', TF)
+        self.assertNotRegex(TF, r"sk-[A-Za-z0-9]{20,}")
+
+    def test_resource_policy_matches_the_existing_development_boundary(self):
+        policy = block("aws_secretsmanager_secret_policy", "stability_api_key")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers)', policy)
+
+    def test_identity_policy_is_scoped_to_one_secret_and_two_roles(self):
+        policy = block("aws_iam_policy_document", "stability_read")
+        self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', policy)
+        self.assertIn('resources = [aws_secretsmanager_secret.stability_api_key.arn]', policy)
+        attach = block("aws_iam_role_policy_attachment", "stability_read")
+        self.assertIn('{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }', attach)
+        self.assertIn('policy_arn = aws_iam_policy.stability_read.arn', attach)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

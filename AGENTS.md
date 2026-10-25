@@ -1400,6 +1400,12 @@ Available if a task needs them; neither needs a key on disk.
   or into a file or a commit:
   `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+- **Stability AI** (offline audio, artwork and 3D assets). `games/stability-api-key` in
+  us-west-1 has the same admin/dev-role read boundary as ElevenLabs. Fetch it only when
+  generating assets as `STABILITY_API_KEY`; no key in app bundles, profiles or logs.
+  Terraform owns only the container and grants. Pricing and capabilities must come from
+  the current official API documentation; the web subscription and API credits differ.
+
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda

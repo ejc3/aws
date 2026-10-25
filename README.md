@@ -223,6 +223,12 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
+The Stability AI key for offline asset creation is `games/stability-api-key` in the same
+region. Terraform creates its container and grants the same two dev roles as ElevenLabs;
+populate it with `put-secret-value` on stdin after applying. Tools fetch it when needed as
+`STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
+The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
+
 The claw-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
