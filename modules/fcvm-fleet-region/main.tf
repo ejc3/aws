@@ -257,6 +257,21 @@ resource "aws_launch_template" "host" {
     name = var.host_profile_name
   }
 
+  # The root volume is filled from the AMI's snapshot at 300 MiB/s (provisioned rate for volume
+  # initialization, the most EBS offers) instead of block by block on first read. A host's first boot
+  # reads its root volume throughout: on g4dn.metal from one AMI (ejc3/fcvm#1257, one boot each) the
+  # store unit started 21.8 s after kernel start lazily loaded (7.6 ms per read) and 17.2 s at 300 MiB/s
+  # (3.7 ms per read); the same first boot on a volume already read took 11.1 s. Fast Snapshot Restore
+  # would reach that, at 0.75 USD per AZ-hour for each AZ a host can launch in. This is billed once per
+  # launch per GiB of snapshot data: 0.0036 USD in the 201 to 300 MiB/s tier in us-east-1, about 0.12 USD
+  # for the 32 GiB host AMI. The device is the Ubuntu AMI's root device.
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_initialization_rate = 300
+    }
+  }
+
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
