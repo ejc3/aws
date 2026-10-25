@@ -55,6 +55,15 @@ class HostTests(unittest.TestCase):
         self.assertIn('http_tokens                 = "required"', lt)
         self.assertIn("http_put_response_hop_limit = 1", lt)
 
+    def test_the_host_root_volume_is_filled_at_the_highest_initialization_rate(self):
+        # A lazily loaded root volume put 32.3 s between kernel start and the store unit on a host's first boot, against
+        # 11.1 s on a volume already read (ejc3/fcvm#1257); EBS takes 100 to 300 MiB/s.
+        lt = block('resource "aws_launch_template" "host"', MOD)
+        bdm = re.search(r"block_device_mappings \{\n(.*?)\n  \}\n", lt, re.S)
+        self.assertIsNotNone(bdm, lt)
+        self.assertIn('device_name = "/dev/sda1"', bdm.group(1))
+        self.assertIn("volume_initialization_rate = 300", bdm.group(1))
+
     def test_the_host_group_is_spot_price_capacity_optimized_and_gated(self):
         asg = block('resource "aws_autoscaling_group" "hosts"', MOD)
         self.assertIn("on_demand_base_capacity                  = 0", asg)
