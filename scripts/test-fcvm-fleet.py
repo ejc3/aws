@@ -321,6 +321,18 @@ class TileSubnetTests(unittest.TestCase):
             self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
         self.assertIn("tile_az = local.azs[0]", MOD)
 
+    def test_the_coordinator_gets_every_fleet_subnet_and_group_for_tile_launches(self):
+        # A tile launch tries each AZ's subnet of a region, in order, before the next region (ejc3/fcvm#1284). The
+        # launch names the subnet and the group, which the role may reference by ARN.
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${join(",", m.subnet_ids)}"]) }', task)
+        self.assertIn('{ name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${m.security_group_id}"]) }', task)
+        refs = TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('[for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]', refs)
+        self.assertIn('"arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"', refs)
+
 
 class SlotV4Tests(unittest.TestCase):
     """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
