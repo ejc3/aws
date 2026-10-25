@@ -472,7 +472,8 @@ fi
 # let the kernel select an OOM victim inside that slice. Host networking, SSH and
 # tunnels live outside it. Bound swap too, before paging can starve the host.
 # set-property persists these settings and applies them to running containers.
-systemctl set-property machine.slice MemoryHigh=80% MemoryMax=85% MemorySwapMax=1G
+systemctl set-property machine.slice MemoryHigh=80% MemoryMax=85% MemorySwapMax=1G \
+  || { echo "ERROR: shared container memory budget did not install" >&2; exit 1; }
 
 # ---------------------------------------------------------------- memory
 # A 4 GB swapfile absorbs compile spikes; earlyoom kills the biggest offender at 4% available memory so

@@ -870,7 +870,8 @@ class SharedMemoryBudgetTests(unittest.TestCase):
             fake(root, "systemctl", 'printf "%s\\n" "$*" >> "$MEMORY_CALLS"\nexit "$MEMORY_FAILURE"\n')
             env = dict(os.environ, PATH=str(root) + ":" + os.environ["PATH"],
                        MEMORY_CALLS=str(log), MEMORY_FAILURE=str(failure))
-            result = subprocess.run(["bash", "-e"], input=self.command() + '\necho completed\n',
+            shell_options = re.search(r"^set -[^\n]+$", SCRIPT, re.M).group()
+            result = subprocess.run(["bash"], input=shell_options + '\n' + self.command() + '\necho completed\n',
                                     text=True, capture_output=True, env=env)
             return result, log.read_text().splitlines()
 
@@ -894,7 +895,7 @@ class SharedMemoryBudgetTests(unittest.TestCase):
 
     def test_failed_budget_stops_setup_instead_of_recording_success(self):
         result, calls = self.run_command(failure=17)
-        self.assertEqual(result.returncode, 17)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(calls), 1)
         self.assertNotIn("completed", result.stdout)
 
