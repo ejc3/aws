@@ -324,6 +324,31 @@ resource "aws_eip_association" "firecracker_dev_next" {
   private_ip_address   = one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))
 }
 
+# Persist the address in netplan for ordinary reboots and add it live without reconfiguring
+# the primary interface. State Manager also restores it if the managed file is removed.
+resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
+  count = var.enable_firecracker_instance ? 1 : 0
+
+  name                     = "AWS-RunShellScript"
+  association_name         = "fcvm-arm-secondary-ipv4"
+  schedule_expression      = "rate(1 day)"
+  wait_for_success_timeout = "5m"
+
+  targets {
+    key    = "InstanceIds"
+    values = [aws_instance.firecracker_dev[0].id]
+  }
+
+  parameters = {
+    commands         = <<-EOT
+      python3 - '${one(setsubtract(aws_network_interface.firecracker_dev[0].private_ips, [aws_network_interface.firecracker_dev[0].private_ip]))}' <<'PYSECONDARY'
+      ${indent(6, chomp(file("${path.module}/scripts/fcvm-secondary-ipv4.py")))}
+      PYSECONDARY
+    EOT
+    executionTimeout = "120"
+  }
+}
+
 locals {
   # Both public addresses of fcvm-metal-arm, current first. Allowlists of the box use this list.
   firecracker_dev_public_ips = concat(

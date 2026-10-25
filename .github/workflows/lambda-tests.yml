@@ -61,6 +61,9 @@ jobs:
       - name: Dev-host credential boundaries
         run: python3 -S -B scripts/test-dev-credential-boundary.py
 
+      - name: Metal secondary IPv4 persists across boots without restarting networking
+        run: python3 -S -B scripts/test-fcvm-secondary-ipv4.py
+
       - name: Jumpbox native Claude installation boundaries
         run: python3 -S -B scripts/test-jumpbox-native-claude.py
 

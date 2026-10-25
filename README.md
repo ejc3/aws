@@ -394,6 +394,12 @@ ssh nextjs
 ssh io
 ```
 
+The ARM host's second inbound address is reported by
+`firecracker_dev_public_ip_next`. Terraform persists its secondary private
+address in netplan and adds it live without restarting networking. The original
+address remains the outbound address until a separate cutover.
+
+
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
 address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, not the
 `fcvm-ec2` admin key, so ordinary dev-to-dev access does not grant an admin shell on a

@@ -131,7 +131,8 @@ class GpuBoxTests(unittest.TestCase):
         ingress, egress = sg.split('dynamic "egress"')
         self.assertNotIn('0.0.0.0/0', ingress)
         # exactly the boxes holding the grant, each a /32 of its own Elastic IP
-        self.assertEqual(re.findall(r'aws_eip\.(\w+) :', ingress), ['nextjs_dev', 'firecracker_dev', 'x86_dev'])
+        self.assertEqual(re.findall(r'aws_eip\.(\w+) :', ingress), ['nextjs_dev', 'x86_dev'])
+        self.assertIn('for i, ip in local.firecracker_dev_public_ips', ingress)
         self.assertIn('cidr_blocks = ["${ingress.value}/32"]', ingress)
         # the group's description is immutable (a change replaces the group under any running gbox)
         self.assertIn('description = "On-demand GPU test box: SSH from nextjs-dev only"', sg)
