@@ -26,8 +26,13 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
         self.assertNotIn("22", sg)
+        # The coordinator task admits nothing, except 443 for the EC2 half's aggregator with aggregated streaming on
+        # (AggregatedTests).
         coord = block('resource "aws_security_group" "fcvm_fleet_coordinator"')
-        self.assertNotIn("ingress", coord)
+        self.assertEqual(coord.count("ingress"), 1, coord)
+        self.assertIn("for_each = local.fcvm_fleet_aggregated ? [1] : []", coord)
+        self.assertIn("from_port        = 443", coord)
+        self.assertIn("to_port          = 443", coord)
 
     def test_every_az_gets_a_public_ipv6_subnet_and_flow_logs(self):
         sub = block('resource "aws_subnet" "public"', MOD)
@@ -325,7 +330,10 @@ class SlotV4Tests(unittest.TestCase):
         slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
         self.assertEqual((base, slots), (20200, 8))
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        self.assertIn("to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
+        # The slots' ports, and with aggregated streaming the host aggregator's port after them.
+        self.assertIn(
+            "to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
+            "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
         # The agent forwards from the same base.
         self.assertIn('"--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}"', TF)
         self.assertIn('"--public-ipv4-from-imds"', TF)
@@ -344,6 +352,36 @@ class SlotV4Tests(unittest.TestCase):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
         self.assertIn('"--dns-nameservers", join(",", local.fcvm_dev_nameservers)', cmd)
 
+
+
+class AggregatedTests(unittest.TestCase):
+    """Aggregated streaming (ejc3/fcvm#1232) is one switch, off, and off changes nothing staging runs."""
+
+    def test_the_switch_is_off(self):
+        self.assertRegex(TF, r"\n  fcvm_fleet_aggregated = false\n")
+
+    def test_everything_it_adds_is_gated_by_it(self):
+        agent = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('], local.fcvm_fleet_aggregated ? [', agent)
+        self.assertIn('"--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}"', agent)
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:', cmd)
+        self.assertIn('"--ec2-aggregate-tls"', cmd)
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('for_each = local.fcvm_fleet_aggregated ? ["fleet-run"] : []', task)
+        self.assertIn("[for _ in(local.fcvm_fleet_aggregated ? [1] : []) : {", task)
+        self.assertIn('namespace = "net.ipv4.ip_unprivileged_port_start", value = "443"', task)
+        self.assertIn('containerPath = "/run/fcvm-fleet"', task)
+        self.assertIn('"/run/fcvm-fleet/tls"', cmd)
+        dual = block('resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack"')
+        self.assertIn("count    = local.fcvm_fleet_aggregated ? 1 : 0", dual)
+
+    def test_the_host_aggregator_port_follows_the_slots(self):
+        self.assertIn(
+            "fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots", TF)
+        priv = int(re.search(r"fcvm_fleet_aggregate_port\s+= (\d+)", TF).group(1))
+        # The private listener is outside the admitted range.
+        self.assertFalse(20200 <= priv <= 20208, priv)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
