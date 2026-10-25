@@ -1386,7 +1386,9 @@ Available if a task needs them; neither needs a key on disk.
 - **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
   `dolphin-maps-loop-sweep` and `dolphin-maps-loop-refit` (one bundle) on EventBridge schedules in America/Los_Angeles
   time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night, the refit an hour later; all off
-  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms), reading `browserbase/credentials`
+  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms; the sweep function also runs the week passes
+  on the month's first Saturday from 20:00, one a day of the week 20 minutes apart, and the weekend pass on
+  Thursday 23:00, on the same switch), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.
