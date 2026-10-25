@@ -43,11 +43,16 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.elevenlabs_api_key.arn]
   }
+  statement {
+    sid       = "ReadTheStabilityKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.stability_api_key.arn]
+  }
 }
 
 resource "aws_iam_policy" "elevenlabs_read" {
   name        = "dev-elevenlabs-read"
-  description = "Dev boxes: read the ElevenLabs API key (games/elevenlabs-api-key) and nothing else"
+  description = "Dev boxes: read only the ElevenLabs and Stability creative-assets keys"
   policy      = data.aws_iam_policy_document.elevenlabs_read.json
 }
 
@@ -103,25 +108,8 @@ resource "aws_secretsmanager_secret_policy" "stability_api_key" {
   })
 }
 
-data "aws_iam_policy_document" "stability_read" {
-  statement {
-    sid       = "ReadTheStabilityKey"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.stability_api_key.arn]
-  }
-}
-
-resource "aws_iam_policy" "stability_read" {
-  name        = "dev-stability-read"
-  description = "Dev boxes: read only the Stability AI creative-assets key"
-  policy      = data.aws_iam_policy_document.stability_read.json
-}
-
-resource "aws_iam_role_policy_attachment" "stability_read" {
-  for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
-  role       = each.value
-  policy_arn = aws_iam_policy.stability_read.arn
-}
+# Reuse elevenlabs_read above: dev-server-role is already at its managed-policy
+# attachment limit. Its existing two-role attachment is also the Stability boundary.
 
 # AWS Price List API for the dev boxes (metal and nextjs-dev, the "dolphin" box): public list
 # prices only, so agents can price an instance, a volume or a model call themselves. Nothing

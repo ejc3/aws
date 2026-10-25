@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """dev-ai-services.tf: the ElevenLabs key readable only by the administration set and the
-two dev roles, and the dev roles may read that one secret and nothing else. Offline."""
+two dev roles; Stability shares the same existing attachment. Offline."""
 import re
 import unittest
 from pathlib import Path
@@ -123,13 +123,15 @@ class StabilitySecretTests(unittest.TestCase):
         self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
         self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers)', policy)
 
-    def test_identity_policy_is_scoped_to_one_secret_and_two_roles(self):
-        policy = block("aws_iam_policy_document", "stability_read")
+    def test_identity_policy_reuses_the_existing_attachment_with_exact_secret_scope(self):
+        policy = block("aws_iam_policy_document", "elevenlabs_read")
         self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', policy)
         self.assertIn('resources = [aws_secretsmanager_secret.stability_api_key.arn]', policy)
-        attach = block("aws_iam_role_policy_attachment", "stability_read")
+        attach = block("aws_iam_role_policy_attachment", "elevenlabs_read")
         self.assertIn('{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }', attach)
-        self.assertIn('policy_arn = aws_iam_policy.stability_read.arn', attach)
+        self.assertIn('policy_arn = aws_iam_policy.elevenlabs_read.arn', attach)
+        self.assertNotIn('resource "aws_iam_policy" "stability_read"', TF)
+        self.assertNotIn('resource "aws_iam_role_policy_attachment" "stability_read"', TF)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
