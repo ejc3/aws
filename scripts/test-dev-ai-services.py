@@ -133,5 +133,25 @@ class StabilitySecretTests(unittest.TestCase):
         self.assertNotIn('resource "aws_iam_policy" "stability_read"', TF)
         self.assertNotIn('resource "aws_iam_role_policy_attachment" "stability_read"', TF)
 
+class SunoSecretTests(unittest.TestCase):
+    def test_session_stays_out_of_state_and_reuses_the_exact_creative_boundary(self):
+        for kind in ("resource", "data"):
+            self.assertNotIn(f'{kind} "aws_secretsmanager_secret_version" "suno_cookie"', TF)
+        self.assertNotIn('resource "vercel_project_environment_variable" "suno_cookie"', TF)
+        secret = block("aws_secretsmanager_secret", "suno_cookie")
+        self.assertIn('name                    = "games/suno-cookie"', secret)
+        policy = block("aws_secretsmanager_secret_policy", "suno_cookie")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn('Resource  = aws_secretsmanager_secret.suno_cookie.arn', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers)', policy)
+        doc = block("aws_iam_policy_document", "elevenlabs_read")
+        statement = re.search(r'statement \{\n    sid       = "ReadTheSunoSessionCookie".*?\n  \}', doc, re.S).group()
+        self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', statement)
+        self.assertIn('resources = [aws_secretsmanager_secret.suno_cookie.arn]', statement)
+        self.assertNotIn('resource "aws_iam_policy" "suno_read"', TF)
+        self.assertNotIn('resource "aws_iam_role_policy_attachment" "suno_read"', TF)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

@@ -1406,6 +1406,13 @@ Available if a task needs them; neither needs a key on disk.
   Terraform owns only the container and grants. Pricing and capabilities must come from
   the current official API documentation; the web subscription and API credits differ.
 
+- **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
+  uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
+  SUNO_COOKIE at use time only. It is a full website session: never in files, command
+  arguments, logs, Terraform state or app environments. Terraform owns the container and
+  grants only. Do not call the utility verified until real login, generation and renewal
+  checks pass; a paid website account is not an official API.
+
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
