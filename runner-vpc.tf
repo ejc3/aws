@@ -141,8 +141,7 @@ resource "aws_security_group" "runner" {
     self      = true # fcvm runner-to-runner only
     cidr_blocks = [
       "${aws_eip.jumpbox[0].public_ip}/32",              # jumpbox (management host)
-      "${aws_eip.firecracker_dev[0].public_ip}/32",      # fcvm-metal-arm dev server
-      "${aws_eip.firecracker_dev_next[0].public_ip}/32", # fcvm-metal-arm, second address
+      "${aws_eip.firecracker_dev_next[0].public_ip}/32", # fcvm-metal-arm dev server
       "${aws_eip.x86_dev[0].public_ip}/32",              # fcvm-metal-x86 dev server
     ]
     description = "SSH from fcvm runners (self) + operator EIPs (jumpbox, dev servers); SSM elsewhere"
