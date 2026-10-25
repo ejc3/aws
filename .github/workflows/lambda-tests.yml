@@ -210,6 +210,8 @@ jobs:
         run: python3 -S -B scripts/test-claw-master-dashboard-site.py
       - name: colton-games picture moderation grant
         run: python3 -S -B scripts/test-colton-games-moderation.py
+      - name: dolphin-maps picture and text moderation (two actions, each in its own region, Dolphin account, each key to its own Worker)
+        run: python3 -S -B scripts/test-dolphin-maps-moderation.py
       - name: dolphin-films credentials (production for administration only, non-production for the metal dev role)
         run: python3 -S -B scripts/test-dolphin-films.py
 

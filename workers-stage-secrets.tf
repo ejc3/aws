@@ -34,6 +34,10 @@
 #
 # Rolling a Dolphin site back here inside the 7-day recovery window needs the deleted container restored first.
 #
+# One exception to "Terraform never holds a value": dolphin-maps-stage also gets a key Terraform makes (its moderation user,
+# dolphin-maps-moderation.tf), written into a second container of its own, workers-stage/dolphin-maps/terraform in the
+# Dolphin account. The loader merges the two and refuses a name in both; the out-of-band container stays out of state.
+#
 # The staging copies use NON-production values where the site has them (their own OAuth client, the non-production
 # database) and fresh stage-only random secrets where a value only has to be unguessable. Vercel never returns a
 # variable of type `sensitive`, so those cannot be copied from there: take them from the real source, or make new ones.

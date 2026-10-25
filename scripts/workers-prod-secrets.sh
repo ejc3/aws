@@ -7,9 +7,10 @@
 #   workers-prod/SITE             what an administrator put (values Terraform does not hold)
 #   workers-prod/SITE/terraform   what Terraform writes (the same values it writes to Vercel production)
 # The two are merged; a name in both, an empty value or a placeholder refuses the whole load before Cloudflare is called.
-# dolphin-maps has only workers-prod/dolphin-maps, kept in the Dolphin account (dolphin-labs-hq/dolphin-aws, secrets.tf) and
-# read there through OrganizationAccountAccessRole, as workers-stage-secrets.sh reads the Dolphin sites' staging containers;
-# Terraform here holds none of its values.
+# dolphin-maps' two are both in the Dolphin account and read there through OrganizationAccountAccessRole, as
+# workers-stage-secrets.sh reads the Dolphin sites' staging containers: workers-prod/dolphin-maps (out of band; the container
+# is dolphin-labs-hq/dolphin-aws secrets.tf's) and workers-prod/dolphin-maps/terraform (the moderation key, written by
+# dolphin-maps-moderation.tf here through aws.dolphin).
 # The merged JSON is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this script's
 # output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a deploy is
 # uploading can be lost when that deploy activates.
@@ -34,9 +35,11 @@ case "$SITE" in
   colton-games) OUT_OF_BAND_NAMES="SKYHOOK_LEADERBOARD_SECRET SUPABASE_SECRET_KEY SUPABASE_URL" ;;
   dolphin-maps)
     SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID
-    MANAGED_CONTAINER=""
+    MANAGED_CONTAINER=1 # workers-prod/dolphin-maps/terraform: the moderation key (dolphin-maps-moderation.tf)
     OUT_OF_BAND_NAMES="ACCOUNT_TOKEN_KEY APPLE_BUNDLE_ID APPLE_KEY_ID APPLE_PRIVATE_KEY APPLE_SERVICES_ID APPLE_TEAM_ID"
     OUT_OF_BAND_NAMES+=" GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET LEDGER_AUTH_TOKEN LEDGER_DATABASE_URL TURSO_AUTH_TOKEN TURSO_DATABASE_URL"
+    # The arrival page's place lookups (dolphin-maps /api/place, server-side only): the fetch services Dolphin licenses.
+    OUT_OF_BAND_NAMES+=" BROWSERBASE_API_KEY BROWSERBASE_PROJECT_ID EXA_API_KEY SCRAPINGDOG_API_KEY"
     ;;
   *) echo "no production Worker secrets are defined for $SITE (workers-prod-secrets.tf)" >&2; exit 2 ;;
 esac
@@ -63,7 +66,7 @@ read_container() {
     # Either profile variable makes the CLI ignore the session in the environment.
     unset AWS_PROFILE AWS_DEFAULT_PROFILE
     aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null
-  ) || { echo "$1 in account $SOURCE_ACCOUNT has no value yet: put one first (dolphin-labs-hq/dolphin-aws, secrets.tf)" >&2; return 1; }
+  ) || { echo "$1 in account $SOURCE_ACCOUNT has no value yet: put one first (dolphin-labs-hq/dolphin-aws, secrets.tf; a /terraform container is written by an apply here)" >&2; return 1; }
 }
 OUT_OF_BAND=$(read_container "workers-prod/$SITE") || exit 1
 MANAGED=""
@@ -96,6 +99,12 @@ for label in ("OUT_OF_BAND", "MANAGED"):
         merged[k] = v
     if label == "OUT_OF_BAND" and sorted(d) != sorted(os.environ["OUT_OF_BAND_NAMES"].split()):
         sys.exit("workers-prod/%s must hold exactly: %s (it holds: %s)" % (sys.argv[1], os.environ["OUT_OF_BAND_NAMES"], " ".join(sorted(d))))
+if sys.argv[1] == "dolphin-maps":
+    required = {"MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_SECRET_ACCESS_KEY",
+                "MODERATION_AWS_REGION", "MODERATION_TEXT_REGION"}
+    missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
+    if missing:
+        sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
 print("workers-prod/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")

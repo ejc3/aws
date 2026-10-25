@@ -2,8 +2,9 @@
 """Dolphin Maps production on Cloudflare (dolphin-labs-zone.tf, scripts/workers-prod-secrets.sh; ejc3/aws #529):
 maps.dolphin-labs.dev is a proxied placeholder record and a Workers route to dolphin-maps-prod; it is public through an
 Access application of its own with a bypass-everyone policy, which exists only after the record and the route, while the
-*.dolphin-labs.dev wildcard application is unchanged; and the loader reads workers-prod/dolphin-maps in the Dolphin
-account, run here for real against stub `aws` and `npx`."""
+*.dolphin-labs.dev wildcard application is unchanged; and the loader reads workers-prod/dolphin-maps and the
+Terraform-written workers-prod/dolphin-maps/terraform (the moderation key) in the Dolphin account and merges them, run here
+for real against stub `aws` and `npx`."""
 import json
 import os
 import re
@@ -17,11 +18,15 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "dolphin-labs-zone.tf").read_text()
 SCRIPT = ROOT / "scripts" / "workers-prod-secrets.sh"
 DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
-# The names dolphin-maps-prod reads (issue #529; web/lib/server/db.ts and auth.ts in dolphin-labs-hq/dolphin-maps).
+# The names dolphin-maps-prod reads (issue #529 and the arrival page's server-side place lookups).
 # APP_ORIGIN is a wrangler.jsonc var, not a secret.
 NAMES = ["ACCOUNT_TOKEN_KEY", "APPLE_BUNDLE_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_SERVICES_ID", "APPLE_TEAM_ID",
-         "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "TURSO_AUTH_TOKEN",
+         "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "EXA_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+         "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "SCRAPINGDOG_API_KEY", "TURSO_AUTH_TOKEN",
          "TURSO_DATABASE_URL"]
+# What Terraform writes into workers-prod/dolphin-maps/terraform (dolphin-maps-moderation.tf).
+MANAGED_NAMES = ["MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_REGION", "MODERATION_AWS_SECRET_ACCESS_KEY",
+                 "MODERATION_TEXT_REGION"]
 
 
 def code(text):
@@ -134,7 +139,7 @@ if a.startswith("sts assume-role"):
         print("None\tNone\tNone"); sys.exit(0)
     print("ASIAFAKEDOLPHIN\tfake-secret-key-0123\tfake-session-token-4567")
 elif "workers-prod/" in a:
-    p = os.environ.get("FAKE_OOB")
+    p = os.environ.get("FAKE_MANAGED" if "workers-prod/dolphin-maps/terraform " in a + " " else "FAKE_OOB")
     if p is None or os.environ.get("AWS_ACCESS_KEY_ID") != "ASIAFAKEDOLPHIN":
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
@@ -153,6 +158,7 @@ print("Successfully created secret for key: X")
 
 class LoaderTests(unittest.TestCase):
     VALUES = {name: "%s-VALUE-%02d-abcdefghijklmnop" % (name.lower(), i) for i, name in enumerate(NAMES)}
+    MANAGED = {name: "%s-MANAGED-%02d-qrstuvwxyz" % (name.lower(), i) for i, name in enumerate(MANAGED_NAMES)}
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -162,36 +168,65 @@ class LoaderTests(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         self.log, self.stdin, self.aws_log = self.tmp / "npx.log", self.tmp / "npx.stdin", self.tmp / "aws.log"
 
-    def run_loader(self, oob, **extra):
+    def run_loader(self, oob, managed=MANAGED, **extra):
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
                    NPX_STDIN=str(self.stdin), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile", **extra)
         env.pop("AWS_ACCESS_KEY_ID", None)
-        if oob is None:
-            env.pop("FAKE_OOB", None)
-        else:
-            env["FAKE_OOB"] = json.dumps(oob)
+        for name, value in (("FAKE_OOB", oob), ("FAKE_MANAGED", managed)):
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = json.dumps(value)
         r = subprocess.run(["bash", str(SCRIPT), "dolphin-maps"], capture_output=True, text=True, env=env, timeout=60)
         return r, r.stdout + r.stderr
 
-    def test_it_loads_the_dolphin_account_container_into_the_prod_worker(self):
+    def test_it_loads_both_dolphin_account_containers_into_the_prod_worker(self):
         r, out = self.run_loader(self.VALUES)
         self.assertEqual(r.returncode, 0, out)
-        self.assertEqual(json.loads(self.stdin.read_text()), self.VALUES)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.VALUES, **self.MANAGED})
         self.assertIn("secret bulk --name dolphin-maps-prod", self.log.read_text())
         self.assertNotIn("-stage", self.log.read_text())
         aws = self.aws_log.read_text()
         self.assertIn("sts assume-role --role-arn %s" % DOLPHIN_ROLE, aws)
         reads = [l for l in aws.splitlines() if "workers-prod/" in l]
-        # One read, of the one container, with the Dolphin session and no profile to override it; no Terraform container.
-        self.assertEqual(len(reads), 1, reads)
+        # Two reads, the out-of-band container and Terraform's, each with the Dolphin session and no profile to override it.
+        self.assertEqual(len(reads), 2, reads)
         self.assertIn("--secret-id workers-prod/dolphin-maps ", reads[0])
-        self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=-", reads[0])
-        self.assertNotIn("/terraform", aws)
+        self.assertIn("--secret-id workers-prod/dolphin-maps/terraform ", reads[1])
+        for read in reads:
+            self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=-", read)
+        self.assertNotIn("workers-stage/", aws)
+
+    def test_the_moderation_key_comes_from_terraform_and_is_refused_from_both(self):
+        # A missing Terraform container stops the load; a moderation name put out of band as well is refused.
+        r, out = self.run_loader(self.VALUES, managed=None)
+        self.assertNotEqual(r.returncode, 0, out)
+        r, out = self.run_loader({**self.VALUES, "MODERATION_AWS_REGION": "us-west-1"})
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("must hold exactly", out)
+        r, out = self.run_loader(self.VALUES, managed={**self.MANAGED, "TURSO_AUTH_TOKEN": "x-0123456789"})
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("in both containers", out)
+        for secret in list(self.MANAGED.values()):
+            self.assertNotIn(secret, out)
+        self.assertFalse(self.log.exists())
+
+    def test_all_moderation_names_are_required_and_other_managed_names_are_preserved(self):
+        for name in self.MANAGED:
+            with self.subTest(name=name):
+                r, out = self.run_loader(self.VALUES, managed={k: v for k, v in self.MANAGED.items() if k != name})
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name, out)
+                self.assertFalse(self.log.exists(), "a missing moderation binding must not reach Wrangler")
+        extra = {**self.MANAGED, "EXTRA_MANAGED": "extra-managed-value-0123"}
+        r, out = self.run_loader(self.VALUES, managed=extra)
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.VALUES, **extra})
 
     def test_it_prints_names_never_values_or_credentials(self):
         r, out = self.run_loader(self.VALUES)
         self.assertIn("APPLE_PRIVATE_KEY", out)
-        for secret in list(self.VALUES.values()) + ["cfat_fake-deploy-token", "fake-secret-key-0123", "fake-session-token-4567"]:
+        for secret in list(self.VALUES.values()) + list(self.MANAGED.values()) + ["cfat_fake-deploy-token", "fake-secret-key-0123", "fake-session-token-4567"]:
             self.assertNotIn(secret, out)
             self.assertNotIn(secret, self.log.read_text())
 
@@ -219,13 +254,22 @@ class LoaderTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0, oob)
         self.assertFalse(self.log.exists())
 
+    def test_each_place_lookup_credential_is_required_before_loading(self):
+        for name in ("BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "EXA_API_KEY", "SCRAPINGDOG_API_KEY"):
+            with self.subTest(name=name):
+                r, out = self.run_loader({k: v for k, v in self.VALUES.items() if k != name})
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("must hold exactly", out)
+                self.assertFalse(self.log.exists(), "a missing credential must not reach Wrangler")
+
     def test_the_loader_names_are_the_workers(self):
         text = SCRIPT.read_text()
         case = re.search(r"\n  dolphin-maps\)\n(.*?)\n    ;;", text, re.S).group(1)
         names = " ".join(re.findall(r'OUT_OF_BAND_NAMES\+?="([^"]+)"', case)).split()
         self.assertEqual(sorted(names), NAMES)
         self.assertIn("SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID", case)
-        self.assertIn('MANAGED_CONTAINER=""', case)
+        self.assertIn("MANAGED_CONTAINER=1", case)
+        self.assertNotIn("MODERATION_", " ".join(names))  # Terraform's names are never also out of band
 
 
 class DocsTests(unittest.TestCase):

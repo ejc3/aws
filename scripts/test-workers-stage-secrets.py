@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The staging Workers' secrets kept in AWS (workers-stage-secrets.tf and scripts/workers-stage-secrets.sh): one
-administrators-only container per site, Terraform never holding a value, and a loader that is run here for real against
-stub `aws` and `npx` so it passes the JSON through untouched, refuses a placeholder before calling Cloudflare, and prints
-names, never values."""
+administrators-only container per site, Terraform never holding a value of one (dolphin-maps' second container,
+workers-stage/dolphin-maps/terraform, is Terraform's own: dolphin-maps-moderation.tf), and a loader that is run here for real
+against stub `aws` and `npx` so it passes the JSON through untouched (merging the two containers where a site has both),
+refuses a placeholder or a name in both before calling Cloudflare, and prints names, never values."""
 import json
 import os
 import re
@@ -62,7 +63,7 @@ if a.startswith("sts assume-role"):
         print("None\tNone\tNone"); sys.exit(0)
     print("ASIAFAKEDOLPHIN\tfake-secret-key-0123\tfake-session-token-4567")
 elif "workers-stage/" in a:
-    p = os.environ.get("FAKE_STAGE_JSON")
+    p = os.environ.get("FAKE_MANAGED_JSON" if "/terraform " in a + " " else "FAKE_STAGE_JSON")
     if p is None:
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
@@ -90,16 +91,20 @@ class LoaderTests(unittest.TestCase):
         self.log, self.stdin, self.env = self.tmp / "npx.log", self.tmp / "npx.stdin", self.tmp / "npx.env"
         self.aws_log = self.tmp / "aws.log"
 
-    def run_loader(self, *args, stage_json=None, **extra_env):
+    MANAGED = {"MODERATION_AWS_ACCESS_KEY_ID": "AKIAFAKEMODERATION01", "MODERATION_AWS_SECRET_ACCESS_KEY": "moderation-secret-0123",
+               "MODERATION_AWS_REGION": "us-west-1", "MODERATION_TEXT_REGION": "us-west-2"}
+
+    def run_loader(self, *args, stage_json=None, managed_json=json.dumps(MANAGED), **extra_env):
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
                    NPX_STDIN=str(self.stdin), NPX_ENV=str(self.env), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile")
         for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "FAKE_ASSUME_FAILS", "FAKE_ASSUME_MALFORMED", "AWS_DEFAULT_PROFILE"):
             env.pop(k, None)
         env.update(extra_env)
-        if stage_json is not None:
-            env["FAKE_STAGE_JSON"] = stage_json
-        else:
-            env.pop("FAKE_STAGE_JSON", None)
+        for name, value in (("FAKE_STAGE_JSON", stage_json), ("FAKE_MANAGED_JSON", managed_json)):
+            if value is not None:
+                env[name] = value
+            else:
+                env.pop(name, None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=60)
         return r, r.stdout + r.stderr
 
@@ -157,14 +162,55 @@ class LoaderTests(unittest.TestCase):
             calls = self.aws_calls()
             self.assertIn("sts assume-role --role-arn %s" % DOLPHIN_ROLE, calls[0])
             read = [c for c in calls if "workers-stage/%s" % site in c]
-            self.assertEqual(len(read), 1, calls)
-            self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=- DEFAULT=-", read[0])  # the assumed session, no profile
+            self.assertEqual(len(read), 2 if site == "dolphin-maps" else 1, calls)
+            for each in read:
+                self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=- DEFAULT=-", each)  # the assumed session, no profile
             token = [c for c in calls if "cloudflare-workers-deploy-token" in c]
             self.assertIn("KEY=- PROFILE=example-profile", token[0])  # the deploy token stays in this account
             self.assertIn("secret bulk --name %s-stage" % site, self.log.read_text())
             for secret in ("fake-secret-key-0123", "fake-session-token-4567", "dolphin-value-0123456789"):
                 self.assertNotIn(secret, out)
                 self.assertNotIn(secret, "\n".join(calls))  # never on a command line
+
+    def test_dolphin_maps_merges_terraforms_container_and_no_other_site_reads_one(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **self.MANAGED})
+        self.assertIn("--secret-id workers-stage/dolphin-maps/terraform ", "\n".join(self.aws_calls()) + " ")
+        for secret in ("moderation-secret-0123", "AKIAFAKEMODERATION01"):
+            self.assertNotIn(secret, out)
+        for site in ("dolphin-labs", "imagine"):
+            self.aws_log.unlink(missing_ok=True)
+            r, out = self.run_loader(site, stage_json=json.dumps(payload))
+            self.assertEqual(r.returncode, 0, out)
+            self.assertEqual(json.loads(self.stdin.read_text()), payload)
+            self.assertFalse([c for c in self.aws_calls() if "/terraform" in c], site)
+
+    def test_dolphin_maps_refuses_a_name_in_both_and_a_missing_terraform_container(self):
+        both = {"AUTH_SECRET": "x-0123456789", "MODERATION_AWS_REGION": "us-west-1"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(both))
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("in both containers", out)
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps({"AUTH_SECRET": "x-0123456789"}), managed_json=None)
+        self.assertEqual(r.returncode, 1, out)
+        self.assertIn("workers-stage/dolphin-maps/terraform", out)
+        self.assertIn("ResourceNotFoundException", out)
+        self.assertFalse(self.log.exists(), "wrangler must not run")
+
+    def test_all_moderation_names_are_required_and_other_managed_names_are_preserved(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        for name in self.MANAGED:
+            with self.subTest(name=name):
+                partial = {k: v for k, v in self.MANAGED.items() if k != name}
+                r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), managed_json=json.dumps(partial))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name, out)
+                self.assertFalse(self.log.exists(), "a missing moderation binding must not reach Wrangler")
+        extra = {**self.MANAGED, "EXTRA_MANAGED": "extra-managed-value-0123"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), managed_json=json.dumps(extra))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **extra})
 
     def test_other_sites_never_assume_a_role(self):
         r, out = self.run_loader("imagine", stage_json=json.dumps({"A": "b"}))
