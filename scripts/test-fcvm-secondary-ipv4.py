@@ -66,7 +66,7 @@ class SecondaryAddress(unittest.TestCase):
         association = tf.split('resource "aws_ssm_association" "firecracker_dev_secondary_ipv4"', 1)[1].split('\n}\n', 1)[0]
         self.assertIn('file("${path.module}/scripts/fcvm-secondary-ipv4.py")', association)
         self.assertIn('aws_instance.firecracker_dev[0].id', association)
-        self.assertIn('wait_for_success_timeout', association)
+        self.assertIn('wait_for_success_timeout_seconds', association)
 
 
 if __name__ == '__main__':

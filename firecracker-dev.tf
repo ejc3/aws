@@ -329,10 +329,10 @@ resource "aws_eip_association" "firecracker_dev_next" {
 resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
   count = var.enable_firecracker_instance ? 1 : 0
 
-  name                     = "AWS-RunShellScript"
-  association_name         = "fcvm-arm-secondary-ipv4"
-  schedule_expression      = "rate(1 day)"
-  wait_for_success_timeout = "5m"
+  name                             = "AWS-RunShellScript"
+  association_name                 = "fcvm-arm-secondary-ipv4"
+  schedule_expression              = "rate(1 day)"
+  wait_for_success_timeout_seconds = 300
 
   targets {
     key    = "InstanceIds"
