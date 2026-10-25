@@ -113,7 +113,7 @@ resource "aws_security_group" "gpu_box" {
   dynamic "ingress" {
     for_each = merge(
       { for i, e in aws_eip.nextjs_dev : "nextjs-dev" => e.public_ip },
-      { for i, e in aws_eip.firecracker_dev : "fcvm-metal-arm" => e.public_ip },
+      { for i, ip in local.firecracker_dev_public_ips : "fcvm-metal-arm-${i}" => ip },
       { for i, e in aws_eip.x86_dev : "fcvm-metal-x86" => e.public_ip },
     )
     content {

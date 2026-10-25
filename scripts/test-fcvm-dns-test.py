@@ -39,7 +39,7 @@ class TokenTests(unittest.TestCase):
         self.assertIn("request_ip = { in = local.fcvm_dns_test_client_cidrs }", token)
         cidrs = TF.split("fcvm_dns_test_client_cidrs = concat(", 1)[1].split("\n  )", 1)[0]
         self.assertIn("[for s in local.dev_fleet_subnets : s.ipv6_cidr_block]", cidrs)
-        self.assertIn('[for e in aws_eip.firecracker_dev : "${e.public_ip}/32"]', cidrs)
+        self.assertIn('[for ip in local.firecracker_dev_public_ips : "${ip}/32"]', cidrs)
         self.assertIn('[for e in aws_eip.x86_dev : "${e.public_ip}/32"]', cidrs)
         self.assertNotRegex(TF, r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "no IPv4 literal")
         self.assertNotRegex(TF, r'"[0-9a-f]{1,4}:[0-9a-f:]+(/\d+)?"', "no IPv6 literal")
