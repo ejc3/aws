@@ -15,12 +15,25 @@
 # the native Claude login or between profiles.
 set -euo pipefail
 
-HOST=${FCVM_HOST:-184.72.40.255}   # fcvm-metal-arm's Elastic IP
+# fcvm-metal-arm's address is not kept in this repository: FCVM_HOST, else the HostName of the user's `fcvm-arm` ssh
+# alias (ssh -G prints the alias itself for a name with no entry, which is not an address), else an error.
+fcvm_host() {
+  local h=${FCVM_HOST:-}
+  if [ -z "$h" ]; then
+    h=$(ssh -G fcvm-arm 2>/dev/null | awk '$1 == "hostname" { print $2; exit }' || true)
+    [ "$h" != fcvm-arm ] || h=""
+  fi
+  [ -n "$h" ] || { echo "no address for fcvm-metal-arm: set FCVM_HOST, or give the ssh alias fcvm-arm a HostName in ~/.ssh/config" >&2; exit 2; }
+  printf '%s\n' "$h"
+}
+
 KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 SERVER=0
 if [ "${1:-}" = "--server" ]; then
   SERVER=1; shift
   HOST=${CLAUDE_MASTER_SERVER_HOST:-10.0.1.50}   # claw-master-server.tf: a fixed private address
+else
+  HOST=$(fcvm_host)
 fi
 
 profiles=("$@")

@@ -33,7 +33,17 @@
 set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
-FCVM=${FCVM_HOST:-184.72.40.255} # fcvm-metal-arm's Elastic IP
+# fcvm-metal-arm's address is not kept in this repository: FCVM_HOST, else the HostName of the user's `fcvm-arm` ssh
+# alias (ssh -G prints the alias itself for a name with no entry, which is not an address), else an error.
+fcvm_host() {
+  local h=${FCVM_HOST:-}
+  if [ -z "$h" ]; then
+    h=$(ssh -G fcvm-arm 2>/dev/null | awk '$1 == "hostname" { print $2; exit }' || true)
+    [ "$h" != fcvm-arm ] || h=""
+  fi
+  [ -n "$h" ] || { echo "no address for fcvm-metal-arm: set FCVM_HOST, or give the ssh alias fcvm-arm a HostName in ~/.ssh/config" >&2; exit 2; }
+  printf '%s\n' "$h"
+}
 KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins: keep CFD_* equal to scripts/claw-master-windows-setup.sh (scripts/test-windows-pc-setup.py enforces it).
@@ -68,6 +78,7 @@ case "$ALIAS" in
     ;;
   *) usage ;;
 esac
+FCVM=$(fcvm_host)
 
 PC_SSH="$ALIAS"
 if [ -n "$BOOTSTRAP_PORT" ]; then

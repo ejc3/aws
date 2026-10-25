@@ -43,7 +43,9 @@ case "$ACTION" in
     client=$(cut -d' ' -f1-2 "$HOME/.ssh/to-$ALIAS.pub")
     [[ $client =~ ^ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$ ]] ||
       { echo "no ~/.ssh/to-$ALIAS.pub here (mac-ssh-client.tf makes it)" >&2; exit 1; }
-    ip=${FCVM_HOST:-184.72.40.255} # fcvm-metal-arm's Elastic IP, as in the other scripts
+    # This runs on the box itself, where no ssh alias names the box, so its address is FCVM_HOST (as in the other scripts).
+    ip=${FCVM_HOST:-}
+    [ -n "$ip" ] || { echo "no address for fcvm-metal-arm: set FCVM_HOST to its public address" >&2; exit 2; }
     hostkey=$(cut -d' ' -f1-2 /etc/ssh/ssh_host_ed25519_key.pub)
     sed -e "s|@@BOX@@|pcboot@$ip|" -e "s|@@BOX_HOST_KEY_LINE@@|$ip $hostkey|" \
       -e "s|@@CLIENT_KEY@@|$client fcvm-arm-to-$ALIAS|" -e "s|@@PORT@@|$PORT|" "$HERE/windows/bootstrap.ps1"
