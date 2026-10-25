@@ -737,6 +737,11 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = "state.json" },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
+        # Each region's fleet subnets (one per AZ) and security group: a tile launch tries every AZ of a region, in this
+        # order, before the next region (ejc3/fcvm#1284), instead of only the template's subnet. An image without it
+        # ignores both variables and launches in the template's subnet.
+        { name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${join(",", m.subnet_ids)}"]) },
+        { name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${m.security_group_id}"]) },
         # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
         { name = "RUST_LOG", value = "info" },
       ]

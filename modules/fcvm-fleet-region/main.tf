@@ -132,9 +132,10 @@ locals {
   # One host while enabled and an AMI exists; 0 otherwise. max 2 lets a capacity-rebalance replacement start before the old
   # host is gone.
   host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0
-  # The subnet a tile launches in. The coordinator launches from the template without naming a subnet, and an interface
-  # without one lands in the default VPC, where the fleet's security group does not exist and the task role may not
-  # launch (an EC2 tile's RunInstances was refused on the default subnet, 2026-10-24). The first AZ, in name order.
+  # The subnet a tile launches in when the launch names none. The coordinator names each fleet subnet in turn
+  # (FLEET_EC2_SUBNETS, fcvm-fleet.tf); an image older than that launches from the template alone, and an interface
+  # without a subnet lands in the default VPC, where the fleet's security group does not exist and the task role may
+  # not launch (an EC2 tile's RunInstances was refused on the default subnet, 2026-10-24). The first AZ, in name order.
   tile_az = local.azs[0]
   # The AMI carries the agent as a systemd unit, installed disabled and conditional on /etc/fcvm-fleet/agent.env (fcvm
   # fleet/ami/host/fcvm-fleet-agent.service; its arguments are fcvm fleet/PROTOCOL.md, "Agent", "Running it"). Boot writes
