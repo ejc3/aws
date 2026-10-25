@@ -1530,6 +1530,33 @@ Every account is opted out of AWS AI services keeping or using what they are sen
 - The production Worker `colton-games-prod` has its own user, `colton-games-moderation-worker-prod`, whose key Terraform writes
   into `workers-prod/colton-games/terraform` only ("Colton Games production on Cloudflare").
 
+### Dolphin Maps picture and text moderation
+
+`dolphin-maps-moderation.tf` lets the dolphin-maps Workers check what people send before it is kept or shown, the Colton
+Games pattern for a Cloudflare-only site. Two actions are the whole grant, each pinned to its own region with
+`aws:RequestedRegion`: Amazon Rekognition `DetectModerationLabels` in us-west-1 (pictures, as Colton's; the bytes travel in
+the request and nothing is stored) and Amazon Comprehend `DetectToxicContent` in us-west-2 (text: up to 10 segments of 1 KB,
+English only). Comprehend is not offered in us-west-1; us-west-2 is the nearest region with toxicity detection, and both
+are regions the Dolphin account's SCP allows (a precondition checks it). The AI-services opt-out on the organization root
+covers what is sent.
+
+- **In the Dolphin account**, through `aws.dolphin` (as `dolphin-redis.tf`'s secrets): the calls are billed and audited
+  there, and no key of this account is held in the Dolphin account. dolphin-aws keeps no secret value in its state, so the
+  keys Terraform makes are written from here.
+- **One IAM user per Worker**, because a Worker cannot present a Vercel OIDC token: `dolphin-maps-moderation-worker-prod`
+  and `dolphin-maps-moderation-worker-stage`, each with only the two actions. Terraform writes production's key only into
+  `workers-prod/dolphin-maps/terraform` and staging's only into `workers-stage/dolphin-maps/terraform` (administration only),
+  each as `MODERATION_AWS_ACCESS_KEY_ID`, `MODERATION_AWS_SECRET_ACCESS_KEY`, `MODERATION_AWS_REGION` (Rekognition's,
+  us-west-1) and `MODERATION_TEXT_REGION` (Comprehend's, us-west-2). The loaders merge each with the site's out-of-band
+  container and refuse a name in both: `scripts/workers-prod-secrets.sh dolphin-maps`, `scripts/workers-stage-secrets.sh
+  dolphin-maps`, after a deploy has finished. Never put a `MODERATION_*` name in an out-of-band container.
+- **Cost:** about $1 per 1,000 pictures; text $0.0001 per 100 characters with a 300-character minimum per request
+  (about $0.0003 for a short text, $0.01 for a full request). Alarm `dolphin-maps-moderation-volume` (Dolphin account,
+  us-west-1, on `dolphin-alerts`) fires above 500 picture checks an hour, roughly $0.50 of picture calls. It sends a
+  notification; it does not cap spending. Text checks are not alarmed: no per-call Comprehend metric was confirmed.
+- **Rotation:** `terraform apply -replace='aws_iam_access_key.dolphin_maps_moderation_worker["prod"]'` (or `["stage"]`) from
+  a jumpbox, then the matching loader. The keys are in this repository's state, as Colton's Worker keys are.
+
 ### The Dolphin account
 
 Dolphin (the dolphin-labs-hq sites) gets an AWS member account of its own, `dolphin`, in OU `Dolphin` at the org root
@@ -1827,7 +1854,8 @@ reads every Worker's logs in the account, not just dolphin-labs-prod's: Cloudfla
 Dolphin Maps production (#529, 2026-10-19) is maps.dolphin-labs.dev, served by `dolphin-maps-prod` (`dolphin-labs-zone.tf`): a
 proxied placeholder record and a Workers route, PUBLIC through an Access application for exactly that host with a bypass-everyone
 policy (the `*.dolphin-labs.dev` GitHub gate still covers every other host). Its secrets are `workers-prod/dolphin-maps` in the
-Dolphin account (dolphin-aws `secrets.tf`), loaded by `scripts/workers-prod-secrets.sh dolphin-maps`.
+Dolphin account (dolphin-aws `secrets.tf`) plus `workers-prod/dolphin-maps/terraform` (the moderation key, "Dolphin Maps
+picture and text moderation"), loaded together by `scripts/workers-prod-secrets.sh dolphin-maps`.
 Every other production hostname (www.cc-games.org and the old domains, which Vercel still redirects) and the multiplayer `play.cc-games.*` entries are DNS-only records
 pointing at Vercel or the games load balancer, so Cloudflare's WAF, rate limiting and bot rules do nothing for them. Do not proxy a Vercel hostname to
 get them: TLS then ends at Cloudflare, Vercel's certificate issuance fails, and every per-IP limit in the apps sees
