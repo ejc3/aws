@@ -1,0 +1,23 @@
+{
+  "source": "STS DecodeAuthorizationMessage of the real coordinator CreateFleet denial",
+  "observation_at": "2026-10-26T04:12:12.677000+00:00",
+  "action": "ec2:CreateFleet",
+  "resource_type": "arn:aws:ec2:us-east-1:<fleet-account>:instance/*",
+  "explicit_deny": true,
+  "matched_statement_ids": ["FleetTypesOnly"],
+  "actual_context_key_names": [
+    "aws:Region",
+    "aws:Service",
+    "ec2:InstanceID",
+    "aws:Resource",
+    "aws:Type",
+    "aws:Account",
+    "aws:ARN"
+  ],
+  "missing_resource_keys": [
+    "ec2:InstanceType",
+    "aws:RequestTag/Purpose",
+    "ec2:LaunchTemplate",
+    "aws:RequestedRegion"
+  ]
+}
