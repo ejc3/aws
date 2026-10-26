@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-fleet.tf").read_text()
+DNS = (ROOT / "fcvm-fleet-dns.tf").read_text()
 MOD = (ROOT / "modules" / "fcvm-fleet-region" / "main.tf").read_text()
 
 
@@ -26,10 +27,16 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
         self.assertNotIn("22", sg)
-        # The coordinator task admits nothing, except 443 for the EC2 half's aggregator with aggregated streaming on
-        # (AggregatedTests).
+        # The coordinator admits its DNS port (DnsTests) and, with aggregated streaming on, 443 for the EC2 half's
+        # aggregator (AggregatedTests); nothing else.
         coord = block('resource "aws_security_group" "fcvm_fleet_coordinator"')
-        self.assertEqual(coord.count("ingress"), 1, coord)
+        rules = re.findall(r"  ingress \{\n(.*?)\n  \}", coord, re.S)
+        self.assertEqual(len(rules), 2, rules)
+        for rule in rules:
+            self.assertIn("from_port   = local.fcvm_fleet_dns_port", rule)
+            self.assertIn("to_port     = local.fcvm_fleet_dns_port", rule)
+        self.assertEqual(sorted(re.findall(r'protocol    = "(\w+)"', coord)), ["tcp", "udp"])
+        self.assertEqual(coord.count('dynamic "ingress"'), 1, coord)
         self.assertIn("for_each = local.fcvm_fleet_aggregated ? [1] : []", coord)
         self.assertIn("from_port        = 443", coord)
         self.assertIn("to_port          = 443", coord)
@@ -54,6 +61,15 @@ class HostTests(unittest.TestCase):
         self.assertNotIn("ipv6_address_count", lt)  # EC2 refuses a prefix count and an address count together
         self.assertIn('http_tokens                 = "required"', lt)
         self.assertIn("http_put_response_hop_limit = 1", lt)
+
+    def test_the_host_root_volume_is_filled_at_the_highest_initialization_rate(self):
+        # A lazily loaded root volume put 32.3 s between kernel start and the store unit on a host's first boot, against
+        # 11.1 s on a volume already read (ejc3/fcvm#1257); EBS takes 100 to 300 MiB/s.
+        lt = block('resource "aws_launch_template" "host"', MOD)
+        bdm = re.search(r"block_device_mappings \{\n(.*?)\n  \}\n", lt, re.S)
+        self.assertIsNotNone(bdm, lt)
+        self.assertIn('device_name = "/dev/sda1"', bdm.group(1))
+        self.assertIn("volume_initialization_rate = 300", bdm.group(1))
 
     def test_the_host_group_is_spot_price_capacity_optimized_and_gated(self):
         asg = block('resource "aws_autoscaling_group" "hosts"', MOD)
@@ -321,6 +337,18 @@ class TileSubnetTests(unittest.TestCase):
             self.assertIn("subnet_id                   = aws_subnet.public[local.tile_az].id", block(name, MOD))
         self.assertIn("tile_az = local.azs[0]", MOD)
 
+    def test_the_coordinator_gets_every_fleet_subnet_and_group_for_tile_launches(self):
+        # A tile launch tries each AZ's subnet of a region, in order, before the next region (ejc3/fcvm#1284). The
+        # launch names the subnet and the group, which the role may reference by ARN.
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('{ name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${join(",", m.subnet_ids)}"]) }', task)
+        self.assertIn('{ name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : '
+                      '"${r}:${m.security_group_id}"]) }', task)
+        refs = TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('[for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]', refs)
+        self.assertIn('"arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"', refs)
+
 
 class SlotV4Tests(unittest.TestCase):
     """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
@@ -348,9 +376,73 @@ class SlotV4Tests(unittest.TestCase):
         self.assertNotIn("ipv6_cidr_blocks", slot[0])
         self.assertEqual(TF.count("slot_tls_ports            = local.fcvm_fleet_slot_tls_ports"), 3)
 
-    def test_the_coordinator_confirms_names_at_the_zones_nameservers(self):
+    def test_the_coordinator_serves_the_launch_names_subzone(self):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
-        self.assertIn('"--dns-nameservers", join(",", local.fcvm_dev_nameservers)', cmd)
+        self.assertNotIn("--dns-nameservers", cmd)
+        self.assertIn('["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), '
+                      '"--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"]', cmd)
+        # The certificate renewal still needs the zone's DNS token.
+        self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name', cmd)
+        self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
+
+
+class DnsTests(unittest.TestCase):
+    """fcvm-fleet-dns.tf: the subzone is delegated to two static addresses that reach the coordinator's DNS port."""
+
+    def test_the_subzone_is_below_the_zone_and_its_nameservers_are_outside_it(self):
+        zone = re.search(r'fcvm_fleet_names_zone = "([^"]+)"', DNS)[1]
+        ns = re.findall(r'"(ns\d-[^"]+)"', DNS.split("fcvm_fleet_names_ns", 1)[1].split("\n", 1)[0])
+        self.assertTrue(zone.endswith(".fcvm.dev"), zone)
+        self.assertEqual(len(ns), 2)
+        for n in ns:
+            self.assertTrue(n.endswith(".fcvm.dev") and not n.endswith("." + zone), n)
+
+    def test_two_static_addresses_in_two_azs_reach_the_one_task_across_zones(self):
+        self.assertIn("count    = 2", block('resource "aws_eip" "fcvm_fleet_dns"', DNS))
+        lb = block('resource "aws_lb" "fcvm_fleet_dns"', DNS)
+        self.assertIn('load_balancer_type               = "network"', lb)
+        self.assertIn("enable_cross_zone_load_balancing = true", lb)
+        self.assertIn("allocation_id = aws_eip.fcvm_fleet_dns[subnet_mapping.key].id", lb)
+        self.assertIn("fcvm_fleet_dns_subnets = slice(module.fcvm_fleet_east2.subnet_ids, 0, 2)", DNS)
+
+    def test_udp_and_tcp_53_go_to_the_tasks_high_port_with_the_client_address(self):
+        listener = block('resource "aws_lb_listener" "fcvm_fleet_dns"', DNS)
+        self.assertIn("port              = 53", listener)
+        self.assertIn('protocol          = "TCP_UDP"', listener)
+        tg = block('resource "aws_lb_target_group" "fcvm_fleet_dns"', DNS)
+        self.assertIn('protocol             = "TCP_UDP"', tg)
+        self.assertIn("port                 = local.fcvm_fleet_dns_port", tg)
+        self.assertIn('target_type          = "ip"', tg)
+        self.assertIn('preserve_client_ip   = "true"', tg)
+        self.assertIn('protocol            = "TCP"', tg)
+        self.assertIn("fcvm_fleet_dns_port = 5353", DNS)
+        svc = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        self.assertIn("target_group_arn = aws_lb_target_group.fcvm_fleet_dns.arn", svc)
+        self.assertIn("container_port   = local.fcvm_fleet_dns_port", svc)
+        self.assertIn('portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]', TF)
+
+    def test_the_task_runs_only_where_the_load_balancer_listens_and_after_its_listener(self):
+        # A target in an AZ the load balancer does not enable is unused even across zones, and ECS refuses a target
+        # group no listener attaches yet.
+        svc = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        self.assertIn("subnets          = local.fcvm_fleet_dns_subnets", svc)
+        self.assertRegex(svc, r"depends_on\s*=\s*\[[^\]]*aws_lb_listener\.fcvm_fleet_dns")
+
+    def test_the_coordinator_group_keeps_its_original_description(self):
+        # The description is ForceNew, and the running task's interface keeps the group from being deleted.
+        coord = block('resource "aws_security_group" "fcvm_fleet_coordinator"')
+        self.assertIn('description = "fcvm fleet coordinator task: nothing in (browsers and agents arrive through its '
+                      'Cloudflare tunnel), all out"', coord)
+
+    def test_the_delegation_is_ns_records_with_unproxied_addresses_and_no_ds(self):
+        addr = block('resource "cloudflare_dns_record" "fcvm_fleet_names_ns_address"', DNS)
+        self.assertIn('type    = "A"', addr)
+        self.assertIn("content = aws_eip.fcvm_fleet_dns[count.index].public_ip", addr)
+        self.assertIn("proxied = false", addr)
+        ns = block('resource "cloudflare_dns_record" "fcvm_fleet_names_delegation"', DNS)
+        self.assertIn('type       = "NS"', ns)
+        self.assertIn("name       = local.fcvm_fleet_names_zone", ns)
+        self.assertNotRegex(DNS, r'type\s*=\s*"(DS|AAAA)"')
 
 
 

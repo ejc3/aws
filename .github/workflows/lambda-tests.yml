@@ -203,6 +203,9 @@ jobs:
       - name: dolphin-labs.dev email forwards (privacy, ej@, steve@ from people/addresses only)
         run: python3 -S -B scripts/test-dolphin-labs-email.py
 
+      - name: Sending as the dolphin-labs.dev ej@ address (SES in the Dolphin account, one action from one address, SMTP password only in its secret)
+        run: python3 -S -B scripts/test-dolphin-labs-email-send.py
+
       - name: Search and fetch provider usage poller (parsing, publishing, no key in logs)
         run: python3 -S -B scripts/test-search-fetch-usage.py
 

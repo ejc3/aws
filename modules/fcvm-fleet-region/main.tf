@@ -132,9 +132,10 @@ locals {
   # One host while enabled and an AMI exists; 0 otherwise. max 2 lets a capacity-rebalance replacement start before the old
   # host is gone.
   host_desired = var.hosts_enabled && length(local.host_archs) > 0 ? 1 : 0
-  # The subnet a tile launches in. The coordinator launches from the template without naming a subnet, and an interface
-  # without one lands in the default VPC, where the fleet's security group does not exist and the task role may not
-  # launch (an EC2 tile's RunInstances was refused on the default subnet, 2026-10-24). The first AZ, in name order.
+  # The subnet a tile launches in when the launch names none. The coordinator names each fleet subnet in turn
+  # (FLEET_EC2_SUBNETS, fcvm-fleet.tf); an image older than that launches from the template alone, and an interface
+  # without a subnet lands in the default VPC, where the fleet's security group does not exist and the task role may
+  # not launch (an EC2 tile's RunInstances was refused on the default subnet, 2026-10-24). The first AZ, in name order.
   tile_az = local.azs[0]
   # The AMI carries the agent as a systemd unit, installed disabled and conditional on /etc/fcvm-fleet/agent.env (fcvm
   # fleet/ami/host/fcvm-fleet-agent.service; its arguments are fcvm fleet/PROTOCOL.md, "Agent", "Running it"). Boot writes
@@ -254,6 +255,21 @@ resource "aws_launch_template" "host" {
 
   iam_instance_profile {
     name = var.host_profile_name
+  }
+
+  # The root volume is filled from the AMI's snapshot at 300 MiB/s (provisioned rate for volume
+  # initialization, the most EBS offers) instead of block by block on first read. A host's first boot
+  # reads its root volume throughout: on g4dn.metal from one AMI (ejc3/fcvm#1257, one boot each) the
+  # store unit started 21.8 s after kernel start lazily loaded (7.6 ms per read) and 17.2 s at 300 MiB/s
+  # (3.7 ms per read); the same first boot on a volume already read took 11.1 s. Fast Snapshot Restore
+  # would reach that, at 0.75 USD per AZ-hour for each AZ a host can launch in. This is billed once per
+  # launch per GiB of snapshot data: 0.0036 USD in the 201 to 300 MiB/s tier in us-east-1, about 0.12 USD
+  # for the 32 GiB host AMI. The device is the Ubuntu AMI's root device.
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_initialization_rate = 300
+    }
   }
 
   metadata_options {

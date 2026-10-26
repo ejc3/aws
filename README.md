@@ -223,6 +223,20 @@ read -rs T; printf %s "$T" | aws secretsmanager put-secret-value --region us-wes
   --secret-id games/elevenlabs-api-key --secret-string file:///dev/stdin; unset T
 ```
 
+The Stability AI key for offline asset creation is `games/stability-api-key` in the same
+region. Terraform creates its container and grants the same two dev roles as ElevenLabs;
+populate it with `put-secret-value` on stdin after applying. Tools fetch it when needed as
+`STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
+The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
+
+The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
+as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
+session, not an official API key. Terraform manages only its empty container and grants;
+populate or renew the value out of band over stdin after the owner signs in. Never put it
+in a file, command argument, log, state or deployed-game environment. Keep the adapter
+optional until real authentication, generation and renewal checks pass; do not assume a
+website subscription provides an official or unattended API.
+
 The claw-master backup API key, `claude-master/backup-api-key` (us-west-1, from
 `dev-ai-services.tf`), is the paid last resort after every subscription profile is out of quota. Terraform
 creates only the container, so until it has a value `get-secret-value` returns `ResourceNotFoundException`
@@ -357,13 +371,11 @@ us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
 
 ## Access and trust boundaries
 
-The Next.js containers share one memory pool in `machine.slice`: reclaim starts at 80% of
-host RAM, with bursts allowed up to an 85% hard limit and 1 GiB of combined swap. Any one
-person can still use their existing 75% allowance when the others are quiet. If the pool
-cannot reclaim enough memory, the kernel kills a process inside the containers; host SSH,
-networking and Cloudflare tunnels are outside that pool. Setup applies and persists these
-limits without restarting containers or the host. The remaining 15% is headroom for host
-services, not an allocation guarantee against memory consumed by other host processes.
+The Next.js containers have no cgroup memory or swap caps, individually or in their shared
+`machine.slice`. Setup explicitly clears the former limits, including persistent
+`systemctl set-property` overrides, without restarting containers or the host. The existing
+host swapfile and earlyoom safeguard remain enabled. CPU, network and credential boundaries
+are unchanged.
 
 The fcvm staging coordinator has a main-only CI release path (`fcvm-fleet-ci.tf`). CI builds
 and tests its ARM64 image, publishes an immutable commit tag, and invokes an image-only release

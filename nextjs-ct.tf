@@ -62,6 +62,8 @@ resource "aws_instance" "nextjs_ct" {
   root_block_device {
     volume_size           = var.nextjs_ct_volume_size
     volume_type           = "gp3"
+    iops                  = 6000
+    throughput            = 250
     delete_on_termination = false
     encrypted             = true
   }
