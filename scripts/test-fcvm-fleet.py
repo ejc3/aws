@@ -3,8 +3,11 @@
 the GPU hosts and the coordinator stay off until their gates and inputs exist, and the coordinator's role reaches GPU hosts
 and EC2 tiles from their templates only."""
 import re
+import importlib.util
+import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-fleet.tf").read_text()
@@ -117,6 +120,71 @@ class OnDemandFallbackTests(unittest.TestCase):
         for gone in ("--scale-group", "--on-demand-group", "--spot-wait", "--host-template"):
             self.assertNotIn(gone, cmd)
 
+    def test_accepted_on_demand_launches_keep_the_existing_notification_destination(self):
+        # Preserve SNS addresses so the confirmed subscriber is not deleted/recreated with the Auto Scaling groups.
+        topic = block('resource "aws_sns_topic" "alerts"', MOD)
+        subscriber = block('resource "aws_sns_topic_subscription" "alerts_email"', MOD)
+        self.assertIn('name  = "fcvm-fleet-alerts"', topic)
+        self.assertIn('topic_arn = aws_sns_topic.alerts[0].arn', subscriber)
+        self.assertIn('endpoint  = var.alert_email', subscriber)
+        metric = block('resource "aws_cloudwatch_log_metric_filter" "fcvm_fleet_on_demand_launches"')
+        self.assertIn('pattern        = "\\\"wake: host launch accepted\\\" \\\"on-demand\\\""', metric)
+        self.assertNotIn('spot launch refused', metric)
+        alarm = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_on_demand_launches"')
+        self.assertIn('statistic           = "Sum"', alarm)
+        self.assertIn('threshold           = 1', alarm)
+        self.assertIn('alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]', alarm)
+        for region in ('east2', 'west2', 'east1'):
+            self.assertIn('module.fcvm_fleet_%s.alert_topic_arns' % region, TF)
+        # A launch-event counter returning to zero says nothing about whether the host is still charging.
+        self.assertNotIn('ok_actions', alarm)
+        permission = block('resource "aws_lambda_permission" "fcvm_fleet_on_demand_notify"')
+        self.assertIn('principal      = "lambda.alarms.cloudwatch.amazonaws.com"', permission)
+        self.assertIn('source_arn     = local.fcvm_fleet_on_demand_alarm_arn', permission)
+        self.assertIn('source_account = local.fcvm_fleet_account_id', permission)
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_on_demand_notify"')
+        self.assertIn('Action   = "sns:Publish"', policy)
+        self.assertIn('Resource = local.fcvm_fleet_alert_topic_arns', policy)
+        self.assertNotIn('Resource = "*"', policy)
+
+
+class OnDemandNotificationTests(unittest.TestCase):
+    ALARM = 'arn:aws:cloudwatch:us-east-2:123456789012:alarm:fcvm-fleet-on-demand-host-launches'
+    TOPICS = ['arn:aws:sns:us-east-1:123456789012:fcvm-fleet-alerts',
+              'arn:aws:sns:us-west-2:123456789012:fcvm-fleet-alerts']
+
+    def setUp(self):
+        self.sdk = mock.Mock()
+        spec = importlib.util.spec_from_file_location('fleet_notify', ROOT / 'scripts/fcvm-fleet-on-demand-notify.py')
+        self.notify = importlib.util.module_from_spec(spec)
+        with mock.patch.dict('sys.modules', {'boto3': self.sdk}):
+            spec.loader.exec_module(self.notify)
+        env = mock.patch.dict('os.environ', {'ALARM_ARN': self.ALARM, 'TOPIC_ARNS': json.dumps(self.TOPICS)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def event(self, state='ALARM', alarm=None, source='aws.cloudwatch'):
+        return {'source': source, 'alarmArn': alarm or self.ALARM,
+                'alarmData': {'state': {'value': state, 'reason': 'accepted on-demand launch'}}}
+
+    def test_accepted_launch_alarm_uses_each_existing_topics_regional_endpoint(self):
+        self.assertEqual(self.notify.handler(self.event(), None), {'notified': 2})
+        self.assertEqual(self.sdk.client.call_args_list,
+                         [mock.call('sns', region_name='us-east-1'), mock.call('sns', region_name='us-west-2')])
+        calls = self.sdk.client.return_value.publish.call_args_list
+        self.assertEqual([c.kwargs['TopicArn'] for c in calls], self.TOPICS)
+        self.assertTrue(all('not a running-host count' in c.kwargs['Message'] for c in calls))
+
+    def test_ok_other_alarms_and_other_event_sources_do_not_send(self):
+        for event in (self.event(state='OK'), self.event(alarm='unrelated'), self.event(source='unrelated'), {}):
+            self.assertEqual(self.notify.handler(event, None), {'notified': 0})
+        self.sdk.client.assert_not_called()
+
+    def test_publish_failures_raise_for_lambda_asynchronous_retry(self):
+        self.sdk.client.return_value.publish.side_effect = RuntimeError('publish unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'publish unavailable'):
+            self.notify.handler(self.event(), None)
+
 
 class CoordinatorTests(unittest.TestCase):
     def test_the_service_runs_the_tagged_image_from_the_fleet_repository(self):
@@ -180,7 +248,12 @@ class CoordinatorLaunchSplit(unittest.TestCase):
         refs = self.TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
         for part in (":image/${ami}", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_tile_template_arns"):
             self.assertIn(part, refs, part)
-        self.assertIn('"instance", "volume", "network-interface", "spot-instances-request"', self.TF)
+        self.assertIn('"instance", "volume", "network-interface"', self.TF)
+        spot = self.stmt("LaunchTaggedTileSpotRequestsOnly")
+        self.assertIn('Resource = local.fcvm_fleet_tile_spot_request_arns', spot)
+        self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-tile"', spot)
+        self.assertIn('"aws:RequestedRegion"', spot)
+        self.assertNotIn('"ec2:LaunchTemplate"', spot)
 
     def test_state_object_secrets_and_spot_role(self):
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', self.TF)
@@ -204,21 +277,39 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         fleet = self.stmt("LaunchHostsAsInstantFleets")
         self.assertIn('Action    = "ec2:CreateFleet"', fleet)
         self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', fleet)
+        self.assertIn('Resource  = concat(local.fcvm_fleet_host_fleet_arns, local.fcvm_fleet_host_volume_arns)', fleet)
+        self.assertNotIn('Resource  = "*"', fleet)
+        instances = self.stmt("LaunchFleetInstancesAsTaggedHostsOnly")
+        self.assertIn('Resource = local.fcvm_fleet_host_instance_arns', instances)
+        self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-host"', instances)
+        self.assertIn('"ec2:InstanceType"', instances)
+        fleet_refs = self.stmt("LaunchHostsWithTheirOwnResources")
+        self.assertRegex(fleet_refs, r'Resource\s*=\s*local\.fcvm_fleet_host_referenced_arns')
+        self.assertRegex(fleet_refs, r'Action\s*=\s*\["ec2:RunInstances", "ec2:CreateFleet"\]')
+        # Instance context is absent on fleet, volume, AMI, template and subnet authorization checks.
+        for s in (fleet, fleet_refs):
+            self.assertNotIn('"ec2:InstanceType"', s)
+            self.assertNotIn('"aws:RequestTag/Purpose"', s)
         created = self.stmt("LaunchHostsFromTheirTemplates")
         referenced = self.stmt("LaunchHostsWithTheirOwnResources")
-        self.assertIn("Resource  = local.fcvm_fleet_host_referenced_arns", referenced)
-        for s in (created, referenced):
-            self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition', s)
+        self.assertRegex(referenced, r'Resource\s*=\s*local\.fcvm_fleet_host_referenced_arns')
+        self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition', created)
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', referenced)
+        self.assertIn('ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }', referenced)
         refs = self.TF.split("fcvm_fleet_host_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
         for part in ("var.fcvm_fleet_host_amis", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_host_template_arns"):
             self.assertIn(part, refs, part)
-        # A host template launches host types only, and EC2 Fleet's service-linked role exists.
+        self.assertIn('m.host_subnet_ids', refs)
+        self.assertIn('if length(m.host_template_names) > 0', refs)
+        self.assertIn('value = local.hosts_on ? [for t in aws_launch_template.host : t.arn] : []',
+                      block('output "host_template_arns"', MOD))
+        # A host template launches host types only. Instant fleets need no EC2 Fleet service-linked role.
         deny = self.stmt("HostTemplatesLaunchHostTypesOnly")
         self.assertIn('Effect   = "Deny"', deny)
         self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }', deny)
         self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_host_types }', deny)
         self.assertIn('fcvm_fleet_host_types              = ["g4dn.metal", "g5g.metal"]', self.TF)
-        self.assertIn('aws_service_name = "ec2fleet.amazonaws.com"', self.TF)
+        self.assertNotIn('aws_service_name = "ec2fleet.amazonaws.com"', self.TF)
         self.assertNotIn("autoscaling:", self.TF)
 
     def test_an_on_demand_tile_template_is_a_launchable_template(self):
@@ -249,8 +340,10 @@ class CoordinatorTileTypes(unittest.TestCase):
         stmt = CoordinatorLaunchSplit.stmt
         s = stmt(CoordinatorLaunchSplit, "FleetTypesOnly")
         self.assertIn('Effect    = "Deny"', s)
-        self.assertIn('Action    = "ec2:RunInstances"', s)
+        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', s)
         self.assertIn('"ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types)', s)
+        tagged = stmt(CoordinatorLaunchSplit, "FleetInstancesAreTagged")
+        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', tagged)
         t = stmt(CoordinatorLaunchSplit, "TileTemplatesLaunchTileTypesOnly")
         self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition }', t)
         self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_tile_types }', t)

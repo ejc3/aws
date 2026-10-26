@@ -1,7 +1,7 @@
 # modules/fcvm-fleet-region
 #
 # One region of fcvm's GPU VM wall (fcvm-fleet.tf; design ejc3/fcvm#1136, docs/fleet/ARCHITECTURE.md), inside the fcvm-fleet
-# member account (fcvm-fleet-account.tf): the network, the GPU host group and the EC2 comparison tiles' launch templates.
+# member account (fcvm-fleet-account.tf): the network and the GPU host and EC2 comparison tile launch templates.
 #
 # - Network: a VPC with an Amazon-provided IPv6 /56, one public subnet per AZ (IPv4 /20 and IPv6 /64), an internet gateway,
 #   and one security group that admits TCP 443 from anywhere and nothing else. No SSH: hosts are reached with SSM Session
@@ -48,8 +48,13 @@ variable "tile_amis" {
 }
 
 variable "hosts_enabled" {
-  description = "Run one spot GPU host here (fcvm-fleet.tf's local.fcvm_fleet_hosts_enabled); false keeps the group at 0"
+  description = "Give the coordinator this region's host templates (fcvm-fleet.tf's local.fcvm_fleet_hosts_enabled)"
   type        = bool
+}
+
+variable "alert_email" {
+  description = "The existing fleet-alerts subscriber; preserve the topic and confirmed subscription when groups go away"
+  type        = string
 }
 
 variable "host_agent_args" {
@@ -277,6 +282,20 @@ resource "aws_launch_template" "host" {
   tags = { Name = "fcvm-fleet-host-${each.key}" }
 }
 
+# Preserve the existing topic and confirmed email subscription at their original Terraform addresses. The coordinator's
+# accepted-launch alarm replaces the obsolete Auto Scaling metric; a narrowly scoped Lambda publishes here through SNS.
+resource "aws_sns_topic" "alerts" {
+  count = length(local.host_archs) > 0 ? 1 : 0
+  name  = "fcvm-fleet-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  count     = length(local.host_archs) > 0 ? 1 : 0
+  topic_arn = aws_sns_topic.alerts[0].arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
 # ------------------------------------------------------------------------------------------------ EC2 tiles
 resource "aws_launch_template" "tile" {
   for_each      = toset(local.tile_archs)
@@ -386,7 +405,12 @@ output "host_subnet_ids" {
 
 # The coordinator's RunInstances (through CreateFleet) is limited to these templates and the host AMIs.
 output "host_template_arns" {
-  value = [for t in aws_launch_template.host : t.arn]
+  value = local.hosts_on ? [for t in aws_launch_template.host : t.arn] : []
+}
+
+output "alert_topic_arns" {
+  description = "Existing fleet alert destinations, with their confirmed subscriptions retained"
+  value       = aws_sns_topic.alerts[*].arn
 }
 
 output "host_types" {

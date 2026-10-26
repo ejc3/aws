@@ -1727,12 +1727,16 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   EC2 Fleet over the region's host templates and host subnets, `FLEET_HOST_TEMPLATES`, `FLEET_HOST_SUBNETS`), on demand
   in the same pass when spot is refused for capacity, at most `local.fcvm_fleet_on_demand_max` = 8 on-demand hosts across
   the fleet (owner, 2026-10-24: "Up to 8 on-demand max"; `FLEET_HOST_ON_DEMAND_MAX`), and terminates every host while
-  the fleet sleeps. The us-east-1 on-demand G and VT quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal.
+  the fleet sleeps. The us-east-1 on-demand G and VT quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal. Accepted on-demand
+  launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
+  `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
+  notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile
   roles; read and write only `state.json`; read the DNS token and the certificate
-  and store the certificate it issues. The fleet account has EC2's spot and EC2 Fleet service-linked roles. Hosts read the certificate,
+  and store the certificate it issues. The fleet account has EC2's spot service-linked role; instant EC2 Fleets need no
+  EC2 Fleet service-linked role. Hosts read the certificate,
   the agent token and the asset bucket.
 - Not yet covered: security monitoring like the Dolphin account's.
 

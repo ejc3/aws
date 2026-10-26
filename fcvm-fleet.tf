@@ -53,7 +53,9 @@ locals {
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
   # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
-  fcvm_fleet_on_demand_max = 8
+  fcvm_fleet_on_demand_max       = 8
+  fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
+  fcvm_fleet_alert_topic_arns    = concat(module.fcvm_fleet_east2.alert_topic_arns, module.fcvm_fleet_west2.alert_topic_arns, module.fcvm_fleet_east1.alert_topic_arns)
   # The coordinator's host launches (fcvm fleet coord, FLEET_HOST_TEMPLATES and FLEET_HOST_SUBNETS, ejc3/fcvm#1257): every
   # region's host templates while the gate is on, and the subnets of the AZs that offer a host type. Environment, not
   # arguments: an image from before ejc3/fcvm#1257 ignores them, where it would refuse an unknown argument and not start.
@@ -375,6 +377,7 @@ module "fcvm_fleet_east2" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-2", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -390,6 +393,7 @@ module "fcvm_fleet_west2" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-west-2", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -405,6 +409,7 @@ module "fcvm_fleet_east1" {
   gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-1", {})
   tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -431,26 +436,32 @@ locals {
     local.fcvm_fleet_tile_template_arns,
     ["arn:aws:ec2:us-east-1::image/ami-none"],
   )
-  # What a tile launch creates: the instance, its volume, its network interface and its one-time spot request.
+  # Created resources with launch-template context. A tagged spot request has no ec2:LaunchTemplate context and gets
+  # its own region/Purpose-scoped authorization below; putting that condition on its ARN rejects persistent tile pools.
   fcvm_fleet_tile_created_arns = flatten([for r in local.fcvm_fleet_regions : [
-    for kind in ["instance", "volume", "network-interface", "spot-instances-request"] :
+    for kind in ["instance", "volume", "network-interface"] :
     "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:${kind}/*"
   ]])
+  fcvm_fleet_tile_spot_request_arns  = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:spot-instances-request/*"]
   fcvm_fleet_tile_template_condition = length(local.fcvm_fleet_tile_template_arns) > 0 ? local.fcvm_fleet_tile_template_arns : ["arn:aws:ec2:*:*:launch-template/none"]
   fcvm_fleet_tile_types              = ["g4dn.xlarge", "g5g.xlarge"]
 
-  # The same for GPU hosts: the host AMIs, the fleet's subnets and group, and the host templates. A host launch creates
-  # what a tile launch does (instance, volume, network interface, spot request).
+  # The same for GPU hosts: their AMIs, host-eligible fleet subnets and groups, and enabled host templates.
   fcvm_fleet_host_template_arns = concat(module.fcvm_fleet_east2.host_template_arns, module.fcvm_fleet_west2.host_template_arns, module.fcvm_fleet_east1.host_template_arns)
   fcvm_fleet_host_referenced_arns = concat(
     flatten([for r, amis in var.fcvm_fleet_host_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}" if ami != ""]]),
-    flatten([for r, m in local.fcvm_fleet_regional : [for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]]),
-    [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"],
+    flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"] if length(m.host_template_names) > 0]),
+    [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}" if length(m.host_template_names) > 0],
     local.fcvm_fleet_host_template_arns,
     ["arn:aws:ec2:us-east-1::image/ami-none"],
   )
   fcvm_fleet_host_template_condition = length(local.fcvm_fleet_host_template_arns) > 0 ? local.fcvm_fleet_host_template_arns : ["arn:aws:ec2:*:*:launch-template/none"]
   fcvm_fleet_host_types              = ["g4dn.metal", "g5g.metal"]
+  # CreateFleet authorizes the fleet and its newly created instances/volumes separately from the resources in the
+  # launch template (those still need RunInstances). Keep instance-only conditions off fleet and volume resources.
+  fcvm_fleet_host_fleet_arns    = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:fleet/*"]
+  fcvm_fleet_host_instance_arns = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:instance/*"]
+  fcvm_fleet_host_volume_arns   = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:volume/*"]
 }
 
 # Spot launches (the tile templates are one-time spot, the hosts spot first) need EC2's spot service-linked role, which a
@@ -460,12 +471,8 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
   aws_service_name = "spot.amazonaws.com"
 }
 
-# The GPU hosts are launched as instant EC2 Fleets (CreateFleet), which need EC2 Fleet's service-linked role; the account
-# has none (2026-10-25), and the coordinator may not create it.
-resource "aws_iam_service_linked_role" "fcvm_fleet_ec2fleet" {
-  provider         = aws.fcvm_fleet
-  aws_service_name = "ec2fleet.amazonaws.com"
-}
+# Instant EC2 Fleets use the caller's permissions and need no EC2 Fleet service-linked role. Do not create the role
+# used by persistent request/maintain fleets: the coordinator owns the lifetime of each launched host itself.
 
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
@@ -519,6 +526,116 @@ resource "aws_cloudwatch_log_group" "fcvm_fleet_coordinator" {
   provider          = aws.fcvm_fleet
   name              = "/ecs/fcvm-fleet-coordinator"
   retention_in_days = 30
+}
+
+# Count only accepted on-demand launches, including an accepted response recovered with its idempotency token
+# (ejc3/fcvm#1282, src/fleet/coord/hosts.rs). The earlier "launching on demand now" line is only an attempt.
+# This is an event notification, not a count of running hosts; a quiet minute does not mean an expensive host stopped.
+resource "aws_cloudwatch_log_metric_filter" "fcvm_fleet_on_demand_launches" {
+  provider       = aws.fcvm_fleet
+  name           = "fcvm-fleet-on-demand-host-launches"
+  log_group_name = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name
+  pattern        = "\"wake: host launch accepted\" \"on-demand\""
+
+  metric_transformation {
+    name          = "OnDemandHostLaunches"
+    namespace     = "FCVM/Fleet"
+    value         = "1"
+    default_value = 0
+    unit          = "Count"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_on_demand_launches" {
+  provider            = aws.fcvm_fleet
+  alarm_name          = "fcvm-fleet-on-demand-host-launches"
+  alarm_description   = "The coordinator accepted an on-demand GPU host launch. A g4dn.metal costs $7.824/hour in us-east-1 and runs until the fleet sleeps; inspect the coordinator hosts and logs. This counts launch events, not running hosts."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  namespace           = aws_cloudwatch_log_metric_filter.fcvm_fleet_on_demand_launches.metric_transformation[0].namespace
+  metric_name         = aws_cloudwatch_log_metric_filter.fcvm_fleet_on_demand_launches.metric_transformation[0].name
+  statistic           = "Sum"
+  period              = 60
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]
+  depends_on          = [aws_lambda_permission.fcvm_fleet_on_demand_notify]
+}
+
+# Alarm actions stay in the coordinator's region. This small forwarder publishes through each retained topic's SNS
+# regional endpoint, preserving the existing confirmed subscriber without relying on cross-region alarm actions.
+data "archive_file" "fcvm_fleet_on_demand_notify" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/fcvm-fleet-on-demand-notify.zip"
+  source {
+    content  = file("${path.module}/scripts/fcvm-fleet-on-demand-notify.py")
+    filename = "notify.py"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "fcvm_fleet_on_demand_notify" {
+  provider          = aws.fcvm_fleet
+  name              = "/aws/lambda/fcvm-fleet-on-demand-notify"
+  retention_in_days = 30
+}
+
+resource "aws_iam_role" "fcvm_fleet_on_demand_notify" {
+  provider = aws.fcvm_fleet
+  name     = "fcvm-fleet-on-demand-notify"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_on_demand_notify" {
+  provider = aws.fcvm_fleet
+  name     = "notify-existing-fleet-subscribers"
+  role     = aws_iam_role.fcvm_fleet_on_demand_notify.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.fcvm_fleet_on_demand_notify.arn}:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "sns:Publish"
+        Resource = local.fcvm_fleet_alert_topic_arns
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_function" "fcvm_fleet_on_demand_notify" {
+  provider         = aws.fcvm_fleet
+  function_name    = "fcvm-fleet-on-demand-notify"
+  filename         = data.archive_file.fcvm_fleet_on_demand_notify.output_path
+  source_code_hash = data.archive_file.fcvm_fleet_on_demand_notify.output_base64sha256
+  role             = aws_iam_role.fcvm_fleet_on_demand_notify.arn
+  runtime          = "python3.12"
+  handler          = "notify.handler"
+  timeout          = 30
+  memory_size      = 128
+  environment {
+    variables = {
+      ALARM_ARN  = local.fcvm_fleet_on_demand_alarm_arn
+      TOPIC_ARNS = jsonencode(local.fcvm_fleet_alert_topic_arns)
+    }
+  }
+  depends_on = [aws_iam_role_policy.fcvm_fleet_on_demand_notify, aws_cloudwatch_log_group.fcvm_fleet_on_demand_notify]
+}
+
+resource "aws_lambda_permission" "fcvm_fleet_on_demand_notify" {
+  provider       = aws.fcvm_fleet
+  statement_id   = "ThisOnDemandLaunchAlarmOnly"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.fcvm_fleet_on_demand_notify.function_name
+  principal      = "lambda.alarms.cloudwatch.amazonaws.com"
+  source_account = local.fcvm_fleet_account_id
+  source_arn     = local.fcvm_fleet_on_demand_alarm_arn
 }
 
 resource "aws_iam_role" "fcvm_fleet_coordinator_execution" {
@@ -614,14 +731,36 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition } }
       },
       {
-        # GPU hosts (fcvm fleet coord --host-template, ejc3/fcvm#1257): an instant EC2 Fleet over the host templates, spot
-        # first and on demand when spot is refused. EC2 Fleet launches with this role's RunInstances, so the two statements
-        # below hold it to the host templates and their own resources as the tile statements above do.
+        # RunInstances checks a tagged persistent spot request separately and that resource has no LaunchTemplate key.
+        # The instance/AMI/subnet/interface still need their template-scoped grants; this cannot authorize a launch alone.
+        Sid      = "LaunchTaggedTileSpotRequestsOnly"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = local.fcvm_fleet_tile_spot_request_arns
+        Condition = { StringEquals = {
+          "aws:RequestedRegion"    = local.fcvm_fleet_regions
+          "aws:RequestTag/Purpose" = "fcvm-fleet-tile"
+        } }
+      },
+      {
+        # CreateFleet has its own resource authorization, in addition to RunInstances for the resources in a template.
+        # The fleet itself has no instance-type or instance-tag context; do not require those on its ARN.
         Sid       = "LaunchHostsAsInstantFleets"
         Effect    = "Allow"
         Action    = "ec2:CreateFleet"
-        Resource  = "*"
+        Resource  = concat(local.fcvm_fleet_host_fleet_arns, local.fcvm_fleet_host_volume_arns)
         Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
+        Sid      = "LaunchFleetInstancesAsTaggedHostsOnly"
+        Effect   = "Allow"
+        Action   = "ec2:CreateFleet"
+        Resource = local.fcvm_fleet_host_instance_arns
+        Condition = { StringEquals = {
+          "aws:RequestedRegion"    = local.fcvm_fleet_regions
+          "ec2:InstanceType"       = local.fcvm_fleet_host_types
+          "aws:RequestTag/Purpose" = "fcvm-fleet-host"
+        } }
       },
       {
         Sid       = "LaunchHostsFromTheirTemplates"
@@ -631,19 +770,24 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition } }
       },
       {
-        # The host AMIs, the fleet's subnets and group, and the host templates.
-        Sid       = "LaunchHostsWithTheirOwnResources"
-        Effect    = "Allow"
-        Action    = "ec2:RunInstances"
-        Resource  = local.fcvm_fleet_host_referenced_arns
-        Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition } }
+        # Exactly the host AMIs, host-eligible subnets, group and templates for both authorization actions. RunInstances
+        # instance creation above still requires a host template. IfExists preserves the template association when
+        # RunInstances supplies that key, while CreateFleet authorizes the exact template/resource ARNs without the key.
+        Sid      = "LaunchHostsWithTheirOwnResources"
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Resource = local.fcvm_fleet_host_referenced_arns
+        Condition = {
+          StringEquals    = { "aws:RequestedRegion" = local.fcvm_fleet_regions }
+          ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }
+        }
       },
       {
         # A launch from a template can still override the instance type: only the fleet's four types, whatever the
         # request says, and each template only its own kind (below).
         Sid       = "FleetTypesOnly"
         Effect    = "Deny"
-        Action    = "ec2:RunInstances"
+        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
         Resource  = "arn:aws:ec2:*:*:instance/*"
         Condition = { StringNotEquals = { "ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types) } }
       },
@@ -672,7 +816,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         # is limited to.
         Sid       = "FleetInstancesAreTagged"
         Effect    = "Deny"
-        Action    = "ec2:RunInstances"
+        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
         Resource  = "arn:aws:ec2:*:*:instance/*"
         Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"] } }
       },
