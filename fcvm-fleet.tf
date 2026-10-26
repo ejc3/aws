@@ -31,18 +31,18 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # bdaa0003 with main's recipe (fleet/ami, ejc3/fcvm#1217): a GPU guest's NIC stays eth0 so its routed address is on it
-  # (#1197), the agent unit runs as root (routed VMs) and the host forwards IPv6; the agent dials the coordinator and takes
-  # --public-ipv4-from-imds (ejc3/fcvm#1229).
-  default = { "us-east-1" = { x86_64 = "ami-0913aacc80394e1bd" } }
+  # 31f42d03 with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
+  # the sky's history (ejc3/fcvm#1342).
+  default = { "us-east-1" = { x86_64 = "ami-0633c6c237794ecb3" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main c93a01d9.
-  default = { "us-east-1" = { x86_64 = "ami-08f3cc41395353a2f" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 31f42d03 (revised from the
+  # c93a01d9 image with main's tile units).
+  default = { "us-east-1" = { x86_64 = "ami-0eae5d080e45fd625" } }
 }
 
 locals {
