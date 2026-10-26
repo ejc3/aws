@@ -213,7 +213,12 @@ class CoordinatorLaunchSplit(unittest.TestCase):
         refs = self.TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
         for part in (":image/${ami}", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_tile_template_arns"):
             self.assertIn(part, refs, part)
-        self.assertIn('"instance", "volume", "network-interface", "spot-instances-request"', self.TF)
+        self.assertIn('"instance", "volume", "network-interface"', self.TF)
+        spot = self.stmt("LaunchTaggedTileSpotRequestsOnly")
+        self.assertIn('Resource = local.fcvm_fleet_tile_spot_request_arns', spot)
+        self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-tile"', spot)
+        self.assertIn('"aws:RequestedRegion"', spot)
+        self.assertNotIn('"ec2:LaunchTemplate"', spot)
 
     def test_state_object_secrets_and_spot_role(self):
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', self.TF)
@@ -256,6 +261,35 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         for part in ("iam_instance_profile", "http_tokens                 = \"required\"", "ipv6_address_count          = 1"):
             self.assertIn(part, od, part)
         self.assertIn("[for t in aws_launch_template.tile_on_demand : t.arn]", block('output "tile_template_arns"', MOD))
+
+
+class TilePool(unittest.TestCase):
+    TF = CoordinatorLaunchSplit.TF
+    stmt = CoordinatorLaunchSplit.stmt
+
+    def test_the_pool_template_is_persistent_spot_that_stops_and_tags_its_request(self):
+        pool = block('resource "aws_launch_template" "tile_pool"', MOD)
+        self.assertIn('spot_instance_type             = "persistent"', pool)
+        self.assertIn('instance_interruption_behavior = "stop"', pool)
+        self.assertIn('resource_type = "spot-instances-request"', pool)
+        self.assertEqual(pool.count('Purpose = "fcvm-fleet-tile"'), 2)
+        self.assertIn("[for t in aws_launch_template.tile_pool : t.arn]", block('output "tile_template_arns"', MOD))
+
+    def test_start_stop_retag_and_cancel_are_limited_to_tiles(self):
+        ss = self.stmt("StartAndStopTilesOnly")
+        self.assertIn('["ec2:StartInstances", "ec2:StopInstances"]', ss)
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', ss)
+        rt = self.stmt("RetagTilesForThePool")
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', rt)
+        self.assertIn('"aws:TagKeys" = ["FleetPool", "FleetTile"]', rt)
+        cs = self.stmt("CancelTileSpotRequestsOnly")
+        self.assertIn('Resource  = "arn:aws:ec2:*:*:spot-instances-request/*"', cs)
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', cs)
+        for s in (ss, rt, cs):
+            self.assertNotIn('Resource = "*"', s)
+
+    def test_the_coordinator_gets_the_pool_flags_only_behind_the_switch(self):
+        self.assertIn('local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "fcvm-fleet-tile-pool-x86_64"] : []', self.TF)
 
 
 class ModuleDependencies(unittest.TestCase):

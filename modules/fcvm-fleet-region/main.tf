@@ -518,6 +518,59 @@ resource "aws_launch_template" "tile_on_demand" {
   tags = { Name = "fcvm-fleet-tile-on-demand-${each.key}" }
 }
 
+# The tile the coordinator keeps a pool of (fcvm fleet coord --ec2-pool <n> --ec2-pool-template
+# fcvm-fleet-tile-pool-<arch>, ejc3/fcvm#1273): persistent spot that stops on interruption, so the coordinator can stop a
+# tile when the fleet sleeps and start it at the next wake (15.5 s to a first frame, against 81 to 84 s for a launch,
+# g4dn.xlarge, 2026-10-25). The spot request is tagged too, so the coordinator's CancelSpotInstanceRequests (it cancels a
+# persistent request before terminating its instance, or the request launches a replacement) is limited to tiles'.
+# Everything else is the spot template's.
+resource "aws_launch_template" "tile_pool" {
+  for_each      = toset(local.tile_archs)
+  name          = "fcvm-fleet-tile-pool-${each.key}"
+  description   = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): persistent spot, stopped between wakes"
+  image_id      = var.tile_amis[each.key]
+  instance_type = local.tile_types[each.key]
+
+  iam_instance_profile {
+    name = var.tile_profile_name
+  }
+
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      spot_instance_type             = "persistent"
+      instance_interruption_behavior = "stop"
+    }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  network_interfaces {
+    device_index                = 0
+    security_groups             = [aws_security_group.fleet.id]
+    associate_public_ip_address = true
+    ipv6_address_count          = 1
+    delete_on_termination       = true
+    subnet_id                   = aws_subnet.public[local.tile_az].id
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+  }
+
+  tag_specifications {
+    resource_type = "spot-instances-request"
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+  }
+
+  tags = { Name = "fcvm-fleet-tile-pool-${each.key}" }
+}
+
 output "vpc_id" {
   value = aws_vpc.this.id
 }
@@ -530,9 +583,9 @@ output "security_group_id" {
   value = aws_security_group.fleet.id
 }
 
-# Both markets: the coordinator's RunInstances is limited to these templates.
+# Both markets and the pool: the coordinator's RunInstances is limited to these templates.
 output "tile_template_arns" {
-  value = concat([for t in aws_launch_template.tile : t.arn], [for t in aws_launch_template.tile_on_demand : t.arn])
+  value = concat([for t in aws_launch_template.tile : t.arn], [for t in aws_launch_template.tile_on_demand : t.arn], [for t in aws_launch_template.tile_pool : t.arn])
 }
 
 output "host_group_desired" {
