@@ -857,47 +857,64 @@ class NoContainerRestartTests(unittest.TestCase):
         self.assertIn("systemctl stop nextjs-ct-firewall.service", block)
         self.assertIn("exit 1", block)
 
-class SharedMemoryBudgetTests(unittest.TestCase):
-    """The real setup command constrains the common parent, while leaving room for bursts."""
+class MemoryLimitRemovalTests(unittest.TestCase):
+    """Run the real reset commands against systemctl so legacy live/persistent caps cannot survive."""
 
     def command(self):
         return SCRIPT.split("# ---- shared container memory\n", 1)[1].split("\n# ----", 1)[0]
 
-    def run_command(self, failure=0):
+    def run_command(self, failure=0, command=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             log = root / "calls"
             fake(root, "systemctl", 'printf "%s\\n" "$*" >> "$MEMORY_CALLS"\nexit "$MEMORY_FAILURE"\n')
             env = dict(os.environ, PATH=str(root) + ":" + os.environ["PATH"],
-                       MEMORY_CALLS=str(log), MEMORY_FAILURE=str(failure))
+                       MEMORY_CALLS=str(log), MEMORY_FAILURE=str(failure), U="alice")
             shell_options = re.search(r"^set -[^\n]+$", SCRIPT, re.M).group()
-            result = subprocess.run(["bash"], input=shell_options + '\n' + self.command() + '\necho completed\n',
+            result = subprocess.run(["bash"], input=shell_options + '\n' + (self.command() if command is None else command) + '\necho completed\n',
                                     text=True, capture_output=True, env=env)
             return result, log.read_text().splitlines()
 
-    def test_shared_parent_has_persistent_burst_and_swap_limits(self):
+    def assert_unlimited_properties(self, call, unit):
+        args = call.split()
+        self.assertEqual(args[:2], ["set-property", unit])
+        self.assertEqual(dict(arg.split("=", 1) for arg in args[2:]), {
+            "MemoryHigh": "infinity", "MemoryMax": "infinity", "MemorySwapMax": "infinity",
+        })
+
+    def test_shared_parent_resets_live_and_persistent_limits(self):
         result, calls = self.run_command()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "completed")
         self.assertEqual(len(calls), 1)
-        args = calls[0].split()
-        self.assertEqual(args[:2], ["set-property", "machine.slice"])
-        properties = dict(arg.split("=", 1) for arg in args[2:])
-        self.assertRegex(properties["MemoryHigh"], r"^\d+%$")
-        self.assertRegex(properties["MemoryMax"], r"^\d+%$")
-        high = int(properties["MemoryHigh"].rstrip("%"))
-        maximum = int(properties["MemoryMax"].rstrip("%"))
-        self.assertLess(high, maximum, "spikes have headroom above reclaim")
-        self.assertGreaterEqual(high, 75, "one container can still use its existing 75% allowance")
-        self.assertLessEqual(maximum, 85, "at least 15% remains outside the container pool")
-        self.assertEqual(properties["MemorySwapMax"], "1G", "containers cannot consume all host swap")
+        self.assert_unlimited_properties(calls[0], "machine.slice")
         self.assertLess(SCRIPT.index(self.command()), SCRIPT.index('/usr/local/sbin/nextjs-ct-machine ${u}'))
 
-    def test_failed_budget_stops_setup_instead_of_recording_success(self):
-        result, calls = self.run_command(failure=17)
-        self.assertNotEqual(result.returncode, 0)
+    def container_command(self):
+        machine = (HOST / "nextjs-ct-machine").read_text()
+        command = re.search(r'^systemctl set-property "systemd-nspawn@\$U\.service"[^\n]*\\\n  \|\|[^\n]*', machine, re.M).group()
+        self.assertLess(machine.index("systemctl daemon-reload"), machine.index(command))
+        self.assertNotRegex(machine, r'systemctl (restart|try-restart)[^\n]*systemd-nspawn')
+        dropin = machine.split('cat > "/etc/systemd/system/systemd-nspawn@$U.service.d/nextjs-ct.conf" <<EOF\n', 1)[1].split("\nEOF", 1)[0]
+        for prop in ("MemoryHigh", "MemoryMax", "MemorySwapMax"):
+            self.assertIn(prop + "=infinity", dropin)
+        self.assertNotIn("75%", dropin)
+        return command
+
+    def test_each_container_clears_legacy_control_overrides_without_restart(self):
+        result, calls = self.run_command(command=self.container_command())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "completed")
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("completed", result.stdout)
+        self.assert_unlimited_properties(calls[0], "systemd-nspawn@alice.service")
+
+    def test_failed_reset_stops_setup_instead_of_recording_success(self):
+        for command in (self.command(), self.container_command()):
+            with self.subTest(command=command.splitlines()[0]):
+                result, calls = self.run_command(failure=17, command=command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("completed", result.stdout)
 
 
 if __name__ == "__main__":
