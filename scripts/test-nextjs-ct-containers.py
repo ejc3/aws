@@ -863,17 +863,82 @@ class MemoryLimitRemovalTests(unittest.TestCase):
     def command(self):
         return SCRIPT.split("# ---- shared container memory\n", 1)[1].split("\n# ----", 1)[0]
 
-    def run_command(self, failure=0, command=None):
+    def run_command(self, failure=0, command=None, remove_failure=0):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            log = root / "calls"
-            fake(root, "systemctl", 'printf "%s\\n" "$*" >> "$MEMORY_CALLS"\nexit "$MEMORY_FAILURE"\n')
-            env = dict(os.environ, PATH=str(root) + ":" + os.environ["PATH"],
-                       MEMORY_CALLS=str(log), MEMORY_FAILURE=str(failure), U="alice")
+            filesystem = root / "fs"
+            command = self.command() if command is None else command
+            unit = "systemd-nspawn@alice.service" if "systemd-nspawn@" in command else "machine.slice"
+            controls = [filesystem / "run/systemd/system.control", filesystem / "etc/systemd/system.control"]
+            properties = ("MemoryHigh", "MemoryMax", "MemorySwapMax")
+            for control in controls:
+                directory = control / (unit + ".d")
+                directory.mkdir(parents=True)
+                for name, value in zip(properties, ("80%", "75%" if unit.startswith("systemd-nspawn") else "85%", "50%")):
+                    (directory / ("50-" + name + ".conf")).write_text(name + "=infinity\n")
+                    (directory / ("50-" + name + "Scale.conf")).write_text(name + "=" + value + "\n")
+                (directory / "40-CPUWeight.conf").write_text("CPUWeight=100\n")
+                unrelated = control / "unrelated.service.d"
+                unrelated.mkdir()
+                (unrelated / "50-MemoryMaxScale.conf").write_text("MemoryMax=50%\n")
+            helper = root / "fake-control.py"
+            helper.write_text("""import json,os,sys
+from pathlib import Path
+root=Path(os.environ["MEMORY_FS"])
+unit=os.environ["MEMORY_UNIT"]
+operation=sys.argv[1]
+with open(os.environ["MEMORY_CALLS"],"a") as f:f.write(" ".join(sys.argv[1:])+"\\n")
+if operation=="rm":
+    if int(os.environ["MEMORY_REMOVE_FAILURE"]):sys.exit(int(os.environ["MEMORY_REMOVE_FAILURE"]))
+    for value in sys.argv[2:]:
+        if value=="--":continue
+        p=Path(value)
+        assert p.parent.resolve().is_relative_to(root.resolve()), "refusing to touch real filesystem"
+        p.unlink()
+elif operation=="set-property":
+    if int(os.environ["MEMORY_FAILURE"]):sys.exit(int(os.environ["MEMORY_FAILURE"]))
+    assert sys.argv[2]==unit
+    directory=root/"etc/systemd/system.control"/(unit+".d")
+    for value in sys.argv[3:]:
+        key=value.split("=",1)[0]
+        (directory/("50-"+key+".conf")).write_text(value+"\\n")
+elif operation=="daemon-reload":
+    files={}
+    for prefix in ("run","etc"):
+        directory=root/prefix/"systemd/system.control"/(unit+".d")
+        files.update({p.name:p for p in directory.glob("*.conf")})
+    effective={}
+    for name in sorted(files):
+        for line in files[name].read_text().splitlines():
+            if "=" in line:
+                key,value=line.split("=",1)
+                if key.startswith("Memory"):effective[key]=value
+    with open(os.environ["MEMORY_RELOADS"],"a") as f:f.write(json.dumps(effective)+"\\n")
+else:raise AssertionError(operation)
+""")
+            fake(root, "systemctl", 'exec /usr/bin/python3 "$MEMORY_FAKE" "$@"\n')
+            fake(root, "rm", 'exec /usr/bin/python3 "$MEMORY_FAKE" rm "$@"\n')
+            env = dict(os.environ, PATH=str(root) + ":" + os.environ["PATH"], U="alice",
+                       MEMORY_FS=str(filesystem), MEMORY_FAKE=str(helper), MEMORY_UNIT=unit,
+                       MEMORY_CALLS=str(root / "calls"), MEMORY_RELOADS=str(root / "reloads"),
+                       MEMORY_FAILURE=str(failure), MEMORY_REMOVE_FAILURE=str(remove_failure))
+            command = command.replace("/etc/systemd/system.control", str(controls[1])).replace(
+                "/run/systemd/system.control", str(controls[0]))
             shell_options = re.search(r"^set -[^\n]+$", SCRIPT, re.M).group()
-            result = subprocess.run(["bash"], input=shell_options + '\n' + (self.command() if command is None else command) + '\necho completed\n',
+            result = subprocess.run(["bash"], input=shell_options + '\nsystemctl daemon-reload\n' + command
+                                    + '\nsystemctl daemon-reload\nsystemctl daemon-reload\necho completed\n',
                                     text=True, capture_output=True, env=env)
-            return result, log.read_text().splitlines()
+            reloads = [json.loads(line) for line in (root / "reloads").read_text().splitlines()]
+            self.assertNotEqual(reloads[0]["MemoryHigh"], "infinity", "fixture reproduces Scale precedence")
+            if result.returncode == 0:
+                for values in reloads[-2:]:
+                    self.assertEqual(values, {name: "infinity" for name in properties})
+                for control in controls:
+                    self.assertFalse(list((control / (unit + ".d")).glob("*Scale.conf")))
+                    self.assertTrue((control / (unit + ".d") / "40-CPUWeight.conf").exists())
+                    self.assertTrue((control / "unrelated.service.d/50-MemoryMaxScale.conf").exists())
+            calls = (root / "calls").read_text().splitlines()
+            return result, [line for line in calls if line.startswith("set-property ")]
 
     def assert_unlimited_properties(self, call, unit):
         args = call.split()
@@ -892,8 +957,7 @@ class MemoryLimitRemovalTests(unittest.TestCase):
 
     def container_command(self):
         machine = (HOST / "nextjs-ct-machine").read_text()
-        command = re.search(r'^systemctl set-property "systemd-nspawn@\$U\.service"[^\n]*\\\n  \|\|[^\n]*', machine, re.M).group()
-        self.assertLess(machine.index("systemctl daemon-reload"), machine.index(command))
+        command = machine.split("# ---- clear legacy memory scales\n", 1)[1].split("\nnetworkctl reload", 1)[0]
         self.assertNotRegex(machine, r'systemctl (restart|try-restart)[^\n]*systemd-nspawn')
         dropin = machine.split('cat > "/etc/systemd/system/systemd-nspawn@$U.service.d/nextjs-ct.conf" <<EOF\n', 1)[1].split("\nEOF", 1)[0]
         for prop in ("MemoryHigh", "MemoryMax", "MemorySwapMax"):
@@ -914,6 +978,14 @@ class MemoryLimitRemovalTests(unittest.TestCase):
                 result, calls = self.run_command(failure=17, command=command)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(len(calls), 1)
+                self.assertNotIn("completed", result.stdout)
+
+    def test_failed_legacy_file_removal_stops_before_reset(self):
+        for command in (self.command(), self.container_command()):
+            with self.subTest(command=command.splitlines()[0]):
+                result, calls = self.run_command(remove_failure=17, command=command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
                 self.assertNotIn("completed", result.stdout)
 
 
