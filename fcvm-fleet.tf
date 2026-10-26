@@ -442,11 +442,13 @@ locals {
     local.fcvm_fleet_tile_template_arns,
     ["arn:aws:ec2:us-east-1::image/ami-none"],
   )
-  # What a tile launch creates: the instance, its volume, its network interface and its one-time spot request.
+  # Created resources with launch-template context. A tagged spot request has no ec2:LaunchTemplate context and gets
+  # its own region/Purpose-scoped authorization below; putting that condition on its ARN rejects persistent tile pools.
   fcvm_fleet_tile_created_arns = flatten([for r in local.fcvm_fleet_regions : [
-    for kind in ["instance", "volume", "network-interface", "spot-instances-request"] :
+    for kind in ["instance", "volume", "network-interface"] :
     "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:${kind}/*"
   ]])
+  fcvm_fleet_tile_spot_request_arns  = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:spot-instances-request/*"]
   fcvm_fleet_tile_template_condition = length(local.fcvm_fleet_tile_template_arns) > 0 ? local.fcvm_fleet_tile_template_arns : ["arn:aws:ec2:*:*:launch-template/none"]
 }
 
@@ -621,6 +623,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Action    = "ec2:RunInstances"
         Resource  = local.fcvm_fleet_tile_referenced_arns
         Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition } }
+      },
+      {
+        # RunInstances checks a tagged persistent spot request separately and that resource has no LaunchTemplate key.
+        # The instance/AMI/subnet/interface still need their template-scoped grants; this cannot authorize a launch alone.
+        Sid      = "LaunchTaggedTileSpotRequestsOnly"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = local.fcvm_fleet_tile_spot_request_arns
+        Condition = { StringEquals = {
+          "aws:RequestedRegion"    = local.fcvm_fleet_regions
+          "aws:RequestTag/Purpose" = "fcvm-fleet-tile"
+        } }
       },
       {
         # A launch from a template can still override the instance type: only the two tile types, whatever the request says.

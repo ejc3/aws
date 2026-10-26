@@ -197,7 +197,12 @@ class CoordinatorLaunchSplit(unittest.TestCase):
         refs = self.TF.split("fcvm_fleet_tile_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
         for part in (":image/${ami}", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_tile_template_arns"):
             self.assertIn(part, refs, part)
-        self.assertIn('"instance", "volume", "network-interface", "spot-instances-request"', self.TF)
+        self.assertIn('"instance", "volume", "network-interface"', self.TF)
+        spot = self.stmt("LaunchTaggedTileSpotRequestsOnly")
+        self.assertIn('Resource = local.fcvm_fleet_tile_spot_request_arns', spot)
+        self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-tile"', spot)
+        self.assertIn('"aws:RequestedRegion"', spot)
+        self.assertNotIn('"ec2:LaunchTemplate"', spot)
 
     def test_state_object_secrets_and_spot_role(self):
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', self.TF)
