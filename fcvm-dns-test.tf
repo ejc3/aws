@@ -16,8 +16,9 @@
 # permission). Cloudflare scopes a token to a zone, not to a name, so it could edit or delete ANY record in fcvm.dev,
 # including the coordinator's. The limit on names is a convention the box keeps:
 #   - touch only names matching dnstest-*.fcvm.dev, and delete each one when its measurement ends;
-#   - never touch the fleet coordinator's names (slot-*, slot-*-v4, ec2-*, _acme-challenge*), stage.fcvm.dev,
-#     fleet-api-stage.fcvm.dev, the apex, or any other record.
+#   - never touch the fleet coordinator's names (slot-*, slot-*-v4, ec2-*, _acme-challenge*), the tiles-stage.fcvm.dev
+#     delegation and its nameservers' records (fcvm-fleet-dns.tf), stage.fcvm.dev, fleet-api-stage.fcvm.dev, the apex,
+#     or any other record.
 #
 # Client IPs: the token works only from the dev fleet's two subnets over IPv6 (where the dev boxes reach
 # api.cloudflare.com) and from the metal boxes' Elastic IPs over IPv4. Every address comes from Terraform: the subnets'

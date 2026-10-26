@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """dev-ai-services.tf: the ElevenLabs key readable only by the administration set and the
-two dev roles, and the dev roles may read that one secret and nothing else. Offline."""
+two dev roles; Stability shares the same existing attachment. Offline."""
 import re
 import unittest
 from pathlib import Path
@@ -107,6 +107,50 @@ class ElevenLabsSecretTests(unittest.TestCase):
         self.assertNotIn("bedrock:", rest)
         self.assertNotRegex(policy, r"foundation-model/(?!deepseek\.(v3\.2|r1-v1:0)\")")
         self.assertNotIn("anthropic", policy)
+
+
+
+class StabilitySecretTests(unittest.TestCase):
+    def test_value_is_out_of_band_and_not_in_deployed_apps(self):
+        self.assertNotIn('resource "aws_secretsmanager_secret_version" "stability_api_key"', TF)
+        self.assertNotIn('data "aws_secretsmanager_secret_version" "stability_api_key"', TF)
+        self.assertNotIn('resource "vercel_project_environment_variable" "stability_api_key"', TF)
+        self.assertNotRegex(TF, r"sk-[A-Za-z0-9]{20,}")
+
+    def test_resource_policy_matches_the_existing_development_boundary(self):
+        policy = block("aws_secretsmanager_secret_policy", "stability_api_key")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers)', policy)
+
+    def test_identity_policy_reuses_the_existing_attachment_with_exact_secret_scope(self):
+        policy = block("aws_iam_policy_document", "elevenlabs_read")
+        self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', policy)
+        self.assertIn('resources = [aws_secretsmanager_secret.stability_api_key.arn]', policy)
+        attach = block("aws_iam_role_policy_attachment", "elevenlabs_read")
+        self.assertIn('{ dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }', attach)
+        self.assertIn('policy_arn = aws_iam_policy.elevenlabs_read.arn', attach)
+        self.assertNotIn('resource "aws_iam_policy" "stability_read"', TF)
+        self.assertNotIn('resource "aws_iam_role_policy_attachment" "stability_read"', TF)
+
+class SunoSecretTests(unittest.TestCase):
+    def test_session_stays_out_of_state_and_reuses_the_exact_creative_boundary(self):
+        for kind in ("resource", "data"):
+            self.assertNotIn(f'{kind} "aws_secretsmanager_secret_version" "suno_cookie"', TF)
+        self.assertNotIn('resource "vercel_project_environment_variable" "suno_cookie"', TF)
+        secret = block("aws_secretsmanager_secret", "suno_cookie")
+        self.assertIn('name                    = "games/suno-cookie"', secret)
+        policy = block("aws_secretsmanager_secret_policy", "suno_cookie")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn('Resource  = aws_secretsmanager_secret.suno_cookie.arn', policy)
+        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers)', policy)
+        doc = block("aws_iam_policy_document", "elevenlabs_read")
+        statement = re.search(r'statement \{\n    sid       = "ReadTheSunoSessionCookie".*?\n  \}', doc, re.S).group()
+        self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', statement)
+        self.assertIn('resources = [aws_secretsmanager_secret.suno_cookie.arn]', statement)
+        self.assertNotIn('resource "aws_iam_policy" "suno_read"', TF)
+        self.assertNotIn('resource "aws_iam_role_policy_attachment" "suno_read"', TF)
 
 
 if __name__ == "__main__":

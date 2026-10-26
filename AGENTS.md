@@ -1400,6 +1400,19 @@ Available if a task needs them; neither needs a key on disk.
   or into a file or a commit:
   `export ELEVENLABS_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/elevenlabs-api-key --query SecretString --output text)`.
   The deployed games get it as the Vercel env `ELEVENLABS_API_KEY` (server-side only).
+- **Stability AI** (offline audio, artwork and 3D assets). `games/stability-api-key` in
+  us-west-1 has the same admin/dev-role read boundary as ElevenLabs. Fetch it only when
+  generating assets as `STABILITY_API_KEY`; no key in app bundles, profiles or logs.
+  Terraform owns only the container and grants. Pricing and capabilities must come from
+  the current official API documentation; the web subscription and API credits differ.
+
+- **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
+  uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
+  SUNO_COOKIE at use time only. It is a full website session: never in files, command
+  arguments, logs, Terraform state or app environments. Terraform owns the container and
+  grants only. Do not call the utility verified until real login, generation and renewal
+  checks pass; a paid website account is not an official API.
+
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
@@ -1738,6 +1751,14 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   and store the certificate it issues. The fleet account has EC2's spot service-linked role; instant EC2 Fleets need no
   EC2 Fleet service-linked role. Hosts read the certificate,
   the agent token and the asset bucket.
+- **Launch names** (`fcvm-fleet-dns.tf`, ejc3/fcvm#1256): the coordinator is the authoritative DNS server of
+  `tiles-stage.fcvm.dev` (`--dns-subzone`) and names every launch there, answering from its own state, so a name resolves
+  as soon as it is published. A network load balancer on two Elastic IPs in two us-east-2 AZs (cross-zone on) forwards
+  UDP and TCP 53 to the task's port 5353; `ns1-`/`ns2-tiles-stage.fcvm.dev` A records and the NS delegation are in
+  fcvm.dev, with no DS (an insecure delegation; fcvm.dev stays signed). IPv4 only: UDP over IPv6 through a dualstack
+  load balancer needs an IPv6 target group, which an ECS service does not fill for a dual-stack task. The certificate
+  gains `*.tiles-stage.fcvm.dev`; its DNS-01 records stay at `_acme-challenge.fcvm.dev`, which the coordinator's
+  `_acme-challenge.tiles-stage.fcvm.dev` CNAME points to.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)

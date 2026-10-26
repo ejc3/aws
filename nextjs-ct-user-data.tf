@@ -468,17 +468,25 @@ CWACONF
 fi
 
 # ---- shared container memory
-# All people share machine.slice. Reclaim above 80%, allow bursts up to 85%, then
-# let the kernel select an OOM victim inside that slice. Host networking, SSH and
-# tunnels live outside it. Bound swap too, before paging can starve the host.
-# set-property persists these settings and applies them to running containers.
-systemctl set-property machine.slice MemoryHigh=80% MemoryMax=85% MemorySwapMax=1G \
-  || { echo "ERROR: shared container memory budget did not install" >&2; exit 1; }
+# Percentage assignments use separate *Scale.conf control drop-ins. Remove only
+# those legacy files: otherwise they override infinity again on daemon-reload.
+for control in /etc/systemd/system.control /run/systemd/system.control; do
+  for name in 50-MemoryHighScale.conf 50-MemoryMaxScale.conf 50-MemorySwapMaxScale.conf; do
+    legacy="$control/machine.slice.d/$name"
+    if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      rm -- "$legacy" || { echo "ERROR: legacy shared memory limit did not clear" >&2; exit 1; }
+    fi
+  done
+done
+systemctl daemon-reload || { echo "ERROR: shared memory reset reload failed" >&2; exit 1; }
+# Persist and apply infinity without restarting containers or the host.
+systemctl set-property machine.slice MemoryHigh=infinity MemoryMax=infinity MemorySwapMax=infinity \
+  || { echo "ERROR: shared container memory limits did not clear" >&2; exit 1; }
 
 # ---------------------------------------------------------------- memory
 # A 4 GB swapfile absorbs compile spikes; earlyoom kills the biggest offender at 4% available memory so
-# the box never pages itself unreachable (nextjs-dev, 2026-10-10). Each container is also capped at 75%
-# of memory (systemd-nspawn@<user>.service); the shared parent above also contains their combined usage.
+# the box never pages itself unreachable (nextjs-dev, 2026-10-10). Cgroup memory and swap limits
+# are disabled; earlyoom remains the host-wide safeguard.
 if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
