@@ -183,8 +183,10 @@ Requires=$HOME_UNIT nextjs-ct-firewall.service
 After=$HOME_UNIT nextjs-ct-firewall.service systemd-networkd.service
 
 [Service]
-# One person's runaway is killed inside their own container before it can page the box to death.
-MemoryMax=75%
+# Clear legacy limits when this drop-in is regenerated.
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
 EOF
 
 # ---- the host end of the link
@@ -199,6 +201,10 @@ IPv6AcceptRA=no
 EOF
 
 systemctl daemon-reload
+# set-property also replaces persistent system.control overrides from earlier runs
+# and clears the live cgroup settings without restarting this person's container.
+systemctl set-property "systemd-nspawn@$U.service" MemoryHigh=infinity MemoryMax=infinity MemorySwapMax=infinity \
+  || { echo "ERROR: $U's container memory limits did not clear" >&2; exit 1; }
 networkctl reload >/dev/null 2>&1 || true
 systemctl enable --now "$HOME_UNIT" >/dev/null
 systemctl enable "systemd-nspawn@$U.service" >/dev/null 2>&1
