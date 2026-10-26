@@ -62,6 +62,11 @@ locals {
   fcvm_fleet_host_templates = flatten([for r, m in local.fcvm_fleet_regional : [for t in m.host_template_names : "${r}:${t}"]])
   fcvm_fleet_host_subnets = flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "${r}:${s}"]
   if length(m.host_template_names) > 0])
+  # Whether the coordinator keeps its 8 EC2 tiles stopped between wakes and starts them at the next one (--ec2-pool,
+  # ejc3/fcvm#1273) instead of launching them: a tile then reaches its first frame in about 16 s instead of 81 to 84 s.
+  # Needs a coordinator image with --ec2-pool (an unknown flag stops the task). Standing cost: 8 stopped 32 GB gp3 root
+  # volumes, $20.48 a month.
+  fcvm_fleet_tile_pool = true
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
@@ -127,6 +132,7 @@ locals {
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
+    local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "fcvm-fleet-tile-pool-x86_64"] : [],
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
     # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
@@ -833,6 +839,34 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Action    = "ec2:TerminateInstances"
         Resource  = "arn:aws:ec2:*:*:instance/*"
         Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"], "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
+        # The tile pool (ejc3/fcvm#1273): stop a tile into the pool when the fleet sleeps and start it at the next wake.
+        Sid       = "StartAndStopTilesOnly"
+        Effect    = "Allow"
+        Action    = ["ec2:StartInstances", "ec2:StopInstances"]
+        Resource  = "arn:aws:ec2:*:*:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
+        # Moving a tile into and out of the pool retags it (FleetPool, FleetTile) and nothing else.
+        Sid      = "RetagTilesForThePool"
+        Effect   = "Allow"
+        Action   = ["ec2:CreateTags", "ec2:DeleteTags"]
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetPool", "FleetTile"] }
+        }
+      },
+      {
+        # A pool tile's spot request is persistent: it is cancelled before its instance is terminated, or it launches a
+        # replacement. The pool template tags its requests Purpose=fcvm-fleet-tile.
+        Sid       = "CancelTileSpotRequestsOnly"
+        Effect    = "Allow"
+        Action    = "ec2:CancelSpotInstanceRequests"
+        Resource  = "arn:aws:ec2:*:*:spot-instances-request/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
       },
       {
         Sid      = "DescribeEc2"

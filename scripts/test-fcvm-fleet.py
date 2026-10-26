@@ -331,6 +331,35 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn("[for t in aws_launch_template.tile_on_demand : t.arn]", block('output "tile_template_arns"', MOD))
 
 
+class TilePool(unittest.TestCase):
+    TF = CoordinatorLaunchSplit.TF
+    stmt = CoordinatorLaunchSplit.stmt
+
+    def test_the_pool_template_is_persistent_spot_that_stops_and_tags_its_request(self):
+        pool = block('resource "aws_launch_template" "tile_pool"', MOD)
+        self.assertIn('spot_instance_type             = "persistent"', pool)
+        self.assertIn('instance_interruption_behavior = "stop"', pool)
+        self.assertIn('resource_type = "spot-instances-request"', pool)
+        self.assertEqual(pool.count('Purpose = "fcvm-fleet-tile"'), 2)
+        self.assertIn("[for t in aws_launch_template.tile_pool : t.arn]", block('output "tile_template_arns"', MOD))
+
+    def test_start_stop_retag_and_cancel_are_limited_to_tiles(self):
+        ss = self.stmt("StartAndStopTilesOnly")
+        self.assertIn('["ec2:StartInstances", "ec2:StopInstances"]', ss)
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', ss)
+        rt = self.stmt("RetagTilesForThePool")
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', rt)
+        self.assertIn('"aws:TagKeys" = ["FleetPool", "FleetTile"]', rt)
+        cs = self.stmt("CancelTileSpotRequestsOnly")
+        self.assertIn('Resource  = "arn:aws:ec2:*:*:spot-instances-request/*"', cs)
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-tile"', cs)
+        for s in (ss, rt, cs):
+            self.assertNotIn('Resource = "*"', s)
+
+    def test_the_coordinator_gets_the_pool_flags_only_behind_the_switch(self):
+        self.assertIn('local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "fcvm-fleet-tile-pool-x86_64"] : []', self.TF)
+
+
 class ModuleDependencies(unittest.TestCase):
     def test_no_module_level_depends_on(self):
         # A module-level depends_on defers the module's data sources (the AZ list) to apply time, and the subnets'
