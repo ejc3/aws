@@ -6,8 +6,9 @@
 # jumpboxes; what the fleet reads is written into the fcvm-fleet account (fcvm-fleet-account.tf):
 #
 #   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else: the coordinator
-#                                        writes slot-<n>.fcvm.dev AAAA records, the slot-<n>-v4 proxied fallbacks and the
-#                                        _acme-challenge TXT records for the wildcard certificate
+#                                        writes the _acme-challenge TXT records for the wildcard certificate, and once
+#                                        deletes the launch names it wrote here before it served them from
+#                                        tiles-stage.fcvm.dev (fcvm-fleet-dns.tf)
 #   fcvm-fleet/coordinator-tunnel-token  the connector token of tunnel fcvm-fleet-coordinator, for the cloudflared container
 #                                        in the coordinator's Fargate task (TUNNEL_TOKEN)
 #   fcvm-fleet/agent-access-token        the Access service token the GPU hosts' agents present at /agent (client_id,
