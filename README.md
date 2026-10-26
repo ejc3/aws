@@ -398,6 +398,19 @@ The ARM host's inbound and outbound public address is reported by
 `firecracker_dev_public_ip`. Terraform retains the secondary private address in
 netplan after the public-address cutover.
 
+Before releasing a previous ARM Elastic IP, update the active SSH aliases on every
+running dev host that carries them. Terraform publishes new setup scripts but does
+not rewrite an already-running host's `/home/ubuntu/.ssh/config.d-devhop`. Back up
+that file, then atomically replace only the `HostName` for `fcvm-arm fcvm-metal-arm`
+with the new address from the reviewed plan, preserving its owner and `0600` mode.
+Verify `ssh -G fcvm-arm` and `ssh -G fcvm-metal-arm` both select the new address,
+then verify an actual `ssh fcvm-arm hostname` from each running host before the old
+address is released. This step updates the alias file only; running the full
+`dev-selfupdate` script can restart unrelated services. Keep stopped dev hosts
+stopped until the apply has published the updated S3 setup scripts; their next boot
+then installs the new aliases. I/O and parallel boxes normally carry only inbound
+hop authorization, so check whether they have an alias file before including them.
+
 
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
 address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, not the
