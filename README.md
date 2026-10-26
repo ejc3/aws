@@ -406,10 +406,22 @@ ssh nextjs
 ssh io
 ```
 
-The ARM host's second inbound address is reported by
-`firecracker_dev_public_ip_next`. Terraform persists its secondary private
-address in netplan and adds it live without restarting networking. The original
-address remains the outbound address until a separate cutover.
+The ARM host's inbound and outbound public address is reported by
+`firecracker_dev_public_ip`. Terraform retains the secondary private address in
+netplan after the public-address cutover.
+
+Before releasing a previous ARM Elastic IP, update the active SSH aliases on every
+running dev host that carries them. Terraform publishes new setup scripts but does
+not rewrite an already-running host's `/home/ubuntu/.ssh/config.d-devhop`. Back up
+that file, then atomically replace only the `HostName` for `fcvm-arm fcvm-metal-arm`
+with the new address from the reviewed plan, preserving its owner and `0600` mode.
+Verify `ssh -G fcvm-arm` and `ssh -G fcvm-metal-arm` both select the new address,
+then verify an actual `ssh fcvm-arm hostname` from each running host before the old
+address is released. This step updates the alias file only; running the full
+`dev-selfupdate` script can restart unrelated services. Keep stopped dev hosts
+stopped until the apply has published the updated S3 setup scripts; their next boot
+then installs the new aliases. I/O and parallel boxes normally carry only inbound
+hop authorization, so check whether they have an alias file before including them.
 
 
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
@@ -893,8 +905,9 @@ alone lets it reconnect.
 
 1. Add its row to `local.mac_ssh_macs` and a `<alias>-ssh.tf` like `colin-pc-ssh.tf`; claim a port block for it
    (`ports claim <alias>`). After apply, fcvm-arm has `~/.ssh/to-<alias>`.
-2. On fcvm-arm: `scripts/windows-pc-bootstrap.sh print <alias> PORT` prints the one script the person at the PC pastes
-   into PowerShell opened with **Run as administrator** (`scripts/windows/bootstrap.ps1` with this PC's values; publish
+2. On fcvm-arm: `FCVM_HOST=<current-arm-public-address> scripts/windows-pc-bootstrap.sh print <alias> PORT` prints
+   the one script the person at the PC pastes. Use the `firecracker_dev_public_ip` Terraform output for `FCVM_HOST`.
+   Paste into PowerShell opened with **Run as administrator** (`scripts/windows/bootstrap.ps1` with this PC's values; publish
    it behind a Copy button). It installs OpenSSH closed to the network, authorizes fcvm-arm's key, and keeps a reverse
    tunnel, as `pcboot`, to fcvm-arm's `127.0.0.1:PORT`. It ends by printing the PC's own key: authorize it for that
    tunnel only with `scripts/windows-pc-bootstrap.sh allow <alias> PORT '<key line>'` (it writes pcboot's key file, with sudo).

@@ -101,7 +101,6 @@ resource "aws_security_group" "ohio_runner" {
     self      = true
     cidr_blocks = [
       "${aws_eip.jumpbox[0].public_ip}/32",
-      "${aws_eip.firecracker_dev[0].public_ip}/32",
       "${aws_eip.firecracker_dev_next[0].public_ip}/32",
       "${aws_eip.x86_dev[0].public_ip}/32",
     ]

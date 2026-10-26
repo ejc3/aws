@@ -2246,7 +2246,7 @@ aws ec2 start-instances --instance-ids $INSTANCE_ID --region us-west-1
 aws ec2 delete-volume --volume-id $CURRENT_VOL --region us-west-1
 
 # 6. Re-associate EIP (terraform loses the association on recreate)
-# ARM: eipalloc-034a515771765d101, x86: eipalloc-0173c9b5e3d294cc5
+# ARM: Terraform owns its address (aws_eip_association.firecracker_dev_next), x86: eipalloc-0173c9b5e3d294cc5
 EIP_ALLOC="eipalloc-0173c9b5e3d294cc5"  # x86
 aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $EIP_ALLOC --region us-west-1
 
@@ -2260,7 +2260,7 @@ echo "Done!"
 
 **Persistent Volume IDs** (don't delete these!):
 - ARM (fcvm-metal-arm): root volume is built by terraform and changes on every move
-  (`terraform state show 'aws_instance.firecracker_dev[0]'`); EIP: `184.72.40.255` (`eipalloc-034a515771765d101`)
+  (`terraform state show 'aws_instance.firecracker_dev[0]'`); address: `terraform output firecracker_dev_public_ip`
 - x86 (fcvm-metal-x86): `vol-071f114b67441e776`, EIP: `50.18.109.164` (`eipalloc-0173c9b5e3d294cc5`)
 
 **When to run the manual swap** (x86): After `terraform apply` creates a new instance (you'll see a new instance ID in the output). Check if data is missing, then run the swap.

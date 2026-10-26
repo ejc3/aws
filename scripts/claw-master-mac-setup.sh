@@ -22,7 +22,17 @@
 set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
-FCVM=${FCVM_HOST:-184.72.40.255}                       # fcvm-metal-arm's Elastic IP
+# fcvm-metal-arm's address is not kept in this repository: FCVM_HOST, else the HostName of the user's `fcvm-arm` ssh
+# alias (ssh -G prints the alias itself for a name with no entry, which is not an address), else an error.
+fcvm_host() {
+  local h=${FCVM_HOST:-}
+  if [ -z "$h" ]; then
+    h=$(ssh -G fcvm-arm 2>/dev/null | awk '$1 == "hostname" { print $2; exit }' || true)
+    [ "$h" != fcvm-arm ] || h=""
+  fi
+  [ -n "$h" ] || { echo "no address for fcvm-metal-arm: set FCVM_HOST, or give the ssh alias fcvm-arm a HostName in ~/.ssh/config" >&2; exit 2; }
+  printf '%s\n' "$h"
+}
 KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins. Keep CM_TAG equal to claw_master_tag in claw-master-server.tf (a test enforces it) and
@@ -36,6 +46,7 @@ CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fd
 
 ALIAS=${1:-}
 [[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claw-master-mac-setup.sh ALIAS   (mac: the ssh alias on fcvm-arm)" >&2; exit 2; }
+FCVM=$(fcvm_host)
 
 # Run something on the Mac: jumpbox -> fcvm -> (Cloudflare Access) -> Mac. stdin is passed through.
 on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "ssh -o BatchMode=yes -o ConnectTimeout=10 $ALIAS $*"; }

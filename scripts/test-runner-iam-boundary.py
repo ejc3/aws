@@ -212,7 +212,7 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertNotIn('ipv6_cidr_blocks', rule)
         cidrs = re.search(r'cidr_blocks\s*=\s*\[\n(.*?)\n\s*\]', rule, re.S).group(1)
         self.assertEqual(re.findall(r'aws_eip\.(\w+)\[0\]\.public_ip', cidrs),
-                         ['jumpbox', 'firecracker_dev', 'firecracker_dev_next', 'x86_dev'])
+                         ['jumpbox', 'firecracker_dev_next', 'x86_dev'])
         self.assertNotRegex(cidrs, r'"\d+\.\d+\.\d+\.\d+/\d+"')
 
 

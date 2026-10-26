@@ -56,7 +56,7 @@ resource "aws_secretsmanager_secret_version" "dev_hop" {
 locals {
   dev_hop_targets = {
     for k, v in {
-      fcvm-arm = { tag = "fcvm-metal-arm", user = "ubuntu", enabled = var.enable_firecracker_instance, ip = var.enable_firecracker_instance ? aws_eip.firecracker_dev[0].public_ip : "" }
+      fcvm-arm = { tag = "fcvm-metal-arm", user = "ubuntu", enabled = var.enable_firecracker_instance, ip = var.enable_firecracker_instance ? aws_eip.firecracker_dev_next[0].public_ip : "" }
       fcvm-x86 = { tag = "fcvm-metal-x86", user = "ubuntu", enabled = var.enable_x86_dev_instance, ip = var.enable_x86_dev_instance ? aws_eip.x86_dev[0].public_ip : "" }
       nextjs   = { tag = "nextjs-dev", user = "ubuntu", enabled = var.enable_nextjs_dev, ip = var.enable_nextjs_dev ? aws_eip.nextjs_dev[0].public_ip : "" }
       # Same box as nextjs, but the dolphin-labs checkout lives in ejc3's account, so this hop

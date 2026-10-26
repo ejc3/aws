@@ -147,7 +147,7 @@ class MacSshClient(unittest.TestCase):
 
     def test_migrates_fcvm_arms_old_files_and_stanzas(self):
         other = self.ssh / "config.d-devhop"
-        other.write_text("Host fcvm-arm\n    HostName 184.72.40.255\n    User ubuntu\n")
+        other.write_text("Host fcvm-arm\n    HostName 203.0.113.10\n    User ubuntu\n")
         for old in ("config.d-mac-tunnels", "known_hosts.mac-tunnels", "macbook-access-proxy"):
             (self.ssh / old).write_text("old\n")
         original = (f"Include {self.ssh}/config.d-mac-tunnels\n\n"
@@ -169,7 +169,7 @@ class MacSshClient(unittest.TestCase):
         self.check_mac()
         for old in ("config.d-mac-tunnels", "known_hosts.mac-tunnels", "macbook-access-proxy"):
             self.assertFalse((self.ssh / old).exists(), old)
-        self.assertEqual(self.effective("fcvm-arm")["hostname"], "184.72.40.255")
+        self.assertEqual(self.effective("fcvm-arm")["hostname"], "203.0.113.10")
         self.assertEqual(self.effective("fcvm-arm")["user"], "ubuntu")
         self.assertEqual(self.effective("runner-host")["port"], "2200")
         self.assertEqual(self.effective("after-host")["port"], "2201")
@@ -502,7 +502,7 @@ esac
         return False
 
     def run_setup(self, *args):
-        env = {"HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin", "FCVM_KEY": "/nonexistent"}
+        env = {"HOME": str(self.home), "PATH": f"{self.stubs}:/usr/bin:/bin", "FCVM_KEY": "/nonexistent", "FCVM_HOST": "203.0.113.10"}
         return subprocess.run(["bash", str(CONNECTOR), *args], capture_output=True, text=True, timeout=60,
                               env=env, stdin=subprocess.DEVNULL)
 
