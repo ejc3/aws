@@ -64,6 +64,9 @@ jobs:
       - name: Metal secondary IPv4 persists across boots without restarting networking
         run: python3 -S -B scripts/test-fcvm-secondary-ipv4.py
 
+      - name: ARM public address cutover and operator-supplied script destinations
+        run: python3 -S -B scripts/test-fcvm-arm-address.py
+
       - name: Jumpbox native Claude installation boundaries
         run: python3 -S -B scripts/test-jumpbox-native-claude.py
 
