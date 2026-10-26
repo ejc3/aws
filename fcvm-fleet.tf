@@ -750,23 +750,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
       {
         # CreateFleet has its own resource authorization, in addition to RunInstances for the resources in a template.
-        # The fleet itself has no instance-type or instance-tag context; do not require those on its ARN.
-        Sid       = "LaunchHostsAsInstantFleets"
-        Effect    = "Allow"
-        Action    = "ec2:CreateFleet"
-        Resource  = concat(local.fcvm_fleet_host_fleet_arns, local.fcvm_fleet_host_volume_arns)
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+        # Real CreateFleet parent authorization omits type, tags, template and RequestedRegion keys. Its ARNs already
+        # pin the account and regions; the separate RunInstances path checks the resources in the launch template.
+        Sid      = "LaunchHostsAsInstantFleets"
+        Effect   = "Allow"
+        Action   = "ec2:CreateFleet"
+        Resource = concat(local.fcvm_fleet_host_fleet_arns, local.fcvm_fleet_host_volume_arns)
       },
       {
-        Sid      = "LaunchFleetInstancesAsTaggedHostsOnly"
+        Sid      = "LaunchFleetInstancesInFleetRegionsOnly"
         Effect   = "Allow"
         Action   = "ec2:CreateFleet"
         Resource = local.fcvm_fleet_host_instance_arns
-        Condition = { StringEquals = {
-          "aws:RequestedRegion"    = local.fcvm_fleet_regions
-          "ec2:InstanceType"       = local.fcvm_fleet_host_types
-          "aws:RequestTag/Purpose" = "fcvm-fleet-host"
-        } }
       },
       {
         Sid       = "LaunchHostsFromTheirTemplates"
@@ -779,21 +774,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         # Exactly the host AMIs, host-eligible subnets, group and templates for both authorization actions. RunInstances
         # instance creation above still requires a host template. IfExists preserves the template association when
         # RunInstances supplies that key, while CreateFleet authorizes the exact template/resource ARNs without the key.
-        Sid      = "LaunchHostsWithTheirOwnResources"
-        Effect   = "Allow"
-        Action   = ["ec2:RunInstances", "ec2:CreateFleet"]
-        Resource = local.fcvm_fleet_host_referenced_arns
-        Condition = {
-          StringEquals    = { "aws:RequestedRegion" = local.fcvm_fleet_regions }
-          ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }
-        }
+        Sid       = "LaunchHostsWithTheirOwnResources"
+        Effect    = "Allow"
+        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Resource  = local.fcvm_fleet_host_referenced_arns
+        Condition = { ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition } }
       },
       {
         # A launch from a template can still override the instance type: only the fleet's four types, whatever the
         # request says, and each template only its own kind (below).
         Sid       = "FleetTypesOnly"
         Effect    = "Deny"
-        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:*:*:instance/*"
         Condition = { StringNotEquals = { "ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types) } }
       },
@@ -822,9 +814,30 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         # is limited to.
         Sid       = "FleetInstancesAreTagged"
         Effect    = "Deny"
-        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:*:*:instance/*"
         Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"] } }
+      },
+      {
+        # These keys exist on RunInstances instances, not the generic CreateFleet parent or volumes/interfaces.
+        Sid      = "HostTemplatesAreTaggedHostsOnly"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }
+          StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-host" }
+        }
+      },
+      {
+        Sid      = "TileTemplatesAreTaggedTilesOnly"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition }
+          StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-tile" }
+        }
       },
       {
         Sid       = "TagAtLaunchOnly"

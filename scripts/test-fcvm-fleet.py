@@ -282,14 +282,13 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
 
     def test_the_coordinator_launches_hosts_only_from_their_templates(self):
         fleet = self.stmt("LaunchHostsAsInstantFleets")
-        self.assertIn('Action    = "ec2:CreateFleet"', fleet)
-        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', fleet)
-        self.assertIn('Resource  = concat(local.fcvm_fleet_host_fleet_arns, local.fcvm_fleet_host_volume_arns)', fleet)
+        self.assertRegex(fleet, r'Action\s*=\s*"ec2:CreateFleet"')
+        self.assertRegex(fleet, r'Resource\s*=\s*concat\(local\.fcvm_fleet_host_fleet_arns, local\.fcvm_fleet_host_volume_arns\)')
         self.assertNotIn('Resource  = "*"', fleet)
-        instances = self.stmt("LaunchFleetInstancesAsTaggedHostsOnly")
+        self.assertNotIn('Condition', fleet)
+        instances = self.stmt("LaunchFleetInstancesInFleetRegionsOnly")
         self.assertIn('Resource = local.fcvm_fleet_host_instance_arns', instances)
-        self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-host"', instances)
-        self.assertIn('"ec2:InstanceType"', instances)
+        self.assertNotIn('Condition', instances)
         fleet_refs = self.stmt("LaunchHostsWithTheirOwnResources")
         self.assertRegex(fleet_refs, r'Resource\s*=\s*local\.fcvm_fleet_host_referenced_arns')
         self.assertRegex(fleet_refs, r'Action\s*=\s*\["ec2:RunInstances", "ec2:CreateFleet"\]')
@@ -301,8 +300,8 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         referenced = self.stmt("LaunchHostsWithTheirOwnResources")
         self.assertRegex(referenced, r'Resource\s*=\s*local\.fcvm_fleet_host_referenced_arns')
         self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition', created)
-        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', referenced)
         self.assertIn('ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_host_template_condition }', referenced)
+        self.assertNotIn('"aws:RequestedRegion"', referenced)
         refs = self.TF.split("fcvm_fleet_host_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
         for part in ("var.fcvm_fleet_host_amis", ":subnet/${s}", ":security-group/${m.security_group_id}", "local.fcvm_fleet_host_template_arns"):
             self.assertIn(part, refs, part)
@@ -318,6 +317,29 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn('fcvm_fleet_host_types              = ["g4dn.metal", "g5g.metal"]', self.TF)
         self.assertNotIn('aws_service_name = "ec2fleet.amazonaws.com"', self.TF)
         self.assertNotIn("autoscaling:", self.TF)
+
+    def test_create_fleet_parent_does_not_require_keys_absent_from_the_real_denial(self):
+        # Recorded by STS DecodeAuthorizationMessage, not a synthetic context supplied to the policy simulator.
+        fixture = json.loads((ROOT / 'scripts/fixtures/fcvm-fleet-create-fleet-context.json').read_text())
+        self.assertEqual(set(fixture['actual_context_key_names']), {
+            'aws:Region', 'aws:Service', 'ec2:InstanceID', 'aws:Resource', 'aws:Type', 'aws:Account', 'aws:ARN'})
+        self.assertEqual(fixture['matched_statement_ids'], ['FleetTypesOnly'])
+        for sid in ('LaunchHostsAsInstantFleets', 'LaunchFleetInstancesInFleetRegionsOnly'):
+            parent = self.stmt(sid)
+            self.assertNotIn('Condition', parent, sid)
+            self.assertNotRegex(parent, r'Resource\s*=\s*"\*"', sid)
+        for sid in ('FleetTypesOnly', 'FleetInstancesAreTagged'):
+            deny = self.stmt(sid)
+            self.assertIn('"ec2:RunInstances"', deny)
+            self.assertNotIn('"ec2:CreateFleet"', deny)
+
+    def test_each_templates_purpose_is_enforced_on_run_instances_instances_only(self):
+        for sid, kind in (('HostTemplatesAreTaggedHostsOnly', 'host'), ('TileTemplatesAreTaggedTilesOnly', 'tile')):
+            deny = self.stmt(sid)
+            self.assertIn('Action   = "ec2:RunInstances"', deny)
+            self.assertIn('Resource = "arn:aws:ec2:*:*:instance/*"', deny)
+            self.assertIn('"ec2:LaunchTemplate" = local.fcvm_fleet_%s_template_condition' % kind, deny)
+            self.assertIn('"aws:RequestTag/Purpose" = "fcvm-fleet-%s"' % kind, deny)
 
     def test_an_on_demand_tile_template_is_a_launchable_template(self):
         od = block('resource "aws_launch_template" "tile_on_demand"', MOD)
@@ -376,10 +398,10 @@ class CoordinatorTileTypes(unittest.TestCase):
         stmt = CoordinatorLaunchSplit.stmt
         s = stmt(CoordinatorLaunchSplit, "FleetTypesOnly")
         self.assertIn('Effect    = "Deny"', s)
-        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', s)
+        self.assertIn('Action    = "ec2:RunInstances"', s)
         self.assertIn('"ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types)', s)
         tagged = stmt(CoordinatorLaunchSplit, "FleetInstancesAreTagged")
-        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', tagged)
+        self.assertIn('Action    = "ec2:RunInstances"', tagged)
         t = stmt(CoordinatorLaunchSplit, "TileTemplatesLaunchTileTypesOnly")
         self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_tile_template_condition }', t)
         self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_tile_types }', t)
