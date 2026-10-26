@@ -33,12 +33,12 @@ variable "availability_zones" {
 }
 
 variable "ami_name" {
-  description = "Exact name of the Canonical Ubuntu arm64 image, so every region boots the same build"
+  description = "Exact name of the Canonical Ubuntu arm64 image for this region"
   type        = string
 }
 
 variable "ami_name_x86" {
-  description = "Exact name of the x86_64 build of that image, which pbox passes with --image-id for an x86 flavor"
+  description = "Exact name of the Canonical Ubuntu x86_64 image, which pbox passes with --image-id for an x86 flavor"
   type        = string
 }
 

@@ -869,6 +869,34 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
       },
       {
+        # The tile pool (ejc3/fcvm#1273): stop a tile into the pool when the fleet sleeps and start it at the next wake.
+        Sid       = "StartAndStopTilesOnly"
+        Effect    = "Allow"
+        Action    = ["ec2:StartInstances", "ec2:StopInstances"]
+        Resource  = "arn:aws:ec2:*:*:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
+        # Moving a tile into and out of the pool retags it (FleetPool, FleetTile) and nothing else.
+        Sid      = "RetagTilesForThePool"
+        Effect   = "Allow"
+        Action   = ["ec2:CreateTags", "ec2:DeleteTags"]
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetPool", "FleetTile"] }
+        }
+      },
+      {
+        # A pool tile's spot request is persistent: it is cancelled before its instance is terminated, or it launches a
+        # replacement. The pool template tags its requests Purpose=fcvm-fleet-tile.
+        Sid       = "CancelTileSpotRequestsOnly"
+        Effect    = "Allow"
+        Action    = "ec2:CancelSpotInstanceRequests"
+        Resource  = "arn:aws:ec2:*:*:spot-instances-request/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
         Sid      = "DescribeEc2"
         Effect   = "Allow"
         Action   = ["ec2:Describe*"]
