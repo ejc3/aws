@@ -200,9 +200,18 @@ LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF
 
-systemctl daemon-reload
-# set-property also replaces persistent system.control overrides from earlier runs
-# and clears the live cgroup settings without restarting this person's container.
+# ---- clear legacy memory scales
+# Scale drop-ins sort after the absolute-value files written by set-property.
+for control in /etc/systemd/system.control /run/systemd/system.control; do
+  for name in 50-MemoryHighScale.conf 50-MemoryMaxScale.conf 50-MemorySwapMaxScale.conf; do
+    legacy="$control/systemd-nspawn@$U.service.d/$name"
+    if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      rm -- "$legacy" || { echo "ERROR: $U's legacy memory limit did not clear" >&2; exit 1; }
+    fi
+  done
+done
+systemctl daemon-reload || { echo "ERROR: $U's memory reset reload failed" >&2; exit 1; }
+# Clear the live settings and persist infinity without restarting the container.
 systemctl set-property "systemd-nspawn@$U.service" MemoryHigh=infinity MemoryMax=infinity MemorySwapMax=infinity \
   || { echo "ERROR: $U's container memory limits did not clear" >&2; exit 1; }
 networkctl reload >/dev/null 2>&1 || true

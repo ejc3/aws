@@ -468,8 +468,18 @@ CWACONF
 fi
 
 # ---- shared container memory
-# Clear the former shared reclaim, hard-memory and swap caps. Persist the reset
-# and apply it to running containers without restarting them or the host.
+# Percentage assignments use separate *Scale.conf control drop-ins. Remove only
+# those legacy files: otherwise they override infinity again on daemon-reload.
+for control in /etc/systemd/system.control /run/systemd/system.control; do
+  for name in 50-MemoryHighScale.conf 50-MemoryMaxScale.conf 50-MemorySwapMaxScale.conf; do
+    legacy="$control/machine.slice.d/$name"
+    if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      rm -- "$legacy" || { echo "ERROR: legacy shared memory limit did not clear" >&2; exit 1; }
+    fi
+  done
+done
+systemctl daemon-reload || { echo "ERROR: shared memory reset reload failed" >&2; exit 1; }
+# Persist and apply infinity without restarting containers or the host.
 systemctl set-property machine.slice MemoryHigh=infinity MemoryMax=infinity MemorySwapMax=infinity \
   || { echo "ERROR: shared container memory limits did not clear" >&2; exit 1; }
 
