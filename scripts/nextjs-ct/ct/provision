@@ -64,7 +64,9 @@ fi
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null && apt-get install -y -q nodejs || warn "node install failed"
 fi
-command -v pnpm >/dev/null 2>&1 || npm install -g pnpm >/dev/null 2>&1 || warn "pnpm install failed"
+if [ "$(cd / && pnpm --version 2>/dev/null)" != "12.15.0" ]; then
+  npm install -g pnpm@12.15.0 >/dev/null 2>&1 || warn "pnpm install failed"
+fi
 command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || warn "vercel install failed"
 if ! command -v gh >/dev/null 2>&1; then
   curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \

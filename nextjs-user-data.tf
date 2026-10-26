@@ -200,7 +200,7 @@ if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   apt-get install -y nodejs
 fi
-npm install -g pnpm >/dev/null 2>&1 || true
+npm install -g pnpm@12.15.0 >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- cloudflared
 if ! command -v cloudflared >/dev/null 2>&1; then

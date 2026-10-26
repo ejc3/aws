@@ -37,7 +37,16 @@
 #                                 service) for the scheduled PeMS refresh. Value set out of band, never in git. The
 #                                 function and the administration set read it; dev-server-role reads and puts it.
 #
-# All three schedules start DISABLED. Turn on dolphin_maps_loop_enabled after the first deploy and after the app's
+# Eight more schedules invoke the sweep function with the week and weekend modes (dolphin-maps
+# docs/design/weekday-traffic.md): they read the days of the week the sweep does not, into observations/gmaps_week.csv,
+# which the fit does not read. Seven monthly ones, {"mode": "week", "weekday": "mon"..."sun"}, one per day of the week
+# (one day is 18 jobs, one wave of Browserbase's 25 browsers; the whole week would be seven waves, past a Lambda's 15
+# minutes), on the first Saturday of the month from 20:00, 20 minutes apart; and {"mode": "weekend"} (the trips'
+# Saturday and Sunday) on Thursday 23:00. They all run in the sweep function (its role, its one-at-a-time
+# concurrency and its failure alarm), none in a weekday morning (the live loop's browsers), and none overlaps another
+# or the Sunday-night sweep: a pass takes minutes against the 20 minutes between them.
+#
+# All schedules start DISABLED. Turn on dolphin_maps_loop_enabled after the first deploy and after the app's
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
@@ -47,7 +56,7 @@
 #   dev-server-role            journal/ (read, list): replays on the metal boxes; dolphin-maps/pems (read, put)
 
 variable "dolphin_maps_loop_enabled" {
-  description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep). false keeps the function and its data and stops the runs."
+  description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep, the monthly week passes and the weekly weekend pass). false keeps the function and its data and stops the runs."
   type        = bool
   default     = false
 }
@@ -65,6 +74,19 @@ locals {
     sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }
     refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }
   }
+  # The week and weekend passes: the sweep function, another event. Names are the schedules' suffixes. Week passes
+  # are 20 minutes apart from Saturday 20:00 (a pass is a few minutes, 15 at the most); `SAT#1` is the month's first
+  # Saturday. The weekend pass is on Thursday night, a day of no other loop.
+  dolphin_maps_loop_week_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+  dolphin_maps_loop_extra_schedules = merge(
+    {
+      for i, day in local.dolphin_maps_loop_week_days : "week-${day}" => {
+        schedule = "cron(${(i * 20) % 60} ${20 + floor(i * 20 / 60)} ? * SAT#1 *)"
+        input    = { mode = "week", weekday = day }
+      }
+    },
+    { weekend = { schedule = "cron(0 23 ? * THU *)", input = { mode = "weekend" } } },
+  )
 }
 
 # -------------------------------------------------------------------------------------
@@ -420,6 +442,31 @@ resource "aws_scheduler_schedule" "dolphin_maps_loop" {
     arn      = aws_lambda_function.dolphin_maps_loop[each.key].arn
     role_arn = aws_iam_role.dolphin_maps_loop_scheduler.arn
     input    = jsonencode({ mode = each.key })
+
+    retry_policy {
+      maximum_retry_attempts       = 0
+      maximum_event_age_in_seconds = 300
+    }
+  }
+}
+
+# The week and weekend passes: the sweep function, so its permissions and alarms (a failed pass of either counts as a failed
+# sweep). In Los Angeles time, like the others.
+resource "aws_scheduler_schedule" "dolphin_maps_loop_extra" {
+  for_each   = local.dolphin_maps_loop_extra_schedules
+  name       = "${local.dolphin_maps_loop_name}-${each.key}"
+  group_name = "default"
+  state      = var.dolphin_maps_loop_enabled ? "ENABLED" : "DISABLED"
+
+  flexible_time_window { mode = "OFF" }
+
+  schedule_expression          = each.value.schedule
+  schedule_expression_timezone = "America/Los_Angeles"
+
+  target {
+    arn      = aws_lambda_function.dolphin_maps_loop["sweep"].arn
+    role_arn = aws_iam_role.dolphin_maps_loop_scheduler.arn
+    input    = jsonencode(each.value.input)
 
     retry_policy {
       maximum_retry_attempts       = 0
