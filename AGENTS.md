@@ -1720,14 +1720,14 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
   a public subnet per AZ, one security group admitting TCP 443 from anywhere and nothing else, no SSH: SSM only, flow logs
-  to `fcvm-fleet-flow-logs-<id>`); a spot GPU host group per region over g4dn.metal and g5g.metal (launch template per
-  architecture, `Ipv6PrefixCount = 1` only, IMDSv2 hop 1); EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
+  to `fcvm-fleet-flow-logs-<id>`); GPU host launch templates per architecture (g4dn.metal, g5g.metal; `Ipv6PrefixCount = 1`
+  only, IMDSv2 hop 1) the coordinator launches from itself; EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
   coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/tls-wildcard` secret. The
   Cloudflare-fed secrets (DNS token, tunnel token, agent Access token) come from `fcvm-dev.tf`.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
-  `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts scale to zero
-  when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
+  `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
+  terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
   immutable tag, then invokes `fcvm-coordinator-release`. That function holds the same DynamoDB
   backend lock as Terraform, clones the running task definition changing only its image, and
   records the successful digest in `/fcvm-fleet/stage/coordinator-image`. Terraform reads that
@@ -1736,17 +1736,20 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   version. An ephemeral apply-time check rejects a saved plan made before that increment,
   including when a failed release restores the previous image. Infrastructure still changes
   only through Terraform from a jumpbox.
-- **On-demand fallback** (`fcvm-fleet-hosts-on-demand`, beside each spot group): Auto Scaling does not move a spot group's
-  capacity to on demand by itself, so the coordinator does (`--on-demand-group`, `--spot-wait`): a wake whose spot group
-  stays short gives the on-demand group the shortfall, and sleep sets both groups to 0. `max_size` is
-  `local.fcvm_fleet_on_demand_max` = 8 (owner, 2026-10-24: "Up to 8 on-demand max"); the us-east-1 on-demand G and VT
-  quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal. `local.fcvm_fleet_coordinator_falls_back` passes the flags; it stays
-  false until the coordinator tag has them. Alarm `fcvm-fleet-on-demand-hosts` (fleet account, the group's region) mails
-  the owner while any on-demand host is in service.
-- The coordinator's task role may launch EC2 only from the tile templates, referencing only the tile AMIs and the fleet's
-  subnets and group (by exact ARN), only as the two tile types and tagged `Purpose=fcvm-fleet-tile`; terminate only
-  instances so tagged; pass only the tile role; read and write only `state.json`; read the DNS token and the certificate
-  and store the certificate it issues. The fleet account has EC2's spot service-linked role. Hosts read the certificate,
+- **GPU hosts** (ejc3/fcvm#1257): no auto scaling group. The coordinator launches each host itself, spot first (an instant
+  EC2 Fleet over the region's host templates and host subnets, `FLEET_HOST_TEMPLATES`, `FLEET_HOST_SUBNETS`), on demand
+  in the same pass when spot is refused for capacity, at most `local.fcvm_fleet_on_demand_max` = 8 on-demand hosts across
+  the fleet (owner, 2026-10-24: "Up to 8 on-demand max"; `FLEET_HOST_ON_DEMAND_MAX`), and terminates every host while
+  the fleet sleeps. The us-east-1 on-demand G and VT quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal. Accepted on-demand
+  launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
+  `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
+  notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
+- The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
+  referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
+  tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile
+  roles; read and write only `state.json`; read the DNS token and the certificate
+  and store the certificate it issues. The fleet account has EC2's spot service-linked role; instant EC2 Fleets need no
+  EC2 Fleet service-linked role. Hosts read the certificate,
   the agent token and the asset bucket.
 - **Launch names** (`fcvm-fleet-dns.tf`, ejc3/fcvm#1256): the coordinator is the authoritative DNS server of
   `tiles-stage.fcvm.dev` (`--dns-subzone`) and names every launch there, answering from its own state, so a name resolves
