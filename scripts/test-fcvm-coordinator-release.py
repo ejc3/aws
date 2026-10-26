@@ -56,16 +56,23 @@ class AWS:
     def describe_images(self, **kwargs):
         return {"imageDetails": [{"imageDigest": DIGEST}]}
 
+    def refused(self, kwargs):
+        """DynamoDB's refusal; with ALL_OLD it carries the item the condition was checked against."""
+        response = {"Error": {"Code": "ConditionalCheckFailedException", "Message": "secret detail"}}
+        if kwargs.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" and self.lock:
+            response["Item"] = {"LockID": {"S": ENV["LOCK_ID"]}, "Info": {"S": self.lock}}
+        return ClientError(response)
+
     def put_item(self, **kwargs):
         if self.lock and kwargs.get("ConditionExpression") == "attribute_not_exists(LockID)":
-            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}})
+            raise self.refused(kwargs)
         self.lock = kwargs["Item"]["Info"]["S"]
         self.calls.append("lock")
 
     def delete_item(self, **kwargs):
         if (kwargs.get("ConditionExpression") == "#info = :owner"
                 and kwargs["ExpressionAttributeValues"][":owner"]["S"] != self.lock):
-            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}})
+            raise self.refused(kwargs)
         self.lock = None
         self.calls.append("unlock")
 
@@ -186,15 +193,135 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.aws.image, old)
         self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, OLD, "pointer", "deregister:" + NEW, "unlock"])
 
-    def test_the_lock_delete_checks_the_unique_owner(self):
+    def test_a_lock_taken_over_during_the_release_is_left_alone_and_the_release_reports_deployed(self):
         real = self.aws.update_service
         def changed(**kwargs):
             real(**kwargs)
-            self.aws.lock = "new owner"
+            self.aws.lock = "new owner"  # force-released and taken by Terraform while the rollout ran
         self.aws.update_service = changed
-        with self.assertRaises(ClientError):
-            self.run_release()
+        self.assertEqual(self.run_release()["status"], "deployed")
         self.assertEqual(self.aws.lock, "new owner")
+        self.assertEqual(self.aws.image, REPO + "@" + DIGEST)
+
+    def test_a_retried_unlock_whose_first_attempt_landed_reports_deployed(self):
+        real = self.aws.delete_item
+        def retried(**kwargs):
+            real(**kwargs)  # the first attempt deletes the lock, its reply is lost, the SDK retries
+            real(**kwargs)
+        self.aws.delete_item = retried
+        result = self.run_release()
+        self.assertEqual(result["status"], "deployed")
+        self.assertIsNone(self.aws.lock)
+
+    def test_a_retried_lock_write_whose_first_attempt_landed_owns_the_lock(self):
+        real = self.aws.put_item
+        def retried(**kwargs):
+            real(**kwargs)  # the first attempt writes the lock, its reply is lost, the SDK retries
+            real(**kwargs)
+        self.aws.put_item = retried
+        self.assertEqual(self.run_release()["status"], "deployed")
+        self.assertIsNone(self.aws.lock, "the release left its own lock behind")
+
+    def test_a_failed_unlock_of_a_lock_still_held_is_reported(self):
+        def throttled(**kwargs):
+            raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}})
+        self.aws.delete_item = throttled
+        progress = {}
+        with self.assertRaises(ClientError):
+            release.deploy(EVENT, self.aws, self.aws, self.aws, self.aws, progress=progress)
+        self.assertEqual(progress["step"], "unlock")
+
+
+class Session:
+    def __init__(self, aws):
+        self.aws = aws
+
+    def client(self, name, config=None):
+        return self.aws
+
+
+class HandlerTests(unittest.TestCase):
+    """The failure result names the step and the AWS error code, and nothing else."""
+
+    def setUp(self):
+        self.aws = AWS()
+        self.aws.assume_role = lambda **kwargs: {"Credentials": {
+            "AccessKeyId": "id", "SecretAccessKey": "secret", "SessionToken": "token"}}
+        fake = types.SimpleNamespace(client=lambda name, config=None: self.aws,
+                                     Session=lambda **kwargs: Session(self.aws))
+        self.patches = [patch.object(release, "boto3", fake), patch.object(release, "Config", lambda **kwargs: None),
+                        patch.dict(os.environ, {**ENV, "RELEASE_ROLE": "arn:example:role/release"})]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: 850_000)
+
+    def break_call(self, method, code="AccessDeniedException"):
+        def raises(**kwargs):
+            raise ClientError({"Error": {"Code": code, "Message": "secret detail"},
+                               "ResponseMetadata": {"HTTPHeaders": {"x-secret": "value"}}})
+        setattr(self.aws, method, raises)
+
+    def handle(self):
+        result = release.lambda_handler(EVENT, self.context)
+        self.assertNotIn("secret", json.dumps(result))
+        return result
+
+    def test_each_failing_step_is_named_with_its_code(self):
+        cases = [("assume_role", "credentials"), ("put_item", "lock"),
+                 ("describe_task_definition", "inspect"), ("register_task_definition", "register"),
+                 ("delete_item", "unlock")]
+        for method, step in cases:
+            with self.subTest(step=step):
+                self.setUp()
+                self.break_call(method)
+                self.assertEqual(self.handle(), {"status": "failed", "errorType": "ClientError",
+                                                 "step": step, "code": "AccessDeniedException"})
+
+    def test_a_failed_service_update_is_named_after_its_rollback(self):
+        real = self.aws.update_service
+        def forward_update_fails(**kwargs):
+            real(**kwargs)
+            if kwargs["taskDefinition"] == NEW:
+                raise ClientError({"Error": {"Code": "InvalidParameterException", "Message": "secret detail"}})
+        self.aws.update_service = forward_update_fails
+        self.assertEqual(self.handle(), {"status": "failed", "errorType": "ClientError",
+                                         "step": "update", "code": "InvalidParameterException"})
+        self.assertEqual(self.aws.arn, OLD)
+
+    def test_the_failed_pointer_write_is_named(self):
+        real = self.aws.put_parameter
+        def second_write_fails(**kwargs):
+            if kwargs["Value"] == REPO + "@" + DIGEST:
+                raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "secret detail"}})
+            real(**kwargs)
+        self.aws.put_parameter = second_write_fails
+        self.assertEqual(self.handle(), {"status": "failed", "errorType": "ClientError",
+                                         "step": "pointer", "code": "ThrottlingException"})
+
+    def test_a_failed_rollout_is_named_after_a_successful_rollback(self):
+        self.aws.fail_rollout = True
+        self.assertEqual(self.handle(), {"status": "failed", "errorType": "Refused",
+                                         "step": "rollout", "code": "rollout-failed"})
+        self.assertEqual(self.aws.arn, OLD)
+
+    def test_a_failed_rollback_is_named(self):
+        self.aws.fail_rollout = True
+        real = self.aws.update_service
+        def rollback_fails(**kwargs):
+            if kwargs["taskDefinition"] == OLD:
+                raise ClientError({"Error": {"Code": "ServiceNotActiveException"}})
+            real(**kwargs)
+        self.aws.update_service = rollback_fails
+        self.assertEqual(self.handle(), {"status": "failed", "errorType": "ClientError",
+                                         "step": "rollback", "code": "ServiceNotActiveException"})
+
+    def test_an_error_without_a_code_names_only_its_step(self):
+        self.aws.describe_task_definition = lambda **kwargs: (_ for _ in ()).throw(TimeoutError("secret detail"))
+        self.assertEqual(self.handle(), {"status": "failed", "errorType": "TimeoutError", "step": "inspect"})
+
+    def test_a_completed_release_reports_deployed(self):
+        self.assertEqual(self.handle()["status"], "deployed")
 
 
 if __name__ == "__main__":

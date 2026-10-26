@@ -1734,8 +1734,11 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   software release pointer and tracks the latest active task revision; no task/service fields
   are ignored. Before its first ECS mutation the function increments the pointer's parameter
   version. An ephemeral apply-time check rejects a saved plan made before that increment,
-  including when a failed release restores the previous image. Infrastructure still changes
-  only through Terraform from a jumpbox.
+  including when a failed release restores the previous image. A failed release returns only
+  `status`, `errorType`, the `step` that failed and, for an AWS error or a failed release check,
+  its `code`; never a message or an SDK payload. A lock the function no longer holds at the end
+  (deleted, or replaced after a force-unlock) is left alone, and the release's own result stands.
+  Infrastructure still changes only through Terraform from a jumpbox.
 - **GPU hosts** (ejc3/fcvm#1257): no auto scaling group. The coordinator launches each host itself, spot first (an instant
   EC2 Fleet over the region's host templates and host subnets, `FLEET_HOST_TEMPLATES`, `FLEET_HOST_SUBNETS`), on demand
   in the same pass when spot is refused for capacity, at most `local.fcvm_fleet_on_demand_max` = 8 on-demand hosts across
