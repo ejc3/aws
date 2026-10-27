@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the claw-master agent for %i hourly (a renewed certificate restarts it)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Unit=claw-master-agent-setup@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -908,11 +908,14 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   person's own subscription, which the pool also spends: the app said "You've hit your weekly limit" while the terminal worked
   (2026-10-27). For an enrolled account, provision runs `claw-master-agent-setup USER` (scripts/nextjs-ct/ct): the
   `claw-master-agent@USER` unit (`claw-master agent --listen 127.0.0.1:8445 --server ... --dir ~/.config/claude-master`) and its
-  proxy, CA and `NO_PROXY` in `~/.claude/settings.json` `env`, which every Claude Code reads; nothing else in that file changes.
-  `claw-master connect` accepts exactly those entries, and t-claude's sessions keep their own forwarder (connect's lowercase
-  `https_proxy` wins). No fallback: while the agent or the server is down those requests fail. The agent reads its certificate
-  once, so `claw-master-agent@USER.path` sets it up again when `client.pem` changes (enrolling, or the daily renewal, which carries
-  the agent's `agent.token` into the new directory). Not enrolled: no agent, and only those exact entries are removed.
+  proxy, CA and `NO_PROXY` in the managed settings drop-in `/etc/claude-code/managed-settings.d/50-claw-master-agent.json`
+  (mode 640, the person's group: it carries the agent's token), which every Claude Code here reads above user and project
+  settings; the person's own `~/.claude/settings.json` is never touched. `claw-master connect` accepts exactly those entries, and
+  t-claude's sessions keep their own forwarder (connect's lowercase `https_proxy` wins). No fallback: while the agent or the
+  server is down those requests fail, and an enrolled account's fault keeps the drop-in. The agent reads its certificate once,
+  so it is restarted when `client.pem` is newer than it: `claw-master-agent@USER.path` on a change and `.timer` hourly (a
+  renewal swaps the directory, and carries the agent's `agent.token` into the new one). A certificate missing for a few seconds
+  is a swap, not un-enrolment; one that stays missing means no agent and no drop-in.
 - **fcvm-metal-arm uses the pool the same way** (`claw-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
   The block also exports `TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master` (here and on nextjs-dev): this box has a personal build in

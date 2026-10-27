@@ -284,9 +284,11 @@ as_user bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.a
   || warn "claude install failed for $U"
 as_user bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
 # Every Claude Code here through the pool, the desktop app's SSH sessions too, not only t-claude's (claw-master-agent-setup
-# says why). The path unit sets it up again when the certificate is enrolled or renewed; a new claw-master build restarts it.
-systemctl enable "claw-master-agent@$U.path" >/dev/null 2>&1 && systemctl start "claw-master-agent@$U.path" \
-  || warn "claw-master-agent@$U.path not enabled"
+# says why). The path unit and an hourly timer set it up again when the certificate is enrolled or renewed; a new
+# claw-master build restarts it.
+for t in "claw-master-agent@$U.path" "claw-master-agent@$U.timer"; do
+  systemctl enable --now "$t" >/dev/null 2>&1 || warn "$t not enabled"
+done
 /usr/local/bin/claw-master-agent-setup "$U" ${CM_UPDATED:+--restart} || warn "claw-master agent setup failed for $U"
 [ -x "$H/.codex/packages/standalone/current/codex" ] \
   || as_user sh -c "cd $H && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 || warn "codex install failed for $U"
