@@ -90,8 +90,6 @@ if ! systemctl is-active --quiet "$UNIT"; then
 elif [ -n "$RESTART" ] || [ "$(cat "$LOADED" 2>/dev/null)" != "$SUM" ]; then
   systemctl restart "$UNIT" || { say "$UNIT did not restart"; exit 1; }
 fi
-echo "$SUM" > "$LOADED" || { say "cannot write $LOADED"; exit 1; }
-
 # The drop-in is written whether or not the agent came up: the unit keeps restarting it, and failing beats spending the
 # person's own login. It carries the agent's token, so only the person (and root) can read it.
 install -d -m 755 "$(dirname "$DROPIN")" || { say "cannot make $(dirname "$DROPIN")"; exit 1; }
@@ -112,10 +110,12 @@ PORT=${LISTEN##*:}
 for _ in $(seq 1 "$TRIES"); do
   PID=$(systemctl show -p MainPID --value "$UNIT")
   [ "${PID:-0}" != 0 ] && ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -q "pid=$PID," && {
+    echo "$SUM" > "$LOADED" || { say "cannot write $LOADED"; exit 1; }
     echo "claw-master-agent-setup: $U uses the pool through $LISTEN"
     exit 0
   }
   sleep 0.5
 done
+rm -f "$LOADED"
 say "$UNIT is not the listener on $LISTEN"
 exit 1

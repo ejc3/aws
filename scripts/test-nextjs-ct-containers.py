@@ -1025,6 +1025,24 @@ esac
             self.assertIn("is not the listener", r.stderr, why)
             self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w), why + ": the drop-in still keeps Claude off the person's login")
 
+    def test_an_unready_start_clears_the_loaded_mark_and_retries_with_a_restart(self):
+        w = self.world(listening=False)
+        loaded = Path(w.env["CM_AGENT_LOADED"])
+        loaded.write_text("a previous certificate\n")
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(loaded.exists(), "an active but unready unit must not keep a loaded-certificate mark")
+        srv = socket.socket()
+        self.addCleanup(srv.close)
+        srv.bind(("127.0.0.1", w.port))
+        srv.listen(16)
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls(w, "restart")), 1, "the active unready start must be retried")
+        self.assertTrue(loaded.is_file())
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(len(self.calls(w, "restart")), 1, "a ready certificate needs no further restart")
+
     def test_the_units_run_the_agent_and_set_it_up_again(self):
         agent = (self.UNITS / "claw-master-agent@.service").read_text()
         for line in ("User=%i", "EnvironmentFile=/etc/nextjs-ct/claw-master-agent.env", "Restart=always",

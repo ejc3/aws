@@ -274,6 +274,36 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(kv(self.install(home2, cert2).stdout).get("INSTALL"), "ok")
         self.assertFalse((home2 / ".config/claude-master/agent.token").exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "fixture copies as the current unprivileged account")
+    def test_root_install_copies_the_token_as_the_account_and_cannot_write_a_protected_target(self):
+        # Select the root branch with a fake id; runuser records the requested account and then runs as this test's
+        # unprivileged user. A separate privileged smoke check can exercise the same script with real root/runuser.
+        account = sh(["id", "-un"]).stdout.strip()
+        bin_ = Path(tempfile.mkdtemp(dir=self.tmp))
+        trace = bin_ / "runuser-account"
+        (bin_ / "id").write_text('#!/bin/bash\n[ "$*" = -u ] && { echo 0; exit; }; exec /usr/bin/id "$@"\n')
+        (bin_ / "runuser").write_text('#!/bin/bash\n[ "$1" = -u ] && [ "$3" = -- ] || exit 9\n'
+                                      'printf "%%s\\n" "$2" > "%s"\nshift 3\nexec "$@"\n' % trace)
+        for tool in ("id", "runuser"):
+            (bin_ / tool).chmod(0o755)
+        for linked in (False, True):
+            home = self.home(days=3)
+            token = home / ".config/claude-master/agent.token"
+            token.write_text("TOKEN\n"); token.chmod(0o600)
+            new, cert = self.pending(home, days=30)
+            protected = home / "protected-target"
+            protected.write_text("KEEP\n"); protected.chmod(0o400)
+            if linked:
+                (new / "agent.token").symlink_to(protected)
+            trace.unlink(missing_ok=True)
+            r = run_script(SCRIPTS["install"], {"CM_HOME_OVERRIDE": str(home), "PATH": str(bin_) + ":" + os.environ["PATH"]},
+                           Account=account, Name="nextjs-colton", Cert=b64(cert), Ca=b64(self.pki.pem), MinDays=20)
+            self.assertEqual(trace.read_text().strip(), account, "root must delegate the token copy")
+            self.assertEqual(protected.read_text(), "KEEP\n")
+            self.assertEqual(kv(r.stdout).get("INSTALL"), "token-copy-failed" if linked else "ok", r.stdout + r.stderr)
+            if linked:
+                self.assertNotEqual(r.returncode, 0)
+
     def test_install_works_when_there_is_no_live_directory_yet(self):
         home = self.home(days=None)
         _, cert = self.pending(home)

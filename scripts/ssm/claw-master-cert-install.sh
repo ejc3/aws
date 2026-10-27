@@ -28,7 +28,12 @@ if [ "$(id -u)" = 0 ]; then chown "$ACCOUNT": "$NEW/client.pem" "$NEW/ca.pem" ||
 # The claw-master agent's token (nextjs-ct's claw-master-agent-setup) lives beside the certificate, where `claw-master connect`
 # looks for it. It belongs to the account, not to the certificate: without it connect refuses the settings that name it.
 if [ -f "$DIR/agent.token" ] && [ ! -L "$DIR/agent.token" ]; then
-  cp -p "$DIR/agent.token" "$NEW/agent.token" || { echo "INSTALL=token-copy-failed"; exit 1; }
+  # The account owns NEW and can replace its destination with a symlink. Never copy there with root's write access.
+  if [ "$(id -u)" = 0 ]; then
+    runuser -u "$ACCOUNT" -- cp -p "$DIR/agent.token" "$NEW/agent.token"
+  else
+    cp -p "$DIR/agent.token" "$NEW/agent.token"
+  fi || { echo "INSTALL=token-copy-failed"; exit 1; }
 fi
 rm -rf "$OLD"
 if [ -d "$DIR" ]; then mv "$DIR" "$OLD" || { echo "INSTALL=swap-failed"; exit 1; }; fi
