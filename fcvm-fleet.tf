@@ -31,9 +31,11 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 31f42d03 with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
-  # the sky's history (ejc3/fcvm#1342).
-  default = { "us-east-1" = { x86_64 = "ami-0633c6c237794ecb3" } }
+  # 2c965afe with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
+  # the sky's history (ejc3/fcvm#1342), a routed guest gets IPv6 NTP servers it can reach (ejc3/fcvm#1343), and the IPv4
+  # slot ports' relay sets TCP_NODELAY (ejc3/fcvm#1350). Its renderer source is the tile AMI's: 31f42d03 and 2c965afe differ
+  # only outside fleet/renderer.
+  default = { "us-east-1" = { x86_64 = "ami-00d8ecc3edfb8059e" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
