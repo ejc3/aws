@@ -23,7 +23,7 @@
 #   us-east-1, so 8 is $62.59 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is 384 vCPU, 4 hosts at 96
 #   each, less any on-demand EC2 tiles (4 vCPU each); launches beyond the quota fail.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
-#   month). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
+#   month; 2 vCPU and 4 GB, about $58, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
 
 variable "fcvm_fleet_host_amis" {
@@ -140,6 +140,9 @@ locals {
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
     local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:${local.fcvm_fleet_aggregate_port}", "--ec2-aggregate-tls", "--ec2-aggregate-tls-dir", "/run/fcvm-fleet/tls"] : [],
+    # The broadcast (fcvm-fleet-broadcast.tf): its aggregator's private listener, the secret it pushes with and signs
+    # playback tokens from, and the seats for direct streams.
+    local.fcvm_fleet_broadcast ? ["--broadcast-listen", "127.0.0.1:${local.fcvm_fleet_broadcast_port}", "--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_broadcast[0].name, "--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)] : [],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -958,10 +961,11 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   family                   = "fcvm-fleet-coordinator"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.fcvm_fleet_coordinator_execution.arn
-  task_role_arn            = aws_iam_role.fcvm_fleet_coordinator_task.arn
+  # 2 vCPU and 4 GB with the broadcast: its tile decodes and 720p encode took 1.69 cores on a Xeon (ejc3/fcvm#1384).
+  cpu                = local.fcvm_fleet_broadcast ? "2048" : "512"
+  memory             = local.fcvm_fleet_broadcast ? "4096" : "1024"
+  execution_role_arn = aws_iam_role.fcvm_fleet_coordinator_execution.arn
+  task_role_arn      = aws_iam_role.fcvm_fleet_coordinator_task.arn
   # The release function changes only the image and records its digest in the
   # release parameter. Track that revision without ignoring infrastructure drift.
   track_latest = true
@@ -1041,9 +1045,10 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
 }
 
 # A Fargate task gets an IPv6 address in a dual-stack subnet only with this account setting; the EC2 half's aggregator is
-# named at it (agg-ec2-<token> AAAA). Without it the aggregator has its A record only.
+# named at it (agg-ec2-<token> AAAA), and the broadcast reads every tile at its IPv6 name. Without it the aggregator has
+# its A record only.
 resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack" {
-  count    = local.fcvm_fleet_aggregated ? 1 : 0
+  count    = local.fcvm_fleet_aggregated || local.fcvm_fleet_broadcast ? 1 : 0
   provider = aws.fcvm_fleet
   name     = "dualStackIPv6"
   value    = "enabled"
