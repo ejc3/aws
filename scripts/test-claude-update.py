@@ -32,12 +32,12 @@ class RunTests(unittest.TestCase):
         (home / ".local/bin").mkdir(parents=True)
         bin_.mkdir()
         # runuser -u ubuntu -- CMD...: record who it ran as, then run CMD.
-        fake(bin_ / "runuser", f'echo "runuser $2" >> {d}/log\nshift 3\nexec "$@"\n')
+        fake(bin_ / "runuser", f'echo "runuser $2" >> {d}/log\nexport RUNUSER_AS=$2\nshift 3\nexec "$@"\n')
         if claude:
             (d / "version").write_text(claude)
             fake(home / ".local/bin/claude", f"""case "$1" in
   --version) echo "$(cat {d}/version) (Claude Code)" ;;
-  update) echo "update DISABLE_AUTOUPDATER=${{DISABLE_AUTOUPDATER:-unset}} cwd=$PWD HOME=$HOME" >> {d}/log
+  update) echo "update as=${{RUNUSER_AS:-root}} DISABLE_AUTOUPDATER=${{DISABLE_AUTOUPDATER:-unset}} cwd=$PWD HOME=$HOME" >> {d}/log
           {'echo 2.1.311 > ' + str(d) + '/version' if update_ok else 'exit 1'} ;;
 esac
 """)
@@ -51,7 +51,8 @@ esac
         r, log, home = self.run_commands()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("claude: 2.1.296 (Claude Code) -> 2.1.311 (Claude Code).", r.stdout)
-        self.assertIn("update DISABLE_AUTOUPDATER=unset cwd=%s HOME=%s" % (home, home), log)
+        self.assertIn("update as=ubuntu DISABLE_AUTOUPDATER=unset cwd=%s HOME=%s" % (home, home), log,
+                      "the update itself runs through runuser -u ubuntu")
         self.assertEqual(set(re.findall(r"runuser (\S+)", log)), {"ubuntu"}, "every step runs as ubuntu")
 
     def test_a_failed_update_fails_the_run(self):

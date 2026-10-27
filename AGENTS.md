@@ -1125,7 +1125,7 @@ restart interrupts the turns it is running. On 2026-09-30 fcvm-arm's daemon (sta
   `ubuntu` on both jumpboxes and both metal boxes (a stopped spot box catches up at its next run).
   nextjs-dev refreshes every account daily in its own updater and restarts them there.
 - **Claude Code updates daily too.** `claude-update.tf`: an SSM association at 08:00 UTC runs `claude update` as ubuntu on
-  both jumpboxes, fcvm-metal-arm and fcvm-metal-x86 (the nextjs-ct containers do it in their own nightly `agent-update`).
+  both jumpboxes, fcvm-metal-arm and fcvm-metal-x86 (the nextjs-ct containers are outside it: their own nightly `agent-update` covers them).
   Claude's own updater never runs in pool sessions, because `claw-master connect` sets `DISABLE_AUTOUPDATER=1`. Nothing is
   restarted: the next session starts the new binary.
 - **Restart is a decision.** `codex-restart` (installed on every box; `scripts/codex-restart.sh`)

@@ -6,8 +6,8 @@
 # WHY. Nothing updated it. The boot scripts run the installer only when Claude is MISSING, and Claude's own background
 # updater does not run in pool sessions: `claw-master connect`, which t-claude launches every pool session through, sets
 # DISABLE_AUTOUPDATER=1 for the Claude it starts. On 2026-10-27 fcvm-metal-arm was on 2.1.296 while 2.1.311 was out. The
-# nextjs-ct containers update every account in their own nightly agent-update (scripts/nextjs-ct/ct/agent-update) and are
-# not touched here.
+# nextjs-ct containers are outside this association: their own nightly agent-update (scripts/nextjs-ct/ct/agent-update)
+# covers their accounts.
 #
 # HOW. The pattern of codex-update.tf: an SSM State Manager association (Run Command on a schedule, no key on disk, no
 # service on the box, the permitted admin -> box direction), daily at 08:00 UTC. `claude update` runs as ubuntu, never as
