@@ -31,20 +31,18 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 2c965afe with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
-  # the sky's history (ejc3/fcvm#1342), a routed guest gets IPv6 NTP servers it can reach (ejc3/fcvm#1343), and the IPv4
-  # slot ports' relay sets TCP_NODELAY (ejc3/fcvm#1350). Its renderer source is the tile AMI's: 31f42d03 and 2c965afe differ
-  # only outside fleet/renderer.
-  default = { "us-east-1" = { x86_64 = "ami-00d8ecc3edfb8059e" } }
+  # 2e2181cf with main's recipe (fleet/ami), revised from the 2c965afe image: the renderer's SPS carries a VUI
+  # bitstream_restriction with max_num_reorder_frames 0, so decoders stop holding 7 or 8 frames (ejc3/fcvm#1361).
+  default = { "us-east-1" = { x86_64 = "ami-0bba499ff882e9ab8" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 31f42d03 (revised from the
-  # c93a01d9 image with main's tile units).
-  default = { "us-east-1" = { x86_64 = "ami-0eae5d080e45fd625" } }
+  # (fcvm fleet/ami/tile). Its renderer is built from the same source as the host AMI's, ejc3/fcvm main 2e2181cf (revised
+  # from the 31f42d03 image with main's tile units).
+  default = { "us-east-1" = { x86_64 = "ami-08a8da3af39b1836c" } }
 }
 
 locals {
