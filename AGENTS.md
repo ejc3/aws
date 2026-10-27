@@ -1167,6 +1167,11 @@ file) and `~/.claude/CLAUDE.md` (a symlink to it), so Codex and Claude Code read
 - **Create only.** If either path exists (a file, a symlink, a dangling one) the account is left as it is:
   nothing is overwritten, appended to or re-linked. The file is seeded once, not managed, so editing
   `scripts/user-agents.md` reaches new accounts only; an existing account is changed by its owner.
+- **Personal additions go in `~/.claude/local.md`.** The text ends by importing it (`@~/.claude/local.md`, plus a
+  sentence telling Codex, which does not follow imports, to read it if it exists), the same name the distributed
+  accounts use (`agent-local-md.tf`). What one person's account needs (the machines it reaches, its projects,
+  preferences) goes there, never into this shared text or a repository. An account seeded before the import was
+  added gets it only by adding those lines itself: the seeder never appends.
 - **As the account, never as root.** Root only dispatches (`runuser`); the files are created by the account
   that owns them.
 - **No box is replaced or rebooted for it.** It is published inside the S3 setup scripts, and every instance

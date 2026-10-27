@@ -136,7 +136,12 @@ class TextTests(unittest.TestCase):
         self.assertTrue(lines[2].endswith("before every push."))
         # The owner, 2026-10-10: every account is told which cheaper models exist and when to hand them work.
         self.assertEqual(lines[4], "## Cheaper models for straightforward work")
-        self.assertEqual([l for l in lines if l.startswith("#")], [lines[0], lines[4]], "one title, one section")
+        # The owner, 2026-10-27: every account also imports its own ~/.claude/local.md, the same name the
+        # distributed accounts use, so what is personal stays out of this shared text.
+        own = "## This account's own instructions"
+        self.assertEqual([l for l in lines if l.startswith("#")], [lines[0], lines[4], own], "one title, two sections")
+        self.assertIn("\n@~/.claude/local.md\n", text)
+        self.assertIn("Codex does not follow the `@` import above", text)
         for model in ("`haiku`", "`sonnet`", "Opus 5.5"):
             self.assertIn(model, text)
         # Subagents only ever go down a model: a Sonnet session must not start an Opus subagent (owner, 2026-10-10).
