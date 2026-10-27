@@ -29,3 +29,11 @@ How to use them:
 - One task per subagent. Check what it did yourself (run the tests, read the diff) before relying on it.
 - If a subagent gets it wrong once, do that piece in the main session instead; do not retry the same model.
 - Never hand a cheaper model an action that cannot be undone: a deploy, a delete, a push to main, a credential.
+
+## This account's own instructions
+
+@~/.claude/local.md
+
+Codex does not follow the `@` import above: if `~/.claude/local.md` exists, read it too. It holds this account's own
+instructions (the machines it can reach, its projects, what its person prefers), kept out of this shared starter text
+and out of every repository.
