@@ -164,6 +164,19 @@ class WhatIsNotNewTests(Base):
         self.scan(now=1010)
         self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))])
 
+    def test_a_clone_seen_before_its_origin_is_written_is_rechecked_when_finished(self):
+        r = self.home / "cloning"
+        subprocess.run(["git", "init", "-q", str(r)], check=True, env=ENV)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [])
+        git(r, "remote", "add", "origin", "https://github.com/ejc3/example")
+        (r / "f").write_text("x")
+        git(r, "add", "f")
+        git(r, "commit", "-q", "-m", "clone finished")
+        self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))],
+                         "a clone without its origin yet must not be ignored permanently")
+
     def test_a_repo_with_no_commit_or_no_checkout_yet_is_not_launched(self):
         make_repo(self.home, "empty", commit=False)
         self.scan(now=1005)

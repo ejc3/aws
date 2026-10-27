@@ -374,11 +374,11 @@ def scan_once(cfg, state, launcher, now=None):
             log("new repository (its owner is allowed now): %s" % path)
         if entry is None:
             ident = repo_identity(path)
+            if not is_finished(path):
+                continue                      # a clone still running: looked at again next tick
             if not is_allowed(path, owners, repos):
                 state.known[path] = {"ignored": True, "seeded": adopting, "id": ident}
                 continue
-            if not is_finished(path):
-                continue                      # a clone still running: looked at again next tick
             if adopting:
                 state.known[path] = {"claude": True, "codex": True, "seeded": True, "id": ident}
                 continue
