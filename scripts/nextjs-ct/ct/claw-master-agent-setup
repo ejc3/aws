@@ -63,6 +63,14 @@ if ! enrolled; then
 fi
 
 # Enrolled from here on: a fault keeps whatever drop-in is there, so Claude fails rather than use the person's own login.
+# On the first run there is nothing to keep yet. Fence direct routing before invoking the client or starting its unit;
+# connect rejects this sentinel too, since it has no agent token. Validated agent settings replace it below.
+if ! [ -f "$DROPIN" ]; then
+  install -d -m 755 "$(dirname "$DROPIN")" && TMP=$(mktemp "$(dirname "$DROPIN")/.claw-master-agent.XXXXXX") \
+    && jq -n --arg ca "$DIR/ca.pem" '{env: {HTTPS_PROXY: "http://127.0.0.1:1", NODE_EXTRA_CA_CERTS: $ca, NO_PROXY: "localhost,127.0.0.1,::1"}}' > "$TMP" \
+    && chgrp "$(id -gn "$U")" "$TMP" && chmod 640 "$TMP" && mv -f "$TMP" "$DROPIN" \
+    || { rm -f "${TMP:-}"; say "could not fence direct routing in $DROPIN"; exit 1; }
+fi
 [ -x "$CM" ] || { say "$CM is missing"; exit 1; }
 SERVER=$(jq -r '.claw_master.server // empty' "$CONFIG" 2>/dev/null)
 [ -n "$SERVER" ] || { say "no claw_master.server in $CONFIG"; exit 1; }

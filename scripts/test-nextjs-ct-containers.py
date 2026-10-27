@@ -997,6 +997,26 @@ esac
         self.assertIn("unexpected claw-master agent env output", r.stderr)
         self.assertEqual(w.dropin.read_text(), want)
 
+    def test_first_install_faults_fence_direct_routing(self):
+        """A fresh enrolled account must not spend its own login while the client or unit cannot start."""
+        for failure in ("missing_binary", "bad_env", "enable_failure", "start_failure"):
+            with self.subTest(failure=failure):
+                w = self.world(env_output='echo "HTTPS_PROXY=http://elsewhere:1"\n' if failure == "bad_env" else None)
+                if failure == "missing_binary":
+                    Path(w.env["CM_AGENT_BIN"]).unlink()
+                if failure in ("enable_failure", "start_failure"):
+                    ctl = w.d / "bin/systemctl"
+                    ctl.write_text(ctl.read_text().replace('case "$1" in',
+                                   'case "$1" in\n  %s) exit 1 ;;' % failure.removesuffix("_failure")))
+                r = self.run_setup(w)
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(json.loads(w.dropin.read_text()), {"env": {
+                    "HTTPS_PROXY": "http://127.0.0.1:1",
+                    "NODE_EXTRA_CA_CERTS": str(w.home / ".config/claude-master/ca.pem"),
+                    "NO_PROXY": "localhost,127.0.0.1,::1"}})
+                self.assertEqual(w.dropin.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(list(w.dropin.parent.glob(".*")), [], "no temporary file is left behind")
+
     def test_ready_means_the_units_own_process_listens(self):
         for why, kw in (("nothing listens", {"listening": False}), ("another process listens", {"owner_is_unit": False})):
             w = self.world(**kw)
