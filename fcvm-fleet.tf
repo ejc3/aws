@@ -140,6 +140,9 @@ locals {
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
     local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:${local.fcvm_fleet_aggregate_port}", "--ec2-aggregate-tls", "--ec2-aggregate-tls-dir", "/run/fcvm-fleet/tls"] : [],
+    # Every viewer word is checked by Claude Haiku 5.5 on Bedrock before it enters the scene (the task role's
+    # CheckViewerWordsWithClaudeHaiku55). Without a checker the coordinator refuses every word.
+    ["--text-check", "bedrock", "--text-check-model", local.bedrock_haiku_profile, "--text-check-region", local.bedrock_haiku_region],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -721,6 +724,33 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Effect   = "Allow"
         Action   = "secretsmanager:PutSecretValue"
         Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]
+      },
+      {
+        # The viewer word check (--text-check bedrock): Claude Haiku 5.5 through the US inference profile, which routes
+        # from us-west-2 to us-east-1, us-east-2 and us-west-2 (bedrock-haiku.tf), all of them fleet regions the SCP admits.
+        # A routed call needs the profile in this account and the foundation model in the region it lands in.
+        Sid    = "CheckViewerWordsWithClaudeHaiku55"
+        Effect = "Allow"
+        Action = "bedrock:InvokeModel"
+        Resource = [
+          "arn:aws:bedrock:*:${local.fcvm_fleet_account_id}:inference-profile/${local.bedrock_haiku_profile}",
+          "arn:aws:bedrock:*::foundation-model/${local.bedrock_haiku_model}",
+        ]
+      },
+      {
+        # The account's first Haiku 5.5 call subscribes it to the model's Marketplace product with the caller's
+        # permissions (as for the box roles in bedrock-haiku.tf); limited to that product, no Unsubscribe.
+        Sid       = "SubscribeClaudeHaiku55OnFirstUse"
+        Effect    = "Allow"
+        Action    = "aws-marketplace:Subscribe"
+        Resource  = "*"
+        Condition = { "ForAnyValue:StringEquals" = { "aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"] } }
+      },
+      {
+        Sid      = "ViewMarketplaceSubscriptions"
+        Effect   = "Allow"
+        Action   = "aws-marketplace:ViewSubscriptions"
+        Resource = "*"
       },
       {
         # Created resources: only through a tile template, in the fleet regions.

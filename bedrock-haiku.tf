@@ -10,6 +10,8 @@
 #     (BedrockRuntimeInvoke in dev-instance-common.tf); this file leaves them alone. Not here: the GPU boxes
 #     run with no instance profile at all (gpu-box.tf), the jumpboxes are administrators, and runners and
 #     the AMI builder are CI machines, not boxes.
+#   - the fcvm fleet coordinator's task role, in the fleet account, for the viewer word check. Its grant is in
+#     fcvm-fleet.tf (CheckViewerWordsWithClaudeHaiku55) with that account's id, using the model locals below.
 #
 # The model, from AWS's model card (docs.aws.amazon.com/bedrock/latest/userguide/
 # model-card-anthropic-claude-haiku-5-5.html, checked 2026-10-10; launched on Bedrock 2026-10-07):
