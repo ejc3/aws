@@ -31,12 +31,14 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 728be8c3 with main's recipe (fleet/ami), revised from the e15f9e7e image: fluffier clouds and the scene's weather keys
+  # 7f5fb7e6 with main's recipe (fleet/ami), revised from the ce08eee9 image; its renderer source is 728be8c3's, the tile
+  # AMI's. The prefetch list now comes from a launch that restores the baked snapshot (ejc3/fcvm#1397): 74 files and
+  # 74 MiB, where the 728be8c3 recipe listed 6163 files and 334 MiB that took 20 s at boot. Fluffier clouds and the scene's weather keys
   # (ejc3/fcvm#1383); the renderer draws at the tallest asked height whose frame fits a slot (ejc3/fcvm#1380); the SPS
   # carries a VUI bitstream_restriction (ejc3/fcvm#1361); a restored guest re-reads the host clock before stepping
   # (ejc3/fcvm#1382); the root volume files a slot launch reads are prefetched at boot and the agent's pre-start snapshot
   # is baked (ejc3/fcvm#1370).
-  default = { "us-east-1" = { x86_64 = "ami-07ea807a8a9b4c3fa" } }
+  default = { "us-east-1" = { x86_64 = "ami-0f1f1af48e2312360" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
