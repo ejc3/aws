@@ -2,6 +2,7 @@
 """scripts/agent-session-sync.py: a new repository is noticed fast, and only a real new one.
 Offline: real git repositories in a temp directory and a fake launcher."""
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -123,16 +124,16 @@ class WhatIsNotNewTests(Base):
         found = [os.path.basename(p) for p in ass.candidates(self.cfg["roots"])]
         self.assertIn("main-feature", found)
 
-    def test_an_unmarked_clone_is_not_launched_until_it_is_marked(self):
+    def test_an_unmarked_clone_is_launched(self):
         r = make_repo(self.home, "plain", marked=False)
         self.scan(now=1005)
-        self.assertEqual(self.launcher.calls, [], "only folders marked for interactive use get a session")
-        mark(r)
-        self.scan(now=1010)
-        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))])
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))],
+                         "every clone gets a session; only worktrees need the marker")
 
     def test_a_marked_worktree_elsewhere_is_launched_and_takes_the_main_checkout_s_owner(self):
-        main = make_repo(self.home, "main", marked=False)   # the checkout itself is not for interactive use
+        main = make_repo(self.home, "main", marked=False)
+        self.scan(now=1003)                                 # the clone itself gets its session first
+        self.launcher.calls.clear()
         wt = Path(self.tmp) / "elsewhere" / "feature"
         git(main, "worktree", "add", "-q", str(wt), "-b", "feature")
         mark(wt)
@@ -145,7 +146,9 @@ class WhatIsNotNewTests(Base):
         git(main, "worktree", "add", "-q", str(wt), "-b", "agent-1")
         mark(wt)
         self.scan(now=1005)
-        self.assertEqual(self.launcher.calls, [])
+        self.assertNotIn(str(wt), [p for _, p in self.launcher.calls])
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(main)), ("codex", str(main))],
+                         "only the clone itself gets a session")
 
     def test_nothing_nested_below_a_root_is_scanned(self):
         make_repo(self.home / "projects", "deep")
@@ -178,6 +181,38 @@ class WhatIsNotNewTests(Base):
         make_repo(self.home, ".cache-repo")
         self.scan(now=1005)
         self.assertEqual(self.launcher.calls, [])
+
+
+class UpgradeToEveryCloneTests(Base):
+    """A state file from the version that needed a marker on every clone: upgrading must not open a session in
+    every old clone at once."""
+
+    def old_state(self, known):
+        os.makedirs(self.cfg["state_dir"], exist_ok=True)
+        path = os.path.join(self.cfg["state_dir"], "known.json")
+        with open(path, "w") as fh:
+            json.dump({"known": known, "boot_id": "boot-A", "boot": {}}, fh)
+        return ass.State(path, boot_id="boot-A")
+
+    def test_the_first_scan_after_the_upgrade_adopts_old_unmarked_clones_without_launching(self):
+        old = make_repo(self.home, "old-clone", marked=False)
+        state = self.old_state({})
+        self.assertFalse(state.clones)
+        self.scan(now=1005, state=state)
+        self.assertEqual(self.launcher.calls, [], "existing clones are recorded, not launched")
+        self.assertTrue(state.known[str(old)].get("seeded"))
+        self.assertTrue(ass.State(state.path, boot_id="boot-A").clones, "the adoption is saved")
+
+    def test_a_clone_made_after_the_upgrade_is_launched(self):
+        state = self.old_state({})
+        self.scan(now=1005, state=state)
+        new = make_repo(self.home, "new-clone", marked=False)
+        self.scan(now=1010, state=state)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(new)), ("codex", str(new))])
+
+    def test_a_fresh_state_records_the_new_policy_on_its_first_run(self):
+        self.scan(now=1000)
+        self.assertTrue(ass.State(self.state.path).clones)
 
 
 class OwnerTests(Base):
@@ -333,6 +368,8 @@ class RebootTests(Base):
 
     def test_after_a_reboot_claude_starts_in_the_active_folders_only_and_codex_is_left_alone(self):
         idle = make_repo(self.home, "idle", marked=False)
+        self.scan(now=1010, state=self.state)          # a clone from before the reboot that nobody prompted
+        self.launcher.calls.clear()
         self.active = [str(self.fresh)]               # agent-active-dirs: prompted or marked in 30 days
         state = self.state_for("boot-B")
         self.assertTrue(state.rebooted)

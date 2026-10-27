@@ -5,8 +5,8 @@
 # jumpboxes. Before this, the metal boxes looked once at boot (fcvm-claude-rc), nextjs-dev started only
 # each user's one working folder every 5 minutes (agents-enable), and the jumpboxes looked nowhere, so
 # a repo cloned today waited for a reboot or a person. See scripts/agent-session-sync.py for what
-# counts as new: a checkout or worktree MARKED for interactive use (claude-interactive in its git dir), a
-# finished clone, an allowed owner, and nothing that existed when the watcher first looked. After a reboot
+# counts as new: any checkout under the roots, or a worktree MARKED for interactive use (claude-interactive
+# in its git dir), a finished clone, an allowed owner, and nothing that existed when the watcher first looked. After a reboot
 # it opens the folders scripts/agent-active-dirs.py names (prompted or marked in the last 30 days).
 #
 # ONE script and ONE template unit, installed by the same snippet everywhere, so the boxes cannot
