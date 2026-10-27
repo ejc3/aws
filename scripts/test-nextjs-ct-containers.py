@@ -823,6 +823,53 @@ class ContainerScriptTests(unittest.TestCase):
 
 
 
+class AgentUpdateTests(unittest.TestCase):
+    """The nightly agent-update brings every account to the latest Claude Code. Claude's own updater never runs in pool
+    sessions (`claw-master connect` sets DISABLE_AUTOUPDATER=1), so on 2026-10-26 the job logged "2.1.294 -> 2.1.294" in every
+    container: it only ever installed a missing copy. Runs the real script against a fake sudo, claude, curl and systemctl."""
+
+    def run_update(self, claude="2.1.294", update_ok=True):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(d)])
+        home, bin_ = d / "home", d / "bin"
+        (home / ".local/bin").mkdir(parents=True)
+        bin_.mkdir()
+        user = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+        (d / "users").write_text(user + "\n")
+        # sudo -u USER -H CMD...: the test already is USER, with HOME set to the fake home.
+        fake(bin_, "sudo", 'while [ "${1#-}" != "$1" ]; do case "$1" in -u) shift 2 ;; *) shift ;; esac; done\nexec "$@"\n')
+        fake(bin_, "systemctl", "exit 1\n")
+        fake(bin_, "npm", "exit 0\n")
+        fake(bin_, "curl", "echo 'echo installer-ran >> %s/log'\n" % d)
+        if claude:
+            (d / "version").write_text(claude)
+            fake(home / ".local/bin", "claude", f"""case "$1" in
+  --version) echo "$(cat {d}/version) (Claude Code)" ;;
+  update) echo "update DISABLE_AUTOUPDATER=${{DISABLE_AUTOUPDATER:-unset}}" >> {d}/log; {'echo 2.1.311 > ' + str(d) + '/version' if update_ok else 'exit 1'} ;;
+esac
+""")
+        env = {"PATH": "%s:/usr/bin:/bin" % bin_, "HOME": str(home), "AGENT_UPDATE_USERS": str(d / "users"), "AGENT_UPDATE_HOMES": str(d / "homes"), "AGENT_UPDATE_REFRESH": str(fake(bin_, "kid-agents-refresh", 'echo "refresh $1" >> %s/log\n' % d)),
+               "DISABLE_AUTOUPDATER": "1"}
+        r = subprocess.run(["bash", str(CT / "agent-update")], env=env, capture_output=True, text=True, timeout=60)
+        log = (d / "log").read_text() if (d / "log").exists() else ""
+        return r, user, log
+
+    def test_every_account_is_updated_to_the_latest_claude_code(self):
+        r, user, log = self.run_update()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("claude[%s]: 2.1.294 (Claude Code) -> 2.1.311 (Claude Code)" % user, r.stdout)
+        self.assertEqual(log, "update DISABLE_AUTOUPDATER=unset\nrefresh %s\n" % user, "the update must not inherit a disabled updater")
+
+    def test_a_failed_update_is_reported(self):
+        r, user, _ = self.run_update(update_ok=False)
+        self.assertIn("WARNING: claude update failed for %s" % user, r.stdout)
+        self.assertIn("claude[%s]: 2.1.294 (Claude Code) -> 2.1.294 (Claude Code)" % user, r.stdout)
+
+    def test_an_account_without_claude_gets_the_installer(self):
+        r, user, log = self.run_update(claude=None)
+        self.assertIn("installer-ran", log)
+        self.assertIn("claude[%s]: none -> none" % user, r.stdout)
+
 class NoContainerRestartTests(unittest.TestCase):
     """A re-run of setup (any change to the published script) must not restart the containers. Every
     systemd-nspawn@<user> unit Requires= the firewall and its home mount, and restarting a required unit restarts the
