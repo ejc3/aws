@@ -31,20 +31,20 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 2c965afe with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
-  # the sky's history (ejc3/fcvm#1342), a routed guest gets IPv6 NTP servers it can reach (ejc3/fcvm#1343), and the IPv4
-  # slot ports' relay sets TCP_NODELAY (ejc3/fcvm#1350). Its renderer source is the tile AMI's: 31f42d03 and 2c965afe differ
-  # only outside fleet/renderer.
-  default = { "us-east-1" = { x86_64 = "ami-00d8ecc3edfb8059e" } }
+  # ce08eee9 with main's recipe (fleet/ami), revised from the 2e2181cf image: the renderer draws at the tallest asked height
+  # whose frame fits a slot, so an opened tile no longer holds the wall to its rate (ejc3/fcvm#1380); the SPS carries a VUI
+  # bitstream_restriction (ejc3/fcvm#1361); the root volume files a slot launch reads are prefetched at boot and the
+  # agent's pre-start snapshot is baked (ejc3/fcvm#1370).
+  default = { "us-east-1" = { x86_64 = "ami-022d4bacbe2aeec39" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 31f42d03 (revised from the
-  # c93a01d9 image with main's tile units).
-  default = { "us-east-1" = { x86_64 = "ami-0eae5d080e45fd625" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main ce08eee9 (revised from the
+  # 2e2181cf image with main's tile units).
+  default = { "us-east-1" = { x86_64 = "ami-0254d5034aa6efece" } }
 }
 
 locals {
