@@ -31,9 +31,11 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 2e2181cf with main's recipe (fleet/ami), revised from the 2c965afe image: the renderer's SPS carries a VUI
-  # bitstream_restriction with max_num_reorder_frames 0, so decoders stop holding 7 or 8 frames (ejc3/fcvm#1361).
-  default = { "us-east-1" = { x86_64 = "ami-0bba499ff882e9ab8" } }
+  # e15f9e7e with main's recipe (fleet/ami), revised from the 2c965afe image. Over 2e2181cf (the renderer's SPS carries a
+  # VUI bitstream_restriction with max_num_reorder_frames 0, ejc3/fcvm#1361) it bakes the pre-start snapshot the agent's
+  # slots restore and reads their launch files from the root volume at boot (ejc3/fcvm#1370), and every slot of a host
+  # shares that snapshot (ejc3/fcvm#1368): a woken host's first restores took 27 to 40 s.
+  default = { "us-east-1" = { x86_64 = "ami-00feb207580bdc9e3" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
