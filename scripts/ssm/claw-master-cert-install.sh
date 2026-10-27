@@ -25,6 +25,11 @@ CN=$(openssl x509 -noout -subject -nameopt RFC2253 -in "$WORK/client.pem" 2>/dev
 openssl x509 -checkend $((MIN_DAYS * 86400)) -noout -in "$WORK/client.pem" >/dev/null 2>&1 || { echo "INSTALL=expires-too-soon"; exit 1; }
 install -m 0644 "$WORK/client.pem" "$NEW/client.pem" && install -m 0644 "$WORK/ca.pem" "$NEW/ca.pem" || { echo "INSTALL=write-failed"; exit 1; }
 if [ "$(id -u)" = 0 ]; then chown "$ACCOUNT": "$NEW/client.pem" "$NEW/ca.pem" || { echo "INSTALL=chown-failed"; exit 1; }; fi
+# The claw-master agent's token (nextjs-ct's claw-master-agent-setup) lives beside the certificate, where `claw-master connect`
+# looks for it. It belongs to the account, not to the certificate: without it connect refuses the settings that name it.
+if [ -f "$DIR/agent.token" ] && [ ! -L "$DIR/agent.token" ]; then
+  cp -p "$DIR/agent.token" "$NEW/agent.token" || { echo "INSTALL=token-copy-failed"; exit 1; }
+fi
 rm -rf "$OLD"
 if [ -d "$DIR" ]; then mv "$DIR" "$OLD" || { echo "INSTALL=swap-failed"; exit 1; }; fi
 if ! mv "$NEW" "$DIR"; then [ -d "$OLD" ] && mv "$OLD" "$DIR"; echo "INSTALL=swap-failed"; exit 1; fi

@@ -254,6 +254,26 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(oct((live / "client.key").stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct((live / "client.pem").stat().st_mode & 0o777), "0o644")
 
+    def test_install_carries_the_agent_token_over(self):
+        """The agent's token sits beside the certificate, where `claw-master connect` reads it to accept the settings that name
+        it (nextjs-ct's claw-master-agent-setup); a renewal that dropped it would make connect refuse every launch."""
+        home = self.home(days=3)
+        token = home / ".config/claude-master/agent.token"
+        token.write_text("TOKEN\n")
+        token.chmod(0o600)
+        _, cert = self.pending(home, days=30)
+        r = self.install(home, cert)
+        self.assertEqual(kv(r.stdout).get("INSTALL"), "ok", r.stdout + r.stderr)
+        carried = home / ".config/claude-master/agent.token"
+        self.assertEqual(carried.read_text(), "TOKEN\n")
+        self.assertEqual(oct(carried.stat().st_mode & 0o777), "0o600")
+        # a link is not carried: the token must be a private regular file, and connect refuses anything else anyway
+        home2 = self.home(days=3)
+        (home2 / ".config/claude-master/agent.token").symlink_to("/etc/hostname")
+        _, cert2 = self.pending(home2, days=30)
+        self.assertEqual(kv(self.install(home2, cert2).stdout).get("INSTALL"), "ok")
+        self.assertFalse((home2 / ".config/claude-master/agent.token").exists())
+
     def test_install_works_when_there_is_no_live_directory_yet(self):
         home = self.home(days=None)
         _, cert = self.pending(home)

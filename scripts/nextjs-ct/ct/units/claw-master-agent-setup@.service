@@ -1,0 +1,6 @@
+[Unit]
+Description=Set up the claw-master agent for %i (its client certificate changed)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claw-master-agent-setup %i --restart

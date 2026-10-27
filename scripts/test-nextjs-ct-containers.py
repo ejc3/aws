@@ -823,6 +823,178 @@ class ContainerScriptTests(unittest.TestCase):
 
 
 
+class ClawMasterAgentTests(unittest.TestCase):
+    """Every Claude Code in a container reaches the pool, the desktop app's SSH sessions too (they start their own Claude Code
+    with the person's own login, which spent that person's own subscription): claw-master-agent-setup runs the agent for an
+    enrolled account and sets its three entries in ~/.claude/settings.json. Runs for real against fake systemctl and claw-master."""
+
+    SETUP = CT / "claw-master-agent-setup"
+    UNITS = CT / "units"
+    TOKEN = "TESTTOKEN"
+
+    def world(self, enrolled=True, listening=True):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(d)])
+        home, bin_ = d / "home", d / "bin"
+        bin_.mkdir()
+        (home / ".config/claude-master").mkdir(parents=True)
+        if enrolled:
+            (home / ".config/claude-master/client.pem").write_text("cert")
+        fake(bin_, "systemctl", 'echo "$*" >> "%s"\n' % (d / "systemctl.log"))
+        cm = fake(bin_, "claw-master", 'echo "$*" >> "%s"\n' % (d / "cm.log") +
+                  '[ "$1 $2" = "agent env" ] || exit 9\n'
+                  'echo "HTTPS_PROXY=http://claw-master:%s@$4"\n'
+                  'echo "NODE_EXTRA_CA_CERTS=$8/ca.pem"\n'
+                  'echo "NO_PROXY=localhost,127.0.0.1,::1"\n' % self.TOKEN)
+        (d / "config.json").write_text(json.dumps({"claw_master": {"server": "192.0.2.10:8443"}}))
+        port = 0
+        if listening:
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(16)
+            self.addCleanup(srv.close)
+            port = srv.getsockname()[1]
+        else:
+            with socket.socket() as s:      # a port nothing listens on
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+        env = {"PATH": "%s:/usr/bin:/bin" % bin_, "CM_AGENT_HOME": str(home), "CM_AGENT_CONFIG": str(d / "config.json"),
+               "CM_AGENT_BIN": str(cm), "CM_AGENT_ENVFILE": str(d / "etc/claw-master-agent.env"),
+               "CM_AGENT_LISTEN": "127.0.0.1:%d" % port, "CM_AGENT_TRIES": "2"}
+        return types_ns(d=d, home=home, env=env, port=port, settings=home / ".claude/settings.json")
+
+    def run_setup(self, w, *extra):
+        user = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+        return subprocess.run(["bash", str(self.SETUP), user, *extra], env=w.env, capture_output=True, text=True, timeout=60)
+
+    def ours(self, w):
+        return {"HTTPS_PROXY": "http://claw-master:%s@127.0.0.1:%d" % (self.TOKEN, w.port),
+                "NODE_EXTRA_CA_CERTS": "%s/.config/claude-master/ca.pem" % w.home, "NO_PROXY": "localhost,127.0.0.1,::1"}
+
+    def calls(self, w):
+        log = w.d / "systemctl.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_an_enrolled_account_gets_the_agent_and_its_settings(self):
+        w = self.world()
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(w.settings.read_text()), {"env": self.ours(w)})
+        self.assertEqual(oct(w.settings.stat().st_mode & 0o777), "0o600", "the proxy URL carries the agent's token")
+        user = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(self.calls(w), ["enable claw-master-agent@%s.service" % user, "start claw-master-agent@%s.service" % user])
+        self.assertEqual((w.d / "etc/claw-master-agent.env").read_text(),
+                         "CLAW_MASTER_SERVER=192.0.2.10:8443\nCLAW_MASTER_AGENT_LISTEN=127.0.0.1:%d\n" % w.port)
+        self.assertIn("agent env --listen 127.0.0.1:%d --server 192.0.2.10:8443 --dir %s/.config/claude-master" % (w.port, w.home),
+                      (w.d / "cm.log").read_text())
+
+    def test_the_rest_of_settings_is_kept_and_an_unchanged_file_is_not_rewritten(self):
+        w = self.world()
+        w.settings.parent.mkdir()
+        w.settings.write_text(json.dumps({"theme": "dark", "hooks": {"Stop": []}, "env": {"FOO": "1"}}))
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        want = {"theme": "dark", "hooks": {"Stop": []}, "env": dict(FOO="1", **self.ours(w))}
+        self.assertEqual(json.loads(w.settings.read_text()), want)
+        before = w.settings.stat()
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        after = w.settings.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns),
+                         "Claude Code reloads a changed settings file: a run that changes nothing must not touch it")
+        self.assertEqual(list(w.settings.parent.glob(".settings.json.*")), [], "no temporary file is left behind")
+
+    def test_a_symlinked_settings_file_is_edited_where_it_points(self):
+        w = self.world()
+        w.settings.parent.mkdir()
+        target = w.home / "dotfiles-settings.json"
+        target.write_text("{}")
+        w.settings.symlink_to(target)
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertTrue(w.settings.is_symlink())
+        self.assertEqual(json.loads(target.read_text()), {"env": self.ours(w)})
+
+    def test_a_certificate_change_restarts_the_agent(self):
+        w = self.world()
+        self.assertEqual(self.run_setup(w, "--restart").returncode, 0)
+        self.assertTrue(self.calls(w)[-1].startswith("restart claw-master-agent@"), self.calls(w))
+
+    def test_settings_that_are_not_a_json_object_are_left_alone_and_fail(self):
+        w = self.world()
+        w.settings.parent.mkdir()
+        for text in ("{not json", "[1, 2]"):
+            w.settings.write_text(text)
+            r = self.run_setup(w)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertEqual(w.settings.read_text(), text)
+            self.assertIn("not a JSON object", r.stderr)
+
+    def test_a_proxy_spelling_claude_prefers_is_reported(self):
+        w = self.world()
+        w.settings.parent.mkdir()
+        w.settings.write_text(json.dumps({"env": {"https_proxy": "http://elsewhere:1"}}))
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("also sets https_proxy", r.stderr)
+        self.assertEqual(json.loads(w.settings.read_text())["env"]["https_proxy"], "http://elsewhere:1", "never removed: not ours")
+
+    def test_an_agent_that_does_not_come_up_fails_but_still_keeps_claude_off_the_persons_login(self):
+        w = self.world(listening=False)
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("is not listening", r.stderr)
+        self.assertEqual(json.loads(w.settings.read_text()), {"env": self.ours(w)})
+
+    def test_an_account_that_is_not_enrolled_has_no_agent_and_only_its_entries_are_removed(self):
+        w = self.world()
+        w.settings.parent.mkdir()
+        w.settings.write_text(json.dumps({"theme": "dark", "env": dict(FOO="1", **self.ours(w))}))
+        (w.home / ".config/claude-master/client.pem").unlink()
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(w.settings.read_text()), {"theme": "dark", "env": {"FOO": "1"}})
+        self.assertTrue(self.calls(w)[-1].startswith("disable --now claw-master-agent@"), self.calls(w))
+        # with nothing else in env, env goes too
+        w.settings.write_text(json.dumps({"env": self.ours(w)}))
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(json.loads(w.settings.read_text()), {})
+        # someone else's proxy is never touched
+        theirs = {"env": {"HTTPS_PROXY": "http://corp-proxy:3128", "NO_PROXY": "localhost,127.0.0.1,::1"}}
+        w.settings.write_text(json.dumps(theirs))
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(json.loads(w.settings.read_text()), theirs)
+        # and no settings file is not created
+        w.settings.unlink()
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertFalse(w.settings.exists())
+
+    def test_the_units_run_the_agent_and_set_it_up_again_when_the_certificate_changes(self):
+        agent = (self.UNITS / "claw-master-agent@.service").read_text()
+        self.assertIn("User=%i\n", agent)
+        self.assertIn("EnvironmentFile=/etc/nextjs-ct/claw-master-agent.env\n", agent)
+        self.assertIn("ExecStart=/usr/local/bin/claw-master agent --listen ${CLAW_MASTER_AGENT_LISTEN} "
+                      "--server ${CLAW_MASTER_SERVER} --dir /home/%i/.config/claude-master\n", agent)
+        self.assertIn("Restart=always\n", agent)
+        path = (self.UNITS / "claw-master-agent@.path").read_text()
+        self.assertIn("PathChanged=/home/%i/.config/claude-master/client.pem\n", path)
+        self.assertIn("Unit=claw-master-agent-setup@%i.service\n", path)
+        oneshot = (self.UNITS / "claw-master-agent-setup@.service").read_text()
+        self.assertIn("ExecStart=/usr/local/bin/claw-master-agent-setup %i --restart\n", oneshot)
+        setup = self.SETUP.read_text()
+        self.assertIn('ENVFILE=${CM_AGENT_ENVFILE:-/etc/nextjs-ct/claw-master-agent.env}', setup)
+        self.assertIn("LISTEN=${CM_AGENT_LISTEN:-127.0.0.1:8445}", setup)
+
+    def test_provision_sets_up_the_agent_for_its_account_and_restarts_it_for_a_new_build(self):
+        prov = (CT / "provision").read_text()
+        self.assertIn('systemctl enable "claw-master-agent@$U.path" >/dev/null 2>&1 && systemctl start "claw-master-agent@$U.path"', prov)
+        self.assertIn('/usr/local/bin/claw-master-agent-setup "$U" ${CM_UPDATED:+--restart} || warn', prov)
+        self.assertLess(prov.index('CM_UPDATED=""'), prov.index("&& CM_UPDATED=1"))
+        self.assertLess(prov.index("&& CM_UPDATED=1"), prov.index("claw-master-agent-setup \"$U\""))
+        self.assertLess(prov.index('U=$(cat "$ME/user")'), prov.index("claw-master-agent-setup \"$U\""))
+
+
+def types_ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
 class NoContainerRestartTests(unittest.TestCase):
     """A re-run of setup (any change to the published script) must not restart the containers. Every
     systemd-nspawn@<user> unit Requires= the firewall and its home mount, and restarting a required unit restarts the

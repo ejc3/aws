@@ -903,6 +903,16 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   request (429) until its reset, and a success clears it. There is no fallback to a login on the box: a server that is down or out of quota is an
   error in the session, not a quiet switch. Certificates last 30 days and renew themselves (the bullet on certificate renewal). A window running when an
   account is enrolled keeps plain claude until it is relaunched; the window saves the server, so a relaunch (`/clear`, `/cd`) keeps it.
+- **Every Claude Code in a container uses the pool, not only t-claude's.** The Claude desktop app's SSH sessions start their own
+  Claude Code in the container (`~/.claude/remote/ccd-cli/...`) with the person's own login and no proxy, so they spent that
+  person's own subscription, which the pool also spends: the app said "You've hit your weekly limit" while the terminal worked
+  (2026-10-27). For an enrolled account, provision runs `claw-master-agent-setup USER` (scripts/nextjs-ct/ct): the
+  `claw-master-agent@USER` unit (`claw-master agent --listen 127.0.0.1:8445 --server ... --dir ~/.config/claude-master`) and its
+  proxy, CA and `NO_PROXY` in `~/.claude/settings.json` `env`, which every Claude Code reads; nothing else in that file changes.
+  `claw-master connect` accepts exactly those entries, and t-claude's sessions keep their own forwarder (connect's lowercase
+  `https_proxy` wins). No fallback: while the agent or the server is down those requests fail. The agent reads its certificate
+  once, so `claw-master-agent@USER.path` sets it up again when `client.pem` changes (enrolling, or the daily renewal, which carries
+  the agent's `agent.token` into the new directory). Not enrolled: no agent, and only those exact entries are removed.
 - **fcvm-metal-arm uses the pool the same way** (`claw-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
   The block also exports `TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master` (here and on nextjs-dev): this box has a personal build in

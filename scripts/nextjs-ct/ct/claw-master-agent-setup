@@ -1,0 +1,100 @@
+#!/bin/bash
+# claw-master-agent-setup USER [--restart] -- every Claude Code in this container uses the pool, not only the ones t-claude
+# launches.
+#
+# t-claude starts a terminal Claude through `claw-master connect`, which gives that one process the pool's proxy. The Claude
+# desktop app's SSH sessions start their own Claude Code in here (~/.claude/remote/ccd-cli/...) with the person's own login
+# and no proxy, so they spent the person's own subscription, which the pool also spends: the app said "You've hit your weekly
+# limit" while the terminal worked. For an ENROLLED account (its client certificate is readable) this runs the claw-master
+# agent, claw-master-agent@USER (a proxy on loopback that reaches the server with the account's certificate), and sets its
+# proxy, CA and loopback exemption in ~/.claude/settings.json "env", which every Claude Code reads.
+#
+# `claw-master connect` accepts exactly those entries (they name its own client directory's agent.token and ca.pem), and
+# t-claude's sessions keep their own forwarder: connect also sets the lowercase https_proxy, which Claude prefers. No fallback
+# (owner, 2026-10-18): while the agent or the server is down, those requests fail rather than go to Anthropic on the
+# person's own login.
+#
+# Not enrolled: the agent is stopped and the entries it would set are taken out again, only when they are exactly its own.
+# Nothing else in settings.json is ever changed, and the file is rewritten only when its content changes.
+#
+# Run by provision at every container boot, and by claw-master-agent@USER.path when the certificate is enrolled or renewed
+# (--restart: the agent reads its certificate once, when it starts). The CM_AGENT_* variables are for the offline tests.
+set -uo pipefail
+U=${1:-}
+RESTART=""
+[ "${2:-}" = --restart ] && RESTART=1
+case "$U" in ''|*[!a-z0-9_-]*) echo "usage: claw-master-agent-setup USER [--restart]" >&2; exit 2 ;; esac
+H=${CM_AGENT_HOME:-/home/$U}
+CONFIG=${CM_AGENT_CONFIG:-/opt/nextjs-ct/config.json}
+CM=${CM_AGENT_BIN:-/usr/local/bin/claw-master}
+ENVFILE=${CM_AGENT_ENVFILE:-/etc/nextjs-ct/claw-master-agent.env}
+LISTEN=${CM_AGENT_LISTEN:-127.0.0.1:8445}
+TRIES=${CM_AGENT_TRIES:-30}   # half a second each
+NO_PROXY_VALUE=localhost,127.0.0.1,::1   # claw-master's agentNoProxy
+DIR=$H/.config/claude-master
+SETTINGS=$H/.claude/settings.json
+UNIT=claw-master-agent@$U.service
+as_user() { if [ "$(id -un)" = "$U" ]; then "$@"; else sudo -u "$U" -H env HOME="$H" "$@"; fi; }
+say() { echo "claw-master-agent-setup: $*" >&2; }
+
+# Put settings.json through a jq program, as the account and in one rename, only when the result differs. A file that is
+# there but is not a JSON object is left alone.
+edit_settings() {
+  local real tmp
+  real=$(readlink -f "$SETTINGS" 2>/dev/null) || real=$SETTINGS
+  if [ -e "$real" ] && ! jq -e 'type == "object"' "$real" >/dev/null 2>&1; then
+    say "$SETTINGS is not a JSON object; left alone"
+    return 1
+  fi
+  as_user mkdir -p "$(dirname "$real")" || return 1
+  tmp=$(as_user mktemp "$(dirname "$real")/.settings.json.XXXXXX") || return 1
+  if ! { if [ -e "$real" ]; then cat "$real"; else echo '{}'; fi; } | jq "$@" > "$tmp"; then
+    rm -f "$tmp"
+    say "could not update $SETTINGS"
+    return 1
+  fi
+  if [ -e "$real" ] && jq -e --slurpfile new "$tmp" '. == $new[0]' "$real" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 0
+  fi
+  as_user mv -f "$tmp" "$real"
+}
+
+if [ -x "$CM" ] && as_user test -r "$DIR/client.pem"; then
+  SERVER=$(jq -r '.claw_master.server // empty' "$CONFIG" 2>/dev/null)
+  [ -n "$SERVER" ] || { say "no claw_master.server in $CONFIG"; exit 1; }
+  install -d -m 755 "$(dirname "$ENVFILE")" && printf 'CLAW_MASTER_SERVER=%s\nCLAW_MASTER_AGENT_LISTEN=%s\n' "$SERVER" "$LISTEN" > "$ENVFILE" \
+    || { say "could not write $ENVFILE"; exit 1; }
+  # Prints what Claude needs and makes the agent's token (agent.token beside the certificate) on first use.
+  LINES=$(as_user "$CM" agent env --listen "$LISTEN" --server "$SERVER" --dir "$DIR") || { say "claw-master agent env failed"; exit 1; }
+  ADD=$(printf '%s\n' "$LINES" | jq -Rn '[inputs | capture("^(?<key>[A-Z_]+)=(?<value>.+)$")] | from_entries')
+  [ "$(jq -c 'keys' <<<"$ADD")" = '["HTTPS_PROXY","NODE_EXTRA_CA_CERTS","NO_PROXY"]' ] || { say "unexpected agent env output"; exit 1; }
+  systemctl enable "$UNIT" >/dev/null 2>&1 || { say "$UNIT not enabled"; exit 1; }
+  if [ -n "$RESTART" ]; then systemctl restart "$UNIT"; else systemctl start "$UNIT"; fi || { say "$UNIT did not start"; exit 1; }
+  FAILED=""
+  for _ in $(seq 1 "$TRIES"); do
+    (exec 3<>"/dev/tcp/${LISTEN%:*}/${LISTEN##*:}") 2>/dev/null && break
+    sleep 0.5
+  done
+  (exec 3<>"/dev/tcp/${LISTEN%:*}/${LISTEN##*:}") 2>/dev/null || { say "$UNIT is not listening on $LISTEN"; FAILED=1; }
+  # Set even when the agent is not up yet: the unit restarts it, and failing beats spending the person's own login.
+  edit_settings --argjson add "$ADD" '.env = ((.env | objects) // {}) + $add' || exit 1
+  # Spellings Claude would take over these (it prefers the lowercase proxy names), so the agent would be bypassed.
+  OTHER=$(jq -r '(.env | objects) // {} | keys[] | select(. == "https_proxy" or . == "HTTP_PROXY" or . == "http_proxy"
+    or . == "ALL_PROXY" or . == "all_proxy" or . == "no_proxy")' "$(readlink -f "$SETTINGS")" | tr '\n' ' ')
+  [ -z "$OTHER" ] || { say "$SETTINGS also sets ${OTHER% }; Claude may use that instead of the pool"; FAILED=1; }
+  [ -z "$FAILED" ] || exit 1
+  echo "claw-master-agent-setup: $U uses the pool through $LISTEN"
+else
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  if [ -e "$SETTINGS" ]; then
+    edit_settings --arg listen "$LISTEN" --arg ca "$DIR/ca.pem" --arg np "$NO_PROXY_VALUE" '
+      if ((.env | objects | .HTTPS_PROXY) // "" | strings | test("^http://claw-master:[^@/]+@" + ($listen | gsub("\\."; "\\.")) + "/?$"))
+      then .env |= (del(.HTTPS_PROXY)
+                    | if .NODE_EXTRA_CA_CERTS == $ca then del(.NODE_EXTRA_CA_CERTS) else . end
+                    | if .NO_PROXY == $np then del(.NO_PROXY) else . end)
+           | if .env == {} then del(.env) else . end
+      else . end' || exit 1
+  fi
+  echo "claw-master-agent-setup: $U is not enrolled; no agent"
+fi
