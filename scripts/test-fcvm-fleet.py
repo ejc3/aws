@@ -459,6 +459,19 @@ class StageWallTests(unittest.TestCase):
         task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
+    def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
+        # The default, --text-check none, refuses every viewer word. The model the command names is the one the
+        # task role may invoke, through the profile in the fleet account and the foundation model it routes to.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--text-check", "bedrock", "--text-check-model", local.bedrock_haiku_profile, '
+                      '"--text-check-region", local.bedrock_haiku_region]', cmd)
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        grant = pol.split('Sid    = "CheckViewerWordsWithClaudeHaiku55"', 1)[1].split("\n      },", 1)[0]
+        self.assertIn('Action = "bedrock:InvokeModel"', grant)
+        self.assertIn('"arn:aws:bedrock:*:${local.fcvm_fleet_account_id}:inference-profile/${local.bedrock_haiku_profile}"', grant)
+        self.assertIn('"arn:aws:bedrock:*::foundation-model/${local.bedrock_haiku_model}"', grant)
+        self.assertIn('"aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"]', pol)
+
 
 class TileSubnetTests(unittest.TestCase):
     def test_both_tile_templates_name_a_fleet_subnet(self):
