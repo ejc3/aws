@@ -4,29 +4,41 @@ set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
 echo "=== agent-update $(date -u '+%F %T UTC') ==="
 
-# claude updates itself now that it is a native per-user install, so there is nothing to
-# npm-install here. Re-run the installer per account: it is a no-op when current, and it
-# repairs an account whose copy went missing.
-for u in $(cat /etc/nextjs-ct/user); do
+# Claude Code: `claude update` for every account, every night. Claude's own background updater is not enough: every pool
+# session runs under `claw-master connect`, which sets DISABLE_AUTOUPDATER=1 for the Claude it launches, so on 2026-10-26
+# this job reported "2.1.294 -> 2.1.294" in every container while 2.1.311 was out. An account with no native copy gets
+# the installer instead, which also repairs one that went missing. Running sessions keep their binary; the next start of
+# each (t-claude, the restarts below) runs the new one.
+USERS_FILE=${AGENT_UPDATE_USERS:-/etc/nextjs-ct/user}
+HOME_ROOT=${AGENT_UPDATE_HOMES:-/home}
+for u in $(cat "$USERS_FILE"); do
   id -u "$u" >/dev/null 2>&1 || continue
-  BEFORE=$(sudo -u "$u" -H bash -lc 'claude --version 2>/dev/null | head -1')
-  sudo -u "$u" -H bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 || true
-  AFTER=$(sudo -u "$u" -H bash -lc 'claude --version 2>/dev/null | head -1')
+  # shellcheck disable=SC2016 # $HOME is the account's, expanded by its own shell
+  BEFORE=$(sudo -u "$u" -H bash -c '"$HOME/.local/bin/claude" --version 2>/dev/null | head -1')
+  if [ -n "$BEFORE" ]; then
+    # shellcheck disable=SC2016
+    sudo -u "$u" -H env -u DISABLE_AUTOUPDATER bash -c 'cd "$HOME" && "$HOME/.local/bin/claude" update < /dev/null' >/dev/null 2>&1 \
+      || echo "WARNING: claude update failed for $u"
+  else
+    sudo -u "$u" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 || echo "WARNING: claude install failed for $u"
+  fi
+  # shellcheck disable=SC2016
+  AFTER=$(sudo -u "$u" -H bash -c '"$HOME/.local/bin/claude" --version 2>/dev/null | head -1')
   echo "claude[$u]: ${BEFORE:-none} -> ${AFTER:-none}"
 done
 npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel update failed"
 
 
-for u in $(cat /etc/nextjs-ct/user); do
+for u in $(cat "$USERS_FILE"); do
   id "$u" >/dev/null 2>&1 || continue
   # Codex ships its own installer and self-updates the standalone bundle; re-running it is
   # the supported refresh. Must run AS the user from a directory they can read -- from
   # elsewhere it dies in `find` after creating releases/ but before current/.
-  if [ -s "/home/$u/.codex/auth.json" ]; then
-    B=$(sudo -u "$u" -H /home/$u/.local/bin/codex --version 2>/dev/null | head -1)
-    sudo -u "$u" -H sh -c "cd /home/$u && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 \
+  if [ -s "$HOME_ROOT/$u/.codex/auth.json" ]; then
+    B=$(sudo -u "$u" -H $HOME_ROOT/$u/.local/bin/codex --version 2>/dev/null | head -1)
+    sudo -u "$u" -H sh -c "cd $HOME_ROOT/$u && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 \
       || echo "WARNING: codex update failed for $u"
-    echo "codex[$u]: ${B:-none} -> $(sudo -u "$u" -H /home/$u/.local/bin/codex --version 2>/dev/null | head -1)"
+    echo "codex[$u]: ${B:-none} -> $(sudo -u "$u" -H $HOME_ROOT/$u/.local/bin/codex --version 2>/dev/null | head -1)"
   fi
   # Refresh the project list too, so a repo added during the day shows up.
   /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
@@ -43,8 +55,8 @@ case "$IDLE_MIN" in ''|*[!0-9]*) echo "WARNING: AGENT_UPDATE_IDLE_MIN=$IDLE_MIN 
 recent_session() {  # recent_session <user> <claude-rc|codex-rc> -> prints one recently written session file, exit 0 if any
   local u="$1" dir
   case "$2" in
-    claude-rc) dir="/home/$u/.claude/projects" ;;
-    codex-rc)  dir="/home/$u/.codex/sessions" ;;
+    claude-rc) dir="$HOME_ROOT/$u/.claude/projects" ;;
+    codex-rc)  dir="$HOME_ROOT/$u/.codex/sessions" ;;
     *) return 1 ;;
   esac
   [ -d "$dir" ] || return 1
@@ -54,7 +66,7 @@ recent_session() {  # recent_session <user> <claude-rc|codex-rc> -> prints one r
   return 1
 }
 
-for u in $(cat /etc/nextjs-ct/user); do
+for u in $(cat "$USERS_FILE"); do
   id "$u" >/dev/null 2>&1 || continue
   for s in claude-rc codex-rc; do
     systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
