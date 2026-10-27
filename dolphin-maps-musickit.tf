@@ -52,23 +52,6 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_musickit" {
 }
 
 # The metal boxes put it (the key is made on the developer portal from a dev box's session) and see that it has a value,
-# and nothing more: PutSecretValue and DescribeSecret on this one secret, never GetSecretValue. One managed policy, not
-# an inline one: dev-server-role's inline policies are at IAM's 10,240-character total (#574).
-data "aws_iam_policy_document" "dolphin_maps_musickit_dev" {
-  statement {
-    sid       = "PutTheMusicKitKey"
-    actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
-    resources = [aws_secretsmanager_secret.dolphin_maps_musickit.arn]
-  }
-}
-
-resource "aws_iam_policy" "dolphin_maps_musickit_dev" {
-  name        = "dev-dolphin-maps-musickit"
-  description = "Metal dev boxes: put (never read) dolphin-maps' MusicKit key (dolphin-maps/musickit)"
-  policy      = data.aws_iam_policy_document.dolphin_maps_musickit_dev.json
-}
-
-resource "aws_iam_role_policy_attachment" "dolphin_maps_musickit_dev" {
-  role       = aws_iam_role.dev_server.name
-  policy_arn = aws_iam_policy.dolphin_maps_musickit_dev.arn
-}
+# and nothing more: PutSecretValue and DescribeSecret on this one secret, never GetSecretValue. Granted as statements of
+# the PeMS login's managed policy (dolphin-maps-loop.tf, dev-dolphin-maps-pems), not a policy of its own: dev-server-role
+# is at IAM's 20 managed-policy attachments, and its inline policies at their 10,240-character total (#574).
