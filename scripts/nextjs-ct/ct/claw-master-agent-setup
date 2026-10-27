@@ -18,8 +18,8 @@
 #
 # Not enrolled: no agent and no drop-in. Run by provision at every container boot (--restart after it installed a new
 # claw-master), by claw-master-agent@USER.path when the certificate changes and hourly by claw-master-agent@USER.timer. The
-# agent reads its certificate once, when it starts, so it is restarted whenever client.pem is newer than the running agent
-# (enrolling and the daily renewal both swap a new directory in). The CM_AGENT_* variables are for the offline tests.
+# agent reads its certificate once, when it starts, so it is restarted whenever client.pem is not the certificate it was
+# started with (enrolling and the daily renewal both swap a new directory in). The CM_AGENT_* variables are for the offline tests.
 set -uo pipefail
 U=${1:-}
 RESTART=""
@@ -36,6 +36,8 @@ DIR=$H/.config/claude-master
 PEM=$DIR/client.pem
 UNIT=claw-master-agent@$U.service
 LOCK=${CM_AGENT_LOCK:-/run/claw-master-agent-setup.lock}
+LOADED=${CM_AGENT_LOADED:-/run/claw-master-agent@$U.pem.sha256}   # the certificate the running agent was started with
+USER_SETTINGS=$H/.claude/settings.json
 as_user() { if [ "$(id -un)" = "$U" ]; then "$@"; else sudo -u "$U" -H env HOME="$H" "$@"; fi; }
 say() { echo "claw-master-agent-setup: $*" >&2; }
 
@@ -73,14 +75,14 @@ SETTINGS=$(printf '%s\n' "$LINES" | jq -Rn '{env: ([inputs | capture("^(?<key>[A
   || { say "unexpected claw-master agent env output"; exit 1; }
 
 systemctl enable "$UNIT" >/dev/null 2>&1 || { say "$UNIT not enabled"; exit 1; }
-if systemctl is-active --quiet "$UNIT"; then
-  STARTED=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$UNIT")" +%s 2>/dev/null || echo 0)
-  if [ -n "$RESTART" ] || [ "$(stat -c %Y "$PEM")" -gt "$STARTED" ]; then
-    systemctl restart "$UNIT" || { say "$UNIT did not restart"; exit 1; }
-  fi
-else
+# Taken before the agent starts, so a certificate swapped in meanwhile reads as different next time and restarts it again.
+SUM=$(as_user sha256sum "$PEM" | cut -d' ' -f1) && [ -n "$SUM" ] || { say "cannot read $PEM"; exit 1; }
+if ! systemctl is-active --quiet "$UNIT"; then
   systemctl start "$UNIT" || { say "$UNIT did not start"; exit 1; }
+elif [ -n "$RESTART" ] || [ "$(cat "$LOADED" 2>/dev/null)" != "$SUM" ]; then
+  systemctl restart "$UNIT" || { say "$UNIT did not restart"; exit 1; }
 fi
+echo "$SUM" > "$LOADED" || { say "cannot write $LOADED"; exit 1; }
 
 # The drop-in is written whether or not the agent came up: the unit keeps restarting it, and failing beats spending the
 # person's own login. It carries the agent's token, so only the person (and root) can read it.
@@ -90,6 +92,12 @@ if ! [ -f "$DROPIN" ] || [ "$(cat "$DROPIN")" != "$SETTINGS" ]; then
     && chgrp "$(id -gn "$U")" "$TMP" && chmod 640 "$TMP" && mv -f "$TMP" "$DROPIN" \
     || { rm -f "${TMP:-}"; say "could not write $DROPIN"; exit 1; }
 fi
+
+# Spellings Claude takes over HTTPS_PROXY and NO_PROXY (it prefers lowercase), set in the person's own settings, would route
+# around the agent; the drop-in cannot set them (connect accepts only the three it writes), so they are reported.
+OTHER=$(jq -r '(.env | objects) // {} | keys[] | select(IN("https_proxy", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "no_proxy"))' \
+  "$USER_SETTINGS" 2>/dev/null | tr '\n' ' ')
+[ -z "$OTHER" ] || { say "$USER_SETTINGS sets ${OTHER% }, which Claude would use instead of the agent"; exit 1; }
 
 # Ready means the unit's own process listens there: something else on the port would be handed every Claude request.
 PORT=${LISTEN##*:}

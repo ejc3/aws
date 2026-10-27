@@ -874,7 +874,8 @@ esac
                "CM_AGENT_CONFIG": str(d / "config.json"), "CM_AGENT_BIN": str(cm),
                "CM_AGENT_ENVFILE": str(d / "etc/claw-master-agent.env"),
                "CM_AGENT_DROPIN": str(d / "etc/claude-code/managed-settings.d/50-claw-master-agent.json"),
-               "CM_AGENT_LISTEN": "127.0.0.1:%d" % port, "CM_AGENT_TRIES": "4", "CM_AGENT_LOCK": str(d / "setup.lock")}
+               "CM_AGENT_LISTEN": "127.0.0.1:%d" % port, "CM_AGENT_TRIES": "4", "CM_AGENT_LOCK": str(d / "setup.lock"),
+               "CM_AGENT_LOADED": str(d / "loaded.sha256")}
         return types.SimpleNamespace(d=d, home=home, env=env, port=port, state=state, pem=home / ".config/claude-master/client.pem",
                         dropin=Path(env["CM_AGENT_DROPIN"]), log=d / "systemctl.log")
 
@@ -912,7 +913,6 @@ esac
 
     def test_a_second_run_changes_nothing_and_restarts_nothing(self):
         w = self.world()
-        os.utime(w.pem, (time.time() - 3600, time.time() - 3600))
         self.assertEqual(self.run_setup(w).returncode, 0)
         before = w.dropin.stat()
         r = self.run_setup(w)
@@ -923,18 +923,32 @@ esac
         self.assertEqual(self.calls(w, "restart"), [])
         self.assertEqual(len(self.calls(w, "start")), 1)
 
-    def test_a_certificate_newer_than_the_agent_restarts_it_and_so_does_a_new_build(self):
+    def test_a_different_certificate_restarts_the_agent_and_so_does_a_new_build(self):
         w = self.world()
-        os.utime(w.pem, (time.time() - 3600, time.time() - 3600))
+        stamp = (time.time() - 3600, time.time() - 3600)
+        os.utime(w.pem, stamp)
         self.assertEqual(self.run_setup(w).returncode, 0)
-        (w.state / "started_at").write_text(time.strftime("%a %Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time() - 600)) + "\n")
-        os.utime(w.pem)                     # renewed after the agent started
+        # Renewed with an OLDER timestamp than the running agent (staged before it started, swapped in after): content counts.
+        w.pem.write_text("renewed cert")
+        os.utime(w.pem, stamp)
         self.assertEqual(self.run_setup(w).returncode, 0)
         self.assertEqual(len(self.calls(w, "restart")), 1)
         self.assertEqual(self.run_setup(w).returncode, 0)
         self.assertEqual(len(self.calls(w, "restart")), 1, "once restarted, the same certificate restarts nothing")
         self.assertEqual(self.run_setup(w, "--restart").returncode, 0)
         self.assertEqual(len(self.calls(w, "restart")), 2)
+
+    def test_a_lowercase_proxy_in_the_persons_settings_is_reported(self):
+        for key in ("https_proxy", "no_proxy", "ALL_PROXY"):
+            w = self.world()
+            settings = w.home / ".claude/settings.json"
+            settings.parent.mkdir()
+            settings.write_text(json.dumps({"env": {key: "http://proxy.example.com:3128"}}))
+            r = self.run_setup(w)
+            self.assertNotEqual(r.returncode, 0, key)
+            self.assertIn("sets %s, which Claude would use instead of the agent" % key, r.stderr)
+            self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w), "the drop-in is still in place")
+            self.assertEqual(json.loads(settings.read_text()), {"env": {key: "http://proxy.example.com:3128"}}, "never edited")
 
     def test_runs_started_together_take_turns(self):
         """Provision, the path unit and the timer can start a run at the same moment (enabling the timer starts one)."""

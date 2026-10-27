@@ -1,5 +1,5 @@
 [Unit]
-Description=Set up the claw-master agent for %i (restarted when its client certificate is newer than it)
+Description=Set up the claw-master agent for %i (restarted when its client certificate is not the one it runs with)
 
 [Service]
 Type=oneshot

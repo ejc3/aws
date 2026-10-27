@@ -913,9 +913,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   settings; the person's own `~/.claude/settings.json` is never touched. `claw-master connect` accepts exactly those entries, and
   t-claude's sessions keep their own forwarder (connect's lowercase `https_proxy` wins). No fallback: while the agent or the
   server is down those requests fail, and an enrolled account's fault keeps the drop-in. The agent reads its certificate once,
-  so it is restarted when `client.pem` is newer than it: `claw-master-agent@USER.path` on a change and `.timer` hourly (a
+  so it is restarted when `client.pem` is not the certificate it started with (by sha256): `claw-master-agent@USER.path` on a change and `.timer` hourly (a
   renewal swaps the directory, and carries the agent's `agent.token` into the new one). A certificate missing for a few seconds
-  is a swap, not un-enrolment; one that stays missing means no agent and no drop-in.
+  is a swap, not un-enrolment; one that stays missing means no agent and no drop-in. A lowercase `https_proxy` or `no_proxy` (which Claude
+  prefers) in the person's own settings is reported, since the drop-in cannot override it; one in a project's settings is not seen.
 - **fcvm-metal-arm uses the pool the same way** (`claw-master-client.tf`): an SSM association installs the pinned client (the
   server's tag and sha256) and the same certificate-gated `/etc/zsh/zshenv` block, daily and once when applied, and restarts nothing.
   The block also exports `TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master` (here and on nextjs-dev): this box has a personal build in
