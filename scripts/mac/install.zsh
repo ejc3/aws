@@ -50,6 +50,22 @@ for t in swift xcodebuild xcrun; do
   [ "$got" = "$bin/$t" ] || { echo "mac-setup: a non-interactive zsh finds $t at $got, not $bin/$t" >&2; exit 1; }
 done
 
+# Xcode's DerivedData on the disk ~/.config/mac-setup/deriveddata names, when that file exists and the disk is
+# mounted; Xcode's default is ~/Library/Developer/Xcode/DerivedData, on the internal disk. It is a user default,
+# so it applies to Xcode and to every xcodebuild run without -derivedDataPath.
+dd_file=$HOME/.config/mac-setup/deriveddata
+if [ -r "$dd_file" ]; then
+  dd=$(<"$dd_file")
+  if [ -n "$dd" ] && [ -d "${dd:h}" ] && mkdir -p "$dd"; then
+    if [ "$(defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation 2>/dev/null)" != "$dd" ]; then
+      defaults write com.apple.dt.Xcode IDECustomDerivedDataLocation "$dd"
+      echo "mac-setup: Xcode's DerivedData now goes to $dd"
+    fi
+  else
+    echo "mac-setup: WARNING: $dd_file names $dd, whose disk is not mounted; DerivedData left where it is" >&2
+  fi
+fi
+
 # The pinned Peekaboo app and CLI, and its LaunchAgent (the wrapper above runs its CLI).
 if [ "$update_peekaboo" = --update-peekaboo ]; then
   /bin/sh "$src/peekaboo-install.sh" --update-running
