@@ -1,0 +1,121 @@
+#!/bin/bash
+# claw-master-agent-setup USER [--restart] -- every Claude Code in this container uses the pool, not only the ones t-claude
+# launches.
+#
+# t-claude starts a terminal Claude through `claw-master connect`, which gives that one process the pool's proxy. The Claude
+# desktop app's SSH sessions start their own Claude Code in here (~/.claude/remote/ccd-cli/...) with the person's own login
+# and no proxy, so they spent the person's own subscription, which the pool also spends: the app said "You've hit your weekly
+# limit" while the terminal worked. For an ENROLLED account (its client certificate is readable) this runs the claw-master
+# agent, claw-master-agent@USER (a proxy on loopback that reaches the server with the account's certificate), and puts its
+# proxy, CA and loopback exemption in a managed settings drop-in, which every Claude Code here reads and which outranks the
+# person's own and any project's settings. The container is one person's, so a machine-wide file is theirs alone; the
+# person's ~/.claude/settings.json is never touched.
+#
+# `claw-master connect` accepts exactly those entries (they name its own client directory's agent.token and ca.pem), and
+# t-claude's sessions keep their own forwarder: connect also sets the lowercase https_proxy, which Claude prefers. No fallback
+# (owner, 2026-10-18): while the agent or the server is down, those requests fail rather than go to Anthropic on the
+# person's own login.
+#
+# Not enrolled: no agent and no drop-in. Run by provision at every container boot (--restart after it installed a new
+# claw-master), by claw-master-agent@USER.path when the certificate changes and hourly by claw-master-agent@USER.timer. The
+# agent reads its certificate once, when it starts, so it is restarted whenever client.pem is not the certificate it was
+# started with (enrolling and the daily renewal both swap a new directory in). The CM_AGENT_* variables are for the offline tests.
+set -uo pipefail
+U=${1:-}
+RESTART=""
+[ "${2:-}" = --restart ] && RESTART=1
+case "$U" in ''|*[!a-z0-9_-]*) echo "usage: claw-master-agent-setup USER [--restart]" >&2; exit 2 ;; esac
+H=${CM_AGENT_HOME:-/home/$U}
+CONFIG=${CM_AGENT_CONFIG:-/opt/nextjs-ct/config.json}
+CM=${CM_AGENT_BIN:-/usr/local/bin/claw-master}
+ENVFILE=${CM_AGENT_ENVFILE:-/etc/nextjs-ct/claw-master-agent.env}
+DROPIN=${CM_AGENT_DROPIN:-/etc/claude-code/managed-settings.d/50-claw-master-agent.json}
+LISTEN=${CM_AGENT_LISTEN:-127.0.0.1:8445}
+TRIES=${CM_AGENT_TRIES:-30}   # half a second each
+DIR=$H/.config/claude-master
+PEM=$DIR/client.pem
+UNIT=claw-master-agent@$U.service
+LOCK=${CM_AGENT_LOCK:-/run/claw-master-agent-setup.lock}
+LOADED=${CM_AGENT_LOADED:-/run/claw-master-agent@$U.pem.sha256}   # the certificate the running agent was started with
+USER_SETTINGS=$H/.claude/settings.json
+as_user() { if [ "$(id -un)" = "$U" ]; then "$@"; else sudo -u "$U" -H env HOME="$H" "$@"; fi; }
+say() { echo "claw-master-agent-setup: $*" >&2; }
+
+# One run at a time: provision, the path unit and the timer can all start one at once (enabling the timer starts it).
+exec 9>"$LOCK" && flock 9 || { say "cannot take $LOCK"; exit 1; }
+
+# A renewal swaps the directory with two renames, so the certificate can be missing for a moment: only an absence that
+# lasts is "not enrolled".
+enrolled() {
+  local _
+  for _ in $(seq 1 "$TRIES"); do
+    as_user test -r "$PEM" && return 0
+    sleep 0.5
+  done
+  as_user test -r "$PEM"
+}
+
+if ! enrolled; then
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f "$DROPIN"
+  echo "claw-master-agent-setup: $U is not enrolled; no agent"
+  exit 0
+fi
+
+# Enrolled from here on: a fault keeps whatever drop-in is there, so Claude fails rather than use the person's own login.
+# On the first run there is nothing to keep yet. Fence direct routing before invoking the client or starting its unit;
+# connect rejects this sentinel too, since it has no agent token. Validated agent settings replace it below.
+if ! [ -f "$DROPIN" ]; then
+  install -d -m 755 "$(dirname "$DROPIN")" && TMP=$(mktemp "$(dirname "$DROPIN")/.claw-master-agent.XXXXXX") \
+    && jq -n --arg ca "$DIR/ca.pem" '{env: {HTTPS_PROXY: "http://127.0.0.1:1", NODE_EXTRA_CA_CERTS: $ca, NO_PROXY: "localhost,127.0.0.1,::1"}}' > "$TMP" \
+    && chgrp "$(id -gn "$U")" "$TMP" && chmod 640 "$TMP" && mv -f "$TMP" "$DROPIN" \
+    || { rm -f "${TMP:-}"; say "could not fence direct routing in $DROPIN"; exit 1; }
+fi
+[ -x "$CM" ] || { say "$CM is missing"; exit 1; }
+SERVER=$(jq -r '.claw_master.server // empty' "$CONFIG" 2>/dev/null)
+[ -n "$SERVER" ] || { say "no claw_master.server in $CONFIG"; exit 1; }
+install -d -m 755 "$(dirname "$ENVFILE")" && printf 'CLAW_MASTER_SERVER=%s\nCLAW_MASTER_AGENT_LISTEN=%s\n' "$SERVER" "$LISTEN" > "$ENVFILE.new" \
+  && mv -f "$ENVFILE.new" "$ENVFILE" || { say "could not write $ENVFILE"; exit 1; }
+# Prints what Claude needs, and makes the agent's token (agent.token beside the certificate) on first use.
+LINES=$(as_user "$CM" agent env --listen "$LISTEN" --server "$SERVER" --dir "$DIR") || { say "claw-master agent env failed"; exit 1; }
+SETTINGS=$(printf '%s\n' "$LINES" | jq -Rn '{env: ([inputs | capture("^(?<key>[A-Z_]+)=(?<value>.+)$")] | from_entries)}') \
+  && [ "$(jq -c '.env | keys' <<<"$SETTINGS")" = '["HTTPS_PROXY","NODE_EXTRA_CA_CERTS","NO_PROXY"]' ] \
+  || { say "unexpected claw-master agent env output"; exit 1; }
+
+systemctl enable "$UNIT" >/dev/null 2>&1 || { say "$UNIT not enabled"; exit 1; }
+# Taken before the agent starts, so a certificate swapped in meanwhile reads as different next time and restarts it again.
+SUM=$(as_user sha256sum "$PEM" | cut -d' ' -f1) && [ -n "$SUM" ] || { say "cannot read $PEM"; exit 1; }
+if ! systemctl is-active --quiet "$UNIT"; then
+  systemctl start "$UNIT" || { say "$UNIT did not start"; exit 1; }
+elif [ -n "$RESTART" ] || [ "$(cat "$LOADED" 2>/dev/null)" != "$SUM" ]; then
+  systemctl restart "$UNIT" || { say "$UNIT did not restart"; exit 1; }
+fi
+# The drop-in is written whether or not the agent came up: the unit keeps restarting it, and failing beats spending the
+# person's own login. It carries the agent's token, so only the person (and root) can read it.
+install -d -m 755 "$(dirname "$DROPIN")" || { say "cannot make $(dirname "$DROPIN")"; exit 1; }
+if ! [ -f "$DROPIN" ] || [ "$(cat "$DROPIN")" != "$SETTINGS" ]; then
+  TMP=$(mktemp "$(dirname "$DROPIN")/.claw-master-agent.XXXXXX") && printf '%s\n' "$SETTINGS" > "$TMP" \
+    && chgrp "$(id -gn "$U")" "$TMP" && chmod 640 "$TMP" && mv -f "$TMP" "$DROPIN" \
+    || { rm -f "${TMP:-}"; say "could not write $DROPIN"; exit 1; }
+fi
+
+# Spellings Claude takes over HTTPS_PROXY and NO_PROXY (it prefers lowercase), set in the person's own settings, would route
+# around the agent; the drop-in cannot set them (connect accepts only the three it writes), so they are reported.
+OTHER=$(jq -r '(.env | objects) // {} | keys[] | select(IN("https_proxy", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "no_proxy"))' \
+  "$USER_SETTINGS" 2>/dev/null | tr '\n' ' ')
+[ -z "$OTHER" ] || { say "$USER_SETTINGS sets ${OTHER% }, which Claude would use instead of the agent"; exit 1; }
+
+# Ready means the unit's own process listens there: something else on the port would be handed every Claude request.
+PORT=${LISTEN##*:}
+for _ in $(seq 1 "$TRIES"); do
+  PID=$(systemctl show -p MainPID --value "$UNIT")
+  [ "${PID:-0}" != 0 ] && ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -q "pid=$PID," && {
+    echo "$SUM" > "$LOADED" || { say "cannot write $LOADED"; exit 1; }
+    echo "claw-master-agent-setup: $U uses the pool through $LISTEN"
+    exit 0
+  }
+  sleep 0.5
+done
+rm -f "$LOADED"
+say "$UNIT is not the listener on $LISTEN"
+exit 1

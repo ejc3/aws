@@ -1,0 +1,19 @@
+[Unit]
+# claw-master-agent-setup enables it for an enrolled account and writes the environment file; see that script for why.
+Description=claw-master agent for %i: the pool's proxy for every Claude Code in this container
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/%i/.config/claude-master/client.pem
+# Keeps trying while the server is away: each try is cheap, and the agent only exits on a fault it cannot serve through.
+StartLimitIntervalSec=0
+
+[Service]
+User=%i
+Environment=HOME=/home/%i
+EnvironmentFile=/etc/nextjs-ct/claw-master-agent.env
+ExecStart=/usr/local/bin/claw-master agent --listen ${CLAW_MASTER_AGENT_LISTEN} --server ${CLAW_MASTER_SERVER} --dir /home/%i/.config/claude-master
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

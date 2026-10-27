@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -821,6 +822,254 @@ class ContainerScriptTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("belongs to alice", r.stderr)
 
+
+
+class ClawMasterAgentTests(unittest.TestCase):
+    """Every Claude Code in a container reaches the pool, the desktop app's SSH sessions too (they start their own Claude Code
+    with the person's own login, which spent that person's own subscription): claw-master-agent-setup runs the agent for an
+    enrolled account and puts its three entries in a managed settings drop-in. Runs for real against a fake systemctl and a
+    fake claw-master; `ss` is real, so "ready" is checked against an actual listening socket and its owner."""
+
+    SETUP = CT / "claw-master-agent-setup"
+    UNITS = CT / "units"
+    TOKEN = "TESTTOKEN"
+    USER = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+    GROUP = subprocess.run(["id", "-gn"], capture_output=True, text=True, check=True).stdout.strip()
+
+    def world(self, enrolled=True, listening=True, owner_is_unit=True, env_output=None):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(d)])
+        home, bin_, state = d / "home", d / "bin", d / "state"
+        for x in (bin_, state, home / ".config/claude-master"):
+            x.mkdir(parents=True)
+        if enrolled:
+            (home / ".config/claude-master/client.pem").write_text("cert")
+        fake(bin_, "systemctl", f"""echo "$*" >> "{d}/systemctl.log"
+S="{state}"
+case "$1" in
+  is-active) [ -e "$S/active" ] ;;
+  show) case "$3" in ActiveEnterTimestamp) cat "$S/started_at" 2>/dev/null || echo ;; MainPID) cat "$S/mainpid" 2>/dev/null || echo 0 ;; esac ;;
+  start|restart) touch "$S/active"; date '+%a %Y-%m-%d %H:%M:%S %Z' > "$S/started_at" ;;
+  disable) rm -f "$S/active" ;;
+esac
+""")
+        out = env_output if env_output is not None else (
+            'echo "HTTPS_PROXY=http://claw-master:%s@$4"\necho "NODE_EXTRA_CA_CERTS=$8/ca.pem"\n'
+            'echo "NO_PROXY=localhost,127.0.0.1,::1"\n' % self.TOKEN)
+        cm = fake(bin_, "claw-master", 'echo "$*" >> "%s"\n[ "$1 $2" = "agent env" ] || exit 9\n%s' % (d / "cm.log", out))
+        (d / "config.json").write_text(json.dumps({"claw_master": {"server": "192.0.2.10:8443"}}))
+        if listening:
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(16)
+            self.addCleanup(srv.close)
+            port = srv.getsockname()[1]
+        else:
+            with socket.socket() as sock:   # a port nothing listens on
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+        # The unit's main process: this test process owns the listening socket, so its pid is the right answer.
+        (state / "mainpid").write_text(str(os.getpid() if owner_is_unit else 1))
+        env = {"PATH": "%s:/usr/bin:/bin:/usr/sbin:/sbin" % bin_, "CM_AGENT_HOME": str(home),
+               "CM_AGENT_CONFIG": str(d / "config.json"), "CM_AGENT_BIN": str(cm),
+               "CM_AGENT_ENVFILE": str(d / "etc/claw-master-agent.env"),
+               "CM_AGENT_DROPIN": str(d / "etc/claude-code/managed-settings.d/50-claw-master-agent.json"),
+               "CM_AGENT_LISTEN": "127.0.0.1:%d" % port, "CM_AGENT_TRIES": "4", "CM_AGENT_LOCK": str(d / "setup.lock"),
+               "CM_AGENT_LOADED": str(d / "loaded.sha256")}
+        return types.SimpleNamespace(d=d, home=home, env=env, port=port, state=state, pem=home / ".config/claude-master/client.pem",
+                        dropin=Path(env["CM_AGENT_DROPIN"]), log=d / "systemctl.log")
+
+    def run_setup(self, w, *extra):
+        return subprocess.run(["bash", str(self.SETUP), self.USER, *extra], env=w.env, capture_output=True, text=True, timeout=60)
+
+    def ours(self, w):
+        return {"env": {"HTTPS_PROXY": "http://claw-master:%s@127.0.0.1:%d" % (self.TOKEN, w.port),
+                        "NODE_EXTRA_CA_CERTS": "%s/.config/claude-master/ca.pem" % w.home,
+                        "NO_PROXY": "localhost,127.0.0.1,::1"}}
+
+    def calls(self, w, verb=None):
+        lines = w.log.read_text().splitlines() if w.log.exists() else []
+        return [l for l in lines if verb is None or l.split()[0] == verb]
+
+    def test_an_enrolled_account_gets_the_agent_and_a_managed_drop_in(self):
+        w = self.world()
+        settings = w.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"theme": "dark"}')
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w))
+        st = w.dropin.stat()
+        self.assertEqual(oct(st.st_mode & 0o777), "0o640", "the proxy URL carries the agent's token")
+        self.assertEqual(subprocess.run(["stat", "-c", "%G", str(w.dropin)], capture_output=True, text=True).stdout.strip(), self.GROUP)
+        unit = "claw-master-agent@%s.service" % self.USER
+        self.assertEqual(self.calls(w, "enable") + self.calls(w, "start"), ["enable " + unit, "start " + unit])
+        self.assertEqual((w.d / "etc/claw-master-agent.env").read_text(),
+                         "CLAW_MASTER_SERVER=192.0.2.10:8443\nCLAW_MASTER_AGENT_LISTEN=127.0.0.1:%d\n" % w.port)
+        self.assertIn("agent env --listen 127.0.0.1:%d --server 192.0.2.10:8443 --dir %s/.config/claude-master" % (w.port, w.home),
+                      (w.d / "cm.log").read_text())
+        self.assertEqual(settings.read_text(), '{"theme": "dark"}', "the person's own settings are never touched")
+        self.assertEqual(list(w.dropin.parent.glob(".*")), [], "no temporary file is left behind")
+
+    def test_a_second_run_changes_nothing_and_restarts_nothing(self):
+        w = self.world()
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        before = w.dropin.stat()
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = w.dropin.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns),
+                         "Claude Code reloads a changed settings file: a run that changes nothing must not touch it")
+        self.assertEqual(self.calls(w, "restart"), [])
+        self.assertEqual(len(self.calls(w, "start")), 1)
+
+    def test_a_different_certificate_restarts_the_agent_and_so_does_a_new_build(self):
+        w = self.world()
+        stamp = (time.time() - 3600, time.time() - 3600)
+        os.utime(w.pem, stamp)
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        # Renewed with an OLDER timestamp than the running agent (staged before it started, swapped in after): content counts.
+        w.pem.write_text("renewed cert")
+        os.utime(w.pem, stamp)
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(len(self.calls(w, "restart")), 1)
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(len(self.calls(w, "restart")), 1, "once restarted, the same certificate restarts nothing")
+        self.assertEqual(self.run_setup(w, "--restart").returncode, 0)
+        self.assertEqual(len(self.calls(w, "restart")), 2)
+
+    def test_a_lowercase_proxy_in_the_persons_settings_is_reported(self):
+        for key in ("https_proxy", "no_proxy", "ALL_PROXY"):
+            w = self.world()
+            settings = w.home / ".claude/settings.json"
+            settings.parent.mkdir()
+            settings.write_text(json.dumps({"env": {key: "http://proxy.example.com:3128"}}))
+            r = self.run_setup(w)
+            self.assertNotEqual(r.returncode, 0, key)
+            self.assertIn("sets %s, which Claude would use instead of the agent" % key, r.stderr)
+            self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w), "the drop-in is still in place")
+            self.assertEqual(json.loads(settings.read_text()), {"env": {key: "http://proxy.example.com:3128"}}, "never edited")
+
+    def test_runs_started_together_take_turns(self):
+        """Provision, the path unit and the timer can start a run at the same moment (enabling the timer starts one)."""
+        w = self.world()
+        procs = [subprocess.Popen(["bash", str(self.SETUP), self.USER], env=w.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True) for _ in range(4)]
+        results = [(p.wait(timeout=60), p.stderr.read()) for p in procs]
+        for p in procs:
+            p.stdout.close(); p.stderr.close()
+        self.assertEqual([rc for rc, _ in results], [0, 0, 0, 0], results)
+        self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w))
+
+    def test_a_certificate_missing_for_a_moment_is_not_unenrollment(self):
+        """A renewal swaps the directory with two renames; a run that lands between them must wait, not tear down."""
+        w = self.world(enrolled=False)
+        threading.Timer(0.6, lambda: w.pem.write_text("cert")).start()
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls(w, "disable"), [])
+        self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w))
+
+    def test_an_account_that_is_not_enrolled_has_no_agent_and_no_drop_in(self):
+        w = self.world()
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        w.pem.unlink()
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(w.dropin.exists())
+        self.assertEqual(self.calls(w, "disable"), ["disable --now claw-master-agent@%s.service" % self.USER])
+
+    def test_an_enrolled_account_with_a_fault_keeps_its_drop_in(self):
+        """Every fault fails and leaves the drop-in in place: Claude then fails instead of using the person's own login."""
+        w = self.world()
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        want = w.dropin.read_text()
+        cm = Path(w.env["CM_AGENT_BIN"])
+        cm.rename(cm.with_name("gone"))
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("is missing", r.stderr)
+        self.assertEqual((w.dropin.read_text(), self.calls(w, "disable")), (want, []))
+        cm.with_name("gone").rename(cm)
+        cm.write_text('#!/bin/bash\necho "HTTPS_PROXY=http://elsewhere:1"\n')
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unexpected claw-master agent env output", r.stderr)
+        self.assertEqual(w.dropin.read_text(), want)
+
+    def test_first_install_faults_fence_direct_routing(self):
+        """A fresh enrolled account must not spend its own login while the client or unit cannot start."""
+        for failure in ("missing_binary", "bad_env", "enable_failure", "start_failure"):
+            with self.subTest(failure=failure):
+                w = self.world(env_output='echo "HTTPS_PROXY=http://elsewhere:1"\n' if failure == "bad_env" else None)
+                if failure == "missing_binary":
+                    Path(w.env["CM_AGENT_BIN"]).unlink()
+                if failure in ("enable_failure", "start_failure"):
+                    ctl = w.d / "bin/systemctl"
+                    ctl.write_text(ctl.read_text().replace('case "$1" in',
+                                   'case "$1" in\n  %s) exit 1 ;;' % failure.removesuffix("_failure")))
+                r = self.run_setup(w)
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(json.loads(w.dropin.read_text()), {"env": {
+                    "HTTPS_PROXY": "http://127.0.0.1:1",
+                    "NODE_EXTRA_CA_CERTS": str(w.home / ".config/claude-master/ca.pem"),
+                    "NO_PROXY": "localhost,127.0.0.1,::1"}})
+                self.assertEqual(w.dropin.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(list(w.dropin.parent.glob(".*")), [], "no temporary file is left behind")
+
+    def test_ready_means_the_units_own_process_listens(self):
+        for why, kw in (("nothing listens", {"listening": False}), ("another process listens", {"owner_is_unit": False})):
+            w = self.world(**kw)
+            r = self.run_setup(w)
+            self.assertNotEqual(r.returncode, 0, why)
+            self.assertIn("is not the listener", r.stderr, why)
+            self.assertEqual(json.loads(w.dropin.read_text()), self.ours(w), why + ": the drop-in still keeps Claude off the person's login")
+
+    def test_an_unready_start_clears_the_loaded_mark_and_retries_with_a_restart(self):
+        w = self.world(listening=False)
+        loaded = Path(w.env["CM_AGENT_LOADED"])
+        loaded.write_text("a previous certificate\n")
+        r = self.run_setup(w)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(loaded.exists(), "an active but unready unit must not keep a loaded-certificate mark")
+        srv = socket.socket()
+        self.addCleanup(srv.close)
+        srv.bind(("127.0.0.1", w.port))
+        srv.listen(16)
+        r = self.run_setup(w)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls(w, "restart")), 1, "the active unready start must be retried")
+        self.assertTrue(loaded.is_file())
+        self.assertEqual(self.run_setup(w).returncode, 0)
+        self.assertEqual(len(self.calls(w, "restart")), 1, "a ready certificate needs no further restart")
+
+    def test_the_units_run_the_agent_and_set_it_up_again(self):
+        agent = (self.UNITS / "claw-master-agent@.service").read_text()
+        for line in ("User=%i", "EnvironmentFile=/etc/nextjs-ct/claw-master-agent.env", "Restart=always",
+                     "ExecStart=/usr/local/bin/claw-master agent --listen ${CLAW_MASTER_AGENT_LISTEN} "
+                     "--server ${CLAW_MASTER_SERVER} --dir /home/%i/.config/claude-master"):
+            self.assertIn(line + "\n", agent)
+        path = (self.UNITS / "claw-master-agent@.path").read_text()
+        self.assertIn("PathChanged=/home/%i/.config/claude-master/client.pem\n", path)
+        self.assertIn("Unit=claw-master-agent-setup@%i.service\n", path)
+        timer = (self.UNITS / "claw-master-agent@.timer").read_text()
+        self.assertIn("OnUnitActiveSec=1h\n", timer)
+        self.assertIn("Unit=claw-master-agent-setup@%i.service\n", timer)
+        oneshot = (self.UNITS / "claw-master-agent-setup@.service").read_text()
+        self.assertIn("ExecStart=/usr/local/bin/claw-master-agent-setup %i\n", oneshot)
+        setup = self.SETUP.read_text()
+        for default in ("ENVFILE=${CM_AGENT_ENVFILE:-/etc/nextjs-ct/claw-master-agent.env}",
+                        "DROPIN=${CM_AGENT_DROPIN:-/etc/claude-code/managed-settings.d/50-claw-master-agent.json}",
+                        "LISTEN=${CM_AGENT_LISTEN:-127.0.0.1:8445}"):
+            self.assertIn(default, setup)
+
+    def test_provision_sets_up_the_agent_for_its_account_and_restarts_it_for_a_new_build(self):
+        prov = (CT / "provision").read_text()
+        self.assertIn('for t in "claw-master-agent@$U.path" "claw-master-agent@$U.timer"; do', prov)
+        self.assertIn('/usr/local/bin/claw-master-agent-setup "$U" ${CM_UPDATED:+--restart} || warn', prov)
+        self.assertLess(prov.index('CM_UPDATED=""'), prov.index("&& CM_UPDATED=1"))
+        self.assertLess(prov.index("&& CM_UPDATED=1"), prov.index('claw-master-agent-setup "$U"'))
+        self.assertLess(prov.index('U=$(cat "$ME/user")'), prov.index('claw-master-agent-setup "$U"'))
 
 
 class AgentUpdateTests(unittest.TestCase):

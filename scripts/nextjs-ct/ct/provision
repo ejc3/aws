@@ -123,11 +123,13 @@ fi
 
 # claw-master client, pinned with the server (claw-master-server.tf), and the claude-master link t-claude runs.
 CM_TAG=$(cfg .claw_master.tag); CM_SHA=$(cfg .claw_master.sha256)
+CM_UPDATED=""
 if [ "$(uname -m)" = aarch64 ] && [ "$(sha256sum /usr/local/bin/claw-master 2>/dev/null | cut -d' ' -f1)" != "$CM_SHA" ]; then
   T=$(mktemp -d)
   if curl -fsSL --retry 3 "https://github.com/ejc3/CLIProxyAPI/releases/download/$CM_TAG/claw-master-linux-arm64" -o "$T/cm" \
      && echo "$CM_SHA  $T/cm" | sha256sum -c --quiet -; then
-    install -m 0755 "$T/cm" /usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master
+    install -m 0755 "$T/cm" /usr/local/bin/claw-master.new && mv -f /usr/local/bin/claw-master.new /usr/local/bin/claw-master \
+      && CM_UPDATED=1
   else
     warn "pinned claw-master did not download or verify"
   fi
@@ -281,6 +283,13 @@ as_user() { sudo -u "$U" -H env HOME="$H" "$@"; }
 as_user bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
   || warn "claude install failed for $U"
 as_user bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+# Every Claude Code here through the pool, the desktop app's SSH sessions too, not only t-claude's (claw-master-agent-setup
+# says why). The path unit and an hourly timer set it up again when the certificate is enrolled or renewed; a new
+# claw-master build restarts it.
+for t in "claw-master-agent@$U.path" "claw-master-agent@$U.timer"; do
+  systemctl enable --now "$t" >/dev/null 2>&1 || warn "$t not enabled"
+done
+/usr/local/bin/claw-master-agent-setup "$U" ${CM_UPDATED:+--restart} || warn "claw-master agent setup failed for $U"
 [ -x "$H/.codex/packages/standalone/current/codex" ] \
   || as_user sh -c "cd $H && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 || warn "codex install failed for $U"
 
