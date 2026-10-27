@@ -113,6 +113,9 @@ locals {
   # one -- so every additional key had to be installed by hand, which meant terraform did not
   # know about it and a rebuild would silently drop it.
   nextjs_user_keys = {
+    colton = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkDiSjc5h8pkS6huofWCwpFwa0kY6UaWUH2JYkT7K6i colton",
+    ]
     skevh = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local",
       # Odo, Steve's Muse agent. Installed by hand on skevh on 2026-09-15 and declared here
