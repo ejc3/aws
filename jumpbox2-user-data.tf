@@ -185,12 +185,14 @@ FLEET_HOST_ROLE=admin
 ${local.codex_remote_control}
 
 # ---------------------------------------------------------------- new repos within seconds
-# A cheap 5-second watch (agent-session-sync.tf): a repository cloned later gets a Claude session and a
-# Codex thread without a person or a reboot. It runs as ubuntu, starts nothing when there is no tmux
-# server, and downloads nothing: the script is this file's own copy.
+# A cheap 5-second watch (agent-session-sync.tf): a repository marked for interactive use gets a Claude
+# session and a Codex thread without a reboot. Both admin jumpboxes require the marker before starting
+# either agent; an allowed repository origin does not approve its startup hooks. It runs as ubuntu,
+# starts nothing when there is no tmux server, and downloads nothing: the script is this file's own copy.
 ${local.codex_seed_thread_install}
+${local.agent_session_sync_prepare_admin}
 ${local.agent_session_sync_install}
-${local.agent_session_sync_enable_ubuntu}
+${local.agent_session_sync_enable_admin}
 
 # ---------------------------------------------------------------- user-level agent instructions
 # A starter ~/.codex/AGENTS.md with ~/.claude/CLAUDE.md linked to it, only when ubuntu has

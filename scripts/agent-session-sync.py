@@ -17,6 +17,8 @@ WHAT COUNTS AS NEW. A repository that appears after the watcher first looked:
     index exists (a clone writes it last), so a half-cloned repo is not launched;
   * allowed: its origin is owned by an allowed owner (the account's own GitHub login, plus
     ~/.config/agent-session-sync/owners and --owner) or is an exact --repo, and it is not claude-code-sync.
+On administration jumpboxes, --require-clone-marker also requires claude-interactive for a main
+checkout before either agent starts. An allowed origin alone does not approve repository startup hooks.
 The FIRST run only records what already exists and launches nothing: the boot launcher decided about
 those. A state file written before every clone counted (no "clones" key) is adopted the same way: the
 first scan with this version records the unmarked checkouts already there without launching them, so the
@@ -160,8 +162,8 @@ def is_allowed(path, owners, repos):
     return owner.lower() in owners or "%s/%s" % (owner, repo) in repos
 
 
-def candidates(roots):
-    """Every checkout directly under the roots, and those of its linked worktrees marked for interactive use."""
+def candidates(roots, require_clone_marker=False):
+    """Main checkouts (marked too on admin boxes) and marked linked worktrees."""
     seen = set()
     for pattern in roots:
         for p in glob.glob(pattern):
@@ -172,7 +174,7 @@ def candidates(roots):
             if not is_main_checkout(real):
                 continue
             git = os.path.join(real, ".git")
-            if real not in seen:
+            if real not in seen and (not require_clone_marker or os.path.exists(os.path.join(git, MARKER))):
                 seen.add(real)
                 yield real
             for admin in sorted(glob.glob(os.path.join(git, "worktrees", "*"))):
@@ -316,7 +318,7 @@ class State:
 def scan_once(cfg, state, launcher, now=None):
     """One pass. Returns the repos a launch was attempted for."""
     now = time.time() if now is None else now
-    found = list(candidates(cfg["roots"]))
+    found = list(candidates(cfg["roots"], cfg.get("require_clone_marker", False)))
     present = set(found)
     attempted = []
 
@@ -576,6 +578,7 @@ def build_config(args):
     state_dir = args.state_dir or os.path.join(home, ".local", "state", "agent-session-sync")
     return {
         "home": home, "roots": roots, "state_dir": state_dir,
+        "require_clone_marker": args.require_clone_marker,
         "owners": allowed_owners(home, args.owner or []), "owners_extra": list(args.owner or []),
         "owners_sig": owners_signature(home), "repos": set(args.repo or []),
         "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
@@ -610,6 +613,8 @@ def main(argv):
     ap.add_argument("--root", action="append", help="glob of checkout directories (default ~/* and ~/src/*)")
     ap.add_argument("--owner", action="append", help="allowed GitHub owner (also: the account's own gh login)")
     ap.add_argument("--repo", action="append", help="one allowed OWNER/REPO, exactly")
+    ap.add_argument("--require-clone-marker", action="store_true",
+                    help="require claude-interactive for main checkouts too (administration jumpboxes)")
     ap.add_argument("--t-claude", default="auto", help="t-claude.zsh to source (default: the system copy, else ~/.config/t-claude.zsh)")
     ap.add_argument("--codex-seed", default="/usr/local/bin/codex-seed-thread")
     ap.add_argument("--active-dirs", default="/usr/local/bin/agent-active-dirs")

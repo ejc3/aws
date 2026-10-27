@@ -5,8 +5,9 @@
 # jumpboxes. Before this, the metal boxes looked once at boot (fcvm-claude-rc), nextjs-dev started only
 # each user's one working folder every 5 minutes (agents-enable), and the jumpboxes looked nowhere, so
 # a repo cloned today waited for a reboot or a person. See scripts/agent-session-sync.py for what
-# counts as new: any checkout under the roots, or a worktree MARKED for interactive use (claude-interactive
-# in its git dir), a finished clone, an allowed owner, and nothing that existed when the watcher first looked. After a reboot
+# counts as new: any checkout on dev boxes, or a checkout MARKED for interactive use on admin jumpboxes;
+# worktrees always require that marker (claude-interactive in the git dir). A finished clone, an allowed
+# owner, and nothing that existed when the watcher first looked. After a reboot
 # it opens the folders scripts/agent-active-dirs.py names (prompted or marked in the last 30 days).
 #
 # ONE script and ONE template unit, installed by the same snippet everywhere, so the boxes cannot
@@ -37,18 +38,46 @@ INSTALL
   # ejc3's own repositories (its gh login is added automatically) and ONE collaboration repository by
   # exact name, never an organisation wildcard (the same gate fcvm-claude-rc uses at boot).
   agent_session_sync_ubuntu_args = "--owner ejc3 --repo dolphin-labs-hq/dolphin-labs"
+  # An allowed origin does not approve its hooks running with jumpbox administrator credentials.
+  agent_session_sync_admin_args = "${local.agent_session_sync_ubuntu_args} --require-clone-marker"
+
+  # Fence an old watcher before installing code whose dev-box default admits unmarked clones. Stopping
+  # this unit leaves interactive agents and tmux alive (KillMode=process). A failed stop must stop setup.
+  agent_session_sync_prepare_admin = <<-PREPARE
+policy=/etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf
+install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d || exit 1
+printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '${local.agent_session_sync_admin_args}' > "$policy.new" || exit 1
+chmod 644 "$policy.new" || exit 1
+if ! cmp -s "$policy.new" "$policy"; then
+  if [ "$(systemctl show agent-session-sync@ubuntu.service -p LoadState --value 2>/dev/null)" != not-found ]; then
+    systemctl stop agent-session-sync@ubuntu.service || { rm -f "$policy.new"; exit 1; }
+  fi
+  mv -f "$policy.new" "$policy" || exit 1
+  systemctl daemon-reload || exit 1
+else
+  rm -f "$policy.new"
+fi
+PREPARE
 
   agent_session_sync_enable_ubuntu = <<-ENABLE
-install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
-cat > /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf <<'POLICY'
+install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d || exit 1
+cat > /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf.new <<'POLICY' || exit 1
 [Service]
 Environment="ASS_ARGS=${local.agent_session_sync_ubuntu_args}"
 POLICY
+chmod 644 /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf.new \
+  && mv -f /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf.new /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf || exit 1
 systemctl daemon-reload
 systemctl enable agent-session-sync@ubuntu.service >/dev/null 2>&1 || true
 # Starting a stopped watcher is safe; a running one is left alone so a re-run never resets it.
 systemctl is-active --quiet agent-session-sync@ubuntu.service || systemctl start agent-session-sync@ubuntu.service || true
 ENABLE
+
+  agent_session_sync_enable_admin = replace(
+    local.agent_session_sync_enable_ubuntu,
+    local.agent_session_sync_ubuntu_args,
+    local.agent_session_sync_admin_args,
+  )
 }
 
 # The jumpboxes ignore user_data changes and run no downloaded script as root, so a running one gets
@@ -64,13 +93,13 @@ resource "terraform_data" "admin_agent_session_sync" {
     active   = filesha256("${path.module}/scripts/agent-active-dirs.py")
     unit     = filesha256("${path.module}/scripts/agent-session-sync@.service")
     helper   = filesha256("${path.module}/scripts/ssm-agent-session-sync.sh")
-    args     = local.agent_session_sync_ubuntu_args
+    args     = local.agent_session_sync_admin_args
   }
 
   provisioner "local-exec" {
     command = "bash ${path.module}/scripts/ssm-agent-session-sync.sh ${each.value} ${var.aws_region}"
     environment = {
-      ASS_ARGS = local.agent_session_sync_ubuntu_args
+      ASS_ARGS = local.agent_session_sync_admin_args
     }
   }
 }
