@@ -43,12 +43,19 @@ echo $unit | base64 -d > "\$t/unit"
 printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '$ASS_ARGS' > "\$t/policy"
 restart=0
 put() { cmp -s "\$1" "\$2" && return 1; install -m "\$3" "\$1" "\$2.new" && mv -f "\$2.new" "\$2"; }
+# An old watcher self-execs with its old arguments when its script changes. Fence it and install the
+# stricter admin policy BEFORE publishing new code; a failed stop aborts without publishing that code.
+install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
+if ! cmp -s "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf; then
+  if [ "\$(systemctl show agent-session-sync@ubuntu.service -p LoadState --value 2>/dev/null)" != not-found ]; then
+    systemctl stop agent-session-sync@ubuntu.service
+  fi
+  put "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf 644
+fi
 put "\$t/script" /usr/local/bin/agent-session-sync 755 || true
 put "\$t/seeder" /usr/local/bin/codex-seed-thread 755 || true      # the watcher seeds Codex threads through it
 put "\$t/active" /usr/local/bin/agent-active-dirs 755 || true      # which folders open after a reboot
 put "\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1
-install -d /etc/systemd/system/agent-session-sync@ubuntu.service.d
-put "\$t/policy" /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf 644 && restart=1
 systemctl daemon-reload
 systemctl enable agent-session-sync@ubuntu.service >/dev/null 2>&1
 if systemctl is-active --quiet agent-session-sync@ubuntu.service; then

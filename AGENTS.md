@@ -1085,12 +1085,18 @@ folder every 5 minutes (`agents-enable`) and the jumpboxes looked nowhere. Measu
 launcher: a live `--remote-control` session existed 0.9 s after a clone finished; worst case is the 5 s
 scan plus about a second.
 
-- **What is new.** A folder marked for interactive use after the watcher first looked: `claude-interactive`
-  in its git directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`). A checkout directly under
-  `~/*` or `~/src/*`, or a linked worktree of one wherever it lives; a subagent worktree under
-  `.claude/worktrees/` never counts. An unmarked clone gets no session (owner, 2026-10-13: sessions for
-  what is used interactively). The checkout must be finished (no `*.lock`, the index exists). The first run
-  only records what exists and launches nothing.
+- **What is new.** A repository that appears after the watcher first looked. On dev boxes, every checkout
+  directly under `~/*` or `~/src/*` counts on its own: a clone or a new repository gets a session (owner, 2026-10-27:
+  "clone is fine, I just don't want one for every internal worktree that agents create"). A linked worktree
+  of one, wherever it lives, counts only when marked for interactive use: `claude-interactive` in its git
+  directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`); a subagent worktree under
+  `.claude/worktrees/` never counts. The checkout must be finished (no `*.lock`, the index exists). The
+  first run only records what exists and launches nothing, and so does the first scan of a state file from
+  before every clone counted (no `clones` key), so the upgrade does not open a session in every old clone.
+- **The admin jumpboxes require explicit approval for new clones.** Both jumpboxes set `--require-clone-marker`
+  through their root-owned `ASS_ARGS` policy, including cold bootstrap. Their main checkouts require the same
+  `claude-interactive` marker as worktrees before either Claude or Codex starts. An allowed origin, including
+  the collaboration repository, does not authorize its startup hooks to run with administrator credentials.
 - **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
   `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
   also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.

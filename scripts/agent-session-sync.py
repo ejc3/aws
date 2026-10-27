@@ -5,19 +5,24 @@ Installed as /usr/local/bin/agent-session-sync and run as a small service (agent
 or agent-session-sync@<user>.service on nextjs-dev) on every box that keeps remote-control sessions.
 It replaces "the boot launcher looked once, at boot" with a cheap watch loop (default every 5 s).
 
-WHAT COUNTS AS NEW. A folder marked for interactive use after the watcher first looked: the file
-`claude-interactive` in its git directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`, which
-agents do when they clone a repository or create a worktree the user wants to prompt). Owner's rule,
-2026-10-13: a session for what is used interactively, not for every clone. Looked for in:
-  * a checkout directly under one of the roots (default ~/* and ~/src/*) whose `.git` is a directory;
-  * a linked worktree of such a checkout, wherever it lives (git records it in .git/worktrees/<name>);
-    a subagent's worktree under .claude/worktrees/ never counts;
+WHAT COUNTS AS NEW. A repository that appears after the watcher first looked:
+  * every checkout directly under one of the roots (default ~/* and ~/src/*) whose `.git` is a
+    directory: a clone or a new repository gets a session on its own (owner, 2026-10-27: "clone is fine,
+    I just don't want one for every internal worktree that agents create");
+  * a linked worktree of such a checkout, wherever it lives (git records it in .git/worktrees/<name>),
+    only when it is marked for interactive use: the file `claude-interactive` in its git directory
+    (`touch "$(git rev-parse --git-dir)/claude-interactive"`), which agents do for a worktree the user
+    wants to prompt; a subagent's worktree under .claude/worktrees/ never counts;
   * finished: HEAD resolves, no *.lock in .git (a clone, fetch or checkout is still running) and the
     index exists (a clone writes it last), so a half-cloned repo is not launched;
   * allowed: its origin is owned by an allowed owner (the account's own GitHub login, plus
     ~/.config/agent-session-sync/owners and --owner) or is an exact --repo, and it is not claude-code-sync.
+On administration jumpboxes, --require-clone-marker also requires claude-interactive for a main
+checkout before either agent starts. An allowed origin alone does not approve repository startup hooks.
 The FIRST run only records what already exists and launches nothing: the boot launcher decided about
-those.
+those. A state file written before every clone counted (no "clones" key) is adopted the same way: the
+first scan with this version records the unmarked checkouts already there without launching them, so the
+upgrade does not open a session in every old clone at once.
 
 AFTER A REBOOT it starts Claude in every folder agent-active-dirs names (a person prompted there, or it was
 marked, in the last 30 days): the same rule the boot launchers use, so a folder nobody prompted stays closed.
@@ -157,8 +162,8 @@ def is_allowed(path, owners, repos):
     return owner.lower() in owners or "%s/%s" % (owner, repo) in repos
 
 
-def candidates(roots):
-    """Folders marked for interactive use: checkouts directly under the roots, and their linked worktrees."""
+def candidates(roots, require_clone_marker=False):
+    """Main checkouts (marked too on admin boxes) and marked linked worktrees."""
     seen = set()
     for pattern in roots:
         for p in glob.glob(pattern):
@@ -169,7 +174,7 @@ def candidates(roots):
             if not is_main_checkout(real):
                 continue
             git = os.path.join(real, ".git")
-            if real not in seen and os.path.exists(os.path.join(git, MARKER)):
+            if real not in seen and (not require_clone_marker or os.path.exists(os.path.join(git, MARKER))):
                 seen.add(real)
                 yield real
             for admin in sorted(glob.glob(os.path.join(git, "worktrees", "*"))):
@@ -279,6 +284,9 @@ class State:
         self.path = path
         self.first_run = not os.path.exists(path)
         self.known = {}
+        # True once the state was written by a version that launches every clone. An older file lacks it:
+        # its first scan here records the unmarked checkouts already present instead of launching them.
+        self.clones = self.first_run
         # After a reboot: the active folders still to launch, and those launched this boot (trust is kept for them).
         self.boot = {"pending": [], "launched": [], "tried": {}}
         self.boot_id = current_boot_id() if boot_id is None else boot_id
@@ -290,6 +298,7 @@ class State:
                 self.known = data.get("known", {})
                 self.boot.update(data.get("boot") or {})
                 saved = data.get("boot_id")
+                self.clones = bool(data.get("clones"))
             except (OSError, ValueError):
                 self.known = {}
         # An older state file has no boot id: not evidence of a reboot.
@@ -299,7 +308,8 @@ class State:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".known.")
         with os.fdopen(fd, "w") as fh:
-            json.dump({"known": self.known, "boot_id": self.boot_id, "boot": self.boot}, fh, indent=1, sort_keys=True)
+            json.dump({"known": self.known, "boot_id": self.boot_id, "boot": self.boot, "clones": self.clones},
+                      fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
 
@@ -308,11 +318,14 @@ class State:
 def scan_once(cfg, state, launcher, now=None):
     """One pass. Returns the repos a launch was attempted for."""
     now = time.time() if now is None else now
-    found = list(candidates(cfg["roots"]))
+    found = list(candidates(cfg["roots"], cfg.get("require_clone_marker", False)))
     present = set(found)
     attempted = []
 
-    # A path that is no longer a marked checkout is forgotten, so deleting and re-cloning is new again.
+    # Recording only, not launching: the first run, or the first scan after upgrading to "every clone counts".
+    adopting = state.first_run or not state.clones
+
+    # A path that is no longer a candidate is forgotten, so deleting and re-cloning is new again.
     for path in [p for p in state.known if p not in present]:
         del state.known[path]
 
@@ -363,12 +376,12 @@ def scan_once(cfg, state, launcher, now=None):
             log("new repository (its owner is allowed now): %s" % path)
         if entry is None:
             ident = repo_identity(path)
-            if not is_allowed(path, owners, repos):
-                state.known[path] = {"ignored": True, "seeded": state.first_run, "id": ident}
-                continue
             if not is_finished(path):
                 continue                      # a clone still running: looked at again next tick
-            if state.first_run:
+            if not is_allowed(path, owners, repos):
+                state.known[path] = {"ignored": True, "seeded": adopting, "id": ident}
+                continue
+            if adopting:
                 state.known[path] = {"claude": True, "codex": True, "seeded": True, "id": ident}
                 continue
             entry = state.known[path] = {"claude": False, "codex": False, "tried": {}, "id": ident}
@@ -394,7 +407,10 @@ def scan_once(cfg, state, launcher, now=None):
                 # a failed attempt waits RETRY_SECONDS, except "no tmux server yet" (cheap to poll)
                 if getattr(launcher, "cheap_retry", {}).get(kind):
                     tried.pop(kind, None)
+    if not state.first_run and not state.clones:
+        log("adopted the checkouts already present; from now on every new clone gets a session")
     state.first_run = False
+    state.clones = True
     keep_trust(cfg["home"], [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")]
                + list(state.boot.get("launched", [])), state)
     state.save()
@@ -562,6 +578,7 @@ def build_config(args):
     state_dir = args.state_dir or os.path.join(home, ".local", "state", "agent-session-sync")
     return {
         "home": home, "roots": roots, "state_dir": state_dir,
+        "require_clone_marker": args.require_clone_marker,
         "owners": allowed_owners(home, args.owner or []), "owners_extra": list(args.owner or []),
         "owners_sig": owners_signature(home), "repos": set(args.repo or []),
         "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
@@ -596,6 +613,8 @@ def main(argv):
     ap.add_argument("--root", action="append", help="glob of checkout directories (default ~/* and ~/src/*)")
     ap.add_argument("--owner", action="append", help="allowed GitHub owner (also: the account's own gh login)")
     ap.add_argument("--repo", action="append", help="one allowed OWNER/REPO, exactly")
+    ap.add_argument("--require-clone-marker", action="store_true",
+                    help="require claude-interactive for main checkouts too (administration jumpboxes)")
     ap.add_argument("--t-claude", default="auto", help="t-claude.zsh to source (default: the system copy, else ~/.config/t-claude.zsh)")
     ap.add_argument("--codex-seed", default="/usr/local/bin/codex-seed-thread")
     ap.add_argument("--active-dirs", default="/usr/local/bin/agent-active-dirs")

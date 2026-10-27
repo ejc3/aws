@@ -2,6 +2,8 @@
 """scripts/agent-session-sync.py: a new repository is noticed fast, and only a real new one.
 Offline: real git repositories in a temp directory and a fake launcher."""
 import importlib.util
+import base64
+import json
 import os
 import shutil
 import subprocess
@@ -123,16 +125,16 @@ class WhatIsNotNewTests(Base):
         found = [os.path.basename(p) for p in ass.candidates(self.cfg["roots"])]
         self.assertIn("main-feature", found)
 
-    def test_an_unmarked_clone_is_not_launched_until_it_is_marked(self):
+    def test_an_unmarked_clone_is_launched(self):
         r = make_repo(self.home, "plain", marked=False)
         self.scan(now=1005)
-        self.assertEqual(self.launcher.calls, [], "only folders marked for interactive use get a session")
-        mark(r)
-        self.scan(now=1010)
-        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))])
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))],
+                         "every clone gets a session; only worktrees need the marker")
 
     def test_a_marked_worktree_elsewhere_is_launched_and_takes_the_main_checkout_s_owner(self):
-        main = make_repo(self.home, "main", marked=False)   # the checkout itself is not for interactive use
+        main = make_repo(self.home, "main", marked=False)
+        self.scan(now=1003)                                 # the clone itself gets its session first
+        self.launcher.calls.clear()
         wt = Path(self.tmp) / "elsewhere" / "feature"
         git(main, "worktree", "add", "-q", str(wt), "-b", "feature")
         mark(wt)
@@ -145,7 +147,9 @@ class WhatIsNotNewTests(Base):
         git(main, "worktree", "add", "-q", str(wt), "-b", "agent-1")
         mark(wt)
         self.scan(now=1005)
-        self.assertEqual(self.launcher.calls, [])
+        self.assertNotIn(str(wt), [p for _, p in self.launcher.calls])
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(main)), ("codex", str(main))],
+                         "only the clone itself gets a session")
 
     def test_nothing_nested_below_a_root_is_scanned(self):
         make_repo(self.home / "projects", "deep")
@@ -160,6 +164,19 @@ class WhatIsNotNewTests(Base):
         (r / ".git" / "index.lock").unlink()
         self.scan(now=1010)
         self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))])
+
+    def test_a_clone_seen_before_its_origin_is_written_is_rechecked_when_finished(self):
+        r = self.home / "cloning"
+        subprocess.run(["git", "init", "-q", str(r)], check=True, env=ENV)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [])
+        git(r, "remote", "add", "origin", "https://github.com/ejc3/example")
+        (r / "f").write_text("x")
+        git(r, "add", "f")
+        git(r, "commit", "-q", "-m", "clone finished")
+        self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(r)), ("codex", str(r))],
+                         "a clone without its origin yet must not be ignored permanently")
 
     def test_a_repo_with_no_commit_or_no_checkout_yet_is_not_launched(self):
         make_repo(self.home, "empty", commit=False)
@@ -178,6 +195,64 @@ class WhatIsNotNewTests(Base):
         make_repo(self.home, ".cache-repo")
         self.scan(now=1005)
         self.assertEqual(self.launcher.calls, [])
+
+
+class UpgradeToEveryCloneTests(Base):
+    """A state file from the version that needed a marker on every clone: upgrading must not open a session in
+    every old clone at once."""
+
+    def old_state(self, known):
+        os.makedirs(self.cfg["state_dir"], exist_ok=True)
+        path = os.path.join(self.cfg["state_dir"], "known.json")
+        with open(path, "w") as fh:
+            json.dump({"known": known, "boot_id": "boot-A", "boot": {}}, fh)
+        return ass.State(path, boot_id="boot-A")
+
+    def test_the_first_scan_after_the_upgrade_adopts_old_unmarked_clones_without_launching(self):
+        old = make_repo(self.home, "old-clone", marked=False)
+        state = self.old_state({})
+        self.assertFalse(state.clones)
+        self.scan(now=1005, state=state)
+        self.assertEqual(self.launcher.calls, [], "existing clones are recorded, not launched")
+        self.assertTrue(state.known[str(old)].get("seeded"))
+        self.assertTrue(ass.State(state.path, boot_id="boot-A").clones, "the adoption is saved")
+
+    def test_a_clone_made_after_the_upgrade_is_launched(self):
+        state = self.old_state({})
+        self.scan(now=1005, state=state)
+        new = make_repo(self.home, "new-clone", marked=False)
+        self.scan(now=1010, state=state)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(new)), ("codex", str(new))])
+
+    def test_a_fresh_state_records_the_new_policy_on_its_first_run(self):
+        self.scan(now=1000)
+        self.assertTrue(ass.State(self.state.path).clones)
+
+
+class AdminClonePolicyTests(Base):
+    def test_an_admin_clone_waits_for_the_marker_before_both_agents_start(self):
+        self.cfg["require_clone_marker"] = True
+        self.scan()
+        repo = make_repo(self.home, "admin-clone", marked=False)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [])
+        mark(repo)
+        self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(repo)), ("codex", str(repo))])
+
+    def test_the_admin_cli_requires_the_marker_for_the_allowed_collaboration_repo(self):
+        launcher = ass.Launcher
+        ass.Launcher = lambda cfg: self.launcher
+        self.addCleanup(setattr, ass, "Launcher", launcher)
+        args = ["--home", str(self.home), "--state-dir", self.cfg["state_dir"], "--owner", "ejc3",
+                "--repo", "dolphin-labs-hq/dolphin-labs", "--require-clone-marker", "--once"]
+        ass.main(args)
+        repo = make_repo(self.home, "collaboration", origin="https://github.com/dolphin-labs-hq/dolphin-labs", marked=False)
+        ass.main(args)
+        self.assertEqual(self.launcher.calls, [], "an allowed origin does not approve startup hooks")
+        mark(repo)
+        ass.main(args)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(repo)), ("codex", str(repo))])
 
 
 class OwnerTests(Base):
@@ -283,14 +358,31 @@ class WiringTests(unittest.TestCase):
         self.assertIn('systemctl enable "agent-session-sync@$u.service"', tf)
         self.assertIn('local.nextjs_codex_seed_users', tf[tf.index('agent-session-sync@$u.service') - 400:tf.index('agent-session-sync@$u.service')])
         self.assertIn("agent_session_sync_enable_ubuntu", self.read("claude-remote-control.tf"))
-        self.assertIn("agent_session_sync_enable_ubuntu", self.read("jumpbox2-user-data.tf"))
+        self.assertIn("agent_session_sync_enable_admin", self.read("jumpbox2-user-data.tf"))
 
     def test_a_running_jumpbox_converges_through_a_reviewed_step(self):
         tf = self.read("agent-session-sync.tf")
         block = tf[tf.index('resource "terraform_data" "admin_agent_session_sync"'):]
         for trigger in ("local.admin_tmux_boxes", "agent-session-sync.py", "agent-session-sync@.service",
-                        "ssm-agent-session-sync.sh", "local.agent_session_sync_ubuntu_args"):
+                        "ssm-agent-session-sync.sh", "local.agent_session_sync_admin_args"):
             self.assertIn(trigger, block)
+
+    def test_both_admin_entry_paths_require_clone_markers_and_dev_boxes_keep_the_default(self):
+        tf = self.read("agent-session-sync.tf")
+        self.assertIn('agent_session_sync_admin_args = "${local.agent_session_sync_ubuntu_args} --require-clone-marker"', tf)
+        admin = tf.split('resource "terraform_data" "admin_agent_session_sync"', 1)[1]
+        self.assertIn("for_each = local.admin_tmux_boxes", admin)
+        self.assertEqual(admin.count("local.agent_session_sync_admin_args"), 2, "trigger and SSM environment")
+        self.assertNotIn("local.agent_session_sync_ubuntu_args", admin)
+        enable = tf.split("agent_session_sync_enable_admin = replace(", 1)[1].split("\n  )", 1)[0]
+        for value in ("local.agent_session_sync_enable_ubuntu", "local.agent_session_sync_ubuntu_args", "local.agent_session_sync_admin_args"):
+            self.assertIn(value, enable)
+        boot = self.read("jumpbox2-user-data.tf")
+        self.assertEqual(boot.count("content      = local.jumpbox_2_user_data"), 2, "both admin S3 boot objects")
+        self.assertIn("${local.agent_session_sync_enable_admin}", boot)
+        self.assertNotIn("${local.agent_session_sync_enable_ubuntu}", boot)
+        self.assertLess(boot.index("${local.agent_session_sync_prepare_admin}"), boot.index("${local.agent_session_sync_install}"))
+        self.assertNotIn("agent_session_sync_enable_admin", self.read("claude-remote-control.tf"))
 
     def test_the_unit_never_takes_a_session_with_it(self):
         unit = self.read("scripts/agent-session-sync@.service")
@@ -333,6 +425,8 @@ class RebootTests(Base):
 
     def test_after_a_reboot_claude_starts_in_the_active_folders_only_and_codex_is_left_alone(self):
         idle = make_repo(self.home, "idle", marked=False)
+        self.scan(now=1010, state=self.state)          # a clone from before the reboot that nobody prompted
+        self.launcher.calls.clear()
         self.active = [str(self.fresh)]               # agent-active-dirs: prompted or marked in 30 days
         state = self.state_for("boot-B")
         self.assertTrue(state.rebooted)
@@ -525,7 +619,9 @@ class UpdateWiringTests(unittest.TestCase):
     def test_a_running_watcher_is_restarted_only_when_its_unit_or_policy_changed(self):
         sh = self.read("scripts/ssm-agent-session-sync.sh")
         self.assertIn('put "\\$t/unit" /etc/systemd/system/agent-session-sync@.service 644 && restart=1', sh)
-        self.assertIn('policy.conf 644 && restart=1', sh)
+        self.assertIn('systemctl stop agent-session-sync@ubuntu.service', sh)
+        self.assertLess(sh.index('systemctl stop agent-session-sync@ubuntu.service'),
+                        sh.index('put "\\$t/script" /usr/local/bin/agent-session-sync 755'))
         self.assertNotRegex(sh, r'script"? /usr/local/bin/agent-session-sync 755 && restart=1')
         self.assertIn('[ "\\$restart" = 1 ] && systemctl restart agent-session-sync@ubuntu.service', sh)
 
@@ -555,6 +651,108 @@ class UpdateWiringTests(unittest.TestCase):
         self.assertIn('/home/$u/.claude/.credentials.json', guard)
         self.assertIn('/home/$u/.codex/auth.json', guard)
         self.assertIn("||", guard, "either login is enough")
+
+
+class AdminInstallOrderingTests(unittest.TestCase):
+    """Both admin paths fence the old watcher before publishing the new dev-default script."""
+
+    def run_install(self, kind, stop_ok=True, unchanged=False, policy_write_ok=True, enable_write_ok=True):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        bin_, programs, units = d / "bin", d / "programs", d / "units"
+        for p in (bin_, programs, units):
+            p.mkdir()
+        policy = units / "agent-session-sync@ubuntu.service.d" / "policy.conf"
+        policy.parent.mkdir()
+        args = "--owner ejc3 --repo dolphin-labs-hq/dolphin-labs --require-clone-marker"
+        old_args = args if unchanged else "--owner ejc3 --repo dolphin-labs-hq/dolphin-labs"
+        policy.write_text('[Service]\nEnvironment="ASS_ARGS=%s"\n' % old_args)
+        (programs / "agent-session-sync").write_text("old script\n")
+        (units / "agent-session-sync@.service").write_text("unit\n")
+        active, log = d / "active", d / "log"
+        active.touch()
+
+        def fake(name, body):
+            p = bin_ / name
+            p.write_text("#!/bin/bash\n" + body)
+            p.chmod(0o755)
+
+        fake("systemctl", f'''case "$1" in
+show) echo loaded ;;
+stop) echo stop >> {log}; {'rm -f ' + str(active) if stop_ok else 'exit 1'} ;;
+start|restart) echo "$1" >> {log}; touch {active} ;;
+is-active) test -e {active} ;;
+*) exit 0 ;;
+esac
+''')
+        fake("mv", 'echo "publish ${@: -1}" >> "$ORDER_LOG"\nexec /usr/bin/mv "$@"\n')
+        fake("sleep", "exit 0\n")
+        fake("journalctl", "exit 0\n")
+        if not enable_write_ok:
+            fake("cat", "printf '[Service]\\n'; exit 1\n")
+        tf = (ROOT / "agent-session-sync.tf").read_text()
+        if kind == "ssm":
+            sh = (ROOT / "scripts/ssm-agent-session-sync.sh").read_text()
+            body = sh.split("read -r -d '' remote <<REMOTE || true\n", 1)[1].split("\nREMOTE\n", 1)[0].replace("\\$", "$")
+            for key, data in (("script", b"new script\n"), ("seeder", b"seeder\n"), ("active", b"active\n"), ("unit", b"unit\n")):
+                body = body.replace("$" + key, base64.b64encode(data).decode())
+            body = body.replace("$ASS_ARGS", args)
+        else:
+            prepare = tf.split("agent_session_sync_prepare_admin = <<-PREPARE\n", 1)[1].split("\nPREPARE\n", 1)[0]
+            enable = tf.split("agent_session_sync_enable_ubuntu = <<-ENABLE\n", 1)[1].split("\nENABLE\n", 1)[0]
+            body = prepare.replace("${local.agent_session_sync_admin_args}", args)
+            body += '\nprintf "new script\\n" > /usr/local/bin/agent-session-sync\necho "publish /usr/local/bin/agent-session-sync" >> "$ORDER_LOG"\n'
+            body += enable.replace("${local.agent_session_sync_ubuntu_args}", args)
+        body = body.replace("/usr/local/bin", str(programs)).replace("/etc/systemd/system", str(units))
+        if not policy_write_ok:
+            body = "printf() { builtin printf '[Service]\\n'; return 1; }\n" + body
+        self.assertNotIn("/usr/local/bin", body)
+        self.assertNotIn("/etc/systemd/system", body)
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, timeout=10,
+                                env={"PATH": str(bin_) + ":/usr/bin:/bin", "ORDER_LOG": str(log)})
+        operations = log.read_text().splitlines() if log.exists() else []
+        return result, operations, programs, policy
+
+    def test_admin_paths_stop_then_publish_policy_and_script_then_start(self):
+        for kind in ("ssm", "bootstrap"):
+            with self.subTest(kind=kind):
+                result, operations, programs, policy = self.run_install(kind)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertLess(operations.index("stop"), operations.index("publish " + str(policy)))
+                self.assertLess(operations.index("publish " + str(policy)), operations.index("publish " + str(programs / "agent-session-sync")))
+                self.assertLess(operations.index("publish " + str(programs / "agent-session-sync")), operations.index("start"))
+
+    def test_a_failed_stop_aborts_both_admin_paths_before_publication(self):
+        for kind in ("ssm", "bootstrap"):
+            with self.subTest(kind=kind):
+                result, operations, programs, policy = self.run_install(kind, stop_ok=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(operations, ["stop"])
+                self.assertEqual((programs / "agent-session-sync").read_text(), "old script\n")
+                self.assertNotIn("--require-clone-marker", policy.read_text())
+
+    def test_an_unchanged_admin_policy_does_not_restart_the_watcher(self):
+        for kind in ("ssm", "bootstrap"):
+            with self.subTest(kind=kind):
+                result, operations, _, _ = self.run_install(kind, unchanged=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(set(operations) & {"stop", "start", "restart"})
+
+    def test_a_partial_policy_write_aborts_before_policy_or_script_publication(self):
+        for kind in ("ssm", "bootstrap"):
+            with self.subTest(kind=kind):
+                result, operations, programs, policy = self.run_install(kind, policy_write_ok=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(operations, [])
+                self.assertEqual((programs / "agent-session-sync").read_text(), "old script\n")
+                self.assertNotIn("--require-clone-marker", policy.read_text())
+
+    def test_a_failed_bootstrap_enable_write_keeps_the_strict_policy_and_watcher_stopped(self):
+        result, operations, _, policy = self.run_install("bootstrap", enable_write_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("start", operations)
+        self.assertNotIn("restart", operations)
+        self.assertIn("--require-clone-marker", policy.read_text())
 
 
 class CodexSeedTests(Base):
