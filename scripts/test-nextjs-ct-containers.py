@@ -848,7 +848,7 @@ class AgentUpdateTests(unittest.TestCase):
   update) echo "update DISABLE_AUTOUPDATER=${{DISABLE_AUTOUPDATER:-unset}}" >> {d}/log; {'echo 2.1.311 > ' + str(d) + '/version' if update_ok else 'exit 1'} ;;
 esac
 """)
-        env = {"PATH": "%s:/usr/bin:/bin" % bin_, "HOME": str(home), "AGENT_UPDATE_USERS": str(d / "users"), "AGENT_UPDATE_HOMES": str(d / "homes"),
+        env = {"PATH": "%s:/usr/bin:/bin" % bin_, "HOME": str(home), "AGENT_UPDATE_USERS": str(d / "users"), "AGENT_UPDATE_HOMES": str(d / "homes"), "AGENT_UPDATE_REFRESH": str(fake(bin_, "kid-agents-refresh", 'echo "refresh $1" >> %s/log\n' % d)),
                "DISABLE_AUTOUPDATER": "1"}
         r = subprocess.run(["bash", str(CT / "agent-update")], env=env, capture_output=True, text=True, timeout=60)
         log = (d / "log").read_text() if (d / "log").exists() else ""
@@ -858,7 +858,7 @@ esac
         r, user, log = self.run_update()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("claude[%s]: 2.1.294 (Claude Code) -> 2.1.311 (Claude Code)" % user, r.stdout)
-        self.assertEqual(log, "update DISABLE_AUTOUPDATER=unset\n", "the update must not inherit a disabled updater")
+        self.assertEqual(log, "update DISABLE_AUTOUPDATER=unset\nrefresh %s\n" % user, "the update must not inherit a disabled updater")
 
     def test_a_failed_update_is_reported(self):
         r, user, _ = self.run_update(update_ok=False)

@@ -11,6 +11,7 @@ echo "=== agent-update $(date -u '+%F %T UTC') ==="
 # each (t-claude, the restarts below) runs the new one.
 USERS_FILE=${AGENT_UPDATE_USERS:-/etc/nextjs-ct/user}
 HOME_ROOT=${AGENT_UPDATE_HOMES:-/home}
+REFRESH=${AGENT_UPDATE_REFRESH:-/usr/local/bin/kid-agents-refresh}
 for u in $(cat "$USERS_FILE"); do
   id -u "$u" >/dev/null 2>&1 || continue
   # shellcheck disable=SC2016 # $HOME is the account's, expanded by its own shell
@@ -41,7 +42,7 @@ for u in $(cat "$USERS_FILE"); do
     echo "codex[$u]: ${B:-none} -> $(sudo -u "$u" -H $HOME_ROOT/$u/.local/bin/codex --version 2>/dev/null | head -1)"
   fi
   # Refresh the project list too, so a repo added during the day shows up.
-  /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
+  "$REFRESH" "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
 done
 
 # A restart kills everything in the unit's cgroup (KillMode=control-group): the agent, its
