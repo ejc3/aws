@@ -31,20 +31,21 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # ce08eee9 with main's recipe (fleet/ami), revised from the 2e2181cf image: the renderer draws at the tallest asked height
-  # whose frame fits a slot, so an opened tile no longer holds the wall to its rate (ejc3/fcvm#1380); the SPS carries a VUI
-  # bitstream_restriction (ejc3/fcvm#1361); the root volume files a slot launch reads are prefetched at boot and the
-  # agent's pre-start snapshot is baked (ejc3/fcvm#1370).
-  default = { "us-east-1" = { x86_64 = "ami-022d4bacbe2aeec39" } }
+  # 728be8c3 with main's recipe (fleet/ami), revised from the e15f9e7e image: fluffier clouds and the scene's weather keys
+  # (ejc3/fcvm#1383); the renderer draws at the tallest asked height whose frame fits a slot (ejc3/fcvm#1380); the SPS
+  # carries a VUI bitstream_restriction (ejc3/fcvm#1361); a restored guest re-reads the host clock before stepping
+  # (ejc3/fcvm#1382); the root volume files a slot launch reads are prefetched at boot and the agent's pre-start snapshot
+  # is baked (ejc3/fcvm#1370).
+  default = { "us-east-1" = { x86_64 = "ami-07ea807a8a9b4c3fa" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main ce08eee9 (revised from the
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 728be8c3 (revised from the
   # 2e2181cf image with main's tile units).
-  default = { "us-east-1" = { x86_64 = "ami-0254d5034aa6efece" } }
+  default = { "us-east-1" = { x86_64 = "ami-098e582592b24a025" } }
 }
 
 locals {
