@@ -129,6 +129,23 @@ async function main() {
     assert.deepEqual(html.body, fixtureHtml); assert.deepEqual(js.body, fixtureApp); step('originalHTMLandJSbytes remain unchanged');
     await page.evaluate(async () => { const r = await navigator.serviceWorker.getRegistration(); await r.update(); }); await page.waitForTimeout(300);
     assert.equal(await other.locator('#draft').inputValue(), 'unsaved synthetic draft'); assert.equal(await other.evaluate(() => window.syntheticNoReload), 91473); step('workerupdate does not reload otherunsavedtab');
+    assert.ok(await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.active?.state === 'activated'));
+    // Force-refresh can bypass control for this document while its registration is already active.
+    await page.addInitScript(() => {
+      if (location.pathname === '/auth/access-refresh' && location.search === '?synthetic-uncontrolled') {
+        Object.defineProperty(navigator.serviceWorker, 'controller', { configurable: true, get: () => null });
+        sessionStorage.setItem('syntheticUncontrolledRecovery', String(navigator.serviceWorker.controller === null));
+      }
+    });
+    await page.goto(origin + '/auth/access-refresh?synthetic-uncontrolled', { waitUntil: 'domcontentloaded' });
+    const resumedUncontrolled = await Promise.race([
+      page.waitForURL(origin + '/', { timeout: 8000 }).then(() => true),
+      page.locator('#retry:not([hidden])').waitFor({ state: 'visible', timeout: 8000 }).then(() => false),
+    ]);
+    assert.ok(resumedUncontrolled, 'an uncontrolled recovery document must resume through its already active worker');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('syntheticUncontrolledRecovery')), 'true');
+    assert.ok(await page.evaluate(() => !!navigator.serviceWorker.controller));
+    step('uncontrolled recovery resumes through active worker and root is controlled');
     const echo = await page.evaluate(async () => { const r = await fetch(new Request(location.origin + '/api/echo', { method: 'POST', headers: { 'content-type': 'text/plain', 'x-preserve': 'yes' }, body: 'synthetic-body' })); return r.json(); });
     assert.deepEqual(echo, { method: 'POST', body: 'synthetic-body', preserve: 'yes', xhr: 'XMLHttpRequest' });
     const aborted = await page.evaluate(async () => { const c = new AbortController(); c.abort(); try { await fetch('/api/info', { signal: c.signal }); return false; } catch (e) { return e.name === 'AbortError'; } }); assert.ok(aborted); step('Requestbodyheadersandabort preserved');

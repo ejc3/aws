@@ -37,7 +37,7 @@
       await navigator.serviceWorker.ready;
       while (!registration.active || registration.active.state !== 'activated' ||
              registration.installing || registration.waiting ||
-             navigator.serviceWorker.controller !== registration.active) {
+             (navigator.serviceWorker.controller && navigator.serviceWorker.controller !== registration.active)) {
         if (Date.now() >= deadline) throw new Error('service worker not ready');
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
