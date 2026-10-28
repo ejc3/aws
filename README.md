@@ -494,8 +494,16 @@ if desired. Only the owner is admitted; the tunnel also validates the Access tok
 model configuration and sessions; the inference key is read from `abliteration/api-key` into the process environment
 at startup. `opencode-web-proxy@` supplies the private upstream credential after Cloudflare login, so it never reaches
 the browser; the native server stays on loopback. The tunnel routes to the container only; there is no public web port
-or OpenTunnel endpoint. Restart
+or OpenTunnel endpoint. The browser worker checks navigation against Access and opens sign-in automatically when an
+API request confirms an expired login, then returns to OpenCode. It does not serve a cached offline app shell. The
+reconnection page shows a retry action if the server remains unavailable rather than looping through sign-in. Restart
 `opencode-web@<account>.service` inside that container after rotating the inference key.
+
+An already cached copy from before this fix needs one visit to
+[OpenCode's sign-in entry](https://opencode.cc-games.dev/auth/access-refresh) to receive the new browser worker after
+login. Later visits and expired API connections use the automatic flow. Browser regression coverage is in
+`scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
+with `scripts/test-opencode-setup.py` in CI.
 
 ### From the MacBook to the Next.js server
 

@@ -9,7 +9,22 @@ import base64
 import ipaddress
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+
+def prepare_assets(runtime):
+    """Only public code is served here; upstream credentials remain in nginx.conf."""
+    source = Path(__file__).resolve().parent
+    for name in ("service-worker.js", "access-refresh.html"):
+        target = Path(runtime) / name
+        content = (source / ("opencode-web-" + name)).read_bytes()
+        if not target.exists() or target.read_bytes() != content:
+            temporary = target.with_suffix(target.suffix + ".new")
+            temporary.write_bytes(content)
+            temporary.chmod(0o600)
+            temporary.replace(target)
 
 
 def configuration(spec, password, gateway, runtime):
@@ -39,6 +54,26 @@ http {{
         if ($host != "{hostname}") {{ return 421; }}
         if ($origin_allowed = 0) {{ return 403; }}
         client_max_body_size 32m;
+        location = /sw.js {{
+            alias {runtime}/service-worker.js;
+            default_type application/javascript;
+            etag off;
+            if_modified_since off;
+            add_header Cache-Control "no-store" always;
+            add_header Service-Worker-Allowed "/" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            limit_except GET {{ deny all; }}
+        }}
+        location = /auth/access-refresh {{
+            alias {runtime}/access-refresh.html;
+            default_type text/html;
+            etag off;
+            if_modified_since off;
+            add_header Cache-Control "no-store" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "no-referrer" always;
+            limit_except GET {{ deny all; }}
+        }}
         location / {{
             proxy_pass http://127.0.0.1:{upstream};
             proxy_http_version 1.1;
@@ -57,6 +92,8 @@ http {{
 
 
 def main():
+    if sys.argv[1:] not in ([], ["--reload"]):
+        raise SystemExit("usage: opencode-web-proxy [--reload]")
     os.umask(0o077)
     spec = json.loads(Path("/opt/nextjs-ct/config.json").read_text())["opencode_web"]
     password = json.loads((Path.home() / ".config/opencode/service.json").read_text())["password"]
@@ -67,7 +104,24 @@ def main():
     gateway = f"10.88.{uid - 1000}.1"
     runtime = Path(os.environ["RUNTIME_DIRECTORY"])
     path = runtime / "nginx.conf"
-    path.write_text(configuration(spec, password, gateway, runtime))
+    content = configuration(spec, password, gateway, runtime)
+    prepare_assets(runtime)
+    if sys.argv[1:] == ["--reload"]:
+        # Reconfigure only this proxy, gracefully preserving active event streams.
+        if path.exists() and path.read_text() == content:
+            return
+        candidate = runtime / "nginx.conf.new"
+        candidate.write_text(content)
+        candidate.chmod(0o600)
+        check = subprocess.run(["/usr/sbin/nginx", "-p", str(runtime) + "/", "-c", str(candidate), "-t"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if check.returncode:
+            candidate.unlink()
+            raise SystemExit("OpenCode proxy configuration rejected; keeping the running configuration")
+        candidate.replace(path)
+        subprocess.run(["/usr/sbin/nginx", "-p", str(runtime) + "/", "-c", str(path), "-s", "reload"], check=True)
+        return
+    path.write_text(content)
     path.chmod(0o600)
     os.execv("/usr/sbin/nginx", ["nginx", "-p", str(runtime) + "/", "-c", str(path), "-g", "daemon off;"])
 

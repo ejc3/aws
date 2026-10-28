@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconnect to OpenCode</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 15vh auto; padding: 24px; max-width: 30rem; }
+  button { font: inherit; padding: 10px 18px; cursor: pointer; }
+</style>
+<main>
+  <h1>Reconnect to OpenCode</h1>
+  <p id="status" role="status">Checking your sign-in…</p>
+  <button id="retry" hidden>Try again</button>
+</main>
+<script>
+(async () => {
+  const status = document.getElementById('status');
+  const retry = document.getElementById('retry');
+  retry.addEventListener('click', () => location.reload());
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('/api/info', {
+      credentials: 'same-origin', redirect: 'manual', cache: 'no-store',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' }, signal: controller.signal,
+    });
+    if (response.status !== 200) throw new Error('not signed in');
+    const info = await response.json();
+    if (!info || typeof info.version !== 'string' || !info.version) throw new Error('not OpenCode');
+    clearTimeout(timeout);
+    status.textContent = 'Reconnecting…';
+    if (!('serviceWorker' in navigator)) throw new Error('service worker unavailable');
+    const deadline = Date.now() + 5000;
+    const update = (async () => {
+      const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' });
+      await registration.update();
+      await navigator.serviceWorker.ready;
+      while (!registration.active || registration.active.state !== 'activated' ||
+             registration.installing || registration.waiting ||
+             navigator.serviceWorker.controller !== registration.active) {
+        if (Date.now() >= deadline) throw new Error('service worker not ready');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    })();
+    let updateTimeout;
+    try {
+      await Promise.race([update, new Promise((_, reject) => {
+        updateTimeout = setTimeout(() => reject(new Error('update timed out')), 5000);
+      })]);
+    } finally {
+      clearTimeout(updateTimeout);
+    }
+    location.replace('/');
+  } catch (_) {
+    status.textContent = 'OpenCode could not reconnect. Check your connection, then try again.';
+    retry.hidden = false;
+  } finally {
+    clearTimeout(timeout);
+  }
+})();
+</script>
+</html>
