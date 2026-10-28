@@ -97,9 +97,22 @@ class AccessTests(unittest.TestCase):
 class PemsTests(unittest.TestCase):
     def test_the_metal_boxes_read_and_put_it_through_one_managed_policy(self):
         doc = block("aws_iam_policy_document", "dolphin_maps_pems_dev")
-        self.assertEqual(re.findall(r"resources = \[([^\]]+)\]", doc), ["aws_secretsmanager_secret.dolphin_maps_pems.arn"] * 2)
-        self.assertEqual(sorted(re.findall(r'"(secretsmanager:\w+)"', doc)),
-                         ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"])
+        expected = {
+            "ReadThePemsLogin": ({"secretsmanager:GetSecretValue"}, "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
+            "PutThePemsLogin": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
+                                "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
+            "PutTheMusicKitKey": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
+                                 "aws_secretsmanager_secret.dolphin_maps_musickit.arn"),
+        }
+        actual = {}
+        for statement in re.findall(r"  statement \{(.*?)\n  \}", doc, re.S):
+            sid = re.search(r'sid\s+= "([^"]+)"', statement).group(1)
+            self.assertNotIn(sid, actual)
+            actions = re.search(r"actions\s+= \[([^\]]+)\]", statement).group(1)
+            resource = re.search(r"resources\s+= \[([^\]]+)\]", statement).group(1)
+            actual[sid] = (set(re.findall(r'"([^"]+)"', actions)), resource)
+        # Sharing the policy must not turn the MusicKit write grant into a read grant, or broaden either resource.
+        self.assertEqual(actual, expected)
         attach = block("aws_iam_role_policy_attachment", "dolphin_maps_pems_dev")
         self.assertIn("role       = aws_iam_role.dev_server.name", attach)
         # dev-server-role's inline policies are at IAM's size limit: nothing here may add one for this secret.
