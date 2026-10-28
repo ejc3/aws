@@ -118,6 +118,9 @@ class OpencodeProxyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.proxy.configuration(self.spec, "", "10.88.3.1", Path("/run/private"))
 
+    def test_expired_access_session_worker(self):
+        subprocess.run(["node", str(ROOT / "scripts/test-opencode-access-worker.cjs")], check=True)
+
 
 class OpencodeFunctionTests(unittest.TestCase):
     def run_function(self, env_extra, config="[default]\nregion = us-west-1\n", aws=None, full=False):

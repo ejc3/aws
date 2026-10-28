@@ -21,4 +21,8 @@ if [ "$(as_user "$BIN" service get port)" != "$PORT" ]; then
   as_user "$BIN" service set port "$PORT"
 fi
 systemctl daemon-reload
+PROXY_ACTIVE=""
+systemctl is-active --quiet "opencode-web-proxy@$U.service" && PROXY_ACTIVE=1
 systemctl enable --now "opencode-web@$U.service" "opencode-web-proxy@$U.service"
+# A new proxy already reads the new files; only an existing process needs a graceful reload.
+[ -z "$PROXY_ACTIVE" ] || systemctl reload "opencode-web-proxy@$U.service"

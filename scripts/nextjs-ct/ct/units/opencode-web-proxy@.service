@@ -13,6 +13,7 @@ RuntimeDirectory=opencode-web-proxy-%i
 RuntimeDirectoryMode=0700
 UMask=0077
 ExecStart=/usr/local/bin/opencode-web-proxy
+ExecReload=/usr/local/bin/opencode-web-proxy --reload
 Restart=on-failure
 RestartSec=5
 
