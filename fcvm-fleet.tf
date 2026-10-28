@@ -45,9 +45,10 @@ variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 728be8c3 (revised from the
-  # 2e2181cf image with main's tile units).
-  default = { "us-east-1" = { x86_64 = "ami-098e582592b24a025" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 728be8c3. Recipe from main
+  # 71bb448e (revised from the 728be8c3 image): a boot prefetch of the root volume pieces a first boot reads (2,891 pieces,
+  # 422 MiB, the NVIDIA modules first), and the renderer waits for /dev/nvidia-uvm-tools (ejc3/fcvm#1407).
+  default = { "us-east-1" = { x86_64 = "ami-0315bf37f11b3f577" } }
 }
 
 locals {
