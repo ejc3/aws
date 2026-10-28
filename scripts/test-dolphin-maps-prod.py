@@ -143,6 +143,13 @@ elif "workers-prod/" in a:
     if p is None or os.environ.get("AWS_ACCESS_KEY_ID") != "ASIAFAKEDOLPHIN":
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
+elif "dolphin-maps/musickit" in a:
+    p = os.environ.get("FAKE_MUSICKIT")
+    if p is None:
+        sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
+    if p == "DENIED":
+        sys.stderr.write("An error occurred (AccessDeniedException)\n"); sys.exit(254)
+    print(p)
 elif "cloudflare-workers-deploy-token" in a:
     print("cfat_fake-deploy-token-value-for-the-test-0000000000")
 else:
@@ -271,6 +278,40 @@ class LoaderTests(unittest.TestCase):
         self.assertIn("MANAGED_CONTAINER=1", case)
         self.assertNotIn("MODERATION_", " ".join(names))  # Terraform's names are never also out of band
 
+
+    MUSICKIT = {"MUSICKIT_KEY_ID": "ABCDE12345", "MUSICKIT_TEAM_ID": "TEAM123456",
+                "MUSICKIT_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\nfake-musickit-key-material-0123\n-----END PRIVATE KEY-----\n"}
+
+    def test_the_musickit_key_is_read_in_this_account_and_merged(self):
+        r, out = self.run_loader(self.VALUES, FAKE_MUSICKIT=json.dumps(self.MUSICKIT))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.VALUES, **self.MANAGED, **self.MUSICKIT})
+        reads = [l for l in self.aws_log.read_text().splitlines() if "dolphin-maps/musickit" in l]
+        self.assertEqual(len(reads), 1, reads)
+        self.assertIn("KEY=- PROFILE=example-profile", reads[0])  # the caller's own credentials, not the Dolphin session
+        self.assertIn("MUSICKIT_PRIVATE_KEY", out)
+        self.assertNotIn("fake-musickit-key-material-0123", out)
+        self.assertNotIn("fake-musickit-key-material-0123", self.log.read_text())
+
+    def test_no_musickit_value_yet_loads_without_it(self):
+        r, out = self.run_loader(self.VALUES)
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("dolphin-maps/musickit has no value yet", out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.VALUES, **self.MANAGED})
+
+    def test_a_denied_or_malformed_musickit_container_refuses_the_load(self):
+        bad = ("DENIED", json.dumps({**self.MUSICKIT, "EXTRA": "x-0123456789"}),
+               json.dumps({k: v for k, v in self.MUSICKIT.items() if k != "MUSICKIT_TEAM_ID"}),
+               json.dumps({**self.MUSICKIT, "MUSICKIT_PRIVATE_KEY": "not a key"}),
+               json.dumps({**self.MUSICKIT, "MUSICKIT_KEY_ID": "short"}), "not json")
+        for value in bad:
+            with self.subTest(value=value[:20]):
+                r, out = self.run_loader(self.VALUES, FAKE_MUSICKIT=value)
+                self.assertNotEqual(r.returncode, 0, out)
+                self.assertFalse(self.log.exists(), "wrangler must not run")
+        r, out = self.run_loader({**self.VALUES}, managed={**self.MANAGED, "MUSICKIT_KEY_ID": "ABCDE12345"}, FAKE_MUSICKIT=json.dumps(self.MUSICKIT))
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("in both containers", out)
 
 class DocsTests(unittest.TestCase):
     def test_agents_md_names_the_host_and_worker(self):

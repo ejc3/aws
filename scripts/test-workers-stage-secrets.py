@@ -67,6 +67,13 @@ elif "workers-stage/" in a:
     if p is None:
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
+elif "dolphin-maps/musickit" in a:
+    p = os.environ.get("FAKE_MUSICKIT")
+    if p is None:
+        sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
+    if p == "DENIED":
+        sys.stderr.write("An error occurred (AccessDeniedException)\n"); sys.exit(254)
+    print(p)
 elif "cloudflare-workers-deploy-token" in a:
     print("cfat_fake-deploy-token-value-for-the-test-0000000000")
 else:
@@ -250,6 +257,37 @@ class LoaderTests(unittest.TestCase):
             self.assertNotIn(secret, out)
             self.assertNotIn(secret, self.log.read_text())
 
+
+    MUSICKIT = {"MUSICKIT_KEY_ID": "ABCDE12345", "MUSICKIT_TEAM_ID": "TEAM123456",
+                "MUSICKIT_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\nfake-musickit-key-material-0123\n-----END PRIVATE KEY-----\n"}
+
+    def test_dolphin_maps_gets_the_musickit_key_from_this_account_and_no_other_site_reads_it(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), FAKE_MUSICKIT=json.dumps(self.MUSICKIT))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **self.MANAGED, **self.MUSICKIT})
+        read = [c for c in self.aws_calls() if "dolphin-maps/musickit" in c]
+        self.assertEqual(len(read), 1, read)
+        self.assertIn("KEY=- PROFILE=example-profile", read[0])
+        self.assertNotIn("fake-musickit-key-material-0123", out)
+        for site in ("dolphin-labs", "imagine"):
+            self.aws_log.unlink(missing_ok=True)
+            r, out = self.run_loader(site, stage_json=json.dumps(payload), FAKE_MUSICKIT=json.dumps(self.MUSICKIT))
+            self.assertEqual(r.returncode, 0, out)
+            self.assertFalse([c for c in self.aws_calls() if "musickit" in c], site)
+            self.assertNotIn("MUSICKIT", self.stdin.read_text())
+
+    def test_dolphin_maps_loads_without_a_musickit_value_and_refuses_a_denied_read(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("dolphin-maps/musickit has no value yet", out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **self.MANAGED})
+        self.log.unlink()
+        r, out = self.run_loader("dolphin-maps", stage_json=json.dumps(payload), FAKE_MUSICKIT="DENIED")
+        self.assertEqual(r.returncode, 1, out)
+        self.assertIn("AccessDeniedException", out)
+        self.assertFalse(self.log.exists(), "wrangler must not run")
 
 if __name__ == "__main__":
     unittest.main(buffer=True)
