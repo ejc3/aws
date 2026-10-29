@@ -31,20 +31,23 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 2c965afe with main's recipe (fleet/ami), revised from the bdaa0003 image: the renderer denoises moving frames and clamps
-  # the sky's history (ejc3/fcvm#1342), a routed guest gets IPv6 NTP servers it can reach (ejc3/fcvm#1343), and the IPv4
-  # slot ports' relay sets TCP_NODELAY (ejc3/fcvm#1350). Its renderer source is the tile AMI's: 31f42d03 and 2c965afe differ
-  # only outside fleet/renderer.
-  default = { "us-east-1" = { x86_64 = "ami-00d8ecc3edfb8059e" } }
+  # 7f5fb7e6 with main's recipe (fleet/ami), revised from the ce08eee9 image; its renderer source is 728be8c3's, the tile
+  # AMI's. The prefetch list now comes from a launch that restores the baked snapshot (ejc3/fcvm#1397): 74 files and
+  # 74 MiB, where the 728be8c3 recipe listed 6163 files and 334 MiB that took 20 s at boot. Fluffier clouds and the scene's weather keys
+  # (ejc3/fcvm#1383); the renderer draws at the tallest asked height whose frame fits a slot (ejc3/fcvm#1380); the SPS
+  # carries a VUI bitstream_restriction (ejc3/fcvm#1361); a restored guest re-reads the host clock before stepping
+  # (ejc3/fcvm#1382); the root volume files a slot launch reads are prefetched at boot and the agent's pre-start snapshot
+  # is baked (ejc3/fcvm#1370).
+  default = { "us-east-1" = { x86_64 = "ami-0f1f1af48e2312360" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 31f42d03 (revised from the
-  # c93a01d9 image with main's tile units).
-  default = { "us-east-1" = { x86_64 = "ami-0eae5d080e45fd625" } }
+  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 728be8c3 (revised from the
+  # 2e2181cf image with main's tile units).
+  default = { "us-east-1" = { x86_64 = "ami-098e582592b24a025" } }
 }
 
 locals {
@@ -143,6 +146,9 @@ locals {
     # The broadcast (fcvm-fleet-broadcast.tf): its aggregator's private listener, the secret it pushes with and signs
     # playback tokens from, and the seats for direct streams.
     local.fcvm_fleet_broadcast ? ["--broadcast-listen", "127.0.0.1:${local.fcvm_fleet_broadcast_port}", "--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_broadcast[0].name, "--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)] : [],
+    # Every viewer word is checked by Claude Haiku 5.5 on Bedrock before it enters the scene (the task role's
+    # CheckViewerWordsWithClaudeHaiku55). Without a checker the coordinator refuses every word.
+    ["--text-check", "bedrock", "--text-check-model", local.bedrock_haiku_profile, "--text-check-region", local.bedrock_haiku_region],
   )
 
   fcvm_fleet_coordinator_running = local.fcvm_fleet_coordinator_enabled && local.fcvm_fleet_coordinator_tag != ""
@@ -724,6 +730,33 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Effect   = "Allow"
         Action   = "secretsmanager:PutSecretValue"
         Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]
+      },
+      {
+        # The viewer word check (--text-check bedrock): Claude Haiku 5.5 through the US inference profile, which routes
+        # from us-west-2 to us-east-1, us-east-2 and us-west-2 (bedrock-haiku.tf), all of them fleet regions the SCP admits.
+        # A routed call needs the profile in this account and the foundation model in the region it lands in.
+        Sid    = "CheckViewerWordsWithClaudeHaiku55"
+        Effect = "Allow"
+        Action = "bedrock:InvokeModel"
+        Resource = [
+          "arn:aws:bedrock:*:${local.fcvm_fleet_account_id}:inference-profile/${local.bedrock_haiku_profile}",
+          "arn:aws:bedrock:*::foundation-model/${local.bedrock_haiku_model}",
+        ]
+      },
+      {
+        # The account's first Haiku 5.5 call subscribes it to the model's Marketplace product with the caller's
+        # permissions (as for the box roles in bedrock-haiku.tf); limited to that product, no Unsubscribe.
+        Sid       = "SubscribeClaudeHaiku55OnFirstUse"
+        Effect    = "Allow"
+        Action    = "aws-marketplace:Subscribe"
+        Resource  = "*"
+        Condition = { "ForAnyValue:StringEquals" = { "aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"] } }
+      },
+      {
+        Sid      = "ViewMarketplaceSubscriptions"
+        Effect   = "Allow"
+        Action   = "aws-marketplace:ViewSubscriptions"
+        Resource = "*"
       },
       {
         # Created resources: only through a tile template, in the fleet regions.

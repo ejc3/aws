@@ -1453,6 +1453,11 @@ Available if a task needs them; neither needs a key on disk.
   `PEMS_PASSWORD`) is the dolphin-maps PeMS login; dev-server-role may read and put it, the dolphin-maps loop Lambdas' role
   and admins read it (`dolphin-maps-loop.tf`; the functions get `PEMS_SECRET_ID`). Export it with the same `eval "$(aws secretsmanager
   get-secret-value ... | jq -r 'to_entries[] | ...')"` as Browserbase. Never onto a command line, into a file in a repo or a commit.
+- **dolphin-maps' MusicKit key** (Apple Music developer tokens). `dolphin-maps/musickit` (us-west-1; JSON, `MUSICKIT_KEY_ID`,
+  `MUSICKIT_TEAM_ID` and `MUSICKIT_PRIVATE_KEY`, the .p8's PEM text) is loaded into the `dolphin-maps-prod` and
+  `dolphin-maps-stage` Workers by `scripts/workers-prod-secrets.sh` and `scripts/workers-stage-secrets.sh` (which load
+  without it while it has no value). dev-server-role may put it and describe it, never read it; only admins read it
+  (`dolphin-maps-musickit.tf`, which has the put command; the grant is a statement of `dev-dolphin-maps-pems`). Never onto a command line, into a file in a repo or a commit.
 - **Search and fetch APIs: DeepSeek, Exa, ScrapingDog**, metal boxes, nextjs-dev and the scraping jobs: alternatives to
   Browserbase and to the Bedrock models (DeepSeek: chat and reasoning plus its fetch and search tools; Exa: web search and
   page contents; ScrapingDog: scraping API with rendering and proxies). One JSON secret each in us-west-1,

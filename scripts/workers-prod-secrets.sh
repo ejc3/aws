@@ -11,6 +11,8 @@
 # workers-stage-secrets.sh reads the Dolphin sites' staging containers: workers-prod/dolphin-maps (out of band; the container
 # is dolphin-labs-hq/dolphin-aws secrets.tf's) and workers-prod/dolphin-maps/terraform (the moderation key, written by
 # dolphin-maps-moderation.tf here through aws.dolphin).
+# dolphin-maps also gets dolphin-maps/musickit (Apple Music's developer-token key, dolphin-maps-musickit.tf), kept in THIS
+# account and read with the caller's own credentials; while it has no value the load goes on without it.
 # The merged JSON is piped to `wrangler secret bulk`, so no value is on a command line, in a file or in this script's
 # output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a deploy is
 # uploading can be lost when that deploy activates.
@@ -74,8 +76,28 @@ if [[ -n "$MANAGED_CONTAINER" ]]; then
   MANAGED=$(read_container "workers-prod/$SITE/terraform") || exit 1
 fi
 
+# Apple Music's developer-token key (dolphin-maps-musickit.tf): in THIS account, read with the caller's own credentials (not
+# the Dolphin session), and merged as a third container. With no value yet (or no container yet) the site is loaded
+# without it, and keeps Apple Music off on the car screen; any other failure refuses the whole load.
+MUSICKIT=""
+if [[ "$SITE" == dolphin-maps ]]; then
+  MKERR=$(mktemp)
+  if ! MUSICKIT=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id dolphin-maps/musickit --query SecretString --output text 2>"$MKERR"); then
+    MUSICKIT=""
+    if grep -q ResourceNotFoundException "$MKERR"; then
+      echo "dolphin-maps/musickit has no value yet: loading without Apple Music's key (dolphin-maps-musickit.tf)" >&2
+    else
+      echo "could not read dolphin-maps/musickit in this account:" >&2
+      sed 's/^/  /' "$MKERR" >&2
+      rm -f "$MKERR"
+      exit 1
+    fi
+  fi
+  rm -f "$MKERR"
+fi
+
 # Merge and check in one place; the merged object goes to stdout, names and refusals to stderr.
-JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" MANAGED_CONTAINER="$MANAGED_CONTAINER" OUT_OF_BAND_NAMES="$OUT_OF_BAND_NAMES" python3 -c '
+JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" MUSICKIT="$MUSICKIT" MANAGED_CONTAINER="$MANAGED_CONTAINER" OUT_OF_BAND_NAMES="$OUT_OF_BAND_NAMES" python3 -c '
 import json, os, re, sys
 merged = {}
 for label in ("OUT_OF_BAND", "MANAGED"):
@@ -105,10 +127,31 @@ if sys.argv[1] == "dolphin-maps":
     missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
     if missing:
         sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
+musickit = os.environ.get("MUSICKIT", "")
+if musickit:
+    try:
+        d = json.loads(musickit)
+    except ValueError:
+        sys.exit("dolphin-maps/musickit: not JSON")
+    names = {"MUSICKIT_KEY_ID", "MUSICKIT_TEAM_ID", "MUSICKIT_PRIVATE_KEY"}
+    if not isinstance(d, dict) or set(d) != names:
+        sys.exit("dolphin-maps/musickit must hold exactly: " + " ".join(sorted(names)))
+    for k, v in d.items():
+        if not isinstance(v, str) or not v.strip():
+            sys.exit("empty value for %s" % k)
+        if re.fullmatch(r"\[[A-Za-z _]{4,14}\]", v):
+            sys.exit("%s is a placeholder, not a value" % k)
+        if k in merged:
+            sys.exit("%s is in both containers: each name has one owner (dolphin-maps-musickit.tf)" % k)
+        merged[k] = v
+    if not re.fullmatch(r"[A-Z0-9]{10}", d["MUSICKIT_KEY_ID"]) or not re.fullmatch(r"[A-Z0-9]{10}", d["MUSICKIT_TEAM_ID"]):
+        sys.exit("dolphin-maps/musickit: MUSICKIT_KEY_ID and MUSICKIT_TEAM_ID are 10-character Apple ids")
+    if "-----BEGIN PRIVATE KEY-----" not in d["MUSICKIT_PRIVATE_KEY"]:
+        sys.exit("dolphin-maps/musickit: MUSICKIT_PRIVATE_KEY is not the PEM text of the .p8")
 print("workers-prod/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")
-unset OUT_OF_BAND MANAGED
+unset OUT_OF_BAND MANAGED MUSICKIT
 
 export CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID
 CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-workers-deploy-token --query SecretString --output text | tr -d '\n')

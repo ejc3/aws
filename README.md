@@ -494,8 +494,16 @@ if desired. Only the owner is admitted; the tunnel also validates the Access tok
 model configuration and sessions; the inference key is read from `abliteration/api-key` into the process environment
 at startup. `opencode-web-proxy@` supplies the private upstream credential after Cloudflare login, so it never reaches
 the browser; the native server stays on loopback. The tunnel routes to the container only; there is no public web port
-or OpenTunnel endpoint. Restart
+or OpenTunnel endpoint. The browser worker checks navigation against Access and opens sign-in automatically when an
+API request confirms an expired login, then returns to OpenCode. It does not serve a cached offline app shell. The
+reconnection page shows a retry action if the server remains unavailable rather than looping through sign-in. Restart
 `opencode-web@<account>.service` inside that container after rotating the inference key.
+
+An already cached copy from before this fix needs one visit to
+[OpenCode's sign-in entry](https://opencode.cc-games.dev/auth/access-refresh) to receive the new browser worker after
+login. Later visits and expired API connections use the automatic flow. Browser regression coverage is in
+`scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
+with `scripts/test-opencode-setup.py` in CI.
 
 ### From the MacBook to the Next.js server
 
@@ -666,8 +674,7 @@ The internal disk runs nearly full with the owner's own data, so builds go to th
 external drive, one folder per project: `/Volumes/Scratch/<project>/`. For example
 `dolphin-maps/` holds its checkout, `build/` (DerivedData, archives, result bundles:
 `BUILD_DIR` in its scripts), `tours/` (screenshots) and `scratch/` (logs, helpers).
-Simulator devices still live on the internal disk (CoreSimulator), so delete a tour's
-simulator after use. Never write a project's files into `~/src` loose.
+Never write a project's files into `~/src` loose.
 
 Temporary files follow the same rule. Anything a session creates with `mktemp` (a test
 run's DerivedData, a build's intermediates) lands in `TMPDIR`, which by default is on
@@ -677,6 +684,31 @@ at the 12 GB floor. The managed `~/.zshenv` block (`scripts/mac/set-zshenv.sh`) 
 its disk is mounted, for every zsh, non-interactive SSH sessions included; with no file,
 or the drive unplugged, the system default stays. On this Mac:
 `ssh mac 'mkdir -p ~/.config/mac-setup && echo /Volumes/Scratch/tmp > ~/.config/mac-setup/tmpdir'`.
+
+Xcode's DerivedData works the same way: when `~/.config/mac-setup/deriveddata` names a folder
+on a mounted disk, `scripts/mac-setup.sh` sets Xcode's `IDECustomDerivedDataLocation` to it,
+which every `xcodebuild` without `-derivedDataPath` then uses. On this Mac:
+`ssh mac 'echo /Volumes/Scratch/DerivedData > ~/.config/mac-setup/deriveddata'`, then rerun
+`scripts/mac-setup.sh`. With the drive unplugged, Xcode builds fail rather than fill the
+internal disk.
+
+Simulator devices are on the drive too: `~/Library/Developer/CoreSimulator/Devices` is a
+symlink to `/Volumes/Scratch/CoreSimulator/Devices` (moved 2026-10-27, when they held 72 GB
+of the internal disk; free space went from 18 GB to 88 GB). CoreSimulator needs two things
+from the drive first, each a one-time step **(at the Mac)**, or it cannot create or read a
+device there ("device remained in Creating state", Cocoa error 513):
+- ownership on: `sudo diskutil enableOwnership /Volumes/Scratch`, then the drive's root back
+  to the user: `sudo chown "$(whoami)":staff /Volumes/Scratch`;
+- Full Disk Access for the simulator service: System Settings > Privacy & Security > Full Disk
+  Access, add `/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/com.apple.CoreSimulator.CoreSimulatorService.xpc`.
+
+Check it with a throwaway set before moving: `xcrun simctl --set /Volumes/Scratch/<dir>
+create probe "iPhone 17" <runtime>` must list and boot. Then: `rsync -aH --delete` the folder
+across while simulators run, `xcrun simctl shutdown all` and stop
+`com.apple.CoreSimulator.CoreSimulatorService`, sync again, require identical listings, swap
+in the symlink, and keep the old folder until `xcrun simctl list` shows the same device count.
+(`ditto` folds `._` files into extended attributes, so its copy cannot be compared file for
+file.) A tour's simulator is still deleted after use.
 
 ##### MacBook: Checks
 

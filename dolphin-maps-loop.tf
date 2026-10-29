@@ -271,6 +271,12 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
     actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
     resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
   }
+  # dolphin-maps' MusicKit key (dolphin-maps-musickit.tf): put and described, never read, here for the role's 20-policy cap.
+  statement {
+    sid       = "PutTheMusicKitKey"
+    actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_musickit.arn]
+  }
 }
 
 resource "aws_iam_policy" "dolphin_maps_pems_dev" {
