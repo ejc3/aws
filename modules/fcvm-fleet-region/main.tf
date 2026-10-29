@@ -125,6 +125,10 @@ locals {
   # without a subnet lands in the default VPC, where the fleet's security group does not exist and the task role may
   # not launch (an EC2 tile's RunInstances was refused on the default subnet, 2026-10-24). The first AZ, in name order.
   tile_az = local.azs[0]
+  # The tile's root volume, gp3 at 1000 MiB/s and 4000 IOPS instead of the default 125 MiB/s and 3000. A first boot reads
+  # about 500 MiB of it (every block of a volume made from an AMI is fetched from S3 on first read). The size stays the
+  # AMI's 32 GiB.
+  tile_root_volume = { type = "gp3", throughput = 1000, iops = 4000 }
   # The AMI carries the agent as a systemd unit, installed disabled and conditional on /etc/fcvm-fleet/agent.env (fcvm
   # fleet/ami/host/fcvm-fleet-agent.service; its arguments are fcvm fleet/PROTOCOL.md, "Agent", "Running it"). Boot writes
   # that file and starts the unit without waiting for it: the unit itself waits for the GPUs on vfio-pci and the store.
@@ -316,6 +320,15 @@ resource "aws_launch_template" "tile" {
     }
   }
 
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_type = local.tile_root_volume.type
+      throughput  = local.tile_root_volume.throughput
+      iops        = local.tile_root_volume.iops
+    }
+  }
+
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -351,6 +364,15 @@ resource "aws_launch_template" "tile_on_demand" {
 
   iam_instance_profile {
     name = var.tile_profile_name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_type = local.tile_root_volume.type
+      throughput  = local.tile_root_volume.throughput
+      iops        = local.tile_root_volume.iops
+    }
   }
 
   metadata_options {
@@ -398,6 +420,15 @@ resource "aws_launch_template" "tile_pool" {
     spot_options {
       spot_instance_type             = "persistent"
       instance_interruption_behavior = "stop"
+    }
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_type = local.tile_root_volume.type
+      throughput  = local.tile_root_volume.throughput
+      iops        = local.tile_root_volume.iops
     }
   }
 
