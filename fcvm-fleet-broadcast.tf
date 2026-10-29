@@ -83,12 +83,12 @@ resource "aws_secretsmanager_secret_version" "fcvm_fleet_broadcast" {
   })
 }
 
-# The coordinator's task role reads the broadcast secret, and nothing else here.
-resource "aws_iam_role_policy" "fcvm_fleet_coordinator_broadcast" {
+# The coordinator's inline policies already fill its aggregate 10 KiB budget. This
+# managed policy grants only this secret read without changing those permissions.
+resource "aws_iam_policy" "fcvm_fleet_coordinator_broadcast" {
   count    = local.fcvm_fleet_broadcast ? 1 : 0
   provider = aws.fcvm_fleet
-  name     = "broadcast-secret"
-  role     = aws_iam_role.fcvm_fleet_coordinator_task.id
+  name     = "fcvm-fleet-coordinator-broadcast-secret"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -98,4 +98,11 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_broadcast" {
       Resource = aws_secretsmanager_secret.fcvm_fleet_broadcast[0].arn
     }]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_broadcast" {
+  count      = local.fcvm_fleet_broadcast ? 1 : 0
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_coordinator_broadcast[0].arn
 }

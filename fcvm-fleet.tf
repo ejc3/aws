@@ -1089,7 +1089,14 @@ resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack" {
 
 resource "aws_ecs_service" "fcvm_fleet_coordinator" {
   # The listener too: ECS refuses a target group that no load balancer uses yet, and the listener is what attaches it.
-  depends_on      = [ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard, aws_lb_listener.fcvm_fleet_dns]
+  # First enablement must publish the broadcast credentials and read grant before
+  # starting a coordinator with --broadcast-secret. Empty gated collections are valid.
+  depends_on      = [
+    ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard,
+    aws_lb_listener.fcvm_fleet_dns,
+    aws_secretsmanager_secret_version.fcvm_fleet_broadcast,
+    aws_iam_role_policy_attachment.fcvm_fleet_coordinator_broadcast,
+  ]
   provider        = aws.fcvm_fleet
   name            = "fcvm-fleet-coordinator"
   cluster         = aws_ecs_cluster.fcvm_fleet.id
