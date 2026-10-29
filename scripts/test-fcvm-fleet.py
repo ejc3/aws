@@ -225,7 +225,7 @@ class SecretTests(unittest.TestCase):
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= "([^"]+)"', TF, re.S)
         self.assertEqual(names, ["fcvm-fleet/tls-wildcard"])
-        self.assertNotIn("aws_secretsmanager_secret_version", TF)
+        self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
 
     def test_hosts_and_tiles_read_only_what_they_need(self):
         host = block('resource "aws_iam_role_policy" "fcvm_fleet_host"')
@@ -624,7 +624,8 @@ class AggregatedTests(unittest.TestCase):
         self.assertIn('containerPath = "/run/fcvm-fleet"', task)
         self.assertIn('"/run/fcvm-fleet/tls"', cmd)
         dual = block('resource "aws_ecs_account_setting_default" "fcvm_fleet_dual_stack"')
-        self.assertIn("count    = local.fcvm_fleet_aggregated ? 1 : 0", dual)
+        # The broadcast reads every tile at its IPv6 name too (fcvm-fleet-broadcast.tf).
+        self.assertIn("count    = local.fcvm_fleet_aggregated || local.fcvm_fleet_broadcast ? 1 : 0", dual)
 
     def test_the_host_aggregator_port_follows_the_slots(self):
         self.assertIn(
@@ -632,6 +633,50 @@ class AggregatedTests(unittest.TestCase):
         priv = int(re.search(r"fcvm_fleet_aggregate_port\s+= (\d+)", TF).group(1))
         # The private listener is outside the admitted range.
         self.assertFalse(20200 <= priv <= 20208, priv)
+
+class BroadcastTests(unittest.TestCase):
+    """The broadcast (ejc3/fcvm "Broadcast mode") is one switch: the coordinator's flags, its task size, its
+    secret and the private IVS channel all follow it."""
+
+    BC = (ROOT / "fcvm-fleet-broadcast.tf").read_text()
+
+    def test_the_coordinator_gets_its_flags_and_size_from_the_switch(self):
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('local.fcvm_fleet_broadcast ? ["--broadcast-listen", "127.0.0.1:', cmd)
+        self.assertIn('"--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_broadcast[0].name', cmd)
+        self.assertIn('"--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)', cmd)
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('cpu                = local.fcvm_fleet_broadcast ? "2048" : "512"', task)
+        self.assertIn('memory             = local.fcvm_fleet_broadcast ? "4096" : "1024"', task)
+
+    def test_the_channel_is_private_and_only_the_coordinator_reads_its_secret(self):
+        ch = block('resource "aws_ivs_channel" "fcvm_fleet_broadcast"', self.BC)
+        self.assertIn("authorized   = true", ch)
+        self.assertIn('latency_mode = "LOW"', ch)
+        pol = block('resource "aws_iam_policy" "fcvm_fleet_coordinator_broadcast"', self.BC)
+        self.assertIn('Action   = "secretsmanager:GetSecretValue"', pol)
+        self.assertIn("Resource = aws_secretsmanager_secret.fcvm_fleet_broadcast[0].arn", pol)
+        self.assertEqual(pol.count("Effect"), 1)
+        self.assertNotIn('resource "aws_iam_role_policy"', self.BC)
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_broadcast"', self.BC)
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_coordinator_task.name", attachment)
+        self.assertIn("policy_arn = aws_iam_policy.fcvm_fleet_coordinator_broadcast[0].arn", attachment)
+        for r in re.findall(r'resource "([a-z_]+)" "fcvm_fleet_broadcast[a-z_]*"', self.BC):
+            self.assertIn(r, {"aws_ivs_channel", "tls_private_key", "aws_ivs_playback_key_pair", "aws_secretsmanager_secret",
+                              "aws_secretsmanager_secret_version", "aws_iam_policy", "aws_iam_role_policy_attachment"}, r)
+        # Every one of its seven resources and its one data source is counted by the switch.
+        self.assertEqual(len(re.findall(r"count\s+= local\.fcvm_fleet_broadcast \? 1 : 0", self.BC)), 8)
+
+    def test_first_rollout_waits_for_credentials_and_the_read_grant(self):
+        service = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        dependencies = re.search(r"depends_on\s*=\s*\[(.*?)\]", service, re.S).group(1)
+        self.assertEqual(set(re.findall(r"\b(?:ephemeral\.)?aws_[\w.]+", dependencies)), {
+            "ephemeral.aws_ssm_parameter.fcvm_coordinator_release_guard",
+            "aws_lb_listener.fcvm_fleet_dns",
+            "aws_secretsmanager_secret_version.fcvm_fleet_broadcast",
+            "aws_iam_role_policy_attachment.fcvm_fleet_coordinator_broadcast",
+        })
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
