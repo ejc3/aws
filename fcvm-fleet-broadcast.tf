@@ -18,11 +18,11 @@
 # sleeps after 10 minutes with no viewer), $0.072 per viewer-hour at 720p and $0.036 at 480p (North America, first
 # 10,000 hours a month), and the larger task about $43 a month.
 #
-# The gate: local.fcvm_fleet_broadcast. On needs a coordinator image with --broadcast-listen (ejc3/fcvm#1385 and its
-# stack); an image without it refuses the argument and the task does not start.
+# The gate: local.fcvm_fleet_broadcast. Keep it off until admission-enforcing host and tile AMIs are pinned and
+# running (ejc3/aws#722). Enabling also needs a coordinator image with --broadcast-listen (ejc3/fcvm#1385 and its stack).
 
 locals {
-  fcvm_fleet_broadcast = true
+  fcvm_fleet_broadcast = false
   # The broadcast aggregator's private listener (layout and stats) inside the coordinator's task.
   fcvm_fleet_broadcast_port = 20310
   # Seats for direct streams; the rest watch the broadcast.
