@@ -30,25 +30,21 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 7f5fb7e6 with main's recipe (fleet/ami), revised from the ce08eee9 image; its renderer source is 728be8c3's, the tile
-  # AMI's. The prefetch list now comes from a launch that restores the baked snapshot (ejc3/fcvm#1397): 74 files and
-  # 74 MiB, where the 728be8c3 recipe listed 6163 files and 334 MiB that took 20 s at boot. Fluffier clouds and the scene's weather keys
-  # (ejc3/fcvm#1383); the renderer draws at the tallest asked height whose frame fits a slot (ejc3/fcvm#1380); the SPS
-  # carries a VUI bitstream_restriction (ejc3/fcvm#1361); a restored guest re-reads the host clock before stepping
-  # (ejc3/fcvm#1382); the root volume files a slot launch reads are prefetched at boot and the agent's pre-start snapshot
-  # is baked (ejc3/fcvm#1370).
-  default = { "us-east-1" = { x86_64 = "ami-0f1f1af48e2312360" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe 67d383ea;
+  # its fcvm executable is from main 91f52a5a. The host agent passes admission keys to its renderer; the renderer checks
+  # the scene token before accepting scene/budget updates and checks the first WebSocket message before sending frames
+  # (ejc3/fcvm#1425). Its renderer is the tile AMI's. Pin and run both before enabling broadcast (ejc3/aws#722).
+  default = { "us-east-1" = { x86_64 = "ami-02ac54ae25a2312f9" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image, from ejc3/fcvm main 728be8c3. Recipe from main
-  # 71bb448e (revised from the 728be8c3 image): a boot prefetch of the root volume pieces a first boot reads (2,891 pieces,
-  # 422 MiB, the NVIDIA modules first), and the renderer waits for /dev/nvidia-uvm-tools (ejc3/fcvm#1407).
-  default = { "us-east-1" = { x86_64 = "ami-0315bf37f11b3f577" } }
+  # (fcvm fleet/ami/tile). Built with its renderer from ejc3/fcvm main 67d383ea, matching the host AMI and enforcing
+  # scene authentication and direct-viewer admission (ejc3/fcvm#1425). The boot prefetch and NVIDIA device readiness
+  # checks remain in the recipe. Broadcast stays off until both images are running and verified (ejc3/aws#722).
+  default = { "us-east-1" = { x86_64 = "ami-00a1fc37d63fbdad1" } }
 }
 
 locals {
