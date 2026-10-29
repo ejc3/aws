@@ -353,6 +353,21 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         self.assertIn("[for t in aws_launch_template.tile_on_demand : t.arn]", block('output "tile_template_arns"', MOD))
 
 
+class TileRootVolume(unittest.TestCase):
+    def test_every_tile_template_sets_the_root_volume_to_gp3_1000_mibps_4000_iops(self):
+        # A fresh tile reached its first frame in 29 to 40 s on the AMI's default gp3 (125 MiB/s, 3000 IOPS); see the pull
+        # request that set this for the measurements.
+        self.assertIn('tile_root_volume = { type = "gp3", throughput = 1000, iops = 4000 }', MOD)
+        for name in ("tile", "tile_on_demand", "tile_pool"):
+            lt = block('resource "aws_launch_template" "%s"' % name, MOD)
+            bdm = re.search(r"block_device_mappings \{\n(.*?)\n  \}\n", lt, re.S)
+            self.assertIsNotNone(bdm, name)
+            self.assertIn('device_name = "/dev/sda1"', bdm.group(1), name)
+            for part in ("volume_type = local.tile_root_volume.type", "throughput  = local.tile_root_volume.throughput",
+                         "iops        = local.tile_root_volume.iops"):
+                self.assertIn(part, bdm.group(1), name)
+
+
 class TilePool(unittest.TestCase):
     TF = CoordinatorLaunchSplit.TF
     stmt = CoordinatorLaunchSplit.stmt
