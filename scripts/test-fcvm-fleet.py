@@ -453,7 +453,7 @@ class StageWallTests(unittest.TestCase):
                   '"--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}"',
                   '"--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}"',
                   '"--secret-region ${local.fcvm_fleet_home_region}"',
-                  '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone fcvm.dev"']:
+                  '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone fcvm.dev"', '"--phones 2"']:
             self.assertIn(a, args)
         self.assertEqual(TF.count("host_agent_args           = local.fcvm_fleet_host_agent_args"), 3)
 
