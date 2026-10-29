@@ -30,8 +30,8 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 67d383ea with main's recipe (fleet/ami). The host agent passes admission keys to its renderer; the renderer checks
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe 67d383ea;
+  # its fcvm executable is from main 91f52a5a. The host agent passes admission keys to its renderer; the renderer checks
   # the scene token before accepting scene/budget updates and checks the first WebSocket message before sending frames
   # (ejc3/fcvm#1425). Its renderer is the tile AMI's. Pin and run both before enabling broadcast (ejc3/aws#722).
   default = { "us-east-1" = { x86_64 = "ami-02ac54ae25a2312f9" } }
