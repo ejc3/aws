@@ -191,8 +191,11 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet" {
       {
         Effect = "Allow", Action = "ecs:RegisterTaskDefinition", Resource = local.fcvm_stage_family_arn
         Condition = {
-          StringEquals  = { "aws:RequestTag/Project" = "fcvm-fleet" }
-          NumericEquals = { "ecs:task-cpu" = 512, "ecs:task-memory" = 1024 }
+          StringEquals = { "aws:RequestTag/Project" = "fcvm-fleet" }
+          NumericEquals = {
+            "ecs:task-cpu"    = tonumber(aws_ecs_task_definition.fcvm_fleet_coordinator.cpu)
+            "ecs:task-memory" = tonumber(aws_ecs_task_definition.fcvm_fleet_coordinator.memory)
+          }
         }
       },
       {

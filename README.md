@@ -390,6 +390,14 @@ are provisioned by Terraform, with no manual CI setup. If CI releases between a 
 plan and its apply, an apply-time parameter-version check rejects the stale plan; run
 a fresh plan. This check also detects a release attempt that rolled back to the same image.
 
+The wall's broadcast switch is in `fcvm-fleet-broadcast.tf`. It admits 500 direct-stream
+seats and serves later viewers through a private Amazon IVS channel with signed playback
+tokens. Enable it only after both GPU image pins are deployed and scene authentication
+works; then verify missing or forged direct tokens cannot receive frames and signed IVS
+playback succeeds. The CI frame probe sends its direct token as the first WebSocket
+message, and the image-only release role follows the coordinator's configured CPU and
+memory size.
+
 List current connection commands:
 
 ```bash

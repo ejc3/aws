@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import sys
 import types
 import unittest
@@ -129,6 +130,30 @@ class ReleaseTests(unittest.TestCase):
         expected["tags"] = original["tags"]
         self.assertEqual(actual, expected)
         self.assertEqual(self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"], self.aws.image)
+
+    def test_release_policy_allows_exactly_the_active_task_size_with_broadcast_on_or_off(self):
+        infrastructure = (ROOT / "fcvm-fleet.tf").read_text()
+        policy = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        registration = policy.split('Action = "ecs:RegisterTaskDefinition"', 1)[1]
+        registration = registration.split('NumericEquals = {', 1)[1].split('}', 1)[0]
+        limits = dict(re.findall(r'"ecs:task-(cpu|memory)"\s*=\s*(tonumber\([^)]*\)|[0-9]+)', registration))
+        self.assertEqual(set(limits), {"cpu", "memory"})
+        sizes = {field: re.search(r'\b' + field + r'\s*=\s*local\.fcvm_fleet_broadcast\s*\?\s*'
+                                 r'"([0-9]+)"\s*:\s*"([0-9]+)"', infrastructure).groups()
+                 for field in ("cpu", "memory")}
+        for index, broadcast in enumerate((True, False)):
+            with self.subTest(broadcast=broadcast):
+                current = copy.deepcopy(self.aws.old)
+                for field in sizes:
+                    current["taskDefinition"][field] = sizes[field][index]
+                request = release.task_input(current, REPO + "@" + DIGEST)
+                for field, limit in limits.items():
+                    if limit.startswith("tonumber("):
+                        self.assertEqual(limit, "tonumber(aws_ecs_task_definition.fcvm_fleet_coordinator." + field + ")")
+                        allowed = int(current["taskDefinition"][field])
+                    else:
+                        allowed = int(limit)
+                    self.assertEqual(int(request[field]), allowed)
 
     def test_invalid_input_never_takes_the_lock_or_changes_a_service(self):
         for event in ({}, {**EVENT, "digest": "tag:latest"}, {**EVENT, "commit": "main"}):
