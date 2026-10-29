@@ -30,13 +30,10 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 only, from ejc3/fcvm main
-  # 67d383ea with the recipe of main 3bfa4800 (ejc3/fcvm#1429 changes only the build's warm phone). The renderer enforces
-  # direct-stream admission and the scene token (ejc3/fcvm#1399, #1425), and the agent sends the token from
-  # fcvm-fleet/tls-wildcard. Phones mode (ejc3/fcvm#1409, #1420 to #1423): the phone image (the Android Emulator built from
-  # source, the AOSP system image, Robot Park, the phone streamer) and a warm snapshot of a running phone, which a phone
-  # slot restores onto its GPU (about 6.6 s from the request to the clone's first scene frame at build); the agent reads
-  # its phone arguments from /etc/fcvm-fleet/phone.env. Its renderer image is the tile AMI's.
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe 67d383ea;
+  # its fcvm executable is from main 91f52a5a. The host agent passes admission keys to its renderer; the renderer checks
+  # the scene token before accepting scene/budget updates and checks the first WebSocket message before sending frames
+  # (ejc3/fcvm#1425). Its renderer is the tile AMI's. Pin and run both before enabling broadcast (ejc3/aws#722).
   default = { "us-east-1" = { x86_64 = "ami-02ac54ae25a2312f9" } }
 }
 
@@ -44,10 +41,9 @@ variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Its renderer is the host AMI's: the same image (ddc35c47), from ejc3/fcvm main 67d383ea, which
-  # enforces direct-stream admission and the scene token (ejc3/fcvm#1399, #1425; the boot writes the token from the secret).
-  # Revised from ami-0315bf37f11b3f577 with main 67d383ea's recipe; the boot prefetch list was traced again (2,729 pieces,
-  # 417 MiB). Measured on demand from the launch request: first frame over HTTPS at 45.3 s.
+  # (fcvm fleet/ami/tile). Built with its renderer from ejc3/fcvm main 67d383ea, matching the host AMI and enforcing
+  # scene authentication and direct-viewer admission (ejc3/fcvm#1425). The boot prefetch and NVIDIA device readiness
+  # checks remain in the recipe. Broadcast stays off until both images are running and verified (ejc3/aws#722).
   default = { "us-east-1" = { x86_64 = "ami-00a1fc37d63fbdad1" } }
 }
 
