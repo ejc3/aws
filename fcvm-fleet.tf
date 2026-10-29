@@ -30,11 +30,12 @@ variable "fcvm_fleet_host_amis" {
   description = "fcvm fleet host AMI per region and architecture, e.g. { \"us-east-2\" = { x86_64 = \"ami-...\", arm64 = \"\" } }"
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
-  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe 67d383ea;
-  # its fcvm executable is from main 91f52a5a. The host agent passes admission keys to its renderer; the renderer checks
-  # the scene token before accepting scene/budget updates and checks the first WebSocket message before sending frames
-  # (ejc3/fcvm#1425). Its renderer is the tile AMI's. Pin and run both before enabling broadcast (ejc3/aws#722).
-  default = { "us-east-1" = { x86_64 = "ami-02ac54ae25a2312f9" } }
+  # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
+  # executable from main 097595bc: everything in 67d383ea's image (admission, ejc3/fcvm#1425), the phones' GPU mirror
+  # (ejc3/fcvm#1432-#1435: the emulator's command-stream tap and GLES 3.0 cap, the streamer's GET /mirror, the
+  # coordinator's mirror_keys), a bake that leaves /tmp empty (ejc3/fcvm#1444: 40 s off every boot) and the agent's dial
+  # deadlines (ejc3/fcvm#1445). The tile AMI's renderer is unchanged in behaviour.
+  default = { "us-east-1" = { x86_64 = "ami-0940470cc216e012d" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
