@@ -31,24 +31,25 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main afc4894d: everything in 67d383ea's image (admission, ejc3/fcvm#1425), the phones' GPU mirror
-  # (ejc3/fcvm#1432-#1435, #1440) with zstd on its wire (ejc3/fcvm#1449, which the page requires), the emulator from
-  # ejc3/gfxstream#6 (ejc3/fcvm#1450: FREE records, no program binaries, a retake that stays released without Vulkan),
-  # the phone container's fixes (ejc3/fcvm#1448: the driver's TLS library preloaded, UWB off), a bake that leaves /tmp
-  # empty (ejc3/fcvm#1444), the agent's dial deadlines (ejc3/fcvm#1445) and a routed port forward whose dial of the
-  # guest cannot hold fcvm at exit (ejc3/fcvm#1453: a claimed GPU's old VM stopped in 0.45 s, not 4.8 s). The tile
-  # AMI's renderer is unchanged.
-  default = { "us-east-1" = { x86_64 = "ami-0d4b40dfa5b467f22" } }
+  # executable from main 93c33125, revised from the afc4894d image: everything in 67d383ea's image (admission,
+  # ejc3/fcvm#1425), the phones' GPU mirror (ejc3/fcvm#1432-#1435, #1440) with zstd on its wire (ejc3/fcvm#1449, which
+  # the page requires), the emulator from ejc3/gfxstream#6 (ejc3/fcvm#1450: FREE records, no program binaries, a retake
+  # that stays released without Vulkan), the phone container's fixes (ejc3/fcvm#1448: the driver's TLS library
+  # preloaded, UWB off), a bake that leaves /tmp empty (ejc3/fcvm#1444), the agent's dial deadlines (ejc3/fcvm#1445), a
+  # routed port forward whose dial of the guest cannot hold fcvm at exit (ejc3/fcvm#1453: a claimed GPU's old VM stopped
+  # in 0.45 s, not 4.8 s), and the renderer's speckle fix (ejc3/fcvm#1454: clouds and shading edges filtered, a taller
+  # stream interpolated). Its renderer is the tile AMI's.
+  default = { "us-east-1" = { x86_64 = "ami-019a97413616788a5" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Built with its renderer from ejc3/fcvm main 67d383ea, matching the host AMI and enforcing
-  # scene authentication and direct-viewer admission (ejc3/fcvm#1425). The boot prefetch and NVIDIA device readiness
-  # checks remain in the recipe. Broadcast stays off until both images are running and verified (ejc3/aws#722).
-  default = { "us-east-1" = { x86_64 = "ami-00a1fc37d63fbdad1" } }
+  # (fcvm fleet/ami/tile). Revised from the 67d383ea image (scene authentication and direct-viewer admission,
+  # ejc3/fcvm#1425) with the renderer from ejc3/fcvm main 93c33125, the host AMI's: the speckle fix (ejc3/fcvm#1454).
+  # The boot prefetch and NVIDIA device readiness checks remain in the recipe.
+  default = { "us-east-1" = { x86_64 = "ami-01dbdab881c6f5c2a" } }
 }
 
 locals {
