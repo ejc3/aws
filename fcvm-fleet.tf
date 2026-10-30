@@ -31,12 +31,14 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main d8d5f6ad: everything in 67d383ea's image (admission, ejc3/fcvm#1425), the phones' GPU mirror
+  # executable from main afc4894d: everything in 67d383ea's image (admission, ejc3/fcvm#1425), the phones' GPU mirror
   # (ejc3/fcvm#1432-#1435, #1440) with zstd on its wire (ejc3/fcvm#1449, which the page requires), the emulator from
   # ejc3/gfxstream#6 (ejc3/fcvm#1450: FREE records, no program binaries, a retake that stays released without Vulkan),
   # the phone container's fixes (ejc3/fcvm#1448: the driver's TLS library preloaded, UWB off), a bake that leaves /tmp
-  # empty (ejc3/fcvm#1444) and the agent's dial deadlines (ejc3/fcvm#1445). The tile AMI's renderer is unchanged.
-  default = { "us-east-1" = { x86_64 = "ami-0d8c1f425803eb66d" } }
+  # empty (ejc3/fcvm#1444), the agent's dial deadlines (ejc3/fcvm#1445) and a routed port forward whose dial of the
+  # guest cannot hold fcvm at exit (ejc3/fcvm#1453: a claimed GPU's old VM stopped in 0.45 s, not 4.8 s). The tile
+  # AMI's renderer is unchanged.
+  default = { "us-east-1" = { x86_64 = "ami-0d4b40dfa5b467f22" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
