@@ -345,6 +345,44 @@ an ordinary Terraform apply never allocates a billed Mac host.
 
 ## Fleet
 
+The GPU demonstration Fleet's x86 host and tile AMIs have a continuous image factory
+in `fcvm-fleet-ami-pipeline.tf`. Successful `ejc3/fcvm` main CI requests immutable
+source builds; routine changes batch for six hours, at most once per UTC day, with
+a weekly refresh. Critical-labelled merges and a main `critical` dispatch start
+immediately after validation and can preempt a routine build once its builders are
+terminated. Each job has a 150-minute deadline, at most one `g4dn.metal` host and
+one `g4dn.xlarge` tile active, and four total build/validation slots. An independent
+five-minute expiry sweep bounds abandoned compute. EBS, snapshots and transfer
+remain additional to the per-build compute limit.
+
+GitHub receives only a main-environment request/status role. Fixed AWS handlers
+launch the bounded slots and issue job-bound worker credentials; CI cannot read
+Terraform state, change IAM, pass a production instance profile, or change launch
+templates. Builds use isolated test certificates and fresh/sanitized build inputs.
+Real GPU and restored-phone frames, certificate rotation, exact security rules and
+unit configurations, and three distinct boots must pass before the paired release.
+The publisher copies version-pinned validated store assets into the existing Fleet
+asset bucket before promotion; temporary build artifacts can expire safely.
+
+The coordinator uses validated launch-template `$Default` versions. A fixed
+publisher changes only the image field and default of the four permitted templates
+under the Terraform backend lock. `/fcvm-fleet/ami-release` in `us-east-1` records
+the pair and previous bundle. Terraform reads it and rechecks its version at apply
+time, while continuing to own every other template setting. Critical publication
+replaces only old-image Fleet instances, so active streams may briefly reconnect.
+Routine publication leaves active machines running and takes effect on later
+starts or idle recycling. It never restarts the administration, Next.js or metal
+development servers.
+
+Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
+the producer, verify that the four defaults select the already validated guarded
+images, then merge/deploy fcvm's `$Default` consumer and main-only request workflow.
+Only then enable the factory in Terraform and require a fresh empty full plan.
+Request an urgent validated main build with
+`gh workflow run fleet-ami-pipeline.yml -R ejc3/fcvm --ref main -f priority=critical`.
+A request acknowledgement is not publication; inspect the factory status and
+release manifest for the actual build, validation and promotion result.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

@@ -402,8 +402,8 @@ module "fcvm_fleet_east2" {
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet }
   cidr_block                = local.fcvm_fleet_cidrs["us-east-2"]
-  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-2", {})
-  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-2", {})
+  gpu_amis                  = lookup(local.fcvm_active_host_amis, "us-east-2", {})
+  tile_amis                 = lookup(local.fcvm_active_tile_amis, "us-east-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
@@ -420,8 +420,8 @@ module "fcvm_fleet_west2" {
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet_west2 }
   cidr_block                = local.fcvm_fleet_cidrs["us-west-2"]
-  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-west-2", {})
-  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-west-2", {})
+  gpu_amis                  = lookup(local.fcvm_active_host_amis, "us-west-2", {})
+  tile_amis                 = lookup(local.fcvm_active_tile_amis, "us-west-2", {})
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
@@ -433,21 +433,23 @@ module "fcvm_fleet_west2" {
 }
 
 module "fcvm_fleet_east1" {
-  ip_options_bootstrap      = local.linux_ip_options_bootstrap
-  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  source                    = "./modules/fcvm-fleet-region"
-  providers                 = { aws = aws.fcvm_fleet_east1 }
-  cidr_block                = local.fcvm_fleet_cidrs["us-east-1"]
-  gpu_amis                  = lookup(var.fcvm_fleet_host_amis, "us-east-1", {})
-  tile_amis                 = lookup(var.fcvm_fleet_tile_amis, "us-east-1", {})
-  hosts_enabled             = local.fcvm_fleet_hosts_enabled
-  alert_email               = local.browser_manager_owner
-  host_agent_args           = local.fcvm_fleet_host_agent_args
-  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
-  host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
-  tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
-  flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
-  flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
+  ip_options_bootstrap          = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256       = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+  source                        = "./modules/fcvm-fleet-region"
+  providers                     = { aws = aws.fcvm_fleet_east1 }
+  cidr_block                    = local.fcvm_fleet_cidrs["us-east-1"]
+  gpu_amis                      = lookup(local.fcvm_active_host_amis, "us-east-1", {})
+  tile_amis                     = lookup(local.fcvm_active_tile_amis, "us-east-1", {})
+  ami_release_parameter_arn     = var.fcvm_ami_pipeline_enabled ? aws_ssm_parameter.fcvm_ami_release.arn : ""
+  ami_release_parameter_version = var.fcvm_ami_pipeline_enabled ? data.aws_ssm_parameter.fcvm_ami_release[0].version : 0
+  hosts_enabled                 = local.fcvm_fleet_hosts_enabled
+  alert_email                   = local.browser_manager_owner
+  host_agent_args               = local.fcvm_fleet_host_agent_args
+  slot_tls_ports                = local.fcvm_fleet_slot_tls_ports
+  host_profile_name             = aws_iam_instance_profile.fcvm_fleet_host.name
+  tile_profile_name             = aws_iam_instance_profile.fcvm_fleet_tile.name
+  flow_log_destination          = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
+  flow_log_bucket_policy_id     = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
 }
 
 locals {
@@ -462,7 +464,7 @@ locals {
     "us-east-1" = module.fcvm_fleet_east1
   }
   fcvm_fleet_tile_referenced_arns = concat(
-    flatten([for r, amis in var.fcvm_fleet_tile_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}"]]),
+    var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis in var.fcvm_fleet_tile_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}"]]),
     flatten([for r, m in local.fcvm_fleet_regional : [for s in m.subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"]]),
     [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"],
     local.fcvm_fleet_tile_template_arns,
@@ -481,7 +483,7 @@ locals {
   # The same for GPU hosts: their AMIs, host-eligible fleet subnets and groups, and enabled host templates.
   fcvm_fleet_host_template_arns = concat(module.fcvm_fleet_east2.host_template_arns, module.fcvm_fleet_west2.host_template_arns, module.fcvm_fleet_east1.host_template_arns)
   fcvm_fleet_host_referenced_arns = concat(
-    flatten([for r, amis in var.fcvm_fleet_host_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}" if ami != ""]]),
+    var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis in var.fcvm_fleet_host_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}" if ami != ""]]),
     flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"] if length(m.host_template_names) > 0]),
     [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}" if length(m.host_template_names) > 0],
     local.fcvm_fleet_host_template_arns,
