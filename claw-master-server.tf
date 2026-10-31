@@ -308,6 +308,8 @@ locals {
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+${local.linux_ip_options_bootstrap}
+
 TAG='${local.claw_master_tag}'
 SHA='${local.claw_master_sha256_aarch64}'
 IP='${local.claw_master_server_ip}'

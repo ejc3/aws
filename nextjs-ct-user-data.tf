@@ -329,16 +329,17 @@ MACSSH
 
   # Plain files: host tools, and the box's shared files every container mounts read-only.
   nextjs_ct_host_files = {
-    "/usr/local/bin/setup-sync"           = "scripts/nextjs-ct/setup-sync"
-    "/usr/local/sbin/nextjs-ct-health"    = "scripts/nextjs-ct/nextjs-ct-health"
-    "/usr/local/sbin/nextjs-ct-enter"     = "scripts/nextjs-ct/host/nextjs-ct-enter"
-    "/usr/local/sbin/nextjs-ct-imds"      = "scripts/nextjs-ct/host/nextjs-ct-imds"
-    "/usr/local/sbin/nextjs-ct-ndev-sync" = "scripts/nextjs-ct/host/nextjs-ct-ndev-sync"
-    "/usr/local/sbin/nextjs-ct-machine"   = "scripts/nextjs-ct/host/nextjs-ct-machine"
-    "/usr/local/sbin/nextjs-ct-base"      = "scripts/nextjs-ct/host/nextjs-ct-base"
-    "/usr/local/sbin/nextjs-ct-firewall"  = "scripts/nextjs-ct/host/nextjs-ct-firewall"
-    "/usr/local/sbin/nextjs-ct-sshd"      = "scripts/nextjs-ct/host/nextjs-ct-sshd"
-    "/usr/local/sbin/nextjs-ct-migrate"   = "scripts/nextjs-ct/host/nextjs-ct-migrate"
+    "/usr/local/bin/setup-sync"            = "scripts/nextjs-ct/setup-sync"
+    "/usr/local/sbin/nextjs-ct-health"     = "scripts/nextjs-ct/nextjs-ct-health"
+    "/usr/local/sbin/nextjs-ct-enter"      = "scripts/nextjs-ct/host/nextjs-ct-enter"
+    "/usr/local/sbin/nextjs-ct-imds"       = "scripts/nextjs-ct/host/nextjs-ct-imds"
+    "/usr/local/sbin/nextjs-ct-ndev-sync"  = "scripts/nextjs-ct/host/nextjs-ct-ndev-sync"
+    "/usr/local/sbin/nextjs-ct-machine"    = "scripts/nextjs-ct/host/nextjs-ct-machine"
+    "/usr/local/sbin/nextjs-ct-mitigation" = "scripts/nextjs-ct/host/nextjs-ct-mitigation"
+    "/usr/local/sbin/nextjs-ct-base"       = "scripts/nextjs-ct/host/nextjs-ct-base"
+    "/usr/local/sbin/nextjs-ct-firewall"   = "scripts/nextjs-ct/host/nextjs-ct-firewall"
+    "/usr/local/sbin/nextjs-ct-sshd"       = "scripts/nextjs-ct/host/nextjs-ct-sshd"
+    "/usr/local/sbin/nextjs-ct-migrate"    = "scripts/nextjs-ct/host/nextjs-ct-migrate"
   }
   nextjs_ct_shared_files = merge(
     { "/var/lib/nextjs-ct/shared/macpbox" = "scripts/macpbox.py" },
@@ -424,6 +425,7 @@ systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
 apt-get -o DPkg::Lock::Timeout=600 update || true
 apt-get -o DPkg::Lock::Timeout=600 install -y curl git jq unzip python3 rsync systemd-container debootstrap nftables earlyoom \
   || { echo "ERROR: required packages did not install"; exit 1; }
+${local.linux_ip_options_setup}
 if ! command -v aws >/dev/null 2>&1; then
   curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
     && (cd /tmp && unzip -qo awscliv2.zip && ./aws/install) \

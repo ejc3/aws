@@ -188,6 +188,14 @@ MemoryHigh=infinity
 MemoryMax=infinity
 MemorySwapMax=infinity
 EOF
+cat > "/etc/systemd/system/systemd-nspawn@$U.service.d/50-cve-2026-98432.conf" <<'EOF'
+[Unit]
+Requires=cve-2026-98432-mitigation.service
+After=cve-2026-98432-mitigation.service
+
+[Service]
+ExecStartPost=/usr/local/sbin/nextjs-ct-mitigation %i
+EOF
 
 # ---- the host end of the link
 cat > "/etc/systemd/network/10-ve-$U.network" <<EOF

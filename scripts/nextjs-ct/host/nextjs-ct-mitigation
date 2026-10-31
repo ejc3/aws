@@ -1,0 +1,18 @@
+#!/bin/bash
+# Apply the reviewed host helper to ONE managed container's network namespace.
+# Keep the host filesystem/user namespace: never execute a container-controlled path as host root.
+set -euo pipefail
+[ "$EUID" = 0 ] || exit 1
+[ "$#" = 1 ] || exit 1
+U=$1
+case "$U" in ''|*[!a-z0-9_-]*) exit 1 ;; esac
+jq -e --arg u "$U" '.users | has($u)' /etc/nextjs-ct/config.json >/dev/null
+GUARD=/usr/local/sbin/cve-2026-98432-mitigation
+leader=$(machinectl show "$U" -p Leader --value)
+[[ "$leader" =~ ^[1-9][0-9]*$ ]] || exit 1
+net=$(readlink "/proc/$leader/ns/net")
+[ "$net" != "$(readlink /proc/1/ns/net)" ] || exit 1
+nsenter -t "$leader" -n -- "$GUARD" --load >/dev/null
+nsenter -t "$leader" -n -- "$GUARD" --check
+[ "$(machinectl show "$U" -p Leader --value)" = "$leader" ]
+[ "$(readlink "/proc/$leader/ns/net")" = "$net" ]

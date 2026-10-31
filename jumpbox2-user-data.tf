@@ -21,6 +21,8 @@ locals {
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+${local.linux_ip_options_bootstrap}
+
 # ---------------------------------------------------------------- base packages
 apt-get update -y || true
 apt-get install -y curl git build-essential zsh jq unzip tar || echo "WARNING: some base packages failed"

@@ -220,6 +220,8 @@ resource "aws_launch_template" "gpu_box" {
     #!/bin/bash
     set -uxo pipefail
 
+    ${local.linux_ip_options_bootstrap}
+
     # The box's own copy of the hard lifetime, armed first so nothing below can delay it.
     # With the template's shutdown behaviour this terminates the instance. It is only a
     # backup: user_data runs once, so a reboot disarms it; the watchdog's LaunchTime check

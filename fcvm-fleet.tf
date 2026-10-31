@@ -395,6 +395,7 @@ resource "aws_iam_instance_profile" "fcvm_fleet_tile" {
 
 # ------------------------------------------------------------------------------------------------ the three regions
 module "fcvm_fleet_east2" {
+  ip_options_bootstrap      = local.linux_ip_options_bootstrap
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet }
   cidr_block                = local.fcvm_fleet_cidrs["us-east-2"]
@@ -411,6 +412,7 @@ module "fcvm_fleet_east2" {
 }
 
 module "fcvm_fleet_west2" {
+  ip_options_bootstrap      = local.linux_ip_options_bootstrap
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet_west2 }
   cidr_block                = local.fcvm_fleet_cidrs["us-west-2"]
@@ -427,6 +429,7 @@ module "fcvm_fleet_west2" {
 }
 
 module "fcvm_fleet_east1" {
+  ip_options_bootstrap      = local.linux_ip_options_bootstrap
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet_east1 }
   cidr_block                = local.fcvm_fleet_cidrs["us-east-1"]

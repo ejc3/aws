@@ -824,6 +824,81 @@ class ContainerScriptTests(unittest.TestCase):
 
 
 
+class NamespaceMitigationTests(unittest.TestCase):
+    def exercise(self, *, managed=True, leader="4242", host_namespace=False,
+                 fail_mode="", leader_changed=False, namespace_changed=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            log = directory / "calls"
+            # The wrapper has no file writes or real namespace operations in this harness.
+            # Only its root check is bypassed; EVERY external command is a PATH fake.
+            source = (HOST / "nextjs-ct-mitigation").read_text()
+            gate = '[ "$EUID" = 0 ] || exit 1'
+            self.assertEqual(source.count(gate), 1)
+            source = source.replace(gate, "true # unprivileged offline fixture")
+            fake(directory, "jq", "exit " + ("0" if managed else "1") + "\n")
+            fake(directory, "machinectl", f'''n=$(cat "{directory}/machine-count" 2>/dev/null || echo 0)
+echo $((n+1)) > "{directory}/machine-count"
+if [ "$n" -gt 0 ] && [ '{int(leader_changed)}' = 1 ]; then echo 4243; else echo '{leader}'; fi
+''')
+            fake(directory, "readlink", f'''[ "$1" != /proc/1/ns/net ] || {{ echo 'net:[1]'; exit; }}
+n=$(cat "{directory}/net-count" 2>/dev/null || echo 0)
+echo $((n+1)) > "{directory}/net-count"
+if [ '{int(host_namespace)}' = 1 ]; then echo 'net:[1]';
+elif [ "$n" -gt 0 ] && [ '{int(namespace_changed)}' = 1 ]; then echo 'net:[3]'; else echo 'net:[2]'; fi
+''')
+            fake(directory, "nsenter", f'''echo "$*" >> "{log}"
+[ "${{@: -1}}" != '{fail_mode}' ] || exit 7
+echo '{{"status":"PASS"}}'
+''')
+            result = subprocess.run(["bash", "-c", source, "guard", "alice"],
+                                    env={"PATH": f"{directory}:/usr/bin:/bin"},
+                                    capture_output=True, text=True, timeout=10)
+            return result, log.read_text().splitlines() if log.exists() else []
+
+    def test_load_and_check_use_only_the_network_namespace_and_trusted_host_helper(self):
+        result, calls = self.exercise()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [
+            "-t 4242 -n -- /usr/local/sbin/cve-2026-98432-mitigation --load",
+            "-t 4242 -n -- /usr/local/sbin/cve-2026-98432-mitigation --check",
+        ])
+
+    def test_unmanaged_or_invalid_or_host_namespace_is_never_entered(self):
+        for options in ({"managed": False}, {"leader": "0"}, {"host_namespace": True}):
+            with self.subTest(options=options):
+                result, calls = self.exercise(**options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+
+    def test_failed_load_or_check_propagates_to_nspawn(self):
+        for mode, count in (("--load", 1), ("--check", 2)):
+            with self.subTest(mode=mode):
+                result, calls = self.exercise(fail_mode=mode)
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(len(calls), count)
+
+    def test_changed_leader_or_namespace_never_claims_success(self):
+        for options in ({"leader_changed": True}, {"namespace_changed": True}):
+            with self.subTest(options=options):
+                result, calls = self.exercise(**options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(calls), 2)
+
+    def test_boot_protects_external_traffic_first_and_converges_each_private_namespace(self):
+        machine = (HOST / "nextjs-ct-machine").read_text()
+        dropin = machine.split('50-cve-2026-98432.conf" <<\'EOF\'\n', 1)[1].split("\nEOF", 1)[0]
+        self.assertIn("Requires=cve-2026-98432-mitigation.service", dropin)
+        self.assertIn("After=cve-2026-98432-mitigation.service", dropin)
+        self.assertIn("ExecStartPost=/usr/local/sbin/nextjs-ct-mitigation %i", dropin)
+        self.assertLess(SCRIPT.index("nftables earlyoom"), SCRIPT.index("${local.linux_ip_options_setup}"))
+        self.assertLess(SCRIPT.index("${local.linux_ip_options_setup}"), SCRIPT.index("/usr/local/sbin/nextjs-ct-machine ${u}"))
+        provision = (CT / "provision").read_text()
+        self.assertLess(provision.index("-net.mptcp.enabled = 0"), provision.index('if [ -n "$BASE" ]; then'))
+        self.assertIn("-net.ipv4.tcp_migrate_req = 0", provision)
+        self.assertIn("<<'SYSCTL' || exit 1", provision)
+
+
 class ClawMasterAgentTests(unittest.TestCase):
     """Every Claude Code in a container reaches the pool, the desktop app's SSH sessions too (they start their own Claude Code
     with the person's own login, which spent that person's own subscription): claw-master-agent-setup runs the agent for an

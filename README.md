@@ -35,6 +35,17 @@ The operating rules are:
 5. Treat every instance-store NVMe disk as disposable. Persistent data belongs on EBS or
    in a backed-up repository.
 
+Exposed Linux hosts carry interim protection for [CVE-2026-98432](https://almalinux.org/blog/2026-10-30-cve-2026-98432/):
+dedicated nftables rules drop IPv4 TCP packets with IPv4 header options, including bridged
+and locally generated traffic, and MPTCP/request migration are disabled where supported.
+Ordinary TCP options such as timestamps and SACK remain usable. The guard owns only its
+two nftables tables and its boot unit; it preserves other firewall, NAT and container rules.
+Next.js containers need the settings and local rules in their own network namespaces too.
+Check a host with `sudo /usr/local/sbin/cve-2026-98432-mitigation --check`. This is an interim
+mitigation, not a patched kernel: install the vendor fix when available and coordinate a
+reboot. Metal NV2 kernels require the fcvm patch/build workflow in `AGENTS.md`, rather than
+replacing them with the distribution kernel.
+
 Normal operation from an admin box:
 
 ```bash
