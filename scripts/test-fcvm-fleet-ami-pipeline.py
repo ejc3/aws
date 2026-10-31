@@ -779,6 +779,41 @@ class FactoryTests(unittest.TestCase):
                         "input_sha256": INPUT_SHA, "priority": "critical"})
                 self.assertEqual((self.cb.starts, self.store.writes), ([], []))
 
+    def test_ancestor_ci_refuses_build_controls_and_wrapper_renames_before_writes(self):
+        previous = "9" * 40
+        for changed in ({"filename": ".cargo/config.toml"}, {"filename": "rust-toolchain.toml"},
+                        {"filename": "nested.sh"}, {"filename": "docs/nested.md", "previous_filename": "nested.sh"},
+                        {"filename": "docs/build.sh"}, {"filename": ".claude/CLAUDE.md"}):
+            with self.subTest(changed=changed):
+                self.setUp()
+                self.store.values.clear()
+                comparison = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": previous},
+                    "total_commits": 1, "files": [changed]}
+                responses = [{"object": {"sha": SOURCE_SHA}},
+                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
+    def test_ancestor_ci_admits_only_root_and_docs_markdown_including_safe_renames(self):
+        previous = "9" * 40
+        for changed in ({"filename": "README.md"}, {"filename": "docs/guide.md"},
+                        {"filename": "docs/new.md", "previous_filename": "docs/old.md"}):
+            with self.subTest(changed=changed):
+                self.setUp()
+                self.store.values.clear()
+                comparison = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": previous},
+                    "total_commits": 1, "files": [changed]}
+                responses = [{"object": {"sha": SOURCE_SHA}},
+                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison]
+                with patch.object(mod, "public_github", side_effect=responses):
+                    result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual(result["status"], "building")
+                self.assertEqual(self.factory.request_record(INPUT_SHA)["ci_head_sha"], previous)
+                self.assertEqual(len(self.cb.starts), 1)
+
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

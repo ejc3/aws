@@ -377,6 +377,8 @@ development servers.
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
 the producer, verify that the four defaults select the already validated guarded
 images, then merge/deploy fcvm's `$Default` consumer and main-only request workflow.
+Both the request and executor must fingerprint the entire tracked Git tree before
+enabling; the narrower build-path fingerprint requires its follow-up first.
 Only then enable the factory in Terraform and require a fresh empty full plan.
 Request an urgent validated main build with
 `gh workflow run fleet-ami-pipeline.yml -R ejc3/fcvm --ref main -f priority=critical`.

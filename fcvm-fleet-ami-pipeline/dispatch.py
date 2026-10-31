@@ -26,7 +26,6 @@ GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
-SOURCE_PATHS = ("Cargo.lock", "Cargo.toml", "build.rs", "Makefile", "rootfs-config.toml", "src/", "fc-agent/", "fuse-pipe/", "exec-proto/", "failpoint/", "fleet/", "kernel/", "scripts/", "assets/")
 
 
 class Refused(Exception):
@@ -48,6 +47,14 @@ def public_github(path):
     if len(raw) > 2 * 1024 * 1024:
         raise Refused("trusted CI metadata exceeds its fixed bound")
     return json.loads(raw)
+
+
+def documentation_path(path):
+    if not isinstance(path, str) or not path.endswith(".md"):
+        return False
+    pieces = path.split("/")
+    return (all(piece not in {"", ".", ".."} for piece in pieces)
+            and (len(pieces) == 1 or pieces[0] == "docs"))
 
 
 def trusted_ci(source):
@@ -75,16 +82,13 @@ def trusted_ci(source):
             raise Refused("trusted CI comparison is incomplete or outside its bound")
         safe = True
         for item in files:
-            paths = [item.get("filename"), item.get("previous_filename")]
-            if not isinstance(paths[0], str):
+            previous = item.get("previous_filename")
+            if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
                 safe = False
                 break
-            for path in paths:
-                if path and any(path.startswith(prefix) if prefix.endswith("/") else path == prefix for prefix in SOURCE_PATHS):
-                    safe = False
         if safe:
             return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        raise Refused("image inputs changed after the latest successful main CI")
+        raise Refused("non-documentation changes require successful CI for this exact revision")
     raise Refused("no successful trusted main CI covers these image inputs")
 
 
