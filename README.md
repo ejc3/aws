@@ -382,6 +382,11 @@ Request an urgent validated main build with
 `gh workflow run fleet-ami-pipeline.yml -R ejc3/fcvm --ref main -f priority=critical`.
 A request acknowledgement is not publication; inspect the factory status and
 release manifest for the actual build, validation and promotion result.
+Each manual critical dispatch gets a fresh request identity, allowing a controlled
+same-source retry without resetting a failed request or replaying uncertain launches.
+The five-minute reconciler retries successful-build publication outside the backend
+lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
+This publication interval never extends the 150-minute compute lease.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|

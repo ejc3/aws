@@ -39,8 +39,10 @@ data "aws_ssm_parameter" "fcvm_ami_release" {
 }
 
 locals {
-  fcvm_active_host_amis = var.fcvm_ami_pipeline_enabled ? jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).host_amis : var.fcvm_fleet_host_amis
-  fcvm_active_tile_amis = var.fcvm_ami_pipeline_enabled ? jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).tile_amis : var.fcvm_fleet_tile_amis
+  # SSM marks every value sensitive, including this explicitly non-secret image
+  # manifest. Only the AMI maps are declassified so resource keys stay usable.
+  fcvm_active_host_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).host_amis) : var.fcvm_fleet_host_amis
+  fcvm_active_tile_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).tile_amis) : var.fcvm_fleet_tile_amis
   fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates
   # These two pre-pipeline images already passed actual hardware/stream/guard
   # verification. They are eligible for the transition, not sanitized CI bases.

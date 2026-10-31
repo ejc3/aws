@@ -107,6 +107,20 @@ class CodeBuild:
         return {"build": self.builds[id]}
 
 
+class Publisher:
+    def __init__(self):
+        self.calls = []
+        self.lose_response = False
+        self.observe = lambda: None
+
+    def invoke(self, **arguments):
+        self.observe()
+        self.calls.append(arguments)
+        if self.lose_response:
+            raise TimeoutError("lost asynchronous publisher receipt")
+        return {"StatusCode": 202}
+
+
 class EC2:
     def __init__(self, env):
         self.env = env
@@ -232,20 +246,33 @@ class FactoryTests(unittest.TestCase):
             "PIPELINE_BUCKET": "fixture-factory", "RELEASE_PARAMETER": "/release", "CANONICAL_AMI": "ami-canonical",
             "SUBNET_ID": "subnet-fixture", "SECURITY_GROUP": "sg-fixture", "GUARD_SHA256": "a" * 64}
         self.env.update(LOCK_TABLE="fixture-locks", LOCK_ID="fixture-state/terraform.tfstate")
+        self.env.update(CONTROL_ACCOUNT="999999999999", PUBLISH_FUNCTION="arn:aws:lambda:us-west-1:999999999999:function:factory-publish")
         self.env["TEMPLATES_JSON"] = "[]"
         self.store, self.fleet_ssm, self.sts = Store(), Store(), STS()
         self.ddb = Dynamo()
         self.cb = CodeBuild()
         self.cb.clock = lambda: self.time
+        self.publisher = Publisher()
+        self.publisher.observe = lambda: self.assertFalse(self.ddb.held, "publisher must be invoked outside the backend lock")
         self.ec2 = EC2(self.env)
         clients = {("ssm", False): self.store, ("ssm", True): self.fleet_ssm, ("ec2", True): self.ec2,
-                   ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb}
+                   ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb,
+                   ("lambda", False): self.publisher}
         self.factory = mod.Factory(self.env, clients, clock=lambda: self.time)
         self.factory.client = lambda name, fleet=False: clients[(name, fleet)]  # Unexpected clients fail, never reach AWS.
         self.store.values["/factory/control"] = {"active": BUILD, "pending": None}
         self.store.values["/factory/requests/" + INPUT_SHA] = {"request_id": INPUT_SHA, "status": "building", "source_sha": SOURCE_SHA,
             "input_sha256": INPUT_SHA, "priority": "normal", "build_id": BUILD}
         self.queue_prepared = False
+
+    def succeed(self, duration=120):
+        self.factory.journal(BUILD)
+        ended = NOW + duration
+        self.cb.builds[BUILD].update(buildStatus="SUCCEEDED", buildComplete=True,
+            endTime=datetime.datetime.fromtimestamp(ended, datetime.timezone.utc))
+        self.time = ended + 1
+        self.fleet_ssm.values["/release"] = {"build_id": "previous"}
+        return ended
 
     def call(self, action, slot=None, **extra):
         event = {"action": action, "build_id": BUILD, "capability": CAP, **extra}
@@ -325,9 +352,98 @@ class FactoryTests(unittest.TestCase):
         self.ec2.lose_launch = True
         with self.assertRaises(TimeoutError):
             self.launch()
-        result = self.call("launch", "host-build")
+        result = self.call("status", "host-build")
         self.assertEqual(result["state"], "running")
+        _, recovered = self.factory.journal(BUILD)
+        self.assertEqual(recovered["slots"]["host-build"].get("instance_id"), result["instance_id"])
+        self.assertEqual(self.call("launch", "host-build")["instance_id"], result["instance_id"])
         self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_successful_build_is_redriven_after_busy_lock_and_status_polls_are_throttled(self):
+        self.succeed()
+        self.ddb.busy = True
+        self.factory.tick()
+        self.assertEqual(self.publisher.calls, [])
+        self.time += 301
+        self.ddb.busy = False
+        self.factory.tick()
+        self.assertEqual(len(self.publisher.calls), 1)
+        call = self.publisher.calls[0]
+        self.assertEqual((call["FunctionName"], call["InvocationType"]), (self.env["PUBLISH_FUNCTION"], "Event"))
+        event = json.loads(call["Payload"])
+        self.assertEqual(event, {"source": "aws.codebuild", "detail-type": "CodeBuild Build State Change",
+            "account": self.env["CONTROL_ACCOUNT"], "region": self.env["CONTROL_REGION"],
+            "detail": {"build-status": "SUCCEEDED", "project-name": "factory",
+                "build-id": "arn:aws:codebuild:us-west-1:999999999999:build/" + BUILD}})
+        for _ in range(5):
+            self.factory.request({"action": "status", "request_id": INPUT_SHA})
+        self.time += 299
+        self.factory.tick()
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.time += 1
+        self.factory.tick()
+        self.assertEqual(len(self.publisher.calls), 2)
+        self.assertEqual(self.cb.starts, [])
+
+    def test_uncertain_publication_invoke_is_redriven_only_after_the_fixed_interval(self):
+        self.succeed()
+        self.publisher.lose_response = True
+        with self.assertRaises(TimeoutError):
+            self.factory.reconcile()
+        self.publisher.lose_response = False
+        self.factory.reconcile()
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.time += 300
+        self.factory.reconcile()
+        self.assertEqual(len(self.publisher.calls), 2)
+        self.assertEqual(self.publisher.calls[0], self.publisher.calls[1])
+
+    def test_success_near_compute_deadline_keeps_a_separate_publication_lease(self):
+        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
+        self.time = NOW + mod.DEADLINE_SECONDS + 10
+        self.factory.reconcile()
+        record = self.factory.request_record(INPUT_SHA)
+        self.assertEqual(record["status"], "awaiting-publish")
+        self.assertEqual(record["publication_deadline_unix"], ended + 86400)
+        self.assertEqual(self.store.values["/factory/control"]["active"], BUILD)
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.assertEqual(self.cb.stops, [])
+
+    def test_committed_release_keeps_retrying_retirement_past_publication_deadline(self):
+        ended = self.succeed()
+        self.fleet_ssm.values["/release"] = {"build_id": BUILD}
+        self.time = ended + 86400 + 10
+        self.factory.reconcile()
+        record = self.factory.request_record(INPUT_SHA)
+        self.assertEqual(record["status"], "awaiting-publish")
+        self.assertEqual(record["publication_deadline_unix"], ended + 86400)
+        self.assertEqual(self.store.values["/factory/control"]["active"], BUILD)
+        self.assertEqual(self.fleet_ssm.values["/release"], {"build_id": BUILD})
+        self.assertEqual(len(self.publisher.calls), 1)
+
+    def test_uncommitted_publication_lease_expires_without_a_new_build_or_pointer_write(self):
+        ended = self.succeed()
+        self.time = ended + 86400 + 1
+        self.factory.reconcile()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertIsNone(self.store.values["/factory/control"]["active"])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.cb.starts, [])
+        self.assertEqual(self.fleet_ssm.writes, [])
+
+    def test_failed_normal_input_is_terminal_but_a_fresh_critical_nonce_can_run(self):
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        self.factory.reconcile()
+        previous = copy.deepcopy(self.factory.request_record(INPUT_SHA))
+        self.assertEqual(previous["status"], "failed")
+        self.queue_prepared = True
+        self.assertEqual(self.request("critical")["status"], "failed")
+        fresh = self.request("critical", "4" * 64)
+        self.assertEqual(fresh["status"], "building")
+        self.assertEqual(fresh["source_sha"], SOURCE_SHA)
+        self.assertEqual(self.factory.request_record(INPUT_SHA), previous)
+        self.assertEqual(len(self.cb.starts), 1)
+        self.assertEqual(self.cb.starts[0]["sourceVersion"], SOURCE_SHA)
 
     def test_lost_create_image_is_observed_without_repeating_create(self):
         instance_id = self.launch()

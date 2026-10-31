@@ -209,6 +209,8 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       ENABLED           = tostring(var.fcvm_ami_pipeline_enabled)
       PROJECT_NAME      = local.fcvm_ami_project
       CONTROL_REGION    = var.aws_region
+      CONTROL_ACCOUNT   = data.aws_caller_identity.current.account_id
+      PUBLISH_FUNCTION  = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish"
       COMPUTE_REGION    = local.fcvm_ami_region
       STATE_PREFIX      = local.fcvm_ami_state_prefix
       FLEET_ROLE        = aws_iam_role.fcvm_ami_broker_fleet.arn
@@ -415,6 +417,7 @@ resource "aws_iam_role_policy" "fcvm_ami_dispatch" {
     { Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:build/${local.fcvm_ami_project}:*" },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = [aws_iam_role.fcvm_ami_broker_fleet.arn, aws_iam_role.fcvm_ami_worker_fleet.arn] },
     { Effect = "Allow", Action = "sts:TagSession", Resource = aws_iam_role.fcvm_ami_worker_fleet.arn },
+    { Sid = "RedriveOnlyTheFixedPublisher", Effect = "Allow", Action = "lambda:InvokeFunction", Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish" },
     { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.fcvm_ami_dispatch.arn}:*" }
     , { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks",
     Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } } }

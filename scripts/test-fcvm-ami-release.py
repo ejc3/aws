@@ -75,6 +75,12 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("local.fcvm_fleet_host_template_condition", policy)
         self.assertIn("local.fcvm_fleet_tile_template_condition", policy)
 
+    def test_only_nonsecret_image_maps_are_declassified_for_resource_keys(self):
+        for kind in ("host", "tile"):
+            self.assertIn("nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value)."
+                          + kind + "_amis)", self.release)
+        self.assertNotIn("nonsensitive(data.aws_ssm_parameter.fcvm_ami_release[0].value)", self.release)
+
     def test_automatic_mode_removes_the_old_exact_image_bypass(self):
         self.assertEqual(self.fleet.count("var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis"), 2)
         self.assertEqual(len(re.findall(r"lookup\(local\.fcvm_active_(?:host|tile)_amis,", self.fleet)), 6)

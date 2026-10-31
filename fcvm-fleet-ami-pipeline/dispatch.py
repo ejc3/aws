@@ -21,10 +21,11 @@ SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
 VOLUMES = {"host": 64, "tile": 32}
 DEADLINE_SECONDS = 150 * 60
+PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
-PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "message", "ci_head_sha", "ci_run_id")
+PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
 SOURCE_PATHS = ("Cargo.lock", "Cargo.toml", "build.rs", "Makefile", "rootfs-config.toml", "src/", "fc-agent/", "fuse-pipe/", "exec-proto/", "failpoint/", "fleet/", "kernel/", "scripts/", "assets/")
 
 
@@ -176,6 +177,14 @@ class Factory:
             raise Refused("more than one instance in a fixed slot")
         if rows and recorded.get("instance_id") not in (None, rows[0]["InstanceId"]):
             raise Refused("slot identity changed")
+        if rows and slot in journal["slots"]:
+            changed = recorded.get("instance_id") is None or rows[0]["State"]["Name"] == "terminated" and not recorded.get("terminated_seen")
+            recorded["instance_id"] = rows[0]["InstanceId"]
+            if rows[0]["State"]["Name"] == "terminated":
+                recorded["terminated_seen"] = True
+            if changed:
+                # Recover the paid API receipt before returning proof/status.
+                self.save("/builds/" + digest(journal["build_id"]), journal)
         return rows[0] if rows else None
 
     def base_image(self, kind):
@@ -398,6 +407,15 @@ class Factory:
         return complete
 
     def reconcile(self):
+        publication = self.reconcile_control()
+        if publication is not None:
+            # The publisher takes this same mutex. Invoke only after releasing it.
+            response = self.client("lambda").invoke(FunctionName=self.env["PUBLISH_FUNCTION"], InvocationType="Event",
+                Payload=json.dumps(publication, separators=(",", ":")).encode())
+            if response.get("StatusCode") != 202:
+                raise Refused("publication retry was not accepted")
+
+    def reconcile_control(self):
         control = self.load("/control", {})
         if not control.get("active") and not control.get("pending"):
             return
@@ -425,13 +443,23 @@ class Factory:
                 build = self.actual_build(active, active=False)
                 record = self.request_record(journal["request_id"])
                 preempt = pending and pending["priority"] == "critical" and pending["request_id"] != record["request_id"]
-                expired = self.now() >= journal["deadline_unix"]
+                succeeded = build["buildStatus"] == "SUCCEEDED"
+                expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
-                if preempt or expired or failed:
+                publication_expired = False
+                if succeeded:
+                    if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
+                        raise Refused("successful build has no final execution receipt")
+                    publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
+                    record["publication_deadline_unix"] = publication_deadline
+                    if self.now() >= publication_deadline:
+                        release = json.loads(self.client("ssm", True).get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+                        publication_expired = release.get("build_id") != active
+                if preempt or expired or failed or publication_expired:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
                     self.cleanup(journal)
-                    record.update(status="superseded" if preempt else "failed", message="preempted by critical work" if preempt else "factory stopped or reached its fixed deadline")
+                    record.update(status="superseded" if preempt else "failed", message="preempted by critical work" if preempt else "publication lease expired" if publication_expired else "factory stopped or reached its fixed deadline")
                     self.save("/requests/" + record["request_id"], record)
                     if not self.gone(suffix, journal):
                         return
@@ -444,9 +472,17 @@ class Factory:
                     control["active"] = None
                     self.save("/control", control)
                 else:
-                    if build["buildStatus"] == "SUCCEEDED" and record["status"] != "awaiting-publish":
+                    if succeeded:
                         record["status"] = "awaiting-publish"
+                        due = self.now() - record.get("publication_last_attempt", 0) >= 300
+                        if due:
+                            record["publication_last_attempt"] = int(self.now())
                         self.save("/requests/" + record["request_id"], record)
+                        if due:
+                            return {"source": "aws.codebuild", "detail-type": "CodeBuild Build State Change",
+                                "account": self.env["CONTROL_ACCOUNT"], "region": self.env["CONTROL_REGION"],
+                                "detail": {"build-status": "SUCCEEDED", "project-name": self.project,
+                                    "build-id": "arn:aws:codebuild:" + self.env["CONTROL_REGION"] + ":" + self.env["CONTROL_ACCOUNT"] + ":build/" + active}}
                     return
             if start_record is None:
                 if not pending or self.env.get("ENABLED") != "true":
