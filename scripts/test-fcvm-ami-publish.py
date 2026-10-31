@@ -8,7 +8,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
+import types
 import unittest
+from unittest import mock
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "fcvm-fleet-ami-pipeline/publish.py"
@@ -213,7 +216,7 @@ class PublisherTests(unittest.TestCase):
         self.templates = [{"region": "us-east-1", "id": name, "kind": "host" if i == 0 else "tile", "arch": "x86_64"}
                           for i, name in enumerate(self.ids)]
         self.env = {"TEMPLATES_JSON": json.dumps(self.templates), "CONTROL_REGION": "us-west-1",
-            "COMPUTE_REGION": "us-east-1", "ASSET_REGION": "us-east-2", "CONTROL_ACCOUNT": "111111111111",
+            "COMPUTE_REGION": "us-east-1", "ASSET_REGION": "us-east-2", "PIPELINE_REGION": "us-east-2", "CONTROL_ACCOUNT": "111111111111",
             "FLEET_ACCOUNT": "222222222222", "PROJECT_NAME": "factory", "STATE_PREFIX": "/factory",
             "PIPELINE_BUCKET": "private-stage", "ASSET_BUCKET": "runtime-assets", "GUARD_SHA256": "c" * 64,
             "RELEASE_PARAMETER": "/release", "LOCK_ID": "exact-backend/key", "LOCK_TABLE": "locks"}
@@ -274,7 +277,7 @@ class PublisherTests(unittest.TestCase):
             sha, version = hashlib.sha256(value).hexdigest(), "version-" + str(i)
             self.s3.objects[self.stage_prefix + name] = (value, {"sha256": sha}, version)
             objects[name] = {"sha256": sha, "version_id": version, "size": len(value)}
-        self.manifest["store"] = {"bucket": "private-stage", "region": "us-west-1", "prefix": self.stage_prefix,
+        self.manifest["store"] = {"bucket": "private-stage", "region": "us-east-2", "prefix": self.stage_prefix,
             "destination": {"bucket": "runtime-assets", "region": "us-east-2", "prefix": self.target_prefix}, "objects": objects}
         self.update_manifest()
 
@@ -284,12 +287,41 @@ class PublisherTests(unittest.TestCase):
     def publisher(self):
         clients = {("ssm", False, "us-west-1"): self.main_ssm, ("ssm", True, "us-east-1"): self.fleet_ssm,
             ("dynamodb", False, "us-west-1"): self.ddb, ("ec2", True, "us-east-1"): self.ec2,
-            ("codebuild", False, "us-west-1"): self.codebuild, ("s3", False, "us-west-1"): self.s3,
+            ("codebuild", False, "us-west-1"): self.codebuild, ("s3", False, "us-east-2"): self.s3,
             ("s3", True, "us-east-2"): self.assets}
         publisher = MODULE.Publisher(self.env, clients, sleep=lambda _: None)
         # Any missing fake is a test error, never an implicit real boto3 client.
-        publisher.client = lambda service, fleet=False, region=None: clients[(service, fleet, region or self.env["COMPUTE_REGION" if fleet else "CONTROL_REGION"])]
+        regions = {("s3", False): "us-east-2", ("s3", True): "us-east-2",
+                   ("ec2", True): "us-east-1", ("ssm", True): "us-east-1",
+                   ("ssm", False): "us-west-1", ("dynamodb", False): "us-west-1", ("codebuild", False): "us-west-1"}
+        publisher.client = lambda service, fleet=False, region=None: clients[(service, fleet, region or regions[(service, fleet)])]
         return publisher
+
+    def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
+        sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
+        modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
+                   "botocore.config": types.SimpleNamespace(Config=lambda **_kwargs: None)}
+        publisher = MODULE.Publisher(dict(self.env, FLEET_ROLE="arn:aws:iam::222222222222:role/publish"))
+        sts = mock.Mock()
+        sts.assume_role.return_value = {"Credentials": {"AccessKeyId": "dummy", "SecretAccessKey": "dummy", "SessionToken": "dummy"}}
+        publisher.clients[("sts", False, "us-west-1")] = sts
+        with mock.patch.dict(sys.modules, modules):
+            stage = publisher.client("s3")
+            self.assertIs(publisher.client("s3"), stage)
+            publisher.client("ssm")
+            publisher.client("codebuild")
+            publisher.client("ec2", True)
+            self.assertIsNot(publisher.client("s3", True, "us-east-2"), stage)
+        self.assertEqual([(call.args[0], call.kwargs["region_name"]) for call in sdk.client.call_args_list],
+                         [("s3", "us-east-2"), ("ssm", "us-west-1"), ("codebuild", "us-west-1"),
+                          ("ec2", "us-east-1"), ("s3", "us-east-2")])
+
+    def test_staging_proof_cannot_substitute_the_control_region(self):
+        self.manifest["store"]["region"] = "us-west-1"
+        self.update_manifest()
+        with self.assertRaises(MODULE.Refused):
+            self.publisher().run(self.event)
+        self.assertEqual(self.ec2.created, [])
 
     def test_success_changes_only_images_and_copies_exact_immutable_store(self):
         result = self.publisher().run(self.event)

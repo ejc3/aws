@@ -18,11 +18,13 @@ locals {
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {
-  bucket = "fcvm-fleet-image-factory-${data.aws_caller_identity.current.account_id}"
-  tags   = { Purpose = "fcvm-fleet-image-factory" }
+  provider = aws.ohio
+  bucket   = "fcvm-fleet-image-factory-${data.aws_caller_identity.current.account_id}"
+  tags     = { Purpose = "fcvm-fleet-image-factory" }
 }
 
 resource "aws_s3_bucket_public_access_block" "fcvm_ami_pipeline" {
+  provider                = aws.ohio
   bucket                  = aws_s3_bucket.fcvm_ami_pipeline.id
   block_public_acls       = true
   block_public_policy     = true
@@ -31,19 +33,22 @@ resource "aws_s3_bucket_public_access_block" "fcvm_ami_pipeline" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "fcvm_ami_pipeline" {
-  bucket = aws_s3_bucket.fcvm_ami_pipeline.id
+  provider = aws.ohio
+  bucket   = aws_s3_bucket.fcvm_ami_pipeline.id
   rule {
     apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
   }
 }
 
 resource "aws_s3_bucket_versioning" "fcvm_ami_pipeline" {
-  bucket = aws_s3_bucket.fcvm_ami_pipeline.id
+  provider = aws.ohio
+  bucket   = aws_s3_bucket.fcvm_ami_pipeline.id
   versioning_configuration { status = "Enabled" }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "fcvm_ami_pipeline" {
-  bucket = aws_s3_bucket.fcvm_ami_pipeline.id
+  provider = aws.ohio
+  bucket   = aws_s3_bucket.fcvm_ami_pipeline.id
   rule {
     id     = "expire-private-build-artifacts"
     status = "Enabled"
@@ -288,7 +293,7 @@ resource "aws_codebuild_project" "fcvm_ami" {
     }
     environment_variable {
       name  = "FLEET_AMI_ASSET_REGION"
-      value = var.aws_region
+      value = local.fcvm_fleet_home_region
     }
     environment_variable {
       name  = "FLEET_AMI_PUBLISHED_ASSET_BUCKET"
@@ -360,7 +365,8 @@ resource "aws_iam_role_policy" "fcvm_ami_worker" {
 }
 
 resource "aws_s3_bucket_policy" "fcvm_ami_pipeline" {
-  bucket = aws_s3_bucket.fcvm_ami_pipeline.id
+  provider = aws.ohio
+  bucket   = aws_s3_bucket.fcvm_ami_pipeline.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Sid = "TLSOnly", Effect = "Deny", Principal = "*", Action = "s3:*", Resource = [aws_s3_bucket.fcvm_ami_pipeline.arn, "${aws_s3_bucket.fcvm_ami_pipeline.arn}/*"], Condition = { Bool = { "aws:SecureTransport" = "false" } } },
     { Sid = "FleetWorkers", Effect = "Allow", Principal = { AWS = [aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_worker_fleet.arn, aws_iam_role.fcvm_ami_publish_fleet.arn] },
@@ -575,6 +581,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       FLEET_ROLE        = aws_iam_role.fcvm_ami_publish_fleet.arn
       STATE_PREFIX      = local.fcvm_ami_state_prefix
       PIPELINE_BUCKET   = aws_s3_bucket.fcvm_ami_pipeline.id
+      PIPELINE_REGION   = local.fcvm_fleet_home_region
       RELEASE_PARAMETER = aws_ssm_parameter.fcvm_ami_release.name
       GUARD_SHA256      = local.fcvm_ami_guard_sha
       TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)

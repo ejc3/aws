@@ -80,7 +80,8 @@ class Publisher:
         need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
 
     def client(self, service, fleet=False, region=None):
-        region = region or self.env["COMPUTE_REGION" if fleet else "CONTROL_REGION"]
+        region = region or (self.env["PIPELINE_REGION"] if service == "s3" and not fleet
+                            else self.env["COMPUTE_REGION" if fleet else "CONTROL_REGION"])
         key = (service, fleet, region)
         if key not in self.clients:
             import boto3
@@ -252,7 +253,7 @@ class Publisher:
         destination = {"bucket": self.env["ASSET_BUCKET"], "region": self.env["ASSET_REGION"], "prefix": target_prefix}
         objects = proof.get("objects", {})
         need(proof.get("bucket") == self.env["PIPELINE_BUCKET"]
-             and proof.get("region") == self.env["CONTROL_REGION"] and proof.get("prefix") == source_prefix
+             and proof.get("region") == self.env["PIPELINE_REGION"] and proof.get("prefix") == source_prefix
              and proof.get("destination") == destination and set(objects) == STORE_FILES,
              "runtime store proof is outside the fixed source and destination")
         source = self.client("s3")

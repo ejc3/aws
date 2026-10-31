@@ -2,10 +2,12 @@
 """Factory failure/ownership tests. Every AWS client is an in-memory fake."""
 import copy
 import datetime
+import fnmatch
 import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import sys
 import types
 import unittest
@@ -238,6 +240,45 @@ class Dynamo:
 
 
 class FactoryTests(unittest.TestCase):
+    def test_staging_s3_resources_and_endpoints_obey_the_actual_fleet_region_scp(self):
+        root = SOURCE.parents[1]
+        factory = (root / "fcvm-fleet-ami-pipeline.tf").read_text()
+        account = (root / "fcvm-fleet-account.tf").read_text()
+        globals_source = (root / "dolphin-region-scp.tf").read_text()
+        regions = json.loads(re.search(r"fcvm_fleet_regions\s*=\s*(\[[^\]]+\])", account).group(1))
+        home = re.search(r'fcvm_fleet_home_region\s*=\s*"([^"]+)"', account).group(1)
+        default = re.search(r'variable "aws_region" \{.*?default\s*=\s*"([^"]+)"',
+                            (root / "variables.tf").read_text(), re.S).group(1)
+        self.assertIn('region = var.aws_region', (root / "main.tf").read_text())
+        ohio = re.search(r'provider "aws" \{\n\s*alias\s*=\s*"ohio".*?^\}',
+                         (root / "ohio.tf").read_text(), re.S | re.M).group()
+        ohio_region = re.search(r'region\s*=\s*"([^"]+)"', ohio).group(1)
+        self.assertNotIn("assume_role", ohio, "staging must stay in the main account")
+        self.assertEqual(ohio_region, home)
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_regions', account)
+        global_actions = re.findall(r'"([^"]+)"', re.search(
+            r"dolphin_region_scp_global_actions\s*=\s*\[(.*?)\n  \]", globals_source, re.S).group(1))
+        def denied(region, action):
+            return region not in regions and not any(fnmatch.fnmatchcase(action, pattern) for pattern in global_actions)
+        for action in ("s3:GetObject", "s3:PutObject"):
+            self.assertTrue(denied(default, action), "the existing Fleet SCP must stay closed outside its regions")
+        resources = list(re.finditer(r'^resource "(aws_s3_[^"]+)" "fcvm_ami_pipeline" \{\n.*?^\}',
+                                     factory, re.S | re.M))
+        self.assertTrue(resources)
+        for resource in resources:
+            with self.subTest(resource=resource.group(1)):
+                provider = re.search(r"^  provider\s*=\s*([\w.]+)", resource.group(), re.M)
+                alias = provider.group(1) if provider else "aws"
+                region = {"aws": default, "aws.ohio": ohio_region}.get(alias)
+                self.assertFalse(denied(region, "s3:GetObject"))
+                self.assertFalse(denied(region, "s3:PutObject"))
+                self.assertEqual(alias, "aws.ohio", "every bucket configuration must use the same main-account provider")
+        asset = re.search(r'name\s*=\s*"FLEET_AMI_ASSET_REGION"\s+value\s*=\s*([^\n]+)', factory)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset.group(1).strip(), "local.fcvm_fleet_home_region")
+        publisher = re.search(r'^resource "aws_lambda_function" "fcvm_ami_publish" \{\n.*?^\}', factory, re.S | re.M).group()
+        self.assertRegex(publisher, r"PIPELINE_REGION\s*=\s*local\.fcvm_fleet_home_region")
+
     def setUp(self):
         self.time = NOW
         self.env = {"ENABLED": "true", "STATE_PREFIX": "/factory", "PROJECT_NAME": "factory", "CONTROL_REGION": "us-west-1",
