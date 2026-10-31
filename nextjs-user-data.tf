@@ -184,6 +184,8 @@ locals {
 #!/bin/bash
 set -uxo pipefail
 
+${local.linux_ip_options_bootstrap}
+
 # ---------------------------------------------------------------- base packages
 export DEBIAN_FRONTEND=noninteractive
 apt-get update || true

@@ -42,6 +42,11 @@ variable "gpu_amis" {
   type        = map(string)
 }
 
+variable "ip_options_bootstrap" {
+  description = "Reviewed IPv4 TCP-options guard installer; no credentials"
+  type        = string
+}
+
 variable "tile_amis" {
   description = "The EC2 tile AMI per architecture in this region (x86_64, arm64); an empty value skips that template"
   type        = map(string)
@@ -134,6 +139,8 @@ locals {
   # that file and starts the unit without waiting for it: the unit itself waits for the GPUs on vfio-pci and the store.
   user_data = base64encode(<<-EOT
     #!/bin/bash
+    set -eu
+    ${var.ip_options_bootstrap}
     echo "fcvm-fleet host booted $(date -u +%FT%TZ)" > /var/log/fcvm-fleet-boot.log
     %{if var.host_agent_args != ""~}
     install -d -m 0755 /etc/fcvm-fleet
@@ -141,6 +148,12 @@ locals {
     systemctl enable fcvm-fleet-agent.service
     systemctl start --no-block fcvm-fleet-agent.service
     %{endif~}
+  EOT
+  )
+  tile_user_data = base64encode(<<-EOT
+    #!/bin/bash
+    set -eu
+    ${var.ip_options_bootstrap}
   EOT
   )
 }
@@ -190,29 +203,20 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# TCP 443 from anywhere, nothing else in: the VMs' renderers and the tiles serve HTTPS on their own IPv6 addresses.
+# CVE-2026-98432: block public IPv4 TCP until guarded AMIs protect the first listener
+# and stopped-pool resume. User data runs too late to guarantee that boundary.
+# IPv6 HTTPS remains available; this vulnerability affects IPv4 TCP options only.
 resource "aws_security_group" "fleet" {
   name        = "fcvm-fleet"
   description = "fcvm fleet hosts and tiles: TCP 443 in from anywhere, nothing else in"
   vpc_id      = aws_vpc.this.id
 
   ingress {
-    description      = "HTTPS from anywhere"
+    description      = "IPv6 HTTPS; IPv4 held for CVE-2026-98432"
     from_port        = 443
     to_port          = 443
     protocol         = "tcp"
-    cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
-  }
-
-  # IPv4 viewers reach a GPU host's slots on its one public IPv4 address, each slot's renderer TLS forwarded on its own
-  # port. IPv4 only: over IPv6 every slot has its own address and serves 443.
-  ingress {
-    description = "Slot renderer TLS over IPv4, a port per slot"
-    from_port   = var.slot_tls_ports.from
-    to_port     = var.slot_tls_ports.to
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -307,6 +311,7 @@ resource "aws_launch_template" "tile" {
   description   = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): launched by the coordinator"
   image_id      = var.tile_amis[each.key]
   instance_type = local.tile_types[each.key]
+  user_data     = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name
@@ -361,6 +366,7 @@ resource "aws_launch_template" "tile_on_demand" {
   description   = "fcvm fleet EC2 comparison tile on demand, ${each.key} (${local.tile_types[each.key]}): the coordinator's fallback"
   image_id      = var.tile_amis[each.key]
   instance_type = local.tile_types[each.key]
+  user_data     = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name
@@ -410,6 +416,7 @@ resource "aws_launch_template" "tile_pool" {
   description   = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): persistent spot, stopped between wakes"
   image_id      = var.tile_amis[each.key]
   instance_type = local.tile_types[each.key]
+  user_data     = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name

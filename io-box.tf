@@ -179,6 +179,8 @@ resource "aws_instance" "io_box" {
     #!/bin/bash
     set -euxo pipefail
 
+    ${local.linux_ip_options_bootstrap}
+
     hostnamectl set-hostname io
 
     # The existing dev-hop private key stays only on the dev boxes. This host gets its
