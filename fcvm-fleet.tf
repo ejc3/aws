@@ -127,6 +127,10 @@ locals {
     "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
     "--store-ready-file /var/lib/fcvm-fleet/store-ready",
+    # Phones mode (?mode=phones, ejc3/fcvm docs/fleet/ARCHITECTURE.md "Phones mode"): the last two GPUs of each host
+    # run a phone each, restored from the AMI's warm phone snapshot; the wall keeps the other six. The phone's
+    # assets come from /etc/fcvm-fleet/phone.env, which the AMI's build writes.
+    "--phones 2",
     ], local.fcvm_fleet_aggregated ? [
     "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
     "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
