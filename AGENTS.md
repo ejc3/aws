@@ -498,9 +498,31 @@ The function serializes against this backend's DynamoDB lock and changes only th
 coordinator image. CI owns that code and therefore its fleet-only runtime capabilities;
 the fleet account still has no path into this account.
 
-**Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
-also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
-Dedicated Host quota/capacity. Teardown deletes the Mac root.
+**EC2 Mac leases require direct owner approval**: use `macpbox status` / `quote` / `ssh` /
+`workspace` to inspect and reuse the one shared host. Every NEW allocation requires approval
+in the current owner conversation after presenting its current price and 24-hour minimum
+(Oregon M4 Pro currently $1.97/hour, $47.28 minimum, plus EBS, IPv4 and transfer). Billing
+begins at successful host allocation even if instance launch fails; stopping is not release.
+Only the primary `jumpbox` instance-role session may run the paid admin launcher for
+AllocateHosts/RunInstances in this deliberate, narrow ephemeral-compute exception. Its
+local lock serializes that single executor; the recovery jumpbox can inspect status/pricing
+and SSH to an active Mac, but must recover the primary before starting a new lease. Dev
+agents receive read-only discovery/pricing, never a new
+launch grant or a dev-to-jumpbox delegation path. Ordinary Terraform applies manage the
+durable template, profile, networking and cleanup only, not a paid host/instance/EIP.
+Never allocate by default, renew automatically, or allocate one Mac per agent. Reusing an
+active lease needs no new allocation approval. Cleanup is allocation time + 24 hours,
+retries AWS scrubbing (up to 4.5 hours), and must confirm host release. Push source/artifacts
+before teardown; roots and local scratch are disposable.
+
+On the shared Mac, every agent owns a separate validated workspace/worktree, DerivedData,
+Cargo target and cache, temporary files, logs and ports. Do not alter another agent's work,
+global Xcode or Homebrew settings, restart or reboot the host. Use positively identified,
+mounted SSD scratch only; never format a guessed device. Bootstrap authorizes public SSH
+keys only: no private client keys, personal auth, signing keys or VNC credentials are
+seeded. The personal MacBook `ssh mac` flow is separate and unchanged.
+Installing the CLI does not give member containers the owner's dev-hop private key;
+current SSH access uses the existing owner/metal identities only.
 
 ## Development Instances
 

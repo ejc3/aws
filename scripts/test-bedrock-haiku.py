@@ -42,13 +42,10 @@ class GrantTests(unittest.TestCase):
         self.assertIn('"aws-marketplace:ProductId" = ["prod-6cyn7tgqazjhu"]', subscribe.group())
 
     def test_every_role_gets_exactly_the_shared_statements(self):
-        for name in ("box_bedrock_haiku", "mac_bedrock_haiku"):
-            policy = block("aws_iam_role_policy", name)
-            self.assertIn("Statement = local.bedrock_haiku_statements", policy)
+        policy = block("aws_iam_role_policy", "box_bedrock_haiku")
+        self.assertIn("Statement = local.bedrock_haiku_statements", policy)
         self.assertIn("for_each = local.bedrock_haiku_box_roles", block("aws_iam_role_policy", "box_bedrock_haiku"))
-        mac = block("aws_iam_role_policy", "mac_bedrock_haiku")
-        self.assertIn("role     = aws_iam_role.mac_instance[0].id", mac)
-        self.assertIn("count    = var.enable_mac_dev ? 1 : 0", mac)
+        self.assertNotIn('resource "aws_iam_role_policy" "mac_bedrock_haiku"', TF)
         # The roles' own files stay without Bedrock; the grant lives here.
         for tf in ("nextjs-dev.tf", "dev-ebs.tf", "wbox.tf", "member-wbox.tf", "claw-master-server.tf", "mac-dev-secrets.tf"):
             self.assertNotIn("bedrock:", (ROOT / tf).read_text(), tf)
@@ -60,7 +57,7 @@ class GrantTests(unittest.TestCase):
         attached = set(re.findall(r"aws_iam_role\.(\w+)(?:\[0\])?(?:\.id\b| :)", roles.group(1)))
         self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "member_wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
-        # is an administrator (jumpbox_admin), is a CI machine, is the Mac (its own resource above), or is in the
+        # is an administrator (jumpbox_admin), is a CI machine, is the Mac (SSM channels only), or is in the
         # Dolphin account (dolphin_redis, which calls no model), or is in the fcvm-fleet account (its hosts and tiles call none).
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "runner_app_image_builder",
                     "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile"}

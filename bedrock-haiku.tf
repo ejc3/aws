@@ -89,12 +89,3 @@ resource "aws_iam_role_policy" "box_bedrock_haiku" {
   policy   = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
 }
 
-# The Mac's role is made through the aws.mac provider, so its policy is too (as mac_dev_ebs in dev-ebs.tf).
-resource "aws_iam_role_policy" "mac_bedrock_haiku" {
-  count    = var.enable_mac_dev ? 1 : 0
-  provider = aws.mac
-  name     = "invoke-claude-haiku-5-5"
-  role     = aws_iam_role.mac_instance[0].id
-  policy   = jsonencode({ Version = "2012-10-17", Statement = local.bedrock_haiku_statements })
-}
-

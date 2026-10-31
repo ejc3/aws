@@ -367,6 +367,7 @@ done < <(cfg --arg u "$U" '.users[$u].windows_mcp // [] | .[]')
 # pbox, gbox and wbox, in every container: the owner's drive the owner's boxes with the hop key, a member's drive
 # that member's own three (member-boxes.tf), and the session policy admits nothing else.
 bash "$SHARED/snippets/box-tools.sh" || warn "box tools install failed"
+ln -sfn "$SHARED/macpbox" /usr/local/bin/macpbox || warn "macpbox link failed"
 
 # Re-enable what this account published, then retire what was deleted, then start the agents.
 for envf in /var/lib/ndev/instances/*.env; do
