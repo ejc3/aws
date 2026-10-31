@@ -25,7 +25,7 @@ GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "message", "ci_head_sha", "ci_run_id")
-SOURCE_PATHS = ("Cargo.lock", "Cargo.toml", "build.rs", "Makefile", "rootfs-config.toml", "src/", "fc-agent/", "fleet/", "kernel/", "scripts/", "assets/")
+SOURCE_PATHS = ("Cargo.lock", "Cargo.toml", "build.rs", "Makefile", "rootfs-config.toml", "src/", "fc-agent/", "fuse-pipe/", "exec-proto/", "failpoint/", "fleet/", "kernel/", "scripts/", "assets/")
 
 
 class Refused(Exception):
@@ -411,6 +411,15 @@ class Factory:
             active = control.get("active")
             if isinstance(active, dict):
                 start_record = self.request_record(active["intent"])
+                if start_record.get("no_build"):
+                    # A definitive rejection receipt survives a busy mutex.
+                    # Clear this intent only; a newer pending request stays queued.
+                    control["active"] = None
+                    if control.get("pending") == start_record["request_id"]:
+                        control["pending"] = None
+                        pending = None
+                    self.save("/control", control)
+                    start_record = None
             elif active:
                 suffix, journal = self.journal(active, active=False)
                 build = self.actual_build(active, active=False)
@@ -455,11 +464,28 @@ class Factory:
                 self.save("/control", control)
         # No backend lock is held through StartBuild or its reconciliation.
         if is_new:
-            build = self.client("codebuild").start_build(projectName=self.project, sourceVersion=start_record["source_sha"],
-                idempotencyToken=start_record["request_id"], environmentVariablesOverride=[
-                    {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
-                    {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
-                    {"name": "FLEET_AMI_CAPABILITY", "value": secrets.token_urlsafe(32), "type": "PLAINTEXT"}])["build"]
+            try:
+                build = self.client("codebuild").start_build(projectName=self.project, sourceVersion=start_record["source_sha"],
+                    idempotencyToken=start_record["request_id"], environmentVariablesOverride=[
+                        {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
+                        {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
+                        {"name": "FLEET_AMI_CAPABILITY", "value": secrets.token_urlsafe(32), "type": "PLAINTEXT"}])["build"]
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") not in {
+                        "AccountLimitExceededException", "InvalidInputException", "ResourceNotFoundException", "AccessDeniedException"}:
+                    raise  # An unknown outcome still must never replay StartBuild.
+                record = self.request_record(start_record["request_id"])
+                record.update(status="failed", no_build=True, message="CodeBuild definitively rejected the request before starting")
+                self.save("/requests/" + record["request_id"], record)
+                with self.control_lock() as acquired:
+                    if acquired:
+                        control = self.load("/control", {})
+                        if control.get("active") == {"intent": record["request_id"]}:
+                            control["active"] = None
+                            if control.get("pending") == record["request_id"]:
+                                control["pending"] = None
+                            self.save("/control", control)
+                return
         else:
             ids = self.client("codebuild").list_builds_for_project(projectName=self.project, sortOrder="DESCENDING")["ids"][:20]
             builds = self.client("codebuild").batch_get_builds(ids=ids)["builds"] if ids else []

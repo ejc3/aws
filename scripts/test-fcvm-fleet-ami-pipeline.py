@@ -419,6 +419,64 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(record["status"], "building")
         self.assertEqual(record["build_id"], "factory:22222222-2222-2222-2222-222222222222")
 
+    def test_definitive_start_rejection_releases_only_its_intent_for_new_critical_work(self):
+        for code in ("AccountLimitExceededException", "InvalidInputException", "ResourceNotFoundException", "AccessDeniedException"):
+            with self.subTest(code=code):
+                self.setUp()
+                self.cb.builds.clear()
+                def reject(**arguments):
+                    self.cb.starts.append(arguments)
+                    raise mod.ClientError({"Error": {"Code": code}}, "StartBuild")
+                with patch.object(self.cb, "start_build", side_effect=reject):
+                    try:
+                        self.request("critical")
+                    except mod.ClientError:
+                        pass  # The original bug raises while retaining its queued intent.
+                record = self.factory.request_record(INPUT_SHA)
+                self.assertEqual(record["status"], "failed")
+                self.assertTrue(record["no_build"])
+                self.assertIsNone(self.store.values["/factory/control"]["active"])
+                self.time += 86400
+                result = self.request("critical", "3" * 64)
+                self.assertEqual(result["status"], "building")
+                self.assertEqual(len(self.cb.starts), 2)
+                self.assertEqual(self.cb.starts[-1]["environmentVariablesOverride"][1]["value"], "3" * 64)
+
+    def test_rejected_start_receipt_survives_busy_lock_and_preserves_new_pending_critical(self):
+        self.cb.builds.clear()
+        def reject(**arguments):
+            self.cb.starts.append(arguments)
+            self.ddb.busy = True
+            raise mod.ClientError({"Error": {"Code": "AccountLimitExceededException"}}, "StartBuild")
+        with patch.object(self.cb, "start_build", side_effect=reject):
+            try:
+                self.request("critical")
+            except mod.ClientError:
+                pass
+        self.assertTrue(self.factory.request_record(INPUT_SHA).get("no_build"))
+        self.assertEqual(self.store.values["/factory/control"]["active"], {"intent": INPUT_SHA})
+        self.request("critical", "3" * 64)
+        self.assertEqual(self.store.values["/factory/control"]["pending"], "3" * 64)
+        self.ddb.busy = False
+        self.factory.reconcile()
+        self.assertEqual(len(self.cb.starts), 2)
+        self.assertEqual(self.factory.request_record("3" * 64)["status"], "building")
+        self.assertEqual(self.cb.starts[-1]["environmentVariablesOverride"][1]["value"], "3" * 64)
+
+    def test_unknown_start_error_keeps_the_intent_and_discovers_without_replay(self):
+        self.cb.builds.clear()
+        start = self.cb.start_build
+        def uncertain(**arguments):
+            start(**arguments)
+            raise mod.ClientError({"Error": {"Code": "InternalFailure"}}, "StartBuild")
+        with patch.object(self.cb, "start_build", side_effect=uncertain), self.assertRaises(mod.ClientError):
+            self.request("critical")
+        self.assertFalse(self.factory.request_record(INPUT_SHA).get("no_build"))
+        self.assertEqual(self.store.values["/factory/control"]["active"], {"intent": INPUT_SHA})
+        self.factory.reconcile()
+        self.assertEqual(len(self.cb.starts), 1)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "building")
+
     def test_critical_upgrades_same_queued_input_without_six_hour_delay(self):
         self.cb.builds.clear()
         self.request("normal")
@@ -548,6 +606,21 @@ class FactoryTests(unittest.TestCase):
                 check(files)
         with self.assertRaises(mod.Refused):
             check([{"filename": "README.md"}], total_commits=251)
+
+    def test_green_ancestor_cannot_admit_changes_to_any_local_rust_dependency(self):
+        previous = "9" * 40
+        for directory in ("fuse-pipe", "exec-proto", "failpoint"):
+            with self.subTest(directory=directory):
+                self.setUp()
+                self.store.values.clear()
+                comparison = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": previous},
+                    "total_commits": 1, "files": [{"filename": directory + "/src/lib.rs"}]}
+                responses = [{"object": {"sha": SOURCE_SHA}},
+                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
 
 
 if __name__ == "__main__":
