@@ -39,8 +39,9 @@ variable "fcvm_fleet_host_amis" {
   # routed port forward whose dial of the guest cannot hold fcvm at exit (ejc3/fcvm#1453: a claimed GPU's old VM stopped
   # in 0.45 s, not 4.8 s), the renderer's speckle fix (ejc3/fcvm#1454: clouds and shading edges filtered, a taller
   # stream interpolated) and a word cut by terrain along the ground, without a bright rim (ejc3/fcvm#1455). Its
-  # renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-0a63fa06ea592d4c7" } }
+  # renderer is the tile AMI's. Guard-only revision preserves all store/profile/kernel
+  # assets; guard boot/resume was verified on a non-GPU editor, not a GPU runtime test.
+  default = { "us-east-1" = { x86_64 = "ami-00fb7a2e8b89e2446" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -50,8 +51,9 @@ variable "fcvm_fleet_tile_amis" {
   # (fcvm fleet/ami/tile). Revised from the 67d383ea image's lineage (scene authentication and direct-viewer admission,
   # ejc3/fcvm#1425) with the renderer from ejc3/fcvm main e32ad48d, the host AMI's: the speckle fix (ejc3/fcvm#1454)
   # and the word's cut and glow (ejc3/fcvm#1455). Its boot prefetch list was traced again on this image (2,734 pieces,
-  # 417 MiB); the NVIDIA device readiness checks remain in the recipe.
-  default = { "us-east-1" = { x86_64 = "ami-0c6f93b542d72ebcf" } }
+  # 417 MiB); the NVIDIA device readiness checks remain in the recipe. Its guard-only
+  # revision passed actual GPU reboot/resume and renderer-frame checks.
+  default = { "us-east-1" = { x86_64 = "ami-0edfc91ca2e651db9" } }
 }
 
 locals {
@@ -396,6 +398,7 @@ resource "aws_iam_instance_profile" "fcvm_fleet_tile" {
 # ------------------------------------------------------------------------------------------------ the three regions
 module "fcvm_fleet_east2" {
   ip_options_bootstrap      = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet }
   cidr_block                = local.fcvm_fleet_cidrs["us-east-2"]
@@ -413,6 +416,7 @@ module "fcvm_fleet_east2" {
 
 module "fcvm_fleet_west2" {
   ip_options_bootstrap      = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet_west2 }
   cidr_block                = local.fcvm_fleet_cidrs["us-west-2"]
@@ -430,6 +434,7 @@ module "fcvm_fleet_west2" {
 
 module "fcvm_fleet_east1" {
   ip_options_bootstrap      = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                    = "./modules/fcvm-fleet-region"
   providers                 = { aws = aws.fcvm_fleet_east1 }
   cidr_block                = local.fcvm_fleet_cidrs["us-east-1"]

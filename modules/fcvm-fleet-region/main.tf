@@ -47,6 +47,11 @@ variable "ip_options_bootstrap" {
   type        = string
 }
 
+variable "ip_options_guard_sha256" {
+  description = "The canonical reviewed guard helper digest required on every admitted fleet AMI"
+  type        = string
+}
+
 variable "tile_amis" {
   description = "The EC2 tile AMI per architecture in this region (x86_64, arm64); an empty value skips that template"
   type        = map(string)
@@ -94,6 +99,29 @@ variable "flow_log_bucket_policy_id" {
 }
 
 data "aws_region" "current" {}
+
+# A public listener may resume before cloud-init. Admit only images with the
+# persistent reviewed guard, including every nonempty caller-supplied override.
+data "aws_ami" "guarded" {
+  for_each = toset(compact(concat(values(var.gpu_amis), values(var.tile_amis))))
+  owners   = ["self"]
+  filter {
+    name   = "image-id"
+    values = [each.value]
+  }
+  filter {
+    name   = "is-public"
+    values = ["false"]
+  }
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+  filter {
+    name   = "tag:GuardHelperSHA256"
+    values = [var.ip_options_guard_sha256]
+  }
+}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -203,20 +231,29 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# CVE-2026-98432: block public IPv4 TCP until guarded AMIs protect the first listener
-# and stopped-pool resume. User data runs too late to guarantee that boundary.
-# IPv6 HTTPS remains available; this vulnerability affects IPv4 TCP options only.
+# CVE-2026-98432: guarded AMIs must exist before public IPv4 can be restored.
+# User data alone is too late for the first listener or a stopped-pool resume.
 resource "aws_security_group" "fleet" {
+  depends_on  = [data.aws_ami.guarded]
   name        = "fcvm-fleet"
   description = "fcvm fleet hosts and tiles: TCP 443 in from anywhere, nothing else in"
   vpc_id      = aws_vpc.this.id
 
   ingress {
-    description      = "IPv6 HTTPS; IPv4 held for CVE-2026-98432"
+    description      = "HTTPS"
     from_port        = 443
     to_port          = 443
     protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
+  }
+
+  ingress {
+    description = "GPU slot renderer TLS over IPv4"
+    from_port   = var.slot_tls_ports.from
+    to_port     = var.slot_tls_ports.to
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
