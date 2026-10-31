@@ -417,8 +417,8 @@ resource "aws_cloudwatch_event_target" "dolphin_config_recorder" {
   depends_on = [aws_sns_topic_policy.dolphin_alerts]
 }
 
-# dolphin-aws creates dolphin-alerts with no policy (ecs.tf), so the default one applied; this keeps its statement as it
-# was (same-account use, which the platform's CloudWatch alarms rely on) and adds EventBridge, for exactly the rule above.
+# This repository alone owns the complete topic policy; dolphin-aws owns the topic and Batch rule.
+# Keep the default same-account statement and both exact EventBridge publishers here.
 resource "aws_sns_topic_policy" "dolphin_alerts" {
   provider = aws.dolphin
   arn      = data.aws_sns_topic.dolphin_alerts.arn
@@ -441,6 +441,14 @@ resource "aws_sns_topic_policy" "dolphin_alerts" {
         Action    = "sns:Publish"
         Resource  = data.aws_sns_topic.dolphin_alerts.arn
         Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_config_recorder.arn } }
+      },
+      {
+        Sid       = "BatchJobFailures"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = data.aws_sns_topic.dolphin_alerts.arn
+        Condition = { ArnEquals = { "aws:SourceArn" = "arn:aws:events:us-west-1:${data.aws_caller_identity.dolphin.account_id}:rule/dolphin-labs-podcast-whisper-failed" } }
       },
     ]
   })
