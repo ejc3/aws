@@ -420,7 +420,7 @@ resource "aws_iam_role_policy" "fcvm_ami_dispatch" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:GetParametersByPath"], Resource = local.fcvm_ami_state_arn },
     { Effect = "Allow", Action = ["codebuild:StartBuild", "codebuild:ListBuildsForProject"], Resource = aws_codebuild_project.fcvm_ami.arn },
-    { Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:build/${local.fcvm_ami_project}:*" },
+    { Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = aws_codebuild_project.fcvm_ami.arn },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = [aws_iam_role.fcvm_ami_broker_fleet.arn, aws_iam_role.fcvm_ami_worker_fleet.arn] },
     { Effect = "Allow", Action = "sts:TagSession", Resource = aws_iam_role.fcvm_ami_worker_fleet.arn },
     { Sid = "RedriveOnlyTheFixedPublisher", Effect = "Allow", Action = "lambda:InvokeFunction", Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish" },
@@ -527,7 +527,7 @@ resource "aws_iam_role_policy" "fcvm_ami_publish" {
   name = "verified-build-proof-and-backend-mutex-only"
   role = aws_iam_role.fcvm_ami_publish.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
-    { Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:build/${local.fcvm_ami_project}:*" },
+    { Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami.arn },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = local.fcvm_ami_state_arn },
     { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*"] },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
