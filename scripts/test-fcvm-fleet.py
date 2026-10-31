@@ -21,16 +21,20 @@ def block(header, text=TF):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_cve_hold_admits_only_ipv6_https_until_guarded_images_exist(self):
+    def test_guarded_fleet_admits_only_https_and_slot_tls(self):
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(sg.count('protocol    = "tcp"') + sg.count('protocol         = "tcp"'), 1)
+        self.assertEqual(len(rules), 2)
         self.assertIn("from_port        = 443", sg)
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
+        self.assertIn('cidr_blocks      = ["0.0.0.0/0"]', rules[0])
         self.assertIn('ipv6_cidr_blocks = ["::/0"]', rules[0])
-        self.assertIsNone(re.search(r"(?m)^\s*cidr_blocks\s*=", rules[0]))
+        self.assertIn("from_port   = var.slot_tls_ports.from", rules[1])
+        self.assertIn("to_port     = var.slot_tls_ports.to", rules[1])
+        self.assertIn('protocol    = "tcp"', rules[1])
+        self.assertIn('cidr_blocks = ["0.0.0.0/0"]', rules[1])
+        self.assertNotIn("ipv6_cidr_blocks", rules[1])
         self.assertNotIn("22", sg)
         # The coordinator admits its DNS port (DnsTests) and, with aggregated streaming on, 443 for the EC2 half's
         # aggregator (AggregatedTests); nothing else.
@@ -45,6 +49,22 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("for_each = local.fcvm_fleet_aggregated ? [1] : []", coord)
         self.assertIn("from_port        = 443", coord)
         self.assertIn("to_port          = 443", coord)
+
+    def test_ipv4_opening_requires_all_supplied_images_to_have_the_private_reviewed_guard(self):
+        self.assertIn('data "aws_ami" "guarded"', MOD, "Public IPv4 requires AMI guard admission first")
+        admitted = block('data "aws_ami" "guarded"', MOD)
+        self.assertRegex(admitted, r"for_each\s*=\s*toset\(compact\(concat\(values\(var.gpu_amis\), values\(var.tile_amis\)\)\)\)")
+        self.assertRegex(admitted, r'owners\s*=\s*\["self"\]')
+        filters = dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]', admitted))
+        self.assertEqual(filters, {"image-id": "each.value", "is-public": '"false"',
+                                  "state": '"available"', "tag:GuardHelperSHA256": "var.ip_options_guard_sha256"})
+        sg = block('resource "aws_security_group" "fleet"', MOD)
+        self.assertRegex(sg, r"depends_on\s*=\s*\[data.aws_ami.guarded\]")
+        digest = block('variable "ip_options_guard_sha256"', MOD)
+        self.assertNotIn("default", digest)
+        for region in ("east2", "west2", "east1"):
+            module = block('module "fcvm_fleet_%s"' % region)
+            self.assertRegex(module, r'ip_options_guard_sha256\s*=\s*filesha256\("\$\{path.module\}/scripts/cve-2026-98432-mitigation.py"\)')
 
     def test_every_az_gets_a_public_ipv6_subnet_and_flow_logs(self):
         sub = block('resource "aws_subnet" "public"', MOD)
@@ -513,7 +533,7 @@ class TileSubnetTests(unittest.TestCase):
 class SlotV4Tests(unittest.TestCase):
     """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
 
-    def test_slot_publish_contract_is_preserved_but_ipv4_ingress_is_held(self):
+    def test_slot_publish_contract_and_ipv4_ingress_agree(self):
         base = int(re.search(r"fcvm_fleet_slot_tls_port_base = (\d+)", TF).group(1))
         slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
         self.assertEqual((base, slots), (20200, 8))
@@ -527,9 +547,12 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn('"--public-ipv4-from-imds"', TF)
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 1, rules)
-        self.assertFalse(any("var.slot_tls_ports" in rule for rule in rules))
-        self.assertTrue(all(not re.search(r"(?m)^\s*cidr_blocks\s*=", rule) for rule in rules))
+        self.assertEqual(len(rules), 2, rules)
+        slots = [rule for rule in rules if "var.slot_tls_ports" in rule]
+        self.assertEqual(len(slots), 1)
+        self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
+        self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
+        self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
         self.assertEqual(TF.count("slot_tls_ports            = local.fcvm_fleet_slot_tls_ports"), 3)
 
     def test_the_coordinator_serves_the_launch_names_subzone(self):
