@@ -307,8 +307,7 @@ locals {
 #!/bin/bash
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-
-${local.linux_ip_options_bootstrap}
+/usr/local/sbin/cve-2026-98432-mitigation --apply || exit 1
 
 TAG='${local.claw_master_tag}'
 SHA='${local.claw_master_sha256_aarch64}'
@@ -987,6 +986,9 @@ resource "aws_instance" "claw_master_server" {
       curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
       cd /tmp && unzip -qo awscliv2.zip && ./aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
     fi
+    # First boot must guard IPv4 TCP before the fetched script can start Envoy.
+    # Live convergence uses the narrow SSM association, so this leaves its hash alone.
+    ${local.linux_ip_options_bootstrap}
     aws s3 cp s3://ejc3-dev-scripts/user-data/claude-master-server.sh /tmp/user_data.sh --region us-west-1
     chmod +x /tmp/user_data.sh && /tmp/user_data.sh
   BOOTSTRAP
