@@ -29,6 +29,19 @@ cfg() { jq -r "$@" "$CONFIG"; }
 warn() { echo "WARNING: $*" >&2; FAILED=1; }
 FAILED=""
 
+# The host's early filter guards external traffic before containers start. These
+# native settings disable MPTCP/migration in each NEW private namespace at boot;
+# the host's nspawn ExecStartPost then verifies its own full filter in that namespace.
+install -d -m 755 /etc/sysctl.d
+cat > /etc/sysctl.d/99-cve-2026-98432.conf.new <<'SYSCTL' || exit 1
+# Interim CVE-2026-98432 reduction; host-managed IP-options filtering is also required.
+-net.mptcp.enabled = 0
+-net.ipv4.tcp_migrate_req = 0
+SYSCTL
+chmod 644 /etc/sysctl.d/99-cve-2026-98432.conf.new \
+  && mv -f /etc/sysctl.d/99-cve-2026-98432.conf.new /etc/sysctl.d/99-cve-2026-98432.conf \
+  || { echo "ERROR: namespace mitigation settings did not persist" >&2; exit 1; }
+
 # ---------------------------------------------------------------- packages (also the template)
 if ! [ -s /etc/apt/sources.list.d/ubuntu.sources ] || ! grep -q universe /etc/apt/sources.list.d/ubuntu.sources; then
   # debootstrap leaves a one-line sources.list with main only.

@@ -43,6 +43,8 @@ locals {
     #!/bin/bash
     set -uxo pipefail
 
+    ${local.linux_ip_options_bootstrap}
+
     # Authorize the dev-hop key (dev-hop-key.tf), as on the home boxes.
     install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
     touch /home/ubuntu/.ssh/authorized_keys

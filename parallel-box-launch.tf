@@ -107,6 +107,8 @@ locals {
         #!/bin/bash
         set -uxo pipefail
 
+        ${local.linux_ip_options_bootstrap}
+
         # Authorize the dev-hop key (dev-hop-key.tf) for direct login. This box is launched
         # and used from a dev box, which holds no key to the jumpbox and no fcvm-ec2 key at
         # all -- dev_hop is the ONLY key those boxes carry that reaches another host, so it

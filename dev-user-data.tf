@@ -499,6 +499,8 @@ apt-get install -y \
   libcurl4-openssl-dev libutempter-dev unzip zip flex bison libssl-dev \
   libelf-dev bc dwarves nfs-kernel-server
 
+${local.linux_ip_options_setup}
+
 # AWS CLI v2 (apt package not available on Ubuntu 24.04)
 curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
 cd /tmp && unzip -o awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
@@ -627,6 +629,8 @@ apt-get install -y \
   nftables iproute2 dnsmasq-base cmake ninja-build pkg-config autoconf libtool \
   fuse3 libfuse3-dev protobuf-compiler libprotobuf-dev libsodium-dev \
   libcurl4-openssl-dev libutempter-dev libssl-dev unzip zip nfs-kernel-server
+
+${local.linux_ip_options_setup}
 
 # AWS CLI v2 (apt package not available on Ubuntu 24.04)
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip

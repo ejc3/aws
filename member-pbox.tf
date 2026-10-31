@@ -122,6 +122,8 @@ locals {
       #!/bin/bash
       set -uxo pipefail
 
+      ${local.linux_ip_options_bootstrap}
+
       HOURS=${local.member_box_max_hours}
       ${local.member_box_deadline_setup}
 
