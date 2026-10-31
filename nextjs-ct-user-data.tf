@@ -329,17 +329,17 @@ MACSSH
 
   # Plain files: host tools, and the box's shared files every container mounts read-only.
   nextjs_ct_host_files = {
-    "/usr/local/bin/setup-sync"           = "scripts/nextjs-ct/setup-sync"
-    "/usr/local/sbin/nextjs-ct-health"    = "scripts/nextjs-ct/nextjs-ct-health"
-    "/usr/local/sbin/nextjs-ct-enter"     = "scripts/nextjs-ct/host/nextjs-ct-enter"
-    "/usr/local/sbin/nextjs-ct-imds"      = "scripts/nextjs-ct/host/nextjs-ct-imds"
-    "/usr/local/sbin/nextjs-ct-ndev-sync" = "scripts/nextjs-ct/host/nextjs-ct-ndev-sync"
-    "/usr/local/sbin/nextjs-ct-machine"   = "scripts/nextjs-ct/host/nextjs-ct-machine"
+    "/usr/local/bin/setup-sync"            = "scripts/nextjs-ct/setup-sync"
+    "/usr/local/sbin/nextjs-ct-health"     = "scripts/nextjs-ct/nextjs-ct-health"
+    "/usr/local/sbin/nextjs-ct-enter"      = "scripts/nextjs-ct/host/nextjs-ct-enter"
+    "/usr/local/sbin/nextjs-ct-imds"       = "scripts/nextjs-ct/host/nextjs-ct-imds"
+    "/usr/local/sbin/nextjs-ct-ndev-sync"  = "scripts/nextjs-ct/host/nextjs-ct-ndev-sync"
+    "/usr/local/sbin/nextjs-ct-machine"    = "scripts/nextjs-ct/host/nextjs-ct-machine"
     "/usr/local/sbin/nextjs-ct-mitigation" = "scripts/nextjs-ct/host/nextjs-ct-mitigation"
-    "/usr/local/sbin/nextjs-ct-base"      = "scripts/nextjs-ct/host/nextjs-ct-base"
-    "/usr/local/sbin/nextjs-ct-firewall"  = "scripts/nextjs-ct/host/nextjs-ct-firewall"
-    "/usr/local/sbin/nextjs-ct-sshd"      = "scripts/nextjs-ct/host/nextjs-ct-sshd"
-    "/usr/local/sbin/nextjs-ct-migrate"   = "scripts/nextjs-ct/host/nextjs-ct-migrate"
+    "/usr/local/sbin/nextjs-ct-base"       = "scripts/nextjs-ct/host/nextjs-ct-base"
+    "/usr/local/sbin/nextjs-ct-firewall"   = "scripts/nextjs-ct/host/nextjs-ct-firewall"
+    "/usr/local/sbin/nextjs-ct-sshd"       = "scripts/nextjs-ct/host/nextjs-ct-sshd"
+    "/usr/local/sbin/nextjs-ct-migrate"    = "scripts/nextjs-ct/host/nextjs-ct-migrate"
   }
   nextjs_ct_shared_files = merge(
     { for f in fileset(path.module, "scripts/nextjs-ct/ct/*") : "/var/lib/nextjs-ct/shared/ct/${basename(f)}" => f },
