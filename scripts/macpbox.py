@@ -234,6 +234,31 @@ def summary(hosts, instances):
                           for i in instances], "note": "Stopped Macs still incur the dedicated-host charge until the host is released."}
 
 
+def confirm_previous_release(lock, account, call=aws):
+    previous = lock.read()
+    if not previous:
+        return None
+    proof = previous.get("release_confirmation", {})
+    if (proof.get("account") == account and proof.get("region") == REGION
+            and proof.get("host_id") == previous.get("host_id") and proof.get("observed_at")):
+        return True
+    if not previous.get("host_id"):
+        return False
+    try:
+        old = call("ec2", "describe-hosts", {"HostIds": [previous["host_id"]]}).get("Hosts", [])
+    except Error:
+        return False  # Missing history, wrong account/region, and API errors are not release proof.
+    if (len(old) != 1 or old[0].get("HostId") != previous["host_id"]
+            or old[0].get("State") not in ("released", "released-permanent-failure")):
+        return False
+    previous["release_confirmation"] = {
+        "account": account, "region": REGION, "host_id": previous["host_id"],
+        "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    lock.write(previous)
+    return True
+
+
 def up(data, caller, approved=False, cap=None, call=aws, directory=None):
     hosts, instances = inventory(call)
     if hosts or instances:
@@ -243,11 +268,10 @@ def up(data, caller, approved=False, cap=None, call=aws, directory=None):
         hosts, instances = inventory(call)
         if hosts or instances:
             return {"reused_without_mutation": True, **summary(hosts, instances)}
-        previous = lock.read()
-        if previous:
-            old = call("ec2", "describe-hosts", {"HostIds": [previous["host_id"]]}).get("Hosts", []) if previous.get("host_id") else []
-            need(len(old) == 1 and old[0].get("State", "").startswith("released"),
-                 "An earlier billing request is unresolved or its host has not been released. Run macpbox status and reconcile it before any new allocation.")
+        need(confirm_previous_release(lock, caller["Account"], call) is not False,
+             "Previous Mac release is unconfirmed. Run macpbox status on the primary jumpbox while released history exists. "
+             "If history expired, an administration agent must verify successful ReleaseHosts in CloudTrail before reconciling "
+             "the journal. Never delete it or infer release from elapsed time.")
         price = quote(call)
         if not approved or cap is None:
             return {"approval_required": True, **price,
@@ -357,6 +381,9 @@ def main():
         result["ami"] = template(data)["LaunchTemplateData"]["ImageId"]
         ids = [item["id"] for item in result["instances"]]
         result["ssm"] = aws("ssm", "describe-instance-information", {"Filters": [{"Key": "InstanceIds", "Values": ids}]})["InstanceInformationList"] if ids else []
+        if administrator(caller, data):
+            with LeaseLock() as lock:
+                result["previous_lease_release_confirmed"] = confirm_previous_release(lock, caller["Account"])
     elif args.command == "workspace":
         workspace(args.agent_id, data, caller)
         return

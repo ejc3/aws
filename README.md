@@ -551,6 +551,14 @@ The cleanup checks every ten minutes. Its deadline is the host's actual allocati
 plus 24 hours, not a boot timestamp. It terminates the leased instance and retries host
 release while AWS scrubs the Mac; scrubbing can take up to 4.5 hours. A pending cleanup
 is not a confirmed release: check `macpbox status` until AWS reports the host released.
+Run that check on the primary jumpbox while AWS still retains the released host: the
+admin CLI records the exact host/account/region release observation in its existing
+local lease journal. That proof remains usable after AWS's recent-host history expires.
+If history has already expired without recorded proof, the launcher stays blocked.
+An administration agent must verify a successful `ReleaseHosts` event for that exact
+host/account/region in CloudTrail before reconciling the journal; never blindly delete
+the journal or treat a missing host or elapsed 24 hours as proof. The next allocation
+still requires a fresh owner approval and current price check.
 Push source and export needed build artifacts before the deadline; the root and local
 scratch are disposable.
 

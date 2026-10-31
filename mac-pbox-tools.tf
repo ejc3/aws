@@ -32,10 +32,13 @@ locals {
     },
   ]
 
-  macpbox_tool_instances = concat(
-    values(local.admin_tmux_boxes),
-    local.metal_update_guard_instances,
-    var.enable_nextjs_ct || var.enable_nextjs_dev ? [local.nextjs_live_instance.id] : [],
+  # Stable Name targets follow Spot replacements without a new Terraform apply.
+  macpbox_tool_names = concat(
+    var.enable_jumpbox ? ["jumpbox"] : [],
+    var.enable_jumpbox_2 ? ["jumpbox-2"] : [],
+    var.enable_firecracker_instance ? ["fcvm-metal-arm"] : [],
+    var.enable_x86_dev_instance ? ["fcvm-metal-x86"] : [],
+    var.enable_nextjs_ct || var.enable_nextjs_dev ? ["nextjs-dev"] : [],
   )
 
   # Publish only reviewed source through the admin-owned association, rather than giving an
@@ -79,7 +82,7 @@ resource "aws_ssm_parameter" "macpbox" {
 }
 
 resource "aws_ssm_association" "macpbox_tools" {
-  count = length(local.macpbox_tool_instances) > 0 ? 1 : 0
+  count = length(local.macpbox_tool_names) > 0 ? 1 : 0
 
   name                = "AWS-RunShellScript"
   association_name    = "macpbox-tools"
@@ -88,8 +91,8 @@ resource "aws_ssm_association" "macpbox_tools" {
   max_errors          = "1"
 
   targets {
-    key    = "InstanceIds"
-    values = local.macpbox_tool_instances
+    key    = "tag:Name"
+    values = local.macpbox_tool_names
   }
 
   parameters = {

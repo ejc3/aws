@@ -171,6 +171,46 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(mac.Error): self.up(ADMIN, True, "2")
         self.assertEqual(len(self.cloud.writes()), before)
 
+    def test_observed_release_is_retained_when_aws_history_later_disappears(self):
+        self.up(ADMIN, True, "2")
+        self.cloud.instances.clear()
+        self.cloud.hosts[0]["State"] = "released"
+        with mac.LeaseLock(self.directory) as lock:
+            self.assertTrue(mac.confirm_previous_release(lock, ADMIN["Account"], self.cloud))
+        journal = json.loads((self.directory / "pending.json").read_text())
+        self.assertEqual(journal["release_confirmation"]["host_id"], journal["host_id"])
+        self.cloud.hosts.clear()
+        before = len(self.cloud.writes())
+        self.assertTrue(self.up()["approval_required"])
+        self.assertEqual(len(self.cloud.writes()), before)
+
+    def test_expired_or_missing_history_without_recorded_proof_never_allocates(self):
+        self.up(ADMIN, True, "2")
+        self.cloud.hosts.clear()
+        self.cloud.instances.clear()
+        before = len(self.cloud.writes())
+        with self.assertRaisesRegex(mac.Error, "CloudTrail"):
+            self.up(ADMIN, True, "2")
+        self.assertEqual(len(self.cloud.writes()), before)
+        with mac.LeaseLock(self.directory) as lock:
+            self.assertFalse(mac.confirm_previous_release(lock, ADMIN["Account"],
+                lambda *a, **k: (_ for _ in ()).throw(mac.Error("InvalidHostID.NotFound"))))
+        self.assertNotIn("release_confirmation", json.loads((self.directory / "pending.json").read_text()))
+
+    def test_cached_release_proof_cannot_cross_account_region_or_host(self):
+        self.up(ADMIN, True, "2")
+        self.cloud.instances.clear()
+        self.cloud.hosts[0]["State"] = "released"
+        with mac.LeaseLock(self.directory) as lock:
+            self.assertTrue(mac.confirm_previous_release(lock, ADMIN["Account"], self.cloud))
+            original = lock.read()
+            self.cloud.hosts.clear()
+            for key, value in (("account", "000000000000"), ("region", "us-east-1"), ("host_id", "h-other")):
+                changed = copy.deepcopy(original)
+                changed["release_confirmation"][key] = value
+                lock.write(changed)
+                self.assertFalse(mac.confirm_previous_release(lock, ADMIN["Account"], self.cloud))
+
     def test_paid_identity_cannot_come_from_inherited_profiles_or_endpoints(self):
         response = types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
         with patch.dict(os.environ, {"AWS_PROFILE": "example", "AWS_ACCESS_KEY_ID": "not-a-key",
@@ -224,6 +264,21 @@ class WorkspaceTests(unittest.TestCase):
 
 
 class InstallationTests(unittest.TestCase):
+    def test_installer_follows_replacement_names_and_excludes_disabled_hosts(self):
+        source = (ROOT / "mac-pbox-tools.tf").read_text()
+        association = source.split('resource "aws_ssm_association" "macpbox_tools" {', 1)[1]
+        self.assertIn('key    = "tag:Name"', association)
+        self.assertIn('values = local.macpbox_tool_names', association)
+        self.assertIn('count = length(local.macpbox_tool_names) > 0 ? 1 : 0', association)
+        self.assertNotIn('InstanceIds', association)
+        names = source.split('macpbox_tool_names = concat(', 1)[1].split('\n  )', 1)[0]
+        for gate, name in (("enable_jumpbox", "jumpbox"), ("enable_jumpbox_2", "jumpbox-2"),
+                           ("enable_firecracker_instance", "fcvm-metal-arm"),
+                           ("enable_x86_dev_instance", "fcvm-metal-x86")):
+            self.assertIn(f'var.{gate} ? ["{name}"] : []', names)
+        self.assertIn('var.enable_nextjs_ct || var.enable_nextjs_dev ? ["nextjs-dev"] : []', names)
+        self.assertNotIn('.id', names)
+
     def test_developer_discovery_policy_grants_no_write_or_broad_parameter_read(self):
         source = (ROOT / "mac-pbox-tools.tf").read_text()
         actions = set(re.findall(r'"((?:ec2|ssm|pricing):[A-Za-z]+)"', source))
