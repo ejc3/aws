@@ -1874,6 +1874,23 @@ The t4g.micro that served it first (built in `dolphin-redis.tf`) was retired on 
 cleanly; its root volume (kept on termination) and its last daily snapshots stay in the Dolphin account as a cold copy of
 the data from before the move.
 
+### dolphin-labs podcasts R2 (dolphin-labs-podcasts.tf)
+
+The R2 bucket `dolphin-labs-podcasts` is in this Cloudflare account, the account that runs `dolphin-labs-prod` and
+`dolphin-labs-stage`. It holds the team podcasts' transcripts and ad alignments, and objects in it expire after 180 days.
+The bucket is private, with no r2.dev address and no custom domain. The production Worker serves from it through the binding
+`PODCASTS`. The podcast function in the Dolphin account writes it through R2's S3 API, with an account token that reaches
+this bucket's objects and nothing else. Its S3 pair is derived from the token: the key id is the token's id, and the
+secret is the SHA-256 of the token's value. Terraform writes that pair into `dolphin-labs/podcasts-r2` in the Dolphin
+account through `aws.dolphin`.
+
+dolphin-aws owns that container (`podcasts.tf` there) and its policy. Until the container exists, nothing is written
+(output `dolphin_labs_podcasts.secret_written`), and the first apply after it exists writes the value. Rotate with
+`terraform apply -replace=cloudflare_account_token.dolphin_labs_podcasts_r2`, which rewrites the secret in the same
+apply. The bucket needs **Workers R2 Storage Write** (permission group `bf7481a1826f439697cb59a20b22293e`) on the provider
+token `cloudflare-tunnel-token`. Add it with one PUT of the token's definition, the same way Workers KV Storage Write was
+added.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site

@@ -52,6 +52,8 @@ jobs:
         run: python3 -S -B scripts/test-dolphin-family.py
       - name: dolphin-labs' post-deploy log token reads logs only, from a main-only environment
         run: python3 -S -B scripts/test-dolphin-labs-ci-logs.py
+      - name: dolphin-labs podcasts R2 (a private bucket, a token for its objects only, written to the Dolphin account)
+        run: python3 -S -B scripts/test-dolphin-labs-podcasts.py
       - name: browser-manager tunnel rotation (browser-manager.tf)
         run: python3 -S -B scripts/test-browser-manager-tunnel.py
 
