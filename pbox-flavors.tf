@@ -379,7 +379,10 @@ locals {
 resource "aws_iam_policy" "pbox_flavor_types" {
   name        = "pbox-flavor-types"
   description = "Every pbox (the owner's slots, fallback boxes, members' boxes) launches only as one of its flavors' instance types (pbox-flavors.tf)"
-  policy      = data.aws_iam_policy_document.pbox_flavor_types.json
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = concat(jsondecode(data.aws_iam_policy_document.pbox_flavor_types.json).Statement, local.macpbox_readonly_statements)
+  })
 }
 
 resource "aws_iam_role_policy_attachment" "dev_server_pbox_flavor_types" {

@@ -160,6 +160,10 @@ jobs:
         run: python3 -S -B scripts/test-astryx-join.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: python3 -S -B scripts/test-mac-setup.py
+      - name: Mac pbox explicit paid-lease approval, discovery and isolated workspaces (offline)
+        run: python3 -S -B scripts/test-macpbox.py
+      - name: Mac pbox 24-hour minimum and periodic safe host release (offline)
+        run: python3 -S -B scripts/test-macpbox-cleanup.py
       - name: Metal boxes keep their box tools (pbox, gbox, wbox, codex-restart) equal to main daily (offline)
         run: python3 -S -B scripts/test-metal-box-tools.py
       - name: App-repo runners route, launch, cap and reap (offline)

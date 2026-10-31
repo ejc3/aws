@@ -131,15 +131,6 @@ resource "aws_iam_role_policy" "nextjs_dev_ebs" {
   policy = local.dev_ebs_policy
 }
 
-# Optional Mac dev box retains its separate Secrets Manager/SSM role too.
-resource "aws_iam_role_policy" "mac_dev_ebs" {
-  count    = var.enable_mac_dev ? 1 : 0
-  provider = aws.mac
-  name     = "dev-ebs-volume-access"
-  role     = aws_iam_role.mac_instance[0].id
-  policy   = local.dev_ebs_policy
-}
-
 # io-box and parallel-box need no AWS access beyond temporary EBS volume lifecycle, plus Claude Haiku 5.5
 # on Bedrock since 2026-10-10 (bedrock-haiku.tf).
 resource "aws_iam_role" "dev_ebs_only" {

@@ -340,9 +340,8 @@ terraform apply
 ```
 
 Then confirm the SNS email subscription. Do not leave placeholder secret/parameter values
-in a live account. Optional Mac development needs available EC2 Dedicated Host quota and an
-explicit new `mac_teardown_at` at least 24 hours after allocation; its checked-in date is
-historical and must not be reused. Terraform creates its VNC password.
+in a live account. Temporary EC2 Mac builds use the owner-approved `macpbox` lease below;
+an ordinary Terraform apply never allocates a billed Mac host.
 
 ## Fleet
 
@@ -358,7 +357,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number (`pbox up FLAVOR`: any flavor but kvm). Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. At most eight healthy ARM64 and four x86 runners; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
-| Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
+| `macpbox` | `us-west-2b`, owner-approved `mac-m4pro.metal` Dedicated Host | Disposable 200 GB encrypted gp3 root and local SSD scratch | Shared temporary macOS build host. Terraform owns its launch template and cleanup; only an explicitly approved admin launcher allocates a 24-hour lease. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
 the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
@@ -523,6 +522,68 @@ An already cached copy from before this fix needs one visit to
 login. Later visits and expired API connections use the automatic flow. Browser regression coverage is in
 `scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
 with `scripts/test-opencode-setup.py` in CI.
+
+### Temporary EC2 Mac builds: `macpbox`
+
+`macpbox status` discovers the shared build host and `macpbox quote` reads current AWS
+Dedicated Host pricing. The CLI is installed on both jumpboxes, ARM, x86, and the Next.js
+host and containers. `/infra/macpbox` in `us-west-1` holds public discovery metadata; no
+Terraform state, credentials, or personal Mac login is needed to discover it.
+
+Reuse an active lease: `macpbox ssh` opens it, and `macpbox workspace NAME` creates a
+validated directory for that agent's work. Dev roles can inspect pricing and connect with
+their existing `~/.ssh/dev_hop` key; they cannot allocate a host, launch a Mac, pass a role,
+or ask the jumpbox to execute a command. A stopped or missing Mac is reported, never
+silently allocated or restarted by a status, SSH, or workspace command.
+Installing the CLI does not grant a member account the owner's dev-hop key; an account
+without an authorized SSH identity can still inspect status and pricing.
+
+Every **new** lease needs the owner's direct approval in the current conversation, after
+showing the quote and minimum charge. The current Oregon M4 Pro host price is **$1.97/hour,
+with a $47.28 minimum for 24 hours**, plus the 200 GB EBS root, public IPv4, and any data
+transfer. Refresh the quote before seeking approval. Billing starts when `AllocateHosts`
+succeeds, including if macOS fails to boot. Stopping or terminating the instance does not
+release the host. The admin-only `macpbox up` helper is the explicit ephemeral-compute
+exception: Terraform manages the durable template, networking, minimal instance profile,
+and cleanup, without managing an allocated host, instance, or EIP. An ordinary apply
+therefore cannot recreate a paid lease or reap one in use. No automatic renewal and no
+separate host per agent.
+
+After that direct approval, run the launcher on the **primary `jumpbox`** using its
+instance-role session, with both explicit flags:
+`macpbox up --approved-minimum-24h --approved-usd-hour CAP`, replacing `CAP` with the
+approved current hourly price. A higher live quote is refused. These flags record the
+operator's decision; they never substitute for the owner's conversation approval.
+The primary is the only paid launch executor, so separate agents or admin boxes cannot
+race independent leases. `jumpbox-2` can inspect status/pricing and SSH to an active Mac;
+if the primary is unavailable, recover it before starting another lease.
+
+The cleanup checks every ten minutes. Its deadline is the host's actual allocation time
+plus 24 hours, not a boot timestamp. It terminates the leased instance and retries host
+release while AWS scrubs the Mac; scrubbing can take up to 4.5 hours. A pending cleanup
+is not a confirmed release: check `macpbox status` until AWS reports the host released.
+Run that check on the primary jumpbox while AWS still retains the released host: the
+admin CLI records the exact host/account/region release observation in its existing
+local lease journal. That proof remains usable after AWS's recent-host history expires.
+If history has already expired without recorded proof, the launcher stays blocked.
+An administration agent must verify a successful `ReleaseHosts` event for that exact
+host/account/region in CloudTrail before reconciling the journal; never blindly delete
+the journal or treat a missing host or elapsed 24 hours as proof. The next allocation
+still requires a fresh owner approval and current price check.
+Push source and export needed build artifacts before the deadline; the root and local
+scratch are disposable.
+
+Agents share this Mac without sharing build state. Give each agent its own validated
+workspace, Git worktree, DerivedData, Cargo target/cache, temporary files, logs, and ports.
+Use explicit per-command paths such as `xcodebuild -derivedDataPath "$WORK/DerivedData"`
+and `CARGO_TARGET_DIR="$WORK/target"`; do not change global Xcode defaults, Homebrew,
+another agent's files, or the machine's boot state. Use scratch only after positively
+identifying the local SSD and its mount; never format a guessed device or use the root
+as an unlimited cache. Personal signing, Apple, browser, Claude, and Codex credentials
+are not seeded or copied to the host. Only public SSH keys are authorized at bootstrap;
+private admin and dev keys stay on their original Linux clients.
+
+This is separate from the owner's personal `ssh mac` MacBook route below, which is unchanged.
 
 ### From the MacBook to the Next.js server
 
@@ -3018,7 +3079,7 @@ Remove `~/src/aws-browser-manager.before-public` once the Mac URL works.
 | The Dolphin member account: account and OU, its Terraform state bucket and the `dolphin-terraform` apply role that only nextjs-dev may assume (box-wide), Identity Center sign-in (owner admin, Steve read-only). Its own resources live in `dolphin-labs-hq/dolphin-aws` | `dolphin-account.tf`, `dolphin-bootstrap.tf`, `dolphin-identity-center.tf` |
 | The astryx member account (Astryx sync): account and OU with a us-west-1 SCP, its Terraform state bucket, the `astryx-terraform` apply role (fcvm-arm pinned, and the owner's nextjs-ct container), `/infra/astryx`, and staging's hostname, tunnel and Access on `/native/login`. Its own resources live in `ejc3/astryx-infra` | `astryx-account.tf`, `astryx-stage.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager.tf`, `browser-manager-mac.tf` (the app: github.com/ejc3/browser-manager) |
-| Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
+| Owner-approved shared EC2 Mac build lease | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf`, `mac-pbox-tools.tf`, `scripts/macpbox.py`, `scripts/macpbox-cleanup.py` |
 | SSH to EJ's MacBook and Colton's Mac through Cloudflare Access (`ssh mac`, `ssh colton-mac`): tunnels, Access, per-client service tokens, the clients' installer and the Mac-side connector setup | `macbook-ssh.tf`, `colton-mac-ssh.tf`, `mac-ssh-client.tf`, `scripts/mac-ssh-connector-setup.sh` |
 | The metal boxes' box tools (pbox, gbox, wbox, codex-restart) kept equal to main daily, not only at boot | `metal-box-tools.tf` |
 | The Macs' agent tools and the pinned Peekaboo | `scripts/mac-setup.sh`, `scripts/mac/` (`peekaboo-install.sh` holds the pin) |

@@ -52,9 +52,6 @@ EXPECTED_TO_FIX_IN_128 = {}
 
 # Reviewed sites that are safe without an explicit `set +x`, with the reason.
 JUSTIFIED = {
-    "mac-dev.tf:user_data:traced-fetch:PW":
-        "the macOS user data never enables xtrace and runs once under ec2-macos-init; the "
-        "instance is disabled by default (enable_mac_dev) and ignores user_data changes",
     "dev-user-data.tf:user_shell_env:traced-fetch:ablit":
         "inside the opencode() function the boot script writes into ~/.zshrc as text (a quoted heredoc): it runs "
         "later in the account's interactive zsh, never under the boot's xtrace (and turns xtrace off for itself: "
@@ -516,7 +513,7 @@ class RepositoryScanTests(unittest.TestCase):
         for site in (("dev-hop-key.tf", "HOPJSON"), ("dev-instance-common.tf", "GH_TOKEN"),
                      ("jumpbox2-user-data.tf", "FCVM_KEY"), ("scripts/dev-box-triage.sh", "CF_TOKEN"),
                      ("runner-autoscale.tf", "REG_TOKEN"), ("runner-autoscale.tf", "TOKEN6"),
-                     ("runner-autoscale.tf", "TOKEN"), ("mac-dev.tf", "PW")):
+                     ("runner-autoscale.tf", "TOKEN")):
             self.assertIn(site, found)
         untraced = {(s.unit, s.var) for s in REPO.sites if s.off}
         for site in (("dev-hop-key.tf:dev_hop_setup", "HOPJSON"), ("dev-instance-common.tf:gh_auth_script", "GH_TOKEN"),

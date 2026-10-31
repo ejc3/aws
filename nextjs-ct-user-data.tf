@@ -342,6 +342,7 @@ MACSSH
     "/usr/local/sbin/nextjs-ct-migrate"    = "scripts/nextjs-ct/host/nextjs-ct-migrate"
   }
   nextjs_ct_shared_files = merge(
+    { "/var/lib/nextjs-ct/shared/macpbox" = "scripts/macpbox.py" },
     { for f in fileset(path.module, "scripts/nextjs-ct/ct/*") : "/var/lib/nextjs-ct/shared/ct/${basename(f)}" => f },
     { for f in fileset(path.module, "scripts/nextjs-ct/ct/units/*") : "/var/lib/nextjs-ct/shared/ct/units/${basename(f)}" => f },
     # Windows-MCP's client side (colin-pc-ssh.tf): the bridge, its setup and mcp-remote's lockfile.
