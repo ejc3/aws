@@ -307,6 +307,7 @@ locals {
 #!/bin/bash
 set -uxo pipefail
 export DEBIAN_FRONTEND=noninteractive
+/usr/local/sbin/cve-2026-98432-mitigation --apply || exit 1
 
 TAG='${local.claw_master_tag}'
 SHA='${local.claw_master_sha256_aarch64}'
