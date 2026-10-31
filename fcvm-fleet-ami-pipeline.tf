@@ -3,7 +3,7 @@
 variable "fcvm_ami_pipeline_enabled" {
   description = "Enable automatic factory requests only after the main-only consumer and Default-version coordinator are deployed"
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {
