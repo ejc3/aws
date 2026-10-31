@@ -34,6 +34,10 @@ class Cloud:
         self.caller, self.primary_name = ADMIN, "jumpbox"
         self.price, self.fail, self.hidden = "1.9700000000", None, False
         self.architecture = "arm64_mac"
+        self.pricing_family = "Dedicated Host"
+        self.pricing_attributes = {"instanceType": "mac-m4pro", "tenancy": "Host",
+                                   "operatingSystem": "Linux", "location": "US West (Oregon)",
+                                   "regionCode": "us-west-2"}
 
     def __call__(self, service, operation, parameters=None, region=mac.REGION, **kwargs):
         p = parameters or {}
@@ -41,8 +45,13 @@ class Cloud:
         if operation == "get-caller-identity":
             return self.caller
         if operation == "get-products":
-            return {"PriceList": [json.dumps({"product": {"attributes": {
-                "instanceType": "mac-m4pro", "tenancy": "Host", "operatingSystem": "NA"}},
+            filters = {item["Field"]: item["Value"] for item in p.get("Filters", [])}
+            # Match the catalog as AWS does, including the hardware SKU's OS placeholder.
+            fields = {**self.pricing_attributes, "productFamily": self.pricing_family}
+            if any(fields.get(key) != value for key, value in filters.items()):
+                return {"PriceList": []}
+            return {"PriceList": [json.dumps({"product": {"productFamily": self.pricing_family,
+                "attributes": self.pricing_attributes},
                 "terms": {"OnDemand": {"example": {"priceDimensions": {"example": {
                     "unit": "Hrs", "pricePerUnit": {"USD": self.price}}}}}}})]}
         if operation == "describe-hosts":
@@ -127,6 +136,39 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(mac.Error): self.up(ADMIN, True, "1.96")
         self.cloud.price = "0"
         with self.assertRaises(mac.Error): self.up(ADMIN, True, "100")
+        self.assertEqual(self.cloud.writes(), [])
+
+    def test_quote_accepts_the_real_linux_labeled_dedicated_host_catalog(self):
+        try:
+            result = mac.quote(self.cloud)
+        except mac.Error as error:
+            self.fail("The real Dedicated Host catalog must produce a quote: " + str(error))
+        self.assertEqual(mac.Decimal(result["hourly_host_usd"]), mac.Decimal("1.97"))
+        self.assertEqual(mac.Decimal(result["minimum_24h_host_usd"]), mac.Decimal("47.28"))
+        filters = self.cloud.calls[-1][2]["Filters"]
+        self.assertIn({"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Dedicated Host"}, filters)
+        self.assertIn({"Type": "TERM_MATCH", "Field": "regionCode", "Value": "us-west-2"}, filters)
+        self.assertNotIn("operatingSystem", {item["Field"] for item in filters})
+        self.assertEqual(self.cloud.writes(), [])
+
+    def test_quote_rejects_compute_zero_or_mismatched_catalog_even_if_api_returns_it(self):
+        valid = self.cloud("pricing", "get-products")["PriceList"][0]
+        original = json.loads(valid)
+        changes = [("productFamily", "Compute Instance"), ("regionCode", "us-east-1"),
+                   ("location", "US East (N. Virginia)"), ("tenancy", "Shared"),
+                   ("instanceType", "mac-m4"), ("price", "0"), ("price", "-1"),
+                   ("price", "Infinity"), ("price", "NaN")]
+        for field, value in changes:
+            with self.subTest(field=field, value=value):
+                product = copy.deepcopy(original)
+                if field == "productFamily":
+                    product["product"][field] = value
+                elif field == "price":
+                    product["terms"]["OnDemand"]["example"]["priceDimensions"]["example"]["pricePerUnit"]["USD"] = value
+                else:
+                    product["product"]["attributes"][field] = value
+                with self.assertRaises(mac.Error):
+                    mac.quote(lambda *args, **kwargs: {"PriceList": [json.dumps(product)]})
         self.assertEqual(self.cloud.writes(), [])
 
     def test_real_mac_architecture_and_fixed_lt_network_are_used(self):
