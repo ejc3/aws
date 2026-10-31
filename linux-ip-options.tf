@@ -33,6 +33,8 @@ locals {
     ["jumpbox", "jumpbox-2", "fcvm-metal-arm", "fcvm-metal-x86", "nextjs-dev", "claude-master-server", "io-box"],
     local.parallel_box_names, local.gpu_box_names, local.member_pbox_names, local.member_gbox_names
   )
+  # State Manager permits only five values for a tag:Name target per association.
+  linux_ip_options_name_groups = { for index, names in chunklist(local.linux_ip_options_names, 5) : tostring(index) => names }
   linux_ip_options_parameters = {
     commands         = local.linux_ip_options_setup
     executionTimeout = "180"
@@ -42,50 +44,54 @@ locals {
 # Tag targets also catch replacements and currently stopped boxes when their SSM
 # agent returns. They cannot allocate, wake, or restart an instance.
 resource "aws_ssm_association" "linux_ip_options" {
+  for_each            = local.linux_ip_options_name_groups
   name                = "AWS-RunShellScript"
-  association_name    = "cve-2026-98432"
+  association_name    = "cve-2026-98432-${each.key}"
   schedule_expression = "rate(30 minutes)"
   max_concurrency     = "2"
   max_errors          = "1"
   targets {
     key    = "tag:Name"
-    values = local.linux_ip_options_names
+    values = each.value
   }
   parameters = local.linux_ip_options_parameters
 }
 
 resource "aws_ssm_association" "linux_ip_options_west2" {
   provider            = aws.west2
+  for_each            = local.linux_ip_options_name_groups
   name                = "AWS-RunShellScript"
-  association_name    = "cve-2026-98432"
+  association_name    = "cve-2026-98432-${each.key}"
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Name"
-    values = local.linux_ip_options_names
+    values = each.value
   }
   parameters = local.linux_ip_options_parameters
 }
 
 resource "aws_ssm_association" "linux_ip_options_ohio" {
   provider            = aws.ohio
+  for_each            = local.linux_ip_options_name_groups
   name                = "AWS-RunShellScript"
-  association_name    = "cve-2026-98432"
+  association_name    = "cve-2026-98432-${each.key}"
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Name"
-    values = local.linux_ip_options_names
+    values = each.value
   }
   parameters = local.linux_ip_options_parameters
 }
 
 resource "aws_ssm_association" "linux_ip_options_east1" {
   provider            = aws.dr
+  for_each            = local.linux_ip_options_name_groups
   name                = "AWS-RunShellScript"
-  association_name    = "cve-2026-98432"
+  association_name    = "cve-2026-98432-${each.key}"
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Name"
-    values = local.linux_ip_options_names
+    values = each.value
   }
   parameters = local.linux_ip_options_parameters
 }
