@@ -52,14 +52,33 @@ class GuardrailTests(unittest.TestCase):
         self.assertIn("target_id = aws_organizations_organizational_unit.fcvm_fleet.id", att)
 
     def test_nothing_here_trusts_the_fleet_account(self):
-        # No principal in this repository names the fleet account except its own roles' providers and the state bucket.
+        # Fleet-owned resources may name their own account. New main-account
+        # factory role trusts are checked separately below, not exempted.
         for f in ROOT.glob("*.tf"):
-            # The files that build inside the fleet account itself (fcvm-fleet.tf) name its id for its own resources.
-            if f.name in {"fcvm-fleet-account.tf", "fcvm-fleet.tf"}:
+            if f.name in {"fcvm-fleet-account.tf", "fcvm-fleet.tf",
+                          "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
             text = f.read_text()
             self.assertNotIn("aws_organizations_account.fcvm_fleet", text, f.name)
             self.assertNotIn("local.fcvm_fleet_account_id", text, f.name)
+
+    def test_factory_main_roles_do_not_trust_fleet_principals(self):
+        factory = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        expected = {
+            "fcvm_ami_dispatch": '{ Service = "lambda.amazonaws.com" }',
+            "fcvm_ami_codebuild": '{ Service = "codebuild.amazonaws.com" }',
+            "fcvm_ami_ci": "{ Federated = aws_iam_openid_connect_provider.github.arn }",
+            "fcvm_ami_publish": '{ Service = "lambda.amazonaws.com" }',
+        }
+        actual = {}
+        for match in re.finditer(r'^resource "aws_iam_role" "(\w+)" \{\n.*?^\}', factory, re.S | re.M):
+            body = match.group()
+            if re.search(r"provider\s*=\s*aws\.fcvm_fleet\w*\b", body):
+                continue  # These roles are in Fleet and trust the scoped main broker.
+            actual[match.group(1)] = re.findall(r'\bPrincipal\s*=\s*(\{[^}]+\}|"[^"]+")', body)
+        self.assertEqual(actual, {name: [principal] for name, principal in expected.items()})
+        release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertNotRegex(release, r'\bPrincipal\s*=|^resource "aws_iam_role" ',)
 
 
 class ApplyRoleTests(unittest.TestCase):

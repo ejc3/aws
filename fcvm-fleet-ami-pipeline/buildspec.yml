@@ -1,0 +1,13 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - python3 -m venv /tmp/fcvm-image-sdk
+      - '/tmp/fcvm-image-sdk/bin/python -m pip --isolated install --only-binary=:all: --require-hashes -r fleet/ami/requirements-pipeline.txt'
+  build:
+    commands:
+      - set -eu
+      - test "$CODEBUILD_RESOLVED_SOURCE_VERSION" = "$SOURCE_SHA"
+      - /tmp/fcvm-image-sdk/bin/python fleet/ami/pipeline.py

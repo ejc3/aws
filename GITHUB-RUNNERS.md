@@ -54,6 +54,16 @@ main builds; manual dispatch of main remains available to collaborators. Checkou
 uses `github.event.workflow_run.head_sha` for automatic runs and `github.sha` for
 manual runs. Normal CI does not require this publishing approval.
 
+The separate GPU Fleet image factory (`fcvm-fleet-ami-pipeline.tf`) does not reuse
+this runner-image identity or its approval environment. Its `fleet-ami-publish`
+environment permits main only and grants GitHub only request/status invocation of
+a fixed dispatcher alias. A fixed AWS executor owns the finite builder slots and
+job-bound credentials; only a separate fixed publisher can advance the four Fleet
+template image defaults after paired hardware/boot/security validation. No ordinary
+CI identity gains Terraform state, administrator delegation or a production instance
+profile. See the Fleet section of `README.md` for batching, critical preemption,
+the bootstrap gates and the distinction between a request and a published image.
+
 `ejc3/aws/.github/workflows/drift.yml` now runs **Terraform Validation**, not live
 drift: formatting, locked provider installation with `-backend=false`, `validate`,
 and offline security tests. It receives no AWS identity, state, or secret values.

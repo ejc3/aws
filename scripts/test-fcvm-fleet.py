@@ -55,7 +55,13 @@ class NetworkTests(unittest.TestCase):
         admitted = block('data "aws_ami" "guarded"', MOD)
         self.assertRegex(admitted, r"for_each\s*=\s*toset\(compact\(concat\(values\(var.gpu_amis\), values\(var.tile_amis\)\)\)\)")
         self.assertRegex(admitted, r'owners\s*=\s*\["self"\]')
-        filters = dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]', admitted))
+        validated = re.search(r'  dynamic "filter" \{\n.*?\n  \}', admitted, re.S)
+        self.assertIsNotNone(validated)
+        self.assertRegex(validated.group(), r'for_each\s*=\s*var\.ami_release_parameter_arn != "" \? \[true\] : \[\]')
+        self.assertEqual(dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]', validated.group())),
+                         {"tag:FleetImageValidated": '"true"'})
+        filters = dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]',
+                                  admitted[:validated.start()] + admitted[validated.end():]))
         self.assertEqual(filters, {"image-id": "each.value", "is-public": '"false"',
                                   "state": '"available"', "tag:GuardHelperSHA256": "var.ip_options_guard_sha256"})
         sg = block('resource "aws_security_group" "fleet"', MOD)
@@ -368,7 +374,7 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         spot = block('resource "aws_launch_template" "tile"', MOD)
         self.assertNotIn("instance_market_options", od)
         self.assertIn("instance_market_options", spot)
-        self.assertIn('name          = "fcvm-fleet-tile-on-demand-${each.key}"', od)
+        self.assertRegex(od, r'name\s*=\s*"fcvm-fleet-tile-on-demand-\$\{each\.key\}"')
         self.assertIn('tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }', od)
         for part in ("iam_instance_profile", "http_tokens                 = \"required\"", "ipv6_address_count          = 1"):
             self.assertIn(part, od, part)
@@ -428,7 +434,7 @@ class ModuleDependencies(unittest.TestCase):
             start = tf.index('module "fcvm_fleet_%s"' % name)
             body = tf[start:tf.index("\n}\n", start)]
             self.assertNotIn("depends_on", body, name)
-            self.assertIn("flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id", body, name)
+            self.assertRegex(body, r"flow_log_bucket_policy_id\s*=\s*aws_s3_bucket_policy\.fcvm_fleet_flow_logs\.id", name)
 
 class CoordinatorTileTypes(unittest.TestCase):
     def test_the_coordinator_launches_only_the_fleet_types_and_tile_templates_only_tile_types(self):
@@ -477,7 +483,7 @@ class StageWallTests(unittest.TestCase):
                   '"--secret-region ${local.fcvm_fleet_home_region}"',
                   '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone fcvm.dev"', '"--phones 2"']:
             self.assertIn(a, args)
-        self.assertEqual(TF.count("host_agent_args           = local.fcvm_fleet_host_agent_args"), 3)
+        self.assertEqual(len(re.findall(r"host_agent_args\s*=\s*local\.fcvm_fleet_host_agent_args\b", TF)), 3)
 
     def test_boot_writes_the_agent_env_and_starts_the_unit_only_with_arguments(self):
         self.assertIn('%{if var.host_agent_args != ""~}', MOD)
@@ -553,7 +559,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
         self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
         self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
-        self.assertEqual(TF.count("slot_tls_ports            = local.fcvm_fleet_slot_tls_ports"), 3)
+        self.assertEqual(len(re.findall(r"slot_tls_ports\s*=\s*local\.fcvm_fleet_slot_tls_ports\b", TF)), 3)
 
     def test_the_coordinator_serves_the_launch_names_subzone(self):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]

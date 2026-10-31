@@ -52,6 +52,32 @@ variable "ip_options_guard_sha256" {
   type        = string
 }
 
+variable "ami_release_parameter_arn" {
+  description = "Regional non-secret release pointer, empty while automatic publishing is disabled"
+  type        = string
+  default     = ""
+}
+
+variable "ami_release_parameter_version" {
+  description = "Release version read by the administration plan"
+  type        = number
+  default     = 0
+}
+
+# Re-open at apply time under the backend lock. A release after planning must
+# invalidate the saved plan, while AZ discovery remains a plan-time operation.
+ephemeral "aws_ssm_parameter" "ami_release_guard" {
+  count           = var.ami_release_parameter_arn != "" ? 1 : 0
+  arn             = var.ami_release_parameter_arn
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition     = self.version == var.ami_release_parameter_version
+      error_message = "The Fleet AMI release changed after planning; create a fresh plan."
+    }
+  }
+}
+
 variable "tile_amis" {
   description = "The EC2 tile AMI per architecture in this region (x86_64, arm64); an empty value skips that template"
   type        = map(string)
@@ -120,6 +146,13 @@ data "aws_ami" "guarded" {
   filter {
     name   = "tag:GuardHelperSHA256"
     values = [var.ip_options_guard_sha256]
+  }
+  dynamic "filter" {
+    for_each = var.ami_release_parameter_arn != "" ? [true] : []
+    content {
+      name   = "tag:FleetImageValidated"
+      values = ["true"]
+    }
   }
 }
 
@@ -279,12 +312,14 @@ resource "aws_flow_log" "this" {
 
 # ------------------------------------------------------------------------------------------------ GPU hosts
 resource "aws_launch_template" "host" {
-  for_each      = toset(local.host_archs)
-  name          = "fcvm-fleet-host-${each.key}"
-  description   = "fcvm fleet GPU host, ${each.key} (${local.host_types[each.key]}): the fleet AMI, a delegated IPv6 /80, IMDSv2 hop 1"
-  image_id      = var.gpu_amis[each.key]
-  instance_type = local.host_types[each.key]
-  user_data     = local.user_data
+  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  update_default_version = true
+  for_each               = toset(local.host_archs)
+  name                   = "fcvm-fleet-host-${each.key}"
+  description            = "fcvm fleet GPU host, ${each.key} (${local.host_types[each.key]}): the fleet AMI, a delegated IPv6 /80, IMDSv2 hop 1"
+  image_id               = var.gpu_amis[each.key]
+  instance_type          = local.host_types[each.key]
+  user_data              = local.user_data
 
   iam_instance_profile {
     name = var.host_profile_name
@@ -343,12 +378,14 @@ resource "aws_sns_topic_subscription" "alerts_email" {
 
 # ------------------------------------------------------------------------------------------------ EC2 tiles
 resource "aws_launch_template" "tile" {
-  for_each      = toset(local.tile_archs)
-  name          = "fcvm-fleet-tile-${each.key}"
-  description   = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): launched by the coordinator"
-  image_id      = var.tile_amis[each.key]
-  instance_type = local.tile_types[each.key]
-  user_data     = local.tile_user_data
+  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  update_default_version = true
+  for_each               = toset(local.tile_archs)
+  name                   = "fcvm-fleet-tile-${each.key}"
+  description            = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): launched by the coordinator"
+  image_id               = var.tile_amis[each.key]
+  instance_type          = local.tile_types[each.key]
+  user_data              = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name
@@ -398,12 +435,14 @@ resource "aws_launch_template" "tile" {
 # (fcvm fleet coord --ec2-on-demand-template fcvm-fleet-tile-on-demand-<arch>). Everything but the market is the spot
 # template's.
 resource "aws_launch_template" "tile_on_demand" {
-  for_each      = toset(local.tile_archs)
-  name          = "fcvm-fleet-tile-on-demand-${each.key}"
-  description   = "fcvm fleet EC2 comparison tile on demand, ${each.key} (${local.tile_types[each.key]}): the coordinator's fallback"
-  image_id      = var.tile_amis[each.key]
-  instance_type = local.tile_types[each.key]
-  user_data     = local.tile_user_data
+  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  update_default_version = true
+  for_each               = toset(local.tile_archs)
+  name                   = "fcvm-fleet-tile-on-demand-${each.key}"
+  description            = "fcvm fleet EC2 comparison tile on demand, ${each.key} (${local.tile_types[each.key]}): the coordinator's fallback"
+  image_id               = var.tile_amis[each.key]
+  instance_type          = local.tile_types[each.key]
+  user_data              = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name
@@ -448,12 +487,14 @@ resource "aws_launch_template" "tile_on_demand" {
 # persistent request before terminating its instance, or the request launches a replacement) is limited to tiles'.
 # Everything else is the spot template's.
 resource "aws_launch_template" "tile_pool" {
-  for_each      = toset(local.tile_archs)
-  name          = "fcvm-fleet-tile-pool-${each.key}"
-  description   = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): persistent spot, stopped between wakes"
-  image_id      = var.tile_amis[each.key]
-  instance_type = local.tile_types[each.key]
-  user_data     = local.tile_user_data
+  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  update_default_version = true
+  for_each               = toset(local.tile_archs)
+  name                   = "fcvm-fleet-tile-pool-${each.key}"
+  description            = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): persistent spot, stopped between wakes"
+  image_id               = var.tile_amis[each.key]
+  instance_type          = local.tile_types[each.key]
+  user_data              = local.tile_user_data
 
   iam_instance_profile {
     name = var.tile_profile_name
@@ -506,6 +547,16 @@ resource "aws_launch_template" "tile_pool" {
 
 output "vpc_id" {
   value = aws_vpc.this.id
+}
+
+output "image_templates" {
+  description = "Only these templates may receive validated software image releases"
+  value = concat(
+    [for arch, template in aws_launch_template.host : { region = local.region, id = template.id, kind = "host", arch = arch }],
+    [for templates in [aws_launch_template.tile, aws_launch_template.tile_on_demand, aws_launch_template.tile_pool] :
+      [for arch, template in templates : { region = local.region, id = template.id, kind = "tile", arch = arch }]
+    ]...
+  )
 }
 
 output "subnet_ids" {

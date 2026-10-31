@@ -58,15 +58,25 @@ class GrantTests(unittest.TestCase):
         self.assertEqual(attached, {"nextjs_dev", "dev_ebs_only", "wbox", "member_wbox", "claw_master_server"})
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
         # is an administrator (jumpbox_admin), is a CI machine, is the Mac (SSM channels only), or is in the
-        # Dolphin account (dolphin_redis, which calls no model), or is in the fcvm-fleet account (its hosts and tiles call none).
+        # Dolphin account (dolphin_redis, which calls no model), or is in the fcvm-fleet account
+        # (its runtime hosts, tiles and isolated image factory call no model).
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "runner_app_image_builder",
-                    "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile"}
+                    "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile", "fcvm_ami_builder"}
         profile_roles = set()
         for tf in ROOT.glob("*.tf"):
             for m in re.finditer(r'^resource "aws_iam_instance_profile" "\w+" \{\n.*?^\}', tf.read_text(), re.S | re.M):
                 profile_roles.update(re.findall(r"role\s*=\s*aws_iam_role\.(\w+)", m.group()))
         self.assertTrue(profile_roles, "no instance profiles found")
         self.assertEqual(profile_roles - not_here, attached)
+
+    def test_factory_builder_has_no_bedrock_grant(self):
+        roles = re.search(r"^  bedrock_haiku_box_roles = merge\(\n(.*?)^  \)", TF, re.S | re.M)
+        self.assertIsNotNone(roles)
+        self.assertNotIn("aws_iam_role.fcvm_ami_builder", roles.group(1))
+        # The factory is isolated build infrastructure, not an interactive box.
+        # Its dedicated policies must not add a model grant through another path.
+        factory = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertNotIn("bedrock", factory.lower())
 
 
 class RetiredTests(unittest.TestCase):
