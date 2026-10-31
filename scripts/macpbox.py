@@ -152,20 +152,22 @@ def template(data, call=aws):
 
 def quote(call=aws):
     filters = [{"Type": "TERM_MATCH", "Field": key, "Value": value} for key, value in (
-        ("instanceType", "mac-m4pro"), ("tenancy", "Host"), ("operatingSystem", "NA"),
-        ("location", "US West (Oregon)"))]
+        ("productFamily", "Dedicated Host"), ("instanceType", "mac-m4pro"),
+        ("tenancy", "Host"), ("location", "US West (Oregon)"), ("regionCode", REGION))]
     products = call("pricing", "get-products", {"ServiceCode": "AmazonEC2", "Filters": filters}, "us-east-1")
     prices = set()
     for encoded in products.get("PriceList", []):
         product = json.loads(encoded)
         attributes = product["product"]["attributes"]
-        need(attributes.get("instanceType") == "mac-m4pro" and attributes.get("tenancy") == "Host"
-             and attributes.get("operatingSystem") == "NA", "Pricing returned an instance SKU instead of a dedicated host.")
+        need(product["product"].get("productFamily") == "Dedicated Host"
+             and attributes.get("instanceType") == "mac-m4pro" and attributes.get("tenancy") == "Host"
+             and attributes.get("location") == "US West (Oregon)" and attributes.get("regionCode") == REGION,
+             "Pricing returned a different product or region instead of the Oregon dedicated host.")
         for term in product.get("terms", {}).get("OnDemand", {}).values():
             for dimension in term["priceDimensions"].values():
                 need(dimension.get("unit") == "Hrs", "Unexpected dedicated-host billing unit.")
                 price = Decimal(dimension["pricePerUnit"]["USD"])
-                need(price > 0, "Zero-dollar EC2 instance pricing is not the dedicated-host price.")
+                need(price.is_finite() and price > 0, "Invalid or zero-dollar pricing is not the dedicated-host price.")
                 prices.add(price)
     need(len(prices) == 1, "No unambiguous live dedicated-host price; no allocation is permitted.")
     price = prices.pop()
