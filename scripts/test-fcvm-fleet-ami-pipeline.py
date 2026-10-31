@@ -240,6 +240,38 @@ class Dynamo:
 
 
 class FactoryTests(unittest.TestCase):
+    def test_codebuild_metadata_and_stop_authorize_only_the_factory_project(self):
+        # AWS authorizes these APIs against the PROJECT ARN, not the build ID/ARN.
+        # https://docs.aws.amazon.com/service-authorization/latest/reference/list_codebuild.html
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        project = "arn:aws:codebuild:us-west-1:111111111111:project/fcvm-fleet-image-factory"
+        foreign = project + "-unrelated"
+        for role, actions in (("fcvm_ami_dispatch", ("codebuild:BatchGetBuilds", "codebuild:StopBuild")),
+                              ("fcvm_ami_publish", ("codebuild:BatchGetBuilds",))):
+            policy = re.search(r'^resource "aws_iam_role_policy" "' + role + r'" \{\n.*?^\}',
+                               source, re.S | re.M).group()
+            for action in actions:
+                with self.subTest(role=role, action=action):
+                    grants = []
+                    for line in policy.splitlines():
+                        match = re.search(r'Effect\s*=\s*"Allow"\s*,\s*Action\s*=\s*(\[[^\]]+\]|"[^"]+")\s*,\s*Resource\s*=\s*(aws_codebuild_project\.fcvm_ami\.arn|"[^"]+")', line)
+                        if not match:
+                            continue
+                        allowed = json.loads(match[1])
+                        if action not in ([allowed] if isinstance(allowed, str) else allowed):
+                            continue
+                        resource = match[2]
+                        if resource == "aws_codebuild_project.fcvm_ami.arn":
+                            resource = project
+                        else:
+                            resource = json.loads(resource).replace("${var.aws_region}", "us-west-1").replace(
+                                "${data.aws_caller_identity.current.account_id}", "111111111111").replace(
+                                "${local.fcvm_ami_project}", "fcvm-fleet-image-factory")
+                        grants.append(resource)
+                    self.assertEqual(len(grants), 1)
+                    self.assertTrue(fnmatch.fnmatchcase(project, grants[0]), "the factory's project must be authorized")
+                    self.assertFalse(fnmatch.fnmatchcase(foreign, grants[0]), "foreign projects must remain unauthorized")
+
     def test_staging_s3_resources_and_endpoints_obey_the_actual_fleet_region_scp(self):
         root = SOURCE.parents[1]
         factory = (root / "fcvm-fleet-ami-pipeline.tf").read_text()
