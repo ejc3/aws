@@ -52,7 +52,8 @@ locals {
   # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
   # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
   # another repository's job), serve only jobs whose every label is in its own set, and its
-  # deliveries are routed here by repository.full_name while fcvm's still go to the metal webhook.
+  # deliveries are routed here by repository.full_name while fcvm's still go to the metal webhook. ejc3/constellation
+  # is the same shape: its own label, registration, routing, caps and budget bucket.
   #
   # `image` (optional) names a prebuilt image from runner-app-image.tf, built for that same repo. The repo's hosts then
   # boot the newest available build of it that this account's pipeline made and tagged, and Canonical's Ubuntu 24.04,
@@ -71,6 +72,11 @@ locals {
 
     # dolphin-family: the same shape as dolphin-maps, behind its own token gate (below).
     "dolphin-labs-hq/dolphin-family" = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-family" }
+
+    # constellation: the same shape as imagine, behind its own token gate (below). Its Rust suite asks for `xl` and its
+    # other jobs for `l` or `s`; throttled, 4 hosts, which its group's 74 vCPUs fill before then with `l` and `xl` jobs.
+    # Canonical's image: its jobs bring their toolchains through setup actions (GITHUB-RUNNERS.md, "ejc3/constellation").
+    "ejc3/constellation" = { label = "constellation", max = 64, throttled_max = 4 }
   }
 
   # BUDGET. Each group is a leaky bucket of dollars (runner-app/app_runner.py, "budget buckets"; GITHUB-RUNNERS.md,
@@ -90,6 +96,7 @@ locals {
   #
   # The dolphin repos share one bucket: they share the `dolphin` label and one owner. dolphin-family draws on it once its
   # token gate is on (a repo outside runner_app_config is not served and is not counted). colton-games is in no group.
+  # constellation has a bucket of its own, as imagine does: one owner's two repos, each with its own budget.
   runner_budget_defaults = {
     capacity_days   = 2   # the bucket holds two days' budget ($100 at $50/day)
     burst_max       = 64  # hosts per repo in burst: the most hosts 512 vCPUs can be (64 `s`)
@@ -105,10 +112,14 @@ locals {
   runner_budget_groups = {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
     dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }
+
+    # Its own bucket once constellation_token_ready is on (no bucket, metric or alarm before: runner_budget_served).
+    constellation = { daily_usd = 50, repos = ["ejc3/constellation"] }
   }
   # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
   # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
-  # host_hour_usd), at vcpu_hour_usd, rounded down: at $50 a day, imagine 72 vCPUs (8 hosts) and dolphin 68 (14 hosts).
+  # host_hour_usd), at vcpu_hour_usd, rounded down: at $50 a day, imagine 72 vCPUs (8 hosts), dolphin 68 (14 hosts) and
+  # constellation 74 (4 hosts).
   # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
   # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
   # still under the refill ($2.08/h).
@@ -163,8 +174,11 @@ locals {
   # would need Colton's own account) keeps its PAT. The PAT stays the fallback until the app is proven in production.
   # ejc3/imagine takes the app's token once the app is installed on ejc3 (selected repositories: imagine only) and that
   # installation is in github-app/runners; until then app_token() finds no ejc3 installation and its PAT is used.
+  # ejc3/constellation likewise: an ejc3 installation may select imagine and constellation, and nothing else of ejc3's.
+  # The runners app (dolphin-labs-runners) is private to dolphin-labs-hq today, so it has no ejc3 installation and both
+  # use their PATs (GITHUB-RUNNERS.md, "Controller tokens from a GitHub App").
   # dolphin-family is not here: it uses its own controller token until the runners app's installation is widened to it.
-  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine"]
+  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "ejc3/constellation"]
   # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
   # counting its cap would loosen the combined alarm before it serves anything. Each repo counts the most hosts it may
   # hold in any mode (peak_max): a budgeted repo's burst ceiling of 64, which is exactly the most hosts its 512 vCPUs can
@@ -1000,6 +1014,13 @@ variable "imagine_token_ready" {
   default     = true
 }
 
+# The same gate for ejc3/constellation: false until ejc3 has minted and stored its token, then true in a commit.
+variable "constellation_token_ready" {
+  description = "ejc3/constellation's controller token has a value in Secrets Manager, so its webhook can be created"
+  type        = bool
+  default     = false
+}
+
 locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
 
@@ -1011,12 +1032,16 @@ locals {
     "ejc3/imagine"                  = var.imagine_token_ready
 
     "dolphin-labs-hq/dolphin-family" = var.dolphin_family_token_ready
+
+    "ejc3/constellation" = var.constellation_token_ready
   }
   dolphin_films_webhook = local.runner_app_webhooks && var.dolphin_films_token_ready
   dolphin_maps_webhook  = local.runner_app_webhooks && var.dolphin_maps_token_ready
   imagine_webhook       = local.runner_app_webhooks && var.imagine_token_ready
 
   dolphin_family_webhook = local.runner_app_webhooks && var.dolphin_family_token_ready
+
+  constellation_webhook = local.runner_app_webhooks && var.constellation_token_ready
 
   runner_app_webhook_repos = [
     for r in local.runner_extra_repos : r
@@ -1141,6 +1166,25 @@ resource "github_repository_webhook" "runner_app_imagine" {
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
 }
 
+# ejc3/constellation's hook, made the same way as imagine's: the administration GitHub App's ejc3 installation (all of
+# ejc3's repositories, repository_hooks write), never the default provider.
+resource "github_repository_webhook" "runner_app_constellation" {
+  count      = local.constellation_webhook ? 1 : 0
+  provider   = github.agents_md
+  repository = "constellation"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
 resource "github_repository_webhook" "runner_app_dolphin_maps" {
   count      = local.dolphin_maps_webhook ? 1 : 0
   provider   = github.dolphin_labs
@@ -1175,7 +1219,7 @@ resource "github_repository_webhook" "runner_app_dolphin_family" {
   depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
 }
 
-# The runners GitHub App (ejc3-aws-runners): installation tokens for the controller, narrowed per call to one repository and
+# The runners GitHub App (dolphin-labs-runners, owned by dolphin-labs-hq): installation tokens for the controller, narrowed per call to one repository and
 # to administration:write + actions:read, expiring within the hour (app_runner.py, app_token). JSON: app_id, slug,
 # private_key, installations {owner: id}. Terraform owns only the container; the value is stored from GitHub's
 # app-manifest conversion without being printed. Readers: the controller and the jumpboxes' role, nothing else. This
