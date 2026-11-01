@@ -160,14 +160,20 @@ incidents in the patchdoctor DynamoDB table and protected artifacts in the bucke
 reported by terraform output patchdoctor. Never make that bucket public or copy
 raw transcripts into issue comments.
 
-The owner-private Control Room site combines these controls with per-app Prompt
-access setup. Terraform owns its dedicated owner-only Cloudflare Access application
-at `control.cc-games.dev` and its server-only AWS identity. Sites owns the portal's
-source, private publication, and runtime secrets. The portal can invoke the serial
-controller and read typed status; it cannot invoke the command broker, send SSM
-commands, or read administration secrets or Terraform state. Copy only the dedicated
-`control-portal/runtime` payload to Sites runtime secrets, never into source or a
-browser bundle.
+The owner-private Control Room at `control.cc-games.dev` keeps MDM credential
+connection separate from the existing repair controls. Terraform deploys its
+direct Cloudflare Worker from `control-portal/`, its owner-only Access application
+and server-only AWS identity. The Worker validates Cloudflare's authenticated
+invocation context, application audience and owner identity; it requires no
+ChatGPT login. Alternate workers.dev and preview URLs are disabled. The earlier
+Sites publication remains private and is not the custom hostname's origin.
+The portal can invoke the serial controller and read typed status; it cannot
+invoke the command broker, send SSM commands, or read administration secrets or
+Terraform state. Runtime keys are secret Worker bindings, never browser assets.
+The MDM credential connection is not commissioned: Microsoft organizational
+administrator authentication and an owned Entra app registration are prerequisites
+for a real consent and token exchange. The page must not present a redirect URL as
+a completed connection or claim to purchase a license or enroll a device.
 
 True iPhone per-app access requires Intune device enrollment and the Cloudflare One
 Agent: assign only Prompt and a dedicated authentication browser to the VPN profile.
