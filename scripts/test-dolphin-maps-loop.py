@@ -52,10 +52,14 @@ class AccessTests(unittest.TestCase):
 
     def test_the_function_reads_its_secrets_and_writes_only_the_journal(self):
         policy = block("aws_iam_role_policy", "dolphin_maps_loop")
-        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
+        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
         self.assertIn('Resource = "${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"', policy)
         self.assertNotIn("code/", policy)
         self.assertIn("aws_iam_role.dolphin_maps_loop.arn", re.search(r"browserbase_readers = \[[^\]]*\]", AI).group())
+        # The games pass: the Ball Don't Lie key's policy lets the loop's role read it, and the function is told its name.
+        bdl = (ROOT / "dolphin-maps-balldontlie.tf").read_text()
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn])", bdl)
+        self.assertIn("BALLDONTLIE_SECRET_ID = aws_secretsmanager_secret.balldontlie.name", block("aws_lambda_function", "dolphin_maps_loop"))
 
     def test_the_deploy_role_trusts_deploy_loop_yml_on_main_and_nothing_else(self):
         role = block("aws_iam_role", "dolphin_maps_loop_deploy")
@@ -101,6 +105,8 @@ class PemsTests(unittest.TestCase):
             "ReadThePemsLogin": ({"secretsmanager:GetSecretValue"}, "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
             "PutThePemsLogin": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                 "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
+            "ReadAndPutTheBallDontLieKey": ({"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
+                                            "aws_secretsmanager_secret.balldontlie.arn"),
             "PutTheMusicKitKey": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                  "aws_secretsmanager_secret.dolphin_maps_musickit.arn"),
         }
@@ -162,7 +168,7 @@ class AlarmTests(unittest.TestCase):
 
     def test_a_loop_that_stops_running_alarms_while_its_schedule_is_on(self):
         idle = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_not_running")
-        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7 } : {}", idle)
+        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}", idle)
         self.assertIn('metric_name         = "Invocations"', idle)
         self.assertIn('treat_missing_data  = "breaching"', idle)
         self.assertIn("datapoints_to_alarm = each.value", idle)

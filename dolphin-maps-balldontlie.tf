@@ -6,8 +6,9 @@
 #
 #   balldontlie/api-key   JSON: BALLDONTLIE_API_KEY. Terraform owns the container and who may read it; the value is set out
 #                         of band (put-secret-value from a 0600 file, copied from games-worth-watching's key) and never
-#                         enters git. Readers: the administration set and dev-server-role (the metal boxes: recording
-#                         fixtures, a run by hand), which may also put it, as with dolphin-maps/pems.
+#                         enters git. Readers: the administration set, dev-server-role (the metal boxes: recording
+#                         fixtures, a run by hand), which may also put it, as with dolphin-maps/pems, and the loop
+#                         Lambdas' role (dolphin-maps-loop.tf: the games pass, {"mode": "games"}).
 #
 # Once it has a value, set local.dolphin_maps_balldontlie_key_set to true: the key then becomes the BALLDONTLIE_API_KEY of
 # dolphin-maps' data-push environment (main only; the loops' environment, which holds DATA_APP_KEY and the PeMS login).
@@ -29,12 +30,12 @@ resource "aws_secretsmanager_secret_policy" "balldontlie" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "OnlyAdministrationAndTheMetalBoxesCanRead"
+      Sid       = "OnlyAdministrationTheMetalBoxesAndTheLoopCanRead"
       Effect    = "Deny"
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.balldontlie.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn]) } }
     }]
   })
 }

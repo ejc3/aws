@@ -1,6 +1,6 @@
-# dolphin-maps' scheduled loops, run in AWS: three Lambdas from one bundle on three EventBridge schedules, a journal of every pass
+# dolphin-maps' scheduled loops, run in AWS: four Lambdas from one bundle on their EventBridge schedules, a journal of every pass
 # in S3, and a GitHub App for its commits. It replaces the GitHub Actions loops in dolphin-labs-hq/dolphin-maps
-# (scrape-live.yml, scrape-weekly.yml and the dev box's crontab trigger), which stand down when that repository's
+# (scrape-live.yml, scrape-weekly.yml, refresh-games.yml and the dev box's crontab trigger), which stand down when that repository's
 # variable LOOPS_RUN_IN_AWS is true.
 #
 #   dolphin-maps-loop-live        every 5 minutes, 06:00-08:55 America/Los_Angeles, weekdays: {"mode": "live"}.
@@ -14,7 +14,13 @@
 #                                 none after the 12th), which the sweep's pages leave no room for (dolphin-maps #198).
 #                                 A schedule, not an invocation by the sweep: the sweep's role needs no
 #                                 lambda:InvokeFunction, and a refit can be rerun by hand.
-#                                 One bundle, three functions: each loop has its own limits, and Lambda's own Errors
+#   dolphin-maps-loop-games       daily 05:15 America/Los_Angeles: {"mode": "games"}, each Bay Area arena's home games
+#                                 for the next 30 days from Ball Don't Lie (one call per league the key's plan covers,
+#                                 four, 20 s apart), committed as data/events/games.csv. No browser. Its key is
+#                                 balldontlie/api-key (dolphin-maps-balldontlie.tf), named by BALLDONTLIE_SECRET_ID.
+#                                 The GitHub Actions copy (refresh-games.yml) runs at 12:15 UTC; this is the same hour
+#                                 in winter and an hour earlier in summer, before anyone plans the day's drive.
+#                                 One bundle, one function a loop: each loop has its own limits, and Lambda's own Errors
 #                                 metric (timeouts, running out of memory and failed starts included) is that
 #                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a
 #                                 stand-in handler (dolphin-maps-loop/index.mjs, index.handler like the bundle) and then leaves their code
@@ -33,6 +39,8 @@
 #                                 repository and contents:write, which expires within the hour. Value stored
 #                                 from GitHub's app-manifest conversion, never printed.
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
+#   balldontlie/api-key           existing (dolphin-maps-balldontlie.tf), JSON: BALLDONTLIE_API_KEY; the function joins
+#                                 its readers for the games pass.
 #   dolphin-maps/pems             JSON: PEMS_USERNAME, PEMS_PASSWORD. The PeMS login (Caltrans' traffic data
 #                                 service) for the scheduled PeMS refresh. Value set out of band, never in git. The
 #                                 function and the administration set read it; dev-server-role reads and puts it.
@@ -50,13 +58,16 @@
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
-#   the three functions        journal/ (write); the secrets above (read); their own logs
+#   the four functions         journal/ (write); the secrets above (read); their own logs
 #   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these three
 #                              functions only (no UpdateFunctionConfiguration: the handler is Terraform's)
+#
+# A new function changes the output's LOOP_LAMBDA_FUNCTIONS: set dolphin-maps' repository variable of that name to it
+# after the apply, so deploy-loop.yml ships the bundle to the games function too.
 #   dev-server-role            journal/ (read, list): replays on the metal boxes; dolphin-maps/pems (read, put)
 
 variable "dolphin_maps_loop_enabled" {
-  description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep, the monthly week passes and the weekly weekend pass). false keeps the function and its data and stops the runs."
+  description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep and refit, the monthly week passes, the weekly weekend pass and the daily games). false keeps the function and its data and stops the runs."
   type        = bool
   default     = false
 }
@@ -68,11 +79,13 @@ locals {
   # A live pass is a page or two (minutes at most); a sweep is about six minutes of pages; a refit is the routing
   # guard's gyms (8:43 on a dev box, not yet measured here): it starts no gym after the 12th minute and keeps the
   # committed calibration for a stage it has not checked. Memory is set for the CPU share, not the footprint
-  # (about 250 MB).
+  # (about 250 MB). A games pass is four provider calls 20 s apart, a minute or two (more when the shared key's
+  # window is spent and it waits for the reset, about a minute each time).
   dolphin_maps_loop_modes = {
     live  = { schedule = "cron(*/5 6-8 ? * MON-FRI *)", timeout = 300, memory = 1024 }
     sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }
     refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }
+    games = { schedule = "cron(15 5 * * ? *)", timeout = 600, memory = 512 }
   }
   # The week and weekend passes: the sweep function, another event. Names are the schedules' suffixes. Week passes
   # are 20 minutes apart from Saturday 20:00 (a pass is a few minutes, 15 at the most); `SAT#1` is the month's first
@@ -341,7 +354,7 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -360,6 +373,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
     live  = "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3"
     sweep = "dolphin-maps weekly loop: the school week's typical ranges, committed to the repository, journal to S3"
     refit = "dolphin-maps weekly refit: each area's calibration on the ranges in the repository, committed to it, journal to S3"
+    games = "dolphin-maps games loop: each arena's home games for the next 30 days from Ball Don't Lie, committed to the repository, journal to S3"
   }[each.key]
   role = aws_iam_role.dolphin_maps_loop.arn
   # The bundle deploy-loop.yml uploads exports index.handler too, so the handler never changes and the deploy
@@ -386,6 +400,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
       EXA_SECRET_ID         = aws_secretsmanager_secret.search_fetch_api_key["exa"].name
       SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
       PEMS_SECRET_ID        = aws_secretsmanager_secret.dolphin_maps_pems.name
+      BALLDONTLIE_SECRET_ID = aws_secretsmanager_secret.balldontlie.name
       GITHUB_APP_SECRET_ID  = aws_secretsmanager_secret.dolphin_maps_loop_github_app.name
       LOOP_REPO             = "dolphin-labs-hq/dolphin-maps"
       LOOP_BRANCH           = "main"
@@ -541,6 +556,24 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_refit_failed" {
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
 }
 
+# Games: daily, so one failure is a day's schedule not refreshed; the committed games stay and the next morning's pass
+# reads them again. A league refused (an empty read while games are committed ahead) fails the pass after the other
+# leagues' games are committed.
+resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_games_failed" {
+  alarm_name          = "dolphin-maps-loop-games-failed"
+  alarm_description   = "dolphin-maps' games loop failed: a league's schedule was refused or not read, or the commit failed. See /aws/lambda/dolphin-maps-loop-games and journal/games/ (each provider read) in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"games\"}."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["games"].function_name }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+}
+
 # A pass that never ran is not an error: with one run at a time, a live pass that takes past the next five
 # minutes throttles the one after it, and a throttled event older than 300 s is dropped without running. Lambda
 # counts those in AsyncEventsDropped, not Errors, so each function gets its own alarm on them.
@@ -563,9 +596,10 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_dropped" {
 # And a loop that stops running at all (a schedule disabled or broken, the scheduler role changed) produces no
 # Errors and no drops. Only while the schedules are on: the live loop is invoked every weekday morning, so four
 # days without an invocation spans any weekend; the sweep runs once a week, so seven daily periods always hold
-# one run. Missing data is a breach: no invocations publish no datapoint.
+# one run; the games loop runs every day, so two days without one is a broken schedule. Missing data is a breach: no
+# invocations publish no datapoint.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_not_running" {
-  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7 } : {}
+  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}
   alarm_name          = "dolphin-maps-loop-${each.key}-not-running"
   alarm_description   = "dolphin-maps-loop-${each.key} has not been invoked for ${each.value} days although its schedule is on. Check the scheduler schedule dolphin-maps-loop-${each.key} and the dolphin-maps-loop-scheduler role."
   namespace           = "AWS/Lambda"
