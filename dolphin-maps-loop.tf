@@ -271,6 +271,12 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
     actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
     resources = [aws_secretsmanager_secret.dolphin_maps_pems.arn]
   }
+  # Ball Don't Lie's key (dolphin-maps-balldontlie.tf): read and put, here for the role's 20-policy cap.
+  statement {
+    sid       = "ReadAndPutTheBallDontLieKey"
+    actions   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+    resources = [aws_secretsmanager_secret.balldontlie.arn]
+  }
   # dolphin-maps' MusicKit key (dolphin-maps-musickit.tf): put and described, never read, here for the role's 20-policy cap.
   statement {
     sid       = "PutTheMusicKitKey"
@@ -281,7 +287,7 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
 
 resource "aws_iam_policy" "dolphin_maps_pems_dev" {
   name        = "dev-dolphin-maps-pems"
-  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and nothing else"
+  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and the Ball Don't Lie key (balldontlie/api-key); put the MusicKit key"
   policy      = data.aws_iam_policy_document.dolphin_maps_pems_dev.json
 }
 

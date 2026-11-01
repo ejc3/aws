@@ -101,6 +101,8 @@ class PemsTests(unittest.TestCase):
             "ReadThePemsLogin": ({"secretsmanager:GetSecretValue"}, "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
             "PutThePemsLogin": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                 "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
+            "ReadAndPutTheBallDontLieKey": ({"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
+                                            "aws_secretsmanager_secret.balldontlie.arn"),
             "PutTheMusicKitKey": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                  "aws_secretsmanager_secret.dolphin_maps_musickit.arn"),
         }
