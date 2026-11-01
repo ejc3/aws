@@ -666,6 +666,28 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(len(self.publisher.calls), 1)
         self.assertEqual(self.cb.stops, [])
 
+    def test_success_waits_for_late_actual_termination_before_publication(self):
+        for kind in ("host", "tile"):
+            image = self.seal(kind + "-build")
+            self.ec2.instances[image["instance_id"]]["State"]["Name"] = "terminated"
+            self.call("status", kind + "-build")
+            instance_id = self.launch(kind + "-verify")
+            self.ec2.instances[instance_id]["State"]["Name"] = "shutting-down"
+        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
+        self.factory.reconcile()
+        self.assertEqual(self.publisher.calls, [], "a successful executor is not termination proof")
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "awaiting-publish")
+        self.time = NOW + mod.DEADLINE_SECONDS + 360
+        for instance in self.ec2.instances.values():
+            instance["State"]["Name"] = "terminated"
+            instance.pop("IamInstanceProfile", None)  # Actual terminal EC2 shape.
+        self.factory.reconcile()
+        journal = self.factory.journal(BUILD, active=False)[1]
+        self.assertTrue(all(value.get("terminated_seen") is True for value in journal["slots"].values()))
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["publication_deadline_unix"], ended + 86400)
+        self.assertEqual((len(self.ec2.launches), self.cb.starts, self.cb.stops), (4, [], []))
+
     def test_committed_release_keeps_retrying_retirement_past_publication_deadline(self):
         ended = self.succeed()
         self.fleet_ssm.values["/release"] = {"build_id": BUILD}
@@ -967,16 +989,25 @@ class FactoryTests(unittest.TestCase):
         image = self.seal()
         self.fleet_ssm.values["/release"] = {"host_amis": {}, "tile_amis": {}, "previous": None}
         self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        self.cb.builds[BUILD]["endTime"] = datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc)
+        self.ec2.images[image["image_id"]]["BlockDeviceMappings"] = [{"Ebs": {"SnapshotId": "snap-fixture"}}]
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [])
         self.ec2.instances[image["instance_id"]]["State"]["Name"] = "terminated"
+        self.time = NOW + 86400 - 1
+        self.factory.collect_images()
+        self.assertEqual((self.ec2.deleted_images, self.ec2.deleted_snapshots), ([], []))
+        self.time += 1
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [image["image_id"]])
+        self.assertEqual(self.ec2.deleted_snapshots, ["snap-fixture"])
 
     def test_image_retention_preserves_release_references(self):
         image = self.seal()
         self.ec2.instances[image["instance_id"]]["State"]["Name"] = "terminated"
         self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        self.cb.builds[BUILD]["endTime"] = datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc)
+        self.time = NOW + 86400
         self.fleet_ssm.values["/release"] = {"host_amis": {"us-east-1": {"x86_64": image["image_id"]}}, "tile_amis": {}, "previous": None}
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [])
