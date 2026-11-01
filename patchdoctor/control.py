@@ -1,10 +1,15 @@
 """PatchDoctor's durable admission controller and worker-only command broker."""
 import datetime
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import time
+from urllib.parse import quote
+
+import triage
 
 MODEL = 'us.anthropic.claude-opus-5-5'
 CVE = re.compile(r'CVE-[0-9]{4}-[0-9]{4,10}\Z')
@@ -15,7 +20,7 @@ COMMAND_TERMINAL = {'Success', 'Failed', 'Cancelled', 'TimedOut', 'DeliveryTimed
 OUTCOMES = {'patched', 'mitigated', 'blocked', 'self-test-passed'}
 START_REJECTED = {'InvalidInputException', 'ResourceNotFoundException', 'AccountLimitExceededException',
     'AccessDeniedException', 'NotAuthorizedException'}
-ACTIVE_CASES = {'pending', 'running', 'starting', 'start-uncertain', 'daily-budget-wait', 'awaiting-native-closure'}
+ACTIVE_CASES = {'pending', 'running', 'starting', 'start-uncertain', 'daily-budget-wait', 'awaiting-native-closure', 'deferred'}
 _CLIENTS = {}
 
 
@@ -168,7 +173,190 @@ class Doctor:
             self.save(case)
 
     def config(self):
-        return self.store.get('config') or {'armed': False}
+        value = self.store.get('config') or {}
+        # An older armed record cannot bypass the new two-model commissioning gate.
+        return {**value, 'armed': value.get('armed') is True and value.get('gate_version') == 2}
+
+    def triage_input(self, case):
+        """Only re-read native Inspector/EC2 facts can establish Ubuntu package identity."""
+        facts = {'cve': case['cve'], 'targets': sorted(case['targets'], key=lambda t: t['instance_id']), 'packages': [],
+            'known_exploit': None, 'fix_available': None}
+        findings = case.get('findings', [])
+        if any(f.get('exploit_available') == 'YES' for f in findings):
+            facts['known_exploit'] = True
+        if any(f.get('fix_available') in {'YES', 'PARTIAL'} for f in findings):
+            facts['fix_available'] = True
+        try:
+            require(findings and all(f.get('triage_complete') is True for f in findings))
+            targets = {t['instance_id']: t for t in case['targets']}
+            releases = {'UBUNTU_20_04': 'focal', 'UBUNTU_22_04': 'jammy',
+                'UBUNTU_24_04': 'noble', 'UBUNTU_26_04': 'resolute'}
+            architectures = {'ARM64': 'arm64', 'arm64': 'arm64', 'X86_64': 'amd64', 'x86_64': 'amd64', 'amd64': 'amd64'}
+            packages = []
+            for finding in findings:
+                require(finding.get('source') == 'UBUNTU_CVE' and finding.get('platform') in releases)
+                target = targets[finding['instance_id']]
+                for package in finding['packages']:
+                    name, version, release = package['name'], package['version'], package['release']
+                    arch = architectures[package['arch']]
+                    require(package['packageManager'] == 'OS' and architectures[target['architecture']] == arch)
+                    require(re.fullmatch(r'[a-z0-9][a-z0-9.+-]{0,127}', name)
+                        and re.fullmatch(r'[A-Za-z0-9.+:~_-]{1,128}', version)
+                        and (not release or re.fullmatch(r'[A-Za-z0-9.+~_-]{1,128}', release)))
+                    require('fcvm' not in version.lower() and not (
+                        target['name'].startswith('fcvm-metal-') and name.startswith('linux')))
+                    if release and not version.endswith('-' + release):
+                        require('-' not in version)
+                        version += '-' + release
+                    epoch = package.get('epoch')
+                    require(type(epoch) is int and 0 <= epoch < 100000)
+                    if ':' in version:
+                        require(version.split(':', 1)[0] == str(epoch))
+                    elif epoch:
+                        version = str(epoch) + ':' + version
+                    purl = 'pkg:deb/ubuntu/' + name + '@' + quote(version, safe='.+~_-')
+                    purl += '?arch=' + arch + '&distro=' + releases[finding['platform']]
+                    packages.append({'instance_id': target['instance_id'], 'origin': 'ubuntu_archive', 'purl': purl})
+            require({p['instance_id'] for p in packages} == set(targets) and len(packages) <= 32)
+            facts['packages'] = sorted(packages, key=lambda p: (p['instance_id'], p['purl']))
+            if all(f.get('exploit_available') == 'NO' for f in findings):
+                facts['known_exploit'] = False
+            if all(f.get('fix_available') == 'NO' for f in findings):
+                facts['fix_available'] = False
+        except (KeyError, TypeError, ValueError):
+            pass  # Missing, truncated, custom or ambiguous facts always go to Opus.
+        return facts
+
+    def assess(self, case):
+        facts = self.triage_input(case)
+        revision = digest(encoded(facts))
+        if (case.get('triage_revision') == revision and case.get('triage')
+                and (case['triage'].get('decision') != 'defer' or self.now() < case.get('recheck_at', 0))):
+            return case['triage']['decision'], False
+        verdict = triage.classify(facts)
+        case.update(triage=verdict, triage_revision=revision, triage_checked_at=int(self.now()))
+        if verdict['decision'] == 'defer':
+            # The scheduler observes this before one hour, not after it.
+            case.update(status='deferred', recheck_at=int(self.now()) + min(3300, verdict['recheck_after_seconds']))
+        self.save(case)
+        if verdict['decision'] == 'defer':
+            self.notify('deferred-recheck', case)
+            case['triage_notice_at'] = case['triage_checked_at']
+            self.save(case)
+        return verdict['decision'], True
+
+    def status(self):
+        cfg, cases = self.config(), self.active_cases()
+        return {'connected': True, 'armed': cfg['armed'], 'paused': cfg.get('paused_new_runs') is True,
+            'models': {'doctor': MODEL, 'triage': triage.MODEL},
+            'limits': {'worker_minutes': 60, 'attempts_per_case': 2, 'starts_per_day': 4,
+                'model_allowance_usd': 25, 'case_allowance_usd': 50},
+            'setup': {'tenant_connected': False, 'phone_verified': False, 'mac_verified': False},
+            'state': {'active_case_id': (self.store.get('active-case') or {}).get('case_id'),
+                'pending': sum(c['status'] == 'pending' for c in cases),
+                'deferred': sum(c['status'] == 'deferred' for c in cases)},
+            'cases': [{k: c[k] for k in ('case_id', 'cve', 'status', 'created_at', 'updated_at', 'attempts') if k in c}
+                for c in sorted(cases, key=lambda c: c['created_at'])[:50]]}
+
+    def admin(self, event):
+        action, mutation = event['action'], event.get('mutationId')
+        require(isinstance(mutation, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', mutation))
+        require(set(event) <= {'action', 'mutationId', 'paused', 'case_id'})
+        if action == 'pause_new_runs':
+            require(type(event.get('paused')) is bool)
+        if event.get('case_id') is not None:
+            require(action == 'recheck' and DIGEST.fullmatch(event['case_id']))
+        request_hash = digest(encoded(event))
+        key = 'admin#' + digest(mutation)
+        receipt = self.store.get(key)
+        if receipt:
+            require(receipt['request_sha256'] == request_hash)
+            if receipt.get('state') == 'completed':
+                return receipt['result']
+        else:
+            receipt = {'request_sha256': request_hash, 'state': 'prepared', 'action': action,
+                'mutationId': mutation, 'created_at': int(self.now())}
+            self.store.put(key, receipt)
+        result = self.admin_effect(event, key, receipt)
+        if result.get('state') != 'uncertain':
+            receipt.update(state='completed', result=result)
+            self.store.put(key, receipt)  # Durable exact replay receipt BEFORE acknowledging.
+        return result
+
+    def admin_effect(self, event, key, receipt):
+        action, mutation = event['action'], event['mutationId']
+        result = {'action': action, 'mutationId': mutation, 'state': 'completed'}
+        cfg = self.config()
+        previous = cfg.get('last_admin_effect', {})
+        if previous.get('mutationId') == mutation:
+            return previous
+        if action in {'self_test', 'haiku_self_test', 'triage_self_test'}:
+            if 'haiku_result' not in receipt:
+                if receipt.get('haiku_attempted'):
+                    return {**result, 'state': 'uncertain'}
+                receipt['haiku_attempted'] = True
+                self.store.put(key, receipt)
+                try:
+                    proof = triage.self_test()
+                except Exception as error:
+                    proof = {'ok': False, 'model': triage.MODEL, 'error_type': type(error).__name__}
+                receipt['haiku_result'] = {**proof, 'checked_at': int(self.now())}
+                self.store.put(key, receipt)
+            cfg['haiku_self_test'] = receipt['haiku_result']
+            self.store.put('config', cfg)
+            result['haiku'] = receipt['haiku_result']
+            if action != 'self_test' or receipt['haiku_result'].get('ok') is not True:
+                return result
+            case_id = digest('PatchDoctor/SELF_TEST')
+            case = self.store.get('case#' + case_id)
+            if not case:
+                case = {'case_id': case_id, 'account': self.account, 'region': self.region, 'cve': 'SELF_TEST',
+                    'mode': 'self-test', 'status': 'pending', 'created_at': int(self.now()), 'attempts': 0,
+                    'reserved_usd': 0, 'operations': {}, 'targets': [], 'findings': []}
+                self.save(case)
+            self.reconcile()
+            return {**result, 'case_id': case_id, 'armed': self.config()['armed']}
+        if action == 'recheck':
+            if 'case_ids' not in receipt:
+                cases = [self.store.get('case#' + event['case_id'])] if event.get('case_id') else self.active_cases()
+                require(all(cases))
+                receipt['case_ids'] = [c['case_id'] for c in cases if c['mode'] == 'repair'
+                    and c['status'] in {'pending', 'deferred', 'blocked-no-current-critical-target'}]
+                self.store.put(key, receipt)
+            changed = 0
+            for case_id in receipt['case_ids']:
+                case = self.store.get('case#' + case_id)
+                if case.get('last_recheck_mutation') == mutation:
+                    continue
+                require(case['status'] in {'pending', 'deferred', 'blocked-no-current-critical-target'})
+                case.update(status='pending', recheck_at=0, last_recheck_mutation=mutation)
+                case.pop('triage', None)
+                self.save(case)
+                changed += 1
+            if changed:
+                self.reconcile()
+            return {**result, 'case_count': len(receipt['case_ids'])}
+        require(action in {'arm', 'pause_new_runs'})
+        if receipt.get('config_attempted'):
+            return {**result, 'state': 'uncertain'}  # A later admin action must never be overwritten.
+        if action == 'arm':
+            case = self.store.get('case#' + digest('PatchDoctor/SELF_TEST'))
+            require(case and case.get('status') == 'self-test-passed' and case.get('outcome') == 'self-test-passed'
+                and self.build(case['build_id'])['buildStatus'] == 'SUCCEEDED'
+                and cfg.get('haiku_self_test', {}).get('ok') is True
+                and cfg['haiku_self_test'].get('model') == triage.MODEL)
+            cfg.update(armed=True, gate_version=2, paused_new_runs=False)
+        else:
+            cfg['paused_new_runs'] = event['paused']
+        receipt['config_attempted'] = True
+        self.store.put(key, receipt)
+        result.update(armed=cfg.get('armed') is True and cfg.get('gate_version') == 2,
+            paused=cfg.get('paused_new_runs') is True)
+        cfg['last_admin_effect'] = result
+        self.store.put('config', cfg)  # Effect and its recovery marker are ONE atomic item write.
+        if action == 'arm':
+            self.reconcile()
+        return result
 
     def describe_target(self, instance_id, region):
         require(region in self.regions and isinstance(instance_id, str) and IID.fullmatch(instance_id))
@@ -179,7 +367,8 @@ class Doctor:
         tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
         require(reservation.get('OwnerId') == self.account and instance['InstanceId'] == instance_id
             and tags.get('Name') in self.names and instance.get('State', {}).get('Name') == 'running')
-        return {'instance_id': instance_id, 'region': region, 'name': tags['Name']}
+        return {'instance_id': instance_id, 'region': region, 'name': tags['Name'],
+            'architecture': instance.get('Architecture', '')}
 
     def critical_targets(self, cve, region):
         require(CVE.fullmatch(cve) and region in self.regions)
@@ -210,9 +399,11 @@ class Doctor:
                         continue
                     targets[instance_id] = target
                     advisory = finding.get('packageVulnerabilityDetails', {})
-                    packages = [{key: str(package.get(key, ''))[:128] for key in
-                        ('name', 'fixedInVersion', 'version', 'packageManager')}
-                        for package in advisory.get('vulnerablePackages', [])[:8]]
+                    raw_packages = advisory.get('vulnerablePackages', [])
+                    packages = [{**{key: str(package.get(key, ''))[:128] for key in
+                        ('name', 'fixedInVersion', 'version', 'packageManager', 'arch', 'release')},
+                        'epoch': package.get('epoch')}
+                        for package in raw_packages[:8]]
                     urls = [str(url)[:512] for url in [advisory.get('sourceUrl', ''),
                         *advisory.get('referenceUrls', [])[:2]] if str(url).startswith('https://')]
                     findings.append({'finding_arn': finding['findingArn'], 'instance_id': instance_id,
@@ -220,9 +411,17 @@ class Doctor:
                         'exploit_available': finding.get('exploitAvailable', 'UNKNOWN'),
                         'title': str(finding.get('title', ''))[:200],
                         'description': str(finding.get('description', ''))[:800],
-                        'packages': packages, 'source_urls': urls})
+                        'packages': packages, 'source_urls': urls,
+                        'source': advisory.get('source', ''),
+                        'platform': resource.get('details', {}).get('awsEc2Instance', {}).get('platform', ''),
+                        'triage_complete': 0 < len(raw_packages) <= 8 and all(
+                            len(str(p.get(k, ''))) <= 128 for p in raw_packages
+                            for k in ('name', 'version', 'packageManager', 'arch', 'release'))})
             token = page.get('nextToken')
             if not token:
+                if len(findings) > 50:
+                    for finding in findings[:50]:
+                        finding['triage_complete'] = False
                 return list(targets.values()), findings[:50]
         raise RuntimeError('finding pagination bound exceeded')
 
@@ -293,6 +492,8 @@ class Doctor:
                     'status': 'pending', 'created_at': int(self.now()),
                     'attempts': 0, 'reserved_usd': 0, 'operations': {}}
             case.update(targets=targets, findings=findings, finding_arns=sorted(set(case.get('finding_arns', [])) | {f['finding_arn'] for f in findings}))
+            if case['status'] == 'deferred' and case.get('triage_revision') != digest(encoded(self.triage_input(case))):
+                case['status'] = 'pending'  # A new exploit/fix/native package revision bypasses an old deferral.
             self.save(case)
             # Case first, then deterministic generation pointer: a crash can only rediscover it.
             self.store.put(pointer_key, pointer)
@@ -384,6 +585,7 @@ class Doctor:
 
     def reconcile(self):
         cases = self.active_cases()
+        observed = []
         pointer = self.store.get('active-case') or {}
         for case in cases:
             if (case['case_id'] == pointer.get('case_id') and case['status'] not in {'running', 'starting', 'start-uncertain'} and
@@ -391,7 +593,20 @@ class Doctor:
                 self.release('active-case', case['case_id'])
         busy = False
         for case in cases:
-            self.reconcile_operations(case)
+            try:
+                self.reconcile_operations(case)
+            except Exception as error:
+                self.observer_failure(case, error)
+                continue
+            observed.append(case)
+            if case['status'] == 'deferred':
+                if self.now() >= case['recheck_at']:
+                    case['status'] = 'pending'
+                    self.save(case)
+                elif case.get('triage_notice_at') != case.get('triage_checked_at'):
+                    self.notify('deferred-recheck', case)
+                    case['triage_notice_at'] = case['triage_checked_at']
+                    self.save(case)
             if case['status'] == 'daily-budget-wait' and self.now() >= case['retry_after']:
                 case['status'] = 'pending'
                 self.save(case)
@@ -404,7 +619,11 @@ class Doctor:
                     self.recover_start(case)
                 busy = True
             if case.get('status') == 'running':
-                build = self.build(case['build_id'])
+                try:
+                    build = self.build(case['build_id'])
+                except Exception as error:
+                    self.observer_failure(case, error)
+                    continue
                 if build['buildStatus'] not in BUILD_TERMINAL:
                     busy = True
                     if self.now() >= case['deadline_unix']:
@@ -422,28 +641,52 @@ class Doctor:
                     self.notify_once(case['outcome'], case, 'outcome_notice_sent')
                 if case['status'] == 'budget-exhausted':
                     self.notify('budget-exhausted', case)
-        for case in cases:
+        for case in observed:
             if case.get('status') == 'awaiting-native-closure':
-                targets, _ = self.critical_targets(case['cve'], case['region'])
-                if not targets and not case.get('outstanding_operations') and self.native_closed(case):
-                    case['status'] = 'resolved'
-                    self.save(case)
+                try:
+                    targets, _ = self.critical_targets(case['cve'], case['region'])
+                    if not targets and not case.get('outstanding_operations') and self.native_closed(case):
+                        case['status'] = 'resolved'
+                        self.save(case)
+                except Exception as error:
+                    self.observer_failure(case, error)
         if busy or (self.store.get('host-operation') or {}).get('case_id'):
             return
         pointer = self.store.get('active-case') or {}
-        for case in sorted(cases, key=lambda c: (c['case_id'] != pointer.get('case_id'), c['created_at'])):
+        for case in sorted(observed, key=lambda c: (c['case_id'] != pointer.get('case_id'), c['created_at'])):
             if (case['status'] == 'pending' and not case.get('outstanding_operations')
                     and (case['mode'] == 'self-test' or self.config().get('armed') is True)):
                 if case['mode'] != 'self-test':
-                    targets, findings = self.critical_targets(case['cve'], case['region'])
+                    try:
+                        targets, findings = self.critical_targets(case['cve'], case['region'])
+                    except Exception as error:
+                        self.observer_failure(case, error)
+                        continue
                     if not targets:
                         case['status'] = 'blocked-no-current-critical-target'
                         self.save(case)
                         self.release('active-case', case['case_id'])
                         continue
                     case.update(targets=targets, findings=findings)
+                    decision, assessed = self.assess(case)
+                    if decision == 'defer':
+                        return  # At most one paid triage call per controller invocation.
+                    if self.config().get('paused_new_runs') is True:
+                        if assessed:
+                            return
+                        continue  # Pausing new repairs preserves native/triage rechecks.
                 self.start(case)
                 break
+
+    def observer_failure(self, case, error):
+        for key in ('active-case', 'host-operation'):
+            if (self.store.get(key) or {}).get('case_id') == case['case_id']:
+                raise error  # Safety observations for an active build/write must fail closed.
+        # An unrelated historical observer must not stop admission of other critical repairs.
+        try:
+            self.notify_once('observation-attention', case, 'observer_notice_sent')
+        except Exception:
+            pass  # The case remains indexed; next scheduled observation retries its notice.
 
     def native_closed(self, case):
         arns = case.get('finding_arns', [])
@@ -489,6 +732,26 @@ class Doctor:
         require(build.get('buildStatus') == 'IN_PROGRESS' and variables.get('PATCHDOCTOR_CASE_ID') == case['case_id']
             and variables.get('PATCHDOCTOR_MODE') == case['mode'])
         return case
+
+    def require_worker(self, case, event):
+        token = event.get('worker_capability', '')
+        require(isinstance(token, str) and DIGEST.fullmatch(token)
+            and case.get('worker_capability_build_id') == case['build_id']
+            and hmac.compare_digest(case.get('worker_capability_hash', ''), digest(token)))
+
+    def worker_claim(self, event):
+        token = secrets.token_hex(32)
+        for _ in range(4):
+            current = self.authorize(event)
+            require(current.get('worker_capability_build_id') != current['build_id'])
+            current.update(worker_capability_build_id=current['build_id'], worker_capability_hash=digest(token))
+            try:
+                self.save(current)
+                return {'worker_capability': token}
+            except Exception as error:
+                if error_code(error) != 'ConditionalCheckFailedException':
+                    raise
+        raise RuntimeError('worker claim revision conflict')
 
     def operation(self, case, operation_id):
         require(isinstance(operation_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', operation_id))
@@ -564,8 +827,10 @@ class Doctor:
         if not op.get('command_id'):
             commands, token = [], None
             for _ in range(10):
-                args = {'Filters': [{'key': 'InvokedAfter', 'value': datetime.datetime.fromtimestamp(
-                    op['created_at'] - 60, datetime.timezone.utc).isoformat()}], 'MaxResults': 50}
+                args = {'InstanceId': op['target']['instance_id'], 'Filters': [
+                    {'key': 'InvokedAfter', 'value': datetime.datetime.fromtimestamp(
+                        op['created_at'] - 60, datetime.timezone.utc).isoformat()},
+                    {'key': 'DocumentName', 'value': op['document']}], 'MaxResults': 50}
                 if token:
                     args['NextToken'] = token
                 page = ssm.list_commands(**args)
@@ -577,6 +842,10 @@ class Doctor:
                     break
             require(not token and len(commands) <= 1)
             if not commands:
+                if not op.get('attention_sent'):
+                    self.notify('command-delivery-uncertain', case)
+                    op['attention_sent'] = True
+                    self.store.put(key, op)
                 return self.op_receipt(op)
             op.update(command_id=commands[0]['CommandId'], state='submitted')
             self.store.put(key, op)
@@ -620,6 +889,7 @@ class Doctor:
         checkpoint = {'key': key, 'version_id': version}
         for _ in range(4):
             current = self.authorize({'case_id': case['case_id'], 'build_id': case['build_id']})
+            self.require_worker(current, event)
             current['checkpoint'] = checkpoint
             try:
                 self.save(current)
@@ -633,6 +903,8 @@ class Doctor:
         require(len(encoded(event).encode()) <= 24000)
         case = self.authorize(event)
         action = event.get('action')
+        if action == 'worker_claim':
+            return self.worker_claim(event)
         if action == 'get':
             return {**{k: case[k] for k in ('case_id', 'mode', 'targets', 'findings', 'cve', 'deadline_unix')},
                 'model': MODEL, 'budget_usd': 25, 'attempt': case['attempts'],
@@ -644,46 +916,60 @@ class Doctor:
         if action == 'poll':
             return self.poll(case, event)
         if action == 'checkpoint':
+            self.require_worker(case, event)
             return self.checkpoint(case, event)
         if action == 'finish':
             require(event.get('outcome') in OUTCOMES and (event['outcome'] == 'self-test-passed') == (case['mode'] == 'self-test'))
-            case.update(outcome=event['outcome'], summary=summary(event.get('summary', '')))
-            self.save(case)
-            return {'acknowledged': True, 'outcome': case['outcome'], 'status': 'awaiting-build-completion'}
+            text = summary(event.get('summary', ''))
+            for _ in range(4):
+                current = self.authorize(event)
+                self.require_worker(current, event)
+                current.update(outcome=event['outcome'], summary=text)
+                try:
+                    self.save(current)
+                    return {'acknowledged': True, 'outcome': current['outcome'], 'status': 'awaiting-build-completion'}
+                except Exception as error:
+                    if error_code(error) != 'ConditionalCheckFailedException':
+                        raise
+            raise RuntimeError('finish revision conflict')
         raise ValueError('unsupported action')
+
+    def admit_records(self, event):
+        require(isinstance(event.get('Records'), list))
+        failures, admitted, completed = [], [], []
+        for message in event['Records']:
+            try:
+                body = json.loads(message['body'])
+                # Untrusted SQS bodies can ONLY enter native finding admission.
+                admitted.extend(self.admit(body))
+                completed.append(message['messageId'])
+            except Exception:
+                failures.append({'itemIdentifier': message['messageId']})
+        return {'batchItemFailures': failures, 'admitted': admitted}, completed
+
+    def admission(self, event):
+        result, completed = self.admit_records(event)
+        if result['admitted']:
+            try:
+                reply = self.api('lambda').invoke(FunctionName=self.env['CONTROL_ARN'], InvocationType='Event',
+                    Payload=encoded({'source': 'patchdoctor.admission', 'detail-type': 'Pending critical cases'}).encode())
+                require(reply.get('StatusCode') == 202)
+            except Exception:
+                # Case is durable; redelivery retries only the fixed controller wakeup.
+                result['batchItemFailures'].extend({'itemIdentifier': message_id} for message_id in completed)
+        return result
 
     def handler(self, event):
         if 'Records' in event:
-            failures, admitted = [], []
-            for message in event['Records']:
-                try:
-                    body = json.loads(message['body'])
-                    # Untrusted SQS bodies can ONLY enter native finding admission.
-                    admitted.extend(self.admit(body))
-                except Exception:
-                    failures.append({'itemIdentifier': message['messageId']})
+            result, _ = self.admit_records(event)
             self.reconcile()
-            return {'batchItemFailures': failures, 'admitted': admitted}
+            return result
         action = event.get('action') if not event.get('source') and not event.get('detail-type') else None
-        if action == 'self_test':
-            case_id = digest('PatchDoctor/SELF_TEST')
-            case = self.store.get('case#' + case_id)
-            if not case:
-                case = {'case_id': case_id, 'account': self.account, 'region': self.region, 'cve': 'SELF_TEST',
-                    'mode': 'self-test', 'status': 'pending', 'created_at': int(self.now()), 'attempts': 0,
-                    'reserved_usd': 0, 'operations': {}, 'targets': [], 'findings': []}
-                self.save(case)
-            self.reconcile()
-            return {'case_id': case_id, 'armed': self.config().get('armed') is True}
-        if action == 'arm':
-            case = self.store.get('case#' + digest('PatchDoctor/SELF_TEST'))
-            require(case and case.get('status') == 'self-test-passed' and case.get('outcome') == 'self-test-passed'
-                and self.build(case['build_id'])['buildStatus'] == 'SUCCEEDED')
-            cfg = self.config()
-            cfg['armed'] = True
-            self.store.put('config', cfg)
-            self.reconcile()
-            return {'armed': True}
+        if action == 'status':
+            return self.status()
+        if action in {'self_test', 'haiku_self_test', 'triage_self_test', 'arm', 'pause_new_runs', 'recheck'}:
+            return self.admin(event)
+        require(action is None)
         admitted = self.admit(event) if event.get('source') in {'aws.inspector2', 'aws.securityhub'} else []
         self.reconcile()
         return {'admitted': admitted, 'armed': self.config().get('armed') is True}
@@ -691,6 +977,10 @@ class Doctor:
 
 def handler(event, context):
     return Doctor().handler(event)
+
+
+def admission(event, context):
+    return Doctor().admission(event)
 
 
 def broker(event, context):

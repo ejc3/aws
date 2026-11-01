@@ -266,6 +266,7 @@ class Worker:
         return process.returncode, stdout + stderr
 
     async def run(self):
+        await asyncio.to_thread(self.broker.claim_worker)
         case = await asyncio.to_thread(self.broker.call, 'get')
         if case.get('case_id') != self.case_id or case.get('mode') != self.mode:
             raise RuntimeError('case mismatch')

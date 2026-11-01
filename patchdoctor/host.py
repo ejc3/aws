@@ -30,10 +30,25 @@ class Broker:
             client = boto3.client('lambda', region_name=self.arn.split(':')[3], config=Config(
                 connect_timeout=5, read_timeout=70, retries={'total_max_attempts': 1}))
         self.client = client
+        self._worker_capability = None
+
+    def claim_worker(self):
+        if self._worker_capability is not None:
+            raise BrokerError('worker already claimed')
+        value = self.call('worker_claim')
+        capability = value.get('worker_capability')
+        if not isinstance(capability, str) or not re.fullmatch(r'[a-f0-9]{64}', capability):
+            raise BrokerError('invalid worker claim')
+        # Parent memory only: never inherited by the Claude subprocess or checkpointed.
+        self._worker_capability = capability
 
     def call(self, action, **fields):
-        if action not in {'get', 'command', 'poll', 'checkpoint', 'finish'} or {'action', 'case_id', 'build_id'} & fields.keys():
+        if action not in {'worker_claim', 'get', 'command', 'poll', 'checkpoint', 'finish'} or {'action', 'case_id', 'build_id', 'worker_capability'} & fields.keys():
             raise BrokerError('invalid broker operation')
+        if action in {'checkpoint', 'finish'}:
+            if self._worker_capability is None:
+                raise BrokerError('worker claim required')
+            fields['worker_capability'] = self._worker_capability
         payload = dict(fields, action=action, case_id=self.case_id, build_id=self.build_id)
         try:
             reply = self.client.invoke(FunctionName=self.arn, InvocationType='RequestResponse',
@@ -64,11 +79,6 @@ def main(argv=None):
     run.add_argument('--inspect', action='store_true')
     poll = sub.add_parser('poll')
     poll.add_argument('--operation-id', required=True)
-    checkpoint = sub.add_parser('checkpoint')
-    checkpoint.add_argument('--key', required=True)
-    checkpoint.add_argument('--version-id', required=True)
-    finish = sub.add_parser('finish')
-    finish.add_argument('--json-file', type=Path, required=True)
     args = parser.parse_args(argv)
     fields = {}
     action = {'case': 'get', 'run': 'command'}.get(args.action, args.action)
@@ -86,11 +96,6 @@ def main(argv=None):
             if len(script.encode()) > 16384:
                 raise BrokerError('host script exceeds limit')
             fields.update(target={'instance_id': args.target, 'region': args.region}, script=script, inspect=args.inspect)
-        elif action == 'checkpoint':
-            fields.update(key=args.key, version_id=args.version_id)
-        elif action == 'finish':
-            value = json.loads(args.json_file.read_text())
-            fields.update(outcome=value['outcome'], summary=value['summary'])
         result = Broker().call(action, **fields)
         print(json.dumps(result, sort_keys=True))
         return 0

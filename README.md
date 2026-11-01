@@ -103,12 +103,20 @@ findings and checks the affected instance before granting a command. Lower-sever
 findings cannot authorize a repair. Critical findings without a supported CVE are
 recorded and reported for administration review.
 
-The deployment includes an admission Lambda, worker-only command broker, incident
-ledger, private versioned KMS-encrypted artifact bucket, and a single CodeBuild worker.
+The deployment includes a separate concurrent inbox-admission Lambda, a serial
+controller, a worker-only command broker, incident ledger, private versioned
+KMS-encrypted artifact bucket, and a single CodeBuild worker.
 The worker runs the actual Claude Code CLI with its normal tools, Opus 5.5, very high
 reasoning effort, and streaming JSON output. It uses its own Bedrock IAM identity;
 there is no copied personal Claude login or long-lived Anthropic key. Native CLI
 2.1.316 is pinned to its published Linux checksum.
+
+Haiku 5.5 provides the fast advisory triage before an Opus repair starts. A deferral
+requires current, exact primary-vendor evidence for every affected package and host,
+plus a high-confidence Haiku agreement. Missing evidence, known exploitation,
+an available fix, a model error, or uncertainty sends the case to Opus. Deferred
+findings stay open, are notified, and are rechecked within one hour; model text never
+authorizes a host command or declares a vulnerability resolved.
 
 The first release covers the named main-account Linux fleet in us-west-1, us-west-2
 and us-east-1: both jumpboxes, ARM and x86 metal, Next.js and the Claude master server.
@@ -146,6 +154,23 @@ commands. The broker's target and severity gates remain active after arming. Rev
 incidents in the patchdoctor DynamoDB table and protected artifacts in the bucket
 reported by terraform output patchdoctor. Never make that bucket public or copy
 raw transcripts into issue comments.
+
+The owner-private Control Room site combines these controls with per-app Prompt
+access setup. Terraform owns its dedicated owner-only Cloudflare Access application
+at `control.cc-games.dev` and its server-only AWS identity. Sites owns the portal's
+source, private publication, and runtime secrets. The portal can invoke the serial
+controller and read typed status; it cannot invoke the command broker, send SSM
+commands, or read administration secrets or Terraform state. Copy only the dedicated
+`control-portal/runtime` payload to Sites runtime secrets, never into source or a
+browser bundle.
+
+True iPhone per-app access requires Intune device enrollment and the Cloudflare One
+Agent: assign only Prompt and a dedicated authentication browser to the VPN profile.
+Existing Prompt installation and SSH keys stay in place. Intune Plan 1 is $96 per
+user annually unless already included in an eligible Microsoft license; Cloudflare
+Free covers this small deployment. Apple push-certificate setup and iPhone enrollment
+consent are one-time owner actions; renew the Apple certificate yearly. Never mark a
+phone or Mac verified until its real SSH and Prompt transport checks succeed.
 
 ## Prerequisites
 

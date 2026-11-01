@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import triage as T
+
 SPEC = importlib.util.spec_from_file_location('patchdoctor_control', Path(__file__).with_name('control.py'))
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
@@ -23,7 +25,8 @@ COMMAND = '11111111-1111-1111-1111-111111111111'
 ENV = {'ACCOUNT_ID': ACCOUNT, 'TABLE_NAME': 'ledger', 'PROJECT_NAME': 'patchdoctor', 'BUCKET_NAME': 'private-audit',
     'SNS_TOPIC_ARN': 'test-topic', 'ALLOWED_REGIONS_JSON': json.dumps([REGION, 'us-west-2', 'us-east-1']),
     'TARGET_NAMES_JSON': json.dumps(['jumpbox', 'nextjs-ct']), 'COMMAND_DOCUMENT_NAME': 'PatchDoctor-RunCommand',
-    'INSPECT_DOCUMENT_NAME': 'PatchDoctor-Inspect'}
+    'INSPECT_DOCUMENT_NAME': 'PatchDoctor-Inspect',
+    'CONTROL_ARN': 'arn:aws:lambda:us-west-1:111111111111:function:patchdoctor'}
 
 
 class Memory:
@@ -45,8 +48,7 @@ class Memory:
 
     def cases(self):
         return [copy.deepcopy(v) for k, v in self.rows.items() if k.startswith('case#')
-            and (v.get('status') in {'pending', 'running', 'starting', 'start-uncertain',
-                'daily-budget-wait', 'awaiting-native-closure'} or v.get('outstanding_operations'))]
+            and (v.get('status') in C.ACTIVE_CASES or v.get('outstanding_operations'))]
 
 
 class Cloud:
@@ -64,9 +66,10 @@ class Cloud:
         self.invocation_status = 'Success'
         self.shub = None
         self.extra_findings, self.extra_instances = [], []
+        self.invokes, self.fail_invoke = [], False
 
     def client(self, service, region):
-        if service not in {'inspector2', 'securityhub', 'ec2', 'codebuild', 'sns', 'ssm', 's3'}:
+        if service not in {'inspector2', 'securityhub', 'ec2', 'codebuild', 'sns', 'ssm', 's3', 'lambda'}:
             raise AssertionError('unmocked service: ' + service)
         return self
 
@@ -96,6 +99,12 @@ class Cloud:
     def publish(self, **kw):
         self.messages.append(kw)
         return {'MessageId': 'one'}
+
+    def invoke(self, **kw):
+        self.invokes.append(kw)
+        if self.fail_invoke:
+            raise TimeoutError('controller wake delivery unknown')
+        return {'StatusCode': 202}
 
     def start_build(self, **kw):
         self.starts.append(kw)
@@ -207,7 +216,7 @@ def crash_child(mode, directory):
     memory, cloud = FileMemory(directory), FileCloud(directory)
     doctor = C.Doctor(ENV, memory, cloud.client, lambda: 1793538000)
     if mode != 'recover':
-        memory.put('config', {'armed': True})
+        memory.put('config', {'armed': True, 'gate_version': 2})
     event = {'source': 'aws.inspector2', 'detail-type': 'Inspector2 Finding', 'account': ACCOUNT,
         'region': REGION, 'detail': {'findingArn': cloud.finding['findingArn']}}
     case_id = doctor.handler(event)['admitted'][0]
@@ -235,21 +244,342 @@ class Tests(unittest.TestCase):
         self.store, self.cloud = Memory(), Cloud()
         self.clock = 1793538000
         self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+        self.capabilities = {}
         self.event = {'source': 'aws.inspector2', 'detail-type': 'Inspector2 Finding', 'account': ACCOUNT,
             'region': REGION, 'detail': {'findingArn': self.cloud.finding['findingArn'], 'severity': 'CRITICAL'}}
+        class Model:
+            def __init__(self):
+                self.calls, self.decision, self.category = [], 'run_doctor', 'needs_investigation'
+            def converse(self, **kwargs):
+                self.calls.append(kwargs)
+                return {'stopReason': 'end_turn', 'usage': {'inputTokens': 10, 'outputTokens': 12},
+                    'output': {'message': {'role': 'assistant', 'content': [{'text': json.dumps({
+                        'decision': self.decision, 'category': self.category, 'confidence': 0.99, 'reason': 'fake-only'})}]}}}
+        self.model = Model()
+        self.model_patch = patch.object(T, '_client', return_value=self.model)
+        self.model_patch.start()
+        self.addCleanup(self.model_patch.stop)
+        self.vendor_patch = patch.object(T, 'fetch_vendor', side_effect=AssertionError('real vendor network forbidden'))
+        self.vendor_patch.start()
+        self.addCleanup(self.vendor_patch.stop)
 
     def admit(self, armed=True):
         if armed:
-            self.store.put('config', {'armed': True})
+            self.store.put('config', {'armed': True, 'gate_version': 2})
         result = self.doctor.handler(self.event)
         return self.store.get('case#' + result['admitted'][0])
 
     def request(self, case, action, **fields):
+        if action in {'checkpoint', 'finish'} and hasattr(self.doctor, 'worker_claim'):
+            identity = case['case_id'], case['build_id']
+            if identity not in self.capabilities:
+                self.capabilities[identity] = self.doctor.broker({
+                    'case_id': identity[0], 'build_id': identity[1], 'action': 'worker_claim'})['worker_capability']
+            fields.setdefault('worker_capability', self.capabilities[identity])
         return {'case_id': case['case_id'], 'build_id': case['build_id'], 'action': action, **fields}
 
     def command(self, case, **fields):
         return self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
             operation_id='patch-version-1', script=fields.pop('script', 'true'), **fields)
+
+    def native_no_fix(self):
+        self.cloud.instance['Architecture'] = 'arm64'
+        finding = self.cloud.finding
+        finding.update(fixAvailable='NO', exploitAvailable='NO')
+        finding['resources'][0]['details'] = {'awsEc2Instance': {'platform': 'UBUNTU_24_04'}}
+        finding['packageVulnerabilityDetails'].update(source='UBUNTU_CVE', vulnerablePackages=[{
+            'name': 'example-package', 'version': '1.0', 'release': '0ubuntu1', 'epoch': 0,
+            'arch': 'ARM64', 'packageManager': 'OS', 'fixedInVersion': ''}])
+        purl = 'pkg:deb/ubuntu/example-package@1.0-0ubuntu1?arch=arm64&distro=noble'
+        body = {'author': 'Canonical Ltd.', '@id': 'https://github.com/canonical/ubuntu-security-notices/blob/main/vex/cve/2026/CVE-2026-12345',
+            'statements': [{'vulnerability': {'name': 'CVE-2026-12345'}, 'products': [{'@id': purl}],
+                'status': 'not_affected', 'justification': 'vulnerable_code_not_present'}]}
+        self.model.decision, self.model.category = 'defer', 'not_applicable'
+        return T.VendorEvidence('CVE-2026-12345', __import__('time').time(), json.dumps(body).encode())
+
+    def test_native_purl_deferral_is_durable_cached_and_hourly_rechecked(self):
+        vendor = self.native_no_fix()
+        with patch.object(T, 'fetch_vendor', return_value=vendor):
+            case = self.admit()
+            self.assertEqual(case['status'], 'deferred')
+            self.assertEqual(self.cloud.starts, [])
+            self.assertEqual(self.doctor.triage_input(case)['packages'][0]['purl'],
+                'pkg:deb/ubuntu/example-package@1.0-0ubuntu1?arch=arm64&distro=noble')
+            self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+            self.doctor.reconcile()
+            self.assertEqual(len(self.model.calls), 1)
+            self.clock += 3300
+            self.doctor.reconcile()
+            self.assertEqual(len(self.model.calls), 2)
+        self.assertEqual(sum(m['Subject'] == 'PatchDoctor deferred-recheck' for m in self.cloud.messages), 2)
+        self.assertEqual(self.cloud.finding['status'], 'ACTIVE')
+        self.assertEqual(self.cloud.sends, [])
+
+    def test_changed_native_exploit_bypasses_cached_deferral_immediately(self):
+        vendor = self.native_no_fix()
+        with patch.object(T, 'fetch_vendor', return_value=vendor):
+            case = self.admit()
+            self.assertEqual(case['status'], 'deferred')
+            self.cloud.finding['exploitAvailable'] = 'YES'
+            self.doctor.handler(self.event)
+        current = self.store.get('case#' + case['case_id'])
+        self.assertEqual(current['status'], 'running')
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(len(self.cloud.starts), 1)
+
+    def test_native_cache_is_stable_when_inventory_order_changes(self):
+        vendor = self.native_no_fix()
+        other = copy.deepcopy(self.cloud.finding)
+        other['findingArn'] += '-other'
+        other['packageVulnerabilityDetails']['vulnerablePackages'][0]['name'] = 'other-package'
+        self.cloud.extra_findings = [other]
+        document = json.loads(vendor.body)
+        document['statements'][0]['products'].append({'@id':
+            document['statements'][0]['products'][0]['@id'].replace('example-package', 'other-package')})
+        vendor = T.VendorEvidence(vendor.cve, vendor.fetched_at, json.dumps(document).encode())
+        with patch.object(T, 'fetch_vendor', return_value=vendor):
+            first = self.admit()
+            self.cloud.finding, self.cloud.extra_findings[0] = self.cloud.extra_findings[0], self.cloud.finding
+            second = self.doctor.handler({**self.event, 'detail': {'findingArn': self.cloud.finding['findingArn']}})
+        self.assertEqual(second['admitted'], [first['case_id']])
+        self.assertEqual(len(self.model.calls), 1)
+
+    def test_unknown_custom_truncated_or_wrong_arch_native_facts_start_opus(self):
+        for variant in ['source', 'platform', 'arch', 'custom', 'truncated', 'missing']:
+            with self.subTest(variant=variant):
+                self.store, self.cloud = Memory(), Cloud()
+                self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+                self.model.calls.clear()
+                vendor = self.native_no_fix()
+                package = self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'][0]
+                if variant == 'source': self.cloud.finding['packageVulnerabilityDetails']['source'] = 'OTHER'
+                if variant == 'platform': self.cloud.finding['resources'][0]['details']['awsEc2Instance']['platform'] = 'UNKNOWN'
+                if variant == 'arch': package['arch'] = 'X86_64'
+                if variant == 'custom': package['version'] = '7.0-fcvm-custom'
+                if variant == 'truncated': self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'] *= 9
+                if variant == 'missing': package.pop('epoch')
+                with patch.object(T, 'fetch_vendor', side_effect=AssertionError('unknown facts must not fetch')):
+                    case = self.admit()
+                self.assertEqual(case['status'], 'running')
+                self.assertEqual(len(self.model.calls), 0)
+
+    def test_old_armed_config_cannot_bypass_two_model_commissioning_gate(self):
+        self.store.put('config', {'armed': True})
+        self.doctor.handler(self.event)
+        self.assertFalse(self.doctor.config()['armed'])
+        self.assertEqual(self.cloud.starts, [])
+
+    def test_admin_self_test_is_real_haiku_then_opus_and_arm_unpauses(self):
+        result = self.doctor.handler({'action': 'self_test', 'mutationId': 'commission-once'})
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(self.model.calls[0]['modelId'], T.MODEL)
+        self.assertEqual(self.store.get('config')['haiku_self_test']['model'], T.MODEL)
+        case = self.store.get('case#' + result['case_id'])
+        with self.assertRaises(ValueError):
+            self.doctor.handler({'action': 'arm', 'mutationId': 'not-ready'})
+        self.doctor.broker(self.request(case, 'finish', outcome='self-test-passed', summary='actual fixture'))
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'SUCCEEDED'
+        self.doctor.reconcile()
+        self.doctor.handler({'action': 'pause_new_runs', 'paused': True, 'mutationId': 'paused'})
+        armed = self.doctor.handler({'action': 'arm', 'mutationId': 'enable'})
+        self.assertTrue(armed['armed'])
+        self.assertFalse(armed['paused'])
+        self.assertEqual(self.cloud.sends, [])
+
+    def test_failed_haiku_self_test_cannot_enqueue_opus_or_arm(self):
+        with patch.object(T, '_client', side_effect=TimeoutError('private detail')):
+            result = self.doctor.handler({'action': 'self_test', 'mutationId': 'bad-model'})
+        self.assertFalse(result['haiku']['ok'])
+        self.assertEqual(self.cloud.starts, [])
+        self.assertNotIn('private detail', json.dumps(result))
+        with self.assertRaises(ValueError):
+            self.doctor.handler({'action': 'arm', 'mutationId': 'bad-arm'})
+
+    def test_admin_mutation_replay_conflict_and_lost_ack_do_not_repeat_model_or_build(self):
+        event = {'action': 'self_test', 'mutationId': 'same-intent'}
+        original, failed = self.store.put, []
+        def lost_ack(key, value):
+            if key.startswith('admin#') and value.get('state') == 'completed' and not failed:
+                failed.append(True)
+                raise OSError('lost final receipt')
+            return original(key, value)
+        self.store.put = lost_ack
+        with self.assertRaises(OSError):
+            self.doctor.handler(event)
+        replay = self.doctor.handler(event)
+        self.assertEqual(replay['state'], 'completed')
+        self.assertEqual(self.doctor.handler(event), replay)
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(len(self.cloud.starts), 1)
+        with self.assertRaises(ValueError):
+            self.doctor.handler({'action': 'pause_new_runs', 'paused': True, 'mutationId': 'same-intent'})
+
+    def test_pause_effect_marker_recovers_before_ack_without_reapplying(self):
+        original, failed = self.store.put, []
+        def lost_ack(key, value):
+            if key.startswith('admin#') and value.get('state') == 'completed' and not failed:
+                failed.append(True); raise OSError('lost pause ACK')
+            return original(key, value)
+        self.store.put = lost_ack
+        event = {'action': 'pause_new_runs', 'paused': True, 'mutationId': 'pause-once'}
+        with self.assertRaises(OSError): self.doctor.handler(event)
+        revision = self.store.get('config')['_revision']
+        replay = self.doctor.handler(event)
+        self.assertTrue(replay['paused'])
+        self.assertEqual(self.store.get('config')['_revision'], revision)
+        self.doctor.handler(self.event)
+        self.assertEqual(self.cloud.starts, [])
+        with self.assertRaises(ValueError): self.doctor.handler({**event, 'paused': False})
+
+    def test_manual_recheck_is_durable_idempotent_and_respects_pause(self):
+        vendor = self.native_no_fix()
+        with patch.object(T, 'fetch_vendor', return_value=vendor): case = self.admit()
+        self.doctor.handler({'action': 'pause_new_runs', 'paused': True, 'mutationId': 'hold'})
+        event = {'action': 'recheck', 'case_id': case['case_id'], 'mutationId': 'check-once'}
+        first = self.doctor.handler(event)
+        self.assertEqual(first['case_count'], 1)
+        revision = self.store.get('case#' + case['case_id'])['_revision']
+        self.assertEqual(self.doctor.handler(event), first)
+        self.assertEqual(self.store.get('case#' + case['case_id'])['_revision'], revision)
+        self.assertEqual(self.cloud.starts, [])
+
+    def test_status_whitelist_never_exposes_capability_or_private_receipts(self):
+        case = self.admit()
+        case.update(worker_capability_hash='SECRET-CAPABILITY', summary='PRIVATE OUTPUT')
+        self.doctor.save(case)
+        result = self.doctor.handler({'action': 'status'})
+        raw = json.dumps(result)
+        self.assertNotIn('SECRET', raw)
+        self.assertNotIn('PRIVATE OUTPUT', raw)
+        self.assertTrue(result['connected'])
+        self.assertFalse(any(result['setup'].values()))
+        self.assertEqual(result['models']['triage'], T.MODEL)
+
+    def test_finish_conflict_reloads_only_outcome_and_never_retries_other_errors(self):
+        case = self.admit()
+        event = self.request(case, 'finish', outcome='patched', summary='checked installed package')
+        original = self.store.put
+        conflicts = []
+        def concurrent_write(key, value):
+            if key == 'case#' + case['case_id'] and value.get('outcome') and not conflicts:
+                other = self.store.get(key)
+                other['operations']['concurrent'] = 'op#preserved'
+                original(key, other)
+                conflicts.append(True)
+            return original(key, value)
+        self.store.put = concurrent_write
+        try:
+            result = self.doctor.broker(event)
+        except Exception:
+            result = {'acknowledged': False}
+        self.assertIs(result.get('acknowledged'), True)
+        current = self.store.get('case#' + case['case_id'])
+        self.assertEqual(current['outcome'], 'patched')
+        self.assertEqual(current['operations']['concurrent'], 'op#preserved')
+        with patch.object(self.store, 'put', side_effect=OSError('storage unavailable')) as writes:
+            with self.assertRaises(OSError):
+                self.doctor.broker(event)
+            self.assertEqual(writes.call_count, 1)
+
+    def test_parent_capability_is_one_time_build_bound_and_not_in_model_get(self):
+        case = self.admit()
+        raw = {'case_id': case['case_id'], 'build_id': case['build_id']}
+        key = 'cases/' + case['case_id'] + '/builds/' + C.digest(case['build_id']) + '/checkpoints/one.tar.gz'
+        for fields in ({'action': 'checkpoint', 'key': key, 'version_id': 'one'},
+                {'action': 'finish', 'outcome': 'patched', 'summary': 'bypass'}):
+            denied = False
+            try:
+                self.doctor.broker({**raw, **fields})
+            except ValueError:
+                denied = True
+            self.assertTrue(denied, 'model identity alone must not bypass parent proof')
+        first = self.doctor.broker({**raw, 'action': 'worker_claim'})['worker_capability']
+        self.assertRegex(first, r'^[a-f0-9]{64}$')
+        stored = self.store.get('case#' + case['case_id'])
+        self.assertNotIn(first, json.dumps(stored))
+        self.assertEqual(stored['worker_capability_hash'], C.digest(first))
+        exposed = self.doctor.broker({**raw, 'action': 'get'})
+        self.assertNotIn(first, json.dumps(exposed))
+        self.assertNotIn(C.digest(first), json.dumps(exposed))
+        with self.assertRaises(ValueError):
+            self.doctor.broker({**raw, 'action': 'worker_claim'})
+        with self.assertRaises(ValueError):
+            self.doctor.broker({**raw, 'action': 'finish', 'outcome': 'patched', 'worker_capability': '0' * 64})
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+        self.doctor.reconcile()
+        current = self.store.get('case#' + case['case_id'])
+        newer = {'case_id': current['case_id'], 'build_id': current['build_id']}
+        with self.assertRaises(ValueError):
+            self.doctor.broker({**newer, 'action': 'finish', 'outcome': 'patched', 'worker_capability': first})
+        second = self.doctor.broker({**newer, 'action': 'worker_claim'})['worker_capability']
+        self.assertNotEqual(first, second)
+        self.assertTrue(self.doctor.broker({**newer, 'action': 'finish', 'outcome': 'patched',
+            'worker_capability': second})['acknowledged'])
+
+    def test_unknown_send_search_is_scoped_and_never_released_by_age(self):
+        case = self.admit()
+        self.cloud.lose_send = True
+        self.doctor.broker(self.command(case))
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+        self.clock += 7 * 86400
+        with patch.object(self.cloud, 'list_commands', return_value={'Commands': []}) as search:
+            self.doctor.reconcile()
+            self.doctor.reconcile()
+            args = search.call_args.kwargs
+            self.assertEqual(args.get('InstanceId'), INSTANCE)
+            self.assertIn({'key': 'DocumentName', 'value': 'PatchDoctor-RunCommand'}, args['Filters'])
+        op = self.store.get(self.doctor.operation(case, 'patch-version-1'))
+        self.assertEqual(op['state'], 'send-uncertain')
+        self.assertNotIn('receipt_key', op)
+        self.assertEqual(self.store.get('host-operation')['case_id'], case['case_id'])
+        self.assertEqual(sum(m['Subject'] == 'PatchDoctor command-delivery-uncertain' for m in self.cloud.messages), 1)
+        with patch.object(self.cloud, 'list_commands', side_effect=OSError('observer unavailable')):
+            with self.assertRaises(OSError):
+                self.doctor.reconcile()  # An active unknown write still fails closed.
+
+    def test_unrelated_historical_observer_failure_does_not_block_new_critical_case(self):
+        case = self.admit()
+        self.doctor.broker(self.command(case, inspect=True, script=''))
+        old = self.store.get('case#' + case['case_id'])
+        old.update(status='budget-exhausted', attempts=2, reserved_usd=50)
+        self.doctor.save(old)
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+        self.doctor.release('active-case', case['case_id'])
+        self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'][0]['fixedInVersion'] = '9.0'
+        reply = None
+        with patch.object(self.cloud, 'get_command_invocation', side_effect=OSError('PRIVATE_OBSERVER_CANARY')):
+            try:
+                reply = self.doctor.handler(self.event)
+            except OSError:
+                pass
+        self.assertIsNotNone(reply, 'an unrelated old observer must not stop new critical admission')
+        new = self.store.get('case#' + reply['admitted'][0])
+        self.assertEqual(new['status'], 'running')
+        self.assertEqual(len(self.cloud.starts), 2)
+        self.assertTrue(self.store.get('case#' + case['case_id'])['outstanding_operations'])
+        self.assertNotIn('PRIVATE_OBSERVER_CANARY', json.dumps(self.cloud.messages))
+
+    def test_separate_admission_durable_ack_only_wakes_fixed_controller(self):
+        records = {'Records': [{'messageId': 'native', 'body': json.dumps({**self.event, 'action': 'arm'})},
+            {'messageId': 'forged-admin', 'body': json.dumps({'action': 'arm'})}]}
+        try:
+            with patch.object(self.doctor, 'reconcile', side_effect=AssertionError('admission must not schedule builds')):
+                reply = self.doctor.admission(records)
+        except AttributeError:
+            reply = {'admitted': []}
+        self.assertEqual(len(reply['admitted']), 1)
+        self.assertEqual(reply['batchItemFailures'], [{'itemIdentifier': 'forged-admin'}])
+        self.assertFalse(self.doctor.config().get('armed'))
+        self.assertEqual(self.cloud.starts, [])
+        self.assertEqual(self.cloud.sends, [])
+        call = self.cloud.invokes[0]
+        self.assertEqual((call['FunctionName'], call['InvocationType']), (ENV['CONTROL_ARN'], 'Event'))
+        self.assertEqual(json.loads(call['Payload']), {'source': 'patchdoctor.admission', 'detail-type': 'Pending critical cases'})
+        self.assertEqual(self.store.get('case#' + reply['admitted'][0])['status'], 'pending')
+        self.cloud.fail_invoke = True
+        retried = self.doctor.admission({'Records': [records['Records'][0]]})
+        self.assertEqual(retried['batchItemFailures'], [{'itemIdentifier': 'native'}])
+        self.assertEqual(len([k for k in self.store.rows if k.startswith('case#')]), 1)
 
     def test_checkpoint_conflict_reloads_only_checkpoint_and_preserves_command_index(self):
         case = self.admit()
@@ -321,7 +651,7 @@ class Tests(unittest.TestCase):
             with self.subTest(cut=cut):
                 memory, cloud = Memory(), Cloud()
                 doctor = C.Doctor(ENV, memory, cloud.client, lambda: self.clock)
-                memory.put('config', {'armed': True})
+                memory.put('config', {'armed': True, 'gate_version': 2})
                 case_id = doctor.handler(self.event)['admitted'][0]
                 case = memory.get('case#' + case_id)
                 cloud.fail_audit = True
@@ -465,7 +795,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.store.get('active-case')['case_id'], case['case_id'])
         fresh_store, fresh_cloud = Memory(), Cloud()
         fresh = C.Doctor(ENV, fresh_store, fresh_cloud.client, lambda: self.clock)
-        fresh_store.put('config', {'armed': True})
+        fresh_store.put('config', {'armed': True, 'gate_version': 2})
         interrupted = fresh.admit(self.event)[0]
         fresh_store.put('active-case', {'case_id': interrupted})  # Killed before start intent.
         fresh_cloud.finding['status'] = 'CLOSED'
@@ -546,7 +876,7 @@ class Tests(unittest.TestCase):
         case = self.admit(armed=False)
         self.assertEqual(case['status'], 'pending')
         self.assertEqual(self.cloud.starts, [])
-        reply = self.doctor.handler({'action': 'self_test'})
+        reply = self.doctor.handler({'action': 'self_test', 'mutationId': 'existing-selftest'})
         test = self.store.get('case#' + reply['case_id'])
         with self.assertRaises(ValueError):
             self.doctor.broker(self.command(test))
@@ -557,7 +887,7 @@ class Tests(unittest.TestCase):
         reply = self.doctor.handler({'Records': [message]})
         self.assertEqual(reply['batchItemFailures'], [{'itemIdentifier': 'forged'}])
         self.assertFalse(self.doctor.config()['armed'])
-        self.assertTrue(self.doctor.handler({'action': 'arm'})['armed'])
+        self.assertTrue(self.doctor.handler({'action': 'arm', 'mutationId': 'existing-arm'})['armed'])
         self.assertEqual(len(self.cloud.sends), 0)
 
     def test_lost_start_reply_recovers_same_build_without_paid_replay(self):

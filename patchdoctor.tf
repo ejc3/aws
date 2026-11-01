@@ -17,17 +17,12 @@ locals {
     TARGET_NAMES_JSON     = jsonencode(local.patchdoctor_targets)
     COMMAND_DOCUMENT_NAME = "PatchDoctor-RunCommand"
     INSPECT_DOCUMENT_NAME = "PatchDoctor-Inspect"
-    MODEL                 = local.patchdoctor_model
-    MAX_DAILY_RUNS        = "4"
-    ATTEMPT_BUDGET_USD    = "25"
-    CASE_BUDGET_USD       = "50"
-    MAX_ATTEMPTS          = "2"
-    BUILD_TIMEOUT_MINUTES = "60"
   }
   patchdoctor_log_names = {
-    control = "/aws/lambda/patchdoctor"
-    broker  = "/aws/lambda/patchdoctor-broker"
-    worker  = "/aws/codebuild/patchdoctor"
+    control   = "/aws/lambda/patchdoctor"
+    admission = "/aws/lambda/patchdoctor-admit"
+    broker    = "/aws/lambda/patchdoctor-broker"
+    worker    = "/aws/codebuild/patchdoctor"
   }
   patchdoctor_run_document = jsonencode({
     schemaVersion = "2.2"
@@ -143,6 +138,10 @@ data "archive_file" "patchdoctor_control" {
     filename = "index.py"
     content  = file(format("%s/patchdoctor/control.py", path.module))
   }
+  source {
+    filename = "triage.py"
+    content  = file(format("%s/patchdoctor/triage.py", path.module))
+  }
 }
 data "archive_file" "patchdoctor_worker" {
   type        = "zip"
@@ -171,7 +170,8 @@ resource "aws_s3_object" "patchdoctor_worker" {
   source_hash            = data.archive_file.patchdoctor_worker.output_base64sha256
   server_side_encryption = "aws:kms"
   kms_key_id             = aws_kms_key.patchdoctor.arn
-  depends_on             = [aws_s3_bucket_versioning.patchdoctor]
+  bucket_key_enabled     = true
+  depends_on             = [aws_s3_bucket_versioning.patchdoctor, aws_s3_bucket_server_side_encryption_configuration.patchdoctor]
 }
 
 resource "aws_cloudwatch_log_group" "patchdoctor" {
@@ -180,7 +180,7 @@ resource "aws_cloudwatch_log_group" "patchdoctor" {
   retention_in_days = 30
 }
 resource "aws_iam_role" "patchdoctor" {
-  for_each = { control = "lambda.amazonaws.com", broker = "lambda.amazonaws.com", worker = "codebuild.amazonaws.com" }
+  for_each = { control = "lambda.amazonaws.com", broker = "lambda.amazonaws.com", admission = "lambda.amazonaws.com", worker = "codebuild.amazonaws.com" }
   name     = format("patchdoctor-%s", each.key)
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -204,21 +204,26 @@ resource "aws_iam_role_policy" "patchdoctor_common" {
         Effect   = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = format("%s:*", trimsuffix(aws_cloudwatch_log_group.patchdoctor[each.key].arn, ":*"))
       },
-      {
-        Effect   = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]
-        Resource = [for prefix in(each.key == "worker" ? ["runtime", "cases"] : ["cases", "commands"]) : format("%s/%s/*", aws_s3_bucket.patchdoctor.arn, prefix)]
-      },
-      {
-        Effect   = "Allow", Action = ["kms:Decrypt", "kms:GenerateDataKey"]
-        Resource = aws_kms_key.patchdoctor.arn
-        Condition = { StringEquals = {
-          "kms:ViaService"                   = format("s3.%s.amazonaws.com", var.aws_region)
-          "kms:EncryptionContext:aws:s3:arn" = aws_s3_bucket.patchdoctor.arn
-        } }
-      }
       ], [for statement in [
         {
-          Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
+          Effect   = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"]
+          Resource = [for prefix in(each.key == "worker" ? ["runtime", "cases"] : ["cases", "commands"]) : format("%s/%s/*", aws_s3_bucket.patchdoctor.arn, prefix)]
+        },
+        {
+          Effect   = "Allow", Action = ["s3:PutObject"]
+          Resource = [for prefix in ["cases", "commands"] : format("%s/%s/*", aws_s3_bucket.patchdoctor.arn, prefix) if each.key != "worker" || prefix == "cases"]
+        },
+        {
+          Effect   = "Allow", Action = ["kms:Decrypt", "kms:GenerateDataKey"]
+          Resource = aws_kms_key.patchdoctor.arn
+          Condition = { StringEquals = {
+            "kms:ViaService"                   = format("s3.%s.amazonaws.com", var.aws_region)
+            "kms:EncryptionContext:aws:s3:arn" = aws_s3_bucket.patchdoctor.arn
+          } }
+        }
+        ] : statement if each.key != "admission"], [for statement in [
+        {
+          Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
           Resource = [
             aws_dynamodb_table.patchdoctor.arn,
             format("%s/index/active-cases", aws_dynamodb_table.patchdoctor.arn)
@@ -230,6 +235,7 @@ resource "aws_iam_role_policy" "patchdoctor_common" {
           Resource  = "*"
           Condition = { StringEquals = { "aws:RequestedRegion" = local.patchdoctor_regions } }
         },
+        ] : statement if each.key != "worker"], [for statement in [
         {
           Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"]
           Resource = [
@@ -237,7 +243,7 @@ resource "aws_iam_role_policy" "patchdoctor_common" {
             format("arn:aws:codebuild:%s:%s:build/patchdoctor:*", var.aws_region, data.aws_caller_identity.current.account_id)
           ]
         }
-    ] : statement if each.key != "worker"])
+    ] : statement if contains(["control", "broker"], each.key)])
   })
 }
 resource "aws_iam_role_policy" "patchdoctor_start" {
@@ -257,6 +263,23 @@ resource "aws_iam_role_policy" "patchdoctor_start" {
         Condition = { StringEquals = { "aws:RequestedRegion" = local.patchdoctor_regions } }
       }
     ]
+  })
+}
+
+# Haiku is advisory only. The serial controller alone invokes it; admission and
+# dev hosts cannot use this identity or acquire host-command authority.
+resource "aws_iam_role_policy" "patchdoctor_triage" {
+  role = aws_iam_role.patchdoctor["control"].id
+  name = "advisory-haiku-triage"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow", Action = ["bedrock:InvokeModel"]
+      Resource = [
+        format("arn:aws:bedrock:us-east-1:%s:inference-profile/us.anthropic.claude-haiku-5-5", data.aws_caller_identity.current.account_id),
+        "arn:aws:bedrock:us-*::foundation-model/anthropic.claude-haiku-5-5"
+      ]
+    }]
   })
 }
 resource "aws_iam_role_policy" "patchdoctor_worker" {
@@ -353,7 +376,29 @@ resource "aws_lambda_function" "patchdoctor" {
   memory_size                    = 256
   reserved_concurrent_executions = 1
   environment { variables = merge(local.patchdoctor_env, { BROKER_ARN = aws_lambda_function.patchdoctor_broker.arn }) }
-  depends_on = [aws_iam_role_policy.patchdoctor_common, aws_iam_role_policy.patchdoctor_start, aws_cloudwatch_log_group.patchdoctor]
+  depends_on = [aws_iam_role_policy.patchdoctor_common, aws_iam_role_policy.patchdoctor_start, aws_iam_role_policy.patchdoctor_triage, aws_cloudwatch_log_group.patchdoctor]
+}
+
+resource "aws_iam_role_policy" "patchdoctor_wake" {
+  role = aws_iam_role.patchdoctor["admission"].id
+  name = "wake-serial-controller"
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.patchdoctor.arn }]
+  })
+}
+resource "aws_lambda_function" "patchdoctor_admission" {
+  function_name                  = "patchdoctor-admit"
+  role                           = aws_iam_role.patchdoctor["admission"].arn
+  runtime                        = "python3.12"
+  handler                        = "index.admission"
+  filename                       = data.archive_file.patchdoctor_control.output_path
+  source_code_hash               = data.archive_file.patchdoctor_control.output_base64sha256
+  timeout                        = 60
+  memory_size                    = 256
+  reserved_concurrent_executions = 10
+  environment { variables = merge(local.patchdoctor_env, { CONTROL_ARN = aws_lambda_function.patchdoctor.arn }) }
+  depends_on = [aws_iam_role_policy.patchdoctor_common, aws_iam_role_policy.patchdoctor_queue, aws_iam_role_policy.patchdoctor_wake, aws_cloudwatch_log_group.patchdoctor]
 }
 
 resource "aws_codebuild_project" "patchdoctor" {
@@ -436,7 +481,7 @@ resource "aws_sqs_queue" "patchdoctor" {
   message_retention_seconds  = 1209600
   visibility_timeout_seconds = 420
   sqs_managed_sse_enabled    = true
-  redrive_policy             = jsonencode({ deadLetterTargetArn = aws_sqs_queue.patchdoctor_dlq.arn, maxReceiveCount = 5 })
+  redrive_policy             = jsonencode({ deadLetterTargetArn = aws_sqs_queue.patchdoctor_dlq.arn, maxReceiveCount = 30 })
 }
 resource "aws_cloudwatch_event_rule" "patchdoctor" {
   name           = "patchdoctor-critical"
@@ -469,7 +514,7 @@ resource "aws_cloudwatch_event_target" "patchdoctor" {
   depends_on     = [aws_sqs_queue_policy.patchdoctor]
 }
 resource "aws_iam_role_policy" "patchdoctor_queue" {
-  role = aws_iam_role.patchdoctor["control"].id
+  role = aws_iam_role.patchdoctor["admission"].id
   name = "critical-inbox"
   policy = jsonencode({
     Version   = "2012-10-17"
@@ -477,9 +522,10 @@ resource "aws_iam_role_policy" "patchdoctor_queue" {
   })
 }
 resource "aws_lambda_event_source_mapping" "patchdoctor" {
-  event_source_arn        = aws_sqs_queue.patchdoctor.arn
-  function_name           = aws_lambda_function.patchdoctor.arn
-  batch_size              = 1
+  event_source_arn = aws_sqs_queue.patchdoctor.arn
+  function_name    = aws_lambda_function.patchdoctor_admission.arn
+  batch_size       = 1
+  scaling_config { maximum_concurrency = 2 }
   function_response_types = ["ReportBatchItemFailures"]
   depends_on              = [aws_iam_role_policy.patchdoctor_queue]
 }

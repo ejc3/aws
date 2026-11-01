@@ -25,6 +25,7 @@ ENV = {'PATCHDOCTOR_MODE': 'self-test', 'PATCHDOCTOR_BUCKET_NAME': 'private-test
        'PATCHDOCTOR_BROKER_ARN': 'arn:aws:lambda:us-west-1:111111111111:function:patchdoctor:broker',
        'AWS_EC2_METADATA_DISABLED': 'true', 'PATH': os.defpath}
 CANARY = 'DO_NOT_PRINT_SECRET_8e27cc'
+CAPABILITY = 'e' * 64
 
 
 class FakeS3:
@@ -51,6 +52,13 @@ class FakeBroker:
                      'budget_usd': 25, 'model': worker.MODEL, 'reservation_id': 'reservation-one',
                      'attempt': 1, 'operations': []}
         self.calls = []
+        self.claimed_build = None
+
+    def claim_worker(self):
+        if self.claimed_build == self.build_id:
+            raise host.BrokerError('worker already claimed')
+        self.calls.append(('worker_claim', {}))
+        self.claimed_build = self.build_id
 
     def call(self, action, **kw):
         self.calls.append((action, kw))
@@ -107,7 +115,9 @@ class WorkerTests(unittest.TestCase):
             'assert os.environ["CLAUDE_CODE_USE_BEDROCK"]=="1"\n'
             'assert all(os.environ["ANTHROPIC_DEFAULT_"+n+"_MODEL"]=="us.anthropic.claude-opus-5-5" for n in ["OPUS","SONNET","HAIKU"])\n'
             'assert "ANTHROPIC_API_KEY" not in os.environ\n'
-            'sys.stdin.read()\n'
+            'prompt=sys.stdin.read()\n'
+            'assert ' + repr(CAPABILITY) + ' not in prompt\n'
+            'assert all(' + repr(CAPABILITY) + ' not in value for value in os.environ.values())\n'
             + ('pathlib.Path("buggy.py").write_text("def total(values):\\n    return sum(values)\\n")\n' if fixed else '')
             + 'print(json.dumps({"type":"assistant","message":{"content":[{"type":"tool_use","name":n,"input":{"secret":' + repr(CANARY) + '}} for n in ["Read","Edit","Bash"]]}}),flush=True)\n'
             'print(json.dumps({"type":"result","subtype":"success","is_error":False,"total_cost_usd":0.01,"result":' + repr(CANARY) + ',"usage":{"input_tokens":2,"output_tokens":3}}),flush=True)\n'
@@ -128,6 +138,82 @@ class WorkerTests(unittest.TestCase):
         self.assertIn(CANARY, (w.paths['artifacts'] / 'claude.stderr').read_text())
         self.assertEqual(self.broker.calls[-1][0], 'finish')
         self.assertEqual(self.broker.calls[-2][0], 'checkpoint')
+
+    def test_worker_claim_precedes_get_cli_and_durable_artifacts(self):
+        backend = self.broker
+        class Client:
+            def invoke(self, **kw):
+                request = json.loads(kw['Payload'])
+                action = request.pop('action')
+                self_case, self_build = request.pop('case_id'), request.pop('build_id')
+                assert (self_case, self_build) == (CASE, BUILD)
+                capability = request.pop('worker_capability', None)
+                if action == 'worker_claim':
+                    backend.claim_worker()
+                    result = {'worker_capability': CAPABILITY}
+                else:
+                    if action in {'checkpoint', 'finish'}:
+                        assert capability == CAPABILITY
+                    else:
+                        assert capability is None
+                    result = backend.call(action, **request)
+                return {'Payload': io.BytesIO(json.dumps(result).encode())}
+        parent = host.Broker(client=Client(), env=ENV)
+        w = TestWorker(parent, self.s3, env=ENV, root=self.root / 'actual-parent', cli=self.fake_cli())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(asyncio.run(w.run()), 'self-test-passed')
+        self.assertEqual(parent._worker_capability, CAPABILITY)
+        self.assertEqual(self.broker.calls[0][0], 'worker_claim')
+        self.assertEqual(self.broker.calls[1][0], 'get')
+        for raw, _ in self.s3.objects.values():
+            with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tar:
+                for member in tar:
+                    if member.isfile():
+                        self.assertNotIn(CAPABILITY.encode(), tar.extractfile(member).read())
+
+    def test_model_broker_cannot_checkpoint_finish_or_repeat_parent_claim(self):
+        class Client:
+            def __init__(self):
+                self.calls, self.claimed = [], False
+            def invoke(self, **kw):
+                payload = json.loads(kw['Payload'])
+                self.calls.append(payload)
+                action = payload['action']
+                if action == 'worker_claim':
+                    if self.claimed:
+                        result = {'refused': True, 'error_type': 'AlreadyClaimed'}
+                    else:
+                        self.claimed = True
+                        result = {'worker_capability': CAPABILITY}
+                elif action in {'checkpoint', 'finish'}:
+                    result = {'acknowledged': payload.get('worker_capability') == CAPABILITY}
+                else:
+                    result = {'case_id': CASE}
+                return {'Payload': io.BytesIO(json.dumps(result).encode())}
+        client = Client()
+        model = host.Broker(client=client, env=ENV)
+        for action in ('checkpoint', 'finish'):
+            with self.subTest(action=action), self.assertRaises(host.BrokerError):
+                model.call(action)
+        self.assertEqual(client.calls, [])
+        parent = host.Broker(client=client, env=ENV)
+        self.assertTrue(callable(getattr(parent, 'claim_worker', None)))
+        parent.claim_worker()
+        self.assertTrue(parent.call('checkpoint', key='own', version_id='one')['acknowledged'])
+        self.assertTrue(parent.call('finish', outcome='self-test-passed', summary='proof')['acknowledged'])
+        parent.call('get')
+        self.assertNotIn('worker_capability', client.calls[-1])
+        with self.assertRaises(host.BrokerError):
+            host.Broker(client=client, env=ENV).claim_worker()
+        self.assertNotIn(CAPABILITY, json.dumps(ENV))
+
+    def test_model_cli_exposes_no_checkpoint_or_finish_subcommands(self):
+        for argv in (['checkpoint', '--key', 'own', '--version-id', 'one'],
+                     ['finish', '--json-file', str(self.root / 'result.json')]):
+            with self.subTest(action=argv[0]), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    host.main(argv)
+                self.assertEqual(raised.exception.code, 2)
 
     def test_claimed_success_without_fix_never_finishes(self):
         w = self.make_worker(cli=self.fake_cli(fixed=False))
@@ -237,6 +323,7 @@ class WorkerTests(unittest.TestCase):
         for old, replacement in [('"subtype":"success"', '"subtype":"error_max_budget_usd"'),
                                  ('"is_error":False', '"is_error":True')]:
             with self.subTest(replacement=replacement):
+                self.broker = FakeBroker()
                 cli = self.fake_cli()
                 path = Path(cli[-1])
                 source = path.read_text()
