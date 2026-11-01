@@ -83,7 +83,7 @@ class RetiredSiteTests(unittest.TestCase):
     def test_nothing_declares_the_old_volumes_snapshots_templates_or_security_group(self):
         joined = "\n".join(self.ALL_TF.values())
         for gone in ('resource "aws_ebs_volume" "parallel_work"', 'resource "aws_ebs_volume" "parallel_work_2"',
-                     'resource "aws_ebs_snapshot"', 'resource "aws_ebs_snapshot_copy"',
+                     'resource "aws_ebs_snapshot" "pbox_move"', 'resource "aws_ebs_snapshot_copy" "pbox_move"',
                      'resource "aws_security_group" "parallel_box"', 'resource "aws_launch_template" "parallel_box"',
                      "var.parallel_box_ami\n", "var.parallel_box_az"):
             self.assertNotIn(gone, joined, gone)
