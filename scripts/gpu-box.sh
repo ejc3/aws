@@ -33,7 +33,7 @@
 set -uo pipefail
 
 REGION="us-west-2"
-SLOTS="1 2 3 4 metal" # the keys of local.gpu_box_slots
+SLOTS="1 2 3 4 metal native" # the keys of local.gpu_box_slots
 TYPES="${GPU_BOX_TYPES:-g4dn.xlarge g5.xlarge g6.xlarge g4dn.2xlarge}"
 METAL_TYPES="${GPU_BOX_METAL_TYPES:-g4dn.metal}" # local.gpu_box_metal_types
 SSH_WAIT_TRIES=60 # x10 s; a metal host boots slower (set_slot)
@@ -61,6 +61,7 @@ set_slot() {
   if [ "$SLOT" = "1" ]; then NAME="gpu-box"; SUF=""; else NAME="gpu-box-$SLOT"; SUF=" $SLOT"; fi
   LT="$NAME"
   if [ "$SLOT" = "metal" ]; then TYPES="$METAL_TYPES"; SSH_WAIT_TRIES=120; fi
+  if [ "$SLOT" = "native" ]; then TYPES="g4dn.xlarge"; SSH_WAIT_TRIES=180; fi
 }
 
 box_ip() {
@@ -110,7 +111,7 @@ fi
 if [ -z "$MEMBER" ]; then
   case " $SLOTS " in
     *" ${ARG:-1} "*) set_slot "${ARG:-1}" ;;
-    *) say "unknown slot '$ARG' (use 1-4 or metal, or 'status all')"; exit 1 ;;
+    *) say "unknown slot '$ARG' (use 1-4, metal or native, or 'status all')"; exit 1 ;;
   esac
 fi
 
@@ -236,9 +237,15 @@ case "$CMD" in
       --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)
     echo "$NAME: RUNNING at $IP ($T); the watchdog terminates it at its lifetime or after 30 idle minutes"
     [ -f "$KEY" ] || exit 0
+    if [ "${SLOT:-}" = native ]; then
+      ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$IP" \
+        'echo "  gpu:    $(cat /etc/gpu-box-ready 2>/dev/null)"; echo "  up:     $(uptime -p)"; echo "  timer:  $(systemctl show gpu-box-native-expiry.timer -p NextElapseUSecRealtime --value) (30 minutes from launch)"' 2>/dev/null \
+        || echo "  (running, but SSH not answering yet)"
+    else
     ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$IP" \
       'echo "  gpu:    $(cat /etc/gpu-box-ready 2>/dev/null)"; echo "  up:     $(uptime -p)"; E=$(sed -n "s/^USEC=//p" /run/systemd/shutdown/scheduled 2>/dev/null | head -1); if [ -n "$E" ]; then echo "  timer:  on-box shutdown at $(date -u -d @$((E/1000000)) +%H:%M) UTC"; else echo "  timer:  on-box shutdown NOT ARMED (the watchdog lifetime still applies)"; fi' 2>/dev/null \
       || echo "  (running, but SSH not answering yet)"
+    fi
     ;;
 
   ssh)

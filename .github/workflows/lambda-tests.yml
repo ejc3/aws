@@ -119,6 +119,9 @@ jobs:
       - name: GPU test box launch boundaries
         run: python3 -S -B scripts/test-gpu-box.py
 
+      - name: Native GPU diagnostic lifetime and boot state (offline)
+        run: python3 -S -B scripts/test-gpu-box-native.py
+
       - name: Runner IAM least-privilege boundaries
         run: python3 -S -B scripts/test-runner-iam-boundary.py
 

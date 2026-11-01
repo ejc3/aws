@@ -52,6 +52,31 @@ variable "gpu_box_max_hours" {
   default     = 4
 }
 
+# The native diagnostic reproduces the factory tile's distribution and driver recipe,
+# rather than inheriting the browser slots' preinstalled GPU stack.
+data "aws_ami" "gpu_box_native" {
+  provider    = aws.west2
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+}
+
 locals {
   # Slot 1 keeps the original name, so every existing `gbox` caller and the box already
   # running are untouched; the others are suffixed, as parallel-box-2 is.
@@ -62,10 +87,14 @@ locals {
     # with no hypervisor in between, so Firecracker can run on its KVM and hand each GPU to a microVM (VFIO). The
     # same template, watchdog and lifetime as the others; only its type differs (gpu_box_metal_types).
     { metal = "${local.gpu_box_name}-metal" },
+    { native = "${local.gpu_box_name}-native" },
   )
   gpu_box_names = [for k in sort(keys(local.gpu_box_slots)) : local.gpu_box_slots[k]]
 
   gpu_box_template_arns = [for k in sort(keys(local.gpu_box_slots)) : aws_launch_template.gpu_box[k].arn]
+  # Keep every existing slot's launch authority; native has its own exact type/image.
+  gpu_box_standard_template_arns = [for k in sort(keys(local.gpu_box_slots)) : aws_launch_template.gpu_box[k].arn if k != "native"]
+  gpu_box_standard_names         = [for k in sort(keys(local.gpu_box_slots)) : local.gpu_box_slots[k] if k != "native"]
 
   # The tag keys the launch template writes, per created resource. IAM evaluates
   # aws:TagKeys for each resource of a RunInstances call separately (the untagged-ENI trap
@@ -159,7 +188,7 @@ resource "aws_launch_template" "gpu_box" {
   provider               = aws.west2
   for_each               = local.gpu_box_slots
   name                   = each.value
-  image_id               = var.gpu_box_ami
+  image_id               = each.key == "native" ? data.aws_ami.gpu_box_native.id : var.gpu_box_ami
   update_default_version = true
 
   # An OS-initiated shutdown TERMINATES, so the lifetime timer in user_data ends the box
@@ -216,7 +245,25 @@ resource "aws_launch_template" "gpu_box" {
 
   tags = { Name = each.value }
 
-  user_data = base64encode(<<-INIT
+  user_data = each.key == "native" ? base64gzip(<<-NATIVE
+    #!/bin/bash
+    set -euo pipefail
+    # Install the absolute lifetime before package work or admitting an SSH client.
+    install -d -m 0755 /usr/local/sbin
+    printf '%s' '${base64encode(file("${path.module}/scripts/gpu-box-native-bootstrap.sh"))}' | base64 -d > /usr/local/sbin/gpu-box-native-bootstrap
+    chmod 0755 /usr/local/sbin/gpu-box-native-bootstrap
+    /usr/local/sbin/gpu-box-native-bootstrap --install
+
+    ${local.linux_ip_options_bootstrap}
+
+    install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
+    touch /home/ubuntu/.ssh/authorized_keys
+    grep -qxF "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" /home/ubuntu/.ssh/authorized_keys || \
+      echo "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+  NATIVE
+    ) : base64encode(<<-INIT
     #!/bin/bash
     set -uxo pipefail
 
@@ -276,13 +323,13 @@ data "aws_iam_policy_document" "gpu_box_control" {
     condition {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
-      values   = local.gpu_box_template_arns
+      values   = local.gpu_box_standard_template_arns
     }
 
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/Name"
-      values   = local.gpu_box_names
+      values   = local.gpu_box_standard_names
     }
 
     condition {
@@ -362,6 +409,50 @@ data "aws_iam_policy_document" "gpu_box_control" {
       values   = ["required"]
     }
 
+    condition {
+      test     = "Null"
+      variable = "ec2:InstanceProfile"
+      values   = ["true"]
+    }
+  }
+
+  # The diagnostic slot cannot fall back to another GPU generation or the browser AMI.
+  statement {
+    sid       = "RunGpuBoxNativeInstanceOnly"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:instance/*"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.gpu_box["native"].arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Name"
+      values   = [local.gpu_box_slots["native"]]
+    }
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.gpu_box_tag_keys.instance
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:InstanceType"
+      values   = ["g4dn.xlarge"]
+    }
+    condition {
+      test     = "StringNotEquals"
+      variable = "ec2:Tenancy"
+      values   = ["dedicated", "host"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:MetadataHttpTokens"
+      values   = ["required"]
+    }
     condition {
       test     = "Null"
       variable = "ec2:InstanceProfile"
@@ -449,10 +540,11 @@ data "aws_iam_policy_document" "gpu_box_control" {
     actions = ["ec2:RunInstances"]
     resources = concat(
       [
-        "arn:aws:ec2:us-west-2::image/${var.gpu_box_ami}",
         "arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:security-group/${aws_security_group.gpu_box.id}",
       ],
-      local.gpu_box_template_arns,
+      # The condition below pins the request's one template to the exact list;
+      # repeating that list in Resource would consume the managed-policy budget.
+      ["arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:launch-template/*"],
       [for s in local.gpu_box_subnets : "arn:aws:ec2:us-west-2:${data.aws_caller_identity.current.account_id}:subnet/${s}"],
     )
 
@@ -460,6 +552,32 @@ data "aws_iam_policy_document" "gpu_box_control" {
       test     = "ArnEquals"
       variable = "ec2:LaunchTemplate"
       values   = local.gpu_box_template_arns
+    }
+  }
+
+  statement {
+    sid       = "RunGpuBoxBrowserImage"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:aws:ec2:us-west-2::image/${var.gpu_box_ami}"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = local.gpu_box_standard_template_arns
+    }
+  }
+
+  statement {
+    sid       = "RunGpuBoxNativeImage"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:aws:ec2:us-west-2::image/${data.aws_ami.gpu_box_native.id}"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.gpu_box["native"].arn]
     }
   }
 
@@ -523,7 +641,11 @@ data "aws_iam_policy_document" "gpu_box_control" {
 resource "aws_iam_policy" "gpu_box_control" {
   name        = "gpu-box-control"
   description = "nextjs-dev: launch and terminate the tagged on-demand GPU test boxes (gpu-box.tf)"
-  policy      = data.aws_iam_policy_document.gpu_box_control.json
+  # Sids label the reviewed source/tests but have no authorization semantics.
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [for s in jsondecode(data.aws_iam_policy_document.gpu_box_control.json).Statement : { for k, v in s : k => v if k != "Sid" }]
+  })
 }
 
 resource "aws_iam_role_policy_attachment" "nextjs_dev_gpu_box" {

@@ -9,7 +9,10 @@ to touch only that slot's box.
 """
 
 from pathlib import Path
+import base64
 import datetime
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -61,7 +64,8 @@ class GpuBoxTests(unittest.TestCase):
         for sid in self.RUN_SIDS:
             with self.subTest(sid=sid):
                 run = statement(self.tf, sid)
-                self.assertRegex(run, r'"ec2:LaunchTemplate"\s*\n\s*values\s*=\s*local\.gpu_box_template_arns\n')
+                templates = 'gpu_box_standard_template_arns' if sid == 'RunGpuBoxInstanceOnly' else 'gpu_box_template_arns'
+                self.assertRegex(run, r'"ec2:LaunchTemplate"\s*\n\s*values\s*=\s*local\.' + templates + r'\n')
         pbox = source('parallel-box-launch.tf')
         for sid in ('RunTaggedParallelBoxOnly', 'RunInstancesReferencedResources'):
             with self.subTest(sid=sid):
@@ -99,10 +103,14 @@ class GpuBoxTests(unittest.TestCase):
 
     def test_referenced_resources_are_pinned(self):
         ref = statement(self.tf, 'RunGpuBoxReferencedResources')
-        self.assertIn('image/${var.gpu_box_ami}', ref)
+        self.assertIn('image/${var.gpu_box_ami}', statement(self.tf, 'RunGpuBoxBrowserImage'))
         self.assertIn('local.gpu_box_template_arns', ref)
         self.assertIn('security-group/${aws_security_group.gpu_box.id}', ref)
         self.assertNotRegex(ref, r':(subnet|image|security-group)/\*')
+        self.assertIn(':launch-template/*', ref)
+        self.assertRegex(ref, r'test\s*=\s*"ArnEquals"\s*\n\s*variable\s*=\s*"ec2:LaunchTemplate"\s*\n\s*values\s*=\s*local\.gpu_box_template_arns')
+        policy = self.tf.split('resource "aws_iam_policy" "gpu_box_control" {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('for k, v in s : k => v if k != "Sid"', policy)
 
     def test_no_role_passing_and_terminate_only(self):
         self.assertFalse('iam:PassRole' in self.tf, 'the GPU box needs no role, so none may be passed')
@@ -148,7 +156,7 @@ class GpuBoxTests(unittest.TestCase):
         self.assertRegex(watchdog, r'parallel_watchdog_tag_names\s*=\s*concat\(local\.parallel_box_names, local\.gpu_box_names[,)]')
         self.assertRegex(watchdog, r'TAG_NAMES\s*=\s*join\(",", local\.parallel_watchdog_tag_names\)')
         self.assertRegex(watchdog, r'"ec2:ResourceTag/Name"\s*=\s*local\.parallel_watchdog_tag_names\s*\}')
-        self.assertRegex(watchdog, r'MAX_AGE_MINUTES\s*=\s*jsonencode\(\{\s*for n in (?:concat\()?local\.gpu_box_names(?:, local\.member_gbox_names\))?\s*:\s*n\s*=>\s*var\.gpu_box_max_hours \* 60')
+        self.assertRegex(watchdog, r'MAX_AGE_MINUTES\s*=\s*jsonencode\(\{\s*for n in concat\(local\.gpu_box_names, local\.member_gbox_names\)\s*:\s*n\s*=>\s*n == local\.gpu_box_slots\["native"\] \? 30 : var\.gpu_box_max_hours \* 60')
         self.assertIn('terminated_lifetime', watchdog)
 
     def test_tag_keys_are_per_resource(self):
@@ -156,13 +164,13 @@ class GpuBoxTests(unittest.TestCase):
         self.assertIn('local.gpu_box_tag_keys.volume', statement(self.tf, 'RunGpuBoxRootVolume'))
         self.assertIn('local.gpu_box_tag_keys.eni', statement(self.tf, 'RunGpuBoxEni'))
 
-    SLOT_NAMES = ['gpu-box', 'gpu-box-2', 'gpu-box-3', 'gpu-box-4']
+    SLOT_NAMES = ['gpu-box', 'gpu-box-2', 'gpu-box-3', 'gpu-box-4', 'gpu-box-metal', 'gpu-box-native']
 
     def test_four_slots_and_slot_one_keeps_its_name(self):
         self.assertRegex(self.tf, r'gpu_box_name\s*=\s*"gpu-box"\n')
         self.assertIn('{ for n in [1, 2, 3, 4] : tostring(n) => n == 1 ? local.gpu_box_name : "${local.gpu_box_name}-${n}" },', self.tf)
         self.assertIn('{ metal = "${local.gpu_box_name}-metal" },', self.tf)
-        self.assertEqual(re.search(r'^SLOTS="([^"]+)"', self.script, re.M).group(1).split(), ['1', '2', '3', '4', 'metal'])
+        self.assertEqual(re.search(r'^SLOTS="([^"]+)"', self.script, re.M).group(1).split(), ['1', '2', '3', '4', 'metal', 'native'])
         lt = re.search(r'resource "aws_launch_template" "gpu_box" \{.*?\n\}', self.tf, re.S).group()
         self.assertRegex(lt, r'for_each\s*=\s*local\.gpu_box_slots')
         self.assertRegex(lt, r'\n  name\s*=\s*each\.value')
@@ -172,13 +180,67 @@ class GpuBoxTests(unittest.TestCase):
     def test_every_tag_condition_covers_exactly_the_slots(self):
         for sid in ('RunGpuBoxInstanceOnly', 'RunGpuBoxRootVolume', 'RunGpuBoxEni'):
             with self.subTest(sid=sid):
-                self.assertRegex(statement(self.tf, sid), r'"aws:RequestTag/Name"\s*\n\s*values\s*=\s*local\.gpu_box_names\n')
+                names = 'gpu_box_standard_names' if sid == 'RunGpuBoxInstanceOnly' else 'gpu_box_names'
+                self.assertRegex(statement(self.tf, sid), r'"aws:RequestTag/Name"\s*\n\s*values\s*=\s*local\.' + names + r'\n')
         self.assertRegex(statement(self.tf, 'TerminateTaggedGpuBoxOnly'),
                          r'"ec2:ResourceTag/Name"\s*\n\s*values\s*=\s*local\.gpu_box_names\n')
 
     def test_gbox_is_installed_on_nextjs_dev(self):
         self.assertIn('scripts/gpu-box.sh', source('dev-selfupdate.tf'))
         self.assertIn('${local.gbox_setup}', source('nextjs-user-data.tf'))
+
+    def test_native_has_exact_stock_image_type_and_no_cross_slot_image_grant(self):
+        image = re.search(r'data "aws_ami" "gpu_box_native" \{.*?\n\}', self.tf, re.S).group()
+        self.assertIn('provider    = aws.west2', image)
+        self.assertIn('owners      = ["099720109477"]', image)
+        self.assertIn('ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*', image)
+        run = statement(self.tf, 'RunGpuBoxNativeInstanceOnly')
+        for key, values in [('ec2:LaunchTemplate', '[aws_launch_template.gpu_box["native"].arn]'),
+                            ('aws:RequestTag/Name', '[local.gpu_box_slots["native"]]'),
+                            ('ec2:InstanceType', '["g4dn.xlarge"]'),
+                            ('ec2:MetadataHttpTokens', '["required"]'), ('ec2:InstanceProfile', '["true"]')]:
+            self.assertRegex(run, r'variable\s*=\s*"' + re.escape(key) + r'"\s*\n\s*values\s*=\s*' + re.escape(values))
+        self.assertIn('if k != "native"', self.tf)
+        browser = statement(self.tf, 'RunGpuBoxBrowserImage')
+        native = statement(self.tf, 'RunGpuBoxNativeImage')
+        self.assertIn('local.gpu_box_standard_template_arns', browser)
+        self.assertNotIn('gpu_box_native.id', browser)
+        self.assertIn('image/${data.aws_ami.gpu_box_native.id}', native)
+        self.assertIn('[aws_launch_template.gpu_box["native"].arn]', native)
+        self.assertNotIn('image/', statement(self.tf, 'RunGpuBoxReferencedResources'))
+
+    def test_native_arms_lifetime_before_packages_or_ssh_and_keeps_browser_userdata(self):
+        native = self.tf.split('base64gzip(<<-NATIVE\n', 1)[1].split('\n  NATIVE', 1)[0]
+        timer = native.index('/usr/local/sbin/gpu-box-native-bootstrap --install')
+        self.assertLess(timer, native.index('${local.linux_ip_options_bootstrap}'))
+        self.assertLess(timer, native.index('/home/ubuntu/.ssh'))
+        self.assertIn('file("${path.module}/scripts/gpu-box-native-bootstrap.sh")', native)
+        self.assertNotIn('gpu-box-ready', native)
+        self.assertNotIn('shutdown -h +', native)
+        self.assertIn('shutdown -h +${var.gpu_box_max_hours * 60}', self.tf.split('base64encode(<<-INIT', 1)[1])
+
+    def test_native_userdata_compresses_below_ec2_limit_and_roundtrips_exactly(self):
+        native = self.tf.split('base64gzip(<<-NATIVE\n', 1)[1].split('\n  NATIVE', 1)[0]
+        bootstrap = (ROOT / 'scripts/gpu-box-native-bootstrap.sh').read_bytes()
+        guard = (ROOT / 'scripts/cve-2026-98432-mitigation.py').read_bytes()
+        common = source('linux-ip-options.tf')
+        setup = common.split('linux_ip_options_setup = <<-SH\n', 1)[1].split('\n  SH', 1)[0]
+        setup = setup.replace('${base64gzip(file("${path.module}/scripts/cve-2026-98432-mitigation.py"))}',
+                              base64.b64encode(gzip.compress(guard, mtime=0)).decode())
+        setup = setup.replace('${filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")}',
+                              hashlib.sha256(guard).hexdigest())
+        cold = common.split('linux_ip_options_bootstrap = <<-SH\n', 1)[1].split('\n  SH', 1)[0]
+        cold = cold.replace('${local.linux_ip_options_setup}', setup)
+        native = native.replace('${base64encode(file("${path.module}/scripts/gpu-box-native-bootstrap.sh"))}',
+                                base64.b64encode(bootstrap).decode())
+        native = native.replace('${local.linux_ip_options_bootstrap}', cold)
+        native = native.replace('${trimspace(tls_private_key.dev_hop.public_key_openssh)}',
+                                'ssh-ed25519 ' + base64.b64encode(bytes(51)).decode())
+        self.assertNotIn('${', native, 'an unrendered input would hide part of EC2 userdata')
+        original = textwrap.dedent(native).encode()
+        delivered = gzip.compress(original, mtime=0)
+        self.assertLessEqual(len(delivered), 16384)
+        self.assertEqual(gzip.decompress(delivered), original)
 
 
 class WatchdogHarness(unittest.TestCase):
@@ -233,7 +295,8 @@ class WatchdogHarness(unittest.TestCase):
         sys.modules['boto3'] = fake
         slots = GpuBoxTests.SLOT_NAMES
         os.environ.update(TAG_NAMES=','.join(['parallel-box'] + ['parallel-box-%d' % n for n in range(2, 9)] + ['pbox-colton'] + slots), IDLE_MINUTES='30',
-                          MAX_AGE_MINUTES=json.dumps({n: 240 for n in slots}), SNS_TOPIC_ARN='arn:aws:sns:test')
+                          MAX_AGE_MINUTES=json.dumps({n: 30 if n == 'gpu-box-native' else 240 for n in slots}),
+                          SINGLE_NAMES='gpu-box-native', SNS_TOPIC_ARN='arn:aws:sns:test')
         if io_thresholds is not None:
             os.environ['IO_THRESHOLDS'] = json.dumps(io_thresholds)
         try:
@@ -256,6 +319,19 @@ class WatchdogHarness(unittest.TestCase):
         self.assertEqual(actions, {'i-old': 'terminated_lifetime', 'i-idle': 'terminated',
                                    'i-young': 'too_young', 'i-pbox': 'busy'})
         self.assertEqual(calls['terminate'], ['i-old', 'i-idle'])
+
+    def test_native_busy_lifetime_and_duplicate_do_not_affect_existing_slots(self):
+        actions, calls = self.run_watchdog(
+            [('i-native', 'gpu-box-native', 30), ('i-browser', 'gpu-box', 31), ('i-metal', 'gpu-box-metal', 31)],
+            {'i-native': 100.0, 'i-browser': 90.0, 'i-metal': 90.0})
+        self.assertEqual(actions, {'i-native': 'terminated_lifetime', 'i-browser': 'busy', 'i-metal': 'busy'})
+        self.assertEqual(calls['terminate'], ['i-native'])
+        self.assertNotIn('i-native', [iid for iid, _, _ in calls['metrics']])
+        actions, calls = self.run_watchdog(
+            [('i-older', 'gpu-box-native', 10), ('i-newer', 'gpu-box-native', 5)], {})
+        self.assertEqual(actions, {'i-older': 'too_young', 'i-newer': 'terminated_duplicate'})
+        self.assertEqual(calls['terminate'], ['i-newer'])
+        self.assertIn('concat(local.member_gbox_names, [local.gpu_box_slots["native"]])', source('parallel-box-watchdog.tf'))
 
     def test_every_slot_is_lifetime_capped_and_idled_out(self):
         actions, calls = self.run_watchdog(
@@ -418,13 +494,16 @@ if op == 'describe-instances':
     else:
         print('\t'.join(ids))
 elif op == 'describe-subnets':
-    for s in opt('--subnet-ids').split() or [a for a in args if a.startswith('subnet-')]:
+    for s in [a for a in args if a.startswith('subnet-')]:
         print('%s\tus-west-2a' % s)
 elif op == 'describe-instance-type-offerings':
     print('g4dn.xlarge\tus-west-2a')
     print('g4dn.metal\tus-west-2a')
 elif op == 'run-instances':
     name = opt('--launch-template').split(',')[0].split('=', 1)[1]
+    if name == 'gpu-box-native' and os.environ.get('FAKE_NATIVE_NO_CAPACITY') == '1':
+        print('InsufficientInstanceCapacity')
+        sys.exit(255)
     with open(os.path.join(state, name), 'a') as f:
         f.write('i-new-%s\n' % name)
     print('i-new-%s' % name)
@@ -504,6 +583,37 @@ class GboxScript(unittest.TestCase):
         self.assertEqual([c for c in calls if c.startswith('ec2 terminate-instances')],
                          ['ec2 terminate-instances --region us-west-2 --instance-ids i-new-gpu-box-metal'])
 
+    def test_native_ignores_type_overrides_and_uses_only_its_own_template(self):
+        self.env['GPU_BOX_TYPES'] = 'g6.xlarge g4dn.metal'
+        self.env['GPU_BOX_METAL_TYPES'] = 'g5.xlarge'
+        result, calls = self.gbox('up', 'native')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [call for call in calls if call.startswith('ec2 run-instances')]
+        self.assertEqual(len(runs), 1)
+        self.assertIn('LaunchTemplateName=gpu-box-native,Version=$Latest', runs[0])
+        self.assertIn('--instance-type g4dn.xlarge ', runs[0])
+        self.assertNotIn('--iam-instance-profile', runs[0])
+        result, calls = self.gbox('down', 'native')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call for call in calls if call.startswith('ec2 terminate-instances')],
+                         ['ec2 terminate-instances --region us-west-2 --instance-ids i-new-gpu-box-native'])
+
+    def test_member_cannot_select_native_before_any_aws_call(self):
+        self.env['MEMBER_BOX_USER'] = 'colton'
+        result, calls = self.gbox('up', 'native')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('with no slot', result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_native_capacity_failure_never_falls_back_to_another_type(self):
+        self.env.update(GPU_BOX_TYPES='g5.xlarge g6.xlarge', FAKE_NATIVE_NO_CAPACITY='1')
+        result, calls = self.gbox('up', 'native')
+        self.assertEqual(result.returncode, 1)
+        runs = [call for call in calls if call.startswith('ec2 run-instances')]
+        self.assertEqual(len(runs), 4)
+        self.assertTrue(all('--instance-type g4dn.xlarge ' in call for call in runs))
+        self.assertTrue(all('LaunchTemplateName=gpu-box-native,Version=$Latest' in call for call in runs))
+
     def test_status_ip_and_status_all(self):
         self.running(gpu_box_2='i-222')
         r, _ = self.gbox('status')
@@ -515,7 +625,8 @@ class GboxScript(unittest.TestCase):
         lines = [l for l in r.stdout.splitlines() if l.startswith('gpu-box')]  # minus the fake ssh's detail
         self.assertEqual(lines, ['gpu-box: down ($0)', 'gpu-box-2: RUNNING at 198.51.100.2 (g4dn.xlarge); the watchdog '
                                  'terminates it at its lifetime or after 30 idle minutes',
-                                 'gpu-box-3: down ($0)', 'gpu-box-4: down ($0)', 'gpu-box-metal: down ($0)'])
+                                 'gpu-box-3: down ($0)', 'gpu-box-4: down ($0)', 'gpu-box-metal: down ($0)',
+                                 'gpu-box-native: down ($0)'])
 
     def test_unknown_slot_is_refused_before_any_aws_call(self):
         for args in (('up', '5'), ('down', '0'), ('ssh', 'all'), ('down', 'all')):

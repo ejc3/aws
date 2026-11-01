@@ -393,11 +393,10 @@ resource "aws_lambda_function" "parallel_watchdog" {
       IDLE_MINUTES = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT = tostring(var.parallel_box_idle_cpu_pct)
       TAG_NAMES    = join(",", local.parallel_watchdog_tag_names)
-      # gpu-box.tf's hard lifetime, the same for every slot and for the members' gboxes; the
-      # parallel boxes have none (a long job is their point).
-      MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => var.gpu_box_max_hours * 60 })
-      # one instance per member gbox
-      SINGLE_NAMES  = join(",", local.member_gbox_names)
+      # Native diagnostics have a fixed 30-minute lifetime; existing GPU slots/members keep theirs.
+      MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => n == local.gpu_box_slots["native"] ? 30 : var.gpu_box_max_hours * 60 })
+      # One native diagnostic, as well as one instance per member gbox.
+      SINGLE_NAMES  = join(",", concat(local.member_gbox_names, [local.gpu_box_slots["native"]]))
       IO_THRESHOLDS = local.parallel_watchdog_io_thresholds
       # Only the owner's parallel boxes honour a lease (`pbox up --lease`): not the GPU test boxes or the members' boxes.
       LEASE_NAMES   = join(",", local.parallel_box_names)
