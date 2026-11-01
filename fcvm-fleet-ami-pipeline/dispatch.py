@@ -36,6 +36,13 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def terminated_receipt(entry):
+    instance_id = entry.get("instance_id")
+    return (entry.get("attempted") is True and entry.get("terminated_seen") is True
+            and isinstance(instance_id, str) and re.fullmatch(r"i-[0-9a-f]{17}", instance_id) is not None
+            and not entry.get("no_instance") and not entry.get("rejected"))
+
+
 def public_record(record):
     return {key: record[key] for key in PUBLIC_FIELDS if key in record}
 
@@ -175,13 +182,26 @@ class Factory:
     def owned(self, journal, slot):
         recorded = journal["slots"].get(slot, {})
         filters = [{"Name": "tag:Purpose", "Values": [GUARD_PURPOSE]}, {"Name": "tag:FactoryBuild", "Values": [digest(journal["build_id"])]}, {"Name": "tag:FactorySlot", "Values": [slot]}]
-        rows = [i for r in self.client("ec2", True).describe_instances(Filters=filters)["Reservations"] for i in r["Instances"]]
+        instance_id = recorded.get("instance_id")
+        if isinstance(instance_id, str) and re.fullmatch(r"i-[0-9a-f]{17}", instance_id):
+            # An ID filter returns no rows after EC2 forgets a terminated instance.
+            filters = [{"Name": "instance-id", "Values": [instance_id]}]
+        reservations = self.client("ec2", True).describe_instances(Filters=filters)["Reservations"]
+        if recorded.get("terminated_seen") is True and any(
+                r["Instances"] and r.get("OwnerId") != self.env["FLEET_ACCOUNT"] for r in reservations):
+            raise Refused("instance metadata contradicts its recorded owner")
+        reported = [i for r in reservations for i in r["Instances"]]
         # EC2 may omit the profile after termination. Only an already recorded
         # instance can supply that terminal receipt without the profile proof.
-        rows = [i for i in rows if i.get("InstanceType") == TYPES[slot.split("-", 1)[0]] and (
+        rows = [i for i in reported if all({t["Key"]: t["Value"] for t in i.get("Tags", [])}.get(key) == value
+                for key, value in (("Purpose", GUARD_PURPOSE), ("FactoryBuild", digest(journal["build_id"])), ("FactorySlot", slot)))
+            and i.get("InstanceType") == TYPES[slot.split("-", 1)[0]] and (
             i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] or (
                 "IamInstanceProfile" not in i and i["State"]["Name"] == "terminated"
                 and recorded.get("instance_id") == i["InstanceId"]))]
+        if recorded.get("terminated_seen") is True and reported and (
+                len(rows) != len(reported) or any(i["State"]["Name"] != "terminated" for i in rows)):
+            raise Refused("instance metadata contradicts its recorded termination")
         if len(rows) > 1:
             raise Refused("more than one instance in a fixed slot")
         if rows and recorded.get("instance_id") not in (None, rows[0]["InstanceId"]):
@@ -225,8 +245,8 @@ class Factory:
             return self.slot_status(journal, slot)
         kind, stage = slot.split("-", 1)
         if stage == "verify":
-            previous = self.owned(journal, kind + "-build")
-            if not previous or previous["State"]["Name"] != "terminated":
+            previous = self.slot_status(journal, kind + "-build")
+            if previous["state"] != "terminated":
                 raise Refused("build instance must be terminated before verification")
             image_id = journal["candidates"].get(kind)
             if not image_id:
@@ -264,7 +284,8 @@ class Factory:
 
     def slot_status(self, journal, slot):
         instance = self.owned(journal, slot)
-        instance_id = instance["InstanceId"] if instance else journal["slots"].get(slot, {}).get("instance_id")
+        entry = journal["slots"].get(slot, {})
+        instance_id = instance["InstanceId"] if instance else entry.get("instance_id")
         kind = slot.split("-", 1)[0]
         image_id = journal["candidates"].get(kind)
         image_state = None
@@ -272,7 +293,7 @@ class Factory:
             rows = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
             image_state = rows[0]["State"] if rows else "missing"
         return {"slot": slot, "instance_id": instance_id,
-                "state": instance["State"]["Name"] if instance else "rejected" if journal["slots"].get(slot, {}).get("no_instance") else "uncertain", "instance_type": TYPES[kind], "root_gib": VOLUMES[kind],
+                "state": instance["State"]["Name"] if instance else "terminated" if terminated_receipt(entry) else "rejected" if entry.get("no_instance") else "uncertain", "instance_type": TYPES[kind], "root_gib": VOLUMES[kind],
                 "image_id": image_id, "image_state": image_state, "region": self.env["COMPUTE_REGION"], "deadline_unix": journal["deadline_unix"],
                 "source_commit": journal["source_sha"], "input_sha256": journal["input_sha256"],
                 "asset_prefix": "builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/" + instance_id + "/" if instance_id else None}
@@ -411,7 +432,7 @@ class Factory:
             instance = self.owned(journal, slot)
             if instance and instance["State"]["Name"] == "terminated":
                 entry["terminated_seen"] = True
-            elif not entry.get("terminated_seen") and not entry.get("no_instance"):
+            elif not terminated_receipt(entry) and not (entry.get("no_instance") is True and not entry.get("instance_id")):
                 complete = False  # Includes an ambiguous launch: never infer that no instance exists.
         self.save(suffix, journal)
         return complete

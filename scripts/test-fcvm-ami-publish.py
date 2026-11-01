@@ -110,8 +110,18 @@ class EC2:
         self.runtime_order = []
         self.fail_cancel = False
 
-    def describe_instances(self, InstanceIds=None, **_kwargs):
+    def describe_instances(self, InstanceIds=None, Filters=None, **_kwargs):
         values = [self.instances[item] for item in InstanceIds] if InstanceIds else list(self.instances.values())
+        for item in Filters or []:
+            if item["Name"] == "instance-id":
+                values = [instance for instance in values if instance["InstanceId"] in item["Values"]]
+            elif item["Name"].startswith("tag:"):
+                key = item["Name"][4:]
+                values = [instance for instance in values if {t["Key"]: t["Value"] for t in instance.get("Tags", [])}.get(key) in item["Values"]]
+            elif item["Name"] == "instance-state-name":
+                values = [instance for instance in values if instance["State"]["Name"] in item["Values"]]
+            else:
+                raise AssertionError("unexpected instance filter")
         return {"Reservations": [{"OwnerId": "222222222222", "Instances": copy.deepcopy(values)}]}
 
     def describe_images(self, ImageIds):
@@ -219,6 +229,7 @@ class PublisherTests(unittest.TestCase):
             "COMPUTE_REGION": "us-east-1", "ASSET_REGION": "us-east-2", "PIPELINE_REGION": "us-east-2", "CONTROL_ACCOUNT": "111111111111",
             "FLEET_ACCOUNT": "222222222222", "PROJECT_NAME": "factory", "STATE_PREFIX": "/factory",
             "PIPELINE_BUCKET": "private-stage", "ASSET_BUCKET": "runtime-assets", "GUARD_SHA256": "c" * 64,
+            "BUILDER_PROFILE": "arn:aws:iam::222222222222:instance-profile/factory-builder",
             "RELEASE_PARAMETER": "/release", "LOCK_ID": "exact-backend/key", "LOCK_TABLE": "locks"}
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
         build = {"id": self.build, "projectName": "factory", "buildStatus": "SUCCEEDED", "buildComplete": True,
@@ -240,8 +251,12 @@ class PublisherTests(unittest.TestCase):
                    "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
             instance = "i-" + format(i, "017x")
-            journal["slots"][slot] = {"instance_id": instance}
-            self.ec2.instances[instance] = {"InstanceId": instance, "State": {"Name": "terminated"}}
+            journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
+            self.ec2.instances[instance] = {"InstanceId": instance, "State": {"Name": "terminated"},
+                "InstanceType": "g4dn.metal" if slot.startswith("host-") else "g4dn.xlarge",
+                "IamInstanceProfile": {"Arn": self.env["BUILDER_PROFILE"]},
+                "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-ami-builder"},
+                    {"Key": "FactoryBuild", "Value": MODULE.digest(self.build)}, {"Key": "FactorySlot", "Value": slot}]}
         self.main_ssm.values["/factory/control"] = {"active": self.build}
         self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)] = journal
         self.main_ssm.values["/factory/requests/" + self.input] = {"request_id": self.input, "input_sha256": self.input,
@@ -335,6 +350,79 @@ class PublisherTests(unittest.TestCase):
             template = self.ec2.templates[item["id"]]
             self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"], {
                 **template["versions"][1]["LaunchTemplateData"], "ImageId": self.new[item["kind"]]})
+
+    def test_expired_early_builder_metadata_does_not_block_completed_publication(self):
+        for all_expired in (False, True):
+            with self.subTest(all_expired=all_expired):
+                self.setUp()
+                self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(hours=3)
+                journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+                for slot, entry in journal["slots"].items():
+                    if all_expired or slot.endswith("-build"):
+                        del self.ec2.instances[entry["instance_id"]]
+                try:
+                    result = self.publisher().run(self.event)
+                except Exception as error:
+                    self.fail("expired metadata blocked a validated pair: " + type(error).__name__)
+                self.assertEqual(result, {"status": "promoted", "generation": 1})
+                self.assertEqual((len(self.ec2.created), len(self.assets.copies)), (4, 19))
+
+    def test_missing_metadata_requires_strict_exact_slot_receipts_before_writes(self):
+        for variant in ("missing", "false", "string", "attempted-false", "attempted-string", "invalid-id", "duplicate-id", "no-instance", "rejected"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+                entry = journal["slots"]["host-build"]
+                del self.ec2.instances[entry["instance_id"]]
+                if variant == "missing": entry.pop("terminated_seen")
+                elif variant == "false": entry["terminated_seen"] = False
+                elif variant == "string": entry["terminated_seen"] = "true"
+                elif variant == "attempted-false": entry["attempted"] = False
+                elif variant == "attempted-string": entry["attempted"] = "true"
+                elif variant == "invalid-id": entry["instance_id"] = "not-an-instance"
+                elif variant == "duplicate-id": entry["instance_id"] = journal["slots"]["tile-build"]["instance_id"]
+                elif variant == "no-instance": entry["no_instance"] = True
+                else: entry["rejected"] = True
+                with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+                self.assertEqual((self.ec2.created, self.assets.copies), ([], []))
+
+    def test_expired_builder_cannot_hide_a_returned_live_or_foreign_sibling(self):
+        for variant in ("running", "pending", "stopped", "shutting-down", "wrong-type", "wrong-profile", "empty-profile",
+                        "Purpose", "FactoryBuild", "FactorySlot", "wrong-id", "wrong-owner"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+                del self.ec2.instances[journal["slots"]["host-build"]["instance_id"]]
+                original = self.ec2.describe_instances
+                def contradict(**arguments):
+                    reply = original(**arguments)
+                    reservation = reply["Reservations"][0]
+                    row = reservation["Instances"][0]
+                    if variant in ("running", "pending", "stopped", "shutting-down"): row["State"]["Name"] = variant
+                    elif variant == "wrong-type": row["InstanceType"] = "foreign"
+                    elif variant == "wrong-profile": row["IamInstanceProfile"] = {"Arn": "foreign"}
+                    elif variant == "empty-profile": row["IamInstanceProfile"] = {}
+                    elif variant == "wrong-id": row["InstanceId"] = "i-" + "f" * 17
+                    elif variant == "wrong-owner": reservation["OwnerId"] = "foreign"
+                    else: next(t for t in row["Tags"] if t["Key"] == variant)["Value"] = "foreign"
+                    return reply
+                with mock.patch.object(self.ec2, "describe_instances", side_effect=contradict):
+                    with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+                self.assertEqual((self.ec2.created, self.assets.copies), ([], []))
+
+    def test_known_terminated_profileless_rows_still_publish(self):
+        for instance in self.ec2.instances.values(): instance.pop("IamInstanceProfile")
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+
+    def test_receipts_do_not_swallow_ec2_errors(self):
+        with mock.patch.object(self.ec2, "describe_instances", side_effect=RuntimeError("AccessDenied")):
+            with self.assertRaisesRegex(RuntimeError, "AccessDenied"): self.publisher().run(self.event)
+        self.assertEqual((self.ec2.created, self.assets.copies), ([], []))
+
+    def test_publisher_uses_the_managed_builder_profile(self):
+        text = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        block = text.split('resource "aws_lambda_function" "fcvm_ami_publish" {', 1)[1].split('\n}\n', 1)[0]
+        self.assertIn('BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn', block)
 
     def test_success_after_150_minutes_and_at_exactly_240_can_publish(self):
         for seconds in (9001, 14400):

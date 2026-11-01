@@ -584,6 +584,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       RELEASE_PARAMETER = aws_ssm_parameter.fcvm_ami_release.name
       GUARD_SHA256      = local.fcvm_ami_guard_sha
       TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
+      BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
