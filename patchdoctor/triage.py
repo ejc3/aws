@@ -181,12 +181,17 @@ def _request(facts, client):
         raise ValueError('triage input limit')
     response = (client if client is not None else _client()).converse(modelId=MODEL,
         system=[{'text': SYSTEM}], messages=[{'role': 'user', 'content': [{'text': body}]}],
-        inferenceConfig={'maxTokens': MAX_TOKENS})
+        inferenceConfig={'maxTokens': MAX_TOKENS},
+        additionalModelRequestFields={'thinking': {'type': 'disabled'}})
     content = response['output']['message']['content']
     if (response.get('stopReason') != 'end_turn' or response['output']['message'].get('role') != 'assistant'
-            or len(content) != 1 or set(content[0]) != {'text'} or len(content[0]['text'].encode()) > 4096):
+            or not isinstance(content, list) or len(content) not in (1, 2)
+            or set(content[-1]) != {'text'}
+            or (len(content) == 2 and set(content[0]) != {'reasoningContent'})
+            or not isinstance(content[-1]['text'], str) or len(content[-1]['text'].encode()) > 4096):
         raise ValueError('unsupported model response')
-    value = _json(content[0]['text'])
+    # Reasoning metadata is neither inspected nor retained; only final JSON is data.
+    value = _json(content[-1]['text'])
     if (set(value) != {'decision', 'category', 'confidence', 'reason'}
             or value['decision'] not in {'run_doctor', 'defer'}
             or value['category'] not in CATEGORIES | {'needs_investigation'}

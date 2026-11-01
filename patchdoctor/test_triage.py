@@ -174,6 +174,36 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertNotIn('decision', result)
 
+    def test_native_reasoning_metadata_then_final_json_is_supported_without_disclosure(self):
+        client = FakeClient()
+        original = client.converse
+        def response(**kwargs):
+            value = original(**kwargs)
+            value['output']['message']['content'].insert(0, {
+                'reasoningContent': {'reasoningText': {'text': SECRET, 'signature': SECRET}}})
+            return value
+        client.converse = response
+        result = triage.classify(case(), evidence(), client)
+        self.assertEqual(result['decision'], 'defer')
+        self.assertNotIn(SECRET, json.dumps(result))
+        self.assertEqual(client.calls[0]['additionalModelRequestFields'], {'thinking': {'type': 'disabled'}})
+
+    def test_final_text_extraction_does_not_accept_tools_multiple_text_or_json_fences(self):
+        for variant in ('tool', 'multiple-text', 'reasoning-only', 'fenced-json'):
+            client = FakeClient()
+            original = client.converse
+            def response(**kwargs):
+                value = original(**kwargs)
+                blocks = value['output']['message']['content']
+                if variant == 'tool': blocks.insert(0, {'toolUse': {'name': 'script'}})
+                if variant == 'multiple-text': blocks.insert(0, {'text': '{}'})
+                if variant == 'reasoning-only': blocks[:] = [{'reasoningContent': {'reasoningText': {'text': SECRET}}}]
+                if variant == 'fenced-json': blocks[0]['text'] = '```json\n' + blocks[0]['text'] + '\n```'
+                return value
+            client.converse = response
+            with self.subTest(variant=variant):
+                self.assertEqual(triage.classify(case(), evidence(), client)['decision'], 'run_doctor')
+
     def test_fixed_vendor_url_rejects_event_ssrf_and_private_dns(self):
         for value in ['https://169.254.169.254/', '../CVE-2026-12345', CVE + '?url=x', None]:
             with self.subTest(value=value), self.assertRaises(ValueError): triage.vendor_url(value)

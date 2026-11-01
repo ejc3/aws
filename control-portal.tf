@@ -27,7 +27,7 @@ resource "cloudflare_dns_record" "control_portal" {
   zone_id    = var.cc_games_zone_id
   name       = "control.cc-games.dev"
   type       = "CNAME"
-  content    = "custom-domains.chatgpt.site."
+  content    = "custom-domains.chatgpt.site"
   proxied    = true
   ttl        = 1
   depends_on = [cloudflare_zero_trust_access_application.control_portal]
