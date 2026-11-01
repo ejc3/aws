@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 import {createServer} from 'node:net';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
@@ -57,7 +57,7 @@ const config :Workerd.Config = (
 `);
     const binary = process.env.WORKERD_BIN || fileURLToPath(new URL('./node_modules/workerd/bin/workerd', import.meta.url));
     child = spawn(binary, ['serve', join(directory, 'config.capnp')], {detached: true,
-      env: {HOME: directory, PATH: '/usr/bin:/bin', TMPDIR: directory, AWS_EC2_METADATA_DISABLED: 'true',
+      env: {HOME: directory, PATH: dirname(process.execPath) + ':/usr/bin:/bin', TMPDIR: directory, AWS_EC2_METADATA_DISABLED: 'true',
         AWS_CONFIG_FILE: '/dev/null', AWS_SHARED_CREDENTIALS_FILE: '/dev/null'}, stdio: ['ignore', 'pipe', 'pipe']});
     exit = once(child, 'exit');
     child.stdout.on('data', value => { output = (output + value).slice(-8192); });
