@@ -107,7 +107,7 @@ class OwnerUnchanged(unittest.TestCase):
 
     def test_owner_commands_keep_their_slots(self):
         self.assertIn('    1|2|3|4|5|6|7|8) BOX="$1" ;;', PBOX)
-        self.assertIn('SLOTS="1 2 3 4 metal" # the keys of local.gpu_box_slots', GBOX)
+        self.assertIn('SLOTS="1 2 3 4 metal native" # the keys of local.gpu_box_slots', GBOX)
         self.assertIn('NAME="wbox"', WBOX)
 
 
@@ -297,7 +297,7 @@ class Watchdogs(unittest.TestCase):
         self.assertIn("parallel_watchdog_tag_names = concat(local.parallel_box_names, local.gpu_box_names, local.member_gbox_names, local.member_pbox_names)", WATCHDOG)
         fn = block("aws_lambda_function", "parallel_watchdog", WATCHDOG)
         self.assertIn("TAG_NAMES    = join(\",\", local.parallel_watchdog_tag_names)", fn)
-        self.assertIn("MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => var.gpu_box_max_hours * 60 })", fn)
+        self.assertIn('MAX_AGE_MINUTES = jsonencode({ for n in concat(local.gpu_box_names, local.member_gbox_names) : n => n == local.gpu_box_slots["native"] ? 30 : var.gpu_box_max_hours * 60 })', fn)
         ohio = block("aws_lambda_function", "parallel_watchdog_ohio", OHIO)
         self.assertIn('TAG_NAMES       = join(",", concat(local.parallel_box_names, local.member_pbox_names))', ohio)
         self.assertIn("MAX_AGE_MINUTES = jsonencode({ for n in local.member_pbox_names : n => local.member_box_max_hours * 60 })", ohio)
@@ -403,7 +403,7 @@ class OneInstancePerMember(unittest.TestCase):
 
     def test_every_watchdog_names_the_members_as_single(self):
         self.assertIn('SINGLE_NAMES    = join(",", local.member_wbox_names)', block("aws_lambda_function", "member_wbox_watchdog"))
-        self.assertRegex(block("aws_lambda_function", "parallel_watchdog", WATCHDOG), r'SINGLE_NAMES\s+= join\(",", local\.member_gbox_names\)')
+        self.assertRegex(block("aws_lambda_function", "parallel_watchdog", WATCHDOG), r'SINGLE_NAMES\s+= join\(",", concat\(local\.member_gbox_names, \[local\.gpu_box_slots\["native"\]\]\)\)')
         self.assertIn('SINGLE_NAMES    = join(",", local.member_pbox_names)', block("aws_lambda_function", "parallel_watchdog_ohio", OHIO))
 
     def test_extra_instances_are_terminated_keeping_the_oldest_with_an_alert(self):
@@ -891,7 +891,7 @@ class ScriptRuns(unittest.TestCase):
 
     def test_gbox_owner_is_unchanged(self):
         r, calls = self.run_script("gpu-box.sh", "status", "all", user="ejc3")
-        self.assertEqual(r.stdout.splitlines(), ["gpu-box: down ($0)", "gpu-box-2: down ($0)", "gpu-box-3: down ($0)", "gpu-box-4: down ($0)", "gpu-box-metal: down ($0)"])
+        self.assertEqual(r.stdout.splitlines(), ["gpu-box: down ($0)", "gpu-box-2: down ($0)", "gpu-box-3: down ($0)", "gpu-box-4: down ($0)", "gpu-box-metal: down ($0)", "gpu-box-native: down ($0)"])
 
     # ---------------------------------------------------------------- pbox
     def test_pbox_member_launches_their_box_with_their_volume_and_key(self):

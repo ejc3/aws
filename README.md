@@ -1425,6 +1425,15 @@ parallel-box watchdog terminates it after 30 minutes below 5% CPU (and without d
 us-west-2 "Running On-Demand G and VT instances" quota (`L-DB2E81BA`): four `g4dn.xlarge`
 need 16 vCPUs, and 32 covers four of the largest type (`g4dn.2xlarge`).
 
+`gbox up native` is the owner's disposable factory-tile diagnostic: stock Canonical Ubuntu
+24.04 on exactly `g4dn.xlarge`, with no fallback type or instance profile. It applies security
+updates, reboots, runs the pinned public fcvm tile preparation (NVIDIA 580.196.07, Podman
+4.9.3), then reboots again before publishing its ready marker. It has the same SSH-only
+security group and dev-hop public key, and carries no AWS or personal credentials. An
+absolute on-box timer survives both reboots and ends it 30 minutes from launch; the
+independent watchdog enforces the same age and removes duplicate native slots. Use
+`gbox ssh native`, copy diagnostics out, then `gbox down native`; nothing persists.
+
 ## Temporary EBS for agents
 
 Permanent fleet infrastructure remains Terraform-managed. As a deliberate runtime
