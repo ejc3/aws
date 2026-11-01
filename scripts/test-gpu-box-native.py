@@ -54,6 +54,9 @@ class Bootstrap(unittest.TestCase):
             return os.stat_result(values)
         return value
 
+    def fake_lstat(self, path, *args, **kwargs):
+        return self.fake_stat(path, *args, follow_symlinks=False, **kwargs)
+
     def url(self, request, timeout):
         self.calls.append(request.full_url)
         if request.full_url == 'http://169.254.169.254/latest/api/token':
@@ -71,7 +74,9 @@ class Bootstrap(unittest.TestCase):
         # Imported Path is replaced only in the state block's pathlib module;
         # every absolute runtime path it reads is redirected into our own TMP.
         module = types.SimpleNamespace(Path=self.path)
+        # Path.lstat uses stat(follow_symlinks=False) or lstat across Python versions.
         with patch.dict(sys.modules, {'pathlib': module}), patch('os.stat', self.fake_stat), \
+             patch('os.lstat', self.fake_lstat), \
              patch('urllib.request.urlopen', self.url), patch('time.time', lambda: self.now), \
              patch('subprocess.run', self.command), patch.object(sys, 'argv', ['state', str(self.root), *args]), \
              contextlib.redirect_stdout(io.StringIO()) as output:
