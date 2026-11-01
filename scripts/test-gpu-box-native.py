@@ -141,6 +141,31 @@ class Bootstrap(unittest.TestCase):
         self.assertLess(lines.index('enable --now gpu-box-native-expiry.timer'),
                         lines.index('start --no-block gpu-box-native-bootstrap.service'))
 
+    def test_generated_bootstrap_job_has_no_cloud_final_ordering_cycle(self):
+        service = SOURCE.split('cat > /etc/systemd/system/gpu-box-native-bootstrap.service <<EOF\n', 1)[1].split('\nEOF', 1)[0]
+        service = service.replace('$SCRIPT', '/usr/bin/true')
+        wanted = next(line.split('=', 1)[1] for line in service.splitlines() if line.startswith('WantedBy='))
+        self.assertIn(wanted, {'multi-user.target', 'cloud-init.target'})
+        with tempfile.TemporaryDirectory(prefix='native-boot-graph-') as directory:
+            root = Path(directory)
+            units = root / 'etc/systemd/system'; units.mkdir(parents=True)
+            binary = root / 'usr/bin/true'; binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\nexit 0\n'); binary.chmod(0o755)
+            for name in ('sysinit.target', 'basic.target', 'shutdown.target', 'network-online.target'):
+                (units / name).write_text('[Unit]\nDescription=Offline boot fixture\nDefaultDependencies=no\n')
+            (units / 'multi-user.target').write_text('[Unit]\nDescription=Offline multi-user target\n')
+            (units / 'default.target').write_text('[Unit]\nWants=multi-user.target cloud-init.target\n')
+            (units / 'cloud-init.target').write_text('[Unit]\nWants=cloud-final.service\n')
+            # Ubuntu's real cloud-final unit orders itself after multi-user.target.
+            (units / 'cloud-final.service').write_text('[Unit]\nAfter=multi-user.target\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n')
+            (units / 'gpu-box-native-bootstrap.service').write_text(service)
+            installed = units / (wanted + '.wants'); installed.mkdir()
+            (installed / 'gpu-box-native-bootstrap.service').symlink_to('../gpu-box-native-bootstrap.service')
+            result = subprocess.run(['systemd-analyze', 'verify', '--man=no', '--root=' + str(root), 'default.target'],
+                env={'PATH': '/usr/bin:/bin', 'SYSTEMD_LOG_COLOR': '0'}, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn('ordering cycle', result.stderr.lower())
+
     def test_real_expiry_branch_only_shuts_down_at_deadline(self):
         block = self.shell_block('if [[ ${1:-} = --expire ]]; then', '\n\nif [[ ${1:-} = --install ]]')
         self.assertEqual(block.count('/usr/sbin/shutdown'), 1)
