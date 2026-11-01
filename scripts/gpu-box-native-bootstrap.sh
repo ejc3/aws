@@ -142,7 +142,7 @@ Type=oneshot
 ExecStart=$SCRIPT
 TimeoutStartSec=infinity
 [Install]
-WantedBy=multi-user.target
+WantedBy=cloud-init.target
 EOF
   systemctl daemon-reload
   systemctl enable --now gpu-box-native-expiry.timer
