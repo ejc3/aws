@@ -1958,6 +1958,16 @@ step here: `games-mp-migrate` applies every file under its `supabase/migrations`
 merges to `main`, before that release is promoted (`docs/games-multiplayer.md`, "Site
 migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
 
+### Dolphin Maps road tiles
+
+`dolphin-maps-tiles.tf` creates the private `dolphin-maps-tiles` R2 bucket for nationwide road tiles under
+`tiles/<id>.json`, without an expiry rule or a public URL. Its bucket-only object Read/Write token supplies
+`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_BUCKET` to the main-only `osm-tiles` GitHub
+environment in `dolphin-labs-hq/dolphin-maps`; existing `data-push` credentials stay separate. The administration
+minter is read ephemerally; only the narrow token enters protected Terraform state and GitHub. The bucket and
+one-time credential have replacement guards. A separate Maps change binds `TILES` in staging and production and
+adds the uploader after this infrastructure exists; this apply does not deploy either Worker.
+
 ## GitHub Actions and package infrastructure
 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
