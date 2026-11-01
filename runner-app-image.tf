@@ -69,12 +69,17 @@ locals {
     "dolphin-labs-runner" = {
       repo   = "dolphin-labs-hq/dolphin-labs"
       script = "node-web-runner.sh"
-      # .github/workflows/ci.yml, cloudflare-stage.yml, refresh-publish.yml; web/package-lock.json.
+      # .github/workflows/ci.yml, cloudflare-stage.yml, refresh-publish.yml; web/package-lock.json;
+      # rust-toolchain.toml (the engine, built natively and to WebAssembly by cf:build and the engine job, and the
+      # policy lint; every job installs it through .github/actions/engine-rust).
       versions = {
         NODE_MAJOR          = "22"
         PYTHON_VERSIONS     = "3.11"
         PLAYWRIGHT_VERSION  = "1.62.1"
         PLAYWRIGHT_BROWSERS = "chromium,webkit"
+        RUST_TOOLCHAIN      = "1.99.1"
+        RUST_COMPONENTS     = "rustfmt,clippy"
+        RUST_TARGETS        = "wasm32-unknown-unknown"
       }
     }
     "dolphin-films-runner" = {
