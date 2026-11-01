@@ -1,0 +1,13 @@
+{
+  "name": "control-room",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node assemble.mjs",
+    "check": "node assemble.mjs --check",
+    "test": "node --test portal-backend.test.mjs portal-ui.test.mjs portal-workerd.test.mjs"
+  },
+  "devDependencies": {
+    "workerd": "1.20260625.1"
+  }
+}

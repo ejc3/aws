@@ -15,6 +15,28 @@ permissions:
   contents: read
 
 jobs:
+  control-portal:
+    name: Control portal (Cloudflare runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install locked runtime without lifecycle scripts
+        run: npm ci --prefix control-portal --ignore-scripts --no-audit --no-fund
+      - name: Check source syntax and generated deployment artifact
+        run: |
+          node --check control-portal/portal-backend.mjs
+          node --check control-portal/portal-ui.mjs
+          node --check control-portal/index.mjs
+          node control-portal/assemble.mjs --check
+      - name: Owner authorization, controls, MDM page and real workerd AWS transport
+        timeout-minutes: 1
+        run: node --test control-portal/portal-backend.test.mjs control-portal/portal-ui.test.mjs control-portal/portal-workerd.test.mjs
+
   patchdoctor-worker:
     name: PatchDoctor worker (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
