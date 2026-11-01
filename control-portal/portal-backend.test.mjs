@@ -255,6 +255,7 @@ test('events parse only authored metadata and discard raw content, errors and un
     assert.equal(call.target, 'Logs_20140328.FilterLogEvents');
     assert.equal(call.payload.logGroupName, '/aws/codebuild/patchdoctor');
     assert.equal(call.payload.startTime, now() - 3600000);
+    assert.equal(call.payload.startFromHead, false);
     return json({events: [
       {timestamp: now(), message: JSON.stringify({event: 'tool_use', tool: 'Bash', command: 'NEVERRETURNTHIS', token: 'NEVERRETURNTHIS'})},
       {timestamp: now(), message: 'NEVERRETURNTHIS raw log'},
@@ -284,8 +285,9 @@ test('recent activity follows bounded pages, includes newest page and signals tr
   let pages = 0;
   const reply = await invoke('/api/doctor/events', {}, env, call => {
     pages++;
+    assert.equal(call.payload.startFromHead, false);
     assert.equal(call.payload.nextToken, pages === 1 ? undefined : 'page-' + pages);
-    return json({events: [{eventId: String(pages), timestamp: now() - 1000 * (6 - pages),
+    return json({events: [{eventId: String(pages), timestamp: now() - 1000 * pages,
       message: JSON.stringify({event: 'case_finished', raw: 'NEVERRETURNTHIS'})}], nextToken: 'page-' + (pages + 1)});
   });
   assert.equal(pages, 5);
@@ -383,7 +385,11 @@ test('completed failed Haiku commissioning is an informative refusal rather than
       haiku: {ok: false, error_type: 'NEVERRETURNTHIS', reason: 'NEVERRETURNTHIS'}}));
   assert.equal(reply.status, 409);
   assert.equal(reply.body.error, 'commissioning_failed');
-  assert.equal(reply.body.acknowledged, undefined);
+  assert.equal(reply.body.acknowledged, true);
+  assert.equal(reply.body.completed, true);
+  assert.equal(reply.body.mutationId, mutationId);
+  assert.equal(reply.body.action, 'self_test');
+  assert.equal(reply.body.ok, false);
   assert.match(reply.body.message, /Haiku.*failed.*Opus.*not queued/);
   assert.doesNotMatch(JSON.stringify(reply.body), /NEVERRETURNTHIS|error_type/);
   assert.equal(reply.calls.length, 1);

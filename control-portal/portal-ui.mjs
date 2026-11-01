@@ -76,6 +76,7 @@ export function renderPortal() {
             </div>
             <p class="action-note">Pausing stops new repair starts. An operation already in progress may still finish. Model allowances are estimates; AWS compute is billed separately.</p>
             <div id="doctor-message" class="notice message" role="status" hidden></div>
+            <div id="doctor-pending" class="notice message" role="status" hidden><p id="doctor-pending-label"></p><button id="doctor-retry" type="button" class="button secondary">Retry saved request</button></div>
             <div class="limits" aria-label="Configured repair limits">
               <div class="limit"><strong id="limit-attempt">—</strong><span>model allowance per attempt</span></div><div class="limit"><strong id="limit-case">—</strong><span>model allowance per case</span></div><div class="limit"><strong id="limit-starts">—</strong><span>repair starts per day</span></div><div class="limit"><strong id="limit-minutes">—</strong><span>maximum minutes per attempt</span></div>
             </div>
@@ -96,7 +97,8 @@ export function renderPortal() {
   <script>
   (function () {
     'use strict';
-    var state = {status: null, refreshing: false, actionBusy: false, uncertain: false};
+    var state = {status: null, refreshing: false, actionBusy: false, uncertain: false, pending: null, storageReady: true};
+    var outboxKey = 'patchdoctor-control-outbox-v1';
     var byId = function (id) { return document.getElementById(id); };
     var text = function (value, maximum) { return typeof value === 'string' ? value.slice(0, maximum || 500) : ''; };
     var node = function (tag, className, value) { var element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) element.textContent = value; return element; };
@@ -107,11 +109,27 @@ export function renderPortal() {
       var controller = new AbortController(); var timer = setTimeout(function () { controller.abort(); }, 15000);
       try {
         var response = await fetch(path, {method:body === undefined ? 'GET' : 'POST', credentials:'same-origin', cache:'no-store', redirect:'error', signal:controller.signal, headers:body === undefined ? {Accept:'application/json'} : {Accept:'application/json','Content-Type':'application/json'}, body:body === undefined ? undefined : JSON.stringify(body)});
-        if (!response.ok) { var reason = ''; try { var failure = await response.json(); reason = text(failure.message,400); } catch (_) {} var error = new Error(reason || (response.status === 401 ? 'Your sign-in needs to be renewed. Reload this page.' : response.status === 403 ? 'This action is available only to the owner.' : 'The service returned HTTP ' + response.status + '. Refresh the current state before trying again.')); error.confirmed = true; throw error; }
+        if (!response.ok) { var reason = ''; var failure; try { failure = await response.json(); reason = text(failure.message,400); } catch (_) {}
+          if (response.status === 409 && body && body.action === 'self_test' && failure && failure.ok === false
+              && failure.acknowledged === true && failure.completed === true && failure.action === 'self_test'
+              && failure.mutationId === body.mutationId && failure.error === 'commissioning_failed') return failure;
+          var error = new Error(reason || (response.status === 401 ? 'Your sign-in needs to be renewed. Reload this page.' : response.status === 403 ? 'This action is available only to the owner.' : 'The service returned HTTP ' + response.status + '. Refresh the current state before trying again.')); error.confirmed = true; throw error; }
         if ((response.headers.get('content-type') || '').indexOf('application/json') < 0) throw new Error('The service returned an unexpected response. Reload to check your sign-in.');
         return await response.json();
       } catch (error) { if (error.confirmed || error.message === 'The service returned an unexpected response. Reload to check your sign-in.') throw error; throw new Error('The request could not be confirmed. Check your connection and refresh the current state.'); }
       finally { clearTimeout(timer); }
+    }
+    function restorePending() {
+      try {
+        var raw = localStorage.getItem(outboxKey);
+        if (!raw) return;
+        var pending = JSON.parse(raw);
+        if (!pending || Object.keys(pending).sort().join(',') !== 'action,mutationId'
+            || ['arm','pause','self_test','recheck'].indexOf(pending.action) < 0
+            || typeof pending.mutationId !== 'string'
+            || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pending.mutationId)) throw new Error('Saved request unavailable');
+        state.pending = pending; state.uncertain = true;
+      } catch (_) { state.storageReady = false; state.uncertain = true; showMessage('doctor-message','Saved request storage is unavailable. Repair controls are paused until it can be read.','error'); }
     }
     function renderStatus() {
       var data = state.status; var doctor = data && data.doctor;
@@ -139,7 +157,10 @@ export function renderPortal() {
       var limits = doctor && doctor.limits || {};
       byId('limit-attempt').textContent = amount(limits.attemptUsd,'money'); byId('limit-case').textContent = amount(limits.caseUsd,'money'); byId('limit-starts').textContent = amount(limits.startsPerDay); byId('limit-minutes').textContent = amount(limits.minutes);
       byId('triage-model').textContent = text(doctor && doctor.triageModel,80) || 'Not loaded'; byId('repair-model').textContent = text(doctor && doctor.model,80) || 'Not loaded';
-      document.querySelectorAll('[data-control]').forEach(function (button) { var action = button.dataset.control; button.disabled = !connected || typeof armed !== 'boolean' || state.actionBusy || state.uncertain || (action === 'arm' && (armed || proof.canArm !== true)) || (action === 'pause' && !armed); });
+      document.querySelectorAll('[data-control]').forEach(function (button) { var action = button.dataset.control; button.disabled = !connected || typeof armed !== 'boolean' || state.actionBusy || state.uncertain || !!state.pending || state.storageReady === false || (action === 'arm' && (armed || proof.canArm !== true)) || (action === 'pause' && !armed); });
+      byId('doctor-pending').hidden = !state.pending;
+      byId('doctor-pending-label').textContent = state.pending ? 'A saved repair request is awaiting confirmation. Retry it before starting another action.' : '';
+      byId('doctor-retry').disabled = state.actionBusy || !state.pending || state.storageReady === false;
     }
     function caseStatus(value) { if (value === 'resolved') return ['Verified closed','good']; if (value === 'running') return ['Repair in progress','']; if (value === 'awaiting-native-closure' || value === 'patched' || value === 'mitigated') return ['Awaiting verification','']; if (value === 'self-test-passed') return ['Self-test passed','good']; if (typeof value === 'string' && (value.indexOf('blocked') === 0 || ['failed','budget-exhausted'].indexOf(value) >= 0)) return ['Needs attention','attention']; if (['pending','starting','start-uncertain','daily-budget-wait'].indexOf(value) >= 0) return ['Waiting','']; return ['State not confirmed','']; }
     function renderCases(data) {
@@ -150,27 +171,49 @@ export function renderPortal() {
     }
     function renderEvents(data) {
       if (!data || !Array.isArray(data.events) || !data.events.every(function (item) { return item && typeof item === 'object'; })) throw new Error('Activity is unavailable.');
-      var container = byId('events'); container.replaceChildren(); if (!data.events.length) { container.append(node('p','empty','No activity is listed yet. Completed checks and repair steps will appear here.')); return; }
+      var container = byId('events'); container.replaceChildren();
+      if (data.truncated === true || data.events.length > 15) { var partial = node('p','action-note','Partial activity: some recent events are not shown.'); partial.setAttribute('role','status'); container.append(partial); }
+      if (!data.events.length) { container.append(node('p','empty','No activity is listed yet. Completed checks and repair steps will appear here.')); return; }
       var list = node('ol','events'); var labels = {tool_use:'Tool used',usage:'Usage recorded',checkpoint_acknowledged:'Progress saved',checkpoint_restored:'Progress restored',case_finished:'Case updated',worker_failed:'Worker stopped',repair_started:'Repair started',self_test:'Self-test',triage:'Triage checked'}; var tools = ['Read','Edit','Write','Bash','Agent','WebFetch','WebSearch','Glob','Grep'];
       data.events.slice(0,15).forEach(function (event) { if (!event || typeof event !== 'object') return; var item = node('li','event'); var marker = node('span','event-marker'); marker.setAttribute('aria-hidden','true'); var body = node('div'); var title = labels[event.type] || 'Activity recorded'; if (tools.indexOf(event.tool) >= 0) title += ' · ' + event.tool; body.append(node('p','event-title',title),node('p','event-time',formatTime(event.timestamp))); item.append(marker,body); list.append(item); }); container.append(list);
     }
     async function refresh() {
       if (state.refreshing || state.actionBusy) return; state.refreshing = true; byId('refresh').disabled = true;
       var results = await Promise.allSettled([api('/api/status'),api('/api/doctor/cases'),api('/api/doctor/events')]);
-      if (results[0].status === 'fulfilled' && results[0].value && results[0].value.doctor) { state.status = results[0].value; state.uncertain = false; byId('status-error').hidden = true; byId('checked').textContent = 'Checked ' + new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}); }
+      if (results[0].status === 'fulfilled' && results[0].value && results[0].value.doctor) { state.status = results[0].value; if (!state.pending && state.storageReady) state.uncertain = false; byId('status-error').hidden = true; byId('checked').textContent = 'Checked ' + new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}); }
       else { state.status = null; byId('status-error').textContent = 'Current status could not be loaded. ' + (results[0].status === 'rejected' ? results[0].reason.message : 'Please refresh to try again.'); byId('status-error').hidden = false; byId('checked').textContent = 'Current state not confirmed'; }
       try { if (results[1].status !== 'fulfilled') throw results[1].reason; renderCases(results[1].value); } catch (_) { byId('case-count').textContent = ''; byId('cases').replaceChildren(node('p','empty','Repair cases could not be loaded. Refresh to try again.')); }
       try { if (results[2].status !== 'fulfilled') throw results[2].reason; renderEvents(results[2].value); } catch (_) { byId('events').replaceChildren(node('p','empty','Activity could not be loaded. Refresh to try again.')); }
       state.refreshing = false; byId('refresh').disabled = false; renderStatus();
     }
-    document.querySelectorAll('[data-control]').forEach(function (button) { button.addEventListener('click', async function () {
-      if (state.actionBusy || button.disabled) return; var action = button.dataset.control; state.actionBusy = true; renderStatus(); showMessage('doctor-message','Sending your request…','');
-      try { var result = await api('/api/doctor/control',{action:action,mutationId:crypto.randomUUID()}); if (!result || result.ok === false || result.acknowledged === false || result.refused === true || result.error || !(result.ok === true || result.acknowledged === true || text(result.message) || text(result.outcome) || text(result.status))) throw new Error(text(result && (result.message || result.error),300) || 'The service did not confirm this action.'); var outcome = text(result.message,400) || text(result.outcome,120) || text(result.status,120); showMessage('doctor-message',outcome || 'The service acknowledged your request. Refreshing its current state.','success'); byId('announcement').textContent = outcome || 'Request acknowledged.'; }
-      catch (error) { state.uncertain = true; showMessage('doctor-message',text(error.message,400) + ' Refresh before sending another action.','error'); }
+    async function sendPending() {
+      if (state.actionBusy || !state.pending || !state.storageReady) return;
+      var pending = state.pending; state.actionBusy = true; renderStatus(); showMessage('doctor-message','Sending your saved request…','');
+      try {
+        var result = await api('/api/doctor/control',pending);
+        var completed = result && result.acknowledged === true && result.completed === true
+          && result.action === pending.action && result.mutationId === pending.mutationId && result.refused !== true;
+        var failedSelfTest = completed && pending.action === 'self_test' && result.ok === false && result.error === 'commissioning_failed';
+        if (!completed || (!failedSelfTest && (result.ok !== true || result.error))) throw new Error('The service did not confirm this request.');
+        localStorage.removeItem(outboxKey);
+        state.pending = null; state.uncertain = false;
+        var outcome = text(result.message,400) || 'The service acknowledged your request.';
+        showMessage('doctor-message',outcome,failedSelfTest ? 'error' : 'success'); byId('announcement').textContent = outcome;
+      }
+      catch (error) { state.uncertain = true; showMessage('doctor-message',text(error.message,400) + ' Retry the saved request to confirm its outcome.','error'); }
       finally { state.actionBusy = false; renderStatus(); await refresh(); }
+    }
+    document.querySelectorAll('[data-control]').forEach(function (button) { button.addEventListener('click', async function () {
+      if (state.actionBusy || button.disabled || state.pending || !state.storageReady) return;
+      var pending = {action:button.dataset.control,mutationId:crypto.randomUUID()};
+      try { localStorage.setItem(outboxKey,JSON.stringify(pending)); }
+      catch (_) { state.storageReady = false; state.uncertain = true; showMessage('doctor-message','Your request was not sent because it could not be saved. Allow browser storage before using repair controls.','error'); renderStatus(); return; }
+      state.pending = pending;
+      await sendPending();
     }); });
+    byId('doctor-retry').addEventListener('click',sendPending);
     byId('refresh').addEventListener('click',refresh);
-    renderStatus(); refresh();
+    restorePending(); renderStatus(); refresh();
     setInterval(function () { if (document.visibilityState === 'visible') refresh(); },30000);
   })();
   </script>

@@ -166,7 +166,9 @@ direct Cloudflare Worker from `control-portal/`, its owner-only Access applicati
 and server-only AWS identity. The Worker validates Cloudflare's authenticated
 invocation context, application audience and owner identity; it requires no
 ChatGPT login. Alternate workers.dev and preview URLs are disabled. The earlier
-Sites publication remains private and is not the custom hostname's origin.
+Sites publication and its CNAME remain as a private, owner-gated fallback if the
+Worker route is explicitly removed. While the route is installed, the Worker
+answers every path itself and never proxies to Sites.
 The portal can invoke the serial controller and read typed status; it cannot
 invoke the command broker, send SSM commands, or read administration secrets or
 Terraform state. Runtime keys are secret Worker bindings, never browser assets.

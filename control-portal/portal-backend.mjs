@@ -283,7 +283,7 @@ export async function handlePortalRequest(request, env, renderPortal, dependenci
       const endTime = now(), startTime = endTime - 3600000;
       for (let page = 0; page < 5; page++) {
         const result = await aws.call('logs', 'FilterLogEvents', {logGroupName: aws.config.logGroup,
-          startTime, endTime, limit: 50, filterPattern: '{ $.event = "*" }', ...(nextToken ? {nextToken} : {})});
+          startTime, endTime, startFromHead: false, limit: 50, filterPattern: '{ $.event = "*" }', ...(nextToken ? {nextToken} : {})});
         for (const event of (Array.isArray(result.events) ? result.events : []).slice(0, 50)) {
           if (event.eventId && seen.has(event.eventId)) continue;
           if (event.eventId) seen.add(event.eventId);
@@ -318,9 +318,11 @@ export async function handlePortalRequest(request, env, renderPortal, dependenci
         portalFail(409, 'control_unconfirmed', 'This action has not been durably confirmed. Refresh before trying again.');
       }
       if (body.action === 'self_test' && !PORTAL_CASE.test(result.case_id) && result.haiku?.ok === false) {
-        portalFail(409, 'commissioning_failed', 'Haiku’s self-test failed, so the Opus self-test was not queued. Refresh status before trying again.');
+        return portalJson({ok: false, acknowledged: true, completed: true, action: body.action,
+          mutationId: body.mutationId, error: 'commissioning_failed',
+          message: 'Haiku’s self-test failed, so the Opus self-test was not queued. Refresh status before trying again.'}, 409);
       }
-      const reply = {ok: true, action: body.action, acknowledged: true};
+      const reply = {ok: true, action: body.action, acknowledged: true, completed: true, mutationId: body.mutationId};
       if (PORTAL_CASE.test(result.case_id)) reply.caseId = result.case_id;
       for (const key of ['armed', 'paused']) if (typeof result[key] === 'boolean') reply[key] = result[key];
       reply.message = {pause: 'New repair runs are paused. Existing work continues.', arm: 'Repair activation was acknowledged. Refresh to see its current state.',
