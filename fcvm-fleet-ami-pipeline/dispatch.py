@@ -176,7 +176,12 @@ class Factory:
         recorded = journal["slots"].get(slot, {})
         filters = [{"Name": "tag:Purpose", "Values": [GUARD_PURPOSE]}, {"Name": "tag:FactoryBuild", "Values": [digest(journal["build_id"])]}, {"Name": "tag:FactorySlot", "Values": [slot]}]
         rows = [i for r in self.client("ec2", True).describe_instances(Filters=filters)["Reservations"] for i in r["Instances"]]
-        rows = [i for i in rows if i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] and i.get("InstanceType") == TYPES[slot.split("-", 1)[0]]]
+        # EC2 may omit the profile after termination. Only an already recorded
+        # instance can supply that terminal receipt without the profile proof.
+        rows = [i for i in rows if i.get("InstanceType") == TYPES[slot.split("-", 1)[0]] and (
+            i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] or (
+                "IamInstanceProfile" not in i and i["State"]["Name"] == "terminated"
+                and recorded.get("instance_id") == i["InstanceId"]))]
         if len(rows) > 1:
             raise Refused("more than one instance in a fixed slot")
         if rows and recorded.get("instance_id") not in (None, rows[0]["InstanceId"]):
