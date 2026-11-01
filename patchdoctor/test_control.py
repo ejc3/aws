@@ -894,6 +894,30 @@ class Tests(unittest.TestCase):
             (25, 1, case['start_token']))
         self.assertEqual(len(self.store.cases()), 1)
 
+    def test_native_readmission_reopens_same_case_when_stopped_target_returns(self):
+        self.store.put('config', {'armed': True, 'gate_version': 2, 'paused_new_runs': True})
+        first = self.doctor.handler(self.event)['admitted'][0]
+        original = self.store.get('case#' + first)
+        self.assertEqual(original['status'], 'pending')
+        self.assertEqual(self.cloud.starts, [])
+        self.cloud.instance['State']['Name'] = 'stopped'
+        self.doctor.reconcile()
+        blocked = self.store.get('case#' + first)
+        self.assertEqual(blocked['status'], 'blocked-no-current-critical-target')
+        self.assertNotIn(first, [case['case_id'] for case in self.store.cases()])
+        self.cloud.instance['State']['Name'] = 'running'
+        admitted = self.doctor.handler(self.event)['admitted']
+        reopened = self.store.get('case#' + first)
+        self.assertEqual(admitted, [first])
+        self.assertEqual(reopened['status'], 'pending')
+        for key in ('revision', 'generation', 'attempts', 'reserved_usd', 'operations', 'outstanding_operations'):
+            self.assertEqual(reopened.get(key), original.get(key))
+        self.assertEqual(self.cloud.starts, [])
+        self.doctor.handler({'action': 'pause_new_runs', 'paused': False, 'mutationId': 'resume-returned-target'})
+        self.doctor.reconcile()
+        self.assertEqual(self.store.get('case#' + first)['status'], 'running')
+        self.assertEqual(len(self.cloud.starts), 1)
+
     def test_material_fixed_version_or_target_revision_reopens_but_reimport_deduplicates(self):
         first = self.admit(armed=False)
         first['status'] = 'blocked'

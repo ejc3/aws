@@ -494,6 +494,8 @@ class Doctor:
                     'status': 'pending', 'created_at': int(self.now()),
                     'attempts': 0, 'reserved_usd': 0, 'operations': {}}
             case.update(targets=targets, findings=findings, finding_arns=sorted(set(case.get('finding_arns', [])) | {f['finding_arn'] for f in findings}))
+            if case['status'] == 'blocked-no-current-critical-target':
+                case['status'] = 'pending'
             if case['status'] == 'deferred' and case.get('triage_revision') != digest(encoded(self.triage_input(case))):
                 case['status'] = 'pending'  # A new exploit/fix/native package revision bypasses an old deferral.
             self.save(case)
