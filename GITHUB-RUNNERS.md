@@ -667,7 +667,7 @@ poll that ran while a job's runner was booting put up a second host for the same
 whenever the pool had room. A single delivery is one job and is never cut this way.
 
 
-**Controller tokens from a GitHub App (2026-10-11).** For the dolphin-labs-hq repos and `ejc3/imagine` (`local.runner_app_github_app_repos` in
+**Controller tokens from a GitHub App (2026-10-11).** For the dolphin-labs-hq repos, `ejc3/imagine` and `ejc3/constellation` (`local.runner_app_github_app_repos` in
 `runner-app.tf`) the controller mints an installation token from the runners GitHub App (`github-app/runners`: the
 controller and the jumpbox role only) on each run, narrowed to that one repository and to administration:write +
 actions:read, expiring within the hour. The JWT is signed in pure Python (`app_runner.py`, `rs256`), because the Lambda
@@ -675,9 +675,13 @@ runtime has no openssl. Until the secret has a value, or when minting fails (log
 (`github-runner/repo-pat/<owner>/<repo>`) is used, so the PATs stay until the app is proven. The dolphin-labs-hq repos'
 webhooks are managed as the administration agent's GitHub App (`app_auth` from `github-app/aws-admin`), not with those PATs,
 so once the controller has run on app tokens the PATs have no remaining user and can be retired. CoderColton's colton-games keeps
-its PAT: the app would have to be installed from Colton's account. `ejc3/imagine` takes the app's token only once the app
-is installed on the `ejc3` account with **only `imagine` selected** and that installation id is in `github-app/runners`
-(`installations.ejc3`); until then `app_token()` finds no `ejc3` installation and its PAT is used. An installation on all
+its PAT: the app would have to be installed from Colton's account. `ejc3/imagine` and `ejc3/constellation` take the app's
+token only once the app is installed on the `ejc3` account with **only `imagine` and `constellation` selected** and that
+installation id is in `github-app/runners` (`installations.ejc3`); until then `app_token()` finds no `ejc3` installation
+and their PATs are used. The runners app is `dolphin-labs-runners`, owned by the `dolphin-labs-hq` organization, and it is
+private (on 2026-11-01 `GET /apps/dolphin-labs-runners` answers 404 without authentication), and a private app can be
+installed only on the account that owns it. So no `ejc3` installation exists, and both ejc3 repos run on their PATs, until
+the app is made public (below, under `ejc3/constellation`). An installation on all
 of `ejc3`'s repositories would let the controller's role mint administration tokens for `ejc3/fcvm` and `ejc3/aws` too, so
 the controller checks every installation before minting from it (`check_installation_scope`): the installation must
 belong to that owner, GitHub must report `repository_selection: selected`, and the repositories it covers (listed with a
@@ -689,8 +693,8 @@ holds the controller's role can still read the app's key, so the installation it
 
 ## Pattern C — ephemeral x86 spot runners for other repos
 
-`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps`
-and `ejc3/imagine` run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
+`CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps`,
+`ejc3/imagine` and `ejc3/constellation` run on ordinary x86 spot VMs, not metal. Their jobs need no KVM, and a VM boots in about a minute where metal takes 5–10, so
 nothing is kept warm: **one VM per queued job, one job per VM, then it terminates.** fcvm's metal
 controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`,
 `runner-app/`).
@@ -701,11 +705,12 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   they failed or were cancelled on one of its hosts (`runner_name` `i-...`), for spot reruns (below).
   Anything else is answered and dropped.
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
-  `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin` or `imagine`) and one size
+  `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin`, `imagine` or `constellation`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
   `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too. Runners
   register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
-  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`.
+  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`;
+  `ejc3/constellation` for `[self-hosted, constellation, xl]` (its Rust suite) and `l` or `s`.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
@@ -726,9 +731,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   with its `JobId`. Each repo has its own cap, counted as the hosts `DescribeInstances` lists
   plus the unexpired claims for launches it does not list yet (a consistent read, and the controller
   is serialized), so a burst of launches the listing has not caught up with still cannot pass it.
-  For `ejc3/imagine` and the dolphin repos the cap is set by their [budget bucket](#budget-buckets): 512 vCPUs and 64 hosts
-  each while the bucket is healthy, their old host caps (Imagine 8, `dolphin-labs` 8, `dolphin-films`,
-  `dolphin-maps` and `dolphin-family` 2) and one vCPU cap for the whole group while it is throttled. `colton-games` is in no bucket and keeps its cap of 8.
+  For `ejc3/imagine`, `ejc3/constellation` and the dolphin repos the cap is set by their [budget bucket](#budget-buckets):
+  512 vCPUs and 64 hosts each while the bucket is healthy, their throttled host caps (Imagine 8, constellation 4,
+  `dolphin-labs` 8, `dolphin-films`, `dolphin-maps` and `dolphin-family` 2) and one vCPU cap for the whole group while it is
+  throttled. `colton-games` is in no bucket and keeps its cap of 8.
   A repo may also set `max_vcpus`, a vCPU cap in every mode (no repo sets it now; a bucket's caps work the same way). A launch then waits when the
   vCPUs of the repo's hosts in use, plus those of its launches not listed yet, plus the vCPUs of the size the job asks for,
   would pass it. The vCPUs per size come from one map, `runner_app_size_vcpus` (`s` 8, `l` 32, `xl` 64), next to
@@ -755,7 +761,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   zero would hide its hosts. It also publishes `GitHubAppRunner/LiveVcpus`, the vCPUs of those hosts, per repo, and per
   budget group `BucketLevelUsd`, `Throttled` (0 or 1) and `SpendUsd7d`.
   `too-many-app-runners` fires above the combined cap: the sum of the most hosts each served repo may hold in any mode
-  (`peak_max`: a budgeted repo's burst ceiling of 64, else its `max`; 264 today, 328 once dolphin-family is served).
+  (`peak_max`: a budgeted repo's burst ceiling of 64, else its `max`; 264 today, 328 once constellation or dolphin-family
+  is served, 392 with both).
   `too-many-app-runners-<label>` (`-dolphin-films`, `-dolphin-maps` and `-dolphin-family` for those repos, which share a label) fires above one
   repo's own `peak_max`, so a single repo running away is visible even while the total is under the combined cap. A repo
   with a vCPU ceiling in some mode (every budgeted repo) also gets `too-many-app-runner-vcpus-<label>`, its `LiveVcpus`
@@ -832,9 +839,10 @@ The owner, 2026-10-17: "Let's change ci to be a leaky bucket. Whereas long as we
 budget we allow mass parallel. When we think we will clip, we restrict to 8. Do that for dolphin too." Then: smooth it over
 a week, so a quiet stretch banks room for a busy day.
 
-- **Groups.** Two buckets, `runner_budget_groups` in `runner-app.tf`: `imagine` (ejc3/imagine) and `dolphin`
+- **Groups.** Three buckets, `runner_budget_groups` in `runner-app.tf`: `imagine` (ejc3/imagine), `dolphin`
   (dolphin-labs, dolphin-films, dolphin-maps, and dolphin-family once its token gate is on; they share the `dolphin`
-  label and one owner). Each is **$50 a day**. colton-games is in neither and is capped by its 8 hosts as before.
+  label and one owner) and `constellation` (ejc3/constellation, once its token gate is on: until then the group has no
+  bucket, metric or alarm). Each is **$50 a day**. colton-games is in none and is capped by its 8 hosts as before.
 - **The bucket.** One DynamoDB item per group in `github-app-runner-budget`: `level_usd`, `updated_at`, the burn rate at
   that update, the mode, hourly sums of the drain over the last 7 days, and a version. On every reconcile (every 2
   minutes) and before every launch decision, the controller refills it by $50 / 86,400 s for each second since the last
@@ -852,11 +860,11 @@ a week, so a quiet stretch banks room for a busy day.
     and gone already (EC2 lists terminated hosts for about an hour) is charged from its launch to now. A host live at the
     last update and gone now is charged the whole interval. Each errs high.
 - **Modes.** In **burst** each repo may hold 512 vCPUs and 64 hosts (`burst_max_vcpus`, `burst_max`; 64 `s` hosts are
-  512 vCPUs). In **throttled** each repo falls back to its old host cap (`throttled_max`: Imagine 8, dolphin-labs 8,
+  512 vCPUs). In **throttled** each repo falls back to its old host cap (`throttled_max`: Imagine 8, constellation 4, dolphin-labs 8,
   dolphin-films, dolphin-maps and dolphin-family 2), and the group's repos **together** may hold at most the group's
   `throttled_vcpus`: the refill rate's worth of vCPUs, less the overhead of every host the throttled caps allow, rounded
   down. Terraform computes it from the same constants, `floor((daily_usd / 24 - hosts x host_hour_usd) / vcpu_hour_usd)`:
-  at $50 a day, **72** for imagine (8 hosts) and **68** for dolphin (14 hosts). Held there, a throttled group spends no
+  at $50 a day, **72** for imagine (8 hosts), **68** for dolphin (14 hosts) and **74** for constellation (4 hosts). Held there, a throttled group spends no
   more than it refills, so the bucket cannot drain further while throttled. The cap is the group's because the bucket
   is: dolphin-labs' hosts count against dolphin-films' room. So that no job waits forever, a group holding nothing (no
   host and no launch in flight) may launch one host of any size; one `xl` alone ($1.74/h) is still under the $2.08/h
@@ -889,7 +897,7 @@ a week, so a quiet stretch banks room for a busy day.
     about 23 (about $16), both under the refill, so the groups should spend most of their time in burst.
   - **It bounds dollars a day, not vCPUs at an instant.** At once, Imagine may hold 512 vCPUs, the dolphin repos about
     1,900 together (each under its own 512), and colton-games 512 (8 `xl`): about 2,900 vCPUs in all, against 1,472
-    (1,600 with dolphin-family) under the old caps. The account's spot vCPU quota (`L-34B43A08`, us-west-1) bounds it
+    (1,600 with dolphin-family) under the old caps; constellation adds its own 512, about 3,400 in all. The account's spot vCPU quota (`L-34B43A08`, us-west-1) bounds it
     below that; past the quota, launches fail as capacity refusals and jobs wait.
 - **Alarms.**
   - `github-app-runner-budget-throttled-<group>`: throttled for at least half the hour in more than 8 of the last 24
@@ -943,6 +951,47 @@ never the owner:
   ([Prebuilt images](#prebuilt-images)), and Imagine boots it (`image = "imagine-runner"` in its entry).
 - **arm64.** Imagine's `deploy` job builds the arm64 image its Fargate service runs, on GitHub's `ubuntu-24.04-arm`. These
   pools are x86 only, so that job stays there. It runs only on pushes to main, and skips the build when the backend did not change.
+
+### `ejc3/constellation`
+
+constellation (`ejc3/constellation`, private: Rust crates and services, TypeScript packages and a Next.js app, Terraform,
+and Swift built on macOS) was added on 2026-11-01 so that its Rust suite (cargo-nextest) runs in parallel on many cores.
+It is served exactly as Imagine is, and is separated from `ejc3/fcvm` and `ejc3/imagine` the same way: by repository.
+
+- **Registration, labels and routing.** Its hosts register to `https://github.com/ejc3/constellation` only, with a token
+  asked of `POST /repos/ejc3/constellation/actions/runners/registration-token`; the front routes `ejc3/constellation` here
+  by its full name; a job is served only if every label is in `{self-hosted, linux, x64, constellation, <one size>}`.
+  Its jobs ask for `runs-on: [self-hosted, constellation, xl]` (the Rust suite: c7a.16xlarge, 64 vCPUs) or `l` (32) or
+  `s` (8).
+- **Webhook.** `github_repository_webhook.runner_app_constellation`, made as the administration GitHub App's `ejc3`
+  installation (all of ejc3's repositories, `repository_hooks` write) through `github.agents_md`, as Imagine's is. No
+  owner step.
+- **Gate.** `constellation_token_ready` (starts false) keeps the token read, the controller entry, the hook, the budget
+  bucket and the alarms out of every plan until `github-runner/repo-pat/ejc3/constellation` has a value. Set its default
+  to true in a commit, never with `-var`.
+- **Cap and cost.** Its own [budget bucket](#budget-buckets), `constellation`, $50 a day: 512 vCPUs and 64 hosts while it
+  is healthy (8 `xl` at once), 4 hosts and 74 vCPUs while it is throttled (one `xl`, or two `l`, at a time). A Rust job on
+  `xl` costs $1.74 an hour at the bucket's constants, so a full bucket ($100) pays for about 57 `xl`-hours, and a day's
+  refill for about 29. Alarms: `too-many-app-runners-constellation`, `too-many-app-runner-vcpus-constellation` and the
+  bucket's `github-app-runner-budget-throttled-constellation` and `-weekly-constellation`. No daily backstop like
+  `imagine-runner-hours-daily`: that alarm predates the buckets, and the weekly alarm watches the same spend.
+- **Image: Canonical's, no prebuilt image.** Bootstrap gives build-essential (the `cc` linker Rust needs; the workspace's
+  only native dependency is `ring`, which needs nothing more), git, curl, jq, zip and passwordless sudo. The jobs bring the
+  rest with the setup actions they already use: `dtolnay/rust-toolchain` installs rustup when it is missing,
+  `Swatinem/rust-cache` works unchanged, cargo-nextest comes as a prebuilt binary (`taiki-e/install-action`), and
+  `actions/setup-node`, `pnpm/action-setup` and `hashicorp/setup-terraform` bring Node, pnpm and Terraform. `sudo apt-get`
+  works. There is no Docker, so a job with `services:` (the Postgres e2e jobs) stays on GitHub's runners unless Docker
+  is installed during runner bootstrap or included in a prebuilt image before the job starts. A prebuilt
+  `constellation-runner` image ([Prebuilt images](#prebuilt-images)) is the next step only if the measured setup time on
+  these hosts is worth it, as it was for Imagine.
+- **Token.** The repo's own PAT (`github-runner/repo-pat/ejc3/constellation`): fine-grained, resource owner `ejc3`, only
+  `ejc3/constellation`, Administration read and write, Actions read-only. It is in `runner_app_github_app_repos`, so it
+  takes the runners app's token instead once the app has an `ejc3` installation selecting only `imagine` and
+  `constellation`. That needs the app made public first (it is private to `dolphin-labs-hq`, above). Making it public lets
+  any account install it; the controller mints only from the installation ids in `github-app/runners`, and refuses one
+  that covers anything outside `APP_INSTALLATION_REPOS` (`check_installation_scope`).
+- **Must stay private** while these runners serve it, like every Pattern C repo (Threat model, below).
+- **macOS.** The `swift` job runs on GitHub's `macos-15`; these pools are x86 Linux only.
 
 ### Prebuilt images
 
@@ -1181,7 +1230,7 @@ reviewed Terraform removal plan after both acceptance stages pass.
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
-| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller) and administration only (resource policy; fcvm's metal controller, `github-runner-lambda-role`, never reads them); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs); `ejc3/imagine`'s needs no `Webhooks`, its hook is the administration app's. Never in TF state: Terraform manages no version |
+| **Per-repo controller PATs** | `github-runner/repo-pat/<owner>/<repo>`, Secrets Manager `us-west-1`, container only (`runner-repos.tf`) | GitHub-issued, stored in AWS | `github-app-runner-lambda` (Pattern C's controller) and administration only (resource policy; fcvm's metal controller, `github-runner-lambda-role`, never reads them); runner instances have no Secrets Manager access | manual, by each repo's owner; fine-grained, one repo, `Administration` + `Webhooks` read-write, `Actions` read-only (queued runs and jobs); `ejc3/imagine`'s and `ejc3/constellation`'s need no `Webhooks`, their hooks are the administration app's. Never in TF state: Terraform manages no version |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
@@ -1323,7 +1372,7 @@ Still open (accepted for now):
 ## Threat model: runners for other repos
 
 Runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, its downstream
-`dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps` and `ejc3/imagine` (Pattern C,
+`dolphin-labs-hq/dolphin-films`, `dolphin-labs-hq/dolphin-maps`, `ejc3/imagine` and `ejc3/constellation` (Pattern C,
 `runner-app.tf`, `runner-app/`, `runner-repos.tf`; the controller is #172, applied 2026-09-27) are the
 second place people outside the owner run code on AWS resources we manage. Every writer on
 those repos, and every bot that opens pull requests there (for example
@@ -1359,13 +1408,13 @@ admits SSH only from itself and the operator addresses.
 **Cost limits.** Each repo may run at most its cap of VMs at once, enforced by the controller before every launch: for
 the budgeted repos the cap their [budget bucket](#budget-buckets) allows (64 hosts and 512 vCPUs in burst; throttled, the old host
 caps and the group's refill-rate vCPU cap), for colton-games 8. Each bucket bounds its group's spend to $50 a day on
-average, about $150 in any one day, and about $50 a day while throttled. `too-many-app-runners` fires when the total stays above the sum of the burst ceilings (264) for 15 minutes: it
+average, about $150 in any one day, and about $50 a day while throttled. `too-many-app-runners` fires when the total stays above the sum of the burst ceilings (264; 328 with constellation) for 15 minutes: it
 detects the controller launching past its caps, not the caps being reached. The reconcile terminates any VM older than
 3 hours, but only while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own shutdown,
 and if the reconcile stops, `github-app-runner-errors` or `github-app-runner-reconcile-silent` fires and the VM runs
 until someone terminates it. A bucket that stops being updated stops launches too, since every launch decision updates
 it first. With reaping working, the hourly worst case is about 2,900 vCPUs at once (Imagine 512, the dolphin repos about
-1,900, colton-games 512), about $80 an hour. Each bucket's projection lets its share of that through only while its level
+1,900, colton-games 512), about $80 an hour; once constellation is served, about 3,400 vCPUs and $95 an hour. Each bucket's projection lets its share of that through only while its level
 covers two hours of it, so the rate falls as the levels do.
 
 **Shutting it off**
@@ -1385,7 +1434,8 @@ covers two hours of it, so the rate falls as the levels do.
    -target='github_repository_webhook.runner_app_dolphin_labs[0]'
    -target='github_repository_webhook.runner_app_dolphin_films[0]'
    -target='github_repository_webhook.runner_app_dolphin_maps[0]'
-   -target='github_repository_webhook.runner_app_imagine[0]'`, then commit
+   -target='github_repository_webhook.runner_app_imagine[0]'
+   -target='github_repository_webhook.runner_app_constellation[0]'`, then commit
    `enable_runner_app_webhooks` defaulting to `false` and apply. Setting the variable first
    does not work: it also drops the token reads, so the providers have no credentials to
    delete with. The repo's owner can instead revoke its controller token in GitHub, which
@@ -1439,7 +1489,7 @@ operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
 **Open gaps, most severe first**
 
 1. The controller tokens expire: `colton-games` 2027-09-27 (renewed 2026-09-27),
-   `dolphin-labs` 2027-09-28, `dolphin-films` and `imagine` a year after each is minted (record the date here).
+   `dolphin-labs` 2027-09-28, `dolphin-films`, `imagine` and `constellation` a year after each is minted (record the date here).
    That repo's runners stop registering when its token expires;
    renew each before then (Regenerate in GitHub keeps its permissions).
 

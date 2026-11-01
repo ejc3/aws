@@ -2,8 +2,8 @@
 #
 # Self-hosted runners for repos other than ejc3/fcvm. Today the runner system serves exactly
 # one repo on bare metal; CoderColton/colton-games, dolphin-labs-hq/dolphin-labs,
-# dolphin-labs-hq/dolphin-films, dolphin-labs-hq/dolphin-maps and ejc3/imagine are on ordinary
-# x86 spot instances (their jobs need no KVM).
+# dolphin-labs-hq/dolphin-films, dolphin-labs-hq/dolphin-maps, ejc3/imagine and ejc3/constellation are on
+# ordinary x86 spot instances (their jobs need no KVM).
 #
 # STEP 1 (this file, for now): each repo's controller token. A runner registration token needs
 # repo ADMIN, so each repo's owner mints a fine-grained token limited to that one repo with
@@ -18,6 +18,7 @@
 #   ejc3/imagine                   minted by ejc3, Administration RW + Actions read only: its hook
 #                                  is made by the administration GitHub App, not with this token.
 #                                  Never fcvm's /github-runner/pat, which is limited to ejc3/fcvm.
+#   ejc3/constellation             minted by ejc3, the same as ejc3/imagine's (its hook is the administration app's too)
 #
 # CONTAINER ONLY, deliberately not an SSM parameter. Terraform creates the secret and never a
 # version, so it never reads the value and the token cannot land in state. (An
@@ -30,7 +31,7 @@
 # Only administration and Pattern C's controller (runner_app_lambda) may read it; fcvm's metal controller never does. The runner INSTANCE role has no
 # Secrets Manager access at all, so a CI job cannot read it either.
 locals {
-  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family", "ejc3/imagine"]
+  runner_extra_repos = ["CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family", "ejc3/imagine", "ejc3/constellation"]
 }
 
 resource "aws_secretsmanager_secret" "github_runner_repo_pat" {

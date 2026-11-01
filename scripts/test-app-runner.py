@@ -46,6 +46,10 @@ REPOS = {
     DOLPHIN: {"label": "dolphin", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{DOLPHIN}", "sizes": SIZES, "vcpus": VCPUS},
     IMAGINE: {"label": "imagine", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{IMAGINE}", "sizes": SIZES, "vcpus": VCPUS},
 }
+# ejc3/constellation: a second ejc3 repo beside imagine, served only once its token gate is on (ConstellationTests).
+CONSTELLATION = "ejc3/constellation"
+CONSTELLATION_CFG = {"label": "constellation", "max": 3, "max_vcpus": None, "pat_secret": f"github-runner/repo-pat/{CONSTELLATION}",
+                     "sizes": SIZES, "vcpus": VCPUS}
 SUBNETS = [{"subnet_id": "subnet-c", "availability_zone": "us-west-1c"},
            {"subnet_id": "subnet-a", "availability_zone": "us-west-1a"}]
 ENV = {"REPOS": json.dumps(REPOS), "LAUNCH_SUBNETS": json.dumps(SUBNETS), "SECURITY_GROUP_ID": "sg-app",
@@ -2258,6 +2262,17 @@ class BudgetLaunchTests(unittest.TestCase):
         ec2.instances += aged(DOLPHIN, ["s"] * 8, 5)
         self.assertEqual(self.ensure(app, FILMS, 9, "s")[0], "launched")
 
+    def test_a_group_whose_only_repo_is_gated_off_has_no_bucket_and_withholds_no_total(self):
+        # constellation's group is in BUDGET_GROUPS from the first apply, while constellation_token_ready keeps the repo out
+        # of REPOS: no bucket is read or written for it, no metric is published for it, and the Repo=ALL total still is.
+        app, ec2 = load_budget_app(dict(GROUPS, constellation=dict(GROUP, throttled_vcpus=74)))
+        self.reconcile(app)
+        self.assertEqual(sorted(set(app.fake_dynamo.bucket_reads)), ["dolphin", "imagine"])
+        self.assertNotIn("constellation", app.fake_dynamo.buckets)
+        _, data = app.fake_cloudwatch.metrics[-1]
+        self.assertNotIn("constellation", {d["Dimensions"][0]["Value"] for d in data})
+        self.assertIn({"Name": "Repo", "Value": "ALL"}, [d["Dimensions"][0] for d in data if d["MetricName"] == "LiveRunners"])
+
     def test_colton_games_is_in_no_bucket_and_keeps_its_own_cap(self):
         app, ec2 = load_budget_app()
         ec2.instances += aged(COLTON, ["xl"] * 3, 5)
@@ -2358,6 +2373,54 @@ class BudgetTerraformTests(unittest.TestCase):
         self.assertIn("dims = [{'Name': 'Group', 'Value': state['group']}]", source)
         # The per-repo alarms watch the burst ceilings: a burst within them is the bucket's to allow.
         self.assertIn("peak_max = contains(keys(local.runner_app_budget_group), repo) ? min(c.max, local.runner_budget[local.runner_app_budget_group[repo]].burst_max) : c.max", APP_TF)
+
+
+class ConstellationTests(unittest.TestCase):
+    """ejc3/constellation, served the way ejc3/imagine is: its own label, registration, token, caps and budget bucket."""
+
+    def deliver(self, app, repo, labels, job=21):
+        return app.handler({"repo": repo, "action": "queued", "workflow_job": {"id": job, "labels": list(labels)}}, None)
+
+    def served(self):
+        tokens = {f"github-runner/repo-pat/{r}": f"PAT-{r.split('/')[1].upper()}" for r in (COLTON, DOLPHIN, IMAGINE, CONSTELLATION)}
+        app, ec2, ssm, secrets = load_app(tokens=tokens)
+        patch = mock.patch.dict(os.environ, {"REPOS": json.dumps(dict(REPOS, **{CONSTELLATION: CONSTELLATION_CFG}))})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return app, ec2, secrets
+
+    def test_an_xl_job_gets_a_64_vcpu_host_registered_to_constellation_alone(self):
+        app, ec2, secrets = self.served()
+        self.assertEqual(self.deliver(app, CONSTELLATION, ("self-hosted", "constellation", "xl"))["outcome"], "launched")
+        (kw,) = ec2.launched
+        self.assertEqual(kw["InstanceType"], "c7a.16xlarge")
+        tags = {t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}
+        self.assertEqual((tags["Repo"], tags["JobId"], tags["Size"], tags["Vcpus"]), (CONSTELLATION, "21", "xl", "64"))
+        self.assertIn(("POST", f"/repos/{CONSTELLATION}/actions/runners/registration-token", "PAT-CONSTELLATION"), app.github.calls)
+        self.assertEqual(secrets.read, [f"github-runner/repo-pat/{CONSTELLATION}"])
+        self.assertFalse([c for c in app.github.calls if not c[1].startswith(f"/repos/{CONSTELLATION}/")], app.github.calls)
+        self.assertIn(f"REPO='{CONSTELLATION}'", kw["UserData"])
+        self.assertIn("LABELS='constellation,xl'", kw["UserData"])
+
+    def test_its_labels_and_imagines_never_select_each_other_nor_fcvms(self):
+        app, ec2, _ = self.served()
+        for repo, labels in ((CONSTELLATION, ("self-hosted", "imagine", "l")), (IMAGINE, ("self-hosted", "constellation", "l")),
+                             (CONSTELLATION, ("self-hosted", "constellation", "ARM64")), (CONSTELLATION, ("self-hosted", "X64"))):
+            self.assertEqual(self.deliver(app, repo, labels), {"ignored": "labels"}, (repo, labels))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.deliver(app, FCVM, ("self-hosted", "constellation", "xl")), {"ignored": "repo"})
+        self.assertEqual(ec2.launched, [])
+
+    def test_served_like_imagine_with_its_own_bucket_and_canonicals_image(self):
+        rows = dict(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*(\{ label[^\n]*\})', APP_TF, re.M))
+        self.assertEqual(rows[CONSTELLATION], '{ label = "constellation", max = 64, throttled_max = 4 }')
+        groups = re.search(r"runner_budget_groups = \{(.*?)\n  \}", APP_TF, re.S).group(1)
+        self.assertIn('constellation = { daily_usd = 50, repos = ["ejc3/constellation"] }', groups)
+        self.assertEqual(groups.count(CONSTELLATION), 1, "in one bucket only, its own")
+        # Throttled, the group holds its refill's worth of vCPUs: floor((50 / 24 - 4 x 0.016) / 0.027) = 74.
+        self.assertEqual(math.floor((50 / 24 - 4 * 0.016) / 0.027), 74)
+        tokens = re.findall(r'"([^"]+/[^"]+)"', re.search(r"runner_extra_repos = \[([^\]]+)\]", REPOS_TF).group(1))
+        self.assertIn(CONSTELLATION, tokens)
 
 
 class RunnersAppTokenTests(unittest.TestCase):
@@ -2501,6 +2564,23 @@ class RunnersAppTokenTests(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "/app/installations/888/access_tokens"))
         self.assertEqual(body["repositories"], ["imagine"], "narrowed to imagine, never every ejc3 repository")
 
+    def test_an_ejc3_installation_selecting_imagine_and_constellation_mints_a_token_for_each_alone(self):
+        # What the operator installs on ejc3 (GITHUB-RUNNERS.md, "ejc3/constellation"): only imagine and constellation.
+        # The allowed set is runner-app.tf's own list, so dropping constellation from it would refuse this installation.
+        scopes = dict(self.SCOPES, **{"888": ("ejc3", "selected", ["ejc3/imagine", CONSTELLATION])})
+        both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
+                           "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
+        app, calls, _ = self.app_with(both, scopes=scopes)
+        listed = re.findall(r'"([^"]+)"', re.search(r"runner_app_github_app_repos = \[(.*?)\]", APP_TF).group(1))
+        os.environ["APP_INSTALLATION_REPOS"] = json.dumps(listed)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(app.repo_pat(dict(CONSTELLATION_CFG, app_repo=CONSTELLATION)), "ghs_minted", out.getvalue())
+            self.assertEqual(app.repo_pat(dict(REPOS[IMAGINE], app_repo=IMAGINE)), "ghs_minted", out.getvalue())
+        self.assertEqual([(m, p, b["repositories"]) for m, p, b in calls],
+                         [("POST", "/app/installations/888/access_tokens", ["constellation"]),
+                          ("POST", "/app/installations/888/access_tokens", ["imagine"])])
+
     def test_a_failed_mint_falls_back_to_the_pat_and_says_why(self):
         def mint(*a):
             raise RuntimeError("GitHub 502")
@@ -2611,11 +2691,11 @@ class RunnersAppTokenTests(unittest.TestCase):
 class RunnersAppTerraformTests(unittest.TestCase):
     TF = (ROOT / "runner-app.tf").read_text()
 
-    def test_exactly_the_dolphin_repos_and_imagine_take_app_tokens_and_colton_keeps_its_pat(self):
+    def test_exactly_the_dolphin_repos_imagine_and_constellation_take_app_tokens_and_colton_keeps_its_pat(self):
         m = re.search(r"runner_app_github_app_repos = \[(.*?)\]", self.TF)
         repos = re.findall(r'"([^"]+)"', m.group(1))
         self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps",
-                                         "ejc3/imagine"])
+                                         "ejc3/constellation", "ejc3/imagine"])
         self.assertNotIn(COLTON, repos)
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
         self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")

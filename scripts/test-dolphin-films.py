@@ -174,6 +174,15 @@ class WebhookGateTests(unittest.TestCase):
         self.assertIn("period              = 3600", alarm)
         self.assertIn('statistic           = "Average"', alarm)
 
+    def test_constellation_has_the_same_gate_starting_closed_and_its_hook_is_made_as_the_admin_apps_ejc3_installation(self):
+        # Closed until ejc3 has stored its token: an empty secret read would fail every plan.
+        gate = re.search(r'variable "constellation_token_ready" \{.*?\n\}', RUNNER_APP, re.S).group()
+        self.assertIn("default     = false", gate)
+        self.assertIn("constellation_webhook = local.runner_app_webhooks && var.constellation_token_ready", RUNNER_APP)
+        self.assertIn('"ejc3/constellation" = var.constellation_token_ready', RUNNER_APP)
+        hook = re.search(r'resource "github_repository_webhook" "runner_app_constellation" \{.*?\n  count\s+= (.*?)\n  provider\s+= (.*?)\n  repository = (.*?)\n', RUNNER_APP, re.S)
+        self.assertEqual(hook.groups(), ("local.constellation_webhook ? 1 : 0", "github.agents_md", '"constellation"'))
+
     def test_the_other_repos_keep_the_global_gate_only(self):
         self.assertIn("count      = local.runner_app_webhooks ? 1 : 0", RUNNER_APP)
         self.assertIn('runner_repo_pat["CoderColton/colton-games"]', RUNNER_APP)
