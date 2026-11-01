@@ -177,9 +177,27 @@ class Publisher:
         ids = [journal["slots"][slot].get("instance_id", "") for slot in sorted(SLOTS)]
         need(len(set(ids)) == 4 and all(re.fullmatch(r"i-[0-9a-f]{17}", item) for item in ids),
              "broker has no four distinct instance receipts")
-        rows = [item for group in self.client("ec2", True).describe_instances(InstanceIds=ids)["Reservations"] for item in group["Instances"]]
-        need({item["InstanceId"] for item in rows} == set(ids)
-             and all(item["State"]["Name"] == "terminated" for item in rows), "factory instances are not all terminated")
+        slots = {journal["slots"][slot]["instance_id"]: slot for slot in SLOTS}
+        need(all(entry.get("attempted") is True and entry.get("terminated_seen") is True
+                 and not entry.get("no_instance") and not entry.get("rejected")
+                 for entry in journal["slots"].values()), "broker has no durable termination proof for every slot")
+        # Filters safely omit expired IDs; API errors still fail the publication.
+        reservations = self.client("ec2", True).describe_instances(Filters=[{"Name": "instance-id", "Values": ids}])["Reservations"]
+        seen = set()
+        for reservation in reservations:
+            for item in reservation["Instances"]:
+                instance_id = item["InstanceId"]
+                need(instance_id in slots and instance_id not in seen, "unexpected factory instance metadata")
+                seen.add(instance_id)
+                tags = {tag["Key"]: tag["Value"] for tag in item.get("Tags", [])}
+                slot = slots[instance_id]
+                need(reservation.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+                     and item["State"]["Name"] == "terminated"
+                     and item.get("InstanceType") == {"host": "g4dn.metal", "tile": "g4dn.xlarge"}[slot.split("-", 1)[0]]
+                     and tags.get("Purpose") == "fcvm-fleet-ami-builder"
+                     and tags.get("FactoryBuild") == digest(self.build_id) and tags.get("FactorySlot") == slot
+                     and ("IamInstanceProfile" not in item or item["IamInstanceProfile"].get("Arn") == self.env["BUILDER_PROFILE"]),
+                     "instance metadata contradicts its recorded termination")
         key = "runs/" + digest(self.build_id) + "/manifest.json"
         response = self.client("s3").get_object(Bucket=self.env["PIPELINE_BUCKET"], Key=key)
         raw = response["Body"].read(32769)

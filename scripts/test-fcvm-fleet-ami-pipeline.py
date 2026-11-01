@@ -146,9 +146,11 @@ class EC2:
                 rows = [i for i in rows if {t["Key"]: t["Value"] for t in i["Tags"]}.get(key) in f["Values"]]
             elif f["Name"] == "instance-state-name":
                 rows = [i for i in rows if i["State"]["Name"] in f["Values"]]
+            elif f["Name"] == "instance-id":
+                rows = [i for i in rows if i["InstanceId"] in f["Values"]]
             else:
                 raise AssertionError("unexpected fixture filter")
-        return {"Reservations": [{"Instances": copy.deepcopy(rows)}]}
+        return {"Reservations": [{"OwnerId": self.env["FLEET_ACCOUNT"], "Instances": copy.deepcopy(rows)}]}
 
     def describe_images(self, ImageIds=None, Filters=None, **kwargs):
         rows = [self.images[i] for i in ImageIds] if ImageIds else list(self.images.values())
@@ -534,6 +536,85 @@ class FactoryTests(unittest.TestCase):
                 self.assertEqual(case.fleet_ssm.commands, [])
                 self.assertEqual(case.ec2.terminations, [])
                 self.assertEqual(len(case.ec2.launches), 1)
+
+    def test_expired_early_builders_allow_verification_and_full_final_cleanup(self):
+        for kind in ("host", "tile"):
+            image = self.seal(kind + "-build")
+            instance_id = image["instance_id"]
+            self.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+            self.call("status", kind + "-build")  # Persist the actual observed termination.
+            del self.ec2.instances[instance_id]
+        self.time += 3701
+        try:
+            for kind in ("host", "tile"):
+                instance_id = self.call("launch", kind + "-verify")["instance_id"]
+                self.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+                self.call("status", kind + "-verify")
+            result = self.call("cleanup")
+        except mod.Refused as error:
+            self.fail("expired metadata blocked the known terminated builders: " + str(error))
+        self.assertEqual(set(result["slots"]), set(mod.SLOTS))
+        self.assertTrue(all(value["state"] == "terminated" for value in result["slots"].values()))
+        status = self.call("status")
+        self.assertTrue(all(value["state"] == "terminated" for value in status["slots"].values()))
+        self.assertEqual((len(self.ec2.launches), self.ec2.terminations), (4, []))
+
+    def test_absent_instance_requires_a_strict_recorded_termination(self):
+        for variant in ("missing", "false", "string", "attempted-false", "attempted-string", "invalid-id", "no-instance", "rejected"):
+            with self.subTest(variant=variant):
+                case = FactoryTests(); case.setUp()
+                instance_id = case.launch()
+                case.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+                case.call("status", "host-build")
+                del case.ec2.instances[instance_id]
+                suffix, journal = case.factory.journal(BUILD)
+                entry = journal["slots"]["host-build"]
+                if variant == "missing": entry.pop("terminated_seen")
+                elif variant == "false": entry["terminated_seen"] = False
+                elif variant == "string": entry["terminated_seen"] = "true"
+                elif variant == "attempted-false": entry["attempted"] = False
+                elif variant == "attempted-string": entry["attempted"] = "true"
+                elif variant == "invalid-id": entry["instance_id"] = "not-an-instance"
+                elif variant == "no-instance": entry["no_instance"] = True
+                else: entry["rejected"] = True
+                case.factory.save(suffix, journal)
+                self.assertNotEqual(case.call("status", "host-build")["state"], "terminated")
+                self.assertFalse(case.factory.gone(suffix, journal))
+                self.assertEqual((len(case.ec2.launches), case.ec2.terminations), (1, []))
+
+    def test_recorded_termination_never_masks_returned_conflicting_rows(self):
+        for variant in ("running", "stopped", "shutting-down", "wrong-type", "wrong-profile", "empty-profile",
+                        "Purpose", "FactoryBuild", "FactorySlot", "wrong-id", "wrong-owner"):
+            with self.subTest(variant=variant):
+                case = FactoryTests(); case.setUp()
+                instance_id = case.launch()
+                case.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+                case.call("status", "host-build")
+                original = case.ec2.describe_instances
+                def contradict(**arguments):
+                    reply = original(**arguments)
+                    reservation = reply["Reservations"][0]
+                    row = reservation["Instances"][0]
+                    if variant in ("running", "stopped", "shutting-down"): row["State"]["Name"] = variant
+                    elif variant == "wrong-type": row["InstanceType"] = "g4dn.xlarge"
+                    elif variant == "wrong-profile": row["IamInstanceProfile"] = {"Arn": "foreign"}
+                    elif variant == "empty-profile": row["IamInstanceProfile"] = {}
+                    elif variant == "wrong-id": row["InstanceId"] = "i-" + "f" * 17
+                    elif variant == "wrong-owner": reservation["OwnerId"] = "foreign"
+                    else: next(t for t in row["Tags"] if t["Key"] == variant)["Value"] = "foreign"
+                    return reply
+                with patch.object(case.ec2, "describe_instances", side_effect=contradict):
+                    with self.assertRaises(mod.Refused): case.call("status", "host-build")
+                    with self.assertRaises(mod.Refused): case.call("cleanup")
+                self.assertEqual((len(case.ec2.launches), case.ec2.terminations), (1, []))
+
+    def test_termination_receipt_does_not_swallow_ec2_errors(self):
+        instance_id = self.launch()
+        self.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+        self.call("status", "host-build")
+        with patch.object(self.ec2, "describe_instances", side_effect=RuntimeError("AccessDenied")):
+            with self.assertRaisesRegex(RuntimeError, "AccessDenied"): self.call("status", "host-build")
+        self.assertEqual((len(self.ec2.launches), self.ec2.terminations), (1, []))
 
     def test_successful_build_is_redriven_after_busy_lock_and_status_polls_are_throttled(self):
         self.succeed()
