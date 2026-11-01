@@ -460,11 +460,17 @@ class Doctor:
 
     def reconcile_operations(self, case):
         # Existing command observation is independent of the worker/model lease.
-        for operation_id in list(case.get('outstanding_operations', [])):
+        operations = set(case.get('outstanding_operations', []))
+        pointer = self.store.get('host-operation') or {}
+        if pointer.get('case_id') == case['case_id']:
+            operations.add(pointer['operation_id'])
+        for operation_id in sorted(operations):
             key = self.operation(case, operation_id)
             op = self.store.get(key)
             require(op and case['operations'].get(operation_id) == key)
-            if op['state'] == 'prepared':
+            if op['state'] == 'terminal':
+                self.archive_terminal(case, key, op, {'status': op['status']})
+            elif op['state'] == 'prepared':
                 if self.build(op['build_id'])['buildStatus'] not in BUILD_TERMINAL:
                     continue
                 # Prepared proves SendCommand was never attempted. Do not replay it.

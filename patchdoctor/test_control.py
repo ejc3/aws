@@ -314,6 +314,53 @@ class Tests(unittest.TestCase):
         self.doctor.broker(self.command(other))
         self.assertEqual(len(self.cloud.sends), 2)
 
+    def test_terminal_cleanup_recovers_both_crash_cuts_without_ssm_or_rearchive(self):
+        class Cut(BaseException):
+            pass
+        for cut in ('after-terminal-write', 'after-index-clear'):
+            with self.subTest(cut=cut):
+                memory, cloud = Memory(), Cloud()
+                doctor = C.Doctor(ENV, memory, cloud.client, lambda: self.clock)
+                memory.put('config', {'armed': True})
+                case_id = doctor.handler(self.event)['admitted'][0]
+                case = memory.get('case#' + case_id)
+                cloud.fail_audit = True
+                with self.assertRaises(TimeoutError):
+                    doctor.broker(self.command(case))  # Prepared, but never sent.
+                cloud.fail_audit = False
+                case = memory.get('case#' + case_id)
+                case.update(attempts=2, reserved_usd=50)
+                doctor.save(case)
+                cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+                op_key = doctor.operation(case, 'patch-version-1')
+                original = memory.put
+                def crash_after_durable_write(key, value):
+                    result = original(key, value)
+                    if ((cut == 'after-terminal-write' and key == op_key and value.get('state') == 'terminal')
+                            or (cut == 'after-index-clear' and key == 'case#' + case_id
+                                and value.get('outstanding_operations') == [])):
+                        raise Cut()
+                    return result
+                memory.put = crash_after_durable_write
+                with self.assertRaises(Cut):
+                    doctor.reconcile()
+                memory.put = original
+                terminal = memory.get(op_key)
+                self.assertEqual(terminal['state'], 'terminal')
+                self.assertIn(terminal['receipt_key'], cloud.objects)
+                self.assertNotIn('command_id', terminal)
+                self.assertEqual(memory.get('host-operation')['case_id'], case_id)
+                with patch.object(cloud, 'list_commands', wraps=cloud.list_commands) as listing, \
+                        patch.object(cloud, 'get_command_invocation', wraps=cloud.get_command_invocation) as invocation, \
+                        patch.object(cloud, 'put_object', wraps=cloud.put_object) as archive:
+                    doctor.reconcile()
+                    self.assertFalse((memory.get('host-operation') or {}).get('case_id'))
+                    self.assertEqual(memory.get('case#' + case_id).get('outstanding_operations'), [])
+                    self.assertEqual((listing.call_count, invocation.call_count, archive.call_count), (0, 0, 0))
+                self.assertEqual(memory.get(op_key), terminal)
+                self.assertEqual(len(cloud.starts), 1)
+                self.assertEqual(cloud.sends, [])
+
     def test_fixed_inspect_still_checks_host_after_native_closure_without_new_mutation(self):
         case = self.admit()
         self.cloud.finding['status'] = 'CLOSED'
