@@ -350,10 +350,11 @@ in `fcvm-fleet-ami-pipeline.tf`. Successful `ejc3/fcvm` main CI requests immutab
 source builds; routine changes batch for six hours, at most once per UTC day, with
 a weekly refresh. Critical-labelled merges and a main `critical` dispatch start
 immediately after validation and can preempt a routine build once its builders are
-terminated. Each job has a 150-minute deadline, at most one `g4dn.metal` host and
+terminated. Each job has a 240-minute deadline, at most one `g4dn.metal` host and
 one `g4dn.xlarge` tile active, and four total build/validation slots. An independent
-five-minute expiry sweep bounds abandoned compute. EBS, snapshots and transfer
-remain additional to the per-build compute limit.
+five-minute expiry sweep bounds abandoned compute. At the current instance rates,
+four hours plus the expiry sweep is about $35 of compute; EBS, snapshots, CodeBuild
+and transfer remain additional. Individual SSM commands remain capped at 150 minutes.
 
 GitHub receives only a main-environment request/status role. Fixed AWS handlers
 launch the bounded slots and issue job-bound worker credentials; CI cannot read
@@ -388,7 +389,7 @@ Each manual critical dispatch gets a fresh request identity, allowing a controll
 same-source retry without resetting a failed request or replaying uncertain launches.
 The five-minute reconciler retries successful-build publication outside the backend
 lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
-This publication interval never extends the 150-minute compute lease.
+This publication interval never extends the 240-minute compute lease.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|

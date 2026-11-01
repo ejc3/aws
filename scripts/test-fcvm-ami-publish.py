@@ -237,7 +237,7 @@ class PublisherTests(unittest.TestCase):
             "host_amis": {"us-east-1": {"x86_64": old["host"]}}, "tile_amis": {"us-east-1": {"x86_64": old["tile"]}}, "versions": {}, "previous": None}
         self.fleet_ssm.values["/release"] = release
         journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
-                   "deadline_unix": int(start.timestamp()) + 9000, "slots": {}, "candidates": new}
+                   "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
             instance = "i-" + format(i, "017x")
             journal["slots"][slot] = {"instance_id": instance}
@@ -335,6 +335,33 @@ class PublisherTests(unittest.TestCase):
             template = self.ec2.templates[item["id"]]
             self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"], {
                 **template["versions"][1]["LaunchTemplateData"], "ImageId": self.new[item["kind"]]})
+
+    def test_success_after_150_minutes_and_at_exactly_240_can_publish(self):
+        for seconds in (9001, 14400):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=seconds)
+                try:
+                    result = self.publisher().run(self.event)
+                except MODULE.Refused as error:
+                    self.fail("the approved 240-minute build was refused: " + str(error))
+                self.assertEqual(result, {"status": "promoted", "generation": 1})
+                self.assertEqual(len(self.ec2.created), 4)
+
+    def test_overlong_or_mismatched_execution_lease_cannot_change_templates(self):
+        for case in ("elapsed-over-240", "old-journal", "extended-journal"):
+            with self.subTest(case=case):
+                self.setUp()
+                if case == "elapsed-over-240":
+                    self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=14401)
+                else:
+                    journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+                    journal["deadline_unix"] = int(self.codebuild.value["startTime"].timestamp()) + (9000 if case == "old-journal" else 14401)
+                    self.manifest["deadline_unix"] = journal["deadline_unix"]
+                    self.update_manifest()
+                with self.assertRaises(MODULE.Refused):
+                    self.publisher().run(self.event)
+                self.assertEqual((self.ec2.created, self.assets.copies), ([], []))
 
     def test_event_and_actual_build_must_both_be_successful(self):
         self.event["detail"]["build-status"] = "FAILED"

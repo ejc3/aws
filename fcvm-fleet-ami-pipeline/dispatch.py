@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
 VOLUMES = {"host": 64, "tile": 32}
-DEADLINE_SECONDS = 150 * 60
+DEADLINE_SECONDS = 240 * 60
 PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")

@@ -652,6 +652,34 @@ class FactoryTests(unittest.TestCase):
         self.call("cleanup")
         self.assertEqual(self.ec2.terminations, [[instance_id]])
 
+    def test_global_lease_survives_150_minutes_and_expires_at_exactly_240(self):
+        instance_id = self.launch()
+        self.time = NOW + 9001
+        try:
+            self.call("credentials")
+        except mod.Refused:
+            self.fail("the approved 240-minute lease expired at the old 150-minute limit")
+        self.factory.tick()
+        self.assertEqual((self.cb.stops, self.ec2.terminations), ([], []))
+        self.assertEqual(self.factory.journal(BUILD)[1]["deadline_unix"], NOW + 14400)
+        self.time = NOW + 14400
+        issued = len(self.sts.calls)
+        with self.assertRaises(mod.Refused):
+            self.call("credentials")
+        self.assertEqual(len(self.sts.calls), issued)
+        self.factory.tick()
+        self.assertEqual(self.cb.stops, [BUILD])
+        self.assertIn(instance_id, [name for batch in self.ec2.terminations for name in batch])
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_codebuild_global_timeout_keeps_the_separate_command_ceiling(self):
+        text = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertRegex(text, r"fcvm_ami_build_minutes\s*=\s*240\b")
+        self.assertRegex(text, r"build_timeout\s*=\s*local\.fcvm_ami_build_minutes")
+        document = re.search(r'^resource "aws_ssm_document" "fcvm_ami_build" \{\n.*?^\}', text, re.S | re.M).group()
+        self.assertIn('default = "9000"', document)
+        self.assertIn('allowedPattern = "^([1-9][0-9]{0,2}|[1-8][0-9]{3}|9000)$"', document)
+
     def test_sealing_cannot_mark_an_image_runtime_validated(self):
         self.seal()
         tags = {t["Key"]: t["Value"] for t in self.ec2.seals[0]["TagSpecifications"][0]["Tags"]}
