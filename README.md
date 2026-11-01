@@ -174,6 +174,22 @@ Free covers this small deployment. Apple push-certificate setup and iPhone enrol
 consent are one-time owner actions; renew the Apple certificate yearly. Never mark a
 phone or Mac verified until its real SSH and Prompt transport checks succeed.
 
+The administration transport uses a dedicated outbound Cloudflare connector on
+the primary jumpbox. Gateway admits only the owner on TCP 22 and 2022 to the five
+fleet EIPs; all other users and ports to those destinations are blocked. Private
+routes are advertised only after the connector starts and those policies exist.
+This does not change the account's device-wide VPN profile or existing SSH routes.
+
+For Mac SSH, the same connector exposes owner-gated hostnames
+`jumpbox-admin-ssh.cc-games.dev`, `jumpbox2-admin-ssh.cc-games.dev`,
+`arm-admin-ssh.cc-games.dev`, `x86-admin-ssh.cc-games.dev` and
+`nextjs-admin-ssh.cc-games.dev`. Use `cloudflared access ssh --hostname %h` as
+the SSH ProxyCommand in additional aliases, retaining the existing user and key.
+These Access aliases carry SSH; Prompt's Eternal Terminal uses its separately
+managed per-app route on TCP 2022. Keep the original Mac aliases until both paths
+are proven. An active dedicated connector refuses changed configuration rather
+than silently restarting; a necessary restart requires the owner's approval.
+
 ## Prerequisites
 
 ### Existing deployment
