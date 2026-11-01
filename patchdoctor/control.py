@@ -108,6 +108,8 @@ class Store:
 class Doctor:
     def __init__(self, env=None, store=None, clients=client, clock=time.time):
         self.env = os.environ if env is None else env
+        self.worker_revision = self.env.get('SELF_TEST_REVISION')
+        require(self.worker_revision is None or isinstance(self.worker_revision, str) and DIGEST.fullmatch(self.worker_revision))
         self.now, self.clients = clock, clients
         self.region = self.env.get('AWS_REGION', 'us-west-1')
         self.account = self.env['ACCOUNT_ID']
@@ -172,10 +174,14 @@ class Doctor:
             case[marker] = True
             self.save(case)
 
+    def current_self_test_id(self):
+        return digest('PatchDoctor/SELF_TEST' + ('/' + self.worker_revision if self.worker_revision else ''))
+
     def config(self):
         value = self.store.get('config') or {}
         # An older armed record cannot bypass the new two-model commissioning gate.
-        return {**value, 'armed': value.get('armed') is True and value.get('gate_version') == 2}
+        return {**value, 'armed': value.get('armed') is True and value.get('gate_version') == 2
+            and (self.worker_revision is None or value.get('commissioned_worker_revision') == self.worker_revision)}
 
     def triage_input(self, case):
         """Only re-read native Inspector/EC2 facts can establish Ubuntu package identity."""
@@ -247,7 +253,7 @@ class Doctor:
 
     def status(self):
         cfg, cases = self.config(), self.active_cases()
-        return {'connected': True, 'armed': cfg['armed'], 'paused': cfg.get('paused_new_runs') is True,
+        return {'connected': True, 'self_test_case_id': self.current_self_test_id(), 'armed': cfg['armed'], 'paused': cfg.get('paused_new_runs') is True,
             'models': {'doctor': MODEL, 'triage': triage.MODEL},
             'limits': {'worker_minutes': 60, 'attempts_per_case': 2, 'starts_per_day': 4,
                 'model_allowance_usd': 25, 'case_allowance_usd': 50},
@@ -307,12 +313,14 @@ class Doctor:
             result['haiku'] = receipt['haiku_result']
             if action != 'self_test' or receipt['haiku_result'].get('ok') is not True:
                 return result
-            case_id = digest('PatchDoctor/SELF_TEST')
+            case_id = self.current_self_test_id()
             case = self.store.get('case#' + case_id)
             if not case:
                 case = {'case_id': case_id, 'account': self.account, 'region': self.region, 'cve': 'SELF_TEST',
                     'mode': 'self-test', 'status': 'pending', 'created_at': int(self.now()), 'attempts': 0,
                     'reserved_usd': 0, 'operations': {}, 'targets': [], 'findings': []}
+                if self.worker_revision is not None:
+                    case['worker_revision'] = self.worker_revision
                 self.save(case)
             self.reconcile()
             return {**result, 'case_id': case_id, 'armed': self.config()['armed']}
@@ -342,11 +350,16 @@ class Doctor:
         if receipt.get('config_attempted'):
             return {**result, 'state': 'uncertain'}  # A later admin action must never be overwritten.
         if action == 'arm':
-            case = self.store.get('case#' + digest('PatchDoctor/SELF_TEST'))
+            case = self.store.get('case#' + self.current_self_test_id())
             require(case and case.get('status') == 'self-test-passed' and case.get('outcome') == 'self-test-passed'
                 and self.build(case['build_id'])['buildStatus'] == 'SUCCEEDED'
                 and cfg.get('haiku_self_test', {}).get('ok') is True
                 and cfg['haiku_self_test'].get('model') == triage.MODEL)
+            if self.worker_revision is not None:
+                variables = {v['name']: v.get('value') for v in self.build(case['build_id']).get('environment', {}).get('environmentVariables', [])}
+                require(case.get('worker_revision') == self.worker_revision
+                    and variables.get('PATCHDOCTOR_SELF_TEST_REVISION') == self.worker_revision)
+                cfg['commissioned_worker_revision'] = self.worker_revision
             cfg.update(armed=True, gate_version=2, paused_new_runs=False)
         else:
             cfg['paused_new_runs'] = event['paused']
@@ -668,6 +681,11 @@ class Doctor:
             return
         pointer = self.store.get('active-case') or {}
         for case in sorted(observed, key=lambda c: (c['case_id'] != pointer.get('case_id'), c['created_at'])):
+            if case['mode'] == 'self-test' and (case['case_id'] != self.current_self_test_id()
+                    or self.worker_revision is not None and case.get('worker_revision') != self.worker_revision):
+                if case['status'] == 'pending':
+                    self.release('active-case', case['case_id'])  # A crash before start intent may leave only this pointer.
+                continue  # Historical commissioning retains its receipts and budget, but cannot start a new worker.
             if (case['status'] == 'pending' and not case.get('outstanding_operations')
                     and (case['mode'] == 'self-test' or self.config().get('armed') is True)):
                 if case['mode'] != 'self-test':
@@ -745,6 +763,9 @@ class Doctor:
         variables = {v['name']: v.get('value') for v in build.get('environment', {}).get('environmentVariables', [])}
         require(build.get('buildStatus') == 'IN_PROGRESS' and variables.get('PATCHDOCTOR_CASE_ID') == case['case_id']
             and variables.get('PATCHDOCTOR_MODE') == case['mode'])
+        if case['mode'] == 'self-test' and case.get('worker_revision') is not None:
+            require(DIGEST.fullmatch(case['worker_revision'])
+                and variables.get('PATCHDOCTOR_SELF_TEST_REVISION') == case['worker_revision'])
         return case
 
     def require_worker(self, case, event):
