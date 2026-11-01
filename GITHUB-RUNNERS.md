@@ -980,8 +980,8 @@ It is served exactly as Imagine is, and is separated from `ejc3/fcvm` and `ejc3/
   rest with the setup actions they already use: `dtolnay/rust-toolchain` installs rustup when it is missing,
   `Swatinem/rust-cache` works unchanged, cargo-nextest comes as a prebuilt binary (`taiki-e/install-action`), and
   `actions/setup-node`, `pnpm/action-setup` and `hashicorp/setup-terraform` bring Node, pnpm and Terraform. `sudo apt-get`
-  works. There is no Docker, so a job with `services:` (the Postgres e2e jobs) stays on GitHub's runners or installs
-  `docker.io` first. A prebuilt
+  works. There is no Docker, so a job with `services:` (the Postgres e2e jobs) stays on GitHub's runners unless Docker
+  is installed during runner bootstrap or included in a prebuilt image before the job starts. A prebuilt
   `constellation-runner` image ([Prebuilt images](#prebuilt-images)) is the next step only if the measured setup time on
   these hosts is worth it, as it was for Imagine.
 - **Token.** The repo's own PAT (`github-runner/repo-pat/ejc3/constellation`): fine-grained, resource owner `ejc3`, only
