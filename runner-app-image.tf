@@ -93,7 +93,8 @@ locals {
       script = "node-web-runner.sh"
       # .github/workflows/ci.yml, scrape-live.yml (Python's Playwright drives a remote browser: nothing to install);
       # engine-rs/rust-toolchain.toml and engine-rs/Cargo.toml (built natively and to WebAssembly);
-      # ci.yml's ffmpeg step (pipeline/test/recorder.test.ts measures the voice clips' loudness).
+      # ci.yml's ffmpeg step (pipeline/test/recorder.test.ts measures the voice clips' loudness);
+      # cloudflare-stage.yml's Tiles step (osmium-tool reads Geofabrik's California extract for pipeline/src/build-tiles.ts).
       versions = {
         NODE_MAJOR           = "22"
         PYTHON_VERSIONS      = "3.12"
@@ -101,7 +102,7 @@ locals {
         RUST_COMPONENTS      = "rustfmt,clippy"
         RUST_TARGETS         = "wasm32-unknown-unknown"
         WASM_BINDGEN_VERSION = "0.2.129"
-        APT_PACKAGES         = "ffmpeg"
+        APT_PACKAGES         = "ffmpeg,osmium-tool"
       }
     }
     "colton-games-runner" = {
