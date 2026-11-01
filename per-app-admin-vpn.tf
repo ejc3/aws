@@ -8,8 +8,7 @@ locals {
     var.enable_x86_dev_instance ? { x86 = aws_eip.x86_dev[0].public_ip } : {},
     var.enable_nextjs_dev ? { nextjs = aws_eip.nextjs_dev[0].public_ip } : {},
   )
-  admin_per_app_cidrs   = [for ip in values(local.admin_per_app_destinations) : "${ip}/32"]
-  admin_per_app_traffic = "any(net.dst.ip[*] in {${join(" ", local.admin_per_app_cidrs)}})"
+  admin_per_app_traffic = "net.dst.ip in {${join(" ", values(local.admin_per_app_destinations))}}"
   admin_per_app_ssh_hostnames = {
     for key, ip in local.admin_per_app_destinations : key => "${key}-admin-ssh.cc-games.dev"
   }

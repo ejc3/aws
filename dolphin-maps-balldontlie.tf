@@ -15,7 +15,7 @@
 # While false, nothing reads the value, so a plan never fails on a container with no version yet.
 locals {
   dolphin_maps_balldontlie_secret  = "balldontlie/api-key"
-  dolphin_maps_balldontlie_key_set = false
+  dolphin_maps_balldontlie_key_set = true
 }
 
 resource "aws_secretsmanager_secret" "balldontlie" {

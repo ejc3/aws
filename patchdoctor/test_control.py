@@ -115,6 +115,9 @@ class Cloud:
             raise error
         value = {'id': 'patchdoctor:' + str(number), 'projectName': 'patchdoctor', 'buildStatus': 'IN_PROGRESS',
             'environment': {'environmentVariables': copy.deepcopy(kw['environmentVariablesOverride'])}}
+        if getattr(self, 'worker_revision', None):
+            value['environment']['environmentVariables'].append({'name': 'PATCHDOCTOR_SELF_TEST_REVISION',
+                'value': self.worker_revision, 'type': 'PLAINTEXT'})
         self.builds[value['id']] = value
         if self.lose_start:
             self.lose_start = False
@@ -459,6 +462,101 @@ class Tests(unittest.TestCase):
         self.assertTrue(armed['armed'])
         self.assertFalse(armed['paused'])
         self.assertEqual(self.cloud.sends, [])
+
+    def test_worker_revision_gets_fresh_commissioning_without_resetting_old_budget(self):
+        old_revision, new_revision = 'a' * 64, 'b' * 64
+        self.cloud.worker_revision = old_revision
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': old_revision}, self.store, self.cloud.client, lambda: self.clock)
+        old = self.doctor.handler({'action': 'self_test', 'mutationId': 'runtime-A'})
+        self.assertEqual(old['case_id'], C.digest('PatchDoctor/SELF_TEST/' + old_revision))
+        for _ in range(2):
+            case = self.store.get('case#' + old['case_id'])
+            self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+            self.doctor.reconcile()
+        previous = self.store.get('case#' + old['case_id'])
+        self.assertEqual((previous['status'], previous['attempts'], previous['reserved_usd']), ('budget-exhausted', 2, 50))
+        config = self.store.get('config')
+        config.update(armed=True, gate_version=2, commissioned_worker_revision=old_revision)
+        self.store.put('config', config)
+        self.cloud.worker_revision = new_revision
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': new_revision}, self.store, self.cloud.client, lambda: self.clock)
+        self.assertFalse(self.doctor.config()['armed'])
+        result = self.doctor.handler({'action': 'self_test', 'mutationId': 'runtime-B'})
+        self.assertNotEqual(result['case_id'], old['case_id'])
+        self.assertEqual(self.doctor.status()['self_test_case_id'], result['case_id'])
+        case = self.store.get('case#' + result['case_id'])
+        self.assertEqual((case['worker_revision'], case['attempts'], case['reserved_usd']), (new_revision, 1, 25))
+        self.assertEqual(self.store.get('case#' + old['case_id']), previous)
+        with self.assertRaises(ValueError):
+            self.doctor.handler({'action': 'arm', 'mutationId': 'old-proof-cannot-arm-B'})
+        self.doctor.broker(self.request(case, 'finish', outcome='self-test-passed', summary='current runtime proof'))
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'SUCCEEDED'
+        self.doctor.reconcile()
+        self.assertTrue(self.doctor.handler({'action': 'arm', 'mutationId': 'arm-B'})['armed'])
+        self.assertEqual(self.store.get('config')['commissioned_worker_revision'], new_revision)
+        self.doctor.handler({'action': 'self_test', 'mutationId': 'same-runtime-B'})
+        daily = self.store.get('daily#2026-11-01')
+        self.assertEqual((len(self.cloud.starts), daily['starts']), (3, 3))
+
+    def test_worker_revision_keeps_daily_limit_and_does_not_start_old_pending_self_test(self):
+        old_revision, current = 'a' * 64, 'b' * 64
+        old_id = C.digest('PatchDoctor/SELF_TEST/' + old_revision)
+        old = {'case_id': old_id, 'account': ACCOUNT, 'region': REGION, 'cve': 'SELF_TEST', 'mode': 'self-test',
+            'status': 'pending', 'created_at': self.clock - 1, 'attempts': 1, 'reserved_usd': 25,
+            'operations': {}, 'targets': [], 'findings': [], 'worker_revision': old_revision}
+        self.doctor.save(old)
+        # Actual start() crash seam: pointer is saved before pending becomes starting.
+        self.store.put('active-case', {'case_id': old_id})
+        self.store.put('daily#2026-11-01', {'starts': 4})
+        self.cloud.worker_revision = current
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': current}, self.store, self.cloud.client, lambda: self.clock)
+        result = self.doctor.handler({'action': 'self_test', 'mutationId': 'budget-preserved'})
+        self.assertEqual(result['case_id'], C.digest('PatchDoctor/SELF_TEST/' + current))
+        fresh = self.store.get('case#' + result['case_id'])
+        self.assertEqual((fresh['status'], fresh['attempts'], fresh['reserved_usd']), ('daily-budget-wait', 0, 0))
+        self.assertEqual(self.store.get('case#' + old_id), old)
+        self.assertEqual((self.store.get('daily#2026-11-01')['starts'], self.cloud.starts), (4, []))
+        self.assertIsNone(self.store.get('active-case')['case_id'])
+        self.clock += 86400
+        self.doctor.reconcile()
+        self.assertEqual(self.store.get('case#' + result['case_id'])['status'], 'running')
+        self.assertEqual(len(self.cloud.starts), 1)
+        self.assertEqual(self.store.get('active-case')['case_id'], result['case_id'])
+        self.assertEqual(self.store.get('case#' + old_id), old)
+
+    def test_previous_revision_success_cannot_leave_new_revision_armed(self):
+        old_revision = 'a' * 64
+        self.cloud.worker_revision = old_revision
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': old_revision}, self.store, self.cloud.client, lambda: self.clock)
+        result = self.doctor.handler({'action': 'self_test', 'mutationId': 'passed-runtime-A'})
+        case = self.store.get('case#' + result['case_id'])
+        self.doctor.broker(self.request(case, 'finish', outcome='self-test-passed', summary='runtime A proof'))
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'SUCCEEDED'
+        self.doctor.reconcile()
+        self.doctor.handler({'action': 'arm', 'mutationId': 'arm-runtime-A'})
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': 'b' * 64}, self.store, self.cloud.client, lambda: self.clock)
+        self.assertFalse(self.doctor.config()['armed'])
+        with self.assertRaises(ValueError):
+            self.doctor.handler({'action': 'arm', 'mutationId': 'cannot-arm-runtime-B'})
+        self.assertEqual(self.store.get('case#' + case['case_id'])['status'], 'self-test-passed')
+        self.assertEqual((len(self.cloud.starts), self.store.get('daily#2026-11-01')['starts']), (1, 1))
+
+    def test_revisioned_self_test_broker_requires_its_actual_build_revision_not_current_revision(self):
+        revision = 'a' * 64
+        self.cloud.worker_revision = revision
+        result = self.doctor.handler({'action': 'self_test', 'mutationId': 'broker-revision'})
+        case = self.store.get('case#' + result['case_id'])
+        case['worker_revision'] = revision
+        self.doctor.save(case)
+        variables = self.cloud.builds[case['build_id']]['environment']['environmentVariables']
+        variable = next(v for v in variables if v['name'] == 'PATCHDOCTOR_SELF_TEST_REVISION')
+        variable['value'] = 'b' * 64
+        event = self.request(case, 'get')
+        with self.assertRaises(ValueError):
+            self.doctor.broker(event)
+        variable['value'] = revision
+        self.doctor = C.Doctor({**ENV, 'SELF_TEST_REVISION': 'b' * 64}, self.store, self.cloud.client, lambda: self.clock)
+        self.assertEqual(self.doctor.broker(event)['case_id'], case['case_id'])
 
     def test_failed_haiku_self_test_cannot_enqueue_opus_or_arm(self):
         with patch.object(T, '_client', side_effect=TimeoutError('private detail')):

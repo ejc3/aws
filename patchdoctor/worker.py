@@ -240,7 +240,7 @@ class Worker:
         while not self.stop.is_set():
             try:
                 await asyncio.wait_for(self.dirty.wait(), timeout=5)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
             if not self.stop.is_set():
                 await self.checkpoint()
@@ -250,7 +250,7 @@ class Worker:
             os.killpg(self.process.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=15)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 os.killpg(self.process.pid, signal.SIGKILL)
                 await self.process.wait()
 
@@ -367,7 +367,7 @@ class Worker:
             # Drain private streams before their final durable snapshot.
             try:
                 await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), timeout=DRAIN_SECONDS)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 # wait_for cancels and awaits collectors if a detached child retained a pipe.
                 emit('private_stream_drain_expired')
             if persister and not persister.done():

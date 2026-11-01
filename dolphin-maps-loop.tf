@@ -19,7 +19,7 @@
 #                                 four, 20 s apart), committed as data/events/games.csv. No browser. Its key is
 #                                 balldontlie/api-key (dolphin-maps-balldontlie.tf), named by BALLDONTLIE_SECRET_ID.
 #                                 The GitHub Actions copy (refresh-games.yml) runs at 12:15 UTC; this is the same hour
-#                                 in winter and an hour earlier in summer, before anyone plans the day's drive.
+#                                 in summer and an hour later in winter, before anyone plans the day's drive.
 #                                 One bundle, one function a loop: each loop has its own limits, and Lambda's own Errors
 #                                 metric (timeouts, running out of memory and failed starts included) is that
 #                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a

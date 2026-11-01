@@ -301,6 +301,27 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNotNone(w.process.returncode)
         self.assertFalse(any(action == 'finish' for action, _ in self.broker.calls))
 
+    def test_idle_five_second_wait_checkpoints_without_failing(self):
+        w = self.make_worker()
+        checkpoint = w.checkpoint
+        async def checkpoint_then_stop():
+            await checkpoint()
+            w.stop.set()
+        w.checkpoint = checkpoint_then_stop
+        async def scenario():
+            try:
+                await asyncio.wait_for(w.persist_loop(), timeout=8)
+            except Exception as error:
+                return type(error).__module__ + '.' + type(error).__name__
+            return None
+        started = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            error = asyncio.run(scenario())
+        self.assertIsNone(error, 'normal idle timeout escaped: ' + str(error))
+        self.assertGreaterEqual(time.monotonic() - started, 5)
+        self.assertIn('checkpoint', self.broker.case)
+        self.assertEqual([action for action, _ in self.broker.calls], ['checkpoint'])
+
     def test_cleanup_cancels_and_awaits_readers_that_do_not_reach_eof(self):
         w = self.make_worker(cli=self.fake_cli())
         cli_path = Path(w.cli[-1])

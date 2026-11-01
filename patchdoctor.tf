@@ -4,9 +4,45 @@
 # IMPORTANT: root commands on either jumpbox are administration authority, not
 # a "narrow" host grant. This dedicated control plane never delegates to dev roles.
 locals {
-  patchdoctor_regions = ["us-west-1", "us-west-2", "us-east-1"]
-  patchdoctor_targets = ["jumpbox", "jumpbox-2", "fcvm-metal-arm", "fcvm-metal-x86", "nextjs-ct", "nextjs-dev", "claude-master-server"]
-  patchdoctor_model   = "us.anthropic.claude-opus-5-5"
+  patchdoctor_regions        = ["us-west-1", "us-west-2", "us-east-1"]
+  patchdoctor_targets        = ["jumpbox", "jumpbox-2", "fcvm-metal-arm", "fcvm-metal-x86", "nextjs-ct", "nextjs-dev", "claude-master-server"]
+  patchdoctor_model          = "us.anthropic.claude-opus-5-5"
+  patchdoctor_claude_version = "2.1.316"
+  patchdoctor_claude_sha256  = "fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824"
+  patchdoctor_buildspec = yamlencode({
+    version = "0.2"
+    env     = { shell = "bash" }
+    phases = {
+      install = { commands = [
+        "set -euo pipefail",
+        "umask 077",
+        "aws s3api get-object --bucket \"$PATCHDOCTOR_BUCKET_NAME\" --key \"$PATCHDOCTOR_BUNDLE_KEY\" --version-id \"$PATCHDOCTOR_BUNDLE_VERSION\" /tmp/patchdoctor.zip >/dev/null",
+        "printf '%s  %s\\n' \"$PATCHDOCTOR_BUNDLE_SHA256\" /tmp/patchdoctor.zip | sha256sum --check --status",
+        "install -d -m 0755 /opt/patchdoctor",
+        "python3 -m zipfile -e /tmp/patchdoctor.zip /opt/patchdoctor",
+        "chmod 0755 /opt/patchdoctor",
+        "chmod 0644 /opt/patchdoctor/worker.py /opt/patchdoctor/host.py /opt/patchdoctor/prompt.txt /opt/patchdoctor/install-claude.sh",
+        "export PYTHONPATH=/opt/patchdoctor/python:/opt/patchdoctor",
+        "(umask 022; python3 -m pip install --disable-pip-version-check --no-user --target /opt/patchdoctor/python 'boto3==1.43.123' 'botocore==1.43.123' >/dev/null)",
+        "bash /opt/patchdoctor/install-claude.sh /opt/patchdoctor/bin/claude",
+        "id doctor >/dev/null 2>&1 || useradd --create-home --home-dir /tmp/doctor-home --shell /bin/bash doctor",
+        "install -d -o doctor -g doctor -m 0700 /tmp/doctor-work /tmp/doctor-home",
+        "chmod 0755 /opt/patchdoctor/host.py",
+        "ln -s /opt/patchdoctor/host.py /usr/local/bin/patchdoctor-host",
+        "runuser -u doctor -- env HOME=/tmp/doctor-home CLAUDE_CONFIG_DIR=/tmp/doctor-home/.claude PYTHONPATH=/opt/patchdoctor/python:/opt/patchdoctor python3 -c 'import boto3, botocore, host, worker; assert boto3.__version__ == \"1.43.123\"; assert botocore.__version__ == \"1.43.123\"; print(\"PatchDoctor nonroot imports: OK\")'",
+        "runuser -u doctor -- env HOME=/tmp/doctor-home CLAUDE_CONFIG_DIR=/tmp/doctor-home/.claude PYTHONPATH=/opt/patchdoctor/python:/opt/patchdoctor /opt/patchdoctor/bin/claude --version",
+      ] }
+      build = { commands = [
+        "runuser -u doctor -- env HOME=/tmp/doctor-home CLAUDE_CONFIG_DIR=/tmp/doctor-home/.claude CLAUDE_BINARY=/opt/patchdoctor/bin/claude PATCHDOCTOR_WORKSPACE=/tmp/doctor-work PYTHONPATH=/opt/patchdoctor/python:/opt/patchdoctor python3 /opt/patchdoctor/worker.py"
+      ] }
+    }
+  })
+  patchdoctor_self_test_revision = sha256(jsonencode({
+    bundle        = data.archive_file.patchdoctor_worker.output_sha256
+    buildspec     = local.patchdoctor_buildspec
+    claudeVersion = local.patchdoctor_claude_version
+    claudeSha256  = local.patchdoctor_claude_sha256
+  }))
   patchdoctor_env = {
     TABLE_NAME            = aws_dynamodb_table.patchdoctor.name
     PROJECT_NAME          = "patchdoctor"
@@ -17,6 +53,7 @@ locals {
     TARGET_NAMES_JSON     = jsonencode(local.patchdoctor_targets)
     COMMAND_DOCUMENT_NAME = "PatchDoctor-RunCommand"
     INSPECT_DOCUMENT_NAME = "PatchDoctor-Inspect"
+    SELF_TEST_REVISION    = local.patchdoctor_self_test_revision
   }
   patchdoctor_log_names = {
     control   = "/aws/lambda/patchdoctor"
@@ -422,8 +459,9 @@ resource "aws_codebuild_project" "patchdoctor" {
         PATCHDOCTOR_BUNDLE_KEY                   = aws_s3_object.patchdoctor_worker.key
         PATCHDOCTOR_BUNDLE_VERSION               = aws_s3_object.patchdoctor_worker.version_id
         PATCHDOCTOR_BUNDLE_SHA256                = data.archive_file.patchdoctor_worker.output_sha256
-        CLAUDE_VERSION                           = "2.1.316"
-        CLAUDE_SHA256                            = "fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824"
+        PATCHDOCTOR_SELF_TEST_REVISION           = local.patchdoctor_self_test_revision
+        CLAUDE_VERSION                           = local.patchdoctor_claude_version
+        CLAUDE_SHA256                            = local.patchdoctor_claude_sha256
         CLAUDE_CODE_USE_BEDROCK                  = "1"
         DISABLE_AUTOUPDATER                      = "1"
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
@@ -435,32 +473,8 @@ resource "aws_codebuild_project" "patchdoctor" {
     }
   }
   source {
-    type = "NO_SOURCE"
-    buildspec = yamlencode({
-      version = "0.2"
-      env     = { shell = "bash" }
-      phases = {
-        install = { commands = [
-          "set -euo pipefail",
-          "umask 077",
-          "aws s3api get-object --bucket \"$PATCHDOCTOR_BUCKET_NAME\" --key \"$PATCHDOCTOR_BUNDLE_KEY\" --version-id \"$PATCHDOCTOR_BUNDLE_VERSION\" /tmp/patchdoctor.zip >/dev/null",
-          "printf '%s  %s\\n' \"$PATCHDOCTOR_BUNDLE_SHA256\" /tmp/patchdoctor.zip | sha256sum --check --status",
-          "install -d -m 0755 /opt/patchdoctor",
-          "python3 -m zipfile -e /tmp/patchdoctor.zip /opt/patchdoctor",
-          "chmod 0755 /opt/patchdoctor",
-          "chmod 0644 /opt/patchdoctor/worker.py /opt/patchdoctor/host.py /opt/patchdoctor/prompt.txt /opt/patchdoctor/install-claude.sh",
-          "(umask 022; python3 -m pip install --disable-pip-version-check 'boto3==1.43.123' >/dev/null)",
-          "bash /opt/patchdoctor/install-claude.sh /opt/patchdoctor/bin/claude",
-          "id doctor >/dev/null 2>&1 || useradd --create-home --home-dir /tmp/doctor-home --shell /bin/bash doctor",
-          "install -d -o doctor -g doctor -m 0700 /tmp/doctor-work /tmp/doctor-home",
-          "chmod 0755 /opt/patchdoctor/host.py",
-          "ln -s /opt/patchdoctor/host.py /usr/local/bin/patchdoctor-host",
-        ] }
-        build = { commands = [
-          "runuser -u doctor -- env HOME=/tmp/doctor-home CLAUDE_CONFIG_DIR=/tmp/doctor-home/.claude CLAUDE_BINARY=/opt/patchdoctor/bin/claude PATCHDOCTOR_WORKSPACE=/tmp/doctor-work python3 /opt/patchdoctor/worker.py"
-        ] }
-      }
-    })
+    type      = "NO_SOURCE"
+    buildspec = local.patchdoctor_buildspec
   }
   logs_config {
     cloudwatch_logs {
