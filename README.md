@@ -93,6 +93,60 @@ Terraform writes a mandatory state backup. Do not repeat the command once state 
 `ejc3/cloudflare`, and never apply a plan made before the migration. The reverse command
 is required when the stack eventually returns to the upstream provider namespace.
 
+### PatchDoctor: autonomous critical security patches
+
+The owner authorizes PatchDoctor to investigate verified **CRITICAL CVEs**, apply
+necessary host repairs, and perform necessary restarts with recovery checks.
+Native Inspector and Security Hub events enter a dedicated durable inbox immediately;
+the existing security notifications continue independently. The controller re-reads AWS
+findings and checks the affected instance before granting a command. Lower-severity
+findings cannot authorize a repair. Critical findings without a supported CVE are
+recorded and reported for administration review.
+
+The deployment includes an admission Lambda, worker-only command broker, incident
+ledger, private versioned KMS-encrypted artifact bucket, and a single CodeBuild worker.
+The worker runs the actual Claude Code CLI with its normal tools, Opus 5.5, very high
+reasoning effort, and streaming JSON output. It uses its own Bedrock IAM identity;
+there is no copied personal Claude login or long-lived Anthropic key. Native CLI
+2.1.316 is pinned to its published Linux checksum.
+
+The first release covers the named main-account Linux fleet in us-west-1, us-west-2
+and us-east-1: both jumpboxes, ARM and x86 metal, Next.js and the Claude master server.
+The broker holds root-command authority on these targets. **On a jumpbox that is
+administration authority**, because its instance role and files control the account;
+this is the owner's dedicated emergency administration service, not a dev-box grant.
+Dev roles receive no path to the broker, administration hosts, state or its credentials.
+The worker has no direct SSM, IAM or Terraform-state permissions. Infrastructure
+changes still require committed Terraform and the administration review/apply workflow.
+
+The agent must verify applicability, retain recovery evidence, preserve acknowledged
+user state, respect custom NV2 kernels, and check the resulting service health.
+No vendor fix means a documented mitigation or blocked outcome. A successful script
+or an agent's assertion does not close a finding: the controller waits for native
+Inspector closure before calling it resolved.
+
+Each host operation has a stable ID, a durable intent and a command receipt. An
+uncertain delivery is reconciled instead of replayed. Workspaces and potentially
+sensitive full agent streams stay in the private encrypted bucket; CloudWatch shows
+only typed progress metadata. Checkpoints are acknowledged only after a versioned
+object and its ledger reference have both been persisted. Tests kill the controller
+without a shutdown signal and restart it to verify acknowledged state and commands.
+
+Limits are one worker, 60 minutes per attempt, at most two attempts per case, and four
+starts per UTC day. Each attempt reserves a $25 model allowance; a case reserves at
+most $50. Claude's dollar limit is an estimate and can overshoot, so these are model
+allowances, not a guaranteed AWS billing ceiling. Unknown crash spend consumes the
+whole reservation. Cases over a limit are reported rather than silently dropped.
+
+After a clean Terraform apply, PatchDoctor starts **unarmed**. Invoke its
+administration-only self_test action, inspect the durable result and CodeBuild
+success, then invoke arm. The test uses real Opus to read, repair and test a broken
+local fixture and exercises private streaming/checkpoints; it cannot execute host
+commands. The broker's target and severity gates remain active after arming. Review
+incidents in the patchdoctor DynamoDB table and protected artifacts in the bucket
+reported by terraform output patchdoctor. Never make that bucket public or copy
+raw transcripts into issue comments.
+
 ## Prerequisites
 
 ### Existing deployment
