@@ -176,7 +176,12 @@ class Factory:
         recorded = journal["slots"].get(slot, {})
         filters = [{"Name": "tag:Purpose", "Values": [GUARD_PURPOSE]}, {"Name": "tag:FactoryBuild", "Values": [digest(journal["build_id"])]}, {"Name": "tag:FactorySlot", "Values": [slot]}]
         rows = [i for r in self.client("ec2", True).describe_instances(Filters=filters)["Reservations"] for i in r["Instances"]]
-        rows = [i for i in rows if i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] and i.get("InstanceType") == TYPES[slot.split("-", 1)[0]]]
+        # EC2 may omit the profile after termination. Only an already recorded
+        # instance can supply that terminal receipt without the profile proof.
+        rows = [i for i in rows if i.get("InstanceType") == TYPES[slot.split("-", 1)[0]] and (
+            i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] or (
+                "IamInstanceProfile" not in i and i["State"]["Name"] == "terminated"
+                and recorded.get("instance_id") == i["InstanceId"]))]
         if len(rows) > 1:
             raise Refused("more than one instance in a fixed slot")
         if rows and recorded.get("instance_id") not in (None, rows[0]["InstanceId"]):
@@ -259,17 +264,18 @@ class Factory:
 
     def slot_status(self, journal, slot):
         instance = self.owned(journal, slot)
+        instance_id = instance["InstanceId"] if instance else journal["slots"].get(slot, {}).get("instance_id")
         kind = slot.split("-", 1)[0]
         image_id = journal["candidates"].get(kind)
         image_state = None
         if image_id:
             rows = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
             image_state = rows[0]["State"] if rows else "missing"
-        return {"slot": slot, "instance_id": instance["InstanceId"] if instance else journal["slots"].get(slot, {}).get("instance_id"),
+        return {"slot": slot, "instance_id": instance_id,
                 "state": instance["State"]["Name"] if instance else "rejected" if journal["slots"].get(slot, {}).get("no_instance") else "uncertain", "instance_type": TYPES[kind], "root_gib": VOLUMES[kind],
                 "image_id": image_id, "image_state": image_state, "region": self.env["COMPUTE_REGION"], "deadline_unix": journal["deadline_unix"],
                 "source_commit": journal["source_sha"], "input_sha256": journal["input_sha256"],
-                "asset_prefix": "builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/" + instance["InstanceId"] + "/" if instance else None}
+                "asset_prefix": "builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/" + instance_id + "/" if instance_id else None}
 
     def seal(self, suffix, journal, slot):
         if not slot.endswith("-build") or self.now() >= journal["deadline_unix"]:

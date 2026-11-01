@@ -432,6 +432,109 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.call("launch", "host-build")["instance_id"], result["instance_id"])
         self.assertEqual(len(self.ec2.launches), 1)
 
+    def test_accepted_launch_keeps_its_prefix_before_describe_visibility(self):
+        with patch.object(self.ec2, "describe_instances", return_value={"Reservations": []}):
+            result = self.call("launch", "host-build")
+            instance_id = result["instance_id"]
+            _, journal = self.factory.journal(BUILD)
+            self.assertEqual(journal["slots"]["host-build"]["instance_id"], instance_id)
+            prefix = "builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/" + instance_id + "/"
+            self.assertEqual(result["asset_prefix"], prefix)
+            self.assertEqual(result["state"], "uncertain")
+            self.assertEqual(self.call("launch", "host-build"), result)
+            with self.assertRaises(mod.Refused):
+                self.call("command_status", "host-build", command_id="11111111-1111-1111-1111-111111111111")
+            self.assertEqual(self.fleet_ssm.commands, [])
+            self.assertEqual(len(self.ec2.launches), 1)
+        visible = self.call("status", "host-build")
+        self.assertEqual((visible["instance_id"], visible["asset_prefix"], visible["state"]),
+                         (instance_id, prefix, "running"))
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_unknown_launch_receipt_has_no_prefix_and_is_not_replayed_while_hidden(self):
+        self.ec2.lose_launch = True
+        with patch.object(self.ec2, "describe_instances", return_value={"Reservations": []}):
+            with self.assertRaises(TimeoutError):
+                self.call("launch", "host-build")
+            for action in ("status", "launch"):
+                result = self.call(action, "host-build")
+                self.assertIsNone(result["instance_id"])
+                self.assertIsNone(result["asset_prefix"])
+                self.assertEqual(result["state"], "uncertain")
+            self.assertEqual(len(self.ec2.launches), 1)
+        recovered = self.call("status", "host-build")
+        self.assertEqual(recovered["state"], "running")
+        self.assertTrue(recovered["asset_prefix"].endswith("/" + recovered["instance_id"] + "/"))
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_known_prefix_does_not_authorize_an_instance_with_the_wrong_profile(self):
+        accepted = self.call("launch", "host-build")
+        self.ec2.instances[accepted["instance_id"]]["IamInstanceProfile"] = {"Arn": "foreign-profile"}
+        result = self.call("status", "host-build")
+        self.assertEqual(result["instance_id"], accepted["instance_id"])
+        self.assertEqual(result["asset_prefix"], accepted["asset_prefix"])
+        self.assertEqual(result["state"], "uncertain")
+        with self.assertRaises(mod.Refused):
+            self.call("command_status", "host-build", command_id="11111111-1111-1111-1111-111111111111")
+        self.assertEqual(self.fleet_ssm.commands, [])
+        self.assertEqual(self.call("launch", "host-build"), result)
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_known_terminated_instance_without_a_profile_persists_its_terminal_receipt(self):
+        instance_id = self.launch()
+        instance = self.ec2.instances[instance_id]
+        instance["State"]["Name"] = "terminated"
+        del instance["IamInstanceProfile"]  # Actual terminal DescribeInstances shape.
+        writes = len(self.store.writes)
+        result = self.call("status", "host-build")
+        self.assertEqual((result["instance_id"], result["state"]), (instance_id, "terminated"))
+        self.assertEqual(len(self.store.writes), writes + 1)
+        suffix, journal = self.factory.journal(BUILD)
+        self.assertTrue(journal["slots"]["host-build"]["terminated_seen"])
+        self.assertTrue(self.factory.gone(suffix, journal))
+        self.assertEqual(self.call("cleanup")["slots"]["host-build"]["state"], "terminated")
+        self.assertEqual(self.ec2.terminations, [])
+        del self.ec2.instances[instance_id]
+        suffix, journal = self.factory.journal(BUILD)
+        self.assertTrue(self.factory.gone(suffix, journal), "retain the observed terminal proof after EC2 forgets the row")
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_profileless_terminal_receipts_cannot_bypass_identity_or_active_profile_guards(self):
+        variants = ("running", "pending", "stopped", "shutting-down", "wrong-profile", "empty-profile",
+                    "unknown-id", "different-id", "wrong-type", "Purpose", "FactoryBuild", "FactorySlot")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                case = FactoryTests()
+                case.setUp()
+                instance_id = case.launch()
+                instance = case.ec2.instances[instance_id]
+                instance["State"]["Name"] = "terminated"
+                del instance["IamInstanceProfile"]
+                suffix, journal = case.factory.journal(BUILD)
+                if variant in ("running", "pending", "stopped", "shutting-down"):
+                    instance["State"]["Name"] = variant
+                elif variant in ("wrong-profile", "empty-profile"):
+                    instance["IamInstanceProfile"] = {"Arn": "foreign-profile"} if variant == "wrong-profile" else {}
+                elif variant in ("unknown-id", "different-id"):
+                    journal["slots"]["host-build"].pop("instance_id")
+                    if variant == "different-id":
+                        journal["slots"]["host-build"]["instance_id"] = "i-" + "f" * 17
+                    case.factory.save(suffix, journal)
+                elif variant == "wrong-type":
+                    instance["InstanceType"] = "g4dn.xlarge"
+                else:
+                    next(tag for tag in instance["Tags"] if tag["Key"] == variant)["Value"] = "foreign"
+                self.assertEqual(case.call("status", "host-build")["state"], "uncertain")
+                self.assertEqual(case.call("launch", "host-build")["state"], "uncertain")
+                with self.assertRaises(mod.Refused):
+                    case.call("command_status", "host-build", command_id="11111111-1111-1111-1111-111111111111")
+                suffix, journal = case.factory.journal(BUILD)
+                self.assertFalse(journal["slots"]["host-build"].get("terminated_seen"))
+                self.assertFalse(case.factory.gone(suffix, journal))
+                self.assertEqual(case.fleet_ssm.commands, [])
+                self.assertEqual(case.ec2.terminations, [])
+                self.assertEqual(len(case.ec2.launches), 1)
+
     def test_successful_build_is_redriven_after_busy_lock_and_status_polls_are_throttled(self):
         self.succeed()
         self.ddb.busy = True
