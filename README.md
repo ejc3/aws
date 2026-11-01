@@ -391,6 +391,11 @@ same-source retry without resetting a failed request or replaying uncertain laun
 The five-minute reconciler retries successful-build publication outside the backend
 lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
 This publication interval never extends the 240-minute compute lease.
+The executor saves validation before final cleanup; publication waits for the
+dispatcher to confirm every actual termination, including delayed EC2 shutdowns.
+Failed, unreferenced candidates remain private for 24 hours after the native build
+end time for diagnosis, then normal cleanup removes them. Retention never permits
+a failed build to publish.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|

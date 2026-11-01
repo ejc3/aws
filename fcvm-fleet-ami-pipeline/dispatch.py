@@ -505,6 +505,9 @@ class Factory:
                 else:
                     if succeeded:
                         record["status"] = "awaiting-publish"
+                        self.save("/requests/" + record["request_id"], record)
+                        if not self.gone(suffix, journal):
+                            return  # Final EC2 shutdown can outlast the executor's compute lease.
                         due = self.now() - record.get("publication_last_attempt", 0) >= 300
                         if due:
                             record["publication_last_attempt"] = int(self.now())
@@ -631,6 +634,10 @@ class Factory:
                 build = by_id.get(build_id)
                 if image["ImageId"] in referenced or build_id in keep_builds or not build or build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                     continue
+                if build["buildStatus"] != "SUCCEEDED":
+                    ended = build.get("endTime")
+                    if not isinstance(ended, datetime.datetime) or self.now() < ended.timestamp() + PUBLICATION_SECONDS:
+                        continue  # Preserve failed candidates for one bounded day of diagnosis.
                 journal = self.load("/builds/" + digest(build_id))
                 if not journal or not self.gone("/builds/" + digest(build_id), journal):
                     continue
