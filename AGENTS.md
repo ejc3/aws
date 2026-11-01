@@ -1451,9 +1451,10 @@ Available if a task needs them; neither needs a key on disk.
   through `OrganizationAccountAccessRole` in the Dolphin account. Changes are dolphin-aws pull requests, applied from
   nextjs-dev.
 - **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
-  `dolphin-maps-loop-sweep` and `dolphin-maps-loop-refit` (one bundle) on EventBridge schedules in America/Los_Angeles
-  time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night, the refit an hour later; all off
-  until `dolphin_maps_loop_enabled`; one failed sweep or refit alarms; the sweep function also runs the week passes
+  `dolphin-maps-loop-sweep`, `dolphin-maps-loop-refit` and `dolphin-maps-loop-games` (one bundle) on EventBridge
+  schedules in America/Los_Angeles time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night,
+  the refit an hour later, the games at 05:15 daily with `balldontlie/api-key`; all off until
+  `dolphin_maps_loop_enabled`; one failed sweep, refit or games pass alarms; the sweep function also runs the week passes
   on the month's first Saturday from 20:00, one a day of the week 20 minutes apart, and the weekend pass on
   Thursday 23:00, on the same switch), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
