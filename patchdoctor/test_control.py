@@ -36,13 +36,17 @@ class Memory:
     def put(self, key, value):
         old = self.rows.get(key, {})
         if old.get('_revision', 0) != value.get('_revision', 0):
-            raise RuntimeError('conditional write conflict')
+            error = RuntimeError('conditional write conflict')
+            error.response = {'Error': {'Code': 'ConditionalCheckFailedException'}}
+            raise error
         value['_revision'] = value.get('_revision', 0) + 1
         self.rows[key] = copy.deepcopy(value)
         return value
 
     def cases(self):
-        return [copy.deepcopy(v) for k, v in self.rows.items() if k.startswith('case#')]
+        return [copy.deepcopy(v) for k, v in self.rows.items() if k.startswith('case#')
+            and (v.get('status') in {'pending', 'running', 'starting', 'start-uncertain',
+                'daily-budget-wait', 'awaiting-native-closure'} or v.get('outstanding_operations'))]
 
 
 class Cloud:
@@ -247,6 +251,187 @@ class Tests(unittest.TestCase):
         return self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
             operation_id='patch-version-1', script=fields.pop('script', 'true'), **fields)
 
+    def test_checkpoint_conflict_reloads_only_checkpoint_and_preserves_command_index(self):
+        case = self.admit()
+        event = self.request(case, 'checkpoint', key='cases/' + case['case_id'] + '/builds/'
+            + C.digest(case['build_id']) + '/checkpoints/immutable.tar.gz', version_id='version-one')
+        original = self.store.put
+        conflicts = []
+        def concurrent_write(key, value):
+            if key == 'case#' + case['case_id'] and value.get('checkpoint') and not conflicts:
+                other = self.store.get(key)
+                other['operations']['concurrent'] = 'op#durably-registered'
+                other['outstanding_operations'] = ['concurrent']
+                other['outcome'] = 'patched'
+                original(key, other)
+                conflicts.append(True)
+            return original(key, value)
+        self.store.put = concurrent_write
+        with patch.object(self.cloud, 'head_object', wraps=self.cloud.head_object) as head:
+            try:
+                result = self.doctor.broker(event)
+            except Exception:
+                result = {'acknowledged': False}
+            self.assertIs(result.get('acknowledged'), True)
+            self.assertEqual(head.call_count, 1)
+        current = self.store.get('case#' + case['case_id'])
+        self.assertEqual(current['operations']['concurrent'], 'op#durably-registered')
+        self.assertEqual(current['outcome'], 'patched')
+        self.assertEqual(current['checkpoint']['version_id'], 'version-one')
+
+    def test_terminal_worker_operations_reconcile_outside_deadline_and_fence_new_mutations(self):
+        case = self.admit()
+        self.cloud.lose_send = True
+        self.cloud.invocation_status = 'InProgress'
+        self.doctor.broker(self.command(case))
+        with self.assertRaises(ValueError):
+            self.doctor.broker(self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
+                operation_id='second-mutation', script='true'))
+        latest = self.store.get('case#' + case['case_id'])
+        latest.update(attempts=2, reserved_usd=50)
+        self.doctor.save(latest)
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+        self.clock += 4000
+        self.doctor.reconcile()
+        key = C.Doctor.operation(self.doctor, case, 'patch-version-1')
+        self.assertNotEqual(self.store.get(key)['state'], 'terminal')
+        self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'][0]['fixedInVersion'] = '3.0'
+        other = self.store.get('case#' + self.doctor.handler(self.event)['admitted'][0])
+        self.assertEqual(other['status'], 'pending')
+        self.assertNotIn('build_id', other)
+        self.assertEqual(len(self.cloud.starts), 1, 'no new model reservation while the old command is uncertain')
+        self.assertEqual(len(self.cloud.sends), 1)
+        self.cloud.invocation_status = 'Success'
+        self.doctor.reconcile()
+        op = self.store.get(key)
+        self.assertEqual(op['state'], 'terminal')
+        self.assertIn(op['receipt_key'], self.cloud.objects)
+        self.assertEqual(self.store.get('case#' + case['case_id']).get('outstanding_operations'), [])
+        self.assertFalse((self.store.get('host-operation') or {}).get('case_id'))
+        other = self.store.get('case#' + other['case_id'])
+        self.assertEqual(len(self.cloud.starts), 2)
+        self.assertEqual(other['status'], 'running')
+        self.doctor.broker(self.command(other))
+        self.assertEqual(len(self.cloud.sends), 2)
+
+    def test_fixed_inspect_still_checks_host_after_native_closure_without_new_mutation(self):
+        case = self.admit()
+        self.cloud.finding['status'] = 'CLOSED'
+        failure = None
+        try:
+            result = self.doctor.broker(self.command(case, script='', inspect=True))
+        except Exception as error:
+            failure = type(error).__name__
+        self.assertIsNone(failure, 'native closure must not prevent admitted read-only health verification')
+        self.assertEqual(result['command_id'], COMMAND)
+        self.assertEqual(self.cloud.sends[-1]['DocumentName'], 'PatchDoctor-Inspect')
+        self.assertEqual(self.cloud.sends[-1]['Parameters'], {})
+        with self.assertRaises(ValueError):
+            self.doctor.broker(self.command(case))
+        self.cloud.instance['Tags'][0]['Value'] = 'foreign'
+        with self.assertRaises(ValueError):
+            self.doctor.broker(self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
+                operation_id='foreign-inspect', inspect=True, script=''))
+
+    def test_native_recurrence_creates_one_new_generation_after_resolved_case(self):
+        case = self.admit()
+        current = self.store.get('case#' + case['case_id'])
+        current['status'] = 'resolved'
+        self.doctor.save(current)
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'SUCCEEDED'
+        self.doctor.release('active-case', case['case_id']) if hasattr(self.doctor, 'release') else None
+        # Simulate a crash after the deterministic new case save but before pointer ACK.
+        original = self.store.put
+        failed = []
+        def lose_pointer(key, value):
+            if key.startswith('revision#') and value.get('generation') == 1 and not failed:
+                failed.append(True)
+                raise TimeoutError('pointer write never delivered')
+            return original(key, value)
+        self.store.put = lose_pointer
+        try:
+            self.doctor.admit(self.event)
+        except TimeoutError:
+            pass
+        self.store.put = original
+        second = self.doctor.handler(self.event)['admitted'][0]
+        self.assertNotEqual(second, case['case_id'])
+        self.assertEqual(self.doctor.handler(self.event)['admitted'], [second])
+        self.assertEqual(len([k for k in self.store.rows if k.startswith('case#')]), 2)
+        self.assertEqual(self.store.get('case#' + case['case_id'])['status'], 'resolved')
+        self.assertEqual(self.store.get('case#' + second)['generation'], 1)
+        self.assertEqual(len(self.cloud.starts), 2)
+
+    def test_sparse_index_paginates_keys_and_strong_active_pointer_survives_index_lag(self):
+        class DDB:
+            def __init__(self):
+                self.rows, self.pages = {}, 0
+            def put_item(self, **kw):
+                self.rows[kw['Item']['pk']['S']] = copy.deepcopy(kw['Item'])
+            def get_item(self, **kw):
+                assert kw['ConsistentRead'] is True
+                return {'Item': copy.deepcopy(self.rows[kw['Key']['pk']['S']])}
+            def query(self, **kw):
+                assert kw['IndexName'] == 'active-cases'
+                assert kw['KeyConditionExpression'] == 'record_kind = :kind'
+                self.pages += 1
+                index = int(kw.get('ExclusiveStartKey', {}).get('pk', {}).get('S', '0'))
+                result = {'Items': [{'pk': {'S': 'case#' + str(index)}}]}
+                if index < 20:
+                    result['LastEvaluatedKey'] = {'pk': {'S': str(index + 1)}}
+                return result
+            def scan(self, **kw):
+                # 2,100 old daily/op records precede actionable cases: old global cap fails.
+                return {'Items': [], 'LastEvaluatedKey': {'pk': {'S': 'old-audit'}}}
+        ddb = DDB()
+        actual = C.Store(ddb, 'ledger')
+        for i in range(21):
+            value = {'case_id': str(i), 'status': 'pending', 'created_at': i}
+            actual.put('case#' + str(i), value)
+        try:
+            cases = actual.cases()
+        except RuntimeError:
+            cases = []
+        self.assertEqual(len(cases), 21)
+        self.assertEqual(ddb.pages, 21)
+        for i in range(21):
+            self.assertEqual(ddb.rows['case#' + str(i)].get('record_kind'), {'S': 'active-case'})
+        value = actual.get('case#0')
+        value['status'] = 'resolved'
+        actual.put('case#0', value)
+        self.assertNotIn('record_kind', ddb.rows['case#0'])
+        value['outstanding_operations'] = ['still-running']
+        actual.put('case#0', value)
+        self.assertEqual(ddb.rows['case#0']['record_kind'], {'S': 'active-case'})
+        case = self.admit()
+        self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'][0]['fixedInVersion'] = '4.0'
+        self.doctor.admit(self.event)
+        self.store.cases = lambda: []  # GSI has not propagated either case.
+        self.doctor.reconcile()
+        self.assertEqual(len(self.cloud.starts), 1)
+        self.assertEqual(self.store.get('active-case')['case_id'], case['case_id'])
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'FAILED'
+        self.doctor.reconcile()
+        self.assertEqual(len(self.cloud.starts), 2)
+        self.doctor.reconcile()
+        self.assertEqual(len(self.cloud.starts), 2)
+        self.assertEqual(self.store.get('active-case')['case_id'], case['case_id'])
+        fresh_store, fresh_cloud = Memory(), Cloud()
+        fresh = C.Doctor(ENV, fresh_store, fresh_cloud.client, lambda: self.clock)
+        fresh_store.put('config', {'armed': True})
+        interrupted = fresh.admit(self.event)[0]
+        fresh_store.put('active-case', {'case_id': interrupted})  # Killed before start intent.
+        fresh_cloud.finding['status'] = 'CLOSED'
+        other_finding = copy.deepcopy(fresh_cloud.finding)
+        other_finding.update(status='ACTIVE', findingArn=other_finding['findingArn'] + '-second')
+        other_finding['packageVulnerabilityDetails']['vulnerabilityId'] = 'CVE-2026-54321'
+        fresh_cloud.extra_findings.append(other_finding)
+        following = fresh.admit({**self.event, 'detail': {'findingArn': other_finding['findingArn']}})[0]
+        fresh.reconcile()
+        self.assertEqual(fresh_store.get('case#' + interrupted)['status'], 'blocked-no-current-critical-target')
+        self.assertEqual(len(fresh_cloud.starts), 1)
+        self.assertEqual(fresh_store.get('active-case')['case_id'], following)
+
     def test_duplicate_native_delivery_does_not_start_or_notify_twice(self):
         case = self.admit()
         self.doctor.handler(self.event)
@@ -271,7 +456,8 @@ class Tests(unittest.TestCase):
         fresh = self.doctor.handler(self.event)['admitted'][0]
         self.assertNotEqual(fresh, first['case_id'])
         self.assertEqual(self.store.get('case#' + fresh)['status'], 'pending')
-        self.assertEqual(len(self.store.cases()), 2)
+        self.assertEqual(len([k for k in self.store.rows if k.startswith('case#')]), 2)
+        self.assertEqual(self.store.get('case#' + first['case_id'])['status'], 'blocked')
         facts = self.store.get('case#' + fresh)['findings'][0]
         self.assertEqual(facts['packages'][0]['fixedInVersion'], '2.1')
         self.assertEqual(facts['source_urls'], ['https://vendor.example/CVE-2026-12345'])

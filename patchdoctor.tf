@@ -71,6 +71,20 @@ resource "aws_dynamodb_table" "patchdoctor" {
     name = "pk"
     type = "S"
   }
+  attribute {
+    name = "record_kind"
+    type = "S"
+  }
+  attribute {
+    name = "created_at"
+    type = "N"
+  }
+  global_secondary_index {
+    name            = "active-cases"
+    hash_key        = "record_kind"
+    range_key       = "created_at"
+    projection_type = "KEYS_ONLY"
+  }
   point_in_time_recovery { enabled = true }
   server_side_encryption { enabled = true }
   tags = { Managed = "terraform", Purpose = "critical-patch-administration" }
@@ -202,25 +216,28 @@ resource "aws_iam_role_policy" "patchdoctor_common" {
           "kms:EncryptionContext:aws:s3:arn" = aws_s3_bucket.patchdoctor.arn
         } }
       }
-      ], each.key == "worker" ? [] : [
-      {
-        Effect   = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:TransactWriteItems"]
-        Resource = aws_dynamodb_table.patchdoctor.arn
-      },
-      { Effect = "Allow", Action = ["sns:Publish"], Resource = aws_sns_topic.cost_alerts.arn },
-      {
-        Effect    = "Allow", Action = ["inspector2:ListFindings", "securityhub:GetFindings", "ec2:DescribeInstances"]
-        Resource  = "*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.patchdoctor_regions } }
-      },
-      {
-        Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"]
-        Resource = [
-          format("arn:aws:codebuild:%s:%s:project/patchdoctor", var.aws_region, data.aws_caller_identity.current.account_id),
-          format("arn:aws:codebuild:%s:%s:build/patchdoctor:*", var.aws_region, data.aws_caller_identity.current.account_id)
-        ]
-      }
-    ])
+      ], [for statement in [
+        {
+          Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
+          Resource = [
+            aws_dynamodb_table.patchdoctor.arn,
+            format("%s/index/active-cases", aws_dynamodb_table.patchdoctor.arn)
+          ]
+        },
+        { Effect = "Allow", Action = ["sns:Publish"], Resource = aws_sns_topic.cost_alerts.arn },
+        {
+          Effect    = "Allow", Action = ["inspector2:ListFindings", "securityhub:GetFindings", "ec2:DescribeInstances"]
+          Resource  = "*"
+          Condition = { StringEquals = { "aws:RequestedRegion" = local.patchdoctor_regions } }
+        },
+        {
+          Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"]
+          Resource = [
+            format("arn:aws:codebuild:%s:%s:project/patchdoctor", var.aws_region, data.aws_caller_identity.current.account_id),
+            format("arn:aws:codebuild:%s:%s:build/patchdoctor:*", var.aws_region, data.aws_caller_identity.current.account_id)
+          ]
+        }
+    ] : statement if each.key != "worker"])
   })
 }
 resource "aws_iam_role_policy" "patchdoctor_start" {
@@ -228,8 +245,18 @@ resource "aws_iam_role_policy" "patchdoctor_start" {
   name = "start-fixed-doctor"
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = ["codebuild:StartBuild", "codebuild:StopBuild"],
-    Resource = format("arn:aws:codebuild:%s:%s:project/patchdoctor", var.aws_region, data.aws_caller_identity.current.account_id) }]
+    Statement = [
+      {
+        Effect   = "Allow", Action = ["codebuild:StartBuild", "codebuild:StopBuild"],
+        Resource = format("arn:aws:codebuild:%s:%s:project/patchdoctor", var.aws_region, data.aws_caller_identity.current.account_id)
+      },
+      {
+        # Reconcile existing commands after their worker dies; this role cannot send commands.
+        Effect    = "Allow", Action = ["ssm:GetCommandInvocation", "ssm:ListCommands", "ssm:ListCommandInvocations"]
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.patchdoctor_regions } }
+      }
+    ]
   })
 }
 resource "aws_iam_role_policy" "patchdoctor_worker" {

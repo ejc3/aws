@@ -15,6 +15,7 @@ COMMAND_TERMINAL = {'Success', 'Failed', 'Cancelled', 'TimedOut', 'DeliveryTimed
 OUTCOMES = {'patched', 'mitigated', 'blocked', 'self-test-passed'}
 START_REJECTED = {'InvalidInputException', 'ResourceNotFoundException', 'AccountLimitExceededException',
     'AccessDeniedException', 'NotAuthorizedException'}
+ACTIVE_CASES = {'pending', 'running', 'starting', 'start-uncertain', 'daily-budget-wait', 'awaiting-native-closure'}
 _CLIENTS = {}
 
 
@@ -71,6 +72,8 @@ class Store:
         require(len(encoded(body).encode()) < 350000)
         kwargs = {'TableName': self.table, 'Item': {'pk': {'S': pk}, 'body': {'S': encoded(body)},
             'revision': {'N': str(revision + 1)}}}
+        if pk.startswith('case#') and (body.get('status') in ACTIVE_CASES or body.get('outstanding_operations')):
+            kwargs['Item'].update(record_kind={'S': 'active-case'}, created_at={'N': str(body['created_at'])})
         if revision:
             kwargs.update(ConditionExpression='revision = :old', ExpressionAttributeValues={':old': {'N': str(revision)}})
         else:
@@ -81,20 +84,20 @@ class Store:
 
     def cases(self):
         result, start = [], None
-        for _ in range(20):
-            kwargs = {'TableName': self.table, 'ConsistentRead': True, 'Limit': 100,
-                'FilterExpression': 'begins_with(pk, :prefix)', 'ExpressionAttributeValues': {':prefix': {'S': 'case#'}}}
+        while True:
+            kwargs = {'TableName': self.table, 'IndexName': 'active-cases', 'Limit': 100,
+                'KeyConditionExpression': 'record_kind = :kind',
+                'ExpressionAttributeValues': {':kind': {'S': 'active-case'}}}
             if start:
                 kwargs['ExclusiveStartKey'] = start
-            page = self.ddb.scan(**kwargs)
+            page = self.ddb.query(**kwargs)
             for item in page.get('Items', []):
-                value = json.loads(item['body']['S'])
-                value['_revision'] = int(item['revision']['N'])
-                result.append(value)
+                value = self.get(item['pk']['S'])
+                if value and (value.get('status') in ACTIVE_CASES or value.get('outstanding_operations')):
+                    result.append(value)
             start = page.get('LastEvaluatedKey')
             if not start:
                 return result
-        raise RuntimeError('incident ledger scan bound exceeded')
 
 
 class Doctor:
@@ -114,6 +117,44 @@ class Doctor:
     def save(self, case):
         case['updated_at'] = int(self.now())
         return self.store.put('case#' + case['case_id'], case)
+
+    def active_cases(self):
+        # Strong pointers cover GSI propagation delay for active builds and commands.
+        result = {}
+        for key in ('active-case', 'host-operation'):
+            pointer = self.store.get(key)
+            if pointer and pointer.get('case_id'):
+                case = self.store.get('case#' + pointer['case_id'])
+                require(case)
+                result[case['case_id']] = case
+        for case in self.store.cases():
+            if case['case_id'] not in result:
+                result[case['case_id']] = case
+        return list(result.values())
+
+    def release(self, key, case_id, operation_id=None):
+        pointer = self.store.get(key)
+        if pointer and pointer.get('case_id') == case_id and (operation_id is None or pointer.get('operation_id') == operation_id):
+            pointer.update(case_id=None, operation_id=None)
+            self.store.put(key, pointer)
+
+    def operation_index(self, case, operation_id, key, terminal=False):
+        for _ in range(4):
+            current = self.store.get('case#' + case['case_id'])
+            require(current)
+            current.setdefault('operations', {})[operation_id] = key
+            pending = set(current.get('outstanding_operations', []))
+            pending.discard(operation_id) if terminal else pending.add(operation_id)
+            current['outstanding_operations'] = sorted(pending)
+            try:
+                self.save(current)
+                case.clear()
+                case.update(current)
+                return
+            except Exception as error:
+                if error_code(error) != 'ConditionalCheckFailedException':
+                    raise
+        raise RuntimeError('case operation index conflict')
 
     def notify(self, kind, case):
         self.api('sns').publish(TopicArn=self.env['SNS_TOPIC_ARN'], Subject='PatchDoctor ' + kind,
@@ -235,14 +276,26 @@ class Doctor:
             revision = digest(encoded({'targets': sorted(t['instance_id'] for t in targets),
                 'fixes': sorted((f['instance_id'], f['fix_available'],
                     sorted((p['name'], p['fixedInVersion']) for p in f['packages'])) for f in findings)}))
-            case_id = digest('/'.join((self.account, region, cve, revision)))
+            revision_id = digest('/'.join((self.account, region, cve, revision)))
+            pointer_key = 'revision#' + revision_id
+            pointer = self.store.get(pointer_key) or {'case_id': revision_id, 'generation': 0}
+            case_id = pointer['case_id']
             case = self.store.get('case#' + case_id)
+            if case and case['status'] == 'resolved':
+                # Native ACTIVE was re-read above: this is a new occurrence, not an old delivery.
+                pointer.update(generation=pointer['generation'] + 1)
+                pointer['case_id'] = digest(revision_id + '/' + str(pointer['generation']))
+                case_id = pointer['case_id']
+                case = self.store.get('case#' + case_id)
             if not case:
                 case = {'case_id': case_id, 'account': self.account, 'region': region, 'cve': cve,
-                    'mode': 'repair', 'revision': revision, 'status': 'pending', 'created_at': int(self.now()),
+                    'mode': 'repair', 'revision': revision, 'generation': pointer['generation'],
+                    'status': 'pending', 'created_at': int(self.now()),
                     'attempts': 0, 'reserved_usd': 0, 'operations': {}}
             case.update(targets=targets, findings=findings, finding_arns=sorted(set(case.get('finding_arns', [])) | {f['finding_arn'] for f in findings}))
             self.save(case)
+            # Case first, then deterministic generation pointer: a crash can only rediscover it.
+            self.store.put(pointer_key, pointer)
             if not case.get('notice_sent'):
                 self.notify('CRITICAL', case)
                 case['notice_sent'] = True
@@ -275,6 +328,11 @@ class Doctor:
 
     def start(self, case):
         require(case['attempts'] < 2 and case['reserved_usd'] + 25 <= 50)
+        active = self.store.get('active-case') or {'case_id': None}
+        if active.get('case_id') not in {None, case['case_id']}:
+            return
+        active['case_id'] = case['case_id']
+        self.store.put('active-case', active)
         today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
         daily = self.store.get('daily#' + today) or {'starts': 0}
         if daily['starts'] >= 4:
@@ -283,6 +341,7 @@ class Doctor:
                 datetime.date.fromisoformat(today) + datetime.timedelta(days=1),
                 datetime.time(), datetime.timezone.utc).timestamp())
             self.save(case)
+            self.release('active-case', case['case_id'])
             self.notify('daily-budget-exhausted', case)
             return
         # Reserve before any StartBuild. A crash consumes the reservation conservatively.
@@ -293,6 +352,7 @@ class Doctor:
         case.update(status='starting', started_at=int(self.now()), deadline_unix=int(self.now()) + 3600,
             start_token=digest(case['case_id'] + '/' + str(case['attempts'])), start_attempted=False)
         case.pop('outcome', None)
+        case.pop('build_status', None)
         self.save(case)
         self.submit(case)
 
@@ -311,6 +371,7 @@ class Doctor:
             if code in START_REJECTED:
                 case.update(status='blocked-start-rejected', no_build=True, rejection_code=code)
                 self.save(case)
+                self.release('active-case', case['case_id'])
                 self.notify_once('start-rejected', case, 'start_notice_sent')
             else:
                 case['status'] = 'start-uncertain'
@@ -322,12 +383,19 @@ class Doctor:
         self.save(case)
 
     def reconcile(self):
-        cases = self.store.cases()
+        cases = self.active_cases()
+        pointer = self.store.get('active-case') or {}
+        for case in cases:
+            if (case['case_id'] == pointer.get('case_id') and case['status'] not in {'running', 'starting', 'start-uncertain'} and
+                    (case.get('build_status') in BUILD_TERMINAL or case.get('no_build') is True)):
+                self.release('active-case', case['case_id'])
         busy = False
         for case in cases:
+            self.reconcile_operations(case)
             if case['status'] == 'daily-budget-wait' and self.now() >= case['retry_after']:
                 case['status'] = 'pending'
                 self.save(case)
+                self.release('active-case', case['case_id'])
             if case['status'] in {'starting', 'start-uncertain'}:
                 if case['status'] == 'starting' and case.get('start_attempted') is False:
                     self.submit(case)  # Proven pre-send intent, not an uncertain replay.
@@ -349,6 +417,7 @@ class Doctor:
                 else:
                     case['status'] = 'pending' if case['attempts'] < 2 else 'budget-exhausted'
                 self.save(case)
+                self.release('active-case', case['case_id'])
                 if case.get('outcome'):
                     self.notify_once(case['outcome'], case, 'outcome_notice_sent')
                 if case['status'] == 'budget-exhausted':
@@ -356,18 +425,21 @@ class Doctor:
         for case in cases:
             if case.get('status') == 'awaiting-native-closure':
                 targets, _ = self.critical_targets(case['cve'], case['region'])
-                if not targets and self.native_closed(case):
+                if not targets and not case.get('outstanding_operations') and self.native_closed(case):
                     case['status'] = 'resolved'
                     self.save(case)
-        if busy:
+        if busy or (self.store.get('host-operation') or {}).get('case_id'):
             return
-        for case in sorted(cases, key=lambda c: c['created_at']):
-            if case['status'] == 'pending' and (case['mode'] == 'self-test' or self.config().get('armed') is True):
+        pointer = self.store.get('active-case') or {}
+        for case in sorted(cases, key=lambda c: (c['case_id'] != pointer.get('case_id'), c['created_at'])):
+            if (case['status'] == 'pending' and not case.get('outstanding_operations')
+                    and (case['mode'] == 'self-test' or self.config().get('armed') is True)):
                 if case['mode'] != 'self-test':
                     targets, findings = self.critical_targets(case['cve'], case['region'])
                     if not targets:
                         case['status'] = 'blocked-no-current-critical-target'
                         self.save(case)
+                        self.release('active-case', case['case_id'])
                         continue
                     case.update(targets=targets, findings=findings)
                 self.start(case)
@@ -385,6 +457,21 @@ class Doctor:
             if len(matches) != 1 or matches[0].get('status') != 'CLOSED':
                 return False
         return True
+
+    def reconcile_operations(self, case):
+        # Existing command observation is independent of the worker/model lease.
+        for operation_id in list(case.get('outstanding_operations', [])):
+            key = self.operation(case, operation_id)
+            op = self.store.get(key)
+            require(op and case['operations'].get(operation_id) == key)
+            if op['state'] == 'prepared':
+                if self.build(op['build_id'])['buildStatus'] not in BUILD_TERMINAL:
+                    continue
+                # Prepared proves SendCommand was never attempted. Do not replay it.
+                self.archive_terminal(case, key, op, {'status': 'Cancelled', 'response_code': -1,
+                    'stdout': '', 'stderr': '', 'reason': 'worker-ended-before-send'})
+            else:
+                self.poll(case, {'operation_id': operation_id})
 
     def authorize(self, event):
         require(isinstance(event.get('case_id'), str) and DIGEST.fullmatch(event['case_id']))
@@ -414,8 +501,9 @@ class Doctor:
             require(existing['body_hash'] == body_hash)
             if existing['state'] != 'prepared':
                 return self.op_receipt(existing)
-        targets, _ = self.critical_targets(case['cve'], target['region'])
-        require(any(t['instance_id'] == target['instance_id'] for t in targets))
+        if not inspect:
+            targets, _ = self.critical_targets(case['cve'], target['region'])
+            require(any(t['instance_id'] == target['instance_id'] for t in targets))
         self.describe_target(target['instance_id'], target['region'])
         op = existing or {'operation_id': event['operation_id'], 'body_hash': body_hash, 'script_sha256': digest(script),
             'target': target, 'state': 'prepared', 'comment': 'PatchDoctor-' + digest(key)[:48],
@@ -423,8 +511,13 @@ class Doctor:
             'created_at': int(self.now()), 'build_id': case['build_id']}
         if not existing:
             self.store.put(key, op)
-        case['operations'][event['operation_id']] = key
-        self.save(case)
+        self.operation_index(case, event['operation_id'], key)
+        if not inspect:
+            active = self.store.get('host-operation') or {'case_id': None}
+            require(not active.get('case_id') or (active['case_id'] == case['case_id']
+                and active.get('operation_id') == event['operation_id']))
+            active.update(case_id=case['case_id'], operation_id=event['operation_id'])
+            self.store.put('host-operation', active)
         if not op.get('request_version_id'):
             authored = encoded({'case_id': case['case_id'], 'operation_id': op['operation_id'],
                 'target': target, 'document': op['document'], 'script': script}).encode()
@@ -492,14 +585,22 @@ class Doctor:
             'stdout': str(result.get('StandardOutputContent', ''))[:24576],
             'stderr': str(result.get('StandardErrorContent', ''))[:8192]}
         if status in COMMAND_TERMINAL:
-            receipt_key = 'commands/' + case['case_id'] + '/' + digest(key) + '.json'
-            # Host roles never write into the audit bucket. Only this broker records results.
-            self.api('s3').put_object(Bucket=self.env['BUCKET_NAME'], Key=receipt_key,
-                Body=encoded(receipt).encode(), ContentType='application/json', ExpectedBucketOwner=self.account)
-            op.update(state='terminal', status=status, receipt_key=receipt_key)
-            self.store.put(key, op)
+            self.archive_terminal(case, key, op, receipt)
             receipt['state'] = 'terminal'
         return receipt
+
+    def archive_terminal(self, case, key, op, receipt):
+        if op['state'] != 'terminal':
+            receipt_key = 'commands/' + case['case_id'] + '/' + digest(key) + '.json'
+            # No host role writes into the audit bucket; terminal ACK follows its archive.
+            archived = self.api('s3').put_object(Bucket=self.env['BUCKET_NAME'], Key=receipt_key,
+                Body=encoded(receipt).encode(), ContentType='application/json', ExpectedBucketOwner=self.account)
+            require(isinstance(archived.get('VersionId'), str) and archived['VersionId'] not in {'', 'null'})
+            op.update(state='terminal', status=receipt['status'], receipt_key=receipt_key,
+                receipt_version_id=archived['VersionId'])
+            self.store.put(key, op)
+        self.operation_index(case, op['operation_id'], key, terminal=True)
+        self.release('host-operation', case['case_id'], op['operation_id'])
 
     def checkpoint(self, case, event):
         prefix = 'cases/' + case['case_id'] + '/builds/' + digest(case['build_id']) + '/checkpoints/'
@@ -510,9 +611,17 @@ class Doctor:
             VersionId=version, ExpectedBucketOwner=self.account)
         require(obj.get('VersionId') == version and 0 < obj['ContentLength'] <= 256 * 1024 * 1024
             and obj.get('ServerSideEncryption') == 'aws:kms')
-        case['checkpoint'] = {'key': key, 'version_id': version}
-        self.save(case)
-        return {'acknowledged': True, 'checkpoint': case['checkpoint']}
+        checkpoint = {'key': key, 'version_id': version}
+        for _ in range(4):
+            current = self.authorize({'case_id': case['case_id'], 'build_id': case['build_id']})
+            current['checkpoint'] = checkpoint
+            try:
+                self.save(current)
+                return {'acknowledged': True, 'checkpoint': checkpoint}
+            except Exception as error:
+                if error_code(error) != 'ConditionalCheckFailedException':
+                    raise
+        raise RuntimeError('checkpoint revision conflict')
 
     def broker(self, event):
         require(len(encoded(event).encode()) <= 24000)
