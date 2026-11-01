@@ -315,6 +315,80 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.cloud.finding['status'], 'ACTIVE')
         self.assertEqual(self.cloud.sends, [])
 
+    def test_due_evidence_recheck_runs_before_busy_and_unknown_host_operation_fences(self):
+        for fence in ('busy-build', 'unknown-host-operation'):
+            with self.subTest(fence=fence):
+                self.store, self.cloud = Memory(), Cloud()
+                self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+                self.model.calls.clear()
+                vendor = self.native_no_fix()
+                with patch.object(T, 'fetch_vendor', return_value=vendor):
+                    deferred = self.admit()
+                    other = copy.deepcopy(self.cloud.finding)
+                    other['findingArn'] += '-other'
+                    other['fixAvailable'] = 'YES'
+                    other['packageVulnerabilityDetails']['vulnerabilityId'] = 'CVE-2026-54321'
+                    self.cloud.extra_findings = [other]
+                    other_id = self.doctor.handler({**self.event, 'detail': {'findingArn': other['findingArn']}})['admitted'][0]
+                    repair = self.store.get('case#' + other_id)
+                    self.assertEqual(len(self.cloud.starts), 1)
+                    if fence == 'unknown-host-operation':
+                        self.cloud.lose_send = True
+                        self.doctor.broker(self.command(repair))
+                        repair = self.store.get('case#' + other_id)
+                        repair.update(attempts=2, reserved_usd=50)
+                        self.doctor.save(repair)
+                        self.cloud.builds[repair['build_id']]['buildStatus'] = 'FAILED'
+                    sends = len(self.cloud.sends)
+                    self.clock += 3300
+                    with patch.object(self.cloud, 'list_commands', return_value={'Commands': []}):
+                        self.doctor.reconcile()
+                checked = self.store.get('case#' + deferred['case_id'])
+                self.assertEqual(len(self.model.calls), 2, 'due evidence must be checked even while another repair is fenced')
+                self.assertEqual(checked['triage_checked_at'], self.clock)
+                self.assertEqual(checked['status'], 'deferred')
+                self.assertEqual(len(self.cloud.starts), 1)
+                self.assertEqual(len(self.cloud.sends), sends)
+                if fence == 'unknown-host-operation':
+                    self.assertEqual(self.store.get('host-operation')['case_id'], repair['case_id'])
+
+    def test_recheck_effect_survives_lost_ack_and_later_recheck_even_after_worker_start(self):
+        for start_after_second in (False, True):
+            with self.subTest(start_after_second=start_after_second):
+                self.store, self.cloud = Memory(), Cloud()
+                self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+                self.model.calls.clear()
+                vendor = self.native_no_fix()
+                with patch.object(T, 'fetch_vendor', return_value=vendor):
+                    case = self.admit()
+                    self.doctor.handler({'action': 'pause_new_runs', 'paused': True, 'mutationId': 'hold'})
+                    first = {'action': 'recheck', 'case_id': case['case_id'], 'mutationId': 'recheck-A'}
+                    original, failed = self.store.put, []
+                    def lose_final_ack(key, value):
+                        if key == 'admin#' + C.digest(first['mutationId']) and value.get('state') == 'completed' and not failed:
+                            failed.append(True)
+                            raise OSError('lost first final acknowledgement')
+                        return original(key, value)
+                    self.store.put = lose_final_ack
+                    with self.assertRaises(OSError):
+                        self.doctor.handler(first)
+                    if start_after_second:
+                        self.model.decision, self.model.category = 'run_doctor', 'needs_investigation'
+                        self.doctor.handler({'action': 'pause_new_runs', 'paused': False, 'mutationId': 'resume'})
+                    self.doctor.handler({**first, 'mutationId': 'recheck-B'})
+                    before = self.store.get('case#' + case['case_id'])
+                    calls, starts = len(self.model.calls), len(self.cloud.starts)
+                    try:
+                        replay = self.doctor.handler(first)
+                    except ValueError:
+                        replay = {'state': 'refused'}
+                    self.assertEqual(replay, {'action': 'recheck', 'mutationId': 'recheck-A', 'state': 'completed', 'case_count': 1})
+                    self.assertEqual(self.store.get('case#' + case['case_id']), before)
+                    self.assertEqual((len(self.model.calls), len(self.cloud.starts)), (calls, starts))
+                    self.assertEqual(starts, int(start_after_second))
+                    for mutation in ('recheck-A', 'recheck-B'):
+                        self.assertTrue(before['recheck_effects'][C.digest(mutation)])
+
     def test_changed_native_exploit_bypasses_cached_deferral_immediately(self):
         vendor = self.native_no_fix()
         with patch.object(T, 'fetch_vendor', return_value=vendor):

@@ -326,10 +326,12 @@ class Doctor:
             changed = 0
             for case_id in receipt['case_ids']:
                 case = self.store.get('case#' + case_id)
-                if case.get('last_recheck_mutation') == mutation:
+                effect_id = digest(mutation)
+                if case.get('recheck_effects', {}).get(effect_id) is True:
                     continue
                 require(case['status'] in {'pending', 'deferred', 'blocked-no-current-critical-target'})
-                case.update(status='pending', recheck_at=0, last_recheck_mutation=mutation)
+                case.update(status='pending', recheck_at=0)
+                case.setdefault('recheck_effects', {})[effect_id] = True
                 case.pop('triage', None)
                 self.save(case)
                 changed += 1
@@ -601,8 +603,18 @@ class Doctor:
             observed.append(case)
             if case['status'] == 'deferred':
                 if self.now() >= case['recheck_at']:
-                    case['status'] = 'pending'
-                    self.save(case)
+                    try:
+                        # Evidence checks do not acquire the repair/command lease.
+                        targets, findings = self.critical_targets(case['cve'], case['region'])
+                        if not targets:
+                            case['status'] = 'blocked-no-current-critical-target'
+                            self.save(case)
+                        else:
+                            case.update(status='pending', targets=targets, findings=findings)
+                            self.assess(case)
+                    except Exception as error:
+                        self.observer_failure(case, error)
+                        continue
                 elif case.get('triage_notice_at') != case.get('triage_checked_at'):
                     self.notify('deferred-recheck', case)
                     case['triage_notice_at'] = case['triage_checked_at']
@@ -670,7 +682,7 @@ class Doctor:
                     case.update(targets=targets, findings=findings)
                     decision, assessed = self.assess(case)
                     if decision == 'defer':
-                        return  # At most one paid triage call per controller invocation.
+                        return  # A deferred case cannot start a repair worker.
                     if self.config().get('paused_new_runs') is True:
                         if assessed:
                             return

@@ -117,6 +117,8 @@ plus a high-confidence Haiku agreement. Missing evidence, known exploitation,
 an available fix, a model error, or uncertainty sends the case to Opus. Deferred
 findings stay open, are notified, and are rechecked within one hour; model text never
 authorizes a host command or declares a vulnerability resolved.
+Lack of a vendor fix alone never defers a critical case: Opus investigates possible
+host mitigations before reporting a blocked outcome.
 
 The first release covers the named main-account Linux fleet in us-west-1, us-west-2
 and us-east-1: both jumpboxes, ARM and x86 metal, Next.js and the Claude master server.

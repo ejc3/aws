@@ -155,8 +155,6 @@ def _proof(case, evidence, now):
                 kind = 'not_applicable'
             elif status == 'not_affected' and justification == 'inline_mitigations_already_exist':
                 kind = 'already_mitigated'
-            elif status == 'under_investigation' and statement.get('status_notes') == 'The vulnerability is known but remediation is deferred.':
-                kind = 'waiting_for_vendor'
             else:
                 raise ValueError('vendor state needs doctor')
             kinds.add(kind)

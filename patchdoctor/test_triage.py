@@ -69,12 +69,13 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(set(client.calls[0]['inferenceConfig']), {'maxTokens'})
         self.assertNotIn('toolConfig', client.calls[0])
 
-    def test_waiting_vendor_requires_exact_explicit_deferred_statement(self):
-        for notes, decision in [('The vulnerability is known but remediation is deferred.', 'defer'),
-                                ('Vulnerability assessment is pending.', 'run_doctor'), ('', 'run_doctor')]:
+    def test_waiting_vendor_always_needs_doctor_even_with_explicit_deferred_remediation(self):
+        for notes in ['The vulnerability is known but remediation is deferred.',
+                      'Vulnerability assessment is pending.', '']:
             with self.subTest(notes=notes):
                 client = FakeClient(category='waiting_for_vendor')
-                self.assertEqual(triage.classify(case(), evidence('under_investigation', notes=notes), client)['decision'], decision)
+                self.assertEqual(triage.classify(case(), evidence('under_investigation', notes=notes), client)['decision'], 'run_doctor')
+                self.assertEqual(client.calls, [])
 
     def test_mitigation_requires_primary_inline_mitigation_not_model_claim(self):
         self.assertEqual(triage.classify(case(), evidence(justification='inline_mitigations_already_exist'),
