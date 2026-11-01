@@ -1,6 +1,6 @@
-# Private combined VPN/MDM enrollment and emergency patch administration portal.
-# Sites owns code and its owner-private ChatGPT gate. This more-specific Access
-# application overrides the family wildcard before any custom-domain DNS exists.
+# Owner-private credential setup and existing emergency patch administration.
+# The direct Worker uses Cloudflare's authenticated invocation context. It never
+# proxies to the archived private Sites publication or requires a ChatGPT login.
 resource "cloudflare_zero_trust_access_policy" "control_portal" {
   account_id       = var.cloudflare_account_id
   name             = "Control Room: owner only"
@@ -74,7 +74,7 @@ resource "aws_iam_access_key" "control_portal" {
 }
 resource "aws_secretsmanager_secret" "control_portal" {
   name                    = "control-portal/runtime"
-  description             = "Dedicated Control Room Worker AWS identity; administrator copies to Sites runtime secrets only."
+  description             = "Dedicated Control Room server identity; Terraform installs private Cloudflare Worker bindings."
   recovery_window_in_days = 7
 }
 resource "aws_secretsmanager_secret_policy" "control_portal" {
@@ -100,4 +100,44 @@ resource "aws_secretsmanager_secret_version" "control_portal" {
     LOG_GROUP             = aws_cloudwatch_log_group.patchdoctor["worker"].name
     OWNER_EMAIL           = local.people.owner
   })
+}
+
+# Reuse the existing owner-only Access app and its audience. The route answers
+# every request itself; the old private Sites publication remains unreachable
+# through this hostname and is not made public to bypass its second login.
+resource "cloudflare_workers_script" "control_portal" {
+  account_id         = var.cloudflare_account_id
+  script_name        = "control-room"
+  main_module        = "index.mjs"
+  content_file       = "${path.module}/control-portal/index.mjs"
+  content_sha256     = filesha256("${path.module}/control-portal/index.mjs")
+  compatibility_date = "2026-11-01"
+  bindings = [
+    { name = "ACCESS_AUD", type = "plain_text", text = cloudflare_zero_trust_access_application.control_portal.aud },
+    { name = "OWNER_EMAIL", type = "secret_text", text = local.people.owner },
+    { name = "AWS_ACCESS_KEY_ID", type = "secret_text", text = aws_iam_access_key.control_portal.id },
+    { name = "AWS_SECRET_ACCESS_KEY", type = "secret_text", text = aws_iam_access_key.control_portal.secret },
+    { name = "AWS_REGION", type = "plain_text", text = var.aws_region },
+    { name = "CONTROL_LAMBDA_NAME", type = "plain_text", text = aws_lambda_function.patchdoctor.function_name },
+    { name = "TABLE_NAME", type = "plain_text", text = aws_dynamodb_table.patchdoctor.name },
+    { name = "PROJECT_NAME", type = "plain_text", text = aws_codebuild_project.patchdoctor.name },
+    { name = "LOG_GROUP", type = "plain_text", text = aws_cloudwatch_log_group.patchdoctor["worker"].name },
+  ]
+}
+
+resource "cloudflare_workers_script_subdomain" "control_portal" {
+  account_id       = var.cloudflare_account_id
+  script_name      = cloudflare_workers_script.control_portal.script_name
+  enabled          = false
+  previews_enabled = false
+}
+
+resource "cloudflare_workers_route" "control_portal" {
+  zone_id = var.cc_games_zone_id
+  pattern = "control.cc-games.dev/*"
+  script  = cloudflare_workers_script.control_portal.script_name
+  depends_on = [
+    cloudflare_zero_trust_access_application.control_portal,
+    cloudflare_workers_script_subdomain.control_portal,
+  ]
 }
