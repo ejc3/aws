@@ -152,7 +152,10 @@ After a clean Terraform apply, PatchDoctor starts **unarmed**. Invoke its
 administration-only self_test action, inspect the durable result and CodeBuild
 success, then invoke arm. The test uses real Opus to read, repair and test a broken
 local fixture and exercises private streaming/checkpoints; it cannot execute host
-commands. The broker's target and severity gates remain active after arming. Review
+commands. Commissioning is tied to the worker bundle, bootstrap recipe and pinned CLI.
+A changed runtime requires a new successful test before repairs can be armed;
+historical attempts and the shared daily budget remain intact.
+The broker's target and severity gates remain active after arming. Review
 incidents in the patchdoctor DynamoDB table and protected artifacts in the bucket
 reported by terraform output patchdoctor. Never make that bucket public or copy
 raw transcripts into issue comments.
