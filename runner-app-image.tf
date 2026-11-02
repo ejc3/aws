@@ -99,10 +99,13 @@ locals {
       # .github/workflows/ci.yml, scrape-live.yml (Python's Playwright drives a remote browser: nothing to install);
       # engine-rs/rust-toolchain.toml and engine-rs/Cargo.toml (built natively and to WebAssembly);
       # ci.yml's ffmpeg step (pipeline/test/recorder.test.ts measures the voice clips' loudness);
-      # cloudflare-stage.yml's Tiles step (osmium-tool reads Geofabrik's California extract for pipeline/src/build-tiles.ts).
+      # cloudflare-stage.yml's Tiles step (osmium-tool reads Geofabrik's California extract for pipeline/src/build-tiles.ts);
+      # ci.yml's Chromium step (web/test/car-compact.test.ts lays the car page out in headless Chrome).
       versions = {
         NODE_MAJOR           = "22"
         PYTHON_VERSIONS      = "3.12"
+        PLAYWRIGHT_VERSION   = "1.62.1"
+        PLAYWRIGHT_BROWSERS  = "chromium"
         RUST_TOOLCHAIN       = "1.93.0"
         RUST_COMPONENTS      = "rustfmt,clippy"
         RUST_TARGETS         = "wasm32-unknown-unknown"
