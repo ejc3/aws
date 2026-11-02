@@ -137,6 +137,31 @@ resource "aws_secretsmanager_secret_policy" "intune_connection" {
   })
 }
 
+# A new organization needs a bootstrap login even when the owner's Mac Keychain
+# is locked. It is separate from the application's credential and has no portal
+# or development-host reader. Existing personal logins are never copied here.
+resource "aws_secretsmanager_secret" "intune_administrator" {
+  name                    = "intune/administrator"
+  description             = "New Intune organization bootstrap login; administration only, never a portal credential."
+  recovery_window_in_days = 30
+  tags                    = { Managed = "terraform", Purpose = "owner-mdm-bootstrap" }
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_secretsmanager_secret_policy" "intune_administrator" {
+  secret_arn = aws_secretsmanager_secret.intune_administrator.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Deny", Principal = "*", Action = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.intune_administrator.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
 # Reuse the existing owner-only Access app and its audience. The route answers
 # every request itself; the old private Sites publication remains unreachable
 # through this hostname and is not made public to bypass its second login.

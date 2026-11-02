@@ -179,6 +179,15 @@ Administrators provision the payload after creating the Intune account and app;
 Terraform owns the protected container and grants the portal read access to only
 that secret. Browser sessions and the organization's administrator login remain
 separate. No credential payload goes into Terraform state, source or browser code.
+The application needs the Microsoft Graph application permission
+`DeviceManagementConfiguration.Read.All` with administrator consent. Provision
+the payload with `secretsmanager:PutSecretValue` on `intune/connection`, passing
+the JSON directly to the SDK in memory with a stable request token; keep it out
+of shell arguments and temporary files. Verify the stored version before
+acknowledging the handoff.
+A newly created organization's bootstrap login has a separate administrator-only
+`intune/administrator` vault. Neither the portal identity nor development roles
+may read it. Existing personal browser credentials are never copied into it.
 
 `GET /api/mdm/status` shows Connected only after app-only Microsoft authentication
 and a successful native Intune configuration read. Missing credentials, licensing
