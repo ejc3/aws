@@ -94,6 +94,21 @@ class ReleaseContracts(unittest.TestCase):
             self.assertNotIn('key         = "PipelineSanitized"', body)
         self.assertNotRegex(self.release, r'key\s*=\s*"PipelineSanitized"')
 
+    def test_legacy_image_authorization_survives_default_pair_updates(self):
+        catalog = re.search(r"fcvm_ami_bootstrap\s*=\s*\{(.*?)\n  \}", self.release, re.S)
+        self.assertIsNotNone(catalog, "legacy image tags must have an explicit additive catalog")
+        self.assertNotIn("var.", catalog.group(1))
+        for key, image, kind in (
+            ("host/x86_64", "ami-00fb7a2e8b89e2446", "host"),
+            ("tile/x86_64", "ami-0edfc91ca2e651db9", "tile"),
+            ("host/x86_64/38d63412", "ami-0d94bb60fbf180b7f", "host"),
+            ("tile/x86_64/2f861183", "ami-0a9804d3fc86cd87e", "tile"),
+        ):
+            with self.subTest(resource_key=key):
+                self.assertRegex(catalog.group(1), r'"' + re.escape(key)
+                                 + r'"\s*=\s*\{\s*image\s*=\s*"' + image
+                                 + r'",\s*kind\s*=\s*"' + kind + r'"\s*\}')
+
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

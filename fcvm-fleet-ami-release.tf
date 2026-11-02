@@ -44,12 +44,15 @@ locals {
   fcvm_active_host_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).host_amis) : var.fcvm_fleet_host_amis
   fcvm_active_tile_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).tile_amis) : var.fcvm_fleet_tile_amis
   fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates
-  # These two pre-pipeline images already passed actual hardware/stream/guard
-  # verification. They are eligible for the transition, not sanitized CI bases.
-  fcvm_ami_bootstrap = merge(
-    { for arch, image in lookup(var.fcvm_fleet_host_amis, "us-east-1", {}) : "host/${arch}" => { image = image, kind = "host" } if image != "" },
-    { for arch, image in lookup(var.fcvm_fleet_tile_amis, "us-east-1", {}) : "tile/${arch}" => { image = image, kind = "tile" } if image != "" }
-  )
+  # Manually verified legacy images, not sanitized CI bases. Keep this catalog
+  # additive: moving a tag's resource_id revokes the old image's launch permission,
+  # including an active or rollback release. Preserve the original resource keys.
+  fcvm_ami_bootstrap = {
+    "host/x86_64"          = { image = "ami-00fb7a2e8b89e2446", kind = "host" }
+    "tile/x86_64"          = { image = "ami-0edfc91ca2e651db9", kind = "tile" }
+    "host/x86_64/38d63412" = { image = "ami-0d94bb60fbf180b7f", kind = "host" }
+    "tile/x86_64/2f861183" = { image = "ami-0a9804d3fc86cd87e", kind = "tile" }
+  }
 }
 
 resource "aws_ec2_tag" "fcvm_ami_bootstrap_kind" {
