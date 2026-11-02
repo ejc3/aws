@@ -9,7 +9,7 @@ export function renderMdmCredentialsPortal() {
   <meta name="description" content="Your private MDM credential connection status.">
   <title>MDM credentials</title>
   <style>
-    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#22332b;background:#f5f3eb;font-synthesis:none}*{box-sizing:border-box}body{margin:0;min-width:320px}.shell{max-width:740px;margin:auto;padding:30px 24px 48px}.brand{display:flex;align-items:center;gap:11px;padding-bottom:24px;border-bottom:1px solid #dce0d4;font-size:14px;font-weight:600}.mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid #bccbb5;border-radius:11px;background:#edf0e6;color:#315b42;font:italic 25px Georgia,serif}.card{margin-top:38px;padding:34px;border:1px solid #dce0d4;border-radius:22px;background:#fffef9}.eyebrow{margin:0;color:#667267;font-size:11px;letter-spacing:1.5px;text-transform:uppercase}h1{margin:14px 0 23px;font:400 clamp(32px,7vw,46px)/1.15 "Iowan Old Style",Palatino,Georgia,serif;letter-spacing:-1px}.status{display:inline-block;margin:0 0 15px;padding:7px 11px;border-radius:20px;background:#f5ecd9;color:#795c29;font-size:12px;font-weight:600}.explanation{max-width:530px;margin:0;color:#667267;font-size:15px;line-height:1.8}.note{margin:26px 0 0;padding-top:20px;border-top:1px solid #dce0d4;color:#667267;font-size:12px;line-height:1.8}.skip{position:fixed;top:-80px;left:16px;padding:12px;background:#22332b;color:white}.skip:focus{top:12px}a:focus-visible{outline:3px solid #8ca97a;outline-offset:4px}@media(max-width:480px){.shell{padding:23px 20px 32px}.card{margin-top:28px;padding:25px 22px;border-radius:18px}.explanation{font-size:14px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#22332b;background:#f5f3eb;font-synthesis:none}*{box-sizing:border-box}body{margin:0;min-width:320px}.shell{max-width:740px;margin:auto;padding:30px 24px 48px}.brand{display:flex;align-items:center;gap:11px;padding-bottom:24px;border-bottom:1px solid #dce0d4;font-size:14px;font-weight:600}.mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid #bccbb5;border-radius:11px;background:#edf0e6;color:#315b42;font:italic 25px Georgia,serif}.card{margin-top:38px;padding:34px;border:1px solid #dce0d4;border-radius:22px;background:#fffef9}.eyebrow{margin:0;color:#667267;font-size:11px;letter-spacing:1.5px;text-transform:uppercase}h1{margin:14px 0 23px;font:400 clamp(32px,7vw,46px)/1.15 "Iowan Old Style",Palatino,Georgia,serif;letter-spacing:-1px}.status{display:inline-block;margin:0 0 15px;padding:7px 11px;border-radius:20px;background:#f5ecd9;color:#795c29;font-size:12px;font-weight:600}.status.connected{background:#e8eee3;color:#315b42}.status.unavailable{background:#f8eae4;color:#93463b}.explanation{max-width:530px;margin:0;color:#667267;font-size:15px;line-height:1.8}.action{margin-top:24px}button{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:44px;padding:12px 18px;border:1px solid #315b42;border-radius:11px;background:#315b42;color:#fffef9;cursor:pointer}button:disabled{cursor:wait;opacity:.6}.checked{min-height:18px;margin:12px 0 0;color:#667267;font-size:11px;line-height:1.6}.note{margin:26px 0 0;padding-top:20px;border-top:1px solid #dce0d4;color:#667267;font-size:12px;line-height:1.8}.skip{position:fixed;top:-80px;left:16px;padding:12px;background:#22332b;color:white}.skip:focus{top:12px}a:focus-visible,button:focus-visible{outline:3px solid #8ca97a;outline-offset:4px}@media(max-width:480px){.shell{padding:23px 20px 32px}.card{margin-top:28px;padding:25px 22px;border-radius:18px}.explanation{font-size:14px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
   </style>
 </head>
 <body>
@@ -19,11 +19,60 @@ export function renderMdmCredentialsPortal() {
     <main id="main" class="card">
       <p class="eyebrow">Microsoft Intune</p>
       <h1>MDM credentials.</h1>
-      <p class="status" role="status">Not connected</p>
-      <p class="explanation">Microsoft organization administrator sign-in is still needed. The Intune account connection has not been configured here.</p>
+      <p id="mdm-status" class="status" role="status">Checking connection…</p>
+      <p id="mdm-message" class="explanation">Checking your Microsoft Intune account connection.</p>
+      <div class="action"><button id="mdm-recheck" type="button" disabled>Recheck connection</button><p id="mdm-checked" class="checked" aria-live="polite"></p></div>
       <p class="note">Your existing devices and apps are unchanged.</p>
     </main>
   </div>
+  <script>
+  (function () {
+    'use strict';
+    var busy = false;
+    var status = document.getElementById('mdm-status');
+    var message = document.getElementById('mdm-message');
+    var checked = document.getElementById('mdm-checked');
+    var button = document.getElementById('mdm-recheck');
+    var reasons = {pending:['config_missing','service_not_configured','secret_missing'],
+      unavailable:['credentials_invalid','secret_unavailable','token_unavailable','graph_forbidden','graph_unavailable','graph_invalid']};
+    function valid(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      var keys = Object.keys(value).sort().join(',');
+      if (value.connected === true && value.state === 'connected') return keys === 'connected,state';
+      return value.connected === false && keys === 'connected,reason,state'
+        && Object.prototype.hasOwnProperty.call(reasons,value.state) && reasons[value.state].indexOf(value.reason) >= 0;
+    }
+    function unavailable() {
+      status.textContent = 'Connection not confirmed'; status.className = 'status unavailable';
+      message.textContent = 'The connection check could not be completed. Recheck the connection to try again.';
+    }
+    async function checkConnection() {
+      if (busy) return;
+      busy = true; button.disabled = true; checked.textContent = '';
+      status.textContent = 'Checking connection…'; status.className = 'status';
+      message.textContent = 'Checking your Microsoft Intune account connection.';
+      var controller = new AbortController();
+      var timer = setTimeout(function () { controller.abort(); },20000);
+      try {
+        var response = await fetch('/api/mdm/status',{method:'GET',credentials:'same-origin',cache:'no-store',redirect:'error',signal:controller.signal,headers:{Accept:'application/json'}});
+        if (response.status !== 200 || !response.ok || (response.headers.get('content-type') || '').indexOf('application/json') < 0) throw new Error('Connection check unavailable');
+        var value = await response.json();
+        if (!valid(value)) throw new Error('Connection status unavailable');
+        if (value.connected === true) {
+          status.textContent = 'Connected'; status.className = 'status connected';
+          message.textContent = 'Your Microsoft Intune account is connected.';
+        } else if (value.state === 'pending') {
+          status.textContent = 'Not connected'; status.className = 'status';
+          message.textContent = 'Your Intune credentials have not been connected yet.';
+        } else unavailable();
+        checked.textContent = 'Checked ' + new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+      } catch (_) { unavailable(); }
+      finally { clearTimeout(timer); busy = false; button.disabled = false; }
+    }
+    button.addEventListener('click',checkConnection);
+    checkConnection();
+  })();
+  </script>
 </body>
 </html>`;
 }
@@ -386,6 +435,79 @@ class PortalAws {
   }
 }
 
+async function portalMdmStatus(env, fetcher, now) {
+  const status = (state, reason) => ({connected: state === 'connected', state, ...(reason ? {reason} : {})});
+  const arn = env.MDM_SECRET_ARN;
+  if (arn === undefined || arn === '') return status('pending', 'config_missing');
+  if (typeof arn !== 'string' || !/^arn:aws:secretsmanager:us-west-1:\d{12}:secret:intune\/connection-[A-Za-z0-9]{6}$/.test(arn)) {
+    return status('unavailable', 'credentials_invalid');
+  }
+  if (env.AWS_REGION !== PORTAL_REGION || ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
+    .some(key => typeof env[key] !== 'string' || !env[key].trim())) return status('pending', 'service_not_configured');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  let stage = 'secret';
+  try {
+    const url = 'https://secretsmanager.us-west-1.amazonaws.com/';
+    const body = JSON.stringify({SecretId: arn, VersionStage: 'AWSCURRENT'});
+    const headers = await signAwsRequest({url, service: 'secretsmanager', region: PORTAL_REGION,
+      headers: {'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'secretsmanager.GetSecretValue'},
+      body, credentials: {accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+        sessionToken: env.AWS_SESSION_TOKEN}, now: new Date(now())});
+    const secretResponse = await fetcher(url, {method: 'POST', headers, body, redirect: 'manual', signal: controller.signal});
+    const secret = await portalReadJson(secretResponse, 65536);
+    if (secretResponse.status !== 200) {
+      const errorType = typeof secret?.__type === 'string' ? secret.__type.split('#').pop() : '';
+      return errorType === 'ResourceNotFoundException' ? status('pending', 'secret_missing') : status('unavailable', 'secret_unavailable');
+    }
+    if (secret?.ARN !== arn || secret.Name !== 'intune/connection'
+        || typeof secret.SecretString !== 'string' || secret.SecretString.length > 16384) return status('unavailable', 'credentials_invalid');
+    let credentials;
+    try { credentials = JSON.parse(secret.SecretString); }
+    catch { return status('unavailable', 'credentials_invalid'); }
+    const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!credentials || Array.isArray(credentials) || Object.keys(credentials).sort().join(',') !== 'CLIENT_ID,CLIENT_SECRET,TENANT_ID'
+        || typeof credentials.TENANT_ID !== 'string' || !guid.test(credentials.TENANT_ID)
+        || typeof credentials.CLIENT_ID !== 'string' || !guid.test(credentials.CLIENT_ID)
+        || typeof credentials.CLIENT_SECRET !== 'string' || credentials.CLIENT_SECRET.length < 1
+        || credentials.CLIENT_SECRET.length > 4096 || /[\u0000-\u001f\u007f]/.test(credentials.CLIENT_SECRET)) {
+      return status('unavailable', 'credentials_invalid');
+    }
+    stage = 'token';
+    const tokenResponse = await fetcher(`https://login.microsoftonline.com/${credentials.TENANT_ID}/oauth2/v2.0/token`, {
+      method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, redirect: 'manual', signal: controller.signal,
+      body: new URLSearchParams({grant_type: 'client_credentials', client_id: credentials.CLIENT_ID,
+        client_secret: credentials.CLIENT_SECRET, scope: 'https://graph.microsoft.com/.default'}).toString(),
+    });
+    if (tokenResponse.status !== 200) {
+      await tokenResponse.body?.cancel();
+      return status('unavailable', 'token_unavailable');
+    }
+    const token = await portalReadJson(tokenResponse, 32768);
+    if (typeof token?.access_token !== 'string' || token.access_token.length < 16 || token.access_token.length > 16384
+        || !/^[A-Za-z0-9._~+/-]+=*$/.test(token.access_token) || typeof token.token_type !== 'string'
+        || token.token_type.toLowerCase() !== 'bearer' || !Number.isSafeInteger(token.expires_in)
+        || token.expires_in <= 0 || token.expires_in > 86400) return status('unavailable', 'token_unavailable');
+    stage = 'graph';
+    const graphResponse = await fetcher('https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations?$top=1', {
+      method: 'GET', headers: {authorization: 'Bearer ' + token.access_token, accept: 'application/json'},
+      redirect: 'manual', signal: controller.signal,
+    });
+    if (graphResponse.status !== 200) {
+      await graphResponse.body?.cancel();
+      return status('unavailable', graphResponse.status === 403 ? 'graph_forbidden' : 'graph_unavailable');
+    }
+    const graph = await portalReadJson(graphResponse, 65536);
+    if (!graph || !Array.isArray(graph.value) || graph.value.length > 1 || graph.value.some(item =>
+      !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !guid.test(item.id))) {
+      return status('unavailable', 'graph_invalid');
+    }
+    return status('connected');
+  } catch {
+    return status('unavailable', stage + '_unavailable');
+  } finally { clearTimeout(timeout); }
+}
+
 function portalText(value, length = 1000) {
   if (typeof value !== 'string') return '';
   if (/PRIVATE KEY|(?:AKIA|ASIA)[A-Z0-9]{16}|sk-ant-|github_pat_|ghp_|Bearer\s|(?:password|secret|token|access.?key)\s*[=:]/i.test(value)) return '[Sensitive details withheld]';
@@ -460,6 +582,10 @@ export async function handlePortalRequest(request, env, renderPortal, dependenci
     const fetcher = dependencies.fetch ?? globalThis.fetch.bind(globalThis);
     const now = dependencies.now ?? Date.now;
     const diagnostic = dependencies.diagnostic ?? (value => console.warn(JSON.stringify(value)));
+    if (request.method === 'GET' && url.pathname === '/api/mdm/status') {
+      if (url.search) portalFail(400, 'mdm_request_invalid', 'This connection check does not accept request parameters.');
+      return portalJson(await portalMdmStatus(env, fetcher, now));
+    }
     if (request.method === 'GET' && url.pathname === '/api/status') {
       try {
         const aws = new PortalAws(env, fetcher, now, diagnostic);

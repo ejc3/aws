@@ -172,10 +172,30 @@ answers every path itself and never proxies to Sites.
 The portal can invoke the serial controller and read typed status; it cannot
 invoke the command broker, send SSM commands, or read administration secrets or
 Terraform state. Runtime keys are secret Worker bindings, never browser assets.
-The MDM credential connection is not commissioned: Microsoft organizational
-administrator authentication and an owned Entra app registration are prerequisites
-for a real consent and token exchange. The page must not present a redirect URL as
-a completed connection or claim to purchase a license or enroll a device.
+The MDM page checks its own connection independently of the repair service. The
+single-tenant Entra application's credential is kept in `intune/connection` in
+Secrets Manager, with exactly `TENANT_ID`, `CLIENT_ID` and `CLIENT_SECRET` fields.
+Administrators provision the payload after creating the Intune account and app;
+Terraform owns the protected container and grants the portal read access to only
+that secret. Browser sessions and the organization's administrator login remain
+separate. No credential payload goes into Terraform state, source or browser code.
+The application needs the Microsoft Graph application permission
+`DeviceManagementConfiguration.Read.All` with administrator consent. Provision
+the payload with `secretsmanager:PutSecretValue` on `intune/connection`, passing
+the JSON directly to the SDK in memory with a stable request token; keep it out
+of shell arguments and temporary files. Verify the stored version before
+acknowledging the handoff.
+A newly created organization's bootstrap login has a separate administrator-only
+`intune/administrator` vault. Neither the portal identity nor development roles
+may read it. Existing personal browser credentials are never copied into it.
+
+`GET /api/mdm/status` shows Connected only after app-only Microsoft authentication
+and a successful native Intune configuration read. Missing credentials, licensing
+or permissions remain visibly unconnected. The page provides one manual recheck,
+without enrolling devices, purchasing licenses or claiming that the VPN is ready.
+Creating a new Intune organization uses Microsoft's Plan 1 signup with the owner's
+contact email; it does not require an existing school account. The owner completes
+any phone verification or MFA that Microsoft requires.
 
 True iPhone per-app access requires Intune device enrollment and the Cloudflare One
 Agent: assign only Prompt and a dedicated authentication browser to the VPN profile.
