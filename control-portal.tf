@@ -46,7 +46,8 @@ resource "cloudflare_dns_record" "control_portal_verification" {
 
 # Workers do not have an AWS workload identity here. A dedicated server-only key
 # follows the existing dashboard pattern; no personal login or admin key is copied.
-# It cannot send SSM commands, invoke the broker, read Terraform state, or read secrets.
+# It can read only the dedicated Intune application credential, never administration
+# secrets or Terraform state, and cannot invoke the broker or send SSM commands.
 resource "aws_iam_user" "control_portal" {
   name = "control-portal"
   tags = { Managed = "terraform", Purpose = "private-owner-admin-portal" }
@@ -65,6 +66,11 @@ resource "aws_iam_user_policy" "control_portal" {
       {
         Effect   = "Allow", Action = "logs:FilterLogEvents"
         Resource = format("%s:*", trimsuffix(aws_cloudwatch_log_group.patchdoctor["worker"].arn, ":*"))
+      },
+      {
+        Sid      = "ReadOnlyTheIntuneConnection"
+        Effect   = "Allow", Action = "secretsmanager:GetSecretValue"
+        Resource = aws_secretsmanager_secret.intune_connection.arn
       }
     ]
   })
@@ -102,6 +108,35 @@ resource "aws_secretsmanager_secret_version" "control_portal" {
   })
 }
 
+# Only the application credential goes here. Personal browser sessions and the
+# organization's administrator password are never copied into the portal.
+# The payload is provisioned after account creation, outside Terraform state.
+resource "aws_secretsmanager_secret" "intune_connection" {
+  name                    = "intune/connection"
+  description             = "Owner Intune application connection: TENANT_ID, CLIENT_ID, CLIENT_SECRET; no administrator login."
+  recovery_window_in_days = 30
+  tags                    = { Managed = "terraform", Purpose = "owner-mdm-connection" }
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_secretsmanager_secret_policy" "intune_connection" {
+  secret_arn = aws_secretsmanager_secret.intune_connection.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Deny", Principal = "*", Action = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.intune_connection.arn
+      Condition = {
+        ArnNotLike = {
+          "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_user.control_portal.arn])
+        }
+      }
+    }]
+  })
+}
+
 # Reuse the existing owner-only Access app and its audience. The route answers
 # every request itself; the old private Sites publication remains unreachable
 # through this hostname and is not made public to bypass its second login.
@@ -122,7 +157,9 @@ resource "cloudflare_workers_script" "control_portal" {
     { name = "TABLE_NAME", type = "plain_text", text = aws_dynamodb_table.patchdoctor.name },
     { name = "PROJECT_NAME", type = "plain_text", text = aws_codebuild_project.patchdoctor.name },
     { name = "LOG_GROUP", type = "plain_text", text = aws_cloudwatch_log_group.patchdoctor["worker"].name },
+    { name = "MDM_SECRET_ARN", type = "plain_text", text = aws_secretsmanager_secret.intune_connection.arn },
   ]
+  depends_on = [aws_iam_user_policy.control_portal, aws_secretsmanager_secret_policy.intune_connection]
 }
 
 resource "cloudflare_workers_script_subdomain" "control_portal" {

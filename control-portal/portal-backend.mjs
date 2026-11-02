@@ -162,6 +162,79 @@ class PortalAws {
   }
 }
 
+async function portalMdmStatus(env, fetcher, now) {
+  const status = (state, reason) => ({connected: state === 'connected', state, ...(reason ? {reason} : {})});
+  const arn = env.MDM_SECRET_ARN;
+  if (arn === undefined || arn === '') return status('pending', 'config_missing');
+  if (typeof arn !== 'string' || !/^arn:aws:secretsmanager:us-west-1:\d{12}:secret:intune\/connection-[A-Za-z0-9]{6}$/.test(arn)) {
+    return status('unavailable', 'credentials_invalid');
+  }
+  if (env.AWS_REGION !== PORTAL_REGION || ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
+    .some(key => typeof env[key] !== 'string' || !env[key].trim())) return status('pending', 'service_not_configured');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  let stage = 'secret';
+  try {
+    const url = 'https://secretsmanager.us-west-1.amazonaws.com/';
+    const body = JSON.stringify({SecretId: arn, VersionStage: 'AWSCURRENT'});
+    const headers = await signAwsRequest({url, service: 'secretsmanager', region: PORTAL_REGION,
+      headers: {'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'secretsmanager.GetSecretValue'},
+      body, credentials: {accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+        sessionToken: env.AWS_SESSION_TOKEN}, now: new Date(now())});
+    const secretResponse = await fetcher(url, {method: 'POST', headers, body, redirect: 'manual', signal: controller.signal});
+    const secret = await portalReadJson(secretResponse, 65536);
+    if (secretResponse.status !== 200) {
+      const errorType = typeof secret?.__type === 'string' ? secret.__type.split('#').pop() : '';
+      return errorType === 'ResourceNotFoundException' ? status('pending', 'secret_missing') : status('unavailable', 'secret_unavailable');
+    }
+    if (secret?.ARN !== arn || secret.Name !== 'intune/connection'
+        || typeof secret.SecretString !== 'string' || secret.SecretString.length > 16384) return status('unavailable', 'credentials_invalid');
+    let credentials;
+    try { credentials = JSON.parse(secret.SecretString); }
+    catch { return status('unavailable', 'credentials_invalid'); }
+    const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!credentials || Array.isArray(credentials) || Object.keys(credentials).sort().join(',') !== 'CLIENT_ID,CLIENT_SECRET,TENANT_ID'
+        || typeof credentials.TENANT_ID !== 'string' || !guid.test(credentials.TENANT_ID)
+        || typeof credentials.CLIENT_ID !== 'string' || !guid.test(credentials.CLIENT_ID)
+        || typeof credentials.CLIENT_SECRET !== 'string' || credentials.CLIENT_SECRET.length < 1
+        || credentials.CLIENT_SECRET.length > 4096 || /[\u0000-\u001f\u007f]/.test(credentials.CLIENT_SECRET)) {
+      return status('unavailable', 'credentials_invalid');
+    }
+    stage = 'token';
+    const tokenResponse = await fetcher(`https://login.microsoftonline.com/${credentials.TENANT_ID}/oauth2/v2.0/token`, {
+      method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, redirect: 'manual', signal: controller.signal,
+      body: new URLSearchParams({grant_type: 'client_credentials', client_id: credentials.CLIENT_ID,
+        client_secret: credentials.CLIENT_SECRET, scope: 'https://graph.microsoft.com/.default'}).toString(),
+    });
+    if (tokenResponse.status !== 200) {
+      await tokenResponse.body?.cancel();
+      return status('unavailable', 'token_unavailable');
+    }
+    const token = await portalReadJson(tokenResponse, 32768);
+    if (typeof token?.access_token !== 'string' || token.access_token.length < 16 || token.access_token.length > 16384
+        || !/^[A-Za-z0-9._~+/-]+=*$/.test(token.access_token) || typeof token.token_type !== 'string'
+        || token.token_type.toLowerCase() !== 'bearer' || !Number.isSafeInteger(token.expires_in)
+        || token.expires_in <= 0 || token.expires_in > 86400) return status('unavailable', 'token_unavailable');
+    stage = 'graph';
+    const graphResponse = await fetcher('https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations?$top=1', {
+      method: 'GET', headers: {authorization: 'Bearer ' + token.access_token, accept: 'application/json'},
+      redirect: 'manual', signal: controller.signal,
+    });
+    if (graphResponse.status !== 200) {
+      await graphResponse.body?.cancel();
+      return status('unavailable', graphResponse.status === 403 ? 'graph_forbidden' : 'graph_unavailable');
+    }
+    const graph = await portalReadJson(graphResponse, 65536);
+    if (!graph || !Array.isArray(graph.value) || graph.value.length > 1 || graph.value.some(item =>
+      !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !guid.test(item.id))) {
+      return status('unavailable', 'graph_invalid');
+    }
+    return status('connected');
+  } catch {
+    return status('unavailable', stage + '_unavailable');
+  } finally { clearTimeout(timeout); }
+}
+
 function portalText(value, length = 1000) {
   if (typeof value !== 'string') return '';
   if (/PRIVATE KEY|(?:AKIA|ASIA)[A-Z0-9]{16}|sk-ant-|github_pat_|ghp_|Bearer\s|(?:password|secret|token|access.?key)\s*[=:]/i.test(value)) return '[Sensitive details withheld]';
@@ -236,6 +309,10 @@ export async function handlePortalRequest(request, env, renderPortal, dependenci
     const fetcher = dependencies.fetch ?? globalThis.fetch.bind(globalThis);
     const now = dependencies.now ?? Date.now;
     const diagnostic = dependencies.diagnostic ?? (value => console.warn(JSON.stringify(value)));
+    if (request.method === 'GET' && url.pathname === '/api/mdm/status') {
+      if (url.search) portalFail(400, 'mdm_request_invalid', 'This connection check does not accept request parameters.');
+      return portalJson(await portalMdmStatus(env, fetcher, now));
+    }
     if (request.method === 'GET' && url.pathname === '/api/status') {
       try {
         const aws = new PortalAws(env, fetcher, now, diagnostic);

@@ -6,6 +6,7 @@ import {renderPortal, renderMdmCredentialsPortal} from './portal-ui.mjs';
 const html = renderPortal();
 const mdmPanel = renderMdmCredentialsPortal();
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const mdmScript = mdmPanel.match(/<script>([\s\S]*?)<\/script>/)[1];
 const mutationId = '11111111-2222-4333-8444-555555555555';
 const outboxKey = 'patchdoctor-control-outbox-v1';
 
@@ -51,12 +52,12 @@ async function browser(fetcher, {storage = memoryStorage(), uuid = mutationId} =
 function reply(value, status = 200) { return {ok: status >= 200 && status < 300, status, headers: {get: () => 'application/json'}, json: async () => value}; }
 
 
-test('root MDM page is static and truthful, without a wizard, credential form or dead-end control', () => {
+test('root MDM page checks credentials only, without a wizard, manual credential form or Doctor features', () => {
   assert.match(mdmPanel, /<h1>MDM credentials\.<\/h1>/);
-  assert.match(mdmPanel, /role="status">Not connected/);
-  assert.match(mdmPanel, /Microsoft organization administrator sign-in is still needed/);
-  assert.match(mdmPanel, /The Intune account connection has not been configured here/);
-  assert.doesNotMatch(mdmPanel, /<script|<button|<form|<input|<ol|role="tab|PatchDoctor|fetch\(|setInterval|\$96|APNs|push certificate|enrollment|subscription|adminconsent/i);
+  assert.match(mdmPanel, /role="status">Checking connection/);
+  assert.match(mdmPanel, /id="mdm-recheck"[^>]*disabled>Recheck connection/);
+  assert.doesNotMatch(mdmPanel, /<form|<input|<ol|role="tab|PatchDoctor|setInterval|\$96|APNs|push certificate|enrollment|subscription|adminconsent/i);
+  assert.doesNotMatch(mdmScript, /api\/doctor|api\/status|localStorage/);
   assert.match(mdmPanel, /<html lang="en">/);
   assert.match(mdmPanel, /name="viewport"/);
   assert.match(mdmPanel, /href="#main"/);
@@ -68,7 +69,7 @@ test('Doctor API failures leave the independent MDM status available and repair 
   const calls = [];
   const {elements, controls} = await browser(async path => { calls.push(path); throw new Error('offline fixture'); });
   assert.deepEqual(calls, ['/api/status', '/api/doctor/cases', '/api/doctor/events']);
-  assert.match(mdmPanel, /role="status">Not connected/);
+  assert.match(mdmPanel, /role="status">Checking connection/);
   assert.doesNotMatch(mdmPanel, /status-error|offline fixture/);
   assert.equal(elements.get('status-error').hidden, false);
   assert.ok(controls.every(button => button.disabled));
@@ -206,4 +207,107 @@ test('partial activity is disclosed for backend truncation and the visible fifte
     const view = await browser(async path => path.endsWith('/events') ? reply(events) : doctorReply(path));
     assert.match(view.elements.get('events').children[0].textContent, /Partial activity: some recent events are not shown/);
   }
+});
+
+
+async function mdmBrowser(fetcher) {
+  const elements = new Map(['mdm-status', 'mdm-message', 'mdm-checked', 'mdm-recheck'].map(id => [id, new Element(id)]));
+  const timers = [];
+  vm.runInNewContext(mdmScript, {AbortController, Date,
+    document: {getElementById: id => { assert.ok(elements.has(id)); return elements.get(id); }},
+    fetch: fetcher,
+    setTimeout: (callback, delay) => { timers.push({callback, delay}); return timers.length; },
+    clearTimeout() {},
+  }, {timeout: 1000});
+  await new Promise(resolve => setImmediate(resolve));
+  return {elements, timers};
+}
+
+function mdmText(view) { return [...view.elements.values()].map(element => element.textContent).join(' '); }
+
+
+test('MDM connected, pending and unavailable states require exact verified DTOs and fixed copy', async () => {
+  for (const [value, label, message] of [
+    [{connected: true, state: 'connected'}, 'Connected', 'Your Microsoft Intune account is connected.'],
+    [{connected: false, state: 'pending', reason: 'secret_missing'}, 'Not connected', 'Your Intune credentials have not been connected yet.'],
+    [{connected: false, state: 'unavailable', reason: 'graph_forbidden'}, 'Connection not confirmed', 'The connection check could not be completed. Recheck the connection to try again.'],
+  ]) {
+    const calls = [];
+    const view = await mdmBrowser(async (path, options) => {
+      calls.push(path);
+      assert.equal(path, '/api/mdm/status'); assert.equal(options.method, 'GET');
+      assert.equal(options.credentials, 'same-origin'); assert.equal(options.cache, 'no-store');
+      assert.equal(options.redirect, 'error'); assert.equal(options.body, undefined);
+      return reply(value);
+    });
+    assert.deepEqual(calls, ['/api/mdm/status']);
+    assert.equal(view.elements.get('mdm-status').textContent, label);
+    assert.equal(view.elements.get('mdm-message').textContent, message);
+    assert.match(view.elements.get('mdm-checked').textContent, /^Checked /);
+    assert.equal(view.elements.get('mdm-recheck').disabled, false);
+    assert.doesNotMatch(mdmText(view), /graph_forbidden|secret_missing/);
+  }
+});
+
+test('MDM refuses unknown, inconsistent or secret-bearing HTTP200 payloads', async () => {
+  const canary = 'PRIVATE_VALUE_NEVER_RENDER';
+  for (const value of [null, [], {}, {connected: 'true', state: 'connected'},
+    {connected: true, state: 'pending'}, {connected: false, state: 'connected'},
+    {connected: true, state: 'connected', token: canary},
+    {connected: false, state: 'pending', reason: 'unknown'},
+    {connected: false, state: 'unavailable', reason: 'graph_forbidden', message: canary}]) {
+    const view = await mdmBrowser(async () => reply(value));
+    assert.equal(view.elements.get('mdm-status').textContent, 'Connection not confirmed');
+    assert.equal(view.elements.get('mdm-checked').textContent, '');
+    assert.doesNotMatch(mdmText(view), new RegExp(canary));
+  }
+});
+
+test('MDM denied, non-JSON and failed requests show safe copy without retrying or rendering errors', async () => {
+  for (const fetcher of [async () => reply({message: 'PRIVATE_ERROR'}, 403),
+    async () => ({...reply({connected: true, state: 'connected'}), headers: {get: () => 'text/html'}}),
+    async () => { throw new Error('PRIVATE_ERROR'); }]) {
+    let calls = 0;
+    const view = await mdmBrowser((...args) => { calls++; return fetcher(...args); });
+    assert.equal(calls, 1);
+    assert.equal(view.elements.get('mdm-status').textContent, 'Connection not confirmed');
+    assert.equal(view.elements.get('mdm-checked').textContent, '');
+    assert.equal(view.elements.get('mdm-recheck').disabled, false);
+    assert.doesNotMatch(mdmText(view), /PRIVATE_ERROR/);
+  }
+});
+
+test('MDM timeout aborts the single request and offers a safe manual recheck', async () => {
+  let calls = 0, signal;
+  const view = await mdmBrowser(async (path, options) => {
+    calls++; signal = options.signal;
+    return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('PRIVATE_TIMEOUT'))));
+  });
+  assert.equal(view.elements.get('mdm-status').textContent, 'Checking connection…');
+  assert.equal(view.elements.get('mdm-recheck').disabled, true);
+  assert.equal(view.timers.length, 1); assert.equal(view.timers[0].delay, 20000);
+  view.timers[0].callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signal.aborted, true); assert.equal(calls, 1);
+  assert.equal(view.elements.get('mdm-status').textContent, 'Connection not confirmed');
+  assert.equal(view.elements.get('mdm-checked').textContent, '');
+  assert.equal(view.elements.get('mdm-recheck').disabled, false);
+  assert.doesNotMatch(mdmText(view), /PRIVATE_TIMEOUT/);
+});
+
+test('MDM makes one initial fetch and ignores overlapping button requests', async () => {
+  let calls = 0, release;
+  const view = await mdmBrowser(async () => {
+    calls++;
+    if (calls === 1) return new Promise(resolve => { release = resolve; });
+    return reply({connected: true, state: 'connected'});
+  });
+  await Promise.all([view.elements.get('mdm-recheck').handlers.click(), view.elements.get('mdm-recheck').handlers.click()]);
+  assert.equal(calls, 1);
+  release(reply({connected: false, state: 'pending', reason: 'config_missing'}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(view.elements.get('mdm-recheck').disabled, false);
+  await view.elements.get('mdm-recheck').handlers.click();
+  assert.equal(calls, 2);
+  assert.equal(view.elements.get('mdm-status').textContent, 'Connected');
 });

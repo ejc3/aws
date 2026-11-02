@@ -61,7 +61,7 @@ test('SigV4 matches the published AWS SDK DynamoDB signing fixture', async () =>
 });
 
 test('shell and every API require Cloudflare platform context, exact audience and owner before AWS', async () => {
-  for (const path of ['/', '/doctor', '/api/status', '/api/doctor/cases', '/api/doctor/events', '/api/doctor/control', '/api/setup/start']) {
+  for (const path of ['/', '/doctor', '/api/status', '/api/mdm/status', '/api/doctor/cases', '/api/doctor/events', '/api/doctor/control', '/api/setup/start']) {
     const reply = await handlePortalRequest(new Request('https://portal.example.test' + path), env, () => 'secret shell');
     assert.equal(reply.status, 401, path);
     assert.doesNotMatch(await reply.text(), /secret shell/);
@@ -82,6 +82,166 @@ test('shell and every API require Cloudflare platform context, exact audience an
     const unset = await invoke('/api/status', {}, settings);
     assert.equal(unset.status, 503);
     assert.equal(unset.calls.length, 0);
+  }
+});
+
+const mdmArn = 'arn:aws:secretsmanager:us-west-1:111122223333:secret:intune/connection-AbCd12';
+const mdmCredentials = {TENANT_ID: '11111111-2222-4333-8444-555555555555',
+  CLIENT_ID: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', CLIENT_SECRET: 'DUMMY-CLIENT-SECRET-NEVERRETURN'};
+const mdmToken = {access_token: 'DUMMY-GRAPH-ACCESS-TOKEN-NEVERRETURN', token_type: 'Bearer', expires_in: 3599};
+function mdmSecret(credentials = mdmCredentials) {
+  return {ARN: mdmArn, Name: 'intune/connection', SecretString: JSON.stringify(credentials)};
+}
+async function mdmInvoke(responses, {settings = {...env, MDM_SECRET_ARN: mdmArn}, options = {}, path = '/api/mdm/status'} = {}) {
+  const calls = [], diagnostics = [];
+  const response = await handlePortalRequest(request(path, options), settings, () => 'private shell', {
+    access: Object.hasOwn(options, 'access') ? options.access : ownerAccess, now,
+    diagnostic: value => diagnostics.push(value), fetch: async (url, init) => {
+      assert.equal(init.redirect, 'manual');
+      assert.equal(init.signal.aborted, false);
+      calls.push({url, ...init});
+      const result = responses[calls.length - 1];
+      assert.ok(result, 'unexpected outbound request');
+      return typeof result === 'function' ? result(url, init) : result;
+    },
+  });
+  const body = await response.json();
+  assert.doesNotMatch(JSON.stringify([body, diagnostics]), /DUMMY|NEVERRETURN|TENANT_ID|CLIENT_ID|CLIENT_SECRET|111122223333|11111111-2222/);
+  return {status: response.status, body, calls, diagnostics};
+}
+
+test('MDM connection requires the exact secret, client-credentials token and verified Graph collection', async () => {
+  for (const collection of [[], [{id: mdmCredentials.CLIENT_ID, displayName: 'NEVERRETURNTHIS'}]]) {
+    const reply = await mdmInvoke([json(mdmSecret()), json(mdmToken), json({value: collection})],
+      {options: {headers: {authorization: 'Bearer CALLER-NOT-TRUSTED', 'x-amz-security-token': 'CALLER-NOT-TRUSTED'}}});
+    assert.equal(reply.status, 200);
+    assert.deepEqual(reply.body, {connected: true, state: 'connected'});
+    assert.equal(reply.calls.length, 3);
+    assert.deepEqual(reply.diagnostics, []);
+    const [secret, token, graph] = reply.calls;
+    assert.equal(secret.url, 'https://secretsmanager.us-west-1.amazonaws.com/');
+    assert.equal(secret.method, 'POST');
+    assert.equal(secret.headers.get('content-type'), 'application/x-amz-json-1.1');
+    assert.equal(secret.headers.get('x-amz-target'), 'secretsmanager.GetSecretValue');
+    assert.match(secret.headers.get('authorization'), /\/us-west-1\/secretsmanager\/aws4_request/);
+    assert.equal(secret.headers.get('x-amz-security-token'), env.AWS_SESSION_TOKEN);
+    assert.deepEqual(JSON.parse(secret.body), {SecretId: mdmArn, VersionStage: 'AWSCURRENT'});
+    assert.equal(token.url, `https://login.microsoftonline.com/${mdmCredentials.TENANT_ID}/oauth2/v2.0/token`);
+    assert.equal(token.method, 'POST');
+    assert.equal(new Headers(token.headers).get('authorization'), null);
+    assert.equal(new Headers(token.headers).get('content-type'), 'application/x-www-form-urlencoded');
+    assert.deepEqual(Object.fromEntries(new URLSearchParams(token.body)), {grant_type: 'client_credentials',
+      client_id: mdmCredentials.CLIENT_ID, client_secret: mdmCredentials.CLIENT_SECRET, scope: 'https://graph.microsoft.com/.default'});
+    assert.equal(graph.url, 'https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations?$top=1');
+    assert.equal(graph.method, 'GET');
+    assert.equal(graph.body, undefined);
+    assert.equal(new Headers(graph.headers).get('authorization'), 'Bearer ' + mdmToken.access_token);
+    assert.equal(new Headers(graph.headers).get('x-amz-security-token'), null);
+    assert.equal(new Headers(graph.headers).get('accept'), 'application/json');
+    assert.equal(secret.signal, token.signal);
+    assert.equal(token.signal, graph.signal);
+    assert.doesNotMatch(JSON.stringify([secret.url, token.url, graph.url]), /CLIENT-SECRET|ACCESS-TOKEN|CALLER/);
+  }
+});
+
+test('MDM wrong owner and caller URLs are refused before reading credentials', async () => {
+  for (const access of [undefined, {aud: 'other-app', getIdentity: async () => ({email: env.OWNER_EMAIL})},
+    {aud: env.ACCESS_AUD, getIdentity: async () => ({email: 'other@example.test'})}]) {
+    const reply = await mdmInvoke([], {options: {access}});
+    assert.ok([401, 403].includes(reply.status));
+    assert.equal(reply.calls.length, 0);
+  }
+  const query = await mdmInvoke([], {path: '/api/mdm/status?url=https://caller.example.com/'});
+  assert.equal(query.status, 400);
+  assert.equal(query.calls.length, 0);
+  const post = await mdmInvoke([], {options: {method: 'POST', body: {tokenUrl: 'https://caller.example.com/'}}});
+  assert.equal(post.status, 404);
+  assert.equal(post.calls.length, 0);
+});
+
+test('MDM absent configuration and missing native secret remain honest pending states', async () => {
+  for (const settings of [{...env}, {...env, MDM_SECRET_ARN: ''}, {...env, MDM_SECRET_ARN: mdmArn, AWS_SECRET_ACCESS_KEY: ''}]) {
+    const reply = await mdmInvoke([], {settings});
+    assert.equal(reply.status, 200);
+    assert.equal(reply.body.connected, false);
+    assert.equal(reply.body.state, 'pending');
+    assert.equal(reply.calls.length, 0);
+  }
+  for (const code of ['ResourceNotFoundException', 'com.amazonaws.secretsmanager#ResourceNotFoundException']) {
+    const reply = await mdmInvoke([json({__type: code, Message: 'NEVERRETURNTHIS'}, {status: 400})]);
+    assert.deepEqual(reply.body, {connected: false, state: 'pending', reason: 'secret_missing'});
+    assert.equal(reply.calls.length, 1);
+  }
+});
+
+test('MDM malformed credentials and invalid GUIDs never reach a caller-controlled token endpoint', async () => {
+  for (const settings of [{...env, MDM_SECRET_ARN: 'https://caller.example.com/'},
+    {...env, MDM_SECRET_ARN: mdmArn.replace('us-west-1', 'us-east-1')},
+    {...env, MDM_SECRET_ARN: mdmArn.replace('intune/connection', 'another/secret')}]) {
+    const reply = await mdmInvoke([], {settings});
+    assert.equal(reply.body.connected, false);
+    assert.equal(reply.body.reason, 'credentials_invalid');
+    assert.equal(reply.calls.length, 0);
+  }
+  for (const secret of [{...mdmSecret(), SecretString: 'not JSON'}, {...mdmSecret(), ARN: mdmArn + 'other'},
+    {...mdmSecret(), Name: 'another/secret'}, {...mdmSecret(), SecretString: 'x'.repeat(16385)},
+    ...[null, [], {...mdmCredentials, TENANT_ID: '../../caller.example.com'},
+      {...mdmCredentials, CLIENT_ID: 'https://caller.example.com'}, {...mdmCredentials, CLIENT_SECRET: ''},
+      {...mdmCredentials, CLIENT_SECRET: 'x'.repeat(4097)}, {...mdmCredentials, CLIENT_SECRET: 'DUMMY\nSECRET'},
+      {...mdmCredentials, TOKEN_URL: 'https://caller.example.com'}].map(value => mdmSecret(value))]) {
+    const reply = await mdmInvoke([json(secret)]);
+    assert.equal(reply.body.connected, false);
+    assert.equal(reply.body.reason, 'credentials_invalid');
+    assert.equal(reply.calls.length, 1);
+  }
+});
+
+test('MDM native secret denial, failed network and malformed response never masquerade as missing credentials', async () => {
+  for (const response of [json({__type: 'AccessDeniedException', Message: 'NEVERRETURNTHIS'}, {status: 403}),
+    new Response('NEVERRETURNTHIS'), new Response('{}', {headers: {'content-length': '65537'}}),
+    () => { throw new Error('NEVERRETURNTHIS secret=PRIVATE'); }]) {
+    const reply = await mdmInvoke([response]);
+    assert.deepEqual(reply.body, {connected: false, state: 'unavailable', reason: 'secret_unavailable'});
+    assert.deepEqual(reply.diagnostics, []);
+    assert.equal(reply.calls.length, 1);
+  }
+});
+
+test('MDM rejected, expired or malformed tokens never authorize a Graph request', async () => {
+  for (const response of [json({error_description: 'NEVERRETURNTHIS'}, {status: 401}),
+    new Response('NEVERRETURNTHIS'), ...[{}, {...mdmToken, expires_in: 0}, {...mdmToken, expires_in: -1},
+      {...mdmToken, expires_in: '3599'}, {...mdmToken, token_type: 'Basic'}, {...mdmToken, access_token: 'DUMMY\r\nTOKEN'},
+      {...mdmToken, access_token: 'x'.repeat(16385)}].map(value => json(value)),
+    () => { throw new DOMException('NEVERRETURNTHIS', 'AbortError'); }]) {
+    const reply = await mdmInvoke([json(mdmSecret()), response]);
+    assert.deepEqual(reply.body, {connected: false, state: 'unavailable', reason: 'token_unavailable'});
+    assert.equal(reply.calls.length, 2);
+    assert.deepEqual(reply.diagnostics, []);
+  }
+});
+
+test('MDM Graph permission, expiry and license failures never become connected, even with collection-shaped JSON', async () => {
+  for (const status of [401, 403, 429, 500]) {
+    const reply = await mdmInvoke([json(mdmSecret()), json(mdmToken), json({value: [], error: 'NEVERRETURNTHIS'}, {status})]);
+    assert.deepEqual(reply.body, {connected: false, state: 'unavailable', reason: status === 403 ? 'graph_forbidden' : 'graph_unavailable'});
+    assert.equal(reply.calls.length, 3);
+  }
+  for (const value of [{}, {value: null}, {value: [null]}, {value: ['NEVERRETURNTHIS']}, {value: [{}]},
+    {value: [{id: 'not-a-guid'}]}, {value: [{id: mdmCredentials.CLIENT_ID}, {id: mdmCredentials.CLIENT_ID}]}]) {
+    const reply = await mdmInvoke([json(mdmSecret()), json(mdmToken), json(value)]);
+    assert.deepEqual(reply.body, {connected: false, state: 'unavailable', reason: 'graph_invalid'});
+  }
+});
+
+test('MDM never follows redirects or forwards credentials to redirect targets at any stage', async () => {
+  for (let stage = 0; stage < 3; stage++) {
+    const responses = [json(mdmSecret()), json(mdmToken), json({value: []})];
+    responses[stage] = new Response('{}', {status: 307, headers: {location: 'https://caller.example.com/NEVERRETURNTHIS'}});
+    const reply = await mdmInvoke(responses);
+    assert.equal(reply.body.connected, false);
+    assert.equal(reply.body.state, 'unavailable');
+    assert.equal(reply.calls.length, stage + 1);
+    assert.ok(reply.calls.every(call => !call.url.includes('caller.example.com')));
   }
 });
 

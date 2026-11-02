@@ -8,7 +8,7 @@ export function renderMdmCredentialsPortal() {
   <meta name="description" content="Your private MDM credential connection status.">
   <title>MDM credentials</title>
   <style>
-    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#22332b;background:#f5f3eb;font-synthesis:none}*{box-sizing:border-box}body{margin:0;min-width:320px}.shell{max-width:740px;margin:auto;padding:30px 24px 48px}.brand{display:flex;align-items:center;gap:11px;padding-bottom:24px;border-bottom:1px solid #dce0d4;font-size:14px;font-weight:600}.mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid #bccbb5;border-radius:11px;background:#edf0e6;color:#315b42;font:italic 25px Georgia,serif}.card{margin-top:38px;padding:34px;border:1px solid #dce0d4;border-radius:22px;background:#fffef9}.eyebrow{margin:0;color:#667267;font-size:11px;letter-spacing:1.5px;text-transform:uppercase}h1{margin:14px 0 23px;font:400 clamp(32px,7vw,46px)/1.15 "Iowan Old Style",Palatino,Georgia,serif;letter-spacing:-1px}.status{display:inline-block;margin:0 0 15px;padding:7px 11px;border-radius:20px;background:#f5ecd9;color:#795c29;font-size:12px;font-weight:600}.explanation{max-width:530px;margin:0;color:#667267;font-size:15px;line-height:1.8}.note{margin:26px 0 0;padding-top:20px;border-top:1px solid #dce0d4;color:#667267;font-size:12px;line-height:1.8}.skip{position:fixed;top:-80px;left:16px;padding:12px;background:#22332b;color:white}.skip:focus{top:12px}a:focus-visible{outline:3px solid #8ca97a;outline-offset:4px}@media(max-width:480px){.shell{padding:23px 20px 32px}.card{margin-top:28px;padding:25px 22px;border-radius:18px}.explanation{font-size:14px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#22332b;background:#f5f3eb;font-synthesis:none}*{box-sizing:border-box}body{margin:0;min-width:320px}.shell{max-width:740px;margin:auto;padding:30px 24px 48px}.brand{display:flex;align-items:center;gap:11px;padding-bottom:24px;border-bottom:1px solid #dce0d4;font-size:14px;font-weight:600}.mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid #bccbb5;border-radius:11px;background:#edf0e6;color:#315b42;font:italic 25px Georgia,serif}.card{margin-top:38px;padding:34px;border:1px solid #dce0d4;border-radius:22px;background:#fffef9}.eyebrow{margin:0;color:#667267;font-size:11px;letter-spacing:1.5px;text-transform:uppercase}h1{margin:14px 0 23px;font:400 clamp(32px,7vw,46px)/1.15 "Iowan Old Style",Palatino,Georgia,serif;letter-spacing:-1px}.status{display:inline-block;margin:0 0 15px;padding:7px 11px;border-radius:20px;background:#f5ecd9;color:#795c29;font-size:12px;font-weight:600}.status.connected{background:#e8eee3;color:#315b42}.status.unavailable{background:#f8eae4;color:#93463b}.explanation{max-width:530px;margin:0;color:#667267;font-size:15px;line-height:1.8}.action{margin-top:24px}button{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:44px;padding:12px 18px;border:1px solid #315b42;border-radius:11px;background:#315b42;color:#fffef9;cursor:pointer}button:disabled{cursor:wait;opacity:.6}.checked{min-height:18px;margin:12px 0 0;color:#667267;font-size:11px;line-height:1.6}.note{margin:26px 0 0;padding-top:20px;border-top:1px solid #dce0d4;color:#667267;font-size:12px;line-height:1.8}.skip{position:fixed;top:-80px;left:16px;padding:12px;background:#22332b;color:white}.skip:focus{top:12px}a:focus-visible,button:focus-visible{outline:3px solid #8ca97a;outline-offset:4px}@media(max-width:480px){.shell{padding:23px 20px 32px}.card{margin-top:28px;padding:25px 22px;border-radius:18px}.explanation{font-size:14px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
   </style>
 </head>
 <body>
@@ -18,11 +18,60 @@ export function renderMdmCredentialsPortal() {
     <main id="main" class="card">
       <p class="eyebrow">Microsoft Intune</p>
       <h1>MDM credentials.</h1>
-      <p class="status" role="status">Not connected</p>
-      <p class="explanation">Microsoft organization administrator sign-in is still needed. The Intune account connection has not been configured here.</p>
+      <p id="mdm-status" class="status" role="status">Checking connection…</p>
+      <p id="mdm-message" class="explanation">Checking your Microsoft Intune account connection.</p>
+      <div class="action"><button id="mdm-recheck" type="button" disabled>Recheck connection</button><p id="mdm-checked" class="checked" aria-live="polite"></p></div>
       <p class="note">Your existing devices and apps are unchanged.</p>
     </main>
   </div>
+  <script>
+  (function () {
+    'use strict';
+    var busy = false;
+    var status = document.getElementById('mdm-status');
+    var message = document.getElementById('mdm-message');
+    var checked = document.getElementById('mdm-checked');
+    var button = document.getElementById('mdm-recheck');
+    var reasons = {pending:['config_missing','service_not_configured','secret_missing'],
+      unavailable:['credentials_invalid','secret_unavailable','token_unavailable','graph_forbidden','graph_unavailable','graph_invalid']};
+    function valid(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      var keys = Object.keys(value).sort().join(',');
+      if (value.connected === true && value.state === 'connected') return keys === 'connected,state';
+      return value.connected === false && keys === 'connected,reason,state'
+        && Object.prototype.hasOwnProperty.call(reasons,value.state) && reasons[value.state].indexOf(value.reason) >= 0;
+    }
+    function unavailable() {
+      status.textContent = 'Connection not confirmed'; status.className = 'status unavailable';
+      message.textContent = 'The connection check could not be completed. Recheck the connection to try again.';
+    }
+    async function checkConnection() {
+      if (busy) return;
+      busy = true; button.disabled = true; checked.textContent = '';
+      status.textContent = 'Checking connection…'; status.className = 'status';
+      message.textContent = 'Checking your Microsoft Intune account connection.';
+      var controller = new AbortController();
+      var timer = setTimeout(function () { controller.abort(); },20000);
+      try {
+        var response = await fetch('/api/mdm/status',{method:'GET',credentials:'same-origin',cache:'no-store',redirect:'error',signal:controller.signal,headers:{Accept:'application/json'}});
+        if (response.status !== 200 || !response.ok || (response.headers.get('content-type') || '').indexOf('application/json') < 0) throw new Error('Connection check unavailable');
+        var value = await response.json();
+        if (!valid(value)) throw new Error('Connection status unavailable');
+        if (value.connected === true) {
+          status.textContent = 'Connected'; status.className = 'status connected';
+          message.textContent = 'Your Microsoft Intune account is connected.';
+        } else if (value.state === 'pending') {
+          status.textContent = 'Not connected'; status.className = 'status';
+          message.textContent = 'Your Intune credentials have not been connected yet.';
+        } else unavailable();
+        checked.textContent = 'Checked ' + new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+      } catch (_) { unavailable(); }
+      finally { clearTimeout(timer); busy = false; button.disabled = false; }
+    }
+    button.addEventListener('click',checkConnection);
+    checkConnection();
+  })();
+  </script>
 </body>
 </html>`;
 }
