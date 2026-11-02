@@ -31,29 +31,23 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main e32ad48d, revised from the 93c33125 image: everything in 67d383ea's image (admission,
-  # ejc3/fcvm#1425), the phones' GPU mirror (ejc3/fcvm#1432-#1435, #1440) with zstd on its wire (ejc3/fcvm#1449, which
-  # the page requires), the emulator from ejc3/gfxstream#6 (ejc3/fcvm#1450: FREE records, no program binaries, a retake
-  # that stays released without Vulkan), the phone container's fixes (ejc3/fcvm#1448: the driver's TLS library
-  # preloaded, UWB off), a bake that leaves /tmp empty (ejc3/fcvm#1444), the agent's dial deadlines (ejc3/fcvm#1445), a
-  # routed port forward whose dial of the guest cannot hold fcvm at exit (ejc3/fcvm#1453: a claimed GPU's old VM stopped
-  # in 0.45 s, not 4.8 s), the renderer's speckle fix (ejc3/fcvm#1454: clouds and shading edges filtered, a taller
-  # stream interpolated) and a word cut by terrain along the ground, without a bright rim (ejc3/fcvm#1455). Its
-  # renderer is the tile AMI's. Guard-only revision preserves all store/profile/kernel
-  # assets; guard boot/resume was verified on a non-GPU editor, not a GPU runtime test.
-  default = { "us-east-1" = { x86_64 = "ami-00fb7a2e8b89e2446" } }
+  # executable from main 38d63412, revised from the e32ad48d guard image (ami-00fb7a2e8b89e2446): everything in it, plus
+  # frame streams that drop a viewer's frames by age (ejc3/fcvm#1481: no frame older than 200 ms after a stall, per-viewer
+  # queue depth and drops in /health, for the renderer and the phone streamer), the wall without places for phone GPUs
+  # (ejc3/fcvm#1477) and the phones page's mirror fixes (ejc3/fcvm#1476). The IP-options guard is installed by prep and its
+  # publication proof passed. Its renderer is the tile AMI's (image 0a93571b74e6).
+  default = { "us-east-1" = { x86_64 = "ami-0d94bb60fbf180b7f" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the 67d383ea image's lineage (scene authentication and direct-viewer admission,
-  # ejc3/fcvm#1425) with the renderer from ejc3/fcvm main e32ad48d, the host AMI's: the speckle fix (ejc3/fcvm#1454)
-  # and the word's cut and glow (ejc3/fcvm#1455). Its boot prefetch list was traced again on this image (2,734 pieces,
-  # 417 MiB); the NVIDIA device readiness checks remain in the recipe. Its guard-only
-  # revision passed actual GPU reboot/resume and renderer-frame checks.
-  default = { "us-east-1" = { x86_64 = "ami-0edfc91ca2e651db9" } }
+  # (fcvm fleet/ami/tile). Revised from the e32ad48d guard image (ami-0edfc91ca2e651db9) with the renderer from ejc3/fcvm
+  # main 38d63412, the host AMI's (ejc3/fcvm#1481), and the units of main 2f861183: nvidia-persistenced retries its first
+  # start (ejc3/fcvm#1482), which failed on every boot and cost a cold tile 13 s (first frame over HTTPS 29.9 and 32.1 s
+  # from the launch request, against 42.3 and 44.9 s). Its boot prefetch list was traced again on this image.
+  default = { "us-east-1" = { x86_64 = "ami-0a9804d3fc86cd87e" } }
 }
 
 locals {
