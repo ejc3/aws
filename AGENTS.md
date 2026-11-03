@@ -1451,12 +1451,13 @@ Available if a task needs them; neither needs a key on disk.
   through `OrganizationAccountAccessRole` in the Dolphin account. Changes are dolphin-aws pull requests, applied from
   nextjs-dev.
 - **dolphin-maps' loops** (`dolphin-maps-loop.tf`). Lambdas `dolphin-maps-loop-live`,
-  `dolphin-maps-loop-sweep`, `dolphin-maps-loop-refit` and `dolphin-maps-loop-games` (one bundle) on EventBridge
+  `dolphin-maps-loop-sweep`, `dolphin-maps-loop-refit`, `dolphin-maps-loop-games` and `dolphin-maps-loop-signals` (one bundle) on EventBridge
   schedules in America/Los_Angeles time (live samples every 5 minutes on weekday mornings, the sweep on Sunday night,
   the refit an hour later, the games at 05:15 daily with `balldontlie/api-key`; all off until
   `dolphin_maps_loop_enabled`; one failed sweep, refit or games pass alarms; the sweep function also runs the week passes
   on the month's first Saturday from 20:00, one a day of the week 20 minutes apart, and the weekend pass on
-  Thursday 23:00, on the same switch), reading `browserbase/credentials`
+  Thursday 23:00, on the same switch; the signals pass nightly at 02:30 on its own, `dolphin_maps_signals_enabled`,
+  with `dolphin-maps/drives-read`), reading `browserbase/credentials`
   and committing to the repository through its own GitHub App (`github-app/dolphin-maps-loop`, contents
   write on dolphin-maps only; the function and the jumpbox role read it). Every pass journals each page's
   text to `journal/` in the `dolphin-maps-loop-<account>` bucket; dev-server-role reads it for replays.
@@ -1488,6 +1489,10 @@ Available if a task needs them; neither needs a key on disk.
   not dev-ebs-only, which the I/O box shares). Export both with `eval "$(aws secretsmanager get-secret-value --region us-west-1
   --secret-id browserbase/credentials --query SecretString --output text | jq -r 'to_entries[] |
   "export \(.key)=\(.value|@sh)"')"`. Never onto a command line, into a file in a repo or a commit.
+- **dolphin-maps' drives, read-only** (the signals loop). `dolphin-maps/drives-read` (us-west-1; JSON, `DRIVES_DB_URL`,
+  `DRIVES_DB_TOKEN`, a read-only token for the drives database alone, and `DRIVES_OWNER_ID`, the account whose drives
+  the pass reads); dev-server-role may put it and not read it, the dolphin-maps loop Lambdas' role and admins read it
+  (`dolphin-maps-loop.tf`; the functions get `DRIVES_SECRET_ID`). It reads personal data: nothing else may be given it.
 - **dolphin-maps' PeMS login** (Caltrans' traffic data service). `dolphin-maps/pems` (us-west-1; JSON, `PEMS_USERNAME` and
   `PEMS_PASSWORD`) is the dolphin-maps PeMS login; dev-server-role may read and put it, the dolphin-maps loop Lambdas' role
   and admins read it (`dolphin-maps-loop.tf`; the functions get `PEMS_SECRET_ID`). Export it with the same `eval "$(aws secretsmanager

@@ -2346,6 +2346,14 @@ switch-over in a fixed order so the loops never run in both places:
    `scrape-live.yml`, `scrape-weekly.yml` and `refresh-games.yml` then stand down), then set
    `dolphin_maps_loop_enabled = true` here and apply (the schedules and the not-running alarms come on). To go back, the reverse order: the gate false and
    apply first (the schedules stop), then the variable false (the GitHub loops resume).
+4. **The signals pass** (`dolphin-maps-loop-signals`, nightly 02:30), on its own switch, since it has no GitHub
+   Actions copy: after the apply, add `dolphin-maps-loop-signals` to dolphin-maps' repository variable
+   `LOOP_LAMBDA_FUNCTIONS` (output `dolphin_maps_loop`) and run `deploy-loop.yml`. From a metal box, store
+   `dolphin-maps/drives-read`: a read-only token for the drives database alone (the Turso platform API's
+   `auth/tokens?authorization=read-only` for that database, with `turso/api-token`), the database's https URL, and the
+   id of the account whose drives it reads, as JSON `DRIVES_DB_URL`, `DRIVES_DB_TOKEN`, `DRIVES_OWNER_ID`, from stdin.
+   The box's role can put it and cannot read it back. Invoke `{"mode": "signals"}` once by hand and read
+   `journal/signals/` (counts only), then set `dolphin_maps_signals_enabled = true` and apply.
 
 Every setup script also gives an account that has no user-level agent instructions a
 starting file (`user-agents.tf`): `~/.codex/AGENTS.md`, which Codex reads, with
