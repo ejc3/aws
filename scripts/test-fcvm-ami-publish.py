@@ -4,6 +4,7 @@ import base64
 import copy
 import datetime
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -108,6 +109,7 @@ class EC2:
         self.cancelled_spot = []
         self.reopened_spot = []
         self.runtime_order = []
+        self.tagged = []
         self.fail_cancel = False
 
     def describe_instances(self, InstanceIds=None, Filters=None, **_kwargs):
@@ -178,6 +180,7 @@ class EC2:
     def create_tags(self, Resources, Tags):
         assert Tags == [{"Key": "FleetImageValidated", "Value": "true"}]
         assert all(name in self.images or name in self.snapshots for name in Resources)
+        self.tagged.extend(Resources)
 
     def terminate_instances(self, InstanceIds):
         if self.fail_terminate:
@@ -220,6 +223,9 @@ class CodeBuild:
 
 class PublisherTests(unittest.TestCase):
     def setUp(self):
+        network = mock.patch.object(http.client, "HTTPSConnection", side_effect=AssertionError("offline fixture forbids network"))
+        network.start()
+        self.addCleanup(network.stop)
         self.build = "factory:00000000-0000-0000-0000-000000000001"
         self.source, self.input = "a" * 40, "b" * 64
         self.ids = ["lt-" + format(i, "017x") for i in range(1, 5)]
@@ -247,6 +253,7 @@ class PublisherTests(unittest.TestCase):
         release = {"version": 1, "generation": 0, "source_sha": "", "build_id": "", "guard_sha256": self.env["GUARD_SHA256"],
             "host_amis": {"us-east-1": {"x86_64": old["host"]}}, "tile_amis": {"us-east-1": {"x86_64": old["tile"]}}, "versions": {}, "previous": None}
         self.fleet_ssm.values["/release"] = release
+        self.env["SEED_RELEASE_JSON"] = json.dumps({"source_sha": self.source, "images": new, "expected": copy.deepcopy(release)})
         journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
                    "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
@@ -311,6 +318,144 @@ class PublisherTests(unittest.TestCase):
                    ("ssm", False): "us-west-1", ("dynamodb", False): "us-west-1", ("codebuild", False): "us-west-1"}
         publisher.client = lambda service, fleet=False, region=None: clients[(service, fleet, region or regions[(service, fleet)])]
         return publisher
+
+    def legacy_seed(self):
+        for image in self.ec2.images.values():
+            image["Tags"] = [tag for tag in image["Tags"]
+                             if tag["Key"] in {"Purpose", "FleetImageKind", "GuardHelperSHA256"}]
+            image["Tags"].append({"Key": "FleetImageValidated", "Value": "true"})
+        return {"action": "activate-reviewed-seed"}
+
+    def seed_success(self, publisher, event):
+        try:
+            return publisher.run(event)
+        except MODULE.Refused as error:
+            self.fail("reviewed seed transition was refused: " + str(error))
+
+    def test_reviewed_seed_uses_only_the_existing_image_transaction(self):
+        event = self.legacy_seed()
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        requests = copy.deepcopy(self.main_ssm.values)
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("no paid build path")):
+            self.assertEqual(self.seed_success(self.publisher(), event), {"status": "promoted", "generation": 1})
+        release = self.fleet_ssm.values["/release"]
+        self.assertEqual(release["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertTrue(release["build_id"].startswith("reviewed-seed:"))
+        self.assertEqual(release["source_sha"], self.source)
+        self.assertEqual(len(self.ec2.created), 4)
+        for item in self.templates:
+            template = self.ec2.templates[item["id"]]
+            self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"],
+                             {**template["versions"][1]["LaunchTemplateData"], "ImageId": self.new[item["kind"]]})
+        self.assertEqual((self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], []))
+        self.assertTrue(all(self.main_ssm.values[key] == value for key, value in requests.items()))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_seed_refuses_caller_overrides_nonseed_and_unvalidated_images(self):
+        variants = ("caller-image", "caller-source", "published", "changed-seed", "wrong-config",
+                    "OwnerId", "Public", "State", "FleetImageKind", "FleetImageValidated", "GuardHelperSHA256")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.setUp()
+                event = self.legacy_seed()
+                if variant == "caller-image": event["images"] = self.old
+                elif variant == "caller-source": event["source_sha"] = "f" * 40
+                elif variant == "published": self.fleet_ssm.values["/release"]["generation"] = 1
+                elif variant == "changed-seed": self.fleet_ssm.values["/release"]["host_amis"]["us-east-1"]["x86_64"] = self.new["host"]
+                elif variant == "wrong-config": self.env["SEED_RELEASE_JSON"] = '{}'
+                else:
+                    image = self.ec2.images[self.new["host"]]
+                    if variant == "Public": image[variant] = True
+                    elif variant in {"OwnerId", "State"}: image[variant] = "foreign"
+                    else: next(tag for tag in image["Tags"] if tag["Key"] == variant)["Value"] = "foreign"
+                with self.assertRaises(MODULE.Refused): self.publisher().run(event)
+                self.assertEqual((self.ec2.created, self.ec2.tagged, self.assets.copies), ([], [], []))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_seed_partial_selection_rolls_back_and_never_replays(self):
+        event = self.legacy_seed()
+        self.ec2.fail_select = self.ids[2]
+        publisher = self.publisher()
+        with self.assertRaises(MODULE.Refused): publisher.run(event)
+        self.assertGreater(len(self.ec2.created), 4, "actual seed transaction must reach rollback")
+        self.assertEqual(self.fleet_ssm.values["/release"]["generation"], 0)
+        for item in self.templates:
+            template = self.ec2.templates[item["id"]]
+            self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"],
+                             template["versions"][1]["LaunchTemplateData"])
+        created = list(self.ec2.created)
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(len(self.ec2.deleted), 4)
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_seed_lost_commit_ack_replays_and_interrupted_transaction_recovers(self):
+        event = self.legacy_seed()
+        original = self.fleet_ssm.put_parameter
+        def lost_ack(**arguments):
+            original(**arguments)
+            raise RuntimeError("response lost after durable commit")
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=lost_ack):
+            self.assertEqual(self.seed_success(self.publisher(), event), {"status": "promoted", "generation": 1})
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 1})
+        self.assertEqual(len(self.ec2.created), 4)
+        self.setUp()
+        event = self.legacy_seed()
+        original_select = self.ec2.modify_launch_template
+        class Interrupted(BaseException):
+            pass
+        def interrupt(**arguments):
+            original_select(**arguments)
+            raise Interrupted()
+        with mock.patch.object(self.ec2, "modify_launch_template", side_effect=interrupt):
+            try:
+                self.publisher().run(event)
+            except MODULE.Refused as error:
+                self.fail("seed transaction never reached the interruption: " + str(error))
+            except Interrupted:
+                pass
+        with self.assertRaises(MODULE.Refused): self.publisher().run(event)
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertEqual(len(self.ec2.deleted), 4)
+        self.assertEqual(self.fleet_ssm.values["/release"]["generation"], 0)
+        self.assertIsNone(self.ddb.item)
+
+    def test_factory_source_fence_refuses_older_or_unknown_sources_and_keeps_full_proof(self):
+        self.assertTrue(hasattr(self.publisher(), "compare_sources"), "publication needs a native source ancestry fence")
+        with mock.patch.object(http.client, "HTTPSConnection") as transport:
+            response = transport.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b'{"status":"ahead"}'
+            self.assertEqual(self.publisher().compare_sources("9" * 40, self.source), {"status": "ahead"})
+            transport.assert_called_once_with("api.github.com", timeout=10)
+            request = transport.return_value.request.call_args
+            self.assertEqual(request.args, ("GET", "/repos/ejc3/fcvm/compare/" + "9" * 40 + "..." + self.source + "?per_page=1&page=2"))
+            response.read.assert_called_once_with(2 * 1024 * 1024 + 1)
+            transport.return_value.close.assert_called_once_with()
+        for variant in ("older", "network", "descendant", "missing-proof", "changed-under-lock"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                config = json.loads(self.env["SEED_RELEASE_JSON"])
+                config["source_sha"] = "9" * 40
+                self.env["SEED_RELEASE_JSON"] = json.dumps(config)
+                publisher = self.publisher()
+                comparison = {"status": "ahead", "behind_by": 0, "base_commit": {"sha": "9" * 40},
+                              "merge_base_commit": {"sha": "9" * 40}}
+                if variant == "network": publisher.compare_sources = mock.Mock(side_effect=OSError("network unavailable"))
+                elif variant == "older": publisher.compare_sources = mock.Mock(return_value={**comparison, "status": "behind"})
+                elif variant == "changed-under-lock": publisher.compare_sources = mock.Mock(side_effect=[comparison, {**comparison, "status": "behind"}])
+                else: publisher.compare_sources = mock.Mock(return_value=comparison)
+                if variant == "missing-proof":
+                    self.ec2.images[self.new["host"]]["Tags"] = [tag for tag in self.ec2.images[self.new["host"]]["Tags"]
+                                                                if tag["Key"] != "PipelineSanitized"]
+                if variant == "descendant":
+                    self.assertEqual(publisher.run(self.event), {"status": "promoted", "generation": 1})
+                    self.assertEqual(len(self.assets.copies), 19)
+                    self.assertGreaterEqual(publisher.compare_sources.call_count, 3)
+                else:
+                    with self.assertRaises((MODULE.Refused, OSError)): publisher.run(self.event)
+                    self.assertEqual(self.ec2.created, [])
+                if variant in {"older", "network"}: self.assertEqual(self.assets.copies, [])
 
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
