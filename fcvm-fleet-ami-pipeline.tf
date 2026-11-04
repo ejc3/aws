@@ -7,7 +7,7 @@ variable "fcvm_ami_pipeline_enabled" {
 }
 
 locals {
-  # One reviewed legacy transition, never caller-supplied images or fake factory provenance.
+  # Reviewed legacy transitions never accept caller-supplied images or fake factory provenance.
   fcvm_ami_reviewed_seed = {
     source_sha = "2414e10133ea7035ff8e6b53eb22b0d92aac68da"
     images     = { host = "ami-05234f17eb73f6a34", tile = "ami-0a76a813745a28952" }
@@ -18,6 +18,28 @@ locals {
       tile_amis    = { "us-east-1" = { x86_64 = "ami-0edfc91ca2e651db9" } }
       versions     = {}
       previous     = null
+    }
+  }
+  # Fixed activation of the independently reviewed a70ad25c pair from #776,
+  # only while the exact previously published 2414e101 bundle is active.
+  fcvm_ami_reviewed_phone_release = {
+    source_sha = "a70ad25c2fb0ee3890d2d6cd8b5d5e057fbbbf3c"
+    images     = { host = "ami-0129863cf5498d43b", tile = "ami-05dd36badf188758b" }
+    expected = {
+      version      = 1
+      generation   = 1
+      source_sha   = local.fcvm_ami_reviewed_seed.source_sha
+      build_id     = "reviewed-seed:${sha256(jsonencode(local.fcvm_ami_reviewed_seed))}"
+      guard_sha256 = local.fcvm_ami_guard_sha
+      host_amis    = { "us-east-1" = { x86_64 = local.fcvm_ami_reviewed_seed.images.host } }
+      tile_amis    = { "us-east-1" = { x86_64 = local.fcvm_ami_reviewed_seed.images.tile } }
+      versions = {
+        "us-east-1/lt-01972ab31436a0ce0" = 15
+        "us-east-1/lt-05856e91e1cd7c5f7" = 10
+        "us-east-1/lt-06851b9720c0517fe" = 13
+        "us-east-1/lt-06c7abdc28186e26c" = 13
+      }
+      previous = { for key, value in local.fcvm_ami_reviewed_seed.expected : key => value if key != "previous" }
     }
   }
 }
@@ -607,6 +629,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
       SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
+      PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
     }
   }
 }

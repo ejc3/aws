@@ -1,7 +1,7 @@
 """Promote one independently validated image pair under Terraform's exact lock.
 
-Factory publication requires a successful fixed-project CodeBuild event. One
-reviewed, configuration-pinned transition can replace the initial legacy seed.
+Factory publication requires a successful fixed-project CodeBuild event.
+Reviewed, configuration-pinned transitions use the same image transaction.
 Every new template version differs solely in ImageId.
 """
 import base64
@@ -82,25 +82,45 @@ class Publisher:
         _, request = self.request(source, input_sha)
         need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
 
-    def reviewed_seed(self):
-        config = json.loads(self.env["SEED_RELEASE_JSON"])
+    def reviewed_pair(self, variable):
+        config = json.loads(self.env[variable])
         need(set(config) == {"source_sha", "images", "expected"}
-             and SHA.fullmatch(config["source_sha"]), "invalid reviewed seed configuration")
+             and SHA.fullmatch(config["source_sha"]), "invalid reviewed image configuration")
         expected = config["expected"]
         need(set(expected) == {"version", "generation", "source_sha", "build_id", "guard_sha256",
                               "host_amis", "tile_amis", "versions", "previous"}
-             and expected["version"] == 1 and type(expected["generation"]) is int and expected["generation"] == 0
-             and expected["source_sha"] == expected["build_id"] == ""
-             and expected["versions"] == {} and expected["previous"] is None
+             and expected["version"] == 1 and type(expected["generation"]) is int
              and expected["guard_sha256"] == self.env["GUARD_SHA256"]
-             and set(config["images"]) == {"host", "tile"}, "reviewed transition is not an initial seed")
+             and set(config["images"]) == {"host", "tile"}, "invalid reviewed release predecessor")
         images = []
         for kind in ("host", "tile"):
             maps = expected[kind + "_amis"]
             need(set(maps) == {self.env["COMPUTE_REGION"]}
-                 and set(maps[self.env["COMPUTE_REGION"]]) == {"x86_64"}, "unexpected seed topology")
+                 and set(maps[self.env["COMPUTE_REGION"]]) == {"x86_64"}, "unexpected reviewed release topology")
             images.extend([config["images"][kind], maps[self.env["COMPUTE_REGION"]]["x86_64"]])
-        need(len(set(images)) == 4 and all(IMAGE.fullmatch(item) for item in images), "invalid seed image identities")
+        need(len(set(images)) == 4 and all(IMAGE.fullmatch(item) for item in images), "invalid reviewed image identities")
+        return config
+
+    def reviewed_seed(self):
+        config = self.reviewed_pair("SEED_RELEASE_JSON")
+        expected = config["expected"]
+        need(expected["generation"] == 0 and expected["source_sha"] == expected["build_id"] == ""
+             and expected["versions"] == {} and expected["previous"] is None,
+             "reviewed transition is not an initial seed")
+        return config
+
+    def reviewed_phone_release(self):
+        config = self.reviewed_pair("PHONE_AMI_JSON")
+        seed = self.reviewed_seed()
+        expected = config["expected"]
+        need(expected["generation"] == 1 and expected["source_sha"] == seed["source_sha"] != config["source_sha"]
+             and expected["build_id"] == "reviewed-seed:" + digest(encoded(seed))
+             and expected["previous"] == {k: v for k, v in seed["expected"].items() if k != "previous"}
+             and all(expected[kind + "_amis"] == {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                     for kind, image in seed["images"].items())
+             and set(expected["versions"]) == {t["region"] + "/" + t["id"] for t in self.templates}
+             and all(type(v) is int and v > 0 for v in expected["versions"].values()),
+             "reviewed phone transition must follow the exact seed publication")
         return config
 
     def compare_sources(self, base, head):
@@ -207,12 +227,12 @@ class Publisher:
             if not self.recovery_failed:
                 self.release()
 
-    def seed_fence(self, config):
+    def reviewed_fence(self, config):
         need(self.load(self.env["RELEASE_PARAMETER"], True) == config["expected"],
-             "reviewed transition requires the unchanged initial seed")
+             "reviewed transition requires its unchanged predecessor")
         for kind, image_id in config["images"].items():
             rows = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
-            need(len(rows) == 1, "reviewed seed image is missing")
+            need(len(rows) == 1, "reviewed image is missing")
             image = rows[0]
             tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
             need(image.get("ImageId") == image_id and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
@@ -221,35 +241,49 @@ class Publisher:
                  and all(tags.get(key) == value for key, value in {
                      "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
                      "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
-                 "reviewed seed image is outside its private validated scope")
+                 "reviewed image is outside its private validated scope")
 
     def run_seed(self, event):
         need(event == {"action": "activate-reviewed-seed"}, "reviewed seed accepts no caller configuration")
-        config = self.reviewed_seed()
-        self.build_id = "reviewed-seed:" + digest(encoded(config))
+        return self.run_reviewed(self.reviewed_seed(), "reviewed-seed")
+
+    def run_phone_release(self, event):
+        need(event == {"action": "activate-reviewed-phone-release"}, "reviewed release accepts no caller configuration")
+        return self.run_reviewed(self.reviewed_phone_release(), "reviewed-phone-release", check_ancestry=True)
+
+    def run_reviewed(self, config, identity, check_ancestry=False):
+        self.build_id = identity + ":" + digest(encoded(config))
+        generation = config["expected"]["generation"] + 1
+
+        def fence():
+            self.reviewed_fence(config)
+            if check_ancestry:
+                self.source_fence(config["source_sha"])
+
         with self.publication_lock():
             active = self.load(self.env["RELEASE_PARAMETER"], True)
             if active.get("build_id") == self.build_id:
-                need(active.get("generation") == 1 and active.get("source_sha") == config["source_sha"]
+                need(active.get("generation") == generation and active.get("source_sha") == config["source_sha"]
                      and active.get("previous") == {k: v for k, v in config["expected"].items() if k != "previous"}
                      and all(active.get(kind + "_amis") == {self.env["COMPUTE_REGION"]: {"x86_64": image}}
-                             for kind, image in config["images"].items()), "committed seed receipt differs")
+                             for kind, image in config["images"].items()), "committed reviewed receipt differs")
                 self.committed = True
-                return {"status": "promoted", "generation": 1}
-            self.seed_fence(config)
+                return {"status": "promoted", "generation": generation}
+            need(active == config["expected"], "reviewed transition requires its unchanged predecessor")
             prior = self.prior_transaction()
             if prior:
-                need(prior.get("before") == config["expected"], "seed transaction identity changed")
+                need(prior.get("before") == config["expected"], "reviewed transaction identity changed")
                 if prior.get("status") == "rolled_back":
                     return {"status": "failed", "reason": "rolled_back"}
                 self.transaction = prior
                 if not all(entry.get("candidate") for entry in prior.get("entries", {}).values()):
                     self.recovery_failed = True
                     self.transaction = None
-                    raise Refused("uncertain seed version requires administrator reconciliation")
-                raise Refused("interrupted seed publication must roll back before terminal replay")
+                    raise Refused("uncertain reviewed version requires administrator reconciliation")
+                raise Refused("interrupted reviewed publication must roll back before terminal replay")
+            fence()
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
-            result = self.promote(manifest, config["source_sha"], None, [], fence=lambda: self.seed_fence(config))
+            result = self.promote(manifest, config["source_sha"], None, [], fence=fence)
             return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
@@ -687,6 +721,8 @@ class Publisher:
     def run(self, event):
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-seed":
             return self.run_seed(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-phone-release":
+            return self.run_phone_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
