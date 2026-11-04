@@ -31,23 +31,23 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 38d63412, revised from the e32ad48d guard image (ami-00fb7a2e8b89e2446): everything in it, plus
-  # frame streams that drop a viewer's frames by age (ejc3/fcvm#1481: no frame older than 200 ms after a stall, per-viewer
-  # queue depth and drops in /health, for the renderer and the phone streamer), the wall without places for phone GPUs
-  # (ejc3/fcvm#1477) and the phones page's mirror fixes (ejc3/fcvm#1476). The IP-options guard is installed by prep and its
-  # publication proof passed. Its renderer is the tile AMI's (image 0a93571b74e6).
-  default = { "us-east-1" = { x86_64 = "ami-0d94bb60fbf180b7f" } }
+  # executable from main 2414e101, revised from the 38d63412 image (ami-0d94bb60fbf180b7f): everything in it, plus GPU
+  # application clocks at the board's maximum when fc-agent brings a GPU up (ejc3/fcvm#1488: a T4 defaults to 585 MHz,
+  # and the wall's renderers, idle between frames, ran at it, which held the grid budget at a stride-2 checkerboard) and
+  # the renderer's height guard predicting a taller height from the budget's samples (ejc3/fcvm#1489: a tile asked 180 by
+  # the broadcast and 432 by a viewer draws 432). The IP-options guard is installed by prep and its publication proof
+  # passed. Its renderer is the tile AMI's (image 0a91ee2c0c1c).
+  default = { "us-east-1" = { x86_64 = "ami-05234f17eb73f6a34" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the e32ad48d guard image (ami-0edfc91ca2e651db9) with the renderer from ejc3/fcvm
-  # main 38d63412, the host AMI's (ejc3/fcvm#1481), and the units of main 2f861183: nvidia-persistenced retries its first
-  # start (ejc3/fcvm#1482), which failed on every boot and cost a cold tile 13 s (first frame over HTTPS 29.9 and 32.1 s
-  # from the launch request, against 42.3 and 44.9 s). Its boot prefetch list was traced again on this image.
-  default = { "us-east-1" = { x86_64 = "ami-0a9804d3fc86cd87e" } }
+  # (fcvm fleet/ami/tile). Revised from the 2f861183 image (ami-0a9804d3fc86cd87e) with the renderer from ejc3/fcvm main
+  # 2414e101, the host AMI's, and its units: nvidia-persistenced sets the GPU's application clocks to the maximum
+  # (ejc3/fcvm#1488). Its boot prefetch list was traced again on this image.
+  default = { "us-east-1" = { x86_64 = "ami-0a76a813745a28952" } }
 }
 
 locals {

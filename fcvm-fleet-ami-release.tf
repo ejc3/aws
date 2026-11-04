@@ -52,6 +52,8 @@ locals {
     "tile/x86_64"          = { image = "ami-0edfc91ca2e651db9", kind = "tile" }
     "host/x86_64/38d63412" = { image = "ami-0d94bb60fbf180b7f", kind = "host" }
     "tile/x86_64/2f861183" = { image = "ami-0a9804d3fc86cd87e", kind = "tile" }
+    "host/x86_64/2414e101" = { image = "ami-05234f17eb73f6a34", kind = "host" }
+    "tile/x86_64/2414e101" = { image = "ami-0a76a813745a28952", kind = "tile" }
   }
 }
 
