@@ -360,6 +360,10 @@ resource "aws_launch_template" "host" {
   }
 
   tags = { Name = "fcvm-fleet-host-${each.key}" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
 # Preserve the existing topic and confirmed email subscription at their original Terraform addresses. The coordinator's
@@ -429,6 +433,10 @@ resource "aws_launch_template" "tile" {
   }
 
   tags = { Name = "fcvm-fleet-tile-${each.key}" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
 # The same tile on demand: the coordinator's fallback when EC2 has no spot capacity for a tile in any fleet region
@@ -478,6 +486,10 @@ resource "aws_launch_template" "tile_on_demand" {
   }
 
   tags = { Name = "fcvm-fleet-tile-on-demand-${each.key}" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
 # The tile the coordinator keeps a pool of (fcvm fleet coord --ec2-pool <n> --ec2-pool-template
@@ -543,6 +555,10 @@ resource "aws_launch_template" "tile_pool" {
   }
 
   tags = { Name = "fcvm-fleet-tile-pool-${each.key}" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
 output "vpc_id" {
