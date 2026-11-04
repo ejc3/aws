@@ -476,11 +476,13 @@ an ordinary Terraform apply never allocates a billed Mac host.
 
 The GPU demonstration Fleet's x86 host and tile AMIs have a continuous image factory
 in `fcvm-fleet-ami-pipeline.tf`. Successful `ejc3/fcvm` main CI requests immutable
-source builds; routine changes batch for six hours, at most once per UTC day, with
-a weekly refresh. Critical-labelled merges and a main `critical` dispatch start
-immediately after validation and can preempt a routine build once its builders are
-terminated. Each job has a 240-minute deadline, at most one `g4dn.metal` host and
-one `g4dn.xlarge` tile active, and four total build/validation slots. An independent
+source builds; routine changes batch for six hours from the first queued request,
+at most once per UTC day, with a weekly refresh. Newer routine inputs replace the
+queued source without pushing back its deadline. Critical-labelled merges and a
+main `critical` dispatch start immediately after validation and can preempt a
+routine build once its builders are terminated. Each job has a 240-minute deadline,
+at most one `g4dn.metal` host and one `g4dn.xlarge` tile active, and four total
+build/validation slots. An independent
 five-minute expiry sweep bounds abandoned compute. At the current instance rates,
 four hours plus the expiry sweep is about $35 of compute; EBS, snapshots, CodeBuild
 and transfer remain additional. Individual SSM commands remain capped at 150 minutes.
