@@ -7,6 +7,22 @@ variable "fcvm_ami_pipeline_enabled" {
 }
 
 locals {
+  # One reviewed legacy transition, never caller-supplied images or fake factory provenance.
+  fcvm_ami_reviewed_seed = {
+    source_sha = "2414e10133ea7035ff8e6b53eb22b0d92aac68da"
+    images     = { host = "ami-05234f17eb73f6a34", tile = "ami-0a76a813745a28952" }
+    expected = {
+      version      = 1, generation = 0, source_sha = "", build_id = ""
+      guard_sha256 = local.fcvm_ami_guard_sha
+      host_amis    = { "us-east-1" = { x86_64 = "ami-00fb7a2e8b89e2446" } }
+      tile_amis    = { "us-east-1" = { x86_64 = "ami-0edfc91ca2e651db9" } }
+      versions     = {}
+      previous     = null
+    }
+  }
+}
+
+locals {
   fcvm_ami_project       = "fcvm-fleet-image-factory"
   fcvm_ami_region        = "us-east-1"
   fcvm_ami_state_prefix  = "/fcvm-fleet/ami-pipeline"
@@ -590,6 +606,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
+      SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
     }
   }
 }
