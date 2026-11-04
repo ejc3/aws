@@ -358,7 +358,7 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
 
 resource "aws_iam_policy" "dolphin_maps_pems_dev" {
   name        = "dev-dolphin-maps-pems"
-  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and the Ball Don't Lie key (balldontlie/api-key); put the MusicKit key and the drives read token"
+  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and the Ball Don't Lie key (balldontlie/api-key); put the MusicKit key"
   policy      = data.aws_iam_policy_document.dolphin_maps_pems_dev.json
 }
 

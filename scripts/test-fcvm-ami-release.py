@@ -35,7 +35,8 @@ class ReleaseContracts(unittest.TestCase):
                 template = block(self.module, 'resource "aws_launch_template"', name)
                 self.assertRegex(template, r"depends_on\s*=\s*\[ephemeral\.aws_ssm_parameter\.ami_release_guard\]")
                 self.assertRegex(template, r"update_default_version\s*=\s*true")
-                self.assertNotIn("ignore_changes", template)
+                ignored = re.findall(r"\bignore_changes\s*=\s*([^\n]+)", template)
+                self.assertEqual([value.strip() for value in ignored], ["[description]"])
 
     def test_release_dependency_does_not_defer_region_topology(self):
         for module in ("fcvm_fleet_east1", "fcvm_fleet_east2", "fcvm_fleet_west2"):

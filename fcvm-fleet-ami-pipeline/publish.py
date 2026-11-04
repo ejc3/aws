@@ -1,13 +1,15 @@
 """Promote one independently validated image pair under Terraform's exact lock.
 
-Only a successful, fixed-project CodeBuild event reaches this consumer. The
-worker has no template authority; the Fleet delegate can change only four
-configured templates, and every new version differs solely in ImageId.
+Factory publication requires a successful fixed-project CodeBuild event. One
+reviewed, configuration-pinned transition can replace the initial legacy seed.
+Every new template version differs solely in ImageId.
 """
 import base64
 import copy
+from contextlib import contextmanager
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -80,6 +82,59 @@ class Publisher:
         _, request = self.request(source, input_sha)
         need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
 
+    def reviewed_seed(self):
+        config = json.loads(self.env["SEED_RELEASE_JSON"])
+        need(set(config) == {"source_sha", "images", "expected"}
+             and SHA.fullmatch(config["source_sha"]), "invalid reviewed seed configuration")
+        expected = config["expected"]
+        need(set(expected) == {"version", "generation", "source_sha", "build_id", "guard_sha256",
+                              "host_amis", "tile_amis", "versions", "previous"}
+             and expected["version"] == 1 and type(expected["generation"]) is int and expected["generation"] == 0
+             and expected["source_sha"] == expected["build_id"] == ""
+             and expected["versions"] == {} and expected["previous"] is None
+             and expected["guard_sha256"] == self.env["GUARD_SHA256"]
+             and set(config["images"]) == {"host", "tile"}, "reviewed transition is not an initial seed")
+        images = []
+        for kind in ("host", "tile"):
+            maps = expected[kind + "_amis"]
+            need(set(maps) == {self.env["COMPUTE_REGION"]}
+                 and set(maps[self.env["COMPUTE_REGION"]]) == {"x86_64"}, "unexpected seed topology")
+            images.extend([config["images"][kind], maps[self.env["COMPUTE_REGION"]]["x86_64"]])
+        need(len(set(images)) == 4 and all(IMAGE.fullmatch(item) for item in images), "invalid seed image identities")
+        return config
+
+    def compare_sources(self, base, head):
+        connection = http.client.HTTPSConnection("api.github.com", timeout=10)
+        try:
+            # GitHub includes file patches only on page one; ancestry metadata remains on page two.
+            connection.request("GET", "/repos/ejc3/fcvm/compare/" + base + "..." + head + "?per_page=1&page=2",
+                               headers={"User-Agent": "fcvm-image-publisher", "Accept": "application/vnd.github+json"})
+            response = connection.getresponse()
+            need(response.status == 200, "source ancestry is unavailable")
+            raw = response.read(2 * 1024 * 1024 + 1)
+            need(len(raw) <= 2 * 1024 * 1024, "source ancestry exceeds its bound")
+            return json.loads(raw)
+        finally:
+            connection.close()
+
+    def source_fence(self, source):
+        need(SHA.fullmatch(source), "invalid factory source")
+        active = self.load(self.env["RELEASE_PARAMETER"], True)
+        floors = {self.reviewed_seed()["source_sha"]}
+        if active.get("source_sha"):
+            need(SHA.fullmatch(active["source_sha"]), "active release source is invalid")
+            floors.add(active["source_sha"])
+        for floor in sorted(floors - {source}):
+            comparison = self.compare_sources(floor, source)
+            need(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                 and comparison.get("base_commit", {}).get("sha") == floor
+                 and comparison.get("merge_base_commit", {}).get("sha") == floor,
+                 "factory source precedes the reviewed or active release")
+
+    def factory_fence(self, source, input_sha):
+        self.current_request(source, input_sha)
+        self.source_fence(source)
+
     def client(self, service, fleet=False, region=None):
         region = region or (self.env["PIPELINE_REGION"] if service == "s3" and not fleet
                             else self.env["COMPUTE_REGION" if fleet else "CONTROL_REGION"])
@@ -134,6 +189,68 @@ class Publisher:
                 Key={"LockID": {"S": self.env["LOCK_ID"]}}, ConditionExpression="#info = :ours",
                 ExpressionAttributeNames={"#info": "Info"}, ExpressionAttributeValues={":ours": {"S": self.lock_info}})
             self.lock_info = None
+
+    @contextmanager
+    def publication_lock(self):
+        self.acquire()
+        try:
+            yield
+        except Exception:
+            if self.transaction and not self.committed:
+                try:
+                    self.rollback()
+                except Exception:
+                    self.recovery_failed = True
+                    raise Refused("image publication recovery needs administrator reconciliation") from None
+            raise
+        finally:
+            if not self.recovery_failed:
+                self.release()
+
+    def seed_fence(self, config):
+        need(self.load(self.env["RELEASE_PARAMETER"], True) == config["expected"],
+             "reviewed transition requires the unchanged initial seed")
+        for kind, image_id in config["images"].items():
+            rows = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
+            need(len(rows) == 1, "reviewed seed image is missing")
+            image = rows[0]
+            tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+            need(image.get("ImageId") == image_id and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+                 and image.get("Public") is False and image.get("State") == "available"
+                 and image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs"
+                 and all(tags.get(key) == value for key, value in {
+                     "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                     "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
+                 "reviewed seed image is outside its private validated scope")
+
+    def run_seed(self, event):
+        need(event == {"action": "activate-reviewed-seed"}, "reviewed seed accepts no caller configuration")
+        config = self.reviewed_seed()
+        self.build_id = "reviewed-seed:" + digest(encoded(config))
+        with self.publication_lock():
+            active = self.load(self.env["RELEASE_PARAMETER"], True)
+            if active.get("build_id") == self.build_id:
+                need(active.get("generation") == 1 and active.get("source_sha") == config["source_sha"]
+                     and active.get("previous") == {k: v for k, v in config["expected"].items() if k != "previous"}
+                     and all(active.get(kind + "_amis") == {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                             for kind, image in config["images"].items()), "committed seed receipt differs")
+                self.committed = True
+                return {"status": "promoted", "generation": 1}
+            self.seed_fence(config)
+            prior = self.prior_transaction()
+            if prior:
+                need(prior.get("before") == config["expected"], "seed transaction identity changed")
+                if prior.get("status") == "rolled_back":
+                    return {"status": "failed", "reason": "rolled_back"}
+                self.transaction = prior
+                if not all(entry.get("candidate") for entry in prior.get("entries", {}).values()):
+                    self.recovery_failed = True
+                    self.transaction = None
+                    raise Refused("uncertain seed version requires administrator reconciliation")
+                raise Refused("interrupted seed publication must roll back before terminal replay")
+            manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
+            result = self.promote(manifest, config["source_sha"], None, [], fence=lambda: self.seed_fence(config))
+            return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
         need(isinstance(event, dict) and event.get("source") == "aws.codebuild"
@@ -417,7 +534,7 @@ class Publisher:
         self.transaction["status"] = "rolled_back"
         self.record()
 
-    def promote(self, manifest, source, input_sha, resources):
+    def promote(self, manifest, source, input_sha, resources, fence=None):
         name = self.env["RELEASE_PARAMETER"]
         before = self.load(name, True)
         need(before.get("version") == 1 and before.get("guard_sha256") == self.env["GUARD_SHA256"]
@@ -437,7 +554,8 @@ class Publisher:
             self.record()
             entry["candidate"] = self.version(template["id"], current, manifest["images"][template["kind"]]["image_id"], "candidate", entry)
             self.record()
-        self.client("ec2", True).create_tags(Resources=resources, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
+        if resources:
+            self.client("ec2", True).create_tags(Resources=resources, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
         for template, entry in self.transaction["entries"].items():
             need(self.current(template)["VersionNumber"] == entry["old_version"], "template default changed during publication")
             self.select(template, entry["candidate"])
@@ -447,7 +565,10 @@ class Publisher:
         after["versions"] = {t["region"] + "/" + t["id"]: self.transaction["entries"][t["id"]]["candidate"] for t in self.templates}
         for kind in ("host", "tile"):
             after[kind + "_amis"][self.env["COMPUTE_REGION"]]["x86_64"] = manifest["images"][kind]["image_id"]
-        self.current_request(source, input_sha)
+        if fence is None:
+            self.factory_fence(source, input_sha)
+        else:
+            fence()
         try:
             self.save(name, after, True)
         except Exception:
@@ -564,6 +685,8 @@ class Publisher:
         return {"status": "promoted", "generation": result["generation"]}
 
     def run(self, event):
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-seed":
+            return self.run_seed(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
@@ -576,35 +699,22 @@ class Publisher:
                 self.save(name, request)
                 return {"status": "failed", "reason": "rolled_back"}
             self.request(source, input_sha)
+            self.source_fence(source)
             manifest = self.proof(build, source, input_sha)
             resources = self.images(manifest, source, input_sha)
             # Large content transfers need not hold the infrastructure state lock.
             self.store(manifest, input_sha)
-        self.acquire()
-        try:
+        with self.publication_lock():
             active = self.load(self.env["RELEASE_PARAMETER"], True)
             if active.get("build_id") == self.build_id:
                 self.committed = True
                 return self.finish(active, source, input_sha)
             self.request(source, input_sha)
-            self.current_request(source, input_sha)
+            self.factory_fence(source, input_sha)
             need(self.proof(build, source, input_sha) == manifest,
                  "factory proof changed before the publication lock")
             result = self.promote(manifest, source, input_sha, resources)
             return self.finish(result, source, input_sha)
-        except Exception:
-            if self.transaction and not self.committed:
-                try:
-                    self.rollback()
-                except Exception:
-                    self.recovery_failed = True
-                    # Retain the exact backend lock on uncertain recovery. Never
-                    # let Terraform proceed through a partially selected pair.
-                    raise Refused("image publication recovery needs administrator reconciliation") from None
-            raise
-        finally:
-            if not self.recovery_failed:
-                self.release()
 
 
 def lambda_handler(event, context):

@@ -498,7 +498,8 @@ The coordinator uses validated launch-template `$Default` versions. A fixed
 publisher changes only the image field and default of the four permitted templates
 under the Terraform backend lock. `/fcvm-fleet/ami-release` in `us-east-1` records
 the pair and previous bundle. Terraform reads it and rechecks its version at apply
-time, while continuing to own every other template setting. Critical publication
+time, while continuing to own every functional template setting. Version descriptions
+retain the publisher's recovery labels; Terraform ignores only `description`. Critical publication
 replaces only old-image Fleet instances, so active streams may briefly reconnect.
 Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
@@ -524,6 +525,17 @@ dispatcher to confirm every actual termination, including delayed EC2 shutdowns.
 Failed, unreferenced candidates remain private for 24 hours after the native build
 end time for diagnosis, then normal cleanup removes them. Retention never permits
 a failed build to publish.
+
+The existing publisher also accepts the fixed administration action
+`{"action":"activate-reviewed-seed"}` once, only from the exact unpublished
+generation-zero seed to the reviewed 2414e101 pair pinned in Terraform. It uses
+the same backend mutex, image-only template transaction, rollback and previous
+bundle, requires the private images' existing guard/validation tags, and makes
+no factory-sanitization claim or running-instance changes. Later factory sources
+must descend from this reviewed source and the active release; unavailable ancestry
+evidence refuses publication. Review this narrow contract with the five seed/source
+regression groups and existing publisher suite; do not expand it into general
+caller-selected image promotion.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
