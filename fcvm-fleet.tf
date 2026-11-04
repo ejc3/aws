@@ -31,22 +31,23 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 46f2d8bc, revised from the 2414e101 image (ami-05234f17eb73f6a34) by way of a 97df1b73 build:
-  # everything in it, plus the phones' web browser (ejc3/fcvm#1491: Cromite on www.nvidia.com in the warm phone snapshot,
-  # the take-over actions open_browser and open_app, and the agent's phone web proxy, HTTPS CONNECT to names under
-  # nvidia.com only) and the agent's hello listing the actions its phones carry out (ejc3/fcvm#1502). The IP-options guard
-  # is installed by prep and its publication proof passed. Its renderer is the tile AMI's (image 30c0400d7c78).
-  default = { "us-east-1" = { x86_64 = "ami-0653ffbb5ec723d2f" } }
+  # executable from main a70ad25c, revised from the 46f2d8bc image (ami-0653ffbb5ec723d2f): everything in it, plus taps on
+  # Robot Park (ejc3/fcvm#1510: the agent lists the take-over action tap and carries out `phone.sh action tap x y`, an adb
+  # `input tap` at that point of the screen while Robot Park is in front, and tells Robot Park its place for the info tab),
+  # the GPU mirror's join restarting the app only on a host that lists restart_app (ejc3/fcvm#1508), and the renderer's
+  # checkerboard frames launching one trace thread per drawn pixel (ejc3/fcvm#1507). The IP-options guard is installed by
+  # prep and its publication proof passed. Its renderer is the tile AMI's (image b67be0d8a97a).
+  default = { "us-east-1" = { x86_64 = "ami-0129863cf5498d43b" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the 2414e101 image (ami-0a76a813745a28952) by way of a 97df1b73 build, with the
-  # renderer image the 46f2d8bc host AMI built (the same sources as 2414e101's; ejc3/fcvm#1491 and #1502 change no
-  # renderer or tile file). Its boot prefetch list was traced again on this image.
-  default = { "us-east-1" = { x86_64 = "ami-00578e249371ea9fe" } }
+  # (fcvm fleet/ami/tile). Revised from the 46f2d8bc image (ami-00578e249371ea9fe) with the renderer image the a70ad25c
+  # host AMI built (ejc3/fcvm#1507 changes the renderer's checkerboard frames). Its boot prefetch list was traced again on
+  # this image.
+  default = { "us-east-1" = { x86_64 = "ami-05dd36badf188758b" } }
 }
 
 locals {
