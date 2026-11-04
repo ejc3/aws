@@ -22,8 +22,11 @@ def block(kind, name):
 class ScheduleTests(unittest.TestCase):
     def test_both_schedules_start_off_behind_one_committed_gate(self):
         self.assertRegex(block("", "dolphin_maps_loop_enabled"), r"default\s+= false")
+        # The signals pass has a switch of its own (no GitHub Actions copy to cut over from), off too.
+        self.assertRegex(block("", "dolphin_maps_signals_enabled"), r"default\s+= false")
         schedule = block("aws_scheduler_schedule", "dolphin_maps_loop")
-        self.assertIn('state      = var.dolphin_maps_loop_enabled ? "ENABLED" : "DISABLED"', schedule)
+        self.assertIn('state      = (each.key == "signals" ? var.dolphin_maps_signals_enabled : var.dolphin_maps_loop_enabled) ? "ENABLED" : "DISABLED"', schedule)
+        self.assertIn('state      = var.dolphin_maps_loop_enabled ? "ENABLED" : "DISABLED"', block("aws_scheduler_schedule", "dolphin_maps_loop_extra"))
 
     def test_the_schedules_are_in_los_angeles_time_and_name_their_mode(self):
         schedule = block("aws_scheduler_schedule", "dolphin_maps_loop")
@@ -35,6 +38,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn('sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }', TF)
         # The refit is its own function with its own 15 minutes, an hour after the sweep (dolphin-maps #198).
         self.assertIn('refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }', TF)
+        # Signals: nightly, with the memory the Bay Area's graph needs (about 2.5 GB at its peak on a dev box).
+        self.assertIn('signals = { schedule = "cron(30 2 * * ? *)", timeout = 900, memory = 4096 }', TF)
 
     def test_a_failed_pass_is_not_retried(self):
         self.assertIn("maximum_retry_attempts       = 0", block("aws_lambda_function_event_invoke_config", "dolphin_maps_loop"))
@@ -52,7 +57,7 @@ class AccessTests(unittest.TestCase):
 
     def test_the_function_reads_its_secrets_and_writes_only_the_journal(self):
         policy = block("aws_iam_role_policy", "dolphin_maps_loop")
-        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
+        self.assertIn("concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn, aws_secretsmanager_secret.dolphin_maps_drives_read.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])", policy)
         self.assertIn('Resource = "${aws_s3_bucket.dolphin_maps_loop.arn}/journal/*"', policy)
         self.assertNotIn("code/", policy)
         self.assertIn("aws_iam_role.dolphin_maps_loop.arn", re.search(r"browserbase_readers = \[[^\]]*\]", AI).group())
@@ -60,6 +65,17 @@ class AccessTests(unittest.TestCase):
         bdl = (ROOT / "dolphin-maps-balldontlie.tf").read_text()
         self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.dolphin_maps_loop.arn])", bdl)
         self.assertIn("BALLDONTLIE_SECRET_ID = aws_secretsmanager_secret.balldontlie.name", block("aws_lambda_function", "dolphin_maps_loop"))
+
+    def test_the_drives_credential_is_read_by_the_loop_and_administration_only(self):
+        policy = block("aws_secretsmanager_secret_policy", "dolphin_maps_drives_read")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', policy)
+        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_maps_loop.arn])", policy)
+        self.assertNotIn("dev_server", policy)
+        self.assertIn("DRIVES_SECRET_ID      = aws_secretsmanager_secret.dolphin_maps_drives_read.name", block("aws_lambda_function", "dolphin_maps_loop"))
+        # Public repository: the owner is named by an account id inside the secret's value, never here.
+        self.assertNotRegex(TF, r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}")
+        self.assertNotIn("turso.io", TF)
 
     def test_the_deploy_role_trusts_deploy_loop_yml_on_main_and_nothing_else(self):
         role = block("aws_iam_role", "dolphin_maps_loop_deploy")
@@ -107,6 +123,8 @@ class PemsTests(unittest.TestCase):
                                 "aws_secretsmanager_secret.dolphin_maps_pems.arn"),
             "ReadAndPutTheBallDontLieKey": ({"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                             "aws_secretsmanager_secret.balldontlie.arn"),
+            "PutTheDrivesReadToken": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
+                                      "aws_secretsmanager_secret.dolphin_maps_drives_read.arn"),
             "PutTheMusicKitKey": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                  "aws_secretsmanager_secret.dolphin_maps_musickit.arn"),
         }
@@ -117,7 +135,7 @@ class PemsTests(unittest.TestCase):
             actions = re.search(r"actions\s+= \[([^\]]+)\]", statement).group(1)
             resource = re.search(r"resources\s+= \[([^\]]+)\]", statement).group(1)
             actual[sid] = (set(re.findall(r'"([^"]+)"', actions)), resource)
-        # Sharing the policy must not turn the MusicKit write grant into a read grant, or broaden either resource.
+        # Sharing the policy must not turn the MusicKit or drives-token write grants into read grants, or broaden a resource.
         self.assertEqual(actual, expected)
         attach = block("aws_iam_role_policy_attachment", "dolphin_maps_pems_dev")
         self.assertIn("role       = aws_iam_role.dev_server.name", attach)
@@ -153,6 +171,9 @@ class AlarmTests(unittest.TestCase):
         self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["sweep"].function_name }', sweep)
         self.assertIn("evaluation_periods  = 1", sweep)
         self.assertNotIn("aws_cloudwatch_log_metric_filter", TF)
+        signals = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_signals_failed")
+        self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["signals"].function_name }', signals)
+        self.assertIn("evaluation_periods  = 1", signals)
         refit = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_refit_failed")
         self.assertIn('dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["refit"].function_name }', refit)
         self.assertIn("evaluation_periods  = 1", refit)
@@ -168,7 +189,7 @@ class AlarmTests(unittest.TestCase):
 
     def test_a_loop_that_stops_running_alarms_while_its_schedule_is_on(self):
         idle = block("aws_cloudwatch_metric_alarm", "dolphin_maps_loop_not_running")
-        self.assertIn("var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}", idle)
+        self.assertIn("merge(var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}, var.dolphin_maps_signals_enabled ? { signals = 2 } : {})", idle)
         self.assertIn('metric_name         = "Invocations"', idle)
         self.assertIn('treat_missing_data  = "breaching"', idle)
         self.assertIn("datapoints_to_alarm = each.value", idle)

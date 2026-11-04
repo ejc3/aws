@@ -673,8 +673,8 @@ class BroadcastTests(unittest.TestCase):
         self.assertIn('"--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_broadcast[0].name', cmd)
         self.assertIn('"--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)', cmd)
         task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
-        self.assertIn('cpu                = local.fcvm_fleet_broadcast ? "2048" : "512"', task)
-        self.assertIn('memory             = local.fcvm_fleet_broadcast ? "4096" : "1024"', task)
+        self.assertIn('cpu                = local.fcvm_fleet_broadcast ? "4096" : "512"', task)  # 1080 lines need 4 CPUs (ejc3/fcvm#1498)
+        self.assertIn('memory             = local.fcvm_fleet_broadcast ? "8192" : "1024"', task)
 
     def test_the_channel_is_private_and_only_the_coordinator_reads_its_secret(self):
         ch = block('resource "aws_ivs_channel" "fcvm_fleet_broadcast"', self.BC)

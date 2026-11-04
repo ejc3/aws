@@ -1,4 +1,4 @@
-# dolphin-maps' scheduled loops, run in AWS: four Lambdas from one bundle on their EventBridge schedules, a journal of every pass
+# dolphin-maps' scheduled loops, run in AWS: five Lambdas from one bundle on their EventBridge schedules, a journal of every pass
 # in S3, and a GitHub App for its commits. It replaces the GitHub Actions loops in dolphin-labs-hq/dolphin-maps
 # (scrape-live.yml, scrape-weekly.yml, refresh-games.yml and the dev box's crontab trigger), which stand down when that repository's
 # variable LOOPS_RUN_IN_AWS is true.
@@ -20,6 +20,13 @@
 #                                 balldontlie/api-key (dolphin-maps-balldontlie.tf), named by BALLDONTLIE_SECRET_ID.
 #                                 The GitHub Actions copy (refresh-games.yml) runs at 12:15 UTC; this is the same hour
 #                                 in summer and an hour later in winter, before anyone plans the day's drive.
+#   dolphin-maps-loop-signals     nightly 02:30 America/Los_Angeles: {"mode": "signals"}, the light card's measured timing:
+#                                 every recorded drive of the owner's account, read with a read-only token, placed on the
+#                                 areas' graphs and committed as each area's data/areas/<id>/signal_waits.csv (aggregates
+#                                 per public intersection: nothing of any one drive), merged with what is committed. No
+#                                 browser. Its credential is dolphin-maps/drives-read, named by DRIVES_SECRET_ID. Its own
+#                                 switch, dolphin_maps_signals_enabled: it has no GitHub Actions copy to cut over from.
+#                                 4096 MB: the Bay Area's graph is about 2 GB of the run.
 #                                 One bundle, one function a loop: each loop has its own limits, and Lambda's own Errors
 #                                 metric (timeouts, running out of memory and failed starts included) is that
 #                                 loop's alone, so a single failed sweep alarms. Terraform creates both with a
@@ -41,6 +48,11 @@
 #   browserbase/credentials       existing (dev-ai-services.tf); the function joins its readers.
 #   balldontlie/api-key           existing (dolphin-maps-balldontlie.tf), JSON: BALLDONTLIE_API_KEY; the function joins
 #                                 its readers for the games pass.
+#   dolphin-maps/drives-read      JSON: DRIVES_DB_URL (the drives database's https:// URL), DRIVES_DB_TOKEN (a read-only
+#                                 token for that database alone, from the Turso platform API with authorization=read-only),
+#                                 DRIVES_OWNER_ID (the id of the account whose drives alone the signals pass reads). Value
+#                                 set out of band from a metal box (dev-server-role puts and describes it, never reads it),
+#                                 never in git. Only the function and the administration set read it.
 #   dolphin-maps/pems             JSON: PEMS_USERNAME, PEMS_PASSWORD. The PeMS login (Caltrans' traffic data
 #                                 service) for the scheduled PeMS refresh. Value set out of band, never in git. The
 #                                 function and the administration set read it; dev-server-role reads and puts it.
@@ -58,13 +70,20 @@
 # secret has a value; a run before that fails on the stand-in, which the alarms report.
 #
 # Who reaches what:
-#   the four functions         journal/ (write); the secrets above (read); their own logs
+#   the five functions         journal/ (write); the secrets above (read); their own logs
 #   deploy-loop.yml (main)     code/ (write); UpdateFunctionCode, GetFunction and GetFunctionConfiguration on these three
 #                              functions only (no UpdateFunctionConfiguration: the handler is Terraform's)
 #
 # A new function changes the output's LOOP_LAMBDA_FUNCTIONS: set dolphin-maps' repository variable of that name to it
-# after the apply, so deploy-loop.yml ships the bundle to the games function too.
+# after the apply, so deploy-loop.yml ships the bundle to the new function too (the signals function: add
+# dolphin-maps-loop-signals).
 #   dev-server-role            journal/ (read, list): replays on the metal boxes; dolphin-maps/pems (read, put)
+
+variable "dolphin_maps_signals_enabled" {
+  description = "Run dolphin-maps' nightly signals pass (the light card's timing from the owner's drives). Its own switch: it has no GitHub Actions copy. Turn on once dolphin-maps/drives-read has a value and a pass run by hand has committed."
+  type        = bool
+  default     = false
+}
 
 variable "dolphin_maps_loop_enabled" {
   description = "Run dolphin-maps' scheduled loops (live samples, the weekly sweep and refit, the monthly week passes, the weekly weekend pass and the daily games). false keeps the function and its data and stops the runs."
@@ -86,6 +105,9 @@ locals {
     sweep = { schedule = "cron(0 23 ? * SUN *)", timeout = 900, memory = 2048 }
     refit = { schedule = "cron(0 0 ? * MON *)", timeout = 900, memory = 2048 }
     games = { schedule = "cron(15 5 * * ? *)", timeout = 600, memory = 512 }
+    # Every drive of the owner, each on its area's graph from main: under half a minute and a 2.5 GB peak on a dev
+    # box, most of it the Bay Area's graph. At 02:30, when no other loop runs and no drive is being recorded.
+    signals = { schedule = "cron(30 2 * * ? *)", timeout = 900, memory = 4096 }
   }
   # The week and weekend passes: the sweep function, another event. Names are the schedules' suffixes. Week passes
   # are 20 minutes apart from Saturday 20:00 (a pass is a few minutes, 15 at the most); `SAT#1` is the month's first
@@ -241,6 +263,36 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_loop_github_app" {
 }
 
 # -------------------------------------------------------------------------------------
+# The drives database, read-only, for the signals pass
+# -------------------------------------------------------------------------------------
+
+# A read-only token for dolphin-maps' drives database, the database's URL and the owner's account id (JSON:
+# DRIVES_DB_URL, DRIVES_DB_TOKEN, DRIVES_OWNER_ID). Terraform owns the container and who may read it; the value is
+# set out of band from a metal box (its role puts it and cannot read it back) and never enters git. The account is
+# named by its id, so nothing here or in the function's settings names a person.
+resource "aws_secretsmanager_secret" "dolphin_maps_drives_read" {
+  name                    = "dolphin-maps/drives-read"
+  description             = "dolphin-maps' drives database, read-only (JSON: DRIVES_DB_URL, DRIVES_DB_TOKEN, DRIVES_OWNER_ID) for the signals pass. Value set out of band; see dolphin-maps-loop.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "dolphin-maps/drives-read", Project = "dolphin-maps" }
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_maps_drives_read" {
+  secret_arn = aws_secretsmanager_secret.dolphin_maps_drives_read.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheLoopCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.dolphin_maps_drives_read.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dolphin_maps_loop.arn]) } }
+    }]
+  })
+}
+
+# -------------------------------------------------------------------------------------
 # The PeMS login
 # -------------------------------------------------------------------------------------
 
@@ -290,6 +342,12 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
     actions   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
     resources = [aws_secretsmanager_secret.balldontlie.arn]
   }
+  # The signals pass's drives credential (above): put and described, never read, here for the role's 20-policy cap.
+  statement {
+    sid       = "PutTheDrivesReadToken"
+    actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_drives_read.arn]
+  }
   # dolphin-maps' MusicKit key (dolphin-maps-musickit.tf): put and described, never read, here for the role's 20-policy cap.
   statement {
     sid       = "PutTheMusicKitKey"
@@ -300,7 +358,7 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
 
 resource "aws_iam_policy" "dolphin_maps_pems_dev" {
   name        = "dev-dolphin-maps-pems"
-  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and the Ball Don't Lie key (balldontlie/api-key); put the MusicKit key"
+  description = "Metal dev boxes: read and put the dolphin-maps PeMS login (dolphin-maps/pems) and the Ball Don't Lie key (balldontlie/api-key); put the MusicKit key and the drives read token"
   policy      = data.aws_iam_policy_document.dolphin_maps_pems_dev.json
 }
 
@@ -354,7 +412,7 @@ resource "aws_iam_role_policy" "dolphin_maps_loop" {
         Sid      = "ReadItsSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
+        Resource = concat([aws_secretsmanager_secret.dolphin_maps_loop_github_app.arn, aws_secretsmanager_secret.browserbase.arn, aws_secretsmanager_secret.dolphin_maps_pems.arn, aws_secretsmanager_secret.balldontlie.arn, aws_secretsmanager_secret.dolphin_maps_drives_read.arn], [for s in aws_secretsmanager_secret.search_fetch_api_key : s.arn])
       },
       {
         Sid      = "WriteOwnLogs"
@@ -370,10 +428,11 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
   for_each      = local.dolphin_maps_loop_modes
   function_name = "${local.dolphin_maps_loop_name}-${each.key}"
   description = {
-    live  = "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3"
-    sweep = "dolphin-maps weekly loop: the school week's typical ranges, committed to the repository, journal to S3"
-    refit = "dolphin-maps weekly refit: each area's calibration on the ranges in the repository, committed to it, journal to S3"
-    games = "dolphin-maps games loop: each arena's home games for the next 30 days from Ball Don't Lie, committed to the repository, journal to S3"
+    live    = "dolphin-maps live loop: Google Maps samples on school mornings, committed to the repository, journal to S3"
+    sweep   = "dolphin-maps weekly loop: the school week's typical ranges, committed to the repository, journal to S3"
+    refit   = "dolphin-maps weekly refit: each area's calibration on the ranges in the repository, committed to it, journal to S3"
+    games   = "dolphin-maps games loop: each arena's home games for the next 30 days from Ball Don't Lie, committed to the repository, journal to S3"
+    signals = "dolphin-maps signals loop: the light card's measured timing from the owner's recorded drives (read-only), committed to the repository as per-intersection aggregates, journal to S3"
   }[each.key]
   role = aws_iam_role.dolphin_maps_loop.arn
   # The bundle deploy-loop.yml uploads exports index.handler too, so the handler never changes and the deploy
@@ -401,6 +460,7 @@ resource "aws_lambda_function" "dolphin_maps_loop" {
       SCRAPINGDOG_SECRET_ID = aws_secretsmanager_secret.search_fetch_api_key["scrapingdog"].name
       PEMS_SECRET_ID        = aws_secretsmanager_secret.dolphin_maps_pems.name
       BALLDONTLIE_SECRET_ID = aws_secretsmanager_secret.balldontlie.name
+      DRIVES_SECRET_ID      = aws_secretsmanager_secret.dolphin_maps_drives_read.name
       GITHUB_APP_SECRET_ID  = aws_secretsmanager_secret.dolphin_maps_loop_github_app.name
       LOOP_REPO             = "dolphin-labs-hq/dolphin-maps"
       LOOP_BRANCH           = "main"
@@ -453,12 +513,13 @@ resource "aws_iam_role_policy" "dolphin_maps_loop_scheduler" {
   })
 }
 
-# In Los Angeles time, as the routes' arrive-by times are: no daylight-saving arithmetic anywhere.
+# In Los Angeles time, as the routes' arrive-by times are: no daylight-saving arithmetic anywhere. The signals pass
+# has its own switch; the others share the cut-over's.
 resource "aws_scheduler_schedule" "dolphin_maps_loop" {
   for_each   = local.dolphin_maps_loop_modes
   name       = "${local.dolphin_maps_loop_name}-${each.key}"
   group_name = "default"
-  state      = var.dolphin_maps_loop_enabled ? "ENABLED" : "DISABLED"
+  state      = (each.key == "signals" ? var.dolphin_maps_signals_enabled : var.dolphin_maps_loop_enabled) ? "ENABLED" : "DISABLED"
 
   flexible_time_window { mode = "OFF" }
 
@@ -574,6 +635,23 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_games_failed" {
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
 }
 
+# Signals: nightly, so one failure is a night's drives not yet in the light timing; the committed rows stay and the next
+# night's pass reads every drive again.
+resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_signals_failed" {
+  alarm_name          = "dolphin-maps-loop-signals-failed"
+  alarm_description   = "dolphin-maps' signals loop failed: the light timing was not read or committed. See /aws/lambda/dolphin-maps-loop-signals and journal/signals/ (the run's counts) in the dolphin-maps-loop bucket; rerun it with {\"mode\": \"signals\"}."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.dolphin_maps_loop["signals"].function_name }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+}
+
 # A pass that never ran is not an error: with one run at a time, a live pass that takes past the next five
 # minutes throttles the one after it, and a throttled event older than 300 s is dropped without running. Lambda
 # counts those in AsyncEventsDropped, not Errors, so each function gets its own alarm on them.
@@ -596,10 +674,10 @@ resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_dropped" {
 # And a loop that stops running at all (a schedule disabled or broken, the scheduler role changed) produces no
 # Errors and no drops. Only while the schedules are on: the live loop is invoked every weekday morning, so four
 # days without an invocation spans any weekend; the sweep runs once a week, so seven daily periods always hold
-# one run; the games loop runs every day, so two days without one is a broken schedule. Missing data is a breach: no
-# invocations publish no datapoint.
+# one run; the games and signals loops run every day, so two days without one is a broken schedule (the signals one
+# while its own switch is on). Missing data is a breach: no invocations publish no datapoint.
 resource "aws_cloudwatch_metric_alarm" "dolphin_maps_loop_not_running" {
-  for_each            = var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}
+  for_each            = merge(var.dolphin_maps_loop_enabled ? { live = 4, sweep = 7, refit = 7, games = 2 } : {}, var.dolphin_maps_signals_enabled ? { signals = 2 } : {})
   alarm_name          = "dolphin-maps-loop-${each.key}-not-running"
   alarm_description   = "dolphin-maps-loop-${each.key} has not been invoked for ${each.value} days although its schedule is on. Check the scheduler schedule dolphin-maps-loop-${each.key} and the dolphin-maps-loop-scheduler role."
   namespace           = "AWS/Lambda"

@@ -23,7 +23,7 @@
 #   us-east-1, so 8 is $62.59 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is 384 vCPU, 4 hosts at 96
 #   each, less any on-demand EC2 tiles (4 vCPU each); launches beyond the quota fail.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
-#   month; 2 vCPU and 4 GB, about $58, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
+#   month; 4 vCPU and 8 GB, about $115, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
 
 variable "fcvm_fleet_host_amis" {
@@ -1004,9 +1004,10 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   family                   = "fcvm-fleet-coordinator"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  # 2 vCPU and 4 GB with the broadcast: its tile decodes and 720p encode took 1.69 cores on a Xeon (ejc3/fcvm#1384).
-  cpu                = local.fcvm_fleet_broadcast ? "2048" : "512"
-  memory             = local.fcvm_fleet_broadcast ? "4096" : "1024"
+  # 4 vCPU and 8 GB with the broadcast: from 4 CPUs the coordinator broadcasts 1080 lines (ejc3/fcvm#1498), whose
+  # encode and 16 tile decodes take 1.96 times the 720-line set's CPU; the 2 vCPU task ran at 69 to 77% at 720 lines.
+  cpu                = local.fcvm_fleet_broadcast ? "4096" : "512"
+  memory             = local.fcvm_fleet_broadcast ? "8192" : "1024"
   execution_role_arn = aws_iam_role.fcvm_fleet_coordinator_execution.arn
   task_role_arn      = aws_iam_role.fcvm_fleet_coordinator_task.arn
   # The release function changes only the image and records its digest in the
