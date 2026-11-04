@@ -5,18 +5,21 @@
 # the coordinator encodes and pushes to an Amazon IVS low-latency channel. Measured 2026-10-27 (ejc3/fcvm#1384): 1.79 s
 # glass to glass at the median, 0.21 s to the first frame.
 #
-# - One IVS channel in us-east-1 (IVS is not offered in us-east-2), STANDARD (IVS transcodes the 720p input into 720p,
-#   480p, 360p and 160p), LOW latency, private: a playback request needs a token signed with the channel's playback key
-#   pair. The coordinator holds the private key and signs a token per /live connection; /live is behind Cloudflare
-#   Access on staging, so only Access-authenticated viewers get one.
+# - One IVS channel in us-east-1 (IVS is not offered in us-east-2), STANDARD (IVS passes the 1080p input through and
+#   transcodes 720p, 480p, 360p and 160p; a 720p input's top rendition is a 2.4 Mbit/s transcode), LOW latency,
+#   private: a playback request needs a token signed with the channel's playback key pair. The coordinator holds the
+#   private key and signs a token per /live connection; /live is behind Cloudflare Access on staging, so only
+#   Access-authenticated viewers get one.
 # - The secret fcvm-fleet/broadcast (us-east-2, with the fleet's other secrets): the ingest URL with the stream key, the
 #   playback URL, the channel ARN and the playback private key. Only the coordinator's task role reads it.
-# - The coordinator's task grows to 2 vCPU and 4 GB for the decode and the 720p encode (1.69 cores measured on a Xeon),
+# - The coordinator's task grows to 4 vCPU and 8 GB, from which it broadcasts 1080 lines at up to 7.5 Mbit/s
+#   (ejc3/fcvm#1498: the encode and tile decodes take about 2.7 cores; the 2 vCPU task ran at 69 to 77% at 720 lines),
 #   and runs with --broadcast-listen, --broadcast-secret and --direct-capacity (fcvm-fleet.tf).
 #
 # Cost: $2.00 an hour while the channel is live (the coordinator pushes only while the fleet is awake, and the fleet
-# sleeps after 10 minutes with no viewer), $0.072 per viewer-hour at 720p and $0.036 at 480p (North America, first
-# 10,000 hours a month), and the larger task about $43 a month.
+# sleeps after 10 minutes with no viewer), $0.144 per viewer-hour at 1080p (Full HD), $0.072 at 720p and $0.036 at
+# 480p (North America, first 10,000 hours a month, 2026-11-03), and the larger task about $100 a month over the 0.5 vCPU
+# one (about $58 more than at 2 vCPU and 4 GB).
 #
 # The gate: local.fcvm_fleet_broadcast. Enabling requires admission-enforcing host and tile AMIs to be pinned and
 # running (ejc3/aws#722), plus a coordinator image with --broadcast-listen and private ingest errors kept out of logs.
