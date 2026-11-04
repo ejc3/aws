@@ -1633,6 +1633,20 @@ by then, the project is published again. It runs on every setup run, in `setup-s
 the health check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it
 immediately. DNS needs nothing because each zone has a single wildcard record.
 
+**Nightly disk cleanup.** At 10:30 UTC, `nextjs-worktree-prune.timer` checks the
+disk for the host's `ubuntu` account and every running Next.js account container.
+It checks for merged linked Git worktrees only when at least 90% of blocks or
+inodes are unavailable, or fewer than 20 GiB are available. It removes the oldest
+eligible worktrees across all accounts first and stops when space recovers.
+The job checks for running processes in each account's filesystem and runs Git
+as the worktree owner, rechecking eligibility before removal. It keeps main
+checkouts, branches, interactive or locked worktrees, worktrees in use, and
+worktrees with local files or changes. Merge evidence must come from the
+upstream default branch or a verified GitHub merge of the exact worktree head.
+`sudo nextjs-worktree-prune` previews the job without removing anything. The
+dedicated SSM association installs the timer without rerunning Next.js setup
+or starting cleanup during installation.
+
 **The zone follows the account, not a flag.** `colton` and `connor` publish to
 `https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.
 `/usr/local/bin/ndev-zone` is the single source of truth for user -> zone -> tunnel, and
