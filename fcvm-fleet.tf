@@ -31,23 +31,21 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 2414e101, revised from the 38d63412 image (ami-0d94bb60fbf180b7f): everything in it, plus GPU
-  # application clocks at the board's maximum when fc-agent brings a GPU up (ejc3/fcvm#1488: a T4 defaults to 585 MHz,
-  # and the wall's renderers, idle between frames, ran at it, which held the grid budget at a stride-2 checkerboard) and
-  # the renderer's height guard predicting a taller height from the budget's samples (ejc3/fcvm#1489: a tile asked 180 by
-  # the broadcast and 432 by a viewer draws 432). The IP-options guard is installed by prep and its publication proof
-  # passed. Its renderer is the tile AMI's (image 0a91ee2c0c1c).
-  default = { "us-east-1" = { x86_64 = "ami-05234f17eb73f6a34" } }
+  # executable from main 97df1b73, revised from the 2414e101 image (ami-05234f17eb73f6a34): everything in it, plus the
+  # phones' web browser (ejc3/fcvm#1491: Cromite on www.nvidia.com in the warm phone snapshot, the take-over actions
+  # open_browser and open_app, and the agent's phone web proxy, HTTPS CONNECT to names under nvidia.com only). The
+  # IP-options guard is installed by prep and its publication proof passed. Its renderer is the tile AMI's (image f0ac440041f8).
+  default = { "us-east-1" = { x86_64 = "ami-07b224c4b84223a47" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the 2f861183 image (ami-0a9804d3fc86cd87e) with the renderer from ejc3/fcvm main
-  # 2414e101, the host AMI's, and its units: nvidia-persistenced sets the GPU's application clocks to the maximum
-  # (ejc3/fcvm#1488). Its boot prefetch list was traced again on this image.
-  default = { "us-east-1" = { x86_64 = "ami-0a76a813745a28952" } }
+  # (fcvm fleet/ami/tile). Revised from the 2414e101 image (ami-0a76a813745a28952) with the renderer image the
+  # 97df1b73 host AMI built (the same sources as 2414e101's; ejc3/fcvm#1491 changes no renderer or tile file). Its boot
+  # prefetch list was traced again on this image.
+  default = { "us-east-1" = { x86_64 = "ami-032e92060650823bd" } }
 }
 
 locals {
