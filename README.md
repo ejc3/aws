@@ -537,6 +537,13 @@ evidence refuses publication. Review this narrow contract with the five seed/sou
 regression groups and existing publisher suite; do not expand it into general
 caller-selected image promotion.
 
+The fixed administration action `{"action":"activate-reviewed-phone-release"}`
+can advance only that exact generation-one bundle to the reviewed a70ad25c
+phone-browser and Robot Park tap pair. It requires the catalog tags and source
+ancestry under the same lock, keeps 2414e101 for rollback, and affects future
+launches. It cannot select a caller-supplied image, start a build, retire a
+running instance, or override a newer release.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

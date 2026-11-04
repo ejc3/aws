@@ -457,6 +457,82 @@ class PublisherTests(unittest.TestCase):
                     self.assertEqual(self.ec2.created, [])
                 if variant in {"older", "network"}: self.assertEqual(self.assets.copies, [])
 
+    def reviewed_phone_fixture(self):
+        self.assertEqual(self.publisher().run(self.legacy_seed()), {"status": "promoted", "generation": 1})
+        self.ec2.created.clear()
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "7"), ("tile", "8"))}
+        for kind, image_id in images.items():
+            image = copy.deepcopy(self.ec2.images[self.new[kind]])
+            image["ImageId"] = image_id
+            self.ec2.images[image_id] = image
+        source = "d" * 40
+        self.env["PHONE_AMI_JSON"] = json.dumps({"source_sha": source, "images": images, "expected": before})
+        ancestry = {"status": "ahead", "behind_by": 0, "base_commit": {"sha": self.source},
+                    "merge_base_commit": {"sha": self.source}}
+        publisher = self.publisher()
+        publisher.compare_sources = mock.Mock(return_value=ancestry)
+        return publisher, {"action": "activate-reviewed-phone-release"}, before, images, source, ancestry
+
+    def test_reviewed_phone_pair_uses_exact_predecessor_and_replays_without_writes(self):
+        publisher, event, before, images, source, _ = self.reviewed_phone_fixture()
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
+            try:
+                result = publisher.run(event)
+            except MODULE.Refused as error:
+                self.fail("reviewed phone transition was refused: " + str(error))
+        self.assertEqual(result, {"status": "promoted", "generation": 2})
+        self.assertEqual(publisher.compare_sources.call_args_list, [mock.call(self.source, source)] * 2)
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertEqual(after["source_sha"], source)
+        self.assertTrue(after["build_id"].startswith("reviewed-phone-release:"))
+        for template in self.templates:
+            name, kind = template["id"], template["kind"]
+            table = self.ec2.templates[name]
+            version = after["versions"]["us-east-1/" + name]
+            self.assertEqual(table["default"], version)
+            self.assertEqual(table["versions"][version]["LaunchTemplateData"],
+                             {**table["versions"][1]["LaunchTemplateData"], "ImageId": images[kind]})
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 2})
+        self.assertEqual(len(self.ec2.created), 4)
+        self.assertEqual((self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_phone_rejects_overrides_changed_predecessor_and_unreviewed_targets(self):
+        for variant in ("override", "predecessor", "untagged", "diverged"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, images, _, ancestry = self.reviewed_phone_fixture()
+                if variant == "override":
+                    event["images"] = images
+                elif variant == "predecessor":
+                    self.fleet_ssm.values["/release"]["versions"]["us-east-1/" + self.ids[0]] += 1
+                elif variant == "untagged":
+                    tags = self.ec2.images[images["tile"]]["Tags"]
+                    tags[:] = [tag for tag in tags if tag["Key"] != "FleetImageValidated"]
+                else:
+                    publisher.compare_sources.return_value = {**ancestry, "status": "diverged"}
+                unchanged = copy.deepcopy(self.fleet_ssm.values["/release"])
+                with self.assertRaises(MODULE.Refused):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values["/release"], unchanged)
+                self.assertEqual(self.ec2.created, [])
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_phone_rolls_back_when_ancestry_fails_at_commit(self):
+        publisher, event, before, _, _, ancestry = self.reviewed_phone_fixture()
+        publisher.compare_sources.side_effect = [ancestry, {**ancestry, "status": "diverged"}]
+        with self.assertRaises(MODULE.Refused):
+            publisher.run(event)
+        self.assertEqual(len(self.ec2.deleted), 4)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        for template in self.templates:
+            table = self.ec2.templates[template["id"]]
+            self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"]["ImageId"],
+                             self.new[template["kind"]])
+        self.assertIsNone(self.ddb.item)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
