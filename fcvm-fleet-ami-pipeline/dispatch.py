@@ -392,10 +392,14 @@ class Factory:
         now = int(self.now())
         record = {"request_id": request_id, "status": "queued", "source_sha": current, "input_sha256": request_id,
                   "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
-        self.save("/requests/" + request_id, record)
         control = self.load("/control", {})
-        if control.get("pending"):
-            previous = self.request_record(control["pending"])
+        previous = self.request_record(control["pending"]) if control.get("pending") else None
+        if (previous is not None and previous["priority"] == record["priority"] == "normal"
+                and previous["status"] == "queued" and not previous.get("start_attempted")):
+            # Keep the first request's window while replacing its source with the newest main.
+            record["not_before"] = min(record["not_before"], previous["not_before"])
+        self.save("/requests/" + request_id, record)
+        if previous is not None:
             if previous["priority"] == "critical" and record["priority"] == "normal":
                 record.update(status="superseded", message="a critical request is pending")
                 self.save("/requests/" + request_id, record)

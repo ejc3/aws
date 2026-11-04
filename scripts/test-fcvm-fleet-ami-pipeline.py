@@ -96,6 +96,7 @@ class CodeBuild:
         digit = str(len(self.starts) + 1)
         build_id = "factory:" + "-".join(digit * n for n in (8, 4, 4, 4, 12))
         build = self.build(build_id, kwargs["environmentVariablesOverride"])
+        build["resolvedSourceVersion"] = kwargs["sourceVersion"]
         build["startTime"] = datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc)
         self.builds[build_id] = build
         if self.lose_start:
@@ -363,17 +364,17 @@ class FactoryTests(unittest.TestCase):
         self.ec2.instances[instance_id]["State"]["Name"] = "stopped"
         return self.call("seal", slot)
 
-    def request(self, priority="normal", input_sha=INPUT_SHA):
+    def request(self, priority="normal", input_sha=INPUT_SHA, source_sha=SOURCE_SHA):
         if not self.queue_prepared and not self.ec2.launches:
             self.store.values.pop("/factory/control", None)
             self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
         self.queue_prepared = True
         def response(path):
             if path == "git/ref/heads/main":
-                return {"object": {"sha": SOURCE_SHA}}
-            return {"workflow_runs": [self.ci_run()]}
+                return {"object": {"sha": source_sha}}
+            return {"workflow_runs": [self.ci_run(head_sha=source_sha)]}
         with patch.object(mod, "public_github", side_effect=response):
-            return self.factory.request({"action": "request", "source_sha": SOURCE_SHA, "input_sha256": input_sha, "priority": priority})
+            return self.factory.request({"action": "request", "source_sha": source_sha, "input_sha256": input_sha, "priority": priority})
 
     def ci_run(self, **changes):
         return {"id": 99, "head_sha": SOURCE_SHA, "head_branch": "main", "event": "push", "status": "completed",
@@ -830,6 +831,30 @@ class FactoryTests(unittest.TestCase):
         self.factory.reconcile()
         self.assertEqual(len(self.cb.starts), 1)
         self.assertEqual(self.cb.starts[0]["sourceVersion"], SOURCE_SHA)
+
+    def test_latest_normal_replacement_starts_once_at_the_first_deadline(self):
+        first = self.request()
+        deadline = first["not_before"]
+        self.assertEqual(deadline, NOW + 21600)
+        self.time += 7200
+        second = self.request(input_sha="3" * 64, source_sha="4" * 40)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "superseded")
+        self.time = deadline - 1
+        latest_source = "5" * 40
+        latest_input = "6" * 64
+        latest = self.request(input_sha=latest_input, source_sha=latest_source)
+        self.assertEqual(self.factory.request_record(second["request_id"])["status"], "superseded")
+        self.assertEqual(latest["status"], "queued")
+        self.assertEqual(self.cb.starts, [])
+
+        self.time = deadline
+        self.factory.reconcile()
+        self.factory.reconcile()
+        self.assertEqual(len(self.cb.starts), 1)
+        self.assertEqual(self.cb.starts[0]["sourceVersion"], latest_source)
+        self.assertEqual(self.cb.starts[0]["idempotencyToken"], latest_input)
+        self.assertEqual(self.factory.request_record(latest_input)["status"], "building")
+        self.assertEqual(latest["not_before"], deadline)
 
     def test_lost_start_response_never_starts_another_build(self):
         self.cb.builds.clear()
