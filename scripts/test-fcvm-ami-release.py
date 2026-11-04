@@ -105,8 +105,8 @@ class ReleaseContracts(unittest.TestCase):
             ("tile/x86_64/2f861183", "ami-0a9804d3fc86cd87e", "tile"),
             ("host/x86_64/2414e101", "ami-05234f17eb73f6a34", "host"),
             ("tile/x86_64/2414e101", "ami-0a76a813745a28952", "tile"),
-            ("host/x86_64/97df1b73", "ami-07b224c4b84223a47", "host"),
-            ("tile/x86_64/97df1b73", "ami-032e92060650823bd", "tile"),
+            ("host/x86_64/46f2d8bc", "ami-0653ffbb5ec723d2f", "host"),
+            ("tile/x86_64/46f2d8bc", "ami-00578e249371ea9fe", "tile"),
         ):
             with self.subTest(resource_key=key):
                 self.assertRegex(catalog.group(1), r'"' + re.escape(key)
