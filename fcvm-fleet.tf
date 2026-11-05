@@ -31,13 +31,12 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 3b597cf9, revised from the 04915961 image (ami-0e7a6e72f1dc8f4f4): everything in it (the phones' GPU
-  # mirror joining a running phone, ejc3/fcvm#1505 and #1506; the take-over actions, #1516; the renderer's reported fit,
-  # #1515), plus a renderer whose trace runs its terrain, marches, clouds, sky and water out of line and its eye-ray march in
-  # a kernel of its own (ejc3/fcvm#1527: the inlined trace kernel was 42,336 instructions and waited on instruction fetch for
-  # 10.0 of 14.3 cycles; heavy terrain tiles now take 0.760 of the trace time, with the same samples). The IP-options guard is
-  # installed by prep and its publication proof passed. Its renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-017c2fffe2dd0c176" } }
+  # executable from main 95217caa, revised from the 3b597cf9 image (ami-017c2fffe2dd0c176): everything in it, plus potato
+  # mode (ejc3/fcvm#1529 to #1534): the player image localhost/fcvm-potato:fleet in root's store for --potato-players, and
+  # `fcvm snapshot create --stop` (the other merges since 3b597cf9, #1526 and #1535, move bench records and reports). The
+  # IP-options guard is installed by prep and its publication proof passed. The renderer's source and the tile recipe are
+  # unchanged since 3b597cf9, so the tile AMI stays.
+  default = { "us-east-1" = { x86_64 = "ami-0620224a0a4dd168e" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -126,6 +125,10 @@ locals {
     # run a phone each, restored from the AMI's warm phone snapshot; the wall keeps the other six. The phone's
     # assets come from /etc/fcvm-fleet/phone.env, which the AMI's build writes.
     "--phones 2",
+    # Potato mode (?mode=potato, ejc3/fcvm docs/fleet/ARCHITECTURE.md "Potato mode"): up to 96 CPU-only player VMs at
+    # addresses in the host's IPv6 prefix, asleep (snapshotted, no process) except the few the ball reaches next. The
+    # player image is in root's store from the AMI's build; the agent makes the players' snapshot when it starts.
+    "--potato-players 96",
     ], local.fcvm_fleet_aggregated ? [
     "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
     "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
