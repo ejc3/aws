@@ -163,15 +163,19 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
 # path) with this token, which the API application admits and the site and /agent applications do not. Anyone the
 # Worker serves has already passed the site application, whose policies are the API application's own two.
 # The token reaches the Worker as two secrets of ejc3/fcvm's main-only cloudflare-deploy environment, which the deploy
-# uploads with the version (wrangler deploy --secrets-file). ROTATE: -replace the token, then dispatch ejc3/fcvm's
-# "Fleet web staging deploy": until that deploy the Worker holds the old token, which create_before_destroy deletes.
+# uploads with the version (wrangler deploy --secrets-file).
+# Rotate the secret in place: commit the next client_secret_version (initial default is 1) and an explicit RFC3339
+# previous_client_secret_expires_at far enough ahead to deploy and verify. Terraform updates the GitHub secret while
+# the old one still works; the Fleet web staging deploy must finish and be verified before that deadline. Retain both
+# values in git so future plans do not try to roll back the rotation. To extend the token's own lifetime, separately
+# update duration before its expiry and verify Cloudflare reports a later expires_at; rotation alone does not renew it.
 resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker" {
   account_id = var.cloudflare_account_id
   name       = "fcvm-fleet-stage-worker"
   duration   = "8760h"
 
   lifecycle {
-    create_before_destroy = true
+    prevent_destroy = true
   }
 }
 

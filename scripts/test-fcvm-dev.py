@@ -63,7 +63,7 @@ class AccessTests(unittest.TestCase):
         for app in ("fcvm_dev_site_stage", "fcvm_dev_agent"):
             self.assertNotIn(ref, block(f'resource "cloudflare_zero_trust_access_application" "{app}"'))
         self.assertEqual(TF.count(ref), 1)
-        self.assertIn("create_before_destroy = true", block('resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker"'))
+        self.assertIn("prevent_destroy = true", block('resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker"'))
 
     def test_the_stage_worker_token_goes_to_the_main_only_deploy_environment(self):
         sec = block('resource "github_actions_environment_secret" "fcvm_fleet_stage_worker"')
