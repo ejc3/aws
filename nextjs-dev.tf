@@ -23,8 +23,7 @@
 
 # RUNS PERSISTENTLY. Deliberately absent from dev-auto-stop-lambda.tf's INSTANCE_IDS
 # (which reaps only the two metal boxes after 12h idle) -- these URLs are meant to keep
-# working, so the box must not be reaped for being quiet. It runs on-demand (see the
-# instance below): t4g.xlarge is $0.16/h in us-west-1, about $117/month running 24/7.
+# working, so the box must not be reaped for being quiet. The live containerized instance runs on demand.
 variable "enable_nextjs_dev" {
   description = "Run the Next.js dev box (stays up; not covered by the idle auto-stop)."
   type        = bool
@@ -32,7 +31,7 @@ variable "enable_nextjs_dev" {
 }
 
 variable "nextjs_instance_type" {
-  description = "t4g.xlarge: 4 vCPU / 16GB Graviton, burstable. Four accounts, each with a `next dev` plus Claude and Codex; the 4GB swapfile absorbs compile spikes rather than carrying steady state."
+  description = "Next.js shared dev host size. The t4g.2xlarge default provides 8 vCPU and 32 GiB of memory."
   type        = string
   # 8GB, raised from t4g.medium (4GB) on 2026-08-16. At 4GB the kernel paged to /swapfile,
   # swap-in reads pinned the root volume at its 125MB/s ceiling, and with the disk saturated
@@ -40,7 +39,8 @@ variable "nextjs_instance_type" {
   # connections. A session then hit the OOM killer at a 6.7GB peak.
   # 16GB, raised from t4g.large on 2026-09-15 at the owner's request. All four accounts were
   # running Claude and `next dev`, three of them Codex too, with 1.15GB of the swapfile in use.
-  default = "t4g.xlarge"
+  # 32 GiB and 8 vCPU, doubled from t4g.xlarge on 2026-11-05 at the owner's request.
+  default = "t4g.2xlarge"
 }
 
 variable "nextjs_dolphin_gdocs_access_enabled" {
