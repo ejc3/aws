@@ -587,6 +587,71 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.created, [])
         self.assertIsNone(self.ddb.item)
 
+    def reviewed_potato_fixture(self):
+        renderer, event, _, _, renderer_source, _ = self.reviewed_renderer_fixture()
+        self.assertEqual(renderer.run(event), {"status": "promoted", "generation": 3})
+        self.ec2.created.clear()
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "b"), ("tile", "c"))}
+        for kind, image_id in images.items():
+            image = copy.deepcopy(self.ec2.images[self.new[kind]])
+            image["ImageId"] = image_id
+            self.ec2.images[image_id] = image
+        source, tile_source = "f" * 40, "9" * 40
+        self.env["POTATO_AMI_JSON"] = json.dumps({
+            "source_sha": source, "tile_source_sha": tile_source, "images": images, "versions": before["versions"],
+        })
+        publisher = self.publisher()
+        publisher.compare_sources = mock.Mock(side_effect=lambda base, head: {
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": base}, "merge_base_commit": {"sha": base},
+        })
+        return publisher, {"action": "activate-reviewed-potato-release"}, before, images, source, tile_source, renderer_source
+
+    def test_reviewed_potato_pair_pins_both_sources_and_keeps_renderer_rollback(self):
+        publisher, event, before, images, source, tile_source, renderer_source = self.reviewed_potato_fixture()
+        self.assertEqual(publisher.reviewed_potato_release()[0]["expected"], before)
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
+            self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 4})
+        self.assertEqual(publisher.compare_sources.call_args_list,
+                         [mock.call(base, source) for base in sorted({self.source, renderer_source, tile_source})] * 2)
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(after["source_sha"], source)
+        self.assertEqual(after["previous"], {key: value for key, value in before.items() if key != "previous"})
+        self.assertTrue(after["build_id"].startswith("reviewed-potato-release:"))
+        for template in self.templates:
+            name, kind = template["id"], template["kind"]
+            table = self.ec2.templates[name]
+            key = "us-east-1/" + name
+            self.assertEqual(table["default"], after["versions"][key])
+            self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                             {**table["versions"][before["versions"][key]]["LaunchTemplateData"],
+                              "ImageId": images[kind]})
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 4})
+        self.assertEqual(len(self.ec2.created), 4)
+        self.assertEqual((self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_potato_refuses_overrides_newer_release_and_divergent_tile(self):
+        for variant in ("override", "newer", "divergent-tile"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, _, _, tile_source, _ = self.reviewed_potato_fixture()
+                if variant == "override":
+                    event["tile_source_sha"] = "b" * 40
+                elif variant == "newer":
+                    self.fleet_ssm.values["/release"]["generation"] = 4
+                else:
+                    compare = publisher.compare_sources.side_effect
+                    publisher.compare_sources.side_effect = lambda base, head: (
+                        {"status": "diverged"} if base == tile_source else compare(base, head)
+                    )
+                before = copy.deepcopy(self.fleet_ssm.values["/release"])
+                with self.assertRaises(MODULE.Refused):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values["/release"], before)
+                self.assertEqual(self.ec2.created, [])
+                self.assertIsNone(self.ddb.item)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

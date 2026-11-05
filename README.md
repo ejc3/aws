@@ -552,6 +552,13 @@ registered by #782. The publisher verifies source ancestry and both image tags,
 changes only the image in the four template defaults, and retains generation
 two for rollback. It does not wake Fleet or retire any running instance.
 
+The fixed action `{"action":"activate-reviewed-potato-release"}` advances the
+exact generation-three release to the reviewed 95217caa host (#790) and
+3b597cf9 tile (#788). The renderer source and tile recipe are identical between
+these builds. The publisher verifies both image tags and that the host source
+descends from the tile and active release sources. It retains generation three
+for rollback and changes only the default images for future launches.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
