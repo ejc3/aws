@@ -613,7 +613,8 @@ class PublisherTests(unittest.TestCase):
         with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
             self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 4})
         self.assertEqual(publisher.compare_sources.call_args_list,
-                         [mock.call(base, source) for base in sorted({self.source, renderer_source, tile_source})] * 2)
+                         ([mock.call(base, tile_source) for base in sorted({self.source, renderer_source})]
+                          + [mock.call(tile_source, source)]) * 2)
         after = self.fleet_ssm.values["/release"]
         self.assertEqual(after["source_sha"], source)
         self.assertEqual(after["previous"], {key: value for key, value in before.items() if key != "previous"})
@@ -632,18 +633,19 @@ class PublisherTests(unittest.TestCase):
         self.assertIsNone(self.ddb.item)
 
     def test_reviewed_potato_refuses_overrides_newer_release_and_divergent_tile(self):
-        for variant in ("override", "newer", "divergent-tile"):
+        for variant in ("override", "newer", "divergent-tile", "divergent-active"):
             with self.subTest(variant=variant):
                 self.setUp()
-                publisher, event, _, _, _, tile_source, _ = self.reviewed_potato_fixture()
+                publisher, event, _, _, _, tile_source, renderer_source = self.reviewed_potato_fixture()
                 if variant == "override":
                     event["tile_source_sha"] = "b" * 40
                 elif variant == "newer":
                     self.fleet_ssm.values["/release"]["generation"] = 4
                 else:
                     compare = publisher.compare_sources.side_effect
+                    divergent_base = tile_source if variant == "divergent-tile" else renderer_source
                     publisher.compare_sources.side_effect = lambda base, head: (
-                        {"status": "diverged"} if base == tile_source else compare(base, head)
+                        {"status": "diverged"} if base == divergent_base else compare(base, head)
                     )
                 before = copy.deepcopy(self.fleet_ssm.values["/release"])
                 with self.assertRaises(MODULE.Refused):

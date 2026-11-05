@@ -181,14 +181,21 @@ class Publisher:
         need(SHA.fullmatch(source), "invalid factory source")
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         floors = {self.reviewed_seed()["source_sha"]}
-        if tile_source is not None:
-            need(SHA.fullmatch(tile_source) and tile_source != source, "invalid reviewed tile source")
-            floors.add(tile_source)
         if active.get("source_sha"):
             need(SHA.fullmatch(active["source_sha"]), "active release source is invalid")
             floors.add(active["source_sha"])
-        for floor in sorted(floors - {source}):
-            comparison = self.compare_sources(floor, source)
+        target = source
+        if tile_source is not None:
+            need(SHA.fullmatch(tile_source) and tile_source != source, "invalid reviewed tile source")
+            # Prove both floors precede the reviewed tile, then the tile precedes
+            # the host. GitHub can refuse the longer floor-to-host diff; the two
+            # strict links also prevent publishing a tile older than either floor.
+            target = tile_source
+        edges = [(floor, target) for floor in sorted(floors - {target})]
+        if tile_source is not None:
+            edges.append((tile_source, source))
+        for floor, head in edges:
+            comparison = self.compare_sources(floor, head)
             need(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                  and comparison.get("base_commit", {}).get("sha") == floor
                  and comparison.get("merge_base_commit", {}).get("sha") == floor,
