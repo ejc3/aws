@@ -19,6 +19,8 @@
 #                                connector requires an Access token on every path: the owner's, or at /agent the agents'
 #                                service token (its own application, so it is never a bypass).
 #   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its own application.
+#                                The Worker forwards the page's /live and /poster.jpg to fleet-api-stage with its own
+#                                service token, so a browser needs one Access session (the page host's), not two.
 # The public apex and fleet-api.fcvm.dev go live only on the owner's go-ahead: neither has a record or an application here.
 #
 # CREDENTIAL: the provider token (cloudflare-tunnel-token) has DNS Write account-wide and Zone Settings Write on this zone
@@ -104,6 +106,7 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
   policies = [
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
+    { id = cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id, precedence = 3 },
   ]
 }
 
@@ -151,6 +154,44 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
   domain       = local.fcvm_dev_agent_path
   destinations = [{ type = "public", uri = local.fcvm_dev_agent_path }]
   policies     = [{ id = cloudflare_zero_trust_access_policy.fcvm_fleet_agents.id, precedence = 1 }]
+}
+
+# The stage.fcvm.dev Worker's way to the coordinator (ejc3/fcvm fleet/web/core/live-proxy.ts). An Access session cookie
+# belongs to one host, so a browser signed in to stage.fcvm.dev had no session on fleet-api-stage.fcvm.dev and its /live
+# upgrade got Access's 302 to the login page, which a WebSocket cannot follow: the page said "Cannot reach the fleet
+# yet" until the window had visited the API host once. The Worker now forwards /live and /poster.jpg (and no other
+# path) with this token, which the API application admits and the site and /agent applications do not. Anyone the
+# Worker serves has already passed the site application, whose policies are the API application's own two.
+# The token reaches the Worker as two secrets of ejc3/fcvm's main-only cloudflare-deploy environment, which the deploy
+# uploads with the version (wrangler deploy --secrets-file). ROTATE: -replace the token, then dispatch ejc3/fcvm's
+# "Fleet web staging deploy": until that deploy the Worker holds the old token, which create_before_destroy deletes.
+resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker" {
+  account_id = var.cloudflare_account_id
+  name       = "fcvm-fleet-stage-worker"
+  duration   = "8760h"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "fcvm_fleet_stage_worker" {
+  account_id = var.cloudflare_account_id
+  name       = "fcvm fleet API staging: the stage.fcvm.dev Worker"
+  decision   = "non_identity"
+  include    = [{ service_token = { token_id = cloudflare_zero_trust_access_service_token.fcvm_fleet_stage_worker.id } }]
+}
+
+resource "github_actions_environment_secret" "fcvm_fleet_stage_worker" {
+  provider    = github.agents_md
+  for_each    = toset(["FLEET_ACCESS_CLIENT_ID", "FLEET_ACCESS_CLIENT_SECRET"])
+  repository  = "fcvm"
+  environment = github_repository_environment.workers_deploy_ejc3["fcvm"].environment
+  secret_name = each.key
+  plaintext_value = {
+    FLEET_ACCESS_CLIENT_ID     = cloudflare_zero_trust_access_service_token.fcvm_fleet_stage_worker.client_id
+    FLEET_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.fcvm_fleet_stage_worker.client_secret
+  }[each.key]
 }
 
 # ------------------------------------------------------------------------------------------------ the stage.fcvm.dev Worker

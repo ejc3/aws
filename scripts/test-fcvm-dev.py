@@ -53,6 +53,26 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn("everyone", TF)
         self.assertNotIn('"bypass"', TF)
 
+    def test_the_stage_worker_token_reaches_the_api_host_only(self):
+        # The Worker forwards /live and /poster.jpg to the API host: its token is admitted there and nowhere else.
+        pol = block('resource "cloudflare_zero_trust_access_policy" "fcvm_fleet_stage_worker"')
+        self.assertIn('decision   = "non_identity"', pol)
+        self.assertIn("service_token = { token_id = cloudflare_zero_trust_access_service_token.fcvm_fleet_stage_worker.id }", pol)
+        ref = "cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id"
+        self.assertIn(ref, block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"'))
+        for app in ("fcvm_dev_site_stage", "fcvm_dev_agent"):
+            self.assertNotIn(ref, block(f'resource "cloudflare_zero_trust_access_application" "{app}"'))
+        self.assertEqual(TF.count(ref), 1)
+        self.assertIn("create_before_destroy = true", block('resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker"'))
+
+    def test_the_stage_worker_token_goes_to_the_main_only_deploy_environment(self):
+        sec = block('resource "github_actions_environment_secret" "fcvm_fleet_stage_worker"')
+        self.assertIn('for_each    = toset(["FLEET_ACCESS_CLIENT_ID", "FLEET_ACCESS_CLIENT_SECRET"])', sec)
+        self.assertIn('repository  = "fcvm"', sec)
+        self.assertIn('environment = github_repository_environment.workers_deploy_ejc3["fcvm"].environment', sec)
+        self.assertIn("fcvm_fleet_stage_worker.client_id", sec)
+        self.assertIn("fcvm_fleet_stage_worker.client_secret", sec)
+
     def test_the_connector_requires_an_access_token_on_every_path(self):
         cfg = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"')
         self.assertEqual(cfg.count("hostname ="), 1)
