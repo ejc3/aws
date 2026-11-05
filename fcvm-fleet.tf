@@ -439,12 +439,16 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
-  potato_host_ami               = local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image
-  slot_tls_ports                = local.fcvm_fleet_slot_tls_ports
-  host_profile_name             = aws_iam_instance_profile.fcvm_fleet_host.name
-  tile_profile_name             = aws_iam_instance_profile.fcvm_fleet_tile.name
-  flow_log_destination          = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
-  flow_log_bucket_policy_id     = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
+  # The current host must keep potato mode while the new image is registered and on rollback.
+  potato_host_amis = [
+    local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
+    local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image,
+  ]
+  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
+  tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
+  flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
+  flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
 }
 
 locals {

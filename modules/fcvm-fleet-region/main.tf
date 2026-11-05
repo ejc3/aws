@@ -99,14 +99,14 @@ variable "host_agent_args" {
   default     = ""
 }
 
-variable "potato_host_ami" {
-  description = "Exact reviewed host AMI that includes the potato player image; empty disables potato mode."
-  type        = string
-  default     = ""
+variable "potato_host_amis" {
+  description = "Exact reviewed host AMIs that include the potato player image; empty disables potato mode."
+  type        = set(string)
+  default     = []
 
   validation {
-    condition     = var.potato_host_ami == "" || can(regex("^ami-[0-9a-f]{17}$", var.potato_host_ami))
-    error_message = "potato_host_ami must be empty or an exact EC2 AMI ID."
+    condition     = alltrue([for ami in var.potato_host_amis : can(regex("^ami-[0-9a-f]{17}$", ami))])
+    error_message = "Each potato_host_amis entry must be an exact EC2 AMI ID."
   }
 }
 
@@ -217,7 +217,7 @@ locals {
     %{if var.host_agent_args != ""~}
     install -d -m 0755 /etc/fcvm-fleet
     agent_args='${var.host_agent_args}'
-    %{if var.potato_host_ami != ""~}
+    %{if length(var.potato_host_amis) > 0~}
     # The publisher changes ImageId without changing user data. Check the
     # actual boot image so publishing or rolling back cannot break older agents.
     set +x
@@ -225,9 +225,10 @@ locals {
     if token=$(/usr/bin/curl --noproxy '*' -fs --max-time 2 -X PUT \
         -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/api/token") && [ -n "$token" ] &&
       boot_ami=$(printf 'X-aws-ec2-metadata-token: %s\n' "$token" |
-        /usr/bin/curl --noproxy '*' -fs --max-time 2 -H @- "$imds/meta-data/ami-id") &&
-      [ "$boot_ami" = '${var.potato_host_ami}' ]; then
-      agent_args="$agent_args --potato-players 96"
+        /usr/bin/curl --noproxy '*' -fs --max-time 2 -H @- "$imds/meta-data/ami-id"); then
+      case "$boot_ami" in
+        ${join("|", sort(tolist(var.potato_host_amis)))}) agent_args="$agent_args --potato-players 96" ;;
+      esac
     fi
     unset token boot_ami
     %{endif~}
