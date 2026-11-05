@@ -108,6 +108,87 @@ class ScriptTests(unittest.TestCase):
             shutil.copy(self.pki.pem, home / ".config" / "claude-master" / "ca.pem")
         return home
 
+    def routed_document_fixture(self, host_home, container_home):
+        """Model SSM's executable script and systemd's fresh namespace over stdin."""
+        root = Path(tempfile.mkdtemp(dir=self.tmp))
+        config = root / "nextjs-ct"
+        config.mkdir()
+        (config / "config.json").write_text('{"users":{"colton":{},"connor":{}}}')
+        machinectl = root / "machinectl"
+        machinectl.write_text('#!/bin/bash\n[ "$*" = "show colton -p State --value" ] || exit 9\n'
+                              'printf "%s\\n" "${FIXTURE_STATE:-running}"\n')
+        systemd = root / "systemd-run"
+        systemd.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$FIXTURE_TRACE"\n'
+                           '[ "$1" = --machine=colton ] || exit 9\n'
+                           '[ "${FIXTURE_BROKEN:-0}" = 0 ] || exit 44\n'
+                           'export CM_CERT_IN_CONTAINER=1 CM_HOME_OVERRIDE="$FIXTURE_CONTAINER_HOME"\n'
+                           'exec /bin/bash -s\n')
+        for stub in (machinectl, systemd):
+            stub.chmod(0o755)
+        trace = root / "dispatch"
+        route = (SSM_DIR / "claw-master-cert-client-route.sh").read_text().replace("/etc/nextjs-ct", str(config))
+        route = route.replace("/usr/bin/machinectl", str(machinectl)).replace("/usr/bin/systemd-run", str(systemd))
+        env = dict(os.environ, CM_HOME_OVERRIDE=str(host_home), FIXTURE_CONTAINER_HOME=str(container_home),
+                   FIXTURE_TRACE=str(trace), CM_BIN=str(self.stub_client_init()))
+        env.pop("CM_CERT_IN_CONTAINER", None)
+
+        def invoke(document, extra=None, **params):
+            script = root / "_script.sh"
+            script.write_text(render(route + SCRIPTS[document], **params))
+            script.chmod(0o755)
+            return sh(["sh", "-c", 'exec "$1"', "sh", str(script)], env=dict(env, **(extra or {})))
+
+        return config, trace, invoke
+
+    def test_nextjs_status_request_and_install_use_the_same_container(self):
+        host = self.home(days=30)
+        container = self.home(days=3)
+        token = container / ".config/claude-master/agent.token"
+        token.write_text("token retained\n")
+        token.chmod(0o600)
+        _, trace, invoke = self.routed_document_fixture(host, container)
+        status = invoke("status", Account="colton")
+        self.assertEqual((status.returncode, kv(status.stdout)["STATUS"]), (0, "ok"), status.stderr)
+        self.assertAlmostEqual(int(kv(status.stdout)["NOTAFTER"]) - time.time(), 3 * 86400, delta=10)
+        request = invoke("request", Account="colton", Name="nextjs-colton")
+        self.assertEqual(request.returncode, 0, request.stderr)
+        self.assertNotIn("PRIVATE", request.stdout)
+        pending = container / ".config/claude-master.new"
+        self.assertEqual(base64.b64decode(kv(request.stdout)["CSR"]), (pending / "client.csr").read_bytes())
+        self.assertFalse((host / ".config/claude-master.new").exists())
+        cert = pending / "signed.pem"
+        self.pki.sign(pending / "client.csr", cert, 30)
+        install = invoke("install", Account="colton", Name="nextjs-colton",
+                         Cert=b64(cert), Ca=b64(self.pki.pem), MinDays=20)
+        self.assertEqual((install.returncode, kv(install.stdout)["INSTALL"]), (0, "ok"), install.stderr)
+        self.assertEqual(token.read_text(), "token retained\n")
+        self.assertEqual(trace.read_text().splitlines(), [
+            "--machine=colton --wait --pipe --collect --quiet --service-type=exec "
+            "--property=RuntimeMaxSec=120s --setenv=CM_CERT_IN_CONTAINER=1 /bin/bash -s"
+        ] * 3)
+
+    def test_container_routing_refuses_invalid_offline_or_failed_routes_and_arm_stays_direct(self):
+        host = self.home(days=30)
+        config, trace, invoke = self.routed_document_fixture(host, self.home(days=3))
+        invalid = invoke("status", Account="unknown")
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn("not-a-configured-container", invalid.stderr)
+        stopped = invoke("status", {"FIXTURE_STATE": "dead"}, Account="colton")
+        self.assertEqual(stopped.returncode, 1)
+        self.assertIn("container-not-running", stopped.stderr)
+        self.assertFalse(trace.exists())
+        broken = invoke("status", {"FIXTURE_BROKEN": "1"}, Account="colton")
+        self.assertEqual((broken.returncode, broken.stdout), (44, ""))
+        trace.unlink()
+        (config / "config.json").unlink()
+        missing = invoke("status", Account="colton")
+        self.assertEqual(missing.returncode, 1, "a configured host must never fall back to its host home")
+        config.rmdir()
+        direct = invoke("status", Account="ubuntu")
+        self.assertEqual((direct.returncode, kv(direct.stdout)["STATUS"]), (0, "ok"), direct.stderr)
+        self.assertAlmostEqual(int(kv(direct.stdout)["NOTAFTER"]) - time.time(), 30 * 86400, delta=10)
+        self.assertFalse(trace.exists())
+
     # status ------------------------------------------------------------------------------------------------------
     def test_status_reports_the_end_date_the_subject_and_a_missing_certificate(self):
         home = self.home(days=30)
