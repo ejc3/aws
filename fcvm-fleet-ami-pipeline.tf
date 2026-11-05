@@ -55,6 +55,19 @@ locals {
       "us-east-1/lt-06c7abdc28186e26c" = 14
     }
   }
+  # Fixed reviewed pair: the #790 host uses the same renderer and tile recipe
+  # as #788's tile. Only the exact generation-three renderer release precedes it.
+  fcvm_ami_reviewed_potato_release = {
+    source_sha      = "95217caa89c76b4e02b0df3a4fe700b34a3491e9"
+    tile_source_sha = "3b597cf9d6fb8b53249dc06ba16345c62fe341a6"
+    images          = { host = "ami-0620224a0a4dd168e", tile = "ami-058b6cec0b53ddf4d" }
+    versions = {
+      "us-east-1/lt-01972ab31436a0ce0" = 17
+      "us-east-1/lt-05856e91e1cd7c5f7" = 12
+      "us-east-1/lt-06851b9720c0517fe" = 15
+      "us-east-1/lt-06c7abdc28186e26c" = 15
+    }
+  }
 }
 
 locals {
@@ -644,6 +657,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
       PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
       RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
+      POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
     }
   }
 }

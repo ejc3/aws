@@ -141,6 +141,28 @@ class Publisher:
         }
         return self.reviewed_pair(config)
 
+    def reviewed_potato_release(self):
+        config = json.loads(self.env["POTATO_AMI_JSON"])
+        need(set(config) == {"source_sha", "tile_source_sha", "images", "versions"},
+             "invalid reviewed potato configuration")
+        renderer = self.reviewed_renderer_release()
+        versions, tile_source = config.pop("versions"), config.pop("tile_source_sha")
+        need(renderer["source_sha"] != config["source_sha"]
+             and SHA.fullmatch(tile_source) and tile_source != config["source_sha"]
+             and isinstance(versions, dict)
+             and set(versions) == {t["region"] + "/" + t["id"] for t in self.templates}
+             and all(type(v) is int and v > 0 for v in versions.values()),
+             "reviewed potato transition must follow the exact renderer publication")
+        config["expected"] = {
+            "version": 1, "generation": 3, "source_sha": renderer["source_sha"],
+            "build_id": "reviewed-renderer-release:" + digest(encoded(renderer)),
+            "guard_sha256": self.env["GUARD_SHA256"], "versions": versions,
+            "previous": {k: v for k, v in renderer["expected"].items() if k != "previous"},
+            **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+               for kind, image in renderer["images"].items()},
+        }
+        return self.reviewed_pair(config), tile_source
+
     def compare_sources(self, base, head):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -155,15 +177,25 @@ class Publisher:
         finally:
             connection.close()
 
-    def source_fence(self, source):
+    def source_fence(self, source, tile_source=None):
         need(SHA.fullmatch(source), "invalid factory source")
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         floors = {self.reviewed_seed()["source_sha"]}
         if active.get("source_sha"):
             need(SHA.fullmatch(active["source_sha"]), "active release source is invalid")
             floors.add(active["source_sha"])
-        for floor in sorted(floors - {source}):
-            comparison = self.compare_sources(floor, source)
+        target = source
+        if tile_source is not None:
+            need(SHA.fullmatch(tile_source) and tile_source != source, "invalid reviewed tile source")
+            # Prove both floors precede the reviewed tile, then the tile precedes
+            # the host. GitHub can refuse the longer floor-to-host diff; the two
+            # strict links also prevent publishing a tile older than either floor.
+            target = tile_source
+        edges = [(floor, target) for floor in sorted(floors - {target})]
+        if tile_source is not None:
+            edges.append((tile_source, source))
+        for floor, head in edges:
+            comparison = self.compare_sources(floor, head)
             need(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                  and comparison.get("base_commit", {}).get("sha") == floor
                  and comparison.get("merge_base_commit", {}).get("sha") == floor,
@@ -273,14 +305,20 @@ class Publisher:
         need(event == {"action": "activate-reviewed-renderer-release"}, "reviewed release accepts no caller configuration")
         return self.run_reviewed(self.reviewed_renderer_release(), "reviewed-renderer-release", check_ancestry=True)
 
-    def run_reviewed(self, config, identity, check_ancestry=False):
-        self.build_id = identity + ":" + digest(encoded(config))
+    def run_potato_release(self, event):
+        need(event == {"action": "activate-reviewed-potato-release"}, "reviewed release accepts no caller configuration")
+        config, tile_source = self.reviewed_potato_release()
+        return self.run_reviewed(config, "reviewed-potato-release", check_ancestry=True, tile_source=tile_source)
+
+    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None):
+        transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
+        self.build_id = identity + ":" + digest(encoded(transaction_config))
         generation = config["expected"]["generation"] + 1
 
         def fence():
             self.reviewed_fence(config)
             if check_ancestry:
-                self.source_fence(config["source_sha"])
+                self.source_fence(config["source_sha"], tile_source)
 
         with self.publication_lock():
             active = self.load(self.env["RELEASE_PARAMETER"], True)
@@ -747,6 +785,8 @@ class Publisher:
             return self.run_phone_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-renderer-release":
             return self.run_renderer_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-potato-release":
+            return self.run_potato_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
