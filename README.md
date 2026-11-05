@@ -546,6 +546,12 @@ ancestry under the same lock, keeps 2414e101 for rollback, and affects future
 launches. It cannot select a caller-supplied image, start a build, retire a
 running instance, or override a newer release.
 
+The fixed action `{"action":"activate-reviewed-renderer-release"}` advances the
+exact generation-two phone release to the reviewed a5bae67b host and tile pair
+registered by #782. The publisher verifies source ancestry and both image tags,
+changes only the image in the four template defaults, and retains generation
+two for rollback. It does not wake Fleet or retire any running instance.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

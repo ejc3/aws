@@ -42,6 +42,19 @@ locals {
       previous = { for key, value in local.fcvm_ami_reviewed_seed.expected : key => value if key != "previous" }
     }
   }
+  # Reviewed renderer pair from #782; only the exact generation-two phone
+  # publication can precede it. Derive the rest of the predecessor from the
+  # phone release in the publisher to stay below the Lambda environment limit.
+  fcvm_ami_reviewed_renderer_release = {
+    source_sha = "a5bae67b58fce942df830cdbb66fd6427737254c"
+    images     = { host = "ami-051db4be56ae7f6b0", tile = "ami-0ce935fe1f66fb10f" }
+    versions = {
+      "us-east-1/lt-01972ab31436a0ce0" = 16
+      "us-east-1/lt-05856e91e1cd7c5f7" = 11
+      "us-east-1/lt-06851b9720c0517fe" = 14
+      "us-east-1/lt-06c7abdc28186e26c" = 14
+    }
+  }
 }
 
 locals {
@@ -630,6 +643,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
       SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
       PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
+      RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
     }
   }
 }
