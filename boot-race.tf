@@ -190,14 +190,6 @@ resource "aws_iam_role_policy" "boot_race_task_execution" {
   })
 }
 
-locals {
-  boot_race_container = {
-    name         = "workload"
-    image        = "${aws_ecr_repository.boot_race.repository_url}:workload"
-    essential    = true
-    portMappings = [{ containerPort = 8080, hostPort = 8080, protocol = "tcp" }]
-  }
-}
 
 resource "aws_ecs_task_definition" "boot_race_fargate" {
   provider                 = aws.ohio
@@ -207,7 +199,14 @@ resource "aws_ecs_task_definition" "boot_race_fargate" {
   cpu                      = "1024"
   memory                   = "2048"
   execution_role_arn       = aws_iam_role.boot_race_task_execution.arn
-  container_definitions    = jsonencode([local.boot_race_container])
+
+  container_definitions = jsonencode([{
+    name                   = "workload"
+    image                  = "${aws_ecr_repository.boot_race.repository_url}:workload"
+    essential              = true
+    readonlyRootFilesystem = true
+    portMappings           = [{ containerPort = 8080, hostPort = 8080, protocol = "tcp" }]
+  }])
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -226,7 +225,14 @@ resource "aws_ecs_task_definition" "boot_race_ec2" {
   cpu                      = "1024"
   memory                   = "1536"
   execution_role_arn       = aws_iam_role.boot_race_task_execution.arn
-  container_definitions    = jsonencode([local.boot_race_container])
+
+  container_definitions = jsonencode([{
+    name                   = "workload"
+    image                  = "${aws_ecr_repository.boot_race.repository_url}:workload"
+    essential              = true
+    readonlyRootFilesystem = true
+    portMappings           = [{ containerPort = 8080, hostPort = 8080, protocol = "tcp" }]
+  }])
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -655,6 +661,7 @@ data "aws_iam_policy_document" "boot_race_driver" {
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
       "ecr:DescribeImages",
+      "ecr:BatchDeleteImage",
     ]
     resources = [aws_ecr_repository.boot_race.arn]
   }
