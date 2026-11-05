@@ -5,6 +5,10 @@ and EC2 tiles from their templates only."""
 import re
 import importlib.util
 import json
+import os
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -86,6 +90,42 @@ class NetworkTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
+        # The publisher reuses user data when it switches image IDs. Exercise
+        # the same bootstrap with the reviewed image, a rollback and failed IMDS.
+        ami = "ami-0620224a0a4dd168e"
+        east = block('module "fcvm_fleet_east1"')
+        self.assertRegex(east, r'potato_host_ami\s*=\s*local\.fcvm_ami_bootstrap\["host/x86_64/95217caa"\]\.image')
+        guard = MOD.split('%{if var.potato_host_ami != ""~}\n', 1)[1].split('%{endif~}', 1)[0]
+        with tempfile.TemporaryDirectory() as temp:
+            curl = Path(temp) / "curl"
+            curl.write_text(
+                "#!/bin/bash\n"
+                "set -eu\n"
+                'case "${!#}" in\n'
+                "  */api/token) test \"$BOOT_AMI\" != no-token; printf fixture-token;;\n"
+                "  */meta-data/ami-id)\n"
+                "    test \"$(cat)\" = 'X-aws-ec2-metadata-token: fixture-token'\n"
+                '    test "$BOOT_AMI" != no-ami; printf "%s" "$BOOT_AMI";;\n'
+                "  *) exit 90;;\n"
+                "esac\n"
+            )
+            curl.chmod(0o700)
+            boot = textwrap.dedent(guard).replace("${var.potato_host_ami}", ami).replace("/usr/bin/curl", str(curl))
+            for actual, expected in (
+                (ami, "--phones 2 --potato-players 96"),
+                ("ami-051db4be56ae7f6b0", "--phones 2"),
+                ("no-token", "--phones 2"),
+                ("no-ami", "--phones 2"),
+            ):
+                with self.subTest(actual=actual):
+                    result = subprocess.run(
+                        ["/bin/bash", "-eux", "-c", "agent_args='--phones 2'\n" + boot + '\nprintf "%s" "$agent_args"'],
+                        env=dict(os.environ, BOOT_AMI=actual), capture_output=True, text=True, check=True, timeout=5,
+                    )
+                    self.assertEqual(result.stdout, expected)
+                    self.assertNotIn("fixture-token", result.stderr)
+
     def test_hosts_ask_for_a_prefix_only_and_imdsv2_hop_1(self):
         lt = block('resource "aws_launch_template" "host"', MOD)
         self.assertIn("ipv6_prefix_count           = 1", lt)

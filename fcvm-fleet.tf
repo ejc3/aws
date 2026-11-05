@@ -31,13 +31,12 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 3b597cf9, revised from the 04915961 image (ami-0e7a6e72f1dc8f4f4): everything in it (the phones' GPU
-  # mirror joining a running phone, ejc3/fcvm#1505 and #1506; the take-over actions, #1516; the renderer's reported fit,
-  # #1515), plus a renderer whose trace runs its terrain, marches, clouds, sky and water out of line and its eye-ray march in
-  # a kernel of its own (ejc3/fcvm#1527: the inlined trace kernel was 42,336 instructions and waited on instruction fetch for
-  # 10.0 of 14.3 cycles; heavy terrain tiles now take 0.760 of the trace time, with the same samples). The IP-options guard is
-  # installed by prep and its publication proof passed. Its renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-017c2fffe2dd0c176" } }
+  # executable from main 95217caa, revised from the 3b597cf9 image (ami-017c2fffe2dd0c176): everything in it, plus potato
+  # mode (ejc3/fcvm#1529 to #1534): the player image localhost/fcvm-potato:fleet in root's store for --potato-players, and
+  # `fcvm snapshot create --stop` (the other merges since 3b597cf9, #1526 and #1535, move bench records and reports). The
+  # IP-options guard is installed by prep and its publication proof passed. The renderer's source and the tile recipe are
+  # unchanged since 3b597cf9, so the tile AMI stays.
+  default = { "us-east-1" = { x86_64 = "ami-0620224a0a4dd168e" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -438,6 +437,7 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
+  potato_host_ami               = local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image
   slot_tls_ports                = local.fcvm_fleet_slot_tls_ports
   host_profile_name             = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name             = aws_iam_instance_profile.fcvm_fleet_tile.name
