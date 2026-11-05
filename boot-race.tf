@@ -1,0 +1,712 @@
+# boot-race.tf
+#
+# Resources for one measurement campaign in fcvm (bench/boot-race): the time from asking for compute to a small
+# workload answering an HTTP request from outside it, for an fcvm snapshot restore and for the AWS ways of getting the
+# same workload running. The lanes that need AWS resources:
+#
+#   EC2 launch           RunInstances from an AMI holding the workload (made by the driver with CreateImage)
+#   EC2 start            StartInstances of a stopped instance of that AMI
+#   EC2 hibernate        StartInstances of an instance stopped with Hibernate=true (c8g.medium supports hibernation)
+#   ECS on Fargate       RunTask of a one-container task definition
+#   ECS on EC2           RunTask on a container instance that is already running, image already pulled
+#   Lambda, cold         a function URL whose handler ends its execution environment after every response
+#   Lambda, warm         the same code without the exit, for reference
+#
+# Everything is named boot-race and lives in us-east-2, in the parallel-box VPC and subnet (ohio-pbox.tf), because the
+# driver runs on a parallel box and reaches each workload over the VPC. Nothing is public: the workload group admits
+# TCP 8080 (the workload) and 22 (to install the workload on the AMI builder) from the parallel-box group only, and
+# the function URLs take IAM auth only. Nothing here runs or bills while idle; every instance and task is started by
+# the driver and terminated or stopped by it when its samples are taken.
+#
+# The driver uses boot-race-driver, which the dev role assumes. Its grants are scoped to these resources by ARN or by
+# the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
+# parallel-box-control (parallel-box-launch.tf).
+
+locals {
+  boot_race_region  = "us-east-2"
+  boot_race_account = data.aws_caller_identity.current.account_id
+  boot_race_tag     = { Project = "boot-race" }
+
+  # The base image for the EC2 lanes: Amazon Linux 2023 arm64 (al2023-ami-2023.12.20261102.0-kernel-6.1-arm64), which
+  # supports hibernation. The driver makes the workload AMI from an instance of it.
+  boot_race_base_ami = "ami-0e59f38361eb8490c"
+
+  boot_race_lambdas = {
+    cold = "1" # the handler exits its runtime after each response
+    warm = "0"
+  }
+
+  boot_race_ec2_arn = "arn:aws:ec2:${local.boot_race_region}:${local.boot_race_account}"
+  boot_race_ecs_arn = "arn:aws:ecs:${local.boot_race_region}:${local.boot_race_account}"
+}
+
+# The ECS-optimized Amazon Linux 2023 arm64 image, for the ECS-on-EC2 container instance.
+data "aws_ssm_parameter" "boot_race_ecs_ami" {
+  provider = aws.ohio
+  name     = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+}
+
+# ============================================================ network
+resource "aws_security_group" "boot_race" {
+  provider    = aws.ohio
+  name_prefix = "boot-race-"
+  description = "boot-race workloads: TCP 8080 and SSH from the parallel boxes only"
+  vpc_id      = aws_vpc.ohio_pbox.id
+
+  ingress {
+    description     = "The workload, from the parallel boxes"
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ohio_pbox.id]
+  }
+
+  ingress {
+    description     = "SSH, from the parallel boxes (installing the workload on the AMI builder)"
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ohio_pbox.id]
+  }
+
+  # Fargate tasks and the container instance pull the image from ECR and reach the ECS endpoint over the internet.
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = merge(local.boot_race_tag, { Name = "boot-race" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ============================================================ EC2 lanes
+resource "aws_launch_template" "boot_race_ec2" {
+  provider      = aws.ohio
+  name          = "boot-race-ec2"
+  description   = "boot-race EC2 lanes: c8g.medium, hibernation configured, encrypted root"
+  image_id      = local.boot_race_base_ami
+  instance_type = "c8g.medium"
+  key_name      = aws_key_pair.ohio_pbox.key_name
+
+  hibernation_options {
+    configured = true
+  }
+
+  # Hibernation needs an encrypted root volume large enough for the instance's memory (2 GiB).
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = 8
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  network_interfaces {
+    subnet_id                   = aws_subnet.ohio_pbox.id
+    security_groups             = [aws_security_group.boot_race.id]
+    associate_public_ip_address = true
+  }
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ec2" })
+  }
+  tag_specifications {
+    resource_type = "volume"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ec2" })
+  }
+  tag_specifications {
+    resource_type = "network-interface"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ec2" })
+  }
+
+  tags = local.boot_race_tag
+}
+
+# ============================================================ ECS lanes
+resource "aws_ecr_repository" "boot_race" {
+  provider             = aws.ohio
+  name                 = "boot-race"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+  tags                 = local.boot_race_tag
+}
+
+resource "aws_ecs_cluster" "boot_race" {
+  provider = aws.ohio
+  name     = "boot-race"
+  tags     = local.boot_race_tag
+
+  setting {
+    name  = "containerInsights"
+    value = "disabled"
+  }
+}
+
+resource "aws_iam_role" "boot_race_task_execution" {
+  name = "boot-race-task-execution"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+resource "aws_iam_role_policy" "boot_race_task_execution" {
+  name = "boot-race-pull"
+  role = aws_iam_role.boot_race_task_execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "EcrToken"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      },
+      {
+        Sid      = "PullWorkloadImage"
+        Effect   = "Allow"
+        Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
+        Resource = aws_ecr_repository.boot_race.arn
+      },
+    ]
+  })
+}
+
+locals {
+  boot_race_container = {
+    name         = "workload"
+    image        = "${aws_ecr_repository.boot_race.repository_url}:workload"
+    essential    = true
+    portMappings = [{ containerPort = 8080, hostPort = 8080, protocol = "tcp" }]
+  }
+}
+
+resource "aws_ecs_task_definition" "boot_race_fargate" {
+  provider                 = aws.ohio
+  family                   = "boot-race-fargate"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = aws_iam_role.boot_race_task_execution.arn
+  container_definitions    = jsonencode([local.boot_race_container])
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  tags = local.boot_race_tag
+}
+
+# Host networking on the container instance: no ENI to attach, which is the fastest ECS-on-EC2 path.
+resource "aws_ecs_task_definition" "boot_race_ec2" {
+  provider                 = aws.ohio
+  family                   = "boot-race-ec2"
+  requires_compatibilities = ["EC2"]
+  network_mode             = "host"
+  cpu                      = "1024"
+  memory                   = "1536"
+  execution_role_arn       = aws_iam_role.boot_race_task_execution.arn
+  container_definitions    = jsonencode([local.boot_race_container])
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  tags = local.boot_race_tag
+}
+
+resource "aws_iam_role" "boot_race_ecs_host" {
+  name = "boot-race-ecs-host"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+resource "aws_iam_role_policy_attachment" "boot_race_ecs_host" {
+  role       = aws_iam_role.boot_race_ecs_host.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_instance_profile" "boot_race_ecs_host" {
+  name = "boot-race-ecs-host"
+  role = aws_iam_role.boot_race_ecs_host.name
+}
+
+resource "aws_launch_template" "boot_race_ecs_host" {
+  provider      = aws.ohio
+  name          = "boot-race-ecs-host"
+  description   = "boot-race ECS-on-EC2 lane: one container instance in the boot-race cluster"
+  image_id      = data.aws_ssm_parameter.boot_race_ecs_ami.insecure_value
+  instance_type = "c8g.medium"
+  key_name      = aws_key_pair.ohio_pbox.key_name
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.boot_race_ecs_host.name
+  }
+
+  network_interfaces {
+    subnet_id                   = aws_subnet.ohio_pbox.id
+    security_groups             = [aws_security_group.boot_race.id]
+    associate_public_ip_address = true
+  }
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  user_data = base64encode(<<-EOT
+    #!/bin/bash
+    cat >> /etc/ecs/ecs.config <<'CFG'
+    ECS_CLUSTER=boot-race
+    ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+    CFG
+  EOT
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ecs-host" })
+  }
+  tag_specifications {
+    resource_type = "volume"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ecs-host" })
+  }
+  tag_specifications {
+    resource_type = "network-interface"
+    tags          = merge(local.boot_race_tag, { Name = "boot-race-ecs-host" })
+  }
+
+  tags = local.boot_race_tag
+
+  # The recommended image moves with every ECS AMI release; a new one is picked up by a later apply, not forced.
+  lifecycle {
+    ignore_changes = [image_id]
+  }
+}
+
+# ============================================================ Lambda lanes
+# A custom runtime (provided.al2023): the bootstrap is the workload binary itself, uploaded by the driver with
+# UpdateFunctionCode. The placeholder below only exists so the functions can be created.
+data "archive_file" "boot_race_placeholder" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/boot-race-placeholder.zip"
+
+  source {
+    content  = "#!/bin/sh\necho 'boot-race placeholder: the driver uploads the workload' >&2\nexit 1\n"
+    filename = "bootstrap"
+  }
+}
+
+resource "aws_iam_role" "boot_race_lambda" {
+  name = "boot-race-lambda"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+resource "aws_cloudwatch_log_group" "boot_race" {
+  for_each          = local.boot_race_lambdas
+  provider          = aws.ohio
+  name              = "/aws/lambda/boot-race-${each.key}"
+  retention_in_days = 7
+  tags              = local.boot_race_tag
+}
+
+resource "aws_iam_role_policy" "boot_race_lambda" {
+  name = "boot-race-logs"
+  role = aws_iam_role.boot_race_lambda.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "OwnLogGroups"
+      Effect   = "Allow"
+      Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource = [for g in aws_cloudwatch_log_group.boot_race : "${g.arn}:*"]
+    }]
+  })
+}
+
+resource "aws_lambda_function" "boot_race" {
+  for_each         = local.boot_race_lambdas
+  provider         = aws.ohio
+  function_name    = "boot-race-${each.key}"
+  role             = aws_iam_role.boot_race_lambda.arn
+  runtime          = "provided.al2023"
+  handler          = "bootstrap"
+  architectures    = ["arm64"]
+  memory_size      = 2048
+  timeout          = 10
+  filename         = data.archive_file.boot_race_placeholder.output_path
+  source_code_hash = data.archive_file.boot_race_placeholder.output_base64sha256
+
+  environment {
+    variables = {
+      BOOT_RACE_EXIT_AFTER_RESPONSE = each.value
+    }
+  }
+
+  tags = local.boot_race_tag
+
+  # The driver uploads the workload, and may change the environment between invocations to force a new environment.
+  lifecycle {
+    ignore_changes = [filename, source_code_hash, environment]
+  }
+
+  depends_on = [aws_cloudwatch_log_group.boot_race, aws_iam_role_policy.boot_race_lambda]
+}
+
+resource "aws_lambda_function_url" "boot_race" {
+  for_each           = local.boot_race_lambdas
+  provider           = aws.ohio
+  function_name      = aws_lambda_function.boot_race[each.key].function_name
+  authorization_type = "AWS_IAM"
+  invoke_mode        = "BUFFERED"
+}
+
+# ============================================================ the driver's role
+resource "aws_iam_role" "boot_race_driver" {
+  name                 = "boot-race-driver"
+  max_session_duration = 3600
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.dev_server.arn }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+data "aws_iam_policy_document" "boot_race_driver" {
+  # The instance, its volume and its interface: created only through the two templates, carrying Project=boot-race.
+  statement {
+    sid     = "RunTaggedBootRaceOnly"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+    resources = [
+      "${local.boot_race_ec2_arn}:instance/*",
+      "${local.boot_race_ec2_arn}:volume/*",
+      "${local.boot_race_ec2_arn}:network-interface/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = ["boot-race"]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.boot_race_ec2.arn, aws_launch_template.boot_race_ecs_host.arn]
+    }
+  }
+
+  # What a launch references, by exact ARN: subnet, group, key pair, templates, and the two public base images.
+  statement {
+    sid     = "RunInstancesReferencedResources"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+    resources = [
+      aws_subnet.ohio_pbox.arn,
+      aws_security_group.boot_race.arn,
+      aws_key_pair.ohio_pbox.arn,
+      aws_launch_template.boot_race_ec2.arn,
+      aws_launch_template.boot_race_ecs_host.arn,
+      "arn:aws:ec2:${local.boot_race_region}::image/${local.boot_race_base_ami}",
+      "arn:aws:ec2:${local.boot_race_region}::image/${data.aws_ssm_parameter.boot_race_ecs_ami.insecure_value}",
+    ]
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.boot_race_ec2.arn, aws_launch_template.boot_race_ecs_host.arn]
+    }
+  }
+
+  # The workload AMI the driver makes: an image of this account carrying Project=boot-race.
+  statement {
+    sid       = "RunInstancesWorkloadImage"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:aws:ec2:${local.boot_race_region}::image/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Owner"
+      values   = [local.boot_race_account]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.boot_race_ec2.arn]
+    }
+  }
+
+  statement {
+    sid     = "TagAtCreateOnly"
+    effect  = "Allow"
+    actions = ["ec2:CreateTags"]
+    resources = [
+      "${local.boot_race_ec2_arn}:instance/*",
+      "${local.boot_race_ec2_arn}:volume/*",
+      "${local.boot_race_ec2_arn}:network-interface/*",
+      "arn:aws:ec2:${local.boot_race_region}::image/*",
+      "arn:aws:ec2:${local.boot_race_region}::snapshot/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["RunInstances", "CreateImage"]
+    }
+  }
+
+  # Start, stop (with or without hibernation) and terminate only the instances these templates made.
+  statement {
+    sid       = "ManageTaggedBootRaceInstances"
+    effect    = "Allow"
+    actions   = ["ec2:StartInstances", "ec2:StopInstances", "ec2:TerminateInstances"]
+    resources = ["${local.boot_race_ec2_arn}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid       = "ImageFromTaggedInstance"
+    effect    = "Allow"
+    actions   = ["ec2:CreateImage"]
+    resources = ["${local.boot_race_ec2_arn}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid     = "ImageCarriesTag"
+    effect  = "Allow"
+    actions = ["ec2:CreateImage"]
+    resources = [
+      "arn:aws:ec2:${local.boot_race_region}::image/*",
+      "arn:aws:ec2:${local.boot_race_region}::snapshot/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid     = "RemoveTaggedImages"
+    effect  = "Allow"
+    actions = ["ec2:DeregisterImage", "ec2:DeleteSnapshot"]
+    resources = [
+      "arn:aws:ec2:${local.boot_race_region}::image/*",
+      "arn:aws:ec2:${local.boot_race_region}::snapshot/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid    = "Ec2Describe"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceStatus",
+      "ec2:DescribeImages",
+      "ec2:DescribeSnapshots",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeLaunchTemplates",
+      "ec2:DescribeLaunchTemplateVersions",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid     = "RunBootRaceTasks"
+    effect  = "Allow"
+    actions = ["ecs:RunTask"]
+    resources = [
+      "${local.boot_race_ecs_arn}:task-definition/boot-race-fargate:*",
+      "${local.boot_race_ecs_arn}:task-definition/boot-race-ec2:*",
+    ]
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.boot_race.arn]
+    }
+  }
+
+  statement {
+    sid     = "ManageBootRaceTasks"
+    effect  = "Allow"
+    actions = ["ecs:StopTask", "ecs:DescribeTasks", "ecs:ListTasks", "ecs:ListContainerInstances", "ecs:DescribeContainerInstances"]
+    resources = [
+      aws_ecs_cluster.boot_race.arn,
+      "${local.boot_race_ecs_arn}:task/boot-race/*",
+      "${local.boot_race_ecs_arn}:container-instance/boot-race/*",
+    ]
+  }
+
+  statement {
+    sid       = "DescribeTaskDefinitions"
+    effect    = "Allow"
+    actions   = ["ecs:DescribeTaskDefinition"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "PassTaskExecutionRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.boot_race_task_execution.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "PassEcsHostRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.boot_race_ecs_host.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ec2.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "EcrToken"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "PushWorkloadImage"
+    effect = "Allow"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:DescribeImages",
+    ]
+    resources = [aws_ecr_repository.boot_race.arn]
+  }
+
+  statement {
+    sid    = "DriveBootRaceFunctions"
+    effect = "Allow"
+    actions = [
+      "lambda:InvokeFunction",
+      "lambda:GetFunction",
+      "lambda:GetFunctionConfiguration",
+      "lambda:GetFunctionUrlConfig",
+      "lambda:UpdateFunctionCode",
+      "lambda:UpdateFunctionConfiguration",
+    ]
+    resources = [for f in aws_lambda_function.boot_race : f.arn]
+  }
+
+  statement {
+    sid       = "InvokeBootRaceUrls"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunctionUrl"]
+    resources = [for f in aws_lambda_function.boot_race : f.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "lambda:FunctionUrlAuthType"
+      values   = ["AWS_IAM"]
+    }
+  }
+
+  # The REPORT lines (Init Duration) of the two functions.
+  statement {
+    sid       = "ReadBootRaceLogs"
+    effect    = "Allow"
+    actions   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+    resources = [for g in aws_cloudwatch_log_group.boot_race : "${g.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "boot_race_driver" {
+  name   = "boot-race-driver"
+  role   = aws_iam_role.boot_race_driver.id
+  policy = data.aws_iam_policy_document.boot_race_driver.json
+}
+
+# The dev role may assume the driver role and nothing more.
+resource "aws_iam_role_policy" "dev_server_boot_race" {
+  name = "boot-race-assume-driver"
+  role = aws_iam_role.dev_server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AssumeBootRaceDriver"
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = aws_iam_role.boot_race_driver.arn
+    }]
+  })
+}
+
+output "boot_race" {
+  description = "What the boot-race driver needs: its role, the function URLs, the image repository"
+  value = {
+    driver_role_arn = aws_iam_role.boot_race_driver.arn
+    function_urls   = { for k, u in aws_lambda_function_url.boot_race : k => u.function_url }
+    repository_url  = aws_ecr_repository.boot_race.repository_url
+  }
+}
