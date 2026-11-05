@@ -550,7 +550,7 @@ The long-lived development and administration instances are:
 | jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
 | fcvm-metal-arm | r8gd.metal-24xl (96 vCPU / 768GB, Graviton4) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
-| nextjs-dev | t4g.xlarge (4 vCPU / 16GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
+| nextjs-dev | t4g.2xlarge (8 vCPU / 32 GiB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-ct.tf / nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
 | wbox-, pbox-, gbox-`<member>` | per member (colton, connor, colin, skevh): a Windows g4dn spot box in us-west-1a, a Graviton spot box in us-east-2c, a small NVIDIA box in us-west-2a | launched and terminated on demand; idle and lifetime reaped | Each member's own boxes, each with a fixed private IP; the wbox and pbox keep a persistent disk per person. The same `wbox` / `pbox` / `gbox` commands, run from the member's account, act on them (`member-boxes.tf`) | member-wbox.tf, member-pbox.tf, member-gbox.tf |
