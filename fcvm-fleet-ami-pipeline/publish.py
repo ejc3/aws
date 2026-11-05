@@ -82,8 +82,7 @@ class Publisher:
         _, request = self.request(source, input_sha)
         need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
 
-    def reviewed_pair(self, variable):
-        config = json.loads(self.env[variable])
+    def reviewed_pair(self, config):
         need(set(config) == {"source_sha", "images", "expected"}
              and SHA.fullmatch(config["source_sha"]), "invalid reviewed image configuration")
         expected = config["expected"]
@@ -102,7 +101,7 @@ class Publisher:
         return config
 
     def reviewed_seed(self):
-        config = self.reviewed_pair("SEED_RELEASE_JSON")
+        config = self.reviewed_pair(json.loads(self.env["SEED_RELEASE_JSON"]))
         expected = config["expected"]
         need(expected["generation"] == 0 and expected["source_sha"] == expected["build_id"] == ""
              and expected["versions"] == {} and expected["previous"] is None,
@@ -110,7 +109,7 @@ class Publisher:
         return config
 
     def reviewed_phone_release(self):
-        config = self.reviewed_pair("PHONE_AMI_JSON")
+        config = self.reviewed_pair(json.loads(self.env["PHONE_AMI_JSON"]))
         seed = self.reviewed_seed()
         expected = config["expected"]
         need(expected["generation"] == 1 and expected["source_sha"] == seed["source_sha"] != config["source_sha"]
@@ -122,6 +121,25 @@ class Publisher:
              and all(type(v) is int and v > 0 for v in expected["versions"].values()),
              "reviewed phone transition must follow the exact seed publication")
         return config
+
+    def reviewed_renderer_release(self):
+        config = json.loads(self.env["RENDERER_AMI_JSON"])
+        need(set(config) == {"source_sha", "images", "versions"}, "invalid reviewed renderer configuration")
+        phone = self.reviewed_phone_release()
+        versions = config.pop("versions")
+        need(phone["source_sha"] != config["source_sha"]
+             and set(versions) == {t["region"] + "/" + t["id"] for t in self.templates}
+             and all(type(v) is int and v > 0 for v in versions.values()),
+             "reviewed renderer transition must follow the exact phone publication")
+        config["expected"] = {
+            "version": 1, "generation": 2, "source_sha": phone["source_sha"],
+            "build_id": "reviewed-phone-release:" + digest(encoded(phone)),
+            "guard_sha256": self.env["GUARD_SHA256"], "versions": versions,
+            "previous": {k: v for k, v in phone["expected"].items() if k != "previous"},
+            **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+               for kind, image in phone["images"].items()},
+        }
+        return self.reviewed_pair(config)
 
     def compare_sources(self, base, head):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
@@ -250,6 +268,10 @@ class Publisher:
     def run_phone_release(self, event):
         need(event == {"action": "activate-reviewed-phone-release"}, "reviewed release accepts no caller configuration")
         return self.run_reviewed(self.reviewed_phone_release(), "reviewed-phone-release", check_ancestry=True)
+
+    def run_renderer_release(self, event):
+        need(event == {"action": "activate-reviewed-renderer-release"}, "reviewed release accepts no caller configuration")
+        return self.run_reviewed(self.reviewed_renderer_release(), "reviewed-renderer-release", check_ancestry=True)
 
     def run_reviewed(self, config, identity, check_ancestry=False):
         self.build_id = identity + ":" + digest(encoded(config))
@@ -723,6 +745,8 @@ class Publisher:
             return self.run_seed(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-phone-release":
             return self.run_phone_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-renderer-release":
+            return self.run_renderer_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

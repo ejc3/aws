@@ -533,6 +533,60 @@ class PublisherTests(unittest.TestCase):
                              self.new[template["kind"]])
         self.assertIsNone(self.ddb.item)
 
+    def reviewed_renderer_fixture(self):
+        phone, event, _, _, phone_source, _ = self.reviewed_phone_fixture()
+        self.assertEqual(phone.run(event), {"status": "promoted", "generation": 2})
+        self.ec2.created.clear()
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "9"), ("tile", "a"))}
+        for kind, image_id in images.items():
+            image = copy.deepcopy(self.ec2.images[self.new[kind]])
+            image["ImageId"] = image_id
+            self.ec2.images[image_id] = image
+        source = "e" * 40
+        self.env["RENDERER_AMI_JSON"] = json.dumps({"source_sha": source, "images": images,
+                                                  "versions": before["versions"]})
+        publisher = self.publisher()
+        publisher.compare_sources = mock.Mock(side_effect=lambda base, head: {
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": base}, "merge_base_commit": {"sha": base},
+        })
+        return publisher, {"action": "activate-reviewed-renderer-release"}, before, images, source, phone_source
+
+    def test_reviewed_renderer_only_updates_default_images_and_preserves_phone_rollback(self):
+        publisher, event, before, images, source, phone_source = self.reviewed_renderer_fixture()
+        self.assertEqual(publisher.reviewed_renderer_release()["expected"], before)
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
+            self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 3})
+        self.assertEqual(publisher.compare_sources.call_args_list,
+                         [mock.call(self.source, source), mock.call(phone_source, source)] * 2)
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(after["source_sha"], source)
+        self.assertEqual(after["previous"], {key: value for key, value in before.items() if key != "previous"})
+        self.assertTrue(after["build_id"].startswith("reviewed-renderer-release:"))
+        for template in self.templates:
+            name, kind = template["id"], template["kind"]
+            table = self.ec2.templates[name]
+            key = "us-east-1/" + name
+            self.assertEqual(table["default"], after["versions"][key])
+            self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                             {**table["versions"][before["versions"][key]]["LaunchTemplateData"],
+                              "ImageId": images[kind]})
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 3})
+        self.assertEqual(len(self.ec2.created), 4)
+        self.assertEqual((self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_renderer_refuses_overrides_and_changed_predecessor(self):
+        publisher, event, before, images, _, _ = self.reviewed_renderer_fixture()
+        with self.assertRaisesRegex(MODULE.Refused, "no caller configuration"):
+            publisher.run({**event, "images": images})
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.fleet_ssm.values["/release"]["previous"]["generation"] = 0
+        with self.assertRaisesRegex(MODULE.Refused, "unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.ec2.created, [])
+        self.assertIsNone(self.ddb.item)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
