@@ -31,21 +31,22 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 04915961, revised from the a5bae67b image (ami-051db4be56ae7f6b0): everything in it (the renderer's
-  # reported fit, ejc3/fcvm#1515), plus the phones' GPU mirror joining a running phone (ejc3/fcvm#1505, #1506): the phone
-  # emulator's gfxstream sends a snapshot of every color buffer and of the GL state when a viewer opens the mirror, and its
-  # streamer relays it, so the viewer sees the screen at once and every process keeps drawing with no app restart. The
-  # IP-options guard is installed by prep and its publication proof passed. Its renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-0e7a6e72f1dc8f4f4" } }
+  # executable from main 3b597cf9, revised from the 04915961 image (ami-0e7a6e72f1dc8f4f4): everything in it (the phones' GPU
+  # mirror joining a running phone, ejc3/fcvm#1505 and #1506; the take-over actions, #1516; the renderer's reported fit,
+  # #1515), plus a renderer whose trace runs its terrain, marches, clouds, sky and water out of line and its eye-ray march in
+  # a kernel of its own (ejc3/fcvm#1527: the inlined trace kernel was 42,336 instructions and waited on instruction fetch for
+  # 10.0 of 14.3 cycles; heavy terrain tiles now take 0.760 of the trace time, with the same samples). The IP-options guard is
+  # installed by prep and its publication proof passed. Its renderer is the tile AMI's.
+  default = { "us-east-1" = { x86_64 = "ami-017c2fffe2dd0c176" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the a70ad25c image (ami-05dd36badf188758b) with the renderer image the a5bae67b
-  # host AMI built (ejc3/fcvm#1515). Its boot prefetch list was traced again on a boot that read on its own.
-  default = { "us-east-1" = { x86_64 = "ami-0ce935fe1f66fb10f" } }
+  # (fcvm fleet/ami/tile). Revised from the a5bae67b image (ami-0ce935fe1f66fb10f) with the renderer image the 3b597cf9
+  # host AMI built (ejc3/fcvm#1527). Its boot prefetch list was traced again on a boot that read on its own.
+  default = { "us-east-1" = { x86_64 = "ami-058b6cec0b53ddf4d" } }
 }
 
 locals {
