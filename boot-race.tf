@@ -434,6 +434,19 @@ data "aws_iam_policy_document" "boot_race_driver" {
     }
   }
 
+  # The templates set c8g.medium, but RunInstances can override the type: hold the instance to it.
+  statement {
+    sid       = "DenyOtherInstanceTypes"
+    effect    = "Deny"
+    actions   = ["ec2:RunInstances", "ec2:StartInstances"]
+    resources = ["${local.boot_race_ec2_arn}:instance/*"]
+    condition {
+      test     = "StringNotEquals"
+      variable = "ec2:InstanceType"
+      values   = ["c8g.medium"]
+    }
+  }
+
   # What a launch references, by exact ARN: subnet, group, key pair, templates, and the two public base images.
   statement {
     sid     = "RunInstancesReferencedResources"
