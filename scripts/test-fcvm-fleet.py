@@ -120,10 +120,11 @@ class HostTests(unittest.TestCase):
             ):
                 with self.subTest(actual=actual):
                     result = subprocess.run(
-                        ["/bin/bash", "-eu", "-c", "agent_args='--phones 2'\n" + boot + '\nprintf "%s" "$agent_args"'],
+                        ["/bin/bash", "-eux", "-c", "agent_args='--phones 2'\n" + boot + '\nprintf "%s" "$agent_args"'],
                         env=dict(os.environ, BOOT_AMI=actual), capture_output=True, text=True, check=True, timeout=5,
                     )
                     self.assertEqual(result.stdout, expected)
+                    self.assertNotIn("fixture-token", result.stderr)
 
     def test_hosts_ask_for_a_prefix_only_and_imdsv2_hop_1(self):
         lt = block('resource "aws_launch_template" "host"', MOD)

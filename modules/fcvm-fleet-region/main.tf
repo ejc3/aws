@@ -220,6 +220,7 @@ locals {
     %{if var.potato_host_ami != ""~}
     # The publisher changes ImageId without changing user data. Check the
     # actual boot image so publishing or rolling back cannot break older agents.
+    set +x
     imds=http://169.254.169.254/latest
     if token=$(/usr/bin/curl --noproxy '*' -fs --max-time 2 -X PUT \
         -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/api/token") && [ -n "$token" ] &&
