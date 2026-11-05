@@ -31,12 +31,13 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main a5bae67b, revised from the a70ad25c image (ami-0129863cf5498d43b): everything in it, plus a renderer
-  # that reports its budget_fit as the largest budget whose frame draws no more samples than it fits, and keeps its cost
-  # model across drawn-size changes (ejc3/fcvm#1515: a fit reported in samples let the grid controller's next raise put a
-  # 432-line tile at one sample a pixel, 1.53 times its fit, and a tile moved between heights reported no fit for 60 s at a
-  # time). The IP-options guard is installed by prep and its publication proof passed. Its renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-051db4be56ae7f6b0" } }
+  # executable from main 206b7437, revised from the a5bae67b image (ami-051db4be56ae7f6b0): everything in it, plus a held
+  # phone that shows each take-over action (ejc3/fcvm#1516: while a viewer holds a phone, Robot Park follows that phone's
+  # own robot instead of drawing its slice with the wall's camera, which looks away from every robot; rotate, dark mode,
+  # dance, wave and Robot Park show the scene tab first). The IP-options guard is installed by prep and its publication
+  # proof passed. Its renderer is built from the same sources as the tile AMI's (fcvm a5bae67b..206b7437 changes nothing
+  # under fleet/renderer), in another image build.
+  default = { "us-east-1" = { x86_64 = "ami-0149479cf0840d23a" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
