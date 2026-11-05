@@ -334,8 +334,8 @@ class TerraformWiringTests(unittest.TestCase):
 
     def test_only_the_launch_function_may_run_or_stop_engines_besides_the_sweeper(self):
         # The lobby's roles may only invoke games-mp-launch (scripts/test-games-mp-launch.py).
-        # The boot-race driver may run and stop tasks too, but only its own task families on its own
-        # cluster, so it can never reach a games engine.
+        # The boot-race launcher may run and stop tasks too, but only its own task families on its own
+        # cluster, so it can never reach a games engine. The boot-race driver holds neither action.
         for path in ROOT.glob("*.tf"):
             text = path.read_text()
             for action in ("ecs:RunTask", "ecs:StopTask"):
@@ -345,9 +345,9 @@ class TerraformWiringTests(unittest.TestCase):
                     key = (path.name, owner[-1] if owner else None)
                     self.assertIn(key,
                                   {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper"),
-                                   ("boot-race.tf", "boot_race_driver")},
+                                   ("boot-race.tf", "boot_race_launcher")},
                                   "%s granted outside the launch function and the sweeper" % action)
-                    if key == ("boot-race.tf", "boot_race_driver"):
+                    if key == ("boot-race.tf", "boot_race_launcher"):
                         start = text.rfind("statement {", 0, m.start())
                         end = text.find("\n  }\n", m.start())
                         statement = text[start:end]

@@ -15,12 +15,14 @@
 # Everything is named boot-race and lives in us-east-2, in the parallel-box VPC and subnet (ohio-pbox.tf), because the
 # driver runs on a parallel box and reaches each workload over the VPC. Nothing is public: the workload group admits
 # TCP 8080 (the workload) and 22 (to install the workload on the AMI builder) from the parallel-box group only, and
-# the function URLs take IAM auth only. Nothing here runs or bills while idle; every instance and task is started by
-# the driver and terminated or stopped by it when its samples are taken.
+# the function URLs take IAM auth only. Every instance and task is started by the driver and terminated or stopped by
+# it when its samples are taken. The two ECR interface endpoints bill while they exist (about $0.02 an hour together).
 #
 # The driver uses boot-race-driver, which the dev role assumes. Its grants are scoped to these resources by ARN or by
 # the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
-# parallel-box-control (parallel-box-launch.tf).
+# parallel-box-control (parallel-box-launch.tf). ECS tasks are run and stopped only by boot-race-launcher, a
+# Terraform-owned function whose code fixes the cluster, the task definitions and the Fargate network (the
+# parallel-box subnet, the boot-race group, no public IP); Fargate pulls the image through ECR endpoints in the VPC.
 
 locals {
   boot_race_region  = "us-east-2"
@@ -69,7 +71,8 @@ resource "aws_security_group" "boot_race" {
     security_groups = [aws_security_group.ohio_pbox.id]
   }
 
-  # Fargate tasks and the container instance pull the image from ECR and reach the ECS endpoint over the internet.
+  # Fargate tasks reach ECR through the endpoints below; the container instance reaches the ECS endpoint over the
+  # internet through its public address (the launch template), which this group closes to inbound traffic.
   egress {
     from_port        = 0
     to_port          = 0
@@ -255,9 +258,59 @@ resource "aws_iam_role" "boot_race_ecs_host" {
   tags = local.boot_race_tag
 }
 
-resource "aws_iam_role_policy_attachment" "boot_race_ecs_host" {
-  role       = aws_iam_role.boot_race_ecs_host.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+# What the ECS agent on the one container instance needs, held to the boot-race cluster, instead of the managed
+# AmazonEC2ContainerServiceforEC2Role (which reaches every cluster and every repository in the account).
+resource "aws_iam_role_policy" "boot_race_ecs_host" {
+  name = "boot-race-ecs-agent"
+  role = aws_iam_role.boot_race_ecs_host.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # DiscoverPollEndpoint has no resource type.
+        Sid      = "DiscoverPollEndpoint"
+        Effect   = "Allow"
+        Action   = "ecs:DiscoverPollEndpoint"
+        Resource = "*"
+      },
+      {
+        Sid    = "RegisterInTheBootRaceCluster"
+        Effect = "Allow"
+        Action = [
+          "ecs:RegisterContainerInstance",
+          "ecs:DeregisterContainerInstance",
+          "ecs:SubmitContainerStateChange",
+          "ecs:SubmitTaskStateChange",
+          "ecs:SubmitAttachmentStateChanges",
+        ]
+        Resource = aws_ecs_cluster.boot_race.arn
+      },
+      {
+        Sid      = "PollAsABootRaceContainerInstance"
+        Effect   = "Allow"
+        Action   = ["ecs:Poll", "ecs:StartTelemetrySession", "ecs:UpdateContainerInstancesState"]
+        Resource = "${local.boot_race_ecs_arn}:container-instance/boot-race/*"
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.boot_race.arn }
+        }
+      },
+      {
+        # The container-instance role page says the instance role pulls ECR images on the EC2 launch type; the
+        # task-execution role page lists ECR pulls for Fargate, Managed Instances and external instances only. So the
+        # host may pull, but only the workload image.
+        Sid      = "EcrToken"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      },
+      {
+        Sid      = "PullTheWorkloadImageOnly"
+        Effect   = "Allow"
+        Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
+        Resource = aws_ecr_repository.boot_race.arn
+      },
+    ]
+  })
 }
 
 resource "aws_iam_instance_profile" "boot_race_ecs_host" {
@@ -400,6 +453,169 @@ resource "aws_lambda_function_url" "boot_race" {
   function_name      = aws_lambda_function.boot_race[each.key].function_name
   authorization_type = "AWS_IAM"
   invoke_mode        = "BUFFERED"
+}
+
+# ============================================================ the task launcher
+# The only caller of RunTask and StopTask for boot-race tasks. Its code (boot-race/launcher.py) fixes the cluster, the
+# task definitions and the Fargate network configuration: the parallel-box subnet, the boot-race group and no public
+# IP. The driver may invoke it and nothing more; it cannot change its code, configuration or role.
+data "archive_file" "boot_race_launcher" {
+  type        = "zip"
+  source_file = "${path.module}/boot-race/launcher.py"
+  output_path = "${path.module}/.terraform/boot-race-launcher.zip"
+}
+
+resource "aws_cloudwatch_log_group" "boot_race_launcher" {
+  provider          = aws.ohio
+  name              = "/aws/lambda/boot-race-launcher"
+  retention_in_days = 7
+  tags              = local.boot_race_tag
+}
+
+resource "aws_iam_role" "boot_race_launcher" {
+  name        = "boot-race-launcher"
+  description = "boot-race-launcher Lambda: RunTask and StopTask of the two boot-race task definitions"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+data "aws_iam_policy_document" "boot_race_launcher" {
+  statement {
+    sid     = "RunBootRaceTasks"
+    effect  = "Allow"
+    actions = ["ecs:RunTask"]
+    resources = [
+      "${local.boot_race_ecs_arn}:task-definition/boot-race-fargate:*",
+      "${local.boot_race_ecs_arn}:task-definition/boot-race-ec2:*",
+    ]
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.boot_race.arn]
+    }
+  }
+
+  statement {
+    sid       = "StopBootRaceTasks"
+    effect    = "Allow"
+    actions   = ["ecs:StopTask"]
+    resources = ["${local.boot_race_ecs_arn}:task/boot-race/*"]
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.boot_race.arn]
+    }
+  }
+
+  statement {
+    sid       = "PassTaskExecutionRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.boot_race_task_execution.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "OwnLogGroup"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.boot_race_launcher.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "boot_race_launcher" {
+  name   = "run-and-stop-boot-race-tasks"
+  role   = aws_iam_role.boot_race_launcher.id
+  policy = data.aws_iam_policy_document.boot_race_launcher.json
+}
+
+resource "aws_lambda_function" "boot_race_launcher" {
+  provider         = aws.ohio
+  function_name    = "boot-race-launcher"
+  role             = aws_iam_role.boot_race_launcher.arn
+  handler          = "launcher.lambda_handler"
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  timeout          = 30
+  memory_size      = 256
+  filename         = data.archive_file.boot_race_launcher.output_path
+  source_code_hash = data.archive_file.boot_race_launcher.output_base64sha256
+
+  logging_config {
+    log_format = "Text"
+    log_group  = aws_cloudwatch_log_group.boot_race_launcher.name
+  }
+
+  environment {
+    variables = {
+      CLUSTER        = aws_ecs_cluster.boot_race.name
+      FARGATE_FAMILY = aws_ecs_task_definition.boot_race_fargate.family
+      EC2_FAMILY     = aws_ecs_task_definition.boot_race_ec2.family
+      SUBNET         = aws_subnet.ohio_pbox.id
+      SECURITY_GROUP = aws_security_group.boot_race.id
+    }
+  }
+
+  tags = local.boot_race_tag
+
+  depends_on = [aws_iam_role_policy.boot_race_launcher]
+}
+
+# ============================================================ private ECR for Fargate
+# A Fargate task with no public IP reaches ECR through these: the two ECR interface endpoints in the parallel-box
+# subnet and an S3 gateway endpoint for the image layers. Private DNS points every client in the VPC at them, so the
+# endpoints' group admits the parallel boxes as well as the boot-race workloads.
+resource "aws_security_group" "boot_race_endpoints" {
+  provider    = aws.ohio
+  name_prefix = "boot-race-endpoints-"
+  description = "ECR interface endpoints in the parallel-box VPC: HTTPS from the boot-race workloads and parallel boxes"
+  vpc_id      = aws_vpc.ohio_pbox.id
+
+  ingress {
+    description     = "HTTPS to ECR, from the boot-race workloads and the parallel boxes"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.boot_race.id, aws_security_group.ohio_pbox.id]
+  }
+
+  tags = merge(local.boot_race_tag, { Name = "boot-race-endpoints" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_endpoint" "boot_race_ecr" {
+  for_each            = toset(["ecr.api", "ecr.dkr"])
+  provider            = aws.ohio
+  vpc_id              = aws_vpc.ohio_pbox.id
+  service_name        = "com.amazonaws.${local.boot_race_region}.${each.key}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.ohio_pbox.id]
+  security_group_ids  = [aws_security_group.boot_race_endpoints.id]
+  private_dns_enabled = true
+  tags                = merge(local.boot_race_tag, { Name = "boot-race-${each.key}" })
+}
+
+resource "aws_vpc_endpoint" "boot_race_s3" {
+  provider          = aws.ohio
+  vpc_id            = aws_vpc.ohio_pbox.id
+  service_name      = "com.amazonaws.${local.boot_race_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.ohio_pbox.id]
+  tags              = merge(local.boot_race_tag, { Name = "boot-race-s3" })
 }
 
 # ============================================================ the driver's role
@@ -585,25 +801,19 @@ data "aws_iam_policy_document" "boot_race_driver" {
     resources = ["*"]
   }
 
+  # Tasks are run and stopped only by the launcher function, whose network configuration is fixed in its code: RunTask
+  # has no condition key for the subnet or a public IP, so the driver holds neither RunTask nor StopTask.
   statement {
-    sid     = "RunBootRaceTasks"
-    effect  = "Allow"
-    actions = ["ecs:RunTask"]
-    resources = [
-      "${local.boot_race_ecs_arn}:task-definition/boot-race-fargate:*",
-      "${local.boot_race_ecs_arn}:task-definition/boot-race-ec2:*",
-    ]
-    condition {
-      test     = "ArnEquals"
-      variable = "ecs:cluster"
-      values   = [aws_ecs_cluster.boot_race.arn]
-    }
+    sid       = "InvokeTheLauncher"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.boot_race_launcher.arn]
   }
 
   statement {
-    sid     = "ManageBootRaceTasks"
+    sid     = "ReadBootRaceTasks"
     effect  = "Allow"
-    actions = ["ecs:StopTask", "ecs:DescribeTasks", "ecs:ListTasks", "ecs:ListContainerInstances", "ecs:DescribeContainerInstances"]
+    actions = ["ecs:DescribeTasks", "ecs:ListTasks", "ecs:ListContainerInstances", "ecs:DescribeContainerInstances"]
     resources = [
       aws_ecs_cluster.boot_race.arn,
       "${local.boot_race_ecs_arn}:task/boot-race/*",
@@ -616,18 +826,6 @@ data "aws_iam_policy_document" "boot_race_driver" {
     effect    = "Allow"
     actions   = ["ecs:DescribeTaskDefinition"]
     resources = ["*"]
-  }
-
-  statement {
-    sid       = "PassTaskExecutionRole"
-    effect    = "Allow"
-    actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.boot_race_task_execution.arn]
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PassedToService"
-      values   = ["ecs-tasks.amazonaws.com"]
-    }
   }
 
   statement {

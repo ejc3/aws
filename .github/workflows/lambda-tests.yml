@@ -248,6 +248,9 @@ jobs:
       - name: Games multiplayer launch admission (offline)
         run: python3 -S -B scripts/test-games-mp-launch.py
 
+      - name: boot-race task launcher fixes the network (offline)
+        run: python3 -S -B scripts/test-boot-race-launcher.py
+
       - name: play.cc-games.app edge protections (offline)
         run: python3 -S -B scripts/test-games-mp-edge.py
 
