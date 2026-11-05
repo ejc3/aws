@@ -621,6 +621,11 @@ output "host_template_names" {
   value = local.hosts_on ? [for a in local.host_archs : aws_launch_template.host[a].name] : []
 }
 
+output "host_user_data_sha256" {
+  description = "SHA-256 of the exact base64-encoded launch template user data."
+  value       = sha256(local.user_data)
+}
+
 output "host_subnet_ids" {
   value = local.host_subnets
 }

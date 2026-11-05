@@ -68,6 +68,18 @@ locals {
       "us-east-1/lt-06c7abdc28186e26c" = 15
     }
   }
+  # #794 changes only the host. The existing tile recipe and renderer were
+  # reviewed as identical; preserve every tile version from generation four.
+  fcvm_ami_reviewed_potato_host_fix = {
+    source_sha = "47d925f5439c19196e94be7bba1fc12bb55d49d4"
+    host_image = local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image
+    versions = {
+      "us-east-1/lt-01972ab31436a0ce0" = 19
+      "us-east-1/lt-05856e91e1cd7c5f7" = 13
+      "us-east-1/lt-06851b9720c0517fe" = 16
+      "us-east-1/lt-06c7abdc28186e26c" = 16
+    }
+  }
 }
 
 locals {
@@ -658,6 +670,8 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
       RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
       POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
+      HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
+      HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
     }
   }
 }

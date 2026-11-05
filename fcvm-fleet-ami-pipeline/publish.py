@@ -82,7 +82,7 @@ class Publisher:
         _, request = self.request(source, input_sha)
         need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
 
-    def reviewed_pair(self, config):
+    def reviewed_pair(self, config, *, host_only=False):
         need(set(config) == {"source_sha", "images", "expected"}
              and SHA.fullmatch(config["source_sha"]), "invalid reviewed image configuration")
         expected = config["expected"]
@@ -97,7 +97,8 @@ class Publisher:
             need(set(maps) == {self.env["COMPUTE_REGION"]}
                  and set(maps[self.env["COMPUTE_REGION"]]) == {"x86_64"}, "unexpected reviewed release topology")
             images.extend([config["images"][kind], maps[self.env["COMPUTE_REGION"]]["x86_64"]])
-        need(len(set(images)) == 4 and all(IMAGE.fullmatch(item) for item in images), "invalid reviewed image identities")
+        need(len(set(images)) == (3 if host_only else 4) and (not host_only or images[2] == images[3])
+             and all(IMAGE.fullmatch(item) for item in images), "invalid reviewed image identities")
         return config
 
     def reviewed_seed(self):
@@ -163,19 +164,58 @@ class Publisher:
         }
         return self.reviewed_pair(config), tile_source
 
-    def compare_sources(self, base, head):
+    def reviewed_potato_host_fix(self):
+        fixed = json.loads(self.env["HOST_FIX_AMI_JSON"])
+        need(set(fixed) == {"source_sha", "host_image", "versions"}, "invalid reviewed host fix configuration")
+        potato, tile_source = self.reviewed_potato_release()
+        versions = fixed["versions"]
+        need(fixed["source_sha"] not in {potato["source_sha"], tile_source}
+             and isinstance(versions, dict) and set(versions) == set(potato["expected"]["versions"])
+             and all(type(v) is int and v > 0 for v in versions.values()),
+             "reviewed host fix must follow the exact potato publication")
+        return self.reviewed_pair({
+            "source_sha": fixed["source_sha"],
+            "images": {"host": fixed["host_image"], "tile": potato["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 4, "source_sha": potato["source_sha"],
+                "build_id": "reviewed-potato-release:" + digest(encoded({**potato, "tile_source_sha": tile_source})),
+                "guard_sha256": self.env["GUARD_SHA256"], "versions": versions,
+                "previous": {k: v for k, v in potato["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in potato["images"].items()},
+            },
+        }, host_only=True)
+
+    def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
-            # GitHub includes file patches only on page one; ancestry metadata remains on page two.
-            connection.request("GET", "/repos/ejc3/fcvm/compare/" + base + "..." + head + "?per_page=1&page=2",
+            connection.request("GET", "/repos/ejc3/fcvm/" + path,
                                headers={"User-Agent": "fcvm-image-publisher", "Accept": "application/vnd.github+json"})
             response = connection.getresponse()
-            need(response.status == 200, "source ancestry is unavailable")
+            need(response.status == 200, proof + " is unavailable")
             raw = response.read(2 * 1024 * 1024 + 1)
-            need(len(raw) <= 2 * 1024 * 1024, "source ancestry exceeds its bound")
+            need(len(raw) <= 2 * 1024 * 1024, proof + " exceeds its bound")
             return json.loads(raw)
         finally:
             connection.close()
+
+    def compare_sources(self, base, head):
+        # GitHub includes file patches only on page one; ancestry metadata remains on page two.
+        return self.github_source_json("compare/" + base + "..." + head + "?per_page=1&page=2", "source ancestry")
+
+    def strict_source_edge(self, floor, head):
+        comparison = self.compare_sources(floor, head)
+        need(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+             and comparison.get("base_commit", {}).get("sha") == floor
+             and comparison.get("merge_base_commit", {}).get("sha") == floor,
+             "factory source precedes the reviewed or active release")
+
+    def reviewed_host_source_fence(self, predecessor, source):
+        commit = self.github_source_json("commits/" + source, "reviewed host source signature")
+        signature = commit.get("commit", {}).get("verification", {})
+        need(commit.get("sha") == source and signature.get("verified") is True and signature.get("reason") == "valid",
+             "reviewed host source signature is invalid")
+        self.strict_source_edge(predecessor, source)
 
     def source_fence(self, source, tile_source=None):
         need(SHA.fullmatch(source), "invalid factory source")
@@ -195,11 +235,7 @@ class Publisher:
         if tile_source is not None:
             edges.append((tile_source, source))
         for floor, head in edges:
-            comparison = self.compare_sources(floor, head)
-            need(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
-                 and comparison.get("base_commit", {}).get("sha") == floor
-                 and comparison.get("merge_base_commit", {}).get("sha") == floor,
-                 "factory source precedes the reviewed or active release")
+            self.strict_source_edge(floor, head)
 
     def factory_fence(self, source, input_sha):
         self.current_request(source, input_sha)
@@ -310,14 +346,24 @@ class Publisher:
         config, tile_source = self.reviewed_potato_release()
         return self.run_reviewed(config, "reviewed-potato-release", check_ancestry=True, tile_source=tile_source)
 
-    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None):
+    def run_potato_host_fix(self, event):
+        need(event == {"action": "activate-reviewed-potato-host-fix"}, "reviewed host fix accepts no caller configuration")
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        return self.run_reviewed(self.reviewed_potato_host_fix(), "reviewed-potato-host-fix", host_user_data=host_user_data)
+
+    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
         generation = config["expected"]["generation"] + 1
 
         def fence():
             self.reviewed_fence(config)
-            if check_ancestry:
+            if host_user_data is not None:
+                # The exact generation-four receipt already proves the retained
+                # tile; only the signed host source must advance.
+                self.reviewed_host_source_fence(config["expected"]["source_sha"], config["source_sha"])
+            elif check_ancestry:
                 self.source_fence(config["source_sha"], tile_source)
 
         with self.publication_lock():
@@ -327,6 +373,10 @@ class Publisher:
                      and active.get("previous") == {k: v for k, v in config["expected"].items() if k != "previous"}
                      and all(active.get(kind + "_amis") == {self.env["COMPUTE_REGION"]: {"x86_64": image}}
                              for kind, image in config["images"].items()), "committed reviewed receipt differs")
+                if host_user_data is not None:
+                    need(all(active["versions"].get(key) == value
+                             for key, value in self.retained_tiles(config["expected"]).items()),
+                         "committed reviewed tile versions differ")
                 self.committed = True
                 return {"status": "promoted", "generation": generation}
             need(active == config["expected"], "reviewed transition requires its unchanged predecessor")
@@ -343,7 +393,7 @@ class Publisher:
                 raise Refused("interrupted reviewed publication must roll back before terminal replay")
             fence()
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
-            result = self.promote(manifest, config["source_sha"], None, [], fence=fence)
+            result = self.promote(manifest, config["source_sha"], None, [], fence=fence, host_user_data=host_user_data)
             return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
@@ -628,7 +678,19 @@ class Publisher:
         self.transaction["status"] = "rolled_back"
         self.record()
 
-    def promote(self, manifest, source, input_sha, resources, fence=None):
+    def retained_tiles(self, before):
+        versions = {}
+        for template in self.templates:
+            if template["kind"] == "tile":
+                key = template["region"] + "/" + template["id"]
+                current = self.current(template["id"])
+                need(current["VersionNumber"] == before["versions"][key]
+                     and current["LaunchTemplateData"].get("ImageId") == before["tile_amis"][template["region"]][template["arch"]],
+                     "retained tile template default differs from generation four")
+                versions[key] = current["VersionNumber"]
+        return versions
+
+    def promote(self, manifest, source, input_sha, resources, fence=None, *, host_user_data=None):
         name = self.env["RELEASE_PARAMETER"]
         before = self.load(name, True)
         need(before.get("version") == 1 and before.get("guard_sha256") == self.env["GUARD_SHA256"]
@@ -636,17 +698,30 @@ class Publisher:
              "active release schema is incompatible")
         if before.get("build_id") == self.build_id:
             return before
+        templates = self.templates
+        versions = {}
+        prepared_host = None
+        if host_user_data is not None:
+            versions = self.retained_tiles(before)
+            templates = [t for t in self.templates if t["kind"] == "host"]
+            host, = templates
+            prepared_host = self.current(host["id"])
+            key = host["region"] + "/" + host["id"]
+            need(prepared_host["VersionNumber"] > before["versions"][key]
+                 and digest(prepared_host["LaunchTemplateData"].get("UserData", "")) == host_user_data,
+                 "Terraform has not prepared the exact reviewed host bootstrap")
         self.transaction = {"status": "preparing", "build_id": self.build_id, "entries": {}, "before": before}
         # Persist the rollback image identities before changing any default.
         self.record()
-        for template in self.templates:
-            current = self.current(template["id"])
+        for template in templates:
+            current = prepared_host or self.current(template["id"])
             old_image = before[template["kind"] + "_amis"][template["region"]][template["arch"]]
             need(current["LaunchTemplateData"].get("ImageId") == old_image, "release pointer and template default disagree")
             entry = {"old_image": old_image, "old_version": current["VersionNumber"]}
             self.transaction["entries"][template["id"]] = entry
             self.record()
             entry["candidate"] = self.version(template["id"], current, manifest["images"][template["kind"]]["image_id"], "candidate", entry)
+            versions[template["region"] + "/" + template["id"]] = entry["candidate"]
             self.record()
         if resources:
             self.client("ec2", True).create_tags(Resources=resources, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
@@ -656,13 +731,15 @@ class Publisher:
         after = copy.deepcopy(before)
         after.update(generation=before["generation"] + 1, source_sha=source, build_id=self.build_id,
                      previous={key: value for key, value in before.items() if key != "previous"})
-        after["versions"] = {t["region"] + "/" + t["id"]: self.transaction["entries"][t["id"]]["candidate"] for t in self.templates}
+        after["versions"] = versions
         for kind in ("host", "tile"):
             after[kind + "_amis"][self.env["COMPUTE_REGION"]]["x86_64"] = manifest["images"][kind]["image_id"]
         if fence is None:
             self.factory_fence(source, input_sha)
         else:
             fence()
+        if host_user_data is not None:
+            self.retained_tiles(before)
         try:
             self.save(name, after, True)
         except Exception:
@@ -787,6 +864,8 @@ class Publisher:
             return self.run_renderer_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-potato-release":
             return self.run_potato_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-potato-host-fix":
+            return self.run_potato_host_fix(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
