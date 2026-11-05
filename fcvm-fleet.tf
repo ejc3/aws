@@ -31,12 +31,14 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 95217caa, revised from the 3b597cf9 image (ami-017c2fffe2dd0c176): everything in it, plus potato
-  # mode (ejc3/fcvm#1529 to #1534): the player image localhost/fcvm-potato:fleet in root's store for --potato-players, and
-  # `fcvm snapshot create --stop` (the other merges since 3b597cf9, #1526 and #1535, move bench records and reports). The
-  # IP-options guard is installed by prep and its publication proof passed. The renderer's source and the tile recipe are
-  # unchanged since 3b597cf9, so the tile AMI stays.
-  default = { "us-east-1" = { x86_64 = "ami-0620224a0a4dd168e" } }
+  # executable from main 47d925f5, revised from the 95217caa image (ami-0620224a0a4dd168e): everything in it, plus the
+  # potato agent never putting the player holding the ball to sleep (ejc3/fcvm#1552: a stale drop report slept the holder
+  # of the next round's ball, which then dropped at the deadline), phones nobody holds drawn with Robot Park's own camera
+  # instead of the wall's, whose keyframes are kilometres of the wall's terrain (ejc3/fcvm#1550), and a dance or wave
+  # right after Robot Park restarts no longer dropped (ejc3/fcvm#1551). The IP-options guard is installed by prep and its
+  # publication proof passed. The renderer's source and the tile recipe are unchanged since 3b597cf9, so the tile AMI
+  # stays.
+  default = { "us-east-1" = { x86_64 = "ami-0a2496fb1ae43a6c2" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -437,7 +439,7 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
-  potato_host_ami               = local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image
+  potato_host_ami               = local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image
   slot_tls_ports                = local.fcvm_fleet_slot_tls_ports
   host_profile_name             = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name             = aws_iam_instance_profile.fcvm_fleet_tile.name
