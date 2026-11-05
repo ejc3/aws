@@ -99,6 +99,17 @@ variable "host_agent_args" {
   default     = ""
 }
 
+variable "potato_host_ami" {
+  description = "Exact reviewed host AMI that includes the potato player image; empty disables potato mode."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.potato_host_ami == "" || can(regex("^ami-[0-9a-f]{17}$", var.potato_host_ami))
+    error_message = "potato_host_ami must be empty or an exact EC2 AMI ID."
+  }
+}
+
 variable "slot_tls_ports" {
   description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
@@ -205,7 +216,21 @@ locals {
     echo "fcvm-fleet host booted $(date -u +%FT%TZ)" > /var/log/fcvm-fleet-boot.log
     %{if var.host_agent_args != ""~}
     install -d -m 0755 /etc/fcvm-fleet
-    printf 'FLEET_AGENT_ARGS=%s\n' '${var.host_agent_args}' > /etc/fcvm-fleet/agent.env
+    agent_args='${var.host_agent_args}'
+    %{if var.potato_host_ami != ""~}
+    # The publisher changes ImageId without changing user data. Check the
+    # actual boot image so publishing or rolling back cannot break older agents.
+    imds=http://169.254.169.254/latest
+    if token=$(/usr/bin/curl --noproxy '*' -fs --max-time 2 -X PUT \
+        -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/api/token") && [ -n "$token" ] &&
+      boot_ami=$(printf 'X-aws-ec2-metadata-token: %s\n' "$token" |
+        /usr/bin/curl --noproxy '*' -fs --max-time 2 -H @- "$imds/meta-data/ami-id") &&
+      [ "$boot_ami" = '${var.potato_host_ami}' ]; then
+      agent_args="$agent_args --potato-players 96"
+    fi
+    unset token boot_ami
+    %{endif~}
+    printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
     systemctl enable fcvm-fleet-agent.service
     systemctl start --no-block fcvm-fleet-agent.service
     %{endif~}

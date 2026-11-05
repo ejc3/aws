@@ -125,10 +125,6 @@ locals {
     # run a phone each, restored from the AMI's warm phone snapshot; the wall keeps the other six. The phone's
     # assets come from /etc/fcvm-fleet/phone.env, which the AMI's build writes.
     "--phones 2",
-    # Potato mode (?mode=potato, ejc3/fcvm docs/fleet/ARCHITECTURE.md "Potato mode"): up to 96 CPU-only player VMs at
-    # addresses in the host's IPv6 prefix, asleep (snapshotted, no process) except the few the ball reaches next. The
-    # player image is in root's store from the AMI's build; the agent makes the players' snapshot when it starts.
-    "--potato-players 96",
     ], local.fcvm_fleet_aggregated ? [
     "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
     "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
@@ -441,6 +437,7 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
+  potato_host_ami               = local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image
   slot_tls_ports                = local.fcvm_fleet_slot_tls_ports
   host_profile_name             = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name             = aws_iam_instance_profile.fcvm_fleet_tile.name
