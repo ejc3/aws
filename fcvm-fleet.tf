@@ -31,12 +31,12 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main a5bae67b, revised from the a70ad25c image (ami-0129863cf5498d43b): everything in it, plus a renderer
-  # that reports its budget_fit as the largest budget whose frame draws no more samples than it fits, and keeps its cost
-  # model across drawn-size changes (ejc3/fcvm#1515: a fit reported in samples let the grid controller's next raise put a
-  # 432-line tile at one sample a pixel, 1.53 times its fit, and a tile moved between heights reported no fit for 60 s at a
-  # time). The IP-options guard is installed by prep and its publication proof passed. Its renderer is the tile AMI's.
-  default = { "us-east-1" = { x86_64 = "ami-051db4be56ae7f6b0" } }
+  # executable from main 04915961, revised from the a5bae67b image (ami-051db4be56ae7f6b0): everything in it (the renderer's
+  # reported fit, ejc3/fcvm#1515), plus the phones' GPU mirror joining a running phone (ejc3/fcvm#1505, #1506): the phone
+  # emulator's gfxstream sends a snapshot of every color buffer and of the GL state when a viewer opens the mirror, and its
+  # streamer relays it, so the viewer sees the screen at once and every process keeps drawing with no app restart. The
+  # IP-options guard is installed by prep and its publication proof passed. Its renderer is the tile AMI's.
+  default = { "us-east-1" = { x86_64 = "ami-0e7a6e72f1dc8f4f4" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
