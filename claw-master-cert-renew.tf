@@ -98,7 +98,12 @@ resource "aws_ssm_document" "claw_master_cert" {
     mainSteps = [{
       action = "aws:runShellScript"
       name   = "run"
-      inputs = { runCommand = split("\n", trimsuffix(file("${path.module}/scripts/ssm/${each.value.script}"), "\n")) }
+      inputs = {
+        runCommand = split("\n", trimsuffix(join("", [
+          contains(keys(each.value.parameters), "Account") ? file("${path.module}/scripts/ssm/claw-master-cert-client-route.sh") : "",
+          file("${path.module}/scripts/ssm/${each.value.script}"),
+        ]), "\n"))
+      }
     }]
   })
 
