@@ -3,7 +3,10 @@
 # Next.js accounts' homes are visible on the host, but their tools and UID
 # boundary live in the matching container. Do not touch their homes as host root.
 CT_DIR=/etc/nextjs-ct
-if [ "${CM_CERT_IN_CONTAINER:-}" != 1 ] && { [ -e "$CT_DIR" ] || [ -L "$CT_DIR" ]; }; then
+CT_STATE=/var/lib/nextjs-ct
+# The state directory also identifies a provisioned host if its config was lost.
+if [ "${CM_CERT_IN_CONTAINER:-}" != 1 ] &&
+  { [ -e "$CT_DIR" ] || [ -L "$CT_DIR" ] || [ -e "$CT_STATE" ] || [ -L "$CT_STATE" ]; }; then
   CT_ACCOUNT='{{ Account }}'
   if [ -L "$CT_DIR" ] || [ -L "$CT_DIR/config.json" ] || [ ! -f "$CT_DIR/config.json" ] ||
     ! /usr/bin/jq -e --arg account "$CT_ACCOUNT" '.users | type == "object" and has($account)' "$CT_DIR/config.json" >/dev/null; then

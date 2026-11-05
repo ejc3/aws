@@ -112,7 +112,9 @@ class ScriptTests(unittest.TestCase):
         """Model SSM's executable script and systemd's fresh namespace over stdin."""
         root = Path(tempfile.mkdtemp(dir=self.tmp))
         config = root / "nextjs-ct"
+        state = root / "nextjs-ct-state"
         config.mkdir()
+        state.mkdir()
         (config / "config.json").write_text('{"users":{"colton":{},"connor":{}}}')
         machinectl = root / "machinectl"
         machinectl.write_text('#!/bin/bash\n[ "$*" = "show colton -p State --value" ] || exit 9\n'
@@ -126,7 +128,8 @@ class ScriptTests(unittest.TestCase):
         for stub in (machinectl, systemd):
             stub.chmod(0o755)
         trace = root / "dispatch"
-        route = (SSM_DIR / "claw-master-cert-client-route.sh").read_text().replace("/etc/nextjs-ct", str(config))
+        route = (SSM_DIR / "claw-master-cert-client-route.sh").read_text()
+        route = route.replace("/etc/nextjs-ct", str(config)).replace("/var/lib/nextjs-ct", str(state))
         route = route.replace("/usr/bin/machinectl", str(machinectl)).replace("/usr/bin/systemd-run", str(systemd))
         env = dict(os.environ, CM_HOME_OVERRIDE=str(host_home), FIXTURE_CONTAINER_HOME=str(container_home),
                    FIXTURE_TRACE=str(trace), CM_BIN=str(self.stub_client_init()))
@@ -138,7 +141,7 @@ class ScriptTests(unittest.TestCase):
             script.chmod(0o755)
             return sh(["sh", "-c", 'exec "$1"', "sh", str(script)], env=dict(env, **(extra or {})))
 
-        return config, trace, invoke
+        return config, state, trace, invoke
 
     def test_nextjs_status_request_and_install_use_the_same_container(self):
         host = self.home(days=30)
@@ -146,7 +149,7 @@ class ScriptTests(unittest.TestCase):
         token = container / ".config/claude-master/agent.token"
         token.write_text("token retained\n")
         token.chmod(0o600)
-        _, trace, invoke = self.routed_document_fixture(host, container)
+        _, _, trace, invoke = self.routed_document_fixture(host, container)
         status = invoke("status", Account="colton")
         self.assertEqual((status.returncode, kv(status.stdout)["STATUS"]), (0, "ok"), status.stderr)
         self.assertAlmostEqual(int(kv(status.stdout)["NOTAFTER"]) - time.time(), 3 * 86400, delta=10)
@@ -169,7 +172,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_container_routing_refuses_invalid_offline_or_failed_routes_and_arm_stays_direct(self):
         host = self.home(days=30)
-        config, trace, invoke = self.routed_document_fixture(host, self.home(days=3))
+        config, state, trace, invoke = self.routed_document_fixture(host, self.home(days=3))
         invalid = invoke("status", Account="unknown")
         self.assertEqual(invalid.returncode, 1)
         self.assertIn("not-a-configured-container", invalid.stderr)
@@ -184,6 +187,11 @@ class ScriptTests(unittest.TestCase):
         missing = invoke("status", Account="colton")
         self.assertEqual(missing.returncode, 1, "a configured host must never fall back to its host home")
         config.rmdir()
+        missing_dir = invoke("status", Account="colton")
+        self.assertEqual((missing_dir.returncode, missing_dir.stdout), (1, ""),
+                         "persistent container state must prevent host fallback when the whole config directory is missing")
+        self.assertIn("not-a-configured-container", missing_dir.stderr)
+        state.rmdir()
         direct = invoke("status", Account="ubuntu")
         self.assertEqual((direct.returncode, kv(direct.stdout)["STATUS"]), (0, "ok"), direct.stderr)
         self.assertAlmostEqual(int(kv(direct.stdout)["NOTAFTER"]) - time.time(), 30 * 86400, delta=10)
