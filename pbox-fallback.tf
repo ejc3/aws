@@ -76,10 +76,7 @@ locals {
     else
       echo "$DEV already has a filesystem -- mounting as-is, NOT formatting"
     fi
-    mkdir -p /mnt/work
-    mount "$DEV" /mnt/work
-    chown ubuntu:ubuntu /mnt/work
-    grep -q "$DEV" /etc/fstab || echo "$DEV /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
+    ${local.pbox_mount_work_volume}
     echo "fallback site: /mnt/work is a fresh volume that is deleted with this box; /srv/io is not mounted" > /mnt/work/FALLBACK-BOX-README
 
     export DEBIAN_FRONTEND=noninteractive

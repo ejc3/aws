@@ -66,6 +66,43 @@ locals {
   pbox_flavor_types = distinct(flatten(values(local.pbox_flavors)))
   member_pbox_types = distinct(flatten([for f, types in local.pbox_flavors : types if !startswith(f, "kvm-")]))
 
+  # The selected EBS device is already formatted. Only advertise readiness after it is mounted,
+  # and update this mount's fstab entry without disturbing other records. Names can swap on reboot.
+  pbox_mount_work_volume = <<-WORK
+pbox_work_error() {
+  echo "FATAL: /mnt/work: $1" >&2
+  exit 1
+}
+WORK_UUID=$(blkid -s UUID -o value "$DEV") &&
+  [[ "$WORK_UUID" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] ||
+  pbox_work_error "cannot read the work volume UUID"
+WORK_DEVICE=$(lsblk -dnro MAJ:MIN -- "$DEV") &&
+  [[ "$WORK_DEVICE" =~ ^[0-9]+:[0-9]+$ ]] ||
+  pbox_work_error "cannot identify the work volume"
+mkdir -p /mnt/work || pbox_work_error "cannot create the mount point"
+if WORK_MOUNTED=$(mountpoint -d -- /mnt/work); then
+  :
+else
+  [ "$?" -eq 32 ] || pbox_work_error "cannot inspect the mount point"
+  mount -t ext4 -- "$DEV" /mnt/work || pbox_work_error "cannot mount the work volume"
+  WORK_MOUNTED=$(mountpoint -d -- /mnt/work) || pbox_work_error "mount did not take effect"
+fi
+[ "$WORK_MOUNTED" = "$WORK_DEVICE" ] || pbox_work_error "a different device is mounted"
+chown ubuntu:ubuntu /mnt/work || pbox_work_error "cannot set work volume ownership"
+
+WORK_FSTAB=$(mktemp /etc/fstab.pbox.XXXXXX) || pbox_work_error "cannot stage fstab"
+if ! {
+  awk '$2 != "/mnt/work" || /^[[:space:]]*#/' /etc/fstab > "$WORK_FSTAB" &&
+  printf 'UUID=%s /mnt/work ext4 defaults,nofail 0 2\n' "$WORK_UUID" >> "$WORK_FSTAB" &&
+  chown --reference=/etc/fstab "$WORK_FSTAB" &&
+  chmod --reference=/etc/fstab "$WORK_FSTAB" &&
+  mv -fT -- "$WORK_FSTAB" /etc/fstab
+}; then
+  rm -f -- "$WORK_FSTAB"
+  pbox_work_error "cannot update fstab"
+fi
+  WORK
+
   # Instance-store NVMe (the storage flavors, and the types with a "d"): found by its model name, never by a guessed
   # /dev name, and blank at every launch (a pbox is one-time spot or on-demand, terminated and never stopped). One disk is
   # formatted and mounted at /mnt/nvme; several become one RAID0 first. A disk that holds any filesystem is never

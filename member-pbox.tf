@@ -151,10 +151,7 @@ locals {
       if ! blkid "$DEV" >/dev/null 2>&1; then
         mkfs.ext4 -L parallel-work "$DEV"
       fi
-      mkdir -p /mnt/work
-      mount "$DEV" /mnt/work
-      chown ubuntu:ubuntu /mnt/work
-      grep -q "$DEV" /etc/fstab || echo "$DEV /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
+      ${local.pbox_mount_work_volume}
 
       export DEBIAN_FRONTEND=noninteractive
       apt-get -o DPkg::Lock::Timeout=300 update

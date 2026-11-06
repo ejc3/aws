@@ -159,10 +159,7 @@ locals {
           echo "$DEV already has a filesystem -- mounting as-is, NOT formatting"
         fi
 
-        mkdir -p /mnt/work
-        mount "$DEV" /mnt/work
-        chown ubuntu:ubuntu /mnt/work
-        grep -q "$DEV" /etc/fstab || echo "$DEV /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
+        ${local.pbox_mount_work_volume}
 
         # Parallel-work basics. GNU parallel is the usual driver for this shape of job.
         export DEBIAN_FRONTEND=noninteractive

@@ -405,6 +405,12 @@ class GpuVfio(unittest.TestCase):
         self.assertIn("ubuntu hard memlock unlimited", g)
         self.assertNotRegex(g, r"nvidia-(driver|utils|dkms)|cuda")  # the host never drives the GPUs
 
+    def test_every_pbox_boot_mounts_the_work_volume_by_uuid(self):
+        for name, text in (("parallel-box-launch.tf", LAUNCH), ("pbox-fallback.tf", FALLBACK),
+                           ("member-pbox.tf", MEMBER)):
+            self.assertEqual(text.count("${local.pbox_mount_work_volume}"), 1, name)
+            self.assertNotIn("/etc/fstab", text, name)
+
     def test_every_apt_call_in_a_pbox_boot_waits_for_the_dpkg_lock(self):
         # ejc3/aws#609: the boot-time package run held the dpkg lock, driverctl failed to install, every GPU stayed on nouveau.
         import re as _re
@@ -539,10 +545,93 @@ class GpuIommuReboot(unittest.TestCase):
             at = text.index("${local.pbox_gpu_iommu_reboot}")
             # after the dev-hop key (idempotent), before anything that is not: the work volume, apt, NVMe, vfio
             self.assertLess(text.index("chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys"), at)
-            for later in ('mount "$DEV" /mnt/work', "mkfs.ext4", "apt-get -o DPkg::Lock::Timeout=300 update", "${local.pbox_local_nvme_setup}",
+            for later in ("${local.pbox_mount_work_volume}", "mkfs.ext4", "apt-get -o DPkg::Lock::Timeout=300 update", "${local.pbox_local_nvme_setup}",
                           "${local.pbox_gpu_vfio_setup}"):
                 self.assertLess(at, text.index(later), later)
         self.assertNotIn("pbox_gpu_iommu_reboot", MEMBER)
+
+
+class WorkVolumeMount(unittest.TestCase):
+    uuid = "56bb7ad1-6855-455b-b819-18dff2d753ae"
+    unrelated = ("# UUID=56bb7ad1-6855-455b-b819-18dff2d753ae /mnt/work is the work volume\n"
+                 "UUID=some-root / ext4 defaults 0 1\n"
+                 "io:/work /srv/io nfs4 defaults,nofail 0 0\n")
+    previous = unrelated + "/dev/nvme1n1 /mnt/work ext4 defaults,nofail 0 2\n"
+
+    def run_mount(self, scenario, *, repetitions=1):
+        snippet = FLAVORS_TF.split("pbox_mount_work_volume = <<-WORK\n", 1)[1].split("\n  WORK\n", 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fstab = root / "fstab"
+            fstab.write_text(self.previous)
+            fstab.chmod(0o640)
+            mounted = root / "mounted"
+            if scenario in {"already", "wrong-device"}:
+                mounted.write_text("259:9" if scenario == "wrong-device" else "259:7")
+            shim = root / "shim"
+            shim.write_text(r"""#!/bin/bash
+case "${0##*/}" in
+  blkid)
+    [[ "$SCENARIO" != missing-uuid ]] || exit 2
+    [[ "$SCENARIO" != empty-uuid ]] || exit 0
+    echo "$TEST_UUID"
+    ;;
+  lsblk) echo 259:7 ;;
+  mountpoint)
+    [[ "$SCENARIO" != inspect-fail ]] || exit 1
+    [[ -f "$TEST_MOUNTED" ]] || exit 32
+    cat "$TEST_MOUNTED"
+    ;;
+  mount)
+    echo called >> "$TEST_MOUNTED.calls"
+    [[ "$SCENARIO" != mount-fail ]] || exit 1
+    echo 259:7 > "$TEST_MOUNTED"
+    ;;
+  mkdir) [[ "$*" == "-p /mnt/work" ]] ;;
+  chown) [[ "$1" != --reference=* ]] || exec /usr/bin/chown "$@" ;;
+  mv)
+    [[ "$SCENARIO" != fstab-fail ]] || exit 1
+    exec /usr/bin/mv "$@"
+    ;;
+esac
+""")
+            shim.chmod(0o755)
+            for command in ("blkid", "lsblk", "mountpoint", "mount", "mkdir", "chown", "mv"):
+                (root / command).symlink_to(shim)
+            environment = {
+                "PATH": f"{root}:/usr/bin:/bin", "SCENARIO": scenario,
+                "TEST_UUID": self.uuid, "TEST_MOUNTED": str(mounted),
+            }
+            for _ in range(repetitions):
+                result = subprocess.run(
+                    ["/bin/bash", "-uc", 'DEV=/dev/fake-work\n' + snippet.replace("/etc/fstab", str(fstab))],
+                    env=environment, capture_output=True, text=True, timeout=5)
+            return (result, fstab.read_text(), stat.S_IMODE(fstab.stat().st_mode),
+                    (root / "mounted.calls").exists(), list(root.glob("fstab.pbox.*")))
+
+    def test_replaces_old_device_path_without_changing_unrelated_records(self):
+        result, content, mode, mounted, temporary = self.run_mount("new", repetitions=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(content, self.unrelated + f"UUID={self.uuid} /mnt/work ext4 defaults,nofail 0 2\n")
+        self.assertEqual(mode, 0o640)
+        self.assertTrue(mounted)
+        self.assertEqual(temporary, [])
+
+    def test_already_mounted_correct_device_is_not_mounted_again(self):
+        result, content, _, mounted, _ = self.run_mount("already")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"UUID={self.uuid} /mnt/work", content)
+        self.assertFalse(mounted)
+
+    def test_bad_identity_mount_or_write_stops_without_changing_fstab(self):
+        for scenario in ("missing-uuid", "empty-uuid", "wrong-device", "inspect-fail", "mount-fail", "fstab-fail"):
+            with self.subTest(scenario=scenario):
+                result, content, _, mounted, temporary = self.run_mount(scenario)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("FATAL: /mnt/work:", result.stderr)
+                self.assertEqual(content, self.previous)
+                self.assertEqual(temporary, [])
+                self.assertEqual(mounted, scenario in {"mount-fail", "fstab-fail"})
 
 
 class SecurityUpdatesAtBoot(unittest.TestCase):
@@ -579,7 +668,7 @@ class LocalNvme(unittest.TestCase):
             self.assertEqual(text.count("${local.pbox_local_nvme_setup}"), 1)
             # after apt-get update (mdadm), after the work volume is mounted
             self.assertLess(text.index("apt-get -o DPkg::Lock::Timeout=300 update"), text.index("${local.pbox_local_nvme_setup}"))
-            self.assertLess(text.index("mount \"$DEV\" /mnt/work"), text.index("${local.pbox_local_nvme_setup}"))
+            self.assertLess(text.index("${local.pbox_mount_work_volume}"), text.index("${local.pbox_local_nvme_setup}"))
 
 
 # The script against a fake aws: every call is logged; run-instances always finds no capacity.
