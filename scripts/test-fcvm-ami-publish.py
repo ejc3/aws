@@ -712,6 +712,10 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.created, [(host, prepared, default)])
         self.assertEqual(self.ec2.selected, [(host, default)])
         self.assertEqual((self.ec2.deleted, self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], [], []))
+        self.ec2.templates[host]["default"] = prepared
+        with self.assertRaisesRegex(MODULE.Refused, "host template default differs"):
+            self.publisher().run(event)
+        self.assertEqual(self.ec2.created, [(host, prepared, default)])
         self.assertIsNone(self.ddb.item)
 
     def test_reviewed_host_fix_refuses_unprepared_or_unproven_inputs_before_mutation(self):
@@ -757,6 +761,24 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(self.ec2.templates[tile], old_templates[tile])
         self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
         self.assertEqual([item[0] for item in self.ec2.created], [host, host])
+        self.assertEqual([item[0] for item in self.ec2.deleted], [host])
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_host_fix_refuses_default_drift_during_final_source_fence(self):
+        publisher, event, before, _, _ = self.reviewed_host_fix_fixture()
+        host = self.ids[0]
+        table = self.ec2.templates[host]
+        prepared = table["default"]
+        proof = publisher.compare_sources.return_value
+        def compare(*_args):
+            if publisher.compare_sources.call_count == 2:
+                table["default"] = prepared
+            return proof
+        publisher.compare_sources.side_effect = compare
+        with self.assertRaisesRegex(MODULE.Refused, "host template default differs"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(table["default"], prepared)
         self.assertEqual([item[0] for item in self.ec2.deleted], [host])
         self.assertIsNone(self.ddb.item)
 

@@ -377,6 +377,7 @@ class Publisher:
                     need(all(active["versions"].get(key) == value
                              for key, value in self.retained_tiles(config["expected"]).items()),
                          "committed reviewed tile versions differ")
+                    self.check_reviewed_host_default(active, host_user_data)
                 self.committed = True
                 return {"status": "promoted", "generation": generation}
             need(active == config["expected"], "reviewed transition requires its unchanged predecessor")
@@ -690,6 +691,15 @@ class Publisher:
                 versions[key] = current["VersionNumber"]
         return versions
 
+    def check_reviewed_host_default(self, release, host_user_data):
+        host = next(t for t in self.templates if t["kind"] == "host")
+        current = self.current(host["id"])
+        data = current["LaunchTemplateData"]
+        need(current["VersionNumber"] == release["versions"].get(host["region"] + "/" + host["id"])
+             and data.get("ImageId") == release["host_amis"][host["region"]][host["arch"]]
+             and digest(data.get("UserData", "")) == host_user_data,
+             "reviewed host template default differs from the release")
+
     def promote(self, manifest, source, input_sha, resources, fence=None, *, host_user_data=None):
         name = self.env["RELEASE_PARAMETER"]
         before = self.load(name, True)
@@ -707,8 +717,10 @@ class Publisher:
             host, = templates
             prepared_host = self.current(host["id"])
             key = host["region"] + "/" + host["id"]
+            data = prepared_host["LaunchTemplateData"]
             need(prepared_host["VersionNumber"] > before["versions"][key]
-                 and digest(prepared_host["LaunchTemplateData"].get("UserData", "")) == host_user_data,
+                 and data.get("ImageId") == before["host_amis"][host["region"]][host["arch"]]
+                 and digest(data.get("UserData", "")) == host_user_data,
                  "Terraform has not prepared the exact reviewed host bootstrap")
         self.transaction = {"status": "preparing", "build_id": self.build_id, "entries": {}, "before": before}
         # Persist the rollback image identities before changing any default.
@@ -740,6 +752,7 @@ class Publisher:
             fence()
         if host_user_data is not None:
             self.retained_tiles(before)
+            self.check_reviewed_host_default(after, host_user_data)
         try:
             self.save(name, after, True)
         except Exception:
