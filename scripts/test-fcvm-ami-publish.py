@@ -654,6 +654,134 @@ class PublisherTests(unittest.TestCase):
                 self.assertEqual(self.ec2.created, [])
                 self.assertIsNone(self.ddb.item)
 
+    def reviewed_host_fix_fixture(self):
+        potato, event, _, _, _, _, _ = self.reviewed_potato_fixture()
+        self.assertEqual(potato.run(event), {"status": "promoted", "generation": 4})
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        host, image_id, source = self.ids[0], "ami-" + "d" * 17, "7" * 40
+        image = copy.deepcopy(self.ec2.images[before["host_amis"]["us-east-1"]["x86_64"]])
+        self.ec2.images[image_id] = {**image, "ImageId": image_id}
+        self.env["HOST_FIX_AMI_JSON"] = json.dumps({
+            "source_sha": source, "host_image": image_id, "versions": before["versions"],
+        })
+        # Terraform prepares a new host default without changing the published image or tile defaults.
+        table = self.ec2.templates[host]
+        prepared = table["default"] + 1
+        table["versions"][prepared] = copy.deepcopy(table["versions"][table["default"]])
+        user_data = base64.b64encode(b"exact Terraform-managed bootstrap for both reviewed hosts").decode()
+        table["versions"][prepared].update(VersionNumber=prepared, VersionDescription="terraform")
+        table["versions"][prepared]["LaunchTemplateData"]["UserData"] = user_data
+        table["default"] = prepared
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        publisher = self.publisher()
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": before["source_sha"]},
+            "merge_base_commit": {"sha": before["source_sha"]},
+        })
+        publisher.github_source_json = mock.Mock(return_value={
+            "sha": source, "commit": {"verification": {"verified": True, "reason": "valid"}},
+        })
+        return publisher, {"action": "activate-reviewed-potato-host-fix"}, before, source, image_id
+
+    def test_reviewed_host_fix_changes_one_image_and_keeps_exact_tiles_and_rollback(self):
+        publisher, event, before, source, image_id = self.reviewed_host_fix_fixture()
+        self.assertEqual(publisher.reviewed_potato_host_fix()["expected"], before)
+        old_templates = copy.deepcopy(self.ec2.templates)
+        host = self.ids[0]
+        host_key = "us-east-1/" + host
+        prepared = old_templates[host]["default"]
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
+            self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 5})
+        self.assertEqual(publisher.github_source_json.call_args_list,
+                         [mock.call("commits/" + source, "reviewed host source signature")] * 2)
+        self.assertEqual(publisher.compare_sources.call_args_list, [mock.call(before["source_sha"], source)] * 2)
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(after["source_sha"], source)
+        self.assertEqual(after["tile_amis"], before["tile_amis"])
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": image_id}})
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        default = self.ec2.templates[host]["default"]
+        self.assertEqual(after["versions"], {**before["versions"], host_key: default})
+        self.assertEqual(self.ec2.templates[host]["versions"][default]["LaunchTemplateData"],
+                         {**old_templates[host]["versions"][prepared]["LaunchTemplateData"], "ImageId": image_id})
+        for tile in self.ids[1:]:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 5})
+        self.assertEqual(self.ec2.created, [(host, prepared, default)])
+        self.assertEqual(self.ec2.selected, [(host, default)])
+        self.assertEqual((self.ec2.deleted, self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], [], []))
+        self.ec2.templates[host]["default"] = prepared
+        with self.assertRaisesRegex(MODULE.Refused, "host template default differs"):
+            self.publisher().run(event)
+        self.assertEqual(self.ec2.created, [(host, prepared, default)])
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_host_fix_refuses_unprepared_or_unproven_inputs_before_mutation(self):
+        for variant in ("override", "generation", "unsigned", "wrong-commit", "divergent", "public-host",
+                        "wrong-tile-tag", "tile-default", "old-host-default", "wrong-user-data"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, before, _, image_id = self.reviewed_host_fix_fixture()
+                host, tile = (self.ec2.templates[name] for name in self.ids[:2])
+                signature = publisher.github_source_json.return_value
+                if variant == "override": event["host_image"] = image_id
+                elif variant == "generation": self.fleet_ssm.values["/release"]["generation"] += 1
+                elif variant == "unsigned": signature["commit"]["verification"]["verified"] = False
+                elif variant == "wrong-commit": signature["sha"] = "8" * 40
+                elif variant == "divergent": publisher.compare_sources.return_value["merge_base_commit"]["sha"] = "8" * 40
+                elif variant == "public-host": self.ec2.images[image_id]["Public"] = True
+                elif variant == "wrong-tile-tag":
+                    tile_id = before["tile_amis"]["us-east-1"]["x86_64"]
+                    next(tag for tag in self.ec2.images[tile_id]["Tags"] if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "tile-default": tile["default"] -= 1
+                elif variant == "old-host-default": host["default"] -= 1
+                elif variant == "wrong-user-data": host["versions"][host["default"]]["LaunchTemplateData"]["UserData"] = "eA=="
+                original = copy.deepcopy(self.fleet_ssm.values["/release"])
+                journal = copy.deepcopy(self.main_ssm.values)
+                with self.assertRaises(MODULE.Refused): publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values["/release"], original)
+                self.assertEqual(self.main_ssm.values, journal)
+                self.assertEqual((self.ec2.created, self.ec2.selected), ([], []))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_host_fix_failed_pointer_write_rolls_back_host_only(self):
+        publisher, event, before, _, _ = self.reviewed_host_fix_fixture()
+        old_templates = copy.deepcopy(self.ec2.templates)
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=RuntimeError("no write")):
+            with self.assertRaisesRegex(MODULE.Refused, "pointer update was not confirmed"):
+                publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        host = self.ids[0]
+        table = self.ec2.templates[host]
+        self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                         old_templates[host]["versions"][old_templates[host]["default"]]["LaunchTemplateData"])
+        for tile in self.ids[1:]:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertEqual([item[0] for item in self.ec2.created], [host, host])
+        self.assertEqual([item[0] for item in self.ec2.deleted], [host])
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_host_fix_refuses_default_drift_during_final_source_fence(self):
+        publisher, event, before, _, _ = self.reviewed_host_fix_fixture()
+        host = self.ids[0]
+        table = self.ec2.templates[host]
+        prepared = table["default"]
+        proof = publisher.compare_sources.return_value
+        def compare(*_args):
+            if publisher.compare_sources.call_count == 2:
+                table["default"] = prepared
+            return proof
+        publisher.compare_sources.side_effect = compare
+        with self.assertRaisesRegex(MODULE.Refused, "host template default differs"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(table["default"], prepared)
+        self.assertEqual([item[0] for item in self.ec2.deleted], [host])
+        self.assertIsNone(self.ddb.item)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

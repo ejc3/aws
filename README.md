@@ -559,6 +559,13 @@ these builds. The publisher verifies both image tags and that the host source
 descends from the tile and active release sources. It retains generation three
 for rollback and changes only the default images for future launches.
 
+The fixed action `{"action":"activate-reviewed-potato-host-fix"}` advances that
+exact generation-four release to the signed a4a0bd3e host from #794. It requires
+Terraform to have prepared the exact host bootstrap for both reviewed images.
+It changes only the host template's default image for future launches, leaves
+all three tile templates and the active tile untouched, and retains generation
+four for rollback. It does not wake or retire Fleet instances.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

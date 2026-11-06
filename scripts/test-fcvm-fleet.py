@@ -92,11 +92,15 @@ class NetworkTests(unittest.TestCase):
 class HostTests(unittest.TestCase):
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
-        # the same bootstrap with the reviewed image, a rollback and failed IMDS.
-        ami = "ami-0620224a0a4dd168e"
+        # the same bootstrap with both reviewed images, an older host and failed IMDS.
+        previous = "ami-0620224a0a4dd168e"
+        candidate = "ami-04c3294f21cb88942"
         east = block('module "fcvm_fleet_east1"')
-        self.assertRegex(east, r'potato_host_ami\s*=\s*local\.fcvm_ami_bootstrap\["host/x86_64/95217caa"\]\.image')
-        guard = MOD.split('%{if var.potato_host_ami != ""~}\n', 1)[1].split('%{endif~}', 1)[0]
+        configured = re.search(r'potato_host_amis\s*=\s*\[(.*?)\n  \]', east, re.S)
+        self.assertIsNotNone(configured)
+        self.assertEqual(re.findall(r'local\.fcvm_ami_bootstrap\["host/x86_64/([0-9a-f]+)"\]\.image',
+                                    configured[1]), ["95217caa", "a4a0bd3e"])
+        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split('%{endif~}', 1)[0]
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
             curl.write_text(
@@ -111,9 +115,12 @@ class HostTests(unittest.TestCase):
                 "esac\n"
             )
             curl.chmod(0o700)
-            boot = textwrap.dedent(guard).replace("${var.potato_host_ami}", ami).replace("/usr/bin/curl", str(curl))
+            boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
+                                                   "|".join(sorted([previous, candidate])))
+            boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
-                (ami, "--phones 2 --potato-players 96"),
+                (previous, "--phones 2 --potato-players 96"),
+                (candidate, "--phones 2 --potato-players 96"),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
                 ("no-token", "--phones 2"),
                 ("no-ami", "--phones 2"),

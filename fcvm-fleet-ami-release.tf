@@ -64,6 +64,7 @@ locals {
     "host/x86_64/3b597cf9" = { image = "ami-017c2fffe2dd0c176", kind = "host" }
     "tile/x86_64/3b597cf9" = { image = "ami-058b6cec0b53ddf4d", kind = "tile" }
     "host/x86_64/95217caa" = { image = "ami-0620224a0a4dd168e", kind = "host" }
+    "host/x86_64/a4a0bd3e" = { image = "ami-04c3294f21cb88942", kind = "host" }
   }
 }
 
