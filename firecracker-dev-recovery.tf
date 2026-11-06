@@ -102,9 +102,10 @@ resource "aws_instance" "firecracker_recovery_donor" {
 
   lifecycle {
     prevent_destroy = true
-    # Once the exact production root is attached, never reconcile it back to
-    # the disposable disk's size, settings, or tags while the donor is staged.
-    ignore_changes = [root_block_device]
+    # The type is chosen at launch only: the provider would stop an existing
+    # donor before attempting an in-place change that EC2 forbids for Spot.
+    # After transplant, also leave the production root's settings and tags alone.
+    ignore_changes = [instance_type, root_block_device]
   }
 }
 
