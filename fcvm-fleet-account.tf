@@ -30,6 +30,11 @@ locals {
   # G and VT spot vCPUs per region (#605): a g4dn.metal (96) and its replacement while the old one terminates, or a
   # g5g.metal (64) plus the EC2 comparison tiles at 4 vCPU each.
   fcvm_fleet_spot_g_vcpus = 192
+  # On-demand G vCPUs in us-east-1 (ejc3/fcvm#1257): the wall's host (96) and its replacement while the old one shuts
+  # down (96), the EC2 tiles started on demand (8 x 4), and the gpubox test hosts and AMI builders that share the
+  # region (96 each, four at once). At 384 the wall's host was refused with VcpuLimitExceeded for 13 minutes on two
+  # wakes of 2026-11-05 while two gpuboxes, an AMI builder and the tiles held the quota.
+  fcvm_fleet_on_demand_g_vcpus = 768
 }
 
 resource "aws_organizations_organizational_unit" "fcvm_fleet" {
@@ -283,6 +288,19 @@ resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_east1" {
   service_code = "ec2"
   quota_code   = "L-3819A6DF"
   value        = max(local.fcvm_fleet_spot_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_spot_g_east1.value)
+}
+
+data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-DB2E81BA"
+}
+
+resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-DB2E81BA"
+  value        = max(local.fcvm_fleet_on_demand_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value)
 }
 
 output "fcvm_fleet" {
