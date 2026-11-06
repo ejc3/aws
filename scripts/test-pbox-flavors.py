@@ -405,6 +405,17 @@ class GpuVfio(unittest.TestCase):
         self.assertIn("ubuntu hard memlock unlimited", g)
         self.assertNotRegex(g, r"nvidia-(driver|utils|dkms)|cuda")  # the host never drives the GPUs
 
+    def test_every_pbox_boot_mounts_the_work_volume_by_uuid(self):
+        # NVMe names follow probe order: after a reboot of a c8g.metal-48xl the root disk
+        # took the name the work volume had, and a "/dev/nvmeN /mnt/work" line mounted nothing.
+        for name, text in (("parallel-box-launch.tf", LAUNCH), ("pbox-fallback.tf", FALLBACK),
+                           ("member-pbox.tf", MEMBER)):
+            lines = [line.strip() for line in text.splitlines() if "/etc/fstab" in line and "echo" in line]
+            self.assertEqual(len(lines), 1, f"{name}: {lines}")
+            self.assertIn('echo "UUID=$WORK_UUID /mnt/work ext4', lines[0], name)
+            self.assertNotIn('echo "$DEV', lines[0], name)
+            self.assertIn('WORK_UUID=$(blkid -s UUID -o value "$DEV")', text, name)
+
     def test_every_apt_call_in_a_pbox_boot_waits_for_the_dpkg_lock(self):
         # ejc3/aws#609: the boot-time package run held the dpkg lock, driverctl failed to install, every GPU stayed on nouveau.
         import re as _re
