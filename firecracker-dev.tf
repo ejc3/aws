@@ -14,7 +14,7 @@ variable "enable_firecracker_instance" {
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "r8gd.metal-24xl" # ARM64 Graviton4 metal, 96 vCPU / 768 GB / 5.7 TB NVMe; was c7gd.metal (Graviton3, 64 / 128 GB / 3.8 TB)
+  default     = "c7gd.metal" # Same-AZ Spot donor adopted with the original 800 GiB root.
 }
 
 variable "firecracker_volume_size" {
@@ -143,6 +143,38 @@ resource "aws_network_interface" "firecracker_dev" {
 
   lifecycle {
     create_before_destroy = true
+    # Keep the recovered primary interface until a later migration explicitly removes this guard.
+    prevent_destroy = true
+  }
+}
+
+# Retain the former primary interface (including its IPv6 prefix and private
+# addresses) through the recovery. Importing the exact ENI also prevents this
+# address from creating a look-alike if its state binding is missing.
+import {
+  to = aws_network_interface.firecracker_dev_retired
+  id = "eni-0c56d49bcd6502d3f"
+}
+
+resource "aws_network_interface" "firecracker_dev_retired" {
+  subnet_id         = local.subnet_ids_by_az["us-west-1a"]
+  security_groups   = [aws_security_group.firecracker_dev[0].id]
+  ipv6_prefix_count = 1
+  private_ips_count = 1
+  tags              = { Name = "fcvm-metal-arm-retired-eni" }
+
+  lifecycle {
+    prevent_destroy = true
+
+    precondition {
+      condition     = !var.enable_firecracker_recovery_donor
+      error_message = "Move the verified donor into the canonical state addresses before planning adoption with staging disabled."
+    }
+
+    postcondition {
+      condition     = self.id == "eni-0c56d49bcd6502d3f"
+      error_message = "The retired FCVM ARM interface must be the original retained ENI."
+    }
   }
 }
 
@@ -270,6 +302,9 @@ resource "aws_instance" "firecracker_dev" {
     # Build the replacement before destroying the old box, so a move refused for spot
     # capacity leaves the old box intact.
     create_before_destroy = true
+    # The donor now carries the only live copy of the recovered root. Any later
+    # replacement must deliberately remove this guard after proving a backup.
+    prevent_destroy = true
     # Prevent recreation for imported instance
     ignore_changes = [
       ami,
