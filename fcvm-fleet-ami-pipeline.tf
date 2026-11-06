@@ -71,8 +71,8 @@ locals {
   # #794 changes only the host. The existing tile recipe and renderer were
   # reviewed as identical; preserve every tile version from generation four.
   fcvm_ami_reviewed_potato_host_fix = {
-    source_sha = "47d925f5439c19196e94be7bba1fc12bb55d49d4"
-    host_image = local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image
+    source_sha = "a4a0bd3e279bf11f92b9f72f0a034b8d7f20f10e"
+    host_image = local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image
     versions = {
       "us-east-1/lt-01972ab31436a0ce0" = 19
       "us-east-1/lt-05856e91e1cd7c5f7" = 13

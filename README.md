@@ -560,7 +560,7 @@ descends from the tile and active release sources. It retains generation three
 for rollback and changes only the default images for future launches.
 
 The fixed action `{"action":"activate-reviewed-potato-host-fix"}` advances that
-exact generation-four release to the signed 47d925f5 host from #794. It requires
+exact generation-four release to the signed a4a0bd3e host from #794. It requires
 Terraform to have prepared the exact host bootstrap for both reviewed images.
 It changes only the host template's default image for future launches, leaves
 all three tile templates and the active tile untouched, and retains generation

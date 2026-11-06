@@ -31,14 +31,15 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 47d925f5, revised from the 95217caa image (ami-0620224a0a4dd168e): everything in it, plus the
+  # executable from main a4a0bd3e, revised from the 95217caa image (ami-0620224a0a4dd168e): everything in it, plus the
   # potato agent never putting the player holding the ball to sleep (ejc3/fcvm#1552: a stale drop report slept the holder
-  # of the next round's ball, which then dropped at the deadline), phones nobody holds drawn with Robot Park's own camera
-  # instead of the wall's, whose keyframes are kilometres of the wall's terrain (ejc3/fcvm#1550), and a dance or wave
-  # right after Robot Park restarts no longer dropped (ejc3/fcvm#1551). The IP-options guard is installed by prep and its
-  # publication proof passed. The renderer's source and the tile recipe are unchanged since 3b597cf9, so the tile AMI
-  # stays.
-  default = { "us-east-1" = { x86_64 = "ami-0a2496fb1ae43a6c2" } }
+  # of the next round's ball, which then dropped at the deadline), faster wakes (ejc3/fcvm#1555 creates a VM's veth peer
+  # inside its namespace, #1556 reflinks small clone disks; four concurrent potato wakes p50 413 ms, p99 500 ms on a gpubox
+  # from this image), phones nobody holds drawn with Robot Park's own camera instead of the wall's, whose keyframes are
+  # kilometres of the wall's terrain (ejc3/fcvm#1550), and a dance or wave right after Robot Park restarts no longer
+  # dropped (ejc3/fcvm#1551). The IP-options guard is installed by prep and its publication proof passed. The renderer's
+  # source and the tile recipe are unchanged since 3b597cf9, so the tile AMI stays.
+  default = { "us-east-1" = { x86_64 = "ami-04c3294f21cb88942" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -442,7 +443,7 @@ module "fcvm_fleet_east1" {
   # The current host must keep potato mode while the new image is registered and on rollback.
   potato_host_amis = [
     local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
-    local.fcvm_ami_bootstrap["host/x86_64/47d925f5"].image,
+    local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image,
   ]
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
