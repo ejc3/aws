@@ -159,13 +159,7 @@ locals {
           echo "$DEV already has a filesystem -- mounting as-is, NOT formatting"
         fi
 
-        mkdir -p /mnt/work
-        mount "$DEV" /mnt/work
-        chown ubuntu:ubuntu /mnt/work
-        # By UUID: NVMe names follow probe order, and a reboot gave the root disk
-        # the work volume's name, so a /dev/nvmeN line mounted nothing (nofail).
-        WORK_UUID=$(blkid -s UUID -o value "$DEV")
-        grep -q "UUID=$WORK_UUID " /etc/fstab || echo "UUID=$WORK_UUID /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
+        ${local.pbox_mount_work_volume}
 
         # Parallel-work basics. GNU parallel is the usual driver for this shape of job.
         export DEBIAN_FRONTEND=noninteractive
