@@ -65,7 +65,7 @@ resource "cloudflare_zero_trust_access_policy" "claw_master_dashboard_owner" {
 }
 
 # ---------------------------------------------------------------------------------
-# The Worker's allowlist (2 above). Workers KV, because the pinned provider (ejc3/cloudflare 5.24.0) has no resource
+# The Worker's allowlist (2 above). Workers KV, because the pinned provider (ejc3/cloudflare 5.25.0) has no resource
 # that sets one secret on a Worker without owning its code: v5 dropped cloudflare_workers_secret, and a secret_text
 # binding exists only on cloudflare_workers_script / cloudflare_worker_version, which would take the code away from
 # the repository's Wrangler deploys. A KV value is a separate object: Terraform writes it, a deploy never touches it.
