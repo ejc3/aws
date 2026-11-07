@@ -1561,6 +1561,7 @@ pbox flavors               # the menu: vCPU, memory, local disk, what each is fo
 pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
+pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
 
@@ -1574,6 +1575,10 @@ a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` 
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and
 `kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often.
+
+Use `--local-nvme` with `pbox up N kvm-96` when a workload needs both KVM and disposable local disks.
+The flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; it refuses an occupied slot with another
+instance type and leaves that box alone. `pbox capacity N kvm-96 --local-nvme` checks those same candidates.
 
 `kvm-gpu-64` is a `g5g.metal` (Graviton2, 64 vCPU, 128 GiB, two NVIDIA T4G) for GPU passthrough into fcvm microVMs:
 `/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent

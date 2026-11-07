@@ -185,6 +185,13 @@ class FallbackScript(unittest.TestCase):
         self.assertEqual(self.calls("attach-volume"), [])  # never the home volume
         self.assertIn("FRESH, EMPTY work volume", err)
 
+    def test_local_nvme_filters_home_and_fallback_attempts(self):
+        rc, out, err = self.pbox("up", "4", "kvm-96", "--local-nvme", "--fallback", capacity="us-west-2/us-west-2b")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("type=c8gd.metal-24xl", out)
+        self.assertEqual([c[c.index("--instance-type") + 1] for c in self.calls("run-instances")],
+                         ["c8gd.metal-24xl", "m8gd.metal-24xl", "c8gd.metal-24xl"])
+
     def test_an_x86_gpu_flavor_launches_with_each_sites_x86_image_and_waits_out_its_reboot(self):
         p = self.tmp / "ssh"
         p.write_text(FAKE_SSH)

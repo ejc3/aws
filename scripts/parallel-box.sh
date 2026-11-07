@@ -17,6 +17,9 @@
 #                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on.
 #                     A GPU flavor implies --fallback: home first, then every fallback region that offers
 #                     the type (owner, 2026-10-22: the region does not matter for these).
+#   pbox up [N] kvm-96 --local-nvme
+#                     try only the KVM types with disposable instance-store NVMe. A slot already occupied
+#                     by a different type is left alone; choose a free or compatible slot.
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -59,7 +62,7 @@
 #                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
-#                     fallback AZ; launches nothing
+#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96.
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
 #   "launched box=N region=R az=Z type=T ip=IP id=i-... work=persistent|fresh", or "running ..." when it already was,
@@ -163,6 +166,9 @@ flavor_lines() {
 }
 
 flavor_types() { flavor_lines | awk -v f="$1" '$1 == f { for (i = 6; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") }'; }
+has_kvm96_local_nvme() {
+  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl) return 0 ;; *) return 1 ;; esac
+}
 
 # The flavor an instance type belongs to (each type is in exactly one), or nothing.
 type_flavor() { printf '%s\n' "$FLAVORS" | awk -v t="$1" 'NF { for (i = 6; i <= NF; i++) if ($i == t) print $1 }'; }
@@ -245,6 +251,7 @@ CMD="${1:-status}"
 BOX=""
 MODE=""
 FLAVOR=""
+LOCAL_NVME=""
 FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
@@ -261,6 +268,7 @@ while [ $# -gt 0 ]; do
       [ -n "${1:-}" ] || { say "--flavor needs a name (pbox flavors)"; exit 2; }
       FLAVOR="$1" ;;
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
+    --local-nvme) LOCAL_NVME=1 ;;
     --fallback) FALLBACK=1 ;;
     --open) OPEN=1 ;;
     --on-demand) ONDEMAND=1 ;;
@@ -288,7 +296,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
   esac
   shift
 done
@@ -376,6 +384,11 @@ lease_line() {
 if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
+if [ -n "$LOCAL_NVME" ]; then
+  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || [ "$FLAVOR" != "kvm-96" ]; then
+    say "--local-nvme only applies to 'up kvm-96' and 'capacity kvm-96'"; exit 2
+  fi
+fi
 
 if [ "$CMD" = "flavors" ]; then
   print_menu all
@@ -400,6 +413,17 @@ if [ "$CMD" = "up" ] || [ "$CMD" = "capacity" ]; then
     print_menu
     exit 2
   fi
+  if [ -n "$LOCAL_NVME" ]; then
+    NVME_TYPES=()
+    for T in $TYPES; do
+      if has_kvm96_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
+    done
+    if [ "${#NVME_TYPES[@]}" -eq 0 ]; then
+      say "No local NVMe types are configured for $FLAVOR; nothing was launched."; exit 2
+    fi
+    TYPES="${NVME_TYPES[*]}"
+  fi
+  FLAVOR_HINT="$FLAVOR${LOCAL_NVME:+ --local-nvme}"
   case "$FLAVOR" in kvm-*) MODE="kvm" ;; esac
 fi
 
@@ -408,7 +432,30 @@ fi
 # home region for a one-off.
 # A member's box is always in its own region and has no fallback sites, so it reads no pointer.
 POINTER=""
-[ -n "$MEMBER" ] || POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)"
+DISCOVERY_HOME=""
+if [ -z "$MEMBER" ]; then
+  if ! POINTER="$(aws ssm get-parameter --region us-west-1 --name /infra/parallel-box --query Parameter.Value --output text 2>/dev/null)" \
+    && [ -n "$LOCAL_NVME" ]; then
+    say "Refusing --local-nvme: could not read /infra/parallel-box; nothing was changed."
+    exit 1
+  fi
+  if [ -n "$LOCAL_NVME" ]; then
+    # Even with a region override, the published home and fallback regions are needed to find every incumbent.
+    if ! DISCOVERY_HOME="$(python3 -c 'import json, re, sys
+try:
+    p = json.load(sys.stdin)
+    home, sites = p["region"], p["fallback"]["regions"]
+    is_region = lambda name: isinstance(name, str) and re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+", name)
+    if not is_region(home) or not isinstance(sites, dict) or not all(is_region(k) and isinstance(v, dict) for k, v in sites.items()):
+        sys.exit(1)
+    print(home)
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)' <<< "$POINTER")"; then
+      say "Refusing --local-nvme: /infra/parallel-box lacks valid home and fallback discovery; nothing was changed."
+      exit 1
+    fi
+  fi
+fi
 pointer() { # pointer KEY...: the value at that path in the pointer (an object's keys or a list, space-separated), or nothing
   printf '%s' "$POINTER" | python3 -c 'import json, sys
 try:
@@ -563,10 +610,18 @@ check_instance() {
 locate_box() {
   local r id
   for r in $(all_regions); do
-    id=$(aws ec2 describe-instances --region "$r" \
+    if id=$(aws ec2 describe-instances --region "$r" \
       --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
-      --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v '^None$' || true)
-    if [ -n "$id" ] && [ "${id#i-}" != "$id" ]; then REGION="$r"; return 0; fi
+      --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null); then
+      case "$id" in
+        i-*) REGION="$r"; LOCATED_ID="$id"; return 0 ;;
+        None) continue ;;
+      esac
+    fi
+    if [ -n "$LOCAL_NVME" ]; then
+      say "Refusing --local-nvme: could not verify whether $NAME is in use in $r; nothing was changed."
+      exit 1
+    fi
   done
   REGION="$HOME_REGION"
   return 1
@@ -575,7 +630,7 @@ locate_box() {
 # Home first, then each fallback region once (us-east-2 is both home and a fallback site for its other AZs).
 all_regions() {
   local r seen=" "
-  for r in "$HOME_REGION" $FB_REGIONS; do
+  for r in "$HOME_REGION" $DISCOVERY_HOME $FB_REGIONS; do
     case "$seen" in *" $r "*) continue ;; esac
     seen="$seen$r "
     echo "$r"
@@ -632,7 +687,7 @@ lease_note() {
 
 # When `up --open` finds the box already running without a prefix: it was not launched open, and is kept as it is.
 open_note() {
-  if [ -n "$OPEN" ] && [ -z "$(box_ipv6_prefix)" ]; then
+  if [ -n "$OPEN" ] && [ -z "$(box_ipv6_prefix "$@")" ]; then
     say "NOTE: $NAME is already running without --open (no open security group, no IPv6 /80); it is kept. For --open: $SELF down ${BOX:-}, then up again with --open."
   fi
 }
@@ -641,8 +696,10 @@ open_note() {
 ondemand_note() {
   [ -n "$ONDEMAND" ] || return 0
   local l
+  local -a sel=(--filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running")
+  [ -z "${1:-}" ] || sel=(--instance-ids "$1")
   l=$(aws ec2 describe-instances --region "$REGION" \
-    --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+    "${sel[@]}" \
     --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
   if [ "$l" = spot ]; then
     say "NOTE: $NAME is already running as spot; it is kept. For on-demand: $SELF down ${BOX:-}, then up again with --on-demand."
@@ -837,10 +894,17 @@ wait_ready() {
       ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
         'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"' >&2 2>/dev/null || true
       if [ "$MODE" = "kvm" ]; then
-        # The entire point of metal: prove /dev/kvm exists and make it usable by
-        # ubuntu (group change applies from the next SSH session on).
-        if on_box 'test -c /dev/kvm && sudo usermod -aG kvm ubuntu'; then
-          say "  kvm:   /dev/kvm present; ubuntu in kvm group (applies on next login)"
+        # Prepare a new box for KVM. Reusing an incumbent with --local-nvme only checks it.
+        local kvm_message=""
+        if [ -n "$LOCAL_NVME" ] && [ "${2:-}" = running ]; then
+          if on_box 'test -c /dev/kvm'; then kvm_message='/dev/kvm present'; fi
+        else
+          if on_box 'test -c /dev/kvm && sudo usermod -aG kvm ubuntu'; then
+            kvm_message='/dev/kvm present; ubuntu in kvm group (applies on next login)'
+          fi
+        fi
+        if [ -n "$kvm_message" ]; then
+          say "  kvm:   $kvm_message"
         else
           say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
           say "That should be impossible on a *.metal type -- investigate before using."
@@ -1056,6 +1120,55 @@ wait_volume_free() {
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Reuse an incumbent by exact ID. Never infer its work mode from a separate lookup of the slot name,
+# and never repair a missing attachment or terminate an incumbent as part of the opt-in path.
+reuse_local_nvme_box() {
+  local details parsed work attached
+  ID="$LOCATED_ID"
+  if ! details="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
+    --query 'Reservations[0].Instances[0].{id:InstanceId,type:InstanceType,state:State.Name,az:Placement.AvailabilityZone,tags:Tags}' \
+    --output json 2>/dev/null)" || ! parsed="$(python3 -c 'import json, re, sys
+try:
+    record = json.load(sys.stdin)
+    instance, name, region = sys.argv[1:]
+    kind, az, tags = record["type"], record["az"], record["tags"]
+    if (record["id"] != instance or record["state"] not in ("pending", "running")
+            or not re.fullmatch(r"[a-z0-9.-]+", kind) or not re.fullmatch(re.escape(region) + r"[a-z]", az)
+            or not isinstance(tags, list)
+            or [t["Value"] for t in tags if t["Key"] == "Name"] != [name]):
+        sys.exit(1)
+    fallback = [t["Value"] for t in tags if t["Key"] == "Fallback"]
+    if fallback not in ([], ["true"]):
+        sys.exit(1)
+    print(kind, az, "fresh" if fallback else "persistent")
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)' "$ID" "$NAME" "$REGION" <<< "$details")"; then
+    say "Refusing --local-nvme: could not verify the active instance and work mode for $NAME ($ID); nothing was changed."
+    return 1
+  fi
+  read -r CHOSEN CHOSEN_AZ work <<< "$parsed"
+  case " $TYPES " in
+    *" $CHOSEN "*) ;;
+    *) say "Refusing --local-nvme: $NAME ($ID) is $CHOSEN, not a compatible KVM host with local NVMe."
+       say "It was left alone. Choose a free or compatible slot."
+       return 1 ;;
+  esac
+  if [ "$work" = persistent ]; then
+    # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+    if ! attached="$(aws ec2 describe-volumes --region "$REGION" --filters "Name=tag:Name,Values=$VOLTAG" \
+      --query 'Volumes[0].Attachments[?State==`attached`].InstanceId | [0]' --output text 2>/dev/null)" \
+      || [ "$attached" != "$ID" ]; then
+      say "Refusing --local-nvme: could not verify $VOLTAG is already attached to $ID; nothing was changed."
+      say "Choose a free slot or check this instance's work volume before trying again."
+      return 1
+    fi
+  fi
+  open_note "$ID"
+  ondemand_note "$ID"
+  lease_note
+  wait_ready "$work" running
+}
+
 case "$CMD" in
   ip)
     locate_box || true
@@ -1066,6 +1179,10 @@ case "$CMD" in
   up)
     member_key
     if locate_box; then
+      if [ -n "$LOCAL_NVME" ]; then
+        reuse_local_nvme_box
+        exit $?
+      fi
       # A box on its persistent work volume (a member's, or one of the owner's slots at home) is not taken as ready: it
       # may be the box of an interrupted launch, waiting for its volume. A fallback box's fresh volume is its own.
       if [ -n "$MEMBER" ] || [ "$(box_work)" = persistent ]; then
@@ -1229,8 +1346,8 @@ case "$CMD" in
       say "  - another flavor that still fits the work: the same shape a size down, or another shape of the same size"
       say "      ($SELF flavors;  $SELF capacity ${BOX:-1} FLAVOR  scores one without launching)"
       say "  - launch in another US AZ with an EMPTY work volume (deleted with the box):"
-      say "      $SELF up ${BOX:-1} $FLAVOR --fallback      (or --regions us-east-1,us-west-2)"
-      say "    \`$SELF capacity ${BOX:-1} $FLAVOR\` shows which AZs score best."
+      say "      $SELF up ${BOX:-1} $FLAVOR_HINT --fallback      (or --regions us-east-1,us-west-2)"
+      say "    \`$SELF capacity ${BOX:-1} $FLAVOR_HINT\` shows which AZs score best."
       exit 3
     fi
 
