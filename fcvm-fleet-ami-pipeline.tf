@@ -686,11 +686,14 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
     { Sid      = "RetireUnneededCopies", Effect = "Allow", Action = "ec2:DeregisterImage",
       Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
-    # A copy's snapshots carry no tags (CopyImage copies only the image's), so this grant cannot
-    # name a tag; publish.py retain() deletes only the snapshots of copies it just deregistered.
-    { Sid      = "DeleteRetiredCopySnapshots", Effect = "Allow", Action = "ec2:DeleteSnapshot",
+    # Retention tags a retired image's snapshots FleetRetired before it deregisters the image, and
+    # deletes only snapshots carrying that tag (a copy's snapshots carry no other).
+    { Sid      = "MarkRetiredSnapshots", Effect = "Allow", Action = "ec2:CreateTags",
       Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
-    Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    Condition = { StringEquals = { "aws:RequestTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetRetired"] } } },
+    { Sid      = "DeleteRetiredSnapshots", Effect = "Allow", Action = "ec2:DeleteSnapshot",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "ec2:ResourceTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
     { Sid      = "CopyImageTagsOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
       Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },

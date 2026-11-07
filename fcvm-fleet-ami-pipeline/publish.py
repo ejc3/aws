@@ -26,6 +26,8 @@ COPY_DESCRIPTION = re.compile(r"copy of (ami-[0-9a-f]{17}) from (us-(?:east|west
 FACTORY_NAME = re.compile(r"fcvm-factory-[0-9a-f]{24}-(host|tile)\Z")
 HANDMADE_NAME = re.compile(r"fcvm-fleet-(host|tile)-x86_64-[A-Za-z0-9._-]{1,100}\Z")
 HANDMADE_DAYS = 14
+# Longer than a publication's 24-hour lease (dispatch.py PUBLICATION_SECONDS).
+RETAIN_MIN_DAYS = 2
 RETAIN_LIMIT = 16
 # A published image's name: the factory's (dispatch.py seal) or a hand-built one's (build-ami.sh).
 NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-" + kind + r"-x86_64-[0-9a-f]{8}-[0-9]{12})\Z")
@@ -1051,28 +1053,34 @@ class Publisher:
                 and image.get("Public") is False and tags.get("Purpose") == "fcvm-fleet"
                 and image.get("State") in {"available", "failed"}):
             return False
+        try:
+            age = self.clock() - datetime.datetime.fromisoformat(image.get("CreationDate", "").replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return False
         name = image.get("Name", "")
         described = COPY_DESCRIPTION.fullmatch(image.get("Description", ""))
         if described:
+            # A copy younger than a publication lease may belong to a publication still in progress.
             return ((image.get("SourceImageId"), image.get("SourceImageRegion")) == described.groups()
-                    and any(NAME[kind].fullmatch(name) for kind in NAME))
+                    and any(NAME[kind].fullmatch(name) for kind in NAME) and age >= RETAIN_MIN_DAYS * 86400)
         if FACTORY_NAME.fullmatch(name):
             return (region != self.build_region and tags.get("PipelineSanitized") == "true"
-                    and tags.get("PipelineBuildId", "").startswith(self.env["PROJECT_NAME"] + ":"))
+                    and tags.get("PipelineBuildId", "").startswith(self.env["PROJECT_NAME"] + ":")
+                    and age >= RETAIN_MIN_DAYS * 86400)
         if HANDMADE_NAME.fullmatch(name) and "FleetImageValidated" not in tags and "PipelineSanitized" not in tags:
-            try:
-                created = datetime.datetime.fromisoformat(image.get("CreationDate", "").replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                return False
-            return self.clock() - created >= HANDMADE_DAYS * 86400
+            return age >= HANDMADE_DAYS * 86400
         return False
 
     def retain(self, release, record):
         """Deregister the retirable images (retirable()) that nothing needs, and delete their snapshots.
 
         Kept: the active release and the previous one (the release pointer and the copy record
-        name both, in every region), every launch template's default image, and every image an
-        instance in the region still uses. At most RETAIN_LIMIT copies go per region and run."""
+        name both), every launch template's default image, every image an instance or an open
+        Spot request in the region uses, and every copy of a kept image or image a kept copy was
+        made from, in any region (so a record without previous_images still keeps the previous
+        release's copies). At most RETAIN_LIMIT images go per region and run. A snapshot is
+        tagged FleetRetired before its image is deregistered, so a deletion that fails is found
+        again and retried by the next run."""
         keep = set()
         for bundle in (release, release.get("previous") or {}):
             for key in ("host_amis", "tile_amis"):
@@ -1083,7 +1091,7 @@ class Publisher:
                 keep.update(kinds.values())
         keep.update(self.current(template["id"])["LaunchTemplateData"].get("ImageId") for template in self.templates)
         regions = sorted({self.env["COMPUTE_REGION"], self.build_region, *self.copy_regions})
-        removed = {}
+        listed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
             arguments = {"Filters": [{"Name": "instance-state-name",
@@ -1096,18 +1104,47 @@ class Publisher:
                 arguments["NextToken"] = page["NextToken"]
             else:
                 raise Refused("instance inventory exceeds its fixed bound; nothing was removed")
-            images = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
+            requests = ec2.describe_spot_instance_requests(Filters=[{"Name": "state", "Values": ["open", "active", "disabled"]}])
+            keep.update(item.get("LaunchSpecification", {}).get("ImageId") for item in requests["SpotInstanceRequests"])
+            listed[region] = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
                 Filters=[{"Name": "tag:Purpose", "Values": ["fcvm-fleet"]}])["Images"]
-            stale = sorted((image for image in images if self.retirable(image, region) and image["ImageId"] not in keep), key=lambda image: image["ImageId"])
+        # Copies are linked to their sources across regions: keep both ends of every link to a kept image.
+        links = [(image["ImageId"], image.get("SourceImageId")) for images in listed.values() for image in images
+                 if image.get("SourceImageId")]
+        for _ in range(len(links) + 1):
+            grown = {a for a, b in links if b in keep} | {b for a, b in links if a in keep}
+            if grown <= keep:
+                break
+            keep |= grown
+        removed = {}
+        for region in regions:
+            ec2 = self.client("ec2", True, region)
+            retired = ec2.describe_snapshots(OwnerIds=[self.env["FLEET_ACCOUNT"]],
+                Filters=[{"Name": "tag:FleetRetired", "Values": ["true"]}])["Snapshots"]
+            for snapshot in retired[:RETAIN_LIMIT]:
+                self.delete_retired_snapshot(ec2, snapshot["SnapshotId"])
+            stale = sorted((image for image in listed[region] if self.retirable(image, region) and image["ImageId"] not in keep),
+                           key=lambda image: image["ImageId"])
             removed[region] = []
             for image in stale[:RETAIN_LIMIT]:
                 snapshots = [item["Ebs"]["SnapshotId"] for item in image.get("BlockDeviceMappings", [])
                              if item.get("Ebs", {}).get("SnapshotId")]
+                if snapshots:
+                    ec2.create_tags(Resources=snapshots, Tags=[{"Key": "FleetRetired", "Value": "true"}])
                 ec2.deregister_image(ImageId=image["ImageId"])
                 for snapshot in snapshots:
-                    ec2.delete_snapshot(SnapshotId=snapshot)
+                    self.delete_retired_snapshot(ec2, snapshot)
                 removed[region].append(image["ImageId"])
         return removed
+
+    @staticmethod
+    def delete_retired_snapshot(ec2, snapshot):
+        try:
+            ec2.delete_snapshot(SnapshotId=snapshot)
+        except Exception as error:
+            # Still in use by an image whose deregistration has not landed: the next run retries.
+            if getattr(error, "response", {}).get("Error", {}).get("Code") not in {"InvalidSnapshot.InUse", "InvalidSnapshot.NotFound"}:
+                raise
 
     def finish(self, result, source, input_sha):
         name, request = self.request(source, input_sha)
