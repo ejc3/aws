@@ -244,6 +244,31 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_admin" {
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
+# Every G launch by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which
+# leaves the wall's GPU host its room in the account's G vCPU quotas and tags the launch
+# fcvm-admission=wall-reserve. A launch without the tag is a copy of gpubox.sh or build-ami.sh
+# that predates the admission: on 2026-11-07 one took the on-demand quota the wall's host
+# needed, in the second the wall woke, and the staging smoke got no fcvm tile. The coordinator
+# and the image factory launch with their own roles and are not affected.
+resource "aws_iam_role_policy" "fcvm_fleet_terraform_g_admission" {
+  provider = aws.fcvm_fleet
+  name     = "g-launches-through-the-wall-reserve"
+  role     = aws_iam_role.fcvm_fleet_terraform.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "DenyUnadmittedGLaunch"
+      Effect   = "Deny"
+      Action   = "ec2:RunInstances"
+      Resource = "arn:aws:ec2:*:*:instance/*"
+      Condition = {
+        StringLike      = { "ec2:InstanceType" = ["g*", "vt*"] }
+        StringNotEquals = { "aws:RequestTag/fcvm-admission" = "wall-reserve" }
+      }
+    }]
+  })
+}
+
 # What fcvm-arm reads to find the account (no credentials): /infra/fcvm-fleet, granted in assume-constellation-terraform
 # (constellation-account.tf) with the same instance pin, as dev-server-role has no room for another policy.
 resource "aws_ssm_parameter" "fcvm_fleet" {
