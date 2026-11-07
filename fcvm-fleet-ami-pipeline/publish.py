@@ -186,6 +186,26 @@ class Publisher:
             },
         }, host_only=True)
 
+    def reviewed_stride_release(self):
+        # The reviewed #805 pair and observed generation-five host version are
+        # fixed here so this transition needs no more Lambda environment space.
+        prior = self.reviewed_potato_host_fix()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        return self.reviewed_pair({
+            "source_sha": "92a26793a818b142e71ba7d96b014d033f014562",
+            "images": {"host": "ami-09ac99f69700ec306", "tile": "ami-094ca9c62a284a389"},
+            "expected": {
+                "version": 1, "generation": 5, "source_sha": prior["source_sha"],
+                "build_id": "reviewed-potato-host-fix:" + digest(encoded(prior)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**prior["expected"]["versions"], host_key: 21},
+                "previous": {k: v for k, v in prior["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in prior["images"].items()},
+            },
+        })
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -350,9 +370,16 @@ class Publisher:
         need(event == {"action": "activate-reviewed-potato-host-fix"}, "reviewed host fix accepts no caller configuration")
         host_user_data = self.env["HOST_FIX_BOOT_SHA"]
         need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
-        return self.run_reviewed(self.reviewed_potato_host_fix(), "reviewed-potato-host-fix", host_user_data=host_user_data)
+        return self.run_reviewed(self.reviewed_potato_host_fix(), "reviewed-potato-host-fix",
+                                 host_user_data=host_user_data, host_only=True)
 
-    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None):
+    def run_stride_release(self, event):
+        need(event == {"action": "activate-reviewed-stride-release"}, "reviewed stride release accepts no caller configuration")
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        return self.run_reviewed(self.reviewed_stride_release(), "reviewed-stride-release", host_user_data=host_user_data)
+
+    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
         generation = config["expected"]["generation"] + 1
@@ -360,8 +387,8 @@ class Publisher:
         def fence():
             self.reviewed_fence(config)
             if host_user_data is not None:
-                # The exact generation-four receipt already proves the retained
-                # tile; only the signed host source must advance.
+                # Bootstrap-bound transitions require the signed source to
+                # descend directly from the exact published predecessor.
                 self.reviewed_host_source_fence(config["expected"]["source_sha"], config["source_sha"])
             elif check_ancestry:
                 self.source_fence(config["source_sha"], tile_source)
@@ -374,9 +401,12 @@ class Publisher:
                      and all(active.get(kind + "_amis") == {self.env["COMPUTE_REGION"]: {"x86_64": image}}
                              for kind, image in config["images"].items()), "committed reviewed receipt differs")
                 if host_user_data is not None:
-                    need(all(active["versions"].get(key) == value
-                             for key, value in self.retained_tiles(config["expected"]).items()),
-                         "committed reviewed tile versions differ")
+                    if host_only:
+                        need(all(active["versions"].get(key) == value
+                                 for key, value in self.retained_tiles(config["expected"]).items()),
+                             "committed reviewed tile versions differ")
+                    else:
+                        self.retained_tiles(active)
                     self.check_reviewed_host_default(active, host_user_data)
                 self.committed = True
                 return {"status": "promoted", "generation": generation}
@@ -394,7 +424,8 @@ class Publisher:
                 raise Refused("interrupted reviewed publication must roll back before terminal replay")
             fence()
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
-            result = self.promote(manifest, config["source_sha"], None, [], fence=fence, host_user_data=host_user_data)
+            result = self.promote(manifest, config["source_sha"], None, [], fence=fence,
+                                  host_user_data=host_user_data, host_only=host_only)
             return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
@@ -687,7 +718,7 @@ class Publisher:
                 current = self.current(template["id"])
                 need(current["VersionNumber"] == before["versions"][key]
                      and current["LaunchTemplateData"].get("ImageId") == before["tile_amis"][template["region"]][template["arch"]],
-                     "retained tile template default differs from generation four")
+                     "retained tile template default differs from the reviewed release")
                 versions[key] = current["VersionNumber"]
         return versions
 
@@ -700,7 +731,7 @@ class Publisher:
              and digest(data.get("UserData", "")) == host_user_data,
              "reviewed host template default differs from the release")
 
-    def promote(self, manifest, source, input_sha, resources, fence=None, *, host_user_data=None):
+    def promote(self, manifest, source, input_sha, resources, fence=None, *, host_user_data=None, host_only=False):
         name = self.env["RELEASE_PARAMETER"]
         before = self.load(name, True)
         need(before.get("version") == 1 and before.get("guard_sha256") == self.env["GUARD_SHA256"]
@@ -712,9 +743,11 @@ class Publisher:
         versions = {}
         prepared_host = None
         if host_user_data is not None:
-            versions = self.retained_tiles(before)
-            templates = [t for t in self.templates if t["kind"] == "host"]
-            host, = templates
+            retained = self.retained_tiles(before)
+            host = next(t for t in self.templates if t["kind"] == "host")
+            if host_only:
+                versions = retained
+                templates = [host]
             prepared_host = self.current(host["id"])
             key = host["region"] + "/" + host["id"]
             data = prepared_host["LaunchTemplateData"]
@@ -726,7 +759,7 @@ class Publisher:
         # Persist the rollback image identities before changing any default.
         self.record()
         for template in templates:
-            current = prepared_host or self.current(template["id"])
+            current = (prepared_host if template["kind"] == "host" else None) or self.current(template["id"])
             old_image = before[template["kind"] + "_amis"][template["region"]][template["arch"]]
             need(current["LaunchTemplateData"].get("ImageId") == old_image, "release pointer and template default disagree")
             entry = {"old_image": old_image, "old_version": current["VersionNumber"]}
@@ -751,7 +784,7 @@ class Publisher:
         else:
             fence()
         if host_user_data is not None:
-            self.retained_tiles(before)
+            self.retained_tiles(before if host_only else after)
             self.check_reviewed_host_default(after, host_user_data)
         try:
             self.save(name, after, True)
@@ -879,6 +912,8 @@ class Publisher:
             return self.run_potato_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-potato-host-fix":
             return self.run_potato_host_fix(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-stride-release":
+            return self.run_stride_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

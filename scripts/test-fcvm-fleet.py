@@ -92,14 +92,15 @@ class NetworkTests(unittest.TestCase):
 class HostTests(unittest.TestCase):
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
-        # the same bootstrap with both reviewed images, an older host and failed IMDS.
-        previous = "ami-0620224a0a4dd168e"
-        candidate = "ami-04c3294f21cb88942"
+        # the same bootstrap with the candidate, current host, rollback and failed IMDS.
+        rollback = "ami-0620224a0a4dd168e"
+        previous = "ami-04c3294f21cb88942"
+        candidate = "ami-09ac99f69700ec306"
         east = block('module "fcvm_fleet_east1"')
         configured = re.search(r'potato_host_amis\s*=\s*\[(.*?)\n  \]', east, re.S)
         self.assertIsNotNone(configured)
         self.assertEqual(re.findall(r'local\.fcvm_ami_bootstrap\["host/x86_64/([0-9a-f]+)"\]\.image',
-                                    configured[1]), ["95217caa", "a4a0bd3e"])
+                                    configured[1]), ["95217caa", "a4a0bd3e", "92a26793"])
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split('%{endif~}', 1)[0]
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
@@ -116,9 +117,10 @@ class HostTests(unittest.TestCase):
             )
             curl.chmod(0o700)
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
-                                                   "|".join(sorted([previous, candidate])))
+                                                   "|".join(sorted([rollback, previous, candidate])))
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
+                (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
                 (candidate, "--phones 2 --potato-players 96"),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
@@ -548,6 +550,17 @@ class StageWallTests(unittest.TestCase):
         self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
         task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
+
+    def test_the_coordinator_takes_forwarded_viewer_addresses_only_behind_required_access(self):
+        # The coordinator reads x-fleet-viewer-ip on a service-token request without verifying the JWT itself; the
+        # tunnel connector's access.required is what does.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('"--access-viewer-address"', cmd)
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
+        tunnel = tunnel[:tunnel.index("\n}\n")]
+        self.assertIn("required  = true", tunnel)
+        self.assertEqual(tunnel.count("hostname ="), 1)
 
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the

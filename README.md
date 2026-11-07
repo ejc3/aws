@@ -572,6 +572,14 @@ It changes only the host template's default image for future launches, leaves
 all three tile templates and the active tile untouched, and retains generation
 four for rollback. It does not wake or retire Fleet instances.
 
+The fixed action `{"action":"activate-reviewed-stride-release"}` advances only
+the exact generation-five receipt to the signed 92a26793 host and tile pair from
+#805. Apply the reviewed AMI catalog tags and host bootstrap first. The publisher
+checks the prepared bootstrap and the existing tile defaults, changes only the
+four template image IDs, and retains generation five for rollback. Both older
+reviewed potato host images keep potato mode. The action does not wake or retire
+running instances.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
@@ -749,6 +757,25 @@ An already cached copy from before this fix needs one visit to
 login. Later visits and expired API connections use the automatic flow. Browser regression coverage is in
 `scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
 with `scripts/test-opencode-setup.py` in CI.
+
+### One-off fcvm boot benchmark
+
+`boot_race_enabled` defaults to false. An ordinary apply leaves the benchmark driver's
+role absent and the cleanup schedule disabled. It provisions no Fargate endpoints and
+leaves ECR DNS unchanged for existing Ohio pboxes.
+
+When the [benchmark driver](https://github.com/ejc3/fcvm/pull/1539) has a reviewed revision
+ready to run, commit the activation setting and apply that revision of this repository.
+Review the plan for the driver role and the isolated Fargate subnet, route table, and
+endpoints. The two ECR interface endpoints cost about $0.02/hour together plus data
+processing. During the campaign, their private DNS also applies to other boxes in the
+Ohio VPC. Run the campaign from its pbox after the plan is applied.
+
+Afterward, confirm no live or stopped instances, ECS tasks, workload AMIs, snapshots,
+or workload images remain. Keep the cleanup schedule enabled until that check passes.
+Restore `boot_race_enabled = false` in Git, apply, and confirm AWS reports that the
+campaign endpoints and driver role are gone. The dormant reaper remains available for
+admin recovery if any campaign resources still need cleanup.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
