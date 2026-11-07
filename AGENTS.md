@@ -1798,10 +1798,11 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, behind Access for the owner and the main-only CI service token: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
-  agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm; it forwards the
-  page's `/live` and `/poster.jpg` to the API host with its own service token, `fcvm-fleet-stage-worker`, admitted by the
-  API application only and uploaded from ejc3/fcvm's `cloudflare-deploy` environment, so a browser needs one Access
-  session). Written into the
+  agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm). Both hosts are one
+  Access application with the eager redirect cookie, so sign-in sets a session on both and the page opens its `/live`
+  socket to the API host directly. The Worker also forwards the page's `/live` and `/poster.jpg` there with its own
+  service token, `fcvm-fleet-stage-worker` (not admitted at `/agent`, uploaded from ejc3/fcvm's `cloudflare-deploy`
+  environment): the page's fallback. Written into the
   fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
