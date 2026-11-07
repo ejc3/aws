@@ -12,7 +12,7 @@
 #   Lambda, cold         a function URL whose handler ends its execution environment after every response
 #   Lambda, warm         the same code without the exit, for reference
 #
-# Everything is named boot-race and lives in us-east-2, in the parallel-box VPC and subnet (ohio-pbox.tf), because the
+# Everything is named boot-race and lives in us-east-2, in the parallel-box VPC (ohio-pbox.tf), because the
 # driver runs on a parallel box and reaches each workload over the VPC. Nothing is public: the workload group admits
 # TCP 8080 (the workload) and 22 (to install the workload on the AMI builder) from the parallel-box group only, and
 # the function URLs take IAM auth only. Every instance and task is started by the driver and terminated or stopped by
@@ -24,7 +24,8 @@
 # the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
 # parallel-box-control (parallel-box-launch.tf). ECS tasks are run and stopped only by boot-race-launcher, a
 # Terraform-owned function whose code fixes the cluster, the task definitions and the Fargate network (the
-# parallel-box subnet, the boot-race group, no public IP); Fargate pulls the image through ECR endpoints in the VPC.
+# dedicated boot-race subnet, the boot-race group, no public IP); Fargate pulls the image through ECR endpoints in the VPC.
+# The driver role, campaign network and reaper schedule are disabled by default; see README.md for activation and retirement.
 
 locals {
   boot_race_region  = "us-east-2"
@@ -746,6 +747,7 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
   flexible_time_window { mode = "OFF" }
 
   schedule_expression = "rate(15 minutes)"
+  state               = var.boot_race_enabled ? "ENABLED" : "DISABLED"
 
   target {
     arn      = aws_lambda_function.boot_race_reaper.arn
@@ -767,12 +769,12 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
 # Private DNS on the interface endpoints applies to the whole VPC, so while they exist new ECR connections from any
 # subnet resolve to them; their group admits HTTPS from the VPC's own range so those keep working.
 #
-# Retirement: after the campaign, set boot_race_enabled = false. That removes the subnet, its route table, the three
-# endpoints and their group, and with them the endpoints' hourly charge. The launcher then refuses the Fargate lane.
+# After confirming campaign cleanup, setting boot_race_enabled back to false removes the subnet, its route table,
+# the three endpoints and their group, and with them the endpoints' hourly charge.
 variable "boot_race_enabled" {
-  description = "Keep the boot-race campaign network (subnet, route table, ECR and S3 endpoints); false retires it"
+  description = "Activate the boot-race campaign: driver access, scoped reaper schedule and billed Fargate network"
   type        = bool
-  default     = true
+  default     = false
 }
 
 resource "aws_subnet" "boot_race" {
@@ -845,6 +847,7 @@ resource "aws_vpc_endpoint" "boot_race_s3" {
 
 # ============================================================ the driver's role
 resource "aws_iam_role" "boot_race_driver" {
+  count                = var.boot_race_enabled ? 1 : 0
   name                 = "boot-race-driver"
   max_session_duration = 3600
   assume_role_policy = jsonencode({
@@ -1125,31 +1128,33 @@ data "aws_iam_policy_document" "boot_race_driver" {
 }
 
 resource "aws_iam_role_policy" "boot_race_driver" {
+  count  = var.boot_race_enabled ? 1 : 0
   name   = "boot-race-driver"
-  role   = aws_iam_role.boot_race_driver.id
+  role   = aws_iam_role.boot_race_driver[0].id
   policy = data.aws_iam_policy_document.boot_race_driver.json
 }
 
 # The dev role may assume the driver role and nothing more.
 resource "aws_iam_role_policy" "dev_server_boot_race" {
-  name = "boot-race-assume-driver"
-  role = aws_iam_role.dev_server.id
+  count = var.boot_race_enabled ? 1 : 0
+  name  = "boot-race-assume-driver"
+  role  = aws_iam_role.dev_server.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Sid      = "AssumeBootRaceDriver"
       Effect   = "Allow"
       Action   = "sts:AssumeRole"
-      Resource = aws_iam_role.boot_race_driver.arn
+      Resource = aws_iam_role.boot_race_driver[0].arn
     }]
   })
 }
 
 output "boot_race" {
-  description = "What the boot-race driver needs: its role, the function URLs, the image repository"
-  value = {
-    driver_role_arn = aws_iam_role.boot_race_driver.arn
+  description = "What the boot-race driver needs when enabled: its role, the function URLs, the image repository"
+  value = var.boot_race_enabled ? {
+    driver_role_arn = aws_iam_role.boot_race_driver[0].arn
     function_urls   = { for k, u in aws_lambda_function_url.boot_race : k => u.function_url }
     repository_url  = aws_ecr_repository.boot_race.repository_url
-  }
+  } : null
 }

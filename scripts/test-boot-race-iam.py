@@ -116,6 +116,19 @@ class SharedRoute(unittest.TestCase):
 
 
 class Retirement(unittest.TestCase):
+    def test_ordinary_apply_leaves_the_driver_and_paid_network_dormant(self):
+        def block(header):
+            content = TF[TF.index(header):]
+            return re.sub(r"\s+", " ", content[:content.index("\n}\n")])
+
+        self.assertIn("default = false", block('variable "boot_race_enabled"'))
+        for header in ('resource "aws_iam_role" "boot_race_driver"',
+                       'resource "aws_iam_role_policy" "boot_race_driver"',
+                       'resource "aws_iam_role_policy" "dev_server_boot_race"'):
+            self.assertIn("count = var.boot_race_enabled ? 1 : 0", block(header), header)
+        self.assertIn('state = var.boot_race_enabled ? "ENABLED" : "DISABLED"',
+                      block('resource "aws_scheduler_schedule" "boot_race_reaper"'))
+
     def test_the_switch_removes_the_subnet_and_every_endpoint(self):
         for header in ('resource "aws_subnet" "boot_race"', 'resource "aws_route_table" "boot_race"',
                        'resource "aws_route_table_association" "boot_race"',

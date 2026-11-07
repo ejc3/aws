@@ -730,6 +730,25 @@ login. Later visits and expired API connections use the automatic flow. Browser 
 `scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
 with `scripts/test-opencode-setup.py` in CI.
 
+### One-off fcvm boot benchmark
+
+`boot_race_enabled` defaults to false. An ordinary apply leaves the benchmark driver's
+role absent and the cleanup schedule disabled. It provisions no Fargate endpoints and
+leaves ECR DNS unchanged for existing Ohio pboxes.
+
+When the [benchmark driver](https://github.com/ejc3/fcvm/pull/1539) has a reviewed revision
+ready to run, commit the activation setting and apply that revision of this repository.
+Review the plan for the driver role and the isolated Fargate subnet, route table, and
+endpoints. The two ECR interface endpoints cost about $0.02/hour together plus data
+processing. During the campaign, their private DNS also applies to other boxes in the
+Ohio VPC. Run the campaign from its pbox after the plan is applied.
+
+Afterward, confirm no live or stopped instances, ECS tasks, workload AMIs, snapshots,
+or workload images remain. Keep the cleanup schedule enabled until that check passes.
+Restore `boot_race_enabled = false` in Git, apply, and confirm AWS reports that the
+campaign endpoints and driver role are gone. The dormant reaper remains available for
+admin recovery if any campaign resources still need cleanup.
+
 ### Temporary EC2 Mac builds: `macpbox`
 
 `macpbox status` discovers the shared build host and `macpbox quote` reads current AWS
