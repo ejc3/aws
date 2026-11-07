@@ -16,7 +16,9 @@
 # driver runs on a parallel box and reaches each workload over the VPC. Nothing is public: the workload group admits
 # TCP 8080 (the workload) and 22 (to install the workload on the AMI builder) from the parallel-box group only, and
 # the function URLs take IAM auth only. Every instance and task is started by the driver and terminated or stopped by
-# it when its samples are taken. The two ECR interface endpoints bill while they exist (about $0.02 an hour together).
+# it when its samples are taken, and boot-race-reaper expires whatever a failed or interrupted campaign leaves (instances
+# after 3 hours, tasks after 1 hour, images and snapshots after a day). The two ECR interface endpoints bill while they
+# exist (about $0.02 an hour together).
 #
 # The driver uses boot-race-driver, which the dev role assumes. Its grants are scoped to these resources by ARN or by
 # the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
@@ -42,10 +44,14 @@ locals {
   boot_race_ecs_arn = "arn:aws:ecs:${local.boot_race_region}:${local.boot_race_account}"
 }
 
-# The ECS-optimized Amazon Linux 2023 arm64 image, for the ECS-on-EC2 container instance.
-data "aws_ssm_parameter" "boot_race_ecs_ami" {
-  provider = aws.ohio
-  name     = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+# The ECS-optimized Amazon Linux 2023 arm64 image, for the ECS-on-EC2 container instance
+# (al2023-ami-ecs-hvm-2023.0.20261031-kernel-6.1-arm64). Pinned, not read from AWS's "recommended" parameter: the
+# launch template and the driver's RunInstances grant both name this one value, so an AWS release cannot move the
+# grant to an image the template does not launch. A new image is a change to this line.
+variable "boot_race_ecs_ami" {
+  description = "ECS-optimized Amazon Linux 2023 arm64 image in us-east-2 for the boot-race container instance"
+  type        = string
+  default     = "ami-0e5deb4438b0e4cdc"
 }
 
 # ============================================================ network
@@ -322,7 +328,7 @@ resource "aws_launch_template" "boot_race_ecs_host" {
   provider      = aws.ohio
   name          = "boot-race-ecs-host"
   description   = "boot-race ECS-on-EC2 lane: one container instance in the boot-race cluster"
-  image_id      = data.aws_ssm_parameter.boot_race_ecs_ami.insecure_value
+  image_id      = var.boot_race_ecs_ami
   instance_type = "c8g.medium"
   key_name      = aws_key_pair.ohio_pbox.key_name
 
@@ -363,11 +369,6 @@ resource "aws_launch_template" "boot_race_ecs_host" {
   }
 
   tags = local.boot_race_tag
-
-  # The recommended image moves with every ECS AMI release; a new one is picked up by a later apply, not forced.
-  lifecycle {
-    ignore_changes = [image_id]
-  }
 }
 
 # ============================================================ Lambda lanes
@@ -572,6 +573,189 @@ resource "aws_lambda_function" "boot_race_launcher" {
   depends_on = [aws_iam_role_policy.boot_race_launcher]
 }
 
+# ============================================================ the reaper
+# The server-side expiry: every 15 minutes, terminate any Project=boot-race instance whose current run began more than
+# 3 hours ago, stop any boot-race task older than 1 hour, and remove Project=boot-race images and snapshots older than
+# a day. The campaign cleans up after itself; this bounds what a failed or interrupted one leaves billing.
+data "archive_file" "boot_race_reaper" {
+  type        = "zip"
+  source_file = "${path.module}/boot-race/reaper.py"
+  output_path = "${path.module}/.terraform/boot-race-reaper.zip"
+}
+
+resource "aws_cloudwatch_log_group" "boot_race_reaper" {
+  provider          = aws.ohio
+  name              = "/aws/lambda/boot-race-reaper"
+  retention_in_days = 14
+  tags              = local.boot_race_tag
+}
+
+resource "aws_iam_role" "boot_race_reaper" {
+  name        = "boot-race-reaper"
+  description = "boot-race-reaper Lambda: expire boot-race instances, tasks, images and snapshots"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+data "aws_iam_policy_document" "boot_race_reaper" {
+  statement {
+    sid       = "Describe"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSnapshots"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "TerminateTaggedInstances"
+    effect    = "Allow"
+    actions   = ["ec2:TerminateInstances"]
+    resources = ["${local.boot_race_ec2_arn}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid     = "RemoveTaggedImages"
+    effect  = "Allow"
+    actions = ["ec2:DeregisterImage", "ec2:DeleteSnapshot"]
+    resources = [
+      "arn:aws:ec2:${local.boot_race_region}::image/*",
+      "arn:aws:ec2:${local.boot_race_region}::snapshot/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = ["boot-race"]
+    }
+  }
+
+  statement {
+    sid       = "ListBootRaceTasks"
+    effect    = "Allow"
+    actions   = ["ecs:ListTasks"]
+    resources = ["${local.boot_race_ecs_arn}:container-instance/boot-race/*"]
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.boot_race.arn]
+    }
+  }
+
+  statement {
+    sid       = "StopOldBootRaceTasks"
+    effect    = "Allow"
+    actions   = ["ecs:DescribeTasks", "ecs:StopTask"]
+    resources = ["${local.boot_race_ecs_arn}:task/boot-race/*"]
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.boot_race.arn]
+    }
+  }
+
+  statement {
+    sid       = "OwnLogGroup"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.boot_race_reaper.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "boot_race_reaper" {
+  name   = "expire-boot-race-compute"
+  role   = aws_iam_role.boot_race_reaper.id
+  policy = data.aws_iam_policy_document.boot_race_reaper.json
+}
+
+resource "aws_lambda_function" "boot_race_reaper" {
+  provider         = aws.ohio
+  function_name    = "boot-race-reaper"
+  role             = aws_iam_role.boot_race_reaper.arn
+  handler          = "reaper.lambda_handler"
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  timeout          = 120
+  memory_size      = 128
+  filename         = data.archive_file.boot_race_reaper.output_path
+  source_code_hash = data.archive_file.boot_race_reaper.output_base64sha256
+
+  logging_config {
+    log_format = "Text"
+    log_group  = aws_cloudwatch_log_group.boot_race_reaper.name
+  }
+
+  environment {
+    variables = {
+      CLUSTER          = aws_ecs_cluster.boot_race.name
+      INSTANCE_LIMIT_S = "10800"
+      TASK_LIMIT_S     = "3600"
+      IMAGE_LIMIT_S    = "86400"
+    }
+  }
+
+  tags = local.boot_race_tag
+
+  depends_on = [aws_iam_role_policy.boot_race_reaper]
+}
+
+resource "aws_iam_role" "boot_race_reaper_scheduler" {
+  name = "boot-race-reaper-scheduler"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = { StringEquals = { "aws:SourceAccount" = local.boot_race_account } }
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+resource "aws_iam_role_policy" "boot_race_reaper_scheduler" {
+  name = "invoke-boot-race-reaper"
+  role = aws_iam_role.boot_race_reaper_scheduler.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.boot_race_reaper.arn
+    }]
+  })
+}
+
+resource "aws_scheduler_schedule" "boot_race_reaper" {
+  provider   = aws.ohio
+  name       = "boot-race-reaper"
+  group_name = "default"
+
+  flexible_time_window { mode = "OFF" }
+
+  schedule_expression = "rate(15 minutes)"
+
+  target {
+    arn      = aws_lambda_function.boot_race_reaper.arn
+    role_arn = aws_iam_role.boot_race_reaper_scheduler.arn
+
+    # The next run is 15 minutes away; a retry of a stale one would only overlap it.
+    retry_policy {
+      maximum_retry_attempts       = 0
+      maximum_event_age_in_seconds = 300
+    }
+  }
+}
+
 # ============================================================ private ECR for Fargate
 # A Fargate task with no public IP reaches ECR through these: the two ECR interface endpoints in the parallel-box
 # subnet and an S3 gateway endpoint for the image layers. Private DNS points every client in the VPC at them, so the
@@ -681,7 +865,7 @@ data "aws_iam_policy_document" "boot_race_driver" {
       aws_launch_template.boot_race_ec2.arn,
       aws_launch_template.boot_race_ecs_host.arn,
       "arn:aws:ec2:${local.boot_race_region}::image/${local.boot_race_base_ami}",
-      "arn:aws:ec2:${local.boot_race_region}::image/${data.aws_ssm_parameter.boot_race_ecs_ami.insecure_value}",
+      "arn:aws:ec2:${local.boot_race_region}::image/${var.boot_race_ecs_ami}",
     ]
     condition {
       test     = "ArnEquals"
