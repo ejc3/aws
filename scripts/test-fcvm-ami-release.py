@@ -2,6 +2,7 @@
 """Offline contracts for release ownership, stale saved plans and image admission."""
 from pathlib import Path
 import re
+import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +124,96 @@ class ReleaseContracts(unittest.TestCase):
                                  + r'"\s*=\s*\{\s*image\s*=\s*"' + image
                                  + r'",\s*kind\s*=\s*"' + kind + r'"\s*\}')
 
+    def test_published_images_are_copied_out_of_the_staging_region_only_as_a_record(self):
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        regions = re.search(r'fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]', self.release)
+        self.assertIsNotNone(regions)
+        self.assertEqual(re.findall(r'"([a-z0-9-]+)"', regions.group(1)), ["us-west-2"])
+        record = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_copies")
+        self.assertIn('"${aws_ssm_parameter.fcvm_ami_release.name}-copies"', record)
+        self.assertRegex(record, r"ignore_changes\s*=\s*\[value\]")
+        # The copies never enter the release's image maps, which make launch templates.
+        pointer = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_release")
+        self.assertNotIn("copy", pointer)
+        function = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        self.assertIn('COPY_REGIONS = join(",", local.fcvm_ami_copy_regions)', function)
+        policy = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        self.assertIn("aws_ssm_parameter.fcvm_ami_copies.arn", policy)
+        copy = policy[policy.index('"CopyPublishedImagesOnly"'):policy.index('"CopyImageTagsOnCreate"')]
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_ami_release_regions', copy)
+        tags = policy[policy.index('"CopyImageTagsOnCreate"'):]
+        tags = tags[:tags.index("} },")]
+        self.assertIn('"ec2:CreateAction" = "CopyImage"', tags)
+    def test_the_factory_builds_in_us_west_2_and_releases_in_us_east_1(self):
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertRegex(pipeline, r'fcvm_ami_region\s*=\s*"us-east-1"')
+        self.assertRegex(pipeline, r'fcvm_ami_build_region\s*=\s*"us-west-2"')
+        for kind, name in (('data "aws_ami"', "fcvm_ami_canonical"), ('resource "aws_security_group"', "fcvm_ami_builder"),
+                           ('resource "aws_ssm_document"', "fcvm_ami_build"),
+                           ('data "aws_ec2_instance_type_offerings"', "fcvm_ami_builder")):
+            with self.subTest(resource=name):
+                self.assertIn("aws.fcvm_fleet_west2", block(pipeline, kind, name))
+        dispatch = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_dispatch")
+        self.assertRegex(dispatch, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_build_region")
+        self.assertRegex(dispatch, r"SUBNET_ID\s*=\s*local\.fcvm_ami_builder_subnet")
+        self.assertRegex(dispatch, r"RELEASE_REGION\s*=\s*local\.fcvm_ami_region\b")
+        self.assertIn("module.fcvm_fleet_west2.subnet_ids_by_az[local.fcvm_ami_build_az]", pipeline)
+        publish = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        self.assertRegex(publish, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_region\b")
+        self.assertRegex(publish, r"BUILD_REGION\s*=\s*local\.fcvm_ami_build_region")
+        project = block(pipeline, 'resource "aws_codebuild_project"', "fcvm_ami")
+        self.assertRegex(project, r'"FLEET_AMI_REGION"\s*value\s*=\s*local\.fcvm_ami_build_region')
+        # The TLS secrets stay in us-east-1, where they are.
+        self.assertRegex(project, r'"FLEET_AMI_SECRET_REGION"\s*value\s*=\s*local\.fcvm_ami_region\b')
+        self.assertIn("aws.fcvm_fleet_east1", block(pipeline, 'resource "aws_secretsmanager_secret"', "fcvm_ami_tls"))
+        # Retirement acts on the staging fleet's own hosts, in the release region.
+        fleet = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        self.assertIn('"ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:', fleet)
+    def test_publisher_environment_stays_far_below_lambdas_limit(self):
+        # Lambda refuses an environment over 4 KB (its JSON form). The release configuration grew
+        # it to an estimated 4,020 bytes, one variable away from a failed apply; it now ships in
+        # the publisher's bundle. Every remaining value is bounded here, and the worst case must
+        # stay within half the limit. An expression this table does not know fails the test.
+        sources = "\n".join(path.read_text() for path in ROOT.glob("*.tf"))
+        def literal(name):
+            found = re.findall(r"^\s*" + re.escape(name) + r'\s*=\s*"([^"$]*)"\s*$', sources, re.M)
+            self.assertEqual(len(found), 1, name)
+            return len(found[0])
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        function = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        variables = function[function.index("variables = {"):]
+        pairs = re.findall(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.+?)\s*$", variables, re.M)
+        copy_regions = re.search(r"fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]", self.release).group(1).count('"') // 2
+        bounds = [
+            (r'"[^"$]*"', lambda v: len(v) - 2),
+            (r"local\.fcvm_fleet_account_id", lambda v: 12),
+            (r"local\.fcvm_ami_guard_sha", lambda v: 64),
+            (r"local\.(fcvm_[a-z0-9_]+)", lambda v: literal(v.split(".", 1)[1])),
+            (r"var\.aws_region", lambda v: 14),
+            (r"data\.aws_caller_identity\.current\.account_id", lambda v: 12),
+            (r"aws_[a-z0-9_]+\.[a-z0-9_]+\.arn", lambda v: 256),
+            (r"aws_s3_bucket\.[a-z0-9_]+\.id", lambda v: 63),
+            (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 128),
+            (r"module\.[a-z0-9_]+\.host_user_data_sha256", lambda v: 64),
+            (r'join\(",", local\.fcvm_ami_copy_regions\)', lambda v: 15 * copy_regions),
+        ]
+        total = 2
+        for key, value in pairs:
+            with self.subTest(variable=key):
+                self.assertNotIn("jsonencode", value, "bulky configuration belongs in the bundle")
+                for pattern, bound in bounds:
+                    if re.fullmatch(pattern, value):
+                        total += len(key) + 6 + bound(value)
+                        break
+                else:
+                    self.fail(f"no size bound for {key} = {value}")
+        self.assertGreater(len(pairs), 15)
+        print(f"worst-case publisher environment: {total} bytes", file=sys.stderr)
+        self.assertLessEqual(total, 2048, f"worst-case publisher environment {total} bytes")
+        bundle = block(pipeline, 'data "archive_file"', "fcvm_ami_publish")
+        for key in ("TEMPLATES_JSON", "SEED_RELEASE_JSON", "PHONE_AMI_JSON", "RENDERER_AMI_JSON", "POTATO_AMI_JSON", "HOST_FIX_AMI_JSON"):
+            self.assertIn(key + " ", bundle)
+        self.assertIn('filename = "publisher-config.json"', bundle)
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

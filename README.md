@@ -513,6 +513,30 @@ Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
 
+The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
+builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
+pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatcher redrives
+publication every five minutes within its 24-hour lease), and releases the copies there. After
+each publication it records the release's ids in every region in `/fcvm-fleet/ami-release-copies`
+(us-east-1): the us-east-1 copies, and in us-west-2 the factory's originals, or for an older
+pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
+`fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
+only, so us-west-2 gets no launch templates or fleet hosts. A copy failure after a commit
+leaves the release live; the next invocation completes it. To record and copy the active
+release on demand (after the first apply, for example). After each publication and each
+on-demand run the publisher also retires images nothing needs, at most 16 per region per run
+(`retain()` in `publish.py`): its own copies, factory candidates outside the build region, and
+images built by hand that were never validated and are 14 days old. It keeps the active and the
+previous release in every region, every launch template's default image and every image an
+instance still uses; validated images (the bootstrap catalog's) are never retired, and in the
+build region the dispatcher retains factory candidates. The publisher's release configuration
+(templates and reviewed pairs) ships in its code bundle as `publisher-config.json`, not in its
+environment. Apply a change of
+`fcvm_ami_build_region` only while no factory build is active (`/fcvm-fleet/ami-pipeline/control`
+in us-west-1 has `active` null): a build's journal records instance ids without a region, so the
+dispatcher cannot clean up builders left in the old region:
+`aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
+
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
 the producer, verify that the four defaults select the already validated guarded
 images, then merge/deploy fcvm's `$Default` consumer and main-only request workflow.
