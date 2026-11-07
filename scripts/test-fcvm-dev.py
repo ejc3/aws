@@ -73,6 +73,20 @@ class AccessTests(unittest.TestCase):
         self.assertIn("fcvm_fleet_stage_worker.client_id", sec)
         self.assertIn("fcvm_fleet_stage_worker.client_secret", sec)
 
+    def test_one_application_covers_the_page_and_the_coordinator_with_the_eager_cookie(self):
+        # The page's /live WebSocket to the coordinator host needs a session there from sign-in (ejc3/fcvm#1649).
+        api = block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"')
+        self.assertIn("eager_redirect_cookie_setting = true", api)
+        self.assertIn("{ type = \"public\", uri = local.fcvm_dev_api_stage_hostname },", api)
+        self.assertIn("{ type = \"public\", uri = local.fcvm_dev_site_stage_host },", api)
+        # The first destination is the application's domain.
+        self.assertLess(api.index("local.fcvm_dev_api_stage_hostname },"), api.index("local.fcvm_dev_site_stage_host },"))
+        # Step 1 of 2: the page host keeps its own application until the merged one covers it.
+        self.assertIn("domain           = local.fcvm_dev_site_stage_host",
+                      block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"'))
+        # The agents keep their own path-specific application.
+        self.assertNotIn("eager_redirect_cookie_setting", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"'))
+
     def test_the_connector_requires_an_access_token_on_every_path(self):
         cfg = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"')
         self.assertEqual(cfg.count("hostname ="), 1)

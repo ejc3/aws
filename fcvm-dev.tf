@@ -92,12 +92,24 @@ resource "cloudflare_zero_trust_access_policy" "fcvm_dev_stage_owner" {
   include          = [{ email = { email = local.browser_manager_owner } }]
 }
 
+# One application for the page host and the coordinator host (ejc3/fcvm fleet/web): an Access session cookie belongs to one
+# hostname, and the page's /live WebSocket to the coordinator host cannot follow Access's login redirect. With both hosts as
+# destinations and the eager redirect cookie, sign-in sets the cookie on both, so the page connects to the coordinator
+# directly; the Worker proxy (its service token, below) is the fallback. /agent keeps its own application.
+#
+# Step 1 of 2: stage.fcvm.dev is also still covered by fcvm_dev_site_stage, so the page host is never without Access while
+# this applies. Step 2 (the next PR) removes that application.
 resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
   account_id       = var.cloudflare_account_id
   name             = "fcvm fleet API staging"
   domain           = local.fcvm_dev_api_stage_hostname
   type             = "self_hosted"
   session_duration = "12h"
+  destinations = [
+    { type = "public", uri = local.fcvm_dev_api_stage_hostname },
+    { type = "public", uri = local.fcvm_dev_site_stage_host },
+  ]
+  eager_redirect_cookie_setting = true
   allowed_idps = concat(
     cloudflare_zero_trust_access_identity_provider.github[*].id,
     cloudflare_zero_trust_access_identity_provider.google[*].id,
