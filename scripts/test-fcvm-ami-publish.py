@@ -166,7 +166,8 @@ class EC2:
         """A pending image carrying the source's tags; `available()` completes it."""
         assert SourceRegion != self.region and Encrypted is True and CopyImageTags is True
         assert TagSpecifications == [{"ResourceType": "snapshot", "Tags": [{"Key": "FleetPublisherCopy", "Value": "true"}]}]
-        assert ClientToken == MODULE.digest(SourceImageId + "/" + self.region)
+        suffix = Name[-1] if Name.endswith(("-copy-2", "-copy-3")) else ""
+        assert ClientToken == MODULE.digest(SourceImageId + "/" + self.region + ("/" + suffix if suffix else ""))
         if self.fail_copy:
             raise RuntimeError("copy unavailable")
         assert all(item.get("Name") != Name for item in self.images.values()), "a name is never copied twice"
@@ -1415,13 +1416,40 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(len(self.west.copies), 2)
         host = self.west.images[self.copies()[self.new["host"]]]
         host["State"] = "failed"
-        with self.assertRaises(MODULE.Refused):
+        with self.assertRaisesRegex(MODULE.Refused, "regional AMI copies are still pending"):
             self.publisher().run(event)
         self.assertEqual(self.fleet_ssm.values["/release-copies"], previous)
-        host["State"] = "available"
+        retry = self.copies()[self.new["host"]]
+        self.assertEqual(self.west.images[retry]["Name"], host["Name"] + "-copy-2")
+        self.assertEqual(self.west.deregistered, [])
+        with self.assertRaisesRegex(MODULE.Refused, "regional AMI copies are still pending"):
+            self.publisher().run(event)
         self.west.available()
         self.assertEqual(self.publisher().run(event), {"status": "replicated", "generation": 6})
+        self.assertEqual(len(self.west.copies), 3)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"], retry)
+
+    def test_foreign_failed_copies_are_not_replaced_and_own_retries_are_bounded(self):
+        self.active_new_pair()
+        self.west.copy_state = "failed"
+        event = {"action": "replicate-active-release"}
+        with self.assertRaisesRegex(MODULE.Refused, "still pending"):
+            self.publisher().run(event)
+        image = self.west.images[self.copies()[self.new["host"]]]
+        source = image["SourceImageId"]
+        image["SourceImageId"] = "ami-" + "f" * 17
+        with self.assertRaisesRegex(MODULE.Refused, "lineage"):
+            self.publisher().run(event)
         self.assertEqual(len(self.west.copies), 2)
+        image["SourceImageId"] = source
+        for _ in range(2):
+            with self.assertRaisesRegex(MODULE.Refused, "still pending"):
+                self.publisher().run(event)
+        with self.assertRaisesRegex(MODULE.Refused, "attempts exhausted"):
+            self.publisher().run(event)
+        self.assertEqual(len(self.west.copies), 6)
+        self.assertEqual(self.west.deregistered, [])
+        self.assertNotIn("/release-copies", self.fleet_ssm.values)
 
     def test_unvalidated_public_or_misnamed_image_is_never_copied(self):
         for variant in ("FleetImageValidated", "Purpose", "Public", "OwnerId", "Name"):
@@ -1522,6 +1550,25 @@ class PublisherTests(unittest.TestCase):
                 with self.assertRaises(MODULE.Refused) as refused: self.publisher().run(self.event)
                 self.assertIn("lineage", str(refused.exception))
                 self.assertEqual((self.ec2.created, self.fleet_ssm.values["/release"]["generation"]), ([], 0))
+
+    def test_retried_east_release_copy_keeps_the_canonical_west_original(self):
+        self.build_in_west()
+        with self.assertRaisesRegex(MODULE.Refused, "still pending"):
+            self.publisher().run(self.event)
+        first = dict(self.ec2.copies)[self.new["host"]]
+        self.ec2.images[first]["State"] = "failed"
+        with self.assertRaisesRegex(MODULE.Refused, "still pending"):
+            self.publisher().run(self.event)
+        retry = dict(self.ec2.copies)[self.new["host"]]
+        self.assertEqual(self.ec2.images[retry]["Name"], self.west.images[self.new["host"]]["Name"] + "-copy-2")
+        self.ec2.available()
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        record = self.fleet_ssm.values["/release-copies"]["images"]
+        self.assertEqual(record["us-east-1"]["host"], retry)
+        self.assertEqual(record["us-west-2"], self.new)
+        self.assertEqual((self.west.copies, self.ec2.deregistered), ([], []))
+        self.publisher().run({"action": "replicate-active-release"})
+        self.assertEqual(len(self.ec2.copies), 3)
 
     def test_builders_are_proven_terminated_in_the_build_region(self):
         # A builder still running in us-west-2 contradicts its recorded termination.

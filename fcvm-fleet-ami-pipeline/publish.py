@@ -23,6 +23,8 @@ IMAGE = re.compile(r"ami-[0-9a-f]{17}\Z")
 COPY_REGION = re.compile(r"us-(east|west)-[12]\Z")
 # What release_copies() and replicate() write as a copy's description.
 COPY_DESCRIPTION = re.compile(r"copy of (ami-[0-9a-f]{17}) from (us-(?:east|west)-[12])\Z")
+COPY_RETRY_SUFFIX = re.compile(r"-copy-[23]\Z")
+COPY_ATTEMPTS = 3
 FACTORY_NAME = re.compile(r"fcvm-factory-[0-9a-f]{24}-(host|tile)\Z")
 HANDMADE_NAME = re.compile(r"fcvm-fleet-(host|tile)-x86_64-[A-Za-z0-9._-]{1,100}\Z")
 HANDMADE_DAYS = 14
@@ -62,6 +64,10 @@ def without_image(value):
 
 def copy_snapshot_tags():
     return [{"ResourceType": "snapshot", "Tags": [{"Key": COPY_SNAPSHOT_TAG, "Value": "true"}]}]
+
+
+def canonical_image_name(name):
+    return COPY_RETRY_SUFFIX.sub("", name)
 
 
 def copy_sdk_status():
@@ -615,6 +621,67 @@ class Publisher:
             resources.extend([image_id, *snapshots])
         return {self.build_region: resources}
 
+    def regional_copy(self, target, region, original, source_region, base, expected, *, reverse=None, factory=False):
+        """Retry proven failed copies under deterministic names without deleting their receipts."""
+        names = [base] + [f"{base}-copy-{attempt}" for attempt in range(2, COPY_ATTEMPTS + 1)]
+        found = target.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
+            Filters=[{"Name": "name", "Values": names}])["Images"]
+        by_name = {image["Name"]: image for image in found}
+        need(len(by_name) == len(found) and by_name.keys() <= set(names), "ambiguous regional copy names")
+        description = "copy of " + original + " from " + source_region
+
+        def status(image, name):
+            if image.get("State") == "pending":
+                return "pending"
+            image_id = image.get("ImageId", "")
+            tags = {tag["Key"]: tag["Value"] for tag in image.get("Tags", [])}
+            forward = (image.get("SourceImageId"), image.get("SourceImageRegion")) == (original, source_region)
+            state = image.get("State")
+            need(image.get("Name") == name and IMAGE.fullmatch(image_id)
+                 and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
+                 and all(tags.get(key) == value for key, value in expected.items())
+                 and (forward or (reverse == image_id and state == "available"))
+                 and (not (factory or state == "failed") or image.get("Description") == description),
+                 "a regional copy is outside its private image lineage")
+            if state == "available":
+                need(image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs",
+                     "a regional copy is not an x86_64 EBS image")
+            else:
+                need(state == "failed", "a regional copy is not pending, available or failed")
+            return state
+
+        # A release copied in from the target region can use its verified original, which
+        # keeps its canonical name even when the released image needed a retry suffix.
+        if reverse is not None and by_name.get(base, {}).get("ImageId") == reverse:
+            return reverse if status(by_name[base], base) == "available" else None
+        latest = max((names.index(name) for name in by_name), default=-1)
+        if latest >= 0:
+            image = by_name[names[latest]]
+            state = status(image, names[latest])
+            if state == "available":
+                return image["ImageId"]
+            if state == "pending":
+                return None
+        next_attempt = latest + 1
+        need(next_attempt < COPY_ATTEMPTS, "regional copy attempts exhausted; inspect the failed AMIs")
+        name = names[next_attempt]
+        token = original + "/" + region + ("/" + str(next_attempt + 1) if next_attempt else "")
+        copied = target.copy_image(SourceImageId=original, SourceRegion=source_region, Name=name,
+            Description=description, Encrypted=True, CopyImageTags=True, TagSpecifications=copy_snapshot_tags(),
+            ClientToken=digest(token))["ImageId"]
+        need(IMAGE.fullmatch(copied), "image copy returned no image identity")
+        try:
+            rows = target.describe_images(ImageIds=[copied])["Images"]
+        except Exception as error:
+            if getattr(error, "response", {}).get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
+                raise
+            return None
+        need(len(rows) <= 1, "copy image returned more than one identity")
+        if not rows:
+            return None
+        need(rows[0].get("ImageId") == copied, "copy image returned a different identity")
+        return copied if status(rows[0], name) == "available" else None
+
     def release_copies(self, manifest, source, input_sha):
         """The candidate pair in the release region: the candidates themselves when the factory
         builds there, else their copies, started here and found again by name on a replay.
@@ -633,33 +700,12 @@ class Publisher:
             original = manifest["images"][kind]["image_id"]
             rows = source_ec2.describe_images(ImageIds=[original])["Images"]
             need(len(rows) == 1 and NAME[kind].fullmatch(rows[0].get("Name", "")), "candidate image has no factory name")
-            name, description = rows[0]["Name"], "copy of " + original + " from " + self.build_region
-            found = target.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
-                Filters=[{"Name": "name", "Values": [name]}])["Images"]
-            need(len(found) <= 1, "more than one image holds a candidate name")
-            if not found:
-                copied = target.copy_image(SourceImageId=original, SourceRegion=self.build_region, Name=name,
-                    Description=description, Encrypted=True, CopyImageTags=True,
-                    TagSpecifications=copy_snapshot_tags(),
-                    ClientToken=digest(original + "/" + compute))["ImageId"]
-                need(IMAGE.fullmatch(copied), "image copy returned no image identity")
-                pending.append(kind)
-                ids[kind] = copied
-                continue
-            image = found[0]
-            tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
-            need(IMAGE.fullmatch(image.get("ImageId", "")) and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
-                 and image.get("Public") is False and image.get("Description") == description
-                 and image.get("SourceImageId") == original and image.get("SourceImageRegion") == self.build_region
-                 and image.get("State") in {"pending", "available"}
-                 and all(tags.get(key) == value for key, value in {**expected, "FleetImageKind": kind}.items()),
-                 "a release-region copy is outside the candidate's private factory lineage")
-            if image["State"] != "available":
+            copied = self.regional_copy(target, compute, original, self.build_region, rows[0]["Name"],
+                                        {**expected, "FleetImageKind": kind}, factory=True)
+            if copied is None:
                 pending.append(kind)
             else:
-                need(image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs",
-                     "a release-region copy is not an x86_64 EBS image")
-            ids[kind] = image["ImageId"]
+                ids[kind] = copied
         need(not pending, "release-region copies are still pending: " + ",".join(pending))
         return ids, list(ids.values())
 
@@ -1007,7 +1053,7 @@ class Publisher:
         tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
         need(image.get("ImageId") == image_id and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
              and image.get("Public") is False and image.get("State") == "available" and image.get("Architecture") == "x86_64"
-             and image.get("RootDeviceType") == "ebs" and NAME[kind].fullmatch(image.get("Name", ""))
+             and image.get("RootDeviceType") == "ebs" and NAME[kind].fullmatch(canonical_image_name(image.get("Name", "")))
              and all(tags.get(key) == value for key, value in {
                  "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
                  "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
@@ -1031,43 +1077,20 @@ class Publisher:
              "invalid published image identities")
         source = self.client("ec2", True)
         published = {kind: self.validated_image(source, image_id, kind) for kind, image_id in sources.items()}
-        names = {kind: image["Name"] for kind, image in published.items()}
         images, pending = {compute: dict(sources)}, []
         for region in self.copy_regions:
             ec2 = self.client("ec2", True, region)
             images[region] = {}
             for kind in ("host", "tile"):
-                found = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
-                    Filters=[{"Name": "name", "Values": [names[kind]]}])["Images"]
-                need(len(found) <= 1, "more than one image holds a published name")
-                if not found:
-                    copied = ec2.copy_image(SourceImageId=sources[kind], SourceRegion=compute, Name=names[kind],
-                        Description="copy of " + sources[kind] + " from " + compute, Encrypted=True,
-                        CopyImageTags=True, TagSpecifications=copy_snapshot_tags(),
-                        ClientToken=digest(sources[kind] + "/" + region))["ImageId"]
-                    need(IMAGE.fullmatch(copied), "image copy returned no image identity")
-                    try:
-                        found = ec2.describe_images(ImageIds=[copied])["Images"]
-                    except Exception as error:
-                        if getattr(error, "response", {}).get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
-                            raise
-                    need(len(found) <= 1, "copy image returned more than one identity")
-                if not found or found[0].get("State") == "pending":
+                source_image = published[kind]
+                reverse = source_image.get("SourceImageId") if source_image.get("SourceImageRegion") == region else None
+                copied = self.regional_copy(ec2, region, sources[kind], compute, canonical_image_name(source_image["Name"]), {
+                    "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                    "GuardHelperSHA256": self.env["GUARD_SHA256"]}, reverse=reverse)
+                if copied is None:
                     pending.append(region + "/" + kind)
-                    continue
-                image = found[0]
-                tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
-                # The regional copy, or the original when the factory built in this region.
-                origin = (image.get("SourceImageId"), image.get("SourceImageRegion")) == (sources[kind], compute) or (
-                    (published[kind].get("SourceImageId"), published[kind].get("SourceImageRegion")) == (image.get("ImageId"), region))
-                need(origin and image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
-                     and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
-                     and image.get("State") == "available" and image.get("Architecture") == "x86_64"
-                     and image.get("RootDeviceType") == "ebs" and all(tags.get(key) == value for key, value in {
-                         "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
-                         "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
-                    "an image copy is outside its available private validated scope")
-                images[region][kind] = image["ImageId"]
+                else:
+                    images[region][kind] = copied
         need(not pending, "regional AMI copies are still pending: " + ",".join(pending))
         try:
             current = self.load(self.copies_parameter, True)
@@ -1121,7 +1144,7 @@ class Publisher:
         if described:
             # A copy younger than a publication lease may belong to a publication still in progress.
             return ((image.get("SourceImageId"), image.get("SourceImageRegion")) == described.groups()
-                    and any(NAME[kind].fullmatch(name) for kind in NAME) and age >= RETAIN_MIN_DAYS * 86400)
+                    and any(NAME[kind].fullmatch(canonical_image_name(name)) for kind in NAME) and age >= RETAIN_MIN_DAYS * 86400)
         if FACTORY_NAME.fullmatch(name):
             return (region != self.build_region and tags.get("PipelineSanitized") == "true"
                     and tags.get("PipelineBuildId", "").startswith(self.env["PROJECT_NAME"] + ":")

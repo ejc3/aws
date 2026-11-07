@@ -522,7 +522,9 @@ each publication it records the release's ids in every region in `/fcvm-fleet/am
 pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
 `fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
 only, so us-west-2 gets no launch templates or fleet hosts. Pending or failed copies never
-replace the last available copy record. After each publication and each
+replace the last available copy record. A confirmed failed copy gets up to two retry names;
+the publisher leaves the failed AMIs in place so interrupted retries can resume safely.
+After each publication and each
 on-demand run the publisher also retires images nothing needs, at most 16 per region per run
 (`retain()` in `publish.py`): its own copies, factory candidates outside the build region, and
 images built by hand that were never validated and are 14 days old. It keeps the active and the
