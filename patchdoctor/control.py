@@ -12,6 +12,7 @@ from urllib.parse import quote
 import triage
 
 MODEL = 'us.anthropic.claude-opus-5-5'
+DAILY_START_LIMIT = 4
 CVE = re.compile(r'CVE-[0-9]{4}-[0-9]{4,10}\Z')
 IID = re.compile(r'i-[0-9a-f]{8}(?:[0-9a-f]{9})?\Z')
 DIGEST = re.compile(r'[0-9a-f]{64}\Z')
@@ -238,8 +239,11 @@ class Doctor:
         revision = digest(encoded(facts))
         if (case.get('triage_revision') == revision and case.get('triage')
                 and (case['triage'].get('decision') != 'defer' or self.now() < case.get('recheck_at', 0))):
+            if case.pop('manual_recheck_pending', False):
+                self.save(case)
             return case['triage']['decision'], False
         verdict = triage.classify(facts)
+        case.pop('manual_recheck_pending', None)
         case.update(triage=verdict, triage_revision=revision, triage_checked_at=int(self.now()))
         if verdict['decision'] == 'defer':
             # The scheduler observes this before one hour, not after it.
@@ -338,7 +342,7 @@ class Doctor:
                 if case.get('recheck_effects', {}).get(effect_id) is True:
                     continue
                 require(case['status'] in {'pending', 'deferred', 'blocked-no-current-critical-target'})
-                case.update(status='pending', recheck_at=0)
+                case.update(status='pending', recheck_at=0, manual_recheck_pending=True)
                 case.setdefault('recheck_effects', {})[effect_id] = True
                 case.pop('triage', None)
                 self.save(case)
@@ -544,6 +548,28 @@ class Doctor:
         # No found build is NOT permission to replay an uncertain StartBuild.
         return bool(matches)
 
+    def daily_budget(self):
+        today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
+        key = 'daily#' + today
+        return today, key, self.store.get(key) or {'starts': 0}
+
+    def notify_daily_budget(self, today, key, daily, retry_after):
+        if daily.get('budget_notice_claimed'):
+            return
+        # Reserve the day's notice before the non-idempotent SNS call. A lost
+        # reply may already have delivered it, so log the error without replay.
+        daily['budget_notice_claimed'] = True
+        self.store.put(key, daily)
+        try:
+            self.api('sns').publish(TopicArn=self.env['SNS_TOPIC_ARN'],
+                Subject='PatchDoctor daily-budget-exhausted', Message=encoded({
+                    'kind': 'daily-budget-exhausted', 'day_utc': today,
+                    'reserved_starts': daily['starts'], 'start_limit': DAILY_START_LIMIT,
+                    'retry_after': retry_after}))
+        except Exception as error:
+            print(encoded({'kind': 'daily-budget-notice-error', 'day_utc': today,
+                'error_type': type(error).__name__}))
+
     def start(self, case):
         require(case['attempts'] < 2 and case['reserved_usd'] + 25 <= 50)
         active = self.store.get('active-case') or {'case_id': None}
@@ -551,20 +577,19 @@ class Doctor:
             return
         active['case_id'] = case['case_id']
         self.store.put('active-case', active)
-        today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
-        daily = self.store.get('daily#' + today) or {'starts': 0}
-        if daily['starts'] >= 4:
+        today, daily_key, daily = self.daily_budget()
+        if daily['starts'] >= DAILY_START_LIMIT:
             case['status'] = 'daily-budget-wait'
             case['retry_after'] = int(datetime.datetime.combine(
                 datetime.date.fromisoformat(today) + datetime.timedelta(days=1),
                 datetime.time(), datetime.timezone.utc).timestamp())
             self.save(case)
             self.release('active-case', case['case_id'])
-            self.notify('daily-budget-exhausted', case)
+            self.notify_daily_budget(today, daily_key, daily, case['retry_after'])
             return
         # Reserve before any StartBuild. A crash consumes the reservation conservatively.
         daily['starts'] += 1
-        self.store.put('daily#' + today, daily)
+        self.store.put(daily_key, daily)
         case['attempts'] += 1
         case['reserved_usd'] += 25
         case.update(status='starting', started_at=int(self.now()), deadline_unix=int(self.now()) + 3600,
@@ -680,6 +705,9 @@ class Doctor:
         if busy or (self.store.get('host-operation') or {}).get('case_id'):
             return
         pointer = self.store.get('active-case') or {}
+        cfg = self.config()
+        _, _, daily = self.daily_budget()
+        budget_notice_claimed = daily['starts'] >= DAILY_START_LIMIT and daily.get('budget_notice_claimed')
         for case in sorted(observed, key=lambda c: (c['case_id'] != pointer.get('case_id'), c['created_at'])):
             if case['mode'] == 'self-test' and (case['case_id'] != self.current_self_test_id()
                     or self.worker_revision is not None and case.get('worker_revision') != self.worker_revision):
@@ -687,8 +715,15 @@ class Doctor:
                     self.release('active-case', case['case_id'])  # A crash before start intent may leave only this pointer.
                 continue  # Historical commissioning retains its receipts and budget, but cannot start a new worker.
             if (case['status'] == 'pending' and not case.get('outstanding_operations')
-                    and (case['mode'] == 'self-test' or self.config().get('armed') is True)):
+                    and (case['mode'] == 'self-test' or cfg.get('armed') is True)):
                 if case['mode'] != 'self-test':
+                    # The day's cap and notice are already durable. Leave the
+                    # queue in place until UTC reset, without re-triaging it.
+                    if (budget_notice_claimed and not case.get('manual_recheck_pending')
+                            and cfg.get('paused_new_runs') is not True):
+                        if case['case_id'] == pointer.get('case_id'):
+                            self.release('active-case', case['case_id'])
+                        continue
                     try:
                         targets, findings = self.critical_targets(case['cve'], case['region'])
                     except Exception as error:
@@ -696,6 +731,7 @@ class Doctor:
                         continue
                     if not targets:
                         case['status'] = 'blocked-no-current-critical-target'
+                        case.pop('manual_recheck_pending', None)
                         self.save(case)
                         self.release('active-case', case['case_id'])
                         continue

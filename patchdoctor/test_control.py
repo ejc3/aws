@@ -1242,6 +1242,138 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(self.cloud.starts), 3)
         self.assertEqual(self.store.get('case#' + case['case_id'])['status'], 'running')
 
+    def test_daily_budget_alert_is_durable_across_cases_and_utc_days(self):
+        self.store.put('config', {'armed': True, 'gate_version': 2})
+        self.store.put('daily#2026-11-01', {'starts': 4})
+        first, = self.doctor.admit(self.event)
+        self.clock += 1
+        second_finding = copy.deepcopy(self.cloud.finding)
+        second_finding['findingArn'] += '-second'
+        second_finding['packageVulnerabilityDetails']['vulnerabilityId'] = 'CVE-2026-54321'
+        self.cloud.extra_findings.append(second_finding)
+        second, = self.doctor.admit({**self.event, 'detail': {'findingArn': second_finding['findingArn']}})
+        pending = self.store.get('case#' + second)
+
+        self.doctor.reconcile()
+        waiting = self.store.get('case#' + first)
+        self.assertEqual((waiting['status'], waiting['attempts'], waiting['reserved_usd']), ('daily-budget-wait', 0, 0))
+        self.assertIs(self.store.get('daily#2026-11-01').get('budget_notice_claimed'), True)
+
+        def notices():
+            return [json.loads(m['Message']) for m in self.cloud.messages
+                if m['Subject'] == 'PatchDoctor daily-budget-exhausted']
+
+        self.assertEqual(notices(), [{'kind': 'daily-budget-exhausted', 'day_utc': '2026-11-01',
+            'reserved_starts': 4, 'start_limit': 4, 'retry_after': waiting['retry_after']}])
+        active = self.store.get('active-case')
+        active['case_id'] = second  # Recovery from a crash before start intent.
+        self.store.put('active-case', active)
+        self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+        with patch.object(self.doctor, 'critical_targets', wraps=self.doctor.critical_targets) as read_native, \
+                patch.object(self.doctor, 'assess', wraps=self.doctor.assess) as assess:
+            self.doctor.reconcile()
+            self.doctor.reconcile()
+            read_native.assert_not_called()
+            assess.assert_not_called()
+        self.assertEqual(self.store.get('case#' + second), pending)
+        self.assertIsNone(self.store.get('active-case')['case_id'])
+        self.assertEqual(len(notices()), 1)
+        self.assertEqual(self.cloud.starts, [])
+
+        self.clock = waiting['retry_after']
+        self.doctor.reconcile()
+        running = self.store.get('case#' + first)
+        self.assertEqual(running['status'], 'running')
+        self.assertEqual(len(self.cloud.starts), 1)
+        daily = self.store.get('daily#2026-11-02')
+        self.assertEqual(daily['starts'], 1)
+        self.assertFalse(daily.get('budget_notice_claimed', False))
+
+        # Other reservations can fill the new day independently of yesterday's alert.
+        daily['starts'] = 4
+        self.store.put('daily#2026-11-02', daily)
+        self.doctor.broker(self.request(running, 'finish', outcome='blocked', summary='fake terminal outcome'))
+        self.cloud.builds[running['build_id']]['buildStatus'] = 'SUCCEEDED'
+        self.doctor.reconcile()
+        self.assertEqual([m['day_utc'] for m in notices()], ['2026-11-01', '2026-11-02'])
+        self.assertEqual(self.store.get('case#' + second)['status'], 'daily-budget-wait')
+        self.assertEqual(len(self.cloud.starts), 1)
+
+    def test_lost_budget_notification_reply_does_not_resend_or_consume_a_start(self):
+        self.store.put('config', {'armed': True, 'gate_version': 2})
+        self.store.put('daily#2026-11-01', {'starts': 4})
+        case_id, = self.doctor.admit(self.event)
+        publish = self.cloud.publish
+
+        def lose_reply(**kwargs):
+            self.assertIs(self.store.get('daily#2026-11-01').get('budget_notice_claimed'), True)
+            publish(**kwargs)  # Simulate SNS accepting the message but losing the acknowledgement.
+            raise TimeoutError('sk-ant-PRIVATE_SNS_ERROR_CANARY')
+
+        with patch.object(self.cloud, 'publish', side_effect=lose_reply) as delivery, \
+                patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.doctor.reconcile()
+            self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+            self.doctor.reconcile()
+            delivery.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), {'kind': 'daily-budget-notice-error',
+            'day_utc': '2026-11-01', 'error_type': 'TimeoutError'})
+        case = self.store.get('case#' + case_id)
+        self.assertEqual((case['status'], case['attempts'], case['reserved_usd']), ('daily-budget-wait', 0, 0))
+        self.assertEqual(self.store.get('daily#2026-11-01')['starts'], 4)
+        self.assertIsNone((self.store.get('active-case') or {}).get('case_id'))
+        self.assertEqual(self.cloud.starts, [])
+
+    def test_capped_manual_recheck_survives_busy_controller_and_restart(self):
+        daily_key = 'daily#2026-11-01'
+        self.store.put(daily_key, {'starts': 3})
+        running = self.admit()
+        self.assertEqual(self.store.get(daily_key)['starts'], 4)
+        self.assertEqual(len(self.cloud.starts), 1)
+
+        second_finding = copy.deepcopy(self.cloud.finding)
+        second_finding['findingArn'] += '-manual'
+        second_finding['packageVulnerabilityDetails']['vulnerabilityId'] = 'CVE-2026-54321'
+        self.cloud.extra_findings.append(second_finding)
+        case_id, = self.doctor.admit({**self.event, 'detail': {'findingArn': second_finding['findingArn']}})
+        response = self.doctor.handler({'action': 'recheck', 'case_id': case_id, 'mutationId': 'capped-while-busy'})
+        self.assertEqual((response['state'], response['case_count']), ('completed', 1))
+        case = self.store.get('case#' + case_id)
+        self.assertIs(case.get('manual_recheck_pending'), True)
+        self.assertNotIn('triage_checked_at', case)
+
+        self.doctor.broker(self.request(running, 'finish', outcome='blocked', summary='fake terminal outcome'))
+        self.cloud.builds[running['build_id']]['buildStatus'] = 'SUCCEEDED'
+        daily = self.store.get(daily_key)
+        daily['budget_notice_claimed'] = True
+        self.store.put(daily_key, daily)
+        self.clock += 60
+        self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+        self.doctor.reconcile()
+        case = self.store.get('case#' + case_id)
+        self.assertEqual(case['triage_checked_at'], self.clock)
+        self.assertFalse(case.get('manual_recheck_pending'))
+        self.assertEqual((case['attempts'], case['reserved_usd']), (0, 0))
+        self.assertEqual(self.store.get(daily_key)['starts'], 4)
+        self.assertEqual(len(self.cloud.starts), 1)
+
+    def test_claimed_daily_alert_preserves_paused_triage_and_current_self_test(self):
+        self.store.put('config', {'armed': True, 'gate_version': 2, 'paused_new_runs': True})
+        self.store.put('daily#2026-11-01', {'starts': 4, 'budget_notice_claimed': True})
+        repair, = self.doctor.admit(self.event)
+        self.doctor.reconcile()
+        self.assertIsNotNone(self.store.get('case#' + repair).get('triage_checked_at'))
+        self.assertEqual(self.cloud.starts, [])
+        self_test = self.doctor.handler({'action': 'self_test', 'mutationId': 'test-while-paused-and-capped'})
+        case = self.store.get('case#' + self_test['case_id'])
+        self.assertEqual((case['status'], case['attempts']), ('daily-budget-wait', 0))
+        self.assertFalse(any(m['Subject'] == 'PatchDoctor daily-budget-exhausted' for m in self.cloud.messages))
+        self.clock = case['retry_after']
+        self.doctor.reconcile()
+        self.assertEqual(self.store.get('case#' + repair)['status'], 'pending')
+        self.assertEqual(self.store.get('case#' + self_test['case_id'])['status'], 'running')
+        self.assertEqual(len(self.cloud.starts), 1)
+
     def test_credential_canaries_never_escape_errors_or_notifications(self):
         canary = 'sk-ant-CREDENTIAL_CANARY_DO_NOT_PRINT'
         with patch.object(C, 'Doctor') as factory, patch('sys.stdout', new_callable=io.StringIO) as output:
