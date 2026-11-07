@@ -88,14 +88,15 @@ locals {
   # fleet's region. The factory builds and verifies in us-west-2, so its g4dn.metal builders never
   # take staging's G quota; the publisher copies each verified pair to us-east-1 and releases the
   # copies there.
-  fcvm_ami_region        = "us-east-1"
-  fcvm_ami_build_region  = "us-west-2"
-  fcvm_ami_build_az      = "us-west-2a"
-  fcvm_ami_state_prefix  = "/fcvm-fleet/ami-pipeline"
-  fcvm_ami_builder_tag   = "fcvm-fleet-ami-builder"
-  fcvm_ami_source        = "https://github.com/ejc3/fcvm.git"
-  fcvm_ami_guard_sha     = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  fcvm_ami_build_minutes = 240
+  fcvm_ami_region         = "us-east-1"
+  fcvm_ami_build_region   = "us-west-2"
+  fcvm_ami_build_az       = "us-west-2a"
+  fcvm_ami_builder_subnet = module.fcvm_fleet_west2.subnet_ids_by_az[local.fcvm_ami_build_az]
+  fcvm_ami_state_prefix   = "/fcvm-fleet/ami-pipeline"
+  fcvm_ami_builder_tag    = "fcvm-fleet-ami-builder"
+  fcvm_ami_source         = "https://github.com/ejc3/fcvm.git"
+  fcvm_ami_guard_sha      = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+  fcvm_ami_build_minutes  = 240
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {
@@ -165,7 +166,8 @@ data "aws_ami" "fcvm_ami_canonical" {
   }
 }
 
-# The builders' subnet: the fleet's in the build AZ, which must offer both builder types.
+# The builders' subnet is the fleet's in the build AZ, which must offer both builder types
+# (checked on the dispatcher below).
 data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" {
   provider      = aws.fcvm_fleet_west2
   for_each      = toset(["g4dn.metal", "g4dn.xlarge"])
@@ -173,21 +175,6 @@ data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" {
   filter {
     name   = "instance-type"
     values = [each.key]
-  }
-}
-
-data "aws_subnet" "fcvm_ami_builder" {
-  provider = aws.fcvm_fleet_west2
-  vpc_id   = module.fcvm_fleet_west2.vpc_id
-  filter {
-    name   = "tag:Name"
-    values = ["fcvm-fleet-${local.fcvm_ami_build_az}"]
-  }
-  lifecycle {
-    postcondition {
-      condition     = alltrue([for o in data.aws_ec2_instance_type_offerings.fcvm_ami_builder : contains(o.locations, self.availability_zone)])
-      error_message = "The image factory's build AZ must offer g4dn.metal and g4dn.xlarge."
-    }
   }
 }
 
@@ -306,6 +293,12 @@ data "archive_file" "fcvm_ami_dispatch" {
 }
 
 resource "aws_lambda_function" "fcvm_ami_dispatch" {
+  lifecycle {
+    precondition {
+      condition     = alltrue([for o in data.aws_ec2_instance_type_offerings.fcvm_ami_builder : contains(o.locations, local.fcvm_ami_build_az)])
+      error_message = "The image factory's build AZ must offer g4dn.metal and g4dn.xlarge."
+    }
+  }
   function_name                  = "fcvm-fleet-ami-dispatch"
   role                           = aws_iam_role.fcvm_ami_dispatch.arn
   runtime                        = "python3.12"
@@ -324,12 +317,13 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       CONTROL_ACCOUNT   = data.aws_caller_identity.current.account_id
       PUBLISH_FUNCTION  = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish"
       COMPUTE_REGION    = local.fcvm_ami_build_region
+      RELEASE_REGION    = local.fcvm_ami_region
       STATE_PREFIX      = local.fcvm_ami_state_prefix
       FLEET_ROLE        = aws_iam_role.fcvm_ami_broker_fleet.arn
       WORKER_ROLE       = aws_iam_role.fcvm_ami_worker_fleet.arn
       FLEET_ACCOUNT     = local.fcvm_fleet_account_id
       BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn
-      SUBNET_ID         = data.aws_subnet.fcvm_ami_builder.id
+      SUBNET_ID         = local.fcvm_ami_builder_subnet
       SECURITY_GROUP    = aws_security_group.fcvm_ami_builder.id
       CANONICAL_AMI     = data.aws_ami.fcvm_ami_canonical.id
       GUARD_SHA256      = local.fcvm_ami_guard_sha
@@ -500,7 +494,7 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     { Sid = "CanonicalBase", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/${data.aws_ami.fcvm_ami_canonical.id}" },
     { Sid = "PrivateFactoryImages", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/*",
     Condition = { StringEquals = { "ec2:Owner" = local.fcvm_fleet_account_id, "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true", "ec2:ResourceTag/GuardHelperSHA256" = local.fcvm_ami_guard_sha }, Bool = { "ec2:Public" = "false" } } },
-    { Sid = "FixedNetwork", Effect = "Allow", Action = "ec2:RunInstances", Resource = ["arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:subnet/${data.aws_subnet.fcvm_ami_builder.id}", aws_security_group.fcvm_ami_builder.arn] },
+    { Sid = "FixedNetwork", Effect = "Allow", Action = "ec2:RunInstances", Resource = ["arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:subnet/${local.fcvm_ami_builder_subnet}", aws_security_group.fcvm_ami_builder.arn] },
     { Sid = "FixedInstance", Effect = "Allow", Action = "ec2:RunInstances", Resource = local.fcvm_ami_instance_arn,
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"], "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
     { Sid = "FixedRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:volume/*",

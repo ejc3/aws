@@ -21,8 +21,9 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE = re.compile(r"ami-[0-9a-f]{17}\Z")
 COPY_REGION = re.compile(r"us-(east|west)-[12]\Z")
-NAME = {"host": re.compile(r"fcvm-fleet-host-x86_64-[0-9a-f]{8}-[0-9]{12}\Z"),
-        "tile": re.compile(r"fcvm-fleet-tile-x86_64-[0-9a-f]{8}-[0-9]{12}\Z")}
+# A published image's name: the factory's (dispatch.py seal) or a hand-built one's (build-ami.sh).
+NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-" + kind + r"-x86_64-[0-9a-f]{8}-[0-9]{12})\Z")
+        for kind in ("host", "tile")}
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
@@ -572,6 +573,7 @@ class Publisher:
             tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
             need(IMAGE.fullmatch(image.get("ImageId", "")) and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
                  and image.get("Public") is False and image.get("Description") == description
+                 and image.get("SourceImageId") == original and image.get("SourceImageRegion") == self.build_region
                  and image.get("State") in {"pending", "available"}
                  and all(tags.get(key) == value for key, value in {**expected, "FleetImageKind": kind}.items()),
                  "a release-region copy is outside the candidate's private factory lineage")
@@ -949,7 +951,8 @@ class Publisher:
         need(all(IMAGE.fullmatch(item) for item in sources.values()) and sources["host"] != sources["tile"],
              "invalid published image identities")
         source = self.client("ec2", True)
-        names = {kind: self.validated_image(source, image_id, kind)["Name"] for kind, image_id in sources.items()}
+        published = {kind: self.validated_image(source, image_id, kind) for kind, image_id in sources.items()}
+        names = {kind: image["Name"] for kind, image in published.items()}
         images = {compute: dict(sources)}
         for region in self.copy_regions:
             ec2 = self.client("ec2", True, region)
@@ -961,7 +964,11 @@ class Publisher:
                 if found:
                     image = found[0]
                     tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
-                    need(image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
+                    # Either this release's copy into the region, or the image the release was itself
+                    # copied from (a pair the factory built there).
+                    origin = (image.get("SourceImageId"), image.get("SourceImageRegion")) == (sources[kind], compute) or (
+                        (published[kind].get("SourceImageId"), published[kind].get("SourceImageRegion")) == (image.get("ImageId"), region))
+                    need(origin and image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
                          and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
                          and image.get("State") in {"pending", "available"}
                          and all(tags.get(key) == value for key, value in {
@@ -1006,9 +1013,11 @@ class Publisher:
                 request["status"] = "awaiting-publish"
                 self.save(name, request)
                 raise
+        # Before the request is promoted: a failure leaves it awaiting publication, and the
+        # dispatcher redrives it until the copies and their record are confirmed.
+        self.replicate(result)
         request.update(status="promoted", generation=result["generation"])
         self.save(name, request)
-        self.replicate(result)
         return {"status": "promoted", "generation": result["generation"]}
 
     def run(self, event):

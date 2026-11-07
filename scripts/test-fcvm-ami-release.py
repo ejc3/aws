@@ -148,12 +148,15 @@ class ReleaseContracts(unittest.TestCase):
         self.assertRegex(pipeline, r'fcvm_ami_region\s*=\s*"us-east-1"')
         self.assertRegex(pipeline, r'fcvm_ami_build_region\s*=\s*"us-west-2"')
         for kind, name in (('data "aws_ami"', "fcvm_ami_canonical"), ('resource "aws_security_group"', "fcvm_ami_builder"),
-                           ('resource "aws_ssm_document"', "fcvm_ami_build"), ('data "aws_subnet"', "fcvm_ami_builder")):
+                           ('resource "aws_ssm_document"', "fcvm_ami_build"),
+                           ('data "aws_ec2_instance_type_offerings"', "fcvm_ami_builder")):
             with self.subTest(resource=name):
                 self.assertIn("aws.fcvm_fleet_west2", block(pipeline, kind, name))
         dispatch = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_dispatch")
         self.assertRegex(dispatch, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_build_region")
-        self.assertRegex(dispatch, r"SUBNET_ID\s*=\s*data\.aws_subnet\.fcvm_ami_builder\.id")
+        self.assertRegex(dispatch, r"SUBNET_ID\s*=\s*local\.fcvm_ami_builder_subnet")
+        self.assertRegex(dispatch, r"RELEASE_REGION\s*=\s*local\.fcvm_ami_region\b")
+        self.assertIn("module.fcvm_fleet_west2.subnet_ids_by_az[local.fcvm_ami_build_az]", pipeline)
         publish = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
         self.assertRegex(publish, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_region\b")
         self.assertRegex(publish, r"BUILD_REGION\s*=\s*local\.fcvm_ami_build_region")

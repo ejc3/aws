@@ -149,7 +149,7 @@ class EC2:
         image_id = "ami-" + format(0xc0000 + 16 * len(self.peers) + len(self.images) + 4096 * (self.region == "us-east-1"), "017x")
         self.images[image_id] = {"ImageId": image_id, "Name": Name, "Description": Description, "OwnerId": source["OwnerId"],
             "Public": False, "State": "pending", "Architecture": "x86_64", "RootDeviceType": "ebs",
-            "Tags": copy.deepcopy(source["Tags"])}
+            "SourceImageId": SourceImageId, "SourceImageRegion": SourceRegion, "Tags": copy.deepcopy(source["Tags"])}
         self.copies.append((SourceImageId, image_id))
         return {"ImageId": image_id}
 
@@ -499,7 +499,8 @@ class PublisherTests(unittest.TestCase):
         images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "7"), ("tile", "8"))}
         for kind, image_id in images.items():
             image = copy.deepcopy(self.ec2.images[self.new[kind]])
-            image["ImageId"] = image_id
+            # An AMI name is unique in its region.
+            image.update(ImageId=image_id, Name=f"fcvm-fleet-{kind}-x86_64-{image_id[4:12]}-202611010000")
             self.ec2.images[image_id] = image
         source = "d" * 40
         self.env["PHONE_AMI_JSON"] = json.dumps({"source_sha": source, "images": images, "expected": before})
@@ -576,7 +577,8 @@ class PublisherTests(unittest.TestCase):
         images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "9"), ("tile", "a"))}
         for kind, image_id in images.items():
             image = copy.deepcopy(self.ec2.images[self.new[kind]])
-            image["ImageId"] = image_id
+            # An AMI name is unique in its region.
+            image.update(ImageId=image_id, Name=f"fcvm-fleet-{kind}-x86_64-{image_id[4:12]}-202611010000")
             self.ec2.images[image_id] = image
         source = "e" * 40
         self.env["RENDERER_AMI_JSON"] = json.dumps({"source_sha": source, "images": images,
@@ -630,7 +632,8 @@ class PublisherTests(unittest.TestCase):
         images = {kind: "ami-" + digit * 17 for kind, digit in (("host", "b"), ("tile", "c"))}
         for kind, image_id in images.items():
             image = copy.deepcopy(self.ec2.images[self.new[kind]])
-            image["ImageId"] = image_id
+            # An AMI name is unique in its region.
+            image.update(ImageId=image_id, Name=f"fcvm-fleet-{kind}-x86_64-{image_id[4:12]}-202611010000")
             self.ec2.images[image_id] = image
         source, tile_source = "f" * 40, "9" * 40
         self.env["POTATO_AMI_JSON"] = json.dumps({
@@ -695,7 +698,7 @@ class PublisherTests(unittest.TestCase):
         before = copy.deepcopy(self.fleet_ssm.values["/release"])
         host, image_id, source = self.ids[0], "ami-" + "d" * 17, "7" * 40
         image = copy.deepcopy(self.ec2.images[before["host_amis"]["us-east-1"]["x86_64"]])
-        self.ec2.images[image_id] = {**image, "ImageId": image_id}
+        self.ec2.images[image_id] = {**image, "ImageId": image_id, "Name": f"fcvm-fleet-host-x86_64-{image_id[4:12]}-202611010000"}
         self.env["HOST_FIX_AMI_JSON"] = json.dumps({
             "source_sha": source, "host_image": image_id, "versions": before["versions"],
         })
@@ -1224,7 +1227,8 @@ class PublisherTests(unittest.TestCase):
         self.west.fail_copy = True
         with self.assertRaises(RuntimeError): self.publisher().run(self.event)
         self.assertEqual(self.fleet_ssm.values["/release"]["generation"], 1)
-        self.assertEqual(self.main_ssm.values["/factory/requests/" + self.input]["status"], "promoted")
+        # Not promoted until the copies are recorded, so the dispatcher keeps redriving it.
+        self.assertNotEqual(self.main_ssm.values["/factory/requests/" + self.input]["status"], "promoted")
         self.assertNotIn("/release-copies", self.fleet_ssm.values)
         self.west.fail_copy = False
         self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
@@ -1265,16 +1269,17 @@ class PublisherTests(unittest.TestCase):
                 self.assertNotIn("/release-copies", self.fleet_ssm.values)
 
     def test_an_existing_copy_is_reused_and_a_foreign_image_holding_the_name_refuses(self):
-        for foreign in (False, True):
+        for foreign in (False, True, "source"):
             with self.subTest(foreign=foreign):
                 self.setUp()
                 self.active_new_pair()
                 source = self.ec2.images[self.new["host"]]
                 tags = copy.deepcopy(source["Tags"])
-                if foreign:
+                if foreign is True:
                     tags = [tag for tag in tags if tag["Key"] != "FleetImageKind"] + [{"Key": "FleetImageKind", "Value": "tile"}]
                 self.west.images["ami-" + "9" * 17] = {"ImageId": "ami-" + "9" * 17, "Name": source["Name"],
-                    "OwnerId": "222222222222", "Public": False, "State": "available", "Tags": tags}
+                    "OwnerId": "222222222222", "Public": False, "State": "available", "Tags": tags,
+                    "SourceImageId": self.new["host"] if foreign != "source" else "ami-" + "7" * 17, "SourceImageRegion": "us-east-1"}
                 if foreign:
                     with self.assertRaises(MODULE.Refused): self.publisher().run({"action": "replicate-active-release"})
                     self.assertNotIn("/release-copies", self.fleet_ssm.values)
@@ -1295,8 +1300,10 @@ class PublisherTests(unittest.TestCase):
         for name in ("instances", "snapshots"):
             getattr(self.west, name).update(getattr(self.ec2, name))
             getattr(self.ec2, name).clear()
-        for image in self.new.values():
+        for kind, image in self.new.items():
             self.west.images[image] = self.ec2.images.pop(image)
+            # The name dispatch.py gives a sealed candidate.
+            self.west.images[image]["Name"] = "fcvm-factory-" + MODULE.digest(self.build)[:24] + "-" + kind
 
     def test_a_pair_built_in_us_west_2_is_released_from_its_us_east_1_copies(self):
         self.build_in_west()
@@ -1327,7 +1334,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual((len(self.ec2.copies), len(self.ec2.created)), (2, 4))
 
     def test_an_image_holding_a_candidate_name_in_the_release_region_refuses(self):
-        for field in ("Description", "PipelineBuildId", "FleetImageKind"):
+        for field in ("Description", "PipelineBuildId", "FleetImageKind", "SourceImageId", "SourceImageRegion"):
             with self.subTest(field=field):
                 self.setUp()
                 self.build_in_west()
@@ -1335,8 +1342,11 @@ class PublisherTests(unittest.TestCase):
                 tags = copy.deepcopy(original["Tags"])
                 image = {"ImageId": "ami-" + "8" * 17, "Name": original["Name"], "OwnerId": "222222222222", "Public": False,
                          "State": "available", "Architecture": "x86_64", "RootDeviceType": "ebs",
-                         "Description": "copy of " + self.new["host"] + " from us-west-2", "Tags": tags}
+                         "Description": "copy of " + self.new["host"] + " from us-west-2", "Tags": tags,
+                         "SourceImageId": self.new["host"], "SourceImageRegion": "us-west-2"}
                 if field == "Description": image["Description"] = "something else"
+                elif field == "SourceImageId": image["SourceImageId"] = "ami-" + "9" * 17
+                elif field == "SourceImageRegion": image["SourceImageRegion"] = "us-east-2"
                 else: next(tag for tag in tags if tag["Key"] == field)["Value"] = "foreign"
                 self.ec2.images[image["ImageId"]] = image
                 with self.assertRaises(MODULE.Refused) as refused: self.publisher().run(self.event)

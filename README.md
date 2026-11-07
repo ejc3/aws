@@ -523,7 +523,10 @@ pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcv
 `fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
 only, so us-west-2 gets no launch templates or fleet hosts. A copy failure after a commit
 leaves the release live; the next invocation completes it. To record and copy the active
-release on demand (after the first apply, for example):
+release on demand (after the first apply, for example). Apply a change of
+`fcvm_ami_build_region` only while no factory build is active (`/fcvm-fleet/ami-pipeline/control`
+in us-west-1 has `active` null): a build's journal records instance ids without a region, so the
+dispatcher cannot clean up builders left in the old region:
 `aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
 
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply

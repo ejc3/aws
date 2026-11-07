@@ -1074,6 +1074,20 @@ class FactoryTests(unittest.TestCase):
         self.fleet_ssm.values["/release-copies"] = {"images": {"us-west-2": {"host": "ami-" + "2" * 17}}}
         self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-" + "2" * 17)
 
+    def test_release_parameters_are_read_in_the_release_region(self):
+        # The factory builds in us-west-2; the release and its copy record are in us-east-1.
+        east = Store()
+        east.values["/release"] = {"host_amis": {"us-east-1": {"x86_64": "ami-" + "1" * 17}}, "tile_amis": {}, "previous": None}
+        east.values["/release-copies"] = {"images": {"us-west-2": {"host": "ami-" + "2" * 17}}}
+        tags = [{"Key": k, "Value": v} for k, v in {"Purpose": "fcvm-fleet", "PipelineSanitized": "true", "FleetImageValidated": "true",
+                "FleetImageKind": "host", "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()]
+        self.ec2.images["ami-" + "2" * 17] = {"ImageId": "ami-" + "2" * 17, "OwnerId": self.env["FLEET_ACCOUNT"], "Public": False,
+            "State": "available", "Architecture": "x86_64", "RootDeviceName": "/dev/sda1", "Tags": tags}
+        self.factory.env.update(COMPUTE_REGION="us-west-2", RELEASE_REGION="us-east-1")
+        clients = self.factory.client
+        self.factory.client = lambda name, fleet=False, region=None: east if (name, fleet, region) == ("ssm", True, "us-east-1") else clients(name, fleet)
+        self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-" + "2" * 17)
+
     def test_failed_foreign_pr_and_docs_summary_ci_cannot_admit(self):
         for run in [self.ci_run(conclusion="failure"), self.ci_run(event="pull_request"),
                     self.ci_run(head_repository={"full_name": "other/fcvm"}),
