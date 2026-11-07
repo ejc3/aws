@@ -1059,6 +1059,10 @@ class FactoryTests(unittest.TestCase):
         self.factory.client = lambda name, fleet=False, region=None: Templates() if region == "us-east-1" else clients(name, fleet)
         self.factory.collect_images()
         self.assertEqual((self.ec2.deleted_images, asked), ([], ["lt-00000000000000001"]))
+        # The previous release's images, kept for rollback, are kept too.
+        self.fleet_ssm.values["/release-copies"] = {"images": {}, "previous_images": {"us-west-2": {"host": image["image_id"]}}}
+        self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [])
         del self.fleet_ssm.values["/release-copies"]
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [image["image_id"]], "the record is what kept it")

@@ -523,7 +523,15 @@ pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcv
 `fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
 only, so us-west-2 gets no launch templates or fleet hosts. A copy failure after a commit
 leaves the release live; the next invocation completes it. To record and copy the active
-release on demand (after the first apply, for example). Apply a change of
+release on demand (after the first apply, for example). After each publication and each
+on-demand run the publisher also retires images nothing needs, at most 16 per region per run
+(`retain()` in `publish.py`): its own copies, factory candidates outside the build region, and
+images built by hand that were never validated and are 14 days old. It keeps the active and the
+previous release in every region, every launch template's default image and every image an
+instance still uses; validated images (the bootstrap catalog's) are never retired, and in the
+build region the dispatcher retains factory candidates. The publisher's release configuration
+(templates and reviewed pairs) ships in its code bundle as `publisher-config.json`, not in its
+environment. Apply a change of
 `fcvm_ami_build_region` only while no factory build is active (`/fcvm-fleet/ami-pipeline/control`
 in us-west-1 has `active` null): a build's journal records instance ids without a region, so the
 dispatcher cannot clean up builders left in the old region:

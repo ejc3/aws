@@ -8,6 +8,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import types
@@ -102,6 +103,7 @@ class EC2:
         self.region, self.peers = region, peers if peers is not None else {}
         self.peers[region] = self
         self.copies, self.fail_copy = [], False
+        self.deregistered, self.deleted_snapshots = [], []
         self.templates, self.images, self.snapshots, self.instances = {}, {}, {}, {}
         self.created, self.selected, self.deleted, self.terminated = [], [], [], []
         self.fail_select = None
@@ -134,9 +136,23 @@ class EC2:
         if ImageIds is not None:
             assert Owners is None and Filters is None
             return {"Images": [copy.deepcopy(self.images[name]) for name in ImageIds]}
-        assert Owners == ["222222222222"] and [item["Name"] for item in Filters] == ["name"]
-        names = Filters[0]["Values"]
-        return {"Images": [copy.deepcopy(item) for item in self.images.values() if item.get("Name") in names]}
+        assert Owners == ["222222222222"] and len(Filters) == 1
+        name, values = Filters[0]["Name"], Filters[0]["Values"]
+        if name == "name":
+            rows = [item for item in self.images.values() if item.get("Name") in values]
+        else:
+            assert name.startswith("tag:")
+            rows = [item for item in self.images.values()
+                    if {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get(name[4:]) in values]
+        return {"Images": copy.deepcopy(rows)}
+
+    def deregister_image(self, ImageId):
+        self.deregistered.append(ImageId)
+        del self.images[ImageId]
+
+    def delete_snapshot(self, SnapshotId):
+        self.deleted_snapshots.append(SnapshotId)
+        self.snapshots.pop(SnapshotId, None)
 
     def copy_image(self, SourceImageId, SourceRegion, Name, Description, Encrypted, CopyImageTags, ClientToken):
         """A pending image carrying the source's tags; `available()` completes it."""
@@ -1210,7 +1226,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(set(copies), set(self.new.values()))
         self.assertEqual(self.fleet_ssm.values["/release-copies"], {"version": 1, "generation": 1, "build_id": self.build,
             "source_sha": self.source, "images": {"us-east-1": self.new,
-                "us-west-2": {kind: copies[image] for kind, image in self.new.items()}}})
+                "us-west-2": {kind: copies[image] for kind, image in self.new.items()}}, "previous_images": {}})
         for source, copied in copies.items():
             self.assertEqual(self.west.images[copied]["Name"], self.ec2.images[source]["Name"])
         self.assertEqual(self.fleet_ssm.values["/release"]["host_amis"], {"us-east-1": {"x86_64": self.new["host"]}},
@@ -1359,6 +1375,95 @@ class PublisherTests(unittest.TestCase):
         next(iter(self.west.instances.values()))["State"]["Name"] = "running"
         with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
         self.assertEqual((self.ec2.copies, self.ec2.created), ([], []))
+
+    def publisher_copy(self, fake, image_id, source, source_region, kind="host", snapshot=None, description=None):
+        """An image the publisher made with CopyImage, in `fake`'s region."""
+        fake.images[image_id] = {"ImageId": image_id, "Name": "fcvm-factory-" + image_id[4:16] * 2 + "-" + kind,
+            "Description": description or "copy of " + source + " from " + source_region, "OwnerId": "222222222222",
+            "Public": False, "State": "available", "Architecture": "x86_64", "RootDeviceType": "ebs",
+            "SourceImageId": source, "SourceImageRegion": source_region,
+            "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet"}, {"Key": "FleetImageKind", "Value": kind}],
+            "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot}}] if snapshot else []}
+
+    def test_retention_removes_only_copies_nothing_needs(self):
+        self.build_in_west()
+        stale, in_use, previous = "ami-" + "e1" * 8 + "e", "ami-" + "e2" * 8 + "e", "ami-" + "e3" * 8 + "e"
+        handmade, stale_west = "ami-" + "e4" * 8 + "e", "ami-" + "e5" * 8 + "e"
+        self.publisher_copy(self.ec2, stale, "ami-" + "f1" * 8 + "f", "us-west-2", snapshot="snap-" + "e1" * 8 + "e")
+        self.publisher_copy(self.ec2, in_use, "ami-" + "f2" * 8 + "f", "us-west-2")
+        self.publisher_copy(self.ec2, previous, "ami-" + "f3" * 8 + "f", "us-west-2")
+        self.publisher_copy(self.ec2, handmade, "ami-" + "f4" * 8 + "f", "us-west-2", description="built by hand")
+        self.publisher_copy(self.west, stale_west, "ami-" + "f5" * 8 + "f", "us-east-1", kind="tile", snapshot="snap-" + "e5" * 8 + "e")
+        self.ec2.instances["i-" + "e" * 17] = {"InstanceId": "i-" + "e" * 17, "ImageId": in_use, "State": {"Name": "stopped"}, "Tags": []}
+        # The record of the release before this one names `previous` in us-east-1.
+        self.fleet_ssm.values["/release-copies"] = {"version": 1, "generation": 0, "build_id": "older", "source_sha": "",
+            "images": {"us-east-1": {"host": previous}}, "previous_images": {}}
+        with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+        self.ec2.available()
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual((self.ec2.deregistered, self.ec2.deleted_snapshots), ([stale], ["snap-" + "e1" * 8 + "e"]))
+        self.assertEqual((self.west.deregistered, self.west.deleted_snapshots), ([stale_west], ["snap-" + "e5" * 8 + "e"]))
+        for image in (in_use, previous, handmade):
+            self.assertIn(image, self.ec2.images)
+        record = self.fleet_ssm.values["/release-copies"]
+        for image in [*record["images"]["us-east-1"].values()]:
+            self.assertIn(image, self.ec2.images)
+        for image in self.new.values():
+            self.assertIn(image, self.west.images)
+        self.assertEqual(record["previous_images"], {"us-east-1": {"host": previous}})
+
+    def test_retention_takes_old_factory_and_unvalidated_handmade_images_only(self):
+        import time as clock
+        self.active_new_pair()
+        def image(fake, image_id, name, days, **tags):
+            created = datetime.datetime.fromtimestamp(clock.time() - days * 86400, datetime.timezone.utc)
+            fake.images[image_id] = {"ImageId": image_id, "Name": name, "OwnerId": "222222222222", "Public": False,
+                "State": "available", "CreationDate": created.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "Tags": [{"Key": k, "Value": v} for k, v in {"Purpose": "fcvm-fleet", **tags}.items()],
+                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-" + image_id[4:]}}]}
+        factory = {"PipelineSanitized": "true", "PipelineBuildId": "factory:00000000-0000-0000-0000-00000000000f"}
+        ids = {name: "ami-" + format(0xb000 + i, "017x") for i, name in enumerate(
+            ["old-handmade", "new-handmade", "validated-handmade", "east-factory", "west-factory", "foreign-factory", "other-name"])}
+        image(self.ec2, ids["old-handmade"], "fcvm-fleet-host-x86_64-1234abcd-202610230135", 15)
+        image(self.ec2, ids["new-handmade"], "fcvm-fleet-host-x86_64-1234abce-202611060135", 13)
+        image(self.ec2, ids["validated-handmade"], "fcvm-fleet-tile-x86_64-1234abcf-202610230135", 30, FleetImageValidated="true")
+        image(self.ec2, ids["east-factory"], "fcvm-factory-" + "1" * 24 + "-host", 1, **factory)
+        # In the build region the factory's own retention (dispatch.py) owns candidates.
+        self.env["BUILD_REGION"] = "us-west-2"
+        image(self.west, ids["west-factory"], "fcvm-factory-" + "2" * 24 + "-host", 30, **factory)
+        image(self.ec2, ids["foreign-factory"], "fcvm-factory-" + "3" * 24 + "-host", 30, PipelineSanitized="true", PipelineBuildId="other:1")
+        image(self.ec2, ids["other-name"], "something-else", 30)
+        self.publisher().run({"action": "replicate-active-release"})
+        self.assertEqual(sorted(self.ec2.deregistered), sorted([ids["old-handmade"], ids["east-factory"]]))
+        self.assertEqual(sorted(self.ec2.deleted_snapshots), sorted("snap-" + ids[n][4:] for n in ("old-handmade", "east-factory")))
+        self.assertEqual(self.west.deregistered, [])
+
+    def test_retention_removes_a_bounded_number_per_run(self):
+        self.active_new_pair()
+        for index in range(MODULE.RETAIN_LIMIT + 3):
+            self.publisher_copy(self.west, "ami-" + format(0xd000 + index, "017x"), "ami-" + format(0xa000 + index, "017x"), "us-east-1")
+        self.publisher().run({"action": "replicate-active-release"})
+        self.assertEqual(len(self.west.deregistered), MODULE.RETAIN_LIMIT)
+        self.publisher().run({"action": "replicate-active-release"})
+        self.assertEqual(len(self.west.deregistered), MODULE.RETAIN_LIMIT + 3)
+        self.assertEqual(set(self.copies()), set(self.new.values()))
+
+    def test_bulky_configuration_comes_from_the_bundle_not_the_environment(self):
+        import tempfile
+        bundled = {key: self.env.pop(key) for key in ("TEMPLATES_JSON", "SEED_RELEASE_JSON")}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "publisher-config.json")
+            with open(path, "w") as handle:
+                json.dump(bundled, handle)
+            publisher = MODULE.Publisher(self.env, {}, config=path)
+            self.assertEqual(publisher.templates, self.templates)
+            self.assertEqual(publisher.reviewed_seed()["images"], self.new)
+            with self.assertRaises(MODULE.Refused):
+                MODULE.Publisher({**self.env, "TEMPLATES_JSON": bundled["TEMPLATES_JSON"]}, {}, config=path)
+            with open(path, "w") as handle:
+                json.dump({**bundled, "FLEET_ROLE": "arn:aws:iam::333333333333:role/other"}, handle)
+            with self.assertRaises(MODULE.Refused):
+                MODULE.Publisher(self.env, {}, config=path)
 
 
 if __name__ == "__main__":

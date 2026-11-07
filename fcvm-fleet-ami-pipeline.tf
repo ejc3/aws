@@ -286,6 +286,28 @@ resource "aws_cloudwatch_log_group" "fcvm_ami_codebuild" {
   retention_in_days = 14
 }
 
+# The publisher's own bundle: publish.py and its fixed configuration (publish.py BUNDLED_KEYS),
+# which would not fit in Lambda's 4 KB environment beside the rest.
+data "archive_file" "fcvm_ami_publish" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/fcvm-fleet-ami-publish.zip"
+  source {
+    content  = file("${path.module}/fcvm-fleet-ami-pipeline/publish.py")
+    filename = "publish.py"
+  }
+  source {
+    content = jsonencode({
+      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
+      SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
+      PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
+      RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
+      POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
+      HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
+    })
+    filename = "publisher-config.json"
+  }
+}
+
 data "archive_file" "fcvm_ami_dispatch" {
   type        = "zip"
   source_dir  = "${path.module}/fcvm-fleet-ami-pipeline"
@@ -661,6 +683,14 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
     { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
       Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    { Sid      = "RetireUnneededCopies", Effect = "Allow", Action = "ec2:DeregisterImage",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
+    Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    # A copy's snapshots carry no tags (CopyImage copies only the image's), so this grant cannot
+    # name a tag; publish.py retain() deletes only the snapshots of copies it just deregistered.
+    { Sid      = "DeleteRetiredCopySnapshots", Effect = "Allow", Action = "ec2:DeleteSnapshot",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
     { Sid      = "CopyImageTagsOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
       Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
@@ -679,8 +709,8 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
   timeout                        = 900
   memory_size                    = 512
   reserved_concurrent_executions = 1
-  filename                       = data.archive_file.fcvm_ami_dispatch.output_path
-  source_code_hash               = data.archive_file.fcvm_ami_dispatch.output_base64sha256
+  filename                       = data.archive_file.fcvm_ami_publish.output_path
+  source_code_hash               = data.archive_file.fcvm_ami_publish.output_base64sha256
   environment {
     variables = {
       PROJECT_NAME      = local.fcvm_ami_project
@@ -694,20 +724,15 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       PIPELINE_REGION   = local.fcvm_fleet_home_region
       RELEASE_PARAMETER = aws_ssm_parameter.fcvm_ami_release.name
       GUARD_SHA256      = local.fcvm_ami_guard_sha
-      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
       BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
-      SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
-      PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
-      RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
-      POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
-      HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
       HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
-      # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies".
+      # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies". The release
+      # configuration is in the bundle (publisher-config.json).
       COPY_REGIONS = join(",", local.fcvm_ami_copy_regions)
       BUILD_REGION = local.fcvm_ami_build_region
     }

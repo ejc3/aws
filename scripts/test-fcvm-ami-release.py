@@ -2,6 +2,7 @@
 """Offline contracts for release ownership, stale saved plans and image admission."""
 from pathlib import Path
 import re
+import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,6 +169,51 @@ class ReleaseContracts(unittest.TestCase):
         # Retirement acts on the staging fleet's own hosts, in the release region.
         fleet = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
         self.assertIn('"ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:', fleet)
+    def test_publisher_environment_stays_far_below_lambdas_limit(self):
+        # Lambda refuses an environment over 4 KB (its JSON form). The release configuration grew
+        # it to an estimated 4,020 bytes, one variable away from a failed apply; it now ships in
+        # the publisher's bundle. Every remaining value is bounded here, and the worst case must
+        # stay within half the limit. An expression this table does not know fails the test.
+        sources = "\n".join(path.read_text() for path in ROOT.glob("*.tf"))
+        def literal(name):
+            found = re.findall(r"^\s*" + re.escape(name) + r'\s*=\s*"([^"$]*)"\s*$', sources, re.M)
+            self.assertEqual(len(found), 1, name)
+            return len(found[0])
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        function = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        variables = function[function.index("variables = {"):]
+        pairs = re.findall(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.+?)\s*$", variables, re.M)
+        copy_regions = re.search(r"fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]", self.release).group(1).count('"') // 2
+        bounds = [
+            (r'"[^"$]*"', lambda v: len(v) - 2),
+            (r"local\.fcvm_fleet_account_id", lambda v: 12),
+            (r"local\.fcvm_ami_guard_sha", lambda v: 64),
+            (r"local\.(fcvm_[a-z0-9_]+)", lambda v: literal(v.split(".", 1)[1])),
+            (r"var\.aws_region", lambda v: 14),
+            (r"data\.aws_caller_identity\.current\.account_id", lambda v: 12),
+            (r"aws_[a-z0-9_]+\.[a-z0-9_]+\.arn", lambda v: 256),
+            (r"aws_s3_bucket\.[a-z0-9_]+\.id", lambda v: 63),
+            (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 128),
+            (r"module\.[a-z0-9_]+\.host_user_data_sha256", lambda v: 64),
+            (r'join\(",", local\.fcvm_ami_copy_regions\)', lambda v: 15 * copy_regions),
+        ]
+        total = 2
+        for key, value in pairs:
+            with self.subTest(variable=key):
+                self.assertNotIn("jsonencode", value, "bulky configuration belongs in the bundle")
+                for pattern, bound in bounds:
+                    if re.fullmatch(pattern, value):
+                        total += len(key) + 6 + bound(value)
+                        break
+                else:
+                    self.fail(f"no size bound for {key} = {value}")
+        self.assertGreater(len(pairs), 15)
+        print(f"worst-case publisher environment: {total} bytes", file=sys.stderr)
+        self.assertLessEqual(total, 2048, f"worst-case publisher environment {total} bytes")
+        bundle = block(pipeline, 'data "archive_file"', "fcvm_ami_publish")
+        for key in ("TEMPLATES_JSON", "SEED_RELEASE_JSON", "PHONE_AMI_JSON", "RENDERER_AMI_JSON", "POTATO_AMI_JSON", "HOST_FIX_AMI_JSON"):
+            self.assertIn(key + " ", bundle)
+        self.assertIn('filename = "publisher-config.json"', bundle)
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

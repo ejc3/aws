@@ -648,8 +648,9 @@ class Factory:
                 record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
             except self.release_ssm().exceptions.ParameterNotFound:
                 record = {}
-            for kinds in record.get("images", {}).values():
-                referenced.update(v for v in kinds.values() if v)
+            for field in ("images", "previous_images"):
+                for kinds in record.get(field, {}).values():
+                    referenced.update(v for v in kinds.values() if v)
             for template in json.loads(self.env.get("TEMPLATES_JSON", "[]")):
                 where = ec2 if template["region"] == self.env["COMPUTE_REGION"] else self.client("ec2", True, template["region"])
                 versions = where.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
