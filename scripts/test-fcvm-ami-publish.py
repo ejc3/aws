@@ -871,6 +871,103 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual([item[0] for item in self.ec2.deleted], [host])
         self.assertIsNone(self.ddb.item)
 
+    def reviewed_stride_fixture(self):
+        host_fix, event, _, _, _ = self.reviewed_host_fix_fixture()
+        self.assertEqual(host_fix.run(event), {"status": "promoted", "generation": 5})
+        before = self.fleet_ssm.values["/release"]
+        host = self.ec2.templates[self.ids[0]]
+        # Model the observed production generation-five host receipt and the
+        # subsequent Terraform-only bootstrap change before #805 publication.
+        prior = copy.deepcopy(host["versions"][host["default"]])
+        host["versions"][21] = {**prior, "VersionNumber": 21}
+        before["versions"]["us-east-1/" + self.ids[0]] = 21
+        user_data = base64.b64encode(b"reviewed bootstrap for candidate, current and rollback hosts").decode()
+        host["versions"][22] = {**prior, "VersionNumber": 22, "VersionDescription": "terraform",
+                                "LaunchTemplateData": {**prior["LaunchTemplateData"], "UserData": user_data}}
+        host["default"] = 22
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        images = {"host": "ami-09ac99f69700ec306", "tile": "ami-094ca9c62a284a389"}
+        for kind, image_id in images.items():
+            self.assertRegex(catalog, rf'"{kind}/x86_64/92a26793"\s*=\s*{{ image = "{image_id}", kind = "{kind}" }}')
+            old_id = before[kind + "_amis"]["us-east-1"]["x86_64"]
+            self.ec2.images[image_id] = {**copy.deepcopy(self.ec2.images[old_id]), "ImageId": image_id,
+                "Name": "fcvm-fleet-" + kind + "-x86_64-92a26793-202611070000"}
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        publisher = self.publisher()
+        source = "92a26793a818b142e71ba7d96b014d033f014562"
+        publisher.github_source_json = mock.Mock(return_value={
+            "sha": source, "commit": {"verification": {"verified": True, "reason": "valid"}},
+        })
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": before["source_sha"]},
+            "merge_base_commit": {"sha": before["source_sha"]},
+        })
+        return publisher, {"action": "activate-reviewed-stride-release"}, copy.deepcopy(before), images, source
+
+    def test_reviewed_stride_pair_changes_only_images_and_preserves_generation_five(self):
+        publisher, event, before, images, source = self.reviewed_stride_fixture()
+        old_templates = copy.deepcopy(self.ec2.templates)
+        with mock.patch.object(self.codebuild, "batch_get_builds", side_effect=AssertionError("not a factory build")):
+            self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 6})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(after["source_sha"], source)
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertEqual(publisher.compare_sources.call_args_list, [mock.call(before["source_sha"], source)] * 2)
+        self.assertEqual(len(self.ec2.created), 4)
+        for template, kind in zip(self.ids, ("host", "tile", "tile", "tile"), strict=True):
+            table, old = self.ec2.templates[template], old_templates[template]
+            self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                             {**old["versions"][old["default"]]["LaunchTemplateData"], "ImageId": images[kind]})
+            self.assertEqual(after["versions"]["us-east-1/" + template], table["default"])
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 6})
+        self.assertEqual(len(self.ec2.created), 4)
+        self.assertEqual((self.ec2.tagged, self.ec2.terminated, self.assets.copies), ([], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_stride_pair_refuses_unprepared_or_unproven_inputs_before_mutation(self):
+        for variant in ("override", "predecessor", "unsigned", "unvalidated-tile", "bootstrap", "tile-default"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, images, _ = self.reviewed_stride_fixture()
+                if variant == "override":
+                    event["host_image"] = images["host"]
+                elif variant == "predecessor":
+                    self.fleet_ssm.values["/release"]["previous"]["generation"] = 3
+                elif variant == "unsigned":
+                    publisher.github_source_json.return_value["commit"]["verification"]["verified"] = False
+                elif variant == "unvalidated-tile":
+                    tags = self.ec2.images[images["tile"]]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "bootstrap":
+                    self.ec2.templates[self.ids[0]]["default"] = 21
+                elif variant == "tile-default":
+                    self.ec2.templates[self.ids[1]]["default"] -= 1
+                before = copy.deepcopy(self.fleet_ssm.values["/release"])
+                journal = copy.deepcopy(self.main_ssm.values)
+                with self.assertRaises(MODULE.Refused):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values["/release"], before)
+                self.assertEqual(self.main_ssm.values, journal)
+                self.assertEqual((self.ec2.created, self.ec2.selected), ([], []))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_stride_pair_restores_all_defaults_if_pointer_write_fails(self):
+        publisher, event, before, _, _ = self.reviewed_stride_fixture()
+        old_templates = copy.deepcopy(self.ec2.templates)
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=RuntimeError("no write")):
+            with self.assertRaisesRegex(MODULE.Refused, "pointer update was not confirmed"):
+                publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        for template in self.ids:
+            table, old = self.ec2.templates[template], old_templates[template]
+            self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                             old["versions"][old["default"]]["LaunchTemplateData"])
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertCountEqual([item[0] for item in self.ec2.deleted], self.ids)
+        self.assertIsNone(self.ddb.item)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

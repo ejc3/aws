@@ -608,6 +608,14 @@ It changes only the host template's default image for future launches, leaves
 all three tile templates and the active tile untouched, and retains generation
 four for rollback. It does not wake or retire Fleet instances.
 
+The fixed action `{"action":"activate-reviewed-stride-release"}` advances only
+the exact generation-five receipt to the signed 92a26793 host and tile pair from
+#805. Apply the reviewed AMI catalog tags and host bootstrap first. The publisher
+checks the prepared bootstrap and the existing tile defaults, changes only the
+four template image IDs, and retains generation five for rollback. Both older
+reviewed potato host images keep potato mode. The action does not wake or retire
+running instances.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
