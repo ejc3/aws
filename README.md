@@ -146,8 +146,8 @@ Limits are one worker, 60 minutes per attempt, at most two attempts per case, an
 starts per UTC day. Each attempt reserves a $25 model allowance; a case reserves at
 most $50. Claude's dollar limit is an estimate and can overshoot, so these are model
 allowances, not a guaranteed AWS billing ceiling. Unknown crash spend consumes the
-whole reservation. When work is waiting after the daily cap, PatchDoctor sends one
-notice per UTC day and leaves the repair queue in place until midnight UTC. The notice
+whole reservation. When work is waiting after the daily cap, PatchDoctor sends at
+most one notice per UTC day and leaves the repair queue in place until midnight UTC. The notice
 reports reserved build slots, not spend. A case that uses both attempts without a
 result still receives its own alert.
 

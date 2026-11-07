@@ -239,8 +239,11 @@ class Doctor:
         revision = digest(encoded(facts))
         if (case.get('triage_revision') == revision and case.get('triage')
                 and (case['triage'].get('decision') != 'defer' or self.now() < case.get('recheck_at', 0))):
+            if case.pop('manual_recheck_pending', False):
+                self.save(case)
             return case['triage']['decision'], False
         verdict = triage.classify(facts)
+        case.pop('manual_recheck_pending', None)
         case.update(triage=verdict, triage_revision=revision, triage_checked_at=int(self.now()))
         if verdict['decision'] == 'defer':
             # The scheduler observes this before one hour, not after it.
@@ -339,13 +342,13 @@ class Doctor:
                 if case.get('recheck_effects', {}).get(effect_id) is True:
                     continue
                 require(case['status'] in {'pending', 'deferred', 'blocked-no-current-critical-target'})
-                case.update(status='pending', recheck_at=0)
+                case.update(status='pending', recheck_at=0, manual_recheck_pending=True)
                 case.setdefault('recheck_effects', {})[effect_id] = True
                 case.pop('triage', None)
                 self.save(case)
                 changed += 1
             if changed:
-                self.reconcile(manual_recheck=True)
+                self.reconcile()
             return {**result, 'case_count': len(receipt['case_ids'])}
         require(action in {'arm', 'pause_new_runs'})
         if receipt.get('config_attempted'):
@@ -622,7 +625,7 @@ class Doctor:
         case.update(build_id=result['build']['id'], status='running')
         self.save(case)
 
-    def reconcile(self, manual_recheck=False):
+    def reconcile(self):
         cases = self.active_cases()
         observed = []
         pointer = self.store.get('active-case') or {}
@@ -716,7 +719,8 @@ class Doctor:
                 if case['mode'] != 'self-test':
                     # The day's cap and notice are already durable. Leave the
                     # queue in place until UTC reset, without re-triaging it.
-                    if budget_notice_claimed and not manual_recheck and cfg.get('paused_new_runs') is not True:
+                    if (budget_notice_claimed and not case.get('manual_recheck_pending')
+                            and cfg.get('paused_new_runs') is not True):
                         if case['case_id'] == pointer.get('case_id'):
                             self.release('active-case', case['case_id'])
                         continue
@@ -727,6 +731,7 @@ class Doctor:
                         continue
                     if not targets:
                         case['status'] = 'blocked-no-current-critical-target'
+                        case.pop('manual_recheck_pending', None)
                         self.save(case)
                         self.release('active-case', case['case_id'])
                         continue

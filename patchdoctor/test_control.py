@@ -1324,6 +1324,39 @@ class Tests(unittest.TestCase):
         self.assertIsNone((self.store.get('active-case') or {}).get('case_id'))
         self.assertEqual(self.cloud.starts, [])
 
+    def test_capped_manual_recheck_survives_busy_controller_and_restart(self):
+        daily_key = 'daily#2026-11-01'
+        self.store.put(daily_key, {'starts': 3})
+        running = self.admit()
+        self.assertEqual(self.store.get(daily_key)['starts'], 4)
+        self.assertEqual(len(self.cloud.starts), 1)
+
+        second_finding = copy.deepcopy(self.cloud.finding)
+        second_finding['findingArn'] += '-manual'
+        second_finding['packageVulnerabilityDetails']['vulnerabilityId'] = 'CVE-2026-54321'
+        self.cloud.extra_findings.append(second_finding)
+        case_id, = self.doctor.admit({**self.event, 'detail': {'findingArn': second_finding['findingArn']}})
+        response = self.doctor.handler({'action': 'recheck', 'case_id': case_id, 'mutationId': 'capped-while-busy'})
+        self.assertEqual((response['state'], response['case_count']), ('completed', 1))
+        case = self.store.get('case#' + case_id)
+        self.assertIs(case.get('manual_recheck_pending'), True)
+        self.assertNotIn('triage_checked_at', case)
+
+        self.doctor.broker(self.request(running, 'finish', outcome='blocked', summary='fake terminal outcome'))
+        self.cloud.builds[running['build_id']]['buildStatus'] = 'SUCCEEDED'
+        daily = self.store.get(daily_key)
+        daily['budget_notice_claimed'] = True
+        self.store.put(daily_key, daily)
+        self.clock += 60
+        self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+        self.doctor.reconcile()
+        case = self.store.get('case#' + case_id)
+        self.assertEqual(case['triage_checked_at'], self.clock)
+        self.assertFalse(case.get('manual_recheck_pending'))
+        self.assertEqual((case['attempts'], case['reserved_usd']), (0, 0))
+        self.assertEqual(self.store.get(daily_key)['starts'], 4)
+        self.assertEqual(len(self.cloud.starts), 1)
+
     def test_claimed_daily_alert_preserves_paused_triage_and_current_self_test(self):
         self.store.put('config', {'armed': True, 'gate_version': 2, 'paused_new_runs': True})
         self.store.put('daily#2026-11-01', {'starts': 4, 'budget_notice_claimed': True})
