@@ -437,8 +437,9 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
-  # The current host must keep potato mode while the new image is registered and on rollback.
+  # Keep potato mode for the current host, the new candidate and the retained older rollback image.
   potato_host_amis = [
+    local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
     local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image,
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
   ]
