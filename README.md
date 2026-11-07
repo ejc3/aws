@@ -71,9 +71,9 @@ review and commit any intentional provider upgrade.
 the ephemeral Workers Builds control-token read. Any Terraform upgrade must update the
 constraint, both jumpboxes, and the Terraform validation workflow together.
 
-Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.24.0`
-provider release. That fork adds typed Worker-native Access destinations and the Workers
-Builds APIs used below while preserving ordinary `terraform init` on both ARM64 jumpboxes
+Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.25.0`
+provider release. That fork adds typed Worker-native Access destinations, the Workers
+Builds APIs used below and the Access application's `eager_redirect_cookie_setting` while preserving ordinary `terraform init` on both ARM64 jumpboxes
 and amd64 CI; there is no local provider override or machine-specific installation step.
 Return to `cloudflare/cloudflare` only after an upstream release includes the same fields
 and regression coverage.
