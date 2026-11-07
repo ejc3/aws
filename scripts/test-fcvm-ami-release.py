@@ -123,6 +123,26 @@ class ReleaseContracts(unittest.TestCase):
                                  + r'"\s*=\s*\{\s*image\s*=\s*"' + image
                                  + r'",\s*kind\s*=\s*"' + kind + r'"\s*\}')
 
+    def test_published_images_are_copied_out_of_the_staging_region_only_as_a_record(self):
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        regions = re.search(r'fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]', self.release)
+        self.assertIsNotNone(regions)
+        self.assertEqual(re.findall(r'"([a-z0-9-]+)"', regions.group(1)), ["us-west-2"])
+        record = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_copies")
+        self.assertIn('"${aws_ssm_parameter.fcvm_ami_release.name}-copies"', record)
+        self.assertRegex(record, r"ignore_changes\s*=\s*\[value\]")
+        # The copies never enter the release's image maps, which make launch templates.
+        pointer = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_release")
+        self.assertNotIn("copy", pointer)
+        function = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        self.assertIn('COPY_REGIONS = join(",", local.fcvm_ami_copy_regions)', function)
+        policy = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        self.assertIn("aws_ssm_parameter.fcvm_ami_copies.arn", policy)
+        copy = policy[policy.index('"CopyPublishedImagesOnly"'):policy.index('"CopyImageTagsOnCreate"')]
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_ami_copy_regions', copy)
+        tags = policy[policy.index('"CopyImageTagsOnCreate"'):]
+        tags = tags[:tags.index("} },")]
+        self.assertIn('"ec2:CreateAction" = "CopyImage"', tags)
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

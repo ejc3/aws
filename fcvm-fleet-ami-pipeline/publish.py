@@ -20,6 +20,9 @@ import uuid
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE = re.compile(r"ami-[0-9a-f]{17}\Z")
+COPY_REGION = re.compile(r"us-(east|west)-[12]\Z")
+NAME = {"host": re.compile(r"fcvm-fleet-host-x86_64-[0-9a-f]{8}-[0-9]{12}\Z"),
+        "tile": re.compile(r"fcvm-fleet-tile-x86_64-[0-9a-f]{8}-[0-9]{12}\Z")}
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
@@ -62,6 +65,14 @@ class Publisher:
                  and t["kind"] in {"host", "tile"} for t in self.templates)
              and sum(t["kind"] == "host" for t in self.templates) == 1,
              "template configuration is outside the fixed image-pair scope")
+        # Regions that receive a copy of every published pair, for work kept off the
+        # compute region's quotas (agents' GPU boxes). Never the compute region itself.
+        # Comma-separated, not JSON: the environment is close to Lambda's 4 KB limit.
+        self.copy_regions = self.env["COPY_REGIONS"].split(",") if self.env["COPY_REGIONS"] else []
+        need(len(set(self.copy_regions)) == len(self.copy_regions)
+             and all(COPY_REGION.fullmatch(region) for region in self.copy_regions)
+             and self.env["COMPUTE_REGION"] not in self.copy_regions, "image copy configuration is outside its fixed scope")
+        self.copies_parameter = self.env["RELEASE_PARAMETER"] + "-copies"
         self.build_id = None
         self.lock_info = None
         self.transaction = None
@@ -379,6 +390,7 @@ class Publisher:
                          "committed reviewed tile versions differ")
                     self.check_reviewed_host_default(active, host_user_data)
                 self.committed = True
+                self.replicate(active)
                 return {"status": "promoted", "generation": generation}
             need(active == config["expected"], "reviewed transition requires its unchanged predecessor")
             prior = self.prior_transaction()
@@ -395,6 +407,7 @@ class Publisher:
             fence()
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
             result = self.promote(manifest, config["source_sha"], None, [], fence=fence, host_user_data=host_user_data)
+            self.replicate(result)
             return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
@@ -855,6 +868,84 @@ class Publisher:
             self.sleep(10)
         raise Refused("critical release committed; old Fleet reclamation is still pending")
 
+    def validated_image(self, ec2, image_id, kind):
+        rows = ec2.describe_images(ImageIds=[image_id])["Images"]
+        need(len(rows) == 1, "published image is missing")
+        image = rows[0]
+        tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+        need(image.get("ImageId") == image_id and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+             and image.get("Public") is False and image.get("Architecture") == "x86_64"
+             and image.get("RootDeviceType") == "ebs" and NAME[kind].fullmatch(image.get("Name", ""))
+             and all(tags.get(key) == value for key, value in {
+                 "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                 "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
+             "published image is outside its private validated scope")
+        return image
+
+    def replicate(self, release):
+        """Copy the committed pair into every copy region and record each region's ids.
+
+        Runs only after the release is committed, and never changes it: a failure
+        leaves the release live and is retried by the next invocation. A copy is
+        found again by its name (unique per region), so a replay never starts a
+        second one. The copies are not in host_amis or tile_amis, so no copy region
+        gets launch templates or fleet hosts.
+        """
+        compute = self.env["COMPUTE_REGION"]
+        need(release.get("version") == 1 and type(release.get("generation")) is int
+             and release.get("guard_sha256") == self.env["GUARD_SHA256"], "active release schema is incompatible")
+        sources = {kind: release[kind + "_amis"][compute]["x86_64"] for kind in ("host", "tile")}
+        need(all(IMAGE.fullmatch(item) for item in sources.values()) and sources["host"] != sources["tile"],
+             "invalid published image identities")
+        source = self.client("ec2", True)
+        names = {kind: self.validated_image(source, image_id, kind)["Name"] for kind, image_id in sources.items()}
+        images = {compute: dict(sources)}
+        for region in self.copy_regions:
+            ec2 = self.client("ec2", True, region)
+            images[region] = {}
+            for kind in ("host", "tile"):
+                found = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
+                    Filters=[{"Name": "name", "Values": [names[kind]]}])["Images"]
+                need(len(found) <= 1, "more than one image holds a published name")
+                if found:
+                    image = found[0]
+                    tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+                    need(image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
+                         and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
+                         and image.get("State") in {"pending", "available"}
+                         and all(tags.get(key) == value for key, value in {
+                             "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                             "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
+                         "an image copy is outside its private validated scope")
+                    copied = image["ImageId"]
+                else:
+                    copied = ec2.copy_image(SourceImageId=sources[kind], SourceRegion=compute, Name=names[kind],
+                        Description="copy of " + sources[kind] + " from " + compute, Encrypted=True,
+                        CopyImageTags=True, ClientToken=digest(sources[kind] + "/" + region))["ImageId"]
+                    need(IMAGE.fullmatch(copied), "image copy returned no image identity")
+                images[region][kind] = copied
+        record = {"version": 1, "generation": release["generation"], "build_id": release.get("build_id", ""),
+                  "source_sha": release.get("source_sha", ""), "images": images}
+        try:
+            current = self.load(self.copies_parameter, True)
+        except Exception as error:
+            if getattr(error, "response", {}).get("Error", {}).get("Code") != "ParameterNotFound":
+                raise
+            current = None
+        if current != record:
+            try:
+                self.save(self.copies_parameter, record, True)
+            except Exception:
+                # A lost acknowledgement is resolved by reading the record back.
+                pass
+        need(self.load(self.copies_parameter, True) == record, "image copy record was not confirmed")
+        return record
+
+    def run_replicate(self, event):
+        need(event == {"action": "replicate-active-release"}, "image copy accepts no caller configuration")
+        record = self.replicate(self.load(self.env["RELEASE_PARAMETER"], True))
+        return {"status": "replicated", "generation": record["generation"]}
+
     def finish(self, result, source, input_sha):
         name, request = self.request(source, input_sha)
         if request["priority"] == "critical":
@@ -866,9 +957,12 @@ class Publisher:
                 raise
         request.update(status="promoted", generation=result["generation"])
         self.save(name, request)
+        self.replicate(result)
         return {"status": "promoted", "generation": result["generation"]}
 
     def run(self, event):
+        if isinstance(event, dict) and event.get("action") == "replicate-active-release":
+            return self.run_replicate(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-seed":
             return self.run_seed(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-phone-release":

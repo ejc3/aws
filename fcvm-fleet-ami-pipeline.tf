@@ -628,7 +628,13 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
     { Sid      = "CancelPersistentTileRequestsBeforeRetirement", Effect = "Allow", Action = "ec2:CancelSpotInstanceRequests",
       Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:spot-instances-request/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_ami_region } } },
-    { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = aws_ssm_parameter.fcvm_ami_release.arn },
+    { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
+      Resource = concat(local.fcvm_ami_image_arns, flatten([for region in local.fcvm_ami_copy_regions : ["arn:aws:ec2:${region}::image/*", "arn:aws:ec2:${region}::snapshot/*"]])),
+    Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_copy_regions } } },
+    { Sid      = "CopyImageTagsOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
+      Resource = flatten([for region in local.fcvm_ami_copy_regions : ["arn:aws:ec2:${region}::image/*", "arn:aws:ec2:${region}::snapshot/*"]]),
+    Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestedRegion" = local.fcvm_ami_copy_regions } } },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject", "s3:GetObjectAttributes"], Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/factory/*" },
     { Effect = "Allow", Action = "s3:ListBucket", Resource = aws_s3_bucket.fcvm_fleet_assets.arn, Condition = { StringLike = { "s3:prefix" = "factory/*" } } },
@@ -672,6 +678,8 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
       HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
       HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
+      # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies".
+      COPY_REGIONS = join(",", local.fcvm_ami_copy_regions)
     }
   }
 }

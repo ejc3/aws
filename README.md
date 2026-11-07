@@ -513,6 +513,16 @@ Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
 
+After each publication the publisher copies the host and tile images into
+us-west-2 (`fcvm_ami_copy_regions`, `fcvm-fleet-ami-release.tf`) and records the ids
+of both regions in `/fcvm-fleet/ami-release-copies` (us-east-1). Agents' GPU boxes
+(fcvm `fleet/tools/gpubox.sh`) launch there, off the staging fleet's us-east-1 G
+quota. The copies are not in the release's image maps, so us-west-2 gets no launch
+templates or fleet hosts. A copy failure leaves the release live; the next
+invocation completes it. To copy the active release on demand (after the first
+apply, for example):
+`aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
+
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
 the producer, verify that the four defaults select the already validated guarded
 images, then merge/deploy fcvm's `$Default` consumer and main-only request workflow.
