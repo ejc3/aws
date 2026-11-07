@@ -121,7 +121,9 @@ class Retirement(unittest.TestCase):
             content = TF[TF.index(header):]
             return re.sub(r"\s+", " ", content[:content.index("\n}\n")])
 
-        self.assertIn("default = false", block('variable "boot_race_enabled"'))
+        # One campaign is active: this PR sets the default to true, and the follow-up that retires the campaign
+        # sets it, and this line, back to false.
+        self.assertIn("default = true", block('variable "boot_race_enabled"'))
         for header in ('resource "aws_iam_role" "boot_race_driver"',
                        'resource "aws_iam_role_policy" "boot_race_driver"',
                        'resource "aws_iam_role_policy" "dev_server_boot_race"'):

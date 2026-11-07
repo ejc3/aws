@@ -774,7 +774,7 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
 variable "boot_race_enabled" {
   description = "Activate the boot-race campaign: driver access, scoped reaper schedule and billed Fargate network"
   type        = bool
-  default     = false
+  default     = true
 }
 
 resource "aws_subnet" "boot_race" {
