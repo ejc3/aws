@@ -852,12 +852,6 @@ class Doctor:
         if not existing:
             self.store.put(key, op)
         self.operation_index(case, event['operation_id'], key)
-        if not inspect:
-            active = self.store.get('host-operation') or {'case_id': None}
-            require(not active.get('case_id') or (active['case_id'] == case['case_id']
-                and active.get('operation_id') == event['operation_id']))
-            active.update(case_id=case['case_id'], operation_id=event['operation_id'])
-            self.store.put('host-operation', active)
         if not op.get('request_version_id'):
             authored = encoded({'case_id': case['case_id'], 'operation_id': op['operation_id'],
                 'target': target, 'document': op['document'], 'script': script}).encode()
@@ -869,9 +863,64 @@ class Doctor:
             op.update(request_key=request_key, request_version_id=archived['VersionId'],
                 request_sha256=hashlib.sha256(authored).hexdigest())
             self.store.put(key, op)
+        return self.dispatch_prepared(case, key, op, script, inspect)
+
+    def claim_host_operation(self, case, op):
+        for _ in range(4):
+            active = self.store.get('host-operation') or {'case_id': None}
+            if active.get('case_id'):
+                if active['case_id'] == case['case_id'] and active.get('operation_id') == op['operation_id']:
+                    return None
+                return active
+            active.update(case_id=case['case_id'], operation_id=op['operation_id'])
+            try:
+                self.store.put('host-operation', active)
+                return None
+            except Exception as error:
+                if error_code(error) != 'ConditionalCheckFailedException':
+                    raise
+        return self.store.get('host-operation') or {}
+
+    def dispatch_prepared(self, case, key, op, script, inspect):
+        case = self.authorize({'case_id': case['case_id'], 'build_id': case['build_id']})
+        require(op['build_id'] == case['build_id'])
+        target = op['target']
+        body_hash, request_hash = op['body_hash'], op['request_sha256']
+        require(target in [{k: t[k] for k in ('instance_id', 'region')} for t in case['targets']])
+        if not inspect:
+            targets, _ = self.critical_targets(case['cve'], target['region'])
+            require(any(t['instance_id'] == target['instance_id'] for t in targets))
+        self.describe_target(target['instance_id'], target['region'])
+        current = self.store.get(key)
+        require(current and current['body_hash'] == op['body_hash'])
+        if current['state'] != 'prepared':
+            return self.op_receipt(current)
+        if not inspect:
+            active = self.claim_host_operation(case, op)
+            if active is not None:
+                return {**self.op_receipt(current), 'dispatch_status': 'queued',
+                    'waiting_for_op': active.get('operation_id'), 'waiting_for_case': active.get('case_id')}
         # The durable request archive and send intent precede every SSM send.
-        op['state'] = 'send-uncertain'
-        self.store.put(key, op)
+        for _ in range(4):
+            op = self.store.get(key)
+            require(op and op.get('request_version_id') and op.get('request_sha256') == request_hash
+                and op['body_hash'] == body_hash and op['script_sha256'] == digest(script))
+            if op['state'] != 'prepared':
+                if not inspect and op['state'] == 'terminal':
+                    self.release('host-operation', case['case_id'], op['operation_id'])
+                return self.op_receipt(op)
+            current = self.authorize({'case_id': case['case_id'], 'build_id': case['build_id']})
+            require(op['build_id'] == current['build_id']
+                and target in [{k: t[k] for k in ('instance_id', 'region')} for t in current['targets']])
+            op['state'] = 'send-uncertain'
+            try:
+                self.store.put(key, op)
+                break
+            except Exception as error:
+                if error_code(error) != 'ConditionalCheckFailedException':
+                    raise
+        else:
+            return {**self.op_receipt(self.store.get(key)), 'dispatch_status': 'queued'}
         parameters = {} if inspect else {'commands': [script], 'executionTimeout': [str(min(900, max(1, int(case['deadline_unix'] - self.now()))))]}
         try:
             result = self.api('ssm', target['region']).send_command(InstanceIds=[target['instance_id']],
@@ -894,6 +943,32 @@ class Doctor:
         key = self.operation(case, event.get('operation_id'))
         op = self.store.get(key)
         require(op and case['operations'].get(event['operation_id']) == key)
+        if op['state'] == 'prepared':
+            current = self.authorize({'case_id': case['case_id'], 'build_id': case['build_id']})
+            require(op['build_id'] == current['build_id'])
+            if not op.get('request_version_id'):
+                return {**self.op_receipt(op), 'dispatch_status': 'retry-original-command',
+                    'retry_original_command': True}
+            request_key = 'commands/' + case['case_id'] + '/' + digest(key) + '/request.json'
+            require(op.get('request_key') == request_key and isinstance(op['request_version_id'], str)
+                and op['request_version_id'] not in {'', 'null'} and DIGEST.fullmatch(op.get('request_sha256', '')))
+            archived = self.api('s3').get_object(Bucket=self.env['BUCKET_NAME'], Key=request_key,
+                VersionId=op['request_version_id'], ExpectedBucketOwner=self.account)
+            try:
+                raw = archived['Body'].read(24577)
+            finally:
+                archived['Body'].close()
+            require(archived.get('VersionId') == op['request_version_id'] and len(raw) <= 24576
+                and hashlib.sha256(raw).hexdigest() == op['request_sha256'])
+            authored = json.loads(raw)
+            require(isinstance(authored, dict) and set(authored) == {'case_id', 'operation_id', 'target', 'document', 'script'}
+                and authored['case_id'] == case['case_id'] and authored['operation_id'] == op['operation_id']
+                and authored['target'] == op['target'] and authored['document'] == op['document']
+                and op['document'] in {self.env['INSPECT_DOCUMENT_NAME'], self.env['COMMAND_DOCUMENT_NAME']}
+                and isinstance(authored['script'], str) and digest(authored['script']) == op['script_sha256'])
+            inspect = op['document'] == self.env['INSPECT_DOCUMENT_NAME']
+            require(digest(encoded({'target': authored['target'], 'script': authored['script'], 'inspect': inspect})) == op['body_hash'])
+            return self.command(current, {**event, 'target': authored['target'], 'script': authored['script'], 'inspect': inspect})
         ssm = self.api('ssm', op['target']['region'])
         if not op.get('command_id'):
             commands, token = [], None

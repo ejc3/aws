@@ -136,7 +136,10 @@ or an agent's assertion does not close a finding: the controller waits for nativ
 Inspector closure before calling it resolved.
 
 Each host operation has a stable ID, a durable intent and a command receipt. An
-uncertain delivery is reconciled instead of replayed. Workspaces and potentially
+operation waiting for the single host-command slot retains its versioned request;
+polling it sends that same operation when the slot becomes free, after revalidating
+the active repair and target. An uncertain delivery is reconciled instead of
+replayed. Workspaces and potentially
 sensitive full agent streams stay in the private encrypted bucket; CloudWatch shows
 only typed progress metadata. Checkpoints are acknowledged only after a versioned
 object and its ledger reference have both been persisted. Tests kill the controller

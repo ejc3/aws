@@ -1,5 +1,6 @@
 """Credential-free tests of real controller/broker paths and durable crash seams."""
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -146,7 +147,8 @@ class Cloud:
             'DocumentName': c['DocumentName']} for c in self.sends]}
 
     def get_command_invocation(self, **kw):
-        assert kw == {'CommandId': COMMAND, 'InstanceId': INSTANCE}
+        assert kw['CommandId'] == COMMAND
+        assert any(c['InstanceIds'] == [kw['InstanceId']] for c in self.sends)
         return {'Status': self.invocation_status, 'ResponseCode': 0, 'StandardOutputContent': 'patched', 'StandardErrorContent': ''}
 
     def put_object(self, **kw):
@@ -158,6 +160,12 @@ class Cloud:
     def head_object(self, **kw):
         assert kw['ExpectedBucketOwner'] == ACCOUNT
         return {'VersionId': kw['VersionId'], 'ContentLength': 10, 'ServerSideEncryption': 'aws:kms'}
+
+    def get_object(self, **kw):
+        assert kw['ExpectedBucketOwner'] == ACCOUNT
+        assert kw['VersionId'] == 'audit-version'
+        body = self.objects[kw['Key']]
+        return {'VersionId': kw['VersionId'], 'ContentLength': len(body), 'Body': io.BytesIO(body)}
 
 
 def durable_json(path, value):
@@ -218,6 +226,8 @@ def crash_child(mode, directory):
     os.umask(0o077)
     memory, cloud = FileMemory(directory), FileCloud(directory)
     doctor = C.Doctor(ENV, memory, cloud.client, lambda: 1793538000)
+    if mode == 'recover':
+        cloud.invocation_status = 'InProgress'
     if mode != 'recover':
         memory.put('config', {'armed': True, 'gate_version': 2})
     event = {'source': 'aws.inspector2', 'detail-type': 'Inspector2 Finding', 'account': ACCOUNT,
@@ -227,12 +237,21 @@ def crash_child(mode, directory):
     command = {'action': 'command', 'case_id': case_id, 'build_id': case['build_id'],
         'target': {'instance_id': INSTANCE, 'region': REGION}, 'operation_id': 'durable-patch', 'script': 'true'}
     reply = doctor.broker(command)
+    queued_command = {**command, 'operation_id': 'durable-queued', 'script': 'uname -r'}
+    queued = doctor.broker(queued_command)
+    assert queued['state'] == 'prepared' and queued.get('request_version_id') == 'audit-version'
     if mode == 'recover':
         assert len(cloud.starts) == len(cloud.sends) == 1
         assert reply['command_id'] == COMMAND
+        cloud.invocation_status = 'Success'
         poll = doctor.broker({**command, 'action': 'poll'})
-        assert poll['state'] == 'terminal' and len(cloud.objects) == 2
-        print(json.dumps({'recovered': True, 'starts': 1, 'commands': 1}), flush=True)
+        assert poll['state'] == 'terminal'
+        dispatched = doctor.broker({**queued_command, 'action': 'poll'})
+        assert dispatched['state'] == 'submitted' and len(cloud.sends) == 2
+        assert cloud.sends[-1]['Parameters']['commands'] == ['uname -r']
+        completed = doctor.broker({**queued_command, 'action': 'poll'})
+        assert completed['state'] == 'terminal' and len(cloud.objects) == 4
+        print(json.dumps({'recovered': True, 'starts': 1, 'commands': 2, 'queued_recovered': True}), flush=True)
         return
     assert reply['command_id'] == COMMAND
     # Actual handler/broker have ACKed; all fake service state is already fsynced.
@@ -284,6 +303,20 @@ class Tests(unittest.TestCase):
     def command(self, case, **fields):
         return self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
             operation_id='patch-version-1', script=fields.pop('script', 'true'), **fields)
+
+    def fleet_commands(self):
+        self.cloud.instance['Tags'] = [{'Key': 'Name', 'Value': 'nextjs-ct'}]
+        for number, name in ((2, 'jumpbox-2'), (3, 'jumpbox')):
+            instance = 'i-' + str(number) * 17
+            self.cloud.extra_instances.append({'InstanceId': instance, 'State': {'Name': 'running'},
+                'Tags': [{'Key': 'Name', 'Value': name}]})
+            self.cloud.finding['resources'].append({'type': 'AWS_EC2_INSTANCE', 'id': instance, 'region': REGION})
+            self.doctor.names.add(name)
+        case = self.admit()
+        commands = [self.request(case, 'command', target={'instance_id': 'i-' + str(number) * 17,
+            'region': REGION}, operation_id='recon-' + name, script='set -eu\nuname -r\n')
+            for number, name in ((1, 'nextjs'), (2, 'jumpbox-2'), (3, 'jumpbox'))]
+        return case, commands
 
     def native_no_fix(self):
         self.cloud.instance['Architecture'] = 'arm64'
@@ -427,14 +460,20 @@ class Tests(unittest.TestCase):
                 self.store, self.cloud = Memory(), Cloud()
                 self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
                 self.model.calls.clear()
-                vendor = self.native_no_fix()
+                self.native_no_fix()
                 package = self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'][0]
-                if variant == 'source': self.cloud.finding['packageVulnerabilityDetails']['source'] = 'OTHER'
-                if variant == 'platform': self.cloud.finding['resources'][0]['details']['awsEc2Instance']['platform'] = 'UNKNOWN'
-                if variant == 'arch': package['arch'] = 'X86_64'
-                if variant == 'custom': package['version'] = '7.0-fcvm-custom'
-                if variant == 'truncated': self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'] *= 9
-                if variant == 'missing': package.pop('epoch')
+                if variant == 'source':
+                    self.cloud.finding['packageVulnerabilityDetails']['source'] = 'OTHER'
+                if variant == 'platform':
+                    self.cloud.finding['resources'][0]['details']['awsEc2Instance']['platform'] = 'UNKNOWN'
+                if variant == 'arch':
+                    package['arch'] = 'X86_64'
+                if variant == 'custom':
+                    package['version'] = '7.0-fcvm-custom'
+                if variant == 'truncated':
+                    self.cloud.finding['packageVulnerabilityDetails']['vulnerablePackages'] *= 9
+                if variant == 'missing':
+                    package.pop('epoch')
                 with patch.object(T, 'fetch_vendor', side_effect=AssertionError('unknown facts must not fetch')):
                     case = self.admit()
                 self.assertEqual(case['status'], 'running')
@@ -590,22 +629,26 @@ class Tests(unittest.TestCase):
         original, failed = self.store.put, []
         def lost_ack(key, value):
             if key.startswith('admin#') and value.get('state') == 'completed' and not failed:
-                failed.append(True); raise OSError('lost pause ACK')
+                failed.append(True)
+                raise OSError('lost pause ACK')
             return original(key, value)
         self.store.put = lost_ack
         event = {'action': 'pause_new_runs', 'paused': True, 'mutationId': 'pause-once'}
-        with self.assertRaises(OSError): self.doctor.handler(event)
+        with self.assertRaises(OSError):
+            self.doctor.handler(event)
         revision = self.store.get('config')['_revision']
         replay = self.doctor.handler(event)
         self.assertTrue(replay['paused'])
         self.assertEqual(self.store.get('config')['_revision'], revision)
         self.doctor.handler(self.event)
         self.assertEqual(self.cloud.starts, [])
-        with self.assertRaises(ValueError): self.doctor.handler({**event, 'paused': False})
+        with self.assertRaises(ValueError):
+            self.doctor.handler({**event, 'paused': False})
 
     def test_manual_recheck_is_durable_idempotent_and_respects_pause(self):
         vendor = self.native_no_fix()
-        with patch.object(T, 'fetch_vendor', return_value=vendor): case = self.admit()
+        with patch.object(T, 'fetch_vendor', return_value=vendor):
+            case = self.admit()
         self.doctor.handler({'action': 'pause_new_runs', 'paused': True, 'mutationId': 'hold'})
         event = {'action': 'recheck', 'case_id': case['case_id'], 'mutationId': 'check-once'}
         first = self.doctor.handler(event)
@@ -786,9 +829,10 @@ class Tests(unittest.TestCase):
         self.cloud.lose_send = True
         self.cloud.invocation_status = 'InProgress'
         self.doctor.broker(self.command(case))
-        with self.assertRaises(ValueError):
-            self.doctor.broker(self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
-                operation_id='second-mutation', script='true'))
+        queued = self.doctor.broker(self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
+            operation_id='second-mutation', script='true'))
+        self.assertEqual((queued['state'], queued['dispatch_status']), ('prepared', 'queued'))
+        self.assertEqual(queued['waiting_for_op'], 'patch-version-1')
         latest = self.store.get('case#' + case['case_id'])
         latest.update(attempts=2, reserved_usd=50)
         self.doctor.save(latest)
@@ -851,7 +895,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(terminal['state'], 'terminal')
                 self.assertIn(terminal['receipt_key'], cloud.objects)
                 self.assertNotIn('command_id', terminal)
-                self.assertEqual(memory.get('host-operation')['case_id'], case_id)
+                self.assertFalse((memory.get('host-operation') or {}).get('case_id'))
                 with patch.object(cloud, 'list_commands', wraps=cloud.list_commands) as listing, \
                         patch.object(cloud, 'get_command_invocation', wraps=cloud.get_command_invocation) as invocation, \
                         patch.object(cloud, 'put_object', wraps=cloud.put_object) as archive:
@@ -881,6 +925,193 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.doctor.broker(self.request(case, 'command', target={'instance_id': INSTANCE, 'region': REGION},
                 operation_id='foreign-inspect', inspect=True, script=''))
+
+    def test_three_host_checks_queue_then_dispatch_once_each_through_poll(self):
+        case, commands = self.fleet_commands()
+        first = self.doctor.broker(commands[0])
+        self.assertEqual(first['state'], 'submitted')
+        for event in commands[1:]:
+            queued = self.doctor.broker(event)
+            self.assertEqual((queued['state'], queued['dispatch_status']), ('prepared', 'queued'))
+            self.assertEqual((queued['waiting_for_case'], queued['waiting_for_op']),
+                (case['case_id'], commands[0]['operation_id']))
+            self.assertEqual(queued['request_version_id'], 'audit-version')
+            self.assertNotIn('command_id', queued)
+        self.assertEqual(len(self.cloud.sends), 1)
+        self.assertEqual(len(self.cloud.objects), 3, 'acknowledged queue entries retain their authored requests')
+
+        with patch.object(self.cloud, 'list_commands', side_effect=AssertionError('prepared means never sent')):
+            for event in commands[1:]:
+                waiting = self.doctor.broker(self.request(case, 'poll', operation_id=event['operation_id']))
+                self.assertEqual(waiting['dispatch_status'], 'queued')
+                self.assertEqual(len(self.cloud.sends), 1)
+
+        self.doctor = C.Doctor(ENV, self.store, self.cloud.client, lambda: self.clock)
+        self.doctor.names.add('jumpbox-2')
+        completed = self.doctor.broker(self.request(case, 'poll', operation_id=commands[0]['operation_id']))
+        self.assertEqual(completed['state'], 'terminal')
+        for number, event in enumerate(commands[1:], start=2):
+            with patch.object(self.cloud, 'get_object', wraps=self.cloud.get_object) as read, \
+                    patch.object(self.cloud, 'list_commands', side_effect=AssertionError('prepared means never sent')):
+                sent = self.doctor.broker(self.request(case, 'poll', operation_id=event['operation_id']))
+            self.assertEqual(sent['state'], 'submitted')
+            self.assertEqual(read.call_args.kwargs['VersionId'], 'audit-version')
+            self.assertEqual(len(self.cloud.sends), number)
+            self.assertEqual(self.cloud.sends[-1]['InstanceIds'], [event['target']['instance_id']])
+            self.assertEqual(self.cloud.sends[-1]['Parameters']['commands'], [event['script']])
+            completed = self.doctor.broker(self.request(case, 'poll', operation_id=event['operation_id']))
+            self.assertEqual(completed['state'], 'terminal')
+            self.doctor.broker(event)  # A repeated delivery of the original request is an observation.
+            self.assertEqual(len(self.cloud.sends), number)
+        self.assertEqual(self.store.get('case#' + case['case_id'])['outstanding_operations'], [])
+        self.assertFalse((self.store.get('host-operation') or {}).get('case_id'))
+
+    def test_fixed_inspections_bypass_the_custom_command_queue(self):
+        _case, commands = self.fleet_commands()
+        self.doctor.broker(commands[0])
+        queued = self.doctor.broker(commands[1])
+        self.assertEqual(queued['dispatch_status'], 'queued')
+        for event in commands:
+            inspection = {**event, 'operation_id': event['operation_id'] + '-fixed', 'script': '', 'inspect': True}
+            self.assertEqual(self.doctor.broker(inspection)['state'], 'submitted')
+            self.assertEqual(self.cloud.sends[-1]['Parameters'], {})
+            self.assertEqual(self.cloud.sends[-1]['DocumentName'], 'PatchDoctor-Inspect')
+        self.assertEqual(len(self.cloud.sends), 4)
+        self.assertEqual(self.store.get('host-operation')['operation_id'], commands[0]['operation_id'])
+
+    def test_unarchived_prepared_command_requires_original_request_without_ssm_search(self):
+        case = self.admit()
+        event = self.command(case)
+        self.cloud.fail_audit = True
+        with self.assertRaises(TimeoutError):
+            self.doctor.broker(event)
+        self.cloud.fail_audit = False
+        with patch.object(self.cloud, 'list_commands', side_effect=AssertionError('never sent')), \
+                patch.object(self.cloud, 'get_object', side_effect=AssertionError('no archive exists')):
+            reply = self.doctor.broker(self.request(case, 'poll', operation_id=event['operation_id']))
+        self.assertEqual((reply['state'], reply['dispatch_status']), ('prepared', 'retry-original-command'))
+        self.assertIs(reply['retry_original_command'], True)
+        self.assertEqual(self.cloud.sends, [])
+        self.assertFalse(any(m['Subject'] == 'PatchDoctor command-delivery-uncertain' for m in self.cloud.messages))
+        self.assertEqual(self.doctor.broker(event)['state'], 'submitted')
+        self.assertEqual(len(self.cloud.sends), 1)
+
+    def test_queued_command_revalidates_live_critical_target_build_and_deadline(self):
+        case, commands = self.fleet_commands()
+        for event in commands[:2]:
+            self.doctor.broker(event)
+        self.doctor.broker(self.request(case, 'poll', operation_id=commands[0]['operation_id']))
+        poll = self.request(case, 'poll', operation_id=commands[1]['operation_id'])
+        self.cloud.finding['severity'] = 'HIGH'
+        with self.assertRaises(ValueError):
+            self.doctor.broker(poll)
+        self.cloud.finding['severity'] = 'CRITICAL'
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'SUCCEEDED'
+        with self.assertRaises(ValueError):
+            self.doctor.broker(poll)
+        self.cloud.builds[case['build_id']]['buildStatus'] = 'IN_PROGRESS'
+        self.clock = case['deadline_unix']
+        with self.assertRaises(ValueError):
+            self.doctor.broker(poll)
+        self.assertEqual(len(self.cloud.sends), 1)
+        op = self.store.get(self.doctor.operation(case, commands[1]['operation_id']))
+        self.assertEqual(op['state'], 'prepared')
+
+    def test_queued_archive_corruption_or_identity_change_never_dispatches(self):
+        case, commands = self.fleet_commands()
+        for event in commands[:2]:
+            self.doctor.broker(event)
+        self.doctor.broker(self.request(case, 'poll', operation_id=commands[0]['operation_id']))
+        key = self.doctor.operation(case, commands[1]['operation_id'])
+        original = self.store.get(key)
+        raw = self.cloud.objects[original['request_key']]
+        body = json.loads(raw)
+        changes = {
+            'response-version': {},
+            'raw-bytes': {},
+            'request-hash': {'request_sha256': '0' * 64},
+            'body-hash': {'body_hash': '0' * 64},
+            'script-hash': {'script_sha256': '0' * 64},
+            'target': {'target': commands[2]['target']},
+            'case': {},
+            'operation': {},
+            'document': {},
+            'script': {},
+            'oversized': {},
+        }
+        for kind, fields in changes.items():
+            with self.subTest(kind=kind):
+                value = self.store.get(key)
+                value.update(fields)
+                damaged = copy.deepcopy(body)
+                if kind in {'case', 'operation', 'document', 'script'}:
+                    name = {'case': 'case_id', 'operation': 'operation_id', 'document': 'document', 'script': 'script'}[kind]
+                    damaged[name] = 'changed'
+                    returned = C.encoded(damaged).encode()
+                    value['request_sha256'] = hashlib.sha256(returned).hexdigest()
+                elif kind == 'raw-bytes':
+                    returned = raw + b' '
+                elif kind == 'oversized':
+                    returned = b' ' * 24577
+                    value['request_sha256'] = hashlib.sha256(returned).hexdigest()
+                else:
+                    returned = raw
+                self.store.put(key, value)
+                response = {'VersionId': 'other-version' if kind == 'response-version' else 'audit-version',
+                    'ContentLength': len(returned), 'Body': io.BytesIO(returned)}
+                with patch.object(self.cloud, 'get_object', return_value=response), \
+                        self.assertRaises((ValueError, json.JSONDecodeError)):
+                    self.doctor.broker(self.request(case, 'poll', operation_id=commands[1]['operation_id']))
+                self.assertEqual(len(self.cloud.sends), 1)
+                current = self.store.get(key)
+                restored = copy.deepcopy(original)
+                restored['_revision'] = current['_revision']
+                self.store.put(key, restored)
+
+    def test_operation_send_intent_conflict_observes_winner_without_replay(self):
+        case = self.admit()
+        event = self.command(case)
+        key = self.doctor.operation(case, event['operation_id'])
+        original = self.store.put
+        raced = []
+        def concurrent_send(pk, value):
+            if pk == key and value.get('state') == 'send-uncertain' and not raced:
+                raced.append(None)
+                raced[0] = self.doctor.broker(event)
+            return original(pk, value)
+        self.store.put = concurrent_send
+        try:
+            result = self.doctor.broker(event)
+        finally:
+            self.store.put = original
+        self.assertEqual(result['state'], 'submitted')
+        self.assertEqual(raced[0]['command_id'], result['command_id'])
+        self.assertEqual(len(self.cloud.sends), 1)
+
+    def test_host_lock_conflict_queues_loser_until_winner_finishes(self):
+        case, commands = self.fleet_commands()
+        self.doctor.broker(commands[0])
+        self.doctor.broker(self.request(case, 'poll', operation_id=commands[0]['operation_id']))
+        original = self.store.put
+        raced = []
+        def concurrent_lock(pk, value):
+            if pk == 'host-operation' and value.get('operation_id') == commands[1]['operation_id'] and not raced:
+                raced.append(None)
+                raced[0] = self.doctor.broker(commands[2])
+            return original(pk, value)
+        self.store.put = concurrent_lock
+        try:
+            queued = self.doctor.broker(commands[1])
+        finally:
+            self.store.put = original
+        self.assertEqual(queued['dispatch_status'], 'queued')
+        self.assertEqual(queued['waiting_for_op'], commands[2]['operation_id'])
+        self.assertEqual(raced[0]['state'], 'submitted')
+        self.assertEqual(len(self.cloud.sends), 2)
+        self.doctor.broker(self.request(case, 'poll', operation_id=commands[2]['operation_id']))
+        self.assertEqual(self.doctor.broker(self.request(case, 'poll', operation_id=commands[1]['operation_id']))['state'],
+            'submitted')
+        self.assertEqual(len(self.cloud.sends), 3)
 
     def test_native_recurrence_creates_one_new_generation_after_resolved_case(self):
         case = self.admit()
@@ -1389,7 +1620,6 @@ class Tests(unittest.TestCase):
     def test_acknowledged_state_survives_hard_exit_and_sigterm_process_restart(self):
         for mode in ('hard', 'term'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='patchdoctor-restart-') as raw:
-                directory = Path(raw)
                 argv = [sys.executable, '-S', '-B', str(Path(__file__).resolve()), '--crash-child']
                 env = {'PATH': '/usr/bin:/bin', 'HOME': raw, 'AWS_EC2_METADATA_DISABLED': 'true'}
                 child = subprocess.Popen([*argv, mode, raw], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
@@ -1406,7 +1636,8 @@ class Tests(unittest.TestCase):
                         child.communicate(timeout=5)
                 recovered = subprocess.run([*argv, 'recover', raw], capture_output=True, env=env, timeout=10)
                 self.assertEqual(recovered.returncode, 0, recovered.stderr.decode())
-                self.assertEqual(json.loads(recovered.stdout), {'recovered': True, 'starts': 1, 'commands': 1})
+                self.assertEqual(json.loads(recovered.stdout),
+                    {'recovered': True, 'starts': 1, 'commands': 2, 'queued_recovered': True})
 
     def test_non_cve_critical_recorded_blocked_without_host_actions(self):
         self.cloud.finding['packageVulnerabilityDetails'] = {}
