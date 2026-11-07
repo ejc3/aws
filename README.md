@@ -73,10 +73,17 @@ constraint, both jumpboxes, and the Terraform validation workflow together.
 
 Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.25.0`
 provider release. That fork adds typed Worker-native Access destinations, the Workers
-Builds APIs used below and the Access application's `eager_redirect_cookie_setting` while preserving ordinary `terraform init` on both ARM64 jumpboxes
-and amd64 CI; there is no local provider override or machine-specific installation step.
+Builds APIs used below, and eager Access cookies. Standard `terraform init` works on
+both ARM64 jumpboxes and amd64 CI without a local provider override.
 Return to `cloudflare/cloudflare` only after an upstream release includes the same fields
 and regression coverage.
+
+The FCVM staging page and its direct `/live` WebSocket share one owner/CI Access
+application so signing in to the page also sets the socket cookie. For the first
+rollout, apply only `cloudflare_dns_record.fcvm_dev_direct_stage` and check that
+the new hostname resolves and returns the tunnel's default 404. Then apply the
+Access destination and gated ingress before deploying the Worker binding. The
+Worker's service token stays on `fleet-api-stage.fcvm.dev`.
 
 The fork has a different provider source address. On the first live-jumpbox update to the
 fork, stop after `terraform providers` if state still lists `cloudflare/cloudflare`.

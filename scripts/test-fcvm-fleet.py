@@ -559,8 +559,10 @@ class StageWallTests(unittest.TestCase):
         dev = (ROOT / "fcvm-dev.tf").read_text()
         tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
         tunnel = tunnel[:tunnel.index("\n}\n")]
-        self.assertIn("required  = true", tunnel)
-        self.assertEqual(tunnel.count("hostname ="), 1)
+        self.assertEqual(tunnel.count("hostname ="), 2)
+        api, direct = tunnel.split("hostname = local.fcvm_dev_direct_stage_host", 1)
+        self.assertIn("required  = true", api)
+        self.assertIn("required  = true", direct)
 
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the

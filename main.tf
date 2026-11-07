@@ -12,9 +12,8 @@ terraform {
     }
     cloudflare = {
       # Exact fork pin adds Worker-native Access destinations, typed Workers Builds
-      # resources and the Access application's eager_redirect_cookie_setting (5.25.0).
-      # Return to the upstream namespace only after an upstream release carries the
-      # same schemas and regression coverage.
+      # resources and the Access application's eager_redirect_cookie_setting.
+      # Return to the upstream namespace only when it carries the same coverage.
       source  = "ejc3/cloudflare"
       version = "= 5.25.0"
     }

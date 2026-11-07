@@ -25,7 +25,7 @@ class ZoneTests(unittest.TestCase):
     def test_nothing_public_yet(self):
         # The apex and fleet-api.fcvm.dev go live only on the owner's go-ahead.
         names = re.findall(r'name    = "?([^"\n]+)"?\n', "".join(block(m.group(0)[:-2]) for m in re.finditer(r'resource "cloudflare_dns_record" "\w+" \{', TF)))
-        self.assertEqual(names, ["local.fcvm_dev_api_stage_hostname"])
+        self.assertEqual(names, ["local.fcvm_dev_api_stage_hostname", "local.fcvm_dev_direct_stage_host"])
         self.assertNotRegex(TF, r'"fleet-api\.fcvm\.dev"')
         self.assertNotIn('"fcvm.dev"', TF.split("variable", 1)[1].replace('"fcvm.dev staging', ""))
 
@@ -73,31 +73,46 @@ class AccessTests(unittest.TestCase):
         self.assertIn("fcvm_fleet_stage_worker.client_id", sec)
         self.assertIn("fcvm_fleet_stage_worker.client_secret", sec)
 
-    def test_one_application_covers_the_page_and_the_coordinator_with_the_eager_cookie(self):
-        # The page's /live WebSocket to the coordinator host needs a session there from sign-in (ejc3/fcvm#1649).
+    def test_only_the_page_application_admits_the_direct_viewer_host(self):
+        site = block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"')
         api = block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"')
-        self.assertIn("eager_redirect_cookie_setting = true", api)
-        self.assertIn("{ type = \"public\", uri = local.fcvm_dev_api_stage_hostname },", api)
-        self.assertIn("{ type = \"public\", uri = local.fcvm_dev_site_stage_host },", api)
-        # The first destination is the application's domain.
-        self.assertLess(api.index("local.fcvm_dev_api_stage_hostname },"), api.index("local.fcvm_dev_site_stage_host },"))
-        # Step 1 of 2: the page host keeps its own application until the merged one covers it.
-        self.assertIn("domain           = local.fcvm_dev_site_stage_host",
-                      block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"'))
-        # The agents keep their own path-specific application.
-        self.assertNotIn("eager_redirect_cookie_setting", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"'))
+        agents = block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"')
+        self.assertEqual(re.findall(r'uri = (local\.\w+)', site),
+                         ["local.fcvm_dev_site_stage_host", "local.fcvm_dev_direct_stage_host"])
+        self.assertIn("eager_redirect_cookie_setting = true", site)
+        self.assertNotIn("fcvm_dev_direct_stage_host", api + agents)
+        self.assertNotIn("fcvm_dev_site_stage_host", api + agents)
+        self.assertEqual(re.findall(r'id = cloudflare_zero_trust_access_policy\.(\w+)\.id', site),
+                         ["fcvm_dev_stage_owner", "fcvm_stage_ci"])
 
     def test_the_connector_requires_an_access_token_on_every_path(self):
         cfg = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"')
-        self.assertEqual(cfg.count("hostname ="), 1)
-        self.assertIn("required  = true", cfg)
-        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud", cfg)
-        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_agent.aud", cfg)
+        self.assertEqual(cfg.count("hostname ="), 2)
+        api, direct = cfg.split("hostname = local.fcvm_dev_direct_stage_host", 1)
+        self.assertIn("required  = true", api)
+        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud", api)
+        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_agent.aud", api)
+        self.assertIn("required  = true", direct)
+        self.assertEqual(re.findall(r'cloudflare_zero_trust_access_application\.(\w+)\.aud', direct), ["fcvm_dev_site_stage"])
+        path = re.search(r'path\s*=\s*"([^"\n]+)"', direct).group(1)
+        self.assertIsNotNone(re.search(path, "/live"))
+        for blocked in ("/", "/agent", "/poster.jpg", "/healthz", "/live/agent", "/x/live"):
+            self.assertIsNone(re.search(path, blocked), blocked)
+        self.assertIn('{ service = "http_status:404" }', direct)
 
     def test_the_record_waits_for_access(self):
         rec = block('resource "cloudflare_dns_record" "fcvm_dev_api_stage"')
         for dep in ("fcvm_dev_api_stage", "fcvm_dev_agent"):
             self.assertIn(f"cloudflare_zero_trust_access_application.{dep}", rec)
+
+    def test_the_viewer_record_can_be_staged_at_the_tunnels_default_404(self):
+        direct = block('resource "cloudflare_dns_record" "fcvm_dev_direct_stage"')
+        self.assertIn("proxied = true", direct)
+        self.assertIn("cloudflare_zero_trust_tunnel_cloudflared.fcvm_fleet_coordinator.id", direct)
+        self.assertNotIn("cloudflare_zero_trust_access_application.", direct)
+        self.assertNotIn("cloudflare_zero_trust_tunnel_cloudflared_config.", direct)
+        site = block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"')
+        self.assertIn("depends_on = [cloudflare_dns_record.fcvm_dev_direct_stage]", site)
 
 
 class StageWorkerTests(unittest.TestCase):
