@@ -11,11 +11,11 @@ terraform {
       version = "~> 2.0"
     }
     cloudflare = {
-      # Exact fork pin adds Worker-native Access destinations and typed Workers Builds
-      # resources. Return to the upstream namespace only after an upstream release
-      # carries the same schemas and regression coverage.
+      # Exact fork pin adds Worker-native Access destinations, typed Workers Builds
+      # resources and the Access application's eager_redirect_cookie_setting.
+      # Return to the upstream namespace only when it carries the same coverage.
       source  = "ejc3/cloudflare"
-      version = "= 5.24.0"
+      version = "= 5.25.0"
     }
     github = {
       source  = "integrations/github"

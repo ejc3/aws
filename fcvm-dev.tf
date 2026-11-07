@@ -18,9 +18,10 @@
 #   fleet-api-stage.fcvm.dev  -> tunnel fcvm-fleet-coordinator -> the coordinator in its task (localhost:8080). The
 #                                connector requires an Access token on every path: the owner's, or at /agent the agents'
 #                                service token (its own application, so it is never a bypass).
-#   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its own application.
-#                                The Worker forwards the page's /live and /poster.jpg to fleet-api-stage with its own
-#                                service token, so a browser needs one Access session (the page host's), not two.
+#   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its owner/CI application.
+#                                Its fallback forwards /live and /poster.jpg to fleet-api-stage with its service token.
+#   fleet-api-direct-stage.fcvm.dev -> /live only, gated by the page's Access application and exact audience. Sign-in
+#                                     sets cookies on both hosts, without admitting the Worker token to either one.
 # The public apex and fleet-api.fcvm.dev go live only on the owner's go-ahead: neither has a record or an application here.
 #
 # CREDENTIAL: the provider token (cloudflare-tunnel-token) has DNS Write account-wide and Zone Settings Write on this zone
@@ -35,6 +36,7 @@ variable "fcvm_dev_zone_id" {
 
 locals {
   fcvm_dev_api_stage_hostname = "fleet-api-stage.fcvm.dev"
+  fcvm_dev_direct_stage_host  = "fleet-api-direct-stage.fcvm.dev"
   fcvm_dev_site_stage_host    = "stage.fcvm.dev"
   # The coordinator's port inside its task: the cloudflared container shares the task's network namespace.
   fcvm_fleet_coordinator_port = 8080
@@ -116,6 +118,11 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
   domain           = local.fcvm_dev_site_stage_host
   type             = "self_hosted"
   session_duration = "12h"
+  destinations = [
+    { type = "public", uri = local.fcvm_dev_site_stage_host },
+    { type = "public", uri = local.fcvm_dev_direct_stage_host },
+  ]
+  eager_redirect_cookie_setting = true
   allowed_idps = concat(
     cloudflare_zero_trust_access_identity_provider.github[*].id,
     cloudflare_zero_trust_access_identity_provider.google[*].id,
@@ -125,6 +132,9 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
   ]
+  # Eager sign-in redirects through both destinations. The new hostname must resolve
+  # first; it reaches only the tunnel's 404 until this application gates its /live.
+  depends_on = [cloudflare_dns_record.fcvm_dev_direct_stage]
 }
 
 # The GPU hosts' agents: a service token, never a person (non_identity). A year long, as claw-master's.
@@ -240,8 +250,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "fcvm_fleet_coordinator" {
   config_src = "cloudflare"
 }
 
-# Every request needs an Access token for one of the two applications: the connector refuses anything else even if an
-# application were dropped.
+# The connector verifies the allowed application audiences itself. The browser-only route takes only /live with the
+# page application's audience, never a Worker or agent credential.
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator" {
   account_id = var.cloudflare_account_id
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.fcvm_fleet_coordinator.id
@@ -255,6 +265,18 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinat
             required  = true
             team_name = "ejc3"
             aud_tag   = [cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud, cloudflare_zero_trust_access_application.fcvm_dev_agent.aud]
+          }
+        }
+      },
+      {
+        hostname = local.fcvm_dev_direct_stage_host
+        path     = "^/live$"
+        service  = "http://localhost:${local.fcvm_fleet_coordinator_port}"
+        origin_request = {
+          access = {
+            required  = true
+            team_name = "ejc3"
+            aud_tag   = [cloudflare_zero_trust_access_application.fcvm_dev_site_stage.aud]
           }
         }
       },
@@ -277,6 +299,16 @@ resource "cloudflare_dns_record" "fcvm_dev_api_stage" {
     cloudflare_zero_trust_access_application.fcvm_dev_agent,
     cloudflare_zero_trust_tunnel_cloudflared_config.fcvm_fleet_coordinator,
   ]
+}
+
+resource "cloudflare_dns_record" "fcvm_dev_direct_stage" {
+  zone_id = var.fcvm_dev_zone_id
+  name    = local.fcvm_dev_direct_stage_host
+  type    = "CNAME"
+  content = "${cloudflare_zero_trust_tunnel_cloudflared.fcvm_fleet_coordinator.id}.cfargotunnel.com"
+  proxied = true
+  ttl     = 1
+  comment = "fcvm fleet staging viewer socket; Access-gated"
 }
 
 data "cloudflare_zero_trust_tunnel_cloudflared_token" "fcvm_fleet_coordinator" {
