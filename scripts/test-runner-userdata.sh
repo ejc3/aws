@@ -689,6 +689,8 @@ registration_case() { # scenario expected_rc expected_service expected_delete [f
     local scenario=$1 want_rc=$2 want_service=$3 want_delete=$4 mode=${5:-first} rc=0
     local journal="$REG_TMP/$scenario.log" agent_id=77 output="$REG_TMP/$scenario.output"
     local label="$scenario${REG_TRACE:+ under $REG_TRACE}"
+    local market_labels=${REG_MARKET_LABELS:-}
+    label="$label${market_labels:+ with $market_labels}"
     local run=(bash)
     case "$REG_TRACE" in
       "bash -x") run=(bash -x) ;;
@@ -713,7 +715,7 @@ registration_case() { # scenario expected_rc expected_service expected_delete [f
       PATH="$REG_TMP/bin:$PATH" \
       FAKE_SCENARIO="$scenario" FAKE_MODE="$mode" FAKE_AGENT_ID="$agent_id" \
       JOURNAL="$journal" FAKE_SYSTEMD_DIR="$REG_TMP/systemd" \
-      INSTANCE_ID=i-test RUNNER_LABEL=ARM64 REGION=us-west-1 \
+      INSTANCE_ID=i-test RUNNER_LABEL=ARM64 RUNNER_LABELS="$market_labels" REGION=us-west-1 \
         "${run[@]}" "$REG_BLOCK" "$mode"
     ) >"$output" 2>&1 || rc=$?
     if [ "$mode" = next ] && grep -q '^svc:install' "$journal"; then
@@ -734,6 +736,10 @@ registration_case() { # scenario expected_rc expected_service expected_delete [f
         return
     fi
     if grep -q '^config$' "$journal"; then
+        if ! grep -qF -- "--labels self-hosted,Linux,${market_labels:-ARM64} " "$journal.config-args"; then
+            bad "$label: config.sh did not get the expected runner labels"
+            return
+        fi
         if ! grep -q '^token-received$' "$journal"; then
             bad "$label: config.sh ran without the registration credential"
             return
@@ -807,6 +813,8 @@ echo "next job on the same host:"
 # GitHub gives the new registration 78. No credential, a failed delete, a wrong
 # identity or a row that moved on all power the host off without a service.
 registration_case next_token            0 1 1 next
+REG_MARKET_LABELS=ARM64,on-demand registration_case bootstrap  0 1 1
+REG_MARKET_LABELS=ARM64,on-demand registration_case next_token 0 1 1 next
 registration_case next_lost_answer      0 1 1 next
 registration_case next_no_token         1 0 1 next
 registration_case next_delete_failure   1 0 0 next
@@ -867,6 +875,7 @@ case "$*" in
   */latest/meta-data/network/interfaces/macs/0a:1b:2c:3d:4e:5f/interface-id) echo eni-0fake ;;
   */latest/meta-data/placement/region) echo us-west-1 ;;
   */latest/meta-data/instance-id) echo i-0fake ;;
+  */latest/meta-data/instance-life-cycle) echo on-demand ;;
   *) echo "unexpected metadata path" >&2; exit 97 ;;
 esac
 FAKE_IMDS_CURL
@@ -926,7 +935,7 @@ imds_case() { # n trace(on|off) expected_log_line token_variable
     ok "$label: token untraced and unset, values logged, tracing as before"
 }
 IMDS_LOG1='IMDS: MAC=0a:1b:2c:3d:4e:5f ENI_ID=eni-0fake REGION=us-west-1'
-IMDS_LOG2='IMDS: INSTANCE_ID=i-0fake'
+IMDS_LOG2='IMDS: INSTANCE_ID=i-0fake INSTANCE_LIFE_CYCLE=on-demand'
 imds_case 1 on  "$IMDS_LOG1" TOKEN6
 imds_case 1 off "$IMDS_LOG1" TOKEN6
 imds_case 2 on  "$IMDS_LOG2" TOKEN
