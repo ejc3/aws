@@ -8,7 +8,8 @@
 # (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
 # administration; every other site's container is in this account. A site whose Worker also gets values Terraform makes
 # (dolphin-maps: the moderation key, dolphin-maps-moderation.tf) has a second container, workers-stage/SITE/terraform, beside
-# it; the two are merged, and a name in both refuses the whole load. The result is piped to `wrangler secret bulk`, so no
+# it; the two are merged, and a name in both refuses the whole load. lights has only that second container (the photo
+# reader's Bedrock key, lights-vision.tf), so for it the hand-set one is not read. The result is piped to `wrangler secret bulk`, so no
 # value is on a command line, in a file or in this script's output; only names are printed. Run it AFTER the site's own
 # deploy has finished: a secret change made while a deploy is uploading can be lost when that deploy activates.
 # dolphin-maps also gets dolphin-maps/musickit (Apple Music's developer-token key, dolphin-maps-musickit.tf), kept in THIS
@@ -23,9 +24,11 @@ ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
 DOLPHIN_ACCOUNT_ID=484888470752
 MANAGED_CONTAINER="" # set: workers-stage/SITE/terraform exists too (Terraform writes it)
+MANAGED_ONLY=""      # set: the site has no hand-set container, only Terraform's (lights: lights-vision.tf)
 case "$SITE" in
   dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
   dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;
+  lights) SOURCE_ACCOUNT="" MANAGED_CONTAINER=1 MANAGED_ONLY=1 ;;
   *) SOURCE_ACCOUNT="" ;;
 esac
 
@@ -63,7 +66,10 @@ read_or_say() {
     return 1
   fi
 }
-OUT_OF_BAND=$(read_or_say "workers-stage/$SITE") || exit 1
+OUT_OF_BAND=""
+if [[ -z "$MANAGED_ONLY" ]]; then
+  OUT_OF_BAND=$(read_or_say "workers-stage/$SITE") || exit 1
+fi
 MANAGED=""
 if [[ -n "$MANAGED_CONTAINER" ]]; then
   MANAGED=$(read_or_say "workers-stage/$SITE/terraform") || exit 1
@@ -95,7 +101,7 @@ JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" MUSICKIT="$MUSICKIT" python
 import json, os, re, sys
 merged = {}
 for label in ("OUT_OF_BAND", "MANAGED"):
-    if label == "MANAGED" and not os.environ[label]:
+    if not os.environ[label] and (label == "MANAGED" or sys.argv[1] == "lights"):
         continue
     try:
         d = json.loads(os.environ[label])
@@ -116,6 +122,11 @@ for label in ("OUT_OF_BAND", "MANAGED"):
 if sys.argv[1] == "dolphin-maps":
     required = {"MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_SECRET_ACCESS_KEY",
                 "MODERATION_AWS_REGION", "MODERATION_TEXT_REGION"}
+    missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
+    if missing:
+        sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
+if sys.argv[1] == "lights":
+    required = {"LIGHTS_AWS_ACCESS_KEY_ID", "LIGHTS_AWS_SECRET_ACCESS_KEY", "LIGHTS_BEDROCK_REGION", "LIGHTS_BEDROCK_MODEL"}
     missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
     if missing:
         sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))

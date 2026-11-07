@@ -1766,6 +1766,11 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
   Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
   constellation-mcp`.
+- **Lights' photo reader on staging** (`lights-vision.tf`): the IAM user `lights-vision-worker-stage`, whose only grant is
+  bedrock-haiku.tf's Haiku 5.5 statements, so the Worker `lights-stage` (ejc3/constellation `apps/lights-web`) can read a
+  photo of a house. Its key is written to `workers-stage/lights/terraform` and loaded with
+  `scripts/workers-stage-secrets.sh lights`, which reads that container alone for this site (lights has no hand-set staging
+  secrets). The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
 - **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
   script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
   of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
