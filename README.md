@@ -527,10 +527,11 @@ on-demand run the publisher also retires images nothing needs, at most 16 per re
 (`retain()` in `publish.py`): its own copies, factory candidates outside the build region, and
 images built by hand that were never validated and are 14 days old. It keeps the active and the
 previous release in every region, every launch template's default image and every image an
-instance still uses; validated images (the bootstrap catalog's) are never retired, and in the
-build region the dispatcher retains factory candidates. The publisher's release configuration
-(templates and reviewed pairs) ships in its code bundle as `publisher-config.json`, not in its
-environment.
+instance still uses. Validated bootstrap images are never retired, and in the build region the
+dispatcher retains factory candidates. The publisher deletes snapshots only when its CopyImage
+call tagged them at creation; older unmarked snapshots remain for separate review. The publisher's
+release configuration (templates and reviewed pairs) ships in its code bundle as
+`publisher-config.json`, not in its environment.
 
 To copy the active release on demand, invoke the publisher below. If copies are pending,
 invoke it again after they become available:
@@ -543,8 +544,10 @@ Wait for old dispatcher invocations to drain and confirm `/fcvm-fleet/ami-pipeli
 in us-west-1 has both `active` and `pending` null and no builder remains in the old region.
 A build's journal records instance IDs without a region, so the new dispatcher cannot clean
 up a build stranded there. Keep admission paused while applying the reviewed region change
-under the normal Terraform lock; verify the dispatcher, SSM document and CodeBuild regions,
-then restore admission.
+under the normal Terraform lock; verify the dispatcher, SSM document and CodeBuild regions.
+Before restoring admission, verify the publisher's managed SDK supports copy snapshot tags and
+returns image lineage. Invoke the publisher with `{"action":"check-copy-sdk"}` and require
+`{"status":"ready"}`. This check reads the SDK model without making any AWS API requests.
 
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
 the producer, verify that the four defaults select the already validated guarded

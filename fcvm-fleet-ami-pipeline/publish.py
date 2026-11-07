@@ -29,6 +29,7 @@ HANDMADE_DAYS = 14
 # Longer than a publication's 24-hour lease (dispatch.py PUBLICATION_SECONDS).
 RETAIN_MIN_DAYS = 2
 RETAIN_LIMIT = 16
+COPY_SNAPSHOT_TAG = "FleetPublisherCopy"
 # A published image's name: the factory's (dispatch.py seal) or a hand-built one's (build-ami.sh).
 NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-" + kind + r"-x86_64-[0-9a-f]{8}-[0-9]{12})\Z")
         for kind in ("host", "tile")}
@@ -57,6 +58,22 @@ def digest(value):
 
 def without_image(value):
     return {key: item for key, item in value.items() if key != "ImageId"}
+
+
+def copy_snapshot_tags():
+    return [{"ResourceType": "snapshot", "Tags": [{"Key": COPY_SNAPSHOT_TAG, "Value": "true"}]}]
+
+
+def copy_sdk_status():
+    """Check the managed runtime's SDK model without constructing any AWS client."""
+    from botocore.session import get_session
+    ec2 = get_session().get_service_model("ec2")
+    tags = ec2.operation_model("CopyImage").input_shape.members.get("TagSpecifications")
+    image = ec2.operation_model("DescribeImages").output_shape.members["Images"].member
+    missing = ["DescribeImages." + field for field in ("SourceImageId", "SourceImageRegion") if field not in image.members]
+    if not tags or "snapshot" not in tags.member.members["ResourceType"].enum:
+        missing.append("CopyImage.TagSpecifications[snapshot]")
+    return {"status": "incompatible", "missing": missing} if missing else {"status": "ready"}
 
 
 # The publisher's bulky fixed configuration ships in its code bundle (Terraform writes it),
@@ -592,6 +609,7 @@ class Publisher:
             if not found:
                 copied = target.copy_image(SourceImageId=original, SourceRegion=self.build_region, Name=name,
                     Description=description, Encrypted=True, CopyImageTags=True,
+                    TagSpecifications=copy_snapshot_tags(),
                     ClientToken=digest(original + "/" + compute))["ImageId"]
                 need(IMAGE.fullmatch(copied), "image copy returned no image identity")
                 pending.append(kind)
@@ -992,7 +1010,8 @@ class Publisher:
                 if not found:
                     copied = ec2.copy_image(SourceImageId=sources[kind], SourceRegion=compute, Name=names[kind],
                         Description="copy of " + sources[kind] + " from " + compute, Encrypted=True,
-                        CopyImageTags=True, ClientToken=digest(sources[kind] + "/" + region))["ImageId"]
+                        CopyImageTags=True, TagSpecifications=copy_snapshot_tags(),
+                        ClientToken=digest(sources[kind] + "/" + region))["ImageId"]
                     need(IMAGE.fullmatch(copied), "image copy returned no image identity")
                     try:
                         found = ec2.describe_images(ImageIds=[copied])["Images"]
@@ -1086,8 +1105,8 @@ class Publisher:
         Spot request in the region uses, and every copy of a kept image or image a kept copy was
         made from, in any region (so a record without previous_images still keeps the previous
         release's copies). At most RETAIN_LIMIT images go per region and run. A snapshot is
-        tagged FleetRetired before its image is deregistered, so a deletion that fails is found
-        again and retried by the next run."""
+        eligible for deletion only if CopyImage stamped its provenance at creation. Eligible
+        snapshots are tagged FleetRetired before deregistration, so a failed deletion is retried."""
         keep = set()
         for bundle in (release, release.get("previous") or {}):
             for key in ("host_amis", "tile_amis"):
@@ -1126,16 +1145,15 @@ class Publisher:
         removed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
-            retired = ec2.describe_snapshots(OwnerIds=[self.env["FLEET_ACCOUNT"]],
-                Filters=[{"Name": "tag:FleetRetired", "Values": ["true"]}])["Snapshots"]
-            for snapshot in retired[:RETAIN_LIMIT]:
-                self.delete_retired_snapshot(ec2, snapshot["SnapshotId"])
+            for snapshot in self.copy_snapshots(ec2):
+                self.delete_retired_snapshot(ec2, snapshot)
             stale = sorted((image for image in listed[region] if self.retirable(image, region) and image["ImageId"] not in keep),
                            key=lambda image: image["ImageId"])
             removed[region] = []
             for image in stale[:RETAIN_LIMIT]:
-                snapshots = [item["Ebs"]["SnapshotId"] for item in image.get("BlockDeviceMappings", [])
-                             if item.get("Ebs", {}).get("SnapshotId")]
+                mapped = [item["Ebs"]["SnapshotId"] for item in image.get("BlockDeviceMappings", [])
+                          if item.get("Ebs", {}).get("SnapshotId")]
+                snapshots = self.copy_snapshots(ec2, mapped) if mapped else []
                 if snapshots:
                     ec2.create_tags(Resources=snapshots, Tags=[{"Key": "FleetRetired", "Value": "true"}])
                 ec2.deregister_image(ImageId=image["ImageId"])
@@ -1143,6 +1161,18 @@ class Publisher:
                     self.delete_retired_snapshot(ec2, snapshot)
                 removed[region].append(image["ImageId"])
         return removed
+
+    def copy_snapshots(self, ec2, mapped=None):
+        scope = {"Name": "tag:FleetRetired", "Values": ["true"]} if mapped is None else {"Name": "snapshot-id", "Values": mapped}
+        snapshots = ec2.describe_snapshots(OwnerIds=[self.env["FLEET_ACCOUNT"]], MaxResults=RETAIN_LIMIT, Filters=[
+            {"Name": "tag:" + COPY_SNAPSHOT_TAG, "Values": ["true"]}, scope])["Snapshots"]
+        owned = []
+        for snapshot in snapshots:
+            tags = {item["Key"]: item["Value"] for item in snapshot.get("Tags", [])}
+            if (snapshot.get("OwnerId") == self.env["FLEET_ACCOUNT"] and tags.get(COPY_SNAPSHOT_TAG) == "true"
+                    and (tags.get("FleetRetired") == "true" if mapped is None else snapshot["SnapshotId"] in mapped)):
+                owned.append(snapshot["SnapshotId"])
+        return owned
 
     @staticmethod
     def delete_retired_snapshot(ec2, snapshot):
@@ -1220,6 +1250,8 @@ class Publisher:
 
 def lambda_handler(event, context):
     try:
+        if event == {"action": "check-copy-sdk"}:
+            return copy_sdk_status()
         return Publisher().run(event)
     except Exception:
         # SDK errors may contain request details. Only a static failure escapes.

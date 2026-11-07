@@ -162,18 +162,22 @@ class EC2:
         self.deleted_snapshots.append(SnapshotId)
         self.snapshots.pop(SnapshotId, None)
 
-    def copy_image(self, SourceImageId, SourceRegion, Name, Description, Encrypted, CopyImageTags, ClientToken):
+    def copy_image(self, SourceImageId, SourceRegion, Name, Description, Encrypted, CopyImageTags, TagSpecifications, ClientToken):
         """A pending image carrying the source's tags; `available()` completes it."""
         assert SourceRegion != self.region and Encrypted is True and CopyImageTags is True
+        assert TagSpecifications == [{"ResourceType": "snapshot", "Tags": [{"Key": "FleetPublisherCopy", "Value": "true"}]}]
         assert ClientToken == MODULE.digest(SourceImageId + "/" + self.region)
         if self.fail_copy:
             raise RuntimeError("copy unavailable")
         assert all(item.get("Name") != Name for item in self.images.values()), "a name is never copied twice"
         source = self.peers[SourceRegion].images[SourceImageId]
         image_id = "ami-" + format(0xc0000 + 16 * len(self.peers) + len(self.images) + 4096 * (self.region == "us-east-1"), "017x")
+        snapshot = "snap-" + image_id[4:]
+        self.snapshots[snapshot] = {"SnapshotId": snapshot, "OwnerId": source["OwnerId"], "Tags": copy.deepcopy(TagSpecifications[0]["Tags"])}
         self.images[image_id] = {"ImageId": image_id, "Name": Name, "Description": Description, "OwnerId": source["OwnerId"],
             "Public": False, "State": getattr(self, "copy_state", "pending" if self.region == "us-east-1" else "available"),
             "Architecture": "x86_64", "RootDeviceType": "ebs",
+            "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot}}],
             "SourceImageId": SourceImageId, "SourceImageRegion": SourceRegion, "Tags": copy.deepcopy(source["Tags"])}
         self.copies.append((SourceImageId, image_id))
         return {"ImageId": image_id}
@@ -183,12 +187,19 @@ class EC2:
             if item["State"] == "pending":
                 item["State"] = "available"
 
-    def describe_snapshots(self, SnapshotIds=None, OwnerIds=None, Filters=None):
+    def describe_snapshots(self, SnapshotIds=None, OwnerIds=None, Filters=None, MaxResults=None):
         if SnapshotIds is not None:
             return {"Snapshots": [copy.deepcopy(self.snapshots[name]) for name in SnapshotIds]}
-        assert OwnerIds == ["222222222222"] and [item["Name"] for item in Filters] == ["tag:FleetRetired"]
-        return {"Snapshots": [copy.deepcopy(item) for item in self.snapshots.values()
-                              if {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get("FleetRetired") in Filters[0]["Values"]]}
+        assert OwnerIds == ["222222222222"] and MaxResults == MODULE.RETAIN_LIMIT
+        values = [item for item in self.snapshots.values() if item.get("OwnerId") in OwnerIds]
+        for scope in Filters:
+            name = scope["Name"]
+            if name == "snapshot-id":
+                values = [item for item in values if item["SnapshotId"] in scope["Values"]]
+            else:
+                assert name in {"tag:FleetRetired", "tag:FleetPublisherCopy"}
+                values = [item for item in values if {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get(name[4:]) in scope["Values"]]
+        return {"Snapshots": copy.deepcopy(values[:MaxResults])}
 
     def describe_launch_templates(self, LaunchTemplateIds):
         return {"LaunchTemplates": [{"LaunchTemplateId": key, "DefaultVersionNumber": self.templates[key]["default"]}
@@ -239,7 +250,8 @@ class EC2:
         if Tags == [{"Key": "FleetRetired", "Value": "true"}]:
             assert all(name.startswith("snap-") for name in Resources)
             for name in Resources:
-                item = self.snapshots.setdefault(name, {"SnapshotId": name, "Tags": []})
+                item = self.snapshots[name]
+                assert {tag["Key"]: tag["Value"] for tag in item["Tags"]}.get("FleetPublisherCopy") == "true"
                 item["Tags"] = [t for t in item.get("Tags", []) if t["Key"] != "FleetRetired"] + copy.deepcopy(Tags)
             return
         assert Tags == [{"Key": "FleetImageValidated", "Value": "true"}]
@@ -1423,6 +1435,9 @@ class PublisherTests(unittest.TestCase):
 
     def publisher_copy(self, fake, image_id, source, source_region, kind="host", snapshot=None, description=None, created=None):
         """An image the publisher made with CopyImage, in `fake`'s region."""
+        if snapshot:
+            fake.snapshots[snapshot] = {"SnapshotId": snapshot, "OwnerId": "222222222222",
+                "Tags": [{"Key": "FleetPublisherCopy", "Value": "true"}]}
         fake.images[image_id] = {"ImageId": image_id, "Name": "fcvm-factory-" + image_id[4:16] * 2 + "-" + kind,
             "Description": description or "copy of " + source + " from " + source_region, "OwnerId": "222222222222",
             "Public": False, "State": "available", "Architecture": "x86_64", "RootDeviceType": "ebs",
@@ -1462,10 +1477,12 @@ class PublisherTests(unittest.TestCase):
         self.active_new_pair()
         def image(fake, image_id, name, days, **tags):
             created = datetime.datetime.fromtimestamp(clock.time() - days * 86400, datetime.timezone.utc)
+            snapshot = "snap-" + image_id[4:]
+            fake.snapshots[snapshot] = {"SnapshotId": snapshot, "OwnerId": "222222222222", "Tags": []}
             fake.images[image_id] = {"ImageId": image_id, "Name": name, "OwnerId": "222222222222", "Public": False,
                 "State": "available", "CreationDate": created.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "Tags": [{"Key": k, "Value": v} for k, v in {"Purpose": "fcvm-fleet", **tags}.items()],
-                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-" + image_id[4:]}}]}
+                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot}}]}
         factory = {"PipelineSanitized": "true", "PipelineBuildId": "factory:00000000-0000-0000-0000-00000000000f"}
         ids = {name: "ami-" + format(0xb000 + i, "017x") for i, name in enumerate(
             ["old-handmade", "new-handmade", "validated-handmade", "east-factory", "west-factory", "foreign-factory", "other-name",
@@ -1483,7 +1500,8 @@ class PublisherTests(unittest.TestCase):
         image(self.ec2, ids["other-name"], "something-else", 30)
         self.publisher().run({"action": "replicate-active-release"})
         self.assertEqual(sorted(self.ec2.deregistered), sorted([ids["old-handmade"], ids["east-factory"]]))
-        self.assertEqual(sorted(self.ec2.deleted_snapshots), sorted("snap-" + ids[n][4:] for n in ("old-handmade", "east-factory")))
+        self.assertEqual(self.ec2.deleted_snapshots, [])
+        self.assertTrue(all("snap-" + ids[name][4:] in self.ec2.snapshots for name in ("old-handmade", "east-factory")))
         self.assertEqual(self.west.deregistered, [])
 
     def test_retention_keeps_fresh_copies_spot_images_and_copies_of_kept_images(self):
@@ -1510,6 +1528,21 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual((self.west.deregistered, self.west.deleted_snapshots), ([stale], []))
         self.publisher().run({"action": "replicate-active-release"})
         self.assertEqual(self.west.deleted_snapshots, [snapshot])
+
+    def test_retention_never_claims_an_unproven_snapshot(self):
+        self.active_new_pair()
+        stale = "ami-" + "c5" * 8 + "c"
+        legacy, retired_only, wrong_owner = ["snap-" + format(0xc500 + i, "017x") for i in range(3)]
+        self.publisher_copy(self.west, stale, "ami-" + "d5" * 8 + "d", "us-east-1", snapshot=legacy)
+        for snapshot, owner, tags in ((legacy, "222222222222", []),
+            (retired_only, "222222222222", [{"Key": "FleetRetired", "Value": "true"}]),
+            (wrong_owner, "333333333333", [{"Key": "FleetRetired", "Value": "true"},
+                                         {"Key": "FleetPublisherCopy", "Value": "true"}])):
+            self.west.snapshots[snapshot] = {"SnapshotId": snapshot, "OwnerId": owner, "Tags": tags}
+        self.publisher().run({"action": "replicate-active-release"})
+        self.assertEqual(self.west.deregistered, [stale])
+        self.assertEqual(self.west.deleted_snapshots, [])
+        self.assertEqual(self.west.snapshots[legacy]["Tags"], [])
 
     def test_retention_removes_a_bounded_number_per_run(self):
         self.active_new_pair()

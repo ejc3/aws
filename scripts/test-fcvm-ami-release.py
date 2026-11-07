@@ -144,6 +144,21 @@ class ReleaseContracts(unittest.TestCase):
         tags = policy[policy.index('"CopyImageTagsOnCreate"'):]
         tags = tags[:tags.index("} },")]
         self.assertIn('"ec2:CreateAction" = "CopyImage"', tags)
+
+    def test_publisher_cannot_mark_an_existing_snapshot_as_its_copy(self):
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        policy = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        for sid in ("MarkRetiredSnapshots", "DeleteRetiredSnapshots"):
+            with self.subTest(statement=sid):
+                statement = policy.split('"' + sid + '"', 1)[1].split("} },", 1)[0]
+                self.assertIn('"ec2:ResourceTag/FleetPublisherCopy" = "true"', statement)
+                self.assertIn('"ec2:Owner" = local.fcvm_fleet_account_id', statement)
+                self.assertIn('::snapshot/*', statement)
+        creation = policy.split('"CopySnapshotProvenanceOnCreate"', 1)[1].split("} },", 1)[0]
+        self.assertIn('"ec2:CreateAction" = "CopyImage"', creation)
+        self.assertIn('"aws:RequestTag/FleetPublisherCopy" = "true"', creation)
+        self.assertIn('"aws:TagKeys" = ["FleetPublisherCopy"]', creation)
+
     def test_the_factory_builds_in_us_west_2_and_releases_in_us_east_1(self):
         pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
         self.assertRegex(pipeline, r'fcvm_ami_region\s*=\s*"us-east-1"')

@@ -689,17 +689,20 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
     { Sid      = "RetireUnneededCopies", Effect = "Allow", Action = "ec2:DeregisterImage",
       Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
-    # Retention tags a retired image's snapshots FleetRetired before it deregisters the image, and
-    # deletes only snapshots carrying that tag (a copy's snapshots carry no other).
+    # FleetPublisherCopy may only be written to new snapshots as part of CopyImage. Require
+    # it both to mark a snapshot for retry and to delete it; never backfill copy provenance.
     { Sid      = "MarkRetiredSnapshots", Effect = "Allow", Action = "ec2:CreateTags",
       Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
-    Condition = { StringEquals = { "aws:RequestTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetRetired"] } } },
+    Condition = { StringEquals = { "ec2:ResourceTag/FleetPublisherCopy" = "true", "ec2:Owner" = local.fcvm_fleet_account_id, "aws:RequestTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetRetired"] } } },
     { Sid      = "DeleteRetiredSnapshots", Effect = "Allow", Action = "ec2:DeleteSnapshot",
       Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
-    Condition = { StringEquals = { "ec2:ResourceTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    Condition = { StringEquals = { "ec2:ResourceTag/FleetPublisherCopy" = "true", "ec2:ResourceTag/FleetRetired" = "true", "ec2:Owner" = local.fcvm_fleet_account_id, "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
     { Sid      = "CopyImageTagsOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
-      Resource = local.fcvm_ami_release_image_arns,
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
     Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    { Sid      = "CopySnapshotProvenanceOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestTag/FleetPublisherCopy" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetPublisherCopy"] } } },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject", "s3:GetObjectAttributes"], Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/factory/*" },
     { Effect = "Allow", Action = "s3:ListBucket", Resource = aws_s3_bucket.fcvm_fleet_assets.arn, Condition = { StringLike = { "s3:prefix" = "factory/*" } } },
