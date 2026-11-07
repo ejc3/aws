@@ -334,14 +334,26 @@ class TerraformWiringTests(unittest.TestCase):
 
     def test_only_the_launch_function_may_run_or_stop_engines_besides_the_sweeper(self):
         # The lobby's roles may only invoke games-mp-launch (scripts/test-games-mp-launch.py).
+        # The boot-race launcher may run and stop tasks too, and the boot-race reaper stop them, but only on
+        # the boot-race cluster, so neither can reach a games engine. The boot-race driver holds neither action.
         for path in ROOT.glob("*.tf"):
             text = path.read_text()
             for action in ("ecs:RunTask", "ecs:StopTask"):
                 for m in re.finditer(r'"%s"' % action, text):
-                    owner = re.findall(r'^resource "aws_iam_role_policy" "(\w+)"', text[:m.start()], re.M)
-                    self.assertIn((path.name, owner[-1] if owner else None),
-                                  {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper")},
+                    owner = re.findall(r'^(?:resource "aws_iam_role_policy"|data "aws_iam_policy_document") "(\w+)"',
+                                       text[:m.start()], re.M)
+                    key = (path.name, owner[-1] if owner else None)
+                    self.assertIn(key,
+                                  {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper"),
+                                   ("boot-race.tf", "boot_race_launcher"), ("boot-race.tf", "boot_race_reaper")},
                                   "%s granted outside the launch function and the sweeper" % action)
+                    if key[0] == "boot-race.tf":
+                        start = text.rfind("statement {", 0, m.start())
+                        end = text.find("\n  }\n", m.start())
+                        statement = text[start:end]
+                        self.assertNotIn("games", statement)
+                        self.assertNotIn('"*"', statement)
+                        self.assertRegex(statement, r"boot-race|boot_race")
 
     def test_router_is_denied_and_carries_the_denied_tag(self):
         block = self.launch_statement("NeverStopTheRouter")
