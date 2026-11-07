@@ -73,6 +73,10 @@ class Publisher:
              and all(COPY_REGION.fullmatch(region) for region in self.copy_regions)
              and self.env["COMPUTE_REGION"] not in self.copy_regions, "image copy configuration is outside its fixed scope")
         self.copies_parameter = self.env["RELEASE_PARAMETER"] + "-copies"
+        # Where the factory builds and verifies candidates. The release (the launch templates) is in
+        # COMPUTE_REGION; a candidate built elsewhere is copied there before it is promoted.
+        self.build_region = self.env["BUILD_REGION"]
+        need(COPY_REGION.fullmatch(self.build_region), "image build region is outside its fixed scope")
         self.build_id = None
         self.lock_info = None
         self.transaction = None
@@ -457,7 +461,7 @@ class Publisher:
                  and not entry.get("no_instance") and not entry.get("rejected")
                  for entry in journal["slots"].values()), "broker has no durable termination proof for every slot")
         # Filters safely omit expired IDs; API errors still fail the publication.
-        reservations = self.client("ec2", True).describe_instances(Filters=[{"Name": "instance-id", "Values": ids}])["Reservations"]
+        reservations = self.client("ec2", True, self.build_region).describe_instances(Filters=[{"Name": "instance-id", "Values": ids}])["Reservations"]
         seen = set()
         for reservation in reservations:
             for item in reservation["Instances"]:
@@ -507,7 +511,7 @@ class Publisher:
         return manifest
 
     def images(self, manifest, source, input_sha):
-        ec2 = self.client("ec2", True)
+        ec2 = self.client("ec2", True, self.build_region)
         resources = []
         for kind in ("host", "tile"):
             image_id = manifest["images"][kind]["image_id"]
@@ -532,7 +536,53 @@ class Publisher:
                      and snapshot.get("Encrypted") is True and all(tags.get(key) == value for key, value in expected.items()),
                      "candidate snapshot provenance does not match")
             resources.extend([image_id, *snapshots])
-        return resources
+        return {self.build_region: resources}
+
+    def release_copies(self, manifest, source, input_sha):
+        """The candidate pair in the release region: the candidates themselves when the factory
+        builds there, else their copies, started here and found again by name on a replay.
+
+        A copy still pending refuses; the dispatcher redrives publication every five minutes
+        until its fixed publication lease ends. Returns the release-region ids and the copies'
+        image ids, which promote tags validated with the originals."""
+        compute = self.env["COMPUTE_REGION"]
+        if self.build_region == compute:
+            return {kind: manifest["images"][kind]["image_id"] for kind in ("host", "tile")}, []
+        source_ec2, target = self.client("ec2", True, self.build_region), self.client("ec2", True, compute)
+        expected = {"Purpose": "fcvm-fleet", "GuardHelperSHA256": self.env["GUARD_SHA256"], "SourceCommit": source,
+                    "InputSHA256": input_sha, "PipelineBuildId": self.build_id, "PipelineSanitized": "true"}
+        ids, pending = {}, []
+        for kind in ("host", "tile"):
+            original = manifest["images"][kind]["image_id"]
+            rows = source_ec2.describe_images(ImageIds=[original])["Images"]
+            need(len(rows) == 1 and NAME[kind].fullmatch(rows[0].get("Name", "")), "candidate image has no factory name")
+            name, description = rows[0]["Name"], "copy of " + original + " from " + self.build_region
+            found = target.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
+                Filters=[{"Name": "name", "Values": [name]}])["Images"]
+            need(len(found) <= 1, "more than one image holds a candidate name")
+            if not found:
+                copied = target.copy_image(SourceImageId=original, SourceRegion=self.build_region, Name=name,
+                    Description=description, Encrypted=True, CopyImageTags=True,
+                    ClientToken=digest(original + "/" + compute))["ImageId"]
+                need(IMAGE.fullmatch(copied), "image copy returned no image identity")
+                pending.append(kind)
+                ids[kind] = copied
+                continue
+            image = found[0]
+            tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+            need(IMAGE.fullmatch(image.get("ImageId", "")) and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+                 and image.get("Public") is False and image.get("Description") == description
+                 and image.get("State") in {"pending", "available"}
+                 and all(tags.get(key) == value for key, value in {**expected, "FleetImageKind": kind}.items()),
+                 "a release-region copy is outside the candidate's private factory lineage")
+            if image["State"] != "available":
+                pending.append(kind)
+            else:
+                need(image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs",
+                     "a release-region copy is not an x86_64 EBS image")
+            ids[kind] = image["ImageId"]
+        need(not pending, "release-region copies are still pending: " + ",".join(pending))
+        return ids, list(ids.values())
 
     def store(self, manifest, input_sha):
         """Copy only immutable, proof-bound source versions into runtime assets.
@@ -748,8 +798,9 @@ class Publisher:
             entry["candidate"] = self.version(template["id"], current, manifest["images"][template["kind"]]["image_id"], "candidate", entry)
             versions[template["region"] + "/" + template["id"]] = entry["candidate"]
             self.record()
-        if resources:
-            self.client("ec2", True).create_tags(Resources=resources, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
+        for region, names in sorted((resources or {}).items()):
+            if names:
+                self.client("ec2", True, region).create_tags(Resources=names, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
         for template, entry in self.transaction["entries"].items():
             need(self.current(template)["VersionNumber"] == entry["old_version"], "template default changed during publication")
             self.select(template, entry["candidate"])
@@ -990,6 +1041,9 @@ class Publisher:
             resources = self.images(manifest, source, input_sha)
             # Large content transfers need not hold the infrastructure state lock.
             self.store(manifest, input_sha)
+            targets, copies = self.release_copies(manifest, source, input_sha)
+            if copies:
+                resources[self.env["COMPUTE_REGION"]] = copies
         with self.publication_lock():
             active = self.load(self.env["RELEASE_PARAMETER"], True)
             if active.get("build_id") == self.build_id:
@@ -999,7 +1053,8 @@ class Publisher:
             self.factory_fence(source, input_sha)
             need(self.proof(build, source, input_sha) == manifest,
                  "factory proof changed before the publication lock")
-            result = self.promote(manifest, source, input_sha, resources)
+            released = {"images": {kind: {"image_id": image} for kind, image in targets.items()}}
+            result = self.promote(released, source, input_sha, resources)
             return self.finish(result, source, input_sha)
 
 

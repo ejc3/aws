@@ -97,7 +97,11 @@ class S3:
 
 
 class EC2:
-    def __init__(self):
+    """One region of the fleet account; `peers` maps every region to its fake, for CopyImage."""
+    def __init__(self, region="us-east-1", peers=None):
+        self.region, self.peers = region, peers if peers is not None else {}
+        self.peers[region] = self
+        self.copies, self.fail_copy = [], False
         self.templates, self.images, self.snapshots, self.instances = {}, {}, {}, {}
         self.created, self.selected, self.deleted, self.terminated = [], [], [], []
         self.fail_select = None
@@ -126,8 +130,33 @@ class EC2:
                 raise AssertionError("unexpected instance filter")
         return {"Reservations": [{"OwnerId": "222222222222", "Instances": copy.deepcopy(values)}]}
 
-    def describe_images(self, ImageIds):
-        return {"Images": [copy.deepcopy(self.images[name]) for name in ImageIds]}
+    def describe_images(self, ImageIds=None, Owners=None, Filters=None):
+        if ImageIds is not None:
+            assert Owners is None and Filters is None
+            return {"Images": [copy.deepcopy(self.images[name]) for name in ImageIds]}
+        assert Owners == ["222222222222"] and [item["Name"] for item in Filters] == ["name"]
+        names = Filters[0]["Values"]
+        return {"Images": [copy.deepcopy(item) for item in self.images.values() if item.get("Name") in names]}
+
+    def copy_image(self, SourceImageId, SourceRegion, Name, Description, Encrypted, CopyImageTags, ClientToken):
+        """A pending image carrying the source's tags; `available()` completes it."""
+        assert SourceRegion != self.region and Encrypted is True and CopyImageTags is True
+        assert ClientToken == MODULE.digest(SourceImageId + "/" + self.region)
+        if self.fail_copy:
+            raise RuntimeError("copy unavailable")
+        assert all(item.get("Name") != Name for item in self.images.values()), "a name is never copied twice"
+        source = self.peers[SourceRegion].images[SourceImageId]
+        image_id = "ami-" + format(0xc0000 + 16 * len(self.peers) + len(self.images) + 4096 * (self.region == "us-east-1"), "017x")
+        self.images[image_id] = {"ImageId": image_id, "Name": Name, "Description": Description, "OwnerId": source["OwnerId"],
+            "Public": False, "State": "pending", "Architecture": "x86_64", "RootDeviceType": "ebs",
+            "Tags": copy.deepcopy(source["Tags"])}
+        self.copies.append((SourceImageId, image_id))
+        return {"ImageId": image_id}
+
+    def available(self):
+        for item in self.images.values():
+            if item["State"] == "pending":
+                item["State"] = "available"
 
     def describe_snapshots(self, SnapshotIds):
         return {"Snapshots": [copy.deepcopy(self.snapshots[name]) for name in SnapshotIds]}
@@ -215,31 +244,6 @@ class EC2:
         return {"CancelledSpotInstanceRequests": [{"SpotInstanceRequestId": name, "State": "cancelled"} for name in SpotInstanceRequestIds]}
 
 
-class CopyEC2:
-    """A copy region: copy_image makes a pending image carrying the source's tags."""
-    def __init__(self, source):
-        self.source, self.images, self.copies = source, {}, []
-        self.fail_copy = False
-
-    def describe_images(self, Owners, Filters):
-        assert Owners == ["222222222222"] and [item["Name"] for item in Filters] == ["name"]
-        names = Filters[0]["Values"]
-        return {"Images": [copy.deepcopy(item) for item in self.images.values() if item["Name"] in names]}
-
-    def copy_image(self, SourceImageId, SourceRegion, Name, Description, Encrypted, CopyImageTags, ClientToken):
-        assert SourceRegion == "us-east-1" and Encrypted is True and CopyImageTags is True
-        assert ClientToken == MODULE.digest(SourceImageId + "/us-west-2")
-        if self.fail_copy:
-            raise RuntimeError("copy unavailable")
-        assert all(item["Name"] != Name for item in self.images.values()), "a name is never copied twice"
-        source = self.source.images[SourceImageId]
-        image_id = "ami-" + format(0xc0000 + len(self.images), "017x")
-        self.images[image_id] = {"ImageId": image_id, "Name": Name, "OwnerId": source["OwnerId"], "Public": False,
-            "State": "pending", "Tags": copy.deepcopy(source["Tags"])}
-        self.copies.append((SourceImageId, image_id))
-        return {"ImageId": image_id}
-
-
 class CodeBuild:
     def __init__(self, value):
         self.value = value
@@ -265,13 +269,13 @@ class PublisherTests(unittest.TestCase):
             "PIPELINE_BUCKET": "private-stage", "ASSET_BUCKET": "runtime-assets", "GUARD_SHA256": "c" * 64,
             "BUILDER_PROFILE": "arn:aws:iam::222222222222:instance-profile/factory-builder",
             "RELEASE_PARAMETER": "/release", "LOCK_ID": "exact-backend/key", "LOCK_TABLE": "locks",
-            "COPY_REGIONS": "us-west-2"}
+            "COPY_REGIONS": "us-west-2", "BUILD_REGION": "us-east-1"}
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
         build = {"id": self.build, "projectName": "factory", "buildStatus": "SUCCEEDED", "buildComplete": True,
             "resolvedSourceVersion": self.source, "startTime": start, "endTime": start + datetime.timedelta(hours=2),
             "environment": {"environmentVariables": [{"name": "SOURCE_SHA", "value": self.source}, {"name": "INPUT_SHA256", "value": self.input}]}}
         self.main_ssm, self.fleet_ssm, self.ddb, self.ec2 = SSM(), SSM(), DDB(), EC2()
-        self.west = CopyEC2(self.ec2)
+        self.west = EC2("us-west-2", self.ec2.peers)
         self.s3, self.assets = S3(), S3()
         self.assets.source = self.s3
         self.codebuild = CodeBuild(build)
@@ -1284,6 +1288,67 @@ class PublisherTests(unittest.TestCase):
             with self.subTest(regions=regions):
                 self.env["COPY_REGIONS"] = regions
                 with self.assertRaises(MODULE.Refused): MODULE.Publisher(self.env, {})
+
+    def build_in_west(self):
+        """The factory builds in us-west-2: builders, candidates and their snapshots live there."""
+        self.env["BUILD_REGION"] = "us-west-2"
+        for name in ("instances", "snapshots"):
+            getattr(self.west, name).update(getattr(self.ec2, name))
+            getattr(self.ec2, name).clear()
+        for image in self.new.values():
+            self.west.images[image] = self.ec2.images.pop(image)
+
+    def test_a_pair_built_in_us_west_2_is_released_from_its_us_east_1_copies(self):
+        self.build_in_west()
+        with self.assertRaises(MODULE.Refused) as pending:
+            self.publisher().run(self.event)
+        self.assertIn("pending", str(pending.exception))
+        self.assertEqual((self.ec2.created, self.fleet_ssm.values["/release"]["generation"]), ([], 0))
+        self.assertIsNone(self.ddb.item)
+        copies = {source: copied for source, copied in self.ec2.copies}
+        self.assertEqual(set(copies), set(self.new.values()))
+        with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+        self.assertEqual(len(self.ec2.copies), 2, "a redrive must find its copies, not start new ones")
+        self.ec2.available()
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        released = {kind: copies[image] for kind, image in self.new.items()}
+        release = self.fleet_ssm.values["/release"]
+        self.assertEqual((release["host_amis"], release["tile_amis"]),
+                         ({"us-east-1": {"x86_64": released["host"]}}, {"us-east-1": {"x86_64": released["tile"]}}))
+        for item in self.templates:
+            template = self.ec2.templates[item["id"]]
+            self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"]["ImageId"], released[item["kind"]])
+        for fake, image in [(self.ec2, image) for image in released.values()] + [(self.west, image) for image in self.new.values()]:
+            tags = {tag["Key"]: tag["Value"] for tag in fake.images[image]["Tags"]}
+            self.assertEqual(tags.get("FleetImageValidated"), "true", (fake.region, image))
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"], {"us-east-1": released, "us-west-2": self.new})
+        self.assertEqual(self.west.copies, [], "the originals are the us-west-2 images")
+        self.publisher().run(self.event)
+        self.assertEqual((len(self.ec2.copies), len(self.ec2.created)), (2, 4))
+
+    def test_an_image_holding_a_candidate_name_in_the_release_region_refuses(self):
+        for field in ("Description", "PipelineBuildId", "FleetImageKind"):
+            with self.subTest(field=field):
+                self.setUp()
+                self.build_in_west()
+                original = self.west.images[self.new["host"]]
+                tags = copy.deepcopy(original["Tags"])
+                image = {"ImageId": "ami-" + "8" * 17, "Name": original["Name"], "OwnerId": "222222222222", "Public": False,
+                         "State": "available", "Architecture": "x86_64", "RootDeviceType": "ebs",
+                         "Description": "copy of " + self.new["host"] + " from us-west-2", "Tags": tags}
+                if field == "Description": image["Description"] = "something else"
+                else: next(tag for tag in tags if tag["Key"] == field)["Value"] = "foreign"
+                self.ec2.images[image["ImageId"]] = image
+                with self.assertRaises(MODULE.Refused) as refused: self.publisher().run(self.event)
+                self.assertIn("lineage", str(refused.exception))
+                self.assertEqual((self.ec2.created, self.fleet_ssm.values["/release"]["generation"]), ([], 0))
+
+    def test_builders_are_proven_terminated_in_the_build_region(self):
+        # A builder still running in us-west-2 contradicts its recorded termination.
+        self.build_in_west()
+        next(iter(self.west.instances.values()))["State"]["Name"] = "running"
+        with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+        self.assertEqual((self.ec2.copies, self.ec2.created), ([], []))
 
 
 if __name__ == "__main__":

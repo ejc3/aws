@@ -139,10 +139,32 @@ class ReleaseContracts(unittest.TestCase):
         policy = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
         self.assertIn("aws_ssm_parameter.fcvm_ami_copies.arn", policy)
         copy = policy[policy.index('"CopyPublishedImagesOnly"'):policy.index('"CopyImageTagsOnCreate"')]
-        self.assertIn('"aws:RequestedRegion" = local.fcvm_ami_copy_regions', copy)
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_ami_release_regions', copy)
         tags = policy[policy.index('"CopyImageTagsOnCreate"'):]
         tags = tags[:tags.index("} },")]
         self.assertIn('"ec2:CreateAction" = "CopyImage"', tags)
+    def test_the_factory_builds_in_us_west_2_and_releases_in_us_east_1(self):
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertRegex(pipeline, r'fcvm_ami_region\s*=\s*"us-east-1"')
+        self.assertRegex(pipeline, r'fcvm_ami_build_region\s*=\s*"us-west-2"')
+        for kind, name in (('data "aws_ami"', "fcvm_ami_canonical"), ('resource "aws_security_group"', "fcvm_ami_builder"),
+                           ('resource "aws_ssm_document"', "fcvm_ami_build"), ('data "aws_subnet"', "fcvm_ami_builder")):
+            with self.subTest(resource=name):
+                self.assertIn("aws.fcvm_fleet_west2", block(pipeline, kind, name))
+        dispatch = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_dispatch")
+        self.assertRegex(dispatch, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_build_region")
+        self.assertRegex(dispatch, r"SUBNET_ID\s*=\s*data\.aws_subnet\.fcvm_ami_builder\.id")
+        publish = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
+        self.assertRegex(publish, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_region\b")
+        self.assertRegex(publish, r"BUILD_REGION\s*=\s*local\.fcvm_ami_build_region")
+        project = block(pipeline, 'resource "aws_codebuild_project"', "fcvm_ami")
+        self.assertRegex(project, r'"FLEET_AMI_REGION"\s*value\s*=\s*local\.fcvm_ami_build_region')
+        # The TLS secrets stay in us-east-1, where they are.
+        self.assertRegex(project, r'"FLEET_AMI_SECRET_REGION"\s*value\s*=\s*local\.fcvm_ami_region\b')
+        self.assertIn("aws.fcvm_fleet_east1", block(pipeline, 'resource "aws_secretsmanager_secret"', "fcvm_ami_tls"))
+        # Retirement acts on the staging fleet's own hosts, in the release region.
+        fleet = block(pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        self.assertIn('"ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:', fleet)
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

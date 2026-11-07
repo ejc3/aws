@@ -1037,6 +1037,43 @@ class FactoryTests(unittest.TestCase):
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [])
 
+    def test_image_retention_preserves_the_copy_records_images_and_reads_templates_in_their_region(self):
+        # The factory builds in us-west-2 and releases from copies in us-east-1: the release pointer
+        # names only the copies, and the launch templates are in us-east-1.
+        image = self.seal()
+        self.ec2.instances[image["instance_id"]]["State"]["Name"] = "terminated"
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        self.cb.builds[BUILD]["endTime"] = datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc)
+        self.time = NOW + 86400
+        self.factory.env.update(COMPUTE_REGION="us-west-2", TEMPLATES_JSON=json.dumps(
+            [{"region": "us-east-1", "id": "lt-00000000000000001", "kind": "host", "arch": "x86_64"}]))
+        self.fleet_ssm.values["/release"] = {"host_amis": {"us-east-1": {"x86_64": "ami-" + "1" * 17}}, "tile_amis": {}, "previous": None}
+        self.fleet_ssm.values["/release-copies"] = {"images": {"us-east-1": {"host": "ami-" + "1" * 17},
+                                                              "us-west-2": {"host": image["image_id"]}}}
+        asked = []
+        class Templates:
+            def describe_launch_template_versions(self, LaunchTemplateId, Versions):
+                asked.append(LaunchTemplateId)
+                return {"LaunchTemplateVersions": [{"LaunchTemplateData": {"ImageId": "ami-" + "1" * 17}}]}
+        clients = self.factory.client
+        self.factory.client = lambda name, fleet=False, region=None: Templates() if region == "us-east-1" else clients(name, fleet)
+        self.factory.collect_images()
+        self.assertEqual((self.ec2.deleted_images, asked), ([], ["lt-00000000000000001"]))
+        del self.fleet_ssm.values["/release-copies"]
+        self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [image["image_id"]], "the record is what kept it")
+
+    def test_the_build_region_bases_a_build_on_the_copy_records_image(self):
+        tags = [{"Key": k, "Value": v} for k, v in {"Purpose": "fcvm-fleet", "PipelineSanitized": "true", "FleetImageValidated": "true",
+                "FleetImageKind": "host", "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()]
+        self.ec2.images["ami-" + "2" * 17] = {"ImageId": "ami-" + "2" * 17, "OwnerId": self.env["FLEET_ACCOUNT"], "Public": False,
+            "State": "available", "Architecture": "x86_64", "RootDeviceName": "/dev/sda1", "Tags": tags}
+        self.factory.env["COMPUTE_REGION"] = "us-west-2"
+        self.fleet_ssm.values["/release"] = {"host_amis": {"us-east-1": {"x86_64": "ami-" + "1" * 17}}, "tile_amis": {}, "previous": None}
+        self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-canonical")
+        self.fleet_ssm.values["/release-copies"] = {"images": {"us-west-2": {"host": "ami-" + "2" * 17}}}
+        self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-" + "2" * 17)
+
     def test_failed_foreign_pr_and_docs_summary_ci_cannot_admit(self):
         for run in [self.ci_run(conclusion="failure"), self.ci_run(event="pull_request"),
                     self.ci_run(head_repository={"full_name": "other/fcvm"}),

@@ -513,14 +513,17 @@ Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
 
-After each publication the publisher copies the host and tile images into
-us-west-2 (`fcvm_ami_copy_regions`, `fcvm-fleet-ami-release.tf`) and records the ids
-of both regions in `/fcvm-fleet/ami-release-copies` (us-east-1). Agents' GPU boxes
-(fcvm `fleet/tools/gpubox.sh`) launch there, off the staging fleet's us-east-1 G
-quota. The copies are not in the release's image maps, so us-west-2 gets no launch
-templates or fleet hosts. A copy failure leaves the release live; the next
-invocation completes it. To copy the active release on demand (after the first
-apply, for example):
+The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
+builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
+pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatcher redrives
+publication every five minutes within its 24-hour lease), and releases the copies there. After
+each publication it records the release's ids in every region in `/fcvm-fleet/ami-release-copies`
+(us-east-1): the us-east-1 copies, and in us-west-2 the factory's originals, or for an older
+pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
+`fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
+only, so us-west-2 gets no launch templates or fleet hosts. A copy failure after a commit
+leaves the release live; the next invocation completes it. To record and copy the active
+release on demand (after the first apply, for example):
 `aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
 
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
