@@ -93,13 +93,13 @@ class HostTests(unittest.TestCase):
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
         # the same bootstrap with both reviewed images, an older host and failed IMDS.
-        previous = "ami-0620224a0a4dd168e"
-        candidate = "ami-04c3294f21cb88942"
+        previous = "ami-04c3294f21cb88942"
+        candidate = "ami-09ac99f69700ec306"
         east = block('module "fcvm_fleet_east1"')
         configured = re.search(r'potato_host_amis\s*=\s*\[(.*?)\n  \]', east, re.S)
         self.assertIsNotNone(configured)
         self.assertEqual(re.findall(r'local\.fcvm_ami_bootstrap\["host/x86_64/([0-9a-f]+)"\]\.image',
-                                    configured[1]), ["95217caa", "a4a0bd3e"])
+                                    configured[1]), ["a4a0bd3e", "92a26793"])
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split('%{endif~}', 1)[0]
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"

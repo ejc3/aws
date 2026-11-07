@@ -31,24 +31,21 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main a4a0bd3e, revised from the 95217caa image (ami-0620224a0a4dd168e): everything in it, plus the
-  # potato agent never putting the player holding the ball to sleep (ejc3/fcvm#1552: a stale drop report slept the holder
-  # of the next round's ball, which then dropped at the deadline), faster wakes (ejc3/fcvm#1555 creates a VM's veth peer
-  # inside its namespace, #1556 reflinks small clone disks; four concurrent potato wakes p50 413 ms, p99 500 ms on a gpubox
-  # from this image), phones nobody holds drawn with Robot Park's own camera instead of the wall's, whose keyframes are
-  # kilometres of the wall's terrain (ejc3/fcvm#1550), and a dance or wave right after Robot Park restarts no longer
-  # dropped (ejc3/fcvm#1551). The IP-options guard is installed by prep and its publication proof passed. The renderer's
-  # source and the tile recipe are unchanged since 3b597cf9, so the tile AMI stays.
-  default = { "us-east-1" = { x86_64 = "ami-04c3294f21cb88942" } }
+  # executable from main 92a26793, revised from the a4a0bd3e image (ami-04c3294f21cb88942): everything in it, plus each
+  # wall tile whose own fit can draw every pixel granted stride 1 instead of the checkerboard the slowest tile's fit sets
+  # (ejc3/fcvm#1565: the renderer reports the budget at which it draws every pixel and takes a per-tile `every_pixel`
+  # grant, the host agent posts each tile its own grant, bound to its renderer process). The IP-options guard is installed
+  # by prep and its publication proof passed.
+  default = { "us-east-1" = { x86_64 = "ami-09ac99f69700ec306" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
   description = "EC2 tile AMI per region and architecture, same shape as fcvm_fleet_host_amis"
   type        = map(map(string))
   # Ubuntu 24.04, the NVIDIA driver and container toolkit, the renderer image loaded, TLS on 443 from fcvm-fleet/tls-wildcard
-  # (fcvm fleet/ami/tile). Revised from the a5bae67b image (ami-0ce935fe1f66fb10f) with the renderer image the 3b597cf9
-  # host AMI built (ejc3/fcvm#1527). Its boot prefetch list was traced again on a boot that read on its own.
-  default = { "us-east-1" = { x86_64 = "ami-058b6cec0b53ddf4d" } }
+  # (fcvm fleet/ami/tile). Revised from the 3b597cf9 image (ami-058b6cec0b53ddf4d) with the renderer image the 92a26793
+  # host AMI built (ejc3/fcvm#1565). Its boot prefetch list was traced again on a boot that read on its own.
+  default = { "us-east-1" = { x86_64 = "ami-094ca9c62a284a389" } }
 }
 
 locals {
@@ -442,8 +439,8 @@ module "fcvm_fleet_east1" {
   host_agent_args               = local.fcvm_fleet_host_agent_args
   # The current host must keep potato mode while the new image is registered and on rollback.
   potato_host_amis = [
-    local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
     local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image,
+    local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
   ]
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
