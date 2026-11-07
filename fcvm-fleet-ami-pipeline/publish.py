@@ -273,6 +273,27 @@ class Publisher:
             },
         })
 
+    def reviewed_retake_host_release(self):
+        stride = self.reviewed_stride_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-six receipt selected the next version on each tile
+        # and version 23 on the host, after Terraform prepared version 22.
+        versions = {key: number + 1 for key, number in stride["expected"]["versions"].items()}
+        versions[host_key] = 23
+        return self.reviewed_pair({
+            "source_sha": "343b2287636d07b1726ab7a2d431c9a1ec854a67",
+            "images": {"host": "ami-05923927f810a2ce9", "tile": stride["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 6, "source_sha": stride["source_sha"],
+                "build_id": "reviewed-stride-release:" + digest(encoded(stride)),
+                "guard_sha256": self.env["GUARD_SHA256"], "versions": versions,
+                "previous": {k: v for k, v in stride["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in stride["images"].items()},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -445,6 +466,14 @@ class Publisher:
         host_user_data = self.env["HOST_FIX_BOOT_SHA"]
         need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
         return self.run_reviewed(self.reviewed_stride_release(), "reviewed-stride-release", host_user_data=host_user_data)
+
+    def run_retake_host_release(self, event):
+        need(event == {"action": "activate-reviewed-retake-host-release"},
+             "reviewed host release accepts no caller configuration")
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        return self.run_reviewed(self.reviewed_retake_host_release(), "reviewed-retake-host-release",
+                                 host_user_data=host_user_data, host_only=True)
 
     def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
@@ -1272,6 +1301,8 @@ class Publisher:
             return self.run_potato_host_fix(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-stride-release":
             return self.run_stride_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-retake-host-release":
+            return self.run_retake_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

@@ -625,6 +625,14 @@ four template image IDs, and retains generation five for rollback. Both older
 reviewed potato host images keep potato mode. The action does not wake or retire
 running instances.
 
+The fixed action `{"action":"activate-reviewed-retake-host-release"}` advances
+only the exact generation-six receipt to the signed 343b2287 host from #812.
+Apply the candidate tags and reviewed host bootstrap first. The publisher
+changes only the host image for future launches, keeps all three tile versions,
+and retains generation six for rollback. It reuses the existing West tile copy;
+if the new West host copy is still pending, the East release stays committed
+and `{"action":"replicate-active-release"}` completes the regional record.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

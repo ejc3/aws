@@ -31,12 +31,15 @@ variable "fcvm_fleet_host_amis" {
   type        = map(map(string))
   # Ubuntu 24.04, IOMMU on, every NVIDIA GPU on vfio-pci at boot, fcvm with the gpu profile set up and the renderer warmed;
   # the store is restored onto the instance store at boot (fcvm fleet/ami/host). Built in us-east-1 with recipe and fcvm
-  # executable from main 92a26793, revised from the a4a0bd3e image (ami-04c3294f21cb88942): everything in it, plus each
-  # wall tile whose own fit can draw every pixel granted stride 1 instead of the checkerboard the slowest tile's fit sets
-  # (ejc3/fcvm#1565: the renderer reports the budget at which it draws every pixel and takes a per-tile `every_pixel`
-  # grant, the host agent posts each tile its own grant, bound to its renderer process). The IP-options guard is installed
-  # by prep and its publication proof passed.
-  default = { "us-east-1" = { x86_64 = "ami-09ac99f69700ec306" } }
+  # executable from main 343b2287, revised from the 92a26793 image (ami-09ac99f69700ec306): everything in it, plus a
+  # browser's first show after a phone retake in about 0.3 s instead of 2.7 s (ejc3/fcvm#1619: gfxstream restores the
+  # retake's share groups in the background after the guest's first frame), `gpu release` refused while QEMU dumps guest
+  # memory, Robot Park built with the AOSP build's tools, an activity start judged by the activity in front
+  # (ejc3/fcvm#1696), the guest image without Ubuntu's maintenance timers (ejc3/fcvm#1668), potato coordinator logging
+  # (ejc3/fcvm#1667), snapshot memory files stored uncompressed (ejc3/fcvm#1537) and the host kernel's bridge
+  # rcu_barrier removal (ejc3/fcvm#1685). The renderer is unchanged, so the tile AMI stays. The IP-options guard is
+  # installed by prep and its publication proof passed.
+  default = { "us-east-1" = { x86_64 = "ami-05923927f810a2ce9" } }
 }
 
 variable "fcvm_fleet_tile_amis" {
@@ -446,6 +449,7 @@ module "fcvm_fleet_east1" {
     local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
     local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image,
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
+    local.fcvm_ami_bootstrap["host/x86_64/343b2287"].image,
   ]
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
