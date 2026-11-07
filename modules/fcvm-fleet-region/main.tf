@@ -606,6 +606,11 @@ output "subnet_ids" {
   value = [for s in aws_subnet.public : s.id]
 }
 
+# The fleet subnet in each AZ (the image factory picks its builders' AZ by name).
+output "subnet_ids_by_az" {
+  value = { for az, s in aws_subnet.public : az => s.id }
+}
+
 output "security_group_id" {
   value = aws_security_group.fleet.id
 }

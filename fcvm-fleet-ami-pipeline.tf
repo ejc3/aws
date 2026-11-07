@@ -83,13 +83,20 @@ locals {
 }
 
 locals {
-  fcvm_ami_project       = "fcvm-fleet-image-factory"
-  fcvm_ami_region        = "us-east-1"
-  fcvm_ami_state_prefix  = "/fcvm-fleet/ami-pipeline"
-  fcvm_ami_builder_tag   = "fcvm-fleet-ami-builder"
-  fcvm_ami_source        = "https://github.com/ejc3/fcvm.git"
-  fcvm_ami_guard_sha     = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  fcvm_ami_build_minutes = 240
+  fcvm_ami_project = "fcvm-fleet-image-factory"
+  # The release (the launch templates and /fcvm-fleet/ami-release) is in us-east-1, the staging
+  # fleet's region. The factory builds and verifies in us-west-2, so its g4dn.metal builders never
+  # take staging's G quota; the publisher copies each verified pair to us-east-1 and releases the
+  # copies there.
+  fcvm_ami_region         = "us-east-1"
+  fcvm_ami_build_region   = "us-west-2"
+  fcvm_ami_build_az       = "us-west-2a"
+  fcvm_ami_builder_subnet = module.fcvm_fleet_west2.subnet_ids_by_az[local.fcvm_ami_build_az]
+  fcvm_ami_state_prefix   = "/fcvm-fleet/ami-pipeline"
+  fcvm_ami_builder_tag    = "fcvm-fleet-ami-builder"
+  fcvm_ami_source         = "https://github.com/ejc3/fcvm.git"
+  fcvm_ami_guard_sha      = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+  fcvm_ami_build_minutes  = 240
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {
@@ -142,7 +149,7 @@ resource "aws_ssm_parameter" "fcvm_ami_control" {
 }
 
 data "aws_ami" "fcvm_ami_canonical" {
-  provider    = aws.fcvm_fleet_east1
+  provider    = aws.fcvm_fleet_west2
   most_recent = true
   owners      = ["099720109477"]
   filter {
@@ -159,11 +166,24 @@ data "aws_ami" "fcvm_ami_canonical" {
   }
 }
 
+# The builders' subnet is the fleet's in the build AZ, which must offer both builder types
+# (checked on the dispatcher below).
+data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" {
+  provider      = aws.fcvm_fleet_west2
+  for_each      = toset(["g4dn.metal", "g4dn.xlarge"])
+  location_type = "availability-zone"
+  filter {
+    name   = "instance-type"
+    values = [each.key]
+  }
+}
+
 resource "aws_security_group" "fcvm_ami_builder" {
-  provider    = aws.fcvm_fleet_east1
+  provider    = aws.fcvm_fleet_west2
+  region      = local.fcvm_ami_build_region
   name        = "fcvm-fleet-ami-builder"
   description = "Image factory: no inbound listeners; outbound package/API access and DNS only"
-  vpc_id      = module.fcvm_fleet_east1.vpc_id
+  vpc_id      = module.fcvm_fleet_west2.vpc_id
   egress {
     from_port   = 80
     to_port     = 80
@@ -248,7 +268,9 @@ resource "aws_secretsmanager_secret" "fcvm_ami_tls" {
 }
 
 resource "aws_ssm_document" "fcvm_ami_build" {
-  provider        = aws.fcvm_fleet_east1
+  provider = aws.fcvm_fleet_west2
+  # The unchanged document otherwise retains its computed us-east-1 region in state.
+  region          = local.fcvm_ami_build_region
   name            = "fcvm-fleet-ami-build"
   document_type   = "Command"
   document_format = "JSON"
@@ -267,6 +289,28 @@ resource "aws_cloudwatch_log_group" "fcvm_ami_codebuild" {
   retention_in_days = 14
 }
 
+# The publisher's own bundle: publish.py and its fixed configuration (publish.py BUNDLED_KEYS),
+# which would not fit in Lambda's 4 KB environment beside the rest.
+data "archive_file" "fcvm_ami_publish" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/fcvm-fleet-ami-publish.zip"
+  source {
+    content  = file("${path.module}/fcvm-fleet-ami-pipeline/publish.py")
+    filename = "publish.py"
+  }
+  source {
+    content = jsonencode({
+      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
+      SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
+      PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
+      RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
+      POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
+      HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
+    })
+    filename = "publisher-config.json"
+  }
+}
+
 data "archive_file" "fcvm_ami_dispatch" {
   type        = "zip"
   source_dir  = "${path.module}/fcvm-fleet-ami-pipeline"
@@ -274,6 +318,12 @@ data "archive_file" "fcvm_ami_dispatch" {
 }
 
 resource "aws_lambda_function" "fcvm_ami_dispatch" {
+  lifecycle {
+    precondition {
+      condition     = alltrue([for o in data.aws_ec2_instance_type_offerings.fcvm_ami_builder : contains(o.locations, local.fcvm_ami_build_az)])
+      error_message = "The image factory's build AZ must offer g4dn.metal and g4dn.xlarge."
+    }
+  }
   function_name                  = "fcvm-fleet-ami-dispatch"
   role                           = aws_iam_role.fcvm_ami_dispatch.arn
   runtime                        = "python3.12"
@@ -291,13 +341,14 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       CONTROL_REGION    = var.aws_region
       CONTROL_ACCOUNT   = data.aws_caller_identity.current.account_id
       PUBLISH_FUNCTION  = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish"
-      COMPUTE_REGION    = local.fcvm_ami_region
+      COMPUTE_REGION    = local.fcvm_ami_build_region
+      RELEASE_REGION    = local.fcvm_ami_region
       STATE_PREFIX      = local.fcvm_ami_state_prefix
       FLEET_ROLE        = aws_iam_role.fcvm_ami_broker_fleet.arn
       WORKER_ROLE       = aws_iam_role.fcvm_ami_worker_fleet.arn
       FLEET_ACCOUNT     = local.fcvm_fleet_account_id
       BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn
-      SUBNET_ID         = sort(module.fcvm_fleet_east1.host_subnet_ids)[0]
+      SUBNET_ID         = local.fcvm_ami_builder_subnet
       SECURITY_GROUP    = aws_security_group.fcvm_ami_builder.id
       CANONICAL_AMI     = data.aws_ami.fcvm_ami_canonical.id
       GUARD_SHA256      = local.fcvm_ami_guard_sha
@@ -360,7 +411,7 @@ resource "aws_codebuild_project" "fcvm_ami" {
     }
     environment_variable {
       name  = "FLEET_AMI_REGION"
-      value = local.fcvm_ami_region
+      value = local.fcvm_ami_build_region
     }
     environment_variable {
       name  = "FLEET_AMI_SECRET_REGION"
@@ -430,10 +481,10 @@ resource "aws_iam_role_policy" "fcvm_ami_worker" {
     { Sid = "OwnRunObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/$${aws:PrincipalTag/FactoryBuild}/*" },
     # The broker's mandatory inline session policy narrows this to the four actual instance ARNs.
     { Sid = "ReadOwnedBuilderExports", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*" },
-    { Sid = "OwnBuilderCommands", Effect = "Allow", Action = "ssm:SendCommand", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*",
+    { Sid = "OwnBuilderCommands", Effect = "Allow", Action = "ssm:SendCommand", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:instance/*",
     Condition = { StringEquals = { "ssm:resourceTag/Purpose" = local.fcvm_ami_builder_tag, "ssm:resourceTag/FactoryBuild" = "$${aws:PrincipalTag/FactoryBuild}" } } },
     { Effect = "Allow", Action = "ssm:SendCommand", Resource = aws_ssm_document.fcvm_ami_build.arn },
-    { Effect = "Allow", Action = "ssm:DescribeInstanceInformation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_region } } },
+    { Effect = "Allow", Action = "ssm:DescribeInstanceInformation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_build_region } } },
     { Effect = "Allow", Action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource = [for s in aws_secretsmanager_secret.fcvm_ami_tls : s.arn] },
     { Effect = "Deny", Action = ["iam:*", "sts:AssumeRole*", "ec2:*", "ssm:GetParameter*", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource = "*" }
   ] })
@@ -450,10 +501,13 @@ resource "aws_s3_bucket_policy" "fcvm_ami_pipeline" {
 }
 
 locals {
-  fcvm_ami_instance_arn = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*"
-  fcvm_ami_created_arns = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:${kind}/*"]
-  fcvm_ami_image_arns   = ["arn:aws:ec2:${local.fcvm_ami_region}::image/*", "arn:aws:ec2:${local.fcvm_ami_region}::snapshot/*"]
-  fcvm_ami_state_arn    = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/*"
+  fcvm_ami_instance_arn = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:instance/*"
+  fcvm_ami_created_arns = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:${kind}/*"]
+  fcvm_ami_image_arns   = ["arn:aws:ec2:${local.fcvm_ami_build_region}::image/*", "arn:aws:ec2:${local.fcvm_ami_build_region}::snapshot/*"]
+  # Released images: the build region's candidates and their copies in the release region and the copy regions.
+  fcvm_ami_release_regions    = distinct(concat([local.fcvm_ami_region, local.fcvm_ami_build_region], local.fcvm_ami_copy_regions))
+  fcvm_ami_release_image_arns = flatten([for region in local.fcvm_ami_release_regions : ["arn:aws:ec2:${region}::image/*", "arn:aws:ec2:${region}::snapshot/*"]])
+  fcvm_ami_state_arn          = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/*"
 }
 
 resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
@@ -462,15 +516,15 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
   role     = aws_iam_role.fcvm_ami_broker_fleet.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Sid = "Metadata", Effect = "Allow", Action = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeSnapshots", "ec2:DescribeLaunchTemplateVersions"], Resource = "*" },
-    { Sid = "CanonicalBase", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}::image/${data.aws_ami.fcvm_ami_canonical.id}" },
-    { Sid = "PrivateFactoryImages", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}::image/*",
+    { Sid = "CanonicalBase", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/${data.aws_ami.fcvm_ami_canonical.id}" },
+    { Sid = "PrivateFactoryImages", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/*",
     Condition = { StringEquals = { "ec2:Owner" = local.fcvm_fleet_account_id, "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true", "ec2:ResourceTag/GuardHelperSHA256" = local.fcvm_ami_guard_sha }, Bool = { "ec2:Public" = "false" } } },
-    { Sid = "FixedNetwork", Effect = "Allow", Action = "ec2:RunInstances", Resource = ["arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:subnet/${sort(module.fcvm_fleet_east1.host_subnet_ids)[0]}", aws_security_group.fcvm_ami_builder.arn] },
+    { Sid = "FixedNetwork", Effect = "Allow", Action = "ec2:RunInstances", Resource = ["arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:subnet/${local.fcvm_ami_builder_subnet}", aws_security_group.fcvm_ami_builder.arn] },
     { Sid = "FixedInstance", Effect = "Allow", Action = "ec2:RunInstances", Resource = local.fcvm_ami_instance_arn,
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"], "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
-    { Sid = "FixedRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:volume/*",
+    { Sid = "FixedRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:volume/*",
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "ec2:VolumeType" = "gp3" }, Bool = { "ec2:Encrypted" = "true" }, NumericLessThanEquals = { "ec2:VolumeSize" = 64 } } },
-    { Sid = "TaggedInterface", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:network-interface/*", Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag } } },
+    { Sid = "TaggedInterface", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:network-interface/*", Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag } } },
     { Sid = "TagAtLaunch", Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_created_arns,
     Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Purpose", "FactoryBuild", "FactorySlot", "SourceSHA"] } } },
     { Sid = "OwnSlotsOnly", Effect = "Allow", Action = ["ec2:StopInstances", "ec2:StartInstances", "ec2:RebootInstances", "ec2:TerminateInstances", "ec2:CreateImage"], Resource = local.fcvm_ami_instance_arn,
@@ -483,8 +537,8 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true" } } },
     { Sid = "NoOtherProfile", Effect = "Deny", Action = "iam:PassRole", NotResource = aws_iam_role.fcvm_ami_builder.arn },
     # The fixed broker pins InstanceId from an immutable slot; workers never get this unscoped read.
-    { Sid = "OwnCommandStatusBroker", Effect = "Allow", Action = "ssm:GetCommandInvocation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_region } } },
-    { Effect = "Allow", Action = "ssm:GetParameter", Resource = aws_ssm_parameter.fcvm_ami_release.arn },
+    { Sid = "OwnCommandStatusBroker", Effect = "Allow", Action = "ssm:GetCommandInvocation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_build_region } } },
+    { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
     { Effect = "Deny", Action = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "s3:GetObject*", "sts:AssumeRole*", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*"], Resource = "*" }
   ] })
 }
@@ -621,14 +675,34 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
     { Effect = "Allow", Action = ["ec2:DescribeImages", "ec2:DescribeSnapshots", "ec2:DescribeInstances", "ec2:DescribeSpotInstanceRequests", "ec2:DescribeLaunchTemplateVersions", "ec2:DescribeLaunchTemplates"], Resource = "*" },
     { Effect = "Allow", Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplateVersions"],
     Resource = [for template in local.fcvm_ami_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] },
-    { Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_image_arns,
+    { Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true", "aws:RequestTag/FleetImageValidated" = "true" }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetImageValidated"] } } },
-    { Effect = "Allow", Action = "ec2:TerminateInstances", Resource = local.fcvm_ami_instance_arn,
+    { Effect = "Allow", Action = "ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = ["fcvm-fleet-host", "fcvm-fleet-tile"], "ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"], "aws:RequestedRegion" = local.fcvm_ami_region } } },
     { Sid      = "CancelPersistentTileRequestsBeforeRetirement", Effect = "Allow", Action = "ec2:CancelSpotInstanceRequests",
       Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:spot-instances-request/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_ami_region } } },
-    { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = aws_ssm_parameter.fcvm_ami_release.arn },
+    { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
+      Resource = local.fcvm_ami_release_image_arns,
+    Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    { Sid      = "RetireUnneededCopies", Effect = "Allow", Action = "ec2:DeregisterImage",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
+    Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    # FleetPublisherCopy may only be written to new snapshots as part of CopyImage. Require
+    # it both to mark a snapshot for retry and to delete it; never backfill copy provenance.
+    { Sid      = "MarkRetiredSnapshots", Effect = "Allow", Action = "ec2:CreateTags",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "ec2:ResourceTag/FleetPublisherCopy" = "true", "ec2:Owner" = local.fcvm_fleet_account_id, "aws:RequestTag/FleetRetired" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetRetired"] } } },
+    { Sid      = "DeleteRetiredSnapshots", Effect = "Allow", Action = "ec2:DeleteSnapshot",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "ec2:ResourceTag/FleetPublisherCopy" = "true", "ec2:ResourceTag/FleetRetired" = "true", "ec2:Owner" = local.fcvm_fleet_account_id, "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    { Sid      = "CopyImageTagsOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::image/*"],
+    Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },
+    { Sid      = "CopySnapshotProvenanceOnCreate", Effect = "Allow", Action = "ec2:CreateTags",
+      Resource = [for region in local.fcvm_ami_release_regions : "arn:aws:ec2:${region}::snapshot/*"],
+    Condition = { StringEquals = { "ec2:CreateAction" = "CopyImage", "aws:RequestTag/FleetPublisherCopy" = "true", "aws:RequestedRegion" = local.fcvm_ami_release_regions }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetPublisherCopy"] } } },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject", "s3:GetObjectAttributes"], Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/factory/*" },
     { Effect = "Allow", Action = "s3:ListBucket", Resource = aws_s3_bucket.fcvm_fleet_assets.arn, Condition = { StringLike = { "s3:prefix" = "factory/*" } } },
@@ -644,8 +718,8 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
   timeout                        = 900
   memory_size                    = 512
   reserved_concurrent_executions = 1
-  filename                       = data.archive_file.fcvm_ami_dispatch.output_path
-  source_code_hash               = data.archive_file.fcvm_ami_dispatch.output_base64sha256
+  filename                       = data.archive_file.fcvm_ami_publish.output_path
+  source_code_hash               = data.archive_file.fcvm_ami_publish.output_base64sha256
   environment {
     variables = {
       PROJECT_NAME      = local.fcvm_ami_project
@@ -659,19 +733,17 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       PIPELINE_REGION   = local.fcvm_fleet_home_region
       RELEASE_PARAMETER = aws_ssm_parameter.fcvm_ami_release.name
       GUARD_SHA256      = local.fcvm_ami_guard_sha
-      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
       BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
-      SEED_RELEASE_JSON = jsonencode(local.fcvm_ami_reviewed_seed)
-      PHONE_AMI_JSON    = jsonencode(local.fcvm_ami_reviewed_phone_release)
-      RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
-      POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
-      HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
       HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
+      # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies". The release
+      # configuration is in the bundle (publisher-config.json).
+      COPY_REGIONS = join(",", local.fcvm_ami_copy_regions)
+      BUILD_REGION = local.fcvm_ami_build_region
     }
   }
 }

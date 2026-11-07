@@ -22,6 +22,28 @@ resource "aws_ssm_parameter" "fcvm_ami_release" {
   }
 }
 
+# Every published host and tile image is also copied into these regions, so agents'
+# GPU boxes and other work can run outside the staging fleet's region and quotas. The
+# copies stay out of host_amis and tile_amis: no copy region gets launch templates or
+# fleet hosts. Never the compute region (us-east-1).
+locals {
+  fcvm_ami_copy_regions = ["us-west-2"]
+}
+
+# The ids of the active pair in the compute region and of its copies in each copy
+# region, written by the publisher after each publication (`replicate-active-release`
+# copies the active pair on demand). Tools read it; nothing launches from it.
+resource "aws_ssm_parameter" "fcvm_ami_copies" {
+  provider    = aws.fcvm_fleet_east1
+  name        = "${aws_ssm_parameter.fcvm_ami_release.name}-copies"
+  description = "Region-by-region ids of the active Fleet AMI pair and its copies; image-only publisher owns the value"
+  type        = "String"
+  value       = jsonencode({ version = 1, generation = 0, build_id = "", source_sha = "", images = {} })
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 data "aws_ssm_parameter" "fcvm_ami_release" {
   provider        = aws.fcvm_fleet_east1
   count           = var.fcvm_ami_pipeline_enabled ? 1 : 0

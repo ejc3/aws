@@ -112,15 +112,23 @@ class Factory:
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
 
-    def client(self, service, fleet=False):
-        key = (service, fleet)
+    def client(self, service, fleet=False, region=None):
+        # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
+        # retention, live in another region (the release's), and only they pass one.
+        key = (service, fleet) if region is None else (service, fleet, region)
         if key not in self.clients:
-            kw = {"region_name": self.env["COMPUTE_REGION"] if fleet else self.env["CONTROL_REGION"]}
+            kw = {"region_name": region or (self.env["COMPUTE_REGION"] if fleet else self.env["CONTROL_REGION"])}
             if fleet:
                 creds = self.client("sts").assume_role(RoleArn=self.env["FLEET_ROLE"], RoleSessionName="image-factory-broker")["Credentials"]
                 kw.update(aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
             self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}), **kw)
         return self.clients[key]
+
+    def release_ssm(self):
+        # The release's parameters (/fcvm-fleet/ami-release and its copy record) are in the
+        # release's region, RELEASE_REGION, which is not the build region.
+        region = self.env.get("RELEASE_REGION")
+        return self.client("ssm", True) if region in (None, self.env["COMPUTE_REGION"]) else self.client("ssm", True, region)
 
     def load(self, suffix, default=None):
         try:
@@ -220,15 +228,25 @@ class Factory:
         # Only a sanitized factory release can replace the original Canonical base.
         image_id = self.env["CANONICAL_AMI"]
         try:
-            manifest = json.loads(self.client("ssm", True).get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
-            candidate = manifest[kind + "_amis"][self.env["COMPUTE_REGION"]]["x86_64"]
-            rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
+            # The active release's image in this region: its own entry, else the copy record's (a pair
+            # built here is released from copies in the release's region).
+            manifest = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+            candidate = manifest[kind + "_amis"].get(self.env["COMPUTE_REGION"], {}).get("x86_64")
+            if candidate is None:
+                record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
+                candidate = record["images"][self.env["COMPUTE_REGION"]][kind]
+            try:
+                rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
+                    raise
+                rows = []
             if rows:
                 image = rows[0]
                 tags = {t["Key"]: t["Value"] for t in image.get("Tags", [])}
-                if image["OwnerId"] == self.env["FLEET_ACCOUNT"] and not image.get("Public", True) and tags.get("PipelineSanitized") == "true" and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == kind and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]:
+                if image["OwnerId"] == self.env["FLEET_ACCOUNT"] and not image.get("Public", True) and image.get("State") == "available" and image.get("Architecture") == "x86_64" and tags.get("PipelineSanitized") == "true" and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == kind and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]:
                     image_id = candidate
-        except (KeyError, self.client("ssm", True).exceptions.ParameterNotFound):
+        except (KeyError, self.release_ssm().exceptions.ParameterNotFound):
             pass
         images = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
         if len(images) != 1 or images[0].get("State") != "available" or images[0].get("Architecture") != "x86_64":
@@ -488,7 +506,7 @@ class Factory:
                     publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
                     record["publication_deadline_unix"] = publication_deadline
                     if self.now() >= publication_deadline:
-                        release = json.loads(self.client("ssm", True).get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+                        release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
                 if preempt or expired or failed or publication_expired:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
@@ -623,14 +641,24 @@ class Factory:
         with self.control_lock() as acquired:
             if not acquired:
                 return
-            release = json.loads(self.client("ssm", True).get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+            release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
             referenced = set()
             for bundle in [release, release.get("previous") or {}]:
                 for key in ("host_amis", "tile_amis"):
                     for arches in bundle.get(key, {}).values():
                         referenced.update(v for v in arches.values() if v)
+            # The release's images in every region: a pair built here is released from its copies
+            # elsewhere, so the originals here are named only by the copy record.
+            try:
+                record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
+            except self.release_ssm().exceptions.ParameterNotFound:
+                record = {}
+            for field in ("images", "previous_images"):
+                for kinds in record.get(field, {}).values():
+                    referenced.update(v for v in kinds.values() if v)
             for template in json.loads(self.env.get("TEMPLATES_JSON", "[]")):
-                versions = ec2.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
+                where = ec2 if template["region"] == self.env["COMPUTE_REGION"] else self.client("ec2", True, template["region"])
+                versions = where.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
                 referenced.update(v["LaunchTemplateData"]["ImageId"] for v in versions)
             live = [i for r in ec2.describe_instances(Filters=[{"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped", "shutting-down"]}])["Reservations"] for i in r["Instances"]]
             referenced.update(i.get("ImageId") for i in live)
