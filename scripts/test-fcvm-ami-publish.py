@@ -172,7 +172,8 @@ class EC2:
         source = self.peers[SourceRegion].images[SourceImageId]
         image_id = "ami-" + format(0xc0000 + 16 * len(self.peers) + len(self.images) + 4096 * (self.region == "us-east-1"), "017x")
         self.images[image_id] = {"ImageId": image_id, "Name": Name, "Description": Description, "OwnerId": source["OwnerId"],
-            "Public": False, "State": "pending", "Architecture": "x86_64", "RootDeviceType": "ebs",
+            "Public": False, "State": getattr(self, "copy_state", "pending" if self.region == "us-east-1" else "available"),
+            "Architecture": "x86_64", "RootDeviceType": "ebs",
             "SourceImageId": SourceImageId, "SourceImageRegion": SourceRegion, "Tags": copy.deepcopy(source["Tags"])}
         self.copies.append((SourceImageId, image_id))
         return {"ImageId": image_id}
@@ -1292,6 +1293,27 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values["/release"], before)
         self.assertEqual((self.ec2.created, self.ec2.tagged), ([], []))
 
+    def test_pending_or_failed_copies_preserve_the_previous_available_record(self):
+        self.active_new_pair()
+        previous = {"version": 1, "generation": 5, "images": {"us-west-2": self.old}}
+        self.fleet_ssm.values["/release-copies"] = copy.deepcopy(previous)
+        self.west.copy_state = "pending"
+        event = {"action": "replicate-active-release"}
+        for _ in range(2):
+            with self.assertRaisesRegex(MODULE.Refused, "regional AMI copies are still pending"):
+                self.publisher().run(event)
+            self.assertEqual(self.fleet_ssm.values["/release-copies"], previous)
+            self.assertEqual(len(self.west.copies), 2)
+        host = self.west.images[self.copies()[self.new["host"]]]
+        host["State"] = "failed"
+        with self.assertRaises(MODULE.Refused):
+            self.publisher().run(event)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], previous)
+        host["State"] = "available"
+        self.west.available()
+        self.assertEqual(self.publisher().run(event), {"status": "replicated", "generation": 6})
+        self.assertEqual(len(self.west.copies), 2)
+
     def test_unvalidated_public_or_misnamed_image_is_never_copied(self):
         for variant in ("FleetImageValidated", "Purpose", "Public", "OwnerId", "Name"):
             with self.subTest(variant=variant):
@@ -1316,7 +1338,8 @@ class PublisherTests(unittest.TestCase):
                 if foreign is True:
                     tags = [tag for tag in tags if tag["Key"] != "FleetImageKind"] + [{"Key": "FleetImageKind", "Value": "tile"}]
                 self.west.images["ami-" + "9" * 17] = {"ImageId": "ami-" + "9" * 17, "Name": source["Name"],
-                    "OwnerId": "222222222222", "Public": False, "State": "available", "Tags": tags,
+                    "OwnerId": "222222222222", "Public": False, "State": "available", "Architecture": "x86_64",
+                    "RootDeviceType": "ebs", "Tags": tags,
                     "SourceImageId": self.new["host"] if foreign != "source" else "ami-" + "7" * 17, "SourceImageRegion": "us-east-1"}
                 if foreign:
                     with self.assertRaises(MODULE.Refused): self.publisher().run({"action": "replicate-active-release"})

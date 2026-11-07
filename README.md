@@ -521,9 +521,8 @@ each publication it records the release's ids in every region in `/fcvm-fleet/am
 (us-east-1): the us-east-1 copies, and in us-west-2 the factory's originals, or for an older
 pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
 `fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
-only, so us-west-2 gets no launch templates or fleet hosts. A copy failure after a commit
-leaves the release live; the next invocation completes it. To record and copy the active
-release on demand (after the first apply, for example). After each publication and each
+only, so us-west-2 gets no launch templates or fleet hosts. Pending or failed copies never
+replace the last available copy record. After each publication and each
 on-demand run the publisher also retires images nothing needs, at most 16 per region per run
 (`retain()` in `publish.py`): its own copies, factory candidates outside the build region, and
 images built by hand that were never validated and are 14 days old. It keeps the active and the
@@ -531,11 +530,21 @@ previous release in every region, every launch template's default image and ever
 instance still uses; validated images (the bootstrap catalog's) are never retired, and in the
 build region the dispatcher retains factory candidates. The publisher's release configuration
 (templates and reviewed pairs) ships in its code bundle as `publisher-config.json`, not in its
-environment. Apply a change of
-`fcvm_ami_build_region` only while no factory build is active (`/fcvm-fleet/ami-pipeline/control`
-in us-west-1 has `active` null): a build's journal records instance ids without a region, so the
-dispatcher cannot clean up builders left in the old region:
+environment.
+
+To copy the active release on demand, invoke the publisher below. If copies are pending,
+invoke it again after they become available:
 `aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
+
+Before changing `fcvm_ami_build_region`, pause factory admission in the existing deployment
+with a saved targeted Terraform plan using `fcvm_ami_pipeline_enabled=false` for the dispatcher
+and its request/build aliases. The pause plan must leave fleet hosts and templates alone.
+Wait for old dispatcher invocations to drain and confirm `/fcvm-fleet/ami-pipeline/control`
+in us-west-1 has both `active` and `pending` null and no builder remains in the old region.
+A build's journal records instance IDs without a region, so the new dispatcher cannot clean
+up a build stranded there. Keep admission paused while applying the reviewed region change
+under the normal Terraform lock; verify the dispatcher, SSM document and CodeBuild regions,
+then restore admission.
 
 Bootstrap the factory with `fcvm_ami_pipeline_enabled = false`: review and apply
 the producer, verify that the four defaults select the already validated guarded

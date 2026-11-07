@@ -1077,6 +1077,8 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-canonical")
         self.fleet_ssm.values["/release-copies"] = {"images": {"us-west-2": {"host": "ami-" + "2" * 17}}}
         self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-" + "2" * 17)
+        self.ec2.images["ami-" + "2" * 17]["State"] = "pending"
+        self.assertEqual(self.factory.base_image("host")["ImageId"], "ami-canonical")
 
     def test_release_parameters_are_read_in_the_release_region(self):
         # The factory builds in us-west-2; the release and its copy record are in us-east-1.

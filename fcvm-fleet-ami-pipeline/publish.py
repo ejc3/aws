@@ -955,7 +955,7 @@ class Publisher:
         image = rows[0]
         tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
         need(image.get("ImageId") == image_id and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
-             and image.get("Public") is False and image.get("Architecture") == "x86_64"
+             and image.get("Public") is False and image.get("State") == "available" and image.get("Architecture") == "x86_64"
              and image.get("RootDeviceType") == "ebs" and NAME[kind].fullmatch(image.get("Name", ""))
              and all(tags.get(key) == value for key, value in {
                  "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
@@ -981,7 +981,7 @@ class Publisher:
         source = self.client("ec2", True)
         published = {kind: self.validated_image(source, image_id, kind) for kind, image_id in sources.items()}
         names = {kind: image["Name"] for kind, image in published.items()}
-        images = {compute: dict(sources)}
+        images, pending = {compute: dict(sources)}, []
         for region in self.copy_regions:
             ec2 = self.client("ec2", True, region)
             images[region] = {}
@@ -989,27 +989,34 @@ class Publisher:
                 found = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
                     Filters=[{"Name": "name", "Values": [names[kind]]}])["Images"]
                 need(len(found) <= 1, "more than one image holds a published name")
-                if found:
-                    image = found[0]
-                    tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
-                    # Either this release's copy into the region, or the image the release was itself
-                    # copied from (a pair the factory built there).
-                    origin = (image.get("SourceImageId"), image.get("SourceImageRegion")) == (sources[kind], compute) or (
-                        (published[kind].get("SourceImageId"), published[kind].get("SourceImageRegion")) == (image.get("ImageId"), region))
-                    need(origin and image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
-                         and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
-                         and image.get("State") in {"pending", "available"}
-                         and all(tags.get(key) == value for key, value in {
-                             "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
-                             "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
-                         "an image copy is outside its private validated scope")
-                    copied = image["ImageId"]
-                else:
+                if not found:
                     copied = ec2.copy_image(SourceImageId=sources[kind], SourceRegion=compute, Name=names[kind],
                         Description="copy of " + sources[kind] + " from " + compute, Encrypted=True,
                         CopyImageTags=True, ClientToken=digest(sources[kind] + "/" + region))["ImageId"]
                     need(IMAGE.fullmatch(copied), "image copy returned no image identity")
-                images[region][kind] = copied
+                    try:
+                        found = ec2.describe_images(ImageIds=[copied])["Images"]
+                    except Exception as error:
+                        if getattr(error, "response", {}).get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
+                            raise
+                    need(len(found) <= 1, "copy image returned more than one identity")
+                if not found or found[0].get("State") == "pending":
+                    pending.append(region + "/" + kind)
+                    continue
+                image = found[0]
+                tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+                # The regional copy, or the original when the factory built in this region.
+                origin = (image.get("SourceImageId"), image.get("SourceImageRegion")) == (sources[kind], compute) or (
+                    (published[kind].get("SourceImageId"), published[kind].get("SourceImageRegion")) == (image.get("ImageId"), region))
+                need(origin and image.get("Name") == names[kind] and IMAGE.fullmatch(image.get("ImageId", ""))
+                     and image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
+                     and image.get("State") == "available" and image.get("Architecture") == "x86_64"
+                     and image.get("RootDeviceType") == "ebs" and all(tags.get(key) == value for key, value in {
+                         "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                         "GuardHelperSHA256": self.env["GUARD_SHA256"]}.items()),
+                    "an image copy is outside its available private validated scope")
+                images[region][kind] = image["ImageId"]
+        need(not pending, "regional AMI copies are still pending: " + ",".join(pending))
         try:
             current = self.load(self.copies_parameter, True)
         except Exception as error:

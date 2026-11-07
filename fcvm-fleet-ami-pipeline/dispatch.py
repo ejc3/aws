@@ -235,11 +235,16 @@ class Factory:
             if candidate is None:
                 record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
                 candidate = record["images"][self.env["COMPUTE_REGION"]][kind]
-            rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
+            try:
+                rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
+                    raise
+                rows = []
             if rows:
                 image = rows[0]
                 tags = {t["Key"]: t["Value"] for t in image.get("Tags", [])}
-                if image["OwnerId"] == self.env["FLEET_ACCOUNT"] and not image.get("Public", True) and tags.get("PipelineSanitized") == "true" and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == kind and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]:
+                if image["OwnerId"] == self.env["FLEET_ACCOUNT"] and not image.get("Public", True) and image.get("State") == "available" and image.get("Architecture") == "x86_64" and tags.get("PipelineSanitized") == "true" and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == kind and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]:
                     image_id = candidate
         except (KeyError, self.release_ssm().exceptions.ParameterNotFound):
             pass

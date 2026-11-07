@@ -152,7 +152,10 @@ class ReleaseContracts(unittest.TestCase):
                            ('resource "aws_ssm_document"', "fcvm_ami_build"),
                            ('data "aws_ec2_instance_type_offerings"', "fcvm_ami_builder")):
             with self.subTest(resource=name):
-                self.assertIn("aws.fcvm_fleet_west2", block(pipeline, kind, name))
+                resource = block(pipeline, kind, name)
+                self.assertIn("aws.fcvm_fleet_west2", resource)
+                if kind.startswith("resource"):
+                    self.assertRegex(resource, r'(?m)^  region\s*=\s*local\.fcvm_ami_build_region\s*$')
         dispatch = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_dispatch")
         self.assertRegex(dispatch, r"COMPUTE_REGION\s*=\s*local\.fcvm_ami_build_region")
         self.assertRegex(dispatch, r"SUBNET_ID\s*=\s*local\.fcvm_ami_builder_subnet")

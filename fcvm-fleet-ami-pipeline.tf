@@ -180,6 +180,7 @@ data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" {
 
 resource "aws_security_group" "fcvm_ami_builder" {
   provider    = aws.fcvm_fleet_west2
+  region      = local.fcvm_ami_build_region
   name        = "fcvm-fleet-ami-builder"
   description = "Image factory: no inbound listeners; outbound package/API access and DNS only"
   vpc_id      = module.fcvm_fleet_west2.vpc_id
@@ -267,7 +268,9 @@ resource "aws_secretsmanager_secret" "fcvm_ami_tls" {
 }
 
 resource "aws_ssm_document" "fcvm_ami_build" {
-  provider        = aws.fcvm_fleet_west2
+  provider = aws.fcvm_fleet_west2
+  # The unchanged document otherwise retains its computed us-east-1 region in state.
+  region          = local.fcvm_ami_build_region
   name            = "fcvm-fleet-ami-build"
   document_type   = "Command"
   document_format = "JSON"
