@@ -137,8 +137,12 @@ locals {
   # host templates come from the task's environment. The fleet sleeps after 10 minutes with no viewer (every GPU host
   # terminated) and wakes for the next one (one host per region with a template, spot first, on demand at once when spot
   # is refused). The EC2 side runs its tiles in us-east-1, the one region with a tile AMI, and only while the fleet is awake.
+  # --access-viewer-address: the stage.fcvm.dev Worker forwards every viewer's /live with one Access service token, so
+  # all of them arrive with the Worker's CF-Connecting-IP; the coordinator then keys such a request by the viewer address
+  # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
+  # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
   fcvm_fleet_coordinator_command = concat(
-    ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],

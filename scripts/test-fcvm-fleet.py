@@ -549,6 +549,17 @@ class StageWallTests(unittest.TestCase):
         task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
+    def test_the_coordinator_takes_forwarded_viewer_addresses_only_behind_required_access(self):
+        # The coordinator reads x-fleet-viewer-ip on a service-token request without verifying the JWT itself; the
+        # tunnel connector's access.required is what does.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('"--access-viewer-address"', cmd)
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
+        tunnel = tunnel[:tunnel.index("\n}\n")]
+        self.assertIn("required  = true", tunnel)
+        self.assertEqual(tunnel.count("hostname ="), 1)
+
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the
         # task role may invoke, through the profile in the fleet account and the foundation model it routes to.
