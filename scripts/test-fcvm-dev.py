@@ -45,8 +45,7 @@ class AccessTests(unittest.TestCase):
         owner = block('resource "cloudflare_zero_trust_access_policy" "fcvm_dev_stage_owner"')
         self.assertIn('decision         = "allow"', owner)
         self.assertIn("include          = [{ email = { email = local.browser_manager_owner } }]", owner)
-        for app in ("fcvm_dev_api_stage", "fcvm_dev_site_stage"):
-            self.assertIn("cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id", block(f'resource "cloudflare_zero_trust_access_application" "{app}"'))
+        self.assertIn("cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"'))
         agents = block('resource "cloudflare_zero_trust_access_policy" "fcvm_fleet_agents"')
         self.assertIn('decision         = "non_identity"', agents)
         self.assertIn("service_token = { token_id = cloudflare_zero_trust_access_service_token.fcvm_fleet_agents.id }", agents)
@@ -54,14 +53,14 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn('"bypass"', TF)
 
     def test_the_stage_worker_token_reaches_the_api_host_only(self):
-        # The Worker forwards /live and /poster.jpg to the API host: its token is admitted there and nowhere else.
+        # The Worker forwards /live and /poster.jpg to the API host: its token is admitted by the one staging application
+        # (which also covers the page host) and never by /agent's.
         pol = block('resource "cloudflare_zero_trust_access_policy" "fcvm_fleet_stage_worker"')
         self.assertIn('decision   = "non_identity"', pol)
         self.assertIn("service_token = { token_id = cloudflare_zero_trust_access_service_token.fcvm_fleet_stage_worker.id }", pol)
         ref = "cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id"
         self.assertIn(ref, block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"'))
-        for app in ("fcvm_dev_site_stage", "fcvm_dev_agent"):
-            self.assertNotIn(ref, block(f'resource "cloudflare_zero_trust_access_application" "{app}"'))
+        self.assertNotIn(ref, block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"'))
         self.assertEqual(TF.count(ref), 1)
         self.assertIn("prevent_destroy = true", block('resource "cloudflare_zero_trust_access_service_token" "fcvm_fleet_stage_worker"'))
 
@@ -81,9 +80,9 @@ class AccessTests(unittest.TestCase):
         self.assertIn("{ type = \"public\", uri = local.fcvm_dev_site_stage_host },", api)
         # The first destination is the application's domain.
         self.assertLess(api.index("local.fcvm_dev_api_stage_hostname },"), api.index("local.fcvm_dev_site_stage_host },"))
-        # Step 1 of 2: the page host keeps its own application until the merged one covers it.
-        self.assertIn("domain           = local.fcvm_dev_site_stage_host",
-                      block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"'))
+        # Step 2 of 2: the page host has no application of its own any more; this one covers it.
+        self.assertNotIn('"fcvm_dev_site_stage"', TF)
+        self.assertEqual(TF.count('resource "cloudflare_zero_trust_access_application"'), 2)
         # The agents keep their own path-specific application.
         self.assertNotIn("eager_redirect_cookie_setting", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"'))
 
@@ -117,10 +116,10 @@ class StageWorkerTests(unittest.TestCase):
         self.assertIn("zone_id    = var.fcvm_dev_zone_id", dom)
         self.assertIn("hostname   = local.fcvm_dev_site_stage_host", dom)
         self.assertIn("service    = local.fcvm_fleet_stage_worker", dom)
-        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_site_stage,", dom)
+        self.assertIn("cloudflare_zero_trust_access_application.fcvm_dev_api_stage,", dom)
         self.assertIn("cloudflare_workers_script_subdomain.fcvm_fleet_stage,", dom)
         self.assertIn('fcvm_dev_site_stage_host    = "stage.fcvm.dev"', TF)
-        self.assertIn("domain           = local.fcvm_dev_site_stage_host", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage"'))
+        self.assertIn("{ type = \"public\", uri = local.fcvm_dev_site_stage_host },", block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage"'))
         self.assertEqual(TF.count('resource "cloudflare_workers_custom_domain"'), 1)
 
 

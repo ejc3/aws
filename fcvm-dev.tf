@@ -18,9 +18,10 @@
 #   fleet-api-stage.fcvm.dev  -> tunnel fcvm-fleet-coordinator -> the coordinator in its task (localhost:8080). The
 #                                connector requires an Access token on every path: the owner's, or at /agent the agents'
 #                                service token (its own application, so it is never a bypass).
-#   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its own application.
-#                                The Worker forwards the page's /live and /poster.jpg to fleet-api-stage with its own
-#                                service token, so a browser needs one Access session (the page host's), not two.
+#   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by the same application as
+#                                fleet-api-stage, whose eager redirect cookie gives a browser a session on both hosts at
+#                                sign-in, so the page connects to the coordinator directly. The Worker also forwards the
+#                                page's /live and /poster.jpg there with its own service token, the page's fallback.
 # The public apex and fleet-api.fcvm.dev go live only on the owner's go-ahead: neither has a record or an application here.
 #
 # CREDENTIAL: the provider token (cloudflare-tunnel-token) has DNS Write account-wide and Zone Settings Write on this zone
@@ -97,8 +98,8 @@ resource "cloudflare_zero_trust_access_policy" "fcvm_dev_stage_owner" {
 # destinations and the eager redirect cookie, sign-in sets the cookie on both, so the page connects to the coordinator
 # directly; the Worker proxy (its service token, below) is the fallback. /agent keeps its own application.
 #
-# Step 1 of 2: stage.fcvm.dev is also still covered by fcvm_dev_site_stage, so the page host is never without Access while
-# this applies. Step 2 (the next PR) removes that application.
+# Step 2 of 2: stage.fcvm.dev had its own application until this one covered it too (the previous apply), so the page host
+# was never without Access; that application is gone.
 resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
   account_id       = var.cloudflare_account_id
   name             = "fcvm fleet API staging"
@@ -119,23 +120,6 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
     { id = cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id, precedence = 3 },
-  ]
-}
-
-resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
-  account_id       = var.cloudflare_account_id
-  name             = "fcvm.dev site staging"
-  domain           = local.fcvm_dev_site_stage_host
-  type             = "self_hosted"
-  session_duration = "12h"
-  allowed_idps = concat(
-    cloudflare_zero_trust_access_identity_provider.github[*].id,
-    cloudflare_zero_trust_access_identity_provider.google[*].id,
-    [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
-  )
-  policies = [
-    { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
-    { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
   ]
 }
 
@@ -172,8 +156,8 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
 # belongs to one host, so a browser signed in to stage.fcvm.dev had no session on fleet-api-stage.fcvm.dev and its /live
 # upgrade got Access's 302 to the login page, which a WebSocket cannot follow: the page said "Cannot reach the fleet
 # yet" until the window had visited the API host once. The Worker now forwards /live and /poster.jpg (and no other
-# path) with this token, which the API application admits and the site and /agent applications do not. Anyone the
-# Worker serves has already passed the site application, whose policies are the API application's own two.
+# path) with this token, which the one staging application admits and /agent's does not. Anyone the Worker serves has
+# already passed that same application.
 # The token reaches the Worker as two secrets of ejc3/fcvm's main-only cloudflare-deploy environment, which the deploy
 # uploads with the version (wrangler deploy --secrets-file).
 # Rotate the secret in place: commit the next client_secret_version (initial default is 1) and an explicit RFC3339
@@ -240,7 +224,7 @@ resource "cloudflare_workers_custom_domain" "fcvm_fleet_stage" {
   hostname   = local.fcvm_dev_site_stage_host
   service    = local.fcvm_fleet_stage_worker
   depends_on = [
-    cloudflare_zero_trust_access_application.fcvm_dev_site_stage,
+    cloudflare_zero_trust_access_application.fcvm_dev_api_stage,
     cloudflare_workers_script_subdomain.fcvm_fleet_stage,
   ]
 }
