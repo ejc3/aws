@@ -4551,6 +4551,49 @@ def case_a_capacity_refusal_keeps_the_initialization_rate_for_the_next_pool():
     assert all("VolumeInitializationRate" in root_volume(c) for c in calls), calls
 
 
+def case_a_job_that_asks_for_on_demand_capacity_gets_an_on_demand_host():
+    """fcvm's ci.yml asks for the on-demand label on a rerun, after a spot reclaim
+    killed the first attempt (fcvm #834). The webhook buys that launch on-demand and
+    tags it so; every other job still gets spot capacity."""
+    for labels, market in ((["self-hosted", "Linux", "ARM64", "on-demand"], "on-demand"),
+                           (["self-hosted", "Linux", "ARM64"], "spot")):
+        ec2 = FakeEC2([])
+        body = json.dumps({"action": "queued", "workflow_job": {"labels": labels}})
+        result = webhook(ec2)["handler"]({"body": body}, None)
+        assert result["statusCode"] == 200, result
+        calls = ec2.ops("run_instances")
+        assert len(calls) == 1, (market, calls)
+        call = calls[0]
+        assert ("InstanceMarketOptions" in call) is (market == "spot"), (market, call)
+        tags = {t["Key"]: t["Value"] for spec in call["TagSpecifications"] for t in spec["Tags"]
+                if spec["ResourceType"] == "instance"}
+        assert tags.get("Market") == market, (market, tags)
+
+
+def case_the_poll_asks_for_on_demand_hosts_for_the_jobs_that_asked():
+    """A spot host never registers with the on-demand label, so the poll asks for
+    on-demand capacity for those jobs apart from the rest of the queue."""
+    busy = run(7, "queued")
+    rerun = {"name": "job", "status": "queued", "labels": ["self-hosted", "Linux", "ARM64", "on-demand"]}
+    github = FakeGitHub(runs=[busy], jobs={busy["id"]: [rerun, rerun] + [job("queued", "arm64")] * 3})
+    invoker = FakeLambdaClient()
+    cleanup(FakeEC2(), github, invoker, env=SPLIT_CAPS)["handler"]({}, None)
+    asked = sorted((sorted(x.lower() for x in p["workflow_job"]["labels"]), p["launch_count"])
+                   for p in invoker.invokes)
+    assert asked == [(["arm64", "linux", "on-demand", "self-hosted"], 2),
+                     (["arm64", "linux", "self-hosted"], 3)], asked
+
+
+def case_an_on_demand_host_registers_with_the_on_demand_label():
+    """The label comes from the instance's own IMDS life cycle, on boot and for
+    every later job of a warm host."""
+    tf = TF_FILE.read_text()
+    assert "meta-data/instance-life-cycle" in tf
+    assert 'RUNNER_LABELS="$RUNNER_LABEL,on-demand"' in tf
+    assert '--labels "self-hosted,Linux,$${RUNNER_LABELS:-$RUNNER_LABEL}"' in tf
+    assert "RUNNER_LABELS=%s" in tf
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
 
 

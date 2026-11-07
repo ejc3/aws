@@ -506,8 +506,11 @@ data "archive_file" "runner_webhook" {
           runners = get_online_runners()
           return None if runners is None else set(runners)
 
-      def get_capacity(arch):
+      def get_capacity(arch, market=None):
           """Count runner instances for arch that can actually take work.
+
+          `market` 'on-demand' counts only the hosts launched on-demand (tag Market),
+          the ones that can take a job asking for the on-demand label.
 
           The cap has to be held by runners GitHub can hand a job to, not by EC2
           instances that merely exist. On 2026-08-07 two wedged ARM instances stayed
@@ -536,6 +539,8 @@ data "archive_file" "runner_webhook" {
           if arch:
               name_value = f'github-runner-{arch}'
               filters.append({'Name': 'tag:Name', 'Values': [name_value]})
+          if market == 'on-demand':
+              filters.append({'Name': 'tag:Market', 'Values': ['on-demand']})
           response = ec2.describe_instances(Filters=filters)
           instances = [i for r in response['Reservations'] for i in r['Instances']]
           if not instances:
@@ -854,8 +859,20 @@ data "archive_file" "runner_webhook" {
           """Calculate lease expiry time (now + LEASE_DURATION_MINUTES)"""
           return (datetime.now(timezone.utc) + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
 
-      def launch_runner(arch='arm64', failed_here=None, rate_refused=None):
-          """Launch a new spot runner instance, trying each subnet and instance type.
+      # The label a job asks for when it must not run on spot capacity: fcvm's
+      # ci.yml asks for it on a rerun, after a spot reclaim killed the first attempt
+      # (fcvm #834). Only on-demand hosts register with it.
+      ON_DEMAND_LABEL = 'on-demand'
+
+      def job_market(labels):
+          """'on-demand' for a job that asks for the on-demand label, else 'spot'."""
+          return 'on-demand' if ON_DEMAND_LABEL in [str(l).lower() for l in labels] else 'spot'
+
+      def launch_runner(arch='arm64', failed_here=None, rate_refused=None, market='spot'):
+          """Launch a new runner instance, trying each subnet and instance type.
+
+          `market` 'spot' launches spot capacity, the default; 'on-demand' buys the
+          launch on-demand, for a job that asked for the on-demand label.
 
           failed_here holds the (AZ, type) pairs whose run_instances raised in this
           invocation, and the handler passes one set to every launch in a batch. A
@@ -927,16 +944,13 @@ data "archive_file" "runner_webhook" {
                       MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
                                        'InstanceMetadataTags': 'enabled'},
                       InstanceInitiatedShutdownBehavior='terminate',
-                      InstanceMarketOptions={
-                          'MarketType': 'spot',
-                          'SpotOptions': {'SpotInstanceType': 'one-time'}
-                      },
                       TagSpecifications=[{
                           'ResourceType': 'instance',
                           'Tags': [
                               {'Key': 'Name', 'Value': f'github-runner-{arch}'},
                               {'Key': 'Role', 'Value': 'github-runner'},
                               {'Key': 'Architecture', 'Value': arch},
+                              {'Key': 'Market', 'Value': market},
                               {'Key': 'LeaseExpires', 'Value': lease_expiry},
                               # Keeps Amazon Inspector's SSM agent from installing its
                               # scanner with apt while this one-job host takes work.
@@ -956,6 +970,11 @@ data "archive_file" "runner_webhook" {
                           'Tags': [{'Key': 'Role', 'Value': 'github-runner'}]
                       }]
                   )
+                  if market == 'spot':
+                      request['InstanceMarketOptions'] = {
+                          'MarketType': 'spot',
+                          'SpotOptions': {'SpotInstanceType': 'one-time'}
+                      }
                   try:
                       response = launch_ec2.run_instances(**request)
                   except Exception as e:
@@ -1339,6 +1358,7 @@ data "archive_file" "runner_webhook" {
           workflow_job = payload.get('workflow_job', {})
           labels = workflow_job.get('labels', [])
           arch = detect_architecture(labels)
+          market = job_market(labels)
 
           # A forwarded delivery can wait in the async queue behind this function's one
           # execution. If a complete cleanup queue scan began after the job was queued,
@@ -1368,6 +1388,10 @@ data "archive_file" "runner_webhook" {
           claim_only = not public and payload.get('claim_only') is True
           refused = 'reuse-missed' if claim_only else 'blocked'
           capacity = get_capacity(arch)
+          # A job asking for on-demand capacity is absorbed only by on-demand hosts:
+          # a spot host never registers with that label. The cap above it stays the
+          # architecture's whole pool.
+          serving = capacity if market == 'spot' else get_capacity(arch, 'on-demand')
 
           if capacity['counted'] >= max_runners:
               detail = f'Max {arch} runners ({max_runners}) reached'
@@ -1411,7 +1435,7 @@ data "archive_file" "runner_webhook" {
           # request carrying the poll's count is cut: any other request is one job,
           # and a runner already starting or idle may be there for a different one.
           if not public and not claim_only and 'queued_jobs' in payload:
-              absorbing = capacity['booting'] + capacity['idle']
+              absorbing = serving['booting'] + serving['idle']
               requested = min(requested, max(queued_jobs - absorbing, 0))
               if requested == 0:
                   detail = (f'{absorbing} starting or idle {arch} runner(s) already cover '
@@ -1424,7 +1448,7 @@ data "archive_file" "runner_webhook" {
           # that loses its race falls through to a launch.
           slots = min(requested, max_runners - capacity['counted'])
           launch_room = 0 if claim_only else max_runners + LAUNCH_HEADROOM - capacity['instances']
-          available = list(capacity['available'])
+          available = list(serving['available'])
 
           reused_here = []
           launched_here = []
@@ -1451,7 +1475,7 @@ data "archive_file" "runner_webhook" {
                       continue
                   if len(launched_here) >= launch_room:
                       break
-                  spot_id, instance_type = launch_runner(arch, failed_here, rate_refused)
+                  spot_id, instance_type = launch_runner(arch, failed_here, rate_refused, market)
                   launched_here.append(spot_id)
           except RunnerBootstrapError as e:
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
@@ -1472,7 +1496,8 @@ data "archive_file" "runner_webhook" {
           if reused_here:
               parts.append(f'Reused {len(reused_here)} warm {arch} host(s): {",".join(reused_here)}')
           if launched_here:
-              parts.append(f'Launched {len(launched_here)} {arch} runner(s) ({instance_type}): '
+              kind = arch if market == 'spot' else f'{market} {arch}'
+              parts.append(f'Launched {len(launched_here)} {kind} runner(s) ({instance_type}): '
                            f'{",".join(launched_here)}')
           detail = '; '.join(parts)
           emit_decision(arch, queued_jobs, capacity, max_runners,
@@ -1640,7 +1665,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Resource = flatten([for r in local.runner_regions : [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:${r}:${data.aws_caller_identity.current.account_id}:${kind}/*"]])
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Architecture", "Market", "LeaseExpires", "InspectorEc2Exclusion", "RunnerRegistrationProtocol"] }
         }
       },
       {
@@ -2078,8 +2103,11 @@ case $- in *x*) IMDS_XTRACE=1 ;; *) IMDS_XTRACE= ;; esac
 { set +x; } 2>/dev/null
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+# An on-demand host also registers with the on-demand label, the one a rerun asks
+# for (RERUN_MARKET_LABEL in the webhook): a spot reclaim cannot end it again.
+INSTANCE_LIFE_CYCLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-life-cycle)
 unset TOKEN
-echo "IMDS: INSTANCE_ID=$INSTANCE_ID"
+echo "IMDS: INSTANCE_ID=$INSTANCE_ID INSTANCE_LIFE_CYCLE=$INSTANCE_LIFE_CYCLE"
 if [ -n "$IMDS_XTRACE" ]; then set -x; fi
 ARCH=$(uname -m)
 
@@ -2160,7 +2188,8 @@ set +x
 # REGION (from IMDS above) is where THIS host is: EC2 calls about its own network and its ARN. The control plane (the SSM
 # bootstrap credential, the DynamoDB registration table) does not move with the runners: CONTROL_REGION stays put.
 CONTROL_REGION="${local.runner_control_region}"
-printf 'INSTANCE_ID=%s\nREGION=%s\nCONTROL_REGION=%s\nRUNNER_LABEL=%s\n' "$INSTANCE_ID" "$REGION" "$CONTROL_REGION" "$RUNNER_LABEL" > /etc/fcvm-runner.env
+if [ "$INSTANCE_LIFE_CYCLE" = on-demand ]; then RUNNER_LABELS="$RUNNER_LABEL,on-demand"; else RUNNER_LABELS="$RUNNER_LABEL"; fi
+printf 'INSTANCE_ID=%s\nREGION=%s\nCONTROL_REGION=%s\nRUNNER_LABEL=%s\nRUNNER_LABELS=%s\n' "$INSTANCE_ID" "$REGION" "$CONTROL_REGION" "$RUNNER_LABEL" "$RUNNER_LABELS" > /etc/fcvm-runner.env
 cat > /etc/systemd/system/fcvm-runner-next.service <<'NEXT_JOB_SERVICE'
 [Unit]
 Description=Register this runner host for its next job, or power it off
@@ -2278,7 +2307,7 @@ fi
 # runner reads when --token is absent and removes from its own environment. sudo
 # still resets the environment, so the runner's .env and .path do not change.
 sudo -u ubuntu bash -c 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --url https://github.com/ejc3/fcvm "$@"' config \
-  --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate <<<"$REG_TOKEN"
+  --name "$RUNNER_NAME" --labels "self-hosted,Linux,$${RUNNER_LABELS:-$RUNNER_LABEL}" --unattended --replace --ephemeral --disableupdate <<<"$REG_TOKEN"
 unset REG_TOKEN
 if [ -n "$JOB_XTRACE" ]; then set -x; fi
 
@@ -2363,7 +2392,7 @@ fi
 trap - EXIT
 RUNNER_JOB
 chmod 755 /usr/local/sbin/fcvm-runner-job
-INSTANCE_ID="$INSTANCE_ID" REGION="$REGION" CONTROL_REGION="$CONTROL_REGION" RUNNER_LABEL="$RUNNER_LABEL" /usr/local/sbin/fcvm-runner-job first
+INSTANCE_ID="$INSTANCE_ID" REGION="$REGION" CONTROL_REGION="$CONTROL_REGION" RUNNER_LABEL="$RUNNER_LABEL" RUNNER_LABELS="$RUNNER_LABELS" /usr/local/sbin/fcvm-runner-job first
 EOF
 
   # EC2 receives the script above without its whole-line comments. They stay here for
@@ -3451,6 +3480,13 @@ data "archive_file" "runner_cleanup" {
           """This architecture's runner cap, as the webhook reads it (local.runner_max_by_arch)."""
           return int(os.environ.get(f'MAX_RUNNERS_{arch.upper()}', '4'))
 
+      # As in the webhook: the label a rerun asks for so only an on-demand host takes it.
+      ON_DEMAND_LABEL = 'on-demand'
+
+      def job_market(labels):
+          """'on-demand' for a job that asks for the on-demand label, else 'spot'."""
+          return 'on-demand' if ON_DEMAND_LABEL in [str(l).lower() for l in labels] else 'spot'
+
       def queued_demand(pat, caps, scan=None):
           """Count queued self-hosted jobs per architecture.
 
@@ -3469,6 +3505,7 @@ data "archive_file" "runner_cleanup" {
           not evidence that nothing is queued.
           """
           demand = {'arm64': 0, 'x86_64': 0}
+          on_demand = {'arm64': 0, 'x86_64': 0}
           scan_start = datetime.now(timezone.utc)
           queued_runs = list_run_ids(pat, 'queued', QUEUE_SCAN_MAX_RUNS)
           in_progress_runs = list_run_ids(pat, 'in_progress', QUEUE_SCAN_MAX_RUNS)
@@ -3488,13 +3525,15 @@ data "archive_file" "runner_cleanup" {
                   break
               for job in queued_self_hosted_jobs(pat, run_id):
                   labels = [l.lower() for l in job.get('labels', [])]
-                  if 'x64' in labels or 'x86_64' in labels or 'amd64' in labels:
-                      demand['x86_64'] += 1
-                  else:
-                      demand['arm64'] += 1
+                  arch = 'x86_64' if ('x64' in labels or 'x86_64' in labels or 'amd64' in labels) else 'arm64'
+                  demand[arch] += 1
+                  if job_market(labels) == 'on-demand':
+                      on_demand[arch] += 1
           if scan is not None:
               scan['complete'] = complete
               scan['started_at'] = scan_start.timestamp()
+              # Of `demand`, the jobs only an on-demand host can take.
+              scan['on_demand'] = on_demand
           return demand
 
       def cleanup_expired_bootstrap_parameters(now):
@@ -4233,45 +4272,55 @@ data "archive_file" "runner_cleanup" {
                   webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
                   # Architectures this poll asked runners for, or that had nothing queued.
                   covered = []
+                  on_demand = demand_scan.get('on_demand', {})
                   for arch in sorted(demand):
-                      queued_jobs = demand[arch]
-                      labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
-                      # ONE invoke per architecture, carrying the whole deficit as
-                      # launch_count and the raw demand as queued_jobs. The webhook
-                      # takes its starting and idle runners off queued_jobs, records
-                      # it in its decision line, and launches at most launch_count
-                      # runners inside a single invocation,
-                      # where its own loop count bounds the total - a burst of
-                      # single-launch invocations, even serialized by reserved
-                      # concurrency 1, can each miss the instance the previous one
-                      # just launched (DescribeInstances is eventually consistent)
-                      # and overshoot the cap.
-                      count = min(queued_jobs, caps[arch])
-                      if count <= 0:
+                      arch_labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
+                      # Jobs that asked for on-demand capacity get their own request:
+                      # a spot host this poll launched for them could never take them.
+                      wanted_on_demand = min(on_demand.get(arch, 0), demand[arch])
+                      requests = []
+                      if wanted_on_demand:
+                          requests.append((arch_labels + [ON_DEMAND_LABEL], wanted_on_demand))
+                      requests.append((arch_labels, demand[arch] - wanted_on_demand))
+                      asked = True
+                      for labels, queued_jobs in requests:
+                          # ONE invoke per architecture and market, carrying the whole
+                          # deficit as launch_count and the raw demand as queued_jobs.
+                          # The webhook takes its starting and idle runners off
+                          # queued_jobs, records it in its decision line, and launches
+                          # at most launch_count runners inside a single invocation,
+                          # where its own loop count bounds the total - a burst of
+                          # single-launch invocations, even serialized by reserved
+                          # concurrency 1, can each miss the instance the previous one
+                          # just launched (DescribeInstances is eventually consistent)
+                          # and overshoot the cap.
+                          count = min(queued_jobs, caps[arch])
+                          if count <= 0:
+                              continue
+                          # Direct invoke: no requestContext, so the handler trusts it
+                          # without a header. Skips HMAC, which API Gateway callers cannot.
+                          payload = {
+                              'body': json.dumps({
+                                  'action': 'queued',
+                                  'workflow_job': {'labels': labels},
+                                  'queued_jobs': queued_jobs,
+                                  'launch_count': count
+                              }),
+                              'headers': {}
+                          }
+                          print(f'Requesting up to {count} {job_market(labels)} {arch} runner(s) in one invocation ({queued_jobs} queued jobs)')
+                          try:
+                              lambda_client.invoke(
+                                  FunctionName=webhook_fn,
+                                  InvocationType='Event',
+                                  Payload=json.dumps(payload)
+                              )
+                              launched.extend([arch] * count)
+                          except Exception as e:
+                              asked = False
+                              print(f'Failed to invoke webhook for {arch}: {e}')
+                      if asked:
                           covered.append(arch)
-                          continue
-                      # Direct invoke: no requestContext, so the handler trusts it
-                      # without a header. Skips HMAC, which API Gateway callers cannot.
-                      payload = {
-                          'body': json.dumps({
-                              'action': 'queued',
-                              'workflow_job': {'labels': labels},
-                              'queued_jobs': queued_jobs,
-                              'launch_count': count
-                          }),
-                          'headers': {}
-                      }
-                      print(f'Requesting up to {count} {arch} runner(s) in one invocation ({queued_jobs} queued jobs)')
-                      try:
-                          lambda_client.invoke(
-                              FunctionName=webhook_fn,
-                              InvocationType='Event',
-                              Payload=json.dumps(payload)
-                          )
-                          launched.extend([arch] * count)
-                          covered.append(arch)
-                      except Exception as e:
-                          print(f'Failed to invoke webhook for {arch}: {e}')
                   if demand_scan.get('complete'):
                       for arch in covered:
                           record_queue_scan(arch, demand_scan['started_at'], demand[arch])
