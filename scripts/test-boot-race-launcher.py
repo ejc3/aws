@@ -78,6 +78,12 @@ class Launcher(unittest.TestCase):
                 self.mod.lambda_handler({"action": "stop", "task": bad}, None)
         self.assertEqual(len(self.ecs.stops), 1)
 
+    def test_a_retired_campaign_network_refuses_the_fargate_lane(self):
+        self.mod.SUBNET = ""
+        with self.assertRaisesRegex(ValueError, "retired"):
+            self.mod.lambda_handler({"action": "run", "lane": "fargate"}, None)
+        self.assertEqual(self.ecs.runs, [])
+
     def test_unknown_actions_and_lanes_are_refused(self):
         for event in ({"action": "run", "lane": "other"}, {"action": "delete"}, {}):
             with self.assertRaises(ValueError):
@@ -95,7 +101,7 @@ class Terraform(unittest.TestCase):
         fn = block(TF, 'resource "aws_lambda_function" "boot_race_launcher"')
         self.assertNotIn("ignore_changes", fn)
         self.assertIn("data.archive_file.boot_race_launcher.output_base64sha256", fn)
-        self.assertIn("SUBNET         = aws_subnet.ohio_pbox.id", fn)
+        self.assertIn('SUBNET         = var.boot_race_enabled ? aws_subnet.boot_race[0].id : ""', fn)
         self.assertIn("SECURITY_GROUP = aws_security_group.boot_race.id", fn)
 
     def test_the_driver_may_only_invoke_the_launcher(self):

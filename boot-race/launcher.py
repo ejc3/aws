@@ -21,7 +21,7 @@ ECS = boto3.client("ecs")
 CLUSTER = os.environ["CLUSTER"]
 FARGATE_FAMILY = os.environ["FARGATE_FAMILY"]
 EC2_FAMILY = os.environ["EC2_FAMILY"]
-SUBNET = os.environ["SUBNET"]
+SUBNET = os.environ.get("SUBNET", "")
 SECURITY_GROUP = os.environ["SECURITY_GROUP"]
 
 INSTANCE = re.compile(r"^i-[0-9a-f]{8,17}$")
@@ -31,6 +31,8 @@ TASK = re.compile(r"^arn:aws:ecs:[a-z0-9-]+:\d{12}:task/%s/[0-9a-f]{32}$" % re.e
 def run_arguments(event):
     lane = event.get("lane")
     if lane == "fargate":
+        if not SUBNET:
+            raise ValueError("the campaign network is retired (boot_race_enabled = false)")
         return {
             "taskDefinition": FARGATE_FAMILY,
             "launchType": "FARGATE",

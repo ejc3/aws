@@ -563,7 +563,8 @@ resource "aws_lambda_function" "boot_race_launcher" {
       CLUSTER        = aws_ecs_cluster.boot_race.name
       FARGATE_FAMILY = aws_ecs_task_definition.boot_race_fargate.family
       EC2_FAMILY     = aws_ecs_task_definition.boot_race_ec2.family
-      SUBNET         = aws_subnet.ohio_pbox.id
+      # Empty once the campaign network is retired (boot_race_enabled = false): the Fargate lane is then refused.
+      SUBNET         = var.boot_race_enabled ? aws_subnet.boot_race[0].id : ""
       SECURITY_GROUP = aws_security_group.boot_race.id
     }
   }
@@ -639,11 +640,13 @@ data "aws_iam_policy_document" "boot_race_reaper" {
     }
   }
 
+  # ListTasks of a whole cluster authorizes against "*"; the container-instance resource covers only a list filtered
+  # by container instance. Held to the cluster by ecs:cluster, as in AWS's ECS identity-policy examples.
   statement {
     sid       = "ListBootRaceTasks"
     effect    = "Allow"
     actions   = ["ecs:ListTasks"]
-    resources = ["${local.boot_race_ecs_arn}:container-instance/boot-race/*"]
+    resources = ["*"]
     condition {
       test     = "ArnEquals"
       variable = "ecs:cluster"
@@ -756,22 +759,59 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
   }
 }
 
-# ============================================================ private ECR for Fargate
-# A Fargate task with no public IP reaches ECR through these: the two ECR interface endpoints in the parallel-box
-# subnet and an S3 gateway endpoint for the image layers. Private DNS points every client in the VPC at them, so the
-# endpoints' group admits the parallel boxes as well as the boot-race workloads.
+# ============================================================ the campaign network
+# Fargate tasks run in a subnet of their own (10.12.3.0/24; the owner's boxes use 10.12.1.0/24 and the members'
+# 10.12.2.0/24) whose route table has no internet route: a task has no public IP and reaches ECR through the two
+# interface endpoints and the S3 gateway endpoint here. The parallel boxes' route table is not touched.
+#
+# Private DNS on the interface endpoints applies to the whole VPC, so while they exist new ECR connections from any
+# subnet resolve to them; their group admits HTTPS from the VPC's own range so those keep working.
+#
+# Retirement: after the campaign, set boot_race_enabled = false. That removes the subnet, its route table, the three
+# endpoints and their group, and with them the endpoints' hourly charge. The launcher then refuses the Fargate lane.
+variable "boot_race_enabled" {
+  description = "Keep the boot-race campaign network (subnet, route table, ECR and S3 endpoints); false retires it"
+  type        = bool
+  default     = true
+}
+
+resource "aws_subnet" "boot_race" {
+  count                   = var.boot_race_enabled ? 1 : 0
+  provider                = aws.ohio
+  vpc_id                  = aws_vpc.ohio_pbox.id
+  cidr_block              = "10.12.3.0/24"
+  availability_zone       = local.ohio_pbox_az
+  map_public_ip_on_launch = false
+  tags                    = merge(local.boot_race_tag, { Name = "boot-race" })
+}
+
+resource "aws_route_table" "boot_race" {
+  count    = var.boot_race_enabled ? 1 : 0
+  provider = aws.ohio
+  vpc_id   = aws_vpc.ohio_pbox.id
+  tags     = merge(local.boot_race_tag, { Name = "boot-race" })
+}
+
+resource "aws_route_table_association" "boot_race" {
+  count          = var.boot_race_enabled ? 1 : 0
+  provider       = aws.ohio
+  subnet_id      = aws_subnet.boot_race[0].id
+  route_table_id = aws_route_table.boot_race[0].id
+}
+
 resource "aws_security_group" "boot_race_endpoints" {
+  count       = var.boot_race_enabled ? 1 : 0
   provider    = aws.ohio
   name_prefix = "boot-race-endpoints-"
-  description = "ECR interface endpoints in the parallel-box VPC: HTTPS from the boot-race workloads and parallel boxes"
+  description = "boot-race ECR interface endpoints: HTTPS from inside the parallel-box VPC"
   vpc_id      = aws_vpc.ohio_pbox.id
 
   ingress {
-    description     = "HTTPS to ECR, from the boot-race workloads and the parallel boxes"
-    from_port       = 443
-    to_port         = 443
-    protocol        = "tcp"
-    security_groups = [aws_security_group.boot_race.id, aws_security_group.ohio_pbox.id]
+    description = "HTTPS to ECR from inside the VPC (private DNS sends ECR traffic from every subnet here)"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.ohio_pbox.cidr_block]
   }
 
   tags = merge(local.boot_race_tag, { Name = "boot-race-endpoints" })
@@ -782,23 +822,24 @@ resource "aws_security_group" "boot_race_endpoints" {
 }
 
 resource "aws_vpc_endpoint" "boot_race_ecr" {
-  for_each            = toset(["ecr.api", "ecr.dkr"])
+  for_each            = var.boot_race_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])
   provider            = aws.ohio
   vpc_id              = aws_vpc.ohio_pbox.id
   service_name        = "com.amazonaws.${local.boot_race_region}.${each.key}"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.ohio_pbox.id]
-  security_group_ids  = [aws_security_group.boot_race_endpoints.id]
+  subnet_ids          = [aws_subnet.boot_race[0].id]
+  security_group_ids  = [aws_security_group.boot_race_endpoints[0].id]
   private_dns_enabled = true
   tags                = merge(local.boot_race_tag, { Name = "boot-race-${each.key}" })
 }
 
 resource "aws_vpc_endpoint" "boot_race_s3" {
+  count             = var.boot_race_enabled ? 1 : 0
   provider          = aws.ohio
   vpc_id            = aws_vpc.ohio_pbox.id
   service_name      = "com.amazonaws.${local.boot_race_region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.ohio_pbox.id]
+  route_table_ids   = [aws_route_table.boot_race[0].id]
   tags              = merge(local.boot_race_tag, { Name = "boot-race-s3" })
 }
 
@@ -997,7 +1038,7 @@ data "aws_iam_policy_document" "boot_race_driver" {
   statement {
     sid     = "ReadBootRaceTasks"
     effect  = "Allow"
-    actions = ["ecs:DescribeTasks", "ecs:ListTasks", "ecs:ListContainerInstances", "ecs:DescribeContainerInstances"]
+    actions = ["ecs:DescribeTasks", "ecs:ListContainerInstances", "ecs:DescribeContainerInstances"]
     resources = [
       aws_ecs_cluster.boot_race.arn,
       "${local.boot_race_ecs_arn}:task/boot-race/*",
