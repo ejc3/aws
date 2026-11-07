@@ -679,14 +679,24 @@ a = " ".join(args)
 open(os.environ["FAKE_LOG"], "a").write(json.dumps(args) + "\n")
 if "get-parameter" in a:
     print(os.environ.get("FAKE_POINTER") or '{"region": "us-east-2", "x86_image": "ami-0x86home", "fallback": {}}')
+elif "get-spot-placement-scores" in a:
+    print("9\tus-east-2\tuse2-az3")
+elif "describe-availability-zones" in a:
+    print("use2-az3\tus-east-2c")
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "PublicIpAddress" in a:
     print("203.0.113.9" if os.environ.get("FAKE_RUNNING") else "None")
 elif "describe-instances" in a and "InstanceType" in a:
+    if "--instance-ids" in args and os.environ.get("FAKE_TYPE_ERROR"):
+        sys.exit(254)
     print(os.environ.get("FAKE_RUNNING") or "None")
 elif "describe-instances" in a and "InstanceId" in a:
+    if os.environ.get("FAKE_SLOT_ERROR"):
+        sys.exit(254)
     print("i-0running" if os.environ.get("FAKE_RUNNING") else "None")
+elif "describe-instances" in a and "Fallback" in a:
+    print("true" if os.environ.get("FAKE_FRESH") else "None")
 elif "describe-instances" in a and "InstanceLifecycle" in a:
     print("spot")
 elif "describe-instances" in a:
@@ -718,11 +728,12 @@ class ScriptRuns(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
 
-    def pbox(self, *args, user="ejc3", running="", pointer=""):
+    def pbox(self, *args, user="ejc3", running="", pointer="", fresh="", type_error="", slot_error=""):
         if self.log.exists():
             self.log.unlink()
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
-                   MEMBER_BOX_USER=user, FAKE_RUNNING=running, FAKE_POINTER=pointer)
+                   MEMBER_BOX_USER=user, FAKE_RUNNING=running, FAKE_POINTER=pointer, FAKE_FRESH=fresh,
+                   FAKE_TYPE_ERROR=type_error, FAKE_SLOT_ERROR=slot_error)
         env.pop("PARALLEL_BOX_REGION", None)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -765,6 +776,54 @@ class ScriptRuns(unittest.TestCase):
                 self.assertEqual(self.launched_types(), v[4])
                 runs = [c for c in self.calls() if "run-instances" in c]
                 self.assertTrue(all("LaunchTemplateName=parallel-box-5,Version=$Latest" in c for c in runs))
+
+    def test_local_nvme_launch_and_capacity_both_exclude_diskless_metal(self):
+        rc, _, err = self.pbox("up", "5", "kvm-96", "--local-nvme")
+        self.assertEqual(rc, 3, err)  # fake home is out of capacity
+        self.assertEqual(self.launched_types(), ["c8gd.metal-24xl", "m8gd.metal-24xl"])
+        self.assertIn("up 5 kvm-96 --local-nvme --fallback", err)
+
+        rc, out, err = self.pbox("capacity", "5", "kvm-96", "--local-nvme")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("us-east-2c home", out)
+        [call] = [c for c in self.calls() if "get-spot-placement-scores" in c]
+        self.assertEqual(call[call.index("--instance-types") + 1:call.index("--query")],
+                         ["c8gd.metal-24xl", "m8gd.metal-24xl"])
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_refuses_incompatible_or_unverified_occupied_slot(self):
+        for running, error in (("c8g.metal-24xl", ""), ("m8g.metal-24xl", ""),
+                               ("i8g.24xlarge", ""), ("c8gd.metal-24xl", "1")):
+            with self.subTest(running=running, type_error=error):
+                rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", running=running, type_error=error)
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(out, "")
+                self.assertIn("Refusing --local-nvme", err)
+                [lookup] = [c for c in self.calls() if any("InstanceType" in arg for arg in c)]
+                self.assertIn("i-0running", lookup)
+                self.assertFalse(any(set(c) & {"run-instances", "attach-volume", "terminate-instances"}
+                                     for c in self.calls()))
+
+    def test_local_nvme_reuses_a_compatible_existing_box(self):
+        rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", running="m8gd.metal-24xl", fresh="1")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("id=i-0running work=fresh", out)
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_does_not_launch_when_slot_lookup_fails(self):
+        rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", slot_error="1")
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out, "")
+        self.assertIn("could not verify whether parallel-box-5 is in use", err)
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_requires_kvm96_up_or_capacity_before_aws_calls(self):
+        for args in (("up", "storage-96"), ("capacity", "kvm-192"), ("status",), ("up",)):
+            with self.subTest(args=args):
+                rc, _, err = self.pbox(*args, "--local-nvme")
+                self.assertEqual(rc, 2, err)
+                self.assertIn("--local-nvme only applies", err)
+                self.assertEqual(self.calls(), [])
 
     def test_only_an_x86_type_gets_the_published_x86_image(self):
         rc, _, err = self.pbox("up", "2", "kvm-gpu-96")

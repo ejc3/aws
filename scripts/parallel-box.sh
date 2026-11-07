@@ -17,6 +17,9 @@
 #                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on.
 #                     A GPU flavor implies --fallback: home first, then every fallback region that offers
 #                     the type (owner, 2026-10-22: the region does not matter for these).
+#   pbox up [N] kvm-96 --local-nvme
+#                     try only the KVM types with disposable instance-store NVMe. A slot already occupied
+#                     by a different type is left alone; choose a free or compatible slot.
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -59,7 +62,7 @@
 #                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
-#                     fallback AZ; launches nothing
+#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96.
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
 #   "launched box=N region=R az=Z type=T ip=IP id=i-... work=persistent|fresh", or "running ..." when it already was,
@@ -163,6 +166,9 @@ flavor_lines() {
 }
 
 flavor_types() { flavor_lines | awk -v f="$1" '$1 == f { for (i = 6; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") }'; }
+has_kvm96_local_nvme() {
+  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl) return 0 ;; *) return 1 ;; esac
+}
 
 # The flavor an instance type belongs to (each type is in exactly one), or nothing.
 type_flavor() { printf '%s\n' "$FLAVORS" | awk -v t="$1" 'NF { for (i = 6; i <= NF; i++) if ($i == t) print $1 }'; }
@@ -245,6 +251,7 @@ CMD="${1:-status}"
 BOX=""
 MODE=""
 FLAVOR=""
+LOCAL_NVME=""
 FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
@@ -261,6 +268,7 @@ while [ $# -gt 0 ]; do
       [ -n "${1:-}" ] || { say "--flavor needs a name (pbox flavors)"; exit 2; }
       FLAVOR="$1" ;;
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
+    --local-nvme) LOCAL_NVME=1 ;;
     --fallback) FALLBACK=1 ;;
     --open) OPEN=1 ;;
     --on-demand) ONDEMAND=1 ;;
@@ -288,7 +296,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
   esac
   shift
 done
@@ -376,6 +384,11 @@ lease_line() {
 if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
+if [ -n "$LOCAL_NVME" ]; then
+  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || [ "$FLAVOR" != "kvm-96" ]; then
+    say "--local-nvme only applies to 'up kvm-96' and 'capacity kvm-96'"; exit 2
+  fi
+fi
 
 if [ "$CMD" = "flavors" ]; then
   print_menu all
@@ -400,6 +413,17 @@ if [ "$CMD" = "up" ] || [ "$CMD" = "capacity" ]; then
     print_menu
     exit 2
   fi
+  if [ -n "$LOCAL_NVME" ]; then
+    NVME_TYPES=()
+    for T in $TYPES; do
+      if has_kvm96_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
+    done
+    if [ "${#NVME_TYPES[@]}" -eq 0 ]; then
+      say "No local NVMe types are configured for $FLAVOR; nothing was launched."; exit 2
+    fi
+    TYPES="${NVME_TYPES[*]}"
+  fi
+  FLAVOR_HINT="$FLAVOR${LOCAL_NVME:+ --local-nvme}"
   case "$FLAVOR" in kvm-*) MODE="kvm" ;; esac
 fi
 
@@ -563,10 +587,18 @@ check_instance() {
 locate_box() {
   local r id
   for r in $(all_regions); do
-    id=$(aws ec2 describe-instances --region "$r" \
+    if id=$(aws ec2 describe-instances --region "$r" \
       --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
-      --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v '^None$' || true)
-    if [ -n "$id" ] && [ "${id#i-}" != "$id" ]; then REGION="$r"; return 0; fi
+      --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null); then
+      case "$id" in
+        i-*) REGION="$r"; LOCATED_ID="$id"; return 0 ;;
+        None) continue ;;
+      esac
+    fi
+    if [ -n "$LOCAL_NVME" ]; then
+      say "Refusing --local-nvme: could not verify whether $NAME is in use in $r; nothing was changed."
+      exit 1
+    fi
   done
   REGION="$HOME_REGION"
   return 1
@@ -1066,14 +1098,31 @@ case "$CMD" in
   up)
     member_key
     if locate_box; then
+      if [ -n "$LOCAL_NVME" ]; then
+        # Check the exact instance before attach_work can attach a volume or terminate a failed box.
+        ID="$LOCATED_ID"
+        if ! CHOSEN="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
+          --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"; then
+          say "Refusing --local-nvme: could not verify the instance in $NAME; nothing was changed."
+          exit 1
+        fi
+        case " $TYPES " in
+          *" $CHOSEN "*) ;;
+          *) say "Refusing --local-nvme: $NAME ($ID) is ${CHOSEN:-an unknown type}, not a compatible KVM host with local NVMe."
+             say "It was left alone. Choose a free or compatible slot."
+             exit 1 ;;
+        esac
+      fi
       # A box on its persistent work volume (a member's, or one of the owner's slots at home) is not taken as ready: it
       # may be the box of an interrupted launch, waiting for its volume. A fallback box's fresh volume is its own.
       if [ -n "$MEMBER" ] || [ "$(box_work)" = persistent ]; then
-        ID="$(box_id)"
+        if [ -z "$LOCAL_NVME" ]; then ID="$(box_id)"; fi
         say "$NAME already exists ($ID); making sure its work volume is attached and it answers SSH."
-        CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
-          --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
-          --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+        if [ -z "$LOCAL_NVME" ]; then
+          CHOSEN="$(aws ec2 describe-instances --region "$REGION" \
+            --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null)"
+        fi
         flavor_note "$CHOSEN"
         open_note
         ondemand_note
@@ -1229,8 +1278,8 @@ case "$CMD" in
       say "  - another flavor that still fits the work: the same shape a size down, or another shape of the same size"
       say "      ($SELF flavors;  $SELF capacity ${BOX:-1} FLAVOR  scores one without launching)"
       say "  - launch in another US AZ with an EMPTY work volume (deleted with the box):"
-      say "      $SELF up ${BOX:-1} $FLAVOR --fallback      (or --regions us-east-1,us-west-2)"
-      say "    \`$SELF capacity ${BOX:-1} $FLAVOR\` shows which AZs score best."
+      say "      $SELF up ${BOX:-1} $FLAVOR_HINT --fallback      (or --regions us-east-1,us-west-2)"
+      say "    \`$SELF capacity ${BOX:-1} $FLAVOR_HINT\` shows which AZs score best."
       exit 3
     fi
 
