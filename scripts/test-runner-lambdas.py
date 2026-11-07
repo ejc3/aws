@@ -877,26 +877,6 @@ def case_invalid_or_oversized_user_data_cannot_allocate_runner():
         assert not ec2.ops("run_instances"), "bad script allocated billable metal"
 
 
-def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
-    """SSM holds base64gzip of the script without its whole-line comments."""
-    source = TF_FILE.read_text()
-    assert 'value = base64gzip(local.runner_user_data_document)' in source
-    assert 'if !startswith(trimspace(line), "#") || startswith(line, "#!")' in source
-    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
-    script = (script.replace("${trimspace(tls_private_key.dev_to_runner.public_key_openssh)}",
-                             "ssh-ed25519 " + "x" * 68)
-              .replace("${local.runner_registration_table_name}", "github-runner-registration")
-              .replace("$${", "${"))
-    shipped = "\n".join(line for line in script.split("\n")
-                        if not line.strip().startswith("#") or line.startswith("#!"))
-    assert shipped.startswith("#!/bin/bash\n")
-    wire = base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)).decode()
-    # The controller must still recognize the document it launches with.
-    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
-    # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
-    assert len(wire) <= 8192 - 512, len(wire)
-
-
 def case_controller_recognizes_real_terraform_user_data_document():
     source = TF_FILE.read_text()
     script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
@@ -2146,9 +2126,10 @@ def case_the_shipped_user_data_fits_the_advanced_parameter_tier():
     shipped = "\n".join(line for line in script.split("\n")
                         if not line.strip().startswith("#") or line.startswith("#!"))
     assert shipped.startswith("#!/bin/bash\n") and "\n#!/bin/bash\n" in shipped
-    size = len(base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)))
+    wire = base64.b64encode(gzip.compress(shipped.encode(), compresslevel=6)).decode()
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True, True)
     # Terraform's Go gzip does not produce zlib's bytes; keep a margin for that.
-    assert size <= 8192 - 512, size
+    assert len(wire) <= 8192 - 512, len(wire)
 
 
 def idle_poll(runners, runs=(), jobs=None, recheck=None, delete_error=False, scan_budget=None):
@@ -4345,6 +4326,8 @@ def case_public_webhook_cannot_amplify_launch_count():
         "action": "queued",
         "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
         "launch_count": 4,
+        "queued_jobs": 4,
+        "queued_on_demand": 4,
     })
     sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
     event = {"body": body, "requestContext": {}, "headers": {"x-hub-signature-256": sig}}
@@ -4352,6 +4335,7 @@ def case_public_webhook_cannot_amplify_launch_count():
     result = webhook(ec2, env={"WEBHOOK_SECRET": secret})["handler"](event, None)
     assert "Launched 1 arm64 runner(s)" in result["body"], result
     assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    assert "InstanceMarketOptions" in ec2.ops("run_instances")[0]
 
 
 def case_phantom_only_queue_launches_nothing():
@@ -4549,6 +4533,119 @@ def case_a_capacity_refusal_keeps_the_initialization_rate_for_the_next_pool():
     calls = ec2.ops("run_instances")
     assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second)], launched_pools(ec2)
     assert all("VolumeInitializationRate" in root_volume(c) for c in calls), calls
+
+
+def case_a_job_that_asks_for_on_demand_capacity_gets_an_on_demand_host():
+    """fcvm's ci.yml asks for the on-demand label on a rerun, after a spot reclaim
+    killed the first attempt (fcvm #834). The webhook buys that launch on-demand and
+    tags it so; every other job still gets spot capacity."""
+    for labels, market in ((["self-hosted", "Linux", "ARM64", "on-demand"], "on-demand"),
+                           (["self-hosted", "Linux", "ARM64"], "spot")):
+        ec2 = FakeEC2([])
+        body = json.dumps({"action": "queued", "workflow_job": {"labels": labels}})
+        result = webhook(ec2)["handler"]({"body": body}, None)
+        assert result["statusCode"] == 200, result
+        calls = ec2.ops("run_instances")
+        assert len(calls) == 1, (market, calls)
+        call = calls[0]
+        assert ("InstanceMarketOptions" in call) is (market == "spot"), (market, call)
+        tags = {t["Key"]: t["Value"] for spec in call["TagSpecifications"] for t in spec["Tags"]
+                if spec["ResourceType"] == "instance"}
+        assert tags.get("Market") == market, (market, tags)
+
+
+def case_the_poll_asks_for_on_demand_hosts_for_the_jobs_that_asked():
+    """One request per arch shares the cap even when EC2 sees no new launches."""
+    busy = run(7, "queued")
+    rerun = {"name": "job", "status": "queued", "labels": ["self-hosted", "Linux", "ARM64", "on-demand"]}
+    github = FakeGitHub(runs=[busy], jobs={busy["id"]: [rerun, rerun] + [job("queued", "arm64")] * 3})
+    invoker = FakeLambdaClient()
+    env = {"MAX_RUNNERS_ARM64": "4", "MAX_RUNNERS_X86_64": "4"}
+    cleanup(FakeEC2(), github, invoker, env=env)["handler"]({}, None)
+    (request,) = invoker.invokes
+    assert (request["queued_jobs"], request["queued_on_demand"], request["launch_count"]) == (5, 2, 4), request
+    ec2 = FakeEC2([])  # accepted launches stay invisible to subsequent describes
+    webhook(ec2, env=env)["handler"]({"body": json.dumps(request)}, None)
+    assert ["InstanceMarketOptions" in call for call in ec2.ops("run_instances")] == [False, False, True, True]
+
+
+def case_an_on_demand_runner_cannot_absorb_two_different_market_jobs():
+    booting = instance("i-on-demand", "c7gd.metal", "pending", 1, arch="arm64", tags={"Market": "on-demand"})
+    ec2 = FakeEC2([booting])
+    request = {"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+               "queued_jobs": 2, "queued_on_demand": 1, "launch_count": 2}
+    webhook(ec2)["handler"]({"body": json.dumps(request)}, None)
+    (ordinary,) = ec2.ops("run_instances")
+    assert "InstanceMarketOptions" in ordinary, ordinary
+
+
+def case_mixed_poll_isolates_definite_on_demand_capacity_refusals():
+    request = {"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+               "queued_jobs": 2, "queued_on_demand": 1, "launch_count": 2}
+    for error, spot_allowed in ((FakeClientError("VcpuLimitExceeded"), True),
+                                (FakeClientError("InsufficientInstanceCapacity"), True),
+                                (FakeClientError("UnauthorizedOperation"), False),
+                                (TimeoutError("request may have been accepted"), False)):
+        class MarketEC2(FakeEC2):
+            def run_instances(self, **kw):
+                if "InstanceMarketOptions" not in kw:
+                    self.calls.append(("run_instances", kw))
+                    raise error
+                return super().run_instances(**kw)
+
+        ec2 = MarketEC2()
+        reply = webhook(ec2)["handler"]({"body": json.dumps(request)}, None)
+        markets = ["InstanceMarketOptions" in call for call in ec2.ops("run_instances")]
+        if spot_allowed:
+            assert markets.count(True) == 1 and markets.count(False) > 1, (error, markets)
+            assert reply["statusCode"] == 200 and "On-demand arm64 capacity unavailable" in reply["body"], reply
+        else:
+            assert markets == [False] and reply["statusCode"] == 503, (error, markets, reply)
+
+
+def case_a_warm_spot_host_is_not_claimed_for_an_on_demand_queue():
+    ec2 = FakeEC2([stream_host()])
+    dynamodb, invoker = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    queue = queue_of()
+    queue["jobs"][5001][0]["labels"].append("on-demand")
+    reused = reuse(ec2, dynamodb=dynamodb, github=FakeGitHub(**queue), lambda_client=invoker)
+    reply = reused["reuse_handler"](as_handoff(completed_event()), None)
+    assert reply["statusCode"] == 200 and invoker.invokes == [], reply
+
+
+def case_a_warm_on_demand_host_claim_retains_the_market_label():
+    host = stream_host()
+    host["Tags"].append({"Key": "Market", "Value": "on-demand"})
+    ec2, dynamodb, invoker = FakeEC2([host, stream_host(WARM_TOO)]), FakeDynamoDB([stream_row()]), FakeLambdaClient()
+    queue = queue_of()
+    queue["jobs"][5001][0]["labels"].append("on-demand")
+    github, ssm = FakeGitHub(**queue), FakeSSM()
+    reused = reuse(ec2, dynamodb=dynamodb, github=github, lambda_client=invoker)
+    assert reused["reuse_handler"](as_handoff(completed_event()), None)["statusCode"] == 202
+    (request,) = invoker.invokes
+    assert "on-demand" in request["workflow_job"]["labels"], request
+    webhook(ec2, ssm=ssm, dynamodb=dynamodb, github=github)["handler"]({"body": json.dumps(request)}, None)
+    assert bootstrap_names(ssm) == [f"/github-runner/bootstrap/{WARM}"], ssm.puts
+
+
+def case_only_on_demand_jobs_do_not_hold_incompatible_idle_spot_capacity():
+    queue = job("queued", "arm64")
+    queue["labels"].append("on-demand")
+    result, ec2, journal = idle_poll([runner_record("i-idle", busy=False)],
+                                    runs=[run(6001, "in_progress")], jobs={6001: [queue]})
+    assert result["idle_terminated"] == ["i-idle"], result
+    assert journal.index("github:DELETE:/actions/runners/77") < journal.index("ec2:terminate:i-idle"), journal
+    assert not still_running(ec2)
+
+
+def case_an_on_demand_host_registers_with_the_on_demand_label():
+    """The label comes from the instance's own IMDS life cycle, on boot and for
+    every later job of a warm host."""
+    tf = TF_FILE.read_text()
+    assert "meta-data/instance-life-cycle" in tf
+    assert 'RUNNER_LABELS="$RUNNER_LABEL,on-demand"' in tf
+    assert '--labels "self-hosted,Linux,$${RUNNER_LABELS:-$RUNNER_LABEL}"' in tf
+    assert "RUNNER_LABELS=%s" in tf
 
 
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
