@@ -2091,8 +2091,10 @@ TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, 
    upload succeeds; on a failure, fix the cause and run the pipeline again.
 
 Only administration, nextjs-dev's role, fcvm-metal-arm's instance (dev-server-role pinned by `ec2:SourceInstanceARN`,
-so fcvm-metal-x86 cannot) and `dolphin-labs-testflight` (dolphin-labs CI's TestFlight uploads: GitHub OIDC for
-`testflight.yml` on `main` only, `dolphin-labs-testflight.tf`) can read it. Every account on nextjs-dev has
+so fcvm-metal-x86 cannot), and the two TestFlight upload roles can read it. `dolphin-labs-testflight` and
+`kid-sports-highlights-testflight` each accept GitHub OIDC only from their own repository's
+`.github/workflows/testflight.yml` on `main`. The output `kid_sports_highlights_testflight` supplies that
+repository's three Actions variables; the key value stays in Secrets Manager. Every account on nextjs-dev has
 sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
 and put a new one the same way to rotate.
 

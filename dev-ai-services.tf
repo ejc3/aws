@@ -307,7 +307,8 @@ resource "aws_iam_role_policy_attachment" "search_fetch_api_keys_read" {
 #     --secret-id games-worth-watching/app-store-connect --secret-string file:///dev/stdin && rm "AuthKey_${KEY_ID}.p8"
 # (with set -o pipefail; the .p8 is the only copy, so it is removed only after the upload succeeds)
 # Readers: the administration set, nextjs-dev-role (the dolphin box, which archives on the Mac
-# build tunnel and uploads), and dolphin-labs-testflight (CI's uploads; dolphin-labs-testflight.tf). Every account on nextjs-dev has full sudo, so the grant is box-wide, as
+# build tunnel and uploads), and the separate main-only TestFlight roles for dolphin-labs and
+# kid-sports-highlights. Every account on nextjs-dev has full sudo, so the grant is box-wide, as
 # with browserbase/credentials. fcvm-arm's role (dev_server) reads it too: dolphin-labs-hq/dolphin-maps'
 # iPhone app is built and uploaded from fcvm-arm (archived on the MacBook over `ssh mac`), and its
 # TestFlight feedback and build status are read through the same API. The grant is pinned to
@@ -329,7 +330,12 @@ resource "aws_secretsmanager_secret_policy" "app_store_connect" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.app_store_connect.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.nextjs_dev.arn, aws_iam_role.dolphin_labs_testflight.arn, aws_iam_role.dev_server.arn]) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [
+        aws_iam_role.nextjs_dev.arn,
+        aws_iam_role.dolphin_labs_testflight.arn,
+        aws_iam_role.kid_sports_highlights_testflight.arn,
+        aws_iam_role.dev_server.arn,
+      ]) } }
     }]
   })
 }
