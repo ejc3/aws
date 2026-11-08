@@ -382,6 +382,14 @@ resource "aws_security_group" "fleet" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  ingress {
+    description      = "Minecraft Java Edition to the Minecraft mode servers, each at its own IPv6 address"
+    from_port        = 25565
+    to_port          = 25565
+    protocol         = "tcp"
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
 
   egress {
     description      = "All outbound"

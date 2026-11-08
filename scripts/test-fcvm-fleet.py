@@ -25,10 +25,17 @@ def block(header, text=TF):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_guarded_fleet_admits_only_https_and_slot_tls(self):
+    def test_guarded_fleet_admits_only_https_slot_tls_and_minecraft(self):
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(rules), 3)
+        # Minecraft mode's servers (ejc3/fcvm docs/fleet/minecraft.md): Java Edition's port, IPv6 only, since each
+        # server has its own IPv6 address and none is forwarded over the host's IPv4 address.
+        self.assertIn("from_port        = 25565", rules[2])
+        self.assertIn("to_port          = 25565", rules[2])
+        self.assertIn('protocol         = "tcp"', rules[2])
+        self.assertIn('ipv6_cidr_blocks = ["::/0"]', rules[2])
+        self.assertNotIn("cidr_blocks      =", rules[2].replace("ipv6_cidr_blocks", ""))
         self.assertIn("from_port        = 443", sg)
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
@@ -737,7 +744,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn('"--public-ipv4-from-imds"', TF)
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 2, rules)
+        self.assertEqual(len(rules), 3, rules)
         slots = [rule for rule in rules if "var.slot_tls_ports" in rule]
         self.assertEqual(len(slots), 1)
         self.assertIn('description = "GPU slot renderer TLS over IPv4"', slots[0])
