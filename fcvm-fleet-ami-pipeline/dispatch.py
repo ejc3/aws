@@ -404,13 +404,26 @@ class Factory:
                 existing = self.request_record(request_id)
             return public_record(existing)
         current = public_github("git/ref/heads/main")["object"]["sha"]
-        if current != event["source_sha"]:
-            raise Refused("only the current main revision can enter the factory")
-        ci = trusted_ci(current)
-        now = int(self.now())
-        record = {"request_id": request_id, "status": "queued", "source_sha": current, "input_sha256": request_id,
-                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
+        source = event["source_sha"]
         control = self.load("/control", {})
+        if current != source:
+            # A busy main rarely holds still for its CI (the next merge cancels the head's run, a
+            # download fails it), so a recent ancestor of main with its own successful CI enters
+            # too, but never one older than a revision already admitted: that would roll back.
+            behind = public_github("compare/" + source + "..." + current)
+            if not (behind.get("status") == "ahead" and behind.get("behind_by") == 0
+                    and type(behind.get("ahead_by")) is int and 0 < behind["ahead_by"] <= 250
+                    and behind.get("merge_base_commit", {}).get("sha") == source):
+                raise Refused("only main or a recent ancestor of it can enter the factory")
+            last = control.get("last_source")
+            if isinstance(last, str) and SHA.fullmatch(last) and last != source:
+                newer = public_github("compare/" + source + "..." + last)
+                if newer.get("status") == "ahead":
+                    raise Refused("a newer main revision has already entered the factory")
+        ci = trusted_ci(source)
+        now = int(self.now())
+        record = {"request_id": request_id, "status": "queued", "source_sha": source, "input_sha256": request_id,
+                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
         previous = self.request_record(control["pending"]) if control.get("pending") else None
         if (previous is not None and previous["priority"] == record["priority"] == "normal"
                 and previous["status"] == "queued" and not previous.get("start_attempted")):
@@ -425,6 +438,7 @@ class Factory:
             previous.update(status="superseded", message="a newer input superseded this queued request")
             self.save("/requests/" + previous["request_id"], previous)
         control["pending"] = request_id
+        control["last_source"] = source
         self.save("/control", control)
         self.reconcile()
         return public_record(self.request_record(request_id))

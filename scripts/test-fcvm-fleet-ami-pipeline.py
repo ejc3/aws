@@ -1105,6 +1105,51 @@ class FactoryTests(unittest.TestCase):
                 self.factory.request({"action": "request", "source_sha": SOURCE_SHA, "input_sha256": INPUT_SHA, "priority": "critical"})
             self.assertEqual((self.cb.starts, self.store.writes), ([], []))
 
+    def test_a_green_revision_main_has_moved_past_is_admitted(self):
+        # A busy main rarely holds still for its CI: the head's run is cancelled by the next
+        # merge or fails on a download, and a head-only rule then builds nothing. A recent
+        # ancestor of main with its own successful CI is admitted, and keeps its own source.
+        head = "8" * 40
+        self.store.values.clear()
+        responses = [{"object": {"sha": head}},
+            {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+            {"workflow_runs": [self.ci_run()]}]
+        with patch.object(mod, "public_github", side_effect=responses):
+            result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                "input_sha256": INPUT_SHA, "priority": "critical"})
+        self.assertEqual(result["status"], "building")
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["source_sha"], SOURCE_SHA)
+        self.assertEqual(len(self.cb.starts), 1)
+
+    def test_a_revision_off_main_or_far_behind_it_is_refused(self):
+        head = "8" * 40
+        for comparison in ({"status": "diverged", "ahead_by": 1, "behind_by": 1, "merge_base_commit": {"sha": "7" * 40}},
+                           {"status": "behind", "ahead_by": 0, "behind_by": 2, "merge_base_commit": {"sha": head}},
+                           {"status": "ahead", "ahead_by": 251, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}):
+            with self.subTest(comparison=comparison["status"]):
+                self.setUp()
+                self.store.values.clear()
+                responses = [{"object": {"sha": head}}, comparison, {"workflow_runs": [self.ci_run()]}]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
+    def test_a_revision_older_than_one_already_admitted_is_refused(self):
+        # A late request for an older green revision must not replace a newer one, or a
+        # publication could roll the fleet back.
+        head, newer = "8" * 40, "6" * 40
+        self.store.values.clear()
+        self.factory.save("/control", {"last_source": newer})
+        self.store.writes.clear()
+        responses = [{"object": {"sha": head}},
+            {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+            {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}]
+        with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+            self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                "input_sha256": INPUT_SHA, "priority": "critical"})
+        self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
     def test_green_ancestor_covers_only_complete_docs_changes(self):
         previous = "9" * 40
         run = self.ci_run(head_sha=previous)
