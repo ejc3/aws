@@ -1770,6 +1770,10 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
   of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
   covers it.
+- **Lights on staging** (`workers-stage.tf`): the Worker `lights-stage`, the buying wizard as Worker assets plus a small
+  script for `/api/*` (live Shopify prices and the photo reader), deployed by ejc3/constellation (`deploy-lights-web.yml`)
+  from the same `cloudflare-deploy` environment. It is one of the staging Workers behind the shared "Site staging
+  Workers" Access application; its URLs turn on only after that covers it. The photo reader's key is `lights-vision.tf`'s.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
