@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SPEC = importlib.util.spec_from_file_location("ass", Path(__file__).resolve().parent / "agent-session-sync.py")
@@ -475,6 +476,187 @@ class RebootTests(Base):
         data.pop("boot_id")
         _json.dump(data, open(path, "w"))
         self.assertFalse(self.state_for("boot-Z").rebooted)
+
+
+class ClaudeRetirementTests(Base):
+    def test_retirement_only_mode_does_not_discover_or_launch_repositories(self):
+        make_repo(self.home, "should-not-be-discovered")
+        self.assertEqual(ass.main(["--retire-claude-only", "--once", "--home", str(self.home),
+                                   "--tmux", "/bin/false"]), 0)
+        self.assertFalse((self.home / ".local" / "state" / "agent-session-sync").exists())
+
+    def retire(self, path):
+        marker = Path(ass.retirement_marker(str(path), str(self.home)))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return marker
+
+    def test_lost_tmux_close_reply_keeps_the_pending_retirement(self):
+        folder = make_repo(self.home, "empty")
+        launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        transcript = self.home / ".claude" / "projects" / "example" / (sid + ".jsonl")
+        fields = ("@1", "%1", "120", "1", "0", launch, "1", sid, "", "startup", str(folder), str(transcript))
+        proof = (*fields, 123, 456, 789, 42, 43)
+        r = ass.ClaudeRetirement(self.cfg)
+        with mock.patch.object(r, "eligible", return_value=proof), mock.patch.object(r, "tmux", side_effect=[
+                subprocess.CompletedProcess([], 0, "\t".join(fields) + "\n"),
+                subprocess.TimeoutExpired(["tmux", "if-shell"], timeout=5),
+        ]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                r.retire_locked(proof, now=900000)
+        self.assertTrue(ass.claude_retired(folder, self.home))
+
+    def test_only_the_same_launch_can_recover_an_intent_after_a_watcher_crash(self):
+        folder = make_repo(self.home, "empty")
+        marker = ass.retirement_marker(folder, self.home)
+        launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        transcript = self.home / ".claude" / "projects" / "example" / (sid + ".jsonl")
+        args = (sid, "startup", str(transcript))
+        first = ass.retirement_intent(marker, launch, *args)
+        self.assertTrue(ass.claude_retired(folder, self.home))
+        self.assertIsNone(ass.retirement_intent(marker, "another-launch", *args))
+        self.assertTrue(os.path.samestat(first, ass.retirement_intent(marker, launch, *args)))
+        # A crash after writing intent, then a prompt before reboot, must not
+        # block the next boot's automatic launch when no tmux latch survives.
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"user","message":{}}\n')
+        self.assertFalse(ass.claude_retired(folder, self.home))
+        ass.write_marker(marker, b"retired\n", replace=True)
+        self.assertTrue(ass.claude_retired(folder, self.home), "a confirmed close stays retired")
+
+    def test_retiring_a_linked_worktree_does_not_retire_its_main_checkout_or_sibling(self):
+        main = make_repo(self.home, "main")
+        retired = self.home / "retired"
+        sibling = self.home / "sibling"
+        git(main, "worktree", "add", "-q", str(retired), "-b", "retired")
+        git(main, "worktree", "add", "-q", str(sibling), "-b", "sibling")
+        marker = self.retire(retired)
+        gitdir = subprocess.run(["git", "-C", str(retired), "rev-parse", "--absolute-git-dir"],
+                                check=True, capture_output=True, text=True, env=ENV).stdout.strip()
+        self.assertEqual(marker, Path(gitdir, "claude-remote-retired"))
+        self.assertTrue(ass.claude_retired(str(retired), str(self.home)))
+        self.assertFalse(ass.claude_retired(str(main), str(self.home)))
+        self.assertFalse(ass.claude_retired(str(sibling), str(self.home)))
+
+    def test_non_git_retirement_stays_in_user_state_and_does_not_follow_replacement(self):
+        folder = self.home / "folder"
+        folder.mkdir()
+        marker = self.retire(folder)
+        self.assertTrue(marker.is_relative_to(self.home / ".local" / "state"))
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertTrue(ass.claude_retired(str(folder), str(self.home)))
+        folder.rename(self.home / "original")
+        folder.mkdir()
+        self.assertFalse(ass.claude_retired(str(folder), str(self.home)))
+
+    def test_retired_new_checkout_seeds_codex_only_and_stays_closed_after_watcher_restart(self):
+        self.scan()
+        retired = make_repo(self.home, "retired")
+        self.retire(retired)
+        other = make_repo(self.home, "other")
+        self.scan(now=1005)
+        self.assertCountEqual(self.launcher.calls, [("codex", str(retired)), ("claude", str(other)),
+                                                     ("codex", str(other))])
+        self.launcher.calls.clear()
+        self.scan(now=1200, state=ass.State(self.state.path))
+        self.assertEqual(self.launcher.calls, [])
+
+    def test_retiring_an_already_queued_boot_launch_prevents_it_after_watcher_restart(self):
+        retired = make_repo(self.home, "retired")
+        other = make_repo(self.home, "other")
+        boot_a = ass.State(self.state.path, boot_id="boot-A")
+        self.scan(state=boot_a)
+        self.active = [str(retired), str(other)]
+        self.launcher.ok["claude"] = False  # tmux is not up yet, so both folders remain pending
+        self.scan(now=2000, state=ass.State(boot_a.path, boot_id="boot-B"))
+        self.assertCountEqual(self.launcher.calls, [("claude", str(retired)), ("claude", str(other))])
+        self.retire(retired)
+        self.launcher.calls.clear()
+        self.launcher.ok["claude"] = True
+        self.scan(now=2005, state=ass.State(boot_a.path, boot_id="boot-B"))
+        self.assertEqual(self.launcher.calls, [("claude", str(other))])
+
+    def test_retirement_does_not_follow_a_replacement_checkout_at_the_same_path(self):
+        self.scan()
+        retired = make_repo(self.home, "replace-me")
+        self.retire(retired)
+        self.scan(now=1005)
+        self.assertEqual(self.launcher.calls, [("codex", str(retired))])
+        retired.rename(Path(self.tmp) / "original")  # keep the old git dir alive with a different inode
+        replacement = make_repo(self.home, "replace-me")
+        self.assertFalse(ass.claude_retired(str(replacement), str(self.home)))
+        self.launcher.calls.clear()
+        self.scan(now=1010)
+        self.assertCountEqual(self.launcher.calls, [("claude", str(replacement)), ("codex", str(replacement))])
+
+
+class EmptyTranscriptTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.root = self.home / ".claude"
+        self.sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        self.transcript = self.root / "projects" / "-test-project" / (self.sid + ".jsonl")
+        self.transcript.parent.mkdir(parents=True)
+
+    def empty(self, path=None, sid=None):
+        return ass.empty_transcript(str(path or self.transcript), str(self.root), sid or self.sid)
+
+    def write(self, *records):
+        self.transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    def test_absent_empty_and_metadata_only_transcripts_qualify(self):
+        self.assertTrue(self.empty())
+        self.transcript.touch()
+        self.assertTrue(self.empty())
+        self.write({"type": "file-history-snapshot", "messageId": "snapshot-1", "snapshot": {}})
+        self.assertTrue(self.empty())
+
+    def test_old_bridge_bookkeeping_can_age_a_resumed_empty_conversation(self):
+        leaf = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        self.write({"type": "system", "subtype": "bridge_status", "uuid": leaf,
+                    "sessionId": self.sid, "timestamp": "2026-10-20T00:00:00Z"},
+                   {"type": "last-prompt", "sessionId": self.sid, "leafUuid": leaf})
+        empty, exists, first_bridge = ass.transcript_evidence(str(self.transcript), str(self.root), self.sid)
+        self.assertTrue(empty and exists)
+        self.assertEqual(first_bridge, 1792454400)
+        self.write({"type": "last-prompt", "sessionId": self.sid, "leafUuid": leaf})
+        self.assertFalse(self.empty(), "the pointer must resolve to known bookkeeping")
+
+    def test_any_conversation_record_prevents_retirement_even_without_visible_text(self):
+        for role in ("user", "assistant", "system"):
+            with self.subTest(role=role):
+                self.write({"type": "file-history-snapshot", "snapshot": {}},
+                           {"type": role, "message": {"role": role, "content": []}})
+                self.assertFalse(self.empty())
+        self.write({"type": "queue-operation", "operation": "enqueue", "sessionId": self.sid})
+        self.assertFalse(self.empty(), "a pending turn is evidence of activity")
+
+    def test_unknown_or_unreadable_records_are_not_assumed_empty(self):
+        for raw in (b'{"type":"future-event"}\n', b'{"type":\n', b'[]\n', b'\xff\n',
+                    b'{"type":"file-history-snapshot","message":{}}\n',
+                    b'{"type":"file-history-snapshot","sessionId":"ac984442-bdc1-4657-8fda-c7251e2e33b4"}\n'):
+            with self.subTest(raw=raw):
+                self.transcript.write_bytes(raw)
+                self.assertFalse(self.empty())
+        self.transcript.unlink()
+        self.transcript.mkdir()
+        self.assertFalse(self.empty(), "a directory is not an empty transcript")
+
+    def test_missing_file_cannot_qualify_at_an_unsafe_path_or_for_a_different_session(self):
+        self.assertFalse(self.empty(path=self.root / "not-projects" / self.transcript.name))
+        self.assertFalse(self.empty(path=self.transcript.with_name("other.jsonl")))
+        self.assertFalse(self.empty(sid="other"))
+        outside = self.home / "external"
+        outside.mkdir()
+        self.transcript.parent.rmdir()
+        self.transcript.parent.symlink_to(outside, target_is_directory=True)
+        self.assertFalse(self.empty(), "a symlinked project cannot prove absence in the managed project")
+        self.transcript.parent.unlink()
+        self.transcript.parent.mkdir()
+        self.transcript.symlink_to(outside / self.transcript.name)
+        self.assertFalse(self.empty(), "a dangling transcript symlink cannot prove absence")
 
 
 class TrustKeeperTests(Base):

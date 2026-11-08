@@ -1166,6 +1166,13 @@ scan plus about a second.
   reboot there is no tmux until someone connects; the watcher retries every tick and starts the sessions
   (including the post-reboot ones) the moment a server exists. A boot launcher that owns the server is a
   design decision of its own (what owns the cgroup, what a restart kills), not part of this watcher.
+- **Unused Claude Remote Control windows retire after seven days.** The watcher checks only windows
+  stamped by an unattended t-claude launch, using the exact idle Claude process, its hook-reported
+  transcript, and a prompt latch. A client viewing the pane, a message, or uncertain evidence keeps it
+  open. The marker lives in the checkout's Git directory (per-user local state for non-Git folders)
+  and is written before the window closes. An interrupted close is reconciled with the transcript.
+  Next.js accounts without repo discovery run the same watcher in retirement-only mode. Boot launchers and the watcher respect it; manual t-claude
+  and Codex do not depend on it. Untagged windows are left alone.
 - **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
   same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
   no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,

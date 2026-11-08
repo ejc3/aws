@@ -165,6 +165,10 @@ fi
 curl -fsSL --retry 3 https://raw.githubusercontent.com/ejc3/t-claude/main/nosync-wrap -o /tmp/nw \
   && [ -s /tmp/nw ] && install -m 755 /tmp/nw /usr/local/bin/nosync-wrap; rm -f /tmp/nw
 
+# Install the gate before replacing agents-start: the enable timer can already be running.
+# Judge the install by its files: daemon-reload fails while building the template without systemd.
+bash "$SHARED/snippets/agent-session-sync-install.sh"; [ -x /usr/local/bin/agent-session-sync ] || warn "agent-session-sync install failed"
+
 # Helpers and units, the same in every container.
 for f in "$SHARED"/ct/*; do
   [ -f "$f" ] || continue
@@ -175,7 +179,6 @@ install -m 644 "$SHARED"/ct/units/* /etc/systemd/system/
 install -d /etc/polkit-1/rules.d && install -m 644 "$SHARED/ct/50-ndev-own-units.rules" /etc/polkit-1/rules.d/
 # Judged by what they install: each ends with a daemon-reload, which fails while the template is built
 # without a running systemd.
-bash "$SHARED/snippets/agent-session-sync-install.sh"; [ -x /usr/local/bin/agent-session-sync ] || warn "agent-session-sync install failed"
 bash "$SHARED/snippets/codex-seed-install.sh"; [ -x /usr/local/bin/codex-seed-thread ] || warn "codex seed install failed"
 bash "$SHARED/snippets/user-agents-seed-install.sh"; [ -x /usr/local/bin/user-agents-seed ] || warn "user-agents-seed install failed"
 # The container boots without the host's network services; networkd brings up host0 (configured below).

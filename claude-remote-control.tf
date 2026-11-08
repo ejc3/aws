@@ -102,6 +102,9 @@ grep -qxF '[ -f ~/.config/fcvm-t-claude.zsh ] && source ~/.config/fcvm-t-claude.
     >> /home/ubuntu/.zshrc
 chown ubuntu:ubuntu /home/ubuntu/.zshrc
 
+# Install the gate before publishing or starting the launcher that calls it.
+${local.agent_session_sync_install}
+
 # Launch the folders with session activity in the last 30 days (owner, 2026-10-13): a person prompted
 # a Claude conversation there, or it was marked for interactive use (claude-interactive in its git dir).
 # The rule is /usr/local/bin/agent-active-dirs (scripts/agent-active-dirs.py), shared with nextjs-dev's
@@ -217,7 +220,10 @@ done < "$REPOS"
 ready_count=0
 failed_count=0
 while IFS= read -r repo; do
-  echo "fcvm-claude: starting remote control in $repo"
+  # Keep retired folders in the list for Codex, but leave them out of the Claude readiness totals.
+  if [ -x /usr/local/bin/agent-session-sync ]; then
+    /usr/local/bin/agent-session-sync --check-claude-rc "$repo" || continue
+  fi
 
   # Idempotent safety net: a no-op when the bulk pass above already trusted this repo.
   trust_repo "$repo" || true
@@ -225,8 +231,13 @@ while IFS= read -r repo; do
   # t-claude intentionally tries to attach after creating/reusing its tmux window. There
   # is no terminal under systemd, so that final attach fails harmlessly after launch.
   /usr/bin/zsh -c '
-    source /usr/local/lib/fcvm/t-claude.zsh || exit 1
     cd -- "$1" || exit 1
+    if [ -x /usr/local/bin/agent-session-sync ]; then
+      /usr/local/bin/agent-session-sync --check-claude-rc "$PWD" || exit 0
+      export TCLAUDE_RC_GATE=/usr/local/bin/agent-session-sync
+    fi
+    source /usr/local/lib/fcvm/t-claude.zsh || exit 1
+    printf "fcvm-claude: starting remote control in %s\n" "$PWD"
     t-claude --auto --remote-control
   ' fcvm-claude "$repo" || true
 
@@ -316,7 +327,6 @@ ${local.metal_update_guards}
 # ------------------------------------------------------------- new repos within seconds
 # The launcher above looks once, at boot. This watches every 5 seconds and starts a session (and a
 # Codex thread) for a repository that appears later. See agent-session-sync.tf.
-${local.agent_session_sync_install}
 ${local.agent_session_sync_enable_ubuntu}
 
 # ------------------------------------------------------------- Codex thread per window

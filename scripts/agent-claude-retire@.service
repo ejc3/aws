@@ -1,0 +1,18 @@
+[Unit]
+Description=Retire unused managed Claude sessions for %i
+After=claude-rc@%i.service
+ConditionFileNotEmpty=/home/%i/.claude/.credentials.json
+
+[Service]
+User=%i
+Environment=HOME=/home/%i
+Environment=PATH=/home/%i/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/%i
+ExecStart=/usr/local/bin/agent-session-sync --home /home/%i --retire-claude-only --interval 60
+Restart=always
+RestartSec=5
+KillMode=process
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

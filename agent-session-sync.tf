@@ -10,8 +10,8 @@
 # owner, and nothing that existed when the watcher first looked. After a reboot
 # it opens the folders scripts/agent-active-dirs.py names (prompted or marked in the last 30 days).
 #
-# ONE script and ONE template unit, installed by the same snippet everywhere, so the boxes cannot
-# drift apart the way three bespoke launchers did. Per-box policy is a drop-in setting ASS_ARGS.
+# One script is installed by the same snippet everywhere. Next.js accounts without repo discovery
+# run its retirement-only mode in a separate unit. Per-box policy is a drop-in setting ASS_ARGS.
 locals {
   agent_session_sync_install = <<-INSTALL
 # Replaced atomically: a running watcher re-executes itself when this file changes (it needs no restart),
@@ -31,6 +31,9 @@ mv -f /usr/local/bin/agent-active-dirs.new /usr/local/bin/agent-active-dirs
 cat > /etc/systemd/system/agent-session-sync@.service <<'AGENTSYNCUNIT'
 ${file("${path.module}/scripts/agent-session-sync@.service")}
 AGENTSYNCUNIT
+cat > /etc/systemd/system/agent-claude-retire@.service <<'AGENTRETIREUNIT'
+${file("${path.module}/scripts/agent-claude-retire@.service")}
+AGENTRETIREUNIT
 systemctl daemon-reload
 INSTALL
 
