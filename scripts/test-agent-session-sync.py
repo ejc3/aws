@@ -478,6 +478,12 @@ class RebootTests(Base):
 
 
 class ClaudeRetirementTests(Base):
+    def test_retirement_only_mode_does_not_discover_or_launch_repositories(self):
+        make_repo(self.home, "should-not-be-discovered")
+        self.assertEqual(ass.main(["--retire-claude-only", "--once", "--home", str(self.home),
+                                   "--tmux", "/bin/false"]), 0)
+        self.assertFalse((self.home / ".local" / "state" / "agent-session-sync").exists())
+
     def retire(self, path):
         marker = Path(ass.retirement_marker(str(path), str(self.home)))
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -488,12 +494,20 @@ class ClaudeRetirementTests(Base):
         folder = make_repo(self.home, "empty")
         marker = ass.retirement_marker(folder, self.home)
         launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
-        first = ass.retirement_intent(marker, launch)
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        transcript = self.home / ".claude" / "projects" / "example" / (sid + ".jsonl")
+        args = (sid, "startup", str(transcript))
+        first = ass.retirement_intent(marker, launch, *args)
         self.assertTrue(ass.claude_retired(folder, self.home))
-        self.assertIsNone(ass.retirement_intent(marker, "another-launch"))
-        self.assertTrue(os.path.samestat(first, ass.retirement_intent(marker, launch)))
-        ass.cancel_intent(marker, first)
+        self.assertIsNone(ass.retirement_intent(marker, "another-launch", *args))
+        self.assertTrue(os.path.samestat(first, ass.retirement_intent(marker, launch, *args)))
+        # A crash after writing intent, then a prompt before reboot, must not
+        # block the next boot's automatic launch when no tmux latch survives.
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"user","message":{}}\n')
         self.assertFalse(ass.claude_retired(folder, self.home))
+        ass.write_marker(marker, b"retired\n", replace=True)
+        self.assertTrue(ass.claude_retired(folder, self.home), "a confirmed close stays retired")
 
     def test_retiring_a_linked_worktree_does_not_retire_its_main_checkout_or_sibling(self):
         main = make_repo(self.home, "main")

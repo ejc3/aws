@@ -290,6 +290,10 @@ def retirement_marker(path, home):
     return os.path.join(home, ".local", "state", "agent-session-sync", "retired", key)
 
 
+def claude_root(home):
+    return os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"))
+
+
 def claude_retired(path, home):
     try:
         marker = retirement_marker(path, home)
@@ -297,8 +301,17 @@ def claude_retired(path, home):
     except FileNotFoundError:
         return False
     except OSError:
-        return True  # if state cannot be inspected, do not recreate an unattended session
-    return True
+        return True
+    try:
+        intent = read_intent(marker)
+    except (OSError, ValueError):
+        return True  # an unreadable marker never authorizes automatic startup
+    if intent is None:
+        return True  # completed (or explicitly created) tombstone
+    # A reboot can separate the durable intent from the close. Re-read the exact
+    # transcript: a message delivered to the surviving session overrides the intent.
+    empty, exists, _ = transcript_evidence(intent["transcript"], claude_root(home), intent["sid"])
+    return empty and (exists or intent["source"] == "startup")
 
 
 def regular_read(path, limit):
@@ -388,30 +401,51 @@ def sync_directory(path):
         os.close(fd)
 
 
-def retirement_intent(marker, launch):
-    """Publish a recoverable intent without overwriting a pre-existing tombstone."""
+def read_intent(marker):
+    data = regular_read(marker, 8192)
+    if data in (b"", b"retired\n"):
+        return None
+    intent = json.loads(data)
+    if (not isinstance(intent, dict) or set(intent) != {"launch", "sid", "source", "transcript"}
+            or not all(isinstance(v, str) for v in intent.values())
+            or not UUID.fullmatch(intent["launch"]) or not UUID.fullmatch(intent["sid"])
+            or intent["source"] not in ("startup", "resume")):
+        raise ValueError("invalid retirement intent")
+    return intent
+
+
+def write_marker(marker, data, replace=False):
     directory = os.path.dirname(marker)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    expected = (launch + "\n").encode()
     fd, tmp = tempfile.mkstemp(prefix=".claude-retirement.", dir=directory)
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(expected)
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        try:
-            os.link(tmp, marker)
-        except FileExistsError:
-            # A watcher can die after recording the retirement and before closing
-            # tmux. Only the same live launch may retry that recorded intent.
-            if regular_read(marker, 64) != expected:
-                return None
-        marker_info = os.lstat(marker)
+        if replace:
+            os.replace(tmp, marker)
+        else:
+            os.link(tmp, marker)               # atomically refuse an existing marker
         sync_directory(directory)
         sync_directory(os.path.dirname(directory))
-        return marker_info
     finally:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def retirement_intent(marker, launch, sid, source, transcript):
+    """Publish a recoverable intent without overwriting a pre-existing tombstone."""
+    intent = dict(launch=launch, sid=sid, source=source, transcript=transcript)
+    os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+    try:
+        write_marker(marker, json.dumps(intent, ensure_ascii=False).encode() + b"\n")
+    except FileExistsError:
+        # After a watcher crash only the same exact launch may retry that close.
+        if read_intent(marker) != intent:
+            return None
+    return os.lstat(marker)
 
 
 def cancel_intent(marker, marker_info):
@@ -488,7 +522,7 @@ class ClaudeRetirement:
         self.cfg = cfg
         self.pending = set()
         self.next_scan = 0
-        self.root = os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(cfg["home"], ".claude"))
+        self.root = claude_root(cfg["home"])
 
     def tmux(self, *args):
         return subprocess.run([self.cfg["tmux"], "-u", *args], capture_output=True, text=True, timeout=5)
@@ -536,7 +570,8 @@ class ClaudeRetirement:
                 try:
                     marker = retirement_marker(fields[-2], self.cfg["home"])
                     info = os.lstat(marker)
-                    if regular_read(marker, 64) == (fields[5] + "\n").encode():
+                    intent = read_intent(marker)
+                    if intent is not None and intent["launch"] == fields[5]:
                         cancel_intent(marker, info)
                 except (OSError, ValueError):
                     pass
@@ -589,7 +624,7 @@ class ClaudeRetirement:
             return False
         folder = fields[-2]
         marker = retirement_marker(folder, self.cfg["home"])
-        intent = retirement_intent(marker, fields[5])
+        intent = retirement_intent(marker, fields[5], fields[7], fields[9], fields[-1])
         if intent is None:
             return False
         closed = False
@@ -609,6 +644,8 @@ class ClaudeRetirement:
                                f"kill-window -t {window}", "display-message -p kept")
             closed = result.returncode == 0 and result.stdout.strip() != "kept"
             if closed:
+                if os.path.samestat(os.lstat(marker), intent):
+                    write_marker(marker, b"retired\n", replace=True)
                 log("retired unused Claude Remote Control window in %s" % folder)
             return closed
         finally:
@@ -989,24 +1026,32 @@ def main(argv):
     ap.add_argument("--state-dir")
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--retire-claude-only", action="store_true",
+                    help="retire unused Claude windows without discovering or starting repositories")
     ap.add_argument("--check-claude-rc", metavar="PATH",
                     help="exit nonzero if automatic Claude Remote Control is retired for this checkout")
     args = ap.parse_args(argv)
+    home = args.home or os.path.expanduser("~")
     if args.check_claude_rc is not None:
-        return int(claude_retired(args.check_claude_rc, args.home or os.path.expanduser("~")))
-    cfg = build_config(args)
-    state = State(os.path.join(cfg["state_dir"], "known.json"))
-    launcher = Launcher(cfg)
+        return int(claude_retired(args.check_claude_rc, home))
+    state = None
+    if args.retire_claude_only:
+        cfg = {"home": home, "tmux": args.tmux}
+    else:
+        cfg = build_config(args)
+        state = State(os.path.join(cfg["state_dir"], "known.json"))
+        launcher = Launcher(cfg)
+        log("watching %s as %s; owners=%s repos=%s first_run=%s" % (
+            cfg["roots"], cfg["home"], sorted(cfg["owners"]), sorted(cfg["repos"]), state.first_run))
     retirement = ClaudeRetirement(cfg)
-    log("watching %s as %s; owners=%s repos=%s first_run=%s" % (
-        cfg["roots"], cfg["home"], sorted(cfg["owners"]), sorted(cfg["repos"]), state.first_run))
     me = os.path.abspath(__file__)
     version = file_version(me)
     while True:
-        try:
-            scan_once(cfg, state, launcher)
-        except Exception as exc:              # a bad tick must never end the watch
-            log("scan failed: %s" % exc)
+        if state is not None:
+            try:
+                scan_once(cfg, state, launcher)
+            except Exception as exc:              # a bad tick must never end the watch
+                log("scan failed: %s" % exc)
         try:
             retirement.tick()
         except (OSError, subprocess.SubprocessError, ValueError) as exc:

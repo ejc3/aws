@@ -649,6 +649,14 @@ for u in ${join(" ", local.nextjs_users)}; do
   if [ -s "/home/$u/.claude/.credentials.json" ]; then
     systemctl enable "claude-rc@$u.service" >/dev/null 2>&1 || true
     systemctl is-active --quiet "claude-rc@$u.service"       || systemctl start "claude-rc@$u.service" >/dev/null 2>&1 || true
+    # Seed accounts already retire sessions through the full watcher.
+    case " ${join(" ", local.nextjs_codex_seed_users)} " in
+      *" $u "*) ;;
+      *)
+        systemctl enable "agent-claude-retire@$u.service" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "agent-claude-retire@$u.service" || systemctl start --no-block "agent-claude-retire@$u.service" >/dev/null 2>&1 || true
+        ;;
+    esac
   fi
   if [ -s "/home/$u/.codex/auth.json" ]; then
     systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true

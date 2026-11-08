@@ -1170,7 +1170,8 @@ scan plus about a second.
   stamped by an unattended t-claude launch, using the exact idle Claude process, its hook-reported
   transcript, and a prompt latch. A client viewing the pane, a message, or uncertain evidence keeps it
   open. The marker lives in the checkout's Git directory (per-user local state for non-Git folders)
-  and is written before the window closes. Boot launchers and the watcher respect it; manual t-claude
+  and is written before the window closes. An interrupted close is reconciled with the transcript.
+  Next.js accounts without repo discovery run the same watcher in retirement-only mode. Boot launchers and the watcher respect it; manual t-claude
   and Codex do not depend on it. Untagged windows are left alone.
 - **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
   same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
