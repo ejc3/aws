@@ -695,8 +695,6 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 AETIMER
-systemctl daemon-reload
-systemctl enable --now agents-enable.timer >/dev/null 2>&1 || true
 
 # ------------------------------------------------------- playwright system deps
 # Installed once, as root, at provision time so that nobody needs `--with-deps` (which
@@ -1387,6 +1385,8 @@ chmod 755 /usr/local/bin/kid-agents-refresh
 # `t-claude --remote-control` passes --remote-control straight through to claude
 # (t-claude.zsh, ejc3/t-claude) -- everything it does not itself recognise is relayed
 # verbatim rather than silently dropped.
+# Install the gate before publishing the launcher, including when the timer is already running.
+${local.agent_session_sync_install}
 cat > /usr/local/bin/agents-start <<'AGENTS'
 #!/bin/bash
 # NOT set -e: t-claude's final step attaches to the tmux session, which fails harmlessly
@@ -1397,22 +1397,28 @@ set -uo pipefail
 WHO="$1"
 export HOME="/home/$WHO"
 WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
-# Every folder this run opens a window for, for codex-seed@<user> (seeds a Codex thread in each).
+# Every selected folder, even if Claude is retired there, for codex-seed@<user>.
 DIRS_STATE="$HOME/.local/state/agents-start"
 mkdir -p "$DIRS_STATE"
 DIRS_NEW=$(mktemp "$DIRS_STATE/dirs.XXXXXX")
+
+launch_claude_rc() {
+  # --auto uses --continue when transcripts exist; the interactive picker would wait
+  # forever for a keypress under systemd.
+  zsh -c '
+    cd -- "$1" || exit 1
+    if [ -x /usr/local/bin/agent-session-sync ]; then
+      /usr/local/bin/agent-session-sync --check-claude-rc "$PWD" || exit 0
+      export TCLAUDE_RC_GATE=/usr/local/bin/agent-session-sync
+    fi
+    source ~/.config/t-claude.zsh 2>/dev/null || { echo "agents-start: t-claude.zsh missing" >&2; exit 1; }
+    printf "agents-start: invoking t-claude for %s in %s\n" "$2" "$PWD"
+    t-claude --auto --remote-control
+  ' agents-start "$1" "$WHO" </dev/null
+}
+
 printf '%s\n' "$WORKDIR" > "$DIRS_NEW"
-zsh -c "
-  source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
-  cd '$WORKDIR' || exit 1
-  # --auto is REQUIRED for an unattended launcher. Without it t-claude takes the interactive
-  # path, `claude --resume`, which renders the session PICKER as soon as the user has any
-  # transcript -- and a picker waits for a keypress systemd will never send. The window then
-  # sits there with no claude running, so remote control has nothing to attach to. --auto
-  # resolves to `claude --continue` when transcripts exist, plain `claude` when they do not.
-  t-claude --auto --remote-control
-"
-echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
+launch_claude_rc "$WORKDIR"
 
 # Extra managed folders (added 2026-09-25 by Claude, Starfall Arena handoff to Connor). Optional,
 # per user: ~/.config/agent-extra-dirs lists one folder per line (# comments and blanks skipped).
@@ -1425,29 +1431,19 @@ if [ -f "$EXTRA" ]; then
     case "$XD" in ''|'#'*) continue ;; esac
     [ -d "$XD" ] || { echo "agents-start: $WHO extra dir $XD missing, skipped" >&2; continue; }
     [ "$XD" = "$WORKDIR" ] && continue
-    zsh -c "
-      source ~/.config/t-claude.zsh 2>/dev/null || exit 1
-      cd '$XD' || exit 1
-      t-claude --auto --remote-control
-    " </dev/null
-    echo "agents-start: t-claude invoked for $WHO in $XD"
+    launch_claude_rc "$XD"
     printf '%s\n' "$XD" >> "$DIRS_NEW"
   done < "$EXTRA"
 fi
 # Every folder with session activity in the last 30 days (owner, 2026-10-13): prompted in a Claude
 # conversation, or marked for interactive use (claude-interactive in its git dir). The same rule as
 # fcvm-claude-rc and agent-session-sync: /usr/local/bin/agent-active-dirs. A folder nobody prompted
-# stays closed; agent-extra-dirs above is for pinning one regardless.
+# stays closed; agent-extra-dirs selects additional folders independently of activity.
 while IFS= read -r XD; do
   [ -d "$XD" ] || continue
   [ "$XD" = "$WORKDIR" ] && continue
   grep -qxF -- "$XD" "$DIRS_NEW" && continue
-  zsh -c '
-    source ~/.config/t-claude.zsh 2>/dev/null || exit 1
-    cd -- "$1" || exit 1
-    t-claude --auto --remote-control
-  ' agents-start "$XD" </dev/null
-  echo "agents-start: t-claude invoked for $WHO in $XD (active in the last 30 days)"
+  launch_claude_rc "$XD"
   printf '%s\n' "$XD" >> "$DIRS_NEW"
 done < <(/usr/local/bin/agent-active-dirs --home "$HOME" 2>/dev/null)
 mv -f "$DIRS_NEW" "$DIRS_STATE/dirs"
@@ -1511,10 +1507,6 @@ UNIT
 # Uses the standalone binary explicitly: `codex remote-control` refuses to run against the
 # npm/system install, and $PATH is not dependable inside a unit.
 ${local.codex_seed_thread_install}
-# New repositories within seconds, per account (agent-session-sync.tf). The account's own GitHub login
-# is the allowed owner; ~/.config/agent-session-sync/owners adds more. The watcher never starts the
-# user's tmux server: it waits for claude-rc@<user> to have made it.
-${local.agent_session_sync_install}
 # A Codex thread in every folder agents-start opened a window for (its list:
 # ~/.local/state/agents-start/dirs), so each shows up in the Codex app. Enabled by
 # agents-enable for local.nextjs_codex_seed_users only. Folders that already have a thread are
@@ -1569,6 +1561,7 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+systemctl enable --now agents-enable.timer >/dev/null 2>&1 || true
 
 # Everything that writes /var/lib/ndev (registries, env files, drop-ins) holds the lock that
 # ndev-register and ndev-prune take, so a user publishing during a setup run cannot interleave

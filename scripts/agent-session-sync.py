@@ -36,13 +36,18 @@ turn can take minutes, the thread itself exists at once). Claude and Codex are t
 a Codex that is not logged in yet does not hold up Claude and is retried.
 
 COST. Per tick: one listing and one stat per entry in the roots. Anything already handled is skipped
-before any deeper check, so an idle box does almost nothing.
+before any deeper check, so an idle box does almost nothing. Separately, the watcher retires
+unused unattended Claude windows after one week and records the decision per checkout.
 """
 import argparse
+import datetime
+import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -261,6 +266,356 @@ def repo_identity(path):
     return [st.st_dev, st.st_ino]
 
 
+# ----------------------------------------------------- unattended Claude session retirement
+
+RETIRE_AFTER = 7 * 24 * 60 * 60
+RETIRE_SCAN = 60
+RETIRED_MARKER = "claude-remote-retired"
+UUID = re.compile(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}")
+# A Claude-written transcript may contain bookkeeping before its first turn. Unknown
+# records count as activity: the CLI can add types without coordinating with this script.
+EMPTY_RECORDS = {"file-history-snapshot", "mode", "permission-mode", "session-owner", "bridge-session", "atis-latch"}
+USAGE_FIELDS = {"totalAPIDuration", "totalAPIDurationWithoutRetries", "totalCostUSD",
+                "totalLinesAdded", "totalLinesRemoved", "totalToolDuration"}
+COST_FIELDS = USAGE_FIELDS | {"type", "sessionId", "startTime", "totalDuration", "modelUsage", "hasUnknownModelCost"}
+
+def retirement_marker(path, home):
+    """A tombstone belongs to this checkout/worktree, or to this non-Git directory."""
+    path = os.path.realpath(path)
+    git, _ = git_dirs(path)
+    if git is not None and os.path.isdir(git):
+        return os.path.join(git, RETIRED_MARKER)
+    inode = os.stat(path).st_ino
+    key = hashlib.sha256(os.fsencode(path) + b"\0" + str(inode).encode()).hexdigest()
+    return os.path.join(home, ".local", "state", "agent-session-sync", "retired", key)
+
+
+def claude_retired(path, home):
+    try:
+        marker = retirement_marker(path, home)
+        os.lstat(marker)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # if state cannot be inspected, do not recreate an unattended session
+    return True
+
+
+def regular_read(path, limit):
+    """Open only a bounded, regular file. Never follow a leaf symlink or read a pipe."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("not a small regular file")
+        data = fh.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("file grew beyond its limit")
+        return data
+
+
+def transcript_evidence(path, root, sid):
+    """Return (empty, existing, earliest bridge timestamp) for the exact native transcript."""
+    if not UUID.fullmatch(sid) or not os.path.isabs(path):
+        return False, False, None
+    expected = os.path.join(os.path.realpath(root), "projects")
+    path = os.path.normpath(path)
+    if (os.path.basename(path) != sid + ".jsonl"
+            or os.path.dirname(os.path.dirname(path)) != expected
+            or os.path.realpath(path) != path):
+        return False, False, None
+    bridge_times, metadata_ids, last_pointers = [], set(), set()
+    try:
+        data = regular_read(path, 1024 * 1024)
+        for line in data.splitlines():
+            row = json.loads(line)
+            if (not isinstance(row, dict) or row.get("sessionId") not in (None, sid)
+                    or any(k in row for k in ("message", "prompt", "role"))):
+                return False, True, None
+            kind = row.get("type")
+            if kind in EMPTY_RECORDS:
+                if kind == "file-history-snapshot" and (row.get("snapshot") or {}).get("trackedFileBackups"):
+                    return False, True, None
+            elif (kind, row.get("subtype")) == ("system", "bridge_status"):
+                when = row.get("timestamp")
+                if isinstance(when, str) and row.get("sessionId") == sid:
+                    timestamp = datetime.datetime.fromisoformat(when.replace("Z", "+00:00"))
+                    if timestamp.tzinfo is not None:
+                        bridge_times.append(timestamp.timestamp())
+            elif kind == "cost-state" and (set(row) <= COST_FIELDS
+                    and all(row.get(k) == 0 for k in USAGE_FIELDS)
+                    and row.get("modelUsage") == {} and row.get("hasUnknownModelCost") is False):
+                pass
+            elif kind == "last-prompt" and set(row) <= {"type", "sessionId", "leafUuid"}:
+                if row.get("leafUuid"):
+                    last_pointers.add(row["leafUuid"])
+            else:
+                return False, True, None
+            if isinstance(row.get("uuid"), str):
+                metadata_ids.add(row["uuid"])
+    except FileNotFoundError:
+        # A new SessionStart can report its path before Claude writes the first record.
+        return True, False, None
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return False, False, None
+    return last_pointers <= metadata_ids, True, min(bridge_times, default=None)
+
+
+def empty_transcript(path, root, sid):
+    return transcript_evidence(path, root, sid)[0]
+
+
+def linux_process(pid):
+    """Return PID, parent and boot-relative start ticks for this account's live process."""
+    path = f"/proc/{pid}"
+    try:
+        if os.stat(path).st_uid != os.getuid():
+            return None
+        with open(path + "/stat") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        if fields[0] in ("T", "t", "Z", "X"):
+            return None                         # stopped or exited, not an idle foreground Claude
+        return int(fields[1]), int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def retirement_intent(marker, launch):
+    """Publish a recoverable intent without overwriting a pre-existing tombstone."""
+    directory = os.path.dirname(marker)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    expected = (launch + "\n").encode()
+    fd, tmp = tempfile.mkstemp(prefix=".claude-retirement.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(expected)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, marker)
+        except FileExistsError:
+            # A watcher can die after recording the retirement and before closing
+            # tmux. Only the same live launch may retry that recorded intent.
+            if regular_read(marker, 64) != expected:
+                return None
+        marker_info = os.lstat(marker)
+        sync_directory(directory)
+        sync_directory(os.path.dirname(directory))
+        return marker_info
+    finally:
+        os.unlink(tmp)
+
+
+def cancel_intent(marker, marker_info):
+    try:
+        if os.path.samestat(os.lstat(marker), marker_info):
+            os.unlink(marker)
+            sync_directory(os.path.dirname(marker))
+    except FileNotFoundError:
+        pass
+
+
+def linux_uptime():
+    with open("/proc/uptime") as fh:
+        return float(fh.read().split()[0])
+
+
+def idle_claude(root, pane_pid, sid, folder, now):
+    """Find the exact native Claude child, using the CLI's own PID/UUID/idle record."""
+    candidates = []
+    try:
+        with os.scandir(os.path.join(root, "sessions")) as entries:
+            records = list(entries)
+        uptime = linux_uptime()
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError):
+        return None
+    for entry in records:
+        if not re.fullmatch(r"[1-9][0-9]*\.json", entry.name):
+            continue
+        pid = int(entry.name[:-5])
+        try:
+            meta = json.loads(regular_read(entry.path, 32 * 1024))
+            if (not isinstance(meta, dict) or meta.get("pid") != pid or meta.get("sessionId") != sid
+                    or meta.get("status") != "idle" or type(meta.get("procStart")) is not int
+                    or type(meta.get("startedAt")) is not int or type(meta.get("statusUpdatedAt")) is not int
+                    or not isinstance(meta.get("cwd"), str) or os.path.realpath(meta["cwd"]) != folder):
+                continue
+        except (OSError, ValueError, TypeError):
+            continue
+        process = linux_process(pid)
+        if not process or process[1] != meta["procStart"]:
+            continue
+        try:
+            # The pathname in the registry can now name a replacement checkout.
+            # Compare the directory the live process actually has open.
+            if not os.path.samestat(os.stat(f"/proc/{pid}/cwd"), os.stat(folder)):
+                continue
+        except OSError:
+            continue
+        old_process = now - meta["startedAt"] / 1000 > RETIRE_AFTER and uptime - process[1] / hz > RETIRE_AFTER
+        parent = process[0]
+        for _ in range(64):
+            if parent <= 1:
+                break
+            if parent == pane_pid:
+                candidates.append((pid, process[1], meta["statusUpdatedAt"], old_process))
+                break
+            p = linux_process(parent)
+            if p is None:
+                break
+            parent = p[0]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+class ClaudeRetirement:
+    """Two idle observations, then retire exactly one unattended window under the launch lock."""
+
+    FIELDS = ("window_id", "pane_id", "pane_pid", "window_panes", "window_active_clients",
+              "@tclaude_auto_rc", "@tclaude_auto_rc_started", "@tclaude_auto_rc_sid",
+              "@tclaude_auto_rc_used", "@tclaude_auto_rc_source", "@tclaude_path", "@tclaude_auto_rc_transcript")
+    FORMAT = "\t".join("#{" + k + "}" for k in FIELDS)
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.pending = set()
+        self.next_scan = 0
+        self.root = os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(cfg["home"], ".claude"))
+
+    def tmux(self, *args):
+        return subprocess.run([self.cfg["tmux"], "-u", *args], capture_output=True, text=True, timeout=5)
+
+    def eligible(self, fields, now):
+        window, pane, pid, panes, viewers, token, started, sid, used, source, folder, transcript = fields
+        if (not re.fullmatch(r"@[0-9]+", window) or not re.fullmatch(r"%[0-9]+", pane)
+                or not pid.isdecimal() or panes != "1" or viewers != "0" or used
+                or not UUID.fullmatch(token) or not UUID.fullmatch(sid)
+                or not started.isdecimal() or not 0 < int(started) <= now
+                or source not in ("startup", "resume")
+                or not os.path.isabs(folder) or os.path.realpath(folder) != folder or not os.path.isdir(folder)):
+            return None
+        proc = idle_claude(self.root, int(pid), sid, folder, now)
+        if proc is None:
+            return None
+        empty, exists, first_bridge = transcript_evidence(transcript, self.root, sid)
+        # A resumed conversation without its transcript is not proof of emptiness.
+        if not empty or (not exists and source != "startup"):
+            return None
+        old_process = proc[-1] and now - int(started) > RETIRE_AFTER
+        if not old_process and (first_bridge is None or now - first_bridge <= RETIRE_AFTER):
+            return None
+        git, _ = git_dirs(folder)
+        try:
+            checkout = os.stat(git or folder)
+        except OSError:
+            return None
+        return (*fields, *proc[:-1], checkout.st_dev, checkout.st_ino)
+
+    def sweep(self, now=None):
+        now = time.time() if now is None else now
+        result = self.tmux("list-windows", "-a", "-F", self.FORMAT)
+        if result.returncode:
+            self.pending.clear()
+            return
+        current = set()
+        for line in set(result.stdout.splitlines()):
+            fields = line.split("\t")
+            if len(fields) != len(self.FIELDS):
+                continue
+            # A prompt delivered after a crash between intent and close keeps
+            # the window alive and cancels that launch's unfinished retirement.
+            if fields[8] and UUID.fullmatch(fields[5]) and os.path.isabs(fields[-2]):
+                try:
+                    marker = retirement_marker(fields[-2], self.cfg["home"])
+                    info = os.lstat(marker)
+                    if regular_read(marker, 64) == (fields[5] + "\n").encode():
+                        cancel_intent(marker, info)
+                except (OSError, ValueError):
+                    pass
+                continue
+            proof = self.eligible(fields, now)
+            if proof is None:
+                continue
+            current.add(proof)
+            if proof in self.pending:
+                try:
+                    if self.retire(proof, now):
+                        current.remove(proof)
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    log_rarely("retire-window", "could not confirm an unused window's retirement")
+        self.pending = current
+
+    def tick(self):
+        now = time.monotonic()
+        if now >= self.next_scan:
+            self.next_scan = now + RETIRE_SCAN
+            self.sweep()
+
+    def retire(self, proof, now):
+        socket = self.tmux("display-message", "-p", "#{socket_path}")
+        if socket.returncode:
+            return False
+        sock = os.path.realpath(socket.stdout.removesuffix("\n"))
+        parent = os.path.dirname(sock)
+        st = os.stat(parent)
+        if not stat.S_ISSOCK(os.stat(sock).st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return False  # custom, shared sockets do not use this lock location
+        fd = os.open(sock + ".tclaude-launch.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            lock = os.fstat(fd)
+            if not stat.S_ISREG(lock.st_mode) or lock.st_uid != os.getuid():
+                return False
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return self.retire_locked(proof, now)
+        finally:
+            os.close(fd)
+
+    def retire_locked(self, proof, now):
+        window, pane = proof[:2]
+        snapshot = self.tmux("display-message", "-p", "-t", pane, self.FORMAT)
+        fields = snapshot.stdout.removesuffix("\n").split("\t")
+        if snapshot.returncode or len(fields) != len(self.FIELDS) or self.eligible(fields, now) != proof:
+            return False
+        folder = fields[-2]
+        marker = retirement_marker(folder, self.cfg["home"])
+        intent = retirement_intent(marker, fields[5])
+        if intent is None:
+            return False
+        closed = False
+        try:
+            # Recheck after syncing the marker. Prompt hooks can mark the window used
+            # without the launch lock; evaluate that and viewer state in the kill command.
+            if self.eligible(fields, now) != proof:
+                return False
+            checks = (("window_id", window), ("pane_id", pane), ("pane_pid", fields[2]),
+                      ("window_panes", "1"), ("window_active_clients", "0"),
+                      ("@tclaude_auto_rc", fields[5]), ("@tclaude_auto_rc_sid", fields[7]),
+                      ("@tclaude_auto_rc_used", ""))
+            condition = "1"
+            for name, value in checks:
+                condition = "#{&&:" + condition + ",#{==:#{" + name + "}," + value + "}}"
+            result = self.tmux("if-shell", "-F", "-t", pane, condition,
+                               f"kill-window -t {window}", "display-message -p kept")
+            closed = result.returncode == 0 and result.stdout.strip() != "kept"
+            if closed:
+                log("retired unused Claude Remote Control window in %s" % folder)
+            return closed
+        finally:
+            if not closed:
+                cancel_intent(marker, intent)
+
+
 # ------------------------------------------------------------------ state
 
 def current_boot_id():
@@ -342,6 +697,10 @@ def scan_once(cfg, state, launcher, now=None):
         log("host rebooted: starting Claude in %d folders with session activity in the last 30 days" % len(active))
         state.rebooted = False
     for path in list(state.boot["pending"]):
+        if claude_retired(path, cfg["home"]):
+            state.boot["pending"].remove(path)
+            state.boot.setdefault("tried", {}).pop(path, None)
+            continue
         tried = state.boot.setdefault("tried", {})
         if path in tried and now - tried[path] < RETRY_SECONDS:
             continue
@@ -390,6 +749,9 @@ def scan_once(cfg, state, launcher, now=None):
             continue
         for kind in ("claude", "codex"):
             if entry.get(kind):
+                continue
+            if kind == "claude" and claude_retired(path, cfg["home"]):
+                entry[kind] = True
                 continue
             tried = entry.setdefault("tried", {})
             if now - tried.get(kind, 0) < RETRY_SECONDS and kind in tried:
@@ -495,6 +857,8 @@ class Launcher:
         return r.returncode == 0
 
     def start_claude(self, path):
+        if claude_retired(path, self.cfg["home"]):
+            return True                        # handled, not a retry
         # Looked for on EVERY attempt, never cached: on a rebuilt box this watcher can start before the
         # installer has put t-claude in place, and "not there yet" must never read as "nothing to do".
         t_claude = find_t_claude(self.cfg["home"], self.cfg.get("t_claude_arg"))
@@ -508,9 +872,12 @@ class Launcher:
             return False                      # a window with no login only sits at the login screen
         trust_repo(self.cfg["home"], path)
         script = 'source "$TCLAUDE" || exit 1; cd -- "$1" || exit 1; t-claude --auto --remote-control'
-        env = dict(os.environ, HOME=self.cfg["home"], TCLAUDE=t_claude, TERM="xterm-256color")
+        env = dict(os.environ, HOME=self.cfg["home"], TCLAUDE=t_claude, TERM="xterm-256color",
+                   TCLAUDE_RC_GATE=os.path.abspath(__file__))
         subprocess.run(["zsh", "-c", script, "agent-session-sync", path], env=env, timeout=120,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if claude_retired(path, self.cfg["home"]):
+            return True                        # it retired while the shell was taking its launch lock
         key = "%s_%s" % (cksum(path), cksum(""))
         for _ in range(40):                   # up to ~10 s for the --remote-control child to appear
             out = subprocess.run([self.cfg["tmux"], "list-windows", "-a", "-F", "#{window_id} #{@tclaude_key}"],
@@ -622,10 +989,15 @@ def main(argv):
     ap.add_argument("--state-dir")
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--check-claude-rc", metavar="PATH",
+                    help="exit nonzero if automatic Claude Remote Control is retired for this checkout")
     args = ap.parse_args(argv)
+    if args.check_claude_rc is not None:
+        return int(claude_retired(args.check_claude_rc, args.home or os.path.expanduser("~")))
     cfg = build_config(args)
     state = State(os.path.join(cfg["state_dir"], "known.json"))
     launcher = Launcher(cfg)
+    retirement = ClaudeRetirement(cfg)
     log("watching %s as %s; owners=%s repos=%s first_run=%s" % (
         cfg["roots"], cfg["home"], sorted(cfg["owners"]), sorted(cfg["repos"]), state.first_run))
     me = os.path.abspath(__file__)
@@ -635,6 +1007,10 @@ def main(argv):
             scan_once(cfg, state, launcher)
         except Exception as exc:              # a bad tick must never end the watch
             log("scan failed: %s" % exc)
+        try:
+            retirement.tick()
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            log_rarely("retirement", "Claude retirement check failed: %s" % type(exc).__name__)
         if args.once:
             return 0
         time.sleep(args.interval)

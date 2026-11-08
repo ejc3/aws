@@ -812,6 +812,13 @@ during that period, or its worktree has uncommitted changes. Only `github.com/ej
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
 
+Claude Remote Control windows opened automatically are retired after seven days without a message.
+The watcher leaves open any window viewed in tmux, and keeps a window if it cannot verify the
+conversation is empty. It keeps the transcript and remembers retirement across reboots. Running
+`t-claude` yourself still works; to restore automatic startup for a checkout, remove
+`claude-remote-retired` from that checkout's Git directory. The rule applies once the wrapper has
+identified an unattended launch.
+
 ### OpenCode from a phone or tablet
 
 Open [opencode.cc-games.dev](https://opencode.cc-games.dev/) in your browser and sign in through Cloudflare Access.
