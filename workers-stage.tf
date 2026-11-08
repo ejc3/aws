@@ -26,6 +26,7 @@ locals {
     "dolphin-maps-stage"  = { id = "2ba16e42744a46c892720dfeafeccfd4", urls = true }
     "fantasy-stage"       = { id = "0e46bd44b3934b79a73d16d711efd131", urls = true }
     "imagine-stage"       = { id = "2b8755b7ba1f4845bae8d18ced8fafef", urls = true }
+    "lights-stage"        = { id = "2ca6618103b84bb7aff93f0f5fc6a89b", urls = false }
     "nest-step-stage"     = { id = "d31376c75b8247f7b0a8e8a7e0fc7dba", urls = true }
     "remote-claw-stage"   = { id = "54a603228ad24345b518a9c10cfb3e26", urls = true }
   }
