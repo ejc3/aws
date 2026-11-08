@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SPEC = importlib.util.spec_from_file_location("ass", Path(__file__).resolve().parent / "agent-session-sync.py")
@@ -489,6 +490,22 @@ class ClaudeRetirementTests(Base):
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
         return marker
+
+    def test_lost_tmux_close_reply_keeps_the_pending_retirement(self):
+        folder = make_repo(self.home, "empty")
+        launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        transcript = self.home / ".claude" / "projects" / "example" / (sid + ".jsonl")
+        fields = ("@1", "%1", "120", "1", "0", launch, "1", sid, "", "startup", str(folder), str(transcript))
+        proof = (*fields, 123, 456, 789, 42, 43)
+        r = ass.ClaudeRetirement(self.cfg)
+        with mock.patch.object(r, "eligible", return_value=proof), mock.patch.object(r, "tmux", side_effect=[
+                subprocess.CompletedProcess([], 0, "\t".join(fields) + "\n"),
+                subprocess.TimeoutExpired(["tmux", "if-shell"], timeout=5),
+        ]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                r.retire_locked(proof, now=900000)
+        self.assertTrue(ass.claude_retired(folder, self.home))
 
     def test_only_the_same_launch_can_recover_an_intent_after_a_watcher_crash(self):
         folder = make_repo(self.home, "empty")

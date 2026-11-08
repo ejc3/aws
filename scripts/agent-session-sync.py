@@ -627,11 +627,12 @@ class ClaudeRetirement:
         intent = retirement_intent(marker, fields[5], fields[7], fields[9], fields[-1])
         if intent is None:
             return False
-        closed = False
+        cancel = False
         try:
             # Recheck after syncing the marker. Prompt hooks can mark the window used
             # without the launch lock; evaluate that and viewer state in the kill command.
             if self.eligible(fields, now) != proof:
+                cancel = True
                 return False
             checks = (("window_id", window), ("pane_id", pane), ("pane_pid", fields[2]),
                       ("window_panes", "1"), ("window_active_clients", "0"),
@@ -642,14 +643,17 @@ class ClaudeRetirement:
                 condition = "#{&&:" + condition + ",#{==:#{" + name + "}," + value + "}}"
             result = self.tmux("if-shell", "-F", "-t", pane, condition,
                                f"kill-window -t {window}", "display-message -p kept")
-            closed = result.returncode == 0 and result.stdout.strip() != "kept"
+            cancel = result.returncode == 0 and result.stdout.strip() == "kept"
+            # tmux may close the window before its client loses the reply. Keep
+            # the intent unless we know that the close did not happen.
+            closed = result.returncode == 0 and not cancel
             if closed:
                 if os.path.samestat(os.lstat(marker), intent):
                     write_marker(marker, b"retired\n", replace=True)
                 log("retired unused Claude Remote Control window in %s" % folder)
             return closed
         finally:
-            if not closed:
+            if cancel:
                 cancel_intent(marker, intent)
 
 
