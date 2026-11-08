@@ -294,6 +294,26 @@ class Publisher:
             },
         }, host_only=True)
 
+    def reviewed_held_stamp_host_release(self):
+        retake = self.reviewed_retake_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-seven receipt selected version 25 on the host, after
+        # Terraform prepared version 24, and kept every tile's version.
+        return self.reviewed_pair({
+            "source_sha": "fb2f5c361175bb8a0b5baac141e359906543e101",
+            "images": {"host": "ami-0d176763f9f33416e", "tile": retake["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 7, "source_sha": retake["source_sha"],
+                "build_id": "reviewed-retake-host-release:" + digest(encoded(retake)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**retake["expected"]["versions"], host_key: 25},
+                "previous": {k: v for k, v in retake["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in retake["images"].items()},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -475,9 +495,56 @@ class Publisher:
         return self.run_reviewed(self.reviewed_retake_host_release(), "reviewed-retake-host-release",
                                  host_user_data=host_user_data, host_only=True)
 
-    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False):
+    def reviewed_release_copy(self, original, kind):
+        """The release-region copy of a reviewed image built by hand in BUILD_REGION.
+
+        The copy is made the way release_copies makes a factory candidate's (same name, a
+        CopyImage that carries the original's tags, found again by name on a replay), so the
+        release names a us-east-1 copy, replicate records the original as the build region's
+        image, and retention sees both. Returns None while the copy is pending."""
+        compute = self.env["COMPUTE_REGION"]
+        need(self.build_region != compute, "a reviewed build-region image needs a distinct build region")
+        rows = self.client("ec2", True, self.build_region).describe_images(ImageIds=[original])["Images"]
+        need(len(rows) == 1, "reviewed image is missing")
+        image = rows[0]
+        tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+        validated = {"Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                     "GuardHelperSHA256": self.env["GUARD_SHA256"]}
+        need(image.get("ImageId") == original and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+             and image.get("Public") is False and image.get("State") == "available"
+             and image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs"
+             and NAME[kind].fullmatch(image.get("Name", ""))
+             # build-ami.sh's CreateImage, not a copy (both report a SourceImageId: a CreateImage
+             # image's is the image its builder booted)
+             and image.get("Description") == "fcvm fleet: " + image.get("Name", "")
+             and all(tags.get(key) == value for key, value in validated.items()),
+             "reviewed image is outside its private validated scope")
+        return self.regional_copy(self.client("ec2", True), compute, original, self.build_region,
+                                  image["Name"], validated, factory=True)
+
+    def run_held_stamp_host_release(self, event):
+        need(event == {"action": "activate-reviewed-held-stamp-host-release"},
+             "reviewed host release accepts no caller configuration")
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        config = self.reviewed_held_stamp_host_release()
+        # Built in us-west-2 (#807's build region): the release names the publisher's copy.
+        copied = self.reviewed_release_copy(config["images"]["host"], "host")
+        need(copied is not None, "release-region copies are still pending: host")
+        # Potato mode is chosen by the boot image's id, so the reviewed bootstrap must name the copy.
+        host = next(t for t in self.templates if t["kind"] == "host")
+        boot = base64.b64decode(self.current(host["id"])["LaunchTemplateData"].get("UserData", "")).decode("utf-8", "replace")
+        need(copied in boot, "Terraform's host bootstrap does not name the release-region copy yet")
+        return self.run_reviewed(config, "reviewed-held-stamp-host-release", host_user_data=host_user_data,
+                                 host_only=True, release_images={**config["images"], "host": copied})
+
+    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False,
+                     release_images=None):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
+        if release_images is not None:
+            # The reviewed identity stays the build-region image; the release names its copy.
+            config = self.reviewed_pair({**config, "images": release_images}, host_only=host_only)
         generation = config["expected"]["generation"] + 1
 
         def fence():
@@ -1303,6 +1370,8 @@ class Publisher:
             return self.run_stride_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-retake-host-release":
             return self.run_retake_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-held-stamp-host-release":
+            return self.run_held_stamp_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

@@ -633,6 +633,28 @@ and retains generation six for rollback. It reuses the existing West tile copy;
 if the new West host copy is still pending, the East release stays committed
 and `{"action":"replicate-active-release"}` completes the regional record.
 
+The fixed action `{"action":"activate-reviewed-held-stamp-host-release"}`
+advances only the exact generation-seven receipt to the signed fb2f5c36 host.
+That host was built by hand in the build region (us-west-2), so it is released
+the way a factory candidate is: the publisher copies it to us-east-1 and the
+release names the copy. Potato mode is chosen by the boot image's id, so
+Terraform's host bootstrap has to name the copy before the release:
+
+1. Apply. Terraform tags the us-west-2 original `FleetImageKind` and
+   `FleetImageValidated` (`fcvm_ami_build_region_reviewed`); the bootstrap is
+   unchanged, since no copy exists yet.
+2. Invoke the action. It starts the us-east-1 copy (`CopyImage` with the
+   original's tags) and refuses with `release-region copies are still pending:
+   host`; invoke again until it refuses with `Terraform's host bootstrap does
+   not name the release-region copy yet`.
+3. Apply again. `data.aws_ami_ids.fcvm_ami_build_region_copies` finds the copy
+   by its name and `copy of <original> from us-west-2` description, the potato
+   list names it, and Terraform prepares the host template's next version.
+4. Invoke the action. It releases the copy as generation eight, changes only
+   the host image, keeps every tile version and retains generation seven for
+   rollback. `/fcvm-fleet/ami-release-copies` names the copy in us-east-1 and
+   the original in us-west-2; nothing is copied back.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

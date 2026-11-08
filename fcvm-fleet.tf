@@ -444,13 +444,14 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
-  # Keep potato mode for the current host, the new candidate and the retained older rollback image.
-  potato_host_amis = [
+  # Keep potato mode for the current host, the retained rollback images and the publisher's us-east-1 copy of each
+  # reviewed build-region host (fcvm-fleet-ami-release.tf), once it exists.
+  potato_host_amis = concat([
     local.fcvm_ami_bootstrap["host/x86_64/95217caa"].image,
     local.fcvm_ami_bootstrap["host/x86_64/a4a0bd3e"].image,
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
     local.fcvm_ami_bootstrap["host/x86_64/343b2287"].image,
-  ]
+  ], flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids]))
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
