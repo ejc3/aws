@@ -1943,6 +1943,16 @@ apply. The bucket needs **Workers R2 Storage Write** (permission group `bf7481a1
 token `cloudflare-tunnel-token`. Add it with one PUT of the token's definition, the same way Workers KV Storage Write was
 added.
 
+### dolphin-labs live logs R2 (dolphin-labs-live-logs.tf)
+
+The R2 bucket `dolphin-labs-live-logs` holds the live capture's daily logs, written by the Workers through the binding
+`LIVE_LOGS`. The engine's parity work reads them from nextjs-dev with a read-only account token: Workers R2 Storage Bucket
+Item Read on this one bucket, which lists and reads its objects and nothing else. Terraform writes its S3 pair (derived as
+for the podcasts bucket) and the endpoint into `dolphin-labs/live-logs-r2` in the Dolphin account through `aws.dolphin`.
+dolphin-aws owns that container (`live-logs.tf` there) and keeps it administration only; nextjs-dev reads it through
+`dolphin-terraform`. Until the container exists nothing is written (output `dolphin_labs_live_logs_read.secret_written`).
+Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_labs_live_logs_read`.
+
 ### dolphin-films credentials
 
 `dolphin-films.tf` holds the credentials of dolphin-films (`dolphin-labs-hq/dolphin-films`: a Next.js site
