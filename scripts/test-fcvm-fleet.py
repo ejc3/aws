@@ -92,16 +92,19 @@ class NetworkTests(unittest.TestCase):
 class HostTests(unittest.TestCase):
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
-        # the same bootstrap with the candidate, current host, both rollbacks and failed IMDS.
-        older = "ami-0620224a0a4dd168e"
-        rollback = "ami-04c3294f21cb88942"
-        previous = "ami-09ac99f69700ec306"
-        candidate = "ami-05923927f810a2ce9"
+        # the same bootstrap with the candidate, current host, every rollback and failed IMDS.
+        oldest = "ami-0620224a0a4dd168e"
+        older = "ami-04c3294f21cb88942"
+        rollback = "ami-09ac99f69700ec306"
+        previous = "ami-05923927f810a2ce9"
+        candidate = "ami-0ccccccccccccccc0"   # stands for the publisher's us-east-1 copy of a build-region host
         east = block('module "fcvm_fleet_east1"')
-        configured = re.search(r'potato_host_amis\s*=\s*\[(.*?)\n  \]', east, re.S)
+        configured = re.search(r'potato_host_amis\s*=\s*concat\(\[(.*?)\n  \], (.*?)\)\n', east, re.S)
         self.assertIsNotNone(configured)
         self.assertEqual(re.findall(r'local\.fcvm_ami_bootstrap\["host/x86_64/([0-9a-f]+)"\]\.image',
                                     configured[1]), ["95217caa", "a4a0bd3e", "92a26793", "343b2287"])
+        # and every copy the publisher has made of a reviewed build-region host
+        self.assertEqual(configured[2], "flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids])")
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split('%{endif~}', 1)[0]
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
@@ -118,9 +121,10 @@ class HostTests(unittest.TestCase):
             )
             curl.chmod(0o700)
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
-                                                   "|".join(sorted([older, rollback, previous, candidate])))
+                                                   "|".join(sorted([oldest, older, rollback, previous, candidate])))
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
+                (oldest, "--phones 2 --potato-players 96"),
                 (older, "--phones 2 --potato-players 96"),
                 (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
