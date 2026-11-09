@@ -70,6 +70,9 @@ def trusted_ci(source):
     runs = data.get("workflow_runs")
     if not isinstance(runs, list):
         raise Refused("trusted main CI is unavailable")
+    # A requested ancestor's exact run can follow a newer successful run. Scan the
+    # bounded page for an exact match before trying the existing docs-only fallback.
+    fallback = None
     for run in runs[:20]:
         head = run.get("head_sha", "")
         if not (run.get("conclusion") == "success" and run.get("status") == "completed"
@@ -80,23 +83,23 @@ def trusted_ci(source):
             continue
         if head == source:
             return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        comparison = public_github("compare/" + head + "..." + source)
-        files = comparison.get("files")
-        if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
-                and comparison.get("merge_base_commit", {}).get("sha") == head
-                and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
-                and isinstance(files, list) and len(files) < 300):
-            raise Refused("trusted CI comparison is incomplete or outside its bound")
-        safe = True
-        for item in files:
-            previous = item.get("previous_filename")
-            if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
-                safe = False
-                break
-        if safe:
-            return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        raise Refused("non-documentation changes require successful CI for this exact revision")
-    raise Refused("no successful trusted main CI covers these image inputs")
+        if fallback is None:
+            fallback = head, run["id"]
+    if fallback is None:
+        raise Refused("no successful trusted main CI covers these image inputs")
+    head, run_id = fallback
+    comparison = public_github("compare/" + head + "..." + source)
+    files = comparison.get("files")
+    if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+            and comparison.get("merge_base_commit", {}).get("sha") == head
+            and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
+            and isinstance(files, list) and len(files) < 300):
+        raise Refused("trusted CI comparison is incomplete or outside its bound")
+    for item in files:
+        previous = item.get("previous_filename")
+        if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
+            raise Refused("non-documentation changes require successful CI for this exact revision")
+    return {"ci_head_sha": head, "ci_run_id": run_id}
 
 
 def strict(event, allowed, required):

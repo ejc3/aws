@@ -1108,17 +1108,20 @@ class FactoryTests(unittest.TestCase):
     def test_a_green_revision_main_has_moved_past_is_admitted(self):
         # A busy main rarely holds still for its CI: the head's run is cancelled by the next
         # merge or fails on a download, and a head-only rule then builds nothing. A recent
-        # ancestor of main with its own successful CI is admitted, and keeps its own source.
+        # ancestor of main with its own successful CI is admitted, even when GitHub lists
+        # the newer head's successful run first. No documentation fallback is needed.
         head = "8" * 40
         self.store.values.clear()
         responses = [{"object": {"sha": head}},
             {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
-            {"workflow_runs": [self.ci_run()]}]
-        with patch.object(mod, "public_github", side_effect=responses):
+            {"workflow_runs": [self.ci_run(head_sha=head, id=100), self.ci_run()]},
+            {"status": "behind", "ahead_by": 0, "behind_by": 3, "merge_base_commit": {"sha": SOURCE_SHA}}]
+        with patch.object(mod, "public_github", side_effect=responses) as github:
             result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
                 "input_sha256": INPUT_SHA, "priority": "critical"})
+        self.assertEqual(github.call_count, 3)
         self.assertEqual(result["status"], "building")
-        self.assertEqual(self.factory.request_record(INPUT_SHA)["source_sha"], SOURCE_SHA)
+        self.assertEqual((result["source_sha"], result["ci_head_sha"], result["ci_run_id"]), (SOURCE_SHA, SOURCE_SHA, 99))
         self.assertEqual(len(self.cb.starts), 1)
 
     def test_a_revision_off_main_or_far_behind_it_is_refused(self):
