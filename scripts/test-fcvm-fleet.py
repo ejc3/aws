@@ -108,11 +108,19 @@ class HostTests(unittest.TestCase):
         windows = "ami-0dddddddddddddddd"   # the publisher's copy of the 853eb034 host, a build-region copy too
         self.assertRegex(east, r'windows_host_amis\s*=\s*data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids\n')
+        # Minecraft mode needs the same image: its agent is the first with --minecraft, so the flag is never in
+        # every host's arguments, only in the boot-image case below.
+        self.assertNotIn('"--minecraft', TF)
+        self.assertEqual(MOD.count("--minecraft 4"), 1)
+        self.assertRegex(east, r'minecraft_host_amis\s*=\s*data\.aws_ami_ids\.fcvm_ami_build_region_copies'
+                               r'\["host/x86_64/853eb034"\]\.ids\n')
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
         # the nested Windows case, rendered as Terraform does when the list is not empty
         windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"
+        minecraft_if = "      %{if length(var.minecraft_host_amis) > 0~}\n"
         self.assertEqual(guard.count(windows_if), 1)
-        guard = guard.replace(windows_if, "").replace("      %{endif~}\n", "")
+        self.assertEqual(guard.count(minecraft_if), 1)
+        guard = guard.replace(windows_if, "").replace(minecraft_if, "").replace("      %{endif~}\n", "")
         self.assertNotIn("%{", guard)
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
@@ -131,6 +139,7 @@ class HostTests(unittest.TestCase):
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
                                                    "|".join(sorted([oldest, older, rollback, previous, candidate, windows])))
             boot = boot.replace('${join("|", sort(tolist(var.windows_host_amis)))}', windows)
+            boot = boot.replace('${join("|", sort(tolist(var.minecraft_host_amis)))}', windows)
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
                 (oldest, "--phones 2 --potato-players 96"),
@@ -138,7 +147,8 @@ class HostTests(unittest.TestCase):
                 (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
                 (candidate, "--phones 2 --potato-players 96"),
-                (windows, "--phones 2 --potato-players 96 --windows 4"),
+                # every older image, a rollback included, gets no --minecraft; only the 853eb034 copy does
+                (windows, "--phones 2 --potato-players 96 --windows 4 --minecraft 4"),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
                 ("no-token", "--phones 2"),
                 ("no-ami", "--phones 2"),
