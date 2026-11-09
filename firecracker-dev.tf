@@ -370,6 +370,40 @@ resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
   }
 }
 
+# fcvm's arm64 host kernel (ejc3/fcvm#659). An L1 guest kernel newer than its L0 host wedges L2,
+# so the box that runs nested arm64 guests takes the host kernel fcvm pins before fcvm's
+# guests move to 7.3. Runs once per change of the pinned commit (no schedule); installs and
+# selects the kernel, and leaves the reboot to the owner, since the box is shared.
+variable "fcvm_host_kernel_commit" {
+  description = "ejc3/fcvm commit whose [kernel_profiles.nested.arm64.host_kernel] the dev box installs"
+  type        = string
+  default     = "a5a7132995fbf92a0106f7b24242ab7399fae4b0"
+}
+
+resource "aws_ssm_association" "firecracker_dev_host_kernel" {
+  count = var.enable_firecracker_instance ? 1 : 0
+
+  name                             = "AWS-RunShellScript"
+  association_name                 = "fcvm-arm-host-kernel"
+  wait_for_success_timeout_seconds = 7200
+
+  targets {
+    key    = "InstanceIds"
+    values = [aws_instance.firecracker_dev[0].id]
+  }
+
+  parameters = {
+    commands = join("\n", [
+      "cat > /usr/local/sbin/fcvm-host-kernel-install <<'FCVMHOSTKERNEL'",
+      chomp(file("${path.module}/scripts/fcvm-host-kernel-install.sh")),
+      "FCVMHOSTKERNEL",
+      "chmod 755 /usr/local/sbin/fcvm-host-kernel-install",
+      "/usr/local/sbin/fcvm-host-kernel-install ${var.fcvm_host_kernel_commit}",
+    ])
+    executionTimeout = "7200"
+  }
+}
+
 locals {
   # fcvm-metal-arm's public address. Allowlists of the box use this list.
   firecracker_dev_public_ips = [for e in aws_eip.firecracker_dev_next : e.public_ip]

@@ -20,7 +20,14 @@ symlinks into `fcvm/kernel/patches/`, so a fix there lands on both architectures
 `*.vm.patch` is applied to the VM kernel only -- the `host_kernel` `build_inputs` glob
 deliberately excludes it, so the host takes a strict subset.
 
-**Rebuild and install the host kernel** (fcvm drives the whole thing -- it downloads the
+**The host must not be older than the L1 guest kernel** (ejc3/fcvm#659): a 6.19 or later L1
+on a 6.18 host wedges L2. fcvm pins the arm64 host at 7.3.3, built from its own
+`kernel/patches-arm64-host`, ahead of its guests. On fcvm-metal-arm the SSM association
+`fcvm-arm-host-kernel` (firecracker-dev.tf) installs the host kernel of
+`var.fcvm_host_kernel_commit` and selects it for the next boot, once per commit change. It
+does not reboot the box: the owner does, when nobody is using it.
+
+**Rebuild and install the host kernel by hand** (fcvm drives the whole thing -- it downloads the
 kernel.org tarball for the pinned version, applies the patch set, builds, installs to
 `/boot`, and runs `update-grub`):
 
