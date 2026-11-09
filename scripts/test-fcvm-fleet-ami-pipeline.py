@@ -1116,7 +1116,8 @@ class FactoryTests(unittest.TestCase):
             {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
             {"workflow_runs": [self.ci_run(head_sha=head, id=100), self.ci_run()]},
             {"status": "behind", "ahead_by": 0, "behind_by": 3, "merge_base_commit": {"sha": SOURCE_SHA}}]
-        with patch.object(mod, "public_github", side_effect=responses) as github:
+        with (patch.object(mod, "public_github", side_effect=responses) as github,
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
             result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
                 "input_sha256": INPUT_SHA, "priority": "critical"})
         self.assertEqual(github.call_count, 3)
@@ -1138,20 +1139,89 @@ class FactoryTests(unittest.TestCase):
                         "input_sha256": INPUT_SHA, "priority": "critical"})
                 self.assertEqual((self.cb.starts, self.store.writes), ([], []))
 
-    def test_a_revision_older_than_one_already_admitted_is_refused(self):
-        # A late request for an older green revision must not replace a newer one, or a
-        # publication could roll the fleet back.
+    def test_a_revision_must_descend_from_the_last_admitted_source(self):
         head, newer = "8" * 40, "6" * 40
-        self.store.values.clear()
-        self.factory.save("/control", {"last_source": newer})
-        self.store.writes.clear()
+        for comparison in ({"status": "behind", "ahead_by": 0, "behind_by": 1, "merge_base_commit": {"sha": SOURCE_SHA}},
+                           {"status": "diverged", "ahead_by": 1, "behind_by": 1, "merge_base_commit": {"sha": "7" * 40}}):
+            with self.subTest(status=comparison["status"]):
+                self.store.values.clear()
+                self.factory.save("/control", {"last_source": newer})
+                self.store.writes.clear()
+                responses = [{"object": {"sha": head}},
+                    {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+                    comparison]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaisesRegex(mod.Refused, "already admitted"):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
+    def test_legacy_control_keeps_newer_work_when_an_old_critical_request_arrives(self):
+        older, head, old_input = "9" * 40, "8" * 40, "7" * 64
+        for slot, control in (("active", {"active": BUILD}),
+                              ("intent", {"active": {"intent": INPUT_SHA}}),
+                              ("pending", {"pending": INPUT_SHA})):
+            with self.subTest(slot=slot):
+                self.setUp()
+                self.store.values["/factory/control"] = control
+                if slot == "active":
+                    self.factory.journal(BUILD)
+                if slot == "pending":
+                    self.store.values["/factory/requests/" + INPUT_SHA]["status"] = "queued"
+                self.store.writes.clear()
+                before = copy.deepcopy(self.store.values)
+
+                def response(path):
+                    if path == "git/ref/heads/main":
+                        return {"object": {"sha": head}}
+                    if path.startswith("compare/" + older + "..." + head):
+                        return {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": older}}
+                    if path.startswith("compare/" + SOURCE_SHA + "..." + older):
+                        return {"status": "behind", "ahead_by": 0, "behind_by": 1, "merge_base_commit": {"sha": older}}
+                    return {"workflow_runs": [self.ci_run(head_sha=older)]}
+
+                with patch.object(mod, "public_github", side_effect=response), self.assertRaisesRegex(mod.Refused, "already admitted"):
+                    self.factory.request({"action": "request", "source_sha": older, "input_sha256": old_input, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.cb.stops, self.store.writes), ([], [], []))
+                self.assertEqual(self.store.values, before)
+
+    def test_legacy_control_with_unverifiable_work_refuses_a_non_head_request(self):
+        for control in ({"pending": "7" * 64}, {"active": {}}, {"active": BUILD}):
+            with self.subTest(control=control):
+                self.setUp()
+                self.store.values["/factory/control"] = control
+                self.cb.builds[BUILD].pop("resolvedSourceVersion")
+                responses = [{"object": {"sha": "8" * 40}},
+                    {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": "7" * 64, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.cb.stops, self.store.writes), ([], [], []))
+
+    def test_later_green_revision_can_replace_legacy_queued_work(self):
+        later, head, later_input = "6" * 40, "8" * 40, "7" * 64
+        self.store.values["/factory/control"] = {"pending": INPUT_SHA}
+        self.store.values["/factory/requests/" + INPUT_SHA]["status"] = "queued"
         responses = [{"object": {"sha": head}},
-            {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
-            {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}]
-        with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
-            self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+            {"status": "ahead", "ahead_by": 2, "behind_by": 0, "merge_base_commit": {"sha": later}},
+            {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+            {"workflow_runs": [self.ci_run(head_sha=later)]}]
+        with (patch.object(mod, "public_github", side_effect=responses),
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
+            result = self.factory.request({"action": "request", "source_sha": later, "input_sha256": later_input, "priority": "critical"})
+        self.assertEqual((result["status"], result["source_sha"]), ("building", later))
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "superseded")
+        self.assertEqual(self.factory.load("/control")["last_source"], later)
+
+    def test_current_head_does_not_need_legacy_admission_proof(self):
+        self.store.values.clear()
+        self.store.values["/factory/control"] = {"last_source": "unverified"}
+        responses = [{"object": {"sha": SOURCE_SHA}}, {"workflow_runs": [self.ci_run()]}]
+        with (patch.object(mod, "public_github", side_effect=responses),
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
+            result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
                 "input_sha256": INPUT_SHA, "priority": "critical"})
-        self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+        self.assertEqual(result["status"], "building")
+        self.assertEqual(self.factory.load("/control")["last_source"], SOURCE_SHA)
 
     def test_green_ancestor_covers_only_complete_docs_changes(self):
         previous = "9" * 40
