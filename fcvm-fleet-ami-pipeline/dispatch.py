@@ -90,12 +90,24 @@ def documentation_path(path):
             and (len(pieces) == 1 or pieces[0] == "docs"))
 
 
+def source_descends_from(base, head, limit=None):
+    # GitHub only includes file patches on page one; this check needs ancestry alone.
+    comparison = public_github("compare/" + base + "..." + head + "?per_page=1&page=2")
+    distance = comparison.get("ahead_by")
+    return (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+            and type(distance) is int and distance > 0 and (limit is None or distance <= limit)
+            and comparison.get("merge_base_commit", {}).get("sha") == base)
+
+
 def trusted_ci(source):
     # Pin the actual CI workflow, not its display name (the docs summary is also named CI).
     data = public_github("actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20")
     runs = data.get("workflow_runs")
     if not isinstance(runs, list):
         raise Refused("trusted main CI is unavailable")
+    # A requested ancestor's exact run can follow a newer successful run. Scan the
+    # bounded page for an exact match before trying the existing docs-only fallback.
+    fallback = None
     for run in runs[:20]:
         head = run.get("head_sha", "")
         if not (run.get("conclusion") == "success" and run.get("status") == "completed"
@@ -106,23 +118,23 @@ def trusted_ci(source):
             continue
         if head == source:
             return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        comparison = public_github("compare/" + head + "..." + source)
-        files = comparison.get("files")
-        if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
-                and comparison.get("merge_base_commit", {}).get("sha") == head
-                and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
-                and isinstance(files, list) and len(files) < 300):
-            raise Refused("trusted CI comparison is incomplete or outside its bound")
-        safe = True
-        for item in files:
-            previous = item.get("previous_filename")
-            if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
-                safe = False
-                break
-        if safe:
-            return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        raise Refused("non-documentation changes require successful CI for this exact revision")
-    raise Refused("no successful trusted main CI covers these image inputs")
+        if fallback is None:
+            fallback = head, run["id"]
+    if fallback is None:
+        raise Refused("no successful trusted main CI covers these image inputs")
+    head, run_id = fallback
+    comparison = public_github("compare/" + head + "..." + source)
+    files = comparison.get("files")
+    if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+            and comparison.get("merge_base_commit", {}).get("sha") == head
+            and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
+            and isinstance(files, list) and len(files) < 300):
+        raise Refused("trusted CI comparison is incomplete or outside its bound")
+    for item in files:
+        previous = item.get("previous_filename")
+        if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
+            raise Refused("non-documentation changes require successful CI for this exact revision")
+    return {"ci_head_sha": head, "ci_run_id": run_id}
 
 
 def strict(event, allowed, required):
@@ -411,6 +423,26 @@ class Factory:
         return {"status": result["Status"], "response_code": result.get("ResponseCode"),
                 "standard_output": result.get("StandardOutputContent", ""), "standard_error": result.get("StandardErrorContent", "")}
 
+    def admitted_sources(self, control):
+        last = control.get("last_source")
+        if last is not None:
+            sources = [last]
+        else:
+            # Before last_source existed, these records could already hold a newer
+            # revision. Do not let the first ancestor request displace that work.
+            sources = []
+            pending = control.get("pending")
+            if pending is not None:
+                sources.append(self.request_record(pending).get("source_sha"))
+            active = control.get("active")
+            if isinstance(active, dict):
+                sources.append(self.request_record(active.get("intent")).get("source_sha"))
+            elif active is not None:
+                sources.append(self.actual_build(active, active=False).get("resolvedSourceVersion"))
+        if any(not isinstance(source, str) or not SHA.fullmatch(source) for source in sources):
+            raise Refused("a previously admitted factory source could not be verified")
+        return sorted(set(sources))
+
     def request(self, event):
         action = event.get("action")
         if action == "status":
@@ -432,13 +464,21 @@ class Factory:
                 existing = self.request_record(request_id)
             return public_record(existing)
         current = public_github("git/ref/heads/main")["object"]["sha"]
-        if current != event["source_sha"]:
-            raise Refused("only the current main revision can enter the factory")
-        ci = trusted_ci(current)
-        now = int(self.now())
-        record = {"request_id": request_id, "status": "queued", "source_sha": current, "input_sha256": request_id,
-                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
+        source = event["source_sha"]
         control = self.load("/control", {})
+        if current != source:
+            # A busy main rarely holds still for its CI (the next merge cancels the head's run, a
+            # download fails it), so a recent ancestor of main with its own successful CI enters
+            # too, but never one older than a revision already admitted: that would roll back.
+            if not source_descends_from(source, current, limit=250):
+                raise Refused("only main or a recent ancestor of it can enter the factory")
+            for floor in self.admitted_sources(control):
+                if floor != source and not source_descends_from(floor, source):
+                    raise Refused("requested main revision does not descend from a source already admitted by the factory")
+        ci = trusted_ci(source)
+        now = int(self.now())
+        record = {"request_id": request_id, "status": "queued", "source_sha": source, "input_sha256": request_id,
+                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
         previous = self.request_record(control["pending"]) if control.get("pending") else None
         if (previous is not None and previous["priority"] == record["priority"] == "normal"
                 and previous["status"] == "queued" and not previous.get("start_attempted")):
@@ -454,6 +494,7 @@ class Factory:
             previous.update(status="superseded", message="a newer input superseded this queued request")
             self.save("/requests/" + previous["request_id"], previous)
         control["pending"] = request_id
+        control["last_source"] = source
         self.save("/control", control)
         self.reconcile()
         return public_record(self.request_record(request_id))
