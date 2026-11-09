@@ -110,6 +110,17 @@ variable "potato_host_amis" {
   }
 }
 
+variable "windows_host_amis" {
+  description = "Exact reviewed host AMIs that include Windows mode's image and bridge; their hosts run four Windows sandboxes."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for ami in var.windows_host_amis : can(regex("^ami-[0-9a-f]{17}$", ami))])
+    error_message = "Each windows_host_amis entry must be an exact EC2 AMI ID."
+  }
+}
+
 variable "slot_tls_ports" {
   description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
@@ -229,6 +240,12 @@ locals {
       case "$boot_ami" in
         ${join("|", sort(tolist(var.potato_host_amis)))}) agent_args="$agent_args --potato-players 96" ;;
       esac
+      %{if length(var.windows_host_amis) > 0~}
+      # An agent from an older image has no --windows and would refuse it.
+      case "$boot_ami" in
+        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows 4" ;;
+      esac
+      %{endif~}
     fi
     unset token boot_ami
     %{endif~}
