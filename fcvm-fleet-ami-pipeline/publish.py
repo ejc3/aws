@@ -38,7 +38,7 @@ NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-"
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
-DEADLINE_SECONDS = 360 * 60
+EXECUTION_TIMEOUT_MINUTES = (240, 360)
 
 
 class Refused(Exception):
@@ -48,6 +48,13 @@ class Refused(Exception):
 def need(value, message):
     if not value:
         raise Refused(message)
+
+
+def execution_lease_seconds(build):
+    minutes = build.get("timeoutInMinutes")
+    need(type(minutes) is int and minutes in EXECUTION_TIMEOUT_MINUTES,
+         "CodeBuild execution lease is missing or unsupported")
+    return minutes * 60
 
 
 def encoded(value):
@@ -617,7 +624,7 @@ class Publisher:
         source, input_sha = variables.get("SOURCE_SHA", ""), variables.get("INPUT_SHA256", "")
         need(SHA.fullmatch(source) and DIGEST.fullmatch(input_sha)
              and build.get("resolvedSourceVersion") == source, "factory source provenance changed")
-        need(0 < (build["endTime"] - build["startTime"]).total_seconds() <= DEADLINE_SECONDS,
+        need(0 < (build["endTime"] - build["startTime"]).total_seconds() <= execution_lease_seconds(build),
              "build exceeded its fixed execution lease")
         return build, source, input_sha
 
@@ -630,7 +637,7 @@ class Publisher:
              and journal.get("input_sha256") == input_sha and journal.get("request_id") == input_sha
              and set(journal.get("slots", {})) == SLOTS
              and set(journal.get("candidates", {})) == {"host", "tile"}
-             and journal["deadline_unix"] == int(build["startTime"].timestamp()) + DEADLINE_SECONDS
+             and journal["deadline_unix"] == int(build["startTime"].timestamp()) + execution_lease_seconds(build)
              and build["endTime"].timestamp() <= journal["deadline_unix"], "broker proof does not match this completed build")
         ids = [journal["slots"][slot].get("instance_id", "") for slot in sorted(SLOTS)]
         need(len(set(ids)) == 4 and all(re.fullmatch(r"i-[0-9a-f]{17}", item) for item in ids),

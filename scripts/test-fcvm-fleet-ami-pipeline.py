@@ -81,6 +81,7 @@ class CodeBuild:
     def build(self, build_id, variables=None):
         return {"id": build_id, "projectName": "factory", "buildStatus": "IN_PROGRESS",
                 "startTime": datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc), "resolvedSourceVersion": SOURCE_SHA,
+                "timeoutInMinutes": 360,
                 "environment": {"environmentVariables": variables or [
                     {"name": "SOURCE_SHA", "value": SOURCE_SHA}, {"name": "INPUT_SHA256", "value": INPUT_SHA},
                     {"name": "FLEET_AMI_CAPABILITY", "value": CAP}]}}
@@ -98,6 +99,7 @@ class CodeBuild:
         build = self.build(build_id, kwargs["environmentVariablesOverride"])
         build["resolvedSourceVersion"] = kwargs["sourceVersion"]
         build["startTime"] = datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc)
+        build["timeoutInMinutes"] = kwargs.get("timeoutInMinutesOverride", 240)
         self.builds[build_id] = build
         if self.lose_start:
             self.lose_start = False
@@ -364,7 +366,7 @@ class FactoryTests(unittest.TestCase):
         self.ec2.instances[instance_id]["State"]["Name"] = "stopped"
         return self.call("seal", slot)
 
-    def request(self, priority="normal", input_sha=INPUT_SHA, source_sha=SOURCE_SHA):
+    def request(self, priority="normal", input_sha=INPUT_SHA, source_sha=SOURCE_SHA, comparison=None):
         if not self.queue_prepared and not self.ec2.launches:
             self.store.values.pop("/factory/control", None)
             self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
@@ -372,6 +374,10 @@ class FactoryTests(unittest.TestCase):
         def response(path):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": source_sha}}
+            if path == "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha:
+                if isinstance(comparison, Exception):
+                    raise comparison
+                return comparison
             return {"workflow_runs": [self.ci_run(head_sha=source_sha)]}
         with patch.object(mod, "public_github", side_effect=response):
             return self.factory.request({"action": "request", "source_sha": source_sha, "input_sha256": input_sha, "priority": priority})
@@ -657,8 +663,8 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.publisher.calls[0], self.publisher.calls[1])
 
     def test_success_near_compute_deadline_keeps_a_separate_publication_lease(self):
-        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
-        self.time = NOW + mod.DEADLINE_SECONDS + 10
+        ended = self.succeed(21600 - 2)
+        self.time = NOW + 21600 + 10
         self.factory.reconcile()
         record = self.factory.request_record(INPUT_SHA)
         self.assertEqual(record["status"], "awaiting-publish")
@@ -674,11 +680,11 @@ class FactoryTests(unittest.TestCase):
             self.call("status", kind + "-build")
             instance_id = self.launch(kind + "-verify")
             self.ec2.instances[instance_id]["State"]["Name"] = "shutting-down"
-        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
+        ended = self.succeed(21600 - 2)
         self.factory.reconcile()
         self.assertEqual(self.publisher.calls, [], "a successful executor is not termination proof")
         self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "awaiting-publish")
-        self.time = NOW + mod.DEADLINE_SECONDS + 360
+        self.time = NOW + 21600 + 360
         for instance in self.ec2.instances.values():
             instance["State"]["Name"] = "terminated"
             instance.pop("IamInstanceProfile", None)  # Actual terminal EC2 shape.
@@ -749,7 +755,7 @@ class FactoryTests(unittest.TestCase):
 
     def test_deadline_cannot_be_reset_but_cleanup_still_works(self):
         instance_id = self.launch()
-        self.time += mod.DEADLINE_SECONDS + 1
+        self.time += 21600 + 1
         for action in ("launch", "start", "reboot", "credentials"):
             with self.assertRaises(mod.Refused):
                 self.call(action, "host-build")
@@ -778,9 +784,38 @@ class FactoryTests(unittest.TestCase):
         self.assertIn(instance_id, [name for batch in self.ec2.terminations for name in batch])
         self.assertEqual(len(self.ec2.launches), 1)
 
-    def test_codebuild_global_timeout_keeps_the_separate_command_ceiling(self):
+    def test_legacy_receipt_journals_and_expires_at_240_under_new_broker(self):
+        self.cb.builds[BUILD]["timeoutInMinutes"] = 240
+        instance_id = self.launch()
+        self.assertEqual(self.factory.journal(BUILD)[1]["deadline_unix"], NOW + 14400)
+        self.time = NOW + 14400
+        with self.assertRaises(mod.Refused):
+            self.call("credentials")
+        self.factory.tick()
+        self.assertEqual(self.cb.stops, [BUILD])
+        self.assertTrue(all(ids == [instance_id] for ids in self.ec2.terminations))
+        self.assertTrue(self.ec2.terminations)
+
+    def test_missing_receipt_cannot_authorize_more_work_or_block_cleanup(self):
+        instance_id = self.launch()
+        del self.cb.builds[BUILD]["timeoutInMinutes"]
+        with self.assertRaises(mod.Refused):
+            self.call("launch", "tile-build")
+        self.factory.tick()
+        self.assertEqual(self.cb.stops, [BUILD])
+        self.assertIn([instance_id], self.ec2.terminations)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+
+    def test_orphan_builder_without_journal_keeps_the_shorter_sweep_bound(self):
+        instance_id = self.launch()
+        self.store.values.pop("/factory/builds/" + mod.digest(BUILD))
+        self.time = NOW + 14400
+        self.factory.tick()
+        self.assertEqual(self.ec2.terminations, [[instance_id]])
+
+    def test_codebuild_default_keeps_the_legacy_and_separate_command_bounds(self):
         text = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
-        self.assertRegex(text, r"fcvm_ami_build_minutes\s*=\s*360\b")
+        self.assertRegex(text, r"fcvm_ami_build_minutes\s*=\s*240\b")
         self.assertRegex(text, r"build_timeout\s*=\s*local\.fcvm_ami_build_minutes")
         document = re.search(r'^resource "aws_ssm_document" "fcvm_ami_build" \{\n.*?^\}', text, re.S | re.M).group()
         self.assertIn('default = "9000"', document)
@@ -862,12 +897,37 @@ class FactoryTests(unittest.TestCase):
         self.cb.builds.clear()
         self.cb.lose_start = True
         with self.assertRaises(TimeoutError):
-            self.request("critical")
+            self.request("critical", source_sha=mod.EXTENDED_TIMEOUT_SOURCE)
         self.factory.reconcile()
         self.assertEqual(len(self.cb.starts), 1)
         record = self.factory.request_record(INPUT_SHA)
         self.assertEqual(record["status"], "building")
         self.assertEqual(record["build_id"], "factory:22222222-2222-2222-2222-222222222222")
+        self.assertEqual(record["deadline_unix"], NOW + 21600)
+
+    def test_six_hour_override_requires_a_compatible_executor_source(self):
+        supported = mod.EXTENDED_TIMEOUT_SOURCE
+        proof = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": supported}}
+        for source, compare, expected in (
+            (supported, None, 360),
+            ("1" * 40, proof, 360),
+            ("2" * 40, {**proof, "status": "behind"}, 240),
+            ("3" * 40, {**proof, "merge_base_commit": {"sha": "9" * 40}}, 240),
+            ("4" * 40, OSError("GitHub unavailable"), 240),
+        ):
+            with self.subTest(source=source):
+                self.setUp()
+                result = self.request("critical", source_sha=source, comparison=compare)
+                self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], expected)
+                self.assertEqual(result["deadline_unix"], NOW + expected * 60)
+
+    def test_request_queued_before_upgrade_keeps_legacy_project_timeout(self):
+        result = self.request(source_sha=mod.EXTENDED_TIMEOUT_SOURCE)
+        del self.store.values["/factory/requests/" + INPUT_SHA]["build_timeout_minutes"]
+        self.time = result["not_before"]
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], 240)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["deadline_unix"], self.time + 14400)
 
     def test_definitive_start_rejection_releases_only_its_intent_for_new_critical_work(self):
         for code in ("AccountLimitExceededException", "InvalidInputException", "ResourceNotFoundException", "AccessDeniedException"):
@@ -1008,7 +1068,7 @@ class FactoryTests(unittest.TestCase):
         foreign["InstanceId"] = "i-99999999999999999"
         foreign["IamInstanceProfile"]["Arn"] = "arn:aws:iam::123456789012:instance-profile/production"
         self.ec2.instances[foreign["InstanceId"]] = foreign
-        self.time += mod.DEADLINE_SECONDS + 1
+        self.time += 21600 + 1
         self.factory.tick()
         self.assertEqual(self.ec2.terminations, [[instance_id]])
 
@@ -1165,7 +1225,7 @@ class FactoryTests(unittest.TestCase):
                 comparison = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": previous},
                     "total_commits": 1, "files": [changed]}
                 responses = [{"object": {"sha": SOURCE_SHA}},
-                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison]
+                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison, {"status": "behind"}]
                 with patch.object(mod, "public_github", side_effect=responses):
                     result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
                         "input_sha256": INPUT_SHA, "priority": "critical"})

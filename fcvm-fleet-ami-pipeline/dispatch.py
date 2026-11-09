@@ -20,7 +20,10 @@ from botocore.exceptions import ClientError
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
 VOLUMES = {"host": 64, "tile": 32}
-DEADLINE_SECONDS = 360 * 60
+LEGACY_TIMEOUT_MINUTES = 240
+EXTENDED_TIMEOUT_MINUTES = 360
+# First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
+EXTENDED_TIMEOUT_SOURCE = "063042ae40a1a6df3f1b4fc7d72fc3625a427058"
 PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -54,6 +57,29 @@ def public_github(path):
     if len(raw) > 2 * 1024 * 1024:
         raise Refused("trusted CI metadata exceeds its fixed bound")
     return json.loads(raw)
+
+
+def execution_timeout_minutes(source):
+    if source == EXTENDED_TIMEOUT_SOURCE:
+        return EXTENDED_TIMEOUT_MINUTES
+    try:
+        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source)
+    except (OSError, ValueError, Refused):
+        # Missing ancestry proof is not permission to extend the legacy bound.
+        return LEGACY_TIMEOUT_MINUTES
+    if isinstance(comparison, dict):
+        base = comparison.get("merge_base_commit")
+        if (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                and isinstance(base, dict) and base.get("sha") == EXTENDED_TIMEOUT_SOURCE):
+            return EXTENDED_TIMEOUT_MINUTES
+    return LEGACY_TIMEOUT_MINUTES
+
+
+def execution_deadline(build):
+    minutes = build.get("timeoutInMinutes")
+    if type(minutes) is int and minutes in (LEGACY_TIMEOUT_MINUTES, EXTENDED_TIMEOUT_MINUTES):
+        return int(build["startTime"].timestamp()) + minutes * 60
+    return None
 
 
 def documentation_path(path):
@@ -155,7 +181,8 @@ class Factory:
         record = self.load("/requests/" + journal["request_id"], {})
         build = self.actual_build(journal["build_id"], active=False)
         return (control.get("active") == journal["build_id"] and record.get("status") not in (None, "superseded", "failed")
-                and build["buildStatus"] == "IN_PROGRESS" and build.get("resolvedSourceVersion") == journal["source_sha"])
+                and build["buildStatus"] == "IN_PROGRESS" and build.get("resolvedSourceVersion") == journal["source_sha"]
+                and execution_deadline(build) == journal["deadline_unix"])
 
     def actual_build(self, build_id, active=True):
         if not isinstance(build_id, str) or not build_id.startswith(self.project + ":") or not re.fullmatch(r"[0-9a-f-]{36}", build_id.split(":", 1)[1]):
@@ -181,7 +208,8 @@ class Factory:
         if journal is None:
             started = int(build["startTime"].timestamp())
             journal = {"build_id": build_id, "source_sha": source, "input_sha256": input_sha, "request_id": input_sha,
-                       "started": started, "deadline_unix": started + DEADLINE_SECONDS, "slots": {}, "candidates": {}}
+                       # An unsupported receipt has no compute lease, but still gets cleanup.
+                       "started": started, "deadline_unix": execution_deadline(build) or started, "slots": {}, "candidates": {}}
             self.save(suffix, journal)
         if journal["source_sha"] != source or journal["input_sha256"] != input_sha:
             raise Refused("immutable build provenance changed")
@@ -416,6 +444,7 @@ class Factory:
                 and previous["status"] == "queued" and not previous.get("start_attempted")):
             # Keep the first request's window while replacing its source with the newest main.
             record["not_before"] = min(record["not_before"], previous["not_before"])
+        record["build_timeout_minutes"] = execution_timeout_minutes(record["source_sha"])
         self.save("/requests/" + request_id, record)
         if previous is not None:
             if previous["priority"] == "critical" and record["priority"] == "normal":
@@ -496,7 +525,8 @@ class Factory:
                 build = self.actual_build(active, active=False)
                 record = self.request_record(journal["request_id"])
                 preempt = pending and pending["priority"] == "critical" and pending["request_id"] != record["request_id"]
-                succeeded = build["buildStatus"] == "SUCCEEDED"
+                invalid_lease = execution_deadline(build) != journal["deadline_unix"]
+                succeeded = build["buildStatus"] == "SUCCEEDED" and not invalid_lease
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
@@ -508,11 +538,15 @@ class Factory:
                     if self.now() >= publication_deadline:
                         release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
-                if preempt or expired or failed or publication_expired:
+                if preempt or expired or failed or publication_expired or invalid_lease:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
                     self.cleanup(journal)
-                    record.update(status="superseded" if preempt else "failed", message="preempted by critical work" if preempt else "publication lease expired" if publication_expired else "factory stopped or reached its fixed deadline")
+                    message = ("preempted by critical work" if preempt else
+                               "CodeBuild execution lease does not match its journal" if invalid_lease else
+                               "publication lease expired" if publication_expired else
+                               "factory stopped or reached its fixed deadline")
+                    record.update(status="superseded" if preempt else "failed", message=message)
                     self.save("/requests/" + record["request_id"], record)
                     if not self.gone(suffix, journal):
                         return
@@ -557,8 +591,10 @@ class Factory:
         # No backend lock is held through StartBuild or its reconciliation.
         if is_new:
             try:
+                minutes = (EXTENDED_TIMEOUT_MINUTES if start_record.get("build_timeout_minutes") == EXTENDED_TIMEOUT_MINUTES
+                           else LEGACY_TIMEOUT_MINUTES)
                 build = self.client("codebuild").start_build(projectName=self.project, sourceVersion=start_record["source_sha"],
-                    idempotencyToken=start_record["request_id"], environmentVariablesOverride=[
+                    idempotencyToken=start_record["request_id"], timeoutInMinutesOverride=minutes, environmentVariablesOverride=[
                         {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
                         {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
                         {"name": "FLEET_AMI_CAPABILITY", "value": secrets.token_urlsafe(32), "type": "PLAINTEXT"}])["build"]
@@ -593,7 +629,8 @@ class Factory:
             if control.get("active") != {"intent": start_record["request_id"]}:
                 raise Refused("build start no longer owns the control intent")
             record = self.request_record(start_record["request_id"])
-            record.update(status="superseded" if record["status"] == "superseded" else "building", build_id=build["id"], deadline_unix=int(build["startTime"].timestamp()) + DEADLINE_SECONDS)
+            record.update(status="superseded" if record["status"] == "superseded" else "building",
+                          build_id=build["id"], deadline_unix=execution_deadline(build))
             control["active"] = build["id"]
             if control.get("pending") == start_record["request_id"]:
                 control["pending"] = None
@@ -613,9 +650,15 @@ class Factory:
             if not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
                 continue
             journal = self.load("/builds/" + build_hash)
-            age = self.now() - instance["LaunchTime"].timestamp()
-            expired = age >= DEADLINE_SECONDS or journal is not None and self.now() >= journal["deadline_unix"]
-            terminal = journal is not None and self.actual_build(journal["build_id"], active=False)["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
+            if journal is not None:
+                build = self.actual_build(journal["build_id"], active=False)
+                deadline = execution_deadline(build)
+                expired = deadline is None or self.now() >= min(deadline, journal["deadline_unix"])
+                terminal = build["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
+            else:
+                # A real launch has a durable journal before RunInstances; a lost journal cannot extend compute.
+                expired = self.now() - instance["LaunchTime"].timestamp() >= LEGACY_TIMEOUT_MINUTES * 60
+                terminal = False
             if expired or terminal:
                 self.client("ec2", True).terminate_instances(InstanceIds=[instance["InstanceId"]])
         self.reconcile()
