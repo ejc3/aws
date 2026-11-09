@@ -96,7 +96,8 @@ locals {
   fcvm_ami_builder_tag    = "fcvm-fleet-ami-builder"
   fcvm_ami_source         = "https://github.com/ejc3/fcvm.git"
   fcvm_ami_guard_sha      = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  fcvm_ami_build_minutes  = 240
+  # An older dispatcher still inherits this default; the new broker sets the per-build override.
+  fcvm_ami_build_minutes = 240
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {

@@ -325,6 +325,7 @@ class PublisherTests(unittest.TestCase):
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
         build = {"id": self.build, "projectName": "factory", "buildStatus": "SUCCEEDED", "buildComplete": True,
             "resolvedSourceVersion": self.source, "startTime": start, "endTime": start + datetime.timedelta(hours=2),
+            "timeoutInMinutes": 360,
             "environment": {"environmentVariables": [{"name": "SOURCE_SHA", "value": self.source}, {"name": "INPUT_SHA256", "value": self.input}]}}
         self.main_ssm, self.fleet_ssm, self.ddb, self.ec2 = SSM(), SSM(), DDB(), EC2()
         self.west = EC2("us-west-2", self.ec2.peers)
@@ -341,7 +342,7 @@ class PublisherTests(unittest.TestCase):
         self.fleet_ssm.values["/release"] = release
         self.env["SEED_RELEASE_JSON"] = json.dumps({"source_sha": self.source, "images": new, "expected": copy.deepcopy(release)})
         journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
-                   "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
+                   "deadline_unix": int(start.timestamp()) + 21600, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
             instance = "i-" + format(i, "017x")
             journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
@@ -1405,29 +1406,44 @@ class PublisherTests(unittest.TestCase):
         block = text.split('resource "aws_lambda_function" "fcvm_ami_publish" {', 1)[1].split('\n}\n', 1)[0]
         self.assertIn('BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn', block)
 
-    def test_success_after_150_minutes_and_at_exactly_240_can_publish(self):
-        for seconds in (9001, 14400):
+    def test_success_after_240_minutes_and_at_exactly_360_can_publish(self):
+        for seconds in (9001, 14401, 21600):
             with self.subTest(seconds=seconds):
                 self.setUp()
                 self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=seconds)
                 try:
                     result = self.publisher().run(self.event)
                 except MODULE.Refused as error:
-                    self.fail("the approved 240-minute build was refused: " + str(error))
+                    self.fail("the approved 360-minute build was refused: " + str(error))
                 self.assertEqual(result, {"status": "promoted", "generation": 1})
                 self.assertEqual(len(self.ec2.created), 4)
 
+    def set_execution_receipt(self, timeout_minutes, elapsed_seconds, journal_seconds):
+        build = self.codebuild.value
+        if timeout_minutes is None:
+            del build["timeoutInMinutes"]
+        else:
+            build["timeoutInMinutes"] = timeout_minutes
+        build["endTime"] = build["startTime"] + datetime.timedelta(seconds=elapsed_seconds)
+        journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+        journal["deadline_unix"] = int(build["startTime"].timestamp()) + journal_seconds
+        self.manifest["deadline_unix"] = journal["deadline_unix"]
+        self.update_manifest()
+
+    def test_legacy_execution_receipt_and_proof_still_publish(self):
+        self.set_execution_receipt(240, 14400, 14400)
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual(len(self.ec2.created), 4)
+
     def test_overlong_or_mismatched_execution_lease_cannot_change_templates(self):
-        for case in ("elapsed-over-240", "old-journal", "extended-journal"):
-            with self.subTest(case=case):
+        for timeout_minutes, elapsed_seconds, journal_seconds in (
+            (240, 14401, 14400), (240, 1000, 21600), (360, 21601, 21600),
+            (360, 1000, 14400), (360, 1000, 21601),
+            (None, 1000, 21600), (300, 1000, 18000), ("360", 1000, 21600),
+        ):
+            with self.subTest(timeout=timeout_minutes, elapsed=elapsed_seconds, journal=journal_seconds):
                 self.setUp()
-                if case == "elapsed-over-240":
-                    self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=14401)
-                else:
-                    journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
-                    journal["deadline_unix"] = int(self.codebuild.value["startTime"].timestamp()) + (9000 if case == "old-journal" else 14401)
-                    self.manifest["deadline_unix"] = journal["deadline_unix"]
-                    self.update_manifest()
+                self.set_execution_receipt(timeout_minutes, elapsed_seconds, journal_seconds)
                 with self.assertRaises(MODULE.Refused):
                     self.publisher().run(self.event)
                 self.assertEqual((self.ec2.created, self.assets.copies), ([], []))

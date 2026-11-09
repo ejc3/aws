@@ -493,12 +493,14 @@ source builds; routine changes batch for six hours from the first queued request
 at most once per UTC day, with a weekly refresh. Newer routine inputs replace the
 queued source without pushing back its deadline. Critical-labelled merges and a
 main `critical` dispatch start immediately after validation and can preempt a
-routine build once its builders are terminated. Each job has a 240-minute deadline,
-at most one `g4dn.metal` host and one `g4dn.xlarge` tile active, and four total
-build/validation slots. An independent
-five-minute expiry sweep bounds abandoned compute. At the current instance rates,
-four hours plus the expiry sweep is about $35 of compute; EBS, snapshots, CodeBuild
-and transfer remain additional. Individual SSM commands remain capped at 150 minutes.
+routine build once its builders are terminated. Jobs on a compatible executor have
+a 360-minute deadline; older revisions and requests queued before the change keep
+240 minutes. At most one `g4dn.metal` host and one `g4dn.xlarge` tile are active,
+with four total build/validation slots. An independent five-minute expiry sweep
+bounds abandoned compute. The six-hour ceiling allows up to half again as much
+instance time as the four-hour ceiling, plus the same sweep delay. EBS, snapshots,
+CodeBuild and transfer are additional. Individual SSM commands remain capped at
+150 minutes.
 
 GitHub receives only a main-environment request/status role. Fixed AWS handlers
 launch the bounded slots and issue job-bound worker credentials; CI cannot read
@@ -572,7 +574,7 @@ Each manual critical dispatch gets a fresh request identity, allowing a controll
 same-source retry without resetting a failed request or replaying uncertain launches.
 The five-minute reconciler retries successful-build publication outside the backend
 lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
-This publication interval never extends the 240-minute compute lease.
+This publication interval never extends the build's recorded compute lease.
 The executor saves validation before final cleanup; publication waits for the
 dispatcher to confirm every actual termination, including delayed EC2 shutdowns.
 Failed, unreferenced candidates remain private for 24 hours after the native build
