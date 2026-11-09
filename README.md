@@ -493,7 +493,7 @@ source builds; routine changes batch for six hours from the first queued request
 at most once per UTC day, with a weekly refresh. Newer routine inputs replace the
 queued source without pushing back its deadline. Critical-labelled merges and a
 main `critical` dispatch start immediately after validation and can preempt a
-routine build once its builders are terminated. Each job has a 240-minute deadline,
+routine build once its builders are terminated. Each job has a 360-minute deadline,
 at most one `g4dn.metal` host and one `g4dn.xlarge` tile active, and four total
 build/validation slots. An independent
 five-minute expiry sweep bounds abandoned compute. At the current instance rates,
@@ -572,7 +572,7 @@ Each manual critical dispatch gets a fresh request identity, allowing a controll
 same-source retry without resetting a failed request or replaying uncertain launches.
 The five-minute reconciler retries successful-build publication outside the backend
 lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
-This publication interval never extends the 240-minute compute lease.
+This publication interval never extends the 360-minute compute lease.
 The executor saves validation before final cleanup; publication waits for the
 dispatcher to confirm every actual termination, including delayed EC2 shutdowns.
 Failed, unreferenced candidates remain private for 24 hours after the native build

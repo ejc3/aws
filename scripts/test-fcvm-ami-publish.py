@@ -341,7 +341,7 @@ class PublisherTests(unittest.TestCase):
         self.fleet_ssm.values["/release"] = release
         self.env["SEED_RELEASE_JSON"] = json.dumps({"source_sha": self.source, "images": new, "expected": copy.deepcopy(release)})
         journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
-                   "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
+                   "deadline_unix": int(start.timestamp()) + MODULE.DEADLINE_SECONDS, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
             instance = "i-" + format(i, "017x")
             journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
@@ -1405,27 +1405,27 @@ class PublisherTests(unittest.TestCase):
         block = text.split('resource "aws_lambda_function" "fcvm_ami_publish" {', 1)[1].split('\n}\n', 1)[0]
         self.assertIn('BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn', block)
 
-    def test_success_after_150_minutes_and_at_exactly_240_can_publish(self):
-        for seconds in (9001, 14400):
+    def test_success_after_240_minutes_and_at_exactly_360_can_publish(self):
+        for seconds in (9001, 14401, 21600):
             with self.subTest(seconds=seconds):
                 self.setUp()
                 self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=seconds)
                 try:
                     result = self.publisher().run(self.event)
                 except MODULE.Refused as error:
-                    self.fail("the approved 240-minute build was refused: " + str(error))
+                    self.fail("the approved 360-minute build was refused: " + str(error))
                 self.assertEqual(result, {"status": "promoted", "generation": 1})
                 self.assertEqual(len(self.ec2.created), 4)
 
     def test_overlong_or_mismatched_execution_lease_cannot_change_templates(self):
-        for case in ("elapsed-over-240", "old-journal", "extended-journal"):
+        for case in ("elapsed-over-360", "old-journal", "extended-journal"):
             with self.subTest(case=case):
                 self.setUp()
-                if case == "elapsed-over-240":
-                    self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=14401)
+                if case == "elapsed-over-360":
+                    self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=21601)
                 else:
                     journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
-                    journal["deadline_unix"] = int(self.codebuild.value["startTime"].timestamp()) + (9000 if case == "old-journal" else 14401)
+                    journal["deadline_unix"] = int(self.codebuild.value["startTime"].timestamp()) + (14400 if case == "old-journal" else 21601)
                     self.manifest["deadline_unix"] = journal["deadline_unix"]
                     self.update_manifest()
                 with self.assertRaises(MODULE.Refused):

@@ -38,7 +38,7 @@ NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-"
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
-DEADLINE_SECONDS = 240 * 60
+DEADLINE_SECONDS = 360 * 60
 
 
 class Refused(Exception):
