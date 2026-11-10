@@ -1959,6 +1959,16 @@ apply. The bucket needs **Workers R2 Storage Write** (permission group `bf7481a1
 token `cloudflare-tunnel-token`. Add it with one PUT of the token's definition, the same way Workers KV Storage Write was
 added.
 
+### Dolphin site probe token (dolphin-site-probe.tf)
+
+The site probe in the Dolphin account (dolphin-aws `monitoring.tf`) alarms on the production Worker as Cloudflare saw it:
+failed invocations by event type, console.error lines, and 5xx answers on gamesworthwatching.com. It reads them with an
+account token minted here: Workers Observability Read on the account (Workers Logs) and Analytics Read on the
+gamesworthwatching.com zone only, nothing that writes. Terraform writes it, with the account and zone ids, into
+`dolphin-site-probe/cloudflare` in the Dolphin account through `aws.dolphin`, once dolphin-aws has created that container
+(output `dolphin_site_probe.secret_written`). Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`.
+The `dolphin-alerts` topic's policy (`dolphin-security.tf`) also lets the Dolphin account's own Budgets publish to it.
+
 ### dolphin-labs live logs R2 (dolphin-labs-live-logs.tf)
 
 The R2 bucket `dolphin-labs-live-logs` holds the live capture's daily logs, written by the Workers through the binding
