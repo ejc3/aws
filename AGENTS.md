@@ -1959,15 +1959,19 @@ apply. The bucket needs **Workers R2 Storage Write** (permission group `bf7481a1
 token `cloudflare-tunnel-token`. Add it with one PUT of the token's definition, the same way Workers KV Storage Write was
 added.
 
-### Dolphin site probe token (dolphin-site-probe.tf)
+### Dolphin site probe token and budgets (dolphin-site-probe.tf, dolphin-budgets.tf)
 
 The site probe in the Dolphin account (dolphin-aws `monitoring.tf`) alarms on the production Worker as Cloudflare saw it:
 failed invocations by event type, console.error lines, and 5xx answers on gamesworthwatching.com. It reads them with an
 account token minted here: Workers Observability Read on the account (Workers Logs) and Analytics Read on the
 gamesworthwatching.com zone only, nothing that writes. Terraform writes it, with the account and zone ids, into
-`dolphin-site-probe/cloudflare` in the Dolphin account through `aws.dolphin`, once dolphin-aws has created that container
-(output `dolphin_site_probe.secret_written`). Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`.
-The `dolphin-alerts` topic's policy (`dolphin-security.tf`) also lets the Dolphin account's own Budgets publish to it.
+`dolphin-site-probe/cloudflare` in the Dolphin account through `aws.dolphin`. That container is dolphin-aws's, so
+**dolphin-aws is applied first**, then this merges; the write is unconditional, and a missing container fails the apply.
+Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`.
+
+`dolphin-budgets.tf` keeps the Dolphin account's cost budgets (`dolphin-daily`, $100; `dolphin-monthly`, $1,500
+forecast and actual) on `dolphin-alerts`, after the topic's policy (`dolphin-security.tf`, `DolphinBudgets`) lets
+Budgets publish, in the same apply.
 
 ### dolphin-labs live logs R2 (dolphin-labs-live-logs.tf)
 

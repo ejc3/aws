@@ -14,8 +14,8 @@
 #
 # The container, its reader and its policy are dolphin-aws's (monitoring.tf, modules/admin-secret: no version,
 # administration-only writes, OrganizationAccountAccessRole among administration). This file writes only its value,
-# through aws.dolphin, as dolphin-labs-podcasts.tf writes the podcasts' R2 credentials: until dolphin-aws has created the
-# container nothing is written, and the next apply after it writes the value. The token's value is in state, as with the
+# through aws.dolphin. ORDER: dolphin-aws is applied first (it creates the container); then this merges and the
+# jumpbox applies it once. The token's value is in state, as with the
 # other tokens Terraform mints; state is administration only. ROTATE with
 # `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`; the same apply rewrites the secret.
 
@@ -41,22 +41,10 @@ resource "cloudflare_account_token" "dolphin_site_probe" {
   ]
 }
 
-data "aws_secretsmanager_secrets" "dolphin_site_probe" {
-  provider = aws.dolphin
-  filter {
-    name   = "name"
-    values = [local.dolphin_site_probe_secret]
-  }
-}
-
-locals {
-  # ListSecrets matches the name as a prefix; only the exact name turns this on.
-  dolphin_site_probe_secret_ready = contains(data.aws_secretsmanager_secrets.dolphin_site_probe.names, local.dolphin_site_probe_secret)
-}
-
+# Written unconditionally: dolphin-aws (monitoring.tf) creates the container, and is applied before this file merges
+# (the order is in AGENTS.md, "Dolphin site probe token"). A missing container fails this apply, loudly.
 resource "aws_secretsmanager_secret_version" "dolphin_site_probe" {
   provider  = aws.dolphin
-  count     = local.dolphin_site_probe_secret_ready ? 1 : 0
   secret_id = local.dolphin_site_probe_secret
   secret_string = jsonencode({
     CLOUDFLARE_API_TOKEN  = cloudflare_account_token.dolphin_site_probe.value
@@ -66,9 +54,6 @@ resource "aws_secretsmanager_secret_version" "dolphin_site_probe" {
 }
 
 output "dolphin_site_probe" {
-  description = "The site probe's Cloudflare token: whether it is written to dolphin-site-probe/cloudflare in the Dolphin account (false until dolphin-aws creates that container)."
-  value = {
-    secret         = local.dolphin_site_probe_secret
-    secret_written = local.dolphin_site_probe_secret_ready
-  }
+  description = "The site probe's Cloudflare token, written to this secret in the Dolphin account."
+  value       = { secret = local.dolphin_site_probe_secret }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""dolphin-site-probe.tf: a read-only Cloudflare token for the Dolphin account's site probe (Workers Logs on the account,
-analytics on gamesworthwatching.com alone), written only into the Dolphin account's container, once that container
-exists."""
+"""dolphin-site-probe.tf and dolphin-budgets.tf: a read-only Cloudflare token for the Dolphin account's site probe
+(Workers Logs on the account, analytics on gamesworthwatching.com alone), written only into the Dolphin account's
+container; and that account's budgets on dolphin-alerts."""
 import re
 import unittest
 from pathlib import Path
@@ -38,16 +38,31 @@ class TokenTests(unittest.TestCase):
 
 
 class SecretTests(unittest.TestCase):
-    def test_value_goes_only_to_the_dolphin_accounts_container_once_it_exists(self):
+    def test_value_goes_only_to_the_dolphin_accounts_container_written_once(self):
         ver = block("aws_secretsmanager_secret_version", "dolphin_site_probe")
         self.assertIn("provider  = aws.dolphin", ver)
-        self.assertIn("count     = local.dolphin_site_probe_secret_ready ? 1 : 0", ver)
+        # Unconditional: dolphin-aws is applied first, so the jumpbox's one apply on merge writes it.
+        self.assertNotRegex(ver, r"(?m)^\s*count\s*=")
         self.assertIn("secret_id = local.dolphin_site_probe_secret", ver)
         self.assertIn('dolphin_site_probe_secret = "dolphin-site-probe/cloudflare"', TF)
         for key in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ZONE_ID"):
             self.assertIn(key, ver)
         # dolphin-aws owns the container and its policy; this file never creates one in either account.
         self.assertNotRegex(code(TF), r'resource "aws_secretsmanager_secret(_policy)?" ')
+
+
+BUDGETS = (ROOT / "dolphin-budgets.tf").read_text()
+
+
+class BudgetTests(unittest.TestCase):
+    def test_the_dolphin_accounts_budgets_tell_dolphin_alerts_after_its_policy_lets_them(self):
+        budgets = re.findall(r'^resource "aws_budgets_budget" "(\w+)" \{\n(.*?)^\}', BUDGETS, re.M | re.S)
+        self.assertEqual(sorted(name for name, _ in budgets), ["dolphin_daily", "dolphin_monthly"])
+        for name, body in budgets:
+            self.assertIn("provider     = aws.dolphin", body, name)
+            self.assertIn("subscriber_sns_topic_arns = [data.aws_sns_topic.dolphin_alerts.arn]", body, name)
+            self.assertIn("depends_on = [aws_sns_topic_policy.dolphin_alerts]", body, name)
+        self.assertIn('notification_type         = "FORECASTED"', dict(budgets)["dolphin_monthly"])
 
 
 if __name__ == "__main__":
