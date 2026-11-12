@@ -1487,6 +1487,115 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
         self.assertIsNone(self.ddb.item)
 
+    RESTORE_SOURCE = "0e910245f92d3ff093ec1fad1fdbe69fef948f3c"
+    RESTORE_IMAGE = "ami-0c1f87eea5c86c172"
+    RESTORE_NAME = "fcvm-fleet-host-x86_64-0e910245-202611121727"
+
+    def reviewed_restore_host_fixture(self):
+        """Generation nine live (the 853eb034 host, released by its own action), and the 0e910245
+        host built by hand in us-west-2 and tagged validated there by Terraform."""
+        publisher, event, _, _, _ = self.reviewed_windows_host_fixture()
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 9})
+        nine = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # Generation ten's predecessor constants, as they are filled from the generation-nine receipt.
+        for name, value in (("WINDOWS_HOST_COPY", nine["host_amis"]["us-east-1"]["x86_64"]),
+                            ("WINDOWS_HOST_VERSION", nine["versions"]["us-east-1/" + self.ids[0]])):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        before_copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        original = self.RESTORE_IMAGE
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.RESTORE_SOURCE[:8]}"\s*=\s*{{ image = "{original}", kind = "host", '
+                                  rf'name = "{self.RESTORE_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.WINDOWS_IMAGE])
+        image.update(ImageId=original, Name=self.RESTORE_NAME, State="available",
+                     Description="fcvm fleet: " + self.RESTORE_NAME, SourceImageId=self.WINDOWS_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[original] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.ec2.copies.clear()
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        return publisher, {"action": "activate-reviewed-restore-host-release"}, nine, before_copies, original
+
+    def test_reviewed_restore_host_releases_generation_ten_after_generation_nine(self):
+        publisher, event, nine, nine_copies, original = self.reviewed_restore_host_fixture()
+        host, *tiles = self.ids
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(source_image, copied)] = self.ec2.copies
+        self.assertEqual(source_image, original)
+        self.ec2.available()
+        with self.assertRaisesRegex(MODULE.Refused, "host bootstrap does not name the release-region copy yet"):
+            publisher.run(event)
+        # Terraform's second apply: the bootstrap names the generation-ten copy too.
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap with --windows 4 and --minecraft 4 names the gen9 and gen10 hosts: "
+                                     + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        old_templates = copy.deepcopy(self.ec2.templates)
+        # A publisher reads its environment when it starts: the next invocation sees the new digest.
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 10})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (10, self.RESTORE_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-restore-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_restore_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], nine["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in nine.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**nine["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"], original)
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 10})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_restore_host_names_the_generation_nine_receipt(self):
+        # Filled from the live generation-nine receipt: an image id and a template version.
+        self.assertRegex(MODULE.Publisher.WINDOWS_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertIs(type(MODULE.Publisher.WINDOWS_HOST_VERSION), int)
+        self.assertGreater(MODULE.Publisher.WINDOWS_HOST_VERSION, 0)
+
+    def test_reviewed_restore_host_refuses_a_predecessor_other_than_the_one_it_names(self):
+        # The constants name a generation-nine receipt that is not the live one (here the host
+        # version differs): the action refuses at the predecessor check and changes nothing.
+        publisher, event, nine, _, _ = self.reviewed_restore_host_fixture()
+        host = self.ids[0]
+        patcher = mock.patch.object(MODULE.Publisher, "WINDOWS_HOST_VERSION", nine["versions"]["us-east-1/" + host] + 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(_, copied)] = self.ec2.copies
+        self.ec2.available()
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap names the gen10 host: " + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

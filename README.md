@@ -668,6 +668,15 @@ the release, or after a rollback) starts an agent that has no `--windows` withou
 it. Hosts booted from the copy run four Windows sandboxes each on the staging
 wall (`?mode=windows`, behind Cloudflare Access).
 
+The fixed action `{"action":"activate-reviewed-restore-host-release"}` advances
+only the exact generation-nine receipt to the signed 0e910245 host (generation
+ten), whose Minecraft servers keep their bots connected across a restore
+(ejc3/fcvm#1824). Its predecessor is generation nine's receipt: `WINDOWS_HOST_COPY`
+and `WINDOWS_HOST_VERSION` in `publish.py` are that receipt's `host_amis` and the
+host's entry in `versions`, and any other live receipt is refused. It is released by the
+same apply, invoke, apply, invoke sequence; the second apply lists the copy in
+`windows_host_amis` and `minecraft_host_amis` beside generation nine's.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

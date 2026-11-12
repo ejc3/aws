@@ -345,6 +345,31 @@ class Publisher:
             },
         }, host_only=True)
 
+    # The generation-nine receipt (/fcvm-fleet/ami-release, version 10, 2026-11-13): the publisher's
+    # us-east-1 copy of the 853eb034 host it names, and the host template version it selects.
+    WINDOWS_HOST_COPY = "ami-0aae929f9b7dfd764"
+    WINDOWS_HOST_VERSION = 30
+
+    def reviewed_restore_host_release(self):
+        windows = self.reviewed_windows_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # Generation ten: the 0e910245 host, whose Minecraft servers keep their bots connected
+        # across a restore (ejc3/fcvm#1824). Its predecessor is the generation-nine receipt.
+        return self.reviewed_pair({
+            "source_sha": "0e910245f92d3ff093ec1fad1fdbe69fef948f3c",
+            "images": {"host": "ami-0c1f87eea5c86c172", "tile": windows["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 9, "source_sha": windows["source_sha"],
+                "build_id": "reviewed-windows-host-release:" + digest(encoded(windows)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**windows["expected"]["versions"], host_key: self.WINDOWS_HOST_VERSION},
+                "previous": {k: v for k, v in windows["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.WINDOWS_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": windows["images"]["tile"]}},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -557,6 +582,11 @@ class Publisher:
         need(event == {"action": "activate-reviewed-held-stamp-host-release"},
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_held_stamp_host_release(), "reviewed-held-stamp-host-release")
+
+    def run_restore_host_release(self, event):
+        need(event == {"action": "activate-reviewed-restore-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_restore_host_release(), "reviewed-restore-host-release")
 
     def run_windows_host_release(self, event):
         need(event == {"action": "activate-reviewed-windows-host-release"},
@@ -1412,6 +1442,8 @@ class Publisher:
             return self.run_held_stamp_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-windows-host-release":
             return self.run_windows_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-restore-host-release":
+            return self.run_restore_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
