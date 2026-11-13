@@ -6,11 +6,10 @@
 # cron, the live capture's Durable Object alarms, requests), its console.error lines, and the 5xx answers on
 # gamesworthwatching.com.
 #
-#   Workers Observability Read  account   the telemetry query (Workers Logs). Cloudflare scopes it to the account, so it
-#                                         reads every Worker's logs, as dolphin-labs-ci-logs.tf's token does
-#   Analytics Read              the zone  GraphQL httpRequestsAdaptiveGroups for gamesworthwatching.com alone
-# Nothing that can write. Checked 2026-11-10 with the observability token, which holds both: the telemetry query and the
-# zone's adaptive groups answer for a Free zone.
+#   Individual Workers Metadata Read-Only   dolphin-labs-prod alone (Workers Logs)
+#   Analytics Read                          gamesworthwatching.com alone (GraphQL httpRequestsAdaptiveGroups)
+# On 2026-11-13 the scoped token returned production counts; querying another Worker gave zero and an unfiltered query
+# still counted only production. Zone analytics works on this Free zone.
 #
 # The container, its reader and its policy are dolphin-aws's (monitoring.tf, modules/admin-secret: no version,
 # administration-only writes, OrganizationAccountAccessRole among administration). This file writes only its value,
@@ -20,7 +19,9 @@
 # `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`; the same apply rewrites the secret.
 
 locals {
-  dolphin_site_probe_secret = "dolphin-site-probe/cloudflare"
+  dolphin_site_probe_secret      = "dolphin-site-probe/cloudflare"
+  dolphin_site_probe_worker_id   = "95ade2c68e2c4c0388494692d9aaa38b" # Immutable ID of dolphin-labs-prod, not its name.
+  dolphin_site_probe_worker_read = "afa629b86102452b8b744a5485b870e1" # Individual Workers Metadata Read-Only.
 }
 
 resource "cloudflare_account_token" "dolphin_site_probe" {
@@ -30,8 +31,12 @@ resource "cloudflare_account_token" "dolphin_site_probe" {
   policies = [
     {
       effect            = "allow"
-      permission_groups = [{ id = local.cloudflare_observability_account_groups.workers_observability_read }]
-      resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })
+      permission_groups = [{ id = local.dolphin_site_probe_worker_read }]
+      resources = jsonencode({
+        "com.cloudflare.api.account.${var.cloudflare_account_id}" = {
+          "com.cloudflare.edge.worker.script.${local.dolphin_site_probe_worker_id}" = "*"
+        }
+      })
     },
     {
       effect            = "allow"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """dolphin-site-probe.tf and dolphin-budgets.tf: a read-only Cloudflare token for the Dolphin account's site probe
-(Workers Logs on the account, analytics on gamesworthwatching.com alone), written only into the Dolphin account's
+(Workers Logs for dolphin-labs-prod, analytics on gamesworthwatching.com alone), written only into the Dolphin account's
 container; and that account's budgets on dolphin-alerts."""
 import re
 import unittest
@@ -25,15 +25,16 @@ class TokenTests(unittest.TestCase):
     def test_token_reads_workers_logs_and_the_sites_zone_analytics_and_nothing_else(self):
         tok = block("cloudflare_account_token", "dolphin_site_probe")
         self.assertIn("provider   = cloudflare.token_minter", tok)
-        groups = re.findall(r"\{ id = local\.(cloudflare_observability_\w+)\.(\w+) \}", tok)
-        self.assertEqual(groups, [("cloudflare_observability_account_groups", "workers_observability_read"),
-                                  ("cloudflare_observability_zone_groups", "analytics_read")])
-        # Both groups are read-only ones the observability token already pins.
-        self.assertIn('workers_observability_read = "66c1ed49f4ed46098b75696a6d4ee3c9"', OBSERVABILITY)
+        groups = re.findall(r"\{ id = (local\.[\w.]+) \}", tok)
+        self.assertEqual(groups, ["local.dolphin_site_probe_worker_read",
+                                  "local.cloudflare_observability_zone_groups.analytics_read"])
+        self.assertIn('dolphin_site_probe_worker_read = "afa629b86102452b8b744a5485b870e1"', TF)
+        self.assertRegex(TF, r'dolphin_site_probe_worker_id\s*= "95ade2c68e2c4c0388494692d9aaa38b"')
         self.assertIn('analytics_read          = "9c88f9c5bce24ce7af9a958ba9c504db"', OBSERVABILITY)
         resources = re.findall(r'"(com\.cloudflare\.[^"]+)" = "\*"', tok)
-        self.assertEqual(resources, ["com.cloudflare.api.account.${var.cloudflare_account_id}",
+        self.assertEqual(resources, ["com.cloudflare.edge.worker.script.${local.dolphin_site_probe_worker_id}",
                                      "com.cloudflare.api.account.zone.${var.gww_zone_id}"])
+        self.assertIn('"com.cloudflare.api.account.${var.cloudflare_account_id}" = {', tok)
         self.assertNotRegex(tok, r"(?i)write|edit")
 
 
@@ -44,7 +45,7 @@ class SecretTests(unittest.TestCase):
         # Unconditional: dolphin-aws is applied first, so the jumpbox's one apply on merge writes it.
         self.assertNotRegex(ver, r"(?m)^\s*count\s*=")
         self.assertIn("secret_id = local.dolphin_site_probe_secret", ver)
-        self.assertIn('dolphin_site_probe_secret = "dolphin-site-probe/cloudflare"', TF)
+        self.assertRegex(TF, r'dolphin_site_probe_secret\s*= "dolphin-site-probe/cloudflare"')
         for key in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ZONE_ID"):
             self.assertIn(key, ver)
         # dolphin-aws owns the container and its policy; this file never creates one in either account.
@@ -60,8 +61,13 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(sorted(name for name, _ in budgets), ["dolphin_daily", "dolphin_monthly"])
         for name, body in budgets:
             self.assertIn("provider     = aws.dolphin", body, name)
+            self.assertIn("name         = local." + name + "_budget_name", body, name)
             self.assertIn("subscriber_sns_topic_arns = [data.aws_sns_topic.dolphin_alerts.arn]", body, name)
             self.assertIn("depends_on = [aws_sns_topic_policy.dolphin_alerts]", body, name)
+        self.assertRegex(BUDGETS, r'dolphin_daily_budget_name\s*= "dolphin-daily"')
+        self.assertRegex(BUDGETS, r'dolphin_monthly_budget_name\s*= "dolphin-monthly"')
+        self.assertIn("for name in [local.dolphin_daily_budget_name, local.dolphin_monthly_budget_name]", BUDGETS)
+        self.assertIn('"arn:aws:budgets::${data.aws_caller_identity.dolphin.account_id}:budget/${name}"', BUDGETS)
         self.assertIn('notification_type         = "FORECASTED"', dict(budgets)["dolphin_monthly"])
 
 

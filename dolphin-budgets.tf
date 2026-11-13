@@ -8,9 +8,18 @@
 # subscription (dolphin-alerts.tf); the GitHub router in dolphin-aws passes over anything not a CloudWatch alarm.
 # Budgets reads costs a few hours late.
 
+locals {
+  dolphin_daily_budget_name   = "dolphin-daily"
+  dolphin_monthly_budget_name = "dolphin-monthly"
+  dolphin_budget_arns = [
+    for name in [local.dolphin_daily_budget_name, local.dolphin_monthly_budget_name] :
+    "arn:aws:budgets::${data.aws_caller_identity.dolphin.account_id}:budget/${name}"
+  ]
+}
+
 resource "aws_budgets_budget" "dolphin_daily" {
   provider     = aws.dolphin
-  name         = "dolphin-daily"
+  name         = local.dolphin_daily_budget_name
   budget_type  = "COST"
   limit_amount = "100"
   limit_unit   = "USD"
@@ -29,7 +38,7 @@ resource "aws_budgets_budget" "dolphin_daily" {
 
 resource "aws_budgets_budget" "dolphin_monthly" {
   provider     = aws.dolphin
-  name         = "dolphin-monthly"
+  name         = local.dolphin_monthly_budget_name
   budget_type  = "COST"
   limit_amount = "1500"
   limit_unit   = "USD"

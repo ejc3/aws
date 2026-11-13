@@ -160,14 +160,14 @@ class DolphinSecurityTests(unittest.TestCase):
                 self.assertNotIn("*", statement)
                 self.assertNotRegex(statement, r'\b(?:ArnLike|StringLike)\b')
 
-    def test_budgets_publish_for_the_dolphin_account_alone(self):
+    def test_only_the_two_dolphin_budgets_can_publish(self):
         topic = block((ROOT / "dolphin-security.tf").read_text(),
                       'resource "aws_sns_topic_policy" "dolphin_alerts"')
         statement = dict(re.findall(r'\{\n\s*Sid\s*=\s*"([^"]+)"(.*?)\n      \}', topic, re.S))["DolphinBudgets"]
         self.assertIn('Principal = { Service = "budgets.amazonaws.com" }', statement)
         self.assertRegex(statement, r'Action\s*=\s*"sns:Publish"')
-        self.assertIn('Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.dolphin.account_id } }',
-                      statement)
+        self.assertRegex(statement, r'StringEquals\s*=\s*\{ "aws:SourceAccount" = data\.aws_caller_identity\.dolphin\.account_id \}')
+        self.assertRegex(statement, r'ArnEquals\s*=\s*\{ "aws:SourceArn" = local\.dolphin_budget_arns \}')
         self.assertNotIn("*", statement)
 
     def test_monitoring_grants_the_dolphin_account_nothing_here(self):

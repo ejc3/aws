@@ -450,15 +450,17 @@ resource "aws_sns_topic_policy" "dolphin_alerts" {
         Resource  = data.aws_sns_topic.dolphin_alerts.arn
         Condition = { ArnEquals = { "aws:SourceArn" = "arn:aws:events:us-west-1:${data.aws_caller_identity.dolphin.account_id}:rule/dolphin-labs-podcast-whisper-failed" } }
       },
-      # The Dolphin account's own cost budgets (dolphin-budgets.tf: dolphin-daily, dolphin-monthly), and no other
-      # account's.
+      # Only the two cost budgets defined in dolphin-budgets.tf.
       {
         Sid       = "DolphinBudgets"
         Effect    = "Allow"
         Principal = { Service = "budgets.amazonaws.com" }
         Action    = "sns:Publish"
         Resource  = data.aws_sns_topic.dolphin_alerts.arn
-        Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.dolphin.account_id } }
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.dolphin.account_id }
+          ArnEquals    = { "aws:SourceArn" = local.dolphin_budget_arns }
+        }
       },
     ]
   })
