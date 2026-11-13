@@ -377,7 +377,7 @@ resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
 variable "fcvm_host_kernel_commit" {
   description = "ejc3/fcvm commit whose [kernel_profiles.nested.arm64.host_kernel] the dev box installs"
   type        = string
-  default     = "a5a7132995fbf92a0106f7b24242ab7399fae4b0"
+  default     = "624220f8707472cf01e0c02ceb46101e60e4f600"
 }
 
 resource "aws_ssm_association" "firecracker_dev_host_kernel" {
